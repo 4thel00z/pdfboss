@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pdfboss-core",
+    "crates/pdfboss-text",
+    "crates/pdfboss-render",
+    "crates/pdfboss-cli",
+    "crates/pdfboss-py",
+    "crates/pdfboss-testkit",
+]
+
+[workspace.package]
+version = "0.1.0" # x-release-please-version
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/4thel00z/pdfboss"

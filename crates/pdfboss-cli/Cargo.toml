@@ -1,0 +1,17 @@
+[package]
+name = "pdfboss-cli"
+description = "Command-line interface for pdfboss: info, text, render and obj subcommands"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pdfboss-core = { path = "../pdfboss-core" }
+pdfboss-text = { path = "../pdfboss-text" }
+pdfboss-render = { path = "../pdfboss-render" }
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "pdfboss"
+path = "src/main.rs"

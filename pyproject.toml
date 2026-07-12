@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pdfboss"
+version = "0.1.0"
+description = "PDF parsing, text extraction and rendering in pure Rust with pythonic bindings"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "4thel00z" }]
+keywords = ["pdf", "parser", "text-extraction", "rendering", "rasterizer", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Text Processing",
+    "Topic :: Multimedia :: Graphics",
+]
+
+[project.urls]
+Repository = "https://github.com/4thel00z/pdfboss"
+Issues = "https://github.com/4thel00z/pdfboss/issues"
+
+[tool.maturin]
+python-source = "python"
+module-name = "pdfboss._pdfboss"
+manifest-path = "crates/pdfboss-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+# The declared License-Files live at the workspace root, outside the
+# manifest dir — include them explicitly or PyPI rejects the sdist (PEP 639).
+include = [
+    { path = "LICENSE-MIT", format = "sdist" },
+    { path = "LICENSE-APACHE", format = "sdist" },
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.7",
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

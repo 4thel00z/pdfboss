@@ -1,0 +1,15 @@
+[package]
+name = "pdfboss-core"
+description = "PDF syntax, objects, filters, cross-references and document model (ISO 32000)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "2"
+flate2 = "1"
+memchr = "2"
+
+[dev-dependencies]
+pdfboss-testkit = { path = "../pdfboss-testkit" }

@@ -1,0 +1,10 @@
+[package]
+name = "pdfboss-testkit"
+description = "Internal PDF fixture builder for pdfboss tests"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

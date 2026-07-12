@@ -1,0 +1,15 @@
+[package]
+name = "pdfboss-render"
+description = "Page rasterization to RGBA pixmaps and PNG for pdfboss"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pdfboss-core = { path = "../pdfboss-core" }
+png = "0.18"
+jpeg-decoder = "0.3"
+
+[dev-dependencies]
+pdfboss-testkit = { path = "../pdfboss-testkit" }

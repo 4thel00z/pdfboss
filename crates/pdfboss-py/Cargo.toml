@@ -1,0 +1,17 @@
+[package]
+name = "pdfboss-py"
+description = "Python bindings for pdfboss (extension module pdfboss._pdfboss)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "_pdfboss"
+crate-type = ["cdylib"]
+
+[dependencies]
+pdfboss-core = { path = "../pdfboss-core" }
+pdfboss-text = { path = "../pdfboss-text" }
+pdfboss-render = { path = "../pdfboss-render" }
+pyo3 = { version = "0.25", features = ["abi3-py312"] }
