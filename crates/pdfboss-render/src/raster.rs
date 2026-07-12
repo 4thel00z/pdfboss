@@ -1,0 +1,452 @@
+//! Scanline coverage rasterizer: per-pixel coverage accumulation from
+//! polygon edges, nonzero and even-odd fill rules, and coverage-mask
+//! clipping.
+
+use crate::path::Subpath;
+use crate::Pixmap;
+
+/// Vertical subsamples per pixel row; horizontal coverage is analytic.
+const SUBSAMPLES: u32 = 4;
+
+/// Which interior rule decides what a path encloses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillRule {
+    /// Nonzero winding number.
+    NonZero,
+    /// Even-odd (parity) rule.
+    EvenOdd,
+}
+
+/// A per-pixel coverage buffer (0 = fully clipped out, 255 = fully
+/// visible) with the same dimensions as the pixmap it clips.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Mask {
+    pub width: u32,
+    pub height: u32,
+    /// Row-major coverage values, `width * height` bytes.
+    pub data: Vec<u8>,
+}
+
+impl Mask {
+    /// Creates an all-zero (fully clipped) mask.
+    pub(crate) fn new(width: u32, height: u32) -> Mask {
+        Mask {
+            width,
+            height,
+            data: vec![0; width as usize * height as usize],
+        }
+    }
+
+    /// Rasterizes `polys` under `rule` into a fresh mask of the given
+    /// dimensions.
+    pub(crate) fn from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
+        let mut mask = Mask::new(width, height);
+        let w = width as usize;
+        coverage_rows(width, height, polys, rule, |y, row| {
+            let base = y as usize * w;
+            for (x, cov) in row.iter().enumerate() {
+                mask.data[base + x] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+        });
+        mask
+    }
+
+    /// Intersects this mask with `other` by taking the per-pixel minimum.
+    /// The masks must have identical dimensions.
+    pub(crate) fn intersect(&mut self, other: &Mask) {
+        debug_assert_eq!((self.width, self.height), (other.width, other.height));
+        for (a, b) in self.data.iter_mut().zip(other.data.iter()) {
+            *a = (*a).min(*b);
+        }
+    }
+}
+
+/// A non-horizontal polygon edge, stored top-to-bottom with its winding
+/// direction.
+struct Edge {
+    /// Top endpoint (smaller y).
+    x0: f32,
+    y0: f32,
+    /// Bottom endpoint (larger y).
+    x1: f32,
+    y1: f32,
+    /// +1 if the original edge pointed downward (increasing y), else -1.
+    dir: i32,
+}
+
+impl Edge {
+    /// X coordinate where the edge crosses the horizontal line `y`
+    /// (requires `y0 <= y < y1`).
+    fn x_at(&self, y: f32) -> f32 {
+        self.x0 + (y - self.y0) * (self.x1 - self.x0) / (self.y1 - self.y0)
+    }
+}
+
+/// Collects the non-horizontal edges of `polys`, implicitly closing every
+/// subpath (fills always treat subpaths as closed). Edges with non-finite
+/// vertices are skipped.
+fn build_edges(polys: &[Subpath]) -> Vec<Edge> {
+    let mut edges = Vec::new();
+    for sub in polys {
+        let pts = &sub.points;
+        if pts.len() < 2 {
+            continue;
+        }
+        for i in 0..pts.len() {
+            let p = pts[i];
+            let q = pts[(i + 1) % pts.len()];
+            if !(p.x.is_finite() && p.y.is_finite() && q.x.is_finite() && q.y.is_finite()) {
+                continue;
+            }
+            if p.y == q.y {
+                continue;
+            }
+            let (top, bot, dir) = if p.y < q.y { (p, q, 1) } else { (q, p, -1) };
+            edges.push(Edge {
+                x0: top.x,
+                y0: top.y,
+                x1: bot.x,
+                y1: bot.y,
+                dir,
+            });
+        }
+    }
+    edges
+}
+
+/// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
+/// `weight`, to a row buffer.
+fn add_span(row: &mut [f32], x0: f32, x1: f32, weight: f32) {
+    let w = row.len() as f32;
+    let x0 = x0.max(0.0);
+    let x1 = x1.min(w);
+    if x1 <= x0 {
+        return;
+    }
+    let first = x0.floor() as usize;
+    let last = (x1.ceil() as usize).min(row.len());
+    for (px, slot) in row.iter_mut().enumerate().take(last).skip(first) {
+        let l = x0.max(px as f32);
+        let r = x1.min(px as f32 + 1.0);
+        if r > l {
+            *slot += (r - l) * weight;
+        }
+    }
+}
+
+/// Computes per-row anti-aliased coverage of `polys` under `rule` and
+/// invokes `emit(y, row)` for every pixel row the path touches. Rows the
+/// path does not reach are never emitted (their coverage is zero).
+fn coverage_rows<F: FnMut(u32, &[f32])>(
+    width: u32,
+    height: u32,
+    polys: &[Subpath],
+    rule: FillRule,
+    mut emit: F,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    let edges = build_edges(polys);
+    if edges.is_empty() {
+        return;
+    }
+    let mut ymin = f32::MAX;
+    let mut ymax = f32::MIN;
+    for e in &edges {
+        ymin = ymin.min(e.y0);
+        ymax = ymax.max(e.y1);
+    }
+    let row_start = ymin.floor().max(0.0) as u32;
+    let row_end = (ymax.ceil().max(0.0) as u32).min(height);
+    let mut row = vec![0.0f32; width as usize];
+    let mut crossings: Vec<(f32, i32)> = Vec::new();
+    let weight = 1.0 / SUBSAMPLES as f32;
+    for y in row_start..row_end {
+        row.iter_mut().for_each(|c| *c = 0.0);
+        let mut touched = false;
+        for s in 0..SUBSAMPLES {
+            let ys = y as f32 + (s as f32 + 0.5) / SUBSAMPLES as f32;
+            crossings.clear();
+            for e in &edges {
+                if e.y0 <= ys && ys < e.y1 {
+                    crossings.push((e.x_at(ys), e.dir));
+                }
+            }
+            if crossings.len() < 2 {
+                continue;
+            }
+            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut wind = 0i32;
+            let mut span_start = 0.0f32;
+            for &(x, dir) in &crossings {
+                let was_inside = inside(wind, rule);
+                wind += dir;
+                let is_inside = inside(wind, rule);
+                if !was_inside && is_inside {
+                    span_start = x;
+                } else if was_inside && !is_inside {
+                    add_span(&mut row, span_start, x, weight);
+                    touched = true;
+                }
+            }
+        }
+        if touched {
+            emit(y, &row);
+        }
+    }
+}
+
+/// Whether a winding count is "inside" under `rule`.
+fn inside(wind: i32, rule: FillRule) -> bool {
+    match rule {
+        FillRule::NonZero => wind != 0,
+        FillRule::EvenOdd => wind % 2 != 0,
+    }
+}
+
+/// Composites `rgb` at alpha `a` (0..=1) over one straight-alpha RGBA8
+/// pixel using the source-over rule.
+fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
+    let da = dst[3] as f32 / 255.0;
+    let oa = a + da * (1.0 - a);
+    if oa <= 0.0 {
+        dst.copy_from_slice(&[0, 0, 0, 0]);
+        return;
+    }
+    for i in 0..3 {
+        let s = rgb[i] as f32;
+        let d = dst[i] as f32;
+        let c = (s * a + d * da * (1.0 - a)) / oa;
+        dst[i] = (c + 0.5) as u8;
+    }
+    dst[3] = (oa * 255.0 + 0.5) as u8;
+}
+
+/// Fills `polys` into `pix` under `rule` with the straight-alpha color
+/// `rgba`, further scaled by the constant `alpha` (0..=1) and, when
+/// present, the `clip` coverage mask. Anti-aliased coverage is composited
+/// source-over.
+pub(crate) fn fill_path(
+    pix: &mut Pixmap,
+    polys: &[Subpath],
+    rule: FillRule,
+    rgba: [u8; 4],
+    alpha: f32,
+    clip: Option<&Mask>,
+) {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let base_a = rgba[3] as f32 / 255.0 * alpha;
+    if base_a <= 0.0 {
+        return;
+    }
+    let rgb = [rgba[0], rgba[1], rgba[2]];
+    let w = pix.width as usize;
+    coverage_rows(pix.width, pix.height, polys, rule, |y, row| {
+        let base = y as usize * w;
+        for (x, cov) in row.iter().enumerate() {
+            let mut a = cov.clamp(0.0, 1.0) * base_a;
+            if let Some(mask) = clip {
+                a *= mask.data[base + x] as f32 / 255.0;
+            }
+            if a > 0.0 {
+                let off = (base + x) * 4;
+                composite_over(&mut pix.data[off..off + 4], rgb, a);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdfboss_core::geom::Point;
+
+    fn rect_poly(x0: f32, y0: f32, x1: f32, y1: f32) -> Subpath {
+        Subpath {
+            points: vec![
+                Point::new(x0, y0),
+                Point::new(x1, y0),
+                Point::new(x1, y1),
+                Point::new(x0, y1),
+            ],
+            closed: true,
+        }
+    }
+
+    fn alpha_at(pix: &Pixmap, x: u32, y: u32) -> u8 {
+        pix.data[((y * pix.width + x) * 4 + 3) as usize]
+    }
+
+    fn rgba_at(pix: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let off = ((y * pix.width + x) * 4) as usize;
+        pix.data[off..off + 4].try_into().unwrap()
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+
+    #[test]
+    fn axis_aligned_rect_exact_interior() {
+        let mut pix = Pixmap::new(10, 10);
+        let polys = [rect_poly(2.0, 2.0, 8.0, 8.0)];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        for y in 0..10 {
+            for x in 0..10 {
+                let inside = (2..8).contains(&x) && (2..8).contains(&y);
+                if inside {
+                    assert_eq!(rgba_at(&pix, x, y), RED, "pixel ({x},{y})");
+                } else {
+                    assert_eq!(alpha_at(&pix, x, y), 0, "pixel ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn half_pixel_horizontal_edge_antialiases() {
+        let mut pix = Pixmap::new(10, 10);
+        let polys = [rect_poly(2.5, 2.0, 8.0, 8.0)];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        let a = alpha_at(&pix, 2, 4);
+        assert!((127..=129).contains(&a), "edge alpha {a}");
+        assert_eq!(alpha_at(&pix, 3, 4), 255);
+        assert_eq!(alpha_at(&pix, 1, 4), 0);
+    }
+
+    #[test]
+    fn half_pixel_vertical_edge_antialiases() {
+        let mut pix = Pixmap::new(10, 10);
+        let polys = [rect_poly(2.0, 2.5, 8.0, 8.0)];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        let a = alpha_at(&pix, 4, 2);
+        assert!((115..=140).contains(&a), "edge alpha {a}");
+        assert_eq!(alpha_at(&pix, 4, 3), 255);
+        assert_eq!(alpha_at(&pix, 4, 1), 0);
+    }
+
+    #[test]
+    fn triangle_half_plane_sanity() {
+        let mut pix = Pixmap::new(10, 10);
+        let tri = Subpath {
+            points: vec![
+                Point::new(1.0, 1.0),
+                Point::new(9.0, 1.0),
+                Point::new(5.0, 9.0),
+            ],
+            closed: true,
+        };
+        fill_path(&mut pix, &[tri], FillRule::NonZero, RED, 1.0, None);
+        assert_eq!(alpha_at(&pix, 5, 4), 255, "interior");
+        assert_eq!(alpha_at(&pix, 4, 2), 255, "interior near top");
+        assert_eq!(alpha_at(&pix, 0, 5), 0, "left of triangle");
+        assert_eq!(alpha_at(&pix, 9, 8), 0, "right of apex");
+        assert_eq!(alpha_at(&pix, 5, 0), 0, "above");
+    }
+
+    #[test]
+    fn even_odd_donut_has_hole() {
+        let mut pix = Pixmap::new(12, 12);
+        let polys = [
+            rect_poly(1.0, 1.0, 11.0, 11.0),
+            rect_poly(4.0, 4.0, 8.0, 8.0),
+        ];
+        fill_path(&mut pix, &polys, FillRule::EvenOdd, RED, 1.0, None);
+        assert_eq!(alpha_at(&pix, 6, 6), 0, "hole must be empty");
+        assert_eq!(alpha_at(&pix, 2, 6), 255, "ring left");
+        assert_eq!(alpha_at(&pix, 9, 6), 255, "ring right");
+        assert_eq!(alpha_at(&pix, 6, 2), 255, "ring top");
+        assert_eq!(alpha_at(&pix, 0, 6), 0, "outside");
+    }
+
+    #[test]
+    fn nonzero_same_winding_donut_fills_solid() {
+        let mut pix = Pixmap::new(12, 12);
+        // Both rects share the same winding direction.
+        let polys = [
+            rect_poly(1.0, 1.0, 11.0, 11.0),
+            rect_poly(4.0, 4.0, 8.0, 8.0),
+        ];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        assert_eq!(alpha_at(&pix, 6, 6), 255, "center filled under nonzero");
+        assert_eq!(alpha_at(&pix, 2, 6), 255, "ring");
+        assert_eq!(alpha_at(&pix, 0, 6), 0, "outside");
+    }
+
+    #[test]
+    fn nonzero_opposite_winding_donut_has_hole() {
+        let mut pix = Pixmap::new(12, 12);
+        let inner = Subpath {
+            points: vec![
+                Point::new(4.0, 4.0),
+                Point::new(4.0, 8.0),
+                Point::new(8.0, 8.0),
+                Point::new(8.0, 4.0),
+            ],
+            closed: true,
+        };
+        let polys = [rect_poly(1.0, 1.0, 11.0, 11.0), inner];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        assert_eq!(alpha_at(&pix, 6, 6), 0, "reversed inner rect punches hole");
+        assert_eq!(alpha_at(&pix, 2, 6), 255, "ring");
+    }
+
+    #[test]
+    fn clip_mask_restricts_fill() {
+        let mut pix = Pixmap::new(10, 10);
+        let clip = Mask::from_path(10, 10, &[rect_poly(0.0, 0.0, 5.0, 10.0)], FillRule::NonZero);
+        let polys = [rect_poly(0.0, 0.0, 10.0, 10.0)];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, Some(&clip));
+        for y in 0..10 {
+            for x in 0..10 {
+                if x < 5 {
+                    assert_eq!(alpha_at(&pix, x, y), 255, "inside clip ({x},{y})");
+                } else {
+                    assert_eq!(alpha_at(&pix, x, y), 0, "outside clip untouched ({x},{y})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mask_intersect_takes_minimum() {
+        let mut a = Mask::from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
+        let b = Mask::from_path(8, 8, &[rect_poly(4.0, 0.0, 8.0, 8.0)], FillRule::NonZero);
+        a.intersect(&b);
+        let at = |x: usize, y: usize| a.data[y * 8 + x];
+        assert_eq!(at(2, 4), 0, "only in a");
+        assert_eq!(at(7, 4), 0, "only in b");
+        assert_eq!(at(5, 4), 255, "in both");
+    }
+
+    #[test]
+    fn constant_alpha_composites_over_white() {
+        let mut pix = Pixmap::new(4, 4);
+        pix.fill([255, 255, 255, 255]);
+        let polys = [rect_poly(0.0, 0.0, 4.0, 4.0)];
+        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 0.5, None);
+        let px = rgba_at(&pix, 2, 2);
+        assert_eq!(px[0], 255);
+        assert!((127..=129).contains(&px[1]), "green {}", px[1]);
+        assert!((127..=129).contains(&px[2]), "blue {}", px[2]);
+        assert_eq!(px[3], 255);
+    }
+
+    #[test]
+    fn open_subpath_is_implicitly_closed_for_fill() {
+        let mut pix = Pixmap::new(10, 10);
+        let tri = Subpath {
+            points: vec![
+                Point::new(1.0, 1.0),
+                Point::new(9.0, 1.0),
+                Point::new(5.0, 9.0),
+            ],
+            closed: false,
+        };
+        fill_path(&mut pix, &[tri], FillRule::NonZero, RED, 1.0, None);
+        assert_eq!(alpha_at(&pix, 5, 4), 255);
+    }
+}

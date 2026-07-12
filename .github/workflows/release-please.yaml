@@ -1,0 +1,138 @@
+name: release-please
+
+on:
+  push:
+    branches: [main, master]
+  # Manual dispatch re-publishes the current master version to PyPI
+  # (e.g. when a wheel build failed during the release run).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      prs_created: ${{ steps.rp.outputs.prs_created }}
+      pr: ${{ steps.rp.outputs.pr }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # The generic x-release-please-version updater bumps Cargo.toml, but
+  # nothing rewrites Cargo.lock, which pins every workspace member at the
+  # previous version. Inline markers inside Cargo.lock are not an option:
+  # cargo regenerates the lockfile wholesale and drops comments. Instead,
+  # refresh the lock on the release PR branch so the merged (and tagged)
+  # release commit builds under `cargo build/test/install --locked`.
+  sync-lockfile:
+    needs: release-please
+    if: needs.release-please.outputs.prs_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+      - name: Sync Cargo.lock with the bumped workspace version
+        # --workspace only re-syncs workspace members against their
+        # manifests; third-party pins stay untouched.
+        run: cargo update --workspace
+      - name: Commit refreshed Cargo.lock to the release PR
+        env:
+          BRANCH: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock with release version"
+          git push origin "HEAD:${BRANCH}"
+
+  # The PyPI publish chains off this workflow because tags created by
+  # release-please's GITHUB_TOKEN do not trigger `on: push: tags` workflows.
+
+  pypi-wheels:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: ubuntu-latest
+            target: x86_64
+          - runner: macos-latest
+            target: aarch64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          manylinux: auto
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ runner.os }}-${{ matrix.platform.target }}
+          path: dist
+
+  pypi-sdist:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish-pypi:
+    needs: [release-please, pypi-wheels, pypi-sdist]
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      # Trusted Publishing (OIDC) — no API token needed.
+      id-token: write
+      # Artifact attestation.
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v8
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: wheels-*/*
+      - name: Collect distributions
+        run: |
+          mkdir -p dist
+          cp wheels-*/* dist/
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Manual re-dispatch after a partial publish must not choke on
+          # the wheels that already made it to PyPI.
+          skip-existing: true

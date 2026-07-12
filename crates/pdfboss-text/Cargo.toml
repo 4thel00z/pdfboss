@@ -1,0 +1,13 @@
+[package]
+name = "pdfboss-text"
+description = "Font loading, encodings, ToUnicode CMaps and text extraction for pdfboss"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pdfboss-core = { path = "../pdfboss-core" }
+
+[dev-dependencies]
+pdfboss-testkit = { path = "../pdfboss-testkit" }
