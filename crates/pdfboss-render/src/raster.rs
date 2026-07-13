@@ -42,10 +42,11 @@ impl Mask {
     pub(crate) fn from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
         let mut mask = Mask::new(width, height);
         let w = width as usize;
-        coverage_rows(width, height, polys, rule, |y, row| {
+        coverage_rows(width, height, polys, rule, |y, row, lo, hi| {
             let base = y as usize * w;
-            for (x, cov) in row.iter().enumerate() {
-                mask.data[base + x] = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            let dst = &mut mask.data[base + lo..base + hi];
+            for (cov, out) in row[lo..hi].iter().zip(dst.iter_mut()) {
+                *out = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         });
         mask
@@ -115,8 +116,16 @@ fn build_edges(polys: &[Subpath]) -> Vec<Edge> {
 }
 
 /// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
-/// `weight`, to a row buffer.
-fn add_span(row: &mut [f32], x0: f32, x1: f32, weight: f32) {
+/// `weight`, to a row buffer, and widens `[dirty_lo, dirty_hi)` to cover the
+/// pixels it wrote so the caller can restrict its work to the touched extent.
+fn add_span(
+    row: &mut [f32],
+    x0: f32,
+    x1: f32,
+    weight: f32,
+    dirty_lo: &mut usize,
+    dirty_hi: &mut usize,
+) {
     let w = row.len() as f32;
     let x0 = x0.max(0.0);
     let x1 = x1.min(w);
@@ -125,6 +134,8 @@ fn add_span(row: &mut [f32], x0: f32, x1: f32, weight: f32) {
     }
     let first = x0.floor() as usize;
     let last = (x1.ceil() as usize).min(row.len());
+    *dirty_lo = (*dirty_lo).min(first);
+    *dirty_hi = (*dirty_hi).max(last);
     for (px, slot) in row.iter_mut().enumerate().take(last).skip(first) {
         let l = x0.max(px as f32);
         let r = x1.min(px as f32 + 1.0);
@@ -135,9 +146,11 @@ fn add_span(row: &mut [f32], x0: f32, x1: f32, weight: f32) {
 }
 
 /// Computes per-row anti-aliased coverage of `polys` under `rule` and
-/// invokes `emit(y, row)` for every pixel row the path touches. Rows the
-/// path does not reach are never emitted (their coverage is zero).
-fn coverage_rows<F: FnMut(u32, &[f32])>(
+/// invokes `emit(y, row, x_lo, x_hi)` for every pixel row the path touches,
+/// where `[x_lo, x_hi)` bounds the columns that received coverage. Rows the
+/// path does not reach are never emitted (their coverage is zero), and
+/// columns outside `[x_lo, x_hi)` in an emitted row are guaranteed zero.
+fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
     width: u32,
     height: u32,
     polys: &[Subpath],
@@ -147,7 +160,7 @@ fn coverage_rows<F: FnMut(u32, &[f32])>(
     if width == 0 || height == 0 {
         return;
     }
-    let edges = build_edges(polys);
+    let mut edges = build_edges(polys);
     if edges.is_empty() {
         return;
     }
@@ -157,21 +170,46 @@ fn coverage_rows<F: FnMut(u32, &[f32])>(
         ymin = ymin.min(e.y0);
         ymax = ymax.max(e.y1);
     }
+    // Sort edges by their top `y` so the active-edge sweep below can bring
+    // them in with a single forward-moving pointer as the scanline descends.
+    edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+
     let row_start = ymin.floor().max(0.0) as u32;
     let row_end = (ymax.ceil().max(0.0) as u32).min(height);
     let mut row = vec![0.0f32; width as usize];
     let mut crossings: Vec<(f32, i32)> = Vec::new();
+    // Active-edge table: indices into `edges` for the edges that straddle the
+    // current scanline. `ys` increases monotonically across the whole sweep
+    // (rows outer, subsamples inner), so `next` only ever advances and expired
+    // edges are dropped once and never revisited — turning the per-scanline
+    // cost from O(all edges) into O(edges crossing this row).
+    let mut active: Vec<usize> = Vec::new();
+    let mut next = 0usize;
     let weight = 1.0 / SUBSAMPLES as f32;
+    // `[dirty_lo, dirty_hi)` is the range of `row` written for the row being
+    // built; it is used both to bound `emit` and to clear only the touched
+    // slice before the next row instead of re-zeroing the full width.
+    let full = width as usize;
+    let mut dirty_lo = full;
+    let mut dirty_hi = 0usize;
     for y in row_start..row_end {
-        row.iter_mut().for_each(|c| *c = 0.0);
-        let mut touched = false;
+        if dirty_lo < dirty_hi {
+            row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
+        }
+        dirty_lo = full;
+        dirty_hi = 0;
         for s in 0..SUBSAMPLES {
             let ys = y as f32 + (s as f32 + 0.5) / SUBSAMPLES as f32;
+            while next < edges.len() && edges[next].y0 <= ys {
+                active.push(next);
+                next += 1;
+            }
+            active.retain(|&i| edges[i].y1 > ys);
             crossings.clear();
-            for e in &edges {
-                if e.y0 <= ys && ys < e.y1 {
-                    crossings.push((e.x_at(ys), e.dir));
-                }
+            for &i in &active {
+                // By construction `y0 <= ys` (activation) and `ys < y1`
+                // (retain), so this edge genuinely crosses the scanline.
+                crossings.push((edges[i].x_at(ys), edges[i].dir));
             }
             if crossings.len() < 2 {
                 continue;
@@ -186,13 +224,12 @@ fn coverage_rows<F: FnMut(u32, &[f32])>(
                 if !was_inside && is_inside {
                     span_start = x;
                 } else if was_inside && !is_inside {
-                    add_span(&mut row, span_start, x, weight);
-                    touched = true;
+                    add_span(&mut row, span_start, x, weight, &mut dirty_lo, &mut dirty_hi);
                 }
             }
         }
-        if touched {
-            emit(y, &row);
+        if dirty_lo < dirty_hi {
+            emit(y, &row, dirty_lo, dirty_hi);
         }
     }
 }
@@ -245,16 +282,25 @@ pub(crate) fn fill_path(
         return;
     }
     let rgb = [rgba[0], rgba[1], rgba[2]];
+    let opaque = [rgba[0], rgba[1], rgba[2], 255];
     let w = pix.width as usize;
-    coverage_rows(pix.width, pix.height, polys, rule, |y, row| {
+    coverage_rows(pix.width, pix.height, polys, rule, |y, row, lo, hi| {
         let base = y as usize * w;
-        for (x, cov) in row.iter().enumerate() {
+        for (dx, &cov) in row[lo..hi].iter().enumerate() {
+            let x = lo + dx;
             let mut a = cov.clamp(0.0, 1.0) * base_a;
             if let Some(mask) = clip {
                 a *= mask.data[base + x] as f32 / 255.0;
             }
-            if a > 0.0 {
-                let off = (base + x) * 4;
+            if a <= 0.0 {
+                continue;
+            }
+            let off = (base + x) * 4;
+            if a >= 1.0 {
+                // Fully covered by an opaque source: the source-over result
+                // is exactly the source color, so skip the per-pixel divide.
+                pix.data[off..off + 4].copy_from_slice(&opaque);
+            } else {
                 composite_over(&mut pix.data[off..off + 4], rgb, a);
             }
         }
