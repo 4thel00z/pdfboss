@@ -33,6 +33,10 @@ pub struct Document {
     /// Object numbers currently being parsed, guarding re-entrant fetches
     /// (e.g. a stream whose `/Length` refers back to the stream itself).
     loading: RefCell<HashSet<u32>>,
+    /// Decoded object streams, keyed by their stream object number, so a
+    /// stream is decompressed and its header parsed at most once even when
+    /// many compressed objects are read from it.
+    objstms: RefCell<HashMap<u32, Rc<objstm::ObjStm>>>,
     pages: Vec<PageRec>,
 }
 
@@ -114,6 +118,7 @@ impl Document {
             xref,
             cache: RefCell::new(HashMap::new()),
             loading: RefCell::new(HashSet::new()),
+            objstms: RefCell::new(HashMap::new()),
             pages: Vec::new(),
         };
         doc.pages = doc.flatten_pages();
@@ -168,8 +173,12 @@ impl Document {
         }
     }
 
-    /// Extracts a compressed object from the object stream `stream_num`.
+    /// Extracts a compressed object from the object stream `stream_num`,
+    /// decoding and parsing that stream's header at most once.
     fn load_from_object_stream(&self, stream_num: u32, index: u32) -> Result<Object> {
+        if let Some(stm) = self.objstms.borrow().get(&stream_num) {
+            return stm.object(index);
+        }
         let container = self.get(ObjRef {
             num: stream_num,
             gen: 0,
@@ -189,7 +198,10 @@ impl Document {
             .and_then(|v| usize::try_from(v).ok())
             .ok_or(Error::MissingKey("First"))?;
         let decoded = self.stream_data(stream)?;
-        objstm::extract(&decoded, n, first, index)
+        let stm = Rc::new(objstm::ObjStm::parse(decoded, n, first)?);
+        let object = stm.object(index)?;
+        self.objstms.borrow_mut().insert(stream_num, stm);
+        Ok(object)
     }
 
     /// Chases reference chains with a depth guard of `MAX_RESOLVE_DEPTH`
