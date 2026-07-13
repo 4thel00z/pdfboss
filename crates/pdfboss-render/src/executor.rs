@@ -1,8 +1,9 @@
 //! Content-op execution against a graphics state stack: transforms, colors,
 //! clipping, ExtGState, form XObject recursion, and paint dispatch.
 //!
-//! Limitations (v0.1): text is tracked in state but glyphs are not painted;
-//! `sh` shadings are skipped; pattern fills paint mid-gray.
+//! Limitations (v0.1): only embedded-TrueType glyph outlines are painted
+//! (other fonts are positioned but not drawn); `sh` shadings are skipped;
+//! pattern fills paint mid-gray.
 
 use std::collections::HashMap;
 use std::rc::Rc;
