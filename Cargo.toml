@@ -17,3 +17,11 @@ repository = "https://github.com/4thel00z/pdfboss"
 
 [workspace.dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# Release builds trade compile time for cross-crate inlining and tighter
+# codegen on the CPU-bound parse/raster paths. `panic` is deliberately left as
+# "unwind": the Python extension relies on unwinding to turn Rust panics into
+# Python exceptions rather than aborting the interpreter.
+[profile.release]
+lto = "thin"
+codegen-units = 1
