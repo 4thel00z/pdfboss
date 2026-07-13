@@ -22,10 +22,11 @@ pub(crate) enum Seg {
 pub(crate) struct TrueType {
     data: Vec<u8>,
     units_per_em: u16,
-    num_glyphs: u16,
     /// Absolute byte offsets into `data` for each glyph, `num_glyphs + 1` long.
     loca: Vec<usize>,
     cmap: Option<Cmap>,
+    /// Per-glyph advance widths in font units (from `hmtx`), or empty.
+    advances: Vec<u16>,
 }
 
 impl TrueType {
@@ -44,6 +45,8 @@ impl TrueType {
         let mut loca_tab = None;
         let mut glyf = None;
         let mut cmap_off = None;
+        let mut hhea_off = None;
+        let mut hmtx_off = None;
         for i in 0..num_tables {
             let rec = 12 + i * 16;
             let tag = data.get(rec..rec + 4)?;
@@ -55,6 +58,8 @@ impl TrueType {
                 b"loca" => loca_tab = Some((off, len)),
                 b"glyf" => glyf = Some((off, len)),
                 b"cmap" => cmap_off = Some(off),
+                b"hhea" => hhea_off = Some(off),
+                b"hmtx" => hmtx_off = Some(off),
                 _ => {}
             }
         }
@@ -89,13 +94,35 @@ impl TrueType {
 
         let cmap = cmap_off.and_then(|o| Cmap::parse(&data, o));
 
+        // hmtx: `numberOfHMetrics` (from hhea) long-metric records of
+        // (advanceWidth u16, lsb i16); glyphs past that reuse the last advance.
+        let mut advances = Vec::new();
+        if let (Some(hhea), Some(hmtx)) = (hhea_off, hmtx_off) {
+            if let Some(nhm) = be16(&data, hhea + 34) {
+                let nhm = (nhm as usize).min(num_glyphs as usize);
+                let mut last = 0u16;
+                for i in 0..nhm {
+                    last = be16(&data, hmtx + i * 4).unwrap_or(last);
+                    advances.push(last);
+                }
+                for _ in nhm..num_glyphs as usize {
+                    advances.push(last); // monospaced tail shares the last width
+                }
+            }
+        }
+
         Some(TrueType {
             data,
             units_per_em,
-            num_glyphs,
             loca,
             cmap,
+            advances,
         })
+    }
+
+    /// Advance width of glyph `gid` in font units (0 if metrics are absent).
+    pub(crate) fn advance(&self, gid: u16) -> u16 {
+        self.advances.get(gid as usize).copied().unwrap_or(0)
     }
 
     /// Font design units per em (the outline coordinate space).
@@ -715,7 +742,7 @@ mod tests {
     fn parses_synthetic_font() {
         let font = TrueType::parse(build_font()).expect("valid glyf font parses");
         assert_eq!(font.units_per_em(), 1000);
-        assert_eq!(font.num_glyphs, 2);
+        assert_eq!(font.loca.len(), 3, "two glyphs plus the end sentinel");
         assert!(font.has_cmap());
     }
 
@@ -748,5 +775,57 @@ mod tests {
             "OTTO/CFF is not glyf-based"
         );
         assert!(TrueType::parse(vec![0, 1, 2]).is_none(), "truncated header");
+    }
+
+    /// End-to-end: a page showing one CID from an embedded `CIDFontType2`
+    /// Type0 font must paint the glyph's filled outline on the page.
+    #[test]
+    fn renders_embedded_glyph_onto_page() {
+        use pdfboss_core::Document;
+        use pdfboss_testkit::PdfBuilder;
+
+        let font_program = build_font(); // glyph 1 = a rectangle in 1000-upm units
+
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        // Show CID 0x0001 (== glyph 1 under Identity) at 100pt, origin (20,50).
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <0001> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+             /FontDescriptor 7 0 R /CIDToGIDMap /Identity /DW 1000 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
+        );
+        b.stream(8, "", &font_program);
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let pix = crate::render_page(&doc, &page, 1.0).unwrap();
+
+        // The glyph maps to device x in [30,80], y in [80,150] (y is flipped).
+        let dark = |x: u32, y: u32| {
+            let o = ((y * pix.width + x) * 4) as usize;
+            pix.data[o] < 128 && pix.data[o + 1] < 128 && pix.data[o + 2] < 128
+        };
+        let white = |x: u32, y: u32| {
+            let o = ((y * pix.width + x) * 4) as usize;
+            pix.data[o] == 255 && pix.data[o + 1] == 255 && pix.data[o + 2] == 255
+        };
+        assert!(dark(55, 115), "glyph interior should be painted");
+        assert!(white(10, 10), "top-left corner stays background");
+        assert!(white(150, 170), "area away from the glyph stays background");
     }
 }
