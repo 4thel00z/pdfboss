@@ -11,3 +11,8 @@ pdfboss-core = { path = "../pdfboss-core" }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "extract"
+harness = false

@@ -13,3 +13,8 @@ memchr = "2"
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse"
+harness = false
