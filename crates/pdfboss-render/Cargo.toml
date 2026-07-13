@@ -13,3 +13,8 @@ jpeg-decoder = "0.3"
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "render"
+harness = false
