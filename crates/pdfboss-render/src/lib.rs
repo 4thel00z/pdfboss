@@ -1,5 +1,6 @@
 //! Page rasterization for pdfboss: paths, fills, strokes, clipping, color
-//! spaces and images, rendered to an RGBA8 pixmap and encodable as PNG.
+//! spaces, images and embedded-TrueType glyph outlines, rendered to an RGBA8
+//! pixmap and encodable as PNG.
 
 // The rasterizer modules are consumed by the content-stream executor; the
 // `dead_code` allowances below disappear once it is wired up.
