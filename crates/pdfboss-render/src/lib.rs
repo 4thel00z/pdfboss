@@ -6,6 +6,7 @@
 #[allow(dead_code)]
 mod color;
 mod executor;
+mod glyph;
 mod image;
 #[allow(dead_code)]
 mod path;
@@ -13,7 +14,6 @@ mod path;
 mod raster;
 #[allow(dead_code)]
 mod stroke;
-#[allow(dead_code)]
 mod truetype;
 
 use std::path::Path;

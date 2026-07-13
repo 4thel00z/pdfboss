@@ -4,18 +4,21 @@
 //! Limitations (v0.1): text is tracked in state but glyphs are not painted;
 //! `sh` shadings are skipped; pattern fills paint mid-gray.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
-use pdfboss_core::content::{parse_content, ImageParams, Op};
+use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
 use pdfboss_core::filters::decode_stream;
 use pdfboss_core::geom::Matrix;
 use pdfboss_core::{Dict, Document, Name, Object, Page, Result, Stream};
 
 use crate::color::ColorSpace;
+use crate::glyph::GlyphFont;
 use crate::image::{self, DrawParams};
 use crate::path::PathBuilder;
 use crate::raster::{fill_path, FillRule, Mask};
 use crate::stroke::stroke_path;
+use crate::truetype::Seg;
 use crate::Pixmap;
 
 /// Maximum `q`/`Q` nesting depth.
@@ -106,6 +109,38 @@ impl GState {
     }
 }
 
+/// Text-showing state within a `BT`/`ET` block. Held per content stream (not
+/// saved by `q`/`Q`), matching how the extractor tracks text.
+struct TextState {
+    /// Text matrix and line matrix.
+    tm: Matrix,
+    tlm: Matrix,
+    font: Option<Rc<GlyphFont>>,
+    size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    /// Horizontal scale as a fraction (`Tz` / 100).
+    horiz: f32,
+    leading: f32,
+    rise: f32,
+}
+
+impl Default for TextState {
+    fn default() -> TextState {
+        TextState {
+            tm: Matrix::identity(),
+            tlm: Matrix::identity(),
+            font: None,
+            size: 0.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horiz: 1.0,
+            leading: 0.0,
+            rise: 0.0,
+        }
+    }
+}
+
 /// Converts unit-range RGB to opaque RGBA8.
 fn rgba8(rgb: [f32; 3]) -> [u8; 4] {
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -132,6 +167,29 @@ fn all_finite(vals: &[f32]) -> bool {
 /// True when all six matrix entries are finite.
 fn finite_matrix(m: &Matrix) -> bool {
     all_finite(&[m.a, m.b, m.c, m.d, m.e, m.f])
+}
+
+/// Flattens a glyph outline (font-unit segments) into device-space subpaths via
+/// `to_device`, promoting each quadratic to an equivalent cubic so the shared
+/// cubic flattener can subdivide it.
+fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<crate::path::Subpath> {
+    let mut pb = PathBuilder::new(to_device);
+    for seg in segs {
+        match *seg {
+            Seg::Move(x, y) => pb.move_to(x, y),
+            Seg::Line(x, y) => pb.line_to(x, y),
+            Seg::Quad(cx, cy, x, y) => {
+                let p0 = pb.current_point();
+                let c1x = p0.x + 2.0 / 3.0 * (cx - p0.x);
+                let c1y = p0.y + 2.0 / 3.0 * (cy - p0.y);
+                let c2x = x + 2.0 / 3.0 * (cx - x);
+                let c2y = y + 2.0 / 3.0 * (cy - y);
+                pb.curve_to(c1x, c1y, c2x, c2y, x, y);
+            }
+            Seg::Close => pb.close(),
+        }
+    }
+    pb.finish()
 }
 
 /// The base transform mapping the (normalized) crop box to device pixels:
@@ -222,6 +280,8 @@ impl Executor<'_> {
         let mut stack: Vec<GState> = Vec::new();
         let mut path: Option<PathBuilder> = None;
         let mut pending_clip: Option<FillRule> = None;
+        let mut ts = TextState::default();
+        let mut fonts: HashMap<String, Option<Rc<GlyphFont>>> = HashMap::new();
         for op in ops {
             match op {
                 Op::Save => {
@@ -338,6 +398,69 @@ impl Executor<'_> {
                 Op::ClipNonZero => pending_clip = Some(FillRule::NonZero),
                 Op::ClipEvenOdd => pending_clip = Some(FillRule::EvenOdd),
 
+                // Text: a minimal show-string state machine that paints
+                // embedded TrueType glyph outlines (other fonts stay unpainted).
+                Op::BeginText => {
+                    ts.tm = Matrix::identity();
+                    ts.tlm = Matrix::identity();
+                }
+                Op::SetCharSpacing(v) if v.is_finite() => ts.char_spacing = *v,
+                Op::SetWordSpacing(v) if v.is_finite() => ts.word_spacing = *v,
+                Op::SetHorizScaling(v) if v.is_finite() => ts.horiz = v / 100.0,
+                Op::SetLeading(v) if v.is_finite() => ts.leading = *v,
+                Op::SetTextRise(v) if v.is_finite() => ts.rise = *v,
+                Op::SetFont(name, size) => {
+                    ts.size = if size.is_finite() { *size } else { 0.0 };
+                    ts.font = self.glyph_font(&name.0, chain, &mut fonts);
+                }
+                Op::SetTextMatrix(m) if finite_matrix(m) => {
+                    ts.tm = *m;
+                    ts.tlm = *m;
+                }
+                Op::TextMove(tx, ty) if all_finite(&[*tx, *ty]) => {
+                    ts.tlm = Matrix::translate(*tx, *ty).concat(ts.tlm);
+                    ts.tm = ts.tlm;
+                }
+                Op::TextMoveSetLeading(tx, ty) if all_finite(&[*tx, *ty]) => {
+                    ts.leading = -*ty;
+                    ts.tlm = Matrix::translate(*tx, *ty).concat(ts.tlm);
+                    ts.tm = ts.tlm;
+                }
+                Op::TextNextLine => {
+                    ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
+                    ts.tm = ts.tlm;
+                }
+                Op::ShowText(s) => self.show_text(&gs, &mut ts, s),
+                Op::ShowTextAdjusted(items) => {
+                    for item in items {
+                        match item {
+                            TextItem::Str(s) => self.show_text(&gs, &mut ts, s),
+                            TextItem::Offset(n) => {
+                                let tx = -n / 1000.0 * ts.size * ts.horiz;
+                                if tx.is_finite() {
+                                    ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
+                                }
+                            }
+                        }
+                    }
+                }
+                Op::NextLineShowText(s) => {
+                    ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
+                    ts.tm = ts.tlm;
+                    self.show_text(&gs, &mut ts, s);
+                }
+                Op::NextLineShowTextSpaced(aw, ac, s) => {
+                    if aw.is_finite() {
+                        ts.word_spacing = *aw;
+                    }
+                    if ac.is_finite() {
+                        ts.char_spacing = *ac;
+                    }
+                    ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
+                    ts.tm = ts.tlm;
+                    self.show_text(&gs, &mut ts, s);
+                }
+
                 other => self.run_color_or_misc(other, chain, &mut gs, depth),
             }
         }
@@ -434,8 +557,89 @@ impl Executor<'_> {
         }
     }
 
-    /// Dispatches color, XObject, text, and marked-content operators (the
-    /// remainder of the [`Op`] alphabet; text is tracked but not painted).
+    /// Resolves and caches a paintable font by resource name (`None` for fonts
+    /// whose glyphs cannot be drawn).
+    fn glyph_font(
+        &self,
+        name: &str,
+        chain: &[&Dict],
+        cache: &mut HashMap<String, Option<Rc<GlyphFont>>>,
+    ) -> Option<Rc<GlyphFont>> {
+        if let Some(f) = cache.get(name) {
+            return f.clone();
+        }
+        let loaded = self
+            .find_res(chain, "Font", name)
+            .and_then(|o| o.as_dict().cloned())
+            .and_then(|d| GlyphFont::load(self.doc, &d).map(Rc::new));
+        cache.insert(name.to_string(), loaded.clone());
+        loaded
+    }
+
+    /// Paints one show-string's glyphs and advances the text matrix. Codes with
+    /// no drawable glyph still advance, so surrounding text stays positioned.
+    fn show_text(&mut self, gs: &GState, ts: &mut TextState, bytes: &[u8]) {
+        let Some(font) = ts.font.clone() else {
+            return;
+        };
+        let upm = font.units_per_em();
+        let two_byte = font.two_byte();
+        let fill = gs.fill_rgba8();
+        let mut i = 0;
+        while i < bytes.len() {
+            let (code, n) = if two_byte && i + 1 < bytes.len() {
+                (u32::from(u16::from_be_bytes([bytes[i], bytes[i + 1]])), 2)
+            } else {
+                (u32::from(bytes[i]), 1)
+            };
+            i += n;
+            let gid = font.gid(code);
+
+            // glyph units -> text space (÷ em, then the text-scaling params),
+            // -> user space (Tm) -> device (CTM).
+            let params = Matrix {
+                a: ts.size * ts.horiz,
+                b: 0.0,
+                c: 0.0,
+                d: ts.size,
+                e: 0.0,
+                f: ts.rise,
+            };
+            let to_device = Matrix::scale(1.0 / upm, 1.0 / upm)
+                .concat(params)
+                .concat(ts.tm)
+                .concat(gs.ctm);
+            if gid != 0 && finite_matrix(&to_device) {
+                let segs = font.outline(gid);
+                if !segs.is_empty() {
+                    let polys = build_glyph(&segs, to_device);
+                    fill_path(
+                        &mut self.pix,
+                        &polys,
+                        FillRule::NonZero,
+                        fill,
+                        gs.fill_alpha,
+                        gs.clip.as_deref(),
+                    );
+                }
+            }
+
+            // Advance: (w0·Tfs + Tc + Tw[single-byte space]) · Th.
+            let w0 = f32::from(font.advance(gid)) / upm;
+            let word = if n == 1 && code == 32 {
+                ts.word_spacing
+            } else {
+                0.0
+            };
+            let tx = (w0 * ts.size + ts.char_spacing + word) * ts.horiz;
+            if tx.is_finite() {
+                ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
+            }
+        }
+    }
+
+    /// Dispatches color, XObject, and marked-content operators (the remainder
+    /// of the [`Op`] alphabet not handled directly in `run`).
     fn run_color_or_misc(&mut self, op: &Op, chain: &[&Dict], gs: &mut GState, depth: u32) {
         match op {
             Op::SetFillColorSpace(name) => {
