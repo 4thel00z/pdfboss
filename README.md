@@ -87,6 +87,18 @@ pixmap.save_png("page.png")?;
 
 **Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and embedded-TrueType glyph outlines.
 
+## Benchmarks
+
+Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, aggregated over the files every library handled; pages/sec, higher is faster):
+
+<p align="center">
+  <img src="benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
+</p>
+
+**pdfboss extracts text faster than every library measured — including the C-backed PyMuPDF** (534 vs. 447 pages/s), and 5–29× faster than the pure-Python readers. On open/parse it places second: PyMuPDF opens lazily, while pdfboss currently flattens the whole page tree up front (lazy loading is on the roadmap). Rendering is not compared — pdfboss's rasterizer does not yet paint every glyph, so timing it against full renderers would be misleading.
+
+Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
+
 ## Limitations
 
 Rendered pages paint the outlines of **embedded TrueType** glyphs (Type0/`CIDFontType2` under Identity, and simple `/TrueType` fonts via their `cmap`). Text in other fonts (CFF/Type1 programs, the standard 14, subset fonts without a usable `cmap`) is still positioned but not drawn.
