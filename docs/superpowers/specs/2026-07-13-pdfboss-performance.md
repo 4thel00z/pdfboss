@@ -122,3 +122,40 @@ project in its own right.
   `clippy -D warnings`, `fmt`, and `cargo doc -D warnings` clean.
 - Changes are committed in small, individually-verified batches so any
   regression is trivially bisectable.
+
+## 6. Results — what landed
+
+Landed this pass (each verified: 377 cargo tests + 35 pytest green, clippy
+`-D warnings`, fmt, `cargo doc -D warnings` clean). Cumulative bench deltas vs.
+the section-2 baseline:
+
+| Change | Benchmark impact |
+|---|---|
+| R1 active-edge table + row-extent-bounded fill + opaque fast path | render_1000_rects 18.9ms → 2.99ms (**6.3×**), render_400_curves 65.5ms → 10.07ms (**6.5×**) |
+| R2 `Rc<Mask>` clip (clone-on-write) | render_2000_nested_clips 138ms → ~86ms (**1.6×**) |
+| L1+L2 allocation-free number/name lexing | load_300_pages −20%, load_and_walk −17% |
+| T2 `decode_into` (no per-glyph `String`) | extract_text_warm −47%, extract_text_cold −49% |
+| G1 `zlib-rs` FlateDecode backend | flate_decode_1mib 243µs → 85µs (**2.85×**) |
+| O2 object-stream decode + header cache | fixes O(n²); no bench regression |
+| F1 in-place TIFF predictor | removes a full-buffer copy on predicted streams |
+| G2 thin LTO + codegen-units=1 | few % on top across CPU-bound paths |
+
+Rendering — the dominant cost by 3–4 orders of magnitude — is now **~6.5×**
+faster; the bottleneck was never the edge scan (as first assumed) but touching
+the full pixmap width per scanline and dividing per pixel.
+
+Deferred with rationale (not blocked, just lower ROI than their risk for an
+unattended pass):
+
+- **O1 `Rc<Object>` cache hand-out** — the deep clone only bites on documents
+  that repeatedly re-resolve heavily-shared objects; realising the win means
+  exposing `Rc`-returning APIs to the text/render crates (cross-crate surface
+  change). Pairs naturally with S1.
+- **T1 font-cache hoist** — helps form-heavy / multi-stream pages; a single
+  content stream (the common case and our bench) already loads each font once.
+- **F2 index-based LZW dictionary** — LZWDecode is far rarer than FlateDecode in
+  real files; medium effort, no current bench coverage.
+- **Tier 3 (S1–S5)** — borrowed stream data, mmap, parallelism, interning, and
+  Python-lock narrowing remain the next frontier and the biggest remaining
+  structural wins, but each is API-invasive or blocked on making the object
+  cache `Sync`.
