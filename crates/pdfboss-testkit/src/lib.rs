@@ -21,6 +21,7 @@ pub struct ObjRefLite {
 pub struct PdfBuilder {
     version: (u8, u8),
     objects: BTreeMap<u32, Vec<u8>>,
+    trailer_extra: String,
 }
 
 impl PdfBuilder {
@@ -29,12 +30,20 @@ impl PdfBuilder {
         PdfBuilder {
             version: (1, 7),
             objects: BTreeMap::new(),
+            trailer_extra: String::new(),
         }
     }
 
     /// Overrides the header version.
     pub fn version(mut self, major: u8, minor: u8) -> Self {
         self.version = (major, minor);
+        self
+    }
+
+    /// Appends raw entries into the classic trailer dictionary (e.g.
+    /// `"/Encrypt 9 0 R /ID [<00><00>]"`), inserted after `/Size` and `/Root`.
+    pub fn trailer_extra(mut self, entries: &str) -> Self {
+        self.trailer_extra = entries.to_string();
         self
     }
 
@@ -90,8 +99,17 @@ impl PdfBuilder {
             };
             out.extend_from_slice(line.as_bytes());
         }
+        let extra = if self.trailer_extra.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.trailer_extra)
+        };
         out.extend_from_slice(
-            format!("trailer\n<< /Size {} /Root {} 0 R >>\n", size, root).as_bytes(),
+            format!(
+                "trailer\n<< /Size {} /Root {} 0 R{} >>\n",
+                size, root, extra
+            )
+            .as_bytes(),
         );
         out.extend_from_slice(format!("startxref\n{}\n%%EOF\n", xref_off).as_bytes());
         out
