@@ -1,0 +1,66 @@
+{
+  "corpus": "pdfs",
+  "files": 40,
+  "operations": {
+    "open": {
+      "files_compared": 40,
+      "libraries": {
+        "pdfboss": {
+          "time": 0.05063495500871795,
+          "pages": 951,
+          "ok": 40
+        },
+        "PyMuPDF": {
+          "time": 0.009332874007668579,
+          "pages": 951,
+          "ok": 40
+        },
+        "pypdf": {
+          "time": 0.10687291898284457,
+          "pages": 951,
+          "ok": 40
+        },
+        "pdfplumber": {
+          "time": 0.23030845299945213,
+          "pages": 951,
+          "ok": 40
+        },
+        "pikepdf": {
+          "time": 0.08299583198822802,
+          "pages": 951,
+          "ok": 40
+        }
+      }
+    },
+    "text": {
+      "files_compared": 40,
+      "libraries": {
+        "pdfboss": {
+          "time": 1.7802994180019596,
+          "pages": 951,
+          "ok": 40
+        },
+        "PyMuPDF": {
+          "time": 2.1254892939905403,
+          "pages": 951,
+          "ok": 40
+        },
+        "pypdf": {
+          "time": 9.960730166010762,
+          "pages": 951,
+          "ok": 40
+        },
+        "pdfplumber": {
+          "time": 51.268673624992516,
+          "pages": 951,
+          "ok": 40
+        },
+        "pdfminer.six": {
+          "time": 37.50654308299636,
+          "pages": 951,
+          "ok": 40
+        }
+      }
+    }
+  }
+}
