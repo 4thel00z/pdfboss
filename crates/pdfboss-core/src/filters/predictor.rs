@@ -10,7 +10,7 @@ use crate::object::Dict;
 /// Runs the predictor described by a `/DecodeParms` dictionary over freshly
 /// decompressed data. Reads `/Predictor` (default 1 = none), `/Colors`
 /// (default 1), `/BitsPerComponent` (default 8) and `/Columns` (default 1).
-pub(crate) fn post_pass(data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u8>> {
+pub(crate) fn post_pass(mut data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u8>> {
     let predictor = int_parm(parms, "Predictor", 1);
     if predictor <= 1 {
         return Ok(data);
@@ -21,6 +21,12 @@ pub(crate) fn post_pass(data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u8>> 
         _ => 8,
     };
     let columns = int_parm(parms, "Columns", 1).clamp(1, 1 << 24) as usize;
+    // TIFF horizontal differencing on 8-bit components can run in place on the
+    // buffer we already own, avoiding a full copy of the decompressed data.
+    if predictor == 2 && bpc == 8 {
+        tiff_horizontal_in_place(&mut data, colors, columns);
+        return Ok(data);
+    }
     apply(
         &data,
         predictor.min(i64::from(i32::MAX)) as i32,
@@ -63,19 +69,23 @@ pub fn apply(
 /// Only 8-bit components are handled; other depths pass through.
 fn tiff_horizontal(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Vec<u8> {
     let mut out = data.to_vec();
-    if bpc != 8 {
-        return out;
+    if bpc == 8 {
+        tiff_horizontal_in_place(&mut out, colors, columns);
     }
+    out
+}
+
+/// Undoes TIFF horizontal differencing (8-bit components) in place.
+fn tiff_horizontal_in_place(buf: &mut [u8], colors: usize, columns: usize) {
     let row_len = colors.saturating_mul(columns);
     if row_len == 0 {
-        return out;
+        return;
     }
-    for row in out.chunks_mut(row_len) {
+    for row in buf.chunks_mut(row_len) {
         for i in colors..row.len() {
             row[i] = row[i].wrapping_add(row[i - colors]);
         }
     }
-    out
 }
 
 /// PNG predictors: every row is prefixed with a filter-type byte
