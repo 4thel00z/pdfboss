@@ -110,10 +110,11 @@ gain-to-effort against the measured hot paths:
 
 Out of scope for this performance pass: glyph painting in rasterized output,
 shadings/tiling patterns, and `JPXDecode`. These are feature work, not speed
-work. **Encryption is partially closed** (2026-07-13): the Standard security
-handler with RC4 and the empty user password is now supported (validated
-against a 259-file real corpus — see the encryption commit); AES handlers and
-real passwords remain unsupported.
+work. **Encryption is closed for empty-password files** (2026-07-13): the
+Standard security handler now supports RC4, AESV2 (128-bit) and AESV3 (256-bit,
+R5/R6) under the empty user password — RC4 validated against a 259-file real
+corpus, AES against FIPS/NIST vectors and synthetic fixtures. Only
+password-protected documents remain unsupported.
 
 ## 5. Methodology
 
