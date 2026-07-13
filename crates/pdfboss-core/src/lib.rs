@@ -2,6 +2,7 @@
 //! document model, implemented from the PDF specification (ISO 32000).
 
 pub mod content;
+mod crypt;
 pub mod document;
 pub mod error;
 pub mod filters;

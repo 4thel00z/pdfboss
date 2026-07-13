@@ -85,11 +85,11 @@ pixmap.save_png("page.png")?;
 | `pdfboss-cli` | The `pdfboss` command-line tool |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
-**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, and image/form XObjects.
+**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · Standard-handler RC4 decryption (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, and image/form XObjects.
 
 ## Limitations
 
-Not yet supported in v0.1 (they error or degrade gracefully, and are on the roadmap): encrypted documents · glyph painting in rendered pages (text is positioned, not drawn) · shadings and tiling patterns · `JPXDecode` (JPEG 2000).
+Not yet supported in v0.1 (they error or degrade gracefully, and are on the roadmap): AES-encrypted or password-protected documents (RC4 with the empty user password *is* supported) · glyph painting in rendered pages (text is positioned, not drawn) · shadings and tiling patterns · `JPXDecode` (JPEG 2000).
 
 ## Development
 

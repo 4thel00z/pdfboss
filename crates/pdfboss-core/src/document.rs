@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
+use crate::crypt::Decryptor;
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::geom::Rect;
@@ -37,6 +38,10 @@ pub struct Document {
     /// stream is decompressed and its header parsed at most once even when
     /// many compressed objects are read from it.
     objstms: RefCell<HashMap<u32, Rc<objstm::ObjStm>>>,
+    /// Present when the file uses the Standard security handler with RC4 and
+    /// opens under the empty user password; decrypts strings and stream data
+    /// as objects are loaded from the file.
+    decryptor: Option<Decryptor>,
     pages: Vec<PageRec>,
 }
 
@@ -103,15 +108,13 @@ fn normalize_rotation(deg: i32) -> i32 {
 
 impl Document {
     /// Loads a document from bytes: locates the `%PDF-x.y` header (scanning
-    /// the first 1 KiB, defaulting to 1.4), loads the xref, rejects
-    /// encrypted files with [`Error::Encrypted`], and flattens the page
-    /// tree.
+    /// the first 1 KiB, defaulting to 1.4), loads the xref, sets up decryption
+    /// for files using the Standard RC4 security handler under the empty user
+    /// password (other encrypted files yield [`Error::Encrypted`]), and
+    /// flattens the page tree.
     pub fn load(data: Vec<u8>) -> Result<Document> {
         let version = parse_version(&data);
         let xref = load_xref(&data)?;
-        if xref.trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
-            return Err(Error::Encrypted);
-        }
         let mut doc = Document {
             data,
             version,
@@ -119,10 +122,56 @@ impl Document {
             cache: RefCell::new(HashMap::new()),
             loading: RefCell::new(HashSet::new()),
             objstms: RefCell::new(HashMap::new()),
+            decryptor: None,
             pages: Vec::new(),
         };
+        if doc
+            .xref
+            .trailer
+            .get("Encrypt")
+            .is_some_and(|o| !o.is_null())
+        {
+            doc.setup_decryption()?;
+        }
         doc.pages = doc.flatten_pages();
         Ok(doc)
+    }
+
+    /// Configures decryption for an encrypted file. Supports the Standard
+    /// security handler with RC4 (`/V` 1–2, `/R` 2–3) under the empty user
+    /// password; every other case (AES handlers, a required password) is
+    /// reported as [`Error::Encrypted`]. Must run before any content object is
+    /// fetched, and reads `/Encrypt` and `/ID` while decryption is still off
+    /// (those values are stored unencrypted).
+    fn setup_decryption(&mut self) -> Result<()> {
+        let enc_obj = self
+            .xref
+            .trailer
+            .get("Encrypt")
+            .cloned()
+            .unwrap_or(Object::Null);
+        let enc = self.resolve(&enc_obj)?;
+        let enc_dict = enc.as_dict().ok_or(Error::Encrypted)?;
+        let id0: Vec<u8> = self
+            .xref
+            .trailer
+            .get("ID")
+            .and_then(Object::as_array)
+            .and_then(<[Object]>::first)
+            .and_then(Object::as_str_bytes)
+            .unwrap_or(&[])
+            .to_vec();
+        match Decryptor::from_standard(enc_dict, &id0) {
+            Some(dec) => {
+                self.decryptor = Some(dec);
+                // Objects fetched while resolving /Encrypt were cached without
+                // decryption; drop them so they are re-read through the
+                // decrypting path if referenced again.
+                self.cache.borrow_mut().clear();
+                Ok(())
+            }
+            None => Err(Error::Encrypted),
+        }
     }
 
     /// Reads the file at `path` and loads it via [`Document::load`].
@@ -164,7 +213,13 @@ impl Document {
                     .ok()
                     .filter(|&o| o < self.data.len())
                     .ok_or(Error::ObjectNotFound(r.num, r.gen))?;
-                let (_, object) = Parser::at(&self.data, offset).parse_indirect(self)?;
+                let (_, mut object) = Parser::at(&self.data, offset).parse_indirect(self)?;
+                // Objects stored directly in the file carry encrypted strings
+                // and stream data; decrypt with this object's key. (Objects
+                // living in object streams are decrypted with their container.)
+                if let Some(dec) = &self.decryptor {
+                    dec.decrypt_object(&mut object, r.num, r.gen);
+                }
                 Ok(object)
             }
             Some(XrefEntry::InStream { stream_num, index }) => {

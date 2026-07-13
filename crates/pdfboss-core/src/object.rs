@@ -52,6 +52,11 @@ impl Dict {
         self.0.iter()
     }
 
+    /// Mutable iteration over all values (used by in-place decryption).
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut Object> {
+        self.0.values_mut()
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.0.len()
