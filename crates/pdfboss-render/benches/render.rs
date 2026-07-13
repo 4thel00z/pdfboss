@@ -44,6 +44,18 @@ fn curves_doc(n: usize) -> Vec<u8> {
     doc_with_graphics(&content)
 }
 
+/// A page that sets one clip, then saves/restores graphics state `n` times,
+/// filling under the inherited clip each time. Stresses the per-`q` clone of
+/// the graphics state (and thus the clip mask).
+fn nested_clip_doc(n: usize) -> Vec<u8> {
+    let mut content = String::from("0 0 400 400 re W n ");
+    for i in 0..n {
+        let x = (i % 30) as f32 * 12.0;
+        content.push_str(&format!("q 0.4 0.5 0.6 rg {x} 20 50 50 re f Q "));
+    }
+    doc_with_graphics(&content)
+}
+
 fn bench_render(c: &mut Criterion) {
     let rects = rects_doc(1000);
     let doc = Document::load(rects).unwrap();
@@ -57,6 +69,13 @@ fn bench_render(c: &mut Criterion) {
     let page2 = doc2.page(0).unwrap();
     c.bench_function("render_400_curves_scale2", |b| {
         b.iter(|| black_box(render_page(&doc2, &page2, 2.0).unwrap()));
+    });
+
+    let clips = nested_clip_doc(2000);
+    let doc3 = Document::load(clips).unwrap();
+    let page3 = doc3.page(0).unwrap();
+    c.bench_function("render_2000_nested_clips_scale2", |b| {
+        b.iter(|| black_box(render_page(&doc3, &page3, 2.0).unwrap()));
     });
 }
 
