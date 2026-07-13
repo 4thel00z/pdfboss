@@ -210,7 +210,7 @@ impl Executor<'_> {
         let size = gs.size * (start.c * start.c + start.d * start.d).sqrt();
         let mut text = String::new();
         for code in font.codes(bytes) {
-            text.push_str(&font.decode(code));
+            font.decode_into(code, &mut text);
             let word = if font.is_space(code) {
                 gs.word_spacing
             } else {
