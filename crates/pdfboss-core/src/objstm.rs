@@ -6,34 +6,70 @@ use crate::lexer::{Lexer, Token};
 use crate::object::Object;
 use crate::parser::{NoResolve, Parser};
 
-/// Extracts the object at `index` from decoded object-stream data.
+/// A decoded object stream with its header parsed once.
 ///
-/// The header consists of `2*n` integers — pairs of object number and byte
-/// offset — followed by the object bodies; offsets are relative to `first`,
-/// the position where the first body begins.
+/// The header is `2*n` integers — pairs of object number and byte offset —
+/// followed by the object bodies; offsets are relative to `first`, where the
+/// first body begins. Parsing the header up front turns per-object extraction
+/// from an O(n) rescan (O(n^2) across a whole stream) into a direct lookup.
+pub struct ObjStm {
+    data: Vec<u8>,
+    first: usize,
+    /// Body offset (relative to `first`) for each of the `n` entries, in order.
+    offsets: Vec<usize>,
+}
+
+impl ObjStm {
+    /// Decodes the header of an object stream, keeping the decompressed bytes
+    /// for later per-object parsing.
+    pub fn parse(data: Vec<u8>, n: usize, first: usize) -> Result<ObjStm> {
+        let offsets = {
+            let mut lexer = Lexer::new(&data);
+            let mut offsets = Vec::with_capacity(n);
+            for _ in 0..n {
+                expect_int(&mut lexer)?; // object number (position implies index)
+                offsets.push(expect_int(&mut lexer)?);
+            }
+            offsets
+        };
+        Ok(ObjStm {
+            data,
+            first,
+            offsets,
+        })
+    }
+
+    /// Parses the object at `index` from the already-decoded bytes.
+    pub fn object(&self, index: u32) -> Result<Object> {
+        let offset = *self.offsets.get(index as usize).ok_or_else(|| {
+            Error::Other(format!(
+                "object stream index {index} out of range (N = {})",
+                self.offsets.len()
+            ))
+        })?;
+        let pos = self
+            .first
+            .checked_add(offset)
+            .filter(|&p| p <= self.data.len())
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "object stream offset {offset} lies outside the stream"
+                ))
+            })?;
+        Parser::at(&self.data, pos).parse_object(&NoResolve)
+    }
+}
+
+/// Extracts the object at `index` from decoded object-stream data in one shot
+/// (parses the header, then the object). Callers that read many objects from
+/// the same stream should build an [`ObjStm`] once and reuse it.
 pub fn extract(stream_data: &[u8], n: usize, first: usize, index: u32) -> Result<Object> {
-    let idx = index as usize;
-    if idx >= n {
+    if index as usize >= n {
         return Err(Error::Other(format!(
             "object stream index {index} out of range (N = {n})"
         )));
     }
-    let mut lexer = Lexer::new(stream_data);
-    for _ in 0..idx {
-        expect_int(&mut lexer)?; // object number
-        expect_int(&mut lexer)?; // offset
-    }
-    expect_int(&mut lexer)?; // object number of the wanted entry
-    let offset = expect_int(&mut lexer)?;
-    let pos = first
-        .checked_add(offset)
-        .filter(|&p| p <= stream_data.len())
-        .ok_or_else(|| {
-            Error::Other(format!(
-                "object stream offset {offset} lies outside the stream"
-            ))
-        })?;
-    Parser::at(stream_data, pos).parse_object(&NoResolve)
+    ObjStm::parse(stream_data.to_vec(), n, first)?.object(index)
 }
 
 /// Reads one non-negative integer from the object-stream header.
