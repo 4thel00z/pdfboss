@@ -8,7 +8,9 @@ repository.workspace = true
 
 [dependencies]
 thiserror = "2"
-flate2 = "1"
+# Pure-Rust zlib-rs inflate backend: faster than the default miniz_oxide
+# backend and still C-free (keeps the dependency tree free of native code).
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 memchr = "2"
 
 [dev-dependencies]
