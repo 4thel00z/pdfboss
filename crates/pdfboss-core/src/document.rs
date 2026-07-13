@@ -38,9 +38,9 @@ pub struct Document {
     /// stream is decompressed and its header parsed at most once even when
     /// many compressed objects are read from it.
     objstms: RefCell<HashMap<u32, Rc<objstm::ObjStm>>>,
-    /// Present when the file uses the Standard security handler with RC4 and
-    /// opens under the empty user password; decrypts strings and stream data
-    /// as objects are loaded from the file.
+    /// Present when the file uses the Standard security handler (RC4 or AES)
+    /// and opens under the empty user password; decrypts strings and stream
+    /// data as objects are loaded from the file.
     decryptor: Option<Decryptor>,
     pages: Vec<PageRec>,
 }
@@ -109,9 +109,9 @@ fn normalize_rotation(deg: i32) -> i32 {
 impl Document {
     /// Loads a document from bytes: locates the `%PDF-x.y` header (scanning
     /// the first 1 KiB, defaulting to 1.4), loads the xref, sets up decryption
-    /// for files using the Standard RC4 security handler under the empty user
-    /// password (other encrypted files yield [`Error::Encrypted`]), and
-    /// flattens the page tree.
+    /// for files using the Standard security handler (RC4 or AES) under the
+    /// empty user password (password-protected files yield [`Error::Encrypted`]),
+    /// and flattens the page tree.
     pub fn load(data: Vec<u8>) -> Result<Document> {
         let version = parse_version(&data);
         let xref = load_xref(&data)?;
@@ -138,11 +138,11 @@ impl Document {
     }
 
     /// Configures decryption for an encrypted file. Supports the Standard
-    /// security handler with RC4 (`/V` 1–2, `/R` 2–3) under the empty user
-    /// password; every other case (AES handlers, a required password) is
-    /// reported as [`Error::Encrypted`]. Must run before any content object is
-    /// fetched, and reads `/Encrypt` and `/ID` while decryption is still off
-    /// (those values are stored unencrypted).
+    /// security handler with RC4 (`/V` 1–2), AESV2 (`/V` 4) and AESV3 (`/V` 5)
+    /// under the empty user password; a required password is reported as
+    /// [`Error::Encrypted`]. Must run before any content object is fetched, and
+    /// reads `/Encrypt` and `/ID` while decryption is still off (those values
+    /// are stored unencrypted).
     fn setup_decryption(&mut self) -> Result<()> {
         let enc_obj = self
             .xref
