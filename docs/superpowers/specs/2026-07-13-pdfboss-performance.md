@@ -108,10 +108,12 @@ gain-to-effort against the measured hot paths:
 
 ## 4. Feature gaps (tracked, not addressed here)
 
-Out of scope for this performance pass and unchanged from v0.1: encrypted
-documents, glyph painting in rasterized output, shadings/tiling patterns, and
-`JPXDecode`. These are feature work, not speed work, and each is a substantial
-project in its own right.
+Out of scope for this performance pass: glyph painting in rasterized output,
+shadings/tiling patterns, and `JPXDecode`. These are feature work, not speed
+work. **Encryption is partially closed** (2026-07-13): the Standard security
+handler with RC4 and the empty user password is now supported (validated
+against a 259-file real corpus — see the encryption commit); AES handlers and
+real passwords remain unsupported.
 
 ## 5. Methodology
 
