@@ -4,6 +4,8 @@
 //! Limitations (v0.1): text is tracked in state but glyphs are not painted;
 //! `sh` shadings are skipped; pattern fills paint mid-gray.
 
+use std::rc::Rc;
+
 use pdfboss_core::content::{parse_content, ImageParams, Op};
 use pdfboss_core::filters::decode_stream;
 use pdfboss_core::geom::Matrix;
@@ -55,8 +57,11 @@ struct GState {
     fill_alpha: f32,
     /// Constant stroke alpha (`CA`).
     stroke_alpha: f32,
-    /// Active clip as a device-space coverage mask.
-    clip: Option<Mask>,
+    /// Active clip as a device-space coverage mask. Shared behind an `Rc` so
+    /// that saving state (`q`) and entering a form clone the graphics state
+    /// without copying the full-page mask buffer; a new clip always builds a
+    /// fresh `Mask`, so this is effectively clone-on-write.
+    clip: Option<Rc<Mask>>,
 }
 
 impl GState {
@@ -404,7 +409,7 @@ impl Executor<'_> {
                 rule,
                 gs.fill_rgba8(),
                 gs.fill_alpha,
-                gs.clip.as_ref(),
+                gs.clip.as_deref(),
             );
         }
         if how.stroke {
@@ -417,7 +422,7 @@ impl Executor<'_> {
                 FillRule::NonZero,
                 gs.stroke_rgba8(),
                 gs.stroke_alpha,
-                gs.clip.as_ref(),
+                gs.clip.as_deref(),
             );
         }
         if let Some(rule) = pending.take() {
@@ -425,7 +430,7 @@ impl Executor<'_> {
             if let Some(old) = &gs.clip {
                 mask.intersect(old);
             }
-            gs.clip = Some(mask);
+            gs.clip = Some(Rc::new(mask));
         }
     }
 
@@ -676,7 +681,7 @@ impl Executor<'_> {
             if let Some(old) = &inner.clip {
                 mask.intersect(old);
             }
-            inner.clip = Some(mask);
+            inner.clip = Some(Rc::new(mask));
         }
         let own_res = match stream.dict.get("Resources").map(|o| self.doc.resolve(o)) {
             Some(Ok(Object::Dict(d))) => Some(d),
@@ -726,7 +731,7 @@ impl Executor<'_> {
                 ctm: gs.ctm,
                 alpha: gs.fill_alpha,
                 fill_rgb: [fill[0], fill[1], fill[2]],
-                clip: gs.clip.as_ref(),
+                clip: gs.clip.as_deref(),
             },
         );
     }
