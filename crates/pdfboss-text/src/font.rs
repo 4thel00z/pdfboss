@@ -83,24 +83,40 @@ impl Font {
         }
     }
 
-    /// Decodes one code to Unicode. Priority: `/ToUnicode`, then the
-    /// `/Encoding`-derived table, then StandardEncoding (simple fonts),
-    /// then U+FFFD.
+    /// Decodes one code to Unicode as a fresh `String` (test helper; lib code
+    /// uses [`Font::decode_into`] to avoid the per-glyph allocation).
+    #[cfg(test)]
     pub fn decode(&self, code: u32) -> String {
-        if let Some(s) = self.to_unicode.as_ref().and_then(|c| c.lookup(code)) {
-            return s;
+        let mut out = String::new();
+        self.decode_into(code, &mut out);
+        out
+    }
+
+    /// Decodes one code to Unicode, appending to `out`. Priority:
+    /// `/ToUnicode`, then the `/Encoding`-derived table, then StandardEncoding
+    /// (simple fonts), then U+FFFD. The common single-glyph paths push one
+    /// `char` with no allocation; only a multi-unit `/ToUnicode` mapping copies
+    /// a string.
+    pub fn decode_into(&self, code: u32, out: &mut String) {
+        if let Some(c) = self.to_unicode.as_ref() {
+            if let Some(s) = c.lookup(code) {
+                out.push_str(&s);
+                return;
+            }
         }
         if self.simple {
             if let Ok(byte) = u8::try_from(code) {
                 if let Some(Some(c)) = self.encoding.as_ref().map(|t| t[byte as usize]) {
-                    return c.to_string();
+                    out.push(c);
+                    return;
                 }
                 if let Some(c) = encodings::standard(byte) {
-                    return c.to_string();
+                    out.push(c);
+                    return;
                 }
             }
         }
-        '\u{FFFD}'.to_string()
+        out.push('\u{FFFD}');
     }
 
     /// Glyph-space width (1/1000 em) of `code`.
