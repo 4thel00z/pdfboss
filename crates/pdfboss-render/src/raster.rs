@@ -224,7 +224,14 @@ fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
                 if !was_inside && is_inside {
                     span_start = x;
                 } else if was_inside && !is_inside {
-                    add_span(&mut row, span_start, x, weight, &mut dirty_lo, &mut dirty_hi);
+                    add_span(
+                        &mut row,
+                        span_start,
+                        x,
+                        weight,
+                        &mut dirty_lo,
+                        &mut dirty_hi,
+                    );
                 }
             }
         }
