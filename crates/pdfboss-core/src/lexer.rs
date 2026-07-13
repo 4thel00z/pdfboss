@@ -192,6 +192,21 @@ impl<'a> Lexer<'a> {
         {
             return Token::Keyword(run.to_vec());
         }
+        // Fast path for well-formed numbers (the overwhelming majority):
+        // parse directly off the borrowed slice with no intermediate String.
+        // Integers with no `.` go to `i64`; anything else (including overflow)
+        // to `f64`. Malformed runs (multiple signs/dots, bare sign) fall
+        // through to the lenient cleaner below, preserving its exact result.
+        if let Ok(s) = std::str::from_utf8(run) {
+            if !run.contains(&b'.') {
+                if let Ok(value) = s.parse::<i64>() {
+                    return Token::Int(value);
+                }
+            }
+            if let Ok(value) = s.parse::<f64>() {
+                return Token::Real(value);
+            }
+        }
         // Lenient numeric parse: honor the first sign, then keep digits and
         // the first period; any further signs or periods are ignored.
         let mut bytes = run.iter().copied();
@@ -245,23 +260,35 @@ impl<'a> Lexer<'a> {
     /// Lexes a name after the leading `/`, decoding `#xx` escapes. A `#`
     /// not followed by two hex digits is kept literally.
     fn lex_name(&mut self) -> Token {
-        let mut out = Vec::new();
+        let start = self.pos;
         while let Some(&b) = self.data.get(self.pos) {
             if !is_regular(b) {
                 break;
             }
-            if b == b'#' {
-                if let (Some(hi), Some(lo)) = (
-                    self.data.get(self.pos + 1).copied().and_then(hex_val),
-                    self.data.get(self.pos + 2).copied().and_then(hex_val),
-                ) {
+            self.pos += 1;
+        }
+        let run = &self.data[start..self.pos];
+        // Fast path: no `#` escapes, so the name bytes are exactly the run —
+        // convert the borrowed slice directly without a per-byte copy.
+        if !run.contains(&b'#') {
+            return Token::Name(Name(String::from_utf8_lossy(run).into_owned()));
+        }
+        // Escape path: decode `#xx`; a `#` not followed by two hex digits (or
+        // at the very end of the run) is kept literally. Hex digits are regular
+        // name characters, so any real `#xx` pair lies wholly within the run.
+        let mut out = Vec::with_capacity(run.len());
+        let mut i = 0;
+        while i < run.len() {
+            let b = run[i];
+            if b == b'#' && i + 2 < run.len() {
+                if let (Some(hi), Some(lo)) = (hex_val(run[i + 1]), hex_val(run[i + 2])) {
                     out.push((hi << 4) | lo);
-                    self.pos += 3;
+                    i += 3;
                     continue;
                 }
             }
             out.push(b);
-            self.pos += 1;
+            i += 1;
         }
         Token::Name(Name(String::from_utf8_lossy(&out).into_owned()))
     }
