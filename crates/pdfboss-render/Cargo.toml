@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 pdfboss-core = { path = "../pdfboss-core" }
+pdfboss-encoding = { path = "../pdfboss-encoding" }
 png = "0.18"
 jpeg-decoder = "0.3"
 

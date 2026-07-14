@@ -443,6 +443,7 @@ dependencies = [
  "criterion",
  "jpeg-decoder",
  "pdfboss-core",
+ "pdfboss-encoding",
  "pdfboss-testkit",
  "png",
 ]
