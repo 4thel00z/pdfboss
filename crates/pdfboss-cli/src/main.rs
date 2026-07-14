@@ -190,10 +190,15 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
             pdfboss_text::extract_text(&doc, &page).map_err(|e| e.to_string())?
         }
         None => {
-            let mut parts = Vec::with_capacity(doc.page_count());
-            for index in 0..doc.page_count() {
-                let page = doc.page(index).map_err(|e| e.to_string())?;
+            // Drive iteration by successful page lookups: `page_count()` is
+            // the declared `/Count`, which on a damaged file may not match the
+            // pages the tree yields. `page(index)` fails only past the last
+            // real page.
+            let mut parts = Vec::new();
+            let mut index = 0;
+            while let Ok(page) = doc.page(index) {
                 parts.push(pdfboss_text::extract_text(&doc, &page).map_err(|e| e.to_string())?);
+                index += 1;
             }
             parts.join("\u{c}")
         }

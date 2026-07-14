@@ -1,7 +1,8 @@
 //! The document model: loading, object resolution with caching, the
-//! flattened page tree with attribute inheritance, and document metadata.
+//! lazily-flattened page tree with attribute inheritance, and document
+//! metadata.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
@@ -42,7 +43,10 @@ pub struct Document {
     /// and opens under the empty user password; decrypts strings and stream
     /// data as objects are loaded from the file.
     decryptor: Option<Decryptor>,
-    pages: Vec<PageRec>,
+    /// The flattened page tree, built lazily on the first page access so that
+    /// merely opening a document (or reading its page count) never parses
+    /// every page dictionary. See [`Document::pages`].
+    pages: OnceCell<Vec<PageRec>>,
 }
 
 /// The flattened, inheritance-applied record for one page.
@@ -108,10 +112,14 @@ fn normalize_rotation(deg: i32) -> i32 {
 
 impl Document {
     /// Loads a document from bytes: locates the `%PDF-x.y` header (scanning
-    /// the first 1 KiB, defaulting to 1.4), loads the xref, sets up decryption
-    /// for files using the Standard security handler (RC4 or AES) under the
-    /// empty user password (password-protected files yield [`Error::Encrypted`]),
-    /// and flattens the page tree.
+    /// the first 1 KiB, defaulting to 1.4), loads the xref, and sets up
+    /// decryption for files using the Standard security handler (RC4 or AES)
+    /// under the empty user password (password-protected files yield
+    /// [`Error::Encrypted`]).
+    ///
+    /// The page tree is **not** walked here: it is flattened lazily on the
+    /// first page access, so opening a document (or reading `page_count`) does
+    /// not parse every page dictionary.
     pub fn load(data: Vec<u8>) -> Result<Document> {
         let version = parse_version(&data);
         let xref = load_xref(&data)?;
@@ -123,7 +131,7 @@ impl Document {
             loading: RefCell::new(HashSet::new()),
             objstms: RefCell::new(HashMap::new()),
             decryptor: None,
-            pages: Vec::new(),
+            pages: OnceCell::new(),
         };
         if doc
             .xref
@@ -133,7 +141,6 @@ impl Document {
         {
             doc.setup_decryption()?;
         }
-        doc.pages = doc.flatten_pages();
         Ok(doc)
     }
 
@@ -289,17 +296,50 @@ impl Document {
         filters::decode_stream(s, self)
     }
 
+    /// The flattened page tree, built once on first access.
+    fn pages(&self) -> &[PageRec] {
+        self.pages.get_or_init(|| self.flatten_pages())
+    }
+
     /// Number of pages.
+    ///
+    /// Reports the page tree's declared `/Count` — the same value mature
+    /// engines return — without walking the tree, so it is cheap on an
+    /// otherwise-untouched document. If `/Count` is absent or implausible the
+    /// tree is flattened and its true (lenient, cycle- and depth-guarded)
+    /// length is returned instead. Once the tree has been flattened for any
+    /// reason, that flattened length is authoritative.
     pub fn page_count(&self) -> usize {
-        self.pages.len()
+        if let Some(pages) = self.pages.get() {
+            return pages.len();
+        }
+        if let Some(count) = self.declared_page_count() {
+            return count;
+        }
+        self.pages().len()
+    }
+
+    /// Reads the page tree root's `/Count` cheaply (Root → `/Pages` →
+    /// `/Count`) without descending into `/Kids`. Returns `None` when the
+    /// entry is missing, non-integer, negative, or larger than the file could
+    /// possibly hold (a corrupt count), so the caller falls back to a real
+    /// walk.
+    fn declared_page_count(&self) -> Option<usize> {
+        let root = self.xref.trailer.get("Root")?;
+        let catalog = self.resolve(root).ok()?;
+        let pages = self.resolve(catalog.as_dict()?.get("Pages")?).ok()?;
+        let count = usize::try_from(self.int_value(pages.as_dict()?, "Count")?).ok()?;
+        // A page occupies at least a handful of bytes on disk, so a count that
+        // exceeds the file length is corrupt: fall back to walking the tree.
+        (count <= self.data.len()).then_some(count)
     }
 
     /// The page at 0-based `index`.
     pub fn page(&self, index: usize) -> Result<Page> {
-        let rec = self
-            .pages
+        let pages = self.pages();
+        let rec = pages
             .get(index)
-            .ok_or(Error::PageNotFound(index, self.pages.len()))?;
+            .ok_or(Error::PageNotFound(index, pages.len()))?;
         Ok(Page {
             index,
             media_box: rec.media_box,
@@ -839,7 +879,59 @@ mod tests {
         }
         b.object(last, "<< /Type /Page >>");
         let doc = Document::load(b.build(1)).unwrap();
-        assert_eq!(doc.page_count(), 0, "leaf beyond the depth cap is dropped");
+        // `page_count` reports the tree's declared `/Count` (1) cheaply, as
+        // mature engines do; the leaf itself lies beyond the traversal depth
+        // cap, so the flattened tree is empty and the page cannot be
+        // materialized.
+        assert_eq!(doc.page_count(), 1, "declared /Count is reported cheaply");
+        assert!(
+            matches!(doc.page(0), Err(Error::PageNotFound(0, 0))),
+            "leaf beyond the depth cap cannot be materialized"
+        );
+    }
+
+    #[test]
+    fn page_count_reports_declared_count_cheaply() {
+        // The tree declares five pages but supplies only one kid. `page_count`
+        // reports the declared `/Count` (as mature engines do) without walking,
+        // while page access is bounded by the pages that actually materialize.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 5 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(doc.page_count(), 5, "declared /Count reported verbatim");
+        assert!(doc.page(0).is_ok(), "the one real page materializes");
+        assert!(
+            matches!(doc.page(1), Err(Error::PageNotFound(1, 1))),
+            "access past the real pages fails with the true length"
+        );
+    }
+
+    #[test]
+    fn page_count_falls_back_to_walk_when_count_absent() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] >>"); // no /Count
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(
+            doc.page_count(),
+            1,
+            "missing /Count is recovered by walking"
+        );
+    }
+
+    #[test]
+    fn page_count_ignores_corrupt_oversized_count() {
+        // A `/Count` larger than the whole file is impossible: fall back to a
+        // real walk rather than trust it.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 999999999 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(doc.page_count(), 1, "implausible /Count is rejected");
     }
 
     #[test]
