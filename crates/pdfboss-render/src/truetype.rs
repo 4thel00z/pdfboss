@@ -777,11 +777,13 @@ mod tests {
         assert!(TrueType::parse(vec![0, 1, 2]).is_none(), "truncated header");
     }
 
-    /// End-to-end: a page showing one CID from an embedded `CIDFontType2`
-    /// Type0 font must paint the glyph's filled outline on the page.
-    #[test]
-    fn renders_embedded_glyph_onto_page() {
-        use pdfboss_core::Document;
+    /// Builds a one-page 200x200 doc showing CID 0x0001 (== glyph 1 under
+    /// Identity, a filled rectangle from [`build_font`]) of an embedded
+    /// `CIDFontType2`/Type0 font at 100pt, origin (20,50). The glyph paints to
+    /// device x in [30,80], y in [80,150] (y is flipped). Shared by the paint
+    /// test and the tier-equality test below so the 8-object builder isn't
+    /// duplicated.
+    fn embedded_glyph_doc_bytes() -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
 
         let font_program = build_font(); // glyph 1 = a rectangle in 1000-upm units
@@ -811,7 +813,16 @@ mod tests {
             "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
         );
         b.stream(8, "", &font_program);
-        let doc = Document::load(b.build(1)).unwrap();
+        b.build(1)
+    }
+
+    /// End-to-end: a page showing one CID from an embedded `CIDFontType2`
+    /// Type0 font must paint the glyph's filled outline on the page.
+    #[test]
+    fn renders_embedded_glyph_onto_page() {
+        use pdfboss_core::Document;
+
+        let doc = Document::load(embedded_glyph_doc_bytes()).unwrap();
         let page = doc.page(0).unwrap();
         let pix = crate::render_page(&doc, &page, 1.0).unwrap();
 
@@ -827,5 +838,50 @@ mod tests {
         assert!(dark(55, 115), "glyph interior should be painted");
         assert!(white(10, 10), "top-left corner stays background");
         assert!(white(150, 170), "area away from the glyph stays background");
+    }
+
+    /// TODAY-ONLY invariant: `GlyphFont::load` receives the [`GlyphPainting`]
+    /// tier but has no behavioral effect yet, so every tier must render an
+    /// embedded-TrueType glyph identically to the default. This complements
+    /// `executor::all_glyph_tiers_match_default_render_today`, which only
+    /// exercises glyph-free path content; this test proves the comparison is
+    /// meaningful by first asserting the glyph is actually painted, so the
+    /// three tiers being equal isn't just two blank images matching.
+    ///
+    /// Once the first non-TrueType glyph loader (CFF, Type1, Type3, or font
+    /// substitution) lands, `AllEmbedded`/`Full` will intentionally paint more
+    /// than `EmbeddedTrueTypeOnly` for non-TrueType programs, and this "all
+    /// tiers identical" assertion must be REPLACED (not preserved) to reflect
+    /// that divergence.
+    #[test]
+    fn embedded_glyph_paints_identically_across_tiers() {
+        use pdfboss_core::Document;
+
+        let doc = Document::load(embedded_glyph_doc_bytes()).unwrap();
+        let page = doc.page(0).unwrap();
+
+        let base =
+            crate::render_page_with_options(&doc, &page, 1.0, &crate::RenderOptions::default())
+                .unwrap();
+
+        // Confirm the glyph path is genuinely exercised before trusting the
+        // "all tiers equal" comparison below.
+        let dark = |x: u32, y: u32| {
+            let o = ((y * base.width + x) * 4) as usize;
+            base.data[o] < 128 && base.data[o + 1] < 128 && base.data[o + 2] < 128
+        };
+        assert!(dark(55, 115), "glyph interior should be painted");
+
+        for tier in [
+            crate::GlyphPainting::EmbeddedTrueTypeOnly,
+            crate::GlyphPainting::AllEmbedded,
+            crate::GlyphPainting::Full,
+        ] {
+            let opts = crate::RenderOptions {
+                glyph_painting: tier,
+            };
+            let got = crate::render_page_with_options(&doc, &page, 1.0, &opts).unwrap();
+            assert_eq!(got, base, "tier {tier:?} differs from default render");
+        }
     }
 }
