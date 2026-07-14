@@ -4,6 +4,8 @@
 
 // The rasterizer modules are consumed by the content-stream executor; the
 // `dead_code` allowances below disappear once it is wired up.
+#[allow(dead_code)] // consumed by Tasks 2-3 (Type2 interpreter, GlyphFont loader)
+mod cff;
 #[allow(dead_code)]
 mod color;
 mod executor;
