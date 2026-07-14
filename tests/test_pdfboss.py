@@ -184,6 +184,19 @@ class TestRender:
         with pytest.raises(ValueError):
             page.render(scale=-1.0)
 
+    def test_render_fonts_embedded_only(self, hello_pdf: Path) -> None:
+        png = Document(str(hello_pdf))[0].render(fonts="embedded-only")
+        assert png.startswith(PNG_MAGIC)
+
+    def test_render_fonts_full_degrades_cleanly(self, hello_pdf: Path) -> None:
+        # No substitute source is wired yet, so "full" behaves like the default.
+        page = Document(str(hello_pdf))[0]
+        assert page.render(fonts="full") == page.render(fonts="all-embedded")
+
+    def test_render_unknown_fonts_raises_value_error(self, hello_pdf: Path) -> None:
+        with pytest.raises(ValueError):
+            Document(str(hello_pdf))[0].render(fonts="bogus")
+
 
 class TestThreading:
     """Regressions for the pinned threading behavior: ``Document``/``Page``

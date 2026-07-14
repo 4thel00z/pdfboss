@@ -47,6 +47,19 @@ fn normalize_index(index: isize, count: usize) -> Option<usize> {
     }
 }
 
+/// Maps the Python `fonts=` string to a [`pdfboss_render::GlyphPainting`] tier.
+fn glyph_painting_from_str(s: &str) -> PyResult<pdfboss_render::GlyphPainting> {
+    use pdfboss_render::GlyphPainting;
+    match s {
+        "embedded-only" => Ok(GlyphPainting::EmbeddedTrueTypeOnly),
+        "all-embedded" => Ok(GlyphPainting::AllEmbedded),
+        "full" => Ok(GlyphPainting::Full),
+        other => Err(PyValueError::new_err(format!(
+            "unknown fonts mode {other:?}: expected 'embedded-only', 'all-embedded' or 'full'"
+        ))),
+    }
+}
+
 /// The core document behind a lock, shareable across threads.
 ///
 /// [`CoreDocument`] itself is neither `Send` nor `Sync`: its interior
@@ -232,16 +245,25 @@ impl Page {
 
     /// Renders the page and returns PNG bytes. Releases the GIL while the
     /// rasterization and PNG encoding run.
-    #[pyo3(signature = (scale=1.0))]
-    fn render<'py>(&self, py: Python<'py>, scale: f32) -> PyResult<Bound<'py, PyBytes>> {
+    #[pyo3(signature = (scale=1.0, fonts="all-embedded"))]
+    fn render<'py>(
+        &self,
+        py: Python<'py>,
+        scale: f32,
+        fonts: &str,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         if !scale.is_finite() || scale <= 0.0 {
             return Err(PyValueError::new_err(
                 "scale must be a positive, finite number",
             ));
         }
+        let opts = pdfboss_render::RenderOptions {
+            glyph_painting: glyph_painting_from_str(fonts)?,
+        };
         let png = py.allow_threads(|| {
             let doc = self.doc.lock();
-            let pixmap = pdfboss_render::render_page(&doc, &self.page, scale).map_err(pdf_err)?;
+            let pixmap = pdfboss_render::render_page_with_options(&doc, &self.page, scale, &opts)
+                .map_err(pdf_err)?;
             pixmap.encode_png().map_err(pdf_err)
         })?;
         Ok(PyBytes::new(py, &png))
