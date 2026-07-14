@@ -142,10 +142,42 @@ the section-2 baseline:
 | O2 object-stream decode + header cache | fixes O(n²); no bench regression |
 | F1 in-place TIFF predictor | removes a full-buffer copy on predicted streams |
 | G2 thin LTO + codegen-units=1 | few % on top across CPU-bound paths |
+| P1 lazy page-tree flattening + cheap `page_count` | load_300_pages 750µs → 75µs (**~10×**), load_and_count 90µs; load_and_walk unchanged (−0.4%) |
 
 Rendering — the dominant cost by 3–4 orders of magnitude — is now **~6.5×**
 faster; the bottleneck was never the edge scan (as first assumed) but touching
 the full pixmap width per scanline and dividing per pixel.
+
+### 6.1 P1 — lazy page-tree loading (2026-07-13)
+
+The open/parse gap against a mature native engine was structural: mature
+engines open *lazily* (read the root `/Count`, parse page objects only when a
+page is actually used), while pdfboss flattened the whole tree — parsing and
+cloning every page dictionary — inside `Document::load`.
+
+Landed:
+
+- **Deferred flatten.** The flattened page vector moved behind a
+  `OnceCell<Vec<PageRec>>`, built on the first `page()` access. Opening a
+  document no longer touches a single page dictionary.
+- **Cheap `page_count`.** Now reads the page tree's declared `/Count`
+  (Root → `/Pages` → `/Count`) without descending into `/Kids` — the value
+  mature engines report — and falls back to a full walk only when `/Count` is
+  absent or larger than the file (corrupt). This changes `page_count`
+  semantics from "leaves the lenient walk produced" to "declared count"; the
+  one synthetic test that pinned the old behaviour (a 300-deep unary chain
+  beyond the depth cap) was updated to assert the new, peer-aligned behaviour.
+- **Iterate-by-success.** Because a declared `/Count` can over-report on a
+  damaged file, the "extract every page" loops (Python `extract_text`, CLI
+  `text`) now iterate by successful `page(i)` lookups instead of `0..count`.
+  `page(i)` fails only past the last materializable page (the flattened list
+  has no holes), so this visits exactly the real pages and never aborts a whole
+  document because a phantom trailing page was declared.
+
+Result: `load_300_pages` 750µs → 75µs (~10×), the open-and-count path ~90µs,
+and `load_and_walk_300_pages` unchanged (the flatten cost merely moved to first
+page access). This closes the last structural item behind the open/parse
+comparison in `benchmarks/`.
 
 Deferred with rationale (not blocked, just lower ROI than their risk for an
 unattended pass):
