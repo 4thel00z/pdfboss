@@ -11,6 +11,18 @@ use pdfboss_core::{Dict, Document, Object};
 use crate::truetype::{Seg, TrueType};
 use crate::GlyphPainting;
 
+/// Where a font's glyph outlines and metrics come from.
+///
+/// Today the only source is an embedded TrueType (`glyf`) program. The CFF,
+/// Type1, Type3, and substitute-face loaders specified for later plans add
+/// variants here, and the delegating methods below gain matching arms. This is
+/// the single outline-source seam, which is why `GlyphFont`'s public surface
+/// stays fixed as those loaders land.
+enum Outlines {
+    /// An embedded TrueType (`glyf`) program.
+    TrueType(TrueType),
+}
+
 /// How character codes map to glyph indices for a loaded font.
 enum GlyphKind {
     /// Simple font: one byte per code, mapped through this 256-entry table.
@@ -22,7 +34,7 @@ enum GlyphKind {
 
 /// A font whose glyph outlines can be drawn.
 pub(crate) struct GlyphFont {
-    tt: TrueType,
+    outlines: Outlines,
     kind: GlyphKind,
 }
 
@@ -57,17 +69,23 @@ impl GlyphFont {
 
     /// The glyph's outline as path segments in font units.
     pub(crate) fn outline(&self, gid: u16) -> Vec<Seg> {
-        self.tt.glyph_path(gid)
+        match &self.outlines {
+            Outlines::TrueType(tt) => tt.glyph_path(gid),
+        }
     }
 
     /// The glyph's advance width in font units.
     pub(crate) fn advance(&self, gid: u16) -> u16 {
-        self.tt.advance(gid)
+        match &self.outlines {
+            Outlines::TrueType(tt) => tt.advance(gid),
+        }
     }
 
     /// Font design units per em (outline coordinate scale).
     pub(crate) fn units_per_em(&self) -> f32 {
-        self.tt.units_per_em() as f32
+        match &self.outlines {
+            Outlines::TrueType(tt) => tt.units_per_em() as f32,
+        }
     }
 }
 
@@ -91,7 +109,7 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        tt,
+        outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
     })
 }
@@ -125,7 +143,7 @@ fn load_type0(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         _ => None, // Identity
     };
     Some(GlyphFont {
-        tt,
+        outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
     })
 }
