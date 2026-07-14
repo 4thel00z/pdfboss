@@ -7,6 +7,8 @@
 //! bounds-checked so a malformed embedded font yields empty output rather than
 //! a panic.
 
+use std::collections::HashMap;
+
 /// One outline command in font units. The on-curve start of each `Quad` is the
 /// current point (the end of the previous command).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +27,7 @@ pub(crate) struct TrueType {
     /// Absolute byte offsets into `data` for each glyph, `num_glyphs + 1` long.
     loca: Vec<usize>,
     cmap: Option<Cmap>,
+    post: Option<Post>,
     /// Per-glyph advance widths in font units (from `hmtx`), or empty.
     advances: Vec<u16>,
 }
@@ -47,6 +50,7 @@ impl TrueType {
         let mut cmap_off = None;
         let mut hhea_off = None;
         let mut hmtx_off = None;
+        let mut post_tab = None;
         for i in 0..num_tables {
             let rec = 12 + i * 16;
             let tag = data.get(rec..rec + 4)?;
@@ -60,6 +64,7 @@ impl TrueType {
                 b"cmap" => cmap_off = Some(off),
                 b"hhea" => hhea_off = Some(off),
                 b"hmtx" => hmtx_off = Some(off),
+                b"post" => post_tab = Some((off, len)),
                 _ => {}
             }
         }
@@ -93,6 +98,7 @@ impl TrueType {
         }
 
         let cmap = cmap_off.and_then(|o| Cmap::parse(&data, o));
+        let post = post_tab.and_then(|(o, l)| Post::parse(&data, o, l));
 
         // hmtx: `numberOfHMetrics` (from hhea) long-metric records of
         // (advanceWidth u16, lsb i16); glyphs past that reuse the last advance.
@@ -116,6 +122,7 @@ impl TrueType {
             units_per_em,
             loca,
             cmap,
+            post,
             advances,
         })
     }
@@ -138,6 +145,12 @@ impl TrueType {
     /// Whether a usable `cmap` subtable was found.
     pub(crate) fn has_cmap(&self) -> bool {
         self.cmap.is_some()
+    }
+
+    /// Maps a glyph name to a glyph index via the `post` table's custom names.
+    #[allow(dead_code)] // consumed by glyph.rs in Task 2 (Differences mapping)
+    pub(crate) fn gid_for_name(&self, name: &str) -> Option<u16> {
+        self.post.as_ref().and_then(|p| p.gid_for_name(name))
     }
 
     /// The outline of glyph `gid` as path segments in font units. Empty glyphs
@@ -529,6 +542,57 @@ impl Cmap {
     }
 }
 
+/// The `post` table's custom glyph-name → glyph-id map (format 2.0 only).
+///
+/// Only glyph-name-index entries ≥ 258 (the font's own custom names) are
+/// recorded; entries below 258 reference the standard Macintosh names, which
+/// are recovered elsewhere through the Adobe Glyph List.
+struct Post {
+    names: HashMap<String, u16>,
+}
+
+impl Post {
+    fn parse(data: &[u8], off: usize, len: usize) -> Option<Post> {
+        if be32(data, off)? != 0x0002_0000 {
+            return None; // versions 1.0/2.5/3.0 carry no custom names
+        }
+        let num = be16(data, off + 32)? as usize;
+        let mut indices = Vec::with_capacity(num);
+        for i in 0..num {
+            match be16(data, off + 34 + i * 2) {
+                Some(ix) => indices.push(ix),
+                None => break,
+            }
+        }
+        // Pascal strings follow the index array, bounded by the table length.
+        let end = (off + len).min(data.len());
+        let mut p = off + 34 + num * 2;
+        let mut custom: Vec<String> = Vec::new();
+        while p < end {
+            let slen = *data.get(p)? as usize;
+            p += 1;
+            let Some(bytes) = data.get(p..p + slen).filter(|_| p + slen <= end) else {
+                break;
+            };
+            p += slen;
+            custom.push(String::from_utf8_lossy(bytes).into_owned());
+        }
+        let mut names = HashMap::new();
+        for (gid, &ix) in indices.iter().enumerate() {
+            if ix >= 258 {
+                if let Some(name) = custom.get(ix as usize - 258) {
+                    names.entry(name.clone()).or_insert(gid as u16);
+                }
+            }
+        }
+        (!names.is_empty()).then_some(Post { names })
+    }
+
+    fn gid_for_name(&self, name: &str) -> Option<u16> {
+        self.names.get(name).copied()
+    }
+}
+
 // --- big-endian readers (all bounds-checked) ------------------------------
 
 fn be16(d: &[u8], o: usize) -> Option<u16> {
@@ -694,6 +758,20 @@ mod tests {
         t
     }
 
+    /// A `post` format-2.0 table naming glyph 1 "foo" (glyph 0 keeps the
+    /// standard `.notdef` index 0, which this parser does not resolve).
+    fn table_post() -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&0x0002_0000u32.to_be_bytes()); // version 2.0
+        t.extend_from_slice(&[0u8; 28]); // italicAngle..maxMemType1 (unused here)
+        t.extend_from_slice(&be(2)); // numberOfGlyphs
+        t.extend_from_slice(&be(0)); // glyph 0 → standard name index 0 (.notdef)
+        t.extend_from_slice(&be(258)); // glyph 1 → custom names[0]
+        t.push(3); // Pascal string length
+        t.extend_from_slice(b"foo");
+        t
+    }
+
     /// Assembles a one-glyph (plus .notdef) sfnt with head/maxp/cmap/loca/glyf.
     fn build_font() -> Vec<u8> {
         let glyph1 = rect_glyph(100, 0, 600, 700);
@@ -704,12 +782,13 @@ mod tests {
         loca.extend_from_slice(&be(0));
         loca.extend_from_slice(&be((glyf.len() / 2) as u16));
 
-        let tables: [(&[u8; 4], Vec<u8>); 5] = [
+        let tables: [(&[u8; 4], Vec<u8>); 6] = [
             (b"cmap", table_cmap()),
             (b"glyf", glyf),
             (b"head", table_head()),
             (b"loca", loca),
             (b"maxp", table_maxp(2)),
+            (b"post", table_post()),
         ];
 
         let mut out = Vec::new();
@@ -764,6 +843,19 @@ mod tests {
                 Seg::Close,
             ]
         );
+    }
+
+    #[test]
+    fn post_maps_custom_name_to_glyph() {
+        let font = TrueType::parse(build_font()).expect("font parses");
+        assert_eq!(font.gid_for_name("foo"), Some(1));
+    }
+
+    #[test]
+    fn post_ignores_unknown_and_standard_names() {
+        let font = TrueType::parse(build_font()).expect("font parses");
+        assert_eq!(font.gid_for_name("bar"), None); // not in the table
+        assert_eq!(font.gid_for_name(".notdef"), None); // standard index, not resolved
     }
 
     #[test]
