@@ -148,7 +148,6 @@ impl TrueType {
     }
 
     /// Maps a glyph name to a glyph index via the `post` table's custom names.
-    #[allow(dead_code)] // consumed by glyph.rs in Task 2 (Differences mapping)
     pub(crate) fn gid_for_name(&self, name: &str) -> Option<u16> {
         self.post.as_ref().and_then(|p| p.gid_for_name(name))
     }
@@ -614,7 +613,7 @@ fn f2dot14(d: &[u8], o: usize) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn pt(x: f32, y: f32, on: bool) -> Pt {
@@ -773,7 +772,7 @@ mod tests {
     }
 
     /// Assembles a one-glyph (plus .notdef) sfnt with head/maxp/cmap/loca/glyf.
-    fn build_font() -> Vec<u8> {
+    pub(crate) fn build_font() -> Vec<u8> {
         let glyph1 = rect_glyph(100, 0, 600, 700);
         let glyf = glyph1.clone(); // gid 0 empty, gid 1 at offset 0
                                    // Short loca: [gid0=0, gid1=0, end=len/2].
