@@ -3,8 +3,8 @@
 //! fonts (2-byte codes, `/ToUnicode`, descendant `/W` + `/DW`).
 
 use crate::cmap::ToUnicode;
-use crate::encodings;
 use pdfboss_core::{Dict, Document, Object};
+use pdfboss_encoding as encodings;
 use std::collections::HashMap;
 
 /// A loaded font: everything needed to decode show-string bytes to

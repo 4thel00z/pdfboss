@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 pdfboss-core = { path = "../pdfboss-core" }
+pdfboss-encoding = { path = "../pdfboss-encoding" }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }

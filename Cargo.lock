@@ -423,6 +423,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfboss-encoding"
+version = "0.1.0"
+
+[[package]]
 name = "pdfboss-py"
 version = "0.1.0"
 dependencies = [
@@ -453,6 +457,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "pdfboss-core",
+ "pdfboss-encoding",
  "pdfboss-testkit",
 ]
 
