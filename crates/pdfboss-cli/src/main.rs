@@ -337,6 +337,10 @@ mod tests {
             pdfboss_render::GlyphPainting::EmbeddedTrueTypeOnly
         );
         assert_eq!(
+            FontsArg::AllEmbedded.to_painting(),
+            pdfboss_render::GlyphPainting::AllEmbedded
+        );
+        assert_eq!(
             FontsArg::Full.to_painting(),
             pdfboss_render::GlyphPainting::Full
         );
