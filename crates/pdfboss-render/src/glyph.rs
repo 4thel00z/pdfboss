@@ -91,9 +91,11 @@ impl GlyphFont {
     }
 }
 
-/// Loads a simple `/TrueType` font, building a code-to-glyph table by mapping
-/// each byte to a code point (ASCII/Latin-1) and, failing that, the symbol
-/// range `0xF000 + code`, through the font's `cmap`.
+/// Loads a simple `/TrueType` font, building its 256-entry code-to-glyph table
+/// by resolving each code in three tiers: a `/Differences` glyph name (via the
+/// `post` table, then the Adobe Glyph List: name -> Unicode -> `cmap`); then the
+/// base `/Encoding` character -> `cmap`; and finally the raw byte, then the
+/// symbol range `0xF000 + code`, through the font's `cmap`.
 fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
     let program = stream_bytes(doc, descriptor.get("FontFile2")?)?;
@@ -186,7 +188,7 @@ fn differences(doc: &Document, font: &Dict) -> HashMap<u8, String> {
                 if (0..256).contains(&code) {
                     out.insert(code as u8, name.0.clone());
                 }
-                code += 1;
+                code = code.saturating_add(1);
             }
             _ => {}
         }
@@ -310,6 +312,21 @@ mod tests {
         assert!(
             glyph_painted(doc),
             "letter A should paint via the base encoding"
+        );
+    }
+
+    #[test]
+    fn differences_with_huge_code_does_not_panic() {
+        // A hostile /Differences code at i64::MAX must not overflow `code += 1`.
+        // The out-of-range code is ignored; rendering must complete and 'A'
+        // (0x41, via the base encoding) still paints.
+        let doc = simple_font_doc(
+            "/Encoding << /Differences [9223372036854775807 /foo] >>",
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        assert!(
+            glyph_painted(doc),
+            "render must complete without overflow panic"
         );
     }
 }
