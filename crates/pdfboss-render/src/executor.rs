@@ -20,7 +20,7 @@ use crate::path::PathBuilder;
 use crate::raster::{fill_path, FillRule, Mask};
 use crate::stroke::stroke_path;
 use crate::truetype::Seg;
-use crate::Pixmap;
+use crate::{GlyphPainting, Pixmap, RenderOptions};
 
 /// Maximum `q`/`Q` nesting depth.
 const MAX_GSTATE_DEPTH: usize = 64;
@@ -247,7 +247,12 @@ fn base_ctm(crop: pdfboss_core::Rect, rotate: i32, scale: f32) -> Matrix {
 /// Renders `page` from `doc` at `scale` onto a white background. The pixel
 /// size is `ceil(crop_w * scale) x ceil(crop_h * scale)` after `/Rotate`.
 /// Content errors are lenient: an unreadable stream renders blank.
-pub(crate) fn render_page(doc: &Document, page: &Page, scale: f32) -> Result<Pixmap> {
+pub(crate) fn render_page_with_options(
+    doc: &Document,
+    page: &Page,
+    scale: f32,
+    opts: &RenderOptions,
+) -> Result<Pixmap> {
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
@@ -261,7 +266,11 @@ pub(crate) fn render_page(doc: &Document, page: &Page, scale: f32) -> Result<Pix
     let content = page.content(doc).unwrap_or_default();
     let ops = parse_content(&content).unwrap_or_default();
     let ctm = base_ctm(page.crop_box.normalize(), page.rotate, scale);
-    let mut exec = Executor { doc, pix };
+    let mut exec = Executor {
+        doc,
+        pix,
+        painting: opts.glyph_painting,
+    };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
     Ok(exec.pix)
 }
@@ -271,6 +280,7 @@ pub(crate) fn render_page(doc: &Document, page: &Page, scale: f32) -> Result<Pix
 struct Executor<'a> {
     doc: &'a Document,
     pix: Pixmap,
+    painting: GlyphPainting,
 }
 
 impl Executor<'_> {
@@ -572,7 +582,7 @@ impl Executor<'_> {
         let loaded = self
             .find_res(chain, "Font", name)
             .and_then(|o| o.as_dict().cloned())
-            .and_then(|d| GlyphFont::load(self.doc, &d).map(Rc::new));
+            .and_then(|d| GlyphFont::load(self.doc, &d, self.painting).map(Rc::new));
         cache.insert(name.to_string(), loaded.clone());
         loaded
     }
@@ -963,13 +973,44 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{GlyphPainting, RenderOptions};
     use pdfboss_testkit::{doc_with_graphics, PdfBuilder};
+
+    #[test]
+    fn render_options_default_is_all_embedded() {
+        assert_eq!(
+            RenderOptions::default().glyph_painting,
+            GlyphPainting::AllEmbedded
+        );
+    }
+
+    #[test]
+    fn all_glyph_tiers_match_default_render_today() {
+        // Until CFF/Type1/Type3/substitute loaders land, every tier paints the
+        // same embedded-TrueType glyphs, so all tiers must equal the default.
+        let bytes = small_doc("", b"1 0 0 rg 10 10 80 80 re f", |_| {});
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let base =
+            render_page_with_options(&doc, &page, 1.0, &RenderOptions::default()).expect("render");
+        for tier in [
+            GlyphPainting::EmbeddedTrueTypeOnly,
+            GlyphPainting::AllEmbedded,
+            GlyphPainting::Full,
+        ] {
+            let opts = RenderOptions {
+                glyph_painting: tier,
+            };
+            let got = render_page_with_options(&doc, &page, 1.0, &opts).expect("render");
+            assert_eq!(got, base, "tier {tier:?} differs from default render");
+        }
+    }
 
     /// Renders page 0 of `bytes` at `scale`.
     fn render(bytes: Vec<u8>, scale: f32) -> Pixmap {
         let doc = Document::load(bytes).expect("load");
         let page = doc.page(0).expect("page");
-        render_page(&doc, &page, scale).expect("render")
+        render_page_with_options(&doc, &page, scale, &RenderOptions::default()).expect("render")
     }
 
     fn px(pix: &Pixmap, x: u32, y: u32) -> [u8; 4] {
@@ -1279,7 +1320,8 @@ mod tests {
     fn shapes_fixture_renders_expected_colors() {
         let doc = Document::open(fixture("shapes.pdf")).expect("open");
         let page = doc.page(0).expect("page");
-        let pix = render_page(&doc, &page, 1.0).expect("render");
+        let pix =
+            render_page_with_options(&doc, &page, 1.0, &RenderOptions::default()).expect("render");
         assert_eq!((pix.width, pix.height), (612, 792));
         assert!(
             pix.data.chunks_exact(4).any(|p| p[0] != 255 || p[1] != 255),
@@ -1308,7 +1350,8 @@ mod tests {
         // Text is tracked but not painted in v0.1, so the page stays white.
         let doc = Document::open(fixture("hello.pdf")).expect("open");
         let page = doc.page(0).expect("page");
-        let pix = render_page(&doc, &page, 1.0).expect("render");
+        let pix =
+            render_page_with_options(&doc, &page, 1.0, &RenderOptions::default()).expect("render");
         assert_eq!((pix.width, pix.height), (612, 792));
         assert!(pix.data.iter().all(|&b| b == 255), "expected a white page");
     }

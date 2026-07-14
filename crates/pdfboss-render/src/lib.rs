@@ -70,12 +70,44 @@ impl Pixmap {
     }
 }
 
+/// How aggressively the rasterizer turns text into filled outlines. Each tier is
+/// a strict superset of the previous one; the difference is only observable once
+/// the corresponding glyph loaders exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GlyphPainting {
+    /// Only embedded TrueType (`glyf`) outlines — the cheapest tier.
+    EmbeddedTrueTypeOnly,
+    /// Every embedded program: TrueType, CFF, Type1 and Type3. No bundled assets.
+    #[default]
+    AllEmbedded,
+    /// Also substitute bundled or caller-provided faces for non-embedded fonts.
+    Full,
+}
+
+/// Options controlling a single page render.
+#[derive(Clone, Debug, Default)]
+pub struct RenderOptions {
+    /// Which font programs the rasterizer will paint.
+    pub glyph_painting: GlyphPainting,
+}
+
 /// Renders a page at `scale` onto a white background. The pixel size is
 /// `ceil(crop_w * scale) x ceil(crop_h * scale)` (after `/Rotate`), and the
 /// base transform maps the crop box to device space with a y-flip and the
 /// page rotation applied.
 pub fn render_page(doc: &Document, page: &Page, scale: f32) -> Result<Pixmap> {
-    executor::render_page(doc, page, scale)
+    render_page_with_options(doc, page, scale, &RenderOptions::default())
+}
+
+/// Renders a page like [`render_page`], honoring `opts` (currently the glyph
+/// painting tier). See [`render_page`] for the geometry contract.
+pub fn render_page_with_options(
+    doc: &Document,
+    page: &Page,
+    scale: f32,
+    opts: &RenderOptions,
+) -> Result<Pixmap> {
+    executor::render_page_with_options(doc, page, scale, opts)
 }
 
 #[cfg(test)]
