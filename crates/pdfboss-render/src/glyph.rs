@@ -9,6 +9,7 @@
 use pdfboss_core::{Dict, Document, Object};
 
 use crate::truetype::{Seg, TrueType};
+use crate::GlyphPainting;
 
 /// How character codes map to glyph indices for a loaded font.
 enum GlyphKind {
@@ -28,7 +29,11 @@ pub(crate) struct GlyphFont {
 impl GlyphFont {
     /// Loads paintable glyph data from a (resolved) font dictionary, or `None`
     /// if the font is not an embedded TrueType.
-    pub(crate) fn load(doc: &Document, font: &Dict) -> Option<GlyphFont> {
+    pub(crate) fn load(doc: &Document, font: &Dict, painting: GlyphPainting) -> Option<GlyphFont> {
+        // Embedded TrueType is painted at every tier. Higher tiers will add
+        // branches here: CFF/Type1/Type3 at `AllEmbedded`+, substitution at
+        // `Full`. Until those loaders exist the tier changes nothing.
+        let _ = painting;
         match font.get_name("Subtype").map(|n| n.0.as_str()) {
             Some("Type0") => load_type0(doc, font),
             Some("TrueType") => load_simple(doc, font),
