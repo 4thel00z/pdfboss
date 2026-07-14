@@ -48,6 +48,9 @@ enum Command {
         /// Scale factor.
         #[arg(long, default_value_t = 1.0)]
         scale: f32,
+        /// Which fonts to paint: embedded-only, all-embedded, or full.
+        #[arg(long, value_enum, default_value_t = FontsArg::AllEmbedded)]
+        fonts: FontsArg,
     },
     /// Pretty-print a single object.
     Obj {
@@ -60,6 +63,29 @@ enum Command {
     },
 }
 
+/// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum FontsArg {
+    /// Only embedded TrueType outlines (fastest).
+    EmbeddedOnly,
+    /// Every embedded program (default).
+    #[default]
+    AllEmbedded,
+    /// Also substitute bundled faces for non-embedded fonts.
+    Full,
+}
+
+impl FontsArg {
+    fn to_painting(self) -> pdfboss_render::GlyphPainting {
+        use pdfboss_render::GlyphPainting;
+        match self {
+            FontsArg::EmbeddedOnly => GlyphPainting::EmbeddedTrueTypeOnly,
+            FontsArg::AllEmbedded => GlyphPainting::AllEmbedded,
+            FontsArg::Full => GlyphPainting::Full,
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -70,7 +96,8 @@ fn main() {
             page,
             out,
             scale,
-        } => cmd_render(&file, page, out, scale),
+            fonts,
+        } => cmd_render(&file, page, out, scale, fonts),
         Command::Obj { file, num, gen } => cmd_obj(&file, num, gen.unwrap_or(0)),
     };
     if let Err(msg) = result {
@@ -208,14 +235,24 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
 }
 
 /// `pdfboss render`: rasterizes one page to a PNG file.
-fn cmd_render(file: &Path, page: usize, out: Option<PathBuf>, scale: f32) -> Result<(), String> {
+fn cmd_render(
+    file: &Path,
+    page: usize,
+    out: Option<PathBuf>,
+    scale: f32,
+    fonts: FontsArg,
+) -> Result<(), String> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
     }
     let doc = Document::open(file).map_err(|e| e.to_string())?;
     let index = page_index(page, doc.page_count())?;
     let p = doc.page(index).map_err(|e| e.to_string())?;
-    let pixmap = pdfboss_render::render_page(&doc, &p, scale).map_err(|e| e.to_string())?;
+    let opts = pdfboss_render::RenderOptions {
+        glyph_painting: fonts.to_painting(),
+    };
+    let pixmap = pdfboss_render::render_page_with_options(&doc, &p, scale, &opts)
+        .map_err(|e| e.to_string())?;
     let out = out.unwrap_or_else(|| default_out(page));
     pixmap.save_png(&out).map_err(|e| e.to_string())?;
     println!(
@@ -265,6 +302,45 @@ fn default_out(page: usize) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn fonts_flag_defaults_to_all_embedded() {
+        let cli = Cli::parse_from(["pdfboss", "render", "in.pdf", "--page", "1"]);
+        let Command::Render { fonts, .. } = cli.command else {
+            panic!("expected render command");
+        };
+        assert!(matches!(fonts, FontsArg::AllEmbedded));
+    }
+
+    #[test]
+    fn fonts_flag_parses_embedded_only() {
+        let cli = Cli::parse_from([
+            "pdfboss",
+            "render",
+            "in.pdf",
+            "--page",
+            "1",
+            "--fonts",
+            "embedded-only",
+        ]);
+        let Command::Render { fonts, .. } = cli.command else {
+            panic!("expected render command");
+        };
+        assert!(matches!(fonts, FontsArg::EmbeddedOnly));
+    }
+
+    #[test]
+    fn fonts_arg_maps_to_painting() {
+        assert_eq!(
+            FontsArg::EmbeddedOnly.to_painting(),
+            pdfboss_render::GlyphPainting::EmbeddedTrueTypeOnly
+        );
+        assert_eq!(
+            FontsArg::Full.to_painting(),
+            pdfboss_render::GlyphPainting::Full
+        );
+    }
 
     #[test]
     fn info_text_normal_document() {
