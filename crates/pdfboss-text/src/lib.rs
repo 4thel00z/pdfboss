@@ -2,7 +2,6 @@
 //! and positional layout.
 
 mod cmap;
-mod encodings;
 mod extract;
 mod font;
 

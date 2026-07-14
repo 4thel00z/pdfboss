@@ -1,0 +1,9 @@
+[package]
+name = "pdfboss-encoding"
+description = "Shared font encoding tables and glyph-name mappings for pdfboss (ISO 32000 Appendix D)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

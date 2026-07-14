@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pdfboss-core",
     "crates/pdfboss-text",
+    "crates/pdfboss-encoding",
     "crates/pdfboss-render",
     "crates/pdfboss-cli",
     "crates/pdfboss-py",

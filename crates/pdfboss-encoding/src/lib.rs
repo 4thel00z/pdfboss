@@ -1,5 +1,6 @@
-//! Base encoding tables (WinAnsi/MacRoman/Standard, built from the spec's
-//! Appendix D) and the bundled glyph-name-to-unicode subset.
+//! Shared PDF font-encoding tables (WinAnsi / MacRoman / Standard, from
+//! ISO 32000 Appendix D) and a bundled glyph-name-to-Unicode subset, consumed
+//! by the pdfboss text-extraction and rendering crates.
 
 /// WinAnsiEncoding codes `0x80..=0x9F` (the region that differs from
 /// Latin-1); `None` marks unassigned codes.
