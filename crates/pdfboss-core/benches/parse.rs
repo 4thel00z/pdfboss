@@ -47,6 +47,19 @@ fn bench_parse(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    // The "open a document and ask its page count" path a caller hits first;
+    // with lazy page-tree flattening this reads the declared `/Count` without
+    // walking, so it should track `load_300_pages` rather than the walk.
+    g.bench_function("load_and_count_300_pages", |b| {
+        b.iter_batched(
+            || mp.clone(),
+            |data| {
+                let doc = Document::load(data).unwrap();
+                black_box(doc.page_count())
+            },
+            BatchSize::SmallInput,
+        );
+    });
     g.bench_function("load_and_walk_300_pages", |b| {
         b.iter_batched(
             || mp.clone(),

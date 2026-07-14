@@ -170,13 +170,19 @@ impl Document {
         py.allow_threads(move || {
             let doc = inner.lock();
             let mut out = String::new();
-            for i in 0..doc.page_count() {
+            // Drive iteration by successful page lookups rather than by
+            // `page_count()`: the count is the declared `/Count`, which on a
+            // damaged file can exceed (or fall short of) the pages the tree
+            // actually yields. `page(i)` fails only past the last real page,
+            // so this visits exactly the materializable pages.
+            let mut i = 0;
+            while let Ok(page) = doc.page(i) {
                 if i > 0 {
                     out.push('\u{c}');
                 }
-                let page = doc.page(i).map_err(pdf_err)?;
                 let text = pdfboss_text::extract_text(&doc, &page).map_err(pdf_err)?;
                 out.push_str(&text);
+                i += 1;
             }
             Ok(out)
         })
