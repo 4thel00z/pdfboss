@@ -92,7 +92,13 @@ impl FaceRequest {
             .unwrap_or("");
         let stripped = strip_subset_prefix(base);
         let lower = stripped.to_lowercase();
-        if lower == "symbol" || lower == "zapfdingbats" {
+        // Prefix match, not exact equality: vendor variants like `SymbolMT`
+        // or `ZapfDingbatsITC` are still Symbol/ZapfDingbats under the hood
+        // and have the same no-license-clean-substitute problem as the bare
+        // names -- an exact match would let them fall through to an
+        // unrelated Arimo/Tinos/Cousine substitute instead of staying
+        // unpainted.
+        if lower.starts_with("symbol") || lower.starts_with("zapfdingbats") {
             return None;
         }
 
@@ -281,6 +287,17 @@ mod tests {
     fn symbol_and_zapfdingbats_have_no_substitute() {
         assert_eq!(req_for("Symbol", 0), None);
         assert_eq!(req_for("ZapfDingbats", 0), None);
+    }
+
+    #[test]
+    fn symbol_and_zapfdingbats_vendor_variants_have_no_substitute() {
+        // Vendor-suffixed variants (e.g. Windows' "SymbolMT", ITC's
+        // "ZapfDingbatsITC") are still Symbol/ZapfDingbats under the hood --
+        // an exact-equality match would miss these and hand back an
+        // unrelated Arimo/Tinos/Cousine substitute instead of leaving the
+        // text unpainted.
+        assert_eq!(req_for("SymbolMT", 0), None);
+        assert_eq!(req_for("ZapfDingbatsITC", 0), None);
     }
 
     #[test]

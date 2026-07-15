@@ -569,7 +569,28 @@ fn load_substitute(
     let bytes = provider.face(&req)?;
     let tt = TrueType::parse(bytes)?;
 
-    let base = base_encoding(doc, font);
+    let base_font = font
+        .get_name("BaseFont")
+        .map(|n| n.0.as_str())
+        .unwrap_or("");
+
+    // `base_encoding` returns `None` when the font dict has no `/Encoding`
+    // key at all -- the COMMON shape for a non-embedded standard-14 font
+    // (e.g. bare `/Type1 /Helvetica`, no `/Encoding`, no `/Differences`).
+    // Left as `None`, every code below falls through to `.notdef` and this
+    // substitute paints nothing, even though the AFM width path further
+    // down (`is_standard_encoding`) already defaults an absent `/Encoding`
+    // to StandardEncoding for advances. Match that default here for the
+    // code -> glyph mapping too: a recognized standard-14 `/BaseFont` with
+    // no `/Encoding` key implies StandardEncoding (ISO 32000-1 9.6.6's
+    // built-in encoding for the standard 14), so this substitute face's
+    // `cmap` gets a real code -> char accessor instead of none at all. A
+    // `/Differences` entry (checked first, below) still takes precedence
+    // over this default, exactly as it does over an explicit `/Encoding`.
+    let base = base_encoding(doc, font).or_else(|| {
+        pdfboss_encoding::is_standard_14(base_font)
+            .then_some(pdfboss_encoding::standard as fn(u8) -> Option<char>)
+    });
     let diffs = differences(doc, font);
 
     let mut table = Box::new([0u16; 256]);
@@ -599,10 +620,6 @@ fn load_substitute(
     // with no resolvable glyph name (WinAnsi/MacRoman, which have no
     // code -> name table here) are simply not inserted, so `advance` falls
     // through to the substitute's own hmtx for them.
-    let base_font = font
-        .get_name("BaseFont")
-        .map(|n| n.0.as_str())
-        .unwrap_or("");
     let mut afm_widths = HashMap::new();
     if pdfboss_encoding::is_standard_14(base_font) {
         let standard_ok = is_standard_encoding(doc, font);
@@ -1520,6 +1537,38 @@ mod tests {
         assert!(
             dark_pixel_at(&pix, 135, 115),
             "'A' should land at the /Widths-implied origin (20 + 80 + 35 = 135)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_embedded_helvetica_bare_encoding_paints_via_standard_default() {
+        // /Type1 /Helvetica, NO /Encoding key at all -- the COMMON
+        // non-embedded standard-14 shape (no /Encoding, no /Differences).
+        // `base_encoding` returns None for this font (there is no /Encoding
+        // key to inspect), so without a standard-14 default the code -> glyph
+        // table above never resolves 0x41 and this substitute paints
+        // nothing, even though `is_standard_encoding` (feeding the AFM width
+        // tier) already defaults an absent /Encoding to StandardEncoding for
+        // advances -- the two defaults must agree, or this font advances
+        // correctly but paints blank. Showing 'A' (0x41), which
+        // StandardEncoding maps to 'A' and the substitute face's cmap (via
+        // `build_font`) maps to the box glyph.
+        let bytes = non_embedded_font_doc("Helvetica", "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        let dir = write_temp_face("Arimo[wght].ttf", &build_font());
+
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::Dir(dir.clone()),
+            },
+        );
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "bare /Type1 /Helvetica with no /Encoding key at all should still \
+             paint via the standard-14 implicit StandardEncoding default"
         );
 
         std::fs::remove_dir_all(&dir).ok();
