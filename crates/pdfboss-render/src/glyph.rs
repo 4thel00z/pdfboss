@@ -412,7 +412,7 @@ fn base_encoding(doc: &Document, font: &Dict) -> Option<fn(u8) -> Option<char>> 
 
 /// Parses `/Encoding /Differences` into a code → glyph-name map (empty when
 /// `/Encoding` is not a dictionary or has no `/Differences`).
-fn differences(doc: &Document, font: &Dict) -> HashMap<u8, String> {
+pub(crate) fn differences(doc: &Document, font: &Dict) -> HashMap<u8, String> {
     let mut out = HashMap::new();
     let Some(Ok(Object::Dict(enc))) = font.get("Encoding").map(|o| doc.resolve(o)) else {
         return out;
