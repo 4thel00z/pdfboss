@@ -6,6 +6,11 @@
       "package-name": "pdfboss",
       "include-component-in-tag": false,
       "extra-files": ["Cargo.toml"]
+    },
+    "packages/pdfboss-fonts": {
+      "release-type": "python",
+      "package-name": "pdfboss-fonts",
+      "include-component-in-tag": true
     }
   }
 }

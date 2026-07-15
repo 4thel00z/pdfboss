@@ -74,3 +74,32 @@ class TestLockfileVersionSync:
             manifest_text,
             flags=re.MULTILINE,
         ), "Cargo.toml lost its x-release-please-version marker"
+
+
+class TestPdfbossFontsReleasePipeline:
+    """The pdfboss-fonts data package gets its own release-please component
+    and Trusted-Publishing job, independent of the pdfboss engine release.
+    """
+
+    def test_pdfboss_fonts_package_registered_for_release(self) -> None:
+        config = json.loads((REPO / "release-please-config.json").read_text())
+        assert "packages/pdfboss-fonts" in config["packages"]
+        pkg = config["packages"]["packages/pdfboss-fonts"]
+        assert pkg["package-name"] == "pdfboss-fonts"
+        # The root package's tagging scheme must be untouched.
+        assert config["packages"]["."]["package-name"] == "pdfboss"
+        assert config["packages"]["."]["include-component-in-tag"] is False
+        manifest = json.loads((REPO / ".release-please-manifest.json").read_text())
+        assert "packages/pdfboss-fonts" in manifest
+
+    def test_full_extra_requires_fonts_package(self) -> None:
+        root = tomllib.loads((REPO / "pyproject.toml").read_text())
+        full = root["project"]["optional-dependencies"]["full"]
+        assert any(dep.startswith("pdfboss-fonts") for dep in full)
+
+    def test_release_workflow_publishes_fonts_package(self) -> None:
+        workflow = (
+            REPO / ".github" / "workflows" / "release-please.yaml"
+        ).read_text()
+        assert "pdfboss-fonts" in workflow, "no publish job for the fonts package"
+        assert "gh-action-pypi-publish" in workflow
