@@ -247,14 +247,10 @@ impl Type1Font {
     /// `/FontMatrix` and `/Encoding` are read from the header and `/lenIV`,
     /// `/Subrs`, and `/CharStrings` from the private portion.
     ///
-    /// `/Encoding`'s `StandardEncoding` token form is deliberately NOT
-    /// expanded into a code -> name table here: this font's caller (a later
-    /// task) resolves the PDF `/Encoding` entry first and only falls back to
-    /// this font's built-in encoding when the PDF gives nothing, so the
-    /// built-in `StandardEncoding` case is already covered from the PDF
-    /// side. Only an explicit `dup <code> /<name> put` encoding array
-    /// populates `builtin_encoding` here; the bare `StandardEncoding` token
-    /// leaves every slot `None`.
+    /// `/Encoding`'s bare `StandardEncoding` token form is expanded into a
+    /// full code -> name table via `pdfboss_encoding::standard_encoding_name`
+    /// (spec ch. 6); an explicit `dup <code> /<name> put` encoding array
+    /// still overrides per-code on top of that, as before.
     ///
     /// Returns `None` if `segment` fails, or if the program yields zero
     /// charstrings (nothing paintable).
@@ -302,8 +298,8 @@ impl Type1Font {
     }
 
     /// The font's built-in `/Encoding` name for `code` (see `parse`'s doc
-    /// comment for why the `StandardEncoding` form leaves this `None`
-    /// throughout).
+    /// comment: this covers both the bare `StandardEncoding` token and an
+    /// explicit `dup <code> /<name> put` array).
     pub(crate) fn builtin_name(&self, code: u8) -> Option<&str> {
         self.builtin_encoding[code as usize].as_deref()
     }
@@ -900,7 +896,7 @@ impl<'a> Type1Interpreter<'a> {
         let Ok(code) = u8::try_from(code as i32) else {
             return;
         };
-        let Some(name) = standard_encoding_name(code) else {
+        let Some(name) = pdfboss_encoding::standard_encoding_name(code) else {
             return;
         };
         let Some(gid) = self.font.gid_for_name(name) else {
@@ -925,94 +921,6 @@ impl<'a> Type1Interpreter<'a> {
         // in case a malformed component never reached one.
         self.close_current();
     }
-}
-
-/// The subset of Adobe StandardEncoding (spec Appendix C) needed to resolve
-/// `seac` components: the Latin letters and the common accent glyphs. An
-/// unrecognized code returns `None` and its component is skipped (a complete
-/// StandardEncoding table is a deferred refinement).
-fn standard_encoding_name(code: u8) -> Option<&'static str> {
-    let name = match code {
-        32 => "space",
-        48 => "zero",
-        49 => "one",
-        50 => "two",
-        51 => "three",
-        52 => "four",
-        53 => "five",
-        54 => "six",
-        55 => "seven",
-        56 => "eight",
-        57 => "nine",
-        65 => "A",
-        66 => "B",
-        67 => "C",
-        68 => "D",
-        69 => "E",
-        70 => "F",
-        71 => "G",
-        72 => "H",
-        73 => "I",
-        74 => "J",
-        75 => "K",
-        76 => "L",
-        77 => "M",
-        78 => "N",
-        79 => "O",
-        80 => "P",
-        81 => "Q",
-        82 => "R",
-        83 => "S",
-        84 => "T",
-        85 => "U",
-        86 => "V",
-        87 => "W",
-        88 => "X",
-        89 => "Y",
-        90 => "Z",
-        97 => "a",
-        98 => "b",
-        99 => "c",
-        100 => "d",
-        101 => "e",
-        102 => "f",
-        103 => "g",
-        104 => "h",
-        105 => "i",
-        106 => "j",
-        107 => "k",
-        108 => "l",
-        109 => "m",
-        110 => "n",
-        111 => "o",
-        112 => "p",
-        113 => "q",
-        114 => "r",
-        115 => "s",
-        116 => "t",
-        117 => "u",
-        118 => "v",
-        119 => "w",
-        120 => "x",
-        121 => "y",
-        122 => "z",
-        // Accent glyphs (StandardEncoding high codes).
-        193 => "grave",
-        194 => "acute",
-        195 => "circumflex",
-        196 => "tilde",
-        197 => "macron",
-        198 => "breve",
-        199 => "dotaccent",
-        200 => "dieresis",
-        202 => "ring",
-        203 => "cedilla",
-        205 => "hungarumlaut",
-        206 => "ogonek",
-        207 => "caron",
-        _ => return None,
-    };
-    Some(name)
 }
 
 // --- private-text/clear-text tokenizing (bounds-checked throughout) --------
@@ -1209,18 +1117,27 @@ fn parse_charstrings(
     (charstrings, names, name_to_gid)
 }
 
-/// Parses the clear-text header's `/Encoding` declaration (spec ch. 6): a
-/// custom encoding array's `dup <code> /<name> put` entries populate
-/// `builtin_encoding[code]`. The other legal form -- the bare token
-/// `StandardEncoding` -- has no such entries to find, so it (and any font
-/// with no `/Encoding` at all) simply yields every slot `None`; see
-/// `Type1Font::parse`'s doc comment for why that is an acceptable v1
-/// simplification.
+/// Parses the clear-text header's `/Encoding` declaration (spec ch. 6). Two
+/// legal forms: the bare token `StandardEncoding`, expanded here into a full
+/// code -> name table via `pdfboss_encoding::standard_encoding_name`; or a
+/// custom encoding array, whose `dup <code> /<name> put` entries populate
+/// `builtin_encoding[code]` (and, when both forms somehow appear, still
+/// override the `StandardEncoding` base per-code). A font with no
+/// `/Encoding` at all yields every slot `None`.
 fn parse_encoding(clear: &[u8]) -> Box<[Option<String>; 256]> {
     let mut table: Box<[Option<String>; 256]> = Box::new(std::array::from_fn(|_| None));
     let Some(enc_pos) = find_token(clear, b"/Encoding") else {
         return table;
     };
+
+    let after_enc = enc_pos.saturating_add(b"/Encoding".len());
+    if let Some((tok, _)) = next_token(clear, after_enc) {
+        if tok == b"StandardEncoding" {
+            for (code, slot) in table.iter_mut().enumerate() {
+                *slot = pdfboss_encoding::standard_encoding_name(code as u8).map(String::from);
+            }
+        }
+    }
 
     let mut i = enc_pos;
     while i < clear.len() {
@@ -1525,13 +1442,34 @@ pub(crate) mod tests {
         subrs: &[(u16, Vec<u8>)],
         len_iv: usize,
     ) -> Vec<u8> {
+        let mut encoding_clause = String::from("/Encoding 256 array\n");
+        for (code, name) in encoding {
+            encoding_clause.push_str(&format!("dup {code} /{name} put\n"));
+        }
+        build_type1_program_with_encoding_clause(
+            font_matrix,
+            &encoding_clause,
+            charstrings,
+            subrs,
+            len_iv,
+        )
+    }
+
+    /// Like [`build_type1_program`], but the caller supplies the raw
+    /// `/Encoding` clause verbatim -- lets a test exercise the other legal
+    /// built-in `/Encoding` form, the bare `StandardEncoding` token (spec
+    /// ch. 6), which `build_type1_program`'s custom-array form can't express.
+    fn build_type1_program_with_encoding_clause(
+        font_matrix: &str,
+        encoding_clause: &str,
+        charstrings: &[(&str, Vec<u8>)],
+        subrs: &[(u16, Vec<u8>)],
+        len_iv: usize,
+    ) -> Vec<u8> {
         let mut clear = String::new();
         clear.push_str("%!\n");
         clear.push_str(&format!("/FontMatrix {font_matrix} def\n"));
-        clear.push_str("/Encoding 256 array\n");
-        for (code, name) in encoding {
-            clear.push_str(&format!("dup {code} /{name} put\n"));
-        }
+        clear.push_str(encoding_clause);
 
         let mut private = Vec::new();
         private.extend_from_slice(format!("/lenIV {len_iv} def\n").as_bytes());
@@ -1659,6 +1597,23 @@ pub(crate) mod tests {
                 (".notdef", stub_charstring()),
                 (glyph_name, box_charstring()),
             ],
+            &[],
+            4,
+        )
+    }
+
+    /// Like [`build_type1_box_fixture`], but the built-in `/Encoding` is the
+    /// bare `StandardEncoding` token (spec ch. 6) rather than a custom
+    /// `dup <code> /<name> put` array: gid 0 is `.notdef`, gid 1 is a glyph
+    /// named `"A"` -- StandardEncoding code 65 -- tracing the same
+    /// (100,0)-(600,700) box. Exercises `parse_encoding`'s other legal
+    /// `/Encoding` form end to end (`glyph.rs`'s render test drives code
+    /// `<41>` through it with no PDF `/Encoding` at all).
+    pub(crate) fn build_type1_box_fixture_standard_encoding() -> Vec<u8> {
+        build_type1_program_with_encoding_clause(
+            "[0.001 0 0 0.001 0 0]",
+            "/Encoding StandardEncoding def\n",
+            &[(".notdef", stub_charstring()), ("A", box_charstring())],
             &[],
             4,
         )

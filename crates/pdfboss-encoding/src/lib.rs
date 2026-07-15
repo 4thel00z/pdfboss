@@ -149,6 +149,186 @@ pub fn standard(code: u8) -> Option<char> {
     }
 }
 
+/// StandardEncoding names for codes `0x20..=0x7E` (space..asciitilde), in
+/// code order (index `0` is code `0x20`). Two codes diverge from their plain
+/// ASCII name: `0x27` is `quoteright` (a curly right quote, not the straight
+/// `quotesingle` apostrophe) and `0x60` is `quoteleft` (a curly left quote,
+/// not `grave`) -- matching `standard`'s `0x27`/`0x60` special cases above.
+const STANDARD_ASCII_NAMES: [&str; 95] = [
+    "space",
+    "exclam",
+    "quotedbl",
+    "numbersign",
+    "dollar",
+    "percent",
+    "ampersand",
+    "quoteright",
+    "parenleft",
+    "parenright",
+    "asterisk",
+    "plus",
+    "comma",
+    "hyphen",
+    "period",
+    "slash",
+    "zero",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "colon",
+    "semicolon",
+    "less",
+    "equal",
+    "greater",
+    "question",
+    "at",
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F",
+    "G",
+    "H",
+    "I",
+    "J",
+    "K",
+    "L",
+    "M",
+    "N",
+    "O",
+    "P",
+    "Q",
+    "R",
+    "S",
+    "T",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "bracketleft",
+    "backslash",
+    "bracketright",
+    "asciicircum",
+    "underscore",
+    "quoteleft",
+    "a",
+    "b",
+    "c",
+    "d",
+    "e",
+    "f",
+    "g",
+    "h",
+    "i",
+    "j",
+    "k",
+    "l",
+    "m",
+    "n",
+    "o",
+    "p",
+    "q",
+    "r",
+    "s",
+    "t",
+    "u",
+    "v",
+    "w",
+    "x",
+    "y",
+    "z",
+    "braceleft",
+    "bar",
+    "braceright",
+    "asciitilde",
+];
+
+/// StandardEncoding names for codes above `0x7E` (ISO 32000-1 Annex D.2
+/// "StandardEncoding" column), parallel to [`STANDARD_HIGH`]'s codes, in the
+/// same order.
+const STANDARD_HIGH_NAMES: &[(u8, &str)] = &[
+    (0xA1, "exclamdown"),
+    (0xA2, "cent"),
+    (0xA3, "sterling"),
+    (0xA4, "fraction"),
+    (0xA5, "yen"),
+    (0xA6, "florin"),
+    (0xA7, "section"),
+    (0xA8, "currency"),
+    (0xA9, "quotesingle"),
+    (0xAA, "quotedblleft"),
+    (0xAB, "guillemotleft"),
+    (0xAC, "guilsinglleft"),
+    (0xAD, "guilsinglright"),
+    (0xAE, "fi"),
+    (0xAF, "fl"),
+    (0xB1, "endash"),
+    (0xB2, "dagger"),
+    (0xB3, "daggerdbl"),
+    (0xB4, "periodcentered"),
+    (0xB6, "paragraph"),
+    (0xB7, "bullet"),
+    (0xB8, "quotesinglbase"),
+    (0xB9, "quotedblbase"),
+    (0xBA, "quotedblright"),
+    (0xBB, "guillemotright"),
+    (0xBC, "ellipsis"),
+    (0xBD, "perthousand"),
+    (0xBF, "questiondown"),
+    (0xC1, "grave"),
+    (0xC2, "acute"),
+    (0xC3, "circumflex"),
+    (0xC4, "tilde"),
+    (0xC5, "macron"),
+    (0xC6, "breve"),
+    (0xC7, "dotaccent"),
+    (0xC8, "dieresis"),
+    (0xCA, "ring"),
+    (0xCB, "cedilla"),
+    (0xCD, "hungarumlaut"),
+    (0xCE, "ogonek"),
+    (0xCF, "caron"),
+    (0xD0, "emdash"),
+    (0xE1, "AE"),
+    (0xE3, "ordfeminine"),
+    (0xE8, "Lslash"),
+    (0xE9, "Oslash"),
+    (0xEA, "OE"),
+    (0xEB, "ordmasculine"),
+    (0xF1, "ae"),
+    (0xF5, "dotlessi"),
+    (0xF8, "lslash"),
+    (0xF9, "oslash"),
+    (0xFA, "oe"),
+    (0xFB, "germandbls"),
+];
+
+/// Adobe StandardEncoding glyph name for `code` (ISO 32000-1 Annex D.2
+/// "StandardEncoding" column; equivalently Adobe Type 1 Font Format
+/// Appendix C). `None` for exactly the codes `standard` leaves unassigned
+/// (see the self-verifying `standard_encoding_name_matches_standard_table`
+/// test below, which ties this table to that one so an authoring mistake
+/// here fails a test rather than silently mis-encoding a glyph).
+pub fn standard_encoding_name(code: u8) -> Option<&'static str> {
+    match code {
+        0x20..=0x7E => Some(STANDARD_ASCII_NAMES[(code - 0x20) as usize]),
+        0xA1..=0xFF => STANDARD_HIGH_NAMES
+            .iter()
+            .find(|&&(c, _)| c == code)
+            .map(|&(_, n)| n),
+        _ => None,
+    }
+}
+
 /// Resolves a glyph name (as used in `/Differences`) to a Unicode scalar:
 /// `uniXXXX` and `uXXXX`–`uXXXXXX` hex forms, single ASCII letters, and a
 /// bundled subset of the standard glyph list.
@@ -500,6 +680,51 @@ mod tests {
         assert_eq!(glyph_to_unicode("u00E9"), Some('\u{E9}'));
         assert_eq!(glyph_to_unicode("uniD800"), None); // surrogate
         assert_eq!(glyph_to_unicode("uniXYZW"), None);
+    }
+
+    /// Self-verifying anchor for `standard_encoding_name`: ties the new table
+    /// to the pre-existing, trusted `standard` (code -> Unicode) and
+    /// `glyph_to_unicode` (name -> Unicode) tables so an authoring typo in
+    /// the new table fails a test instead of silently mis-encoding a glyph.
+    /// Domain equality (StandardEncoding assigns a name to exactly the codes
+    /// `standard` maps to a char) must hold for every code; value agreement
+    /// only where `glyph_to_unicode` also resolves the name (some names
+    /// aren't in the bundled glyph-name subset).
+    #[test]
+    fn standard_encoding_name_matches_standard_table() {
+        for code in 0u16..=255 {
+            let code = code as u8;
+            assert_eq!(
+                standard_encoding_name(code).is_some(),
+                standard(code).is_some(),
+                "code {code:#04x}: standard_encoding_name/standard domain mismatch"
+            );
+            if let (Some(name), Some(expected)) = (standard_encoding_name(code), standard(code)) {
+                if let Some(resolved) = glyph_to_unicode(name) {
+                    assert_eq!(
+                        resolved, expected,
+                        "code {code:#04x} name {name:?}: glyph_to_unicode disagrees with standard"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn standard_encoding_name_spot_checks() {
+        assert_eq!(standard_encoding_name(b'A'), Some("A"));
+        assert_eq!(standard_encoding_name(0x27), Some("quoteright"));
+        assert_eq!(standard_encoding_name(0x60), Some("quoteleft"));
+        assert_eq!(standard_encoding_name(0xA1), Some("exclamdown"));
+        assert_eq!(standard_encoding_name(0xA4), Some("fraction"));
+        assert_eq!(standard_encoding_name(0xA6), Some("florin"));
+        assert_eq!(standard_encoding_name(0xC1), Some("grave"));
+        assert_eq!(standard_encoding_name(0xC6), Some("breve"));
+        assert_eq!(standard_encoding_name(0xE1), Some("AE"));
+        assert_eq!(standard_encoding_name(0xF1), Some("ae"));
+        assert_eq!(standard_encoding_name(0xFB), Some("germandbls"));
+        assert_eq!(standard_encoding_name(0x7F), None);
+        assert_eq!(standard_encoding_name(0xA0), None);
     }
 
     #[test]
