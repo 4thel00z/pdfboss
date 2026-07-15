@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 
+use crate::truetype::Seg;
+
 // --- Type1 stream cipher constants (spec ch. 7) -----------------------------
 
 /// The fixed key for decrypting a `FontFile`'s `eexec` portion.
@@ -302,6 +304,685 @@ impl Type1Font {
     pub(crate) fn units_per_em(&self) -> f32 {
         self.units_per_em
     }
+
+    /// Interprets glyph `gid`'s (already-decrypted) Type1 charstring (Type 1
+    /// Font Format ch. 6.4) into outline segments in font design units.
+    /// Bounds-checked and step/recursion-bounded throughout (see
+    /// [`Type1Interpreter`]); a missing gid or malformed charstring yields
+    /// whatever partial outline was decoded so far (empty if nothing could be
+    /// decoded), never a panic.
+    pub(crate) fn glyph_path(&self, gid: u16) -> Vec<Seg> {
+        let Some(code) = self.charstrings.get(gid as usize) else {
+            return Vec::new();
+        };
+        Type1Interpreter::new(self).run(code)
+    }
+}
+
+// --- Type1 charstring interpreter (spec ch. 6.4) ----------------------------
+//
+// Turns one glyph's decrypted charstring into `Seg` outline segments. Every
+// curve is cubic (`Seg::Cubic`); the "current point" starts at the origin and
+// is first positioned by `hsbw`/`sbw`. Each `moveto` closes the previous
+// subpath (mirroring `cff.rs`'s Type2 interpreter and the fill pipeline, which
+// treats `Seg::Close` subpaths as implicitly closed -- no explicit closing
+// edge is needed).
+
+/// Type1 operand stack depth. The spec caps a charstring's operand stack at
+/// 24; 48 gives headroom while still bounding a hostile push storm.
+const MAX_STACK: usize = 48;
+
+/// Bounds nested `callsubr`/`seac` recursion so a self-referential or cyclic
+/// subroutine (or a self-referential `seac`) can't recurse forever or overflow
+/// the real call stack (each level is one Rust stack frame).
+const MAX_SUBR_DEPTH: u32 = 10;
+
+/// Total operator-execution budget for one glyph, guarding against adversarial
+/// charstrings that loop without ever deepening recursion (e.g. a long chain
+/// of subr calls rather than a self-recursive one).
+const MAX_STEPS: u32 = 50_000;
+
+// One-byte operators (Type 1 Font Format ch. 6.4).
+const T1_HSTEM: u8 = 1;
+const T1_VSTEM: u8 = 3;
+const T1_VMOVETO: u8 = 4;
+const T1_RLINETO: u8 = 5;
+const T1_HLINETO: u8 = 6;
+const T1_VLINETO: u8 = 7;
+const T1_RRCURVETO: u8 = 8;
+const T1_CLOSEPATH: u8 = 9;
+const T1_CALLSUBR: u8 = 10;
+const T1_RETURN: u8 = 11;
+const T1_ESCAPE: u8 = 12;
+const T1_HSBW: u8 = 13;
+const T1_ENDCHAR: u8 = 14;
+const T1_RMOVETO: u8 = 21;
+const T1_HMOVETO: u8 = 22;
+const T1_VHCURVETO: u8 = 30;
+const T1_HVCURVETO: u8 = 31;
+
+// Escape (`12 x`) operators.
+const T1E_DOTSECTION: u8 = 0;
+const T1E_VSTEM3: u8 = 1;
+const T1E_HSTEM3: u8 = 2;
+const T1E_SEAC: u8 = 6;
+const T1E_SBW: u8 = 7;
+const T1E_DIV: u8 = 12;
+const T1E_CALLOTHERSUBR: u8 = 16;
+const T1E_POP: u8 = 17;
+const T1E_SETCURRENTPOINT: u8 = 33;
+
+/// What an executed operator (or a bounds/budget failure) tells the calling
+/// decode loop to do next.
+enum OpResult {
+    /// Keep decoding this charstring.
+    Continue,
+    /// The `return` operator, or running off the end of a charstring/subr:
+    /// unwind one `callsubr` level.
+    Return,
+    /// Stop interpreting the glyph entirely: `endchar`/`seac`, an exhausted
+    /// step budget, subr recursion too deep, or a reserved/malformed opcode.
+    Stop,
+}
+
+/// Interprets a single glyph's Type1 charstring, borrowing the font for its
+/// (already-decrypted) local `Subrs` and -- for `seac` -- its other glyphs'
+/// charstrings. Every operand read and subr-index lookup is bounds-checked;
+/// malformed input makes the interpreter stop and `run` return whatever
+/// outline had been decoded so far.
+struct Type1Interpreter<'a> {
+    font: &'a Type1Font,
+    /// Type1 operand stack.
+    stack: Vec<f32>,
+    /// The PostScript-interpreter stack `callothersubr` pushes results onto
+    /// and `pop` retrieves from.
+    ps_stack: Vec<f32>,
+    /// Absolute points collected during a flex (`OtherSubr 1..0`); index 0 is
+    /// the flex reference point (ignored), 1..=6 are the two cubics' control
+    /// and end points.
+    flex_pts: Vec<(f32, f32)>,
+    /// Whether a flex sequence is in progress (moveto captures a point instead
+    /// of emitting `Seg::Move`).
+    in_flex: bool,
+    /// Current point, in the component's own (untranslated) coordinate space.
+    x: f32,
+    y: f32,
+    /// Translation applied to every emitted coordinate: `(0, 0)` for a normal
+    /// glyph or a `seac` base, `(adx - asb, ady)` for a `seac` accent.
+    ox: f32,
+    oy: f32,
+    /// Whether a subpath is open (a `moveto` not yet followed by another
+    /// `moveto`, a `closepath`, or the end of the glyph).
+    open: bool,
+    depth: u32,
+    steps: u32,
+    segs: Vec<Seg>,
+}
+
+impl<'a> Type1Interpreter<'a> {
+    fn new(font: &'a Type1Font) -> Type1Interpreter<'a> {
+        Type1Interpreter {
+            font,
+            stack: Vec::new(),
+            ps_stack: Vec::new(),
+            flex_pts: Vec::new(),
+            in_flex: false,
+            x: 0.0,
+            y: 0.0,
+            ox: 0.0,
+            oy: 0.0,
+            open: false,
+            depth: 0,
+            steps: 0,
+            segs: Vec::new(),
+        }
+    }
+
+    /// Runs the top-level charstring and returns the decoded outline, closing
+    /// any subpath still open when interpretation stops (whether via
+    /// `endchar` or a malformed charstring that never reaches one).
+    fn run(mut self, code: &[u8]) -> Vec<Seg> {
+        self.exec(code);
+        self.close_current();
+        self.segs
+    }
+
+    /// Local subroutine `i`'s bytes, tied to the font's lifetime (not the
+    /// `&self` borrow) so the caller can pass it straight to `exec`.
+    fn subr(&self, i: usize) -> Option<&'a [u8]> {
+        let font: &'a Type1Font = self.font;
+        font.subrs.get(i).map(Vec::as_slice)
+    }
+
+    /// Glyph `gid`'s charstring bytes, tied to the font's lifetime (see
+    /// [`Self::subr`]).
+    fn charstring(&self, gid: u16) -> Option<&'a [u8]> {
+        let font: &'a Type1Font = self.font;
+        font.charstrings.get(gid as usize).map(Vec::as_slice)
+    }
+
+    fn push_operand(&mut self, v: f32) {
+        if self.stack.len() < MAX_STACK {
+            self.stack.push(v);
+        }
+    }
+
+    /// Operand `i`, or `0.0` if the stack came up short (a malformed
+    /// charstring never panics here).
+    fn arg(&self, i: usize) -> f32 {
+        self.stack.get(i).copied().unwrap_or(0.0)
+    }
+
+    fn close_current(&mut self) {
+        if self.open {
+            self.segs.push(Seg::Close);
+            self.open = false;
+        }
+    }
+
+    /// Moves the current point by `(dx, dy)`. While a flex is in progress the
+    /// new point is appended to `flex_pts` rather than starting a subpath.
+    fn moveto(&mut self, dx: f32, dy: f32) {
+        self.x += dx;
+        self.y += dy;
+        if self.in_flex {
+            self.flex_pts.push((self.x, self.y));
+        } else {
+            self.close_current();
+            self.segs
+                .push(Seg::Move(self.x + self.ox, self.y + self.oy));
+            self.open = true;
+        }
+    }
+
+    fn lineto(&mut self, dx: f32, dy: f32) {
+        self.x += dx;
+        self.y += dy;
+        self.segs
+            .push(Seg::Line(self.x + self.ox, self.y + self.oy));
+    }
+
+    /// Appends one cubic Bézier from three deltas relative to the current
+    /// point: first control point, second control point, end point.
+    fn curveto(&mut self, dx1: f32, dy1: f32, dx2: f32, dy2: f32, dx3: f32, dy3: f32) {
+        let c1x = self.x + dx1;
+        let c1y = self.y + dy1;
+        let c2x = c1x + dx2;
+        let c2y = c1y + dy2;
+        self.x = c2x + dx3;
+        self.y = c2y + dy3;
+        self.segs.push(Seg::Cubic(
+            c1x + self.ox,
+            c1y + self.oy,
+            c2x + self.ox,
+            c2y + self.oy,
+            self.x + self.ox,
+            self.y + self.oy,
+        ));
+    }
+
+    /// Decodes operators and operands from `code` until `return`/`endchar`/
+    /// `seac`, the step budget is exhausted, or the bytes run out. Type1
+    /// number encoding (ch. 6.2) differs from Type2: byte 255 introduces a
+    /// 32-bit signed **integer**, not a 16.16 fixed value.
+    fn exec(&mut self, code: &[u8]) -> OpResult {
+        let mut i = 0usize;
+        while i < code.len() {
+            self.steps += 1;
+            if self.steps > MAX_STEPS {
+                return OpResult::Stop;
+            }
+            let b0 = code[i];
+            match b0 {
+                32..=246 => {
+                    self.push_operand(b0 as f32 - 139.0);
+                    i += 1;
+                }
+                247..=250 => {
+                    let Some(&b1) = code.get(i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    self.push_operand((b0 as f32 - 247.0) * 256.0 + b1 as f32 + 108.0);
+                    i += 2;
+                }
+                251..=254 => {
+                    let Some(&b1) = code.get(i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    self.push_operand(-(b0 as f32 - 251.0) * 256.0 - b1 as f32 - 108.0);
+                    i += 2;
+                }
+                255 => {
+                    let Some(bytes) = code.get(i + 1..i + 5) else {
+                        return OpResult::Stop;
+                    };
+                    let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    self.push_operand(v as f32);
+                    i += 5;
+                }
+                T1_ESCAPE => {
+                    let Some(&b1) = code.get(i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    i += 2;
+                    match self.exec_escape(b1) {
+                        OpResult::Continue => {}
+                        other => return other,
+                    }
+                }
+                _ => {
+                    i += 1;
+                    match self.exec_operator(b0) {
+                        OpResult::Continue => {}
+                        other => return other,
+                    }
+                }
+            }
+        }
+        OpResult::Return
+    }
+
+    /// Handles the one-byte operators. Per Type1 semantics the operand stack
+    /// is cleared after each path/hint operator (so operand counts stay
+    /// correct across the glyph), but not after `callsubr`/`return`.
+    fn exec_operator(&mut self, op: u8) -> OpResult {
+        match op {
+            T1_HSBW => {
+                // sbx wx: set current point x = sbx (y = 0); wx (advance) is
+                // recorded by the spec but unused for painting.
+                self.x = self.arg(0);
+                self.y = 0.0;
+                self.stack.clear();
+                OpResult::Continue
+            }
+            T1_RLINETO => {
+                let (dx, dy) = (self.arg(0), self.arg(1));
+                self.stack.clear();
+                if self.open {
+                    self.lineto(dx, dy);
+                }
+                OpResult::Continue
+            }
+            T1_HLINETO => {
+                let dx = self.arg(0);
+                self.stack.clear();
+                if self.open {
+                    self.lineto(dx, 0.0);
+                }
+                OpResult::Continue
+            }
+            T1_VLINETO => {
+                let dy = self.arg(0);
+                self.stack.clear();
+                if self.open {
+                    self.lineto(0.0, dy);
+                }
+                OpResult::Continue
+            }
+            T1_RRCURVETO => {
+                let (dx1, dy1, dx2, dy2, dx3, dy3) = (
+                    self.arg(0),
+                    self.arg(1),
+                    self.arg(2),
+                    self.arg(3),
+                    self.arg(4),
+                    self.arg(5),
+                );
+                self.stack.clear();
+                if self.open {
+                    self.curveto(dx1, dy1, dx2, dy2, dx3, dy3);
+                }
+                OpResult::Continue
+            }
+            T1_VHCURVETO => {
+                // dy1 dx2 dy2 dx3: vertical start tangent, horizontal end.
+                let (dy1, dx2, dy2, dx3) = (self.arg(0), self.arg(1), self.arg(2), self.arg(3));
+                self.stack.clear();
+                if self.open {
+                    self.curveto(0.0, dy1, dx2, dy2, dx3, 0.0);
+                }
+                OpResult::Continue
+            }
+            T1_HVCURVETO => {
+                // dx1 dx2 dy2 dy3: horizontal start tangent, vertical end.
+                let (dx1, dx2, dy2, dy3) = (self.arg(0), self.arg(1), self.arg(2), self.arg(3));
+                self.stack.clear();
+                if self.open {
+                    self.curveto(dx1, 0.0, dx2, dy2, 0.0, dy3);
+                }
+                OpResult::Continue
+            }
+            T1_RMOVETO => {
+                let (dx, dy) = (self.arg(0), self.arg(1));
+                self.stack.clear();
+                self.moveto(dx, dy);
+                OpResult::Continue
+            }
+            T1_HMOVETO => {
+                let dx = self.arg(0);
+                self.stack.clear();
+                self.moveto(dx, 0.0);
+                OpResult::Continue
+            }
+            T1_VMOVETO => {
+                let dy = self.arg(0);
+                self.stack.clear();
+                self.moveto(0.0, dy);
+                OpResult::Continue
+            }
+            T1_CLOSEPATH => {
+                // Closes the current subpath without moving the current point.
+                self.close_current();
+                self.stack.clear();
+                OpResult::Continue
+            }
+            T1_HSTEM | T1_VSTEM => {
+                // Hints do not affect the filled outline: clear and continue.
+                self.stack.clear();
+                OpResult::Continue
+            }
+            T1_CALLSUBR => self.callsubr(),
+            T1_RETURN => OpResult::Return,
+            T1_ENDCHAR => {
+                self.close_current();
+                self.stack.clear();
+                OpResult::Stop
+            }
+            _ => OpResult::Stop, // reserved opcode: malformed charstring
+        }
+    }
+
+    /// Handles the escape (`12 x`) operators.
+    fn exec_escape(&mut self, op: u8) -> OpResult {
+        match op {
+            T1E_DOTSECTION | T1E_VSTEM3 | T1E_HSTEM3 => {
+                // Hint operators: no effect on the filled outline.
+                self.stack.clear();
+                OpResult::Continue
+            }
+            T1E_SBW => {
+                // sbx sby wx wy: set current point to (sbx, sby).
+                self.x = self.arg(0);
+                self.y = self.arg(1);
+                self.stack.clear();
+                OpResult::Continue
+            }
+            T1E_SEAC => self.seac(),
+            T1E_DIV => {
+                // a b div -> a / b (pops exactly two, pushes the quotient;
+                // does not clear the rest of the stack).
+                let b = self.stack.pop().unwrap_or(1.0);
+                let a = self.stack.pop().unwrap_or(0.0);
+                self.push_operand(if b != 0.0 { a / b } else { 0.0 });
+                OpResult::Continue
+            }
+            T1E_CALLOTHERSUBR => {
+                self.callothersubr();
+                OpResult::Continue
+            }
+            T1E_POP => {
+                let v = self.ps_stack.pop().unwrap_or(0.0);
+                self.push_operand(v);
+                OpResult::Continue
+            }
+            T1E_SETCURRENTPOINT => {
+                // x y: set the current point directly (no segment emitted).
+                self.x = self.arg(0);
+                self.y = self.arg(1);
+                self.stack.clear();
+                OpResult::Continue
+            }
+            _ => {
+                // Unknown escape: discard operands and continue (leniency).
+                self.stack.clear();
+                OpResult::Continue
+            }
+        }
+    }
+
+    /// `callsubr`: execute local subroutine `subr#` (no bias, unlike Type2),
+    /// bounding recursion depth. A missing operand or out-of-range/absent
+    /// subr is a no-op rather than an abort.
+    fn callsubr(&mut self) -> OpResult {
+        let Some(idx) = self.stack.pop() else {
+            return OpResult::Continue;
+        };
+        let Ok(idx) = usize::try_from(idx as i32) else {
+            return OpResult::Continue;
+        };
+        let Some(bytes) = self.subr(idx) else {
+            return OpResult::Continue;
+        };
+        if self.depth >= MAX_SUBR_DEPTH {
+            return OpResult::Stop;
+        }
+        self.depth += 1;
+        let result = self.exec(bytes);
+        self.depth -= 1;
+        match result {
+            OpResult::Stop => OpResult::Stop,
+            _ => OpResult::Continue,
+        }
+    }
+
+    /// The OtherSubr protocol (spec ch. 8). `callothersubr` consumes
+    /// `othersubr#` (top), then `n` (arg count), then the `n` args from the
+    /// operand stack. The three standard flex OtherSubrs and hint replacement
+    /// (OtherSubr 3) are recognized; any other `othersubr#` is a generic
+    /// passthrough that moves its `n` args onto the PS stack so subsequent
+    /// `pop`s balance.
+    fn callothersubr(&mut self) {
+        let othersubr = self.stack.pop().unwrap_or(0.0) as i32;
+        let n = self.stack.pop().unwrap_or(0.0).max(0.0) as usize;
+        match othersubr {
+            1 => {
+                // Start flex: begin capturing points (there are no args).
+                self.in_flex = true;
+                self.flex_pts.clear();
+            }
+            2 => {
+                // Collect flex point: a no-op here -- the point was already
+                // captured by the preceding `rmoveto` while `in_flex`.
+            }
+            0 => {
+                // End flex: args (bottom-to-top) are flex_depth, end_x, end_y.
+                let end_y = self.stack.pop().unwrap_or(0.0);
+                let end_x = self.stack.pop().unwrap_or(0.0);
+                let _flex_depth = self.stack.pop().unwrap_or(0.0);
+                self.end_flex();
+                // Push end_y then end_x so the following `pop pop
+                // setcurrentpoint` retrieves x first, then y.
+                self.ps_stack.push(end_y);
+                self.ps_stack.push(end_x);
+            }
+            _ => {
+                // OtherSubr 3 (hint replacement, 1 arg subr#) and any unknown
+                // OtherSubr: push the n args onto the PS stack in reverse so
+                // the following `pop`s retrieve them in their original order.
+                for _ in 0..n {
+                    let v = self.stack.pop().unwrap_or(0.0);
+                    self.ps_stack.push(v);
+                }
+            }
+        }
+    }
+
+    /// Ends a flex sequence: emits the two cubics described by the 7 collected
+    /// points (index 0 is the reference point, ignored) and leaves the current
+    /// point at the flex's final point. Degrades to emitting nothing if fewer
+    /// than 7 points were collected.
+    fn end_flex(&mut self) {
+        self.in_flex = false;
+        if self.flex_pts.len() >= 7 {
+            let p = self.flex_pts.clone();
+            self.segs.push(Seg::Cubic(
+                p[1].0 + self.ox,
+                p[1].1 + self.oy,
+                p[2].0 + self.ox,
+                p[2].1 + self.oy,
+                p[3].0 + self.ox,
+                p[3].1 + self.oy,
+            ));
+            self.segs.push(Seg::Cubic(
+                p[4].0 + self.ox,
+                p[4].1 + self.oy,
+                p[5].0 + self.ox,
+                p[5].1 + self.oy,
+                p[6].0 + self.ox,
+                p[6].1 + self.oy,
+            ));
+            self.x = p[6].0;
+            self.y = p[6].1;
+        }
+        self.flex_pts.clear();
+    }
+
+    /// `seac` (spec ch. 6.4, Appendix C): `asb adx ady bchar achar` composes a
+    /// StandardEncoding accented character from two other glyphs in the font.
+    /// The base glyph (`bchar`) is drawn at the origin; the accent glyph
+    /// (`achar`) is drawn with every coordinate translated by
+    /// `(adx - asb, ady)`. Counts as one recursion level (bounded by
+    /// [`MAX_SUBR_DEPTH`], so a self-referential `seac` terminates); an
+    /// unresolvable component degrades to being skipped. Always terminal.
+    fn seac(&mut self) -> OpResult {
+        let asb = self.arg(0);
+        let adx = self.arg(1);
+        let ady = self.arg(2);
+        let bchar = self.arg(3);
+        let achar = self.arg(4);
+        self.stack.clear();
+        if self.depth >= MAX_SUBR_DEPTH {
+            return OpResult::Stop;
+        }
+        self.depth += 1;
+        self.run_component(bchar, 0.0, 0.0);
+        self.run_component(achar, adx - asb, ady);
+        self.depth -= 1;
+        OpResult::Stop
+    }
+
+    /// Interprets the glyph named by StandardEncoding `code` (from a `seac`)
+    /// with all output translated by `(ox, oy)`, appending its segments to the
+    /// running outline. Resets the per-glyph interpreter state first (so the
+    /// component starts clean) but shares the step budget, recursion depth,
+    /// and segment buffer. An unknown code or missing glyph is skipped.
+    fn run_component(&mut self, code: f32, ox: f32, oy: f32) {
+        let Ok(code) = u8::try_from(code as i32) else {
+            return;
+        };
+        let Some(name) = standard_encoding_name(code) else {
+            return;
+        };
+        let Some(gid) = self.font.gid_for_name(name) else {
+            return;
+        };
+        let Some(bytes) = self.charstring(gid) else {
+            return;
+        };
+        // Close anything left open by a previous component, then reset the
+        // per-glyph state for this one.
+        self.close_current();
+        self.stack.clear();
+        self.ps_stack.clear();
+        self.flex_pts.clear();
+        self.in_flex = false;
+        self.x = 0.0;
+        self.y = 0.0;
+        self.ox = ox;
+        self.oy = oy;
+        self.exec(bytes);
+        // The component's own `endchar` closes its subpath; close defensively
+        // in case a malformed component never reached one.
+        self.close_current();
+    }
+}
+
+/// The subset of Adobe StandardEncoding (spec Appendix C) needed to resolve
+/// `seac` components: the Latin letters and the common accent glyphs. An
+/// unrecognized code returns `None` and its component is skipped (a complete
+/// StandardEncoding table is a deferred refinement).
+fn standard_encoding_name(code: u8) -> Option<&'static str> {
+    let name = match code {
+        32 => "space",
+        48 => "zero",
+        49 => "one",
+        50 => "two",
+        51 => "three",
+        52 => "four",
+        53 => "five",
+        54 => "six",
+        55 => "seven",
+        56 => "eight",
+        57 => "nine",
+        65 => "A",
+        66 => "B",
+        67 => "C",
+        68 => "D",
+        69 => "E",
+        70 => "F",
+        71 => "G",
+        72 => "H",
+        73 => "I",
+        74 => "J",
+        75 => "K",
+        76 => "L",
+        77 => "M",
+        78 => "N",
+        79 => "O",
+        80 => "P",
+        81 => "Q",
+        82 => "R",
+        83 => "S",
+        84 => "T",
+        85 => "U",
+        86 => "V",
+        87 => "W",
+        88 => "X",
+        89 => "Y",
+        90 => "Z",
+        97 => "a",
+        98 => "b",
+        99 => "c",
+        100 => "d",
+        101 => "e",
+        102 => "f",
+        103 => "g",
+        104 => "h",
+        105 => "i",
+        106 => "j",
+        107 => "k",
+        108 => "l",
+        109 => "m",
+        110 => "n",
+        111 => "o",
+        112 => "p",
+        113 => "q",
+        114 => "r",
+        115 => "s",
+        116 => "t",
+        117 => "u",
+        118 => "v",
+        119 => "w",
+        120 => "x",
+        121 => "y",
+        122 => "z",
+        // Accent glyphs (StandardEncoding high codes).
+        193 => "grave",
+        194 => "acute",
+        195 => "circumflex",
+        196 => "tilde",
+        197 => "macron",
+        198 => "breve",
+        199 => "dotaccent",
+        200 => "dieresis",
+        202 => "ring",
+        203 => "cedilla",
+        205 => "hungarumlaut",
+        206 => "ogonek",
+        207 => "caron",
+        _ => return None,
+    };
+    Some(name)
 }
 
 // --- private-text/clear-text tokenizing (bounds-checked throughout) --------
@@ -574,6 +1255,7 @@ fn units_per_em_from_clear(clear: &[u8]) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::truetype::Seg;
 
     /// The shared cipher's inverse: same recurrence, but `C` is the byte this
     /// function itself just emitted (rather than one read from ciphertext).
@@ -901,5 +1583,239 @@ pub(crate) mod tests {
         );
         prog.truncate(prog.len() - 3); // chop the tail
         let _ = Type1Font::parse(prog); // must return Some or None, never panic
+    }
+
+    // --- glyph_path: charstring interpretation ------------------------------
+
+    /// hsbw(0,1000); rmoveto(100,0); rlineto(500,0); rlineto(0,700);
+    /// rlineto(-500,0); closepath; endchar  -> the (100,0)-(600,700) box.
+    fn box_charstring() -> Vec<u8> {
+        let mut c = Vec::new();
+        cs_num(&mut c, 0);
+        cs_num(&mut c, 1000);
+        cs_op(&mut c, 13); // hsbw
+        cs_num(&mut c, 100);
+        cs_num(&mut c, 0);
+        cs_op(&mut c, 21); // rmoveto -> (100,0)
+        cs_num(&mut c, 500);
+        cs_num(&mut c, 0);
+        cs_op(&mut c, 5); // rlineto -> (600,0)
+        cs_num(&mut c, 0);
+        cs_num(&mut c, 700);
+        cs_op(&mut c, 5); // rlineto -> (600,700)
+        cs_num(&mut c, -500);
+        cs_num(&mut c, 0);
+        cs_op(&mut c, 5); // rlineto -> (100,700)
+        cs_op(&mut c, 9); // closepath
+        cs_op(&mut c, 14); // endchar
+        c
+    }
+
+    #[test]
+    fn glyph_path_decodes_rectangle() {
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("box", box_charstring())],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("box").expect("gid");
+        assert_eq!(
+            f.glyph_path(gid),
+            vec![
+                Seg::Move(100.0, 0.0),
+                Seg::Line(600.0, 0.0),
+                Seg::Line(600.0, 700.0),
+                Seg::Line(100.0, 700.0),
+                Seg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn glyph_path_decodes_rrcurveto_as_cubic() {
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13); // hsbw
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 21); // rmoveto -> (0,0)
+                            // rrcurveto 100 0 100 100 0 100 -> ctrl (100,0),(200,100), end (200,200)
+        for d in [100, 0, 100, 100, 0, 100] {
+            cs_num(&mut cs, d);
+        }
+        cs_op(&mut cs, 8);
+        cs_op(&mut cs, 14);
+        let prog = build_type1_program("[0.001 0 0 0.001 0 0]", &[], &[("c", cs)], &[], 4);
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("c").unwrap();
+        assert_eq!(
+            f.glyph_path(gid),
+            vec![
+                Seg::Move(0.0, 0.0),
+                Seg::Cubic(100.0, 0.0, 200.0, 100.0, 200.0, 200.0),
+                Seg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn glyph_path_follows_callsubr() {
+        // Subr 0 draws the rlineto; the charstring calls it.
+        let mut subr0 = Vec::new();
+        cs_num(&mut subr0, 500);
+        cs_num(&mut subr0, 0);
+        cs_op(&mut subr0, 5); // rlineto
+        cs_op(&mut subr0, 11); // return
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13); // hsbw
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 21); // rmoveto (0,0)
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 10); // callsubr 0
+        cs_op(&mut cs, 14);
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("s", cs)],
+            &[(0u16, subr0)],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("s").unwrap();
+        assert_eq!(
+            f.glyph_path(gid),
+            vec![Seg::Move(0.0, 0.0), Seg::Line(500.0, 0.0), Seg::Close]
+        );
+    }
+
+    #[test]
+    fn glyph_path_self_recursive_subr_terminates() {
+        let mut subr0 = Vec::new();
+        cs_num(&mut subr0, 0);
+        cs_op(&mut subr0, 10); // callsubr 0 (infinite without a guard)
+        cs_op(&mut subr0, 11);
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 10); // callsubr 0
+        cs_op(&mut cs, 14);
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("g", cs)],
+            &[(0u16, subr0)],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("g").unwrap();
+        let _ = f.glyph_path(gid); // must return (bounded), not hang or overflow the stack
+    }
+
+    #[test]
+    fn glyph_path_flex_emits_two_cubics() {
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13); // hsbw
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 21); // rmoveto -> (0,0) start
+                            // OtherSubr 1: start flex  (args: 0 1 callothersubr)
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 1);
+        cs_escape(&mut cs, 16);
+        // 7 flex points via rmoveto + OtherSubr 2, deltas summing along a shallow bump.
+        // Points (absolute): p0(0,0 ref) p1(10,10) p2(20,10) p3(30,0) p4(40,-10) p5(50,-10) p6(60,0)
+        let deltas = [
+            (0, 0),
+            (10, 10),
+            (10, 0),
+            (10, -10),
+            (10, -10),
+            (10, 0),
+            (10, 10),
+        ];
+        for (dx, dy) in deltas {
+            cs_num(&mut cs, dx);
+            cs_num(&mut cs, dy);
+            cs_op(&mut cs, 21); // rmoveto
+            cs_num(&mut cs, 0);
+            cs_num(&mut cs, 2);
+            cs_escape(&mut cs, 16); // OtherSubr 2
+        }
+        // OtherSubr 0: end flex (args: flex_depth end_x end_y 3 0 callothersubr) then pop pop setcurrentpoint
+        cs_num(&mut cs, 50);
+        cs_num(&mut cs, 60);
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 3);
+        cs_num(&mut cs, 0);
+        cs_escape(&mut cs, 16);
+        cs_escape(&mut cs, 17);
+        cs_escape(&mut cs, 17);
+        cs_escape(&mut cs, 33); // pop pop setcurrentpoint
+        cs_op(&mut cs, 14); // endchar
+        let prog = build_type1_program("[0.001 0 0 0.001 0 0]", &[], &[("f", cs)], &[], 4);
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("f").unwrap();
+        assert_eq!(
+            f.glyph_path(gid),
+            vec![
+                Seg::Move(0.0, 0.0),
+                Seg::Cubic(10.0, 10.0, 20.0, 10.0, 30.0, 0.0),
+                Seg::Cubic(40.0, -10.0, 50.0, -10.0, 60.0, 0.0),
+                Seg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn glyph_path_seac_composes_base_and_accent() {
+        // 'A' (StandardEncoding 65) is the box; 'grave' (193) is a small box.
+        // seac asb=0 adx=200 ady=300 bchar=65 achar=193 -> base at origin,
+        // accent translated by (200,300).
+        let mut acute = Vec::new();
+        cs_num(&mut acute, 0);
+        cs_num(&mut acute, 0);
+        cs_op(&mut acute, 13); // hsbw
+        cs_num(&mut acute, 0);
+        cs_num(&mut acute, 0);
+        cs_op(&mut acute, 21); // rmoveto (0,0)
+        cs_num(&mut acute, 50);
+        cs_num(&mut acute, 0);
+        cs_op(&mut acute, 5); // rlineto (50,0)
+        cs_op(&mut acute, 9);
+        cs_op(&mut acute, 14); // closepath endchar
+        let mut comp = Vec::new();
+        cs_num(&mut comp, 0);
+        cs_num(&mut comp, 0);
+        cs_op(&mut comp, 13); // hsbw
+        cs_num(&mut comp, 0);
+        cs_num(&mut comp, 200);
+        cs_num(&mut comp, 300);
+        cs_num(&mut comp, 65);
+        cs_num(&mut comp, 193);
+        cs_escape(&mut comp, 6); // seac
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("A", box_charstring()), ("grave", acute), ("Agrave", comp)],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("Agrave").unwrap();
+        let path = f.glyph_path(gid);
+        // Base box present at origin, accent Line translated by (200,300).
+        assert!(path.contains(&Seg::Move(100.0, 0.0))); // base
+        assert!(path.contains(&Seg::Line(250.0, 300.0))); // accent (50+200, 0+300)
     }
 }
