@@ -292,6 +292,15 @@ impl Type1Font {
         self.name_to_gid.get(name).copied()
     }
 
+    /// Maps a glyph index to its name -- the inverse of `gid_for_name`,
+    /// needed by `glyph.rs`'s base-encoding tier to build a `unicode -> gid`
+    /// map by walking every glyph name through the Adobe Glyph List (mirrors
+    /// `CffFont::name_for_gid`, used the same way in `load_cff_simple`).
+    /// `None` for an out-of-range gid.
+    pub(crate) fn name_for_gid(&self, gid: u16) -> Option<&str> {
+        self.names.get(gid as usize).map(String::as_str)
+    }
+
     /// The font's built-in `/Encoding` name for `code` (see `parse`'s doc
     /// comment for why the `StandardEncoding` form leaves this `None`
     /// throughout).
@@ -1630,6 +1639,29 @@ pub(crate) mod tests {
         cs_op(&mut c, 9); // closepath
         cs_op(&mut c, 14); // endchar
         c
+    }
+
+    /// Builds a full Type1 `FontFile` program (raw, non-PFB) usable as a
+    /// fixture from `glyph.rs`'s tests (mirrors how `cff::tests::
+    /// build_box_glyph_fixture` is re-exported and consumed there): gid 0 is
+    /// `.notdef`, gid 1 is `glyph_name`, tracing the (100,0)-(600,700) box in
+    /// 1000-upm units (`box_charstring`) -- the same rectangle the CFF and
+    /// TrueType fixtures trace, so the shared `dark_pixel_at(55,115)` check
+    /// holds. `/FontMatrix [0.001 0 0 0.001 0 0]` and a built-in `/Encoding`
+    /// array mapping code 128 -> `glyph_name` (so the tier-3 built-in-encoding
+    /// resolver in `glyph.rs` has something to find when the PDF font
+    /// dictionary carries no `/Encoding` of its own).
+    pub(crate) fn build_type1_box_fixture(glyph_name: &str) -> Vec<u8> {
+        build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[(128u8, glyph_name)],
+            &[
+                (".notdef", stub_charstring()),
+                (glyph_name, box_charstring()),
+            ],
+            &[],
+            4,
+        )
     }
 
     #[test]

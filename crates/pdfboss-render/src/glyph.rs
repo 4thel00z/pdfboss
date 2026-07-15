@@ -2,11 +2,12 @@
 //!
 //! Supports simple `/TrueType` fonts and `/Type0` composite fonts with a
 //! `CIDFontType2` descendant (an embedded `FontFile2` program) at every
-//! [`GlyphPainting`] tier, plus simple `/Type1`/`/MMType1` fonts and
-//! `CIDFontType0` descendants carrying an embedded CFF `FontFile3` program
-//! once the tier reaches `AllEmbedded`. Every other font (a real Type1
-//! charstring program, Type3, the standard 14, non-embedded fonts) yields
-//! `None`, so the renderer leaves that text unpainted rather than guessing.
+//! [`GlyphPainting`] tier, plus simple `/Type1`/`/MMType1` fonts (either an
+//! embedded CFF `FontFile3` program or a real Type1 charstring `FontFile`
+//! program) and `CIDFontType0` descendants carrying an embedded CFF
+//! `FontFile3` program once the tier reaches `AllEmbedded`. Every other font
+//! (Type3, the standard 14, non-embedded fonts) yields `None`, so the
+//! renderer leaves that text unpainted rather than guessing.
 
 use std::collections::HashMap;
 
@@ -14,12 +15,13 @@ use pdfboss_core::{Dict, Document, Object};
 
 use crate::cff::CffFont;
 use crate::truetype::{Seg, TrueType};
+use crate::type1::Type1Font;
 use crate::GlyphPainting;
 
 /// Where a font's glyph outlines and metrics come from.
 ///
-/// The Type1, Type3, and substitute-face loaders specified for later plans
-/// add further variants here, and the delegating methods below gain matching
+/// The Type3 and substitute-face loaders specified for later plans add
+/// further variants here, and the delegating methods below gain matching
 /// arms. This is the single outline-source seam, which is why `GlyphFont`'s
 /// public surface stays fixed as those loaders land.
 enum Outlines {
@@ -27,6 +29,8 @@ enum Outlines {
     TrueType(TrueType),
     /// An embedded CFF (`Type1C`/`CIDFontType0C`) program.
     Cff(CffFont),
+    /// An embedded Type1 charstring program (`FontFile`).
+    Type1(Type1Font),
 }
 
 /// How character codes map to glyph indices for a loaded font.
@@ -76,15 +80,14 @@ impl GlyphFont {
     /// `None` if the font has no loader for its `/Subtype` at this
     /// `painting` tier.
     pub(crate) fn load(doc: &Document, font: &Dict, painting: GlyphPainting) -> Option<GlyphFont> {
-        // Embedded TrueType paints at every tier. CFF (simple Type1/MMType1
-        // fonts, and CIDFontType0 descendants) joins at `AllEmbedded`+; a
-        // real Type1 charstring program, Type3, and `Full`'s substitution
-        // are later plans.
+        // Embedded TrueType paints at every tier. CFF and Type1 (simple
+        // Type1/MMType1 fonts, and CIDFontType0 descendants for CFF) join at
+        // `AllEmbedded`+; Type3 and `Full`'s substitution are later plans.
         match font.get_name("Subtype").map(|n| n.0.as_str()) {
             Some("Type0") => load_type0(doc, font, painting),
             Some("TrueType") => load_simple(doc, font),
             Some("Type1") | Some("MMType1") if painting.paints_all_embedded() => {
-                load_cff_simple(doc, font)
+                load_simple_type1_or_cff(doc, font)
             }
             _ => None,
         }
@@ -109,6 +112,7 @@ impl GlyphFont {
         match &self.outlines {
             Outlines::TrueType(tt) => tt.glyph_path(gid),
             Outlines::Cff(cff) => cff.glyph_path(gid),
+            Outlines::Type1(t1) => t1.glyph_path(gid),
         }
     }
 
@@ -116,14 +120,17 @@ impl GlyphFont {
     /// declared width (`/Widths` for simple fonts, `/W`+`/DW` for Type0/CID)
     /// is authoritative when present; otherwise this falls back to the
     /// embedded program's own advance metric (`hmtx` for TrueType, `0` for
-    /// CFF, which carries no advance table here).
+    /// CFF and Type1, neither of which has a per-glyph advance table parsed
+    /// here -- Type1's `hsbw`/`sbw` operator does carry a `wx` advance
+    /// operand, but reading it back out of the charstring is a deferred
+    /// fallback, not yet wired up).
     pub(crate) fn advance(&self, code: u32) -> f32 {
         if let Some(width_1000) = self.widths.get(code) {
             return width_1000 / 1000.0 * self.units_per_em();
         }
         match &self.outlines {
             Outlines::TrueType(tt) => f32::from(tt.advance(self.gid(code))),
-            Outlines::Cff(_) => 0.0,
+            Outlines::Cff(_) | Outlines::Type1(_) => 0.0,
         }
     }
 
@@ -132,6 +139,7 @@ impl GlyphFont {
         match &self.outlines {
             Outlines::TrueType(tt) => tt.units_per_em() as f32,
             Outlines::Cff(cff) => cff.units_per_em(),
+            Outlines::Type1(t1) => t1.units_per_em(),
         }
     }
 }
@@ -227,9 +235,10 @@ fn simple_widths(doc: &Document, font: &Dict) -> WidthMap {
 }
 
 /// Loads a simple `/Type1`/`/MMType1` font whose `FontDescriptor` carries an
-/// embedded CFF program (`FontFile3`). A descriptor with `FontFile` instead
-/// (a raw Type1 charstring program, not CFF) is a later plan's job, so that
-/// case is left to fall through to `None` here.
+/// embedded CFF program (`FontFile3`). Dispatched from
+/// `load_simple_type1_or_cff`, which tries this first; a descriptor with
+/// `FontFile` instead (a raw Type1 charstring program, not CFF) goes to
+/// `load_type1_simple`.
 ///
 /// Builds its 256-entry code-to-glyph table from two sources, in priority
 /// order: a `/Differences` glyph name, resolved directly through the CFF's
@@ -278,6 +287,94 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     }
     Some(GlyphFont {
         outlines: Outlines::Cff(cff),
+        kind: GlyphKind::Simple(table),
+        widths: simple_widths(doc, font),
+    })
+}
+
+/// Dispatches a simple `/Type1`/`/MMType1` font's `FontDescriptor` to
+/// whichever embedded program it actually carries. CFF (`FontFile3`) wins
+/// when present -- this is the pre-existing path, unchanged -- falling back
+/// to a raw Type1 charstring program (`FontFile`) only when there is no
+/// `FontFile3`. A descriptor with neither (or no descriptor at all) yields
+/// `None`.
+fn load_simple_type1_or_cff(doc: &Document, font: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
+    if descriptor.get("FontFile3").is_some() {
+        return load_cff_simple(doc, font);
+    }
+    if descriptor.get("FontFile").is_some() {
+        return load_type1_simple(doc, font);
+    }
+    None
+}
+
+/// Loads a simple `/Type1`/`/MMType1` font whose `FontDescriptor` carries a
+/// raw Type1 charstring program (`FontFile`, decrypted and interpreted by
+/// `type1.rs`). Dispatched from `load_simple_type1_or_cff` once `FontFile3`
+/// (CFF) has been ruled out.
+///
+/// Builds its 256-entry code-to-glyph table from three sources, in priority
+/// order: a `/Differences` glyph name, resolved directly through the font's
+/// own name table (`gid_for_name`); then the base `/Encoding` character,
+/// looked up in a `unicode -> gid` map built once by walking every glyph
+/// name through the Adobe Glyph List (mirrors `load_cff_simple`'s
+/// `by_unicode` construction exactly, just sourced from `Type1Font::
+/// name_for_gid` instead of `CffFont::name_for_gid`); then -- a tier
+/// `load_cff_simple` has no counterpart for, since CFF's charset carries no
+/// separate built-in encoding -- the font's own built-in `/Encoding` array
+/// (`builtin_name`), for a font that ships its own encoding and the PDF
+/// gives none. Type1 has no `cmap`, so as with CFF an unresolved code is
+/// left at `.notdef` (gid 0).
+fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
+    let program = stream_bytes(doc, descriptor.get("FontFile")?)?;
+    let t1 = Type1Font::parse(program)?;
+
+    let mut by_unicode: HashMap<char, u16> = HashMap::new();
+    for gid in 1..t1.num_glyphs() {
+        // `num_glyphs` is bounded by `Type1Font::parse`'s `MAX_GLYPHS` cap
+        // (65536), so this cast never truncates.
+        let gid = gid as u16;
+        let Some(name) = t1.name_for_gid(gid) else {
+            continue;
+        };
+        if let Some(ch) = pdfboss_encoding::glyph_to_unicode(name) {
+            by_unicode.entry(ch).or_insert(gid);
+        }
+    }
+
+    let base = base_encoding(doc, font);
+    let diffs = differences(doc, font);
+
+    let mut table = Box::new([0u16; 256]);
+    for (code, slot) in table.iter_mut().enumerate() {
+        let code = code as u8;
+        // 1. A /Differences name, resolved via the font's own name table.
+        if let Some(name) = diffs.get(&code) {
+            if let Some(gid) = t1.gid_for_name(name).filter(|&g| g != 0) {
+                *slot = gid;
+                continue;
+            }
+        }
+        // 2. The base encoding's character, via the unicode -> gid map.
+        if let Some(ch) = base.and_then(|f| f(code)) {
+            if let Some(&gid) = by_unicode.get(&ch) {
+                *slot = gid;
+                continue;
+            }
+        }
+        // 3. The font's own built-in /Encoding -- Type1-specific: a font
+        // that ships its own /Encoding and gets no PDF /Encoding at all
+        // still maps, unlike CFF (which has no built-in encoding concept).
+        if let Some(name) = t1.builtin_name(code) {
+            if let Some(gid) = t1.gid_for_name(name).filter(|&g| g != 0) {
+                *slot = gid;
+            }
+        }
+    }
+    Some(GlyphFont {
+        outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
     })
@@ -517,6 +614,7 @@ mod tests {
 
     use crate::cff::tests::{build_box_glyph_fixture, build_box_glyph_fixture_cid};
     use crate::truetype::tests::build_font;
+    use crate::type1::tests::build_type1_box_fixture;
     use crate::{GlyphPainting, Pixmap, RenderOptions};
 
     /// Builds a one-page PDF showing `content` with a simple `/TrueType` font
@@ -887,6 +985,120 @@ mod tests {
             "CID 1's width (800, declared by the first range, well within \
              the cap) must still govern the second glyph's origin -- the cap \
              degrades the tail of a hostile array, not the CIDs that fit"
+        );
+    }
+
+    // --- Task 4: embedded Type1 (`FontFile`) simple fonts -------------------
+
+    /// Builds a one-page PDF like `simple_cff_font_doc`, but the font is a
+    /// simple `/Type1` font whose `FontDescriptor` carries a raw Type1
+    /// charstring program via `FontFile` (rather than a CFF `FontFile3`
+    /// program).
+    fn simple_type1_font_doc(encoding: &str, content: &[u8]) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            &format!(
+                "<< /Type /Font /Subtype /Type1 /BaseFont /X \
+                 /FontDescriptor 6 0 R {encoding} >>"
+            ),
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile 7 0 R >>",
+        );
+        b.stream(7, "", &build_type1_box_fixture("theboxglyphname"));
+        b.build(1)
+    }
+
+    #[test]
+    fn type1_simple_font_paints_at_all_embedded_not_embedded_truetype_only() {
+        let bytes = simple_type1_font_doc(
+            "/Encoding << /Differences [128 /theboxglyphname] >>",
+            b"BT /F0 100 Tf 20 50 Td <80> Tj ET",
+        );
+        for tier in [GlyphPainting::AllEmbedded, GlyphPainting::Full] {
+            let pix = render_at_tier(&bytes, tier);
+            assert!(
+                dark_pixel_at(&pix, 55, 115),
+                "embedded Type1 glyph should paint at tier {tier:?}"
+            );
+        }
+        let pix = render_at_tier(&bytes, GlyphPainting::EmbeddedTrueTypeOnly);
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "embedded Type1 must not paint at EmbeddedTrueTypeOnly (tier gate)"
+        );
+    }
+
+    #[test]
+    fn type1_builtin_encoding_paints_without_pdf_encoding() {
+        // build_type1_box_fixture already sets a built-in /Encoding mapping
+        // code 128 -> theboxglyphname; the PDF font dict omits /Encoding
+        // entirely.
+        let bytes = simple_type1_font_doc("", b"BT /F0 100 Tf 20 50 Td <80> Tj ET");
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "Type1 built-in /Encoding should map code 128 with no PDF /Encoding"
+        );
+    }
+
+    #[test]
+    fn type1_widths_advance_governs_second_glyph_origin() {
+        // Two 0x80 codes: /FirstChar 128 /Widths [800] declares an 800/1000-em
+        // advance for code 128 -- Type1's program advance is always 0 here
+        // (see GlyphFont::advance's doc comment), so only the PDF /Widths
+        // entry can put the second glyph at (135,115).
+        let bytes = simple_type1_font_doc(
+            "/Encoding << /Differences [128 /theboxglyphname] >> \
+             /FirstChar 128 /Widths [800]",
+            b"BT /F0 100 Tf 20 50 Td <8080> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(dark_pixel_at(&pix, 55, 115), "first glyph at (55,115)");
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "second glyph at the /Widths-implied (135,115)"
+        );
+    }
+
+    #[test]
+    fn type1_malformed_fontfile_degrades_to_blank() {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <80> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /X /FontDescriptor 6 0 R \
+             /Encoding << /Differences [128 /theboxglyphname] >> >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile 7 0 R >>",
+        );
+        b.stream(7, "", b"not a real type1 program");
+        let bytes = b.build(1);
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "malformed FontFile paints nothing, no panic"
         );
     }
 }
