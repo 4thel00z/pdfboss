@@ -1,0 +1,26 @@
+This directory bundles the following font files, unmodified, from the
+Google Fonts OFL collection (google/fonts, ofl/{arimo,tinos,cousine}):
+
+  - Arimo[wght].ttf
+  - Arimo-Italic[wght].ttf
+    Arimo -- Copyright 2026 The Arimo Project Authors
+    (https://github.com/googlefonts/arimo)
+
+  - Tinos-Regular.ttf
+  - Tinos-Bold.ttf
+  - Tinos-Italic.ttf
+  - Tinos-BoldItalic.ttf
+    Tinos -- Copyright 2026 The Tinos Project Authors
+    (https://github.com/googlefonts/tinos)
+
+  - Cousine-Regular.ttf
+  - Cousine-Bold.ttf
+  - Cousine-Italic.ttf
+  - Cousine-BoldItalic.ttf
+    Cousine -- Copyright 2026 The Cousine Project Authors
+    (https://github.com/googlefonts/cousine)
+
+All of the above are licensed under the SIL Open Font License, Version 1.1.
+The full license text is in OFL.txt in this directory. These fonts may be
+used, studied, modified and redistributed freely as long as they are not
+sold by themselves, per the license terms; they are bundled here unmodified.
