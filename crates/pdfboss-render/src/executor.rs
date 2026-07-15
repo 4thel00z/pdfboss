@@ -637,7 +637,7 @@ impl Executor<'_> {
             }
 
             // Advance: (w0·Tfs + Tc + Tw[single-byte space]) · Th.
-            let w0 = f32::from(font.advance(gid)) / upm;
+            let w0 = font.advance(code) / upm;
             let word = if n == 1 && code == 32 {
                 ts.word_spacing
             } else {

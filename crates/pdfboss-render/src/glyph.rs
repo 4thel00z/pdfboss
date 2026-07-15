@@ -38,10 +38,37 @@ enum GlyphKind {
     Cid(Option<Vec<u16>>),
 }
 
+/// Advance widths declared by the PDF font dictionary itself: `/Widths` +
+/// `/FirstChar` for simple fonts, `/W` + `/DW` for Type0/CID fonts. Keyed by
+/// character code (simple) or CID (Type0, under the identity encoding these
+/// loaders assume), holding advances in the PDF's 1000-unit glyph space.
+///
+/// `declared` distinguishes "this font specified widths, and `default`
+/// governs any code without its own entry" from "this font specified no
+/// width information at all" -- the latter is common for simple TrueType
+/// fonts, which rely on the embedded program's own `hmtx` table instead, so
+/// `GlyphFont::advance` must fall back to the program advance rather than
+/// treating every code as width 0.
+struct WidthMap {
+    map: HashMap<u32, f32>,
+    default: f32,
+    declared: bool,
+}
+
+impl WidthMap {
+    /// The PDF-declared advance (1000-unit glyph space) for `code`, or
+    /// `None` if this font declared no width information at all.
+    fn get(&self, code: u32) -> Option<f32> {
+        self.declared
+            .then(|| self.map.get(&code).copied().unwrap_or(self.default))
+    }
+}
+
 /// A font whose glyph outlines can be drawn.
 pub(crate) struct GlyphFont {
     outlines: Outlines,
     kind: GlyphKind,
+    widths: WidthMap,
 }
 
 impl GlyphFont {
@@ -85,15 +112,18 @@ impl GlyphFont {
         }
     }
 
-    /// The glyph's advance width in font units.
-    pub(crate) fn advance(&self, gid: u16) -> u16 {
+    /// The advance width for character `code`, in font units. The PDF's own
+    /// declared width (`/Widths` for simple fonts, `/W`+`/DW` for Type0/CID)
+    /// is authoritative when present; otherwise this falls back to the
+    /// embedded program's own advance metric (`hmtx` for TrueType, `0` for
+    /// CFF, which carries no advance table here).
+    pub(crate) fn advance(&self, code: u32) -> f32 {
+        if let Some(width_1000) = self.widths.get(code) {
+            return width_1000 / 1000.0 * self.units_per_em();
+        }
         match &self.outlines {
-            Outlines::TrueType(tt) => tt.advance(gid),
-            // Placeholder: no per-gid advance table is parsed for CFF here
-            // (there is no `hmtx` equivalent). Task 4 replaces this whole
-            // advance source with the PDF font dict's `/Widths` (simple) or
-            // `/W`+`/DW` (CID), at which point this arm becomes moot.
-            Outlines::Cff(_) => 0,
+            Outlines::TrueType(tt) => f32::from(tt.advance(self.gid(code))),
+            Outlines::Cff(_) => 0.0,
         }
     }
 
@@ -149,7 +179,51 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     Some(GlyphFont {
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
+        widths: simple_widths(doc, font),
     })
+}
+
+/// Parses a simple font's `/Widths` + `/FirstChar` (keyed by character
+/// code) and the `/FontDescriptor /MissingWidth` default. `declared` is true
+/// iff `/Widths` is an array, regardless of whether any entry resolves --
+/// once a font declares widths, an unresolved entry still falls back to
+/// `default`, not to the embedded program's own advance.
+fn simple_widths(doc: &Document, font: &Dict) -> WidthMap {
+    let first = font
+        .get("FirstChar")
+        .and_then(|o| doc.resolve(o).ok())
+        .and_then(|o| o.as_int())
+        .unwrap_or(0)
+        .max(0) as u32;
+
+    let mut map = HashMap::new();
+    let mut declared = false;
+    if let Some(Ok(Object::Array(items))) = font.get("Widths").map(|o| doc.resolve(o)) {
+        declared = true;
+        for (i, item) in items.iter().enumerate() {
+            let Some(code) = first.checked_add(i as u32) else {
+                break; // /FirstChar so large the codes overflow u32
+            };
+            if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+                map.insert(code, w as f32);
+            }
+        }
+    }
+
+    let default = font
+        .get("FontDescriptor")
+        .and_then(|o| doc.resolve(o).ok())
+        .and_then(|o| o.as_dict().cloned())
+        .and_then(|fd| fd.get("MissingWidth").and_then(|o| doc.resolve(o).ok()))
+        .and_then(|o| o.as_f64())
+        .map(|w| w as f32)
+        .unwrap_or(0.0);
+
+    WidthMap {
+        map,
+        default,
+        declared,
+    }
 }
 
 /// Loads a simple `/Type1`/`/MMType1` font whose `FontDescriptor` carries an
@@ -205,6 +279,7 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     Some(GlyphFont {
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
+        widths: simple_widths(doc, font),
     })
 }
 
@@ -306,7 +381,80 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     Some(GlyphFont {
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
+        widths: cid_widths(doc, cid),
     })
+}
+
+/// Parses a descendant CID font's `/W` + `/DW`, keyed by CID (== the code
+/// under the `Identity-H`/`Identity-V` encoding these loaders assume).
+/// `declared` is true iff either key is present, so a descendant with
+/// neither (uncommon, but not forbidden) leaves the fallback in charge.
+fn cid_widths(doc: &Document, cid: &Dict) -> WidthMap {
+    let mut default = 1000.0;
+    let mut declared = false;
+    if let Some(dw) = cid
+        .get("DW")
+        .and_then(|o| doc.resolve(o).ok())
+        .and_then(|o| o.as_f64())
+    {
+        default = dw as f32;
+        declared = true;
+    }
+
+    let mut map = HashMap::new();
+    if let Some(Ok(Object::Array(items))) = cid.get("W").map(|o| doc.resolve(o)) {
+        declared = true;
+        parse_cid_width_array(doc, &items, &mut map);
+    }
+
+    WidthMap {
+        map,
+        default,
+        declared,
+    }
+}
+
+/// Parses a CID `/W` array: `c [w1 w2 ...]` gives consecutive widths from
+/// CID `c`; `c1 c2 w` gives every CID in `c1..=c2` width `w` (ranges capped
+/// at 65536 entries so a hostile span can't allocate unbounded memory).
+fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut HashMap<u32, f32>) {
+    let resolved: Vec<Object> = items
+        .iter()
+        .map(|o| doc.resolve(o).unwrap_or(Object::Null))
+        .collect();
+    let mut i = 0;
+    while i < resolved.len() {
+        let Some(first) = resolved[i].as_int() else {
+            i += 1;
+            continue;
+        };
+        let first = first.max(0) as u32;
+        match resolved.get(i + 1) {
+            Some(Object::Array(list)) => {
+                for (j, item) in list.iter().enumerate() {
+                    let Some(code) = first.checked_add(j as u32) else {
+                        break; // start CID so large the CIDs overflow u32
+                    };
+                    if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+                        map.insert(code, w as f32);
+                    }
+                }
+                i += 2;
+            }
+            Some(other) if other.as_f64().is_some() => {
+                let last = other.as_int().unwrap_or(first as i64).max(0) as u32;
+                let w = resolved.get(i + 2).and_then(|o| o.as_f64());
+                if let Some(w) = w {
+                    let end = last.min(first.saturating_add(65535));
+                    for c in first..=end.max(first) {
+                        map.insert(c, w as f32);
+                    }
+                }
+                i += 3;
+            }
+            _ => i += 1,
+        }
+    }
 }
 
 /// Loads a `CIDFontType0` descendant (embedded CFF). Codes are assumed two
@@ -320,9 +468,11 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     let program = stream_bytes(doc, descriptor.get("FontFile3")?)?;
     let cff = CffFont::parse(program)?;
     let cid_to_gid = cff.cid_to_gid();
+    let widths = cid_widths(doc, cid);
     Some(GlyphFont {
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
+        widths,
     })
 }
 
@@ -546,6 +696,106 @@ mod tests {
         assert!(
             !dark_pixel_at(&pix, 55, 115),
             "embedded CIDFontType0 (CFF) must not paint at EmbeddedTrueTypeOnly (tier gate)"
+        );
+    }
+
+    // --- Task 4: advance from the PDF's declared /Widths (/W + /DW) ---------
+    //
+    // `build_font`'s synthetic sfnt carries no `hhea`/`hmtx` tables, so the
+    // TrueType program's own advance (and CFF's, which has no advance table
+    // at all) is always 0 for these fixtures. That makes a `/Widths` (or
+    // `/W`+`/DW`) entry of 800 (out of 1000 units-per-em) an unambiguous
+    // signal: the second glyph's painted origin only lands at the
+    // `/Widths`-implied x (20 + 80 + 35 = 135) if `advance` reads the PDF
+    // width instead of the (zero) program advance.
+
+    #[test]
+    fn simple_truetype_widths_advance_governs_second_glyph_origin() {
+        // Two 'A's (code 0x41, gid 1): /FirstChar 65 /Widths [800] declares
+        // an 800/1000-em advance for code 65, far from the program's 0.
+        let bytes = simple_font_doc(
+            "/Encoding /WinAnsiEncoding /FirstChar 65 /Widths [800]",
+            b"BT /F0 100 Tf 20 50 Td <4141> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "first glyph paints at the usual (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "second glyph must paint at the /Widths-implied origin (135,115), \
+             not stacked on the first glyph as the program's 0 advance would give"
+        );
+    }
+
+    #[test]
+    fn simple_cff_widths_advance_governs_second_glyph_origin() {
+        // Same idea for CFF, whose program advance is unconditionally 0
+        // (no per-glyph advance table is parsed for CFF outlines).
+        let bytes = simple_cff_font_doc(
+            "/Encoding << /Differences [128 /theboxglyphname] >> \
+             /FirstChar 128 /Widths [800]",
+            b"BT /F0 100 Tf 20 50 Td <8080> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "first glyph paints at the usual (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "second glyph must paint at the /Widths-implied origin (135,115), \
+             not stacked on the first glyph as the program's 0 advance would give"
+        );
+    }
+
+    #[test]
+    fn type0_truetype_w_dw_advance_governs_second_glyph_origin() {
+        // Two CID-1 codes (identity CID-to-GID, no /CIDToGIDMap): the
+        // descendant's /W declares CID 1's advance as 800/1000 em, and /DW
+        // covers everything else -- both far from the program's 0.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <00010001> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+             /FontDescriptor 7 0 R /DW 1000 /W [1 [800]] >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
+        );
+        b.stream(8, "", &build_font());
+        let bytes = b.build(1);
+
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "first glyph paints at the usual (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "second glyph must paint at the /W-implied origin (135,115), not \
+             stacked on the first glyph as the program's 0 advance would give"
         );
     }
 }
