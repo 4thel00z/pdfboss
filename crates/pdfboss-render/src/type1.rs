@@ -20,7 +20,6 @@
 const EEXEC_KEY: u16 = 55665;
 /// The fixed key for decrypting an individual charstring, once extracted
 /// from the decrypted `eexec` portion (consumed by a later task).
-#[allow(dead_code)]
 const CHARSTRING_KEY: u16 = 4330;
 /// Cipher multiplier, shared by both keys' recurrences.
 const C1: u16 = 52845;
@@ -56,9 +55,10 @@ fn decrypt(cipher: &[u8], key: u16, skip: usize) -> Option<Vec<u8>> {
     Some(plain.split_off(skip))
 }
 
-/// PostScript whitespace (spec ch. 2): space, tab, CR, LF, form feed.
+/// PostScript whitespace (spec ch. 2; ISO 32000 Table 1): NUL, tab, LF, FF,
+/// CR, space.
 fn is_ps_whitespace(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0c)
+    matches!(b, 0x00 | b'\t' | b'\n' | 0x0c | b'\r' | b' ')
 }
 
 /// Whether `region`'s first 4 non-whitespace bytes are all ASCII hex digits
@@ -106,21 +106,32 @@ fn hex_decode_lenient(region: &[u8]) -> Vec<u8> {
 }
 
 /// Splits a raw (non-PFB) Type1 program at the ASCII `eexec` token:
-/// `clear_text` is everything up to and including `eexec` and the whitespace
-/// immediately following it; the remainder is the (possibly hex-encoded)
-/// `eexec` region, which is hex-decoded first when [`looks_like_hex`] says
-/// so, then decrypted. `None` if the `eexec` token is not present anywhere in
-/// `program`, or if decryption fails.
+/// `clear_text` is everything up to and including `eexec` and the single
+/// whitespace separator immediately following it (a `\r\n` pair counts as
+/// one separator, per spec ch. 7); the remainder is the (possibly
+/// hex-encoded) `eexec` region, which is hex-decoded first when
+/// [`looks_like_hex`] says so, then decrypted. `None` if the `eexec` token is
+/// not present anywhere in `program`, or if decryption fails.
 fn segment_raw(program: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     const TOKEN: &[u8] = b"eexec";
     let token_at = program.windows(TOKEN.len()).position(|w| w == TOKEN)?;
-    let mut region_start = token_at + TOKEN.len();
-    while program
-        .get(region_start)
+    let after_token = token_at + TOKEN.len();
+    // Consume exactly ONE whitespace separator here, not a run: the eexec
+    // ciphertext is arbitrary binary, so a real font's first ciphertext byte
+    // may itself equal a whitespace value, and eating more than the one
+    // separator the spec defines would misalign the whole decrypt window.
+    let region_start = if program.get(after_token) == Some(&b'\r')
+        && program.get(after_token + 1) == Some(&b'\n')
+    {
+        after_token + 2 // CRLF is a single line terminator
+    } else if program
+        .get(after_token)
         .is_some_and(|&b| is_ps_whitespace(b))
     {
-        region_start += 1;
-    }
+        after_token + 1
+    } else {
+        after_token
+    };
     let clear_text = program.get(..region_start)?.to_vec();
     let region = program.get(region_start..)?;
 
@@ -188,12 +199,21 @@ pub(crate) mod tests {
 
     /// The shared cipher's inverse: same recurrence, but `C` is the byte this
     /// function itself just emitted (rather than one read from ciphertext).
-    /// Prepends `skip` filler bytes before encrypting, mirroring what
-    /// `decrypt` then drops.
+    /// Prepends `skip` zero-valued filler bytes before encrypting, mirroring
+    /// what `decrypt` then drops.
     fn encrypt(plain: &[u8], key: u16, skip: usize) -> Vec<u8> {
+        encrypt_with_lead(plain, key, &vec![0u8; skip])
+    }
+
+    /// Like [`encrypt`], but the caller supplies the lead filler bytes
+    /// explicitly instead of always zero-filling them. Lets a test pin the
+    /// resulting first *ciphertext* byte to a specific value (by choosing
+    /// the corresponding lead plaintext byte), since the cipher's first
+    /// emitted byte depends only on `key` and `lead[0]`.
+    fn encrypt_with_lead(plain: &[u8], key: u16, lead: &[u8]) -> Vec<u8> {
         let mut r = key;
         let mut out = Vec::new();
-        let mut buf = vec![0u8; skip];
+        let mut buf = lead.to_vec();
         buf.extend_from_slice(plain);
         for &p in &buf {
             let c = p ^ (r >> 8) as u8;
@@ -266,6 +286,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn segment_raw_single_separator_does_not_eat_a_whitespace_valued_ciphertext_byte() {
+        // Force the eexec region's first *ciphertext* byte (C0) to be 10
+        // (0x0A, a newline value) to prove the fix consumes exactly one
+        // separator after `eexec`, not a run: C0 = leadByte ^ high_byte(EEXEC_KEY)
+        // = leadByte ^ 217 (EEXEC_KEY = 55665 = 0xD971, high byte 0xD9 = 217).
+        // Solving leadByte ^ 217 == 10 gives leadByte == 211 (211 ^ 217 == 10).
+        // `lead` supplies all EEXEC_SKIP (=4) filler bytes; only byte 0 feeds
+        // C0, so the rest stay 0.
+        let lead = [211u8, 0, 0, 0];
+        let plain = b"/lenIV 4 def";
+        let cipher = encrypt_with_lead(plain, EEXEC_KEY, &lead);
+        assert_eq!(
+            cipher[0], 10,
+            "test setup: first ciphertext byte must itself be a whitespace (newline) value"
+        );
+
+        let mut program = Vec::new();
+        program.extend_from_slice(b"%!FontType1\neexec\n");
+        program.extend_from_slice(&cipher);
+
+        // The old (buggy) run-skipping logic would treat this leading 0x0A
+        // ciphertext byte as more separator whitespace and consume it too,
+        // shifting the whole decrypt window by one byte and corrupting the
+        // result. The fixed logic stops after the single literal `\n` that
+        // follows `eexec` in the program text, leaving `cipher` untouched.
+        let (_clear, priv_dec) = segment(&program).expect("segment");
+        assert_eq!(&priv_dec, plain);
+    }
+
+    #[test]
     fn segment_hex_eexec_is_decoded_then_decrypted() {
         // Same content, but the eexec region is ASCII-hex instead of binary.
         let bin = encrypt(b"/lenIV 4 def", EEXEC_KEY, EEXEC_SKIP);
@@ -295,5 +345,30 @@ pub(crate) mod tests {
     #[test]
     fn segment_without_eexec_returns_none() {
         assert!(segment(b"%!FontType1\nno private here\n").is_none());
+    }
+
+    // --- adversarial-input leniency: never panic, always None on garbage ---
+
+    #[test]
+    fn segment_pfb_truncated_length_field_returns_none() {
+        // A type-2 (binary) segment marker (128 = 0x80, 2) followed by only
+        // one byte (16) of what should be a 4-byte little-endian length --
+        // the header is truncated before the length field is complete.
+        let program = [128u8, 2, 16];
+        assert!(segment(&program).is_none());
+    }
+
+    #[test]
+    fn segment_pfb_length_exceeds_available_bytes_returns_none() {
+        // A well-formed type-2 header declaring a 100-byte payload (little-
+        // endian 100, 0, 0, 0), but the program ends right after the header
+        // with zero bytes of actual data present.
+        let program = [128u8, 2, 100, 0, 0, 0];
+        assert!(segment(&program).is_none());
+    }
+
+    #[test]
+    fn segment_empty_input_returns_none() {
+        assert!(segment(&[]).is_none());
     }
 }
