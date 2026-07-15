@@ -27,26 +27,84 @@ enum Family {
     Courier,
 }
 
-/// Classifies a (subset-prefix-stripped) `/BaseFont` name into a
-/// standard-14 family plus bold/italic flags, recognizing the common
-/// PostScript and TrueType aliases (`Arial` -> Helvetica, `TimesNewRoman`
-/// / `TimesNewRomanPSMT` -> Times, `CourierNew` -> Courier) and the usual
-/// `-Bold`/`-Italic`/`-Oblique`/`,Bold`/`-BoldMT`-style weight/slant
-/// suffixes. Returns `None` for Symbol, ZapfDingbats, and any name
-/// that doesn't resolve to one of the standard 14.
-fn classify(base_font: &str) -> Option<(Family, bool, bool)> {
-    let name = strip_subset_prefix(base_font);
-    let bold = name.contains("Bold");
-    let italic = name.contains("Italic") || name.contains("Oblique");
-    if name.starts_with("Courier") {
-        Some((Family::Courier, bold, italic))
-    } else if name.starts_with("Helvetica") || name.starts_with("Arial") {
-        Some((Family::Helvetica, bold, italic))
-    } else if name.starts_with("Times") {
-        Some((Family::Times, bold, italic))
-    } else {
-        None
+/// Recognized family stems, longest first. Ordering matters: a shorter
+/// stem that is itself a prefix of a longer one (`times` vs.
+/// `timesnewroman` vs. `timesnewromanps`, `courier` vs. `couriernew`)
+/// must never shadow the more specific match, or the leftover
+/// remainder handed to [`strip_style_tokens`] would contain stem
+/// characters instead of style/noise ones. `classify` walks this list
+/// in order and takes the first hit.
+const FAMILY_STEMS: &[(&str, Family)] = &[
+    ("timesnewromanps", Family::Times),
+    ("timesnewroman", Family::Times),
+    ("couriernew", Family::Courier),
+    ("helvetica", Family::Helvetica),
+    ("courier", Family::Courier),
+    ("arial", Family::Helvetica),
+    ("times", Family::Times),
+];
+
+/// Style/noise tokens recognized after the family stem, longest first
+/// (so, e.g., `psmt` is tried whole rather than stopping at `ps`).
+/// `mt`/`ps`/`psmt` are TrueType-alias noise suffixes (`Arial-BoldMT`,
+/// `TimesNewRomanPSMT`). Anything left over after greedily stripping
+/// these tokens means the name carries a real, metrically distinct
+/// qualifier (`Narrow`, `Neue`, `Condensed`, `Light`, `Ten`, ...) and
+/// so isn't one of the standard 14.
+const STYLE_TOKENS: &[&str] = &[
+    "oblique", "regular", "italic", "roman", "bold", "book", "psmt", "ps", "mt",
+];
+
+/// Greedily strips [`STYLE_TOKENS`] from the front of `rest`, folding
+/// them into `(bold, italic)` flags, until `rest` is fully consumed.
+/// Returns `None` the moment a prefix token isn't recognized, i.e. the
+/// name has a qualifier this module doesn't tabulate.
+fn strip_style_tokens(mut rest: &str) -> Option<(bool, bool)> {
+    let mut bold = false;
+    let mut italic = false;
+    while !rest.is_empty() {
+        let tok = *STYLE_TOKENS.iter().find(|&&t| rest.starts_with(t))?;
+        match tok {
+            "bold" => bold = true,
+            "italic" | "oblique" => italic = true,
+            _ => {}
+        }
+        rest = &rest[tok.len()..];
     }
+    Some((bold, italic))
+}
+
+/// Classifies a (subset-prefix-stripped) `/BaseFont` name into a
+/// standard-14 family plus bold/italic flags. The name is lowercased
+/// and separator-stripped (`-`, `,`, space) before matching, so
+/// `Arial-BoldMT`, `arial-bold`, and `Arial,Bold` all resolve alike.
+/// The (separator-stripped) name must then start with one of the
+/// [`FAMILY_STEMS`] (recognizing the common PostScript and TrueType
+/// aliases: `Arial` -> Helvetica, `TimesNewRoman`/`TimesNewRomanPS` ->
+/// Times, `CourierNew` -> Courier), and everything after the stem must
+/// fully reduce to [`STYLE_TOKENS`] noise.
+///
+/// This is deliberately strict: a font that merely shares a standard-14
+/// prefix but is metrically distinct — `Helvetica-Narrow`, `Helvetica
+/// Neue`, `HelveticaNeue-Bold`, `TimesTen-Bold`, `Helvetica-Light`,
+/// `Times New Roman Condensed` — leaves an unrecognized token after the
+/// stem and so classifies as `None`, same as Symbol, ZapfDingbats, or
+/// any other name that isn't one of the standard 14. Returning `None`
+/// here is correct even though it's plausible-looking: the caller then
+/// falls back to the substitute face's own `hmtx` widths rather than a
+/// wrong Core-14 advance.
+fn classify(base_font: &str) -> Option<(Family, bool, bool)> {
+    let stripped = strip_subset_prefix(base_font);
+    let lower = stripped.to_lowercase();
+    let compact: String = lower
+        .chars()
+        .filter(|c| !matches!(c, '-' | ',' | ' '))
+        .collect();
+    let (family, rest) = FAMILY_STEMS
+        .iter()
+        .find_map(|&(stem, family)| compact.strip_prefix(stem).map(|rest| (family, rest)))?;
+    let (bold, italic) = strip_style_tokens(rest)?;
+    Some((family, bold, italic))
 }
 
 /// Binary-searches a `(glyph_name, width)` table sorted by name.
@@ -1533,5 +1591,37 @@ mod tests {
         assert!(is_standard_14("Courier-Bold") && !is_standard_14("Comic Sans"));
         assert!(is_standard_14("Arial-BoldMT"));
         assert!(!is_standard_14("ZapfDingbats"));
+    }
+
+    // Review-fix regression: `classify()` must reject metrically-distinct
+    // siblings that merely share a standard-14 prefix (see module docs on
+    // `classify`), rather than silently returning a wrong-but-plausible
+    // Core-14 width.
+    #[test]
+    fn standard_14_review_fix_positive() {
+        assert_eq!(standard_14_width("Helvetica-Bold", "A"), Some(722.0));
+        assert_eq!(standard_14_width("Arial-BoldMT", "space"), Some(278.0));
+        assert!(standard_14_width("TimesNewRomanPS-BoldItalicMT", "A").is_some());
+        assert_eq!(standard_14_width("CourierNew-Bold", "x"), Some(600.0));
+        // Internal spaces are handled (stripped before stem matching).
+        assert!(standard_14_width("TimesNewRoman", "A").is_some());
+        assert!(standard_14_width("Times New Roman", "A").is_some());
+    }
+
+    #[test]
+    fn standard_14_rejects_metrically_distinct_siblings() {
+        assert!(standard_14_width("Helvetica-Narrow", "A").is_none());
+        assert!(standard_14_width("HelveticaNeue-Bold", "A").is_none());
+        assert!(standard_14_width("Helvetica Neue", "A").is_none());
+        assert!(standard_14_width("TimesTen-Bold", "A").is_none());
+        assert!(standard_14_width("Helvetica-Light", "A").is_none());
+        assert!(standard_14_width("Times New Roman Condensed", "A").is_none());
+    }
+
+    #[test]
+    fn standard_14_classify_case_folds() {
+        // classify() lowercases internally, same as
+        // `FaceRequest::from_font_dict`'s normalization.
+        assert_eq!(standard_14_width("arial-bold", "A"), Some(722.0));
     }
 }
