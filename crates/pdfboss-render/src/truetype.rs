@@ -17,6 +17,8 @@ pub(crate) enum Seg {
     Line(f32, f32),
     /// Quadratic Bezier: control point then end point.
     Quad(f32, f32, f32, f32),
+    /// Cubic Bezier: two control points then the end point.
+    Cubic(f32, f32, f32, f32, f32, f32),
     Close,
 }
 
@@ -264,6 +266,12 @@ fn transform_seg(seg: Seg, a: f32, b: f32, c: f32, d: f32, tx: f32, ty: f32) -> 
             let (cx, cy) = f(cx, cy);
             let (x, y) = f(x, y);
             Seg::Quad(cx, cy, x, y)
+        }
+        Seg::Cubic(x1, y1, x2, y2, x, y) => {
+            let (x1, y1) = f(x1, y1);
+            let (x2, y2) = f(x2, y2);
+            let (x, y) = f(x, y);
+            Seg::Cubic(x1, y1, x2, y2, x, y)
         }
         Seg::Close => Seg::Close,
     }

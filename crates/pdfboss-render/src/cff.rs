@@ -1,16 +1,19 @@
 //! Compact Font Format (CFF) container parser: header, INDEX structures, the
 //! Top and Private DICTs, the charset, the global/local subroutine indexes,
 //! the width defaults, and (for CID-keyed fonts) the font-DICT array and the
-//! `FDSelect` glyph-to-font-DICT map.
+//! `FDSelect` glyph-to-font-DICT map. Also interprets a glyph's Type2
+//! charstring (Tech Note 5177) into [`Seg`] outline segments in font units.
 //!
-//! This module parses the *container* only. Turning a glyph's Type2
-//! charstring into an outline is a later step; every accessor here is
-//! bounds-checked so a malformed embedded font yields `None` rather than a
-//! panic.
+//! Every accessor and the interpreter itself are bounds-checked and
+//! step/recursion-bounded so a malformed or adversarial embedded font yields
+//! `None`/a partial outline rather than a panic or a hang.
 //!
-//! Reference: the public CFF spec (Adobe Tech Note #5176).
+//! References: the public CFF spec (Adobe Tech Note #5176) and the Type2
+//! charstring spec (Adobe Tech Note #5177).
 
 use std::collections::HashMap;
+
+use crate::truetype::Seg;
 
 /// A DICT is a map from operator code to its operand list. The escape
 /// operator `12 x` is encoded as the key `0x0c00 | x` so both one- and
@@ -204,6 +207,39 @@ impl CffFont {
         self.units_per_em
     }
 
+    /// Interprets glyph `gid`'s Type2 charstring (Tech Note 5177) into
+    /// outline segments in font design units. Bounds-checked and
+    /// step/recursion-bounded throughout (see [`Type2Interpreter`]); a
+    /// missing or malformed charstring yields whatever partial outline was
+    /// decoded so far (empty if nothing could be decoded), never a panic.
+    pub(crate) fn glyph_path(&self, gid: u16) -> Vec<Seg> {
+        let Some(charstring) = self.char_strings.get(gid as usize) else {
+            return Vec::new();
+        };
+        // Resolves the Private DICT that applies to this glyph -- for CID
+        // fonts, via FDSelect(gid) -- for its local Subrs (`callsubr`). Its
+        // nominalWidthX is also selected here (per the FDSelect'd Private
+        // DICT) but not consumed: painting doesn't need the glyph width, only
+        // that the optional leading width operand is dropped so operand
+        // counts stay correct (see `Type2Interpreter::maybe_drop_width`);
+        // widths for advances come from the PDF font dict, not here.
+        let local_subrs = self.private_for_gid(gid).map(|p| &p.local_subrs);
+        Type2Interpreter::new(&self.global_subrs, local_subrs).run(charstring)
+    }
+
+    /// The Private DICT that applies to `gid`: the font's single Private
+    /// DICT for a non-CID font, or the `FDSelect`-chosen entry in `fd_array`
+    /// for a CID-keyed font. `None` if there is no matching Private DICT (a
+    /// bare font, or an out-of-range `FDSelect` entry).
+    fn private_for_gid(&self, gid: u16) -> Option<&Private> {
+        if self.is_cid {
+            let fd = self.fd_select.as_ref()?.fd_for_gid(gid) as usize;
+            self.fd_array.get(fd)
+        } else {
+            self.private.as_ref()
+        }
+    }
+
     /// Resolves a glyph name to a string id: the bundled standard-strings
     /// table first (by its real SID), then the font's own String INDEX (SID
     /// = 391 + index).
@@ -224,6 +260,626 @@ impl CffFont {
             }
         }
         None
+    }
+}
+
+// --- Type2 charstring interpreter (Tech Note 5177) --------------------------
+//
+// Turns one glyph's charstring into `Seg` outline segments. Every curve is
+// cubic (`Seg::Cubic`); the "current point" starts at the font origin and
+// each `moveto` closes the previous subpath (mirroring the fill pipeline's
+// `PathBuilder`, which treats `Seg::Close` subpaths as implicitly closed back
+// to their start -- no explicit closing edge is needed).
+
+/// Type2 operand stack depth (Tech Note 5177): pushes beyond this are simply
+/// dropped rather than growing the stack without bound.
+const MAX_STACK: usize = 48;
+
+/// Bounds nested `callsubr`/`callgsubr` recursion so a self-referential or
+/// cyclic subroutine can't recurse forever (or overflow the real call stack,
+/// since each level is one Rust stack frame).
+const MAX_SUBR_DEPTH: u32 = 10;
+
+/// Total operator-execution budget for one glyph, guarding against
+/// adversarial charstrings that loop without ever deepening recursion (e.g.
+/// a long chain of subr calls rather than a self-recursive one).
+const MAX_STEPS: u32 = 50_000;
+
+// One-byte Type2 operators (Tech Note 5177 Appendix A).
+const T2_HSTEM: u8 = 1;
+const T2_VSTEM: u8 = 3;
+const T2_VMOVETO: u8 = 4;
+const T2_RLINETO: u8 = 5;
+const T2_HLINETO: u8 = 6;
+const T2_VLINETO: u8 = 7;
+const T2_RRCURVETO: u8 = 8;
+const T2_CALLSUBR: u8 = 10;
+const T2_RETURN: u8 = 11;
+const T2_ESCAPE: u8 = 12;
+const T2_ENDCHAR: u8 = 14;
+const T2_HSTEMHM: u8 = 18;
+const T2_HINTMASK: u8 = 19;
+const T2_CNTRMASK: u8 = 20;
+const T2_RMOVETO: u8 = 21;
+const T2_HMOVETO: u8 = 22;
+const T2_VSTEMHM: u8 = 23;
+const T2_RCURVELINE: u8 = 24;
+const T2_RLINECURVE: u8 = 25;
+const T2_VVCURVETO: u8 = 26;
+const T2_HHCURVETO: u8 = 27;
+const T2_SHORTINT: u8 = 28; // operand marker, not an operator
+const T2_CALLGSUBR: u8 = 29;
+const T2_VHCURVETO: u8 = 30;
+const T2_HVCURVETO: u8 = 31;
+const T2_FIXED: u8 = 255; // operand marker, not an operator
+
+// Escape (`12 x`) operators.
+const T2_HFLEX: u8 = 34;
+const T2_FLEX: u8 = 35;
+const T2_HFLEX1: u8 = 36;
+const T2_FLEX1: u8 = 37;
+
+/// Subr-index bias (Tech Note 5177): `callsubr`/`callgsubr` add this to their
+/// operand before indexing the (local or global) Subrs INDEX.
+fn subr_bias(n_subrs: usize) -> i32 {
+    if n_subrs < 1240 {
+        107
+    } else if n_subrs < 33900 {
+        1131
+    } else {
+        32768
+    }
+}
+
+/// What an executed operator (or a bounds/budget failure) tells the calling
+/// decode loop to do next.
+enum OpResult {
+    /// Keep decoding this charstring.
+    Continue,
+    /// The Type2 `return` operator, or simply running off the end of a
+    /// charstring/subr: unwind one `callsubr`/`callgsubr` level.
+    Return,
+    /// Stop interpreting the glyph entirely: `endchar`, an exhausted step
+    /// budget, subr recursion too deep, or a reserved/malformed opcode.
+    Stop,
+}
+
+/// Interprets a single glyph's Type2 charstring, given the font's global
+/// Subrs and the (already `FDSelect`-resolved, for CID fonts) local Subrs.
+/// Every operand read and subr-index lookup is bounds-checked; malformed
+/// input makes the interpreter stop and `run` return whatever outline had
+/// been decoded so far.
+struct Type2Interpreter<'a> {
+    global_subrs: &'a Index,
+    local_subrs: Option<&'a Index>,
+    global_bias: i32,
+    local_bias: i32,
+    stack: Vec<f64>,
+    x: f32,
+    y: f32,
+    /// Running count of stem hints declared so far, for `hintmask`/
+    /// `cntrmask`'s `ceil(numStems/8)` mask-byte width.
+    n_stems: u32,
+    /// Whether the one-time optional-width operand has been looked for yet
+    /// (regardless of whether one was actually present).
+    width_parsed: bool,
+    /// Whether a subpath is currently open (there has been a `moveto` not
+    /// yet followed by another `moveto` or the end of the glyph).
+    open: bool,
+    depth: u32,
+    steps: u32,
+    segs: Vec<Seg>,
+}
+
+impl<'a> Type2Interpreter<'a> {
+    fn new(global_subrs: &'a Index, local_subrs: Option<&'a Index>) -> Type2Interpreter<'a> {
+        Type2Interpreter {
+            global_bias: subr_bias(global_subrs.count()),
+            local_bias: subr_bias(local_subrs.map(Index::count).unwrap_or(0)),
+            global_subrs,
+            local_subrs,
+            stack: Vec::new(),
+            x: 0.0,
+            y: 0.0,
+            n_stems: 0,
+            width_parsed: false,
+            open: false,
+            depth: 0,
+            steps: 0,
+            segs: Vec::new(),
+        }
+    }
+
+    /// Runs the top-level charstring and returns the decoded outline,
+    /// closing any subpath still open when interpretation stops (whether via
+    /// `endchar` or a malformed charstring that never reaches one).
+    fn run(mut self, code: &[u8]) -> Vec<Seg> {
+        self.exec(code);
+        if self.open {
+            self.segs.push(Seg::Close);
+        }
+        self.segs
+    }
+
+    fn push_operand(&mut self, v: f64) {
+        if self.stack.len() < MAX_STACK {
+            self.stack.push(v);
+        }
+    }
+
+    /// Operand `i`, or `0.0` if the stack came up short (a malformed
+    /// charstring never panics here).
+    fn arg(&self, i: usize) -> f32 {
+        self.stack.get(i).copied().unwrap_or(0.0) as f32
+    }
+
+    /// Drops the optional leading glyph-width operand, exactly once, the
+    /// first time a stem/moveto/`hintmask`/`cntrmask`/`endchar` operator
+    /// runs (Tech Note 5177's width rule). `extra` is the caller's
+    /// operator-specific test for "one more operand than expected".
+    fn maybe_drop_width(&mut self, extra: bool) {
+        if self.width_parsed {
+            return;
+        }
+        self.width_parsed = true;
+        if extra && !self.stack.is_empty() {
+            self.stack.remove(0);
+        }
+    }
+
+    fn close_current(&mut self) {
+        if self.open {
+            self.segs.push(Seg::Close);
+        }
+    }
+
+    fn moveto(&mut self, dx: f32, dy: f32) {
+        self.close_current();
+        self.x += dx;
+        self.y += dy;
+        self.segs.push(Seg::Move(self.x, self.y));
+        self.open = true;
+    }
+
+    fn lineto(&mut self, dx: f32, dy: f32) {
+        self.x += dx;
+        self.y += dy;
+        self.segs.push(Seg::Line(self.x, self.y));
+    }
+
+    /// Appends one cubic Bézier as three deltas from the current point:
+    /// first control point, second control point, end point.
+    fn curveto(&mut self, dx1: f32, dy1: f32, dx2: f32, dy2: f32, dx3: f32, dy3: f32) {
+        let c1x = self.x + dx1;
+        let c1y = self.y + dy1;
+        let c2x = c1x + dx2;
+        let c2y = c1y + dy2;
+        self.x = c2x + dx3;
+        self.y = c2y + dy3;
+        self.segs
+            .push(Seg::Cubic(c1x, c1y, c2x, c2y, self.x, self.y));
+    }
+
+    /// Decodes operators and operands from `code` until `return`/`endchar`,
+    /// the step budget is exhausted, or the bytes run out.
+    fn exec(&mut self, code: &[u8]) -> OpResult {
+        let mut i = 0usize;
+        while i < code.len() {
+            self.steps += 1;
+            if self.steps > MAX_STEPS {
+                return OpResult::Stop;
+            }
+            let b0 = code[i];
+            match b0 {
+                32..=246 => {
+                    self.push_operand(b0 as f64 - 139.0);
+                    i += 1;
+                }
+                247..=250 => {
+                    let Some(&b1) = code.get(i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    self.push_operand((b0 as f64 - 247.0) * 256.0 + b1 as f64 + 108.0);
+                    i += 2;
+                }
+                251..=254 => {
+                    let Some(&b1) = code.get(i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    self.push_operand(-(b0 as f64 - 251.0) * 256.0 - b1 as f64 - 108.0);
+                    i += 2;
+                }
+                T2_SHORTINT => {
+                    let Some(v) = bei16(code, i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    self.push_operand(v as f64);
+                    i += 3;
+                }
+                T2_FIXED => {
+                    let Some(v) = bei32(code, i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    self.push_operand(v as f64 / 65536.0);
+                    i += 5;
+                }
+                T2_HINTMASK | T2_CNTRMASK => {
+                    // Any pending stem operands implicitly declare a final
+                    // vstem hint before the mask (Tech Note 5177); the
+                    // width-detection rule treats this the same as an
+                    // explicit stem-hint operator.
+                    self.maybe_drop_width(self.stack.len() % 2 == 1);
+                    self.n_stems += (self.stack.len() / 2) as u32;
+                    self.stack.clear();
+                    let mask_bytes = (self.n_stems as usize).div_ceil(8);
+                    let Some(after_op) = i.checked_add(1) else {
+                        return OpResult::Stop;
+                    };
+                    let Some(end) = after_op.checked_add(mask_bytes) else {
+                        return OpResult::Stop;
+                    };
+                    if end > code.len() {
+                        return OpResult::Stop;
+                    }
+                    i = end;
+                }
+                T2_ESCAPE => {
+                    let Some(&b1) = code.get(i + 1) else {
+                        return OpResult::Stop;
+                    };
+                    i += 2;
+                    match self.exec_escape(b1) {
+                        OpResult::Continue => {}
+                        other => return other,
+                    }
+                }
+                _ => {
+                    i += 1;
+                    match self.exec_operator(b0) {
+                        OpResult::Continue => {}
+                        other => return other,
+                    }
+                }
+            }
+        }
+        OpResult::Return
+    }
+
+    /// Handles every one-byte operator except `hintmask`/`cntrmask` (which
+    /// `exec` handles directly, since they consume extra bytes from `code`
+    /// itself rather than from the operand stack).
+    fn exec_operator(&mut self, op: u8) -> OpResult {
+        match op {
+            T2_HSTEM | T2_VSTEM | T2_HSTEMHM | T2_VSTEMHM => {
+                self.maybe_drop_width(self.stack.len() % 2 == 1);
+                self.n_stems += (self.stack.len() / 2) as u32;
+                self.stack.clear();
+                OpResult::Continue
+            }
+            T2_RMOVETO => {
+                self.maybe_drop_width(self.stack.len() > 2);
+                let (dx, dy) = (self.arg(0), self.arg(1));
+                self.stack.clear();
+                self.moveto(dx, dy);
+                OpResult::Continue
+            }
+            T2_HMOVETO => {
+                self.maybe_drop_width(self.stack.len() > 1);
+                let dx = self.arg(0);
+                self.stack.clear();
+                self.moveto(dx, 0.0);
+                OpResult::Continue
+            }
+            T2_VMOVETO => {
+                self.maybe_drop_width(self.stack.len() > 1);
+                let dy = self.arg(0);
+                self.stack.clear();
+                self.moveto(0.0, dy);
+                OpResult::Continue
+            }
+            T2_RLINETO => {
+                let args = std::mem::take(&mut self.stack);
+                for pair in args.chunks_exact(2) {
+                    self.lineto(pair[0] as f32, pair[1] as f32);
+                }
+                OpResult::Continue
+            }
+            T2_HLINETO | T2_VLINETO => {
+                let args = std::mem::take(&mut self.stack);
+                let mut horiz = op == T2_HLINETO;
+                for &v in &args {
+                    if horiz {
+                        self.lineto(v as f32, 0.0);
+                    } else {
+                        self.lineto(0.0, v as f32);
+                    }
+                    horiz = !horiz;
+                }
+                OpResult::Continue
+            }
+            T2_RRCURVETO => {
+                let args = std::mem::take(&mut self.stack);
+                for c in args.chunks_exact(6) {
+                    self.curveto(
+                        c[0] as f32,
+                        c[1] as f32,
+                        c[2] as f32,
+                        c[3] as f32,
+                        c[4] as f32,
+                        c[5] as f32,
+                    );
+                }
+                OpResult::Continue
+            }
+            T2_VVCURVETO => {
+                self.exec_vvcurveto();
+                OpResult::Continue
+            }
+            T2_HHCURVETO => {
+                self.exec_hhcurveto();
+                OpResult::Continue
+            }
+            T2_VHCURVETO => {
+                self.exec_alternating_curve(false);
+                OpResult::Continue
+            }
+            T2_HVCURVETO => {
+                self.exec_alternating_curve(true);
+                OpResult::Continue
+            }
+            T2_RCURVELINE => {
+                let args = std::mem::take(&mut self.stack);
+                if args.len() >= 2 {
+                    let (curves, line) = args.split_at(args.len() - 2);
+                    for c in curves.chunks_exact(6) {
+                        self.curveto(
+                            c[0] as f32,
+                            c[1] as f32,
+                            c[2] as f32,
+                            c[3] as f32,
+                            c[4] as f32,
+                            c[5] as f32,
+                        );
+                    }
+                    self.lineto(line[0] as f32, line[1] as f32);
+                }
+                OpResult::Continue
+            }
+            T2_RLINECURVE => {
+                let args = std::mem::take(&mut self.stack);
+                if args.len() >= 6 {
+                    let (lines, curve) = args.split_at(args.len() - 6);
+                    for pair in lines.chunks_exact(2) {
+                        self.lineto(pair[0] as f32, pair[1] as f32);
+                    }
+                    self.curveto(
+                        curve[0] as f32,
+                        curve[1] as f32,
+                        curve[2] as f32,
+                        curve[3] as f32,
+                        curve[4] as f32,
+                        curve[5] as f32,
+                    );
+                }
+                OpResult::Continue
+            }
+            T2_CALLSUBR => {
+                let Some(idx) = self.stack.pop() else {
+                    return OpResult::Continue;
+                };
+                let biased = idx as i32 + self.local_bias;
+                self.call_subr(self.local_subrs, biased)
+            }
+            T2_CALLGSUBR => {
+                let Some(idx) = self.stack.pop() else {
+                    return OpResult::Continue;
+                };
+                let biased = idx as i32 + self.global_bias;
+                self.call_subr(Some(self.global_subrs), biased)
+            }
+            T2_RETURN => OpResult::Return,
+            T2_ENDCHAR => {
+                // A 4-operand endchar is the deprecated `seac` accent-
+                // composition form (Tech Note 5177): compose two standard-
+                // encoding glyphs. Not implemented -- its extra operands are
+                // simply discarded, i.e. treated as a plain endchar.
+                let extra = self.stack.len() == 1 || self.stack.len() == 5;
+                self.maybe_drop_width(extra);
+                self.stack.clear();
+                OpResult::Stop
+            }
+            _ => OpResult::Stop, // reserved opcode: malformed charstring
+        }
+    }
+
+    /// Handles the escape (`12 x`) operators: the flex family. Any other
+    /// escape operator (the Type2 arithmetic/storage operators, e.g. `and`,
+    /// `put`, `ifelse`) is not implemented -- vanishingly rare outside
+    /// deprecated hint-replacement schemes -- so its operands are discarded
+    /// and decoding continues rather than aborting the glyph.
+    fn exec_escape(&mut self, op: u8) -> OpResult {
+        match op {
+            T2_HFLEX => self.exec_hflex(),
+            T2_FLEX => self.exec_flex(),
+            T2_HFLEX1 => self.exec_hflex1(),
+            T2_FLEX1 => self.exec_flex1(),
+            _ => self.stack.clear(),
+        }
+        OpResult::Continue
+    }
+
+    /// `vvcurveto`: `dx1? {dya dxb dyb dyc}+` -- vertical-tangent curves; an
+    /// optional leading `dx1` only offsets the very first curve's first
+    /// control point.
+    fn exec_vvcurveto(&mut self) {
+        let args = std::mem::take(&mut self.stack);
+        let mut i = 0;
+        let mut lead_dx = 0.0f32;
+        if args.len() % 4 == 1 {
+            lead_dx = args[0] as f32;
+            i = 1;
+        }
+        while i + 4 <= args.len() {
+            let (dya, dxb, dyb, dyc) = (
+                args[i] as f32,
+                args[i + 1] as f32,
+                args[i + 2] as f32,
+                args[i + 3] as f32,
+            );
+            self.curveto(lead_dx, dya, dxb, dyb, 0.0, dyc);
+            lead_dx = 0.0;
+            i += 4;
+        }
+    }
+
+    /// `hhcurveto`: `dy1? {dxa dxb dyb dxc}+` -- horizontal-tangent curves;
+    /// an optional leading `dy1` only offsets the very first curve's first
+    /// control point.
+    fn exec_hhcurveto(&mut self) {
+        let args = std::mem::take(&mut self.stack);
+        let mut i = 0;
+        let mut lead_dy = 0.0f32;
+        if args.len() % 4 == 1 {
+            lead_dy = args[0] as f32;
+            i = 1;
+        }
+        while i + 4 <= args.len() {
+            let (dxa, dxb, dyb, dxc) = (
+                args[i] as f32,
+                args[i + 1] as f32,
+                args[i + 2] as f32,
+                args[i + 3] as f32,
+            );
+            self.curveto(dxa, lead_dy, dxb, dyb, dxc, 0.0);
+            lead_dy = 0.0;
+            i += 4;
+        }
+    }
+
+    /// `hvcurveto`/`vhcurveto`: curves whose start tangent alternates
+    /// horizontal/vertical each curve (`start_horizontal` picks which one
+    /// leads). A final fifth operand on the last curve, when present,
+    /// becomes that curve's otherwise-zero cross-axis endpoint delta.
+    fn exec_alternating_curve(&mut self, start_horizontal: bool) {
+        let args = std::mem::take(&mut self.stack);
+        let n = args.len();
+        let mut i = 0;
+        let mut horiz = start_horizontal;
+        while i + 4 <= n {
+            let remaining = n - i;
+            let extra = if remaining == 5 {
+                Some(args[i + 4] as f32)
+            } else {
+                None
+            };
+            let (v0, v1, v2, v3) = (
+                args[i] as f32,
+                args[i + 1] as f32,
+                args[i + 2] as f32,
+                args[i + 3] as f32,
+            );
+            if horiz {
+                self.curveto(v0, 0.0, v1, v2, extra.unwrap_or(0.0), v3);
+            } else {
+                self.curveto(0.0, v0, v1, v2, v3, extra.unwrap_or(0.0));
+            }
+            horiz = !horiz;
+            i += if extra.is_some() { 5 } else { 4 };
+        }
+    }
+
+    /// `hflex` (`12 34`): `dx1 dx2 dy2 dx3 dx4 dx5 dx6` -- two curves whose y
+    /// returns to the starting value (the flex's whole point is a nearly-
+    /// horizontal join), so only `dy2` ever moves off it and the second
+    /// curve undoes that with `-dy2`.
+    fn exec_hflex(&mut self) {
+        let args = std::mem::take(&mut self.stack);
+        let a = |i: usize| args.get(i).copied().unwrap_or(0.0) as f32;
+        let (dx1, dx2, dy2, dx3, dx4, dx5, dx6) = (a(0), a(1), a(2), a(3), a(4), a(5), a(6));
+        self.curveto(dx1, 0.0, dx2, dy2, dx3, 0.0);
+        self.curveto(dx4, 0.0, dx5, -dy2, dx6, 0.0);
+    }
+
+    /// `flex` (`12 35`): `dx1 dy1 dx2 dy2 dx3 dy3 dx4 dy4 dx5 dy5 dx6 dy6 fd`
+    /// -- two ordinary curves; `fd` is a flex-height selection hint with no
+    /// effect on the geometry, so it is read (for stack bookkeeping) and
+    /// otherwise ignored.
+    fn exec_flex(&mut self) {
+        let args = std::mem::take(&mut self.stack);
+        let a = |i: usize| args.get(i).copied().unwrap_or(0.0) as f32;
+        self.curveto(a(0), a(1), a(2), a(3), a(4), a(5));
+        self.curveto(a(6), a(7), a(8), a(9), a(10), a(11));
+    }
+
+    /// `hflex1` (`12 36`): `dx1 dy1 dx2 dy2 dx3 dx4 dx5 dy5 dx6` -- like
+    /// `flex`, but the final curve's `dy6` is solved for so the whole flex's
+    /// net vertical displacement is zero (`y` returns to its starting
+    /// value).
+    fn exec_hflex1(&mut self) {
+        let args = std::mem::take(&mut self.stack);
+        let a = |i: usize| args.get(i).copied().unwrap_or(0.0) as f32;
+        let (dx1, dy1, dx2, dy2, dx3, dx4, dx5, dy5, dx6) =
+            (a(0), a(1), a(2), a(3), a(4), a(5), a(6), a(7), a(8));
+        let dy6 = -(dy1 + dy2 + dy5);
+        self.curveto(dx1, dy1, dx2, dy2, dx3, 0.0);
+        self.curveto(dx4, 0.0, dx5, dy5, dx6, dy6);
+    }
+
+    /// `flex1` (`12 37`): `dx1 dy1 dx2 dy2 dx3 dy3 dx4 dy4 dx5 dy5 d6` --
+    /// like `hflex1`, but generalized to whichever axis moved more over the
+    /// first five deltas: that axis's final delta is the explicit `d6`, and
+    /// the other axis is solved for so it returns to its starting value.
+    fn exec_flex1(&mut self) {
+        let args = std::mem::take(&mut self.stack);
+        let a = |i: usize| args.get(i).copied().unwrap_or(0.0) as f32;
+        let (dx1, dy1, dx2, dy2, dx3, dy3, dx4, dy4, dx5, dy5, d6) = (
+            a(0),
+            a(1),
+            a(2),
+            a(3),
+            a(4),
+            a(5),
+            a(6),
+            a(7),
+            a(8),
+            a(9),
+            a(10),
+        );
+        let dx_sum = dx1 + dx2 + dx3 + dx4 + dx5;
+        let dy_sum = dy1 + dy2 + dy3 + dy4 + dy5;
+        let (dx6, dy6) = if dx_sum.abs() > dy_sum.abs() {
+            (d6, -dy_sum)
+        } else {
+            (-dx_sum, d6)
+        };
+        self.curveto(dx1, dy1, dx2, dy2, dx3, dy3);
+        self.curveto(dx4, dy4, dx5, dy5, dx6, dy6);
+    }
+
+    /// Calls a bias-resolved subroutine index, bounding recursion depth.
+    /// Leniently does nothing if `idx` is absent, the index is negative, or
+    /// it is out of range for the Subrs INDEX -- a missing subr is treated
+    /// as a no-op rather than aborting the glyph.
+    fn call_subr(&mut self, idx: Option<&'a Index>, biased: i32) -> OpResult {
+        let Some(idx) = idx else {
+            return OpResult::Continue;
+        };
+        let Ok(biased) = usize::try_from(biased) else {
+            return OpResult::Continue;
+        };
+        let Some(bytes) = idx.get(biased) else {
+            return OpResult::Continue;
+        };
+        if self.depth >= MAX_SUBR_DEPTH {
+            return OpResult::Stop;
+        }
+        self.depth += 1;
+        let result = self.exec(bytes);
+        self.depth -= 1;
+        match result {
+            OpResult::Stop => OpResult::Stop,
+            _ => OpResult::Continue,
+        }
     }
 }
 
@@ -588,6 +1244,7 @@ fn read_uint(d: &[u8], o: usize, size: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::truetype::Seg;
 
     // --- byte-level fixture helpers ----------------------------------------
 
@@ -777,6 +1434,201 @@ mod tests {
     fn units_per_em_defaults_to_1000() {
         let font = CffFont::parse(build_fixture()).expect("fixture parses");
         assert_eq!(font.units_per_em(), 1000.0);
+    }
+
+    // --- Type2 charstring fixtures -------------------------------------------
+
+    /// Pushes a Type2 charstring integer operand in the compact single-byte
+    /// range (`-107..=107`, encoded `139 + v`), which covers every operand
+    /// these fixtures need -- so a charstring is just a short, readable list
+    /// of decimal values rather than a hex blob.
+    fn t2_int(out: &mut Vec<u8>, v: i32) {
+        assert!(
+            (-107..=107).contains(&v),
+            "fixture operand {v} out of the compact single-byte range"
+        );
+        out.push((v + 139) as u8);
+    }
+
+    /// Pushes a one-byte Type2 operator (by its decimal opcode, Tech Note
+    /// 5177 Appendix A).
+    fn t2_op(out: &mut Vec<u8>, op: u8) {
+        out.push(op);
+    }
+
+    /// Builds a Private DICT with `Subrs` pointing at `subrs_rel_off` bytes
+    /// past the Private DICT's own start (the offset the `19` operator
+    /// records), alongside the usual default/nominal width operands.
+    fn build_private_dict_with_subrs(
+        default_width_x: i32,
+        nominal_width_x: i32,
+        subrs_rel_off: i32,
+    ) -> Vec<u8> {
+        let mut d = Vec::new();
+        dict_int_operand(&mut d, default_width_x);
+        dict_operator(&mut d, PRIV_DEFAULT_WIDTH_X_OP);
+        dict_int_operand(&mut d, nominal_width_x);
+        dict_operator(&mut d, PRIV_NOMINAL_WIDTH_X_OP);
+        dict_int_operand(&mut d, subrs_rel_off);
+        dict_operator(&mut d, PRIV_SUBRS_OP);
+        d
+    }
+
+    /// Builds a minimal non-CID CFF blob for exercising `glyph_path`:
+    /// `charstrings[i]` becomes gid `i` (conventionally gid 0 is `.notdef`),
+    /// and `local_subrs` becomes the font's local Subrs INDEX (its Type2
+    /// `callsubr` bias is computed from its count, per Tech Note 5177). Uses
+    /// the predefined ISOAdobe charset (Top DICT `charset` operand `0`, so
+    /// gid == SID and no charset bytes are needed) since these tests only
+    /// exercise `glyph_path`, not glyph-name lookup.
+    fn build_glyph_fixture(charstrings: &[&[u8]], local_subrs: &[&[u8]]) -> Vec<u8> {
+        let header = vec![1u8, 0, 4, 4];
+        let name_index = build_index(&[b"Synthetic"]);
+        let string_index = build_index(&[]);
+        let global_subr_index = build_index(&[]);
+        let charstrings_index = build_index(charstrings);
+        let local_subr_index = build_index(local_subrs);
+
+        // The Private DICT's length doesn't depend on the real Subrs offset
+        // (every operand uses the fixed-width int32 form): measure it with a
+        // placeholder offset, then rebuild with the real one (same length),
+        // mirroring the Top DICT placeholder trick used by `build_fixture`.
+        let private_len = build_private_dict_with_subrs(0, 0, 0).len();
+        let private = build_private_dict_with_subrs(0, 0, private_len as i32);
+        assert_eq!(private.len(), private_len);
+
+        let placeholder_top = build_top_dict(0, 0, private_len as i32, 0);
+        let top_dict_index_len = build_index(&[&placeholder_top]).len();
+
+        let prefix_len = header.len()
+            + name_index.len()
+            + top_dict_index_len
+            + string_index.len()
+            + global_subr_index.len();
+
+        // Layout after the leading indexes: Private DICT, then its local
+        // Subrs INDEX (the offset the Subrs operator above points to), then
+        // CharStrings. The predefined charset needs no bytes at all.
+        let private_off = prefix_len as i32;
+        let charstrings_off = private_off + private.len() as i32 + local_subr_index.len() as i32;
+
+        let top_dict = build_top_dict(charstrings_off, 0, private_len as i32, private_off);
+        let top_dict_index = build_index(&[&top_dict]);
+        assert_eq!(top_dict_index.len(), top_dict_index_len);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&name_index);
+        out.extend_from_slice(&top_dict_index);
+        out.extend_from_slice(&string_index);
+        out.extend_from_slice(&global_subr_index);
+        out.extend_from_slice(&private);
+        out.extend_from_slice(&local_subr_index);
+        out.extend_from_slice(&charstrings_index);
+        out
+    }
+
+    const ENDCHAR: u8 = 14;
+
+    #[test]
+    fn glyph_path_decodes_rectangle_via_rmoveto_rlineto_endchar() {
+        const RMOVETO: u8 = 21;
+        const RLINETO: u8 = 5;
+
+        let mut cs = Vec::new();
+        t2_int(&mut cs, 10);
+        t2_int(&mut cs, 10);
+        t2_op(&mut cs, RMOVETO); // move to (10, 10)
+        t2_int(&mut cs, 80);
+        t2_int(&mut cs, 0);
+        t2_int(&mut cs, 0);
+        t2_int(&mut cs, 80);
+        t2_int(&mut cs, -80);
+        t2_int(&mut cs, 0);
+        t2_op(&mut cs, RLINETO); // (90,10) -> (90,90) -> (10,90)
+        t2_op(&mut cs, ENDCHAR);
+
+        let notdef: &[u8] = &[ENDCHAR];
+        let font =
+            CffFont::parse(build_glyph_fixture(&[notdef, &cs], &[])).expect("fixture parses");
+
+        assert_eq!(
+            font.glyph_path(1),
+            vec![
+                Seg::Move(10.0, 10.0),
+                Seg::Line(90.0, 10.0),
+                Seg::Line(90.0, 90.0),
+                Seg::Line(10.0, 90.0),
+                Seg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn glyph_path_decodes_rrcurveto_as_cubic() {
+        const RMOVETO: u8 = 21;
+        const RRCURVETO: u8 = 8;
+
+        let mut cs = Vec::new();
+        t2_int(&mut cs, 0);
+        t2_int(&mut cs, 0);
+        t2_op(&mut cs, RMOVETO); // move to (0, 0)
+        t2_int(&mut cs, 10);
+        t2_int(&mut cs, 20);
+        t2_int(&mut cs, 30);
+        t2_int(&mut cs, 40);
+        t2_int(&mut cs, 5);
+        t2_int(&mut cs, 6);
+        t2_op(&mut cs, RRCURVETO);
+        t2_op(&mut cs, ENDCHAR);
+
+        let notdef: &[u8] = &[ENDCHAR];
+        let font =
+            CffFont::parse(build_glyph_fixture(&[notdef, &cs], &[])).expect("fixture parses");
+
+        // c1 = (0,0)+(10,20); c2 = c1+(30,40); end = c2+(5,6).
+        assert_eq!(
+            font.glyph_path(1),
+            vec![
+                Seg::Move(0.0, 0.0),
+                Seg::Cubic(10.0, 20.0, 40.0, 60.0, 45.0, 66.0),
+                Seg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn glyph_path_follows_callsubr_with_correct_bias() {
+        const RMOVETO: u8 = 21;
+        const RLINETO: u8 = 5;
+        const CALLSUBR: u8 = 10;
+        const RETURN: u8 = 11;
+
+        // One local subr -> nSubrs (1) < 1240 -> bias 107 (Tech Note 5177).
+        // To invoke subr 0 the charstring pushes 0 - 107 = -107, which is
+        // representable in the compact single-byte operand form.
+        let mut subr0 = Vec::new();
+        t2_int(&mut subr0, 30);
+        t2_int(&mut subr0, 0);
+        t2_op(&mut subr0, RLINETO); // relative line (30, 0)
+        t2_op(&mut subr0, RETURN);
+
+        let mut cs = Vec::new();
+        t2_int(&mut cs, 20);
+        t2_int(&mut cs, 20);
+        t2_op(&mut cs, RMOVETO); // move to (20, 20)
+        t2_int(&mut cs, -107); // subr index 0, biased
+        t2_op(&mut cs, CALLSUBR);
+        t2_op(&mut cs, ENDCHAR);
+
+        let notdef: &[u8] = &[ENDCHAR];
+        let font =
+            CffFont::parse(build_glyph_fixture(&[notdef, &cs], &[&subr0])).expect("fixture parses");
+
+        assert_eq!(
+            font.glyph_path(1),
+            vec![Seg::Move(20.0, 20.0), Seg::Line(50.0, 20.0), Seg::Close,]
+        );
     }
 
     // --- CID-keyed fixture ---------------------------------------------------

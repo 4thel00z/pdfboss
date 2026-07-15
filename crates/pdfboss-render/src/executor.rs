@@ -187,6 +187,7 @@ fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<crate::path::Subpath> {
                 let c2y = y + 2.0 / 3.0 * (cy - y);
                 pb.curve_to(c1x, c1y, c2x, c2y, x, y);
             }
+            Seg::Cubic(c1x, c1y, c2x, c2y, x, y) => pb.curve_to(c1x, c1y, c2x, c2y, x, y),
             Seg::Close => pb.close(),
         }
     }
