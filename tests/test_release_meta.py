@@ -14,6 +14,8 @@ import re
 import tomllib
 from pathlib import Path
 
+import yaml
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -98,8 +100,64 @@ class TestPdfbossFontsReleasePipeline:
         assert any(dep.startswith("pdfboss-fonts") for dep in full)
 
     def test_release_workflow_publishes_fonts_package(self) -> None:
-        workflow = (
-            REPO / ".github" / "workflows" / "release-please.yaml"
-        ).read_text()
-        assert "pdfboss-fonts" in workflow, "no publish job for the fonts package"
-        assert "gh-action-pypi-publish" in workflow
+        """The pdfboss-fonts publish job is correctly wired for Trusted
+        Publishing, independent of (and not fooled by) the pre-existing
+        ``publish-pypi`` job for the root ``pdfboss`` engine package, which
+        also references ``gh-action-pypi-publish`` and also builds a
+        `pdfboss-fonts`-mentioning comment elsewhere in the file.
+        """
+        workflow_path = REPO / ".github" / "workflows" / "release-please.yaml"
+        workflow = yaml.safe_load(workflow_path.read_text())
+
+        jobs = workflow["jobs"]
+        fonts_job_name = "publish-pdfboss-fonts"
+        assert fonts_job_name in jobs, (
+            f"expected a `{fonts_job_name}` job publishing the fonts package"
+        )
+        job = jobs[fonts_job_name]
+
+        # Gated on the fonts-component release output, NOT the root
+        # `release_created` output -- otherwise this job would fire on
+        # every pdfboss engine release, even when pdfboss-fonts didn't
+        # change.
+        condition = job.get("if", "")
+        assert "fonts_release_created" in condition, (
+            "publish-pdfboss-fonts must be gated on the fonts-specific "
+            f"release output, got if: {condition!r}"
+        )
+        assert "release-please.outputs.release_created" not in condition, (
+            "publish-pdfboss-fonts must not be gated on the root "
+            f"release_created output, got if: {condition!r}"
+        )
+
+        # Trusted Publishing requires the OIDC id-token permission.
+        permissions = job.get("permissions", {})
+        assert permissions.get("id-token") == "write", (
+            "publish-pdfboss-fonts is missing `permissions: id-token: write` "
+            "required for PyPI Trusted Publishing"
+        )
+
+        steps = job.get("steps", [])
+        uses_list = [step.get("uses", "") for step in steps]
+        assert any("pypa/gh-action-pypi-publish" in u for u in uses_list), (
+            "publish-pdfboss-fonts must publish via pypa/gh-action-pypi-publish"
+        )
+
+        # The fonts package is pure Python: it must be built with
+        # `python -m build`, not maturin (which is for the compiled
+        # pdfboss engine wheel).
+        job_text = yaml.dump(job)
+        assert "maturin" not in job_text, (
+            "publish-pdfboss-fonts must not use maturin; pdfboss-fonts is "
+            "a pure-Python package built with `python -m build`"
+        )
+        run_steps = " ".join(step.get("run", "") for step in steps)
+        assert "python -m build" in run_steps or any(
+            "build" in u for u in uses_list
+        ), (
+            "publish-pdfboss-fonts must build the fonts sdist/wheel with "
+            "`python -m build` (or an equivalent `build` step)"
+        )
+        assert "packages/pdfboss-fonts" in run_steps, (
+            "the build step must target the packages/pdfboss-fonts directory"
+        )
