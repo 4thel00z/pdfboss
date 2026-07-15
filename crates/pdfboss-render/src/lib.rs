@@ -1,6 +1,28 @@
 //! Page rasterization for pdfboss: paths, fills, strokes, clipping, color
-//! spaces, images and embedded-TrueType glyph outlines, rendered to an RGBA8
-//! pixmap and encodable as PNG.
+//! spaces, images and glyph outlines, rendered to an RGBA8 pixmap and
+//! encodable as PNG.
+//!
+//! Glyph painting is staged behind [`GlyphPainting`] tiers: embedded
+//! TrueType only, then every embedded font program (TrueType, CFF, Type1,
+//! Type3), and finally `Full`, which additionally substitutes a
+//! replacement face for a non-embedded simple font (see `crate::glyph` and
+//! `crate::substitute` for the loader and the request/provider plumbing).
+//! A substitute face comes from either a caller-supplied directory
+//! ([`SubstituteSource::Dir`]) or the compiled-in OFL Croscore set
+//! ([`SubstituteSource::Builtin`]), the latter gated behind this crate's
+//! `substitute-fonts` Cargo feature and queryable at runtime via
+//! [`builtin_fonts_available`]. Advance widths for a substituted
+//! standard-14 font additionally consult Adobe Core-14 AFM tables
+//! (`pdfboss_encoding::standard_14_width`) ahead of the substitute's own
+//! `hmtx`, behind only the PDF's own `/Widths`.
+//!
+//! v1 limitations: `/Symbol` and `/ZapfDingbats` have no license-clean
+//! substitute, so they stay unpainted at every tier rather than borrowing
+//! an unrelated face's glyphs; a "bold" *sans* substitute request is not
+//! visually distinct from regular weight (Arimo is a `[wght]` variable
+//! font, rendered at its Regular instance -- only italic varies, via a
+//! separate static face); and advancing *unpainted* non-embedded text at
+//! `AllEmbedded` via the AFM tables is deferred to a later plan.
 
 // The rasterizer modules are consumed by the content-stream executor; the
 // `dead_code` allowances below disappear once it is wired up.
@@ -105,8 +127,14 @@ pub enum SubstituteSource {
     /// No substitution: non-embedded fonts stay unpainted.
     #[default]
     None,
-    /// Compiled-in faces (wired up in a later plan, gated by a
-    /// `substitute-fonts`-style feature).
+    /// Compiled-in faces: the OFL Croscore set (Arimo/Tinos/Cousine,
+    /// metric-compatible with Helvetica/Times/Courier) bundled via
+    /// `include_bytes!` behind the `substitute-fonts` Cargo feature -- see
+    /// [`builtin_fonts_available`] and `crate::substitute::BuiltinProvider`.
+    /// Built without that feature, there are no compiled-in faces to hand
+    /// out: `Builtin` degrades to no provider at all, so `Full` behaves
+    /// exactly like `AllEmbedded` for non-embedded fonts, the same as
+    /// `SubstituteSource::None`.
     Builtin,
     /// Faces read from a directory at render time (e.g. an installed
     /// `pdfboss-fonts` package), one file per style -- see

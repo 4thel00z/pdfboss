@@ -3,9 +3,39 @@
 //! that request onto a replacement face, either compiled in or read from a
 //! directory at render time.
 //!
-//! This module only defines the request/lookup plumbing; nothing in the
-//! loader (`glyph.rs`) consults it yet -- that lands in later plans once the
-//! `Full` tier actually substitutes.
+//! `GlyphFont::load` (`glyph.rs`) consults [`FaceRequest`] and
+//! [`SubstituteProvider`] as the last resort for a SIMPLE font (`/TrueType`,
+//! `/Type1`, `/MMType1`) with no embedded program of its own -- but only at
+//! the `Full` [`crate::GlyphPainting`] tier, and only when
+//! [`crate::RenderOptions::substitutes`] actually names a source; `Full`
+//! with `SubstituteSource::None` behaves exactly like `AllEmbedded`. Two
+//! providers exist: [`DirProvider`] reads faces from a caller-supplied
+//! directory at render time (works in any build), and [`BuiltinProvider`]
+//! hands out faces bundled into the binary via `include_bytes!`, compiled
+//! in only behind the `substitute-fonts` Cargo feature (see
+//! [`crate::builtin_fonts_available`]) so the default build stays free of
+//! the ~4 MB of font data.
+//!
+//! The bundled set is the OFL 1.1 Croscore family -- Arimo (sans), Tinos
+//! (serif) and Cousine (mono), metric-compatible substitutes for
+//! Helvetica, Times and Courier respectively (licensing: `assets/fonts/
+//! OFL.txt` and `NOTICE`). Advance widths for a recognized standard-14
+//! `/BaseFont` prefer the Adobe Core-14 AFM tables
+//! (`pdfboss_encoding::standard_14_width`) over the substitute's own
+//! `hmtx`, behind only the PDF's own `/Widths` -- see `glyph.rs`'s
+//! `GlyphFont::advance` for the full three-tier order.
+//!
+//! v1 limitations, none of which are guessed around: `FaceRequest::
+//! from_font_dict` returns `None` for `/Symbol` and `/ZapfDingbats`, which
+//! have no license-clean substitute in the bundled set, so that text stays
+//! unpainted at every tier rather than borrowing an unrelated face's
+//! glyphs; a "bold" *sans* request is not visually distinct from the
+//! regular weight, because Arimo ships only as a `[wght]` variable font
+//! and is rendered at its default (Regular) instance -- only italic varies,
+//! via a separate static face; and advancing *unpainted* non-embedded text
+//! at `AllEmbedded` (giving that tier the AFM-14 benefit even though it
+//! paints nothing) is deferred -- the AFM tables exist and feed the
+//! `Full`-tier substitute advance now, not any earlier tier.
 
 use pdfboss_core::{Dict, Document};
 
