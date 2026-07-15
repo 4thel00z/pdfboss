@@ -1707,4 +1707,68 @@ mod tests {
             "d0 glyph paints its own color (blue), got {r},{g},{b}"
         );
     }
+
+    #[test]
+    fn type3_d0_nested_in_d1_regains_color() {
+        // ISO 32000-1 9.6.5.2: a `d1` (uncolored) CharProc must not apply its
+        // own color -- it paints in the inherited text fill (red here). But
+        // that lock must not leak into a `d0` (colored) CharProc shown *from
+        // inside* the `d1` glyph (a Type3 font showing itself, ISO 32000-1
+        // 9.6.5): the nested `d0` must regain full color control and paint
+        // its own color (blue), because the lock is saved/restored per
+        // CharProc frame and set to `is_d1`, not hardcoded on.
+        //
+        // Geometry: FontMatrix [0.001 0 0 0.001 0 0], 100pt /Tf, page
+        // 200x200 -- the shared box-glyph setup used throughout this module.
+        // The outer `d1` box "100 0 500 700 re f" lands at device (55,115),
+        // same as the other d0/d1 tests above. Its content then shows the
+        // nested `d0` glyph via its own BT/Tf/Td/Tj at glyph-space offset
+        // (800, 0); working through the nested glyph matrix, that glyph's
+        // (deliberately larger, to stay easily samplable) box
+        // "1000 0 2000 3000 re f" lands at device x in [110,130], y in
+        // [120,150] -- disjoint in x from the outer box's [30,80], so the
+        // two boxes cannot overlap on the device.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        // Red text fill, then show code 65 -> the outer `d1` glyph.
+        b.stream(4, "", b"1 0 0 rg BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+             /FontMatrix [0.001 0 0 0.001 0 0] \
+             /Encoding << /Differences [65 /d1glyph 66 /d0glyph] >> \
+             /CharProcs << /d1glyph 6 0 R /d0glyph 7 0 R >> \
+             /FirstChar 65 /Widths [1000 1000] >>",
+        );
+        // d1 (uncolored): tries blue on its own box (must be suppressed and
+        // paint red instead), then shows the nested d0 glyph (code 66),
+        // which must regain color control for its own subtree.
+        b.stream(
+            6,
+            "",
+            b"1000 0 0 0 1000 1000 d1 0 0 1 rg 100 0 500 700 re f \
+              BT /F0 100 Tf 800 0 Td <42> Tj ET",
+        );
+        // d0 (colored): paints its own blue, at a glyph-space box that maps
+        // to a device location disjoint from the outer one.
+        b.stream(7, "", b"1000 0 d0 0 0 1 rg 1000 0 2000 3000 re f");
+        let pix = render_at_tier(&b.build(1), GlyphPainting::AllEmbedded);
+
+        let [r, g, bch, _] = px(&pix, 55, 115);
+        assert!(
+            r > 200 && g < 60 && bch < 60,
+            "outer d1 box must paint the inherited text fill (red), got {r},{g},{bch}"
+        );
+        let [r, g, bch, _] = px(&pix, 120, 135);
+        assert!(
+            bch > 200 && r < 60 && g < 60,
+            "nested d0 box must regain its own color (blue), got {r},{g},{bch}"
+        );
+    }
 }
