@@ -31,8 +31,10 @@ const FDSELECT_OP: u16 = 0x0c00 | 37;
 
 // --- Private DICT operator keys ---------------------------------------------
 const PRIV_SUBRS_OP: u16 = 19;
-const PRIV_DEFAULT_WIDTH_X_OP: u16 = 20;
-const PRIV_NOMINAL_WIDTH_X_OP: u16 = 21;
+// `defaultWidthX` (20) and `nominalWidthX` (21) are intentionally not listed
+// here: `parse_private` never extracts them (see its doc comment for why),
+// so the only remaining reference to those operator codes is in the test
+// fixture builders below, which declare their own copies.
 
 /// SIDs `0..=390` are reserved for the CFF standard strings regardless of how
 /// many of them this module bundles; `391+` index the font's String INDEX.
@@ -99,9 +101,6 @@ const STANDARD_STRINGS: &[&str] = &[
 /// CIDs to glyph indices and (for a later task) to interpret each glyph's
 /// Type2 charstring.
 pub(crate) struct CffFont {
-    /// The full font program; later accessors (the Type2 interpreter) resolve
-    /// further absolute offsets against it.
-    data: Vec<u8>,
     char_strings: Index,
     global_subrs: Index,
     /// The CFF String INDEX, for resolving custom glyph names (SID >= 391).
@@ -164,7 +163,6 @@ impl CffFont {
         };
 
         Some(CffFont {
-            data,
             char_strings,
             global_subrs,
             strings,
@@ -192,13 +190,52 @@ impl CffFont {
         self.charset.gid_for_code(sid)
     }
 
+    /// Maps a glyph index to its name (non-CID fonts only): charset gid ->
+    /// SID, then SID -> string (the bundled standard strings for SID < 391,
+    /// else the font's own String INDEX). `None` for CID-keyed fonts (no
+    /// names), an out-of-range gid, or a SID this font's String INDEX
+    /// doesn't cover.
+    pub(crate) fn name_for_gid(&self, gid: u16) -> Option<String> {
+        if self.is_cid {
+            return None;
+        }
+        let sid = self.charset.sid_for_gid(gid)?;
+        self.name_for_sid(sid)
+    }
+
     /// Maps a CID to a glyph index (CID-keyed fonts only) via the charset,
-    /// which stores gid -> CID for this font kind.
+    /// which stores gid -> CID for this font kind. `GlyphFont`'s CID loader
+    /// inverts the whole charset once via `cid_to_gid` instead of looking up
+    /// one CID at a time, so this single-CID lookup has no production
+    /// caller yet; kept (and tested) as `gid_for_name`'s CID-keyed
+    /// counterpart.
+    #[allow(dead_code)]
     pub(crate) fn gid_for_cid(&self, cid: u16) -> Option<u16> {
         if !self.is_cid {
             return None;
         }
         self.charset.gid_for_code(cid)
+    }
+
+    /// Inverts the charset into a `cid -> gid` table (CID-keyed fonts only):
+    /// `out[cid]` is that CID's glyph index (0/`.notdef` where no glyph
+    /// claims the CID). Sized to the largest CID the charset actually uses,
+    /// plus one; CIDs are `u16`, so this is bounded to 65536 entries no
+    /// matter how a malformed charset is shaped. Empty for non-CID fonts.
+    pub(crate) fn cid_to_gid(&self) -> Vec<u16> {
+        if !self.is_cid {
+            return Vec::new();
+        }
+        let max_cid = self.charset.codes.iter().copied().max().unwrap_or(0);
+        let mut out = vec![0u16; max_cid as usize + 1];
+        for (gid, &cid) in self.charset.codes.iter().enumerate() {
+            // `codes.len()` (== num_glyphs) is bounded by the CharStrings
+            // INDEX's u16 count, so this cast never truncates.
+            if let Some(slot) = out.get_mut(cid as usize) {
+                *slot = gid as u16;
+            }
+        }
+        out
     }
 
     /// Font design units per em, from the Top DICT's `FontMatrix` (default
@@ -260,6 +297,19 @@ impl CffFont {
             }
         }
         None
+    }
+
+    /// Resolves a SID to its glyph name: the bundled standard-strings table
+    /// for `SID < 391`, otherwise the font's own String INDEX at `SID -
+    /// 391`. Mirrors `sid_for_name`'s two-tier lookup in reverse.
+    fn name_for_sid(&self, sid: u16) -> Option<String> {
+        if sid < NUM_STANDARD_STRINGS {
+            return STANDARD_STRINGS.get(sid as usize).map(|s| s.to_string());
+        }
+        let idx = (sid - NUM_STANDARD_STRINGS) as usize;
+        self.strings
+            .get(idx)
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -896,6 +946,12 @@ fn units_per_em_from_top_dict(top: &Dict) -> f32 {
 /// offset]`) and its local Subrs INDEX (offset relative to the Private
 /// DICT's own start). Works for both the non-CID Top DICT and a CID font's
 /// per-glyph Font DICT, since both use the same operator.
+///
+/// The Private DICT's `defaultWidthX`/`nominalWidthX` operands are
+/// deliberately not extracted: as `CffFont::glyph_path` documents, glyph
+/// widths for painting come from the PDF font dict's `/Widths` (or `/W`/
+/// `/DW`), never from the CFF program, so those two operands would only ever
+/// be parsed and then never read.
 fn parse_private(data: &[u8], dict: &Dict) -> Option<Private> {
     let v = dict.get(&PRIVATE_OP)?;
     if v.len() != 2 {
@@ -906,8 +962,6 @@ fn parse_private(data: &[u8], dict: &Dict) -> Option<Private> {
     let bytes = data.get(offset..offset.checked_add(size)?)?;
     let pd = parse_dict(bytes)?;
 
-    let default_width_x = first_num(&pd, PRIV_DEFAULT_WIDTH_X_OP).unwrap_or(0.0);
-    let nominal_width_x = first_num(&pd, PRIV_NOMINAL_WIDTH_X_OP).unwrap_or(0.0);
     let local_subrs = match first_num(&pd, PRIV_SUBRS_OP) {
         Some(rel_off) => {
             let subrs_off = offset.checked_add(rel_off as usize)?;
@@ -917,11 +971,7 @@ fn parse_private(data: &[u8], dict: &Dict) -> Option<Private> {
         }
         None => Index::default(),
     };
-    Some(Private {
-        default_width_x,
-        nominal_width_x,
-        local_subrs,
-    })
+    Some(Private { local_subrs })
 }
 
 /// The first operand of `key`, if `dict` has an entry for it.
@@ -930,10 +980,8 @@ fn first_num(dict: &Dict, key: u16) -> Option<f64> {
 }
 
 /// A font's (or, for CID-keyed fonts, one font DICT's) local resources: the
-/// default/nominal glyph widths and the local Subrs INDEX used by `callsubr`.
+/// local Subrs INDEX used by `callsubr`.
 struct Private {
-    default_width_x: f64,
-    nominal_width_x: f64,
     local_subrs: Index,
 }
 
@@ -1081,6 +1129,14 @@ impl Charset {
             return Some(0);
         }
         self.codes.iter().position(|&c| c == code).map(|g| g as u16)
+    }
+
+    /// The SID/CID for `gid` (the inverse of `gid_for_code`), or `None` if
+    /// `gid` is out of range. `.notdef` (gid 0) always resolves to code 0,
+    /// which is how the on-disk charset already represents it (`codes[0]`
+    /// is left at its zero-initialized default -- see `parse`).
+    fn sid_for_gid(&self, gid: u16) -> Option<u16> {
+        self.codes.get(gid as usize).copied()
     }
 }
 
@@ -1242,7 +1298,7 @@ fn read_uint(d: &[u8], o: usize, size: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::truetype::Seg;
 
@@ -1317,6 +1373,13 @@ mod tests {
         dict_operator(&mut d, PRIVATE_OP);
         d
     }
+
+    // `parse_private` doesn't extract these two operands into `Private`
+    // (see its doc comment), so production no longer names them; the
+    // fixture builders below still embed them, to keep the synthetic Private
+    // DICTs realistic and to exercise the parser skipping past them.
+    const PRIV_DEFAULT_WIDTH_X_OP: u16 = 20;
+    const PRIV_NOMINAL_WIDTH_X_OP: u16 = 21;
 
     fn build_private_dict(default_width_x: i32, nominal_width_x: i32) -> Vec<u8> {
         let mut d = Vec::new();
@@ -1721,6 +1784,179 @@ mod tests {
         out.extend_from_slice(&fd_select);
         out.extend_from_slice(&charstrings_index);
         out
+    }
+
+    // --- glyph.rs's embedded-CFF paint fixtures --------------------------------
+    //
+    // A real box-glyph charstring (not just `endchar`), reused by both a
+    // named non-CID charset entry and a CID-keyed one so glyph.rs's tier-gate
+    // render tests can exercise the whole `GlyphFont::load` -> `outline`
+    // path, not just container parsing.
+
+    /// The Type2 charstring for a box glyph tracing (100,0)-(600,700) in
+    /// 1000-upm font units -- the same rectangle `truetype::tests::
+    /// build_font` uses, so callers can reuse its known device-pixel
+    /// position. Every operand is a small decimal delta (Type2 charstrings
+    /// are relative); a delta bigger than the compact single-byte operand
+    /// range is chained as several smaller ones within one `rlineto`.
+    fn box_glyph_charstring() -> Vec<u8> {
+        const RMOVETO: u8 = 21;
+        const RLINETO: u8 = 5;
+
+        let mut cs = Vec::new();
+        t2_int(&mut cs, 100);
+        t2_int(&mut cs, 0);
+        t2_op(&mut cs, RMOVETO); // move to (100, 0)
+        for _ in 0..5 {
+            t2_int(&mut cs, 100); // (100,0) -> (600,0): +500, as 5 x +100
+            t2_int(&mut cs, 0);
+        }
+        for _ in 0..7 {
+            t2_int(&mut cs, 0); // (600,0) -> (600,700): +700, as 7 x +100
+            t2_int(&mut cs, 100);
+        }
+        for _ in 0..5 {
+            t2_int(&mut cs, -100); // (600,700) -> (100,700): -500, as 5 x -100
+            t2_int(&mut cs, 0);
+        }
+        t2_op(&mut cs, RLINETO); // one rlineto call draws all 17 segments above
+        t2_op(&mut cs, ENDCHAR);
+        cs
+    }
+
+    /// Builds a minimal non-CID CFF font: gid 0 is `.notdef`; gid 1 is the
+    /// box glyph from `box_glyph_charstring`, named `glyph_name` via a custom
+    /// String INDEX entry (mirrors `build_fixture`'s charset/String-INDEX
+    /// layout, but with a real outline instead of a bare `endchar`).
+    pub(crate) fn build_box_glyph_fixture(glyph_name: &str) -> Vec<u8> {
+        let cs = box_glyph_charstring();
+        let notdef: &[u8] = &[ENDCHAR];
+
+        let header = vec![1u8, 0, 4, 4];
+        let name_index = build_index(&[b"Synthetic"]);
+        let string_index = build_index(&[glyph_name.as_bytes()]);
+        let global_subr_index = build_index(&[]);
+        let charstrings_index = build_index(&[notdef, &cs]);
+        let charset = charset_format0(&[391]); // gid 1 -> SID 391 (glyph_name)
+        let private = build_private_dict(0, 0);
+
+        let placeholder_top = build_top_dict(0, 0, private.len() as i32, 0);
+        let top_dict_index_len = build_index(&[&placeholder_top]).len();
+
+        let prefix_len = header.len()
+            + name_index.len()
+            + top_dict_index_len
+            + string_index.len()
+            + global_subr_index.len();
+
+        let charset_off = prefix_len as i32;
+        let private_off = charset_off + charset.len() as i32;
+        let charstrings_off = private_off + private.len() as i32;
+
+        let top_dict = build_top_dict(
+            charstrings_off,
+            charset_off,
+            private.len() as i32,
+            private_off,
+        );
+        let top_dict_index = build_index(&[&top_dict]);
+        assert_eq!(top_dict_index.len(), top_dict_index_len);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&name_index);
+        out.extend_from_slice(&top_dict_index);
+        out.extend_from_slice(&string_index);
+        out.extend_from_slice(&global_subr_index);
+        out.extend_from_slice(&charset);
+        out.extend_from_slice(&private);
+        out.extend_from_slice(&charstrings_index);
+        out
+    }
+
+    /// Builds a minimal CID-keyed CFF font: gid 0 is `.notdef`; gid 1 is the
+    /// box glyph from `box_glyph_charstring`, mapped to `cid` via the charset
+    /// (mirrors `build_fixture_cid`'s FDArray/FDSelect layout, but with a
+    /// real outline instead of a bare `endchar`).
+    pub(crate) fn build_box_glyph_fixture_cid(cid: u16) -> Vec<u8> {
+        let cs = box_glyph_charstring();
+        let notdef: &[u8] = &[ENDCHAR];
+
+        let header = vec![1u8, 0, 4, 4];
+        let name_index = build_index(&[b"SyntheticCID"]);
+        let string_index = build_index(&[]); // CID fonts carry no glyph names
+        let global_subr_index = build_index(&[]);
+        let charstrings_index = build_index(&[notdef, &cs]);
+        let charset = charset_format0(&[cid]); // gid 1 -> CID `cid`
+        let fd_select = vec![0u8, 0, 0]; // format 0, fd 0 for both glyphs
+        let private = build_private_dict(0, 0);
+
+        let placeholder_top = build_cid_top_dict(0, 0, 0, 0);
+        let top_dict_index_len = build_index(&[&placeholder_top]).len();
+
+        let prefix_len = header.len()
+            + name_index.len()
+            + top_dict_index_len
+            + string_index.len()
+            + global_subr_index.len();
+
+        let charset_off = prefix_len as i32;
+        let private_off = charset_off + charset.len() as i32;
+        let fd_dict = build_fd_dict(private.len() as i32, private_off);
+        let fd_array_index = build_index(&[&fd_dict]);
+        let fd_array_off = private_off + private.len() as i32;
+        let fd_select_off = fd_array_off + fd_array_index.len() as i32;
+        let charstrings_off = fd_select_off + fd_select.len() as i32;
+
+        let top_dict =
+            build_cid_top_dict(charstrings_off, charset_off, fd_array_off, fd_select_off);
+        let top_dict_index = build_index(&[&top_dict]);
+        assert_eq!(top_dict_index.len(), top_dict_index_len);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&name_index);
+        out.extend_from_slice(&top_dict_index);
+        out.extend_from_slice(&string_index);
+        out.extend_from_slice(&global_subr_index);
+        out.extend_from_slice(&charset);
+        out.extend_from_slice(&private);
+        out.extend_from_slice(&fd_array_index);
+        out.extend_from_slice(&fd_select);
+        out.extend_from_slice(&charstrings_index);
+        out
+    }
+
+    #[test]
+    fn box_glyph_fixture_paints_expected_rectangle() {
+        // Locks in `box_glyph_charstring`'s geometry independent of
+        // glyph.rs's render tests, which only assert a single pixel.
+        let font = CffFont::parse(build_box_glyph_fixture("thebox")).expect("fixture parses");
+        assert_eq!(font.gid_for_name("thebox"), Some(1));
+        assert_eq!(
+            font.glyph_path(1),
+            vec![
+                Seg::Move(100.0, 0.0),
+                Seg::Line(200.0, 0.0),
+                Seg::Line(300.0, 0.0),
+                Seg::Line(400.0, 0.0),
+                Seg::Line(500.0, 0.0),
+                Seg::Line(600.0, 0.0),
+                Seg::Line(600.0, 100.0),
+                Seg::Line(600.0, 200.0),
+                Seg::Line(600.0, 300.0),
+                Seg::Line(600.0, 400.0),
+                Seg::Line(600.0, 500.0),
+                Seg::Line(600.0, 600.0),
+                Seg::Line(600.0, 700.0),
+                Seg::Line(500.0, 700.0),
+                Seg::Line(400.0, 700.0),
+                Seg::Line(300.0, 700.0),
+                Seg::Line(200.0, 700.0),
+                Seg::Line(100.0, 700.0),
+                Seg::Close,
+            ]
+        );
     }
 
     #[test]

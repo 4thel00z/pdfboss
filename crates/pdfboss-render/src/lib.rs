@@ -4,7 +4,6 @@
 
 // The rasterizer modules are consumed by the content-stream executor; the
 // `dead_code` allowances below disappear once it is wired up.
-#[allow(dead_code)] // consumed by Tasks 2-3 (Type2 interpreter, GlyphFont loader)
 mod cff;
 #[allow(dead_code)]
 mod color;
@@ -84,6 +83,14 @@ pub enum GlyphPainting {
     AllEmbedded,
     /// Also substitute bundled or caller-provided faces for non-embedded fonts.
     Full,
+}
+
+impl GlyphPainting {
+    /// Whether this tier paints every embedded program (CFF, Type1, Type3),
+    /// not just embedded TrueType.
+    pub fn paints_all_embedded(self) -> bool {
+        !matches!(self, GlyphPainting::EmbeddedTrueTypeOnly)
+    }
 }
 
 /// Options controlling a single page render.
