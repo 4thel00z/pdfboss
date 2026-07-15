@@ -6,12 +6,18 @@
 //! embedded CFF `FontFile3` program or a real Type1 charstring `FontFile`
 //! program) and `CIDFontType0` descendants carrying an embedded CFF
 //! `FontFile3` program once the tier reaches `AllEmbedded`. At the `Full`
-//! tier, a font with no embedded program of its own (a non-embedded simple
-//! font, including the standard 14) instead substitutes a provider-supplied
-//! TrueType face (`crate::substitute`), with Adobe Core-14 AFM metrics
-//! filling in for a missing `/Widths`. Type3 and any font that still yields
-//! no result (Symbol/ZapfDingbats, or `Full` with no substitute provider)
-//! leave that text unpainted rather than guessing.
+//! tier, a SIMPLE font with no embedded program of its own (a non-embedded
+//! `/TrueType`, `/Type1`, or `/MMType1` font, including the standard 14)
+//! instead substitutes a provider-supplied TrueType face
+//! (`crate::substitute`), with Adobe Core-14 AFM metrics filling in for a
+//! missing `/Widths`. Substitution is scoped to simple font subtypes only:
+//! a `/Type0` composite font's codes are two bytes wide and a substitute's
+//! 1-byte table would mis-split them, so a non-embedded `/Type0` never
+//! substitutes, at any tier. `/Type3` (whose glyphs paint via
+//! `/CharProcs`, handled by the executor re-entering itself, not this
+//! module) and any font that still yields no result (Symbol/ZapfDingbats,
+//! or `Full` with no substitute provider) leave that text unpainted rather
+//! than guessing.
 
 use std::collections::HashMap;
 
@@ -111,28 +117,23 @@ impl GlyphFont {
     ) -> Option<GlyphFont> {
         // Embedded TrueType paints at every tier. CFF and Type1 (simple
         // Type1/MMType1 fonts, and CIDFontType0 descendants for CFF) join at
-        // `AllEmbedded`+; Type3 is a later plan.
-        let embedded = match font.get_name("Subtype").map(|n| n.0.as_str()) {
+        // `AllEmbedded`+. `Full`-tier substitution (`substitute_at_full`) is
+        // chained only onto the SIMPLE font arms (TrueType, Type1,
+        // MMType1): `Type0` never substitutes (its codes are two bytes wide;
+        // a substitute's 1-byte table would mis-split them), and `Type3`
+        // (the executor's `/CharProcs` path) falls into the `_` catch-all,
+        // which also never substitutes.
+        match font.get_name("Subtype").map(|n| n.0.as_str()) {
             Some("Type0") => load_type0(doc, font, painting),
-            Some("TrueType") => load_simple(doc, font),
+            Some("TrueType") => {
+                load_simple(doc, font).or_else(|| substitute_at_full(doc, font, painting, provider))
+            }
             Some("Type1") | Some("MMType1") if painting.paints_all_embedded() => {
                 load_simple_type1_or_cff(doc, font)
+                    .or_else(|| substitute_at_full(doc, font, painting, provider))
             }
             _ => None,
-        };
-        if embedded.is_some() {
-            return embedded;
         }
-
-        // `Full`'s non-embedded last resort: substitute a provider-supplied
-        // face. Gated on both the tier and an actual provider, so `Full`
-        // with no `SubstituteSource` behaves exactly like `AllEmbedded`.
-        if painting == GlyphPainting::Full {
-            if let Some(provider) = provider {
-                return load_substitute(doc, font, provider);
-            }
-        }
-        None
     }
 
     /// Whether codes are two bytes wide (composite fonts).
@@ -512,6 +513,28 @@ fn is_standard_encoding(doc: &Document, font: &Dict) -> bool {
         _ => return true, // no /Encoding at all -> defaults to Standard
     };
     !matches!(name.as_str(), "WinAnsiEncoding" | "MacRomanEncoding")
+}
+
+/// `Full`'s non-embedded last resort: substitutes a provider-supplied face.
+/// Gated on both the tier and an actual provider, so `Full` with no
+/// `SubstituteSource` behaves exactly like `AllEmbedded`.
+///
+/// Only ever chained onto a SIMPLE font subtype's arm in `GlyphFont::load`
+/// (`TrueType`, `Type1`, `MMType1`) -- never called for `Type0` (whose
+/// two-byte codes a 1-byte substitute table would mis-split) or `Type3`
+/// (whose glyphs paint via `/CharProcs`, not an outline).
+fn substitute_at_full(
+    doc: &Document,
+    font: &Dict,
+    painting: GlyphPainting,
+    provider: Option<&dyn SubstituteProvider>,
+) -> Option<GlyphFont> {
+    if painting == GlyphPainting::Full {
+        if let Some(provider) = provider {
+            return load_substitute(doc, font, provider);
+        }
+    }
+    None
 }
 
 /// Loads a non-embedded font at the `Full` tier by substituting a
