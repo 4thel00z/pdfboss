@@ -304,7 +304,10 @@ struct Executor<'a> {
     color_locked: bool,
     /// The `Full`-tier substitute source built from
     /// [`RenderOptions::substitutes`], if any. Passed through to
-    /// [`GlyphFont::load`], which does not yet consult it.
+    /// [`GlyphFont::load`], which consults it to substitute a non-embedded
+    /// SIMPLE font (`/TrueType`, `/Type1`, `/MMType1`) at the `Full` tier;
+    /// `/Type0` and `/Type3` fonts never consult it (see `glyph.rs`'s module
+    /// doc).
     provider: Option<Box<dyn SubstituteProvider>>,
 }
 
@@ -1786,5 +1789,133 @@ mod tests {
             bch > 200 && r < 60 && g < 60,
             "nested d0 box must regain its own color (blue), got {r},{g},{bch}"
         );
+    }
+
+    // --- Task 3 review-fix: substitution scoped to simple fonts only --------
+    //
+    // `GlyphFont::load` used to run `Full`-tier substitution unconditionally
+    // once every embedded loader had declined, regardless of `/Subtype`. That
+    // let a `/Type3` font (whose `FaceRequest::from_font_dict` resolves fine
+    // -- nothing there checks `/Subtype`) reach `load_substitute`, so at
+    // `Full` + a provider, `ts.font` came back `Some` and `Executor::run`'s
+    // `ts.type3 = if ts.font.is_some() { None } else { ... }` never resolved
+    // the Type3 font at all -- the CharProcs were silently replaced by a
+    // substitute glyph. The fix chains `substitute_at_full` only onto the
+    // `TrueType`/`Type1`/`MMType1` arms of `GlyphFont::load`'s match, leaving
+    // `Type0` and the `Type3`/unknown `_` catch-all substitution-free.
+
+    /// Writes `bytes` to `basename` inside a freshly created temp directory,
+    /// ready to hand to `SubstituteSource::Dir`/`DirProvider` (mirrors
+    /// `glyph::tests::write_temp_face`).
+    fn write_temp_face(tag: &str, basename: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfboss-executor-{tag}-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join(basename), bytes).expect("write fixture face");
+        dir
+    }
+
+    #[test]
+    fn type3_at_full_with_provider_still_paints_via_charprocs() {
+        // The critical guard: code 0x80 is deliberately NOT 'A' (0x41) -- the
+        // only code point `truetype::tests::build_font` (used here as the
+        // SUBSTITUTE face) maps to a paintable glyph. If substitution ever
+        // wrongly fired for this Type3 font, gid 0 (.notdef) would leave the
+        // page blank; only the real Type3 CharProc path paints the box.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <80> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+             /FontMatrix [0.001 0 0 0.001 0 0] \
+             /Encoding << /Differences [128 /boxglyph] >> \
+             /CharProcs << /boxglyph 6 0 R >> /FirstChar 128 /Widths [1000] >>",
+        );
+        b.stream(6, "", b"1000 0 d0 100 0 500 700 re f");
+        let bytes = b.build(1);
+
+        let dir = write_temp_face(
+            "type3-substitute",
+            "Arimo[wght].ttf",
+            &crate::truetype::tests::build_font(),
+        );
+
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let opts = RenderOptions {
+            glyph_painting: GlyphPainting::Full,
+            substitutes: SubstituteSource::Dir(dir.clone()),
+        };
+        let pix = render_page_with_options(&doc, &page, 1.0, &opts).expect("render");
+        assert!(
+            dark_at(&pix, 55, 115),
+            "Type3 CharProc box must still paint at Full+provider, not be \
+             clobbered by wrongly-fired substitution"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_embedded_type0_at_full_with_provider_stays_blank() {
+        // The important guard: a /Type0 font with no embedded FontFile* at
+        // all must never reach substitution -- `load_substitute` builds a
+        // 1-byte-per-code table, but Type0 codes under Identity-H are two
+        // bytes wide, so if substitution ever fired here, <0041> would
+        // mis-split into codes 0x00 and 0x41 (the latter resolving, via
+        // StandardEncoding and the substitute's cmap, to the paintable box
+        // glyph) and paint stray ink instead of staying blank.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <0041> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /Helvetica \
+             /Encoding /Identity-H /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Helvetica >>",
+        );
+        let bytes = b.build(1);
+
+        let dir = write_temp_face(
+            "type0-substitute",
+            "Arimo[wght].ttf",
+            &crate::truetype::tests::build_font(),
+        );
+
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let opts = RenderOptions {
+            glyph_painting: GlyphPainting::Full,
+            substitutes: SubstituteSource::Dir(dir.clone()),
+        };
+        let pix = render_page_with_options(&doc, &page, 1.0, &opts).expect("render");
+        assert!(
+            !dark_at(&pix, 55, 115),
+            "non-embedded Type0 must not be substituted into mis-split garbage"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
