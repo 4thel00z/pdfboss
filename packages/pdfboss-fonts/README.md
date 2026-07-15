@@ -20,3 +20,13 @@ pdfboss_fonts.font_dir()  # -> absolute path to the bundled .ttf directory
 
 The bundled fonts are licensed under the SIL Open Font License, Version 1.1
 (OFL-1.1). See `pdfboss_fonts/fonts/OFL.txt` and `pdfboss_fonts/fonts/NOTICE`.
+
+## Release pipeline
+
+This package is released independently of `pdfboss` via its own
+release-please component (`packages/pdfboss-fonts`, tagged
+`pdfboss-fonts-vX.Y.Z`) and publishes to PyPI over Trusted Publishing in
+`.github/workflows/release-please.yaml`. **The maintainer must register a
+separate `pdfboss-fonts` Trusted Publisher on PyPI** (its own PyPI project,
+distinct from `pdfboss`'s) before the first automated publish will succeed —
+same one-time setup as was done for `pdfboss`.

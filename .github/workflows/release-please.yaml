@@ -18,6 +18,14 @@ jobs:
       release_created: ${{ steps.rp.outputs.release_created }}
       prs_created: ${{ steps.rp.outputs.prs_created }}
       pr: ${{ steps.rp.outputs.pr }}
+      # Per-package outputs for the manifest-mode "packages/pdfboss-fonts"
+      # component: release-please-action v5 exposes these as
+      # `<path>--<field>` keys alongside the top-level (root-package) ones
+      # above. Using the component-scoped key (rather than substring-matching
+      # `paths_released`) means the pdfboss-fonts publish job only fires when
+      # THAT component released, not whenever any path released.
+      fonts_release_created: ${{ steps.rp.outputs['packages/pdfboss-fonts--release_created'] }}
+      fonts_tag_name: ${{ steps.rp.outputs['packages/pdfboss-fonts--tag_name'] }}
     steps:
       - uses: googleapis/release-please-action@v5
         id: rp
@@ -135,4 +143,36 @@ jobs:
           packages-dir: dist
           # Manual re-dispatch after a partial publish must not choke on
           # the wheels that already made it to PyPI.
+          skip-existing: true
+
+  # pdfboss-fonts is a separate, pure-Python data package (packages/pdfboss-fonts)
+  # released independently of the pdfboss engine — it has its own component
+  # entry in release-please-config.json (tag pdfboss-fonts-vX) and therefore
+  # its own gate, build and publish steps here.
+  publish-pdfboss-fonts:
+    needs: release-please
+    if: needs.release-please.outputs.fonts_release_created == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      # Trusted Publishing (OIDC) — no API token needed. NOTE: the
+      # maintainer must register a *separate* "pdfboss-fonts" Trusted
+      # Publisher on PyPI (its own project, distinct from "pdfboss"),
+      # the same way the "pdfboss" Trusted Publisher was registered.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install build
+        run: python -m pip install --upgrade build
+      - name: Build pdfboss-fonts sdist and wheel
+        run: python -m build packages/pdfboss-fonts --outdir dist
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Manual re-dispatch after a partial publish must not choke on
+          # artifacts that already made it to PyPI.
           skip-existing: true

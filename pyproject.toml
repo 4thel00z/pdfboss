@@ -26,6 +26,12 @@ classifiers = [
 Repository = "https://github.com/4thel00z/pdfboss"
 Issues = "https://github.com/4thel00z/pdfboss/issues"
 
+[project.optional-dependencies]
+# Pulls in the bundled OFL substitute fonts (packages/pdfboss-fonts) so
+# non-embedded-font glyphs render instead of falling back to tofu boxes.
+# The default wheel stays lean: no fonts ship unless this extra is installed.
+full = ["pdfboss-fonts>=0.1"]
+
 [tool.maturin]
 python-source = "python"
 module-name = "pdfboss._pdfboss"
