@@ -277,6 +277,7 @@ pub(crate) fn render_page_with_options(
         doc,
         pix,
         painting: opts.glyph_painting,
+        color_locked: false,
     };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
     Ok(exec.pix)
@@ -288,6 +289,11 @@ struct Executor<'a> {
     doc: &'a Document,
     pix: Pixmap,
     painting: GlyphPainting,
+    /// Set while painting a `d1` (uncolored) Type3 CharProc: ISO 32000-1
+    /// §9.6.5.2 says such a glyph "shall not specify any color", so
+    /// `run_color_or_misc` turns every fill/stroke color-setting op into a
+    /// no-op and the glyph keeps the color inherited from the text state.
+    color_locked: bool,
 }
 
 impl Executor<'_> {
@@ -753,6 +759,16 @@ impl Executor<'_> {
     /// prepended to `chain`, and `depth + 1`. Inherits the caller's clip,
     /// alpha, and fill color (the color a `d0` glyph paints in). Every failure
     /// is a silent skip, matching the caller's still-advance leniency.
+    ///
+    /// ISO 32000-1 §9.6.5.2: the CharProc's *first* operator is `d0`
+    /// (colored) or `d1` (uncolored). A `d1` glyph "shall not specify any
+    /// color" -- its own color operators are ignored and it paints in the
+    /// current text fill color -- so `color_locked` is set for the nested
+    /// `run` iff the first op is `Op::SetGlyphWidthBBox`. The previous lock
+    /// is saved and restored around the call (not just set to `true`) so a
+    /// `d0` glyph nested inside a `d1` glyph regains color control for its
+    /// own subtree, while a `d1` nested inside a `d1` stays locked, and the
+    /// lock never leaks into sibling or outer content.
     fn run_char_proc(
         &mut self,
         proc_obj: &Object,
@@ -778,12 +794,39 @@ impl Executor<'_> {
             inner_chain.push(d);
         }
         inner_chain.extend_from_slice(chain);
+        let is_d1 = matches!(ops.first(), Some(Op::SetGlyphWidthBBox(..)));
+        let saved_lock = self.color_locked;
+        self.color_locked = is_d1;
         self.run(&ops, &inner_chain, inner, depth + 1);
+        self.color_locked = saved_lock;
     }
 
     /// Dispatches color, XObject, and marked-content operators (the remainder
     /// of the [`Op`] alphabet not handled directly in `run`).
+    ///
+    /// Every fill/stroke color-setting arm is a no-op while
+    /// `self.color_locked` (inside a `d1` Type3 CharProc, ISO 32000-1
+    /// §9.6.5.2): the glyph keeps the fill/stroke color inherited from the
+    /// text graphics state instead of applying its own. XObject, inline
+    /// image, shading, and marked-content ops are unaffected by the lock.
     fn run_color_or_misc(&mut self, op: &Op, chain: &[&Dict], gs: &mut GState, depth: u32) {
+        if self.color_locked {
+            match op {
+                Op::SetFillColorSpace(_)
+                | Op::SetStrokeColorSpace(_)
+                | Op::SetFillColor(_)
+                | Op::SetStrokeColor(_)
+                | Op::SetFillColorN(_, _)
+                | Op::SetStrokeColorN(_, _)
+                | Op::SetFillGray(_)
+                | Op::SetStrokeGray(_)
+                | Op::SetFillRGB(_, _, _)
+                | Op::SetStrokeRGB(_, _, _)
+                | Op::SetFillCMYK(_, _, _, _)
+                | Op::SetStrokeCMYK(_, _, _, _) => return,
+                _ => {}
+            }
+        }
         match op {
             Op::SetFillColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, chain);
@@ -1631,6 +1674,37 @@ mod tests {
         assert!(
             dark_at(&pix, 135, 115),
             "second glyph at the /Widths-implied (135,115)"
+        );
+    }
+
+    #[test]
+    fn type3_d1_glyph_ignores_its_own_color_and_uses_text_fill() {
+        // Page sets fill RED before the text; the d1 CharProc tries to set blue.
+        // d1 is uncolored: the box must paint RED.
+        let doc = type3_page_doc(
+            "1000 0 0 0 1000 1000 d1 0 0 1 rg 100 0 500 700 re f",
+            b"1 0 0 rg BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        let pix = render_at_tier(&doc, GlyphPainting::AllEmbedded);
+        let [r, g, b, _] = px(&pix, 55, 115);
+        assert!(
+            r > 200 && g < 60 && b < 60,
+            "d1 glyph paints in the text fill (red), got {r},{g},{b}"
+        );
+    }
+
+    #[test]
+    fn type3_d0_glyph_honors_its_own_color() {
+        // d0 is colored: the CharProc's blue takes effect despite red text fill.
+        let doc = type3_page_doc(
+            "1000 0 d0 0 0 1 rg 100 0 500 700 re f",
+            b"1 0 0 rg BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        let pix = render_at_tier(&doc, GlyphPainting::AllEmbedded);
+        let [r, g, b, _] = px(&pix, 55, 115);
+        assert!(
+            b > 200 && r < 60 && g < 60,
+            "d0 glyph paints its own color (blue), got {r},{g},{b}"
         );
     }
 }
