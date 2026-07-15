@@ -987,8 +987,9 @@ mod tests {
 
     #[test]
     fn all_glyph_tiers_match_default_render_today() {
-        // Until CFF/Type1/Type3/substitute loaders land, every tier paints the
-        // same embedded-TrueType glyphs, so all tiers must equal the default.
+        // The content stream is a raw filled rectangle with no font at all,
+        // so no glyph loading happens at any tier -- the render is
+        // tier-invariant by construction, regardless of which loaders exist.
         let bytes = small_doc("", b"1 0 0 rg 10 10 80 80 re f", |_| {});
         let doc = Document::load(bytes).expect("load");
         let page = doc.page(0).expect("page");
