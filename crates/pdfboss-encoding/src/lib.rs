@@ -2,6 +2,9 @@
 //! ISO 32000 Appendix D) and a bundled glyph-name-to-Unicode subset, consumed
 //! by the pdfboss text-extraction and rendering crates.
 
+mod afm;
+pub use afm::{is_standard_14, standard_14_width};
+
 /// WinAnsiEncoding codes `0x80..=0x9F` (the region that differs from
 /// Latin-1); `None` marks unassigned codes.
 const WIN_ANSI_80_9F: [Option<char>; 32] = [
