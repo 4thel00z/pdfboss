@@ -771,9 +771,17 @@ impl<'a> Type1Interpreter<'a> {
     /// (OtherSubr 3) are recognized; any other `othersubr#` is a generic
     /// passthrough that moves its `n` args onto the PS stack so subsequent
     /// `pop`s balance.
+    ///
+    /// `n` is attacker-controlled (a hostile charstring can push an arbitrary
+    /// 32-bit value via the 255 number encoding, then an unknown
+    /// `othersubr#`). It is capped at `self.stack.len()` -- there can never be
+    /// more real args to pass through than operands actually on the stack --
+    /// so the passthrough loop below can iterate at most `MAX_STACK` times,
+    /// not up to `i32::MAX`. [`Self::push_ps`] additionally caps the PS stack
+    /// itself, so no OtherSubr path (known or unknown) can grow it unbounded.
     fn callothersubr(&mut self) {
         let othersubr = self.stack.pop().unwrap_or(0.0) as i32;
-        let n = self.stack.pop().unwrap_or(0.0).max(0.0) as usize;
+        let n = (self.stack.pop().unwrap_or(0.0).max(0.0) as usize).min(self.stack.len());
         match othersubr {
             1 => {
                 // Start flex: begin capturing points (there are no args).
@@ -792,28 +800,41 @@ impl<'a> Type1Interpreter<'a> {
                 self.end_flex();
                 // Push end_y then end_x so the following `pop pop
                 // setcurrentpoint` retrieves x first, then y.
-                self.ps_stack.push(end_y);
-                self.ps_stack.push(end_x);
+                self.push_ps(end_y);
+                self.push_ps(end_x);
             }
             _ => {
                 // OtherSubr 3 (hint replacement, 1 arg subr#) and any unknown
                 // OtherSubr: push the n args onto the PS stack in reverse so
                 // the following `pop`s retrieve them in their original order.
+                // `n` is already capped at `self.stack.len()` above, so this
+                // loop runs at most `MAX_STACK` times.
                 for _ in 0..n {
                     let v = self.stack.pop().unwrap_or(0.0);
-                    self.ps_stack.push(v);
+                    self.push_ps(v);
                 }
             }
+        }
+    }
+
+    /// Pushes onto the PS-interpreter stack, capping it at [`MAX_STACK`] so
+    /// that no `OtherSubr` path -- known or unknown -- can grow it without
+    /// bound (defense in depth alongside the `n` cap in
+    /// [`Self::callothersubr`]).
+    fn push_ps(&mut self, v: f32) {
+        if self.ps_stack.len() < MAX_STACK {
+            self.ps_stack.push(v);
         }
     }
 
     /// Ends a flex sequence: emits the two cubics described by the 7 collected
     /// points (index 0 is the reference point, ignored) and leaves the current
     /// point at the flex's final point. Degrades to emitting nothing if fewer
-    /// than 7 points were collected.
+    /// than 7 points were collected, or (mirroring the `lineto`/`curveto`
+    /// leniency) if no subpath is open -- a flex with no preceding `moveto`.
     fn end_flex(&mut self) {
         self.in_flex = false;
-        if self.flex_pts.len() >= 7 {
+        if self.open && self.flex_pts.len() >= 7 {
             let p = self.flex_pts.clone();
             self.segs.push(Seg::Cubic(
                 p[1].0 + self.ox,
@@ -1817,5 +1838,96 @@ pub(crate) mod tests {
         // Base box present at origin, accent Line translated by (200,300).
         assert!(path.contains(&Seg::Move(100.0, 0.0))); // base
         assert!(path.contains(&Seg::Line(250.0, 300.0))); // accent (50+200, 0+300)
+    }
+
+    #[test]
+    fn glyph_path_hostile_callothersubr_n_is_bounded() {
+        // Adversarial-input guard for the unknown-`OtherSubr` passthrough.
+        // `callothersubr` pops `othersubr#`, then `n`, then moves `n` args from
+        // the operand stack onto the PS stack. `n` is fully attacker-supplied:
+        // a hostile charstring can push a huge integer via the 255 number
+        // encoding, then an unknown `othersubr#`, then `12 16`. The pre-fix
+        // passthrough looped `for _ in 0..n { ps_stack.push(0.0) }` with `n`
+        // up to ~2.1e9 into an UNCAPPED `ps_stack` and no MAX_STEPS check
+        // inside -- a multi-GB allocation / hang / OOM on well-formed input.
+        // The fix caps `n` at `self.stack.len()` and `push_ps` caps the PS
+        // stack at MAX_STACK, so this must now return quickly and bounded.
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13); // hsbw
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 21); // rmoveto -> open a subpath at (0,0)
+                            // callothersubr with a hostile arg count: operand
+                            // order is (args..., n, othersubr#). We push a huge
+                            // `n` (2_000_000_000, encoded via the 255 form) and
+                            // an unknown `othersubr#` (99), then `12 16`.
+        cs_num(&mut cs, 2_000_000_000); // n (attacker-controlled, huge)
+        cs_num(&mut cs, 99); // unknown othersubr# -> generic passthrough branch
+        cs_escape(&mut cs, 16); // callothersubr
+        cs_op(&mut cs, 14); // endchar
+        let prog = build_type1_program("[0.001 0 0 0.001 0 0]", &[], &[("h", cs)], &[], 4);
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("h").unwrap();
+        let started = std::time::Instant::now();
+        let _ = f.glyph_path(gid); // must return, not hang / OOM
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "hostile callothersubr n must be bounded, not loop ~2.1e9 times \
+             pushing into an unbounded PS stack"
+        );
+    }
+
+    #[test]
+    fn glyph_path_large_number_uses_signed_i32_encoding() {
+        // A coordinate delta of 40000 is > 1131, so `cs_num` emits it via the
+        // 255 (32-bit signed big-endian INTEGER) number encoding. Asserting the
+        // resulting Seg coordinate is exactly 40000.0 proves the interpreter
+        // decodes byte 255 as a signed i32 -- NOT as Type2's 16.16 fixed value,
+        // which would divide by 65536 and give ~0.61 instead.
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13); // hsbw
+        cs_num(&mut cs, 40000);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 21); // rmoveto -> (40000, 0)
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 40000);
+        cs_op(&mut cs, 5); // rlineto -> (40000, 40000)
+        cs_op(&mut cs, 14); // endchar
+        let prog = build_type1_program("[0.001 0 0 0.001 0 0]", &[], &[("n", cs)], &[], 4);
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("n").unwrap();
+        assert_eq!(
+            f.glyph_path(gid),
+            vec![
+                Seg::Move(40000.0, 0.0),
+                Seg::Line(40000.0, 40000.0),
+                Seg::Close,
+            ]
+        );
+    }
+
+    #[test]
+    fn glyph_path_large_negative_number_uses_signed_i32_encoding() {
+        // The negative counterpart: -40000 via the 255 form must decode to
+        // exactly -40000.0, confirming the sign is preserved by the i32 decode.
+        let mut cs = Vec::new();
+        cs_num(&mut cs, 0);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 13); // hsbw
+        cs_num(&mut cs, -40000);
+        cs_num(&mut cs, 0);
+        cs_op(&mut cs, 21); // rmoveto -> (-40000, 0)
+        cs_op(&mut cs, 14); // endchar
+        let prog = build_type1_program("[0.001 0 0 0.001 0 0]", &[], &[("m", cs)], &[], 4);
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("m").unwrap();
+        assert_eq!(
+            f.glyph_path(gid),
+            vec![Seg::Move(-40000.0, 0.0), Seg::Close]
+        );
     }
 }
