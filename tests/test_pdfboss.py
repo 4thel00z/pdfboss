@@ -188,14 +188,43 @@ class TestRender:
         png = Document(str(hello_pdf))[0].render(fonts="embedded-only")
         assert png.startswith(PNG_MAGIC)
 
-    def test_render_fonts_full_degrades_cleanly(self, hello_pdf: Path) -> None:
-        # No substitute source is wired yet, so "full" behaves like the default.
-        page = Document(str(hello_pdf))[0]
-        assert page.render(fonts="full") == page.render(fonts="all-embedded")
-
     def test_render_unknown_fonts_raises_value_error(self, hello_pdf: Path) -> None:
         with pytest.raises(ValueError):
             Document(str(hello_pdf))[0].render(fonts="bogus")
+
+    def test_full_without_fonts_package_raises(self, hello_pdf: Path, monkeypatch) -> None:
+        # Force the discovery import to fail regardless of the test env.
+        monkeypatch.setitem(sys.modules, "pdfboss_fonts", None)
+        page = Document(str(hello_pdf))[0]
+        with pytest.raises((ValueError, ImportError)) as exc:
+            page.render(fonts="full")
+        assert "pdfboss[full]" in str(exc.value)
+
+    def test_full_with_explicit_font_dir_overrides_discovery(
+        self, hello_pdf: Path, tmp_path: Path, monkeypatch
+    ) -> None:
+        # An explicit font_dir bypasses pdfboss_fonts entirely (even absent).
+        monkeypatch.setitem(sys.modules, "pdfboss_fonts", None)
+        page = Document(str(hello_pdf))[0]
+        # An empty dir yields no faces -> Full degrades to all-embedded, but must
+        # NOT raise (font_dir provided).
+        png = page.render(fonts="full", font_dir=str(tmp_path))
+        assert png[:8] == PNG_MAGIC
+
+    def test_full_with_fonts_package_present(self, hello_pdf: Path) -> None:
+        pytest.importorskip("pdfboss_fonts")
+        page = Document(str(hello_pdf))[0]
+        png = page.render(fonts="full")  # discovers pdfboss_fonts, no raise
+        assert png[:8] == PNG_MAGIC
+
+    def test_embedded_tiers_never_touch_discovery(
+        self, hello_pdf: Path, monkeypatch
+    ) -> None:
+        monkeypatch.setitem(sys.modules, "pdfboss_fonts", None)
+        page = Document(str(hello_pdf))[0]
+        # all-embedded / embedded-only must not attempt discovery -> no raise.
+        assert page.render(fonts="all-embedded")[:8] == PNG_MAGIC
+        assert page.render(fonts="embedded-only")[:8] == PNG_MAGIC
 
 
 class TestThreading:
