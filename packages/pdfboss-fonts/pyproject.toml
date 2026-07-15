@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdfboss-fonts"
+version = "0.1.0"
+description = "Bundled OFL 1.1 substitute fonts (Croscore) for pdfboss[full]"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "OFL-1.1"
+license-files = ["pdfboss_fonts/fonts/OFL.txt"]
+authors = [{ name = "4thel00z" }]
+keywords = ["pdf", "fonts", "pdfboss", "ofl", "croscore"]
+
+[project.urls]
+Repository = "https://github.com/4thel00z/pdfboss"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pdfboss_fonts"]
+# hatchling includes non-.py files inside the package by default; the .ttf,
+# OFL.txt and NOTICE under pdfboss_fonts/fonts/ ship as package data.
