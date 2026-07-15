@@ -10,9 +10,14 @@
 //! inside it once decrypted (a later task decrypts those with
 //! `CHARSTRING_KEY`).
 //!
-//! This module only decrypts and segments a program into its clear-text
-//! header and decrypted private portion; parsing those bytes into a font
-//! (dictionaries, encoding, charstrings-as-outlines) is a later task's job.
+//! This module decrypts and segments a program into its clear-text header
+//! and decrypted private portion, then parses those bytes into a
+//! [`Type1Font`]: `/FontMatrix`, `/Encoding`, `/Subrs`, and `/CharStrings`
+//! (spec ch. 6 "Font Dictionary" and ch. 8 "Private Dictionary"; ISO 32000
+//! §9.6.6.2). Interpreting each charstring into an outline is a later
+//! task's job.
+
+use std::collections::HashMap;
 
 // --- Type1 stream cipher constants (spec ch. 7) -----------------------------
 
@@ -193,6 +198,379 @@ fn segment(program: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
+// --- Type1Font: parsed program (spec ch. 6, 8) ------------------------------
+
+/// Default `/lenIV` (spec ch. 8) when the decrypted private portion doesn't
+/// declare one: the number of scrambled lead bytes each charstring/subr's
+/// own (`CHARSTRING_KEY`-keyed) encryption drops, distinct from the fixed
+/// `EEXEC_SKIP` the outer `eexec` layer always uses.
+const DEFAULT_LEN_IV: usize = 4;
+
+/// Cap on the number of `/CharStrings` entries accepted: also the largest
+/// count a `u16` gid (`Type1Font::name_to_gid`, `gid_for_name`) can address,
+/// so it doubles as the defensive bound a hostile declared `/CharStrings
+/// <count>` calls for (this parser never allocates proportionally to that
+/// declared count in the first place -- see `parse_charstrings` -- but the
+/// accepted-entry cap still bounds the work a pathological input can cause).
+const MAX_GLYPHS: usize = 65_536;
+
+/// Cap on an individual `/Subrs` index (`dup <index> ...`): real fonts use
+/// small, roughly contiguous indices, so an index at or beyond this is
+/// almost certainly hostile input (e.g. `dup 4000000000 ...`) rather than
+/// something worth growing `subrs` to match.
+const MAX_SUBR_INDEX: usize = 65_536;
+
+/// A parsed Type 1 font: the pieces needed to map a glyph name to a
+/// charstring and (for a later task) interpret that charstring into an
+/// outline.
+pub(crate) struct Type1Font {
+    /// Decrypted charstring bytes per glyph, indexed by gid (gid 0 ==
+    /// ".notdef" when the font defines it; otherwise CharStrings appearance
+    /// order).
+    charstrings: Vec<Vec<u8>>,
+    /// gid -> glyph name, parallel to `charstrings`.
+    names: Vec<String>,
+    /// name -> gid.
+    name_to_gid: HashMap<String, u16>,
+    /// Decrypted local subroutines, indexed by subr number (gaps -> empty).
+    subrs: Vec<Vec<u8>>,
+    /// The font's built-in `/Encoding`: code -> glyph name (256 slots).
+    builtin_encoding: Box<[Option<String>; 256]>,
+    units_per_em: f32,
+}
+
+impl Type1Font {
+    /// Parses a decrypted-and-segmented Type1 program: [`segment`] splits it
+    /// into a clear-text header and eexec-decrypted private portion, then
+    /// `/FontMatrix` and `/Encoding` are read from the header and `/lenIV`,
+    /// `/Subrs`, and `/CharStrings` from the private portion.
+    ///
+    /// `/Encoding`'s `StandardEncoding` token form is deliberately NOT
+    /// expanded into a code -> name table here: this font's caller (a later
+    /// task) resolves the PDF `/Encoding` entry first and only falls back to
+    /// this font's built-in encoding when the PDF gives nothing, so the
+    /// built-in `StandardEncoding` case is already covered from the PDF
+    /// side. Only an explicit `dup <code> /<name> put` encoding array
+    /// populates `builtin_encoding` here; the bare `StandardEncoding` token
+    /// leaves every slot `None`.
+    ///
+    /// Returns `None` if `segment` fails, or if the program yields zero
+    /// charstrings (nothing paintable).
+    pub(crate) fn parse(program: Vec<u8>) -> Option<Type1Font> {
+        let (clear, private) = segment(&program)?;
+
+        let units_per_em = units_per_em_from_clear(&clear);
+        let builtin_encoding = parse_encoding(&clear);
+
+        let len_iv = parse_len_iv(&private);
+        let subrs = parse_subrs(&private, len_iv);
+        let (charstrings, names, name_to_gid) = parse_charstrings(&private, len_iv);
+
+        if charstrings.is_empty() {
+            return None;
+        }
+
+        Some(Type1Font {
+            charstrings,
+            names,
+            name_to_gid,
+            subrs,
+            builtin_encoding,
+            units_per_em,
+        })
+    }
+
+    /// Number of glyphs (the CharStrings entries found).
+    pub(crate) fn num_glyphs(&self) -> usize {
+        self.charstrings.len()
+    }
+
+    /// Maps a glyph name to a glyph index.
+    pub(crate) fn gid_for_name(&self, name: &str) -> Option<u16> {
+        self.name_to_gid.get(name).copied()
+    }
+
+    /// The font's built-in `/Encoding` name for `code` (see `parse`'s doc
+    /// comment for why the `StandardEncoding` form leaves this `None`
+    /// throughout).
+    pub(crate) fn builtin_name(&self, code: u8) -> Option<&str> {
+        self.builtin_encoding[code as usize].as_deref()
+    }
+
+    /// Font design units per em, from `/FontMatrix` (default 1000; see
+    /// `units_per_em_from_clear`).
+    pub(crate) fn units_per_em(&self) -> f32 {
+        self.units_per_em
+    }
+}
+
+// --- private-text/clear-text tokenizing (bounds-checked throughout) --------
+
+/// Finds the first occurrence of `needle` in `haystack`, or `None`. (A
+/// `needle` longer than `haystack` simply yields no windows, not a panic.)
+fn find_token(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Reads the next whitespace-delimited token at or after `i` (leading
+/// whitespace is skipped first). Returns the token and the index
+/// immediately following it -- which, per the grammar this module parses, is
+/// where the single mandatory separator byte before a binary blob lives.
+/// `None` once no token remains. Every read goes through `.get()`, so a
+/// wildly out-of-range `i` just yields `None` rather than panicking.
+fn next_token(bytes: &[u8], i: usize) -> Option<(&[u8], usize)> {
+    let mut p = i;
+    while bytes.get(p).is_some_and(|&b| is_ps_whitespace(b)) {
+        p += 1;
+    }
+    let start = p;
+    while bytes.get(p).is_some_and(|&b| !is_ps_whitespace(b)) {
+        p += 1;
+    }
+    if p == start {
+        return None;
+    }
+    bytes.get(start..p).map(|tok| (tok, p))
+}
+
+/// Parses a token as a non-negative decimal integer.
+fn parse_uint_token(tok: &[u8]) -> Option<usize> {
+    std::str::from_utf8(tok).ok()?.parse().ok()
+}
+
+/// Parses a token as an `f64`, tolerating a leading `[` (the matrix's first
+/// value is conventionally fused with its opening bracket, e.g. `[0.001`).
+fn parse_matrix_number(tok: &[u8]) -> Option<f64> {
+    let tok = tok.strip_prefix(b"[").unwrap_or(tok);
+    std::str::from_utf8(tok).ok()?.parse().ok()
+}
+
+/// Attempts to read one `<len> RD <len bytes>` (or `-|`) binary object (spec
+/// ch. 6) starting the token scan at `i`: the next token must be a decimal
+/// length, the one after it the binary-read marker (`RD` or `-|`), and then
+/// exactly the single separator byte the spec requires before the binary
+/// data itself begins. Returns the still-`CHARSTRING_KEY`-encrypted blob
+/// (truncated, not panicking, if `len` runs past the end of `bytes`) and the
+/// index immediately following it. `None` if the pattern doesn't match at
+/// `i` at all (no decimal length there, or no recognized marker after it) --
+/// the caller is responsible for advancing the scan itself in that case.
+fn read_rd_blob(bytes: &[u8], i: usize) -> Option<(&[u8], usize)> {
+    let (len_tok, after_len) = next_token(bytes, i)?;
+    let len = parse_uint_token(len_tok)?;
+    let (marker, after_marker) = next_token(bytes, after_len)?;
+    if marker != b"RD" && marker != b"-|" {
+        return None;
+    }
+    if !bytes
+        .get(after_marker)
+        .is_some_and(|&b| is_ps_whitespace(b))
+    {
+        return None; // exactly one separator byte must follow the marker
+    }
+    let blob_start = after_marker.checked_add(1)?;
+    let blob_end = blob_start.saturating_add(len).min(bytes.len());
+    let blob = bytes.get(blob_start..blob_end)?;
+    Some((blob, blob_end))
+}
+
+/// Reads `/lenIV <int> def` from the decrypted private portion (spec ch. 8),
+/// defaulting to [`DEFAULT_LEN_IV`] if absent or unparsable.
+fn parse_len_iv(private: &[u8]) -> usize {
+    let Some(pos) = find_token(private, b"/lenIV") else {
+        return DEFAULT_LEN_IV;
+    };
+    let after = pos.saturating_add(b"/lenIV".len());
+    next_token(private, after)
+        .and_then(|(tok, _)| parse_uint_token(tok))
+        .unwrap_or(DEFAULT_LEN_IV)
+}
+
+/// Parses the decrypted private portion's `/Subrs <count> array` block (spec
+/// ch. 8): repeated `dup <index> <len> RD <len bytes> NP` entries (the
+/// terminator -- `NP`/`|`/`noaccess put` -- is never itself inspected; the
+/// pattern is keyed off `<len> RD` alone, per this module's leniency
+/// convention). Each blob is decrypted with `decrypt(_, CHARSTRING_KEY,
+/// len_iv)`. Indexed into the result by `<index>` (gaps become empty
+/// `Vec`s); an index `>= MAX_SUBR_INDEX`, or a blob that fails to decrypt, is
+/// skipped rather than acted on. The scan stops at `/CharStrings` (Subrs
+/// entries never appear past it) or the end of `private`, whichever comes
+/// first -- this also keeps a spurious `dup` inside `/CharStrings` (there
+/// shouldn't be one, but this parser is deliberately lenient) from being
+/// mistaken for a Subrs entry.
+fn parse_subrs(private: &[u8], len_iv: usize) -> Vec<Vec<u8>> {
+    let mut subrs: Vec<Vec<u8>> = Vec::new();
+    let Some(subrs_pos) = find_token(private, b"/Subrs") else {
+        return subrs;
+    };
+    let tail = private.get(subrs_pos..).unwrap_or(&[]);
+    let scan_end = find_token(tail, b"/CharStrings")
+        .map(|off| subrs_pos.saturating_add(off))
+        .unwrap_or(private.len());
+
+    let mut i = subrs_pos;
+    while i < scan_end {
+        let Some((tok, after_tok)) = next_token(private, i) else {
+            break;
+        };
+        if tok != b"dup" {
+            i = after_tok;
+            continue;
+        }
+        let Some((idx_tok, after_idx)) = next_token(private, after_tok) else {
+            i = after_tok;
+            continue;
+        };
+        let Some(index) = parse_uint_token(idx_tok) else {
+            i = after_idx;
+            continue;
+        };
+        let Some((blob, end)) = read_rd_blob(private, after_idx) else {
+            i = after_idx;
+            continue;
+        };
+        if index < MAX_SUBR_INDEX {
+            if index >= subrs.len() {
+                subrs.resize(index + 1, Vec::new());
+            }
+            if let Some(decoded) = decrypt(blob, CHARSTRING_KEY, len_iv) {
+                subrs[index] = decoded;
+            }
+        }
+        i = end;
+    }
+    subrs
+}
+
+/// Parses the decrypted private portion's `/CharStrings <count> dict dup
+/// begin` block (spec ch. 8): repeated `/<name> <len> RD <len bytes> ND`
+/// entries (terminator -- `ND`/`|-`/`noaccess def` -- not itself inspected,
+/// same leniency convention as [`parse_subrs`]). gid is assignment order: a
+/// literal `.notdef` entry keeps its natural order rather than being forced
+/// to gid 0 (the loader treats gid 0 as "not found"; a real `.notdef`
+/// charstring landing elsewhere is harmless). Each blob is decrypted with
+/// `decrypt(_, CHARSTRING_KEY, len_iv)`; a blob that fails to decrypt is
+/// skipped. Accepts at most [`MAX_GLYPHS`] entries.
+fn parse_charstrings(
+    private: &[u8],
+    len_iv: usize,
+) -> (Vec<Vec<u8>>, Vec<String>, HashMap<String, u16>) {
+    let mut charstrings: Vec<Vec<u8>> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut name_to_gid: HashMap<String, u16> = HashMap::new();
+
+    let Some(cs_pos) = find_token(private, b"/CharStrings") else {
+        return (charstrings, names, name_to_gid);
+    };
+
+    let mut i = cs_pos;
+    while i < private.len() {
+        if charstrings.len() >= MAX_GLYPHS {
+            break;
+        }
+        let Some((tok, after_tok)) = next_token(private, i) else {
+            break;
+        };
+        let Some(name_bytes) = tok.strip_prefix(b"/") else {
+            i = after_tok;
+            continue;
+        };
+        let Some((blob, end)) = read_rd_blob(private, after_tok) else {
+            i = after_tok;
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            i = end;
+            continue;
+        };
+        let Some(decoded) = decrypt(blob, CHARSTRING_KEY, len_iv) else {
+            i = end;
+            continue;
+        };
+        let gid = charstrings.len() as u16; // charstrings.len() < MAX_GLYPHS <= u16::MAX + 1
+        charstrings.push(decoded);
+        names.push(name.to_string());
+        name_to_gid.insert(name.to_string(), gid);
+        i = end;
+    }
+    (charstrings, names, name_to_gid)
+}
+
+/// Parses the clear-text header's `/Encoding` declaration (spec ch. 6): a
+/// custom encoding array's `dup <code> /<name> put` entries populate
+/// `builtin_encoding[code]`. The other legal form -- the bare token
+/// `StandardEncoding` -- has no such entries to find, so it (and any font
+/// with no `/Encoding` at all) simply yields every slot `None`; see
+/// `Type1Font::parse`'s doc comment for why that is an acceptable v1
+/// simplification.
+fn parse_encoding(clear: &[u8]) -> Box<[Option<String>; 256]> {
+    let mut table: Box<[Option<String>; 256]> = Box::new(std::array::from_fn(|_| None));
+    let Some(enc_pos) = find_token(clear, b"/Encoding") else {
+        return table;
+    };
+
+    let mut i = enc_pos;
+    while i < clear.len() {
+        let Some((tok, after_tok)) = next_token(clear, i) else {
+            break;
+        };
+        if tok != b"dup" {
+            i = after_tok;
+            continue;
+        }
+        let Some((code_tok, after_code)) = next_token(clear, after_tok) else {
+            i = after_tok;
+            continue;
+        };
+        let Some(code) = parse_uint_token(code_tok) else {
+            i = after_code;
+            continue;
+        };
+        let Some((name_tok, after_name)) = next_token(clear, after_code) else {
+            i = after_code;
+            continue;
+        };
+        let Some(name_bytes) = name_tok.strip_prefix(b"/") else {
+            i = after_code;
+            continue;
+        };
+        let Some((put_tok, after_put)) = next_token(clear, after_name) else {
+            i = after_name;
+            continue;
+        };
+        if put_tok != b"put" {
+            i = after_name;
+            continue;
+        }
+        if let Ok(name) = std::str::from_utf8(name_bytes) {
+            if let Some(slot) = table.get_mut(code) {
+                *slot = Some(name.to_string());
+            }
+        }
+        i = after_put;
+    }
+    table
+}
+
+/// Computes units-per-em from the clear-text header's `/FontMatrix [a b c d
+/// e f]` (spec ch. 6): `(1.0 / a).abs()`, or 1000.0 if `/FontMatrix` is
+/// absent, unparsable, or `a` is zero. Mirrors the convention
+/// `cff.rs::units_per_em_from_top_dict` uses for the CFF Top DICT's
+/// `FontMatrix`.
+fn units_per_em_from_clear(clear: &[u8]) -> f32 {
+    let Some(pos) = find_token(clear, b"/FontMatrix") else {
+        return 1000.0;
+    };
+    let after = pos.saturating_add(b"/FontMatrix".len());
+    let a = next_token(clear, after).and_then(|(tok, _)| parse_matrix_number(tok));
+    match a {
+        Some(a) if a != 0.0 => (1.0_f64 / a).abs() as f32,
+        _ => 1000.0,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -370,5 +748,158 @@ pub(crate) mod tests {
     #[test]
     fn segment_empty_input_returns_none() {
         assert!(segment(&[]).is_none());
+    }
+
+    // --- Type1Font::parse fixture helpers -----------------------------------
+    //
+    // Charstring bytes are built from small decimal command encoders (spec
+    // ch. 6.2's Type1 charstring number encoding) rather than literal hex/
+    // binary blobs, per this codebase's clean-room fixture convention.
+
+    /// Encodes one Type1 charstring number operand (spec ch. 6.2), decimal
+    /// only.
+    fn cs_num(out: &mut Vec<u8>, v: i32) {
+        if (-107..=107).contains(&v) {
+            out.push((v + 139) as u8);
+        } else if (108..=1131).contains(&v) {
+            let v = v - 108;
+            out.push((v / 256 + 247) as u8);
+            out.push((v % 256) as u8);
+        } else if (-1131..=-108).contains(&v) {
+            let v = -v - 108;
+            out.push((v / 256 + 251) as u8);
+            out.push((v % 256) as u8);
+        } else {
+            out.push(255);
+            out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    /// Encodes a one-byte Type1 charstring operator (1..31).
+    fn cs_op(out: &mut Vec<u8>, op: u8) {
+        out.push(op);
+    }
+
+    /// Encodes an escape (`12 x`) Type1 charstring operator.
+    fn cs_escape(out: &mut Vec<u8>, op: u8) {
+        out.push(12);
+        out.push(op);
+    }
+
+    /// A minimal glyph: `hsbw(0,1000)` then `endchar`.
+    fn stub_charstring() -> Vec<u8> {
+        let mut c = Vec::new();
+        cs_num(&mut c, 0);
+        cs_num(&mut c, 1000);
+        cs_op(&mut c, 13); // hsbw
+        cs_op(&mut c, 14); // endchar
+        c
+    }
+
+    /// Builds a raw (non-PFB) Type1 program with a clear-text header
+    /// (`/FontMatrix`, `/Encoding`) and an eexec-encrypted private portion
+    /// (`/lenIV`, `/Subrs`, `/CharStrings`), mirroring the grammar
+    /// `Type1Font::parse` reads. `subrs` is `&[(index, plaintext
+    /// charstring)]` (index need not be contiguous or sorted); `charstrings`
+    /// is `&[(name, plaintext charstring)]`, emitted -- and so assigned gids
+    /// -- in the given order. Each charstring/subr blob is independently
+    /// encrypted with the charstring key/`len_iv` before being embedded in
+    /// the (separately eexec-encrypted) private text, exactly as a real
+    /// font nests the two ciphers.
+    fn build_type1_program(
+        font_matrix: &str,
+        encoding: &[(u8, &str)],
+        charstrings: &[(&str, Vec<u8>)],
+        subrs: &[(u16, Vec<u8>)],
+        len_iv: usize,
+    ) -> Vec<u8> {
+        let mut clear = String::new();
+        clear.push_str("%!\n");
+        clear.push_str(&format!("/FontMatrix {font_matrix} def\n"));
+        clear.push_str("/Encoding 256 array\n");
+        for (code, name) in encoding {
+            clear.push_str(&format!("dup {code} /{name} put\n"));
+        }
+
+        let mut private = Vec::new();
+        private.extend_from_slice(format!("/lenIV {len_iv} def\n").as_bytes());
+        private.extend_from_slice(format!("/Subrs {} array\n", subrs.len()).as_bytes());
+        for (index, plain) in subrs {
+            let blob = encrypt(plain, CHARSTRING_KEY, len_iv);
+            private.extend_from_slice(format!("dup {index} {} RD ", blob.len()).as_bytes());
+            private.extend_from_slice(&blob);
+            private.extend_from_slice(b" NP\n");
+        }
+        private.extend_from_slice(
+            format!("/CharStrings {} dict dup begin\n", charstrings.len()).as_bytes(),
+        );
+        for (name, plain) in charstrings {
+            let blob = encrypt(plain, CHARSTRING_KEY, len_iv);
+            private.extend_from_slice(format!("/{name} {} RD ", blob.len()).as_bytes());
+            private.extend_from_slice(&blob);
+            private.extend_from_slice(b" ND\n");
+        }
+        private.extend_from_slice(b"end");
+
+        raw_program(&clear, &private)
+    }
+
+    // --- Type1Font::parse ----------------------------------------------------
+
+    #[test]
+    fn parse_reads_charstrings_encoding_and_matrix() {
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[(65u8, "A"), (66, "B")],
+            &[
+                (".notdef", stub_charstring()),
+                ("A", stub_charstring()),
+                ("B", stub_charstring()),
+            ],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        assert_eq!(f.num_glyphs(), 3);
+        assert!(f.gid_for_name("A").is_some());
+        assert!(f.gid_for_name("B").is_some());
+        assert!(f.gid_for_name("nonesuch").is_none());
+        assert_eq!(f.builtin_name(65), Some("A"));
+        assert_eq!(f.builtin_name(66), Some("B"));
+        assert_eq!(f.units_per_em(), 1000.0);
+    }
+
+    #[test]
+    fn parse_reads_non_default_font_matrix() {
+        let prog = build_type1_program(
+            "[0.0005 0 0 0.0005 0 0]",
+            &[],
+            &[(".notdef", stub_charstring())],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        assert_eq!(f.units_per_em(), 2000.0);
+    }
+
+    #[test]
+    fn parse_rejects_program_without_charstrings() {
+        let prog = build_type1_program("[0.001 0 0 0.001 0 0]", &[], &[], &[], 4);
+        assert!(Type1Font::parse(prog).is_none()); // no glyphs -> not paintable
+    }
+
+    #[test]
+    fn parse_tolerates_truncated_charstring_blob() {
+        // Declare a length longer than the bytes actually present; parse must
+        // not panic.
+        let mut prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("A", stub_charstring())],
+            &[],
+            4,
+        );
+        prog.truncate(prog.len() - 3); // chop the tail
+        let _ = Type1Font::parse(prog); // must return Some or None, never panic
     }
 }
