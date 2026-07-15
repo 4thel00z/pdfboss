@@ -18,7 +18,6 @@ mod raster;
 mod stroke;
 mod truetype;
 mod type1;
-#[allow(dead_code)]
 mod type3;
 
 use std::path::Path;

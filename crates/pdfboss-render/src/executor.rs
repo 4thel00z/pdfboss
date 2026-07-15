@@ -20,6 +20,7 @@ use crate::path::PathBuilder;
 use crate::raster::{fill_path, FillRule, Mask};
 use crate::stroke::stroke_path;
 use crate::truetype::Seg;
+use crate::type3::Type3Font;
 use crate::{GlyphPainting, Pixmap, RenderOptions};
 
 /// Maximum `q`/`Q` nesting depth.
@@ -117,6 +118,10 @@ struct TextState {
     tm: Matrix,
     tlm: Matrix,
     font: Option<Rc<GlyphFont>>,
+    /// A `/Type3` font whose glyphs paint by re-entering the executor per
+    /// CharProc (ISO 32000-1 §9.6.5). Invariant: at most one of `font`
+    /// (outline) / `type3` is `Some`.
+    type3: Option<Rc<Type3Font>>,
     size: f32,
     char_spacing: f32,
     word_spacing: f32,
@@ -132,6 +137,7 @@ impl Default for TextState {
             tm: Matrix::identity(),
             tlm: Matrix::identity(),
             font: None,
+            type3: None,
             size: 0.0,
             char_spacing: 0.0,
             word_spacing: 0.0,
@@ -424,6 +430,15 @@ impl Executor<'_> {
                 Op::SetFont(name, size) => {
                     ts.size = if size.is_finite() { *size } else { 0.0 };
                     ts.font = self.glyph_font(&name.0, chain, &mut fonts);
+                    // Type3 is the fallback when no outline font loads: a
+                    // `/Type3` dict at a tier that paints embedded programs.
+                    // The invariant (at most one of font/type3) holds because
+                    // this only runs when `ts.font` is `None`.
+                    ts.type3 = if ts.font.is_some() {
+                        None
+                    } else {
+                        self.type3_font(&name.0, chain)
+                    };
                 }
                 Op::SetTextMatrix(m) if finite_matrix(m) => {
                     ts.tm = *m;
@@ -442,11 +457,11 @@ impl Executor<'_> {
                     ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
                     ts.tm = ts.tlm;
                 }
-                Op::ShowText(s) => self.show_text(&gs, &mut ts, s),
+                Op::ShowText(s) => self.show_text(&gs, &mut ts, s, chain, depth),
                 Op::ShowTextAdjusted(items) => {
                     for item in items {
                         match item {
-                            TextItem::Str(s) => self.show_text(&gs, &mut ts, s),
+                            TextItem::Str(s) => self.show_text(&gs, &mut ts, s, chain, depth),
                             TextItem::Offset(n) => {
                                 let tx = -n / 1000.0 * ts.size * ts.horiz;
                                 if tx.is_finite() {
@@ -459,7 +474,7 @@ impl Executor<'_> {
                 Op::NextLineShowText(s) => {
                     ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
                     ts.tm = ts.tlm;
-                    self.show_text(&gs, &mut ts, s);
+                    self.show_text(&gs, &mut ts, s, chain, depth);
                 }
                 Op::NextLineShowTextSpaced(aw, ac, s) => {
                     if aw.is_finite() {
@@ -470,7 +485,7 @@ impl Executor<'_> {
                     }
                     ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
                     ts.tm = ts.tlm;
-                    self.show_text(&gs, &mut ts, s);
+                    self.show_text(&gs, &mut ts, s, chain, depth);
                 }
 
                 other => self.run_color_or_misc(other, chain, &mut gs, depth),
@@ -588,9 +603,38 @@ impl Executor<'_> {
         loaded
     }
 
+    /// Resolves a `/Type3` font resource for painting, or `None` when the tier
+    /// forbids embedded programs, the name is missing, or the resource is not a
+    /// `/Type3` dict. Called only after the outline loader declined the name.
+    fn type3_font(&self, name: &str, chain: &[&Dict]) -> Option<Rc<Type3Font>> {
+        if !self.painting.paints_all_embedded() {
+            return None;
+        }
+        let dict = self
+            .find_res(chain, "Font", name)
+            .and_then(|o| o.as_dict().cloned())?;
+        if dict.get_name("Subtype").map(|n| n.0.as_str()) != Some("Type3") {
+            return None;
+        }
+        Type3Font::load(self.doc, &dict).map(Rc::new)
+    }
+
     /// Paints one show-string's glyphs and advances the text matrix. Codes with
     /// no drawable glyph still advance, so surrounding text stays positioned.
-    fn show_text(&mut self, gs: &GState, ts: &mut TextState, bytes: &[u8]) {
+    /// `chain`/`depth` thread the resource chain and form-recursion depth
+    /// through to a Type3 glyph's CharProc (which re-enters [`Executor::run`]).
+    fn show_text(
+        &mut self,
+        gs: &GState,
+        ts: &mut TextState,
+        bytes: &[u8],
+        chain: &[&Dict],
+        depth: u32,
+    ) {
+        if ts.type3.is_some() {
+            self.show_text_type3(gs, ts, bytes, chain, depth);
+            return;
+        }
         let Some(font) = ts.font.clone() else {
             return;
         };
@@ -648,6 +692,93 @@ impl Executor<'_> {
                 ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
             }
         }
+    }
+
+    /// Paints a `/Type3` show-string: each one-byte code's CharProc runs as a
+    /// nested content stream (ISO 32000-1 §9.6.5). The glyph matrix mirrors the
+    /// outline path with `/FontMatrix` in place of the `1/upm` scale, so glyph
+    /// space maps through text space, the text state, and the CTM to device.
+    /// Codes with no CharProc, a non-finite matrix, or a depth at the recursion
+    /// limit still advance, keeping surrounding text positioned.
+    fn show_text_type3(
+        &mut self,
+        gs: &GState,
+        ts: &mut TextState,
+        bytes: &[u8],
+        chain: &[&Dict],
+        depth: u32,
+    ) {
+        let Some(t3) = ts.type3.clone() else {
+            return;
+        };
+        let font_matrix = t3.font_matrix();
+        for &byte in bytes {
+            let code = u32::from(byte);
+
+            // glyph space -> text space (/FontMatrix), -> the text-scaling
+            // params, -> user space (Tm) -> device (CTM): the outline chain
+            // with `font_matrix` substituted for `scale(1/upm)`.
+            let params = Matrix {
+                a: ts.size * ts.horiz,
+                b: 0.0,
+                c: 0.0,
+                d: ts.size,
+                e: 0.0,
+                f: ts.rise,
+            };
+            let glyph_ctm = font_matrix.concat(params).concat(ts.tm).concat(gs.ctm);
+
+            // The depth guard bounds a self-referential glyph (one that shows
+            // itself, directly or via a form): each CharProc re-entry increments
+            // `depth`, so painting stops at `MAX_FORM_DEPTH`.
+            if depth < MAX_FORM_DEPTH && finite_matrix(&glyph_ctm) {
+                if let Some(proc_obj) = t3.char_proc(code).cloned() {
+                    self.run_char_proc(&proc_obj, &t3, chain, gs, glyph_ctm, depth);
+                }
+            }
+
+            // Advance: the glyph-space width becomes a text-space displacement
+            // via the matrix x-scale, then (w0·Tfs + Tc + Tw[space]) · Th.
+            let w0 = t3.width(code).unwrap_or(0.0) * font_matrix.a;
+            let word = if code == 32 { ts.word_spacing } else { 0.0 };
+            let tx = (w0 * ts.size + ts.char_spacing + word) * ts.horiz;
+            if tx.is_finite() {
+                ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
+            }
+        }
+    }
+
+    /// Runs one Type3 CharProc: resolve its stream, parse it, and re-enter
+    /// [`Executor::run`] with the glyph CTM, the font's own `/Resources`
+    /// prepended to `chain`, and `depth + 1`. Inherits the caller's clip,
+    /// alpha, and fill color (the color a `d0` glyph paints in). Every failure
+    /// is a silent skip, matching the caller's still-advance leniency.
+    fn run_char_proc(
+        &mut self,
+        proc_obj: &Object,
+        t3: &Type3Font,
+        chain: &[&Dict],
+        base: &GState,
+        glyph_ctm: Matrix,
+        depth: u32,
+    ) {
+        let Ok(Object::Stream(stream)) = self.doc.resolve(proc_obj) else {
+            return;
+        };
+        let Ok(data) = self.doc.stream_data(&stream) else {
+            return;
+        };
+        let Ok(ops) = parse_content(&data) else {
+            return;
+        };
+        let mut inner = base.clone();
+        inner.ctm = glyph_ctm;
+        let mut inner_chain: Vec<&Dict> = Vec::with_capacity(chain.len() + 1);
+        if let Some(d) = t3.resources() {
+            inner_chain.push(d);
+        }
+        inner_chain.extend_from_slice(chain);
+        self.run(&ops, &inner_chain, inner, depth + 1);
     }
 
     /// Dispatches color, XObject, and marked-content operators (the remainder
@@ -1372,5 +1503,134 @@ mod tests {
         let pix = render(small_doc("", content.as_bytes(), |_| {}), 1.0);
         assert_eq!(px(&pix, 50, 70), RED, "triangle interior filled");
         assert!(px(&pix, 50, 90)[0] < 128, "closing edge stroked");
+    }
+
+    // --- Type3 glyph painting (re-entering the executor per CharProc) --------
+    //
+    // Geometry matches the shared box-glyph tests: a 200x200 page, 100pt font,
+    // text origin (20,50), CharProc `100 0 500 700 re f` (the (100,0)-(600,700)
+    // box in glyph space) under `/FontMatrix [0.001 ...]`. That lands the same
+    // interior dark pixel at (55,115); an 800-glyph-unit advance puts a second
+    // glyph's interior at (135,115).
+
+    /// Renders page 0 of `bytes` at the given glyph-painting tier.
+    fn render_at_tier(bytes: &[u8], tier: GlyphPainting) -> Pixmap {
+        let doc = Document::load(bytes.to_vec()).expect("load");
+        let page = doc.page(0).expect("page");
+        let opts = RenderOptions {
+            glyph_painting: tier,
+        };
+        render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
+    }
+
+    /// True iff the pixel at `(x, y)` is dark on all three channels.
+    fn dark_at(pix: &Pixmap, x: u32, y: u32) -> bool {
+        let o = ((y * pix.width + x) * 4) as usize;
+        pix.data[o] < 128 && pix.data[o + 1] < 128 && pix.data[o + 2] < 128
+    }
+
+    /// Builds a one-page 200x200 doc showing a `/Type3` font (object 5) whose
+    /// `/boxglyph` CharProc (object 6) is `charproc`. `font_extra` is spliced
+    /// into the font dict (e.g. `/FirstChar`+`/Widths`); `char_res` optionally
+    /// gives the CharProc stream its own `/Resources` (for self-reference).
+    /// Code 65 maps to `/boxglyph` via `/Differences`.
+    fn type3_doc(
+        charproc: &str,
+        font_extra: &str,
+        char_res: Option<&str>,
+        content: &[u8],
+    ) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            &format!(
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] \
+                 /Encoding << /Differences [65 /boxglyph] >> \
+                 /CharProcs << /boxglyph 6 0 R >> {font_extra} >>"
+            ),
+        );
+        b.stream(6, char_res.unwrap_or(""), charproc.as_bytes());
+        b.build(1)
+    }
+
+    /// A Type3 fixture whose `charproc` paints under `/FirstChar 65 /Widths
+    /// [1000]`.
+    fn type3_page_doc(charproc: &str, content: &[u8]) -> Vec<u8> {
+        type3_doc(charproc, "/FirstChar 65 /Widths [1000]", None, content)
+    }
+
+    /// A Type3 fixture painting the standard box glyph with the given
+    /// glyph-space `/Widths` entry for code 65.
+    fn type3_page_doc_widths(width: i32, content: &[u8]) -> Vec<u8> {
+        type3_doc(
+            "1000 0 d0 100 0 500 700 re f",
+            &format!("/FirstChar 65 /Widths [{width}]"),
+            None,
+            content,
+        )
+    }
+
+    /// A Type3 fixture whose CharProc paints the box AND shows code 65 in the
+    /// same font (via its own `/Resources /F0` pointing back at the font) --
+    /// self-referential, so it must be depth-bounded.
+    fn type3_recursive_doc() -> Vec<u8> {
+        type3_doc(
+            "1000 0 d0 100 0 500 700 re f BT /F0 100 Tf <41> Tj ET",
+            "/FirstChar 65 /Widths [1000]",
+            Some("/Resources << /Font << /F0 5 0 R >> >>"),
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        )
+    }
+
+    #[test]
+    fn type3_glyph_paints_at_all_embedded_not_embedded_truetype_only() {
+        let doc = type3_page_doc(
+            "1000 0 d0 100 0 500 700 re f",
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET", // code 65 -> /boxglyph
+        );
+        for tier in [GlyphPainting::AllEmbedded, GlyphPainting::Full] {
+            let pix = render_at_tier(&doc, tier);
+            assert!(
+                dark_at(&pix, 55, 115),
+                "Type3 glyph should paint at {tier:?}"
+            );
+        }
+        let pix = render_at_tier(&doc, GlyphPainting::EmbeddedTrueTypeOnly);
+        assert!(
+            !dark_at(&pix, 55, 115),
+            "Type3 must not paint at EmbeddedTrueTypeOnly"
+        );
+    }
+
+    #[test]
+    fn type3_self_referential_glyph_terminates() {
+        let doc = type3_recursive_doc();
+        let started = std::time::Instant::now();
+        let pix = render_at_tier(&doc, GlyphPainting::AllEmbedded);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "self-referential Type3 must be depth-bounded, not hang/overflow"
+        );
+        assert!(dark_at(&pix, 55, 115), "the box still paints");
+    }
+
+    #[test]
+    fn type3_width_governs_second_glyph_origin() {
+        let doc = type3_page_doc_widths(800, b"BT /F0 100 Tf 20 50 Td <4141> Tj ET");
+        let pix = render_at_tier(&doc, GlyphPainting::AllEmbedded);
+        assert!(dark_at(&pix, 55, 115), "first glyph at (55,115)");
+        assert!(
+            dark_at(&pix, 135, 115),
+            "second glyph at the /Widths-implied (135,115)"
+        );
     }
 }
