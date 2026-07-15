@@ -5,26 +5,30 @@
 //! [`GlyphPainting`] tier, plus simple `/Type1`/`/MMType1` fonts (either an
 //! embedded CFF `FontFile3` program or a real Type1 charstring `FontFile`
 //! program) and `CIDFontType0` descendants carrying an embedded CFF
-//! `FontFile3` program once the tier reaches `AllEmbedded`. Every other font
-//! (Type3, the standard 14, non-embedded fonts) yields `None`, so the
-//! renderer leaves that text unpainted rather than guessing.
+//! `FontFile3` program once the tier reaches `AllEmbedded`. At the `Full`
+//! tier, a font with no embedded program of its own (a non-embedded simple
+//! font, including the standard 14) instead substitutes a provider-supplied
+//! TrueType face (`crate::substitute`), with Adobe Core-14 AFM metrics
+//! filling in for a missing `/Widths`. Type3 and any font that still yields
+//! no result (Symbol/ZapfDingbats, or `Full` with no substitute provider)
+//! leave that text unpainted rather than guessing.
 
 use std::collections::HashMap;
 
 use pdfboss_core::{Dict, Document, Object};
 
 use crate::cff::CffFont;
-use crate::substitute::SubstituteProvider;
+use crate::substitute::{FaceRequest, SubstituteProvider};
 use crate::truetype::{Seg, TrueType};
 use crate::type1::Type1Font;
 use crate::GlyphPainting;
 
 /// Where a font's glyph outlines and metrics come from.
 ///
-/// The Type3 and substitute-face loaders specified for later plans add
-/// further variants here, and the delegating methods below gain matching
-/// arms. This is the single outline-source seam, which is why `GlyphFont`'s
-/// public surface stays fixed as those loaders land.
+/// The Type3 loader specified for a later plan adds a further variant here,
+/// and the delegating methods below gain a matching arm. This is the single
+/// outline-source seam, which is why `GlyphFont`'s public surface stays
+/// fixed as that loader lands.
 enum Outlines {
     /// An embedded TrueType (`glyf`) program.
     TrueType(TrueType),
@@ -32,6 +36,10 @@ enum Outlines {
     Cff(CffFont),
     /// An embedded Type1 charstring program (`FontFile`).
     Type1(Type1Font),
+    /// A non-embedded font's provider-supplied substitute TrueType face
+    /// (`Full`-tier substitution), standing in for the original font, which
+    /// has no glyph program of its own.
+    Substitute(TrueType),
 }
 
 /// How character codes map to glyph indices for a loaded font.
@@ -74,35 +82,57 @@ pub(crate) struct GlyphFont {
     outlines: Outlines,
     kind: GlyphKind,
     widths: WidthMap,
+    /// A second, per-code-optional advance tier consulted between `widths`
+    /// and each program's own advance metric: Adobe Core-14 AFM widths,
+    /// populated only by `load_substitute`, and only for a recognized
+    /// standard-14 `/BaseFont` (empty for every other loader, and for a
+    /// substitute font that isn't one of the standard 14 -- so this tier is
+    /// a no-op everywhere except non-embedded standard-14 substitution).
+    /// Unlike `WidthMap`, a missing code here means "no AFM entry for this
+    /// code", not "declared width 0" -- see `GlyphFont::advance`.
+    afm_widths: HashMap<u32, f32>,
 }
 
 impl GlyphFont {
     /// Loads paintable glyph data from a (resolved) font dictionary, or
     /// `None` if the font has no loader for its `/Subtype` at this
-    /// `painting` tier.
+    /// `painting` tier and (at `Full`) no usable substitute either.
     ///
     /// `provider` is the `Full`-tier substitute source (from
-    /// [`crate::RenderOptions::substitutes`]); this loader does not yet
-    /// consult it -- that lands once `Full`'s substitution behavior is
-    /// implemented, so results are identical to today's regardless of what
-    /// `provider` is.
+    /// [`crate::RenderOptions::substitutes`]). An embedded program always
+    /// takes precedence when the font actually carries one -- substitution
+    /// is strictly the non-embedded last resort, tried only once every
+    /// embedded loader below has declined.
     pub(crate) fn load(
         doc: &Document,
         font: &Dict,
         painting: GlyphPainting,
-        _provider: Option<&dyn SubstituteProvider>,
+        provider: Option<&dyn SubstituteProvider>,
     ) -> Option<GlyphFont> {
         // Embedded TrueType paints at every tier. CFF and Type1 (simple
         // Type1/MMType1 fonts, and CIDFontType0 descendants for CFF) join at
-        // `AllEmbedded`+; Type3 and `Full`'s substitution are later plans.
-        match font.get_name("Subtype").map(|n| n.0.as_str()) {
+        // `AllEmbedded`+; Type3 is a later plan.
+        let embedded = match font.get_name("Subtype").map(|n| n.0.as_str()) {
             Some("Type0") => load_type0(doc, font, painting),
             Some("TrueType") => load_simple(doc, font),
             Some("Type1") | Some("MMType1") if painting.paints_all_embedded() => {
                 load_simple_type1_or_cff(doc, font)
             }
             _ => None,
+        };
+        if embedded.is_some() {
+            return embedded;
         }
+
+        // `Full`'s non-embedded last resort: substitute a provider-supplied
+        // face. Gated on both the tier and an actual provider, so `Full`
+        // with no `SubstituteSource` behaves exactly like `AllEmbedded`.
+        if painting == GlyphPainting::Full {
+            if let Some(provider) = provider {
+                return load_substitute(doc, font, provider);
+            }
+        }
+        None
     }
 
     /// Whether codes are two bytes wide (composite fonts).
@@ -122,26 +152,34 @@ impl GlyphFont {
     /// The glyph's outline as path segments in font units.
     pub(crate) fn outline(&self, gid: u16) -> Vec<Seg> {
         match &self.outlines {
-            Outlines::TrueType(tt) => tt.glyph_path(gid),
+            Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.glyph_path(gid),
             Outlines::Cff(cff) => cff.glyph_path(gid),
             Outlines::Type1(t1) => t1.glyph_path(gid),
         }
     }
 
-    /// The advance width for character `code`, in font units. The PDF's own
-    /// declared width (`/Widths` for simple fonts, `/W`+`/DW` for Type0/CID)
-    /// is authoritative when present; otherwise this falls back to the
-    /// embedded program's own advance metric (`hmtx` for TrueType, `0` for
-    /// CFF and Type1, neither of which has a per-glyph advance table parsed
-    /// here -- Type1's `hsbw`/`sbw` operator does carry a `wx` advance
-    /// operand, but reading it back out of the charstring is a deferred
-    /// fallback, not yet wired up).
+    /// The advance width for character `code`, in font units. Three tiers,
+    /// most authoritative first: the PDF's own declared width (`/Widths`
+    /// for simple fonts, `/W`+`/DW` for Type0/CID); failing that, `afm_widths`
+    /// (Adobe Core-14 AFM metrics, populated only for non-embedded
+    /// standard-14 substitution -- empty, and so a no-op, everywhere else);
+    /// and only failing both does this fall back to the embedded program's
+    /// own advance metric (`hmtx` for TrueType and for a substitute face,
+    /// `0` for CFF and Type1, neither of which has a per-glyph advance table
+    /// parsed here -- Type1's `hsbw`/`sbw` operator does carry a `wx`
+    /// advance operand, but reading it back out of the charstring is a
+    /// deferred fallback, not yet wired up).
     pub(crate) fn advance(&self, code: u32) -> f32 {
         if let Some(width_1000) = self.widths.get(code) {
             return width_1000 / 1000.0 * self.units_per_em();
         }
+        if let Some(&width_1000) = self.afm_widths.get(&code) {
+            return width_1000 / 1000.0 * self.units_per_em();
+        }
         match &self.outlines {
-            Outlines::TrueType(tt) => f32::from(tt.advance(self.gid(code))),
+            Outlines::TrueType(tt) | Outlines::Substitute(tt) => {
+                f32::from(tt.advance(self.gid(code)))
+            }
             Outlines::Cff(_) | Outlines::Type1(_) => 0.0,
         }
     }
@@ -149,7 +187,7 @@ impl GlyphFont {
     /// Font design units per em (outline coordinate scale).
     pub(crate) fn units_per_em(&self) -> f32 {
         match &self.outlines {
-            Outlines::TrueType(tt) => tt.units_per_em() as f32,
+            Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.units_per_em() as f32,
             Outlines::Cff(cff) => cff.units_per_em(),
             Outlines::Type1(t1) => t1.units_per_em(),
         }
@@ -200,6 +238,7 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
+        afm_widths: HashMap::new(),
     })
 }
 
@@ -301,6 +340,7 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
+        afm_widths: HashMap::new(),
     })
 }
 
@@ -389,6 +429,7 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
+        afm_widths: HashMap::new(),
     })
 }
 
@@ -451,6 +492,119 @@ pub(crate) fn differences(doc: &Document, font: &Dict) -> HashMap<u8, String> {
     out
 }
 
+/// Whether `font`'s base encoding resolves to `StandardEncoding` -- named
+/// explicitly, defaulted by an `/Encoding` dictionary with no
+/// `/BaseEncoding`, or the ISO 32000-1 9.6.6 default when `/Encoding` is
+/// absent entirely -- rather than `WinAnsiEncoding`/`MacRomanEncoding`.
+/// Mirrors `base_encoding`'s own `/Encoding` walk, but yields a name-table
+/// applicability bit instead of a char accessor: `load_substitute`'s AFM
+/// lookup only has a code -> glyph-name table for `StandardEncoding`
+/// (`pdfboss_encoding::standard_encoding_name`), not for WinAnsi or
+/// MacRoman, so a WinAnsi/MacRoman code must not claim an AFM width through
+/// this path (it falls through to the substitute's own `hmtx` instead).
+fn is_standard_encoding(doc: &Document, font: &Dict) -> bool {
+    let name = match font.get("Encoding").map(|o| doc.resolve(o)) {
+        Some(Ok(Object::Name(n))) => n.0,
+        Some(Ok(Object::Dict(d))) => d
+            .get_name("BaseEncoding")
+            .map(|n| n.0.clone())
+            .unwrap_or_else(|| "StandardEncoding".to_string()),
+        _ => return true, // no /Encoding at all -> defaults to Standard
+    };
+    !matches!(name.as_str(), "WinAnsiEncoding" | "MacRomanEncoding")
+}
+
+/// Loads a non-embedded font at the `Full` tier by substituting a
+/// provider-supplied TrueType face -- the last resort tried once every
+/// embedded loader above has declined (`GlyphFont::load` still prefers an
+/// embedded program when the font actually carries one).
+///
+/// Builds its 256-entry code-to-glyph table with the same two tiers as
+/// `load_simple`'s first two (a `/Differences` name, then the base
+/// encoding's character), except both resolve through the Adobe Glyph List
+/// into the SUBSTITUTE face's own `cmap` -- this font has no glyph program
+/// of its own to resolve names or codes against, so there is no `post`-table
+/// tier and no raw-byte/symbol-range fallback: a code that resolves to no
+/// Unicode scalar, or one the substitute's `cmap` doesn't cover, is simply
+/// left at `.notdef` (gid 0).
+///
+/// Advance widths add a middle tier (`GlyphFont::advance`'s `afm_widths`)
+/// between the PDF's own `/Widths` and the substitute's `hmtx`: for a
+/// recognized standard-14 `/BaseFont`, the Adobe Core-14 AFM width of the
+/// code's glyph name (the `/Differences` name, else -- only when the base
+/// encoding is `StandardEncoding` or absent -- the `StandardEncoding` name
+/// for that code). A `WinAnsiEncoding`/`MacRomanEncoding` code has no name
+/// table wired up here, so it simply gets no `afm_widths` entry and falls
+/// through to the substitute's own `hmtx` -- metric-compatible with the
+/// standard 14, so a near-identical advance even then.
+fn load_substitute(
+    doc: &Document,
+    font: &Dict,
+    provider: &dyn SubstituteProvider,
+) -> Option<GlyphFont> {
+    let req = FaceRequest::from_font_dict(doc, font)?;
+    let bytes = provider.face(&req)?;
+    let tt = TrueType::parse(bytes)?;
+
+    let base = base_encoding(doc, font);
+    let diffs = differences(doc, font);
+
+    let mut table = Box::new([0u16; 256]);
+    for (code, slot) in table.iter_mut().enumerate() {
+        let code = code as u8;
+        // 1. A /Differences name, through the glyph list, into the
+        // SUBSTITUTE's own cmap.
+        if let Some(name) = diffs.get(&code) {
+            if let Some(ch) = pdfboss_encoding::glyph_to_unicode(name) {
+                if let Some(gid) = tt.gid_for_unicode(ch as u32).filter(|&g| g != 0) {
+                    *slot = gid;
+                    continue;
+                }
+            }
+        }
+        // 2. The base encoding's character, via the substitute's cmap.
+        if let Some(ch) = base.and_then(|f| f(code)) {
+            if let Some(gid) = tt.gid_for_unicode(ch as u32).filter(|&g| g != 0) {
+                *slot = gid;
+            }
+        }
+    }
+
+    let widths = simple_widths(doc, font);
+
+    // AFM-14 advances: only for a recognized standard-14 /BaseFont. Codes
+    // with no resolvable glyph name (WinAnsi/MacRoman, which have no
+    // code -> name table here) are simply not inserted, so `advance` falls
+    // through to the substitute's own hmtx for them.
+    let base_font = font
+        .get_name("BaseFont")
+        .map(|n| n.0.as_str())
+        .unwrap_or("");
+    let mut afm_widths = HashMap::new();
+    if pdfboss_encoding::is_standard_14(base_font) {
+        let standard_ok = is_standard_encoding(doc, font);
+        for code in 0u32..256 {
+            let name = diffs.get(&(code as u8)).map(String::as_str).or_else(|| {
+                standard_ok
+                    .then(|| pdfboss_encoding::standard_encoding_name(code as u8))
+                    .flatten()
+            });
+            if let Some(name) = name {
+                if let Some(w) = pdfboss_encoding::standard_14_width(base_font, name) {
+                    afm_widths.insert(code, w);
+                }
+            }
+        }
+    }
+
+    Some(GlyphFont {
+        outlines: Outlines::Substitute(tt),
+        kind: GlyphKind::Simple(table),
+        widths,
+        afm_widths,
+    })
+}
+
 /// Loads a `/Type0` composite font by dispatching on its descendant's
 /// `/Subtype`: `CIDFontType2` (embedded TrueType) paints at every tier;
 /// `CIDFontType0` (embedded CFF) joins once `painting` reaches `AllEmbedded`.
@@ -491,6 +645,7 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
         widths: cid_widths(doc, cid),
+        afm_widths: HashMap::new(),
     })
 }
 
@@ -603,6 +758,7 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
         widths,
+        afm_widths: HashMap::new(),
     })
 }
 
@@ -627,7 +783,7 @@ mod tests {
     use crate::cff::tests::{build_box_glyph_fixture, build_box_glyph_fixture_cid};
     use crate::truetype::tests::build_font;
     use crate::type1::tests::{build_type1_box_fixture, build_type1_box_fixture_standard_encoding};
-    use crate::{GlyphPainting, Pixmap, RenderOptions};
+    use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
 
     /// Builds a one-page PDF showing `content` with a simple `/TrueType` font
     /// (the synthetic `build_font` program) and the given `/Encoding` entry.
@@ -1150,5 +1306,190 @@ mod tests {
             !dark_pixel_at(&pix, 55, 115),
             "malformed FontFile paints nothing, no panic"
         );
+    }
+
+    // --- Task 3: Full-tier substitution for non-embedded fonts --------------
+    //
+    // `build_font`'s synthetic cmap (a single format-4 segment covering only
+    // code point 0x41) maps 'A' (0x41) to gid 1, the box glyph, and every
+    // other code point to gid 0 (`.notdef`) -- see
+    // `truetype::tests::maps_char_to_glyph_and_reads_outline`. Reusing
+    // `build_font` as the SUBSTITUTE face below means only 'A' ever paints;
+    // every other code (in particular a `/Differences`-mapped `/space`) is
+    // expected to stay unpainted, exactly like a real space would.
+
+    /// Builds a one-page PDF showing `content` with a simple, NON-embedded
+    /// font (`/BaseFont /{base}`, no `FontDescriptor`/`FontFile*` at all) and
+    /// the given `/Encoding` entry -- the `Full`-tier substitution loader's
+    /// input.
+    fn non_embedded_font_doc(base: &str, encoding: &str, content: &[u8]) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            &format!("<< /Type /Font /Subtype /Type1 /BaseFont /{base} {encoding} >>"),
+        );
+        b.build(1)
+    }
+
+    /// Writes `bytes` to `basename` inside a freshly created temp directory
+    /// (e.g. `"Arimo[wght].ttf"`, matching `substitute::face_filename`'s
+    /// output) and returns the directory, ready to hand to `SubstituteSource::
+    /// Dir` / `DirProvider`.
+    fn write_temp_face(basename: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pdfboss-glyph-substitute-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(dir.join(basename), bytes).expect("write fixture face");
+        dir
+    }
+
+    /// Renders page 0 of `bytes` with the given `RenderOptions` in full --
+    /// unlike `render_at_tier`, which only varies the tier, this also varies
+    /// `substitutes`, needed to exercise `Full`-tier substitution.
+    fn render_with(bytes: &[u8], opts: RenderOptions) -> Pixmap {
+        let doc = Document::load(bytes.to_vec()).expect("load");
+        let page = doc.page(0).expect("page");
+        crate::render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
+    }
+
+    #[test]
+    fn non_embedded_helvetica_paints_at_full_via_substitute() {
+        // /Type1 /Helvetica, no FontFile* at all (non-embedded),
+        // WinAnsiEncoding, showing 'A' (0x41) -- which the substitute face's
+        // cmap maps to the box glyph.
+        let bytes = non_embedded_font_doc(
+            "Helvetica",
+            "/Encoding /WinAnsiEncoding",
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        let dir = write_temp_face("Arimo[wght].ttf", &build_font());
+
+        // Full + a Dir provider: substitution kicks in, the glyph paints.
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::Dir(dir.clone()),
+            },
+        );
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "non-embedded Helvetica should paint via Full-tier substitution"
+        );
+
+        // Full with SubstituteSource::None: no provider, so `Full` behaves
+        // like `AllEmbedded` -- the non-embedded font stays blank.
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::None,
+            },
+        );
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "Full with SubstituteSource::None must not paint (no provider)"
+        );
+
+        // AllEmbedded with a provider present: substitution is Full-only, so
+        // a non-embedded font still stays blank at any lower tier.
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::AllEmbedded,
+                substitutes: SubstituteSource::Dir(dir.clone()),
+            },
+        );
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "AllEmbedded must not substitute even with a provider present (tier gate)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_embedded_helvetica_uses_afm_width_when_widths_absent() {
+        // /Helvetica, NO /Widths, showing two codes: 0x80 (/Differences
+        // "space", no /BaseEncoding so StandardEncoding governs) then 0x41
+        // ('A', via the base encoding). Helvetica's AFM "space" width is
+        // 278/1000 em; at 100pt that's a 27.8pt advance, so 'A' should paint
+        // at x = 20 + 27.8 + 35 (the box glyph's interior offset) = 82.8 --
+        // proving AFM (not the substitute hmtx, which would give 0 here,
+        // since build_font carries no hhea/hmtx) governs when /Widths is
+        // absent. Code 0x80 itself resolves to no glyph in the substitute's
+        // cmap (glyph_to_unicode("space") -> U+0020, uncovered by
+        // `build_font`'s cmap), so it paints nothing -- exactly like a real
+        // space.
+        let bytes = non_embedded_font_doc(
+            "Helvetica",
+            "/Encoding << /Differences [128 /space] >>",
+            b"BT /F0 100 Tf 20 50 Td <8041> Tj ET",
+        );
+        let dir = write_temp_face("Arimo[wght].ttf", &build_font());
+
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::Dir(dir.clone()),
+            },
+        );
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "the /space code itself should paint nothing"
+        );
+        assert!(
+            dark_pixel_at(&pix, 83, 115),
+            "'A' should land at the AFM-implied origin (20 + 27.8 + 35 ~= 83), \
+             not stacked on the first glyph (0 advance) or elsewhere"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn non_embedded_helvetica_widths_still_wins_over_afm() {
+        // Same as above, but an explicit /Widths [800] for code 128 (AFM
+        // would say 278) must still govern: 'A' lands at the classic
+        // /Widths-implied (135, 115), not the AFM-implied (~83, 115).
+        let bytes = non_embedded_font_doc(
+            "Helvetica",
+            "/Encoding << /Differences [128 /space] >> /FirstChar 128 /Widths [800]",
+            b"BT /F0 100 Tf 20 50 Td <8041> Tj ET",
+        );
+        let dir = write_temp_face("Arimo[wght].ttf", &build_font());
+
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::Dir(dir.clone()),
+            },
+        );
+        assert!(
+            !dark_pixel_at(&pix, 83, 115),
+            "the AFM-implied origin must lose to /Widths"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "'A' should land at the /Widths-implied origin (20 + 80 + 35 = 135)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
