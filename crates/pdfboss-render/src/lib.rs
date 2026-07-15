@@ -16,11 +16,13 @@ mod path;
 mod raster;
 #[allow(dead_code)]
 mod stroke;
+#[allow(dead_code)]
+mod substitute;
 mod truetype;
 mod type1;
 mod type3;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use pdfboss_core::{Document, Error, Page, Result};
 
@@ -95,11 +97,31 @@ impl GlyphPainting {
     }
 }
 
+/// Where non-embedded glyph substitution (the `Full` [`GlyphPainting`] tier)
+/// draws replacement faces from. The default, `None`, substitutes nothing --
+/// `Full` behaves exactly like `AllEmbedded` until a caller opts in.
+#[derive(Clone, Debug, Default)]
+pub enum SubstituteSource {
+    /// No substitution: non-embedded fonts stay unpainted.
+    #[default]
+    None,
+    /// Compiled-in faces (wired up in a later plan, gated by a
+    /// `substitute-fonts`-style feature).
+    Builtin,
+    /// Faces read from a directory at render time (e.g. an installed
+    /// `pdfboss-fonts` package), one file per style -- see
+    /// `substitute::face_filename`.
+    Dir(PathBuf),
+}
+
 /// Options controlling a single page render.
 #[derive(Clone, Debug, Default)]
 pub struct RenderOptions {
     /// Which font programs the rasterizer will paint.
     pub glyph_painting: GlyphPainting,
+    /// Where `Full`-tier substitution draws replacement faces from. Ignored
+    /// at every other tier.
+    pub substitutes: SubstituteSource,
 }
 
 /// Renders a page at `scale` onto a white background. The pixel size is

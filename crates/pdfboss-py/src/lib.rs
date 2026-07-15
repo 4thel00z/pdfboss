@@ -259,6 +259,7 @@ impl Page {
         }
         let opts = pdfboss_render::RenderOptions {
             glyph_painting: glyph_painting_from_str(fonts)?,
+            ..Default::default()
         };
         let png = py.allow_threads(|| {
             let doc = self.doc.lock();

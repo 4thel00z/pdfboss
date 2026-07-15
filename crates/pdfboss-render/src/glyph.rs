@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use pdfboss_core::{Dict, Document, Object};
 
 use crate::cff::CffFont;
+use crate::substitute::SubstituteProvider;
 use crate::truetype::{Seg, TrueType};
 use crate::type1::Type1Font;
 use crate::GlyphPainting;
@@ -79,7 +80,18 @@ impl GlyphFont {
     /// Loads paintable glyph data from a (resolved) font dictionary, or
     /// `None` if the font has no loader for its `/Subtype` at this
     /// `painting` tier.
-    pub(crate) fn load(doc: &Document, font: &Dict, painting: GlyphPainting) -> Option<GlyphFont> {
+    ///
+    /// `provider` is the `Full`-tier substitute source (from
+    /// [`crate::RenderOptions::substitutes`]); this loader does not yet
+    /// consult it -- that lands once `Full`'s substitution behavior is
+    /// implemented, so results are identical to today's regardless of what
+    /// `provider` is.
+    pub(crate) fn load(
+        doc: &Document,
+        font: &Dict,
+        painting: GlyphPainting,
+        _provider: Option<&dyn SubstituteProvider>,
+    ) -> Option<GlyphFont> {
         // Embedded TrueType paints at every tier. CFF and Type1 (simple
         // Type1/MMType1 fonts, and CIDFontType0 descendants for CFF) join at
         // `AllEmbedded`+; Type3 and `Full`'s substitution are later plans.
@@ -740,6 +752,7 @@ mod tests {
         let page = doc.page(0).expect("page");
         let opts = RenderOptions {
             glyph_painting: tier,
+            ..Default::default()
         };
         crate::render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
     }

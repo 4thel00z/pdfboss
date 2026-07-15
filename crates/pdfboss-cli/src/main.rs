@@ -250,6 +250,7 @@ fn cmd_render(
     let p = doc.page(index).map_err(|e| e.to_string())?;
     let opts = pdfboss_render::RenderOptions {
         glyph_painting: fonts.to_painting(),
+        ..Default::default()
     };
     let pixmap = pdfboss_render::render_page_with_options(&doc, &p, scale, &opts)
         .map_err(|e| e.to_string())?;

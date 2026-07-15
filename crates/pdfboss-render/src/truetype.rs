@@ -978,6 +978,7 @@ pub(crate) mod tests {
         ] {
             let opts = crate::RenderOptions {
                 glyph_painting: tier,
+                ..Default::default()
             };
             let got = crate::render_page_with_options(&doc, &page, 1.0, &opts).unwrap();
             assert_eq!(got, base, "tier {tier:?} differs from default render");
