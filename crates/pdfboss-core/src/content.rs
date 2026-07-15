@@ -148,6 +148,14 @@ pub enum Op {
     SetLeading(f32),
     /// `Tf` (font resource name, size)
     SetFont(Name, f32),
+    /// `d0` (wx, wy): sets the glyph width for a colored Type3 glyph,
+    /// whose content sets its own color (ISO 32000-1 Table 113).
+    SetGlyphWidth(f32, f32),
+    /// `d1` (wx, wy, llx, lly, urx, ury): sets the glyph width and bounding
+    /// box for an uncolored Type3 glyph description; color comes from the
+    /// text state and color operators in the proc are ignored
+    /// (ISO 32000-1 Table 113).
+    SetGlyphWidthBBox(f32, f32, f32, f32, f32, f32),
     /// `Tr`
     SetTextRender(i32),
     /// `Ts`
@@ -468,6 +476,14 @@ fn dispatch_color_text(kw: &[u8], stack: &[Object]) -> Option<Op> {
                 return None;
             };
             Op::SetFont(font.clone(), size)
+        }
+        b"d0" => {
+            let [wx, wy] = nums::<2>(stack)?;
+            Op::SetGlyphWidth(wx, wy)
+        }
+        b"d1" => {
+            let [wx, wy, llx, lly, urx, ury] = nums::<6>(stack)?;
+            Op::SetGlyphWidthBBox(wx, wy, llx, lly, urx, ury)
         }
         b"Tr" => Op::SetTextRender(int1(stack)?),
         b"Ts" => Op::SetTextRise(nums::<1>(stack)?[0]),
@@ -1012,6 +1028,28 @@ mod tests {
                 Op::EndText,
             ]
         );
+    }
+
+    #[test]
+    fn parses_d0_glyph_width() {
+        let ops = parse_content(b"1000 0 d0").expect("parse");
+        assert_eq!(ops, vec![Op::SetGlyphWidth(1000.0, 0.0)]);
+    }
+
+    #[test]
+    fn parses_d1_glyph_width_bbox() {
+        let ops = parse_content(b"1000 0 0 0 750 700 d1").expect("parse");
+        assert_eq!(
+            ops,
+            vec![Op::SetGlyphWidthBBox(1000.0, 0.0, 0.0, 0.0, 750.0, 700.0)]
+        );
+    }
+
+    #[test]
+    fn d0_with_wrong_arity_is_skipped() {
+        // Too few operands: leniently skipped (like any arity mismatch), not a panic.
+        let ops = parse_content(b"1000 d0").expect("parse");
+        assert!(ops.is_empty());
     }
 
     #[test]
