@@ -614,7 +614,7 @@ mod tests {
 
     use crate::cff::tests::{build_box_glyph_fixture, build_box_glyph_fixture_cid};
     use crate::truetype::tests::build_font;
-    use crate::type1::tests::build_type1_box_fixture;
+    use crate::type1::tests::{build_type1_box_fixture, build_type1_box_fixture_standard_encoding};
     use crate::{GlyphPainting, Pixmap, RenderOptions};
 
     /// Builds a one-page PDF showing `content` with a simple `/TrueType` font
@@ -1049,6 +1049,43 @@ mod tests {
         assert!(
             dark_pixel_at(&pix, 55, 115),
             "Type1 built-in /Encoding should map code 128 with no PDF /Encoding"
+        );
+    }
+
+    #[test]
+    fn type1_builtin_standard_encoding_token_paints_without_pdf_encoding() {
+        // The FontFile's built-in /Encoding is the bare `StandardEncoding`
+        // token (not a `dup <code> /<name> put` array) mapping code 65 to a
+        // glyph literally named "A"; the PDF font dict has NO /Encoding key
+        // at all. Before this fix, `parse_encoding` left `builtin_encoding`
+        // entirely empty for the bare-token form, so every code->GID tier
+        // (Differences, base encoding, built-in encoding) came up empty and
+        // the glyph painted nothing.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /X /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile 7 0 R >>",
+        );
+        b.stream(7, "", &build_type1_box_fixture_standard_encoding());
+        let bytes = b.build(1);
+
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "built-in StandardEncoding token should map code 65 ('A') with no \
+             PDF /Encoding at all"
         );
     }
 
