@@ -1515,4 +1515,78 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    // --- Task 5: real bundled-font integration (feature-gated) --------------
+    //
+    // The tests above all substitute the synthetic `build_font` box glyph via
+    // a `Dir` provider, so they can assert one fixed pixel. These two instead
+    // exercise the actual compiled-in `BuiltinProvider` (the real OFL Croscore
+    // TrueType programs, gated behind the `substitute-fonts` feature): a real
+    // Tinos 'A' has different coverage than the synthetic box, so painting is
+    // asserted with a lenient, page-wide ink scan rather than one coordinate.
+
+    /// Whether any pixel in `pix` is meaningfully darker than the white
+    /// background -- a coverage-shape-agnostic ink check, unlike
+    /// `dark_pixel_at`'s single hard-coded coordinate (tuned to the synthetic
+    /// rectangle-glyph fixtures). A real substitute face's stems, serifs and
+    /// anti-aliased edges land at different pixels than the synthetic box, so
+    /// asserting real ink needs a scan across the whole page instead.
+    #[cfg(feature = "substitute-fonts")]
+    fn has_dark_ink(pix: &Pixmap) -> bool {
+        pix.data
+            .chunks_exact(4)
+            .any(|p| p[0] < 200 && p[1] < 200 && p[2] < 200)
+    }
+
+    /// `/Type1 /Times-Roman`, no `FontFile*` (non-embedded), `WinAnsiEncoding`,
+    /// showing 'A' -- rendered at `Full` with the real compiled-in
+    /// `BuiltinProvider`, which maps a Times-family request to the bundled
+    /// Tinos-Regular face (`substitute::face_filename`). Proves the feature's
+    /// actual font bytes parse and paint real ink end to end, not just that
+    /// the request-derivation and Dir-provider plumbing work.
+    #[cfg(feature = "substitute-fonts")]
+    #[test]
+    fn non_embedded_times_paints_with_builtin_at_full() {
+        let bytes = non_embedded_font_doc(
+            "Times-Roman",
+            "/Encoding /WinAnsiEncoding",
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::Builtin,
+            },
+        );
+        assert!(
+            has_dark_ink(&pix),
+            "non-embedded Times-Roman should paint a real 'A' via the builtin Tinos substitute"
+        );
+    }
+
+    /// `/Type1 /Symbol` has no license-clean substitute in v1 --
+    /// `FaceRequest::from_font_dict` returns `None` for it -- so even at
+    /// `Full` with the real builtin provider available, Symbol text must
+    /// stay unpainted rather than borrowing an unrelated face's glyphs.
+    #[cfg(feature = "substitute-fonts")]
+    #[test]
+    fn symbol_stays_unpainted_at_full() {
+        let bytes = non_embedded_font_doc(
+            "Symbol",
+            "/Encoding /WinAnsiEncoding",
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        let pix = render_with(
+            &bytes,
+            RenderOptions {
+                glyph_painting: GlyphPainting::Full,
+                substitutes: SubstituteSource::Builtin,
+            },
+        );
+        assert!(
+            !has_dark_ink(&pix),
+            "Symbol has no v1 substitute; Full must leave it unpainted, not fall back to a wrong face"
+        );
+    }
 }
