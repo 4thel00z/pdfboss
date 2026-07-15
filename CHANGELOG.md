@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.2.0](https://github.com/4thel00z/pdfboss/compare/v0.1.0...v0.2.0) (2026-07-15)
+
+
+### Features
+
+* **cli:** add --fonts tier flag to render command ([a4034ea](https://github.com/4thel00z/pdfboss/commit/a4034ea9936e7bf9908038b939e04f8bedb5d3b2))
+* **content:** parse Type3 d0/d1 glyph-metric operators ([2c2d194](https://github.com/4thel00z/pdfboss/commit/2c2d19457388675e9f524da146087db03c1dc8a2))
+* **encoding:** standard-14 AFM advance width tables ([6d5775d](https://github.com/4thel00z/pdfboss/commit/6d5775d5489ece4289d6eba05cb6fe93d9169d3a))
+* **py:** add fonts= tier parameter to Page.render ([6a1319c](https://github.com/4thel00z/pdfboss/commit/6a1319c386c7bf8ff6f56601bb56e4a04b8905ae))
+* **python:** discover pdfboss-fonts for fonts=full; font_dir override ([be518f3](https://github.com/4thel00z/pdfboss/commit/be518f3b7fc17a257a9b2c018403e9b692a1f005))
+* **python:** pdfboss-fonts data package with the OFL substitute faces ([d2d02be](https://github.com/4thel00z/pdfboss/commit/d2d02beb8bda0bd8666b6b881cd9b815dac5dae5))
+* **python:** pdfboss[full] extra + pdfboss-fonts release pipeline ([b60f704](https://github.com/4thel00z/pdfboss/commit/b60f704c30305267b64e52841cb4e05b7f8cb732))
+* **render:** add GlyphPainting tier and RenderOptions gate ([eef8b17](https://github.com/4thel00z/pdfboss/commit/eef8b17d929c921bb67d6d13e7a949490cab580f))
+* **render:** advance glyphs by the PDF /Widths, program advance as fallback ([9711bfd](https://github.com/4thel00z/pdfboss/commit/9711bfd904dbeb2902393bdcb5f91b0ec619a7dc))
+* **render:** bundle OFL substitute faces behind the substitute-fonts feature ([0518969](https://github.com/4thel00z/pdfboss/commit/0518969b0360c798c14686ee063051088382b868))
+* **render:** decrypt and segment Type1 FontFile programs ([c176f34](https://github.com/4thel00z/pdfboss/commit/c176f3428a62090f0bf68f717828922e91d5e99e))
+* **render:** honor built-in StandardEncoding for embedded Type1 fonts ([23473d3](https://github.com/4thel00z/pdfboss/commit/23473d3d14ac6a7cdb73fc7149e42c00a7b544e4))
+* **render:** honor Type3 d0/d1 colored vs uncolored glyphs ([bb98088](https://github.com/4thel00z/pdfboss/commit/bb9808824419268d8c769d18f1918613841b58c9))
+* **render:** interpret CFF Type2 charstrings into outlines ([7aa88e4](https://github.com/4thel00z/pdfboss/commit/7aa88e4ea72145a6a43609c81ddd501f699df522))
+* **render:** interpret Type1 charstrings into outlines ([dbae39c](https://github.com/4thel00z/pdfboss/commit/dbae39c814c0f071e271e7d715f2892294dd5b71))
+* **render:** map simple TrueType glyphs via /Encoding and /Differences ([e626893](https://github.com/4thel00z/pdfboss/commit/e62689395c5b523421d8b5c88ad40d947d99d1f2))
+* **render:** paint embedded CFF fonts, gated by the AllEmbedded tier ([f1410a2](https://github.com/4thel00z/pdfboss/commit/f1410a273c9d69b807ab9a2c488955a869005928))
+* **render:** paint embedded Type1 fonts, gated by the AllEmbedded tier ([601744d](https://github.com/4thel00z/pdfboss/commit/601744d56212be7fb5618c2d0e4290f1bfac9e12))
+* **render:** paint Type3 glyphs by re-entering the executor, gated ([7849b1c](https://github.com/4thel00z/pdfboss/commit/7849b1c80496d1be74861f059c6dca392b7fc0f5))
+* **render:** parse the CFF container (INDEX/DICT/charset) ([9c1b047](https://github.com/4thel00z/pdfboss/commit/9c1b0472c0ee9d1a2159499c34810c9f1c2bb95d))
+* **render:** parse the post table for glyph-name lookup ([dcf77d7](https://github.com/4thel00z/pdfboss/commit/dcf77d7997b5ac5a24be50bb877e1167cca0715c))
+* **render:** parse Type1 FontMatrix, Encoding, Subrs, CharStrings ([59f1833](https://github.com/4thel00z/pdfboss/commit/59f18339c02cedab2a25ee0fcf0e51065c584504))
+* **render:** parse Type3 font dicts (CharProcs, FontMatrix, widths) ([bb22596](https://github.com/4thel00z/pdfboss/commit/bb22596250b7b870d3abf9a4c8a66a19e9b254ad))
+* **render:** substitute non-embedded fonts at Full, AFM-14 advances ([4b03a79](https://github.com/4thel00z/pdfboss/commit/4b03a79c62d1e638e529ee5ab32af8de4a6f8b26))
+* **render:** substitute-source option, provider trait, face request ([65d4a1d](https://github.com/4thel00z/pdfboss/commit/65d4a1def2addd1eac9cc1bc17d078a48fd5948d))
+
+
+### Bug Fixes
+
+* **encoding:** reject non-Core-14 siblings in standard-14 width lookup ([e8e8056](https://github.com/4thel00z/pdfboss/commit/e8e8056b97840dc1db32f1480b91e892e09cb02f))
+* **render:** bound callothersubr passthrough; flex open-guard; 255 test ([117f27e](https://github.com/4thel00z/pdfboss/commit/117f27e8042bfe5e1fa11fc641d70f2df5b0807d))
+* **render:** cap aggregate CID /W expansion; correct tier-test comment ([46bfe3b](https://github.com/4thel00z/pdfboss/commit/46bfe3b4c9ea4ab34bc3a55d47cd764652d1767d))
+* **render:** consume a single eexec separator; leniency tests ([31334e4](https://github.com/4thel00z/pdfboss/commit/31334e4c80ea8278522946252251c15b7d8b0501))
+* **render:** paint bare-encoding standard-14; correct NOTICE; Symbol prefix; CLI feature ([53e09af](https://github.com/4thel00z/pdfboss/commit/53e09af67daeac0da48c77bb8e4a63c387f6b571))
+* **render:** saturate /Differences code increment and document load_simple tiers ([f4aa144](https://github.com/4thel00z/pdfboss/commit/f4aa1441cebe00ebf6f08574b906e3fb3dcb2530))
+* **render:** scope substitution to simple fonts; preserve Type3/Type0 ([985368c](https://github.com/4thel00z/pdfboss/commit/985368ccdc0e4edfa961200de35ad4fcd3bfb34a))
+
+
+### Documentation
+
+* **render:** design spec for full glyph painting ([6fb3476](https://github.com/4thel00z/pdfboss/commit/6fb34762b5e79c5e988820d1613379ec8a72ea95))
+
 ## 0.1.0 (2026-07-14)
 
 
