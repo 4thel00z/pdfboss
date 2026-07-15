@@ -414,9 +414,21 @@ fn cid_widths(doc: &Document, cid: &Dict) -> WidthMap {
     }
 }
 
+/// Hard ceiling on the number of CID width entries a single `/W` array may
+/// insert in total. Each `c1 c2 w` RANGE is already capped at 65536 entries
+/// on its own, but that alone doesn't bound the array as a whole: a crafted
+/// `/W` array of many non-overlapping ranges (e.g. `0 65535 1  65536 131071
+/// 1  ...`) can still expand to hundreds of millions of `HashMap` entries.
+/// This caps the aggregate across every range/single-CID entry in the
+/// array, regardless of how many of them there are.
+const MAX_CID_WIDTH_ENTRIES: usize = 1_000_000;
+
 /// Parses a CID `/W` array: `c [w1 w2 ...]` gives consecutive widths from
-/// CID `c`; `c1 c2 w` gives every CID in `c1..=c2` width `w` (ranges capped
-/// at 65536 entries so a hostile span can't allocate unbounded memory).
+/// CID `c`; `c1 c2 w` gives every CID in `c1..=c2` width `w`. The TOTAL
+/// number of entries inserted across the whole array is capped at
+/// `MAX_CID_WIDTH_ENTRIES` (not merely each range), so a hostile array with
+/// many ranges can't allocate unbounded memory; a font that hits the cap is
+/// malformed, so parsing simply stops and keeps whatever was parsed so far.
 fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut HashMap<u32, f32>) {
     let resolved: Vec<Object> = items
         .iter()
@@ -424,6 +436,9 @@ fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut HashMap<u32
         .collect();
     let mut i = 0;
     while i < resolved.len() {
+        if map.len() >= MAX_CID_WIDTH_ENTRIES {
+            break;
+        }
         let Some(first) = resolved[i].as_int() else {
             i += 1;
             continue;
@@ -432,6 +447,9 @@ fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut HashMap<u32
         match resolved.get(i + 1) {
             Some(Object::Array(list)) => {
                 for (j, item) in list.iter().enumerate() {
+                    if map.len() >= MAX_CID_WIDTH_ENTRIES {
+                        break;
+                    }
                     let Some(code) = first.checked_add(j as u32) else {
                         break; // start CID so large the CIDs overflow u32
                     };
@@ -447,6 +465,9 @@ fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut HashMap<u32
                 if let Some(w) = w {
                     let end = last.min(first.saturating_add(65535));
                     for c in first..=end.max(first) {
+                        if map.len() >= MAX_CID_WIDTH_ENTRIES {
+                            break;
+                        }
                         map.insert(c, w as f32);
                     }
                 }
@@ -796,6 +817,76 @@ mod tests {
             dark_pixel_at(&pix, 135, 115),
             "second glyph must paint at the /W-implied origin (135,115), not \
              stacked on the first glyph as the program's 0 advance would give"
+        );
+    }
+
+    #[test]
+    fn cid_width_array_many_ranges_capped_does_not_oom() {
+        // Adversarial-input guard: each `c1 c2 w` RANGE is already capped at
+        // 65536 entries on its own, but nothing previously capped the NUMBER
+        // of ranges. A /W array of many small, non-overlapping ranges (as
+        // built here, all decimal literals -- no hex/binary blobs) could
+        // expand to hundreds of millions of HashMap entries without the
+        // aggregate `MAX_CID_WIDTH_ENTRIES` cap. 16 back-to-back
+        // maximally-sized (65536-entry) ranges declare 1,048,576 entries in
+        // total, which exceeds the 1,000,000 cap partway through the 16th
+        // range, so this exercises the cap actually kicking in mid-array.
+        let mut w_array = String::new();
+        for k in 0u32..16 {
+            let start = k * 65536;
+            let end = start + 65535;
+            let width = if k == 0 { 800 } else { 500 };
+            w_array.push_str(&format!("{start} {end} {width} "));
+        }
+
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <00010001> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            &format!(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+                 /FontDescriptor 7 0 R /DW 1000 /W [{w_array}] >>"
+            ),
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
+        );
+        b.stream(8, "", &build_font());
+        let bytes = b.build(1);
+
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+
+        let started = std::time::Instant::now();
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "capped /W parse must complete quickly, not hang expanding \
+             ~1M+ range entries unbounded"
+        );
+
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "first glyph paints at the usual (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "CID 1's width (800, declared by the first range, well within \
+             the cap) must still govern the second glyph's origin -- the cap \
+             degrades the tail of a hostile array, not the CIDs that fit"
         );
     }
 }
