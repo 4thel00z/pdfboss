@@ -245,21 +245,55 @@ impl Page {
 
     /// Renders the page and returns PNG bytes. Releases the GIL while the
     /// rasterization and PNG encoding run.
-    #[pyo3(signature = (scale=1.0, fonts="all-embedded"))]
+    ///
+    /// `fonts="full"` substitutes replacement faces for non-embedded fonts.
+    /// Faces come from an explicit `font_dir=...`, or else are discovered by
+    /// importing the optional `pdfboss-fonts` data package; if neither is
+    /// available this raises `ValueError` with an actionable install
+    /// message rather than silently degrading or leaking a raw import
+    /// error.
+    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None))]
     fn render<'py>(
         &self,
         py: Python<'py>,
         scale: f32,
         fonts: &str,
+        font_dir: Option<String>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        use pdfboss_render::{GlyphPainting, SubstituteSource};
+
         if !scale.is_finite() || scale <= 0.0 {
             return Err(PyValueError::new_err(
                 "scale must be a positive, finite number",
             ));
         }
+        let glyph_painting = glyph_painting_from_str(fonts)?;
+        let substitutes = if glyph_painting == GlyphPainting::Full {
+            if let Some(dir) = font_dir {
+                SubstituteSource::Dir(dir.into())
+            } else {
+                // The binding discovers the pdfboss-fonts data package. The
+                // import needs the GIL, so this runs before `allow_threads`.
+                match py.import("pdfboss_fonts") {
+                    Ok(module) => {
+                        let dir: String = module.getattr("font_dir")?.call0()?.extract()?;
+                        SubstituteSource::Dir(dir.into())
+                    }
+                    Err(_) => {
+                        return Err(PyValueError::new_err(
+                            "fonts=\"full\" requires the pdfboss-fonts package; \
+                             install it with `pip install pdfboss[full]`, or pass \
+                             an explicit font_dir=...",
+                        ));
+                    }
+                }
+            }
+        } else {
+            SubstituteSource::None
+        };
         let opts = pdfboss_render::RenderOptions {
-            glyph_painting: glyph_painting_from_str(fonts)?,
-            ..Default::default()
+            glyph_painting,
+            substitutes,
         };
         let png = py.allow_threads(|| {
             let doc = self.doc.lock();

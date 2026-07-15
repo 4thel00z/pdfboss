@@ -78,9 +78,22 @@ class Page:
     def extract_text(self) -> str:
         """Extracts the page's text."""
 
-    def render(self, scale: float = 1.0) -> bytes:
+    def render(
+        self,
+        scale: float = 1.0,
+        fonts: str = "all-embedded",
+        font_dir: str | None = None,
+    ) -> bytes:
         """Renders the page at ``scale`` and returns PNG bytes.
 
         ``scale`` must be a positive, finite number (``ValueError``
         otherwise); 1.0 maps one PDF point to one pixel.
+
+        ``fonts`` selects how aggressively non-embedded glyphs are painted:
+        ``"embedded-only"``, ``"all-embedded"`` (default) or ``"full"``.
+        ``"full"`` substitutes replacement faces for non-embedded fonts,
+        read from ``font_dir`` if given, or else discovered from the
+        optional ``pdfboss-fonts`` package; if neither is available this
+        raises ``ValueError`` (install with ``pip install pdfboss[full]``,
+        or pass ``font_dir=...``).
         """
