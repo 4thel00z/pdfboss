@@ -12,7 +12,11 @@
 /// letters followed by `+`, e.g. `ABCDEF+Times-Bold`) from `base_font`.
 fn strip_subset_prefix(base_font: &str) -> &str {
     let bytes = base_font.as_bytes();
-    if bytes.len() > 6 && bytes[6] == b'+' && bytes[..6].iter().all(u8::is_ascii_uppercase) {
+    // `> 7`, not `> 6`: the guard must require at least one character after
+    // the `+` for the strip to be meaningful, so the degenerate
+    // `"ABCDEF+"` (len 7) is left unstripped instead of yielding an empty
+    // name. Matches `substitute.rs`'s `strip_subset_prefix` guard exactly.
+    if bytes.len() > 7 && bytes[6] == b'+' && bytes[..6].iter().all(u8::is_ascii_uppercase) {
         &base_font[7..]
     } else {
         base_font

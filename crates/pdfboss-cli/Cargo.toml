@@ -12,6 +12,12 @@ pdfboss-text = { path = "../pdfboss-text" }
 pdfboss-render = { path = "../pdfboss-render" }
 clap = { version = "4", features = ["derive"] }
 
+[features]
+# Passthrough so `cargo build -p pdfboss-cli --features substitute-fonts`
+# enables the bundled substitute faces, without the caller needing to know
+# the non-obvious `--features pdfboss-render/substitute-fonts` spelling.
+substitute-fonts = ["pdfboss-render/substitute-fonts"]
+
 [[bin]]
 name = "pdfboss"
 path = "src/main.rs"

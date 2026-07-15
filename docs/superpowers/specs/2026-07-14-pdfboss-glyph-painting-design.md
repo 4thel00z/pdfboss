@@ -171,8 +171,10 @@ trait SubstituteProvider { fn face(&self, req: &FaceRequest) -> Option<&[u8]>; }
   or the standard-14 AFM tables when `/Widths` is absent.
 - **Bundled faces:** Croscore — Arimo (Sans/Helvetica), Tinos (Serif/Times),
   Cousine (Mono/Courier). All **Apache-2.0**, compatible with the repo's MIT OR
-  Apache-2.0 license. `Symbol` and `ZapfDingbats` have no license-clean substitute
-  in v1 and remain unpainted (documented partial).
+  Apache-2.0 license. (Superseded by implementation: the bundled Croscore faces
+  actually ship under **SIL OFL 1.1**, not Apache-2.0 -- see `assets/fonts/
+  OFL.txt` and `NOTICE`.) `Symbol` and `ZapfDingbats` have no license-clean
+  substitute in v1 and remain unpainted (documented partial).
 - **Delivery — Rust/CLI:** the `substitute-fonts` cargo feature `include_bytes!`s
   the three TTFs and supplies a `BuiltinProvider`. Without the feature the type
   still exists but yields no faces, so `Full` degrades to `AllEmbedded`.
@@ -251,7 +253,9 @@ interpreters and in Type3 glyph-proc execution.
 ## 9. Risks / decisions to confirm
 
 - **Font licensing:** Croscore (Apache-2.0) chosen for license cleanliness over
-  metric coverage. `Symbol`/`ZapfDingbats` left unpainted in v1.
+  metric coverage. (Superseded by implementation: shipped under **SIL OFL 1.1**,
+  not Apache-2.0 -- see `assets/fonts/OFL.txt` and `NOTICE`.) `Symbol`/
+  `ZapfDingbats` left unpainted in v1.
 - **CFF/Type1 interpreters** are the largest, highest-risk pieces; landed
   independently (steps 5–6) behind the already-shipping gate so partial progress
   never regresses `AllEmbedded`.
