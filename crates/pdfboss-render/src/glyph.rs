@@ -1366,14 +1366,23 @@ mod tests {
     /// (e.g. `"Arimo[wght].ttf"`, matching `substitute::face_filename`'s
     /// output) and returns the directory, ready to hand to `SubstituteSource::
     /// Dir` / `DirProvider`.
+    ///
+    /// The directory name is derived from the PID *and* a process-wide
+    /// monotonic counter, not a timestamp: two calls racing on separate
+    /// threads (as happens under the default parallel test runner) can land
+    /// in the same clock tick and collide on a timestamp-only name, which
+    /// then causes one test's `remove_dir_all` cleanup to race another
+    /// test's still-in-flight read of the (shared) directory -- an
+    /// intermittent missing/half-deleted face file. The atomic counter makes
+    /// every call's directory unique within this process, so no two tests
+    /// ever share one, regardless of thread interleaving.
     fn write_temp_face(basename: &str, bytes: &[u8]) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "pdfboss-glyph-substitute-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            n
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         std::fs::write(dir.join(basename), bytes).expect("write fixture face");
