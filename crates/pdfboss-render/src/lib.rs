@@ -124,6 +124,15 @@ pub struct RenderOptions {
     pub substitutes: SubstituteSource,
 }
 
+/// Whether this binary was built with the `substitute-fonts` feature, i.e.
+/// whether `SubstituteSource::Builtin` has compiled-in faces to hand out.
+/// Callers (e.g. the CLI) use this to give an actionable message when `Full`
+/// is requested with no `--font-dir` and no compiled-in set, rather than
+/// silently rendering as if `Full` had never been asked for.
+pub fn builtin_fonts_available() -> bool {
+    cfg!(feature = "substitute-fonts")
+}
+
 /// Renders a page at `scale` onto a white background. The pixel size is
 /// `ceil(crop_w * scale) x ceil(crop_h * scale)` (after `/Rotate`), and the
 /// base transform maps the crop box to device space with a y-flip and the

@@ -19,6 +19,8 @@ use crate::image::{self, DrawParams};
 use crate::path::PathBuilder;
 use crate::raster::{fill_path, FillRule, Mask};
 use crate::stroke::stroke_path;
+#[cfg(feature = "substitute-fonts")]
+use crate::substitute::BuiltinProvider;
 use crate::substitute::{DirProvider, SubstituteProvider};
 use crate::truetype::Seg;
 use crate::type3::Type3Font;
@@ -276,9 +278,14 @@ pub(crate) fn render_page_with_options(
     let ctm = base_ctm(page.crop_box.normalize(), page.rotate, scale);
     let provider: Option<Box<dyn SubstituteProvider>> = match &opts.substitutes {
         SubstituteSource::Dir(dir) => Some(Box::new(DirProvider { dir: dir.clone() })),
-        // `Builtin` lands once compiled-in faces exist; `None` substitutes
-        // nothing. Both mean no provider for now.
-        SubstituteSource::Builtin | SubstituteSource::None => None,
+        #[cfg(feature = "substitute-fonts")]
+        SubstituteSource::Builtin => Some(Box::new(BuiltinProvider)),
+        // Without the `substitute-fonts` feature there are no compiled-in
+        // faces, so `Builtin` falls back to no provider (`Full` degrades to
+        // `AllEmbedded` for non-embedded fonts). `None` never substitutes.
+        #[cfg(not(feature = "substitute-fonts"))]
+        SubstituteSource::Builtin => None,
+        SubstituteSource::None => None,
     };
     let mut exec = Executor {
         doc,

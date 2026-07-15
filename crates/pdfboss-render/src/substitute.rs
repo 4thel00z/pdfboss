@@ -144,6 +144,34 @@ impl SubstituteProvider for DirProvider {
     }
 }
 
+/// Compiled-in substitute faces: the OFL Croscore set (Arimo/Tinos/Cousine,
+/// metric-compatible with Helvetica/Times/Courier) bundled via
+/// `include_bytes!` under `assets/fonts/`. Gated behind the `substitute-fonts`
+/// feature so the default build stays free of the ~4 MB of font data; see
+/// `assets/fonts/NOTICE` and `OFL.txt` for licensing.
+#[cfg(feature = "substitute-fonts")]
+pub(crate) struct BuiltinProvider;
+
+#[cfg(feature = "substitute-fonts")]
+impl SubstituteProvider for BuiltinProvider {
+    fn face(&self, req: &FaceRequest) -> Option<Vec<u8>> {
+        let bytes: &[u8] = match face_filename(req) {
+            "Arimo[wght].ttf" => include_bytes!("../assets/fonts/Arimo[wght].ttf"),
+            "Arimo-Italic[wght].ttf" => include_bytes!("../assets/fonts/Arimo-Italic[wght].ttf"),
+            "Tinos-Regular.ttf" => include_bytes!("../assets/fonts/Tinos-Regular.ttf"),
+            "Tinos-Bold.ttf" => include_bytes!("../assets/fonts/Tinos-Bold.ttf"),
+            "Tinos-Italic.ttf" => include_bytes!("../assets/fonts/Tinos-Italic.ttf"),
+            "Tinos-BoldItalic.ttf" => include_bytes!("../assets/fonts/Tinos-BoldItalic.ttf"),
+            "Cousine-Regular.ttf" => include_bytes!("../assets/fonts/Cousine-Regular.ttf"),
+            "Cousine-Bold.ttf" => include_bytes!("../assets/fonts/Cousine-Bold.ttf"),
+            "Cousine-Italic.ttf" => include_bytes!("../assets/fonts/Cousine-Italic.ttf"),
+            "Cousine-BoldItalic.ttf" => include_bytes!("../assets/fonts/Cousine-BoldItalic.ttf"),
+            _ => return None,
+        };
+        Some(bytes.to_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use pdfboss_core::{Document, ObjRef, Object};
@@ -342,5 +370,28 @@ mod tests {
             dir: std::path::PathBuf::from("/no/such/pdfboss-substitute-dir"),
         };
         assert_eq!(provider.face(&req(Family::Sans, false, false)), None);
+    }
+
+    /// Every bundled face (all `Family` x bold x italic combinations) is a
+    /// `glyf`-based sfnt with a `cmap` that maps 'A' to a nonempty outline --
+    /// a parse-level smoke test for the compiled-in font bytes themselves,
+    /// independent of the request-derivation logic tested above.
+    #[cfg(feature = "substitute-fonts")]
+    #[test]
+    fn every_builtin_face_parses_and_renders_a() {
+        let p = BuiltinProvider;
+        let families = [Family::Serif, Family::Sans, Family::Mono];
+        let bools = [false, true];
+        for family in families {
+            for bold in bools {
+                for italic in bools {
+                    let r = req(family, bold, italic);
+                    let bytes = p.face(&r).expect("builtin face present");
+                    let tt = crate::truetype::TrueType::parse(bytes).expect("glyf sfnt");
+                    let g = tt.gid_for_unicode('A' as u32).expect("cmap has A");
+                    assert!(!tt.glyph_path(g).is_empty(), "renders A for {r:?}");
+                }
+            }
+        }
     }
 }

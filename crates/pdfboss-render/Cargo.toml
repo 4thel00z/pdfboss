@@ -12,6 +12,12 @@ pdfboss-encoding = { path = "../pdfboss-encoding" }
 png = "0.18"
 jpeg-decoder = "0.3"
 
+[features]
+# Bundles the OFL Croscore substitute faces (Arimo/Tinos/Cousine) into the
+# binary via `include_bytes!`, so `SubstituteSource::Builtin` has faces to
+# hand out without a `--font-dir`. Adds ~4 MB to the binary; off by default.
+substitute-fonts = []
+
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
 criterion = { workspace = true }
