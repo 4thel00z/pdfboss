@@ -19,9 +19,10 @@ use crate::image::{self, DrawParams};
 use crate::path::PathBuilder;
 use crate::raster::{fill_path, FillRule, Mask};
 use crate::stroke::stroke_path;
+use crate::substitute::{DirProvider, SubstituteProvider};
 use crate::truetype::Seg;
 use crate::type3::Type3Font;
-use crate::{GlyphPainting, Pixmap, RenderOptions};
+use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
 
 /// Maximum `q`/`Q` nesting depth.
 const MAX_GSTATE_DEPTH: usize = 64;
@@ -273,11 +274,18 @@ pub(crate) fn render_page_with_options(
     let content = page.content(doc).unwrap_or_default();
     let ops = parse_content(&content).unwrap_or_default();
     let ctm = base_ctm(page.crop_box.normalize(), page.rotate, scale);
+    let provider: Option<Box<dyn SubstituteProvider>> = match &opts.substitutes {
+        SubstituteSource::Dir(dir) => Some(Box::new(DirProvider { dir: dir.clone() })),
+        // `Builtin` lands once compiled-in faces exist; `None` substitutes
+        // nothing. Both mean no provider for now.
+        SubstituteSource::Builtin | SubstituteSource::None => None,
+    };
     let mut exec = Executor {
         doc,
         pix,
         painting: opts.glyph_painting,
         color_locked: false,
+        provider,
     };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
     Ok(exec.pix)
@@ -294,6 +302,10 @@ struct Executor<'a> {
     /// `run_color_or_misc` turns every fill/stroke color-setting op into a
     /// no-op and the glyph keeps the color inherited from the text state.
     color_locked: bool,
+    /// The `Full`-tier substitute source built from
+    /// [`RenderOptions::substitutes`], if any. Passed through to
+    /// [`GlyphFont::load`], which does not yet consult it.
+    provider: Option<Box<dyn SubstituteProvider>>,
 }
 
 impl Executor<'_> {
@@ -604,7 +616,9 @@ impl Executor<'_> {
         let loaded = self
             .find_res(chain, "Font", name)
             .and_then(|o| o.as_dict().cloned())
-            .and_then(|d| GlyphFont::load(self.doc, &d, self.painting).map(Rc::new));
+            .and_then(|d| {
+                GlyphFont::load(self.doc, &d, self.painting, self.provider.as_deref()).map(Rc::new)
+            });
         cache.insert(name.to_string(), loaded.clone());
         loaded
     }
@@ -1176,6 +1190,7 @@ mod tests {
         ] {
             let opts = RenderOptions {
                 glyph_painting: tier,
+                ..Default::default()
             };
             let got = render_page_with_options(&doc, &page, 1.0, &opts).expect("render");
             assert_eq!(got, base, "tier {tier:?} differs from default render");
@@ -1562,6 +1577,7 @@ mod tests {
         let page = doc.page(0).expect("page");
         let opts = RenderOptions {
             glyph_painting: tier,
+            ..Default::default()
         };
         render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
     }
