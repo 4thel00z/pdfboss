@@ -48,6 +48,8 @@ include = [
 dev = [
     "maturin>=1.7",
     "pytest>=8",
+    # test_release_meta.py parses .github/workflows/release-please.yaml
+    "pyyaml>=6",
 ]
 
 [tool.pytest.ini_options]
