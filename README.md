@@ -92,10 +92,10 @@ pixmap.save_png("page.png")?;
 Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, aggregated over the files every library handled; pages/sec, higher is faster):
 
 <p align="center">
-  <img src="benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
+  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 3,184 pages/s versus PyMuPDF's 460 (≈7×), and 30–170× the pure-Python readers. On open + parse it reaches 280,873 pages/s versus PyMuPDF's 102,576 (≈2.7×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Rendering is not compared — pdfboss's rasterizer does not yet paint every glyph, so timing it against full renderers would be misleading.
+**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 1,539 pages/s versus PyMuPDF's 279 (≈5.5×), and 25–80× the pure-Python readers. On open + parse it reaches 19,114 pages/s versus PyMuPDF's 3,766 (≈5×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Rendering is not compared — pdfboss's rasterizer does not yet paint every glyph, so timing it against full renderers would be misleading.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
