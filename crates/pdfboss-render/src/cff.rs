@@ -11,14 +11,14 @@
 //! References: the public CFF spec (Adobe Tech Note #5176) and the Type2
 //! charstring spec (Adobe Tech Note #5177).
 
-use std::collections::HashMap;
+use pdfboss_core::FastMap;
 
 use crate::truetype::Seg;
 
 /// A DICT is a map from operator code to its operand list. The escape
 /// operator `12 x` is encoded as the key `0x0c00 | x` so both one- and
 /// two-byte operators share a single numeric key space.
-type Dict = HashMap<u16, Vec<f64>>;
+type Dict = FastMap<u16, Vec<f64>>;
 
 // --- Top DICT operator keys -------------------------------------------------
 const CHARSET_OP: u16 = 15;
@@ -1195,7 +1195,7 @@ impl FdSelect {
 /// operand) yields `None`. The loop always advances `i` by at least one byte,
 /// so it is bounded by `data.len()` with no separate step counter needed.
 fn parse_dict(data: &[u8]) -> Option<Dict> {
-    let mut out = HashMap::new();
+    let mut out = FastMap::default();
     let mut operands: Vec<f64> = Vec::new();
     let mut i = 0usize;
     while i < data.len() {
@@ -2023,14 +2023,14 @@ pub(crate) mod tests {
 
     #[test]
     fn units_per_em_reads_font_matrix() {
-        let mut top = Dict::new();
+        let mut top = Dict::default();
         top.insert(FONT_MATRIX_OP, vec![0.002, 0.0, 0.0, 0.002, 0.0, 0.0]);
         assert_eq!(units_per_em_from_top_dict(&top), 500.0);
     }
 
     #[test]
     fn units_per_em_defaults_without_font_matrix() {
-        assert_eq!(units_per_em_from_top_dict(&Dict::new()), 1000.0);
+        assert_eq!(units_per_em_from_top_dict(&Dict::default()), 1000.0);
     }
 
     #[test]

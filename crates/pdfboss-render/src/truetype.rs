@@ -7,7 +7,7 @@
 //! bounds-checked so a malformed embedded font yields empty output rather than
 //! a panic.
 
-use std::collections::HashMap;
+use pdfboss_core::FastMap;
 
 /// One outline command in font units. The on-curve start of each `Quad` is the
 /// current point (the end of the previous command).
@@ -555,7 +555,7 @@ impl Cmap {
 /// recorded; entries below 258 reference the standard Macintosh names, which
 /// are recovered elsewhere through the Adobe Glyph List.
 struct Post {
-    names: HashMap<String, u16>,
+    names: FastMap<String, u16>,
 }
 
 impl Post {
@@ -584,7 +584,7 @@ impl Post {
             p += slen;
             custom.push(String::from_utf8_lossy(bytes).into_owned());
         }
-        let mut names = HashMap::new();
+        let mut names = FastMap::default();
         for (gid, &ix) in indices.iter().enumerate() {
             if ix >= 258 {
                 if let Some(name) = custom.get(ix as usize - 258) {
