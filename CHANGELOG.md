@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.1](https://github.com/4thel00z/pdfboss/compare/v0.2.0...v0.2.1) (2026-07-16)
+
+
+### Performance Improvements
+
+* **core:** add an FxHash-based FastMap; use for Dict, caches, and xref ([e8adb40](https://github.com/4thel00z/pdfboss/commit/e8adb40ab55a8f123cfd5cbf4a28381b23c48aaa))
+* **render:** cache flattened glyph outlines, not just parsed ones ([7a2654e](https://github.com/4thel00z/pdfboss/commit/7a2654e82fdc7b99bb86b17af1be9ce5f5e4253d))
+* **render:** drop per-curve alloc and finish-clone in the path flattener ([16950ce](https://github.com/4thel00z/pdfboss/commit/16950ce8008112c567401f6499b85728af5ca879))
+* **render:** memoize glyph outlines per gid ([7c13df6](https://github.com/4thel00z/pdfboss/commit/7c13df6fdfe77f937816a3984cefc5feb04ab599))
+* **render:** route glyph and font-load maps through the fast hasher ([a9ead58](https://github.com/4thel00z/pdfboss/commit/a9ead58b101db1ba56b5f61c0a2b892da5a0b97f))
+
 ## [0.2.0](https://github.com/4thel00z/pdfboss/compare/v0.1.0...v0.2.0) (2026-07-15)
 
 
