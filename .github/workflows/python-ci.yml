@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install package (builds extension via maturin backend)
-        run: pip install . pytest
+        run: pip install . pytest pyyaml
       - name: Run integration tests
         run: pytest -q
 
