@@ -17,7 +17,7 @@
 //! §9.6.6.2). Interpreting each charstring into an outline is a later
 //! task's job.
 
-use std::collections::HashMap;
+use pdfboss_core::FastMap;
 
 use crate::truetype::Seg;
 
@@ -233,7 +233,7 @@ pub(crate) struct Type1Font {
     /// gid -> glyph name, parallel to `charstrings`.
     names: Vec<String>,
     /// name -> gid.
-    name_to_gid: HashMap<String, u16>,
+    name_to_gid: FastMap<String, u16>,
     /// Decrypted local subroutines, indexed by subr number (gaps -> empty).
     subrs: Vec<Vec<u8>>,
     /// The font's built-in `/Encoding`: code -> glyph name (256 slots).
@@ -1075,10 +1075,10 @@ fn parse_subrs(private: &[u8], len_iv: usize) -> Vec<Vec<u8>> {
 fn parse_charstrings(
     private: &[u8],
     len_iv: usize,
-) -> (Vec<Vec<u8>>, Vec<String>, HashMap<String, u16>) {
+) -> (Vec<Vec<u8>>, Vec<String>, FastMap<String, u16>) {
     let mut charstrings: Vec<Vec<u8>> = Vec::new();
     let mut names: Vec<String> = Vec::new();
-    let mut name_to_gid: HashMap<String, u16> = HashMap::new();
+    let mut name_to_gid: FastMap<String, u16> = FastMap::default();
 
     let Some(cs_pos) = find_token(private, b"/CharStrings") else {
         return (charstrings, names, name_to_gid);

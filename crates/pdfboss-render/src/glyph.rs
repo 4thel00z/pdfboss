@@ -19,8 +19,8 @@
 //! or `Full` with no substitute provider) leave that text unpainted rather
 //! than guessing.
 
+use pdfboss_core::FastMap;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use pdfboss_core::{Dict, Document, Object};
@@ -71,7 +71,7 @@ enum GlyphKind {
 /// `GlyphFont::advance` must fall back to the program advance rather than
 /// treating every code as width 0.
 struct WidthMap {
-    map: HashMap<u32, f32>,
+    map: FastMap<u32, f32>,
     default: f32,
     declared: bool,
 }
@@ -98,7 +98,7 @@ pub(crate) struct GlyphFont {
     /// a no-op everywhere except non-embedded standard-14 substitution).
     /// Unlike `WidthMap`, a missing code here means "no AFM entry for this
     /// code", not "declared width 0" -- see `GlyphFont::advance`.
-    afm_widths: HashMap<u32, f32>,
+    afm_widths: FastMap<u32, f32>,
     /// Per-glyph outline memo. A glyph's outline (`Vec<Seg>` in font units)
     /// is transform-independent, so a code point repeated across a page --
     /// the common case in body text -- reparses/reinterprets its charstring
@@ -106,7 +106,7 @@ pub(crate) struct GlyphFont {
     /// rendering is single-threaded (`GlyphFont` lives behind an `Rc`), so a
     /// `RefCell` suffices. The stored `Rc<[Seg]>` is handed back by cheap
     /// refcount clone rather than copying the segment vector.
-    outline_cache: RefCell<HashMap<u16, Rc<[Seg]>>>,
+    outline_cache: RefCell<FastMap<u16, Rc<[Seg]>>>,
 }
 
 impl GlyphFont {
@@ -257,11 +257,11 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        outline_cache: RefCell::new(HashMap::new()),
+        outline_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
-        afm_widths: HashMap::new(),
+        afm_widths: FastMap::default(),
     })
 }
 
@@ -278,7 +278,7 @@ fn simple_widths(doc: &Document, font: &Dict) -> WidthMap {
         .unwrap_or(0)
         .max(0) as u32;
 
-    let mut map = HashMap::new();
+    let mut map = FastMap::default();
     let mut declared = false;
     if let Some(Ok(Object::Array(items))) = font.get("Widths").map(|o| doc.resolve(o)) {
         declared = true;
@@ -326,7 +326,7 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     let program = stream_bytes(doc, descriptor.get("FontFile3")?)?;
     let cff = CffFont::parse(program)?;
 
-    let mut by_unicode: HashMap<char, u16> = HashMap::new();
+    let mut by_unicode: FastMap<char, u16> = FastMap::default();
     for gid in 1..cff.num_glyphs() {
         // `num_glyphs` is bounded by the CharStrings INDEX's u16 count, so
         // this cast never truncates.
@@ -360,11 +360,11 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        outline_cache: RefCell::new(HashMap::new()),
+        outline_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
-        afm_widths: HashMap::new(),
+        afm_widths: FastMap::default(),
     })
 }
 
@@ -407,7 +407,7 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     let program = stream_bytes(doc, descriptor.get("FontFile")?)?;
     let t1 = Type1Font::parse(program)?;
 
-    let mut by_unicode: HashMap<char, u16> = HashMap::new();
+    let mut by_unicode: FastMap<char, u16> = FastMap::default();
     for gid in 1..t1.num_glyphs() {
         // `num_glyphs` is bounded by `Type1Font::parse`'s `MAX_GLYPHS` cap
         // (65536), so this cast never truncates.
@@ -450,11 +450,11 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        outline_cache: RefCell::new(HashMap::new()),
+        outline_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
-        afm_widths: HashMap::new(),
+        afm_widths: FastMap::default(),
     })
 }
 
@@ -490,8 +490,8 @@ fn base_encoding(doc: &Document, font: &Dict) -> Option<fn(u8) -> Option<char>> 
 
 /// Parses `/Encoding /Differences` into a code → glyph-name map (empty when
 /// `/Encoding` is not a dictionary or has no `/Differences`).
-pub(crate) fn differences(doc: &Document, font: &Dict) -> HashMap<u8, String> {
-    let mut out = HashMap::new();
+pub(crate) fn differences(doc: &Document, font: &Dict) -> FastMap<u8, String> {
+    let mut out = FastMap::default();
     let Some(Ok(Object::Dict(enc))) = font.get("Encoding").map(|o| doc.resolve(o)) else {
         return out;
     };
@@ -644,7 +644,7 @@ fn load_substitute(
     // with no resolvable glyph name (WinAnsi/MacRoman, which have no
     // code -> name table here) are simply not inserted, so `advance` falls
     // through to the substitute's own hmtx for them.
-    let mut afm_widths = HashMap::new();
+    let mut afm_widths = FastMap::default();
     if pdfboss_encoding::is_standard_14(base_font) {
         let standard_ok = is_standard_encoding(doc, font);
         for code in 0u32..256 {
@@ -662,7 +662,7 @@ fn load_substitute(
     }
 
     Some(GlyphFont {
-        outline_cache: RefCell::new(HashMap::new()),
+        outline_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Substitute(tt),
         kind: GlyphKind::Simple(table),
         widths,
@@ -707,11 +707,11 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
         _ => None, // Identity
     };
     Some(GlyphFont {
-        outline_cache: RefCell::new(HashMap::new()),
+        outline_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
         widths: cid_widths(doc, cid),
-        afm_widths: HashMap::new(),
+        afm_widths: FastMap::default(),
     })
 }
 
@@ -731,7 +731,7 @@ fn cid_widths(doc: &Document, cid: &Dict) -> WidthMap {
         declared = true;
     }
 
-    let mut map = HashMap::new();
+    let mut map = FastMap::default();
     if let Some(Ok(Object::Array(items))) = cid.get("W").map(|o| doc.resolve(o)) {
         declared = true;
         parse_cid_width_array(doc, &items, &mut map);
@@ -748,7 +748,7 @@ fn cid_widths(doc: &Document, cid: &Dict) -> WidthMap {
 /// insert in total. Each `c1 c2 w` RANGE is already capped at 65536 entries
 /// on its own, but that alone doesn't bound the array as a whole: a crafted
 /// `/W` array of many non-overlapping ranges (e.g. `0 65535 1  65536 131071
-/// 1  ...`) can still expand to hundreds of millions of `HashMap` entries.
+/// 1  ...`) can still expand to hundreds of millions of `FastMap` entries.
 /// This caps the aggregate across every range/single-CID entry in the
 /// array, regardless of how many of them there are.
 const MAX_CID_WIDTH_ENTRIES: usize = 1_000_000;
@@ -759,7 +759,7 @@ const MAX_CID_WIDTH_ENTRIES: usize = 1_000_000;
 /// `MAX_CID_WIDTH_ENTRIES` (not merely each range), so a hostile array with
 /// many ranges can't allocate unbounded memory; a font that hits the cap is
 /// malformed, so parsing simply stops and keeps whatever was parsed so far.
-fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut HashMap<u32, f32>) {
+fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut FastMap<u32, f32>) {
     let resolved: Vec<Object> = items
         .iter()
         .map(|o| doc.resolve(o).unwrap_or(Object::Null))
@@ -821,11 +821,11 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     let cid_to_gid = cff.cid_to_gid();
     let widths = cid_widths(doc, cid);
     Some(GlyphFont {
-        outline_cache: RefCell::new(HashMap::new()),
+        outline_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
         widths,
-        afm_widths: HashMap::new(),
+        afm_widths: FastMap::default(),
     })
 }
 
@@ -1160,7 +1160,7 @@ mod tests {
         // 65536 entries on its own, but nothing previously capped the NUMBER
         // of ranges. A /W array of many small, non-overlapping ranges (as
         // built here, all decimal literals -- no hex/binary blobs) could
-        // expand to hundreds of millions of HashMap entries without the
+        // expand to hundreds of millions of FastMap entries without the
         // aggregate `MAX_CID_WIDTH_ENTRIES` cap. 16 back-to-back
         // maximally-sized (65536-entry) ranges declare 1,048,576 entries in
         // total, which exceeds the 1,000,000 cap partway through the 16th

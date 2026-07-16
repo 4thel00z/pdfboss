@@ -5,7 +5,7 @@
 //! (other fonts are positioned but not drawn); `sh` shadings are skipped;
 //! pattern fills paint mid-gray.
 
-use std::collections::HashMap;
+use pdfboss_core::FastMap;
 use std::rc::Rc;
 
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
@@ -327,7 +327,7 @@ impl Executor<'_> {
         let mut path: Option<PathBuilder> = None;
         let mut pending_clip: Option<FillRule> = None;
         let mut ts = TextState::default();
-        let mut fonts: HashMap<String, Option<Rc<GlyphFont>>> = HashMap::new();
+        let mut fonts: FastMap<String, Option<Rc<GlyphFont>>> = FastMap::default();
         for op in ops {
             match op {
                 Op::Save => {
@@ -618,7 +618,7 @@ impl Executor<'_> {
         &self,
         name: &str,
         chain: &[&Dict],
-        cache: &mut HashMap<String, Option<Rc<GlyphFont>>>,
+        cache: &mut FastMap<String, Option<Rc<GlyphFont>>>,
     ) -> Option<Rc<GlyphFont>> {
         if let Some(f) = cache.get(name) {
             return f.clone();

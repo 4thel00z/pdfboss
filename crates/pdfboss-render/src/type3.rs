@@ -6,7 +6,7 @@
 //! Painting itself -- running each CharProc as a nested content stream -- is
 //! a later plan; this module only parses the font dictionary.
 
-use std::collections::HashMap;
+use pdfboss_core::FastMap;
 
 use pdfboss_core::geom::Matrix;
 use pdfboss_core::{Dict, Document, Object};
@@ -26,11 +26,11 @@ pub(crate) struct Type3Font {
     encoding: Box<[Option<String>; 256]>,
     /// glyph name -> its CharProc stream object. Stored as given (possibly an
     /// indirect reference) and resolved lazily by the executor at paint time.
-    char_procs: HashMap<String, Object>,
+    char_procs: FastMap<String, Object>,
     /// code -> advance width in GLYPH space (`/Widths` + `/FirstChar`,
     /// unscaled by `/1000` and unscaled by `font_matrix` -- both happen at
     /// paint time). Absent for any code the font declared no width for.
-    widths: HashMap<u32, f32>,
+    widths: FastMap<u32, f32>,
     /// The font's own `/Resources` dictionary (used to resolve names
     /// referenced inside its CharProcs), or `None` if the font dict has none
     /// -- the executor then falls back to the surrounding resource chain.
@@ -120,13 +120,13 @@ fn parse_font_matrix(doc: &Document, font: &Dict) -> Option<Matrix> {
 /// Parses `/CharProcs` into a glyph-name -> (unresolved) stream-object map.
 /// `None` if `/CharProcs` is absent, not a dictionary, or resolves to an
 /// empty dictionary -- a Type3 font with no CharProcs can paint nothing.
-fn parse_char_procs(doc: &Document, font: &Dict) -> Option<HashMap<String, Object>> {
+fn parse_char_procs(doc: &Document, font: &Dict) -> Option<FastMap<String, Object>> {
     let resolved = doc.resolve(font.get("CharProcs")?).ok()?;
     let dict = resolved.as_dict()?;
     if dict.is_empty() {
         return None;
     }
-    let map: HashMap<String, Object> = dict
+    let map: FastMap<String, Object> = dict
         .iter()
         .map(|(name, obj)| (name.0.clone(), obj.clone()))
         .collect();
@@ -174,7 +174,7 @@ fn allows_standard_fallback(doc: &Document, font: &Dict) -> bool {
 /// Parses `/Widths` + `/FirstChar` into a code -> glyph-space-width map
 /// (mirrors `glyph.rs::simple_widths`'s shape, but keeps the raw glyph-space
 /// number -- no `/1000` scaling, which happens at paint time instead).
-fn parse_widths(doc: &Document, font: &Dict) -> HashMap<u32, f32> {
+fn parse_widths(doc: &Document, font: &Dict) -> FastMap<u32, f32> {
     let first = font
         .get("FirstChar")
         .and_then(|o| doc.resolve(o).ok())
@@ -182,7 +182,7 @@ fn parse_widths(doc: &Document, font: &Dict) -> HashMap<u32, f32> {
         .unwrap_or(0)
         .max(0) as u32;
 
-    let mut map = HashMap::new();
+    let mut map = FastMap::default();
     if let Some(Ok(Object::Array(items))) = font.get("Widths").map(|o| doc.resolve(o)) {
         for (i, item) in items.iter().enumerate() {
             let Some(code) = first.checked_add(i as u32) else {
