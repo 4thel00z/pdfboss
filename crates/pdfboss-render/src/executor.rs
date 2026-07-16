@@ -31,6 +31,44 @@ const MAX_GSTATE_DEPTH: usize = 64;
 const MAX_FORM_DEPTH: u32 = 16;
 /// Maximum pixmap side length, guarding malformed boxes and huge scales.
 const MAX_SIDE: f32 = 16384.0;
+/// Bound on `Executor::clip_cache`'s size: many real documents repeat the
+/// exact same clip path (often a page-bounds "reset" rect) hundreds of times
+/// per page, which used to re-rasterize it from scratch every time. Capped
+/// like `GlyphFont`'s `flat_cache` so a pathological stream minting endless
+/// distinct clip paths can't grow this unboundedly.
+const MAX_CLIP_CACHE: usize = 256;
+
+/// Identifies a clip path by its exact flattened (device-space) geometry and
+/// fill rule, so an identical clip repeated later in the same page reuses
+/// its rasterized [`Mask`] instead of rebuilding it. `f32` coordinates are
+/// compared by bit pattern (exact match only — this is a cache key, not a
+/// geometric equivalence test, so two paths that are merely numerically
+/// close still miss and just re-rasterize).
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct ClipKey {
+    even_odd: bool,
+    subpaths: Vec<(bool, Vec<(u32, u32)>)>,
+}
+
+impl ClipKey {
+    fn new(polys: &[Subpath], rule: FillRule) -> ClipKey {
+        ClipKey {
+            even_odd: rule == FillRule::EvenOdd,
+            subpaths: polys
+                .iter()
+                .map(|s| {
+                    (
+                        s.closed,
+                        s.points
+                            .iter()
+                            .map(|p| (p.x.to_bits(), p.y.to_bits()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
 
 /// The graphics state carried across operators and saved/restored by
 /// `q`/`Q`.
@@ -269,6 +307,7 @@ pub(crate) fn render_page_with_options(
         color_locked: false,
         provider,
         glyph_blit: Vec::new(),
+        clip_cache: FastMap::default(),
     };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
     Ok(exec.pix)
@@ -297,6 +336,11 @@ struct Executor<'a> {
     /// here translated to the glyph's device origin, so a whole page of text
     /// paints its glyphs without allocating a fresh polygon set per glyph.
     glyph_blit: Vec<Subpath>,
+    /// Rasterized clip masks by exact path geometry, shared across the whole
+    /// page render (including nested forms — a repeated clip means the same
+    /// device-space geometry regardless of which resource scope drew it).
+    /// See [`MAX_CLIP_CACHE`].
+    clip_cache: FastMap<ClipKey, Rc<Mask>>,
 }
 
 impl Executor<'_> {
@@ -585,12 +629,36 @@ impl Executor<'_> {
             );
         }
         if let Some(rule) = pending.take() {
-            let mut mask = Mask::from_path(self.pix.width, self.pix.height, &polys, rule);
-            if let Some(old) = &gs.clip {
-                mask.intersect(old);
-            }
-            gs.clip = Some(Rc::new(mask));
+            let rasterized = self.rasterize_clip(&polys, rule);
+            gs.clip = Some(match &gs.clip {
+                Some(old) => Rc::new(Mask::intersected(&rasterized, old)),
+                None => rasterized,
+            });
         }
+    }
+
+    /// Rasterizes `polys` under `rule` into a clip [`Mask`], reusing a
+    /// cached rasterization when the exact same path was clipped earlier on
+    /// this page (very common: many generators repeat an identical
+    /// page-bounds "reset" clip hundreds of times per page, and re-running
+    /// the scanline rasterizer over the same geometry every time is pure
+    /// waste). The returned mask is pre-intersection — the caller still
+    /// applies any enclosing clip on top.
+    fn rasterize_clip(&mut self, polys: &[Subpath], rule: FillRule) -> Rc<Mask> {
+        let key = ClipKey::new(polys, rule);
+        if let Some(cached) = self.clip_cache.get(&key) {
+            return Rc::clone(cached);
+        }
+        let mask = Rc::new(Mask::from_path(
+            self.pix.width,
+            self.pix.height,
+            polys,
+            rule,
+        ));
+        if self.clip_cache.len() < MAX_CLIP_CACHE {
+            self.clip_cache.insert(key, Rc::clone(&mask));
+        }
+        mask
     }
 
     /// Resolves and caches a paintable font by resource name (`None` for fonts
@@ -1100,16 +1168,11 @@ impl Executor<'_> {
             let (y0, y1) = (b[1].min(b[3]), b[1].max(b[3]));
             let mut pb = PathBuilder::new(inner.ctm);
             pb.rect(x0, y0, x1 - x0, y1 - y0);
-            let mut mask = Mask::from_path(
-                self.pix.width,
-                self.pix.height,
-                &pb.finish(),
-                FillRule::NonZero,
-            );
-            if let Some(old) = &inner.clip {
-                mask.intersect(old);
-            }
-            inner.clip = Some(Rc::new(mask));
+            let rasterized = self.rasterize_clip(&pb.finish(), FillRule::NonZero);
+            inner.clip = Some(match &inner.clip {
+                Some(old) => Rc::new(Mask::intersected(&rasterized, old)),
+                None => rasterized,
+            });
         }
         let own_res = match stream.dict.get("Resources").map(|o| self.doc.resolve(o)) {
             Some(Ok(Object::Dict(d))) => Some(d),

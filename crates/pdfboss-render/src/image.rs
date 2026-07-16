@@ -344,7 +344,7 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba, p: &DrawParams) {
             let s = &img.data[(j * img.width + i) * 4..][..4];
             let mut a = f32::from(s[3]) / 255.0 * alpha;
             if let Some(mask) = p.clip {
-                a *= f32::from(mask.data[(py * pix.width + px) as usize]) / 255.0;
+                a *= f32::from(mask.coverage(px, py)) / 255.0;
             }
             if a > 0.0 {
                 let off = ((py * pix.width + px) * 4) as usize;

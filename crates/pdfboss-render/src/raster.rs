@@ -17,34 +17,103 @@ pub(crate) enum FillRule {
     EvenOdd,
 }
 
-/// A per-pixel coverage buffer (0 = fully clipped out, 255 = fully
-/// visible) with the same dimensions as the pixmap it clips.
+/// A per-pixel coverage mask (0 = fully clipped out, 255 = fully visible)
+/// over a page of `width * height` device pixels.
+///
+/// The coverage is stored only for its bounding box `[x0, x0+bbox_w) x
+/// [y0, y0+bbox_h)`; every pixel outside that box reads as 0. A form field's
+/// clip path is typically a small fraction of the page, so this keeps
+/// `from_path`/`intersect` proportional to the clip's own size instead of
+/// the whole page — real documents can carry hundreds of clips per page, so
+/// an O(page) cost per clip (a naive full-page buffer) dominates render time
+/// even though each clip only ever restricts a small region.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Mask {
     pub width: u32,
     pub height: u32,
-    /// Row-major coverage values, `width * height` bytes.
+    /// Left edge of the stored region, in device pixels.
+    pub x0: u32,
+    /// Top edge of the stored region, in device pixels.
+    pub y0: u32,
+    /// Width of the stored region (0 means the mask covers nothing).
+    pub bbox_w: u32,
+    /// Height of the stored region.
+    pub bbox_h: u32,
+    /// Row-major coverage values over the bbox, `bbox_w * bbox_h` bytes.
     pub data: Vec<u8>,
 }
 
 impl Mask {
-    /// Creates an all-zero (fully clipped) mask.
+    /// Creates an all-zero (fully clipped) mask covering the whole page.
     pub(crate) fn new(width: u32, height: u32) -> Mask {
         Mask {
             width,
             height,
+            x0: 0,
+            y0: 0,
+            bbox_w: width,
+            bbox_h: height,
             data: vec![0; width as usize * height as usize],
         }
     }
 
-    /// Rasterizes `polys` under `rule` into a fresh mask of the given
-    /// dimensions.
+    /// A zero-cost mask that covers no pixels at all (every lookup is 0).
+    fn empty(width: u32, height: u32) -> Mask {
+        Mask {
+            width,
+            height,
+            x0: 0,
+            y0: 0,
+            bbox_w: 0,
+            bbox_h: 0,
+            data: Vec::new(),
+        }
+    }
+
+    /// Rasterizes `polys` under `rule` into a fresh mask sized to `polys`'
+    /// own bounding box (clamped to the page), not the full page.
     pub(crate) fn from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
-        let mut mask = Mask::new(width, height);
-        let w = width as usize;
+        let edges = build_edges(polys);
+        if edges.is_empty() || width == 0 || height == 0 {
+            return Mask::empty(width, height);
+        }
+        let mut xmin = f32::MAX;
+        let mut xmax = f32::MIN;
+        let mut ymin = f32::MAX;
+        let mut ymax = f32::MIN;
+        for e in &edges {
+            xmin = xmin.min(e.x0).min(e.x1);
+            xmax = xmax.max(e.x0).max(e.x1);
+            ymin = ymin.min(e.y0);
+            ymax = ymax.max(e.y1);
+        }
+        let bx0 = xmin.floor().max(0.0) as u32;
+        let bx1 = (xmax.ceil().max(0.0) as u32).min(width);
+        let by0 = ymin.floor().max(0.0) as u32;
+        let by1 = (ymax.ceil().max(0.0) as u32).min(height);
+        if bx1 <= bx0 || by1 <= by0 {
+            return Mask::empty(width, height);
+        }
+        let bbox_w = bx1 - bx0;
+        let bbox_h = by1 - by0;
+        let mut mask = Mask {
+            width,
+            height,
+            x0: bx0,
+            y0: by0,
+            bbox_w,
+            bbox_h,
+            data: vec![0u8; bbox_w as usize * bbox_h as usize],
+        };
+        let bw = bbox_w as usize;
         coverage_rows(width, height, polys, rule, |y, row, lo, hi| {
-            let base = y as usize * w;
-            let dst = &mut mask.data[base + lo..base + hi];
+            // `lo`/`hi` are columns touched on this row, which `coverage_rows`
+            // only ever derives from crossings between edges already bounded
+            // by `[xmin, xmax]` — so they always fall within `[bx0, bx1)`.
+            let base = (y - by0) as usize * bw;
+            let local_lo = lo - bx0 as usize;
+            let local_hi = hi - bx0 as usize;
+            let dst = &mut mask.data[base + local_lo..base + local_hi];
             for (cov, out) in row[lo..hi].iter().zip(dst.iter_mut()) {
                 *out = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
@@ -52,12 +121,63 @@ impl Mask {
         mask
     }
 
+    /// Coverage at device pixel `(x, y)`; 0 outside the stored bbox.
+    #[inline]
+    pub(crate) fn coverage(&self, x: u32, y: u32) -> u8 {
+        if x < self.x0 || y < self.y0 {
+            return 0;
+        }
+        let (lx, ly) = (x - self.x0, y - self.y0);
+        if lx >= self.bbox_w || ly >= self.bbox_h {
+            return 0;
+        }
+        self.data[ly as usize * self.bbox_w as usize + lx as usize]
+    }
+
     /// Intersects this mask with `other` by taking the per-pixel minimum.
-    /// The masks must have identical dimensions.
+    /// The result is stored over just the overlap of the two bboxes (which
+    /// can only shrink or stay the same size), not the full page — a chain
+    /// of nested small clips stays cheap instead of re-touching every pixel
+    /// on the page at each nesting level. The masks must belong to pages of
+    /// identical dimensions.
     pub(crate) fn intersect(&mut self, other: &Mask) {
-        debug_assert_eq!((self.width, self.height), (other.width, other.height));
-        for (a, b) in self.data.iter_mut().zip(other.data.iter()) {
-            *a = (*a).min(*b);
+        *self = Mask::intersected(self, other);
+    }
+
+    /// Like [`Mask::intersect`], but takes both masks by reference and
+    /// returns a fresh one — lets a caller holding `a` behind an `Rc` (e.g. a
+    /// cached rasterization) compute the overlap without first cloning `a`'s
+    /// full buffer just to shrink it back down.
+    pub(crate) fn intersected(a: &Mask, b: &Mask) -> Mask {
+        debug_assert_eq!((a.width, a.height), (b.width, b.height));
+        let x0 = a.x0.max(b.x0);
+        let y0 = a.y0.max(b.y0);
+        let x1 = (a.x0 + a.bbox_w).min(b.x0 + b.bbox_w);
+        let y1 = (a.y0 + a.bbox_h).min(b.y0 + b.bbox_h);
+        if x1 <= x0 || y1 <= y0 {
+            return Mask::empty(a.width, a.height);
+        }
+        let bbox_w = x1 - x0;
+        let bbox_h = y1 - y0;
+        let mut data = vec![0u8; bbox_w as usize * bbox_h as usize];
+        for y in y0..y1 {
+            let a_base = (y - a.y0) as usize * a.bbox_w as usize;
+            let b_base = (y - b.y0) as usize * b.bbox_w as usize;
+            let dst_base = (y - y0) as usize * bbox_w as usize;
+            for x in x0..x1 {
+                let av = a.data[a_base + (x - a.x0) as usize];
+                let bv = b.data[b_base + (x - b.x0) as usize];
+                data[dst_base + (x - x0) as usize] = av.min(bv);
+            }
+        }
+        Mask {
+            width: a.width,
+            height: a.height,
+            x0,
+            y0,
+            bbox_w,
+            bbox_h,
+            data,
         }
     }
 }
@@ -297,7 +417,7 @@ pub(crate) fn fill_path(
             let x = lo + dx;
             let mut a = cov.clamp(0.0, 1.0) * base_a;
             if let Some(mask) = clip {
-                a *= mask.data[base + x] as f32 / 255.0;
+                a *= mask.coverage(x as u32, y) as f32 / 255.0;
             }
             if a <= 0.0 {
                 continue;
@@ -469,10 +589,90 @@ mod tests {
         let mut a = Mask::from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
         let b = Mask::from_path(8, 8, &[rect_poly(4.0, 0.0, 8.0, 8.0)], FillRule::NonZero);
         a.intersect(&b);
-        let at = |x: usize, y: usize| a.data[y * 8 + x];
-        assert_eq!(at(2, 4), 0, "only in a");
-        assert_eq!(at(7, 4), 0, "only in b");
-        assert_eq!(at(5, 4), 255, "in both");
+        assert_eq!(a.coverage(2, 4), 0, "only in a");
+        assert_eq!(a.coverage(7, 4), 0, "only in b");
+        assert_eq!(a.coverage(5, 4), 255, "in both");
+    }
+
+    #[test]
+    fn mask_from_path_bbox_is_tight_not_full_page() {
+        // A small clip rect on a large page should only allocate its own
+        // bounding box, not the whole page — this is the whole point of the
+        // fix (O(clip area), not O(page area), per clip operation).
+        let mask = Mask::from_path(
+            1000,
+            1000,
+            &[rect_poly(10.0, 20.0, 30.0, 50.0)],
+            FillRule::NonZero,
+        );
+        assert_eq!(mask.x0, 10);
+        assert_eq!(mask.y0, 20);
+        assert_eq!(mask.bbox_w, 20);
+        assert_eq!(mask.bbox_h, 30);
+        assert_eq!(mask.data.len(), 20 * 30);
+        assert_eq!(mask.coverage(15, 25), 255, "inside clip");
+        assert_eq!(mask.coverage(500, 500), 0, "far outside clip bbox");
+        assert_eq!(mask.coverage(0, 0), 0, "outside clip bbox but inside page");
+    }
+
+    #[test]
+    fn mask_intersect_disjoint_bboxes_is_empty() {
+        let mut a = Mask::from_path(
+            100,
+            100,
+            &[rect_poly(0.0, 0.0, 10.0, 10.0)],
+            FillRule::NonZero,
+        );
+        let b = Mask::from_path(
+            100,
+            100,
+            &[rect_poly(50.0, 50.0, 60.0, 60.0)],
+            FillRule::NonZero,
+        );
+        a.intersect(&b);
+        assert_eq!(a.bbox_w, 0);
+        assert_eq!(a.bbox_h, 0);
+        for y in 0..100 {
+            for x in 0..100 {
+                assert_eq!(a.coverage(x, y), 0, "disjoint clips leave nothing visible");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_intersect_shrinks_bbox_to_overlap() {
+        let mut a = Mask::from_path(
+            100,
+            100,
+            &[rect_poly(0.0, 0.0, 20.0, 20.0)],
+            FillRule::NonZero,
+        );
+        let b = Mask::from_path(
+            100,
+            100,
+            &[rect_poly(10.0, 10.0, 30.0, 30.0)],
+            FillRule::NonZero,
+        );
+        a.intersect(&b);
+        assert_eq!(a.x0, 10);
+        assert_eq!(a.y0, 10);
+        assert_eq!(a.bbox_w, 10);
+        assert_eq!(a.bbox_h, 10);
+        assert_eq!(a.coverage(15, 15), 255, "in overlap");
+        assert_eq!(a.coverage(5, 5), 0, "only in a");
+        assert_eq!(a.coverage(25, 25), 0, "only in b");
+    }
+
+    #[test]
+    fn mask_new_is_full_page_and_directly_indexable() {
+        // `Mask::new` stays a full-page buffer (unlike `from_path`): a few
+        // tests (and image.rs's) build a synthetic mask by hand via direct
+        // `.data` indexing, which relies on this.
+        let mask = Mask::new(8, 8);
+        assert_eq!(mask.bbox_w, 8);
+        assert_eq!(mask.bbox_h, 8);
+        assert_eq!(mask.data.len(), 64);
+        assert!(mask.data.iter().all(|&b| b == 0));
     }
 
     #[test]
