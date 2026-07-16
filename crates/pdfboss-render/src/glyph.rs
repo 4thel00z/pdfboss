@@ -19,7 +19,9 @@
 //! or `Full` with no substitute provider) leave that text unpainted rather
 //! than guessing.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use pdfboss_core::{Dict, Document, Object};
 
@@ -97,6 +99,14 @@ pub(crate) struct GlyphFont {
     /// Unlike `WidthMap`, a missing code here means "no AFM entry for this
     /// code", not "declared width 0" -- see `GlyphFont::advance`.
     afm_widths: HashMap<u32, f32>,
+    /// Per-glyph outline memo. A glyph's outline (`Vec<Seg>` in font units)
+    /// is transform-independent, so a code point repeated across a page --
+    /// the common case in body text -- reparses/reinterprets its charstring
+    /// only once. Interior mutability keeps `outline` a `&self` accessor;
+    /// rendering is single-threaded (`GlyphFont` lives behind an `Rc`), so a
+    /// `RefCell` suffices. The stored `Rc<[Seg]>` is handed back by cheap
+    /// refcount clone rather than copying the segment vector.
+    outline_cache: RefCell<HashMap<u16, Rc<[Seg]>>>,
 }
 
 impl GlyphFont {
@@ -150,13 +160,24 @@ impl GlyphFont {
         }
     }
 
-    /// The glyph's outline as path segments in font units.
-    pub(crate) fn outline(&self, gid: u16) -> Vec<Seg> {
-        match &self.outlines {
+    /// The glyph's outline as path segments in font units, memoized per
+    /// `gid` (see [`GlyphFont::outline_cache`]). The returned `Rc<[Seg]>` is
+    /// shared with the cache: callers read it (via `build_glyph`) and drop
+    /// it, never mutating it.
+    pub(crate) fn outline(&self, gid: u16) -> Rc<[Seg]> {
+        if let Some(cached) = self.outline_cache.borrow().get(&gid) {
+            return Rc::clone(cached);
+        }
+        let segs: Rc<[Seg]> = match &self.outlines {
             Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.glyph_path(gid),
             Outlines::Cff(cff) => cff.glyph_path(gid),
             Outlines::Type1(t1) => t1.glyph_path(gid),
         }
+        .into();
+        self.outline_cache
+            .borrow_mut()
+            .insert(gid, Rc::clone(&segs));
+        segs
     }
 
     /// The advance width for character `code`, in font units. Three tiers,
@@ -236,6 +257,7 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
+        outline_cache: RefCell::new(HashMap::new()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -338,6 +360,7 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
+        outline_cache: RefCell::new(HashMap::new()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -427,6 +450,7 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
+        outline_cache: RefCell::new(HashMap::new()),
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -638,6 +662,7 @@ fn load_substitute(
     }
 
     Some(GlyphFont {
+        outline_cache: RefCell::new(HashMap::new()),
         outlines: Outlines::Substitute(tt),
         kind: GlyphKind::Simple(table),
         widths,
@@ -682,6 +707,7 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
         _ => None, // Identity
     };
     Some(GlyphFont {
+        outline_cache: RefCell::new(HashMap::new()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
         widths: cid_widths(doc, cid),
@@ -795,6 +821,7 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     let cid_to_gid = cff.cid_to_gid();
     let widths = cid_widths(doc, cid);
     Some(GlyphFont {
+        outline_cache: RefCell::new(HashMap::new()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
         widths,
