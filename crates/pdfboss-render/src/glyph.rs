@@ -23,13 +23,27 @@ use pdfboss_core::FastMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use pdfboss_core::{Dict, Document, Object};
+use pdfboss_core::{Dict, Document, Matrix, Object};
 
 use crate::cff::CffFont;
+use crate::path::{PathBuilder, Subpath};
 use crate::substitute::{FaceRequest, SubstituteProvider};
 use crate::truetype::{Seg, TrueType};
 use crate::type1::Type1Font;
 use crate::GlyphPainting;
+
+/// Memoized flattened glyphs, keyed by `gid` plus the exact bits of the
+/// transform's linear part `(a, b, c, d)`. See [`GlyphFont::flat_cache`].
+type FlatCache = FastMap<(u16, [u32; 4]), Rc<Vec<Subpath>>>;
+
+/// Upper bound on distinct `(gid, linear)` entries kept per font. Real pages
+/// use a handful of sizes, so this is never approached in practice; the cap
+/// exists only so a hostile stream that nudges the transform on every glyph
+/// (minting unbounded distinct keys) cannot grow the cache without limit.
+/// Past the cap, glyphs still paint correctly -- they are just re-flattened
+/// each time rather than cached, trading the cache's speed for bounded
+/// memory (the same constant-space behavior the pre-cache code always had).
+const MAX_FLAT_CACHE: usize = 8192;
 
 /// Where a font's glyph outlines and metrics come from.
 ///
@@ -107,6 +121,19 @@ pub(crate) struct GlyphFont {
     /// `RefCell` suffices. The stored `Rc<[Seg]>` is handed back by cheap
     /// refcount clone rather than copying the segment vector.
     outline_cache: RefCell<FastMap<u16, Rc<[Seg]>>>,
+    /// Per-glyph *flattened* device-space outline memo, keyed by `gid` plus
+    /// the exact bits of the transform's linear part `(a, b, c, d)`. The
+    /// value is the glyph flattened with translation zeroed; the caller adds
+    /// the per-occurrence device origin `(e, f)` to each point. Within a text
+    /// run the linear part is bitwise-constant (only the translation
+    /// advances), so a repeated glyph flattens once and every later
+    /// occurrence is a translate-and-fill. This sits above `outline_cache`:
+    /// a flat miss still reuses the parsed outline; the flat hit skips both
+    /// the parse and the Bezier flattening. The exact-bits key means a
+    /// cached entry is only ever reused for a genuinely identical linear map,
+    /// so the flattening (whose subdivision tolerance is in device pixels)
+    /// stays correct.
+    flat_cache: RefCell<FlatCache>,
 }
 
 impl GlyphFont {
@@ -180,6 +207,40 @@ impl GlyphFont {
         segs
     }
 
+    /// The glyph's outline flattened to device-space polylines under the
+    /// linear map `linear` (its `e`/`f` are ignored — the result is relative
+    /// to the glyph origin), memoized per `(gid, linear bits)`. The caller
+    /// adds the glyph's device origin to each point (see
+    /// [`GlyphFont::flat_cache`]). Painting `a·x + c·y + e` as
+    /// `(a·x + c·y) + e` with the sum cached and `+ e` applied per occurrence
+    /// is bitwise-identical to transforming with the full matrix, since
+    /// `(a·x + c·y) + 0.0 == a·x + c·y` and the flattener's subdivision test
+    /// is translation-invariant.
+    pub(crate) fn flattened(&self, gid: u16, linear: Matrix) -> Rc<Vec<Subpath>> {
+        let key = (
+            gid,
+            [
+                linear.a.to_bits(),
+                linear.b.to_bits(),
+                linear.c.to_bits(),
+                linear.d.to_bits(),
+            ],
+        );
+        if let Some(cached) = self.flat_cache.borrow().get(&key) {
+            return Rc::clone(cached);
+        }
+        let segs = self.outline(gid);
+        let polys = Rc::new(build_glyph(&segs, linear));
+        // Only grow the cache while it is under the cap; past it, hand back
+        // the freshly flattened glyph without retaining it, so a hostile
+        // stream minting unbounded distinct keys cannot blow up memory.
+        let mut cache = self.flat_cache.borrow_mut();
+        if cache.len() < MAX_FLAT_CACHE {
+            cache.insert(key, Rc::clone(&polys));
+        }
+        polys
+    }
+
     /// The advance width for character `code`, in font units. Three tiers,
     /// most authoritative first: the PDF's own declared width (`/Widths`
     /// for simple fonts, `/W`+`/DW` for Type0/CID); failing that, `afm_widths`
@@ -214,6 +275,30 @@ impl GlyphFont {
             Outlines::Type1(t1) => t1.units_per_em(),
         }
     }
+}
+
+/// Flattens a glyph outline (font-unit segments) into device-space subpaths
+/// via `to_device`, promoting each quadratic to an equivalent cubic so the
+/// shared cubic flattener can subdivide it.
+fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<Subpath> {
+    let mut pb = PathBuilder::new(to_device);
+    for seg in segs {
+        match *seg {
+            Seg::Move(x, y) => pb.move_to(x, y),
+            Seg::Line(x, y) => pb.line_to(x, y),
+            Seg::Quad(cx, cy, x, y) => {
+                let p0 = pb.current_point();
+                let c1x = p0.x + 2.0 / 3.0 * (cx - p0.x);
+                let c1y = p0.y + 2.0 / 3.0 * (cy - p0.y);
+                let c2x = x + 2.0 / 3.0 * (cx - x);
+                let c2y = y + 2.0 / 3.0 * (cy - y);
+                pb.curve_to(c1x, c1y, c2x, c2y, x, y);
+            }
+            Seg::Cubic(c1x, c1y, c2x, c2y, x, y) => pb.curve_to(c1x, c1y, c2x, c2y, x, y),
+            Seg::Close => pb.close(),
+        }
+    }
+    pb.finish()
 }
 
 /// Loads a simple `/TrueType` font, building its 256-entry code-to-glyph table
@@ -258,6 +343,7 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     }
     Some(GlyphFont {
         outline_cache: RefCell::new(FastMap::default()),
+        flat_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -361,6 +447,7 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     }
     Some(GlyphFont {
         outline_cache: RefCell::new(FastMap::default()),
+        flat_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -451,6 +538,7 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
     }
     Some(GlyphFont {
         outline_cache: RefCell::new(FastMap::default()),
+        flat_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -663,6 +751,7 @@ fn load_substitute(
 
     Some(GlyphFont {
         outline_cache: RefCell::new(FastMap::default()),
+        flat_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Substitute(tt),
         kind: GlyphKind::Simple(table),
         widths,
@@ -708,6 +797,7 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     };
     Some(GlyphFont {
         outline_cache: RefCell::new(FastMap::default()),
+        flat_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
         widths: cid_widths(doc, cid),
@@ -822,6 +912,7 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     let widths = cid_widths(doc, cid);
     Some(GlyphFont {
         outline_cache: RefCell::new(FastMap::default()),
+        flat_cache: RefCell::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
         widths,
@@ -851,6 +942,83 @@ mod tests {
     use crate::truetype::tests::build_font;
     use crate::type1::tests::{build_type1_box_fixture, build_type1_box_fixture_standard_encoding};
     use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
+
+    /// The flattened-glyph cache flattens under the transform's linear part
+    /// only and re-adds the per-occurrence translation. This must be exactly
+    /// equal (bit for bit) to flattening under the full transform, which is
+    /// what makes the cache invisible to output.
+    #[test]
+    fn flatten_linear_then_translate_equals_full_transform() {
+        use super::{build_glyph, Seg};
+        use pdfboss_core::Matrix;
+
+        // Include a quadratic so the flattener genuinely subdivides.
+        let segs = [
+            Seg::Move(0.0, 0.0),
+            Seg::Line(400.0, 0.0),
+            Seg::Quad(600.0, 500.0, 0.0, 700.0),
+            Seg::Close,
+        ];
+        let (e, f) = (37.5, -12.25);
+        let linear = Matrix {
+            a: 0.02,
+            b: 0.0,
+            c: 0.0,
+            d: -0.02,
+            e: 0.0,
+            f: 0.0,
+        };
+        let full = Matrix { e, f, ..linear };
+
+        let rel = build_glyph(&segs, linear);
+        let full_polys = build_glyph(&segs, full);
+        assert_eq!(rel.len(), full_polys.len());
+        for (r, g) in rel.iter().zip(&full_polys) {
+            assert_eq!(r.points.len(), g.points.len(), "subdivision must match");
+            for (rp, gp) in r.points.iter().zip(&g.points) {
+                assert_eq!(rp.x + e, gp.x);
+                assert_eq!(rp.y + f, gp.y);
+            }
+        }
+    }
+
+    /// A hostile stream can nudge the glyph transform on every glyph, minting
+    /// unbounded distinct `(gid, linear)` keys. The flattened-glyph cache must
+    /// stop growing at its cap while still painting every glyph correctly.
+    #[test]
+    fn flat_cache_is_bounded_under_transform_flooding() {
+        use super::{GlyphFont, MAX_FLAT_CACHE};
+        use pdfboss_core::{Matrix, ObjRef};
+
+        let bytes = simple_font_doc("/Encoding /WinAnsiEncoding", b"BT /F0 10 Tf (A) Tj ET");
+        let doc = Document::load(bytes).unwrap();
+        let font_obj = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
+        let font = font_obj.as_dict().unwrap();
+        let gf = GlyphFont::load(&doc, font, GlyphPainting::AllEmbedded, None).unwrap();
+        let gid = gf.gid(u32::from(b'A'));
+        assert_ne!(gid, 0, "fixture 'A' must map to a real glyph");
+
+        // Flood past the cap with a distinct linear part each iteration.
+        for i in 0..(MAX_FLAT_CACHE + 500) {
+            let s = 0.01 + i as f32 * 1e-6;
+            let linear = Matrix {
+                a: s,
+                b: 0.0,
+                c: 0.0,
+                d: -s,
+                e: 0.0,
+                f: 0.0,
+            };
+            assert!(
+                !gf.flattened(gid, linear).is_empty(),
+                "each glyph must still flatten to output past the cap"
+            );
+        }
+        assert!(
+            gf.flat_cache.borrow().len() <= MAX_FLAT_CACHE,
+            "flat_cache must not grow past MAX_FLAT_CACHE"
+        );
+    }
 
     /// Builds a one-page PDF showing `content` with a simple `/TrueType` font
     /// (the synthetic `build_font` program) and the given `/Encoding` entry.
