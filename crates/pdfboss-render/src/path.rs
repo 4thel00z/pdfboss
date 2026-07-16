@@ -31,6 +31,10 @@ pub(crate) struct PathBuilder {
     start_user: Point,
     /// Current point in user space (source for `v`/`y` curve forms).
     last_user: Point,
+    /// Reused per-curve flattening buffer; kept on the builder so a
+    /// curve-heavy path (e.g. a glyph outline) does not allocate a fresh
+    /// vector for every Bezier segment.
+    scratch: Vec<Point>,
 }
 
 impl PathBuilder {
@@ -42,6 +46,7 @@ impl PathBuilder {
             current: Vec::new(),
             start_user: Point::new(0.0, 0.0),
             last_user: Point::new(0.0, 0.0),
+            scratch: Vec::new(),
         }
     }
 
@@ -100,11 +105,16 @@ impl PathBuilder {
         let p1 = self.ctm.apply(Point::new(x1, y1));
         let p2 = self.ctm.apply(Point::new(x2, y2));
         let p3 = self.ctm.apply(Point::new(x3, y3));
-        let mut pts = Vec::new();
-        flatten_cubic(p0, p1, p2, p3, 0, &mut pts);
-        for p in pts {
+        // Borrow the reusable buffer out so flattening can fill it while
+        // `push_device` mutably borrows `self`; swapping it back keeps its
+        // capacity across curves (the reason it lives on the builder).
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        flatten_cubic(p0, p1, p2, p3, 0, &mut scratch);
+        for &p in &scratch {
             self.push_device(p);
         }
+        self.scratch = scratch;
         self.last_user = Point::new(x3, y3);
     }
 
@@ -138,17 +148,19 @@ impl PathBuilder {
         self.close();
     }
 
-    /// Returns the flattened subpaths accumulated so far, including any
-    /// unfinished (open) subpath.
-    pub(crate) fn finish(&self) -> Vec<Subpath> {
-        let mut out = self.done.clone();
+    /// Consumes the builder, returning the flattened subpaths accumulated so
+    /// far including any unfinished (open) subpath. Takes `self` by value so
+    /// the accumulated geometry moves out instead of being cloned (every
+    /// caller discards the builder immediately after `finish`).
+    pub(crate) fn finish(mut self) -> Vec<Subpath> {
         if self.current.len() >= 2 {
-            out.push(Subpath {
-                points: self.current.clone(),
+            let points = std::mem::take(&mut self.current);
+            self.done.push(Subpath {
+                points,
                 closed: false,
             });
         }
-        out
+        self.done
     }
 }
 
@@ -232,6 +244,26 @@ mod tests {
         let subs = b.finish();
         assert_eq!(subs[0].points.len(), 2);
         assert_eq!(*subs[0].points.last().unwrap(), Point::new(3.0, 0.0));
+    }
+
+    #[test]
+    fn consecutive_curves_reuse_scratch_without_leaking() {
+        // `curve_to` flattens into a buffer reused across curves. A second
+        // curve must see it cleared: if the first curve's vertices leaked,
+        // they would be re-appended here.
+        let mut b = PathBuilder::new(Matrix::identity());
+        b.move_to(0.0, 0.0);
+        // A curved cubic that subdivides into several vertices, ending at
+        // (100, 0).
+        b.curve_to(0.0, 100.0, 100.0, 100.0, 100.0, 0.0);
+        let after_first = b.clone().finish()[0].points.len();
+        assert!(after_first > 4, "first curve should subdivide");
+        // A straight cubic from (100, 0): on its own it flattens to just its
+        // endpoint, so exactly one new vertex should be appended.
+        b.curve_to(100.0, 0.0, 150.0, 0.0, 200.0, 0.0);
+        let subs = b.finish();
+        assert_eq!(subs[0].points.len(), after_first + 1);
+        assert_eq!(*subs[0].points.last().unwrap(), Point::new(200.0, 0.0));
     }
 
     #[test]
