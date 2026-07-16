@@ -2,7 +2,8 @@
 //! references (ISO 32000 §7.3).
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+
+use crate::hash::FastMap;
 
 /// An indirect object reference: object number and generation number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,7 +25,7 @@ impl Borrow<str> for Name {
 
 /// A dictionary object mapping names to objects.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct Dict(HashMap<Name, Object>);
+pub struct Dict(FastMap<Name, Object>);
 
 impl Dict {
     /// Creates an empty dictionary.

@@ -2,8 +2,8 @@
 //! lazily-flattened page tree with attribute inheritance, and document
 //! metadata.
 
+use crate::hash::{FastMap, FastSet};
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -31,14 +31,14 @@ pub struct Document {
     version: (u8, u8),
     xref: Xref,
     /// Interior cache of fetched indirect objects.
-    cache: RefCell<HashMap<(u32, u16), Rc<Object>>>,
+    cache: RefCell<FastMap<(u32, u16), Rc<Object>>>,
     /// Object numbers currently being parsed, guarding re-entrant fetches
     /// (e.g. a stream whose `/Length` refers back to the stream itself).
-    loading: RefCell<HashSet<u32>>,
+    loading: RefCell<FastSet<u32>>,
     /// Decoded object streams, keyed by their stream object number, so a
     /// stream is decompressed and its header parsed at most once even when
     /// many compressed objects are read from it.
-    objstms: RefCell<HashMap<u32, Rc<objstm::ObjStm>>>,
+    objstms: RefCell<FastMap<u32, Rc<objstm::ObjStm>>>,
     /// Present when the file uses the Standard security handler (RC4 or AES)
     /// and opens under the empty user password; decrypts strings and stream
     /// data as objects are loaded from the file.
@@ -127,9 +127,9 @@ impl Document {
             data,
             version,
             xref,
-            cache: RefCell::new(HashMap::new()),
-            loading: RefCell::new(HashSet::new()),
-            objstms: RefCell::new(HashMap::new()),
+            cache: RefCell::new(FastMap::default()),
+            loading: RefCell::new(FastSet::default()),
+            objstms: RefCell::new(FastMap::default()),
             decryptor: None,
             pages: OnceCell::new(),
         };
@@ -395,7 +395,7 @@ impl Document {
         let Some(tree_root) = catalog.as_dict().and_then(|d| d.get("Pages")) else {
             return pages;
         };
-        let mut visited: HashSet<ObjRef> = HashSet::new();
+        let mut visited: FastSet<ObjRef> = FastSet::default();
         let mut stack: Vec<(Object, Inherited, usize)> =
             vec![(tree_root.clone(), Inherited::default(), 0)];
         while let Some((node, mut inherited, depth)) = stack.pop() {

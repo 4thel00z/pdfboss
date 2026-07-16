@@ -2,7 +2,7 @@
 //! hybrid files (`/XRefStm`), `/Prev` chains, and a whole-file recovery scan
 //! when everything else fails.
 
-use std::collections::{HashMap, HashSet};
+use crate::hash::{FastMap, FastSet};
 
 use crate::error::{Error, Result};
 use crate::filters::{decode_stream, is_pdf_whitespace};
@@ -24,7 +24,7 @@ pub enum XrefEntry {
 /// The merged cross-reference table plus the (merged) trailer dictionary.
 #[derive(Debug, Clone, Default)]
 pub struct Xref {
-    map: HashMap<u32, XrefEntry>,
+    map: FastMap<u32, XrefEntry>,
     /// Merged trailer dictionary; keys from newer sections win.
     pub trailer: Dict,
 }
@@ -101,7 +101,7 @@ fn to_offset(v: i64, data: &[u8]) -> Option<usize> {
 /// merge before `/Prev` is followed. Visited offsets guard against loops.
 fn load_chain(data: &[u8], start: usize) -> Result<Xref> {
     let mut acc = Xref::default();
-    let mut visited: HashSet<usize> = HashSet::new();
+    let mut visited: FastSet<usize> = FastSet::default();
     let mut next = Some(start);
     while let Some(off) = next {
         if !visited.insert(off) {
