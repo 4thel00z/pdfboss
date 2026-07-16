@@ -10,19 +10,18 @@ use std::rc::Rc;
 
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
 use pdfboss_core::filters::decode_stream;
-use pdfboss_core::geom::Matrix;
+use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{Dict, Document, Name, Object, Page, Result, Stream};
 
 use crate::color::ColorSpace;
 use crate::glyph::GlyphFont;
 use crate::image::{self, DrawParams};
-use crate::path::PathBuilder;
+use crate::path::{PathBuilder, Subpath};
 use crate::raster::{fill_path, FillRule, Mask};
 use crate::stroke::stroke_path;
 #[cfg(feature = "substitute-fonts")]
 use crate::substitute::BuiltinProvider;
 use crate::substitute::{DirProvider, SubstituteProvider};
-use crate::truetype::Seg;
 use crate::type3::Type3Font;
 use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
 
@@ -179,30 +178,6 @@ fn finite_matrix(m: &Matrix) -> bool {
     all_finite(&[m.a, m.b, m.c, m.d, m.e, m.f])
 }
 
-/// Flattens a glyph outline (font-unit segments) into device-space subpaths via
-/// `to_device`, promoting each quadratic to an equivalent cubic so the shared
-/// cubic flattener can subdivide it.
-fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<crate::path::Subpath> {
-    let mut pb = PathBuilder::new(to_device);
-    for seg in segs {
-        match *seg {
-            Seg::Move(x, y) => pb.move_to(x, y),
-            Seg::Line(x, y) => pb.line_to(x, y),
-            Seg::Quad(cx, cy, x, y) => {
-                let p0 = pb.current_point();
-                let c1x = p0.x + 2.0 / 3.0 * (cx - p0.x);
-                let c1y = p0.y + 2.0 / 3.0 * (cy - p0.y);
-                let c2x = x + 2.0 / 3.0 * (cx - x);
-                let c2y = y + 2.0 / 3.0 * (cy - y);
-                pb.curve_to(c1x, c1y, c2x, c2y, x, y);
-            }
-            Seg::Cubic(c1x, c1y, c2x, c2y, x, y) => pb.curve_to(c1x, c1y, c2x, c2y, x, y),
-            Seg::Close => pb.close(),
-        }
-    }
-    pb.finish()
-}
-
 /// The base transform mapping the (normalized) crop box to device pixels:
 /// translate the crop origin away, apply `/Rotate` clockwise into the
 /// display quadrant, then flip y and scale so the display top-left lands
@@ -293,6 +268,7 @@ pub(crate) fn render_page_with_options(
         painting: opts.glyph_painting,
         color_locked: false,
         provider,
+        glyph_blit: Vec::new(),
     };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
     Ok(exec.pix)
@@ -316,6 +292,11 @@ struct Executor<'a> {
     /// `/Type0` and `/Type3` fonts never consult it (see `glyph.rs`'s module
     /// doc).
     provider: Option<Box<dyn SubstituteProvider>>,
+    /// Reused scratch for painting a cached glyph outline: the flattened
+    /// (origin-relative) subpaths from [`GlyphFont::flattened`] are copied
+    /// here translated to the glyph's device origin, so a whole page of text
+    /// paints its glyphs without allocating a fresh polygon set per glyph.
+    glyph_blit: Vec<Subpath>,
 }
 
 impl Executor<'_> {
@@ -649,6 +630,35 @@ impl Executor<'_> {
         Type3Font::load(self.doc, &dict).map(Rc::new)
     }
 
+    /// Paints a cached, origin-relative flattened glyph outline at device
+    /// origin `(dx, dy)` in color `fill`, reusing [`Executor::glyph_blit`] so
+    /// a page of text paints without a fresh polygon allocation per glyph.
+    /// The fill is anti-aliased, nonzero-rule, alpha- and clip-scaled exactly
+    /// as a direct `fill_path` on the untranslated glyph would be.
+    fn blit_glyph(&mut self, cached: &[Subpath], dx: f32, dy: f32, fill: [u8; 4], gs: &GState) {
+        for (i, src) in cached.iter().enumerate() {
+            if i == self.glyph_blit.len() {
+                self.glyph_blit.push(Subpath {
+                    points: Vec::new(),
+                    closed: src.closed,
+                });
+            }
+            let dst = &mut self.glyph_blit[i];
+            dst.points.clear();
+            dst.points
+                .extend(src.points.iter().map(|p| Point::new(p.x + dx, p.y + dy)));
+            dst.closed = src.closed;
+        }
+        fill_path(
+            &mut self.pix,
+            &self.glyph_blit[..cached.len()],
+            FillRule::NonZero,
+            fill,
+            gs.fill_alpha,
+            gs.clip.as_deref(),
+        );
+    }
+
     /// Paints one show-string's glyphs and advances the text matrix. Codes with
     /// no drawable glyph still advance, so surrounding text stays positioned.
     /// `chain`/`depth` thread the resource chain and form-recursion depth
@@ -696,17 +706,21 @@ impl Executor<'_> {
                 .concat(ts.tm)
                 .concat(gs.ctm);
             if gid != 0 && finite_matrix(&to_device) {
-                let segs = font.outline(gid);
-                if !segs.is_empty() {
-                    let polys = build_glyph(&segs, to_device);
-                    fill_path(
-                        &mut self.pix,
-                        &polys,
-                        FillRule::NonZero,
-                        fill,
-                        gs.fill_alpha,
-                        gs.clip.as_deref(),
-                    );
+                // Flatten under the linear part only (memoized per glyph +
+                // linear map); the per-glyph translation is applied when the
+                // cached outline is blitted, keeping the flatten reusable
+                // across every occurrence in the run.
+                let linear = Matrix {
+                    a: to_device.a,
+                    b: to_device.b,
+                    c: to_device.c,
+                    d: to_device.d,
+                    e: 0.0,
+                    f: 0.0,
+                };
+                let polys = font.flattened(gid, linear);
+                if !polys.is_empty() {
+                    self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
                 }
             }
 
