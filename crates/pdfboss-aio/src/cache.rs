@@ -107,7 +107,10 @@ impl<B: Backend> CachedBackend<B> {
         state.clock += 1;
         let stamp = state.clock;
         state.bytes += data.len();
-        state.chunks.insert(index, CacheEntry { data, stamp });
+        let old_entry = state.chunks.insert(index, CacheEntry { data, stamp });
+        if let Some(old) = old_entry {
+            state.bytes -= old.data.len();
+        }
         while state.bytes > self.max_bytes && state.chunks.len() > 1 {
             let coldest = state
                 .chunks
@@ -256,5 +259,24 @@ mod tests {
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
         cached.read_at(1000, &mut buf).await.unwrap();
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn duplicate_insert_does_not_double_count() {
+        // Create a cache to test byte accounting
+        let (inner, _fetches) = counting(vec![0u8; 200]);
+        let cached = CachedBackend::with_capacity(inner, 64, 256);
+
+        // Insert the same chunk twice directly
+        cached.insert(0, vec![0u8; 64]);
+        cached.insert(0, vec![0u8; 64]);
+
+        // Check that bytes is still 64, not 128
+        let state = cached.state.lock().unwrap();
+        assert_eq!(
+            state.bytes, 64,
+            "Duplicate insert should not double-count bytes"
+        );
+        assert_eq!(state.chunks.len(), 1, "Should have exactly one chunk");
     }
 }
