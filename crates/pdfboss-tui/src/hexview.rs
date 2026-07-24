@@ -20,13 +20,16 @@ pub enum ByteClass {
     Other,
 }
 
-/// Classifies a byte for coloring.
+/// Classifies a byte for coloring. Matches `pdfboss-cli`'s shipped
+/// `classify` in `crates/pdfboss-cli/src/hexdump.rs`, which its hexdump
+/// goldens pin: space and vertical tab are whitespace, not
+/// printable/other.
 pub fn byte_class(byte: u8) -> ByteClass {
     match byte {
         0x00 => ByteClass::Null,
-        b'\t' | b'\n' | b'\x0c' | b'\r' => ByteClass::Whitespace,
-        0x20..=0x7e => ByteClass::Printable,
-        // 0x0b (vertical tab) and everything non-ascii-printable.
+        b'\t' | b'\n' | 0x0b | b'\x0c' | b'\r' | b' ' => ByteClass::Whitespace,
+        0x21..=0x7e => ByteClass::Printable,
+        // Everything else non-ascii-printable.
         0x01..=0x1f | 0x7f..=0xff => ByteClass::Other,
     }
 }
@@ -150,6 +153,13 @@ impl HexState {
 
     /// If the rows `scroll_line..scroll_line+visible` need bytes outside
     /// the resident window, returns the window start to fetch.
+    ///
+    /// Coverage is checked over the *whole* visible byte range, not just its
+    /// top: a viewport that straddles a window boundary (top rows resident,
+    /// bottom rows in the next window) must report the window covering the
+    /// first uncovered byte, which is `window_end` when the top is resident
+    /// but the bottom isn't — not the (already-resident) window at
+    /// `scroll_line`, or the fetch would loop on the same window forever.
     pub fn visible_window_missing(&self, visible: u16) -> Option<u64> {
         if self.source.is_none() || self.total_len == 0 {
             return None;
@@ -161,7 +171,13 @@ impl HexState {
         if first_byte >= self.window_start && last_byte <= window_end {
             return None;
         }
-        Some(window_for_line(self.total_len, self.scroll_line).0)
+        let first_uncovered = if first_byte < self.window_start || first_byte >= window_end {
+            first_byte
+        } else {
+            window_end
+        };
+        let missing_line = first_uncovered / BYTES_PER_LINE as u64;
+        Some(window_for_line(self.total_len, missing_line).0)
     }
 
     /// Pane title: source and viewed range.
@@ -238,7 +254,7 @@ pub fn hex_line(abs_off: u64, bytes: &[u8], hl: Option<(usize, usize)>) -> Line<
         "\u{2502} ".to_string(),
         Style::default().fg(Color::DarkGray),
     ));
-    for (column, byte) in bytes.iter().enumerate() {
+    for (column, byte) in bytes.iter().take(BYTES_PER_LINE).enumerate() {
         let symbol = if (0x20..=0x7e).contains(byte) {
             char::from(*byte).to_string()
         } else {
@@ -269,11 +285,28 @@ mod tests {
     fn byte_classes() {
         assert_eq!(byte_class(0x00), ByteClass::Null);
         assert_eq!(byte_class(b'A'), ByteClass::Printable);
-        assert_eq!(byte_class(b' '), ByteClass::Printable);
+        assert_eq!(byte_class(b' '), ByteClass::Whitespace);
         assert_eq!(byte_class(b'\n'), ByteClass::Whitespace);
         assert_eq!(byte_class(b'\t'), ByteClass::Whitespace);
         assert_eq!(byte_class(b'\r'), ByteClass::Whitespace);
         assert_eq!(byte_class(0xE2), ByteClass::Other);
+    }
+
+    /// Byte classes must match `pdfboss-cli`'s shipped `classify` in
+    /// `crates/pdfboss-cli/src/hexdump.rs` (which its hexdump goldens pin):
+    /// space and vertical tab are Whitespace, not Printable/Other.
+    #[test]
+    fn byte_classes_match_the_cli_convention() {
+        assert_eq!(byte_class(0x00), ByteClass::Null);
+        for b in [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20] {
+            assert_eq!(byte_class(b), ByteClass::Whitespace, "{:#04x}", b);
+        }
+        for b in *b"A~!" {
+            assert_eq!(byte_class(b), ByteClass::Printable, "{:#04x}", b);
+        }
+        for b in [0x7F, 0x80, 0x01] {
+            assert_eq!(byte_class(b), ByteClass::Other, "{:#04x}", b);
+        }
     }
 
     #[test]
@@ -359,6 +392,33 @@ mod tests {
         hex.scroll_by(-50_000);
         assert_eq!(hex.scroll_line, 0);
         assert_eq!(hex.title(), "Hex 0x10..0x30d50");
+    }
+
+    /// A viewport that straddles a 64 KiB window boundary (top rows
+    /// resident, bottom rows in the next window) must request the *next*
+    /// window, not the already-resident one it started in.
+    #[test]
+    fn straddling_viewport_requests_the_next_window() {
+        let mut hex = HexState::new();
+        hex.set_source(HexSource::File {
+            span: Span {
+                start: 0,
+                end: 200_000,
+            },
+        });
+        hex.apply_loaded(0, 200_000, vec![0u8; WINDOW_BYTES]);
+        hex.scroll_to(8188);
+        assert_eq!(hex.visible_window_missing(7), Some(65536));
+    }
+
+    #[test]
+    fn zero_length_span_has_no_lines() {
+        let mut hex = HexState::new();
+        hex.set_source(HexSource::File {
+            span: Span { start: 5, end: 5 },
+        });
+        assert_eq!(hex.line_count(), 0);
+        assert_eq!(hex.visible_window_missing(7), None);
     }
 
     #[test]
