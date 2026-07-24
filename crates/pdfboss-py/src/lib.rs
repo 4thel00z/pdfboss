@@ -667,6 +667,18 @@ impl AsyncDocument {
         })
     }
 
+    /// Opens a PDF over HTTP using range requests; the whole file is
+    /// never downloaded. The server must honor `Range` (a server that
+    /// ignores it raises PdfError with an "http:" message). Coroutine
+    /// resolving to an AsyncDocument.
+    #[staticmethod]
+    fn open_url(py: Python<'_>, url: String) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = AioDocument::open_url(url).await.map_err(aio_err)?;
+            Ok(AsyncDocument { inner })
+        })
+    }
+
     /// Number of pages in the document.
     fn page_count(&self) -> usize {
         self.inner.page_count()
