@@ -4,6 +4,7 @@
 pub mod content;
 mod crypt;
 pub mod document;
+pub mod elements;
 pub mod error;
 pub mod filters;
 pub mod geom;
@@ -16,6 +17,7 @@ pub mod pretty;
 pub mod xref;
 
 pub use document::{Document, Metadata, Page};
+pub use elements::{Element, ElementOpts, Span, XrefKind};
 pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
