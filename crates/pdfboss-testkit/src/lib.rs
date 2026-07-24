@@ -339,15 +339,27 @@ pub fn objstm_doc(extra: &[(u32, &str)]) -> Vec<u8> {
             entries.extend_from_slice(&[0, 0, 0, 255]); // free head
         } else if num == 4 {
             entries.push(1); // in file
+            debug_assert!(
+                objstm_offset <= u16::MAX as usize,
+                "fixture offset exceeds u16 emission width"
+            );
             entries.extend_from_slice(&(objstm_offset as u16).to_be_bytes());
             entries.push(0);
         } else if num == 5 {
             entries.push(1); // the xref stream itself
+            debug_assert!(
+                xref_offset <= u16::MAX as usize,
+                "fixture offset exceeds u16 emission width"
+            );
             entries.extend_from_slice(&(xref_offset as u16).to_be_bytes());
             entries.push(0);
         } else if let Some(index) = members.iter().position(|m| m.0 == num) {
             entries.push(2); // in object stream 4
             entries.extend_from_slice(&4u16.to_be_bytes());
+            debug_assert!(
+                index <= u8::MAX as usize,
+                "fixture member index exceeds u8 emission width"
+            );
             entries.push(index as u8);
         } else {
             entries.extend_from_slice(&[0, 0, 0, 0]); // free gap
