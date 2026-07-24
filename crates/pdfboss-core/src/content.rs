@@ -2,6 +2,7 @@
 //! images. Lenient: unknown operators and arity mismatches are skipped
 //! (the operand stack is cleared), never an error.
 
+use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::geom::Matrix;
 use crate::lexer::{is_whitespace, Lexer, Token};
@@ -205,11 +206,31 @@ pub enum Op {
 /// token boundary (or the declared `/L`ength when present, which is
 /// trusted).
 pub fn parse_content(data: &[u8]) -> Result<Vec<Op>> {
+    Ok(parse_content_spanned(data)?
+        .into_iter()
+        .map(|pair| pair.0)
+        .collect())
+}
+
+/// Like [`parse_content`], but also reports each operator's byte range —
+/// from the first token of its operand run through the operator keyword —
+/// within `data`.
+pub fn parse_content_spanned(data: &[u8]) -> Result<Vec<(Op, Span)>> {
     let mut lexer = Lexer::new(data);
     let mut ops = Vec::new();
     let mut stack: Vec<Object> = Vec::new();
+    // Start of the current operand run; cleared whenever the run dies
+    // (an operator was emitted, an unknown operator dropped it, or a
+    // stray closer flushed it).
+    let mut run_start: Option<usize> = None;
     loop {
-        match lexer.next_token()? {
+        lexer.skip_whitespace_and_comments();
+        let token_start = lexer.pos();
+        let token = lexer.next_token()?;
+        if !matches!(token, Token::Eof) && run_start.is_none() {
+            run_start = Some(token_start);
+        }
+        match token {
             Token::Eof => break,
             Token::Int(i) => stack.push(Object::Int(i)),
             Token::Real(r) => stack.push(Object::Real(r)),
@@ -224,20 +245,25 @@ pub fn parse_content(data: &[u8]) -> Result<Vec<Op>> {
                 stack.push(Object::Dict(d));
             }
             // Stray closers: malformed input, drop pending operands.
-            Token::ArrayClose | Token::DictClose => stack.clear(),
+            Token::ArrayClose | Token::DictClose => {
+                stack.clear();
+                run_start = None;
+            }
             Token::Keyword(kw) => match kw.as_slice() {
                 b"true" => stack.push(Object::Bool(true)),
                 b"false" => stack.push(Object::Bool(false)),
                 b"null" => stack.push(Object::Null),
                 b"BI" => {
+                    let start = run_start.take().unwrap_or(token_start);
                     if let Some(op) = parse_inline_image(&mut lexer) {
-                        ops.push(op);
+                        ops.push((op, Span::new(start as u64, lexer.pos() as u64)));
                     }
                     stack.clear();
                 }
                 _ => {
+                    let start = run_start.take().unwrap_or(token_start);
                     if let Some(op) = dispatch(&kw, &stack) {
-                        ops.push(op);
+                        ops.push((op, Span::new(start as u64, lexer.pos() as u64)));
                     }
                     stack.clear();
                 }
@@ -1163,5 +1189,45 @@ mod tests {
         let got = ops(&data);
         assert_eq!(got.len(), 1);
         assert!(matches!(got[0], Op::BeginMarkedContentProps(_, _)));
+    }
+
+    #[test]
+    fn spanned_ops_cover_their_source_bytes() {
+        let data = b"q 1 0 0 1 5 5 cm BT /F1 12 Tf (Hi) Tj ET Q";
+        let spanned = parse_content_spanned(data).unwrap();
+        let plain = parse_content(data).unwrap();
+        assert_eq!(
+            spanned
+                .iter()
+                .map(|pair| pair.0.clone())
+                .collect::<Vec<_>>(),
+            plain
+        );
+        for (op, span) in &spanned {
+            assert!(span.start < span.end && span.end as usize <= data.len());
+            // Re-parsing exactly the spanned bytes yields exactly this op.
+            let slice = &data[span.start as usize..span.end as usize];
+            let reparsed = parse_content(slice).unwrap();
+            assert_eq!(reparsed.len(), 1, "span of {op:?} reparses to one op");
+            assert_eq!(&reparsed[0], op);
+        }
+        // Spans are ordered and non-overlapping.
+        for pair in spanned.windows(2) {
+            assert!(pair[0].1.end <= pair[1].1.start);
+        }
+    }
+
+    #[test]
+    fn unknown_operator_does_not_stretch_the_next_span() {
+        // `zz` is unknown: its operands are dropped, and the following op's
+        // span must start at `q`, not at `7`.
+        let data = b"7 8 zz q";
+        let spanned = parse_content_spanned(data).unwrap();
+        assert_eq!(spanned.len(), 1);
+        assert_eq!(spanned[0].0, Op::Save);
+        assert_eq!(
+            &data[spanned[0].1.start as usize..spanned[0].1.end as usize],
+            b"q"
+        );
     }
 }
