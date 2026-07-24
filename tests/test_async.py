@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from pdfboss import AsyncDocument, Document, PdfError
+from pdfboss import AsyncDocument, Document, Element, PdfError
 
 
 class TestAsyncOpen:
@@ -92,3 +92,76 @@ class TestAsyncDocumentQueries:
             AsyncDocument.open(three_pages_pdf),
         )
         assert [d.page_count() for d in docs] == [1, 3]
+
+
+def element_key(element: Element) -> tuple[object, ...]:
+    """A comparable identity for an element (everything but value())."""
+    return (element.kind, element.span, element.ref, element.page)
+
+
+class TestAsyncElements:
+    @pytest.mark.asyncio
+    async def test_async_for_yields_elements(self, hello_pdf: Path) -> None:
+        doc = await AsyncDocument.open(hello_pdf)
+        kinds = []
+        async for element in doc.elements():
+            assert isinstance(element, Element)
+            kinds.append(element.kind)
+        assert kinds[0] == "header"
+        assert "page" in kinds
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name", ["hello.pdf", "three-pages.pdf", "shapes.pdf", "xref-stream.pdf"]
+    )
+    async def test_parity_with_sync_elements(
+        self, fixtures_dir: Path, name: str
+    ) -> None:
+        path = fixtures_dir / name
+        expected = [
+            element_key(e) for e in Document(str(path)).elements(content_ops=True)
+        ]
+        doc = await AsyncDocument.open(path)
+        got = []
+        async for element in doc.elements(content_ops=True):
+            got.append(element_key(element))
+        assert got == expected
+
+    @pytest.mark.asyncio
+    async def test_values_match_sync(self, hello_pdf: Path) -> None:
+        expected = [e.value() for e in Document(str(hello_pdf)).elements()]
+        doc = await AsyncDocument.open(hello_pdf)
+        got = []
+        async for element in doc.elements():
+            got.append(element.value())
+        assert got == expected
+
+    @pytest.mark.asyncio
+    async def test_filters_pass_through(self, three_pages_pdf: Path) -> None:
+        doc = await AsyncDocument.open(three_pages_pdf)
+        pages = []
+        async for element in doc.elements(physical=False, pages=[1]):
+            if element.kind == "page":
+                pages.append(element.page)
+        assert pages == [1]
+
+    @pytest.mark.asyncio
+    async def test_event_loop_stays_responsive(self, three_pages_pdf: Path) -> None:
+        doc = await AsyncDocument.open(three_pages_pdf)
+        ticks = 0
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0)
+
+        task = asyncio.create_task(ticker())
+        try:
+            count = 0
+            async for element in doc.elements(content_ops=True):
+                count += 1
+        finally:
+            task.cancel()
+        assert count > 0
+        assert ticks > 0
