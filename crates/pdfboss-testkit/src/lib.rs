@@ -286,6 +286,87 @@ pub fn doc_with_graphics(content: &str) -> Vec<u8> {
     single_page_builder(content.as_bytes()).build(1)
 }
 
+/// A complete one-page document whose catalog (1), page tree (2), and page
+/// (3) — plus every `(num, body)` pair in `extra` — live inside object
+/// stream 4, indexed by cross-reference stream 5. Object numbers 1–5 are
+/// reserved; `extra` numbers must be ≥ 6.
+pub fn objstm_doc(extra: &[(u32, &str)]) -> Vec<u8> {
+    let mut members: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+    ];
+    for (num, body) in extra {
+        assert!(*num >= 6, "extra object numbers must be >= 6");
+        members.push((*num, (*body).to_string()));
+    }
+
+    // Object-stream payload: header of `num offset` pairs, then the bodies.
+    let mut header = String::new();
+    let mut bodies = String::new();
+    for (num, body) in &members {
+        header.push_str(&format!("{} {} ", num, bodies.len()));
+        bodies.push_str(body);
+        bodies.push(' ');
+    }
+    let first = header.len();
+    let payload = format!("{header}{bodies}");
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"%PDF-1.7\n");
+    let objstm_offset = out.len();
+    out.extend_from_slice(
+        format!(
+            "4 0 obj << /Type /ObjStm /N {} /First {} /Length {} >> stream\n",
+            members.len(),
+            first,
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(payload.as_bytes());
+    out.extend_from_slice(b"\nendstream endobj\n");
+    let xref_offset = out.len();
+
+    // Cross-reference stream 5: W [1 2 1]; entries for objects 0..=max.
+    let max_num = members.iter().map(|m| m.0).max().unwrap_or(5).max(5);
+    let mut entries: Vec<u8> = Vec::new();
+    for num in 0..=max_num {
+        if num == 0 {
+            entries.extend_from_slice(&[0, 0, 0, 255]); // free head
+        } else if num == 4 {
+            entries.push(1); // in file
+            entries.extend_from_slice(&(objstm_offset as u16).to_be_bytes());
+            entries.push(0);
+        } else if num == 5 {
+            entries.push(1); // the xref stream itself
+            entries.extend_from_slice(&(xref_offset as u16).to_be_bytes());
+            entries.push(0);
+        } else if let Some(index) = members.iter().position(|m| m.0 == num) {
+            entries.push(2); // in object stream 4
+            entries.extend_from_slice(&4u16.to_be_bytes());
+            entries.push(index as u8);
+        } else {
+            entries.extend_from_slice(&[0, 0, 0, 0]); // free gap
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "5 0 obj << /Type /XRef /Size {} /W [1 2 1] /Root 1 0 R /Length {} >> stream\n",
+            max_num + 1,
+            entries.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&entries);
+    out.extend_from_slice(b"\nendstream endobj\n");
+    out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out
+}
+
 /// Builds the decoded payload and dictionary entries for an object stream
 /// (`/Type /ObjStm`) holding the given `(number, body)` pairs.
 ///
