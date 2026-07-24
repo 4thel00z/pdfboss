@@ -1,10 +1,6 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
-// `hexdump` (formatting engine) is consumed by the `hex` subcommand added
-// in a later plan-04 task; the `dead_code` allowance disappears once it is
-// wired up.
-#[allow(dead_code)]
 mod hexdump;
 mod input;
 mod json;
@@ -127,6 +123,21 @@ enum Command {
         #[arg(long)]
         content_ops: bool,
     },
+    /// Hexdump the file or a selected element (hexyl-style).
+    Hex {
+        /// Path or http(s) URL of the PDF.
+        input: String,
+        /// obj:N[,G] | header | xref:N | trailer | range:START-END
+        /// (offsets decimal or 0x-hex; xref sections indexed in chain
+        /// order, newest first). Default: the whole file.
+        selector: Option<String>,
+        /// Print labeled element boundaries as the dump crosses them.
+        #[arg(long)]
+        annotate: bool,
+        /// Bytes per row.
+        #[arg(long, default_value_t = 16)]
+        width: usize,
+    },
 }
 
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
@@ -185,6 +196,12 @@ fn main() {
             };
             json::cmd_json(&input, &flags).map_err(Failure::from)
         }
+        Command::Hex {
+            input,
+            selector,
+            annotate,
+            width,
+        } => hexdump::cmd_hex(&input, selector.as_deref(), annotate, width).map_err(Failure::from),
     };
     if let Err(failure) = result {
         eprintln!("pdfboss: {}", failure.message);
@@ -622,5 +639,31 @@ mod tests {
         assert_eq!(input, "in.pdf");
         assert!(raw && !decode && no_logical && content_ops);
         assert_eq!(pages, Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn hex_flags_parse() {
+        let cli = Cli::parse_from([
+            "pdfboss",
+            "hex",
+            "in.pdf",
+            "obj:12",
+            "--annotate",
+            "--width",
+            "8",
+        ]);
+        let Command::Hex {
+            input,
+            selector,
+            annotate,
+            width,
+        } = cli.command
+        else {
+            panic!("expected hex command");
+        };
+        assert_eq!(input, "in.pdf");
+        assert_eq!(selector.as_deref(), Some("obj:12"));
+        assert!(annotate);
+        assert_eq!(width, 8);
     }
 }
