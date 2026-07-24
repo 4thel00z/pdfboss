@@ -6,4 +6,5 @@
 //! pure and unit-testable; only [`run`] touches the real terminal.
 
 pub mod hexview;
+pub mod search;
 pub mod tree;
