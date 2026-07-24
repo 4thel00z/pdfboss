@@ -4,6 +4,8 @@
 //! can hold `Arc<dyn Backend>`.
 
 use std::io;
+use std::path::Path;
+use std::sync::Arc;
 
 use bytes::Bytes;
 pub use futures_util::future::BoxFuture;
@@ -55,9 +57,87 @@ impl Backend for MemBackend {
     }
 }
 
+/// A byte source backed by a file. Reads run as positioned reads on a
+/// blocking thread pool so the async runtime is never stalled by disk I/O;
+/// the length is captured once at open (the file is treated as immutable
+/// while the backend lives).
+pub struct FileBackend {
+    file: Arc<std::fs::File>,
+    len: u64,
+}
+
+impl FileBackend {
+    /// Opens `path` and records its current length.
+    pub async fn open(path: impl AsRef<Path>) -> io::Result<FileBackend> {
+        let path = path.as_ref().to_owned();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(path)?;
+            let len = file.metadata()?.len();
+            Ok(FileBackend {
+                file: Arc::new(file),
+                len,
+            })
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+}
+
+/// One positioned read at `offset` (no shared cursor).
+fn positioned_read(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        file.seek_read(buf, offset)
+    }
+}
+
+/// Loops positioned reads over short counts so callers only ever see a
+/// short total at end of file.
+fn read_at_fully(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let count = positioned_read(file, offset + filled as u64, &mut buf[filled..])?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
+    Ok(filled)
+}
+
+impl Backend for FileBackend {
+    fn len(&self) -> BoxFuture<'_, io::Result<u64>> {
+        let total = self.len;
+        Box::pin(async move { Ok(total) })
+    }
+
+    fn read_at<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<usize>> {
+        let file = Arc::clone(&self.file);
+        let wanted = buf.len();
+        Box::pin(async move {
+            let chunk = tokio::task::spawn_blocking(move || {
+                let mut scratch = vec![0u8; wanted];
+                let count = read_at_fully(&file, offset, &mut scratch)?;
+                scratch.truncate(count);
+                Ok::<Vec<u8>, io::Error>(scratch)
+            })
+            .await
+            .map_err(io::Error::other)??;
+            buf[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Backend, MemBackend};
+    use super::*;
 
     #[tokio::test]
     async fn mem_backend_reads_and_reports_length() {
@@ -83,5 +163,34 @@ mod tests {
         let boxed: std::sync::Arc<dyn Backend> =
             std::sync::Arc::new(MemBackend::from(b"xyz".to_vec()));
         assert_eq!(boxed.len().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn file_backend_positioned_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "pdfboss-aio-backend-test-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"0123456789abcdef").unwrap();
+        let backend = FileBackend::open(&path).await.unwrap();
+        assert_eq!(backend.len().await.unwrap(), 16);
+        let mut buf = [0u8; 4];
+        assert_eq!(backend.read_at(10, &mut buf).await.unwrap(), 4);
+        assert_eq!(&buf, b"abcd");
+        // Reads are positioned, not cursor-based: an earlier offset after a
+        // later one must still return the right bytes.
+        assert_eq!(backend.read_at(0, &mut buf).await.unwrap(), 4);
+        assert_eq!(&buf, b"0123");
+        // Short read only at end of file.
+        let mut long = [0u8; 32];
+        assert_eq!(backend.read_at(12, &mut long).await.unwrap(), 4);
+        assert_eq!(&long[..4], b"cdef");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn file_backend_open_missing_file_errors() {
+        let missing = std::env::temp_dir().join("pdfboss-aio-backend-test-missing.bin");
+        assert!(FileBackend::open(&missing).await.is_err());
     }
 }
