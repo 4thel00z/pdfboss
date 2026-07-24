@@ -3,7 +3,11 @@
 //!
 //! State machine (`app`), pane models (`tree`, `inspector`, `hexview`,
 //! `preview`, `search`), key mapping (`input`) and rendering (`ui`) are
-//! pure and unit-testable; only [`run`] touches the real terminal.
+//! pure and unit-testable; only [`run`] touches the real terminal. The
+//! event loop `tokio::select!`s over the crossterm event stream, a
+//! background-task message channel and a 100 ms tick, so long operations
+//! (element streaming, hex fetches, search, preview rasterization) never
+//! block input.
 
 pub mod app;
 pub mod hexview;
@@ -13,3 +17,392 @@ pub mod preview;
 pub mod search;
 pub mod tree;
 pub mod ui;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use crossterm::event::{Event, EventStream};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use futures_util::StreamExt;
+use pdfboss_aio::AsyncDocument;
+use pdfboss_core::elements::{Element, ElementOpts, Span};
+use pdfboss_core::ObjRef;
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use tokio::sync::mpsc::{self, UnboundedSender};
+
+use crate::app::{App, Cmd, Msg};
+use crate::hexview::{HexSource, WINDOW_BYTES};
+use crate::inspector::InspectorPayload;
+use crate::preview::{fit_scale, PreviewFrame};
+use crate::search::{object_matches, SearchHit};
+use crate::tree::TreeReq;
+
+/// Elements per tree batch message.
+const TREE_BATCH: usize = 64;
+
+/// Restores the terminal on drop, so panics and early returns never leave
+/// the shell in raw mode.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        disable_raw_mode().ok();
+        execute!(std::io::stdout(), LeaveAlternateScreen).ok();
+    }
+}
+
+/// Runs the explorer until the user quits. `doc` supplies all data (file-
+/// or HTTP-backed); `title` labels the status bar. Document-level errors
+/// become status-bar toasts; only terminal I/O errors are returned.
+pub async fn run(doc: AsyncDocument, title: String) -> std::io::Result<()> {
+    enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    let guard = TerminalGuard;
+    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    let size = terminal.size()?;
+    let mut app = App::new(
+        title,
+        doc.version(),
+        doc.page_count(),
+        (size.width, size.height),
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+    let search_epoch = Arc::new(AtomicU64::new(0));
+    let mut events = EventStream::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    loop {
+        terminal.draw(|frame| ui::draw(&app, frame))?;
+        let msg = tokio::select! {
+            maybe_event = events.next() => match maybe_event {
+                Some(Ok(Event::Key(key))) => Msg::Key(key),
+                Some(Ok(Event::Resize(width, height))) => Msg::Resize(width, height),
+                Some(Ok(..)) => continue,
+                Some(Err(..)) | None => break,
+            },
+            Some(msg) = rx.recv() => msg,
+            _ = tick.tick() => Msg::Tick,
+        };
+        for cmd in app.update(msg) {
+            execute_cmd(&doc, &tx, &search_epoch, cmd);
+        }
+        if app.should_quit {
+            break;
+        }
+    }
+    drop(guard);
+    Ok(())
+}
+
+/// Spawns the background task a [`Cmd`] describes; completions come back
+/// to the loop as [`Msg`]s on the channel.
+fn execute_cmd(
+    doc: &AsyncDocument,
+    tx: &UnboundedSender<Msg>,
+    search_epoch: &Arc<AtomicU64>,
+    cmd: Cmd,
+) {
+    let doc = doc.clone();
+    let tx = tx.clone();
+    match cmd {
+        Cmd::LoadTree(req) => {
+            tokio::spawn(load_tree(doc, tx, req));
+        }
+        Cmd::LoadContents { page, r } => {
+            tokio::spawn(load_contents(doc, tx, page, r));
+        }
+        Cmd::LoadObject { generation, r } => {
+            tokio::spawn(async move {
+                let message = match doc.get_object(r).await {
+                    Ok(object) => Msg::InspectorLoaded {
+                        generation,
+                        payload: InspectorPayload::Object { r, object },
+                    },
+                    Err(error) => Msg::InspectorFailed {
+                        generation,
+                        error: error.to_string(),
+                    },
+                };
+                tx.send(message).ok();
+            });
+        }
+        Cmd::DecodeStream { generation, r } => {
+            tokio::spawn(async move {
+                let message = match decoded_stream_data(&doc, r).await {
+                    Ok(data) => Msg::InspectorLoaded {
+                        generation,
+                        payload: InspectorPayload::Decoded { r, data },
+                    },
+                    Err(error) => Msg::InspectorFailed { generation, error },
+                };
+                tx.send(message).ok();
+            });
+        }
+        Cmd::LoadHex {
+            generation,
+            source,
+            window_start,
+        } => {
+            tokio::spawn(load_hex(doc, tx, generation, source, window_start));
+        }
+        Cmd::StartSearch { generation, query } => {
+            let epoch = Arc::clone(search_epoch);
+            epoch.store(generation, Ordering::SeqCst);
+            tokio::spawn(run_search(doc, tx, epoch, generation, query));
+        }
+        Cmd::RenderPreview {
+            generation,
+            page,
+            max_w,
+            max_h,
+            file_bytes,
+        } => {
+            tokio::spawn(render_preview(
+                doc, tx, generation, page, max_w, max_h, file_bytes,
+            ));
+        }
+    }
+}
+
+/// Streams a tree section's elements in batches. Per-element parse errors
+/// are counted, never fatal (salvage semantics: a document with an
+/// unusable logical layer still explores physically).
+async fn load_tree(doc: AsyncDocument, tx: UnboundedSender<Msg>, req: TreeReq) {
+    let opts = match req {
+        TreeReq::Physical => ElementOpts {
+            physical: true,
+            logical: false,
+            pages: None,
+            content_ops: false,
+        },
+        TreeReq::Logical => ElementOpts {
+            physical: false,
+            logical: true,
+            pages: None,
+            content_ops: false,
+        },
+        // Contents folders load through `load_contents`.
+        TreeReq::Contents { .. } => return,
+    };
+    let mut stream = doc.elements(opts);
+    let mut batch: Vec<Element> = Vec::new();
+    let mut errors = 0usize;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(element) => batch.push(element),
+            Err(..) => errors += 1,
+        }
+        if batch.len() >= TREE_BATCH {
+            let elements = std::mem::take(&mut batch);
+            let batch_errors = std::mem::take(&mut errors);
+            let sent = tx.send(Msg::TreeBatch {
+                req,
+                elements,
+                errors: batch_errors,
+                done: false,
+            });
+            if sent.is_err() {
+                return;
+            }
+        }
+    }
+    tx.send(Msg::TreeBatch {
+        req,
+        elements: batch,
+        errors,
+        done: true,
+    })
+    .ok();
+}
+
+/// Fetches a page dict and reports its `/Contents` refs (a single ref or
+/// an array of refs).
+async fn load_contents(doc: AsyncDocument, tx: UnboundedSender<Msg>, page: usize, r: ObjRef) {
+    let message = match page_contents(&doc, r).await {
+        Ok(refs) => Msg::ContentsLoaded { page, refs },
+        Err(error) => Msg::ContentsFailed { page, error },
+    };
+    tx.send(message).ok();
+}
+
+async fn page_contents(doc: &AsyncDocument, r: ObjRef) -> Result<Vec<ObjRef>, String> {
+    let object = doc.get_object(r).await.map_err(|error| error.to_string())?;
+    let Some(dict) = object.as_dict() else {
+        return Err(format!("object {} {} is not a page dict", r.num, r.gen));
+    };
+    let mut refs = Vec::new();
+    match dict.get("Contents") {
+        Some(pdfboss_core::Object::Ref(content_ref)) => refs.push(*content_ref),
+        Some(pdfboss_core::Object::Array(items)) => {
+            for item in items {
+                if let pdfboss_core::Object::Ref(content_ref) = item {
+                    refs.push(*content_ref);
+                }
+            }
+        }
+        Some(..) | None => {}
+    }
+    Ok(refs)
+}
+
+/// Decoded data of stream object `r`.
+async fn decoded_stream_data(doc: &AsyncDocument, r: ObjRef) -> Result<Vec<u8>, String> {
+    let object = doc.get_object(r).await.map_err(|error| error.to_string())?;
+    let Some(stream) = object.as_stream() else {
+        return Err(format!("object {} {} is not a stream", r.num, r.gen));
+    };
+    doc.decode_stream(stream)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Loads one hex window: a `read_span` window of a file span, or the whole
+/// decoded object-stream container (decoded buffers are small).
+async fn load_hex(
+    doc: AsyncDocument,
+    tx: UnboundedSender<Msg>,
+    generation: u64,
+    source: HexSource,
+    window_start: u64,
+) {
+    let outcome: Result<(u64, u64, Vec<u8>), String> = match source {
+        HexSource::File { span } => {
+            let total_len = span.end.saturating_sub(span.start);
+            let start = span.start + window_start;
+            let end = (start + WINDOW_BYTES as u64).min(span.end);
+            match doc.read_span(Span { start, end }).await {
+                Ok(bytes) => Ok((window_start, total_len, bytes)),
+                Err(error) => Err(error.to_string()),
+            }
+        }
+        HexSource::DecodedObjStm { container } => {
+            match decoded_stream_data(&doc, container).await {
+                Ok(bytes) => Ok((0, bytes.len() as u64, bytes)),
+                Err(error) => Err(error),
+            }
+        }
+    };
+    let message = match outcome {
+        Ok((start, total_len, bytes)) => Msg::HexLoaded {
+            generation,
+            window_start: start,
+            total_len,
+            bytes,
+        },
+        Err(error) => Msg::HexFailed { generation, error },
+    };
+    tx.send(message).ok();
+}
+
+/// Visits physical objects lazily, streaming one message per match. A
+/// newer search generation (shared epoch) terminates this task early.
+async fn run_search(
+    doc: AsyncDocument,
+    tx: UnboundedSender<Msg>,
+    epoch: Arc<AtomicU64>,
+    generation: u64,
+    query: String,
+) {
+    let opts = ElementOpts {
+        physical: true,
+        logical: false,
+        pages: None,
+        content_ops: false,
+    };
+    let mut stream = doc.elements(opts);
+    while let Some(item) = stream.next().await {
+        if epoch.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let Ok(Element::IndirectObject { r, object, .. }) = item else {
+            continue;
+        };
+        if object_matches(&query, r.num, &object) {
+            let hit = SearchHit { r };
+            if tx.send(Msg::SearchResult { generation, hit }).is_err() {
+                return;
+            }
+        }
+    }
+    tx.send(Msg::SearchDone { generation }).ok();
+}
+
+/// Renders a page preview. The whole file is fetched once (and cached by
+/// the app for later renders); rasterization runs in `spawn_blocking`, and
+/// the sync `Document` is created and dropped entirely inside the closure
+/// (it is not `Send`).
+async fn render_preview(
+    doc: AsyncDocument,
+    tx: UnboundedSender<Msg>,
+    generation: u64,
+    page: usize,
+    max_w: u32,
+    max_h: u32,
+    file_bytes: Option<Arc<Vec<u8>>>,
+) {
+    let bytes = match file_bytes {
+        Some(bytes) => Ok(bytes),
+        None => fetch_whole_file(&doc).await.map(Arc::new),
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tx.send(Msg::PreviewReady {
+                generation,
+                result: Err(error),
+            })
+            .ok();
+            return;
+        }
+    };
+    let render_input = Arc::clone(&bytes);
+    let rendered =
+        tokio::task::spawn_blocking(move || -> Result<pdfboss_render::Pixmap, String> {
+            let document = pdfboss_core::Document::load(render_input.as_ref().clone())
+                .map_err(|error| error.to_string())?;
+            let page_object = document.page(page).map_err(|error| error.to_string())?;
+            let (page_w, page_h) = page_object.size();
+            let scale = fit_scale(page_w, page_h, max_w, max_h);
+            pdfboss_render::render_page(&document, &page_object, scale)
+                .map_err(|error| error.to_string())
+        })
+        .await;
+    let result = match rendered {
+        Ok(Ok(pixmap)) => Ok(PreviewFrame {
+            file_bytes: bytes,
+            pixmap,
+        }),
+        Ok(Err(error)) => Err(error),
+        Err(join_error) => Err(join_error.to_string()),
+    };
+    tx.send(Msg::PreviewReady { generation, result }).ok();
+}
+
+/// Fetches the entire file via one `read_span` over
+/// `0..doc.file_len()` (the aio crate reports the length synchronously).
+async fn fetch_whole_file(doc: &AsyncDocument) -> Result<Vec<u8>, String> {
+    let end = doc.file_len();
+    doc.read_span(Span { start: 0, end })
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fetch_whole_file_reads_exactly_file_len_bytes() {
+        let data = pdfboss_testkit::simple_doc("Hello");
+        let doc = AsyncDocument::from_bytes(data.clone())
+            .await
+            .expect("fixture opens");
+        assert_eq!(doc.file_len(), data.len() as u64, "reported length");
+        let fetched = fetch_whole_file(&doc).await.expect("whole-file fetch");
+        assert_eq!(fetched, data, "fetch covers the entire file");
+    }
+}
