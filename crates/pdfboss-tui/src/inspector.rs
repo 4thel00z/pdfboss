@@ -4,6 +4,7 @@
 
 use pdfboss_core::content::parse_content;
 use pdfboss_core::pretty;
+use pdfboss_core::Dict;
 use pdfboss_core::{ObjRef, Object};
 
 /// Maximum lines the Raw/Decoded byte views materialize.
@@ -101,6 +102,20 @@ impl InspectorState {
         if matches!(self.mode, InspectorMode::Decoded | InspectorMode::Ops) {
             self.rebuild();
         }
+    }
+
+    /// Shows a bare dictionary (the trailer) pretty-printed, refs jumpable.
+    pub fn set_dict(&mut self, title: &str, dict: &Dict) {
+        let text = pretty::format_dict(dict);
+        self.title = title.to_string();
+        self.object = None;
+        self.decoded = None;
+        self.mode = InspectorMode::Pretty;
+        self.scroll = 0;
+        self.lines = text.lines().map(str::to_string).collect();
+        self.refs = ref_lines(&text);
+        self.ref_cursor = None;
+        self.loading = false;
     }
 
     /// Whether the shown object is a stream (enables `d` cycling).
