@@ -10,9 +10,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use pdfboss_core::elements::{Span, XrefKind};
 use pdfboss_core::lexer::{Lexer, Token};
+use pdfboss_core::object::decode_text_string;
 use pdfboss_core::parser::{NoResolve, Parser, Resolve};
 use pdfboss_core::xref::XrefEntry;
-use pdfboss_core::{Dict, ObjRef, Object, Stream};
+use pdfboss_core::{Dict, Metadata, ObjRef, Object, Stream};
 
 use crate::backend::{Backend, BoxFuture, FileBackend, MemBackend};
 use crate::cache::CachedBackend;
@@ -499,9 +500,9 @@ fn non_negative(value: i64) -> Option<u64> {
 /// sync loader's newest-wins semantics.
 pub(crate) struct XrefIndex {
     pub(crate) entries: HashMap<u32, XrefEntry>,
-    /// Consumed, with `trailer_span` below, by a `merged_trailer()`
-    /// accessor (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// The merged trailer dictionary, e.g. `/Info` lookups in `metadata()`;
+    /// also consumed, with `trailer_span` below, by a future
+    /// `merged_trailer()` accessor (Plan 02 task 11).
     pub(crate) trailer: Dict,
     /// Span for the single merged `Trailer` element: the newest section's
     /// trailer region (classic), or that section's own span (stream) —
@@ -1088,6 +1089,60 @@ impl AsyncDocument {
             frontier = next;
         }
         MapResolve(map)
+    }
+
+    /// Decodes a stream's data through its filter chain, resolving indirect
+    /// filter parameters against this document.
+    pub async fn decode_stream(&self, s: &Stream) -> Result<Vec<u8>> {
+        let mut chain = Vec::new();
+        self.decode_stream_with_chain(s, &mut chain).await
+    }
+
+    /// Raw file bytes for `span` (for hex views), clamped to the file
+    /// length.
+    pub async fn read_span(&self, span: Span) -> Result<Vec<u8>> {
+        let start = span.start.min(self.inner.file_len);
+        let end = span.end.min(self.inner.file_len);
+        if start >= end {
+            return Ok(Vec::new());
+        }
+        self.fetcher().read_range(start, end).await
+    }
+
+    /// Total length of the underlying file in bytes.
+    pub fn file_len(&self) -> u64 {
+        self.inner.file_len
+    }
+
+    /// Document metadata from the trailer `/Info` dictionary (lenient:
+    /// absent or malformed entries are simply `None`), mirroring the sync
+    /// document.
+    pub async fn metadata(&self) -> Result<Metadata> {
+        let mut meta = Metadata::default();
+        let Some(info) = self.inner.xref.trailer.get("Info") else {
+            return Ok(meta);
+        };
+        let Ok(info) = self.resolve(info).await else {
+            return Ok(meta);
+        };
+        let Some(dict) = info.as_dict() else {
+            return Ok(meta);
+        };
+        meta.title = self.meta_string(dict, "Title").await;
+        meta.author = self.meta_string(dict, "Author").await;
+        meta.subject = self.meta_string(dict, "Subject").await;
+        meta.keywords = self.meta_string(dict, "Keywords").await;
+        meta.creator = self.meta_string(dict, "Creator").await;
+        meta.producer = self.meta_string(dict, "Producer").await;
+        meta.creation_date = self.meta_string(dict, "CreationDate").await;
+        meta.mod_date = self.meta_string(dict, "ModDate").await;
+        Ok(meta)
+    }
+
+    /// Reads `key` from an info dictionary as a decoded text string.
+    async fn meta_string(&self, dict: &Dict, key: &str) -> Option<String> {
+        let value = self.resolve(dict.get(key)?).await.ok()?;
+        Some(decode_text_string(value.as_str_bytes()?))
     }
 }
 
@@ -1728,5 +1783,71 @@ mod tests {
         // Generation mismatch is tolerated (lenient), like the sync model.
         let catalog = doc.get_object(ObjRef { num: 1, gen: 7 }).await.unwrap();
         assert!(catalog.as_dict().is_some());
+    }
+
+    #[tokio::test]
+    async fn decode_stream_matches_sync_stream_data() {
+        let data = simple_doc("stream parity");
+        let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        let object = doc.get_object(ObjRef { num: 4, gen: 0 }).await.unwrap();
+        let stream = object.as_stream().unwrap();
+        assert_eq!(
+            doc.decode_stream(stream).await.unwrap(),
+            sync_doc.stream_data(stream).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_span_returns_raw_file_bytes() {
+        let data = simple_doc("raw bytes");
+        let doc = AsyncDocument::from_bytes(data.clone()).await.unwrap();
+        let slice = doc.read_span(Span { start: 0, end: 8 }).await.unwrap();
+        assert_eq!(slice, b"%PDF-1.7");
+        // Spans are clamped to the file length, which is also public.
+        let file_len = data.len() as u64;
+        assert_eq!(doc.file_len(), file_len);
+        let tail = doc
+            .read_span(Span {
+                start: file_len - 6,
+                end: file_len + 50,
+            })
+            .await
+            .unwrap();
+        assert_eq!(tail, b"%%EOF\n");
+        assert!(doc
+            .read_span(Span {
+                start: file_len + 1,
+                end: file_len + 2
+            })
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn metadata_matches_the_sync_document() {
+        let mut b = pdfboss_testkit::PdfBuilder::new().trailer_extra("/Info 6 0 R");
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        // /Title is UTF-16BE with BOM; /Author is a plain string.
+        b.object(6, "<< /Title <FEFF00480151> /Author (plain author) >>");
+        let data = b.build(1);
+        let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        let meta = doc.metadata().await.unwrap();
+        assert_eq!(meta, sync_doc.metadata());
+        assert_eq!(meta.title.as_deref(), Some("H\u{151}"));
+        assert_eq!(meta.author.as_deref(), Some("plain author"));
+        assert_eq!(meta.subject, None);
+    }
+
+    #[tokio::test]
+    async fn metadata_without_info_is_all_none() {
+        let doc = AsyncDocument::from_bytes(simple_doc("x")).await.unwrap();
+        assert_eq!(
+            doc.metadata().await.unwrap(),
+            pdfboss_core::Metadata::default()
+        );
     }
 }
