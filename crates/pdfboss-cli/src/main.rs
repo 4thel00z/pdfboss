@@ -138,6 +138,34 @@ enum Command {
         #[arg(long, default_value_t = 16)]
         width: usize,
     },
+    /// Run a jq program over the document's JSON value tree.
+    Q {
+        /// Path or http(s) URL of the PDF.
+        input: String,
+        /// jq program, e.g. '.objects["12 0"]'.
+        program: String,
+        /// Embed raw (still encoded) stream data as base64.
+        #[arg(long, conflicts_with = "decode")]
+        raw: bool,
+        /// Embed decoded stream data as base64.
+        #[arg(long)]
+        decode: bool,
+        /// Hexdump results carrying a `_span` instead of printing JSON.
+        #[arg(long)]
+        hex: bool,
+        /// Print string results raw, without quotes (like jq -r).
+        #[arg(short = 'r')]
+        raw_strings: bool,
+        /// Restrict logical elements to these 1-based pages (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        pages: Option<Vec<usize>>,
+        /// Skip the logical layer (pages/fonts/images/annotations).
+        #[arg(long)]
+        no_logical: bool,
+        /// Include per-page content-stream operators (high volume).
+        #[arg(long)]
+        content_ops: bool,
+    },
 }
 
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
@@ -202,6 +230,26 @@ fn main() {
             annotate,
             width,
         } => hexdump::cmd_hex(&input, selector.as_deref(), annotate, width).map_err(Failure::from),
+        Command::Q {
+            input,
+            program,
+            raw,
+            decode,
+            hex,
+            raw_strings,
+            pages,
+            no_logical,
+            content_ops,
+        } => {
+            let flags = q::value::TreeFlags {
+                raw,
+                decode,
+                pages,
+                no_logical,
+                content_ops,
+            };
+            q::run::cmd_q(&input, &program, &flags, hex, raw_strings)
+        }
     };
     if let Err(failure) = result {
         eprintln!("pdfboss: {}", failure.message);
@@ -665,5 +713,26 @@ mod tests {
         assert_eq!(selector.as_deref(), Some("obj:12"));
         assert!(annotate);
         assert_eq!(width, 8);
+    }
+
+    #[test]
+    fn q_flags_parse() {
+        let cli = Cli::parse_from(["pdfboss", "q", "in.pdf", ".header", "--hex", "-r"]);
+        let Command::Q {
+            input,
+            program,
+            raw,
+            decode,
+            hex,
+            raw_strings,
+            ..
+        } = cli.command
+        else {
+            panic!("expected q command");
+        };
+        assert_eq!(input, "in.pdf");
+        assert_eq!(program, ".header");
+        assert!(hex && raw_strings);
+        assert!(!raw && !decode);
     }
 }
