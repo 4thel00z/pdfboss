@@ -1,5 +1,7 @@
-//! Core PDF machinery: syntax, objects, filters, cross-references and the
-//! document model, implemented from the PDF specification (ISO 32000).
+//! Core PDF machinery: syntax, objects, filters, cross-references, the
+//! document model, and lazy element iteration (physical file structure with
+//! byte spans plus logical document structure), implemented from the PDF
+//! specification (ISO 32000).
 
 pub mod content;
 mod crypt;
