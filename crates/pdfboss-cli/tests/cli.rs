@@ -134,3 +134,32 @@ fn out_of_range_page_exits_one() {
     let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(err.contains("out of range"), "unexpected stderr: {err}");
 }
+
+/// A missing `tui` target must fail before any terminal mode change: the
+/// document open happens before `pdfboss_tui::run` (and therefore before
+/// `enable_raw_mode`/`EnterAlternateScreen`) is ever called, so a
+/// non-interactive run (stdin/stdout piped, not a tty, as `Command::output`
+/// always gives us) exits 1 with a plain stderr message and no ANSI
+/// alternate-screen escape sequence on stdout.
+///
+/// (`AsyncDocument::open`'s underlying `io::Error` does not itself carry the
+/// path -- unlike the sync-path `Input::open` used by `json`/`hex`/`q`,
+/// which wraps it -- so this only asserts a non-empty message, matching
+/// `missing_file_exits_one_with_stderr` above.)
+#[test]
+fn tui_missing_file_exits_one_before_terminal_mode_change() {
+    let output = pdfboss(&["tui", "definitely-not-here.pdf"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!output.stderr.is_empty(), "expected an error message");
+    assert!(
+        output.stdout.is_empty(),
+        "expected no stdout output (no terminal was ever entered): {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // `\x1b[?1049h` is the alternate-screen-enter sequence `EnterAlternateScreen`
+    // writes; its absence confirms raw mode / the alt screen was never touched.
+    assert!(
+        !output.stdout.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "terminal mode was changed before the open failed"
+    );
+}
