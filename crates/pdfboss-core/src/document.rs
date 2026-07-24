@@ -8,6 +8,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::crypt::Decryptor;
+use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::geom::Rect;
@@ -51,6 +52,7 @@ pub struct Document {
 
 /// The flattened, inheritance-applied record for one page.
 struct PageRec {
+    obj_ref: Option<ObjRef>,
     media_box: Rect,
     crop_box: Rect,
     rotate: i32,
@@ -191,6 +193,16 @@ impl Document {
         self.version
     }
 
+    /// Raw bytes of the loaded file.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The merged cross-reference table and trailer.
+    pub fn xref(&self) -> &Xref {
+        &self.xref
+    }
+
     /// Fetches an indirect object by reference (xref lookup, object-stream
     /// indirection, cached). A generation mismatch between the request and
     /// the file is tolerated (lenient).
@@ -220,14 +232,7 @@ impl Document {
                     .ok()
                     .filter(|&o| o < self.data.len())
                     .ok_or(Error::ObjectNotFound(r.num, r.gen))?;
-                let (_, mut object) = Parser::at(&self.data, offset).parse_indirect(self)?;
-                // Objects stored directly in the file carry encrypted strings
-                // and stream data; decrypt with this object's key. (Objects
-                // living in object streams are decrypted with their container.)
-                if let Some(dec) = &self.decryptor {
-                    dec.decrypt_object(&mut object, r.num, r.gen);
-                }
-                Ok(object)
+                self.object_at_spanned(offset).map(|parsed| parsed.1)
             }
             Some(XrefEntry::InStream { stream_num, index }) => {
                 self.load_from_object_stream(stream_num, index)
@@ -235,11 +240,25 @@ impl Document {
         }
     }
 
-    /// Extracts a compressed object from the object stream `stream_num`,
-    /// decoding and parsing that stream's header at most once.
-    fn load_from_object_stream(&self, stream_num: u32, index: u32) -> Result<Object> {
+    /// Parses the indirect object at `offset`, applying decryption, and
+    /// reports the byte range consumed (`N G obj … endobj`).
+    pub(crate) fn object_at_spanned(&self, offset: usize) -> Result<(ObjRef, Object, Span)> {
+        let mut parser = Parser::at(&self.data, offset);
+        let (r, mut object) = parser.parse_indirect(self)?;
+        // Objects stored directly in the file carry encrypted strings and
+        // stream data; decrypt with this object's key. (Objects living in
+        // object streams are decrypted with their container.)
+        if let Some(dec) = &self.decryptor {
+            dec.decrypt_object(&mut object, r.num, r.gen);
+        }
+        Ok((r, object, Span::new(offset as u64, parser.pos() as u64)))
+    }
+
+    /// The decoded, header-parsed object stream `stream_num`, built at most
+    /// once and cached.
+    pub(crate) fn objstm_handle(&self, stream_num: u32) -> Result<Rc<objstm::ObjStm>> {
         if let Some(stm) = self.objstms.borrow().get(&stream_num) {
-            return stm.object(index);
+            return Ok(Rc::clone(stm));
         }
         let container = self.get(ObjRef {
             num: stream_num,
@@ -261,9 +280,15 @@ impl Document {
             .ok_or(Error::MissingKey("First"))?;
         let decoded = self.stream_data(stream)?;
         let stm = Rc::new(objstm::ObjStm::parse(decoded, n, first)?);
-        let object = stm.object(index)?;
-        self.objstms.borrow_mut().insert(stream_num, stm);
-        Ok(object)
+        self.objstms
+            .borrow_mut()
+            .insert(stream_num, Rc::clone(&stm));
+        Ok(stm)
+    }
+
+    /// Extracts a compressed object from the object stream `stream_num`.
+    fn load_from_object_stream(&self, stream_num: u32, index: u32) -> Result<Object> {
+        self.objstm_handle(stream_num)?.object(index)
     }
 
     /// Chases reference chains with a depth guard of `MAX_RESOLVE_DEPTH`
@@ -347,6 +372,7 @@ impl Document {
             rotate: rec.rotate,
             resources: rec.resources.clone(),
             dict: rec.dict.clone(),
+            obj_ref: rec.obj_ref,
         })
     }
 
@@ -402,7 +428,12 @@ impl Document {
             if depth > MAX_TREE_DEPTH {
                 continue;
             }
-            if let Object::Ref(r) = node {
+            let node_ref = if let Object::Ref(r) = node {
+                Some(r)
+            } else {
+                None
+            };
+            if let Some(r) = node_ref {
                 if !visited.insert(r) {
                     continue; // cycle: this node was already traversed
                 }
@@ -438,7 +469,7 @@ impl Document {
                         stack.push((kid.clone(), inherited.clone(), depth + 1));
                     }
                 }
-                None => pages.push(make_page_rec(dict.clone(), &inherited)),
+                None => pages.push(make_page_rec(node_ref, dict.clone(), &inherited)),
             }
         }
         pages
@@ -488,7 +519,7 @@ impl Document {
 
 /// Builds the final page record from a leaf dictionary and its inherited
 /// attributes, applying the spec defaults.
-fn make_page_rec(dict: Dict, inherited: &Inherited) -> PageRec {
+fn make_page_rec(obj_ref: Option<ObjRef>, dict: Dict, inherited: &Inherited) -> PageRec {
     let media_box = inherited
         .media_box
         .filter(|r| r.width() > 0.0 && r.height() > 0.0)
@@ -499,6 +530,7 @@ fn make_page_rec(dict: Dict, inherited: &Inherited) -> PageRec {
         .filter(|r| r.width() > 0.0 && r.height() > 0.0)
         .unwrap_or(media_box);
     PageRec {
+        obj_ref,
         media_box,
         crop_box,
         rotate: normalize_rotation(inherited.rotate.unwrap_or(0)),
@@ -557,9 +589,17 @@ pub struct Page {
     /// The page's (inherited) `/Resources` dictionary.
     pub resources: Dict,
     dict: Dict,
+    obj_ref: Option<ObjRef>,
 }
 
 impl Page {
+    /// The page's indirect object reference, when the page came from an
+    /// indirect kid in the page tree (pages inlined directly into a `/Kids`
+    /// array have none).
+    pub fn object_ref(&self) -> Option<ObjRef> {
+        self.obj_ref
+    }
+
     /// The page's decoded content: the `/Contents` stream, or all streams
     /// of a `/Contents` array decoded and joined with `b"\n"`. A missing
     /// `/Contents` yields empty content (lenient).
@@ -608,6 +648,8 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::{NoResolve, Parser};
+    use crate::xref::XrefEntry;
     use pdfboss_testkit::{multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
 
     /// Replaces the first occurrence of `from` with `to`. Splicing happens
@@ -963,5 +1005,53 @@ mod tests {
         // The over-nested Root is rejected or ignored (lenient), but the
         // process survives and no page is fabricated from it.
         assert!(matches!(outcome, Ok(0) | Err(_)));
+    }
+
+    #[test]
+    fn bytes_and_xref_accessors() {
+        let data = simple_doc("accessors");
+        let doc = Document::load(data.clone()).unwrap();
+        assert_eq!(doc.bytes(), &data[..]);
+        assert!(!doc.xref().is_empty());
+        assert!(doc.xref().trailer.get("Root").is_some());
+    }
+
+    #[test]
+    fn object_at_spanned_reparses_identically() {
+        let data = simple_doc("spanned");
+        let doc = Document::load(data).unwrap();
+        for (num, entry) in doc.xref().iter() {
+            let XrefEntry::InFile { offset, gen } = entry else {
+                continue;
+            };
+            let (r, object, span) = doc.object_at_spanned(offset as usize).unwrap();
+            assert_eq!(r.num, num);
+            assert_eq!(r.gen, gen);
+            assert_eq!(span.start, offset);
+            assert!(span.end as usize <= doc.bytes().len());
+            // The bytes at the span parse back to the same object.
+            let slice = &doc.bytes()[span.start as usize..span.end as usize];
+            let (r2, object2) = Parser::new(slice).parse_indirect(&NoResolve).unwrap();
+            assert_eq!(r2, r);
+            assert_eq!(object2, object);
+        }
+    }
+
+    #[test]
+    fn page_object_ref_points_at_a_page_dict() {
+        let doc = Document::load(multi_page_doc(&["one", "two"])).unwrap();
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let r = page.object_ref().expect("builder pages are indirect");
+            let resolved = doc.get(r).unwrap();
+            assert_eq!(
+                resolved
+                    .as_dict()
+                    .unwrap()
+                    .get_name("Type")
+                    .map(|n| n.0.as_str()),
+                Some("Page")
+            );
+        }
     }
 }

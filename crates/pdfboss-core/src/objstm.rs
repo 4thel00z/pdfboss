@@ -41,6 +41,12 @@ impl ObjStm {
 
     /// Parses the object at `index` from the already-decoded bytes.
     pub fn object(&self, index: u32) -> Result<Object> {
+        self.object_spanned(index).map(|pair| pair.0)
+    }
+
+    /// Parses the object at `index`, also reporting its byte range within
+    /// the decoded stream data.
+    pub fn object_spanned(&self, index: u32) -> Result<(Object, (usize, usize))> {
         let offset = *self.offsets.get(index as usize).ok_or_else(|| {
             Error::Other(format!(
                 "object stream index {index} out of range (N = {})",
@@ -56,7 +62,9 @@ impl ObjStm {
                     "object stream offset {offset} lies outside the stream"
                 ))
             })?;
-        Parser::at(&self.data, pos).parse_object(&NoResolve)
+        let mut parser = Parser::at(&self.data, pos);
+        let object = parser.parse_object(&NoResolve)?;
+        Ok((object, (pos, parser.pos())))
     }
 }
 
@@ -139,5 +147,18 @@ mod tests {
     #[test]
     fn offset_beyond_data_errors() {
         assert!(extract(b"1 999\ntrue", 1, 6, 0).is_err());
+    }
+
+    #[test]
+    fn object_spanned_reports_reparseable_range() {
+        let (data, n, first) = build_stream(&[(11, "<< /A 1 >>"), (12, "(hi)")]);
+        let stm = ObjStm::parse(data.clone(), n, first).unwrap();
+        for index in 0..2u32 {
+            let (object, (start, end)) = stm.object_spanned(index).unwrap();
+            assert!(start >= first && end <= data.len() && start < end);
+            let reparsed = Parser::at(&data, start).parse_object(&NoResolve).unwrap();
+            assert_eq!(reparsed, object);
+            assert_eq!(stm.object(index).unwrap(), object);
+        }
     }
 }
