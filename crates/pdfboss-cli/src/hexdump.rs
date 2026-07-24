@@ -1,6 +1,7 @@
 //! hexyl-style hexdump: offset gutter, hex columns, ascii column, byte-class
 //! coloring, and labeled region boundaries. Also home of the `pdfboss hex`
-//! subcommand (wired in a later task).
+//! subcommand: selector parsing/resolution, `--annotate` boundary marks, and
+//! `cmd_hex` itself.
 
 use std::fmt::Write as _;
 use std::io;
