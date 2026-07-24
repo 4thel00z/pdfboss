@@ -15,6 +15,7 @@ use pyo3::exceptions::{PyException, PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
+use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements};
 use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Page as CorePage;
 
@@ -28,6 +29,29 @@ create_exception!(
 /// Maps any error from the Rust crates to [`PdfError`] with its display text.
 fn pdf_err(e: impl std::fmt::Display) -> PyErr {
     PdfError::new_err(e.to_string())
+}
+
+/// Maps a core error to [`PdfError`] with the parse-layer prefix used by
+/// the element/async APIs.
+fn parse_err(e: pdfboss_core::Error) -> PyErr {
+    PdfError::new_err(format!("parse: {e}"))
+}
+
+/// The stable Python `kind` string for a core element variant.
+fn kind_str(e: &CoreElement) -> &'static str {
+    match e {
+        CoreElement::Header { .. } => "header",
+        CoreElement::IndirectObject { .. } => "object",
+        CoreElement::XrefSection { .. } => "xref",
+        CoreElement::Trailer { .. } => "trailer",
+        CoreElement::StartXref { .. } => "startxref",
+        CoreElement::Eof { .. } => "eof",
+        CoreElement::Page { .. } => "page",
+        CoreElement::Font { .. } => "font",
+        CoreElement::Image { .. } => "image",
+        CoreElement::Annotation { .. } => "annotation",
+        CoreElement::ContentOp { .. } => "content_op",
+    }
 }
 
 /// Formats a `(major, minor)` header version as `"major.minor"`.
@@ -200,6 +224,39 @@ impl Document {
             Ok(out)
         })
     }
+
+    /// Lazily iterates the document's elements: physical file structure in
+    /// file order, then logical document structure in document order.
+    /// Nothing is parsed or decoded before it is yielded.
+    #[pyo3(signature = (*, physical=true, logical=true, pages=None, content_ops=false))]
+    fn elements(
+        &self,
+        physical: bool,
+        logical: bool,
+        pages: Option<Vec<usize>>,
+        content_ops: bool,
+    ) -> ElementIter {
+        let opts = ElementOpts {
+            physical,
+            logical,
+            pages,
+            content_ops,
+        };
+        let doc = Arc::clone(&self.inner);
+        let iter = {
+            let guard = doc.lock();
+            let core: &CoreDocument = &guard;
+            // SAFETY: the borrow is extended to 'static. The Arc stored in
+            // the returned ElementIter keeps the CoreDocument alive at a
+            // stable heap address (it lives inside the Arc'd
+            // SharedDocument), and ElementIter only advances the iterator
+            // while re-holding the document mutex. See SharedElements.
+            let core: &'static CoreDocument =
+                unsafe { std::mem::transmute::<&CoreDocument, &'static CoreDocument>(core) };
+            SharedElements(Mutex::new(core.elements(opts)))
+        };
+        ElementIter { doc, iter }
+    }
 }
 
 /// A single page of a document.
@@ -305,12 +362,153 @@ impl Page {
     }
 }
 
+/// One element of a PDF: physical file structure (header, indirect
+/// objects, xref sections, trailer, startxref, eof — always with byte
+/// spans) or logical document structure (pages, fonts, images,
+/// annotations, content ops).
+#[pyclass(frozen)]
+struct Element {
+    inner: CoreElement,
+}
+
+#[pymethods]
+impl Element {
+    /// The element kind: "header", "object", "xref", "trailer",
+    /// "startxref", "eof", "page", "font", "image", "annotation" or
+    /// "content_op".
+    #[getter]
+    fn kind(&self) -> &'static str {
+        kind_str(&self.inner)
+    }
+
+    /// Byte range as `(start, end)`, end-exclusive. Physical elements:
+    /// the range in the file. Content ops: the range within the page's
+    /// decoded, concatenated content stream. Other logical elements: None.
+    #[getter]
+    fn span(&self) -> Option<(u64, u64)> {
+        match &self.inner {
+            CoreElement::Header { span, .. }
+            | CoreElement::IndirectObject { span, .. }
+            | CoreElement::XrefSection { span, .. }
+            | CoreElement::Trailer { span, .. }
+            | CoreElement::StartXref { span, .. }
+            | CoreElement::Eof { span } => Some((span.start, span.end)),
+            CoreElement::ContentOp {
+                span_in_content, ..
+            } => Some((span_in_content.start, span_in_content.end)),
+            CoreElement::Page { .. }
+            | CoreElement::Font { .. }
+            | CoreElement::Image { .. }
+            | CoreElement::Annotation { .. } => None,
+        }
+    }
+
+    /// The `(num, gen)` object reference, where applicable.
+    #[getter]
+    fn r#ref(&self) -> Option<(u32, u16)> {
+        match &self.inner {
+            CoreElement::IndirectObject { r, .. }
+            | CoreElement::Page { r, .. }
+            | CoreElement::Font { r, .. }
+            | CoreElement::Image { r, .. }
+            | CoreElement::Annotation { r, .. } => Some((r.num, r.gen)),
+            CoreElement::Header { .. }
+            | CoreElement::XrefSection { .. }
+            | CoreElement::Trailer { .. }
+            | CoreElement::StartXref { .. }
+            | CoreElement::Eof { .. }
+            | CoreElement::ContentOp { .. } => None,
+        }
+    }
+
+    /// The 0-based page index for logical elements, None otherwise.
+    #[getter]
+    fn page(&self) -> Option<usize> {
+        match &self.inner {
+            CoreElement::Page { index, .. } => Some(*index),
+            CoreElement::Font { page, .. } | CoreElement::Image { page, .. } => *page,
+            CoreElement::Annotation { page, .. } | CoreElement::ContentOp { page, .. } => {
+                Some(*page)
+            }
+            CoreElement::Header { .. }
+            | CoreElement::IndirectObject { .. }
+            | CoreElement::XrefSection { .. }
+            | CoreElement::Trailer { .. }
+            | CoreElement::StartXref { .. }
+            | CoreElement::Eof { .. } => None,
+        }
+    }
+}
+
+/// The core element iterator with its document borrow extended to
+/// `'static`, lockable for exclusive advancement.
+///
+/// Safety invariants (upheld by `Document::elements` and `ElementIter`):
+///
+/// - the `Arc<SharedDocument>` stored next to this in `ElementIter` keeps
+///   the borrowed `CoreDocument` alive (at a stable heap address inside
+///   the Arc) for the iterator's whole lifetime, and
+/// - the iterator is only ever advanced while the document mutex is held,
+///   which serializes every touch of the document's interior caches.
+struct SharedElements(Mutex<Elements<'static>>);
+
+// SAFETY: `Elements<'static>` embeds a `&CoreDocument`, which is neither
+// `Send` nor `Sync` because of the document's interior object cache. Per
+// the invariants above, that borrow is only dereferenced under the same
+// mutex that makes `SharedDocument` sound, so moving or sharing this
+// wrapper across threads cannot race.
+unsafe impl Send for SharedElements {}
+unsafe impl Sync for SharedElements {}
+
+impl SharedElements {
+    /// Locks the iterator state. A poisoned lock is recovered, matching
+    /// `SharedDocument::lock`.
+    fn lock(&self) -> MutexGuard<'_, Elements<'static>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Sync iterator over a document's elements, returned by
+/// `Document.elements()`.
+#[pyclass(frozen)]
+struct ElementIter {
+    doc: Arc<SharedDocument>,
+    iter: SharedElements,
+}
+
+#[pymethods]
+impl ElementIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Advances the underlying core iterator. Releases the GIL while the
+    /// next element is located and parsed. Per-item parse failures raise
+    /// PdfError for that item; iteration may be continued afterwards
+    /// (salvage semantics).
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Element>> {
+        let item = py.allow_threads(|| {
+            let doc = self.doc.lock();
+            let next = self.iter.lock().next();
+            drop(doc);
+            next
+        });
+        match item {
+            None => Ok(None),
+            Some(Ok(element)) => Ok(Some(Element { inner: element })),
+            Some(Err(e)) => Err(parse_err(e)),
+        }
+    }
+}
+
 #[pymodule]
 fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("PdfError", m.py().get_type::<PdfError>())?;
     m.add_class::<Document>()?;
     m.add_class::<Page>()?;
+    m.add_class::<Element>()?;
+    m.add_class::<ElementIter>()?;
     Ok(())
 }
 
@@ -364,5 +562,21 @@ mod tests {
         assert_send_sync::<super::SharedDocument>();
         assert_send_sync::<super::Document>();
         assert_send_sync::<super::Page>();
+        assert_send_sync::<super::Element>();
+        assert_send_sync::<super::ElementIter>();
+    }
+
+    #[test]
+    fn kind_str_maps_variants_to_kind_names() {
+        use pdfboss_core::elements::{Element as CoreElement, Span};
+        let span = Span { start: 0, end: 9 };
+        assert_eq!(
+            super::kind_str(&CoreElement::Header {
+                version: (1, 7),
+                span
+            }),
+            "header"
+        );
+        assert_eq!(super::kind_str(&CoreElement::Eof { span }), "eof");
     }
 }
