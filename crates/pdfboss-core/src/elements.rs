@@ -5,7 +5,12 @@
 //! and §7.7 (document structure).
 
 use crate::content::Op;
+use crate::document::Document;
+use crate::error::{Error, Result};
+use crate::hash::FastMap;
+use crate::lexer::{Lexer, Token};
 use crate::object::{Dict, Name, ObjRef, Object};
+use crate::xref::{parse_section_at, XrefEntry};
 
 /// Byte range in the physical file, end-exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +131,348 @@ impl Default for ElementOpts {
     }
 }
 
+impl Document {
+    /// Lazy iteration over the document's elements. Physical elements come
+    /// in file order (header, objects by offset with object-stream members
+    /// after their container, xref sections newest→oldest, trailer,
+    /// startxref, eof); logical elements follow in document order. Nothing
+    /// is parsed or decoded before it is yielded; an element that fails to
+    /// parse yields `Err` for that item and iteration continues.
+    pub fn elements(&self, opts: ElementOpts) -> Elements<'_> {
+        Elements {
+            doc: self,
+            opts,
+            stage: Stage::Start,
+            container_spans: FastMap::default(),
+        }
+    }
+}
+
+/// Iterator state. Each `next()` parses at most one element.
+pub struct Elements<'a> {
+    doc: &'a Document,
+    opts: ElementOpts,
+    stage: Stage,
+    /// File spans of already-parsed object-stream containers.
+    container_spans: FastMap<u32, Span>,
+}
+
+enum Stage {
+    Start,
+    Objects {
+        order: Vec<OrderEntry>,
+        next: usize,
+    },
+    Sections {
+        next_offset: Option<usize>,
+        visited: Vec<usize>,
+        /// Newest classic trailer span, or newest stream-section span.
+        trailer_span: Option<Span>,
+    },
+    Trailer {
+        span: Option<Span>,
+    },
+    StartXref,
+    Eof,
+    // Constructed (with real values) at the physical→logical handoff, but
+    // not yet read anywhere: Task 8 fills in the logical-layer arm that
+    // actually inspects `page`/`part`. Until then this only transitions
+    // straight to `Done`, so rustc's dead_code lint sees the fields as
+    // written but never read.
+    #[allow(dead_code)]
+    Logical {
+        page: usize,
+        part: PagePart,
+    },
+    Done,
+}
+
+/// Sub-state within one page during logical iteration (Task 8 fills the
+/// variants in; the physical layer only needs the entry point).
+enum PagePart {
+    PageItself,
+}
+
+/// One object scheduled for physical iteration, pre-sorted by file position.
+struct OrderEntry {
+    num: u32,
+    entry: XrefEntry,
+    /// The object's own offset, or its container's offset for members.
+    sort_offset: u64,
+    /// 0 for in-file objects; 1 + member index for object-stream members,
+    /// so members directly follow their container.
+    sort_member: u64,
+}
+
+impl<'a> Iterator for Elements<'a> {
+    type Item = Result<Element>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match &mut self.stage {
+                Stage::Start => {
+                    let order = if self.opts.physical {
+                        build_order(self.doc)
+                    } else {
+                        Vec::new()
+                    };
+                    let header = self.opts.physical.then(|| header_element(self.doc));
+                    self.stage = Stage::Objects { order, next: 0 };
+                    if let Some(Some(header)) = header {
+                        return Some(Ok(header));
+                    }
+                }
+                Stage::Objects { order, next } => {
+                    if *next >= order.len() {
+                        self.stage = if self.opts.physical {
+                            Stage::Sections {
+                                next_offset: find_startxref_offset(self.doc.bytes()),
+                                visited: Vec::new(),
+                                trailer_span: None,
+                            }
+                        } else {
+                            Stage::Logical {
+                                page: 0,
+                                part: PagePart::PageItself,
+                            }
+                        };
+                        continue;
+                    }
+                    let index = *next;
+                    *next += 1;
+                    // Copy the (Copy) num/entry out of the borrowed order
+                    // slice first: `self.object_element` needs `&mut self`,
+                    // which would otherwise conflict with the still-live
+                    // borrow of `self.stage` (via `order`) that a reference
+                    // used inline as call arguments would keep alive.
+                    let (num, entry) = {
+                        let e = &order[index];
+                        (e.num, e.entry)
+                    };
+                    return Some(self.object_element(num, entry));
+                }
+                Stage::Sections {
+                    next_offset,
+                    visited,
+                    trailer_span,
+                } => {
+                    let Some(off) = *next_offset else {
+                        self.stage = Stage::Trailer {
+                            span: *trailer_span,
+                        };
+                        continue;
+                    };
+                    if visited.contains(&off) {
+                        self.stage = Stage::Trailer {
+                            span: *trailer_span,
+                        };
+                        continue;
+                    }
+                    visited.push(off);
+                    match parse_section_at(self.doc.bytes(), off) {
+                        Ok(info) => {
+                            if trailer_span.is_none() {
+                                *trailer_span = info.trailer_span.or(Some(info.span));
+                            }
+                            *next_offset = info
+                                .prev
+                                .and_then(|v| usize::try_from(v).ok())
+                                .filter(|&o| o < self.doc.bytes().len());
+                            let element = Element::XrefSection {
+                                kind: info.kind,
+                                span: info.span,
+                                entries: info.xref.len(),
+                            };
+                            return Some(Ok(element));
+                        }
+                        Err(err) => {
+                            // Salvage: report the broken section, then stop
+                            // walking the chain.
+                            *next_offset = None;
+                            return Some(Err(err));
+                        }
+                    }
+                }
+                Stage::Trailer { span } => {
+                    let span = *span;
+                    self.stage = Stage::StartXref;
+                    if let Some(span) = span {
+                        return Some(Ok(Element::Trailer {
+                            dict: self.doc.xref().trailer.clone(),
+                            span,
+                        }));
+                    }
+                }
+                Stage::StartXref => {
+                    self.stage = Stage::Eof;
+                    if let Some(element) = startxref_element(self.doc.bytes()) {
+                        return Some(Ok(element));
+                    }
+                }
+                Stage::Eof => {
+                    self.stage = Stage::Logical {
+                        page: 0,
+                        part: PagePart::PageItself,
+                    };
+                    if let Some(element) = eof_element(self.doc.bytes()) {
+                        return Some(Ok(element));
+                    }
+                }
+                Stage::Logical { .. } => {
+                    // Task 8 implements the logical layer; until then it ends
+                    // the iteration.
+                    self.stage = Stage::Done;
+                }
+                Stage::Done => return None,
+            }
+        }
+    }
+}
+
+impl<'a> Elements<'a> {
+    /// Builds the `IndirectObject` element for one xref entry.
+    fn object_element(&mut self, num: u32, entry: XrefEntry) -> Result<Element> {
+        match entry {
+            XrefEntry::Free => Err(Error::ObjectNotFound(num, 0)),
+            XrefEntry::InFile { offset, .. } => {
+                let offset = usize::try_from(offset)
+                    .ok()
+                    .filter(|&o| o < self.doc.bytes().len())
+                    .ok_or(Error::ObjectNotFound(num, 0))?;
+                let (r, object, span) = self.doc.object_at_spanned(offset)?;
+                self.container_spans.insert(r.num, span);
+                Ok(Element::IndirectObject {
+                    r,
+                    object,
+                    span,
+                    in_objstm: None,
+                })
+            }
+            XrefEntry::InStream { stream_num, index } => {
+                let container_span = self.container_span(stream_num)?;
+                let stm = self.doc.objstm_handle(stream_num)?;
+                let (object, (start, end)) = stm.object_spanned(index)?;
+                Ok(Element::IndirectObject {
+                    r: ObjRef { num, gen: 0 },
+                    object,
+                    span: container_span,
+                    in_objstm: Some((
+                        ObjRef {
+                            num: stream_num,
+                            gen: 0,
+                        },
+                        Span::new(start as u64, end as u64),
+                    )),
+                })
+            }
+        }
+    }
+
+    /// The file span of an object-stream container, parsed at most once.
+    fn container_span(&mut self, stream_num: u32) -> Result<Span> {
+        if let Some(span) = self.container_spans.get(&stream_num) {
+            return Ok(*span);
+        }
+        let offset = match self.doc.xref().get(stream_num) {
+            Some(XrefEntry::InFile { offset, .. }) => usize::try_from(offset)
+                .ok()
+                .filter(|&o| o < self.doc.bytes().len())
+                .ok_or(Error::ObjectNotFound(stream_num, 0))?,
+            _ => return Err(Error::ObjectNotFound(stream_num, 0)),
+        };
+        let (.., span) = self.doc.object_at_spanned(offset)?;
+        self.container_spans.insert(stream_num, span);
+        Ok(span)
+    }
+}
+
+/// All live objects sorted into file order: in-file objects by offset, then
+/// object-stream members grouped after their container by member index.
+fn build_order(doc: &Document) -> Vec<OrderEntry> {
+    let mut order: Vec<OrderEntry> = doc
+        .xref()
+        .iter()
+        .filter_map(|(num, entry)| match entry {
+            XrefEntry::Free => None,
+            XrefEntry::InFile { offset, .. } => Some(OrderEntry {
+                num,
+                entry,
+                sort_offset: offset,
+                sort_member: 0,
+            }),
+            XrefEntry::InStream { stream_num, index } => {
+                let container_offset = match doc.xref().get(stream_num) {
+                    Some(XrefEntry::InFile { offset, .. }) => offset,
+                    // A member whose container is missing sorts last and
+                    // surfaces as Err from object_element.
+                    None | Some(XrefEntry::Free) | Some(XrefEntry::InStream { .. }) => u64::MAX,
+                };
+                Some(OrderEntry {
+                    num,
+                    entry,
+                    sort_offset: container_offset,
+                    sort_member: 1 + u64::from(index),
+                })
+            }
+        })
+        .collect();
+    order.sort_by_key(|e| (e.sort_offset, e.sort_member, e.num));
+    order
+}
+
+/// The `%PDF-x.y` header element, when a header is physically present.
+fn header_element(doc: &Document) -> Option<Element> {
+    let data = doc.bytes();
+    let window = &data[..data.len().min(1024)];
+    let pos = memchr::memmem::find(window, b"%PDF-")?;
+    let digits_end = window[pos + 5..]
+        .iter()
+        .position(|&b| !(b.is_ascii_digit() || b == b'.'))
+        .map(|rel| pos + 5 + rel)
+        .unwrap_or(window.len());
+    Some(Element::Header {
+        version: doc.version(),
+        span: Span::new(pos as u64, digits_end as u64),
+    })
+}
+
+/// The byte offset announced by the last `startxref` keyword (the offset the
+/// section walk starts from), bounded to the file.
+fn find_startxref_offset(data: &[u8]) -> Option<usize> {
+    let tail = data.len().saturating_sub(64 * 1024);
+    let rel = memchr::memmem::rfind(&data[tail..], b"startxref")?;
+    let mut lexer = Lexer::at(data, tail + rel + b"startxref".len());
+    match lexer.next_token() {
+        Ok(Token::Int(v)) => usize::try_from(v).ok().filter(|&o| o < data.len()),
+        _ => None,
+    }
+}
+
+/// The `startxref` element: keyword through its integer operand.
+fn startxref_element(data: &[u8]) -> Option<Element> {
+    let tail = data.len().saturating_sub(64 * 1024);
+    let rel = memchr::memmem::rfind(&data[tail..], b"startxref")?;
+    let start = tail + rel;
+    let mut lexer = Lexer::at(data, start + b"startxref".len());
+    match lexer.next_token() {
+        Ok(Token::Int(v)) if v >= 0 => Some(Element::StartXref {
+            offset: v as u64,
+            span: Span::new(start as u64, lexer.pos() as u64),
+        }),
+        _ => None,
+    }
+}
+
+/// The last `%%EOF` marker.
+fn eof_element(data: &[u8]) -> Option<Element> {
+    let tail = data.len().saturating_sub(64 * 1024);
+    let rel = memchr::memmem::rfind(&data[tail..], b"%%EOF")?;
+    let start = tail + rel;
+    Some(Element::Eof {
+        span: Span::new(start as u64, (start + b"%%EOF".len()) as u64),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +493,219 @@ mod tests {
         assert!(!span.is_empty());
         assert!(Span::new(7, 7).is_empty());
         assert_eq!(Span::new(9, 3).len(), 0);
+    }
+
+    use crate::document::Document;
+    use crate::error::Result;
+    use crate::object::ObjRef;
+    use crate::parser::{NoResolve, Parser};
+
+    fn physical(doc: &Document) -> Vec<Element> {
+        let opts = ElementOpts {
+            logical: false,
+            ..ElementOpts::default()
+        };
+        doc.elements(opts).collect::<Result<Vec<_>>>().unwrap()
+    }
+
+    #[test]
+    fn simple_doc_physical_walk() {
+        let data = pdfboss_testkit::simple_doc("walk");
+        let doc = Document::load(data).unwrap();
+        let elements = physical(&doc);
+
+        let Element::Header { version, span } = &elements[0] else {
+            panic!("first element must be the header, got {:?}", elements[0]);
+        };
+        assert_eq!(*version, (1, 7));
+        assert!(doc.bytes()[span.start as usize..].starts_with(b"%PDF-1.7"));
+
+        let mut object_count = 0usize;
+        let mut previous_end = 0u64;
+        for element in &elements {
+            if let Element::IndirectObject {
+                r,
+                object,
+                span,
+                in_objstm,
+            } = element
+            {
+                assert!(in_objstm.is_none());
+                assert!(span.start >= previous_end, "objects come in file order");
+                previous_end = span.end;
+                let slice = &doc.bytes()[span.start as usize..span.end as usize];
+                let (r2, object2) = Parser::new(slice).parse_indirect(&NoResolve).unwrap();
+                assert_eq!(r2, *r);
+                assert_eq!(object2, *object);
+                object_count += 1;
+            }
+        }
+        // `Xref::len` counts every entry including free ones (e.g. object 0's
+        // free-list head); only non-free entries become `IndirectObject`s.
+        let live_entries = doc
+            .xref()
+            .iter()
+            .filter(|(_, entry)| !matches!(entry, crate::xref::XrefEntry::Free))
+            .count();
+        assert_eq!(object_count, live_entries);
+
+        // Exactly one of each closing element, in order, after the objects.
+        let tail_kinds: Vec<&str> = elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::XrefSection { .. } => Some("xref"),
+                Element::Trailer { .. } => Some("trailer"),
+                Element::StartXref { .. } => Some("startxref"),
+                Element::Eof { .. } => Some("eof"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tail_kinds, ["xref", "trailer", "startxref", "eof"]);
+
+        for element in &elements {
+            match element {
+                Element::XrefSection {
+                    kind,
+                    span,
+                    entries,
+                } => {
+                    assert_eq!(*kind, XrefKind::Table);
+                    assert!(*entries > 0);
+                    assert!(doc.bytes()[span.start as usize..].starts_with(b"xref"));
+                }
+                Element::Trailer { dict, span } => {
+                    assert!(dict.get("Root").is_some());
+                    assert!(doc.bytes()[span.start as usize..].starts_with(b"trailer"));
+                }
+                Element::StartXref { offset, span } => {
+                    assert!(doc.bytes()[span.start as usize..].starts_with(b"startxref"));
+                    assert!(*offset > 0);
+                }
+                Element::Eof { span } => {
+                    assert!(doc.bytes()[span.start as usize..].starts_with(b"%%EOF"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn objstm_members_follow_their_container() {
+        let data = pdfboss_testkit::objstm_doc(&[(7, "(seven)"), (8, "(eight)")]);
+        let doc = Document::load(data).unwrap();
+        let elements = physical(&doc);
+        let order: Vec<(u32, bool)> = elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::IndirectObject { r, in_objstm, .. } => Some((r.num, in_objstm.is_some())),
+                _ => None,
+            })
+            .collect();
+        // Container 4 comes first (lowest offset), then its members in
+        // index order (1, 2, 3, 7, 8), then the xref stream object 5.
+        assert_eq!(
+            order,
+            [
+                (4, false),
+                (1, true),
+                (2, true),
+                (3, true),
+                (7, true),
+                (8, true),
+                (5, false),
+            ]
+        );
+        // Member spans index into the decoded container and reparse cleanly.
+        for element in &elements {
+            let Element::IndirectObject {
+                object,
+                in_objstm: Some((container, member_span)),
+                ..
+            } = element
+            else {
+                continue;
+            };
+            assert_eq!(*container, ObjRef { num: 4, gen: 0 });
+            let stm = doc.objstm_handle(4).unwrap();
+            let (reparsed, range) = stm
+                .object_spanned(
+                    // Recover the member's index by matching its span.
+                    (0..)
+                        .map(|i| (i, stm.object_spanned(i)))
+                        .take_while(|pair| pair.1.is_ok())
+                        .find(|pair| {
+                            pair.1.as_ref().unwrap().1
+                                == (member_span.start as usize, member_span.end as usize)
+                        })
+                        .map(|pair| pair.0)
+                        .expect("member span maps to an index"),
+                )
+                .unwrap();
+            assert_eq!(reparsed, *object);
+            assert_eq!(
+                range,
+                (member_span.start as usize, member_span.end as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn xref_stream_docs_yield_stream_section_and_synthetic_trailer_span() {
+        let data = pdfboss_testkit::objstm_doc(&[]);
+        let doc = Document::load(data).unwrap();
+        let elements = physical(&doc);
+        let section = elements
+            .iter()
+            .find_map(|e| match e {
+                Element::XrefSection { kind, span, .. } => Some((*kind, *span)),
+                _ => None,
+            })
+            .expect("xref section present");
+        assert_eq!(section.0, XrefKind::Stream);
+        let trailer = elements
+            .iter()
+            .find_map(|e| match e {
+                Element::Trailer { dict, span } => Some((dict.clone(), *span)),
+                _ => None,
+            })
+            .expect("trailer present");
+        assert!(trailer.0.get("Root").is_some());
+        // No classic trailer keyword exists: the trailer span is the newest
+        // xref stream object's span.
+        assert_eq!(trailer.1, section.1);
+    }
+
+    #[test]
+    fn broken_object_yields_err_and_iteration_continues() {
+        let mut builder = pdfboss_testkit::PdfBuilder::new();
+        builder.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        builder.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        builder.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+        builder.object(6, "<< /Broken >>");
+        let mut data = builder.build(1);
+        // Corrupt object 6's header in place: same length, no valid parse.
+        let pos = memchr::memmem::find(&data, b"6 0 obj").unwrap();
+        data[pos..pos + 7].copy_from_slice(b"6 ) obj");
+        let doc = Document::load(data).unwrap();
+        let opts = ElementOpts {
+            logical: false,
+            ..ElementOpts::default()
+        };
+        let items: Vec<Result<Element>> = doc.elements(opts).collect();
+        assert!(
+            items.iter().any(|i| i.is_err()),
+            "corrupt object surfaces as Err"
+        );
+        let good: Vec<u32> = items
+            .iter()
+            .filter_map(|i| match i {
+                Ok(Element::IndirectObject { r, .. }) => Some(r.num),
+                _ => None,
+            })
+            .collect();
+        for num in [1u32, 2, 3] {
+            assert!(good.contains(&num), "object {num} still iterates");
+        }
+        assert!(items.iter().any(|i| matches!(i, Ok(Element::Eof { .. }))));
     }
 }
