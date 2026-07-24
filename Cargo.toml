@@ -5,6 +5,7 @@ members = [
     "crates/pdfboss-text",
     "crates/pdfboss-encoding",
     "crates/pdfboss-render",
+    "crates/pdfboss-aio",
     "crates/pdfboss-cli",
     "crates/pdfboss-py",
     "crates/pdfboss-testkit",
@@ -18,6 +19,11 @@ repository = "https://github.com/4thel00z/pdfboss"
 
 [workspace.dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "sync", "io-util"] }
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # Release builds trade compile time for cross-crate inlining and tighter
 # codegen on the CPU-bound parse/raster paths. `panic` is deliberately left as
