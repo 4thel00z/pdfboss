@@ -88,7 +88,7 @@ impl HexState {
         }
     }
 
-    /// Points the pane at a new source; bytes arrive via [`apply_loaded`].
+    /// Points the pane at a new source; bytes arrive via [`Self::apply_loaded`].
     pub fn set_source(&mut self, source: HexSource) {
         self.total_len = match &source {
             HexSource::File { span } => span.end.saturating_sub(span.start),

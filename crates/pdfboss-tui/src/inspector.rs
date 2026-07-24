@@ -247,7 +247,7 @@ pub fn ref_lines(text: &str) -> Vec<(usize, ObjRef)> {
 }
 
 /// Byte views: split on newlines, map non-printable bytes to `·`, cap at
-/// [`MAX_BYTE_LINES`] lines.
+/// `MAX_BYTE_LINES` lines.
 pub fn bytes_lines(data: &[u8]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for segment in data.split(|byte| *byte == b'\n') {
