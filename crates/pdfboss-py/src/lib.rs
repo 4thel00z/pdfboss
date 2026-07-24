@@ -10,13 +10,14 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use futures_util::StreamExt;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyIndexError, PyValueError};
+use pyo3::exceptions::{PyException, PyIndexError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
-use pdfboss_aio::AsyncDocument as AioDocument;
+use pdfboss_aio::{AsyncDocument as AioDocument, ElementStream};
 use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, XrefKind};
 use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Metadata as CoreMetadata;
@@ -602,8 +603,12 @@ impl SharedElements {
 /// `Document.elements()`.
 #[pyclass(frozen)]
 struct ElementIter {
-    doc: Arc<SharedDocument>,
+    // Declared before `doc`: fields drop in declaration order, and `iter`
+    // borrows the document (via the 'static-extended `Elements` inside
+    // `SharedElements`), so it must drop before the `Arc` that keeps that
+    // borrowed document alive.
     iter: SharedElements,
+    doc: Arc<SharedDocument>,
 }
 
 #[pymethods]
@@ -697,6 +702,64 @@ impl AsyncDocument {
             Python::with_gil(|py| object_to_py(py, &object).map(Bound::unbind))
         })
     }
+
+    /// Streams the document's elements; use with `async for`. Same
+    /// ordering and salvage semantics as `Document.elements`.
+    #[pyo3(signature = (*, physical=true, logical=true, pages=None, content_ops=false))]
+    fn elements(
+        &self,
+        physical: bool,
+        logical: bool,
+        pages: Option<Vec<usize>>,
+        content_ops: bool,
+    ) -> AsyncElementIter {
+        let opts = ElementOpts {
+            physical,
+            logical,
+            pages,
+            content_ops,
+        };
+        AsyncElementIter {
+            stream: Arc::new(tokio::sync::Mutex::new(self.inner.elements(opts))),
+        }
+    }
+}
+
+/// Async iterator over a document's elements, returned by
+/// `AsyncDocument.elements()`. Each `__anext__` is a coroutine driving
+/// the Rust element stream on the tokio runtime, so the asyncio loop is
+/// never blocked.
+///
+/// `ElementStream` is owned and `'static` (it holds a cheap `Arc` clone of
+/// the document, not a borrow of it — see `pdfboss_aio::stream`), so unlike
+/// the sync `ElementIter` this needs no borrow-extension or drop-order
+/// trick: the `Arc<tokio::sync::Mutex<_>>` alone keeps it alive and
+/// serializes advancement across concurrent `__anext__` calls.
+#[pyclass(frozen)]
+struct AsyncElementIter {
+    stream: Arc<tokio::sync::Mutex<ElementStream>>,
+}
+
+#[pymethods]
+impl AsyncElementIter {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Coroutine resolving to the next Element; raises StopAsyncIteration
+    /// when the stream is exhausted. Per-item failures raise PdfError for
+    /// that item and the stream may be continued (salvage semantics).
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream = Arc::clone(&self.stream);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut stream = stream.lock().await;
+            match stream.next().await {
+                Some(Ok(element)) => Ok(Element { inner: element }),
+                Some(Err(e)) => Err(aio_err(e)),
+                None => Err(PyStopAsyncIteration::new_err("element stream exhausted")),
+            }
+        })
+    }
 }
 
 #[pymodule]
@@ -708,6 +771,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Element>()?;
     m.add_class::<ElementIter>()?;
     m.add_class::<AsyncDocument>()?;
+    m.add_class::<AsyncElementIter>()?;
     Ok(())
 }
 
@@ -764,6 +828,7 @@ mod tests {
         assert_send_sync::<super::Element>();
         assert_send_sync::<super::ElementIter>();
         assert_send_sync::<super::AsyncDocument>();
+        assert_send_sync::<super::AsyncElementIter>();
     }
 
     #[test]

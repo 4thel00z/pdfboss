@@ -2,6 +2,7 @@
 
 from pdfboss._pdfboss import (
     AsyncDocument,
+    AsyncElementIter,
     Document,
     Element,
     ElementIter,
@@ -12,6 +13,7 @@ from pdfboss._pdfboss import (
 
 __all__ = [
     "AsyncDocument",
+    "AsyncElementIter",
     "Document",
     "Element",
     "ElementIter",
