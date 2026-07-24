@@ -8,5 +8,5 @@
 pub mod backend;
 pub mod error;
 
-pub use backend::{Backend, BoxFuture, MemBackend};
+pub use backend::{Backend, BoxFuture, FileBackend, MemBackend};
 pub use error::{Error, Result};
