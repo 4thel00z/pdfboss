@@ -5,6 +5,8 @@
 //! to the existing sync lexer, parser and filters. The whole file is
 //! never read.
 
+pub mod backend;
 pub mod error;
 
+pub use backend::{Backend, BoxFuture, MemBackend};
 pub use error::{Error, Result};
