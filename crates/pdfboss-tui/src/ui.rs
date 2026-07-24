@@ -215,6 +215,12 @@ fn draw_status(app: &App, frame: &mut Frame, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pdfboss_core::{Dict, Name, ObjRef, Object};
+    use pdfboss_render::Pixmap;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use ratatui::Terminal;
 
     #[test]
     fn panes_split_80_by_24_deterministically() {
@@ -223,5 +229,222 @@ mod tests {
         assert_eq!(split.right_top, Rect::new(28, 0, 52, 14));
         assert_eq!(split.hex, Rect::new(28, 14, 52, 9));
         assert_eq!(split.status, Rect::new(0, 23, 80, 1));
+    }
+
+    fn test_split() -> Panes {
+        panes(Rect::new(0, 0, 80, 24))
+    }
+
+    fn draw_frame(app: &App) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        terminal.draw(|frame| draw(app, frame)).expect("draw");
+        terminal
+    }
+
+    /// Concatenates cell symbols across one row, for substring checks on a
+    /// pane's border/title line.
+    fn row_text(buffer: &Buffer, y: u16, x0: u16, width: u16) -> String {
+        (x0..x0 + width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn two_by_four_pixmap() -> Pixmap {
+        Pixmap {
+            width: 2,
+            height: 4,
+            data: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, // row 0: red, green
+                0, 0, 255, 255, 255, 255, 0, 255, // row 1: blue, yellow
+                255, 0, 255, 255, 0, 255, 255, 255, // row 2: magenta, cyan
+                128, 128, 128, 255, 0, 0, 0, 255, // row 3: gray, black
+            ],
+        }
+    }
+
+    /// Regression guard for `pane_block`: the focused pane's title carries
+    /// `BOLD`, and the same title carries no `BOLD` once focus moves away.
+    #[test]
+    fn focused_pane_title_is_bold_others_are_not() {
+        let split = test_split();
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        assert_eq!(app.focus, Pane::Tree, "default focus starts on Tree");
+
+        let terminal = draw_frame(&app);
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer[(split.tree.x + 1, split.tree.y)]
+                .modifier
+                .contains(Modifier::BOLD),
+            "focused Tree title is bold"
+        );
+        assert!(
+            !buffer[(split.right_top.x + 1, split.right_top.y)]
+                .modifier
+                .contains(Modifier::BOLD),
+            "unfocused Inspector title is not bold"
+        );
+
+        app.focus = Pane::Inspector;
+        let terminal = draw_frame(&app);
+        let buffer = terminal.backend().buffer();
+        assert!(
+            !buffer[(split.tree.x + 1, split.tree.y)]
+                .modifier
+                .contains(Modifier::BOLD),
+            "Tree lost focus, its title is no longer bold"
+        );
+        assert!(
+            buffer[(split.right_top.x + 1, split.right_top.y)]
+                .modifier
+                .contains(Modifier::BOLD),
+            "Inspector gained focus, its title is bold"
+        );
+    }
+
+    /// Regression guard for `draw_tree`: the selected row's cells carry
+    /// `REVERSED`; every other visible row does not.
+    #[test]
+    fn selected_tree_row_is_reversed() {
+        let split = test_split();
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        app.tree.selected = app.tree.pages_folder;
+        let terminal = draw_frame(&app);
+        let buffer = terminal.backend().buffer();
+        let x = split.tree.x + 1;
+        let document_row = split.tree.y + 1; // row 0: Document (not selected)
+        let pages_row = split.tree.y + 2; // row 1: Pages (selected)
+        assert!(
+            !buffer[(x, document_row)]
+                .modifier
+                .contains(Modifier::REVERSED),
+            "unselected Document row is not reversed"
+        );
+        assert!(
+            buffer[(x, pages_row)].modifier.contains(Modifier::REVERSED),
+            "selected Pages row is reversed"
+        );
+    }
+
+    /// Regression guard for `draw_inspector`: the line under the ref cursor
+    /// carries `REVERSED` while the inspector is focused; other lines do not.
+    #[test]
+    fn inspector_cursor_line_is_reversed_when_focused() {
+        let split = test_split();
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut dict = Dict::new();
+        dict.insert(
+            Name("Ref".to_string()),
+            Object::Ref(ObjRef { num: 2, gen: 0 }),
+        );
+        app.inspector
+            .set_object(ObjRef { num: 1, gen: 0 }, Object::Dict(dict));
+        app.inspector.move_cursor(1);
+        app.focus = Pane::Inspector;
+        let cursor_line = app
+            .inspector
+            .ref_cursor
+            .and_then(|index| app.inspector.refs.get(index))
+            .map(|(line, ..)| *line)
+            .expect("cursor moved onto the one ref");
+        assert!(
+            app.inspector.lines.len() > 1,
+            "need a non-cursor line to contrast against"
+        );
+        let other_line = if cursor_line == 0 {
+            app.inspector.lines.len() - 1
+        } else {
+            0
+        };
+
+        let terminal = draw_frame(&app);
+        let buffer = terminal.backend().buffer();
+        let x = split.right_top.x + 1;
+        let cursor_y = split.right_top.y + 1 + cursor_line as u16;
+        let other_y = split.right_top.y + 1 + other_line as u16;
+        assert!(
+            buffer[(x, cursor_y)].modifier.contains(Modifier::REVERSED),
+            "ref-cursor line is reversed"
+        );
+        assert!(
+            !buffer[(x, other_y)].modifier.contains(Modifier::REVERSED),
+            "non-cursor line is not reversed"
+        );
+    }
+
+    /// Regression guard for `draw_preview`: an active preview with a ready
+    /// pixmap replaces the inspector, paints half-block (`▀`) cells whose
+    /// fg/bg match `cell_colors`, and only as many rows as
+    /// `div_ceil(height, 2)`.
+    #[test]
+    fn preview_active_pixmap_replaces_inspector_with_half_blocks() {
+        let split = test_split();
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let pixmap = two_by_four_pixmap();
+        let expected_rows = pixmap.height.div_ceil(2);
+        app.preview.active = true;
+        app.preview.pixmap = Some(pixmap);
+
+        let terminal = draw_frame(&app);
+        let buffer = terminal.backend().buffer();
+
+        let title = row_text(
+            buffer,
+            split.right_top.y,
+            split.right_top.x,
+            split.right_top.width,
+        );
+        assert!(title.contains("Preview"), "preview title shown: {title}");
+        assert!(!title.contains("Inspector"), "inspector replaced: {title}");
+
+        let x0 = split.right_top.x + 1;
+        let y0 = split.right_top.y + 1;
+        assert_eq!(
+            expected_rows, 2,
+            "4 pixel rows pack into 2 half-block cell rows"
+        );
+
+        let cell = &buffer[(x0, y0)];
+        assert_eq!(cell.symbol(), "\u{2580}", "half-block glyph");
+        assert_eq!(cell.fg, Color::Rgb(255, 0, 0));
+        assert_eq!(cell.bg, Color::Rgb(0, 0, 255));
+
+        let cell = &buffer[(x0 + 1, y0)];
+        assert_eq!(cell.fg, Color::Rgb(0, 255, 0));
+        assert_eq!(cell.bg, Color::Rgb(255, 255, 0));
+
+        let cell = &buffer[(x0, y0 + 1)];
+        assert_eq!(cell.fg, Color::Rgb(255, 0, 255));
+        assert_eq!(cell.bg, Color::Rgb(128, 128, 128));
+
+        // Only `expected_rows` (2) half-block rows exist; the row after
+        // must be blank, not another painted pixel row.
+        assert_ne!(
+            buffer[(x0, y0 + expected_rows as u16)].symbol(),
+            "\u{2580}",
+            "no third half-block row"
+        );
+    }
+
+    /// Regression guard for `draw_preview`'s loading branch: while
+    /// rendering (no pixmap installed yet) the spinner char leads the line.
+    #[test]
+    fn preview_rendering_without_pixmap_shows_spinner() {
+        let split = test_split();
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        app.preview.active = true;
+        app.preview.rendering = true;
+        app.preview.spinner_frame = 2; // SPINNER[2] == '-'
+
+        let terminal = draw_frame(&app);
+        let buffer = terminal.backend().buffer();
+        let line = row_text(
+            buffer,
+            split.right_top.y + 1,
+            split.right_top.x + 1,
+            split.right_top.width - 2,
+        );
+        assert!(line.starts_with('-'), "spinner char leads the line: {line}");
+        assert!(line.contains("rendering"), "rendering label shown: {line}");
     }
 }
