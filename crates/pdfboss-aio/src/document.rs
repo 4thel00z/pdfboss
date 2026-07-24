@@ -3,20 +3,19 @@
 //! growing windows and parsed by the sync core machinery. The whole file
 //! is never read.
 
-// This module's `pub(crate)` surface (Fetcher, find_tail, parse_version,
-// header_span_in, ...) is exercised only by its own unit tests until Tasks
-// 6-12 construct an `AsyncDocument` that wires them together.
-#![allow(dead_code)] // TODO: remove once AsyncDocument (Task 6+) uses these
-
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use pdfboss_core::elements::{Span, XrefKind};
 use pdfboss_core::lexer::{Lexer, Token};
 use pdfboss_core::parser::{NoResolve, Parser};
 use pdfboss_core::xref::XrefEntry;
 use pdfboss_core::{Dict, Object};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, FileBackend, MemBackend};
+use crate::cache::CachedBackend;
 use crate::error::{Error, Result};
 
 /// Initial tail window scanned for `startxref`, doubling per retry.
@@ -91,7 +90,10 @@ pub(crate) fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 pub(crate) struct StartXrefRecord {
     /// The announced xref offset.
     pub(crate) offset: u64,
-    /// Span of `startxref` through the offset integer.
+    /// Span of `startxref` through the offset integer. Exposed by a
+    /// `startxref_record()` accessor consumed by the element stream's
+    /// physical layer (Plan 02 task 11).
+    #[allow(dead_code)]
     pub(crate) span: Span,
 }
 
@@ -190,11 +192,16 @@ pub(crate) const PARSE_SLACK: usize = 16;
 /// One cross-reference section as found while walking the chain.
 #[derive(Clone)]
 pub(crate) struct SectionRecord {
+    /// Consumed, with `span` and `entries` below, by the element stream's
+    /// physical layer building `Element::XrefSection` (Plan 02 task 11).
+    #[allow(dead_code)]
     pub(crate) kind: XrefKind,
     /// Classic: `xref` keyword to the `trailer` keyword. Stream: the whole
     /// xref-stream object.
+    #[allow(dead_code)] // see `kind` above (Plan 02 task 11)
     pub(crate) span: Span,
     /// Number of entries the section declares (subsection sums).
+    #[allow(dead_code)] // see `kind` above (Plan 02 task 11)
     pub(crate) entries: usize,
     /// The section's trailer dictionary (classic trailer, or the stream's
     /// own dictionary).
@@ -488,6 +495,228 @@ fn non_negative(value: i64) -> Option<u64> {
     u64::try_from(value).ok()
 }
 
+/// Merged cross-reference entries plus the merged trailer, mirroring the
+/// sync loader's newest-wins semantics.
+pub(crate) struct XrefIndex {
+    /// Consumed by `get_object`/`resolve` (Plan 02 task 8).
+    #[allow(dead_code)]
+    pub(crate) entries: HashMap<u32, XrefEntry>,
+    /// Consumed, with `trailer_span` below, by a `merged_trailer()`
+    /// accessor (Plan 02 task 11).
+    #[allow(dead_code)]
+    pub(crate) trailer: Dict,
+    /// Span for the single merged `Trailer` element: the newest section's
+    /// trailer region (classic), or that section's own span (stream) —
+    /// adopted rule 4.
+    #[allow(dead_code)] // see `trailer` above (Plan 02 task 11)
+    pub(crate) trailer_span: Span,
+}
+
+/// A PDF document over an async random-access backend. The whole file is
+/// never read: opening fetches only the tail, the xref chain and the page
+/// tree; objects are fetched span-by-span on demand.
+///
+/// Cloning is cheap (a shared handle); every method takes `&self`, so one
+/// instance can serve many tasks concurrently.
+#[derive(Clone)]
+pub struct AsyncDocument {
+    pub(crate) inner: Arc<DocumentInner>,
+}
+
+pub(crate) struct DocumentInner {
+    /// Read through `fetcher()`; consumed by `get_object`/`resolve` (Plan 02
+    /// task 8).
+    #[allow(dead_code)]
+    pub(crate) backend: Arc<dyn Backend>,
+    /// Read through `fetcher()`; consumed by `get_object`/`resolve` (Plan 02
+    /// task 8).
+    #[allow(dead_code)]
+    pub(crate) file_len: u64,
+    pub(crate) version: (u8, u8),
+    /// Span of the `%PDF-` header run; `None` when the first 1 KiB holds
+    /// no header (the Header element is then omitted, adopted rule 1).
+    /// Exposed by a `header_span()` accessor consumed by the element
+    /// stream's physical layer (Plan 02 task 11).
+    #[allow(dead_code)]
+    pub(crate) header_span: Option<Span>,
+    /// Consumed by `get_object`/`resolve` reading `xref.entries` (Plan 02
+    /// task 8).
+    #[allow(dead_code)]
+    pub(crate) xref: XrefIndex,
+    /// Sections in chain order — newest→oldest — for the element stream.
+    /// Exposed by a `sections()` accessor consumed by the element stream's
+    /// physical layer (Plan 02 task 11).
+    #[allow(dead_code)]
+    pub(crate) sections: Vec<SectionRecord>,
+    /// Exposed by a `startxref_record()` accessor consumed by the element
+    /// stream's physical layer (Plan 02 task 11).
+    #[allow(dead_code)]
+    pub(crate) startxref: StartXrefRecord,
+    /// Exposed by an `eof_span()` accessor consumed by the element stream's
+    /// physical layer (Plan 02 task 11).
+    #[allow(dead_code)]
+    pub(crate) eof_span: Option<Span>,
+}
+
+impl AsyncDocument {
+    /// Opens a file through a [`FileBackend`] wrapped in a
+    /// [`CachedBackend`] with default capacity.
+    pub async fn open(path: impl AsRef<Path>) -> Result<AsyncDocument> {
+        let backend = FileBackend::open(path).await.map_err(Error::from)?;
+        AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend))).await
+    }
+
+    /// Opens an in-memory document through an uncached [`MemBackend`].
+    pub async fn from_bytes(bytes: impl Into<Bytes>) -> Result<AsyncDocument> {
+        AsyncDocument::from_arc(Arc::new(MemBackend::from(bytes.into()))).await
+    }
+
+    /// Opens a document over any backend, as-is (no cache is added).
+    pub async fn with_backend(backend: impl Backend) -> Result<AsyncDocument> {
+        AsyncDocument::from_arc(Arc::new(backend)).await
+    }
+
+    /// The open flow: header window → tail scan → xref chain → indexes.
+    async fn from_arc(backend: Arc<dyn Backend>) -> Result<AsyncDocument> {
+        let file_len = backend.len().await.map_err(Error::from)?;
+        let fetcher = Fetcher {
+            backend: Arc::clone(&backend),
+            len: file_len,
+        };
+        let head = fetcher.window(0, 1024).await?;
+        let version = parse_version(&head);
+        let header_span = header_span_in(&head);
+        let (startxref, eof_span) = find_tail(&fetcher).await?;
+        let (xref, sections) = load_xref_chain(&fetcher, startxref.offset).await?;
+        let inner = DocumentInner {
+            backend,
+            file_len,
+            version,
+            header_span,
+            xref,
+            sections,
+            startxref,
+            eof_span,
+        };
+        Ok(AsyncDocument {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// The PDF version from the header, e.g. `(1, 7)`.
+    pub fn version(&self) -> (u8, u8) {
+        self.inner.version
+    }
+
+    /// A fetch helper bound to this document's backend.
+    #[allow(dead_code)] // consumed by get_object/resolve (Plan 02 task 8)
+    pub(crate) fn fetcher(&self) -> Fetcher {
+        Fetcher {
+            backend: Arc::clone(&self.inner.backend),
+            len: self.inner.file_len,
+        }
+    }
+}
+
+/// Initial window for an xref section, doubling until the section parses
+/// completely.
+const SECTION_WINDOW: usize = 4096;
+
+/// Fetches and parses the section at `offset` through a growing window.
+async fn parse_section_at(fetcher: &Fetcher, offset: u64) -> Result<ParsedSection> {
+    let mut window = SECTION_WINDOW;
+    loop {
+        let buf = fetcher.window(offset, window).await?;
+        let at_eof = offset + buf.len() as u64 >= fetcher.len;
+        if let Some(parsed) = parse_section_window(&buf, offset, fetcher.len, at_eof)? {
+            return Ok(parsed);
+        }
+        // None: the window ended inside the section — double and refetch.
+        window = window.saturating_mul(2);
+    }
+}
+
+/// Walks the section chain newest→oldest starting at `start`, merging every
+/// section into one index (first-seen entries and trailer keys win). A
+/// classic trailer's `/XRefStm` section (hybrid file, ISO 32000 §7.5.8.4)
+/// merges ahead of its table — the table marks the stream's objects free to
+/// hide them from readers without stream support — and both merge before
+/// `/Prev` is followed. Visited offsets guard against loops. Sections come
+/// back in chain order — newest→oldest, hybrid sections where the walk
+/// visits them — for the element stream (adopted rule 4). The merged
+/// trailer's span is the startxref section's trailer region.
+pub(crate) async fn load_xref_chain(
+    fetcher: &Fetcher,
+    start: u64,
+) -> Result<(XrefIndex, Vec<SectionRecord>)> {
+    let mut entries: HashMap<u32, XrefEntry> = HashMap::new();
+    let mut trailer = Dict::new();
+    let mut trailer_span: Option<Span> = None;
+    let mut sections: Vec<SectionRecord> = Vec::new();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut next = Some(start);
+    while let Some(offset) = next {
+        if !visited.insert(offset) {
+            break;
+        }
+        let parsed = parse_section_at(fetcher, offset).await?;
+        if trailer_span.is_none() {
+            trailer_span = Some(parsed.record.trailer_span);
+        }
+        if let Some(hybrid_offset) = parsed.xrefstm.filter(|&v| v < fetcher.len) {
+            if visited.insert(hybrid_offset) {
+                // Lenient: a broken hybrid stream leaves the table alone.
+                if let Ok(hybrid) = parse_section_at(fetcher, hybrid_offset).await {
+                    merge_section(&mut entries, &mut trailer, &hybrid);
+                    sections.push(hybrid.record);
+                }
+            }
+        }
+        next = parsed.prev.filter(|&v| v < fetcher.len);
+        merge_section(&mut entries, &mut trailer, &parsed);
+        sections.push(parsed.record);
+    }
+    if entries.is_empty() {
+        return Err(Error::Core(pdfboss_core::Error::InvalidXref));
+    }
+    // Non-empty entries imply at least one parsed section, which set the
+    // span before any merge could run.
+    let trailer_span = trailer_span.expect("set on the first parsed section");
+    Ok((
+        XrefIndex {
+            entries,
+            trailer,
+            trailer_span,
+        },
+        sections,
+    ))
+}
+
+/// Merges a section into the accumulated index: entries and trailer keys
+/// already present win (sections are walked newest to oldest).
+fn merge_section(
+    entries: &mut HashMap<u32, XrefEntry>,
+    trailer: &mut Dict,
+    parsed: &ParsedSection,
+) {
+    for (num, entry) in &parsed.entries {
+        entries.entry(*num).or_insert(*entry);
+    }
+    for (key, value) in parsed.record.trailer_dict.iter() {
+        if trailer.get(&key.0).is_none() {
+            trailer.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Compile-time guarantee that documents can be shared across tasks.
+#[allow(dead_code)]
+fn assert_document_is_shareable()
+where
+    AsyncDocument: Send + Sync + Clone,
+{
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +966,175 @@ mod tests {
         assert!(parse_section_window(cut, base, file_len, false)
             .unwrap()
             .is_none());
+    }
+
+    use pdfboss_core::xref::load_xref;
+
+    /// Asserts the async xref agrees with the sync loader entry-for-entry
+    /// for object numbers 0..size.
+    async fn assert_xref_parity(data: Vec<u8>) {
+        let sync_xref = load_xref(&data).unwrap();
+        let size = sync_xref.trailer.get_int("Size").unwrap_or(64).max(1) as u32;
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        for num in 0..size + 2 {
+            assert_eq!(
+                doc.inner.xref.entries.get(&num).copied(),
+                sync_xref.get(num),
+                "entry for object {num}"
+            );
+        }
+        assert_eq!(
+            doc.inner.xref.trailer.get_ref("Root"),
+            sync_xref.trailer.get_ref("Root")
+        );
+        assert_eq!(
+            doc.inner.xref.trailer.get_int("Size"),
+            sync_xref.trailer.get_int("Size")
+        );
+    }
+
+    #[tokio::test]
+    async fn classic_document_matches_sync_xref() {
+        assert_xref_parity(simple_doc("chain walk")).await;
+        let doc = AsyncDocument::from_bytes(simple_doc("chain walk"))
+            .await
+            .unwrap();
+        assert_eq!(doc.version(), (1, 7));
+        assert_eq!(doc.inner.sections.len(), 1);
+        let clone = doc.clone();
+        assert_eq!(clone.version(), (1, 7));
+    }
+
+    #[tokio::test]
+    async fn xref_stream_document_matches_sync_xref() {
+        let (dict, payload) = pdfboss_testkit::objstm_payload(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+        ]);
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.stream(6, &dict, &payload);
+        assert_xref_parity(b.build_xref_stream(1)).await;
+    }
+
+    /// An incremental update: a classic base section, then an xref stream
+    /// whose /Prev points back at it.
+    fn prev_chain_doc() -> Vec<u8> {
+        let mut data = b"%PDF-1.5\n".to_vec();
+        let obj1 = data.len();
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let obj2_old = data.len();
+        data.extend_from_slice(b"2 0 obj\n(old)\nendobj\n");
+        let classic_off = data.len();
+        data.extend_from_slice(b"xref\n0 3\n0000000000 65535 f\r\n");
+        data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+        data.extend_from_slice(format!("{obj2_old:010} 00000 n\r\n").as_bytes());
+        data.extend_from_slice(b"trailer\n<< /Size 3 /Root 1 0 R >>\n");
+        let obj2_new = data.len();
+        data.extend_from_slice(b"2 0 obj\n(new)\nendobj\n");
+        let stream_off = data.len();
+        let mut fields = Vec::new();
+        for offset in [obj2_new, stream_off] {
+            fields.push(1u8);
+            fields.extend_from_slice(&(offset as u32).to_be_bytes());
+            fields.extend_from_slice(&0u16.to_be_bytes());
+        }
+        data.extend_from_slice(
+            format!(
+                "4 0 obj\n<< /Type /XRef /Size 5 /W [1 4 2] /Index [2 1 4 1] \
+                 /Prev {} /Root 1 0 R /Length {} >>\nstream\n",
+                classic_off,
+                fields.len()
+            )
+            .as_bytes(),
+        );
+        data.extend_from_slice(&fields);
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        data.extend_from_slice(format!("startxref\n{stream_off}\n%%EOF\n").as_bytes());
+        data
+    }
+
+    #[tokio::test]
+    async fn prev_chain_merges_newest_wins() {
+        let data = prev_chain_doc();
+        let obj2_new = pos_of(&data, b"2 0 obj\n(new)") as u64;
+        assert_xref_parity(data.clone()).await;
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        assert!(matches!(
+            doc.inner.xref.entries.get(&2),
+            Some(XrefEntry::InFile { offset, .. }) if *offset == obj2_new
+        ));
+        // Two sections, in chain order: the startxref section (the xref
+        // stream) first, then the /Prev classic table (adopted rule 4).
+        assert_eq!(doc.inner.sections.len(), 2);
+        assert!(doc.inner.sections[0].span.start > doc.inner.sections[1].span.start);
+        assert_eq!(
+            doc.inner.sections[0].kind,
+            pdfboss_core::elements::XrefKind::Stream
+        );
+        assert_eq!(
+            doc.inner.sections[1].kind,
+            pdfboss_core::elements::XrefKind::Table
+        );
+        // The merged trailer's span is the newest (stream) section's own
+        // span — stream sections have no separate trailer region.
+        assert_eq!(doc.inner.xref.trailer_span, doc.inner.sections[0].span);
+    }
+
+    /// A hybrid file: the classic table hides object 2 behind a free entry
+    /// while /XRefStm reveals it.
+    fn hybrid_doc() -> Vec<u8> {
+        let mut data = b"%PDF-1.5\n".to_vec();
+        let obj1 = data.len();
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let obj2 = data.len();
+        data.extend_from_slice(b"2 0 obj\n(hidden)\nendobj\n");
+        let stm_off = data.len();
+        let mut fields = Vec::new();
+        for offset in [obj2, stm_off] {
+            fields.push(1u8);
+            fields.extend_from_slice(&(offset as u32).to_be_bytes());
+            fields.extend_from_slice(&0u16.to_be_bytes());
+        }
+        data.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /XRef /Size 4 /W [1 4 2] /Index [2 1 3 1] \
+                 /Root 1 0 R /Length {} >>\nstream\n",
+                fields.len()
+            )
+            .as_bytes(),
+        );
+        data.extend_from_slice(&fields);
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        let classic_off = data.len();
+        data.extend_from_slice(b"xref\n0 3\n0000000000 65535 f\r\n");
+        data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+        data.extend_from_slice(b"0000000000 00001 f\r\n");
+        data.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R /XRefStm {stm_off} >>\n").as_bytes(),
+        );
+        data.extend_from_slice(format!("startxref\n{classic_off}\n%%EOF\n").as_bytes());
+        data
+    }
+
+    #[tokio::test]
+    async fn hybrid_xrefstm_beats_the_tables_free_entry() {
+        let data = hybrid_doc();
+        let obj2 = pos_of(&data, b"2 0 obj\n(hidden)") as u64;
+        assert_xref_parity(data.clone()).await;
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        assert!(matches!(
+            doc.inner.xref.entries.get(&2),
+            Some(XrefEntry::InFile { offset, .. }) if *offset == obj2
+        ));
+    }
+
+    #[tokio::test]
+    async fn open_reads_from_disk() {
+        let path =
+            std::env::temp_dir().join(format!("pdfboss-aio-doc-test-{}.pdf", std::process::id()));
+        std::fs::write(&path, simple_doc("from disk")).unwrap();
+        let doc = AsyncDocument::open(&path).await.unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(doc.version(), (1, 7));
     }
 }
