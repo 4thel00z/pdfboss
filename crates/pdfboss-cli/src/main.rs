@@ -1,6 +1,11 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
+// `Input` is consumed by the explorer subcommands added in later plan-04
+// tasks; the `dead_code` allowance disappears once they are wired up.
+#[allow(dead_code)]
+mod input;
+
 use pdfboss_core::pretty;
 
 use std::fmt::Write as _;
@@ -8,6 +13,38 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use pdfboss_core::{Document, Error, Metadata, ObjRef, Object};
+
+/// A fatal CLI failure: message for stderr plus the process exit code.
+/// PDF/IO problems exit 1; invalid jq programs exit 2 (mirroring clap's own
+/// usage-error code and keeping the two failure kinds distinguishable).
+pub struct Failure {
+    pub message: String,
+    pub code: i32,
+}
+
+impl Failure {
+    /// A PDF/IO failure (exit code 1).
+    pub fn new(message: impl Into<String>) -> Failure {
+        Failure {
+            message: message.into(),
+            code: 1,
+        }
+    }
+
+    /// An invalid-program failure (exit code 2).
+    pub fn program(message: impl Into<String>) -> Failure {
+        Failure {
+            message: message.into(),
+            code: 2,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Failure {
+        Failure::new(message)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -93,9 +130,9 @@ impl FontsArg {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Info { file } => cmd_info(&file),
-        Command::Text { file, page } => cmd_text(&file, page),
+    let result: Result<(), Failure> = match cli.command {
+        Command::Info { file } => cmd_info(&file).map_err(Failure::from),
+        Command::Text { file, page } => cmd_text(&file, page).map_err(Failure::from),
         Command::Render {
             file,
             page,
@@ -103,12 +140,14 @@ fn main() {
             scale,
             fonts,
             font_dir,
-        } => cmd_render(&file, page, out, scale, fonts, font_dir),
-        Command::Obj { file, num, gen } => cmd_obj(&file, num, gen.unwrap_or(0)),
+        } => cmd_render(&file, page, out, scale, fonts, font_dir).map_err(Failure::from),
+        Command::Obj { file, num, gen } => {
+            cmd_obj(&file, num, gen.unwrap_or(0)).map_err(Failure::from)
+        }
     };
-    if let Err(msg) = result {
-        eprintln!("pdfboss: {msg}");
-        std::process::exit(1);
+    if let Err(failure) = result {
+        eprintln!("pdfboss: {}", failure.message);
+        std::process::exit(failure.code);
     }
 }
 
@@ -500,5 +539,19 @@ mod tests {
     #[test]
     fn default_out_names_by_page() {
         assert_eq!(default_out(2), PathBuf::from("page-2.png"));
+    }
+
+    #[test]
+    fn failure_from_string_exits_one() {
+        let failure = Failure::from("boom".to_string());
+        assert_eq!(failure.code, 1);
+        assert_eq!(failure.message, "boom");
+    }
+
+    #[test]
+    fn failure_program_exits_two() {
+        let failure = Failure::program("bad program");
+        assert_eq!(failure.code, 2);
+        assert_eq!(failure.message, "bad program");
     }
 }
