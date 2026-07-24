@@ -504,6 +504,25 @@ impl<'a> Elements<'a> {
                 }
             }
         }
+        // Content operators, when requested: parsed against the page's
+        // decoded, concatenated content.
+        if self.opts.content_ops {
+            match page.content(self.doc) {
+                Ok(content) => match crate::content::parse_content_spanned(&content) {
+                    Ok(spanned) => {
+                        for (op, span) in spanned {
+                            queue.push_back(Ok(Element::ContentOp {
+                                page: index,
+                                op,
+                                span_in_content: span,
+                            }));
+                        }
+                    }
+                    Err(err) => queue.push_back(Err(err)),
+                },
+                Err(err) => queue.push_back(Err(err)),
+            }
+        }
         queue
     }
 
@@ -1078,5 +1097,44 @@ mod tests {
         );
         // simple_doc has a /Font resource: it must surface.
         assert!(elements.iter().any(|e| matches!(e, Element::Font { .. })));
+    }
+
+    #[test]
+    fn content_ops_are_spanned_against_page_content() {
+        let doc = Document::load(pdfboss_testkit::simple_doc("ops!")).unwrap();
+        let opts = ElementOpts {
+            physical: false,
+            content_ops: true,
+            ..ElementOpts::default()
+        };
+        let ops: Vec<(usize, Op, Span)> = doc
+            .elements(opts)
+            .filter_map(|item| match item {
+                Ok(Element::ContentOp {
+                    page,
+                    op,
+                    span_in_content,
+                }) => Some((page, op, span_in_content)),
+                _ => None,
+            })
+            .collect();
+        assert!(!ops.is_empty(), "simple_doc paints text: ops must appear");
+        let content = doc.page(0).unwrap().content(&doc).unwrap();
+        for (page, op, span) in &ops {
+            assert_eq!(*page, 0);
+            let slice = &content[span.start as usize..span.end as usize];
+            let reparsed = crate::content::parse_content(slice).unwrap();
+            assert_eq!(reparsed.len(), 1);
+            assert_eq!(&reparsed[0], op);
+        }
+    }
+
+    #[test]
+    fn content_ops_default_off() {
+        let doc = Document::load(pdfboss_testkit::simple_doc("quiet")).unwrap();
+        let none = doc
+            .elements(ElementOpts::default())
+            .all(|item| !matches!(item, Ok(Element::ContentOp { .. })));
+        assert!(none);
     }
 }
