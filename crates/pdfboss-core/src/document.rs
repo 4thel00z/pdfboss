@@ -650,7 +650,7 @@ mod tests {
     use super::*;
     use crate::parser::{NoResolve, Parser};
     use crate::xref::XrefEntry;
-    use pdfboss_testkit::{multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
+    use pdfboss_testkit::{multi_page_doc, objstm_doc, objstm_payload, simple_doc, PdfBuilder};
 
     /// Replaces the first occurrence of `from` with `to`. Splicing happens
     /// after the xref section, so byte offsets stay valid.
@@ -1273,5 +1273,20 @@ mod tests {
             msg, b"Top secret message",
             "decrypted using the file's real gen (0), not the mismatched request (7)"
         );
+    }
+
+    #[test]
+    fn objstm_doc_fixture_loads_and_resolves_members() {
+        let data = objstm_doc(&[(7, "<< /Marker (inside) >>")]);
+        let doc = Document::load(data).unwrap();
+        assert_eq!(doc.page_count(), 1);
+        let member = doc.get(ObjRef { num: 7, gen: 0 }).unwrap();
+        let text = member.as_dict().unwrap().get("Marker").unwrap();
+        assert_eq!(text.as_str_bytes(), Some(&b"inside"[..]));
+        // The member really is xref'd into the object stream.
+        assert!(matches!(
+            doc.xref().get(7),
+            Some(XrefEntry::InStream { stream_num: 4, .. })
+        ));
     }
 }
