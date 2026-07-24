@@ -190,6 +190,29 @@ pub(crate) fn header_span_in(head: &[u8]) -> Option<Span> {
 /// mid-token by the window edge.
 pub(crate) const PARSE_SLACK: usize = 16;
 
+/// The flattened record for one page leaf: its reference (when the leaf
+/// was reached through one), its dictionary, and its inherited
+/// `/Resources` (ISO 32000 §7.7.3.4).
+#[derive(Clone, Debug)]
+pub(crate) struct PageRecord {
+    /// `None` for a page dict inlined directly into `/Kids` (no `ObjRef`
+    /// exists for it). Consumed by the logical element layer building
+    /// `Element::Page` (Plan 02 task 12).
+    #[allow(dead_code)]
+    pub(crate) r: Option<ObjRef>,
+    /// Consumed, with `r` above, by the logical element layer (Plan 02
+    /// task 12).
+    #[allow(dead_code)]
+    pub(crate) dict: Dict,
+    /// Consumed, with `dict` above, by the logical element layer (Plan 02
+    /// task 12).
+    #[allow(dead_code)]
+    pub(crate) resources: Dict,
+}
+
+/// Page-tree traversal depth cap, mirroring the sync document model.
+const MAX_TREE_DEPTH: usize = 256;
+
 /// One cross-reference section as found while walking the chain.
 #[derive(Clone)]
 pub(crate) struct SectionRecord {
@@ -553,6 +576,9 @@ pub(crate) struct DocumentInner {
     /// is never held across a fetch (no deadlocks on nested containers);
     /// concurrent misses may decode twice, and the first insert wins.
     pub(crate) objstms: tokio::sync::Mutex<HashMap<u32, Arc<ObjStmCache>>>,
+    /// The flattened page tree, set exactly once at the end of the open
+    /// flow (fetching only catalog and tree nodes).
+    pub(crate) pages: std::sync::OnceLock<Vec<PageRecord>>,
 }
 
 impl AsyncDocument {
@@ -596,10 +622,17 @@ impl AsyncDocument {
             eof_span,
             objects: std::sync::Mutex::new(HashMap::new()),
             objstms: tokio::sync::Mutex::new(HashMap::new()),
+            pages: std::sync::OnceLock::new(),
         };
-        Ok(AsyncDocument {
+        let doc = AsyncDocument {
             inner: Arc::new(inner),
-        })
+        };
+        let pages = doc.flatten_pages().await;
+        doc.inner
+            .pages
+            .set(pages)
+            .expect("page index is set exactly once at open");
+        Ok(doc)
     }
 
     /// The PDF version from the header, e.g. `(1, 7)`.
@@ -1143,6 +1176,105 @@ impl AsyncDocument {
     async fn meta_string(&self, dict: &Dict, key: &str) -> Option<String> {
         let value = self.resolve(dict.get(key)?).await.ok()?;
         Some(decode_text_string(value.as_str_bytes()?))
+    }
+
+    /// Number of pages: the flattened page tree's length. The tree is
+    /// flattened once at open, so this is synchronous and authoritative —
+    /// mirroring the sync document once its tree has been flattened.
+    pub fn page_count(&self) -> usize {
+        self.inner.pages.get().map_or(0, Vec::len)
+    }
+
+    /// The flattened record for the page at 0-based `index`. Consumed by
+    /// the logical element layer (Plan 02 tasks 11-12).
+    #[allow(dead_code)]
+    pub(crate) fn page_record(&self, index: usize) -> Option<PageRecord> {
+        self.inner
+            .pages
+            .get()
+            .and_then(|pages| pages.get(index))
+            .cloned()
+    }
+
+    /// Flattens the page tree by iterative depth-first traversal of
+    /// `/Kids` with a visited-reference cycle guard and a depth cap,
+    /// carrying inherited `/Resources`. Any structural problem simply
+    /// truncates or skips (lenient) — this never fails. Only the catalog
+    /// and tree nodes are fetched; page content is not.
+    async fn flatten_pages(&self) -> Vec<PageRecord> {
+        let mut chain = Vec::new();
+        let mut pages = Vec::new();
+        let Some(root) = self.inner.xref.trailer.get("Root") else {
+            return pages;
+        };
+        let Ok(catalog) = self.resolve_with_chain(root, &mut chain).await else {
+            return pages;
+        };
+        let Some(tree_root) = catalog.as_dict().and_then(|d| d.get("Pages")).cloned() else {
+            return pages;
+        };
+        let mut visited: HashSet<ObjRef> = HashSet::new();
+        let mut stack: Vec<(Object, Dict, usize)> = vec![(tree_root, Dict::new(), 0)];
+        while let Some((node, inherited_resources, depth)) = stack.pop() {
+            if depth > MAX_TREE_DEPTH {
+                continue;
+            }
+            let node_ref = node.as_ref();
+            if let Some(r) = node_ref {
+                if !visited.insert(r) {
+                    continue; // cycle: this node was already traversed
+                }
+            }
+            let Ok(resolved) = self.resolve_with_chain(&node, &mut chain).await else {
+                continue;
+            };
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            let resources = match dict.get("Resources") {
+                Some(value) => match self.resolve_with_chain(value, &mut chain).await {
+                    Ok(resolved_resources) => resolved_resources
+                        .as_dict()
+                        .cloned()
+                        .unwrap_or(inherited_resources),
+                    Err(_) => inherited_resources,
+                },
+                None => inherited_resources,
+            };
+            let is_page = dict.get_name("Type").is_some_and(|n| n.0 == "Page");
+            let kids = if is_page {
+                None
+            } else {
+                self.array_value(dict, "Kids", &mut chain).await
+            };
+            match kids {
+                Some(kids) => {
+                    // Reverse push so pop order matches document order.
+                    for kid in kids.iter().rev() {
+                        stack.push((kid.clone(), resources.clone(), depth + 1));
+                    }
+                }
+                None => pages.push(PageRecord {
+                    r: node_ref,
+                    dict: dict.clone(),
+                    resources,
+                }),
+            }
+        }
+        pages
+    }
+
+    /// Resolves `dict[key]` to an array, if present and well-formed.
+    async fn array_value(
+        &self,
+        dict: &Dict,
+        key: &str,
+        chain: &mut Vec<u32>,
+    ) -> Option<Vec<Object>> {
+        match self.resolve_with_chain(dict.get(key)?, chain).await.ok()? {
+            Object::Array(items) => Some(items),
+            _ => None,
+        }
     }
 }
 
@@ -1849,5 +1981,66 @@ mod tests {
             doc.metadata().await.unwrap(),
             pdfboss_core::Metadata::default()
         );
+    }
+
+    #[tokio::test]
+    async fn page_count_matches_the_sync_document() {
+        for (data, expected) in [
+            (simple_doc("one"), 1usize),
+            (multi_page_doc(&["a", "b", "c"]), 3usize),
+        ] {
+            let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+            let doc = AsyncDocument::from_bytes(data).await.unwrap();
+            assert_eq!(doc.page_count(), expected);
+            assert_eq!(doc.page_count(), sync_doc.page_count());
+        }
+    }
+
+    #[tokio::test]
+    async fn page_records_carry_inherited_resources_and_refs() {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(
+            2,
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+        );
+        b.object(3, "<< /Type /Page /Parent 2 0 R >>");
+        b.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
+        assert_eq!(doc.page_count(), 1);
+        let record = doc.page_record(0).unwrap();
+        assert_eq!(record.r, Some(ObjRef { num: 3, gen: 0 }));
+        assert!(
+            record.resources.get("Font").is_some(),
+            "inherited resources"
+        );
+        assert!(doc.page_record(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn kids_cycle_truncates_without_hanging() {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        // 2 → 3 → {4, back to 2}: the back-edge must be ignored.
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Pages /Kids [4 0 R 2 0 R] /Count 1 >>");
+        b.object(4, "<< /Type /Page /Parent 3 0 R /MediaBox [0 0 100 100] >>");
+        let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
+        assert_eq!(doc.page_count(), 1, "cycle back-edge yields no extra pages");
+    }
+
+    #[tokio::test]
+    async fn page_count_is_the_flattened_length() {
+        // The tree declares five pages but supplies one kid. The async
+        // document always flattens at open, so — per adopted rule 6 — it
+        // reports the authoritative flattened length (the sync document
+        // reports the declared /Count until its tree is flattened).
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 5 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
+        assert_eq!(doc.page_count(), 1);
     }
 }
