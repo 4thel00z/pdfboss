@@ -358,7 +358,17 @@ fn parse_stream_window(buf: &[u8], base: u64, at_eof: bool) -> Result<Option<Par
     let mut parser = Parser::at(buf, 0);
     let stream = match parser.parse_indirect(&NoResolve) {
         Ok((_, Object::Stream(s))) => s,
-        Ok(_) => return Err(Error::Core(pdfboss_core::Error::InvalidXref)),
+        // Core's dict parser leniently breaks on `Eof` instead of erroring,
+        // so a window cut inside the dictionary (before the `stream`
+        // keyword is even reached) parses as a plain `Object::Dict` sitting
+        // flush with the window edge: ask for more bytes rather than
+        // hard-erroring, unless the window already reaches file end.
+        Ok(_) => {
+            if !at_eof && parser.pos() + PARSE_SLACK > buf.len() {
+                return Ok(None);
+            }
+            return Err(Error::Core(pdfboss_core::Error::InvalidXref));
+        }
         Err(_) if !at_eof => return Ok(None),
         Err(_) => return Err(Error::Core(pdfboss_core::Error::InvalidXref)),
     };
@@ -367,10 +377,19 @@ fn parse_stream_window(buf: &[u8], base: u64, at_eof: bool) -> Result<Option<Par
     }
     // Trust a declared /Length only when the parsed data honors it — a
     // window cut inside the stream falls into the lenient recovery path
-    // and must grow instead.
-    if let Some(declared) = stream.dict.get_int("Length") {
-        if declared >= 0 && stream.data.len() as u64 != declared as u64 && !at_eof {
-            return Ok(None);
+    // and must grow instead. A missing or unresolvable (indirect) /Length
+    // carries no verifiable bound at all, so it can only be accepted once
+    // the window reaches file end.
+    match stream.dict.get_int("Length") {
+        Some(declared) if declared >= 0 => {
+            if stream.data.len() as u64 != declared as u64 && !at_eof {
+                return Ok(None);
+            }
+        }
+        _ => {
+            if !at_eof {
+                return Ok(None);
+            }
         }
     }
     let decoded = pdfboss_core::filters::decode_stream(&stream, &NoResolve)
@@ -683,5 +702,40 @@ mod tests {
         // not grow the window forever.
         let buf = b"xref\n0 999999999\n".to_vec();
         assert!(parse_section_window(&buf, 0, 4096, false).is_err());
+    }
+
+    #[test]
+    fn truncated_stream_section_asks_for_more_bytes() {
+        // Reviewer's minimal reproducer: a window cut mid-dictionary, before
+        // the `stream` keyword is even reached, leniently parses as a plain
+        // `Object::Dict` (core's dict parser breaks on `Eof`) — that must
+        // ask for a wider window, not hard-error.
+        let mid_dict = b"7 0 obj\n<< /Type /XRef /Length 10 ".to_vec();
+        assert!(parse_section_window(&mid_dict, 0, 10_000, false)
+            .unwrap()
+            .is_none());
+        // The same truncated bytes at real end of file are a hard error.
+        assert!(parse_section_window(&mid_dict, 0, mid_dict.len() as u64, true).is_err());
+
+        // A real stream section cut partway into its (still-encoded) stream
+        // data must also ask for a wider window.
+        let (dict, payload) = pdfboss_testkit::objstm_payload(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+        ]);
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.stream(6, &dict, &payload);
+        let data = b.build_xref_stream(1);
+        let off = pos_of(&data, b"7 0 obj");
+        let buf = data[off..].to_vec();
+        let base = off as u64;
+        let file_len = data.len() as u64;
+        let stream_kw = find_bytes(&buf, b"stream\n").expect("stream keyword present");
+        // Cut a few bytes into the stream data: past the keyword, well
+        // short of `endstream`.
+        let cut = &buf[..stream_kw + b"stream\n".len() + 4];
+        assert!(parse_section_window(cut, base, file_len, false)
+            .unwrap()
+            .is_none());
     }
 }
