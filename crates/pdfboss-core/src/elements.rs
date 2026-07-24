@@ -72,6 +72,9 @@ pub enum Element {
     /// The trailer: the merged trailer dictionary plus the byte range of the
     /// newest trailer region (classic `trailer << … >>`, or the newest
     /// cross-reference stream object when no classic trailer exists).
+    /// The `dict` is the MERGED trailer dictionary (keys from newer sections win),
+    /// while `span` covers only the newest trailer region — so unlike other
+    /// physical elements, re-parsing the bytes at `span` does not reproduce `dict`.
     Trailer { dict: Dict, span: Span },
     /// The `startxref` keyword and its offset operand.
     StartXref { offset: u64, span: Span },
@@ -140,6 +143,14 @@ impl Document {
     /// startxref, eof); logical elements follow in document order. Nothing
     /// is parsed or decoded before it is yielded; an element that fails to
     /// parse yields `Err` for that item and iteration continues.
+    ///
+    /// Physical objects sort by `(file offset, member index, object number)`:
+    /// in-file objects use their own offset with member index 0;
+    /// object-stream members use their container's offset with member index
+    /// `1 + index` so they directly follow their container in stream-index order;
+    /// members whose container is missing or free sort last (offset `u64::MAX`)
+    /// and surface as `Err` items; ties on offset and member index break by
+    /// ascending object number.
     pub fn elements(&self, opts: ElementOpts) -> Elements<'_> {
         Elements {
             doc: self,
