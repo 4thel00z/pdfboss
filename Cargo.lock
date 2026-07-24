@@ -357,12 +357,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a88cf1f829d945f548cf8fec32c61b1f202b6d93b45848602fc02af4b12ad218"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "262590f4fe6afeb0bc83be1daa64e52657fe185690a958af7f3ad0e92085c5ae"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -370,6 +386,17 @@ name = "futures-core"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2cd50c473c80f6d7c3670a752354b8e569b1a7cbfdc0419ec88e5edad85e0dc7"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6754879cc9f2c66f88c6e5c35344bb0bdb0708b0352b1201815667c7eabc7458"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"
@@ -406,6 +433,7 @@ version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a77a90a256fce34da66415271e30f94ee91c57b04b8a2c042d9cf3220179deaa"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -865,10 +893,14 @@ version = "0.3.0"
 name = "pdfboss-py"
 version = "0.3.0"
 dependencies = [
+ "futures-util",
+ "pdfboss-aio",
  "pdfboss-core",
  "pdfboss-render",
  "pdfboss-text",
  "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
 ]
 
 [[package]]
@@ -961,6 +993,19 @@ dependencies = [
  "pyo3-ffi",
  "pyo3-macros",
  "unindent",
+]
+
+[[package]]
+name = "pyo3-async-runtimes"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d73cc6b1b7d8b3cef02101d37390dbdfe7e450dfea14921cae80a9534ba59ef2"
+dependencies = [
+ "futures",
+ "once_cell",
+ "pin-project-lite",
+ "pyo3",
+ "tokio",
 ]
 
 [[package]]
