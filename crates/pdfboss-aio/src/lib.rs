@@ -11,6 +11,8 @@ pub mod document;
 pub mod error;
 pub mod stream;
 
+#[cfg(feature = "http")]
+pub use backend::HttpBackend;
 pub use backend::{Backend, BoxFuture, FileBackend, MemBackend};
 pub use cache::CachedBackend;
 pub use document::AsyncDocument;

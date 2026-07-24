@@ -60,7 +60,6 @@ impl From<std::io::Error> for Error {
 /// [`From<std::io::Error>`] above. Only the HTTP backend produces these.
 #[cfg(feature = "http")]
 #[derive(Debug)]
-#[allow(dead_code)] // TODO: remove once HTTP backend task constructs these variants
 pub(crate) enum TransportMarker {
     RangeUnsupported,
     Http { status: Option<u16>, msg: String },

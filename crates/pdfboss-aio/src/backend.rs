@@ -135,6 +135,115 @@ impl Backend for FileBackend {
     }
 }
 
+/// A byte source over HTTP: length via `HEAD`/`Content-Length`, reads via
+/// `Range: bytes=` requests. A server that ignores Range (answers 200
+/// with the full body instead of 206) yields
+/// [`crate::Error::RangeUnsupported`].
+#[cfg(feature = "http")]
+pub struct HttpBackend {
+    client: reqwest::Client,
+    url: reqwest::Url,
+    len: u64,
+}
+
+#[cfg(feature = "http")]
+impl HttpBackend {
+    /// Issues a `HEAD` request to learn the resource length.
+    pub async fn new(url: impl reqwest::IntoUrl) -> crate::Result<HttpBackend> {
+        let url = url.into_url().map_err(|err| crate::Error::Http {
+            status: None,
+            msg: err.to_string(),
+        })?;
+        let client = reqwest::Client::new();
+        let response = client
+            .head(url.clone())
+            .send()
+            .await
+            .map_err(|err| crate::Error::Http {
+                status: err.status().map(|status| status.as_u16()),
+                msg: err.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(crate::Error::Http {
+                status: Some(response.status().as_u16()),
+                msg: format!("HEAD {url} failed"),
+            });
+        }
+        let len = response
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| crate::Error::Http {
+                status: Some(response.status().as_u16()),
+                msg: format!("HEAD {url}: missing or malformed Content-Length"),
+            })?;
+        Ok(HttpBackend { client, url, len })
+    }
+}
+
+/// Wraps a transport marker into `io::Error` so it can cross the
+/// `io::Result` boundary of the [`Backend`] trait; recovered by
+/// `From<std::io::Error> for crate::Error`.
+#[cfg(feature = "http")]
+fn http_io_error(marker: crate::error::TransportMarker) -> io::Error {
+    io::Error::other(marker)
+}
+
+#[cfg(feature = "http")]
+impl Backend for HttpBackend {
+    fn len(&self) -> BoxFuture<'_, io::Result<u64>> {
+        let total = self.len;
+        Box::pin(async move { Ok(total) })
+    }
+
+    fn read_at<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(async move {
+            if offset >= self.len || buf.is_empty() {
+                return Ok(0);
+            }
+            let last = (offset + buf.len() as u64 - 1).min(self.len - 1);
+            let response = self
+                .client
+                .get(self.url.clone())
+                .header(reqwest::header::RANGE, format!("bytes={offset}-{last}"))
+                .send()
+                .await
+                .map_err(|err| {
+                    http_io_error(crate::error::TransportMarker::Http {
+                        status: err.status().map(|status| status.as_u16()),
+                        msg: format!("GET {} range {offset}-{last}: {err}", self.url),
+                    })
+                })?;
+            match response.status().as_u16() {
+                206 => {}
+                200 => {
+                    // The server ignored the Range header and answered
+                    // with the whole body: range fetching cannot work.
+                    return Err(http_io_error(
+                        crate::error::TransportMarker::RangeUnsupported,
+                    ));
+                }
+                status => {
+                    return Err(http_io_error(crate::error::TransportMarker::Http {
+                        status: Some(status),
+                        msg: format!("GET {} range {offset}-{last} failed", self.url),
+                    }));
+                }
+            }
+            let body = response.bytes().await.map_err(|err| {
+                http_io_error(crate::error::TransportMarker::Http {
+                    status: None,
+                    msg: format!("GET {} range {offset}-{last}: {err}", self.url),
+                })
+            })?;
+            let count = buf.len().min(body.len());
+            buf[..count].copy_from_slice(&body[..count]);
+            Ok(count)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +301,26 @@ mod tests {
     async fn file_backend_open_missing_file_errors() {
         let missing = std::env::temp_dir().join("pdfboss-aio-backend-test-missing.bin");
         assert!(FileBackend::open(&missing).await.is_err());
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn range_refusal_marker_round_trips_through_io_error() {
+        let refused = http_io_error(crate::error::TransportMarker::RangeUnsupported);
+        assert!(matches!(
+            crate::Error::from(refused),
+            crate::Error::RangeUnsupported
+        ));
+        let failed = http_io_error(crate::error::TransportMarker::Http {
+            status: Some(503),
+            msg: "unavailable".to_string(),
+        });
+        assert!(matches!(
+            crate::Error::from(failed),
+            crate::Error::Http {
+                status: Some(503),
+                ..
+            }
+        ));
     }
 }

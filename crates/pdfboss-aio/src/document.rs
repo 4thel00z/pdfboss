@@ -587,6 +587,14 @@ impl AsyncDocument {
         AsyncDocument::from_arc(Arc::new(backend)).await
     }
 
+    /// Opens a remote document over HTTP range requests, wrapped in a
+    /// [`CachedBackend`] with default capacity.
+    #[cfg(feature = "http")]
+    pub async fn open_url(url: impl reqwest::IntoUrl) -> Result<AsyncDocument> {
+        let backend = crate::backend::HttpBackend::new(url).await?;
+        AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend))).await
+    }
+
     /// The open flow: header window → tail scan → xref chain → indexes.
     async fn from_arc(backend: Arc<dyn Backend>) -> Result<AsyncDocument> {
         let file_len = backend.len().await.map_err(Error::from)?;
