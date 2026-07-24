@@ -1,6 +1,11 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
+// `hexdump` (formatting engine) is consumed by the `hex` subcommand added
+// in a later plan-04 task; the `dead_code` allowance disappears once it is
+// wired up.
+#[allow(dead_code)]
+mod hexdump;
 mod input;
 mod json;
 mod q;
