@@ -9,6 +9,7 @@ members = [
     "crates/pdfboss-cli",
     "crates/pdfboss-py",
     "crates/pdfboss-testkit",
+    "crates/pdfboss-tui",
 ]
 
 [workspace.package]
