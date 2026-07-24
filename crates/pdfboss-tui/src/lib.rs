@@ -7,5 +7,6 @@
 
 pub mod hexview;
 pub mod inspector;
+pub mod preview;
 pub mod search;
 pub mod tree;
