@@ -641,10 +641,16 @@ async fn parse_section_at(fetcher: &Fetcher, offset: u64) -> Result<ParsedSectio
 /// classic trailer's `/XRefStm` section (hybrid file, ISO 32000 §7.5.8.4)
 /// merges ahead of its table — the table marks the stream's objects free to
 /// hide them from readers without stream support — and both merge before
-/// `/Prev` is followed. Visited offsets guard against loops. Sections come
-/// back in chain order — newest→oldest, hybrid sections where the walk
-/// visits them — for the element stream (adopted rule 4). The merged
-/// trailer's span is the startxref section's trailer region.
+/// `/Prev` is followed. Visited offsets guard against loops. Merge order and
+/// emission order are independent: entries still merge hybrid-before-table
+/// (so the hybrid's objects win over the table's masking free entries), but
+/// sections are *emitted* classic-table-before-its-hybrid-stream, matching
+/// pdfboss-core's element iterator — the parity arbiter — which yields
+/// `[Table, Stream]` for a hybrid file (see
+/// `pdfboss_core::elements::tests::hybrid_xrefstm_yields_both_sections`).
+/// Beyond a hybrid pair, sections come back in chain order — newest→oldest
+/// — for the element stream. The merged trailer's span is the startxref
+/// section's trailer region.
 pub(crate) async fn load_xref_chain(
     fetcher: &Fetcher,
     start: u64,
@@ -663,18 +669,26 @@ pub(crate) async fn load_xref_chain(
         if trailer_span.is_none() {
             trailer_span = Some(parsed.record.trailer_span);
         }
+        // Merge (not emit) the hybrid ahead of its table: first-seen-wins
+        // means the hybrid's objects must beat the table's masking free
+        // entries. Its record is held back and pushed after the table's
+        // below, so emission order stays classic-then-hybrid.
+        let mut hybrid_record = None;
         if let Some(hybrid_offset) = parsed.xrefstm.filter(|&v| v < fetcher.len) {
             if visited.insert(hybrid_offset) {
                 // Lenient: a broken hybrid stream leaves the table alone.
                 if let Ok(hybrid) = parse_section_at(fetcher, hybrid_offset).await {
                     merge_section(&mut entries, &mut trailer, &hybrid);
-                    sections.push(hybrid.record);
+                    hybrid_record = Some(hybrid.record);
                 }
             }
         }
         next = parsed.prev.filter(|&v| v < fetcher.len);
         merge_section(&mut entries, &mut trailer, &parsed);
         sections.push(parsed.record);
+        if let Some(record) = hybrid_record {
+            sections.push(record);
+        }
     }
     if entries.is_empty() {
         return Err(Error::Core(pdfboss_core::Error::InvalidXref));
@@ -1126,6 +1140,20 @@ mod tests {
             doc.inner.xref.entries.get(&2),
             Some(XrefEntry::InFile { offset, .. }) if *offset == obj2
         ));
+        // Emission order must match pdfboss-core's element iterator (the
+        // parity arbiter): the classic section first, then its hybrid
+        // /XRefStm section — even though the hybrid's entries merge ahead
+        // of the classic table's masking free entries (asserted above).
+        let kinds: Vec<pdfboss_core::elements::XrefKind> =
+            doc.inner.sections.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                pdfboss_core::elements::XrefKind::Table,
+                pdfboss_core::elements::XrefKind::Stream
+            ],
+            "classic section first, then its hybrid /XRefStm section"
+        );
     }
 
     #[tokio::test]
