@@ -170,11 +170,25 @@ pub fn cmd_q(
     let color = use_color();
     let stdout = std::io::stdout();
     let mut w = std::io::BufWriter::new(stdout.lock());
+    let file_len = input.file_len();
     for result in results {
         let value = result.map_err(|message| Failure::new(format!("jq: {message}")))?;
         if hex {
             if let Some(spans) = result_spans(&value) {
                 for span in spans {
+                    // A jq program can fabricate a `_span` that doesn't
+                    // correspond to any real element. `Input::read_span`
+                    // diverges by backend on out-of-range spans (the local
+                    // fast path errors, the remote/aio path silently clamps
+                    // to the file length), so validate here first — same
+                    // guard `cmd_hex` applies to its selector-resolved
+                    // spans — to fail the same clear way on both backends.
+                    if span.start > file_len || span.end > file_len {
+                        return Err(Failure::new(format!(
+                            "_span result {}..{} lies outside the file ({file_len} bytes)",
+                            span.start, span.end
+                        )));
+                    }
                     let bytes = input.read_span(span).map_err(Failure::new)?;
                     writeln!(w, "── {:#x}..{:#x} ──", span.start, span.end).map_err(io_failure)?;
                     let hex_opts = HexOpts { width: 16, color };
@@ -309,6 +323,49 @@ mod tests {
             result_spans(&json!([{"_span": [0, 5]}, 7])),
             None,
             "mixed arrays are not hexdumped"
+        );
+    }
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../../tests/fixtures/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        )
+    }
+
+    fn no_flags() -> TreeFlags {
+        TreeFlags {
+            raw: false,
+            decode: false,
+            pages: None,
+            no_logical: false,
+            content_ops: false,
+        }
+    }
+
+    // A jq program is free to fabricate a `_span` that doesn't correspond to
+    // any real element (e.g. by doing arithmetic on a genuine span's
+    // fields). `cmd_q --hex` must reject such an out-of-range span itself,
+    // the same way `cmd_hex` guards its selector-resolved spans, rather than
+    // relying on `Input::read_span`'s backend-dependent behavior (errors
+    // locally, silently clamps remotely).
+    #[test]
+    fn hex_rejects_a_fabricated_out_of_range_span() {
+        let path = fixture("hello.pdf");
+        let len = std::fs::metadata(&path).expect("fixture exists").len();
+        let failure = cmd_q(&path, r#"{"_span": [0, 999999]}"#, &no_flags(), true, false)
+            .expect_err("fabricated span exceeds the file length");
+        assert_eq!(failure.code, 1);
+        assert!(
+            failure.message.contains("_span result"),
+            "not the guard's own message: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains(&len.to_string()),
+            "error does not mention file length {len}: {}",
+            failure.message
         );
     }
 }
