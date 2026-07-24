@@ -1054,4 +1054,224 @@ mod tests {
             );
         }
     }
+
+    // --- Minimal Standard-handler (RC4 V2/R3) fixture builder, duplicating
+    // the key-derivation mechanism `crypt::tests` uses under the empty user
+    // password (those helpers are private to that module's tests). Needed
+    // only to pin the decrypt-identity regression test below: RC4's
+    // per-object key depends on the object's num/gen, so it is the cipher
+    // that can actually distinguish "decrypt with the parsed header's
+    // identity" from "decrypt with the caller's requested identity".
+
+    const RC4_FIXTURE_KEY_LEN: usize = 16; // 128-bit key
+    const RC4_FIXTURE_P: i32 = -44;
+    const RC4_FIXTURE_ID0: &[u8] = b"0123456789abcdef";
+    const RC4_FIXTURE_PAD: [u8; 32] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01,
+        0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53,
+        0x69, 0x7A,
+    ];
+
+    #[rustfmt::skip]
+    const RC4_FIXTURE_MD5_S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    #[rustfmt::skip]
+    const RC4_FIXTURE_MD5_K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ];
+
+    fn rc4_fixture_md5(input: &[u8]) -> [u8; 16] {
+        let (mut a0, mut b0, mut c0, mut d0) = (
+            0x6745_2301u32,
+            0xefcd_ab89u32,
+            0x98ba_dcfeu32,
+            0x1032_5476u32,
+        );
+        let mut msg = input.to_vec();
+        let bitlen = (input.len() as u64).wrapping_mul(8);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bitlen.to_le_bytes());
+        for chunk in msg.chunks_exact(64) {
+            let mut m = [0u32; 16];
+            for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
+                *word = u32::from_le_bytes(bytes.try_into().unwrap());
+            }
+            let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+            for i in 0..64 {
+                let (f, g) = match i {
+                    0..=15 => ((b & c) | (!b & d), i),
+                    16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                    32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                    _ => (c ^ (b | !d), (7 * i) % 16),
+                };
+                let f = f
+                    .wrapping_add(a)
+                    .wrapping_add(RC4_FIXTURE_MD5_K[i])
+                    .wrapping_add(m[g]);
+                a = d;
+                d = c;
+                c = b;
+                b = b.wrapping_add(f.rotate_left(RC4_FIXTURE_MD5_S[i]));
+            }
+            a0 = a0.wrapping_add(a);
+            b0 = b0.wrapping_add(b);
+            c0 = c0.wrapping_add(c);
+            d0 = d0.wrapping_add(d);
+        }
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&a0.to_le_bytes());
+        out[4..8].copy_from_slice(&b0.to_le_bytes());
+        out[8..12].copy_from_slice(&c0.to_le_bytes());
+        out[12..16].copy_from_slice(&d0.to_le_bytes());
+        out
+    }
+
+    fn rc4_fixture_rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
+        let mut j = 0u8;
+        for i in 0..256 {
+            j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
+            s.swap(i, j as usize);
+        }
+        let mut out = Vec::with_capacity(data.len());
+        let (mut i, mut j) = (0u8, 0u8);
+        for &byte in data {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(s[i as usize]);
+            s.swap(i as usize, j as usize);
+            let k = s[s[i as usize].wrapping_add(s[j as usize]) as usize];
+            out.push(byte ^ k);
+        }
+        out
+    }
+
+    /// `/O` for empty owner and user passwords (Algorithm 3, R3).
+    fn rc4_fixture_owner_entry() -> Vec<u8> {
+        let mut d = rc4_fixture_md5(&RC4_FIXTURE_PAD);
+        for _ in 0..50 {
+            d = rc4_fixture_md5(&d[..RC4_FIXTURE_KEY_LEN]);
+        }
+        let rc4key = d[..RC4_FIXTURE_KEY_LEN].to_vec();
+        let mut o = rc4_fixture_rc4(&rc4key, &RC4_FIXTURE_PAD);
+        for i in 1u8..=19 {
+            let k: Vec<u8> = rc4key.iter().map(|b| b ^ i).collect();
+            o = rc4_fixture_rc4(&k, &o);
+        }
+        o
+    }
+
+    /// File key from `/O` for the empty user password (Algorithm 2, R3).
+    fn rc4_fixture_file_key(o: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(&RC4_FIXTURE_PAD);
+        input.extend_from_slice(o);
+        input.extend_from_slice(&(RC4_FIXTURE_P as u32).to_le_bytes());
+        input.extend_from_slice(RC4_FIXTURE_ID0);
+        let mut d = rc4_fixture_md5(&input);
+        for _ in 0..50 {
+            d = rc4_fixture_md5(&d[..RC4_FIXTURE_KEY_LEN]);
+        }
+        d[..RC4_FIXTURE_KEY_LEN].to_vec()
+    }
+
+    /// `/U` for the empty user password (Algorithm 5, R3).
+    fn rc4_fixture_user_entry(key: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(&RC4_FIXTURE_PAD);
+        input.extend_from_slice(RC4_FIXTURE_ID0);
+        let mut x = rc4_fixture_md5(&input).to_vec();
+        x = rc4_fixture_rc4(key, &x);
+        for i in 1u8..=19 {
+            let k: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            x = rc4_fixture_rc4(&k, &x);
+        }
+        x.resize(32, 0); // trailing padding is arbitrary
+        x
+    }
+
+    fn rc4_fixture_obj_key(key: &[u8], num: u32, gen: u16) -> Vec<u8> {
+        let mut input = key.to_vec();
+        input.extend_from_slice(&num.to_le_bytes()[..3]);
+        input.extend_from_slice(&gen.to_le_bytes()[..2]);
+        rc4_fixture_md5(&input)[..(key.len() + 5).min(16)].to_vec()
+    }
+
+    fn rc4_fixture_hexstr(b: &[u8]) -> String {
+        let mut s = String::from("<");
+        for x in b {
+            s.push_str(&format!("{x:02x}"));
+        }
+        s.push('>');
+        s
+    }
+
+    /// Builds a V2/R3 (128-bit RC4) file, encrypted under the empty
+    /// password, with a single indirect object (`3 0 obj`, i.e. gen 0)
+    /// holding an encrypted string.
+    fn rc4_encrypted_fixture() -> Vec<u8> {
+        let o = rc4_fixture_owner_entry();
+        let key = rc4_fixture_file_key(&o);
+        let u = rc4_fixture_user_entry(&key);
+        let msg = rc4_fixture_rc4(&rc4_fixture_obj_key(&key, 3, 0), b"Top secret message");
+
+        let mut b = PdfBuilder::new().version(1, 4);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.object(3, &format!("<< /Msg {} >>", rc4_fixture_hexstr(&msg)));
+        b.object(
+            9,
+            &format!(
+                "<< /Filter /Standard /V 2 /R 3 /Length 128 /P {} /O {} /U {} >>",
+                RC4_FIXTURE_P,
+                rc4_fixture_hexstr(&o),
+                rc4_fixture_hexstr(&u)
+            ),
+        );
+        let trailer = format!(
+            "/Encrypt 9 0 R /ID [{}{}]",
+            rc4_fixture_hexstr(RC4_FIXTURE_ID0),
+            rc4_fixture_hexstr(RC4_FIXTURE_ID0)
+        );
+        b.trailer_extra(&trailer).build(1)
+    }
+
+    #[test]
+    fn encrypted_generation_mismatch_still_decrypts() {
+        // `object_at_spanned` derives the per-object RC4/AESV2 decrypt key
+        // from the PARSED "N G obj" header at the object's file offset
+        // (`r.num`, `r.gen` from `parser.parse_indirect`), never from the
+        // caller's requested `ObjRef` — mirroring how plain (unencrypted)
+        // lookups already tolerate a generation mismatch
+        // (`generation_mismatch_is_tolerated`). Request object 3 (really
+        // "3 0 obj" in the file) under a deliberately wrong generation: if
+        // decryption instead used the requested (wrong) gen to derive the
+        // RC4 object key, the result would be garbage, not the plaintext.
+        let doc = Document::load(rc4_encrypted_fixture()).expect("empty password opens the file");
+        let obj3 = doc.get(ObjRef { num: 3, gen: 7 }).unwrap();
+        let msg = obj3
+            .as_dict()
+            .unwrap()
+            .get("Msg")
+            .unwrap()
+            .as_str_bytes()
+            .unwrap();
+        assert_eq!(
+            msg, b"Top secret message",
+            "decrypted using the file's real gen (0), not the mismatched request (7)"
+        );
+    }
 }
