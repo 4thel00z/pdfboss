@@ -5,6 +5,27 @@
 //! strings; PDF strings are UTF-8 where valid else `{"_bytes": "<base64>"}`;
 //! streams are `{"_stream": {"dict": …, "length": N}}` with data embedded
 //! only under `--raw` / `--decode`.
+//!
+//! ## Stability notes
+//!
+//! Three details of the wire format are documented here rather than pinned
+//! by the spec, because they are either inherently non-contractual or easy
+//! to misread as something they are not:
+//!
+//! - `content_ops[].op` is a best-effort rendering, currently Rust's
+//!   `Debug` format of the operator (see `Element::ContentOp`). It is
+//!   **not** a stable, parseable token: scripts must not rely on its exact
+//!   text or structure. A future version may replace it with a stable
+//!   operator name plus structured operands.
+//! - Inside `_objstm`, the `span` key is bare (not `_span`) on purpose: it
+//!   is a byte range within the *decoded* object-stream container, not a
+//!   span in the file itself. `--hex` (which resolves `_span`/spans to file
+//!   offsets) must never treat this `span` as a file offset — doing so
+//!   would dump the wrong bytes entirely.
+//! - Page objects carry a `content_ops` array only when content-op
+//!   collection was requested (`--content-ops`); otherwise the key is
+//!   absent from the page object, not present-and-empty. Callers checking
+//!   for content ops must test for the key's presence, not just emptiness.
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
