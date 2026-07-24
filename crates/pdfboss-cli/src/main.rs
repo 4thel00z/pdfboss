@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use pdfboss_core::{Document, Error, Metadata, ObjRef, Object};
 
+use crate::input::is_url;
+
 /// A fatal CLI failure: message for stderr plus the process exit code.
 /// PDF/IO problems exit 1; invalid jq programs exit 2 (mirroring clap's own
 /// usage-error code and keeping the two failure kinds distinguishable).
@@ -103,6 +105,12 @@ enum Command {
         /// Generation number (default 0).
         gen: Option<u16>,
     },
+    /// Explore a PDF interactively in the terminal.
+    Tui {
+        /// Path to the PDF file, or an http(s) URL (requires a build with
+        /// the `http` feature).
+        target: String,
+    },
     /// Dump the document as a JSON value tree (for piping to external tools).
     Json {
         /// Path or http(s) URL of the PDF.
@@ -127,6 +135,10 @@ enum Command {
     Hex {
         /// Path or http(s) URL of the PDF.
         input: String,
+        // Not a real intra-doc link: `[,G]` is the CLI's own bracket
+        // notation for an optional generation number, not markdown link
+        // syntax, but rustdoc parses it as one.
+        #[allow(rustdoc::broken_intra_doc_links)]
         /// obj:N[,G] | header | xref:N | trailer | range:START-END
         /// (offsets decimal or 0x-hex; xref sections indexed in chain
         /// order, newest first). Default: the whole file.
@@ -207,6 +219,7 @@ fn main() {
         Command::Obj { file, num, gen } => {
             cmd_obj(&file, num, gen.unwrap_or(0)).map_err(Failure::from)
         }
+        Command::Tui { target } => cmd_tui(&target).map_err(Failure::from),
         Command::Json {
             input,
             raw,
@@ -462,6 +475,54 @@ fn cmd_obj(file: &Path, num: u32, gen: u16) -> Result<(), String> {
         other => println!("{}", pretty::format_object(other)),
     }
     Ok(())
+}
+
+/// `pdfboss tui`: interactive explorer over a local file or an http(s)
+/// URL, on a current-thread tokio runtime (rasterization uses the
+/// runtime's blocking pool; the loop itself is single-threaded).
+fn cmd_tui(target: &str) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let doc = open_async_document(target).await?;
+        pdfboss_tui::run(doc, display_title(target))
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Builds the async document: HTTP backend for URLs (behind the `http`
+/// feature), file backend otherwise.
+async fn open_async_document(target: &str) -> Result<pdfboss_aio::AsyncDocument, String> {
+    if is_url(target) {
+        #[cfg(feature = "http")]
+        {
+            return pdfboss_aio::AsyncDocument::open_url(target)
+                .await
+                .map_err(|e| e.to_string());
+        }
+        #[cfg(not(feature = "http"))]
+        {
+            return Err("URL targets need pdfboss built with the `http` feature \
+                 (cargo build -p pdfboss-cli --features http)"
+                .to_string());
+        }
+    }
+    pdfboss_aio::AsyncDocument::open(target)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// The status-bar title: the last path/URL segment, or the whole target.
+fn display_title(target: &str) -> String {
+    target
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(target)
+        .to_string()
 }
 
 /// Converts a 1-based page number into a 0-based index, validating range.
@@ -734,5 +795,33 @@ mod tests {
         assert_eq!(program, ".header");
         assert!(hex && raw_strings);
         assert!(!raw && !decode);
+    }
+
+    #[test]
+    fn tui_subcommand_parses() {
+        let cli = Cli::parse_from(["pdfboss", "tui", "in.pdf"]);
+        let Command::Tui { target } = cli.command else {
+            panic!("expected tui command");
+        };
+        assert_eq!(target, "in.pdf");
+    }
+
+    #[test]
+    fn url_detection() {
+        assert!(is_url("https://example.com/a.pdf"));
+        assert!(is_url("http://example.com/a.pdf"));
+        assert!(!is_url("plain.pdf"));
+        assert!(!is_url("dir/httpish.pdf"));
+    }
+
+    #[test]
+    fn display_title_takes_last_segment() {
+        assert_eq!(display_title("dir/sub/file.pdf"), "file.pdf");
+        assert_eq!(display_title("file.pdf"), "file.pdf");
+        assert_eq!(
+            display_title("https://example.com/docs/spec.pdf"),
+            "spec.pdf"
+        );
+        assert_eq!(display_title("trailing/"), "trailing/");
     }
 }
