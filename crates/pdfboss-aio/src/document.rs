@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use pdfboss_core::elements::{Span, XrefKind};
+use pdfboss_core::elements::{ElementOpts, Span, XrefKind};
 use pdfboss_core::lexer::{Lexer, Token};
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::parser::{NoResolve, Parser, Resolve};
@@ -93,8 +93,7 @@ pub(crate) struct StartXrefRecord {
     pub(crate) offset: u64,
     /// Span of `startxref` through the offset integer. Exposed by a
     /// `startxref_record()` accessor consumed by the element stream's
-    /// physical layer (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// physical layer.
     pub(crate) span: Span,
 }
 
@@ -217,15 +216,12 @@ const MAX_TREE_DEPTH: usize = 256;
 #[derive(Clone)]
 pub(crate) struct SectionRecord {
     /// Consumed, with `span` and `entries` below, by the element stream's
-    /// physical layer building `Element::XrefSection` (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// physical layer building `Element::XrefSection`.
     pub(crate) kind: XrefKind,
     /// Classic: `xref` keyword to the `trailer` keyword. Stream: the whole
     /// xref-stream object.
-    #[allow(dead_code)] // see `kind` above (Plan 02 task 11)
     pub(crate) span: Span,
     /// Number of entries the section declares (subsection sums).
-    #[allow(dead_code)] // see `kind` above (Plan 02 task 11)
     pub(crate) entries: usize,
     /// The section's trailer dictionary (classic trailer, or the stream's
     /// own dictionary).
@@ -524,13 +520,12 @@ fn non_negative(value: i64) -> Option<u64> {
 pub(crate) struct XrefIndex {
     pub(crate) entries: HashMap<u32, XrefEntry>,
     /// The merged trailer dictionary, e.g. `/Info` lookups in `metadata()`;
-    /// also consumed, with `trailer_span` below, by a future
-    /// `merged_trailer()` accessor (Plan 02 task 11).
+    /// also consumed, with `trailer_span` below, by the `merged_trailer()`
+    /// accessor.
     pub(crate) trailer: Dict,
     /// Span for the single merged `Trailer` element: the newest section's
     /// trailer region (classic), or that section's own span (stream) —
     /// adopted rule 4.
-    #[allow(dead_code)] // see `trailer` above (Plan 02 task 11)
     pub(crate) trailer_span: Span,
 }
 
@@ -552,22 +547,18 @@ pub(crate) struct DocumentInner {
     /// Span of the `%PDF-` header run; `None` when the first 1 KiB holds
     /// no header (the Header element is then omitted, adopted rule 1).
     /// Exposed by a `header_span()` accessor consumed by the element
-    /// stream's physical layer (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// stream's physical layer.
     pub(crate) header_span: Option<Span>,
     pub(crate) xref: XrefIndex,
     /// Sections in chain order — newest→oldest — for the element stream.
     /// Exposed by a `sections()` accessor consumed by the element stream's
-    /// physical layer (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// physical layer.
     pub(crate) sections: Vec<SectionRecord>,
     /// Exposed by a `startxref_record()` accessor consumed by the element
-    /// stream's physical layer (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// stream's physical layer.
     pub(crate) startxref: StartXrefRecord,
     /// Exposed by an `eof_span()` accessor consumed by the element stream's
-    /// physical layer (Plan 02 task 11).
-    #[allow(dead_code)]
+    /// physical layer.
     pub(crate) eof_span: Option<Span>,
     /// Cache of fetched indirect objects.
     pub(crate) objects: std::sync::Mutex<HashMap<(u32, u16), Arc<Object>>>,
@@ -729,13 +720,10 @@ fn object_type_name(o: &Object) -> &'static str {
 /// A fetched and decoded object stream: the container's physical span, the
 /// decoded bytes, and each member's number and offset (ISO 32000 §7.5.7).
 pub(crate) struct ObjStmCache {
-    /// Consumed by the element stream's physical layer (Plan 02 tasks
-    /// 9-12).
-    #[allow(dead_code)]
+    /// Consumed by the element stream's physical layer.
     pub(crate) container: ObjRef,
     /// Consumed, with `container` above, by the element stream's physical
-    /// layer (Plan 02 tasks 9-12).
-    #[allow(dead_code)]
+    /// layer.
     pub(crate) container_span: Span,
     first: usize,
     data: Vec<u8>,
@@ -755,9 +743,7 @@ impl ObjStmCache {
 
     /// Member `index`'s byte range within the decoded stream: from its
     /// header offset to the parser position after its last token.
-    /// Consumed by the element stream's physical layer (Plan 02 tasks
-    /// 9-12).
-    #[allow(dead_code)]
+    /// Consumed by the element stream's physical layer.
     pub(crate) fn member_span(&self, index: u32) -> Result<Span> {
         let start = self.member_start(index)?;
         let mut parser = Parser::at(&self.data, start);
@@ -959,8 +945,7 @@ impl AsyncDocument {
 
     /// The decoded container for object stream `stream_num`, fetched,
     /// decoded and header-parsed at most once. Consumed by the element
-    /// stream's physical layer (Plan 02 tasks 9-12).
-    #[allow(dead_code)]
+    /// stream's physical layer.
     pub(crate) async fn objstm_cache(&self, stream_num: u32) -> Result<Arc<ObjStmCache>> {
         let mut chain = Vec::new();
         self.objstm_cache_with_chain(stream_num, &mut chain).await
@@ -1275,6 +1260,69 @@ impl AsyncDocument {
             Object::Array(items) => Some(items),
             _ => None,
         }
+    }
+
+    /// Lazy element stream mirroring the sync iterator's ordering and
+    /// salvage semantics. Physical elements come in file order (header,
+    /// objects by offset, xref/trailer sections, startxref, eof); logical
+    /// elements follow in document order (pages ascending, and within a
+    /// page: fonts, images, annotations, then content ops if enabled).
+    /// Nothing is fetched, parsed or decoded before it is yielded.
+    pub fn elements(&self, opts: ElementOpts) -> crate::stream::ElementStream<'_> {
+        crate::stream::element_stream(self, opts)
+    }
+
+    /// Fetches an in-file object together with its physical span, caching
+    /// the object like [`AsyncDocument::get_object`].
+    pub(crate) async fn physical_object(&self, r: ObjRef, offset: u64) -> Result<(Span, Object)> {
+        let mut chain = vec![r.num];
+        let (span, object) = self.parse_in_file(offset, &mut chain).await?;
+        self.inner
+            .objects
+            .lock()
+            .expect("object cache mutex")
+            .insert((r.num, r.gen), Arc::new(object.clone()));
+        Ok((span, object))
+    }
+
+    /// Span of the `%PDF-` header run; `None` when the file has none (the
+    /// Header element is then omitted, adopted rule 1).
+    pub(crate) fn header_span(&self) -> Option<Span> {
+        self.inner.header_span
+    }
+
+    /// All merged xref entries (order unspecified).
+    pub(crate) fn xref_entries(&self) -> Vec<(u32, XrefEntry)> {
+        self.inner
+            .xref
+            .entries
+            .iter()
+            .map(|(&num, &entry)| (num, entry))
+            .collect()
+    }
+
+    /// Sections in chain order (newest→oldest).
+    pub(crate) fn sections(&self) -> &[SectionRecord] {
+        &self.inner.sections
+    }
+
+    /// The merged trailer dictionary and the span of the newest section's
+    /// trailer region, for the single Trailer element (adopted rule 4).
+    pub(crate) fn merged_trailer(&self) -> (Dict, Span) {
+        (
+            self.inner.xref.trailer.clone(),
+            self.inner.xref.trailer_span,
+        )
+    }
+
+    /// The final `startxref` announcement: `(offset, span)`.
+    pub(crate) fn startxref_record(&self) -> (u64, Span) {
+        (self.inner.startxref.offset, self.inner.startxref.span)
+    }
+
+    /// Span of the final `%%EOF`, when one exists.
+    pub(crate) fn eof_span(&self) -> Option<Span> {
+        self.inner.eof_span
     }
 }
 

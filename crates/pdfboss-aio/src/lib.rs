@@ -9,8 +9,10 @@ pub mod backend;
 pub mod cache;
 pub mod document;
 pub mod error;
+pub mod stream;
 
 pub use backend::{Backend, BoxFuture, FileBackend, MemBackend};
 pub use cache::CachedBackend;
 pub use document::AsyncDocument;
 pub use error::{Error, Result};
+pub use stream::ElementStream;
