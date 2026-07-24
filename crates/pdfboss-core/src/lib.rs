@@ -12,6 +12,7 @@ pub mod lexer;
 pub mod object;
 pub mod objstm;
 pub mod parser;
+pub mod pretty;
 pub mod xref;
 
 pub use document::{Document, Metadata, Page};
