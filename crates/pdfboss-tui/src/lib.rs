@@ -61,8 +61,13 @@ impl Drop for TerminalGuard {
 /// become status-bar toasts; only terminal I/O errors are returned.
 pub async fn run(doc: AsyncDocument, title: String) -> std::io::Result<()> {
     enable_raw_mode()?;
-    execute!(std::io::stdout(), EnterAlternateScreen)?;
+    // The guard is constructed before `EnterAlternateScreen` (not after) so
+    // that an early return from *that* fallible call still restores raw
+    // mode: a local already constructed at the point of an early `?` return
+    // is dropped, so there is no window where raw mode is enabled but
+    // unguarded.
     let guard = TerminalGuard;
+    execute!(std::io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
     let size = terminal.size()?;
     let mut app = App::new(
