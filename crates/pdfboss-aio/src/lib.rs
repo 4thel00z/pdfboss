@@ -7,6 +7,7 @@
 
 pub mod backend;
 pub mod cache;
+pub mod document;
 pub mod error;
 
 pub use backend::{Backend, BoxFuture, FileBackend, MemBackend};
