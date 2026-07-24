@@ -1,10 +1,8 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
-// `Input` is consumed by the explorer subcommands added in later plan-04
-// tasks; the `dead_code` allowance disappears once they are wired up.
-#[allow(dead_code)]
 mod input;
+mod json;
 // `q` (value tree + jq engine) is consumed by the `q`/`json` subcommands
 // added in later plan-04 tasks; the `dead_code` allowance disappears once
 // they are wired up.
@@ -108,6 +106,26 @@ enum Command {
         /// Generation number (default 0).
         gen: Option<u16>,
     },
+    /// Dump the document as a JSON value tree (for piping to external tools).
+    Json {
+        /// Path or http(s) URL of the PDF.
+        input: String,
+        /// Embed raw (still encoded) stream data as base64.
+        #[arg(long, conflicts_with = "decode")]
+        raw: bool,
+        /// Embed decoded stream data as base64.
+        #[arg(long)]
+        decode: bool,
+        /// Restrict logical elements to these 1-based pages (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        pages: Option<Vec<usize>>,
+        /// Skip the logical layer (pages/fonts/images/annotations).
+        #[arg(long)]
+        no_logical: bool,
+        /// Include per-page content-stream operators (high volume).
+        #[arg(long)]
+        content_ops: bool,
+    },
 }
 
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
@@ -148,6 +166,23 @@ fn main() {
         } => cmd_render(&file, page, out, scale, fonts, font_dir).map_err(Failure::from),
         Command::Obj { file, num, gen } => {
             cmd_obj(&file, num, gen.unwrap_or(0)).map_err(Failure::from)
+        }
+        Command::Json {
+            input,
+            raw,
+            decode,
+            pages,
+            no_logical,
+            content_ops,
+        } => {
+            let flags = q::value::TreeFlags {
+                raw,
+                decode,
+                pages,
+                no_logical,
+                content_ops,
+            };
+            json::cmd_json(&input, &flags).map_err(Failure::from)
         }
     };
     if let Err(failure) = result {
@@ -558,5 +593,33 @@ mod tests {
         let failure = Failure::program("bad program");
         assert_eq!(failure.code, 2);
         assert_eq!(failure.message, "bad program");
+    }
+
+    #[test]
+    fn json_flags_parse() {
+        let cli = Cli::parse_from([
+            "pdfboss",
+            "json",
+            "in.pdf",
+            "--raw",
+            "--pages",
+            "1,3",
+            "--no-logical",
+            "--content-ops",
+        ]);
+        let Command::Json {
+            input,
+            raw,
+            decode,
+            pages,
+            no_logical,
+            content_ops,
+        } = cli.command
+        else {
+            panic!("expected json command");
+        };
+        assert_eq!(input, "in.pdf");
+        assert!(raw && !decode && no_logical && content_ops);
+        assert_eq!(pages, Some(vec![1, 3]));
     }
 }

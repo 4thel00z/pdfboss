@@ -95,6 +95,7 @@ impl Input {
     }
 
     /// Raw bytes for `span` (end-exclusive), for hex views.
+    #[allow(dead_code)]
     pub fn read_span(&self, span: Span) -> Result<Vec<u8>, String> {
         match self {
             Input::Local { doc } => {
@@ -120,6 +121,7 @@ impl Input {
     }
 
     /// Total length of the underlying file in bytes.
+    #[allow(dead_code)]
     pub fn file_len(&self) -> u64 {
         match self {
             Input::Local { doc } => doc.bytes().len() as u64,
