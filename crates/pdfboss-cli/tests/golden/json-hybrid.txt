@@ -1,0 +1,245 @@
+{
+  "header": {
+    "version": "1.7",
+    "_span": [
+      0,
+      8
+    ],
+    "_kind": "header"
+  },
+  "objects": {
+    "1 0": {
+      "_kind": "object",
+      "_ref": [
+        1,
+        0
+      ],
+      "_span": [
+        9,
+        57
+      ],
+      "_objstm": null,
+      "value": {
+        "Pages": {
+          "_r": [
+            2,
+            0
+          ]
+        },
+        "Type": "Catalog"
+      }
+    },
+    "2 0": {
+      "_kind": "object",
+      "_ref": [
+        2,
+        0
+      ],
+      "_span": [
+        58,
+        114
+      ],
+      "_objstm": null,
+      "value": {
+        "Count": 1,
+        "Kids": [
+          {
+            "_r": [
+              3,
+              0
+            ]
+          }
+        ],
+        "Type": "Pages"
+      }
+    },
+    "3 0": {
+      "_kind": "object",
+      "_ref": [
+        3,
+        0
+      ],
+      "_span": [
+        115,
+        240
+      ],
+      "_objstm": null,
+      "value": {
+        "Contents": {
+          "_r": [
+            4,
+            0
+          ]
+        },
+        "MediaBox": [
+          0,
+          0,
+          612,
+          792
+        ],
+        "Parent": {
+          "_r": [
+            2,
+            0
+          ]
+        },
+        "Resources": {
+          "Font": {
+            "F1": {
+              "_r": [
+                5,
+                0
+              ]
+            }
+          }
+        },
+        "Type": "Page"
+      }
+    },
+    "5 0": {
+      "_kind": "object",
+      "_ref": [
+        5,
+        0
+      ],
+      "_span": [
+        241,
+        310
+      ],
+      "_objstm": null,
+      "value": {
+        "BaseFont": "Helvetica",
+        "Subtype": "Type1",
+        "Type": "Font"
+      }
+    },
+    "4 0": {
+      "_kind": "object",
+      "_ref": [
+        4,
+        0
+      ],
+      "_span": [
+        311,
+        397
+      ],
+      "_objstm": null,
+      "value": {
+        "_stream": {
+          "dict": {
+            "Length": 37
+          },
+          "length": 37
+        }
+      }
+    },
+    "6 0": {
+      "_kind": "object",
+      "_ref": [
+        6,
+        0
+      ],
+      "_span": [
+        398,
+        521
+      ],
+      "_objstm": null,
+      "value": {
+        "_stream": {
+          "dict": {
+            "Index": [
+              4,
+              1,
+              6,
+              1
+            ],
+            "Length": 14,
+            "Root": {
+              "_r": [
+                1,
+                0
+              ]
+            },
+            "Size": 7,
+            "Type": "XRef",
+            "W": [
+              1,
+              4,
+              2
+            ]
+          },
+          "length": 14
+        }
+      }
+    }
+  },
+  "pages": [
+    {
+      "index": 0,
+      "_ref": [
+        3,
+        0
+      ],
+      "fonts": [
+        {
+          "_ref": [
+            5,
+            0
+          ],
+          "subtype": "Type1",
+          "base_font": "Helvetica"
+        }
+      ],
+      "images": [],
+      "annotations": []
+    }
+  ],
+  "xref": [
+    {
+      "kind": "table",
+      "entries": 6,
+      "_span": [
+        522,
+        651
+      ]
+    },
+    {
+      "kind": "stream",
+      "entries": 2,
+      "_span": [
+        398,
+        521
+      ]
+    }
+  ],
+  "trailer": {
+    "_span": [
+      651,
+      697
+    ],
+    "value": {
+      "Index": [
+        4,
+        1,
+        6,
+        1
+      ],
+      "Length": 14,
+      "Root": {
+        "_r": [
+          1,
+          0
+        ]
+      },
+      "Size": 7,
+      "Type": "XRef",
+      "W": [
+        1,
+        4,
+        2
+      ],
+      "XRefStm": 398
+    }
+  },
+  "startxref": 522
+}
