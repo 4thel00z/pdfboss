@@ -2,8 +2,8 @@
 
 use std::fmt::Write as _;
 
-use pdfboss_core::object::decode_text_string;
-use pdfboss_core::{Dict, Name, Object};
+use crate::object::decode_text_string;
+use crate::object::{Dict, Name, Object};
 
 /// Maximum rendered length for an array to stay on a single line.
 const INLINE_ARRAY_LIMIT: usize = 60;
@@ -146,7 +146,7 @@ fn write_string(bytes: &[u8], out: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfboss_core::ObjRef;
+    use crate::object::ObjRef;
 
     fn name(s: &str) -> Name {
         Name(s.to_string())

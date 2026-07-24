@@ -1,7 +1,7 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
-mod pretty;
+use pdfboss_core::pretty;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
