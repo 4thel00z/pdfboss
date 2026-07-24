@@ -16,10 +16,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
+use pdfboss_aio::AsyncDocument as AioDocument;
 use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, XrefKind};
 use pdfboss_core::Document as CoreDocument;
+use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
-use pdfboss_core::{Dict, Object};
+use pdfboss_core::{Dict, ObjRef, Object};
 
 create_exception!(
     pdfboss,
@@ -37,6 +39,50 @@ fn pdf_err(e: impl std::fmt::Display) -> PyErr {
 /// the element/async APIs.
 fn parse_err(e: pdfboss_core::Error) -> PyErr {
     PdfError::new_err(format!("parse: {e}"))
+}
+
+/// Maps an aio error to [`PdfError`], prefixed by the layer it came from
+/// ("parse:", "io:" or "http:").
+fn aio_err(e: pdfboss_aio::Error) -> PyErr {
+    use pdfboss_aio::Error as AioError;
+    let msg = match e {
+        AioError::Core(e) => format!("parse: {e}"),
+        AioError::Io(e) => format!("io: {e}"),
+        AioError::Http { status, msg } => match status {
+            Some(code) => format!("http: {code}: {msg}"),
+            None => format!("http: {msg}"),
+        },
+        AioError::RangeUnsupported => "http: server does not support Range requests".to_string(),
+        AioError::TruncatedRead {
+            offset,
+            wanted,
+            got,
+        } => {
+            format!("io: truncated read at offset {offset}: wanted {wanted} bytes, got {got}")
+        }
+    };
+    PdfError::new_err(msg)
+}
+
+/// Builds the metadata dict; only keys present in the file are included.
+fn metadata_dict(py: Python<'_>, meta: CoreMetadata) -> PyResult<Bound<'_, PyDict>> {
+    let dict = PyDict::new(py);
+    let entries = [
+        ("title", meta.title),
+        ("author", meta.author),
+        ("subject", meta.subject),
+        ("keywords", meta.keywords),
+        ("creator", meta.creator),
+        ("producer", meta.producer),
+        ("creation_date", meta.creation_date),
+        ("mod_date", meta.mod_date),
+    ];
+    for (key, value) in entries {
+        if let Some(value) = value {
+            dict.set_item(key, value)?;
+        }
+    }
+    Ok(dict)
 }
 
 /// The stable Python `kind` string for a core element variant.
@@ -202,23 +248,7 @@ impl Document {
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let meta = self.inner.lock().metadata();
-        let dict = PyDict::new(py);
-        let entries = [
-            ("title", meta.title),
-            ("author", meta.author),
-            ("subject", meta.subject),
-            ("keywords", meta.keywords),
-            ("creator", meta.creator),
-            ("producer", meta.producer),
-            ("creation_date", meta.creation_date),
-            ("mod_date", meta.mod_date),
-        ];
-        for (key, value) in entries {
-            if let Some(value) = value {
-                dict.set_item(key, value)?;
-            }
-        }
-        Ok(dict)
+        metadata_dict(py, meta)
     }
 
     fn __len__(&self) -> usize {
@@ -601,6 +631,74 @@ impl ElementIter {
     }
 }
 
+/// A PDF document opened for async I/O. Constructors and data-fetching
+/// methods are coroutines driven by one global multi-thread tokio
+/// runtime; `page_count`/`version` are sync because the open flow already
+/// parsed the xref chain and page tree index.
+#[pyclass(frozen)]
+struct AsyncDocument {
+    inner: AioDocument,
+}
+
+#[pymethods]
+impl AsyncDocument {
+    /// Opens a PDF file for async access. Coroutine resolving to an
+    /// AsyncDocument. The whole file is never read eagerly.
+    #[staticmethod]
+    fn open(py: Python<'_>, path: PathBuf) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = AioDocument::open(path).await.map_err(aio_err)?;
+            Ok(AsyncDocument { inner })
+        })
+    }
+
+    /// Loads a PDF from bytes already in memory. Coroutine resolving to
+    /// an AsyncDocument.
+    #[staticmethod]
+    fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = AioDocument::from_bytes(data).await.map_err(aio_err)?;
+            Ok(AsyncDocument { inner })
+        })
+    }
+
+    /// Number of pages in the document.
+    fn page_count(&self) -> usize {
+        self.inner.page_count()
+    }
+
+    /// PDF version from the file header, e.g. "1.7".
+    fn version(&self) -> String {
+        version_string(self.inner.version())
+    }
+
+    /// Document metadata; only keys present in the file are included.
+    /// Coroutine resolving to a dict.
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let meta = inner.metadata().await.map_err(aio_err)?;
+            Python::with_gil(|py| {
+                Ok::<Py<PyAny>, PyErr>(metadata_dict(py, meta)?.into_any().unbind())
+            })
+        })
+    }
+
+    /// Fetches and parses the indirect object `num gen`, returning its
+    /// converted Python value. Coroutine.
+    #[pyo3(signature = (num, gen=0))]
+    fn get_object<'py>(&self, py: Python<'py>, num: u32, gen: u16) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let object = inner
+                .get_object(ObjRef { num, gen })
+                .await
+                .map_err(aio_err)?;
+            Python::with_gil(|py| object_to_py(py, &object).map(Bound::unbind))
+        })
+    }
+}
+
 #[pymodule]
 fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -609,6 +707,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Page>()?;
     m.add_class::<Element>()?;
     m.add_class::<ElementIter>()?;
+    m.add_class::<AsyncDocument>()?;
     Ok(())
 }
 
@@ -664,6 +763,7 @@ mod tests {
         assert_send_sync::<super::Page>();
         assert_send_sync::<super::Element>();
         assert_send_sync::<super::ElementIter>();
+        assert_send_sync::<super::AsyncDocument>();
     }
 
     #[test]
