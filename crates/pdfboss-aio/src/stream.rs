@@ -11,8 +11,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_core::stream::BoxStream;
-use pdfboss_core::elements::{Element, ElementOpts, Span};
-use pdfboss_core::lexer::{Lexer, Token};
+use pdfboss_core::elements::{Element, ElementOpts};
 use pdfboss_core::xref::XrefEntry;
 use pdfboss_core::{Dict, Name, ObjRef, Object};
 
@@ -277,7 +276,8 @@ async fn logical_resources(state: &mut StreamState<'_>, page: usize) {
     let Some(record) = doc.page_record(page) else {
         return;
     };
-    for value in sorted_dict_values(record.resources.get_dict("Font")) {
+    let font_dict = resolved_category_dict(doc, record.resources.get("Font")).await;
+    for value in sorted_dict_values(font_dict.as_ref()) {
         let Some(r) = value.as_ref() else { continue };
         match doc.resolve(&value).await {
             Ok(resolved) => {
@@ -299,7 +299,8 @@ async fn logical_resources(state: &mut StreamState<'_>, page: usize) {
             Err(err) => state.pending.push_back(Err(err)),
         }
     }
-    for value in sorted_dict_values(record.resources.get_dict("XObject")) {
+    let xobject_dict = resolved_category_dict(doc, record.resources.get("XObject")).await;
+    for value in sorted_dict_values(xobject_dict.as_ref()) {
         let Some(r) = value.as_ref() else { continue };
         match doc.resolve(&value).await {
             Ok(resolved) => {
@@ -352,6 +353,18 @@ async fn logical_resources(state: &mut StreamState<'_>, page: usize) {
     }
 }
 
+/// Resolves a resource-category value (e.g. the `/Font` entry of
+/// `/Resources`) to its dictionary. The category itself may be an
+/// indirect reference (legal PDF, e.g. `/Font 9 0 R`), so it must be
+/// resolved before being read as a dict — mirroring core's
+/// `referenced_dict_entries`. Lenient: a missing category, a resolve
+/// failure, or a non-dict result all yield `None` (no elements, no
+/// salvage `Err`), exactly as core's sync counterpart drops them.
+async fn resolved_category_dict(doc: &AsyncDocument, value: Option<&Object>) -> Option<Dict> {
+    let value = value?;
+    doc.resolve(value).await.ok()?.as_dict().cloned()
+}
+
 /// Values of an optional dictionary, sorted by key name (deterministic
 /// logical ordering — adopted rule 7).
 fn sorted_dict_values(dict: Option<&Dict>) -> Vec<Object> {
@@ -379,7 +392,10 @@ fn dict_u32(dict: &Dict, key: &str) -> u32 {
 }
 
 /// Produces a page's content operators with their byte ranges within the
-/// decoded, concatenated content stream (adopted rule 8).
+/// decoded, concatenated content stream (adopted rule 8). Parsing itself
+/// is delegated to core's own `parse_content_spanned` — the exact function
+/// core's `page_elements` calls — so op/span boundaries (including inline
+/// images and unknown-operator drops) can never diverge from core.
 async fn content_ops(state: &mut StreamState<'_>, page: usize) {
     let doc = state.doc;
     let Some(record) = doc.page_record(page) else {
@@ -392,26 +408,17 @@ async fn content_ops(state: &mut StreamState<'_>, page: usize) {
             return;
         }
     };
-    let (spans, terminal) = op_spans(&decoded);
-    for span in spans {
-        let slice = &decoded[span.start as usize..span.end as usize];
-        match pdfboss_core::content::parse_content(slice) {
-            Ok(ops) => {
-                if let Some(op) = ops.into_iter().next() {
-                    state.pending.push_back(Ok(Element::ContentOp {
-                        page,
-                        op,
-                        span_in_content: span,
-                    }));
-                }
-                // Operators the core parser skips as unknown yield no
-                // element.
+    match pdfboss_core::content::parse_content_spanned(&decoded) {
+        Ok(spanned) => {
+            for (op, span) in spanned {
+                state.pending.push_back(Ok(Element::ContentOp {
+                    page,
+                    op,
+                    span_in_content: span,
+                }));
             }
-            Err(err) => state.pending.push_back(Err(Error::Core(err))),
         }
-    }
-    if let Some(err) = terminal {
-        state.pending.push_back(Err(Error::Core(err)));
+        Err(err) => state.pending.push_back(Err(Error::Core(err))),
     }
 }
 
@@ -442,120 +449,6 @@ async fn page_content(doc: &AsyncDocument, record: &PageRecord) -> Result<Vec<u8
         }
         _ => Ok(Vec::new()),
     }
-}
-
-/// Splits a decoded content stream into per-operator byte ranges: each op
-/// runs from the first byte of its first operand token to the byte after
-/// its operator keyword; inline images run through `EI`. Returns the spans
-/// found plus the lexer error that ended the scan, if any. Trailing
-/// operands without an operator are dropped, matching the core content
-/// parser.
-fn op_spans(data: &[u8]) -> (Vec<Span>, Option<pdfboss_core::Error>) {
-    let mut lexer = Lexer::new(data);
-    let mut spans = Vec::new();
-    let mut start: Option<usize> = None;
-    loop {
-        lexer.skip_whitespace_and_comments();
-        let token_start = lexer.pos();
-        let token = match lexer.next_token() {
-            Ok(token) => token,
-            Err(err) => return (spans, Some(err)),
-        };
-        match token {
-            Token::Eof => return (spans, None),
-            Token::Keyword(keyword) => match keyword.as_slice() {
-                // true/false/null are operands, not operators.
-                b"true" | b"false" | b"null" => {
-                    start.get_or_insert(token_start);
-                }
-                b"BI" => {
-                    let begin = start.take().unwrap_or(token_start);
-                    match inline_image_end(data, lexer.pos()) {
-                        Some(end) => {
-                            spans.push(Span {
-                                start: begin as u64,
-                                end: end as u64,
-                            });
-                            lexer.seek(end);
-                        }
-                        None => {
-                            // Unterminated inline image: it takes the rest
-                            // of the stream.
-                            spans.push(Span {
-                                start: begin as u64,
-                                end: data.len() as u64,
-                            });
-                            return (spans, None);
-                        }
-                    }
-                }
-                _ => {
-                    let begin = start.take().unwrap_or(token_start);
-                    spans.push(Span {
-                        start: begin as u64,
-                        end: lexer.pos() as u64,
-                    });
-                }
-            },
-            _ => {
-                start.get_or_insert(token_start);
-            }
-        }
-    }
-}
-
-/// Position just past the `EI` that ends an inline image whose dictionary
-/// starts at `from` (right after `BI`). Image data runs from after `ID`
-/// plus one whitespace byte to `EI` at a token boundary, or past the
-/// declared `/L`ength when present, which is trusted (ISO 32000 §8.9.7).
-fn inline_image_end(data: &[u8], from: usize) -> Option<usize> {
-    let mut lexer = Lexer::at(data, from);
-    let mut declared_length: Option<usize> = None;
-    let mut awaiting_length_value = false;
-    loop {
-        match lexer.next_token().ok()? {
-            Token::Keyword(ref keyword) if keyword.as_slice() == b"ID" => break,
-            Token::Name(name) => {
-                awaiting_length_value = name.0 == "L" || name.0 == "Length";
-            }
-            Token::Int(value) => {
-                if awaiting_length_value && value >= 0 {
-                    declared_length = Some(value as usize);
-                }
-                awaiting_length_value = false;
-            }
-            Token::Eof => return None,
-            _ => awaiting_length_value = false,
-        }
-    }
-    let data_start = (lexer.pos() + 1).min(data.len()); // one whitespace byte after ID
-    let search_from = data_start
-        .saturating_add(declared_length.unwrap_or(0))
-        .min(data.len());
-    let mut candidate = search_from;
-    while candidate + 2 <= data.len() {
-        let boundary_before = candidate == 0 || is_pdf_space(data[candidate - 1]);
-        let boundary_after = candidate + 2 == data.len() || is_token_boundary(data[candidate + 2]);
-        if boundary_before && boundary_after && &data[candidate..candidate + 2] == b"EI" {
-            return Some(candidate + 2);
-        }
-        candidate += 1;
-    }
-    None
-}
-
-/// PDF whitespace (ISO 32000 Table 1).
-fn is_pdf_space(byte: u8) -> bool {
-    matches!(byte, b'\0' | b'\t' | b'\n' | b'\x0C' | b'\r' | b' ')
-}
-
-/// True for bytes that end a token: PDF whitespace or a delimiter.
-fn is_token_boundary(byte: u8) -> bool {
-    is_pdf_space(byte)
-        || matches!(
-            byte,
-            b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
-        )
 }
 
 #[cfg(test)]
@@ -1029,10 +922,11 @@ mod tests {
 
     #[tokio::test]
     async fn content_ops_match_core_across_varied_operators() {
-        // Stresses `op_spans`' independent boundary reimplementation
-        // against core's `parse_content_spanned`: a TJ array operand, an
-        // unrecognized operator (dropped, no arity match), and an inline
-        // image, alongside plain operators.
+        // End-to-end check of the async content-ops path (page-content
+        // decode/concatenation, then core's own `parse_content_spanned`)
+        // against the sync core walk on the same bytes: a TJ array
+        // operand, an unrecognized operator (dropped, no arity match), and
+        // an inline image, alongside plain operators.
         let content = "q 1 0 0 1 10 20 cm 0 0 10 10 re f Q \
                         BT /F1 12 Tf [(Hi) -250 (there)] TJ ET \
                         zzUnknownOp 1 2 \
@@ -1069,5 +963,83 @@ mod tests {
             streamed, expected,
             "op sequence and spans match core's own spanned parse exactly"
         );
+    }
+
+    #[tokio::test]
+    async fn indirect_resource_category_still_enumerates() {
+        // /Resources /Font is itself an indirect reference to the font
+        // category dict (legal PDF) rather than an inline dict — the
+        // category value must be resolved before its entries are read.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font 6 0 R >> >>",
+        );
+        b.object(6, "<< /F1 5 0 R >>");
+        b.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        let bytes = b.build(1);
+        let doc = AsyncDocument::from_bytes(bytes.clone()).await.unwrap();
+        let opts = ElementOpts {
+            physical: false,
+            logical: true,
+            pages: None,
+            content_ops: false,
+        };
+        let elements: Vec<Element> = collect(&doc, opts.clone())
+            .await
+            .into_iter()
+            .map(|item| item.unwrap())
+            .collect();
+        let fonts: Vec<(ObjRef, String, Option<String>)> = elements
+            .iter()
+            .filter_map(|el| match el {
+                Element::Font {
+                    r,
+                    subtype,
+                    base_font,
+                    ..
+                } => Some((
+                    *r,
+                    subtype.0.clone(),
+                    base_font.as_ref().map(|n| n.0.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fonts,
+            vec![(
+                ObjRef { num: 5, gen: 0 },
+                "Type1".to_string(),
+                Some("Helvetica".to_string())
+            )],
+            "an indirect /Font category dict is still resolved and enumerated"
+        );
+
+        // Cross-check parity against the sync core walk on the same bytes.
+        let sync_doc = pdfboss_core::Document::load(bytes).unwrap();
+        let sync_fonts: Vec<(ObjRef, String, Option<String>)> = sync_doc
+            .elements(opts)
+            .collect::<pdfboss_core::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .filter_map(|el| match el {
+                Element::Font {
+                    r,
+                    subtype,
+                    base_font,
+                    ..
+                } => Some((
+                    r,
+                    subtype.0.clone(),
+                    base_font.as_ref().map(|n| n.0.clone()),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fonts, sync_fonts, "matches the sync core walk exactly");
     }
 }
