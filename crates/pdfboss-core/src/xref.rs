@@ -4,6 +4,7 @@
 
 use crate::hash::{FastMap, FastSet};
 
+use crate::elements::{Span, XrefKind};
 use crate::error::{Error, Result};
 use crate::filters::{decode_stream, is_pdf_whitespace};
 use crate::lexer::{Lexer, Token};
@@ -52,6 +53,21 @@ impl Xref {
                 self.trailer.insert(key.clone(), value.clone());
             }
         }
+    }
+
+    /// Iterates all `(object number, entry)` pairs in unspecified order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, XrefEntry)> + '_ {
+        self.map.iter().map(|(&num, &entry)| (num, entry))
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether the table has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -107,27 +123,17 @@ fn load_chain(data: &[u8], start: usize) -> Result<Xref> {
         if !visited.insert(off) {
             break;
         }
-        let mut lexer = Lexer::at(data, off);
-        let classic = matches!(lexer.peek_token(),
-                               Ok(Token::Keyword(ref k)) if k.as_slice() == b"xref");
-        let prev = if classic {
-            let (section, prev, xrefstm) = parse_classic(data, off)?;
-            if let Some(xs) = xrefstm.and_then(|v| to_offset(v, data)) {
-                if visited.insert(xs) {
-                    // Lenient: a broken hybrid stream leaves the table alone.
-                    if let Ok((stream_section, _)) = parse_stream_section(data, xs) {
-                        acc.merge(stream_section);
-                    }
+        let info = parse_section_at(data, off)?;
+        if let Some(xs) = info.xrefstm.and_then(|v| to_offset(v, data)) {
+            if visited.insert(xs) {
+                // Lenient: a broken hybrid stream leaves the table alone.
+                if let Ok(stream_info) = parse_section_at(data, xs) {
+                    acc.merge(stream_info.xref);
                 }
             }
-            acc.merge(section);
-            prev
-        } else {
-            let (section, prev) = parse_stream_section(data, off)?;
-            acc.merge(section);
-            prev
-        };
-        next = prev.and_then(|v| to_offset(v, data));
+        }
+        acc.merge(info.xref);
+        next = info.prev.and_then(|v| to_offset(v, data));
     }
     if acc.map.is_empty() {
         Err(Error::InvalidXref)
@@ -141,12 +147,41 @@ fn read_be(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0, |acc, &b| (acc << 8) | u64::from(b))
 }
 
+/// One parsed cross-reference section with its byte extents, for element
+/// iteration and for chain walkers that fetch byte ranges on demand.
+#[derive(Debug, Clone)]
+pub struct XrefSectionInfo {
+    /// This section's entries plus its trailer keys.
+    pub xref: Xref,
+    pub kind: XrefKind,
+    /// The trailer's `/Prev` value, when present.
+    pub prev: Option<i64>,
+    /// The classic trailer's `/XRefStm` value (hybrid files), when present.
+    pub xrefstm: Option<i64>,
+    /// Byte range of the section itself: the `xref` table (excluding its
+    /// trailer) or the whole cross-reference stream object.
+    pub span: Span,
+    /// Classic sections: byte range of `trailer << … >>`. Stream sections
+    /// have no separate trailer region.
+    pub trailer_span: Option<Span>,
+}
+
+/// Parses the cross-reference section at `off` — a classic table or a
+/// cross-reference stream — reporting entries, chain pointers, and spans.
+pub fn parse_section_at(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
+    let mut lexer = Lexer::at(data, off);
+    if matches!(lexer.peek_token(), Ok(Token::Keyword(ref k)) if k.as_slice() == b"xref") {
+        parse_classic(data, off)
+    } else {
+        parse_stream_section(data, off)
+    }
+}
+
 /// Parses a classic `xref` section at `off`: `start count` subsection
 /// headers, then `count` entries each of `offset gen n|f`, ending with
 /// `trailer` and its dictionary. Entries are read token-wise, so malformed
 /// 19- or 21-byte entry lines load just as well as conforming 20-byte ones.
-/// Returns the section plus the trailer's `/Prev` and `/XRefStm` values.
-fn parse_classic(data: &[u8], off: usize) -> Result<(Xref, Option<i64>, Option<i64>)> {
+fn parse_classic(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
     let mut lexer = Lexer::at(data, off);
     match lexer.next_token()? {
         Token::Keyword(ref k) if k.as_slice() == b"xref" => {}
@@ -188,6 +223,9 @@ fn parse_classic(data: &[u8], off: usize) -> Result<(Xref, Option<i64>, Option<i
                 }
             }
             Token::Keyword(ref k) if k.as_slice() == b"trailer" => {
+                // The keyword itself ends at lexer.pos(); back up its length
+                // to find where `trailer` (and thus the table span) starts.
+                let trailer_start = lexer.pos() - b"trailer".len();
                 let mut parser = Parser::at(data, lexer.pos());
                 let trailer = match parser.parse_object(&NoResolve)? {
                     Object::Dict(d) => d,
@@ -196,7 +234,14 @@ fn parse_classic(data: &[u8], off: usize) -> Result<(Xref, Option<i64>, Option<i
                 let prev = trailer.get_int("Prev");
                 let xrefstm = trailer.get_int("XRefStm");
                 section.trailer = trailer;
-                return Ok((section, prev, xrefstm));
+                return Ok(XrefSectionInfo {
+                    xref: section,
+                    kind: XrefKind::Table,
+                    prev,
+                    xrefstm,
+                    span: Span::new(off as u64, trailer_start as u64),
+                    trailer_span: Some(Span::new(trailer_start as u64, parser.pos() as u64)),
+                });
             }
             _ => return Err(Error::InvalidXref),
         }
@@ -207,10 +252,10 @@ fn parse_classic(data: &[u8], off: usize) -> Result<(Xref, Option<i64>, Option<i
 /// decoded data holds fixed-width big-endian fields laid out per `/W`; a
 /// zero-width type field defaults to type 1, `/Index` defaults to
 /// `[0 Size]`, and the stream's own dictionary is the section trailer.
-/// Returns the section plus the trailer's `/Prev` value.
-fn parse_stream_section(data: &[u8], off: usize) -> Result<(Xref, Option<i64>)> {
+fn parse_stream_section(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
     let mut parser = Parser::at(data, off);
     let (_, obj) = parser.parse_indirect(&NoResolve)?;
+    let end = parser.pos();
     let stream = match obj {
         Object::Stream(s) => s,
         _ => return Err(Error::InvalidXref),
@@ -282,7 +327,14 @@ fn parse_stream_section(data: &[u8], off: usize) -> Result<(Xref, Option<i64>)> 
     }
     let prev = dict.get_int("Prev");
     section.trailer = dict;
-    Ok((section, prev))
+    Ok(XrefSectionInfo {
+        xref: section,
+        kind: XrefKind::Stream,
+        prev,
+        xrefstm: None,
+        span: Span::new(off as u64, end as u64),
+        trailer_span: None,
+    })
 }
 
 /// Whole-file recovery: collects every `N G obj` header (the last
@@ -757,5 +809,67 @@ mod tests {
         assert_eq!(newer.get(3), Some(XrefEntry::InFile { offset: 30, gen: 1 }));
         assert_eq!(newer.trailer.get_int("Size"), Some(3));
         assert_eq!(newer.trailer.get_int("Info"), Some(7));
+    }
+
+    #[test]
+    fn iter_reports_every_entry() {
+        let data = pdfboss_testkit::simple_doc("iter");
+        let xref = load_xref(&data).unwrap();
+        let mut nums: Vec<u32> = xref.iter().map(|pair| pair.0).collect();
+        nums.sort_unstable();
+        assert_eq!(nums.len(), xref.len());
+        assert!(!xref.is_empty());
+        for (num, entry) in xref.iter() {
+            assert_eq!(xref.get(num), Some(entry));
+        }
+    }
+
+    #[test]
+    fn parse_section_at_classic_reports_spans() {
+        let data = pdfboss_testkit::simple_doc("spans");
+        // `rfind` would match inside `startxref` (which ends in "xref" and
+        // follows the real section); `find` finds the actual keyword.
+        let off = memchr::memmem::find(&data, b"xref").unwrap();
+        let info = parse_section_at(&data, off).unwrap();
+        assert_eq!(info.kind, crate::elements::XrefKind::Table);
+        assert!(info.prev.is_none());
+        assert!(info.xrefstm.is_none());
+        assert!(!info.xref.is_empty());
+        // The section span starts at `xref` and ends where the trailer begins.
+        assert_eq!(info.span.start, off as u64);
+        let tspan = info.trailer_span.expect("classic sections have a trailer");
+        assert_eq!(info.span.end, tspan.start);
+        assert!(data[tspan.start as usize..].starts_with(b"trailer"));
+        // Re-parsing the trailer region yields the same dictionary.
+        let mut parser = Parser::at(&data, tspan.start as usize + b"trailer".len());
+        let reparsed = parser.parse_object(&NoResolve).unwrap();
+        assert_eq!(
+            reparsed.as_dict().unwrap().get("Root"),
+            info.xref.trailer.get("Root")
+        );
+        assert!(tspan.end as usize <= data.len());
+    }
+
+    #[test]
+    fn parse_section_at_stream_reports_spans() {
+        let mut builder = pdfboss_testkit::PdfBuilder::new();
+        builder.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        builder.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        builder.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+        let data = builder.build_xref_stream(1);
+        let startxref = memchr::memmem::rfind(&data, b"startxref").unwrap();
+        let mut lexer = Lexer::at(&data, startxref + b"startxref".len());
+        let off = match lexer.next_token().unwrap() {
+            Token::Int(v) => v as usize,
+            other => panic!("expected startxref offset, got {other:?}"),
+        };
+        let info = parse_section_at(&data, off).unwrap();
+        assert_eq!(info.kind, crate::elements::XrefKind::Stream);
+        assert!(info.trailer_span.is_none());
+        assert_eq!(info.span.start, off as u64);
+        assert!(info.span.end > info.span.start && info.span.end as u64 <= data.len() as u64);
+        // The span covers the whole stream object.
+        let body = &data[info.span.start as usize..info.span.end as usize];
+        assert!(memchr::memmem::find(body, b"endstream").is_some());
     }
 }
