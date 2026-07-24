@@ -379,6 +379,91 @@ pub fn objstm_doc(extra: &[(u32, &str)]) -> Vec<u8> {
     out
 }
 
+/// A hybrid-reference file (ISO 32000 §7.5.8.4): a classic `xref` table
+/// whose trailer carries `/XRefStm`, pointing at a real `/Type /XRef`
+/// cross-reference stream — for readers that understand streams — while
+/// old readers fall back to the table alone.
+///
+/// The table hides the page's content stream (object 4) behind a free
+/// entry; only the hybrid stream reveals its real offset, so a correct
+/// reader must merge the hybrid stream *ahead of* the table (first-seen
+/// entries win) while still emitting the classic section before its hybrid
+/// stream section in physical file order. Catalog(1) -> Pages(2) -> Page(3)
+/// -> Content(4, hidden) -> Font(5); the hybrid stream is object 6.
+///
+/// Adapted (not shared code — each crate builds its own) from the private
+/// fixtures of the same shape in `pdfboss-core`'s
+/// `elements::tests::hybrid_xrefstm_doc` and `pdfboss-aio`'s
+/// `document::tests::hybrid_doc`.
+pub fn hybrid_doc() -> Vec<u8> {
+    let mut data = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = data.len();
+    data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let obj2 = data.len();
+    data.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let obj3 = data.len();
+    data.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let obj5 = data.len();
+    data.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+
+    // Object 4: the page's content stream. The classic table below marks it
+    // free; only the hybrid stream's entry reveals its real offset.
+    let obj4 = data.len();
+    let content = b"BT /F1 12 Tf 72 720 Td (hybrid) Tj ET";
+    data.extend_from_slice(
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+    );
+    data.extend_from_slice(content);
+    data.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Object 6: the hybrid `/Type /XRef` stream (`/W [1 4 2]`), carrying
+    // entries only for the objects it alone reveals: object 4 (the hidden
+    // content stream) and itself.
+    let stm_off = data.len();
+    let mut fields = Vec::new();
+    for offset in [obj4, stm_off] {
+        fields.push(1u8);
+        fields.extend_from_slice(&(offset as u32).to_be_bytes());
+        fields.extend_from_slice(&0u16.to_be_bytes());
+    }
+    data.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Index [4 1 6 1] \
+             /Root 1 0 R /Length {} >>\nstream\n",
+            fields.len()
+        )
+        .as_bytes(),
+    );
+    data.extend_from_slice(&fields);
+    data.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Classic table: objects 0..5 (object 6, the hybrid stream, is only
+    // ever described by its own self-entry above). Object 4 is free here —
+    // masked from readers that don't chase `/XRefStm`.
+    let classic_off = data.len();
+    data.extend_from_slice(b"xref\n0 6\n");
+    data.extend_from_slice(b"0000000000 65535 f\r\n"); // 0: free-list head
+    data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(format!("{obj2:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(format!("{obj3:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(b"0000000000 00001 f\r\n"); // 4: hidden
+    data.extend_from_slice(format!("{obj5:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R /XRefStm {stm_off} >>\n").as_bytes(),
+    );
+    data.extend_from_slice(format!("startxref\n{classic_off}\n%%EOF\n").as_bytes());
+    data
+}
+
 /// Builds the decoded payload and dictionary entries for an object stream
 /// (`/Type /ObjStm`) holding the given `(number, body)` pairs.
 ///

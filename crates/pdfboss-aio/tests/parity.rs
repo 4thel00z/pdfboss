@@ -7,13 +7,14 @@ use futures_util::StreamExt;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::ElementOpts;
 use pdfboss_core::{Document, ObjRef};
-use pdfboss_testkit::{multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
+use pdfboss_testkit::{hybrid_doc, multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
 use std::io::Write;
 
 fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     let mut fixtures = vec![
         ("simple", simple_doc("parity")),
         ("multi_page", multi_page_doc(&["alpha", "beta", "gamma"])),
+        ("hybrid", hybrid_doc()),
     ];
     let (dict, payload) = objstm_payload(&[
         (1, "<< /Type /Catalog /Pages 2 0 R >>"),
