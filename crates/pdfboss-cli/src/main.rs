@@ -3,10 +3,6 @@
 
 mod input;
 mod json;
-// `q` (value tree + jq engine) is consumed by the `q`/`json` subcommands
-// added in later plan-04 tasks; the `dead_code` allowance disappears once
-// they are wired up.
-#[allow(dead_code)]
 mod q;
 
 use pdfboss_core::pretty;
