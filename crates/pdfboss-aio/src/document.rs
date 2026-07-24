@@ -197,15 +197,12 @@ pub(crate) struct PageRecord {
     /// `None` for a page dict inlined directly into `/Kids` (no `ObjRef`
     /// exists for it). Consumed by the logical element layer building
     /// `Element::Page` (Plan 02 task 12).
-    #[allow(dead_code)]
     pub(crate) r: Option<ObjRef>,
     /// Consumed, with `r` above, by the logical element layer (Plan 02
     /// task 12).
-    #[allow(dead_code)]
     pub(crate) dict: Dict,
     /// Consumed, with `dict` above, by the logical element layer (Plan 02
     /// task 12).
-    #[allow(dead_code)]
     pub(crate) resources: Dict,
 }
 
@@ -1172,7 +1169,6 @@ impl AsyncDocument {
 
     /// The flattened record for the page at 0-based `index`. Consumed by
     /// the logical element layer (Plan 02 tasks 11-12).
-    #[allow(dead_code)]
     pub(crate) fn page_record(&self, index: usize) -> Option<PageRecord> {
         self.inner
             .pages
