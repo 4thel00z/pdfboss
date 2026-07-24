@@ -179,12 +179,6 @@ enum Stage {
     },
     StartXref,
     Eof,
-    // Constructed (with real values) at the physical→logical handoff, but
-    // not yet read anywhere: Task 8 fills in the logical-layer arm that
-    // actually inspects `page`/`part`. Until then this only transitions
-    // straight to `Done`, so rustc's dead_code lint sees the fields as
-    // written but never read.
-    #[allow(dead_code)]
     Logical {
         page: usize,
         part: PagePart,
@@ -192,10 +186,12 @@ enum Stage {
     Done,
 }
 
-/// Sub-state within one page during logical iteration (Task 8 fills the
-/// variants in; the physical layer only needs the entry point).
+/// Logical iteration works page-by-page: entering a page materializes that
+/// page's elements into a queue (bounded by one page), which then drains
+/// one `next()` at a time.
 enum PagePart {
     PageItself,
+    Drain { queue: VecDeque<Result<Element>> },
 }
 
 /// One object scheduled for physical iteration, pre-sorted by file position.
@@ -339,10 +335,63 @@ impl<'a> Iterator for Elements<'a> {
                         return Some(Ok(element));
                     }
                 }
-                Stage::Logical { .. } => {
-                    // Task 8 implements the logical layer; until then it ends
-                    // the iteration.
-                    self.stage = Stage::Done;
+                Stage::Logical { page, .. } => {
+                    if !self.opts.logical || *page >= self.doc.page_count() {
+                        self.stage = Stage::Done;
+                        continue;
+                    }
+                    let index = *page;
+                    let selected = self
+                        .opts
+                        .pages
+                        .as_ref()
+                        .map(|list| list.contains(&index))
+                        .unwrap_or(true);
+                    // Take `part` out of `self.stage` by value: the match
+                    // above holds `self.stage` mutably only through `page`
+                    // (an `&mut usize`, dropped by the copy above), so this
+                    // replace is the sole remaining borrow. Taking ownership
+                    // this way — rather than keeping a `&mut PagePart` live
+                    // across the `self.page_elements` call below — sidesteps
+                    // the same borrow conflict `Stage::Objects` avoids by
+                    // copying `num`/`entry` out before calling
+                    // `self.object_element`.
+                    let Stage::Logical { part, .. } =
+                        std::mem::replace(&mut self.stage, Stage::Done)
+                    else {
+                        unreachable!("just matched Stage::Logical");
+                    };
+                    match part {
+                        PagePart::PageItself => {
+                            if !selected {
+                                self.stage = Stage::Logical {
+                                    page: index + 1,
+                                    part: PagePart::PageItself,
+                                };
+                                continue;
+                            }
+                            let queue = self.page_elements(index);
+                            self.stage = Stage::Logical {
+                                page: index,
+                                part: PagePart::Drain { queue },
+                            };
+                        }
+                        PagePart::Drain { mut queue } => match queue.pop_front() {
+                            Some(item) => {
+                                self.stage = Stage::Logical {
+                                    page: index,
+                                    part: PagePart::Drain { queue },
+                                };
+                                return Some(item);
+                            }
+                            None => {
+                                self.stage = Stage::Logical {
+                                    page: index + 1,
+                                    part: PagePart::PageItself,
+                                };
+                            }
+                        },
+                    }
                 }
                 Stage::Done => return None,
             }
@@ -387,6 +436,109 @@ impl<'a> Elements<'a> {
                 })
             }
         }
+    }
+
+    /// Materializes one page's logical elements, in document order: the page
+    /// itself, fonts, images, annotations (content ops are appended by the
+    /// content-op stage when enabled). Broken pieces surface as `Err` items.
+    fn page_elements(&self, index: usize) -> VecDeque<Result<Element>> {
+        let mut queue = VecDeque::new();
+        let page = match self.doc.page(index) {
+            Ok(page) => page,
+            Err(err) => {
+                queue.push_back(Err(err));
+                return queue;
+            }
+        };
+        if let Some(r) = page.object_ref() {
+            queue.push_back(Ok(Element::Page { index, r }));
+        }
+        // Fonts: /Resources /Font — a dict of name → (usually) reference.
+        for (r, dict) in self.referenced_dict_entries(page.resources.get("Font")) {
+            let subtype = dict
+                .get_name("Subtype")
+                .cloned()
+                .unwrap_or_else(|| Name(String::new()));
+            let base_font = dict.get_name("BaseFont").cloned();
+            queue.push_back(Ok(Element::Font {
+                page: Some(index),
+                r,
+                subtype,
+                base_font,
+            }));
+        }
+        // Images: /Resources /XObject entries whose /Subtype is /Image.
+        for (r, dict) in self.referenced_dict_entries(page.resources.get("XObject")) {
+            if dict.get_name("Subtype").map(|n| n.0.as_str()) != Some("Image") {
+                continue;
+            }
+            let width = dict.get_int("Width").and_then(|v| u32::try_from(v).ok());
+            let height = dict.get_int("Height").and_then(|v| u32::try_from(v).ok());
+            queue.push_back(Ok(Element::Image {
+                page: Some(index),
+                r,
+                width: width.unwrap_or(0),
+                height: height.unwrap_or(0),
+            }));
+        }
+        // Annotations: the page dict's /Annots array of references.
+        if let Some(annots) = page.dict().get("Annots") {
+            if let Ok(Object::Array(items)) = self.doc.resolve(annots) {
+                for item in items {
+                    let Object::Ref(r) = item else { continue };
+                    let Ok(resolved) = self.doc.resolve(&Object::Ref(r)) else {
+                        continue;
+                    };
+                    let Some(dict) = resolved.as_dict() else {
+                        continue;
+                    };
+                    let subtype = dict
+                        .get_name("Subtype")
+                        .cloned()
+                        .unwrap_or_else(|| Name(String::new()));
+                    queue.push_back(Ok(Element::Annotation {
+                        page: index,
+                        r,
+                        subtype,
+                    }));
+                }
+            }
+        }
+        queue
+    }
+
+    /// Resolves a resource-category value (e.g. the `/Font` entry) to its
+    /// dictionary and yields, in name order, each entry that is a reference
+    /// to a dictionary or stream — as `(reference, dictionary)`. Entries
+    /// inlined without a reference are skipped (they have no identity to
+    /// report); name order keeps iteration deterministic.
+    fn referenced_dict_entries(&self, category: Option<&Object>) -> Vec<(ObjRef, Dict)> {
+        let Some(category) = category else {
+            return Vec::new();
+        };
+        let Ok(resolved) = self.doc.resolve(category) else {
+            return Vec::new();
+        };
+        let Some(dict) = resolved.as_dict() else {
+            return Vec::new();
+        };
+        let mut names: Vec<&Name> = dict.iter().map(|entry| entry.0).collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let Some(Object::Ref(r)) = dict.get(&name.0) else {
+                continue;
+            };
+            let r = *r;
+            let Ok(target) = self.doc.resolve(&Object::Ref(r)) else {
+                continue;
+            };
+            let Some(target_dict) = target.as_dict() else {
+                continue;
+            };
+            out.push((r, target_dict.clone()));
+        }
+        out
     }
 
     /// The file span of an object-stream container, parsed at most once.
@@ -808,5 +960,123 @@ mod tests {
             assert!(good.contains(&num), "object {num} still iterates");
         }
         assert!(items.iter().any(|i| matches!(i, Ok(Element::Eof { .. }))));
+    }
+
+    #[test]
+    fn logical_walk_reports_page_fonts_images_annots() {
+        let mut builder = pdfboss_testkit::PdfBuilder::new();
+        builder.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        builder.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        builder.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 6 0 R >> /XObject << /Im1 7 0 R >> >> \
+             /Annots [8 0 R] >>",
+        );
+        builder.object(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        builder.stream(
+            7,
+            "/Type /XObject /Subtype /Image /Width 2 /Height 3 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0, 1, 2, 3, 4, 5],
+        );
+        builder.object(8, "<< /Type /Annot /Subtype /Link >>");
+        let doc = Document::load(builder.build(1)).unwrap();
+
+        let opts = ElementOpts {
+            physical: false,
+            ..ElementOpts::default()
+        };
+        let elements: Vec<Element> = doc.elements(opts).collect::<Result<Vec<_>>>().unwrap();
+
+        let kinds: Vec<&str> = elements
+            .iter()
+            .map(|e| match e {
+                Element::Page { .. } => "page",
+                Element::Font { .. } => "font",
+                Element::Image { .. } => "image",
+                Element::Annotation { .. } => "annot",
+                other => panic!("unexpected element in logical-only walk: {other:?}"),
+            })
+            .collect();
+        assert_eq!(kinds, ["page", "font", "image", "annot"]);
+
+        let Element::Page { index, r } = &elements[0] else {
+            unreachable!()
+        };
+        assert_eq!(*index, 0);
+        assert_eq!(*r, ObjRef { num: 3, gen: 0 });
+        let Element::Font {
+            page,
+            r,
+            subtype,
+            base_font,
+        } = &elements[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*page, Some(0));
+        assert_eq!(*r, ObjRef { num: 6, gen: 0 });
+        assert_eq!(subtype.0, "Type1");
+        assert_eq!(base_font.as_ref().map(|n| n.0.as_str()), Some("Helvetica"));
+        let Element::Image {
+            page,
+            r,
+            width,
+            height,
+        } = &elements[2]
+        else {
+            unreachable!()
+        };
+        assert_eq!(*page, Some(0));
+        assert_eq!(*r, ObjRef { num: 7, gen: 0 });
+        assert_eq!((*width, *height), (2, 3));
+        let Element::Annotation { page, r, subtype } = &elements[3] else {
+            unreachable!()
+        };
+        assert_eq!(*page, 0);
+        assert_eq!(*r, ObjRef { num: 8, gen: 0 });
+        assert_eq!(subtype.0, "Link");
+    }
+
+    #[test]
+    fn pages_filter_restricts_logical_elements() {
+        let doc = Document::load(pdfboss_testkit::multi_page_doc(&["a", "b", "c"])).unwrap();
+        let opts = ElementOpts {
+            physical: false,
+            pages: Some(vec![1]),
+            ..ElementOpts::default()
+        };
+        let pages: Vec<usize> = doc
+            .elements(opts)
+            .filter_map(|item| match item {
+                Ok(Element::Page { index, .. }) => Some(index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pages, [1]);
+    }
+
+    #[test]
+    fn full_walk_yields_physical_then_logical() {
+        let doc = Document::load(pdfboss_testkit::simple_doc("both")).unwrap();
+        let elements: Vec<Element> = doc
+            .elements(ElementOpts::default())
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let eof_pos = elements
+            .iter()
+            .position(|e| matches!(e, Element::Eof { .. }))
+            .expect("eof present");
+        let first_page = elements
+            .iter()
+            .position(|e| matches!(e, Element::Page { .. }))
+            .expect("page present");
+        assert!(
+            first_page > eof_pos,
+            "logical elements follow physical ones"
+        );
+        // simple_doc has a /Font resource: it must surface.
+        assert!(elements.iter().any(|e| matches!(e, Element::Font { .. })));
     }
 }
