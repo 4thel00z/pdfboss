@@ -13,11 +13,13 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyIndexError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::IntoPyObjectExt;
 
-use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements};
+use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, XrefKind};
 use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Page as CorePage;
+use pdfboss_core::{Dict, Object};
 
 create_exception!(
     pdfboss,
@@ -57,6 +59,53 @@ fn kind_str(e: &CoreElement) -> &'static str {
 /// Formats a `(major, minor)` header version as `"major.minor"`.
 fn version_string(version: (u8, u8)) -> String {
     format!("{}.{}", version.0, version.1)
+}
+
+/// Converts a core [`Object`] to plain Python data: dict/list/str/bytes/
+/// int/float/bool/None. Names become `str`; strings decode as UTF-8 where
+/// valid, else stay `bytes`; streams become `{"dict": ..., "length": n}`
+/// (raw data length in bytes, data not materialized); indirect references
+/// become `{"ref": (num, gen)}`.
+fn object_to_py<'py>(py: Python<'py>, obj: &Object) -> PyResult<Bound<'py, PyAny>> {
+    match obj {
+        Object::Null => Ok(py.None().into_bound(py)),
+        Object::Bool(b) => (*b).into_bound_py_any(py),
+        Object::Int(i) => (*i).into_bound_py_any(py),
+        Object::Real(r) => (*r).into_bound_py_any(py),
+        Object::String(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => s.into_bound_py_any(py),
+            Err(_) => Ok(PyBytes::new(py, bytes).into_any()),
+        },
+        Object::Name(name) => name.0.as_str().into_bound_py_any(py),
+        Object::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(object_to_py(py, item)?)?;
+            }
+            Ok(list.into_any())
+        }
+        Object::Dict(dict) => Ok(dict_to_py(py, dict)?.into_any()),
+        Object::Stream(stream) => {
+            let out = PyDict::new(py);
+            out.set_item("dict", dict_to_py(py, &stream.dict)?)?;
+            out.set_item("length", stream.data.len())?;
+            Ok(out.into_any())
+        }
+        Object::Ref(r) => {
+            let out = PyDict::new(py);
+            out.set_item("ref", (r.num, r.gen))?;
+            Ok(out.into_any())
+        }
+    }
+}
+
+/// Converts a core [`Dict`] to a Python dict with name-string keys.
+fn dict_to_py<'py>(py: Python<'py>, dict: &Dict) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    for (key, value) in dict.iter() {
+        out.set_item(key.0.as_str(), object_to_py(py, value)?)?;
+    }
+    Ok(out)
 }
 
 /// Normalizes a possibly-negative sequence index against `count`.
@@ -436,6 +485,57 @@ impl Element {
             | CoreElement::Trailer { .. }
             | CoreElement::StartXref { .. }
             | CoreElement::Eof { .. } => None,
+        }
+    }
+
+    /// Lazily converts the element's payload to plain Python data:
+    /// dict/list/str/bytes/int/float/bool/None. Objects and the trailer
+    /// convert fully (names -> str, strings -> str where UTF-8-valid else
+    /// bytes, streams -> {"dict": ..., "length": int}, references ->
+    /// {"ref": (num, gen)}). Header -> the version string; xref ->
+    /// {"kind": ..., "entries": ...}; startxref -> int; font ->
+    /// {"subtype": ..., "base_font": ...}; image -> {"width": ...,
+    /// "height": ...}; annotation -> {"subtype": ...}; content ops -> the
+    /// operator rendered as a string; eof and page -> None.
+    fn value<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            CoreElement::Header { version, .. } => version_string(*version).into_bound_py_any(py),
+            CoreElement::IndirectObject { object, .. } => object_to_py(py, object),
+            CoreElement::XrefSection { kind, entries, .. } => {
+                let out = PyDict::new(py);
+                out.set_item(
+                    "kind",
+                    match kind {
+                        XrefKind::Table => "table",
+                        XrefKind::Stream => "stream",
+                    },
+                )?;
+                out.set_item("entries", *entries)?;
+                Ok(out.into_any())
+            }
+            CoreElement::Trailer { dict, .. } => Ok(dict_to_py(py, dict)?.into_any()),
+            CoreElement::StartXref { offset, .. } => (*offset).into_bound_py_any(py),
+            CoreElement::Eof { .. } | CoreElement::Page { .. } => Ok(py.None().into_bound(py)),
+            CoreElement::Font {
+                subtype, base_font, ..
+            } => {
+                let out = PyDict::new(py);
+                out.set_item("subtype", subtype.0.as_str())?;
+                out.set_item("base_font", base_font.as_ref().map(|n| n.0.as_str()))?;
+                Ok(out.into_any())
+            }
+            CoreElement::Image { width, height, .. } => {
+                let out = PyDict::new(py);
+                out.set_item("width", *width)?;
+                out.set_item("height", *height)?;
+                Ok(out.into_any())
+            }
+            CoreElement::Annotation { subtype, .. } => {
+                let out = PyDict::new(py);
+                out.set_item("subtype", subtype.0.as_str())?;
+                Ok(out.into_any())
+            }
+            CoreElement::ContentOp { op, .. } => format!("{op:?}").into_bound_py_any(py),
         }
     }
 }
