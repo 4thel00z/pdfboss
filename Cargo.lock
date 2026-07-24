@@ -799,6 +799,7 @@ name = "pdfboss-aio"
 version = "0.3.0"
 dependencies = [
  "bytes",
+ "flate2",
  "futures-core",
  "futures-util",
  "pdfboss-core",

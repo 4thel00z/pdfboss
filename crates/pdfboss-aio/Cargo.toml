@@ -22,3 +22,7 @@ http = ["dep:reqwest"]
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
 tokio = { workspace = true, features = ["macros", "net", "time"] }
+# Test-only: compresses fixture payloads for the indirect-/DecodeParms
+# parity test (crates/pdfboss-aio/tests/parity.rs), mirroring the mechanism
+# pdfboss-core's own filter tests use to build FlateDecode fixtures.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
