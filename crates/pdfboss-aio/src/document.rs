@@ -572,23 +572,43 @@ pub(crate) struct DocumentInner {
 impl AsyncDocument {
     /// Opens a file through a [`FileBackend`] wrapped in a
     /// [`CachedBackend`] with default capacity.
+    ///
+    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
+    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
+    /// `Document` transparently decrypts files opened under the empty user
+    /// password, but async decryption parity is a tracked follow-up.
     pub async fn open(path: impl AsRef<Path>) -> Result<AsyncDocument> {
         let backend = FileBackend::open(path).await.map_err(Error::from)?;
         AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend))).await
     }
 
     /// Opens an in-memory document through an uncached [`MemBackend`].
+    ///
+    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
+    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
+    /// `Document` transparently decrypts files opened under the empty user
+    /// password, but async decryption parity is a tracked follow-up.
     pub async fn from_bytes(bytes: impl Into<Bytes>) -> Result<AsyncDocument> {
         AsyncDocument::from_arc(Arc::new(MemBackend::from(bytes.into()))).await
     }
 
     /// Opens a document over any backend, as-is (no cache is added).
+    ///
+    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
+    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
+    /// `Document` transparently decrypts files opened under the empty user
+    /// password, but async decryption parity is a tracked follow-up.
     pub async fn with_backend(backend: impl Backend) -> Result<AsyncDocument> {
         AsyncDocument::from_arc(Arc::new(backend)).await
     }
 
     /// Opens a remote document over HTTP range requests, wrapped in a
     /// [`CachedBackend`] with default capacity.
+    ///
+    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
+    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
+    /// `Document` transparently decrypts files opened under the empty user
+    /// password, but async decryption parity is a tracked follow-up.
     #[cfg(feature = "http")]
     pub async fn open_url(url: impl reqwest::IntoUrl) -> Result<AsyncDocument> {
         let backend = crate::backend::HttpBackend::new(url).await?;
@@ -607,6 +627,14 @@ impl AsyncDocument {
         let header_span = header_span_in(&head);
         let (startxref, eof_span) = find_tail(&fetcher).await?;
         let (xref, sections) = load_xref_chain(&fetcher, startxref.offset).await?;
+        // A non-null /Encrypt trailer entry means every object in the file
+        // is still encrypted; mirrors the check shape in core's
+        // `Document::load`, but async decryption is not implemented (see
+        // the constructors' doc comments), so the document is rejected
+        // outright rather than opened with garbage reads.
+        if xref.trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
+            return Err(Error::Core(pdfboss_core::Error::Encrypted));
+        }
         let inner = DocumentInner {
             backend,
             file_len,
@@ -1272,7 +1300,10 @@ impl AsyncDocument {
     /// elements follow in document order (pages ascending, and within a
     /// page: fonts, images, annotations, then content ops if enabled).
     /// Nothing is fetched, parsed or decoded before it is yielded.
-    pub fn elements(&self, opts: ElementOpts) -> crate::stream::ElementStream<'_> {
+    ///
+    /// The returned stream owns a cheap `Arc` clone of this document rather
+    /// than borrowing it, so it is `'static` and outlives `self`.
+    pub fn elements(&self, opts: ElementOpts) -> crate::stream::ElementStream {
         crate::stream::element_stream(self, opts)
     }
 
@@ -2094,5 +2125,30 @@ mod tests {
         b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
         let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
         assert_eq!(doc.page_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn encrypted_documents_are_rejected_at_open() {
+        // A non-null /Encrypt trailer entry must reject the document before
+        // any object is read through it — otherwise every read would return
+        // still-encrypted garbage. The referenced object (9) is a
+        // plausible-but-dummy Standard-handler dict; its contents are never
+        // inspected because the check runs on the raw trailer entry itself.
+        let mut b = pdfboss_testkit::PdfBuilder::new().trailer_extra("/Encrypt 9 0 R");
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.object(
+            9,
+            "<< /Filter /Standard /V 1 /R 2 /O (dummydummydummydummydummydummyd) \
+             /U (dummydummydummydummydummydummyd) /P -3904 >>",
+        );
+        let data = b.build(1);
+        assert!(
+            matches!(
+                AsyncDocument::from_bytes(data).await,
+                Err(Error::Core(pdfboss_core::Error::Encrypted))
+            ),
+            "an encrypted document must be rejected at open, not opened with garbage reads"
+        );
     }
 }

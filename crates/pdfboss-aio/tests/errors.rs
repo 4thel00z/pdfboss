@@ -172,11 +172,10 @@ async fn backend_failure_after_open_surfaces_as_err() {
     // First, count how many reads are needed to open simple_doc.
     let data = simple_doc("after_open");
     let (counting_backend, count_arc) = CountingBackend::new(MemBackend::from(data.clone()));
-    let open_result = AsyncDocument::with_backend(counting_backend).await;
-    let _doc = match open_result {
-        Ok(d) => d,
-        Err(e) => panic!("failed to open during count phase: {e:?}"),
-    };
+    assert!(
+        AsyncDocument::with_backend(counting_backend).await.is_ok(),
+        "failed to open during count phase"
+    );
     let reads_for_open = count_arc.load(Ordering::SeqCst);
     assert!(
         reads_for_open > 0,

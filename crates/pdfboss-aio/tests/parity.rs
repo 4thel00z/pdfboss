@@ -30,7 +30,31 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     );
     b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (compressed) Tj ET");
     fixtures.push(("objstm", b.build_xref_stream(1)));
+    fixtures.push(("circular_font_ref", circular_font_ref_doc()));
     fixtures
+}
+
+/// A page whose `/Resources /Font /F1` entry is a self-referencing
+/// object (`6 0 R`'s own content is literally `6 0 R`): resolving it loops
+/// until the resolve-depth guard trips, yielding `Error::CircularReference`
+/// — the one way `AsyncDocument::resolve`/`Document::resolve` can ever fail
+/// on a resource-category entry (a missing or unreadable target instead
+/// resolves leniently to `Null`). Core's `referenced_dict_entries` silently
+/// skips such an entry (`let Ok(target) = ... else { continue }`); the
+/// async logical layer must match exactly rather than surfacing a salvage
+/// `Err`.
+fn circular_font_ref_doc() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 6 0 R >> >> /Contents 4 0 R >>",
+    );
+    b.stream(4, "", b"BT ET");
+    b.object(6, "6 0 R"); // self-reference: resolving /F1 hits CircularReference
+    b.build(1)
 }
 
 /// Debug digest of one side's element sequence. `Err` items collapse to
@@ -109,6 +133,36 @@ async fn full_element_sequences_are_identical() {
             assert_eq!(streamed, expected, "{name}: element sequence ({opts:?})");
         }
     }
+}
+
+#[tokio::test]
+async fn circular_font_ref_is_skipped_not_erred_on_both_sides() {
+    let data = circular_font_ref_doc();
+    let sync_doc = Document::load(data.clone()).unwrap();
+    let doc = AsyncDocument::from_bytes(data).await.unwrap();
+    let opts = ElementOpts {
+        physical: false,
+        logical: true,
+        pages: None,
+        content_ops: false,
+    };
+    let sync_digest = digest_sync(&sync_doc, opts.clone());
+    let async_digest = digest_async(&doc, opts).await;
+    assert_eq!(
+        async_digest, sync_digest,
+        "circular font ref: full element-sequence parity"
+    );
+    assert!(
+        !sync_digest.iter().any(|e| e == "ERR"),
+        "core silently skips the circular ref (no Err element): {sync_digest:?}"
+    );
+    assert!(
+        !async_digest.iter().any(|e| e == "ERR"),
+        "async must also silently skip (no salvage Err element): {async_digest:?}"
+    );
+    // Only the Page element remains: the circular font entry contributes
+    // nothing on either side.
+    assert_eq!(sync_digest.len(), 1, "digest: {sync_digest:?}");
 }
 
 // --- Controller-required extra: indirect /DecodeParms bridging ---

@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn duplicate_insert_does_not_double_count() {
         // Create a cache to test byte accounting
-        let (inner, _fetches) = counting(vec![0u8; 200]);
+        let (inner, _) = counting(vec![0u8; 200]);
         let cached = CachedBackend::with_capacity(inner, 64, 256);
 
         // Insert the same chunk twice directly
