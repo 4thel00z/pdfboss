@@ -107,8 +107,7 @@ enum Command {
     },
     /// Explore a PDF interactively in the terminal.
     Tui {
-        /// Path to the PDF file, or an http(s) URL (requires a build with
-        /// the `http` feature).
+        /// Path or http(s) URL of the PDF.
         target: String,
     },
     /// Dump the document as a JSON value tree (for piping to external tools).
@@ -493,22 +492,15 @@ fn cmd_tui(target: &str) -> Result<(), String> {
     })
 }
 
-/// Builds the async document: HTTP backend for URLs (behind the `http`
-/// feature), file backend otherwise.
+/// Builds the async document: the HTTP backend for URLs, the file backend
+/// otherwise -- exactly the split `json`/`hex`/`q` already make via
+/// `Input::open` (`pdfboss-aio`'s `http` feature is unconditionally on for
+/// this crate, so there is no cfg gate to make here).
 async fn open_async_document(target: &str) -> Result<pdfboss_aio::AsyncDocument, String> {
     if is_url(target) {
-        #[cfg(feature = "http")]
-        {
-            return pdfboss_aio::AsyncDocument::open_url(target)
-                .await
-                .map_err(|e| e.to_string());
-        }
-        #[cfg(not(feature = "http"))]
-        {
-            return Err("URL targets need pdfboss built with the `http` feature \
-                 (cargo build -p pdfboss-cli --features http)"
-                .to_string());
-        }
+        return pdfboss_aio::AsyncDocument::open_url(target)
+            .await
+            .map_err(|e| e.to_string());
     }
     pdfboss_aio::AsyncDocument::open(target)
         .await

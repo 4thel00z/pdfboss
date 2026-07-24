@@ -29,8 +29,6 @@ pdfboss-testkit = { path = "../pdfboss-testkit" }
 # enables the bundled substitute faces, without the caller needing to know
 # the non-obvious `--features pdfboss-render/substitute-fonts` spelling.
 substitute-fonts = ["pdfboss-render/substitute-fonts"]
-# Enables http(s) targets for `pdfboss tui` via the aio HTTP backend.
-http = ["pdfboss-aio/http"]
 
 [[bin]]
 name = "pdfboss"

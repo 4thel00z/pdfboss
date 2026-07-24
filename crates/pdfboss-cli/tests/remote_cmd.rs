@@ -1,5 +1,5 @@
-//! End-to-end tests for the `http(s)://` input path shared by `json`, `hex`
-//! and `q`. These drive the actual `pdfboss` binary against a minimal local
+//! End-to-end tests for the `http(s)://` input path shared by `json`, `hex`,
+//! `q` and `tui`. These drive the actual `pdfboss` binary against a minimal local
 //! HTTP range server, so the whole chain — URL detection, the aio HTTP
 //! backend, range requests, and the CLI's own bounds guard — runs for real.
 //!
@@ -211,4 +211,25 @@ fn q_over_url_basic() {
     let output = pdfboss(&["q", &url, ".header.version"]);
     assert!(output.status.success(), "q over url failed: {output:?}");
     assert_eq!(stdout_str(&output), "\"1.7\"\n");
+}
+
+/// `tui` must accept `http(s)://` targets unconditionally in the default
+/// build, exactly like `json`/`hex`/`q` above -- no opt-in cargo feature.
+/// No mock server needed: an unreachable loopback port still proves the
+/// point, since the failure must come from the aio HTTP backend actually
+/// being invoked (an "http:"-prefixed transport error), not from a
+/// feature-gate rejection that never touches the network.
+#[test]
+fn tui_over_unreachable_url_fails_with_http_error_not_a_feature_gate() {
+    let output = pdfboss(&["tui", "http://127.0.0.1:1/nope.pdf"]);
+    assert_eq!(output.status.code(), Some(1), "expected exit 1: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !err.contains("--features http"),
+        "tui must not require an opt-in http feature: {err}"
+    );
+    assert!(
+        err.contains("http:"),
+        "expected the aio HTTP backend's own transport error (\"http: ...\"), got: {err}"
+    );
 }
