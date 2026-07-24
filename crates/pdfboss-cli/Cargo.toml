@@ -16,6 +16,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 futures-core = "0.3"
+jaq-core = "2"
+jaq-std = "2"
+jaq-json = { version = "1", features = ["serde_json"] }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
