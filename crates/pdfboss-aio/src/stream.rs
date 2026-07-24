@@ -18,13 +18,15 @@ use pdfboss_core::{Dict, Name, ObjRef, Object};
 use crate::document::{AsyncDocument, PageRecord};
 use crate::error::{Error, Result};
 
-/// Async counterpart of core's sync element iterator. `Send`, so it can
-/// drive work on multi-threaded runtimes.
-pub struct ElementStream<'a> {
-    inner: BoxStream<'a, Result<Element>>,
+/// Async counterpart of core's sync element iterator. `Send + 'static`
+/// (it owns a cheap `Arc` clone of the document, not a borrow of it), so it
+/// can drive work on multi-threaded runtimes and outlive the call that
+/// created it — e.g. crossing a PyO3 binding boundary.
+pub struct ElementStream {
+    inner: BoxStream<'static, Result<Element>>,
 }
 
-impl<'a> futures_core::Stream for ElementStream<'a> {
+impl futures_core::Stream for ElementStream {
     type Item = Result<Element>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -54,8 +56,11 @@ enum WorkItem {
     PageContentOps(usize),
 }
 
-struct StreamState<'a> {
-    doc: &'a AsyncDocument,
+/// Owns a cheap `Arc` clone of the document (not a borrow): this is what
+/// lets [`ElementStream`] be `'static`, un-tethered from the `AsyncDocument`
+/// that created it.
+struct StreamState {
+    doc: AsyncDocument,
     work: VecDeque<WorkItem>,
     pending: VecDeque<Result<Element>>,
 }
@@ -63,9 +68,9 @@ struct StreamState<'a> {
 /// Builds the stream: the worklist is computed synchronously from state
 /// the open flow already holds (no fetches); each work item is executed
 /// only when the consumer polls for it.
-pub(crate) fn element_stream(doc: &AsyncDocument, opts: ElementOpts) -> ElementStream<'_> {
+pub(crate) fn element_stream(doc: &AsyncDocument, opts: ElementOpts) -> ElementStream {
     let state = StreamState {
-        doc,
+        doc: doc.clone(),
         work: build_worklist(doc, &opts),
         pending: VecDeque::new(),
     };
@@ -187,8 +192,8 @@ fn build_worklist(doc: &AsyncDocument, opts: &ElementOpts) -> VecDeque<WorkItem>
 
 /// Executes one work item, pushing its element(s) — or a salvage `Err` —
 /// into the pending queue.
-async fn produce(state: &mut StreamState<'_>, work: WorkItem) {
-    let doc = state.doc;
+async fn produce(state: &mut StreamState, work: WorkItem) {
+    let doc = state.doc.clone();
     match work {
         WorkItem::Header => {
             if let Some(span) = doc.header_span() {
@@ -269,87 +274,84 @@ async fn produce(state: &mut StreamState<'_>, work: WorkItem) {
 /// and images sorted by resource key name, annotations in `/Annots`
 /// order — adopted rule 7). Only entries that are indirect references
 /// yield elements; a font or annotation missing `/Subtype` still yields
-/// its element with an empty name (lenient, pinned by the core iterator);
-/// other shape problems skip; fetch failures push `Err` (salvage).
-async fn logical_resources(state: &mut StreamState<'_>, page: usize) {
-    let doc = state.doc;
+/// its element with an empty name (lenient, pinned by the core iterator).
+/// A resolve failure here can only be [`pdfboss_core::Error::CircularReference`]
+/// (a missing or unreadable target instead resolves leniently to `Null`);
+/// core's sync counterpart (`referenced_dict_entries`, the annotation loop)
+/// silently skips such an entry rather than surfacing it, so this mirrors
+/// that exactly — no salvage `Err` is pushed for it (CORE-PARITY).
+async fn logical_resources(state: &mut StreamState, page: usize) {
+    let doc = state.doc.clone();
     let Some(record) = doc.page_record(page) else {
         return;
     };
-    let font_dict = resolved_category_dict(doc, record.resources.get("Font")).await;
+    let font_dict = resolved_category_dict(&doc, record.resources.get("Font")).await;
     for value in sorted_dict_values(font_dict.as_ref()) {
         let Some(r) = value.as_ref() else { continue };
-        match doc.resolve(&value).await {
-            Ok(resolved) => {
-                let Some(dict) = resolved.as_dict() else {
-                    continue;
-                };
-                let subtype = dict
-                    .get_name("Subtype")
-                    .cloned()
-                    .unwrap_or_else(|| Name(String::new()));
-                let base_font = dict.get_name("BaseFont").cloned();
-                state.pending.push_back(Ok(Element::Font {
-                    page: Some(page),
-                    r,
-                    subtype,
-                    base_font,
-                }));
-            }
-            Err(err) => state.pending.push_back(Err(err)),
-        }
+        let Ok(resolved) = doc.resolve(&value).await else {
+            continue; // CircularReference: skip, matching core exactly
+        };
+        let Some(dict) = resolved.as_dict() else {
+            continue;
+        };
+        let subtype = dict
+            .get_name("Subtype")
+            .cloned()
+            .unwrap_or_else(|| Name(String::new()));
+        let base_font = dict.get_name("BaseFont").cloned();
+        state.pending.push_back(Ok(Element::Font {
+            page: Some(page),
+            r,
+            subtype,
+            base_font,
+        }));
     }
-    let xobject_dict = resolved_category_dict(doc, record.resources.get("XObject")).await;
+    let xobject_dict = resolved_category_dict(&doc, record.resources.get("XObject")).await;
     for value in sorted_dict_values(xobject_dict.as_ref()) {
         let Some(r) = value.as_ref() else { continue };
-        match doc.resolve(&value).await {
-            Ok(resolved) => {
-                let Some(dict) = resolved.as_dict() else {
-                    continue;
-                };
-                if dict.get_name("Subtype").map(|n| n.0.as_str()) != Some("Image") {
-                    continue; // form XObjects are not image elements
-                }
-                let width = dict_u32(dict, "Width");
-                let height = dict_u32(dict, "Height");
-                state.pending.push_back(Ok(Element::Image {
-                    page: Some(page),
-                    r,
-                    width,
-                    height,
-                }));
-            }
-            Err(err) => state.pending.push_back(Err(err)),
+        let Ok(resolved) = doc.resolve(&value).await else {
+            continue; // CircularReference: skip, matching core exactly
+        };
+        let Some(dict) = resolved.as_dict() else {
+            continue;
+        };
+        if dict.get_name("Subtype").map(|n| n.0.as_str()) != Some("Image") {
+            continue; // form XObjects are not image elements
         }
+        let width = dict_u32(dict, "Width");
+        let height = dict_u32(dict, "Height");
+        state.pending.push_back(Ok(Element::Image {
+            page: Some(page),
+            r,
+            width,
+            height,
+        }));
     }
     let annotations = match record.dict.get("Annots") {
         Some(value) => match doc.resolve(value).await {
             Ok(Object::Array(items)) => items,
-            Ok(_) => Vec::new(),
-            Err(err) => {
-                state.pending.push_back(Err(err));
-                Vec::new()
-            }
+            // Both a non-array result and a resolve failure
+            // (CircularReference) yield no annotations, matching core's
+            // `if let Ok(Object::Array(items)) = self.doc.resolve(annots)`.
+            _ => Vec::new(),
         },
         None => Vec::new(),
     };
     for item in annotations {
         let Some(r) = item.as_ref() else { continue };
-        match doc.resolve(&item).await {
-            Ok(resolved) => {
-                let Some(dict) = resolved.as_dict() else {
-                    continue;
-                };
-                let subtype = dict
-                    .get_name("Subtype")
-                    .cloned()
-                    .unwrap_or_else(|| Name(String::new()));
-                state
-                    .pending
-                    .push_back(Ok(Element::Annotation { page, r, subtype }));
-            }
-            Err(err) => state.pending.push_back(Err(err)),
-        }
+        let Ok(resolved) = doc.resolve(&item).await else {
+            continue; // CircularReference: skip, matching core exactly
+        };
+        let Some(dict) = resolved.as_dict() else {
+            continue;
+        };
+        let subtype = dict
+            .get_name("Subtype")
+            .cloned()
+            .unwrap_or_else(|| Name(String::new()));
+        state
+            .pending
+            .push_back(Ok(Element::Annotation { page, r, subtype }));
     }
 }
 
@@ -396,12 +398,12 @@ fn dict_u32(dict: &Dict, key: &str) -> u32 {
 /// is delegated to core's own `parse_content_spanned` — the exact function
 /// core's `page_elements` calls — so op/span boundaries (including inline
 /// images and unknown-operator drops) can never diverge from core.
-async fn content_ops(state: &mut StreamState<'_>, page: usize) {
-    let doc = state.doc;
+async fn content_ops(state: &mut StreamState, page: usize) {
+    let doc = state.doc.clone();
     let Some(record) = doc.page_record(page) else {
         return;
     };
-    let decoded = match page_content(doc, &record).await {
+    let decoded = match page_content(&doc, &record).await {
         Ok(decoded) => decoded,
         Err(err) => {
             state.pending.push_back(Err(err));
@@ -626,8 +628,14 @@ mod tests {
         fn assert_send<T: Send>(value: T) -> T {
             value
         }
+        // Proves `ElementStream` carries no borrow of the `AsyncDocument`
+        // that created it (Plan 03/PyO3 needs `'static + Send` streams).
+        fn requires_static<T: Send + 'static>(value: T) -> T {
+            value
+        }
         let doc = AsyncDocument::from_bytes(simple_doc("send")).await.unwrap();
-        let mut stream = assert_send(doc.elements(physical_opts()));
+        let mut stream = requires_static(assert_send(doc.elements(physical_opts())));
+        drop(doc); // the stream must not depend on `doc` staying alive
         assert!(stream.next().await.is_some());
     }
 

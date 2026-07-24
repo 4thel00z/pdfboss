@@ -231,15 +231,34 @@ impl Backend for HttpBackend {
                     }));
                 }
             }
-            let body = response.bytes().await.map_err(|err| {
-                http_io_error(crate::error::TransportMarker::Http {
-                    status: None,
-                    msg: format!("GET {} range {offset}-{last}: {err}", self.url),
-                })
-            })?;
-            let count = buf.len().min(body.len());
-            buf[..count].copy_from_slice(&body[..count]);
-            Ok(count)
+            // Collect at most `buf.len()` bytes of the body: a hostile (or
+            // merely buggy) server may answer a small Range with an
+            // arbitrarily large — or never-finishing — body, so the
+            // response is read chunk by chunk and collection stops the
+            // moment `buf` is full. The remaining body (and its
+            // connection) is simply dropped, never buffered; a body
+            // shorter than `buf` yields a short read (handled by the
+            // caller, `Fetcher::read_range`, exactly like any other
+            // short read).
+            use futures_util::StreamExt;
+            let mut chunks = response.bytes_stream();
+            let mut filled = 0usize;
+            while filled < buf.len() {
+                let chunk = match chunks.next().await {
+                    Some(Ok(chunk)) => chunk,
+                    Some(Err(err)) => {
+                        return Err(http_io_error(crate::error::TransportMarker::Http {
+                            status: None,
+                            msg: format!("GET {} range {offset}-{last}: {err}", self.url),
+                        }))
+                    }
+                    None => break, // body ended short of the requested range
+                };
+                let take = (buf.len() - filled).min(chunk.len());
+                buf[filled..filled + take].copy_from_slice(&chunk[..take]);
+                filled += take;
+            }
+            Ok(filled)
         })
     }
 }
