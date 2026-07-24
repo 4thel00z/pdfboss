@@ -1,0 +1,28 @@
+"""The type stubs must cover every name and method the package exports."""
+
+from pathlib import Path
+
+import pdfboss
+
+STUB = Path(__file__).parent.parent / "python" / "pdfboss" / "_pdfboss.pyi"
+
+
+def test_stub_declares_every_exported_class() -> None:
+    stub = STUB.read_text()
+    for name in pdfboss.__all__:
+        if name == "__version__":
+            continue
+        assert f"class {name}" in stub, f"missing stub for {name}"
+
+
+def test_stub_declares_the_element_and_async_surface() -> None:
+    stub = STUB.read_text()
+    assert "def elements(" in stub
+    assert "def value(self) -> object" in stub
+    assert "async def open(path: str | os.PathLike)" in stub
+    assert "async def open_url(url: str)" in stub
+    assert "async def from_bytes(data: bytes)" in stub
+    assert "async def metadata(self) -> dict[str, str]" in stub
+    assert "async def get_object(self, num: int, gen: int = 0)" in stub
+    assert "Iterator[Element]" in stub
+    assert "AsyncIterator[Element]" in stub
