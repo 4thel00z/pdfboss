@@ -208,7 +208,9 @@ impl TreeState {
     }
 
     /// Expands a branch node. Returns the load request the expansion needs
-    /// when its data has not been requested yet (and marks it Loading).
+    /// when its data has not been requested yet, or when a prior attempt
+    /// failed (and marks it Loading either way, so a re-expand after a
+    /// failure retries the load instead of bricking the section).
     pub fn expand(&mut self, id: NodeId) -> Option<TreeReq> {
         if !self.is_branch(id) {
             return None;
@@ -216,17 +218,24 @@ impl TreeState {
         self.nodes[id].expanded = true;
         let kind = self.nodes[id].kind.clone();
         match kind {
-            NodeKind::PagesFolder if self.logical == LoadState::NotLoaded => {
+            NodeKind::PagesFolder
+                if matches!(self.logical, LoadState::NotLoaded | LoadState::Failed) =>
+            {
                 self.logical = LoadState::Loading;
                 Some(TreeReq::Logical)
             }
             NodeKind::ObjectsFolder | NodeKind::XrefFolder
-                if self.physical == LoadState::NotLoaded =>
+                if matches!(self.physical, LoadState::NotLoaded | LoadState::Failed) =>
             {
                 self.physical = LoadState::Loading;
                 Some(TreeReq::Physical)
             }
-            NodeKind::ContentsFolder { page } if self.nodes[id].load == LoadState::NotLoaded => {
+            NodeKind::ContentsFolder { page }
+                if matches!(
+                    self.nodes[id].load,
+                    LoadState::NotLoaded | LoadState::Failed
+                ) =>
+            {
                 self.nodes[id].load = LoadState::Loading;
                 Some(TreeReq::Contents { page })
             }
@@ -253,6 +262,17 @@ impl TreeState {
 
     /// Collapses an expanded branch; on a leaf or collapsed node, moves the
     /// selection to the parent instead. Returns true when anything changed.
+    ///
+    /// Note: this unconditionally retargets `self.selected` to `id`'s parent
+    /// on the leaf/collapsed path, regardless of what was selected before the
+    /// call. Callers driving this from a "collapse the current selection" key
+    /// binding should pass the *currently selected* node; passing an
+    /// unrelated ancestor teleports selection there instead. Separately, if a
+    /// caller collapses a branch that is an ancestor of `self.selected`
+    /// without moving the selection first, the selected node becomes hidden
+    /// and `selected_position`'s `unwrap_or(0)` fallback silently treats it
+    /// as row 0 on the next `select_next`/`select_prev` — callers must
+    /// re-clamp `selected` to a currently visible row after any collapse.
     pub fn collapse_or_parent(&mut self, id: NodeId) -> bool {
         if self.is_branch(id) && self.nodes[id].expanded {
             self.nodes[id].expanded = false;
@@ -268,7 +288,16 @@ impl TreeState {
     }
 
     /// Applies a streamed element batch to the section `req` covers.
+    ///
+    /// Idempotent per section: a batch delivered again after its section
+    /// already finished loading (e.g. a duplicate delivery from the
+    /// background runner) is a no-op rather than re-adding every node.
     pub fn apply_batch(&mut self, req: TreeReq, elements: &[Element], done: bool) {
+        match req {
+            TreeReq::Physical if self.physical == LoadState::Loaded => return,
+            TreeReq::Logical if self.logical == LoadState::Loaded => return,
+            TreeReq::Physical | TreeReq::Logical | TreeReq::Contents { .. } => {}
+        }
         for element in elements {
             match element {
                 Element::Header { version, span } => {
@@ -351,6 +380,12 @@ impl TreeState {
                         },
                     );
                 }
+                // Font/Image/Annotation all rely on the producer guarantee
+                // that a page's `Element::Page` arrives before its
+                // fonts/images/annotations (core's `page_elements` emits the
+                // page first, in document order). An element whose page
+                // hasn't been seen yet finds no entry in `page_folders` and
+                // is silently dropped rather than queued.
                 Element::Font {
                     page: Some(page),
                     r,
@@ -423,10 +458,16 @@ impl TreeState {
     }
 
     /// Fills a page's Contents folder with its stream refs.
+    ///
+    /// Idempotent: a page whose Contents folder is already `Loaded` is left
+    /// untouched, so a duplicate delivery does not duplicate stream nodes.
     pub fn apply_contents(&mut self, page: usize, refs: &[ObjRef]) {
         let Some(folders) = self.page_folders.get(&page).copied() else {
             return;
         };
+        if self.nodes[folders.contents].load == LoadState::Loaded {
+            return;
+        }
         for r in refs {
             self.add(Some(folders.contents), NodeKind::ContentsStream { r: *r });
         }
@@ -984,5 +1025,41 @@ mod tests {
         tree.expand(tree.objects_folder);
         tree.mark_failed(TreeReq::Physical);
         assert_eq!(tree.physical, LoadState::Failed);
+    }
+
+    #[test]
+    fn reapplying_a_batch_is_a_no_op() {
+        let mut tree = TreeState::new((1, 7), 1);
+        tree.apply_batch(TreeReq::Physical, &physical_batch(), true);
+        tree.apply_batch(TreeReq::Logical, &logical_batch(), true);
+        tree.expand(tree.objects_folder);
+        tree.expand(tree.xref_folder);
+        tree.expand(tree.pages_folder);
+        let page_id = tree.node(tree.pages_folder).children[0];
+        tree.expand(page_id);
+        let before = tree.visible_rows();
+
+        tree.apply_batch(TreeReq::Physical, &physical_batch(), true);
+        tree.apply_batch(TreeReq::Logical, &logical_batch(), true);
+        let after = tree.visible_rows();
+
+        assert_eq!(
+            before, after,
+            "reapplying an already-loaded batch must not duplicate nodes"
+        );
+    }
+
+    #[test]
+    fn failed_section_can_be_retried_by_expanding() {
+        let mut tree = TreeState::new((1, 7), 1);
+        assert_eq!(tree.expand(tree.objects_folder), Some(TreeReq::Physical));
+        tree.mark_failed(TreeReq::Physical);
+        assert_eq!(tree.physical, LoadState::Failed);
+        assert_eq!(
+            tree.expand(tree.objects_folder),
+            Some(TreeReq::Physical),
+            "re-expanding a failed section must re-request its load"
+        );
+        assert_eq!(tree.physical, LoadState::Loading);
     }
 }
