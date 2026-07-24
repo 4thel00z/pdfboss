@@ -4,6 +4,8 @@
 //! images, annotations, content operators). ISO 32000 §7.5 (file structure)
 //! and §7.7 (document structure).
 
+use std::collections::VecDeque;
+
 use crate::content::Op;
 use crate::document::Document;
 use crate::error::{Error, Result};
@@ -164,7 +166,10 @@ enum Stage {
         next: usize,
     },
     Sections {
-        next_offset: Option<usize>,
+        /// Offsets still to visit: the newest section first, then each
+        /// section's hybrid `/XRefStm` (queued right after that section, so
+        /// it is visited before the `/Prev` chain continues), then `/Prev`.
+        pending: VecDeque<usize>,
         visited: Vec<usize>,
         /// Newest classic trailer span, or newest stream-section span.
         trailer_span: Option<Span>,
@@ -226,7 +231,9 @@ impl<'a> Iterator for Elements<'a> {
                     if *next >= order.len() {
                         self.stage = if self.opts.physical {
                             Stage::Sections {
-                                next_offset: find_startxref_offset(self.doc.bytes()),
+                                pending: find_startxref_offset(self.doc.bytes())
+                                    .into_iter()
+                                    .collect(),
                                 visited: Vec::new(),
                                 trailer_span: None,
                             }
@@ -252,21 +259,18 @@ impl<'a> Iterator for Elements<'a> {
                     return Some(self.object_element(num, entry));
                 }
                 Stage::Sections {
-                    next_offset,
+                    pending,
                     visited,
                     trailer_span,
                 } => {
-                    let Some(off) = *next_offset else {
+                    let Some(off) = pending.pop_front() else {
                         self.stage = Stage::Trailer {
                             span: *trailer_span,
                         };
                         continue;
                     };
                     if visited.contains(&off) {
-                        self.stage = Stage::Trailer {
-                            span: *trailer_span,
-                        };
-                        continue;
+                        continue; // already visited via another path; skip
                     }
                     visited.push(off);
                     match parse_section_at(self.doc.bytes(), off) {
@@ -274,10 +278,27 @@ impl<'a> Iterator for Elements<'a> {
                             if trailer_span.is_none() {
                                 *trailer_span = info.trailer_span.or(Some(info.span));
                             }
-                            *next_offset = info
+                            let bytes_len = self.doc.bytes().len();
+                            // Hybrid files: the classic trailer's /XRefStm
+                            // names a supplementary cross-reference stream at
+                            // the same revision. Queue it right after this
+                            // section (and ahead of /Prev) so it is visited
+                            // before the chain walks further back; stream
+                            // sections never carry an /XRefStm of their own.
+                            if let Some(xs) = info
+                                .xrefstm
+                                .and_then(|v| usize::try_from(v).ok())
+                                .filter(|&o| o < bytes_len && !visited.contains(&o))
+                            {
+                                pending.push_back(xs);
+                            }
+                            if let Some(prev) = info
                                 .prev
                                 .and_then(|v| usize::try_from(v).ok())
-                                .filter(|&o| o < self.doc.bytes().len());
+                                .filter(|&o| o < bytes_len && !visited.contains(&o))
+                            {
+                                pending.push_back(prev);
+                            }
                             let element = Element::XrefSection {
                                 kind: info.kind,
                                 span: info.span,
@@ -287,8 +308,8 @@ impl<'a> Iterator for Elements<'a> {
                         }
                         Err(err) => {
                             // Salvage: report the broken section, then stop
-                            // walking the chain.
-                            *next_offset = None;
+                            // walking the whole chain.
+                            pending.clear();
                             return Some(Err(err));
                         }
                     }
@@ -673,6 +694,86 @@ mod tests {
         // No classic trailer keyword exists: the trailer span is the newest
         // xref stream object's span.
         assert_eq!(trailer.1, section.1);
+    }
+
+    /// Builds a minimal hybrid-reference file: a classic `xref` table whose
+    /// trailer names `/XRefStm`, pointing at a separate cross-reference
+    /// stream object. Adapted from (not shared with) the hybrid fixture in
+    /// `xref::tests`, which is private to its own test module.
+    fn hybrid_xrefstm_doc() -> Vec<u8> {
+        let mut data = b"%PDF-1.5\n".to_vec();
+        let obj1 = data.len();
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        let obj2 = data.len();
+        data.extend_from_slice(b"2 0 obj\n(hidden)\nendobj\n");
+        let stm_off = data.len();
+        let mut fields = Vec::new();
+        for offset in [obj2, stm_off] {
+            fields.push(1u8);
+            fields.extend_from_slice(&(offset as u32).to_be_bytes());
+            fields.extend_from_slice(&0u16.to_be_bytes());
+        }
+        data.extend_from_slice(
+            format!(
+                "3 0 obj\n<< /Type /XRef /Size 4 /W [1 4 2] /Index [2 1 3 1] \
+                 /Root 1 0 R /Length {} >>\nstream\n",
+                fields.len()
+            )
+            .as_bytes(),
+        );
+        data.extend_from_slice(&fields);
+        data.extend_from_slice(b"\nendstream\nendobj\n");
+        let classic_off = data.len();
+        data.extend_from_slice(b"xref\n0 3\n0000000000 65535 f\r\n");
+        data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+        data.extend_from_slice(b"0000000000 00001 f\r\n"); // object 2 hidden
+        data.extend_from_slice(
+            format!("trailer\n<< /Size 4 /Root 1 0 R /XRefStm {stm_off} >>\n").as_bytes(),
+        );
+        data.extend_from_slice(format!("startxref\n{classic_off}\n%%EOF\n").as_bytes());
+        data
+    }
+
+    #[test]
+    fn hybrid_xrefstm_yields_both_sections() {
+        let data = hybrid_xrefstm_doc();
+        let doc = Document::load(data).unwrap();
+        let elements = physical(&doc);
+
+        let sections: Vec<XrefKind> = elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::XrefSection { kind, .. } => Some(*kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sections,
+            [XrefKind::Table, XrefKind::Stream],
+            "classic section first, then its hybrid /XRefStm section"
+        );
+
+        let trailers: Vec<Span> = elements
+            .iter()
+            .filter_map(|e| match e {
+                Element::Trailer { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trailers.len(), 1, "exactly one trailer element");
+
+        // Independently re-derive the classic section's trailer region and
+        // confirm the emitted Trailer element's span matches it exactly.
+        let startxref = memchr::memmem::rfind(doc.bytes(), b"startxref").unwrap();
+        let mut lexer = Lexer::at(doc.bytes(), startxref + b"startxref".len());
+        let classic_off = match lexer.next_token().unwrap() {
+            Token::Int(v) => v as usize,
+            other => panic!("expected startxref offset, got {other:?}"),
+        };
+        let info = parse_section_at(doc.bytes(), classic_off).unwrap();
+        assert_eq!(info.kind, XrefKind::Table);
+        let expected_trailer_span = info.trailer_span.expect("classic section has a trailer");
+        assert_eq!(trailers[0], expected_trailer_span);
     }
 
     #[test]
