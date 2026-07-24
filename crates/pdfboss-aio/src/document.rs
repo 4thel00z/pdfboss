@@ -10,11 +10,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use pdfboss_core::elements::{Span, XrefKind};
 use pdfboss_core::lexer::{Lexer, Token};
-use pdfboss_core::parser::{NoResolve, Parser};
+use pdfboss_core::parser::{NoResolve, Parser, Resolve};
 use pdfboss_core::xref::XrefEntry;
-use pdfboss_core::{Dict, Object};
+use pdfboss_core::{Dict, ObjRef, Object, Stream};
 
-use crate::backend::{Backend, FileBackend, MemBackend};
+use crate::backend::{Backend, BoxFuture, FileBackend, MemBackend};
 use crate::cache::CachedBackend;
 use crate::error::{Error, Result};
 
@@ -498,8 +498,6 @@ fn non_negative(value: i64) -> Option<u64> {
 /// Merged cross-reference entries plus the merged trailer, mirroring the
 /// sync loader's newest-wins semantics.
 pub(crate) struct XrefIndex {
-    /// Consumed by `get_object`/`resolve` (Plan 02 task 8).
-    #[allow(dead_code)]
     pub(crate) entries: HashMap<u32, XrefEntry>,
     /// Consumed, with `trailer_span` below, by a `merged_trailer()`
     /// accessor (Plan 02 task 11).
@@ -524,13 +522,7 @@ pub struct AsyncDocument {
 }
 
 pub(crate) struct DocumentInner {
-    /// Read through `fetcher()`; consumed by `get_object`/`resolve` (Plan 02
-    /// task 8).
-    #[allow(dead_code)]
     pub(crate) backend: Arc<dyn Backend>,
-    /// Read through `fetcher()`; consumed by `get_object`/`resolve` (Plan 02
-    /// task 8).
-    #[allow(dead_code)]
     pub(crate) file_len: u64,
     pub(crate) version: (u8, u8),
     /// Span of the `%PDF-` header run; `None` when the first 1 KiB holds
@@ -539,9 +531,6 @@ pub(crate) struct DocumentInner {
     /// stream's physical layer (Plan 02 task 11).
     #[allow(dead_code)]
     pub(crate) header_span: Option<Span>,
-    /// Consumed by `get_object`/`resolve` reading `xref.entries` (Plan 02
-    /// task 8).
-    #[allow(dead_code)]
     pub(crate) xref: XrefIndex,
     /// Sections in chain order — newest→oldest — for the element stream.
     /// Exposed by a `sections()` accessor consumed by the element stream's
@@ -556,6 +545,13 @@ pub(crate) struct DocumentInner {
     /// physical layer (Plan 02 task 11).
     #[allow(dead_code)]
     pub(crate) eof_span: Option<Span>,
+    /// Cache of fetched indirect objects.
+    pub(crate) objects: std::sync::Mutex<HashMap<(u32, u16), Arc<Object>>>,
+    /// Decoded object streams, keyed by container number, so a resident
+    /// container is fetched, decoded and header-parsed once. The map lock
+    /// is never held across a fetch (no deadlocks on nested containers);
+    /// concurrent misses may decode twice, and the first insert wins.
+    pub(crate) objstms: tokio::sync::Mutex<HashMap<u32, Arc<ObjStmCache>>>,
 }
 
 impl AsyncDocument {
@@ -597,6 +593,8 @@ impl AsyncDocument {
             sections,
             startxref,
             eof_span,
+            objects: std::sync::Mutex::new(HashMap::new()),
+            objstms: tokio::sync::Mutex::new(HashMap::new()),
         };
         Ok(AsyncDocument {
             inner: Arc::new(inner),
@@ -609,12 +607,487 @@ impl AsyncDocument {
     }
 
     /// A fetch helper bound to this document's backend.
-    #[allow(dead_code)] // consumed by get_object/resolve (Plan 02 task 8)
     pub(crate) fn fetcher(&self) -> Fetcher {
         Fetcher {
             backend: Arc::clone(&self.inner.backend),
             len: self.inner.file_len,
         }
+    }
+}
+
+/// Initial object window, doubling until the object parses completely.
+const OBJECT_WINDOW: usize = 2048;
+/// Reference-chase depth limit, mirroring the sync document model.
+const MAX_RESOLVE_DEPTH: usize = 32;
+
+/// Resolver for window parsing: answers the one known `/Length` value and
+/// records the first reference it could not answer, so the caller can
+/// fetch it and re-parse.
+struct LengthProbe {
+    known: Option<(ObjRef, i64)>,
+    missing: std::cell::Cell<Option<ObjRef>>,
+}
+
+impl LengthProbe {
+    fn new(known: Option<(ObjRef, i64)>) -> LengthProbe {
+        LengthProbe {
+            known,
+            missing: std::cell::Cell::new(None),
+        }
+    }
+
+    fn missing(&self) -> Option<ObjRef> {
+        self.missing.get()
+    }
+}
+
+impl Resolve for LengthProbe {
+    fn resolve_ref(&self, r: ObjRef) -> Option<Object> {
+        match self.known {
+            Some((known_ref, value)) if known_ref == r => Some(Object::Int(value)),
+            _ => {
+                if self.missing.get().is_none() {
+                    self.missing.set(Some(r));
+                }
+                None
+            }
+        }
+    }
+}
+
+/// True when `object` is a stream whose declared `/Length` (direct, or the
+/// known indirect value) does not match the bytes the parser captured —
+/// the signature of a stream cut by the window edge, which fell into the
+/// lenient recovery path the sync parser would not have taken.
+fn stream_dishonors_length(object: &Object, known_length: Option<(ObjRef, i64)>) -> bool {
+    let Some(stream) = object.as_stream() else {
+        return false;
+    };
+    let declared = match stream.dict.get("Length") {
+        Some(Object::Int(n)) => Some(*n),
+        Some(Object::Ref(r)) => {
+            known_length.and_then(|(known_ref, value)| (known_ref == *r).then_some(value))
+        }
+        _ => None,
+    };
+    match declared {
+        Some(length) if length >= 0 => stream.data.len() as u64 != length as u64,
+        _ => false,
+    }
+}
+
+/// Human-readable object type name for error messages.
+fn object_type_name(o: &Object) -> &'static str {
+    match o {
+        Object::Null => "null",
+        Object::Bool(_) => "boolean",
+        Object::Int(_) => "integer",
+        Object::Real(_) => "real",
+        Object::String(_) => "string",
+        Object::Name(_) => "name",
+        Object::Array(_) => "array",
+        Object::Dict(_) => "dictionary",
+        Object::Stream(_) => "stream",
+        Object::Ref(_) => "reference",
+    }
+}
+
+/// A fetched and decoded object stream: the container's physical span, the
+/// decoded bytes, and each member's number and offset (ISO 32000 §7.5.7).
+pub(crate) struct ObjStmCache {
+    /// Consumed by the element stream's physical layer (Plan 02 tasks
+    /// 9-12).
+    #[allow(dead_code)]
+    pub(crate) container: ObjRef,
+    /// Consumed, with `container` above, by the element stream's physical
+    /// layer (Plan 02 tasks 9-12).
+    #[allow(dead_code)]
+    pub(crate) container_span: Span,
+    first: usize,
+    data: Vec<u8>,
+    /// (object number, offset relative to `first`) per member, in header
+    /// order.
+    pub(crate) members: Vec<(u32, usize)>,
+}
+
+impl ObjStmCache {
+    /// Parses member `index` out of the decoded bytes.
+    pub(crate) fn object(&self, index: u32) -> Result<Object> {
+        let start = self.member_start(index)?;
+        Parser::at(&self.data, start)
+            .parse_object(&NoResolve)
+            .map_err(Error::Core)
+    }
+
+    /// Member `index`'s byte range within the decoded stream: from its
+    /// header offset to the parser position after its last token.
+    /// Consumed by the element stream's physical layer (Plan 02 tasks
+    /// 9-12).
+    #[allow(dead_code)]
+    pub(crate) fn member_span(&self, index: u32) -> Result<Span> {
+        let start = self.member_start(index)?;
+        let mut parser = Parser::at(&self.data, start);
+        parser.parse_object(&NoResolve).map_err(Error::Core)?;
+        Ok(Span {
+            start: start as u64,
+            end: parser.pos() as u64,
+        })
+    }
+
+    /// Absolute start of member `index` within the decoded bytes.
+    fn member_start(&self, index: u32) -> Result<usize> {
+        let offset = self
+            .members
+            .get(index as usize)
+            .map(|entry| entry.1)
+            .ok_or_else(|| {
+                Error::Core(pdfboss_core::Error::Other(format!(
+                    "object stream index {index} out of range (N = {})",
+                    self.members.len()
+                )))
+            })?;
+        self.first
+            .checked_add(offset)
+            .filter(|&pos| pos <= self.data.len())
+            .ok_or_else(|| {
+                Error::Core(pdfboss_core::Error::Other(format!(
+                    "object stream offset {offset} lies outside the stream"
+                )))
+            })
+    }
+}
+
+/// Parses the object-stream header: `2*n` integers, pairs of object number
+/// and byte offset relative to `/First` (ISO 32000 §7.5.7).
+fn parse_objstm_header(data: &[u8], n: usize) -> Result<Vec<(u32, usize)>> {
+    let mut lexer = Lexer::new(data);
+    let mut members = Vec::with_capacity(n);
+    for _ in 0..n {
+        let num = expect_header_int(&mut lexer)?;
+        let offset = expect_header_int(&mut lexer)?;
+        members.push((u32::try_from(num).unwrap_or(u32::MAX), offset));
+    }
+    Ok(members)
+}
+
+/// Reads one non-negative integer from the object-stream header.
+fn expect_header_int(lexer: &mut Lexer) -> Result<usize> {
+    match lexer.next_token().map_err(Error::Core)? {
+        Token::Int(v) if v >= 0 => Ok(v as usize),
+        _ => Err(Error::Core(pdfboss_core::Error::Syntax {
+            offset: lexer.pos(),
+            msg: "malformed object stream header".to_string(),
+        })),
+    }
+}
+
+/// A [`Resolve`] over a prefetched reference map.
+struct MapResolve(HashMap<ObjRef, Object>);
+
+impl Resolve for MapResolve {
+    fn resolve_ref(&self, r: ObjRef) -> Option<Object> {
+        self.0.get(&r).cloned()
+    }
+}
+
+impl AsyncDocument {
+    /// Fetches an indirect object by reference (xref lookup, object-stream
+    /// indirection, cached). A generation mismatch between the request and
+    /// the file is tolerated (lenient), mirroring the sync document.
+    pub async fn get_object(&self, r: ObjRef) -> Result<Object> {
+        let mut chain = Vec::new();
+        self.fetch_object_cached(r, &mut chain).await
+    }
+
+    /// Chases reference chains with a depth guard (beyond that:
+    /// `CircularReference`); a reference to a missing or unreadable object
+    /// resolves to `Null` (lenient), mirroring the sync document.
+    pub async fn resolve(&self, o: &Object) -> Result<Object> {
+        let mut chain = Vec::new();
+        self.resolve_with_chain(o, &mut chain).await
+    }
+
+    /// Cached fetch. `chain` carries the object numbers currently being
+    /// loaded up this call path, guarding re-entrant fetches (e.g. a
+    /// stream whose `/Length` refers back to the stream itself) without
+    /// blocking unrelated concurrent fetches of the same object.
+    pub(crate) fn fetch_object_cached<'a>(
+        &'a self,
+        r: ObjRef,
+        chain: &'a mut Vec<u32>,
+    ) -> BoxFuture<'a, Result<Object>> {
+        Box::pin(async move {
+            if let Some(cached) = self
+                .inner
+                .objects
+                .lock()
+                .expect("object cache mutex")
+                .get(&(r.num, r.gen))
+            {
+                return Ok((**cached).clone());
+            }
+            if chain.contains(&r.num) {
+                return Err(Error::Core(pdfboss_core::Error::CircularReference(r.num)));
+            }
+            chain.push(r.num);
+            let outcome = self.load_object(r, chain).await;
+            chain.pop();
+            let object = outcome?;
+            self.inner
+                .objects
+                .lock()
+                .expect("object cache mutex")
+                .insert((r.num, r.gen), Arc::new(object.clone()));
+            Ok(object)
+        })
+    }
+
+    /// Uncached fetch: parses the object at its file offset or extracts it
+    /// from its containing object stream.
+    async fn load_object(&self, r: ObjRef, chain: &mut Vec<u32>) -> Result<Object> {
+        match self.inner.xref.entries.get(&r.num).copied() {
+            None | Some(XrefEntry::Free) => Err(Error::Core(pdfboss_core::Error::ObjectNotFound(
+                r.num, r.gen,
+            ))),
+            Some(XrefEntry::InFile { offset, .. }) => {
+                let parsed = self.parse_in_file(offset, chain).await?;
+                Ok(parsed.1)
+            }
+            Some(XrefEntry::InStream { stream_num, index }) => {
+                let cache = self.objstm_cache_with_chain(stream_num, chain).await?;
+                cache.object(index)
+            }
+        }
+    }
+
+    /// Parses the indirect object at `offset` from a growing window (2 KiB
+    /// doubling), returning the object and its physical span
+    /// (`N G obj … endobj`, end-exclusive). An indirect `/Length` triggers
+    /// exactly one extra object fetch, then a re-parse with the value
+    /// known. The parse is only accepted when it provably matches what the
+    /// sync parser would produce on the whole file: slack after the parse
+    /// end (or true end of file), and stream data honoring its declared
+    /// length.
+    pub(crate) async fn parse_in_file(
+        &self,
+        offset: u64,
+        chain: &mut Vec<u32>,
+    ) -> Result<(Span, Object)> {
+        if offset >= self.inner.file_len {
+            return Err(Error::Core(pdfboss_core::Error::Other(format!(
+                "object offset {offset} lies outside the file"
+            ))));
+        }
+        let fetcher = self.fetcher();
+        let mut window = OBJECT_WINDOW;
+        let mut known_length: Option<(ObjRef, i64)> = None;
+        loop {
+            let buf = fetcher.window(offset, window).await?;
+            let at_eof = offset + buf.len() as u64 >= self.inner.file_len;
+            let probe = LengthProbe::new(known_length);
+            let mut parser = Parser::at(&buf, 0);
+            match parser.parse_indirect(&probe) {
+                Ok((_, object)) => {
+                    let end = parser.pos();
+                    if end + PARSE_SLACK <= buf.len() || at_eof {
+                        if let Some(missing) = probe.missing() {
+                            if let Ok(length_object) =
+                                self.fetch_object_cached(missing, chain).await
+                            {
+                                if let Some(value) = length_object.as_int() {
+                                    known_length = Some((missing, value));
+                                    continue;
+                                }
+                            }
+                            // Unresolvable length: the recovery-scan result
+                            // stands, exactly as in the sync parser.
+                        }
+                        if at_eof || !stream_dishonors_length(&object, known_length) {
+                            return Ok((
+                                Span {
+                                    start: offset,
+                                    end: offset + end as u64,
+                                },
+                                object,
+                            ));
+                        }
+                    }
+                }
+                Err(parse_error) => {
+                    if at_eof {
+                        return Err(Error::Core(parse_error));
+                    }
+                }
+            }
+            window = window.saturating_mul(2);
+        }
+    }
+
+    /// The decoded container for object stream `stream_num`, fetched,
+    /// decoded and header-parsed at most once. Consumed by the element
+    /// stream's physical layer (Plan 02 tasks 9-12).
+    #[allow(dead_code)]
+    pub(crate) async fn objstm_cache(&self, stream_num: u32) -> Result<Arc<ObjStmCache>> {
+        let mut chain = Vec::new();
+        self.objstm_cache_with_chain(stream_num, &mut chain).await
+    }
+
+    async fn objstm_cache_with_chain(
+        &self,
+        stream_num: u32,
+        chain: &mut Vec<u32>,
+    ) -> Result<Arc<ObjStmCache>> {
+        // Circularity is checked first: a reference chain leading back into
+        // a container being decoded must fail fast. The map lock is never
+        // held across the build below, so nested container fetches can
+        // never deadlock on it; concurrent misses may decode a container
+        // twice, and the first insert wins (correctness is unaffected).
+        if chain.contains(&stream_num) {
+            return Err(Error::Core(pdfboss_core::Error::CircularReference(
+                stream_num,
+            )));
+        }
+        if let Some(hit) = self.inner.objstms.lock().await.get(&stream_num) {
+            return Ok(Arc::clone(hit));
+        }
+        let offset = match self.inner.xref.entries.get(&stream_num).copied() {
+            Some(XrefEntry::InFile { offset, .. }) => offset,
+            // A container cannot itself live in an object stream
+            // (ISO 32000 §7.5.7), and a free or absent one has no bytes.
+            Some(XrefEntry::InStream { .. }) | Some(XrefEntry::Free) | None => {
+                return Err(Error::Core(pdfboss_core::Error::ObjectNotFound(
+                    stream_num, 0,
+                )))
+            }
+        };
+        chain.push(stream_num);
+        let outcome = self.build_objstm_cache(stream_num, offset, chain).await;
+        chain.pop();
+        let entry = outcome?;
+        let mut cache = self.inner.objstms.lock().await;
+        let stored = cache
+            .entry(stream_num)
+            .or_insert_with(|| Arc::clone(&entry));
+        Ok(Arc::clone(stored))
+    }
+
+    /// Fetches, decodes and header-parses one container. `chain` already
+    /// carries the container's number.
+    async fn build_objstm_cache(
+        &self,
+        stream_num: u32,
+        offset: u64,
+        chain: &mut Vec<u32>,
+    ) -> Result<Arc<ObjStmCache>> {
+        let (container_span, object) = self.parse_in_file(offset, chain).await?;
+        let stream = object
+            .as_stream()
+            .ok_or(Error::Core(pdfboss_core::Error::TypeMismatch {
+                expected: "stream",
+                found: object_type_name(&object),
+            }))?;
+        let n = self
+            .resolve_with_chain(stream.dict.get("N").unwrap_or(&Object::Null), chain)
+            .await?
+            .as_int()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or(Error::Core(pdfboss_core::Error::MissingKey("N")))?;
+        let first = self
+            .resolve_with_chain(stream.dict.get("First").unwrap_or(&Object::Null), chain)
+            .await?
+            .as_int()
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or(Error::Core(pdfboss_core::Error::MissingKey("First")))?;
+        let data = self.decode_stream_with_chain(stream, chain).await?;
+        let members = parse_objstm_header(&data, n)?;
+        Ok(Arc::new(ObjStmCache {
+            container: ObjRef {
+                num: stream_num,
+                gen: 0,
+            },
+            container_span,
+            first,
+            data,
+            members,
+        }))
+    }
+
+    /// Chain-threaded resolve (see [`AsyncDocument::resolve`]).
+    pub(crate) async fn resolve_with_chain(
+        &self,
+        o: &Object,
+        chain: &mut Vec<u32>,
+    ) -> Result<Object> {
+        let mut current = o.clone();
+        let mut last_num = 0;
+        for _ in 0..MAX_RESOLVE_DEPTH {
+            match current {
+                Object::Ref(r) => {
+                    last_num = r.num;
+                    current = match self.fetch_object_cached(r, chain).await {
+                        Ok(object) => object,
+                        Err(Error::Core(pdfboss_core::Error::CircularReference(n))) => {
+                            return Err(Error::Core(pdfboss_core::Error::CircularReference(n)))
+                        }
+                        Err(_) => return Ok(Object::Null),
+                    };
+                }
+                other => return Ok(other),
+            }
+        }
+        Err(Error::Core(pdfboss_core::Error::CircularReference(
+            last_num,
+        )))
+    }
+
+    /// Decodes a stream through its filter chain. The sync filter pipeline
+    /// resolves references synchronously, so every reference reachable
+    /// from the filter-relevant dict keys is fetched up front into a map
+    /// the pipeline can consult.
+    pub(crate) async fn decode_stream_with_chain(
+        &self,
+        s: &Stream,
+        chain: &mut Vec<u32>,
+    ) -> Result<Vec<u8>> {
+        let resolver = self.prefetch_filter_refs(&s.dict, chain).await;
+        pdfboss_core::filters::decode_stream(s, &resolver).map_err(Error::Core)
+    }
+
+    /// Transitively resolves references reachable from the stream dict's
+    /// filter-relevant keys (bounded rounds; failures resolve to Null,
+    /// lenient).
+    async fn prefetch_filter_refs(&self, dict: &Dict, chain: &mut Vec<u32>) -> MapResolve {
+        const FILTER_KEYS: [&str; 5] = ["Length", "Filter", "DecodeParms", "DP", "F"];
+        let mut map: HashMap<ObjRef, Object> = HashMap::new();
+        let mut frontier: Vec<Object> = FILTER_KEYS
+            .iter()
+            .filter_map(|key| dict.get(key).cloned())
+            .collect();
+        for _ in 0..MAX_RESOLVE_DEPTH {
+            let mut next = Vec::new();
+            for value in frontier.drain(..) {
+                match value {
+                    Object::Ref(r) => {
+                        if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(r) {
+                            let resolved = match self.fetch_object_cached(r, chain).await {
+                                Ok(object) => object,
+                                Err(_) => Object::Null,
+                            };
+                            next.push(resolved.clone());
+                            entry.insert(resolved);
+                        }
+                    }
+                    Object::Array(items) => next.extend(items),
+                    Object::Dict(d) => next.extend(d.iter().map(|(_, v)| v.clone())),
+                    _ => {}
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        MapResolve(map)
     }
 }
 
@@ -735,7 +1208,7 @@ where
 mod tests {
     use super::*;
     use crate::backend::MemBackend;
-    use pdfboss_testkit::simple_doc;
+    use pdfboss_testkit::{multi_page_doc, simple_doc};
 
     fn fetcher_for(data: Vec<u8>) -> Fetcher {
         let len = data.len() as u64;
@@ -1164,5 +1637,96 @@ mod tests {
         let doc = AsyncDocument::open(&path).await.unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(doc.version(), (1, 7));
+    }
+
+    use pdfboss_core::{ObjRef, Object};
+
+    #[tokio::test]
+    async fn objects_match_the_sync_document() {
+        for data in [simple_doc("objects"), multi_page_doc(&["a", "b"])] {
+            let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+            let doc = AsyncDocument::from_bytes(data).await.unwrap();
+            for num in 1..=8u32 {
+                let r = ObjRef { num, gen: 0 };
+                match sync_doc.get(r) {
+                    Ok(expected) => {
+                        assert_eq!(doc.get_object(r).await.unwrap(), expected, "object {num}")
+                    }
+                    Err(_) => assert!(doc.get_object(r).await.is_err(), "object {num}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_objects_are_fetched_from_their_container() {
+        let (dict, payload) = pdfboss_testkit::objstm_payload(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ]);
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.stream(6, &dict, &payload);
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT (compressed) Tj ET");
+        let data = b.build_xref_stream(1);
+        let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        let font = doc.get_object(ObjRef { num: 5, gen: 0 }).await.unwrap();
+        assert_eq!(font, sync_doc.get(ObjRef { num: 5, gen: 0 }).unwrap());
+        assert_eq!(
+            font.as_dict()
+                .and_then(|d| d.get_name("BaseFont"))
+                .map(|n| n.0.as_str()),
+            Some("Helvetica")
+        );
+        let catalog = doc.get_object(ObjRef { num: 1, gen: 0 }).await.unwrap();
+        assert_eq!(catalog, sync_doc.get(ObjRef { num: 1, gen: 0 }).unwrap());
+    }
+
+    #[tokio::test]
+    async fn indirect_stream_length_triggers_one_extra_fetch() {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog >>");
+        b.object(4, "<< /Length 7 0 R >>\nstream\nBT ET\nendstream");
+        b.object(7, "5");
+        let data = b.build(1);
+        let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        let stream = doc.get_object(ObjRef { num: 4, gen: 0 }).await.unwrap();
+        assert_eq!(stream, sync_doc.get(ObjRef { num: 4, gen: 0 }).unwrap());
+        assert_eq!(stream.as_stream().unwrap().data, b"BT ET");
+    }
+
+    #[tokio::test]
+    async fn objects_larger_than_the_initial_window_grow_until_complete() {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog >>");
+        let big = vec![b'q'; 5000];
+        b.stream(4, "", &big);
+        let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
+        let object = doc.get_object(ObjRef { num: 4, gen: 0 }).await.unwrap();
+        assert_eq!(object.as_stream().unwrap().data, big);
+    }
+
+    #[tokio::test]
+    async fn resolve_mirrors_sync_lenient_semantics() {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog >>");
+        b.object(6, "6 0 R");
+        let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
+        let missing = Object::Ref(ObjRef { num: 99, gen: 0 });
+        assert_eq!(doc.resolve(&missing).await.unwrap(), Object::Null);
+        let loops = Object::Ref(ObjRef { num: 6, gen: 0 });
+        assert!(matches!(
+            doc.resolve(&loops).await,
+            Err(Error::Core(pdfboss_core::Error::CircularReference(6)))
+        ));
+        // Generation mismatch is tolerated (lenient), like the sync model.
+        let catalog = doc.get_object(ObjRef { num: 1, gen: 7 }).await.unwrap();
+        assert!(catalog.as_dict().is_some());
     }
 }
