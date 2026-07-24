@@ -6,7 +6,9 @@
 //! never read.
 
 pub mod backend;
+pub mod cache;
 pub mod error;
 
 pub use backend::{Backend, BoxFuture, FileBackend, MemBackend};
+pub use cache::CachedBackend;
 pub use error::{Error, Result};
