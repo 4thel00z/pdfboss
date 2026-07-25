@@ -1,5 +1,86 @@
 # Changelog
 
+## [0.4.0](https://github.com/4thel00z/pdfboss/compare/v0.3.0...v0.4.0) (2026-07-25)
+
+
+### Features
+
+* **aio:** AsyncDocument open flow with span-only xref chain walk ([7a9f9ae](https://github.com/4thel00z/pdfboss/commit/7a9f9ae9c32580579d04dab69d4111d565f3bd66))
+* **aio:** chunked LRU CachedBackend with 64 KiB chunks and 32 MiB cap ([e76b590](https://github.com/4thel00z/pdfboss/commit/e76b59007bd250aeb0580653ed2fb68a9730f255))
+* **aio:** decode_stream, read_span and metadata on AsyncDocument ([76d7d29](https://github.com/4thel00z/pdfboss/commit/76d7d29062f72f55847aeecfc62ddc51c196114f))
+* **aio:** ElementStream logical layer with per-op content spans ([7f35cbe](https://github.com/4thel00z/pdfboss/commit/7f35cbee9e05fd960d2e66a622367d950edca6a7))
+* **aio:** ElementStream physical layer with salvage semantics ([11f8a1d](https://github.com/4thel00z/pdfboss/commit/11f8a1d800d920a8b6efd95a150281b2542f0956))
+* **aio:** fetch helper, tail scan and header version parse ([1f89196](https://github.com/4thel00z/pdfboss/commit/1f89196d7ae1a267a06b5b867b52ae5b7890d678))
+* **aio:** FileBackend with positioned reads on the blocking pool ([aa56cdd](https://github.com/4thel00z/pdfboss/commit/aa56cdd0ffb36f2fa1962eb6b358eb98a7adb8ba))
+* **aio:** HTTP range backend and open_url behind the http feature ([e70ccf4](https://github.com/4thel00z/pdfboss/commit/e70ccf4023d266b034c790472a4d4f3b538768ea))
+* **aio:** new pdfboss-aio workspace crate with layered error type ([a0a26ad](https://github.com/4thel00z/pdfboss/commit/a0a26ad1f2f680a6cd8982e88cae10f774807734))
+* **aio:** object-safe Backend trait and MemBackend ([8809e5a](https://github.com/4thel00z/pdfboss/commit/8809e5a529c78bf1528303a69b35dafac1545205))
+* **aio:** page-tree index built at open with span-only fetches ([0e167b1](https://github.com/4thel00z/pdfboss/commit/0e167b1bf235be594992fb35aabc93971c5e9d24))
+* **aio:** window parsers for classic and stream xref sections ([0e9e1f2](https://github.com/4thel00z/pdfboss/commit/0e9e1f2a89124f9982d6d9f5bb49ab4eb4f75351))
+* **aio:** windowed get_object, resolve and object-stream cache ([722ba15](https://github.com/4thel00z/pdfboss/commit/722ba1524842364fc6f92d3af91bd71c0ec27edb))
+* **cli:** add pdfboss hex with selectors and --annotate ([eaa21ca](https://github.com/4thel00z/pdfboss/commit/eaa21ca0a67a19c84a6a3e60ad98519626aaf2b2))
+* **cli:** add pdfboss json value-tree dump ([0eba71b](https://github.com/4thel00z/pdfboss/commit/0eba71b435acc6c5e0b3042c66495b24b48ba264))
+* **cli:** add pdfboss q with -r and --hex span dumps ([f15dbe0](https://github.com/4thel00z/pdfboss/commit/f15dbe0ec0e65b35f2d3e4280c66c745f09cff59))
+* **cli:** compile and run jq programs via the jaq engine ([0b50218](https://github.com/4thel00z/pdfboss/commit/0b50218c8580a1d8226304ade1168ed514a5f9ba))
+* **cli:** convert documents to the fq-style JSON value tree ([785c76c](https://github.com/4thel00z/pdfboss/commit/785c76ce89c5c80071275e4d18b45b80921f259d))
+* **cli:** hexyl-style hexdump engine ([3c6596d](https://github.com/4thel00z/pdfboss/commit/3c6596d225f22537f728a6ee9e135cfbaec42496))
+* **cli:** input abstraction and exit-code plumbing for explorer subcommands ([8e6cdee](https://github.com/4thel00z/pdfboss/commit/8e6cdee5160150fad32871f31d58b93d7b20cdef))
+* **cli:** pdfboss tui subcommand over file or http targets ([f4debbd](https://github.com/4thel00z/pdfboss/commit/f4debbd09fab6d59c791d5ca34568e776d530e92))
+* **core:** content-operator elements with in-content spans ([aa0e37a](https://github.com/4thel00z/pdfboss/commit/aa0e37a2634d36ca5921514b30296c18fc6d9b31))
+* **core:** document byte/xref accessors, spanned parses, page object refs ([15b13d3](https://github.com/4thel00z/pdfboss/commit/15b13d37621b342eb00d2fe51880b268f8ae74d3))
+* **core:** element model types (Span, Element, ElementOpts, XrefKind) ([074a799](https://github.com/4thel00z/pdfboss/commit/074a7993cf710af0f043de4767341556154e0a97))
+* **core:** lazy physical element iteration with byte spans ([4bfc6e2](https://github.com/4thel00z/pdfboss/commit/4bfc6e23035199fe76ab8f2cef76bf62a939ed63))
+* **core:** logical element iteration (pages, fonts, images, annotations) ([5636d21](https://github.com/4thel00z/pdfboss/commit/5636d21f43f0bb92f48db1237504dd6f74bb285c))
+* **core:** public xref iteration and span-reporting section parser ([fcf613f](https://github.com/4thel00z/pdfboss/commit/fcf613f84c55d1e21096c33936ca80eb1157fcec))
+* **core:** span-reporting content-stream parser ([4917a2a](https://github.com/4thel00z/pdfboss/commit/4917a2a477f65b82bebc788c08530aa96fedc531))
+* distribute the Rust crates on crates.io ([76ed3f0](https://github.com/4thel00z/pdfboss/commit/76ed3f0080c3914f5f6632cda864e2a671abafe9))
+* **python:** async element streaming via AsyncDocument.elements() ([49d0ca6](https://github.com/4thel00z/pdfboss/commit/49d0ca67ef682e34cd1c98117b014bfcd3df54e4))
+* **python:** AsyncDocument with open/from_bytes/metadata/get_object ([b220198](https://github.com/4thel00z/pdfboss/commit/b220198159d7f18122919d2799168b4dccf9d3de))
+* **python:** AsyncDocument.open_url over HTTP range requests ([1753277](https://github.com/4thel00z/pdfboss/commit/1753277962506ffff08b07d0e4685aedc20f5a70))
+* **python:** Element.value() lazy object-to-Python conversion ([0ce7509](https://github.com/4thel00z/pdfboss/commit/0ce7509cb80dc933300fed133adbd0459059ff14))
+* **python:** sync Document.elements() iterator with Element kind/span/ref/page ([489f9c8](https://github.com/4thel00z/pdfboss/commit/489f9c809f2bb72b467025f690c9d3d1abca5f25))
+* **python:** type stubs for Element, elements() and AsyncDocument ([7b66fb7](https://github.com/4thel00z/pdfboss/commit/7b66fb713beeb149687b77b04cd989bf2d9a69a0))
+* **tui:** app state machine with msg/cmd update loop ([9bcad29](https://github.com/4thel00z/pdfboss/commit/9bcad2945e4b85b55d8ba4aab10b65c1a5a88f2b))
+* **tui:** frame rendering with TestBackend snapshots ([1f9eb99](https://github.com/4thel00z/pdfboss/commit/1f9eb9999738a50f74b476d2d98ac2e980442553))
+* **tui:** half-block page preview model with debounce and spinner ([ec7d283](https://github.com/4thel00z/pdfboss/commit/ec7d283f5d1e04ee612d001adc0bd3961526da0e))
+* **tui:** hexyl-style hex pane model with windowed spans ([df1541b](https://github.com/4thel00z/pdfboss/commit/df1541b37501cbfb3b8d3ead9b73cac714650eb4))
+* **tui:** incremental search model with generation-tagged hits ([0e7d9e7](https://github.com/4thel00z/pdfboss/commit/0e7d9e785d4a4dc0424410680121124b0101e9c5))
+* **tui:** inspector with pretty/raw/decoded/ops views and ref cursor ([eb64423](https://github.com/4thel00z/pdfboss/commit/eb64423a60d4ebe9f70e8bf6c9808aca2f3e1da3))
+* **tui:** key-to-action mapping ([427e507](https://github.com/4thel00z/pdfboss/commit/427e507b90ba84c5edca9d17de4079a3b3f115be))
+* **tui:** lazy element tree state machine ([5fce7a6](https://github.com/4thel00z/pdfboss/commit/5fce7a6c602457451a80f448ac037ce7b916b06b))
+* **tui:** scaffold pdfboss-tui workspace crate ([9b1e1fa](https://github.com/4thel00z/pdfboss/commit/9b1e1faf015b1e73bcc93ddda7f4659f324a8299))
+* **tui:** tokio event loop with background command executor ([4f79d5a](https://github.com/4thel00z/pdfboss/commit/4f79d5a55a8567eab910b9d9fb1297458f00e7c8))
+
+
+### Bug Fixes
+
+* **aio:** emit classic section before its hybrid stream for core parity ([2fbccad](https://github.com/4thel00z/pdfboss/commit/2fbccad8577673f8b1359eb63aadd592db285ebd))
+* **aio:** keep cache byte accounting exact when a chunk is re-inserted ([3332536](https://github.com/4thel00z/pdfboss/commit/3332536cf1959a0e004b01a4ea5bf2c0a2018817))
+* **aio:** phase-review fixes — encrypted-doc rejection, salvage parity, owned stream, body cap ([c789f2d](https://github.com/4thel00z/pdfboss/commit/c789f2d59146ebc1b7b049c9fbaa38d293d18741))
+* **aio:** re-export FileBackend from the crate root ([2a421a9](https://github.com/4thel00z/pdfboss/commit/2a421a9deedeb2cec23385f19511e0a48ac5d61c))
+* **aio:** reuse core content spans and resolve resource categories ([f074129](https://github.com/4thel00z/pdfboss/commit/f07412955f82a1ad645f4e7093486915bebc8eec))
+* **aio:** signal window growth for truncated stream sections ([5be941d](https://github.com/4thel00z/pdfboss/commit/5be941d2d33dd8e0b33cc212c5280c28f96cf258))
+* **cli:** bound fabricated --hex spans against the file length ([07ab339](https://github.com/4thel00z/pdfboss/commit/07ab339654f2d712d1c0cc975a3b2504a02cf6c3))
+* **cli:** tui accepts URLs unconditionally like the other subcommands ([d2fc113](https://github.com/4thel00z/pdfboss/commit/d2fc1137887dceeae7c148921b4785c5848142d0))
+* **core:** surface hybrid /XRefStm sections in element iteration ([5fdf1cc](https://github.com/4thel00z/pdfboss/commit/5fdf1ccb26036b2a73e3c9ffa92dfcad3585a8b4))
+* pre-merge polish — docs refresh, error-message normalization, tui target context, aio window ceiling ([e9c5cc8](https://github.com/4thel00z/pdfboss/commit/e9c5cc87ab04d0ac4a0b99fbbda0c53fa0ce1900))
+* **tui:** construct the terminal guard before EnterAlternateScreen ([62a67ad](https://github.com/4thel00z/pdfboss/commit/62a67ad03678e47d2b5c1c6e98ed660d829c4db2))
+* **tui:** correct straddling-window fetch and align byte classes with the CLI ([1c03105](https://github.com/4thel00z/pdfboss/commit/1c031056027b70112b46122e43db2d94dd6e879c))
+* **tui:** idempotent batch delivery and failed-section retry ([cd0c981](https://github.com/4thel00z/pdfboss/commit/cd0c98185a9a9bb3193790f1296c438e38d4944d))
+* **tui:** phase-review fixes — search-cancel epoch, preview byte cache, trailer dead-end, tree failure signal ([a6d3aa8](https://github.com/4thel00z/pdfboss/commit/a6d3aa880d7c3db7a4a9416841a3b3c38999d15c))
+* **tui:** resolve broken intra-doc links for cargo doc -D warnings ([5fdb6b4](https://github.com/4thel00z/pdfboss/commit/5fdb6b4a0d2eb1c3467b106262f6a6725d4c2e1b))
+
+
+### Documentation
+
+* **cli:** update hexdump module doc now that hex is wired ([c52f275](https://github.com/4thel00z/pdfboss/commit/c52f2750fddb1ac653a2f48d236c97431e6c4453))
+* **core:** document element iteration ([3ed5d45](https://github.com/4thel00z/pdfboss/commit/3ed5d45086d25fe7e4da457c1f200396e02dec95))
+* **core:** pin element ordering contract; guard testkit fixture casts ([e4e8378](https://github.com/4thel00z/pdfboss/commit/e4e8378dde54833e7ebc9f6dac44b3354f58245f))
+* design spec for element iterator, async IO, TUI explorer, fq-style CLI ([b8ffd08](https://github.com/4thel00z/pdfboss/commit/b8ffd08c464497f1070e65a167dc192424428efb))
+* **plans:** element-explorer plan 01 — core element model ([c44a8da](https://github.com/4thel00z/pdfboss/commit/c44a8dad0b65d495f4c0cd0830491f6ff8a90307))
+* **plans:** element-explorer plans 02-05 — aio, python, cli, tui ([0666d73](https://github.com/4thel00z/pdfboss/commit/0666d7322b7d2334721fefb0682cd5f1579138bd))
+* reword README element-iteration feature item to list style ([108ace0](https://github.com/4thel00z/pdfboss/commit/108ace0555fa9b7935f1401c9b541283de58185e))
+
 ## [0.2.1](https://github.com/4thel00z/pdfboss/compare/v0.2.0...v0.2.1) (2026-07-16)
 
 
