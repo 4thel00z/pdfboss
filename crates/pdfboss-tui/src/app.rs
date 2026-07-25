@@ -103,6 +103,10 @@ pub enum Cmd {
     },
     /// Start (or restart) an incremental search for `query`.
     StartSearch { generation: u64, query: String },
+    /// Advances the shared search epoch to `generation` so a still-running
+    /// search task's stale-epoch check trips and it self-terminates
+    /// (no task spawn).
+    CancelSearch { generation: u64 },
     /// Render page `page` at fit-to-`(max_w, max_h)`-pixels scale.
     RenderPreview {
         generation: u64,
@@ -331,7 +335,9 @@ impl App {
             }
             Action::SearchCancel => {
                 self.search.cancel();
-                Vec::new()
+                vec![Cmd::CancelSearch {
+                    generation: self.search.generation,
+                }]
             }
             Action::NextHit => match self.search.next_hit() {
                 Some(hit) => self.jump_to(hit.r),
@@ -644,6 +650,14 @@ impl App {
             NodeKind::Trailer => {
                 match self.tree.trailer_dict.clone() {
                     Some(dict) => self.inspector.set_dict("Trailer", &dict),
+                    None if matches!(self.tree.physical, LoadState::Loaded | LoadState::Failed) => {
+                        // The physical pass already ran (successfully or
+                        // not) and never produced a trailer dict: showing
+                        // "loading" forever would dead-end the node, since
+                        // nothing will ever arrive to clear it.
+                        self.inspector
+                            .show_message("Trailer", vec!["no trailer found".to_string()]);
+                    }
                     None => {
                         self.inspector.show_loading("Trailer");
                         if self.tree.physical == LoadState::NotLoaded {
@@ -887,6 +901,28 @@ mod tests {
     }
 
     #[test]
+    fn search_cancel_advances_the_epoch_past_the_in_flight_generation() {
+        let mut app = loaded_app();
+        app.update(key(KeyCode::Char('/')));
+        let cmds = app.update(key(KeyCode::Char('a')));
+        let in_flight_generation = match cmds.as_slice() {
+            [Cmd::StartSearch { generation, .. }] => *generation,
+            other => panic!("expected StartSearch, got {:?}", other),
+        };
+        let cmds = app.update(key(KeyCode::Esc));
+        assert!(!app.search.active);
+        match cmds.as_slice() {
+            [Cmd::CancelSearch { generation }] => {
+                assert!(
+                    *generation > in_flight_generation,
+                    "cancel's epoch must be newer than the in-flight search's generation"
+                );
+            }
+            other => panic!("expected CancelSearch, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn jump_before_physical_load_defers() {
         let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
         let cmds = app.jump_to(obj_ref(2));
@@ -1060,6 +1096,49 @@ mod tests {
         app.update(key(KeyCode::Char('/')));
         app.update(key(KeyCode::Char('a')));
         assert_eq!(app.status_line(), "/a \u{b7} 0 hits \u{2026}");
+    }
+
+    #[test]
+    fn trailer_node_shows_message_when_physical_pass_found_no_trailer() {
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        // Physical pass completes without ever emitting `Element::Trailer`
+        // (e.g. a damaged trailer region): `trailer_dict` stays `None`
+        // even though the pass is done.
+        let elements = vec![Element::IndirectObject {
+            r: obj_ref(1),
+            object: Object::Null,
+            span: Span { start: 15, end: 64 },
+            in_objstm: None,
+        }];
+        let cmds = app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Physical,
+            elements,
+            errors: 0,
+            done: true,
+        });
+        assert!(cmds.is_empty(), "root selection refresh needs no fetches");
+        assert_eq!(app.tree.physical, crate::tree::LoadState::Loaded);
+        assert!(app.tree.trailer_dict.is_none());
+
+        let cmds = app.update(key(KeyCode::Char('G'))); // select bottom: Trailer
+        assert_eq!(app.tree.selected, app.tree.trailer_node);
+        assert!(
+            cmds.is_empty(),
+            "physical already loaded and still no trailer needs no fetch"
+        );
+        assert!(
+            !app.inspector.loading,
+            "must not dead-end on a perpetual loading state"
+        );
+        assert_eq!(app.inspector.title, "Trailer");
+        assert!(
+            app.inspector
+                .lines
+                .iter()
+                .any(|line| line.contains("no trailer")),
+            "expected a no-trailer message, got {:?}",
+            app.inspector.lines
+        );
     }
 
     #[test]

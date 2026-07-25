@@ -44,9 +44,13 @@ impl SearchState {
         self.running = false;
     }
 
-    /// Closes the input and discards everything (Esc).
+    /// Closes the input and discards everything (Esc). Bumps `generation`
+    /// (mirroring `restart()`) so hits from a still-running search task
+    /// tagged with the pre-cancel generation are rejected by `add_hit`
+    /// instead of silently repopulating the just-cleared hit list.
     pub fn cancel(&mut self) {
         self.active = false;
+        self.generation += 1;
         self.query.clear();
         self.hits.clear();
         self.cursor = None;
@@ -270,6 +274,24 @@ mod tests {
             Some(15),
             "wraps back"
         );
+    }
+
+    #[test]
+    fn cancel_invalidates_in_flight_hits() {
+        let mut search = SearchState::new();
+        search.open();
+        let generation = search.push_char('a');
+        search.cancel();
+        assert!(
+            !search.add_hit(
+                generation,
+                SearchHit {
+                    r: ObjRef { num: 1, gen: 0 }
+                }
+            ),
+            "cancel must invalidate the pre-cancel generation"
+        );
+        assert!(search.hits.is_empty());
     }
 
     #[test]
