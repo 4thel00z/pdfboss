@@ -106,6 +106,10 @@ enum Command {
         gen: Option<u16>,
     },
     /// Explore a PDF interactively in the terminal.
+    ///
+    /// Encrypted PDFs are not yet supported over this path (they are
+    /// rejected at open, even under the empty user password that
+    /// `info`/`text`/`render`/`obj` accept).
     Tui {
         /// Path or http(s) URL of the PDF.
         target: String,
@@ -496,15 +500,21 @@ fn cmd_tui(target: &str) -> Result<(), String> {
 /// otherwise -- exactly the split `json`/`hex`/`q` already make via
 /// `Input::open` (`pdfboss-aio`'s `http` feature is unconditionally on for
 /// this crate, so there is no cfg gate to make here).
+///
+/// Both branches wrap the aio error with `target`, the same
+/// `format!("{spec}: {err}")` shape `Input::open` uses for its local
+/// `std::io::Error` failures: without it, a missing file or bad URL surfaces
+/// only the layer-prefixed message ("io: No such file or directory") with
+/// no indication of which target failed to open.
 async fn open_async_document(target: &str) -> Result<pdfboss_aio::AsyncDocument, String> {
     if is_url(target) {
         return pdfboss_aio::AsyncDocument::open_url(target)
             .await
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("{target}: {e}"));
     }
     pdfboss_aio::AsyncDocument::open(target)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| format!("{target}: {e}"))
 }
 
 /// The status-bar title: the last path/URL segment, or the whole target.

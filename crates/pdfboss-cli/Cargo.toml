@@ -1,6 +1,6 @@
 [package]
 name = "pdfboss-cli"
-description = "Command-line interface for pdfboss: info, text, render, obj, json, hex and q subcommands"
+description = "Command-line interface for pdfboss: info, text, render, obj, and the json/hex/q/tui explorer subcommands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

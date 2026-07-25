@@ -34,6 +34,12 @@ pub enum Input {
 impl Input {
     /// Opens `spec`: an `http(s)://` URL via the aio HTTP backend, anything
     /// else as a local file via the sync fast path.
+    ///
+    /// Local and remote failures carry the same layer prefix discipline:
+    /// the aio HTTP path's errors already come out of `pdfboss_aio::Error`'s
+    /// `Display` prefixed by layer ("parse:", "io:", "http:"), so the sync
+    /// local path prefixes its own `std::io::Error` and
+    /// `pdfboss_core::Error` the same way, for the equivalent failure.
     pub fn open(spec: &str) -> Result<Input, String> {
         if is_url(spec) {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -45,8 +51,8 @@ impl Input {
                 .map_err(|e| e.to_string())?;
             Ok(Input::Remote { rt, doc })
         } else {
-            let bytes = std::fs::read(spec).map_err(|e| format!("{spec}: {e}"))?;
-            let doc = Document::load(bytes).map_err(|e| e.to_string())?;
+            let bytes = std::fs::read(spec).map_err(|e| format!("{spec}: io: {e}"))?;
+            let doc = Document::load(bytes).map_err(|e| format!("parse: {e}"))?;
             Ok(Input::Local { doc })
         }
     }
@@ -61,7 +67,7 @@ impl Input {
                 .filter_map(|item| match item {
                     Ok(element) => Some(element),
                     Err(e) => {
-                        eprintln!("pdfboss: warning: skipping unreadable element: {e}");
+                        eprintln!("pdfboss: warning: skipping unreadable element: parse: {e}");
                         None
                     }
                 })
@@ -87,7 +93,7 @@ impl Input {
     /// Decodes a stream's data through its filter chain.
     pub fn decode_stream(&self, s: &Stream) -> Result<Vec<u8>, String> {
         match self {
-            Input::Local { doc, .. } => doc.stream_data(s).map_err(|e| e.to_string()),
+            Input::Local { doc, .. } => doc.stream_data(s).map_err(|e| format!("parse: {e}")),
             Input::Remote { rt, doc } => {
                 rt.block_on(doc.decode_stream(s)).map_err(|e| e.to_string())
             }
