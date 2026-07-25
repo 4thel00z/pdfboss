@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/4thel00z/pdfboss/compare/v0.4.1...v0.5.0) (2026-07-25)
+
+
+### Features
+
+* **cli:** bundle substitute fonts by default ([0112ee6](https://github.com/4thel00z/pdfboss/commit/0112ee65d3a354ddd21edcfc9a6f0d33576f364d))
+
 ## [0.4.1](https://github.com/4thel00z/pdfboss/compare/v0.4.0...v0.4.1) (2026-07-25)
 
 
