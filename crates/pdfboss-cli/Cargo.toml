@@ -5,13 +5,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-pdfboss-core = { path = "../pdfboss-core" }
-pdfboss-text = { path = "../pdfboss-text" }
-pdfboss-render = { path = "../pdfboss-render" }
-pdfboss-aio = { path = "../pdfboss-aio", features = ["http"] }
-pdfboss-tui = { path = "../pdfboss-tui" }
+pdfboss-core = { workspace = true }
+pdfboss-text = { workspace = true }
+pdfboss-render = { workspace = true }
+pdfboss-aio = { workspace = true, features = ["http"] }
+pdfboss-tui = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
