@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/4thel00z/pdfboss/compare/v0.4.0...v0.4.1) (2026-07-25)
+
+
+### Documentation
+
+* list all library crates in the cargo add line ([b46a1ce](https://github.com/4thel00z/pdfboss/commit/b46a1ceb662d80d9424a003fc4abd550f3cb1a12))
+
 ## [0.4.0](https://github.com/4thel00z/pdfboss/compare/v0.3.0...v0.4.0) (2026-07-25)
 
 
