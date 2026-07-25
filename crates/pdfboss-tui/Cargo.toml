@@ -5,11 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-pdfboss-aio = { path = "../pdfboss-aio" }
-pdfboss-core = { path = "../pdfboss-core" }
-pdfboss-render = { path = "../pdfboss-render" }
+pdfboss-aio = { workspace = true }
+pdfboss-core = { workspace = true }
+pdfboss-render = { workspace = true }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }

@@ -5,10 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [dependencies]
-pdfboss-core = { path = "../pdfboss-core" }
-pdfboss-encoding = { path = "../pdfboss-encoding" }
+pdfboss-core = { workspace = true }
+pdfboss-encoding = { workspace = true }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }

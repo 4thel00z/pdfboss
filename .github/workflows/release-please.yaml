@@ -145,6 +145,24 @@ jobs:
           # the wheels that already made it to PyPI.
           skip-existing: true
 
+  # crates.io publish chains off the release the same way PyPI does. Auth is
+  # the CARGO_REGISTRY_TOKEN repo secret (same convention as the release-plz
+  # repos). `--workspace` publishes the members in dependency order and skips
+  # the `publish = false` ones (pdfboss-py, pdfboss-testkit).
+  publish-crates:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   # pdfboss-fonts is a separate, pure-Python data package (packages/pdfboss-fonts)
   # released independently of the pdfboss engine — it has its own component
   # entry in release-please-config.json (tag pdfboss-fonts-vX) and therefore
