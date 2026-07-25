@@ -422,7 +422,8 @@ fn substitute_source(
             None => Err(
                 "--fonts full requested but no substitute faces are available: pass \
                  --font-dir <PATH> (a directory holding the substitute font files), or \
-                 rebuild pdfboss with `--features substitute-fonts` to bundle the OFL set."
+                 rebuild pdfboss with the default `substitute-fonts` feature (this \
+                 binary was built without it) to bundle the OFL set."
                     .to_string(),
             ),
         },
@@ -629,9 +630,20 @@ mod tests {
     }
 
     /// Without `--font-dir`, `full`'s fallback depends on whether this binary
-    /// was built with the `substitute-fonts` feature: the default test build
-    /// (this crate requests no such feature on `pdfboss-render`) has it off,
-    /// so this is the actionable-error path, naming both escape hatches.
+    /// was built with the `substitute-fonts` feature (a default feature, so
+    /// this is the path `cargo install pdfboss-cli` users get).
+    #[cfg(feature = "substitute-fonts")]
+    #[test]
+    fn full_without_font_dir_falls_back_to_builtin_faces() {
+        assert!(matches!(
+            substitute_source(FontsArg::Full, None),
+            Ok(pdfboss_render::SubstituteSource::Builtin)
+        ));
+    }
+
+    /// A `--no-default-features` build has no bundled faces, so `full` without
+    /// `--font-dir` is the actionable-error path, naming both escape hatches.
+    #[cfg(not(feature = "substitute-fonts"))]
     #[test]
     fn full_without_font_dir_or_feature_is_actionable_error() {
         let err = substitute_source(FontsArg::Full, None).expect_err("no dir, no feature");
