@@ -159,6 +159,9 @@ fn execute_cmd(
             epoch.store(generation, Ordering::SeqCst);
             tokio::spawn(run_search(doc, tx, epoch, generation, query));
         }
+        Cmd::CancelSearch { generation } => {
+            search_epoch.store(generation, Ordering::SeqCst);
+        }
         Cmd::RenderPreview {
             generation,
             page,
@@ -171,6 +174,16 @@ fn execute_cmd(
             ));
         }
     }
+}
+
+/// Whether a completed tree-population pass should be reported as an
+/// outright failure (`Msg::TreeFailed`) instead of a normal `done` batch:
+/// the pass delivered *zero* elements in total and recorded at least one
+/// parse error along the way (total salvage failure — nothing usable came
+/// out of it). A pass that delivered any real elements keeps the existing
+/// partial-salvage behavior, even when it also recorded errors.
+fn pass_failed(total_elements: usize, total_errors: usize) -> bool {
+    total_elements == 0 && total_errors > 0
 }
 
 /// Streams a tree section's elements in batches. Per-element parse errors
@@ -196,10 +209,21 @@ async fn load_tree(doc: AsyncDocument, tx: UnboundedSender<Msg>, req: TreeReq) {
     let mut stream = doc.elements(opts);
     let mut batch: Vec<Element> = Vec::new();
     let mut errors = 0usize;
+    // Totals persist across mid-stream flushes (which reset `batch` and
+    // `errors` below) so the end-of-pass decision sees the whole pass,
+    // not just the last unflushed chunk.
+    let mut total_elements = 0usize;
+    let mut total_errors = 0usize;
     while let Some(item) = stream.next().await {
         match item {
-            Ok(element) => batch.push(element),
-            Err(..) => errors += 1,
+            Ok(element) => {
+                batch.push(element);
+                total_elements += 1;
+            }
+            Err(..) => {
+                errors += 1;
+                total_errors += 1;
+            }
         }
         if batch.len() >= TREE_BATCH {
             let elements = std::mem::take(&mut batch);
@@ -215,13 +239,22 @@ async fn load_tree(doc: AsyncDocument, tx: UnboundedSender<Msg>, req: TreeReq) {
             }
         }
     }
-    tx.send(Msg::TreeBatch {
-        req,
-        elements: batch,
-        errors,
-        done: true,
-    })
-    .ok();
+    if pass_failed(total_elements, total_errors) {
+        // Total salvage failure: nothing usable ever came out of this
+        // pass. Emitting `TreeFailed` (instead of a `done: true` batch
+        // with zero elements) marks the section Failed so a re-expand
+        // retries the load, rather than looking permanently empty.
+        let error = format!("{total_errors} element(s) failed to parse, nothing salvaged");
+        tx.send(Msg::TreeFailed { req, error }).ok();
+    } else {
+        tx.send(Msg::TreeBatch {
+            req,
+            elements: batch,
+            errors,
+            done: true,
+        })
+        .ok();
+    }
 }
 
 /// Fetches a page dict and reports its `/Contents` refs (a single ref or
@@ -399,6 +432,24 @@ async fn fetch_whole_file(doc: &AsyncDocument) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pass_failed_true_only_when_zero_elements_and_some_errors() {
+        assert!(
+            pass_failed(0, 1),
+            "zero elements with at least one error is total failure"
+        );
+        assert!(
+            pass_failed(0, 5),
+            "any positive error count still fails when no elements arrived"
+        );
+        assert!(!pass_failed(0, 0), "empty-but-clean pass is not a failure");
+        assert!(
+            !pass_failed(3, 2),
+            "partial salvage: any real element wins over errors"
+        );
+        assert!(!pass_failed(3, 0), "clean pass with elements");
+    }
 
     #[tokio::test]
     async fn fetch_whole_file_reads_exactly_file_len_bytes() {

@@ -63,14 +63,23 @@ impl PreviewState {
 
     /// Applies a finished render; stale generations are dropped. Returns
     /// whether the result was accepted.
+    ///
+    /// The whole-file bytes are cached *before* the generation check: they
+    /// are generation-independent (the same file backs every render of
+    /// this document), so even a superseded render's bytes are worth
+    /// keeping — dropping them here would force the next render to
+    /// re-fetch the entire file. Only the pixmap/error handling stays
+    /// gated on the generation matching.
     pub fn apply_ready(&mut self, generation: u64, result: Result<PreviewFrame, String>) -> bool {
+        if let Ok(frame) = &result {
+            self.file_bytes = Some(Arc::clone(&frame.file_bytes));
+        }
         if generation != self.generation {
             return false;
         }
         self.rendering = false;
         match result {
             Ok(frame) => {
-                self.file_bytes = Some(frame.file_bytes);
                 self.pixmap = Some(frame.pixmap);
                 self.error = None;
             }
@@ -231,6 +240,30 @@ mod tests {
         assert!(preview.file_bytes.is_some(), "bytes cached for re-renders");
         assert!(preview.apply_ready(current, Err("boom".to_string())));
         assert_eq!(preview.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn stale_frame_still_caches_file_bytes() {
+        let mut preview = PreviewState::new();
+        let stale = preview.start_render(0);
+        let _current = preview.start_render(0);
+        let frame = PreviewFrame {
+            file_bytes: Arc::new(vec![9, 9, 9]),
+            pixmap: two_by_two(),
+        };
+        assert!(
+            !preview.apply_ready(stale, Ok(frame)),
+            "stale generation is still rejected"
+        );
+        assert!(
+            preview.pixmap.is_none(),
+            "stale pixmap must not be installed"
+        );
+        assert!(
+            preview.file_bytes.is_some(),
+            "whole-file bytes are generation-independent and must be cached \
+             even from a superseded render, so the next render skips re-fetching"
+        );
     }
 
     #[test]
