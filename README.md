@@ -33,8 +33,8 @@ Prebuilt abi3 wheels (CPython ≥ 3.12) for Linux and macOS; no toolchain requir
 ### Rust
 
 ```bash
-cargo add pdfboss-core pdfboss-text pdfboss-render   # library crates
-cargo install pdfboss-cli                            # the `pdfboss` binary
+cargo add pdfboss-core pdfboss-text pdfboss-render pdfboss-aio pdfboss-tui   # library crates
+cargo install pdfboss-cli                                                    # the `pdfboss` binary
 ```
 
 ## Usage
