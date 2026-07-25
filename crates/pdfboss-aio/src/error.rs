@@ -1,6 +1,6 @@
 //! Error type for pdfboss-aio: wraps core parse errors and transport
 //! failures, with dedicated variants for range-refusing HTTP servers and
-//! short reads. Messages are prefixed by layer ("parse:", "i/o:", "http:")
+//! short reads. Messages are prefixed by layer ("parse:", "io:", "http:")
 //! so downstream consumers can present them uniformly.
 
 /// Convenience alias used throughout pdfboss-aio.
@@ -16,15 +16,21 @@ pub enum Error {
     #[error("parse: {0}")]
     Core(#[from] pdfboss_core::Error),
     /// A transport-layer I/O error.
-    #[error("i/o: {0}")]
+    #[error("io: {0}")]
     Io(std::io::Error),
     /// An HTTP transport error (connection, status, malformed response).
+    /// The status is rendered when known (`http 404: msg`); a connection-
+    /// level failure with no response at all keeps the bare `http:` prefix
+    /// (asserted by the CLI's own tests, which look for that exact
+    /// substring on a refused connection).
     #[cfg(feature = "http")]
-    #[error("http: {msg}")]
+    #[error("http{}: {msg}", status.map(|code| format!(" {code}")).unwrap_or_default())]
     Http { status: Option<u16>, msg: String },
     /// The server ignored `Range` requests (answered 200 with the full
-    /// body instead of 206), so range-fetching cannot work.
-    #[error("server ignored Range requests")]
+    /// body instead of 206), so range-fetching cannot work. Wording matches
+    /// what the Python binding independently produces for this variant
+    /// (`crates/pdfboss-py/src/lib.rs`'s `aio_err`), so both surfaces agree.
+    #[error("http: server does not support Range requests")]
     RangeUnsupported,
     /// A read stopped short of the requested range while more bytes were
     /// expected (the source is shorter than its declared length).
@@ -95,7 +101,7 @@ mod tests {
         );
         let io = Error::from(std::io::Error::other("boom"));
         assert!(matches!(io, Error::Io(_)));
-        assert_eq!(io.to_string(), "i/o: boom");
+        assert_eq!(io.to_string(), "io: boom");
     }
 
     #[test]
@@ -111,7 +117,22 @@ mod tests {
         );
         assert_eq!(
             Error::RangeUnsupported.to_string(),
-            "server ignored Range requests"
+            "http: server does not support Range requests"
         );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn http_error_renders_status_when_known_and_stays_prefixed_without_it() {
+        let with_status = Error::Http {
+            status: Some(404),
+            msg: "not found".to_string(),
+        };
+        assert_eq!(with_status.to_string(), "http 404: not found");
+        let without_status = Error::Http {
+            status: None,
+            msg: "connection refused".to_string(),
+        };
+        assert_eq!(without_status.to_string(), "http: connection refused");
     }
 }

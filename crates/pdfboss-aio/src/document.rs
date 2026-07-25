@@ -24,6 +24,30 @@ const TAIL_WINDOW: u64 = 4096;
 /// Widest tail window tried before the chain is declared unusable.
 const MAX_TAIL_WINDOW: u64 = 64 * 1024;
 
+/// Widest window `parse_in_file` and `parse_section_at` will fetch for a
+/// single object or xref section before giving up as unparseable, however
+/// far from EOF that leaves them.
+///
+/// Both grow their window by doubling until the parse completes, bounded
+/// only by end-of-file otherwise -- fine for a well-formed file, but a
+/// corrupt xref entry (or offset arithmetic gone wrong) pointing into
+/// unrelated bytes deep inside a *large* file would double all the way to
+/// EOF before giving up. For the HTTP backend in particular, one bogus
+/// offset could then pull a Range request spanning most of a multi-
+/// gigabyte file -- exactly the amplification this cap exists to bound.
+///
+/// The cap can't be small: `parse_in_file` must buffer an object's entire
+/// span in one read, including a stream's raw bytes (`stream_dishonors_length`
+/// checks the captured `Stream::data` against the declared `/Length`,
+/// which requires having read all of it), and a single legitimate object
+/// -- an embedded image or file attachment -- can genuinely run to
+/// hundreds of megabytes. 256 MiB is chosen as comfortable headroom over
+/// that, while still bounding any one fetch to a small fraction of even a
+/// multi-gigabyte file. The same bound serves the section loop: a classic
+/// xref table over 256 MiB of entries (20 bytes each) implies on the order
+/// of ten million objects, far beyond any real document.
+const MAX_GROWTH_WINDOW: u64 = 256 * 1024 * 1024;
+
 /// Bounded fetch helper: whole-range reads with truncation detection.
 pub(crate) struct Fetcher {
     pub(crate) backend: Arc<dyn Backend>,
@@ -972,6 +996,12 @@ impl AsyncDocument {
                     }
                 }
             }
+            if window as u64 >= MAX_GROWTH_WINDOW {
+                return Err(Error::Core(pdfboss_core::Error::Other(format!(
+                    "invalid or unrecoverable cross-reference data: object at offset {offset} \
+                     exceeded the {MAX_GROWTH_WINDOW}-byte parse window without completing"
+                ))));
+            }
             window = window.saturating_mul(2);
         }
     }
@@ -1374,7 +1404,15 @@ async fn parse_section_at(fetcher: &Fetcher, offset: u64) -> Result<ParsedSectio
         if let Some(parsed) = parse_section_window(&buf, offset, fetcher.len, at_eof)? {
             return Ok(parsed);
         }
-        // None: the window ended inside the section — double and refetch.
+        // None: the window ended inside the section — double and refetch,
+        // unless that has already grown past the shared cap (see
+        // `MAX_GROWTH_WINDOW`) without completing or reaching EOF.
+        if window as u64 >= MAX_GROWTH_WINDOW {
+            return Err(Error::Core(pdfboss_core::Error::Other(format!(
+                "invalid or unrecoverable cross-reference data: section at offset {offset} \
+                 exceeded the {MAX_GROWTH_WINDOW}-byte parse window without completing"
+            ))));
+        }
         window = window.saturating_mul(2);
     }
 }
@@ -1980,6 +2018,102 @@ mod tests {
         let doc = AsyncDocument::from_bytes(b.build(1)).await.unwrap();
         let object = doc.get_object(ObjRef { num: 4, gen: 0 }).await.unwrap();
         assert_eq!(object.as_stream().unwrap().data, big);
+    }
+
+    /// A `Backend` wrapper that records the cumulative bytes yielded by
+    /// `read_at`, so a test can assert a fetch loop stayed bounded instead
+    /// of growing to (or past) the size of a very large file.
+    struct RecordingBackend {
+        inner: MemBackend,
+        bytes_read: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    impl Backend for RecordingBackend {
+        fn len(&self) -> BoxFuture<'_, std::io::Result<u64>> {
+            self.inner.len()
+        }
+
+        fn read_at<'a>(
+            &'a self,
+            offset: u64,
+            buf: &'a mut [u8],
+        ) -> BoxFuture<'a, std::io::Result<usize>> {
+            Box::pin(async move {
+                let n = self.inner.read_at(offset, buf).await?;
+                self.bytes_read
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
+                Ok(n)
+            })
+        }
+    }
+
+    /// Simulates a corrupt xref entry -- an offset that does not point at
+    /// any real object -- inside a file comfortably larger than
+    /// `MAX_GROWTH_WINDOW`. `PdfBuilder::build` always places the xref
+    /// table and trailer immediately after the last object (so `find_tail`
+    /// can find `startxref` near the true end of file), so the huge
+    /// garbage span is assembled by hand here, positioned *before* a
+    /// normal, valid trailer rather than through the builder.
+    ///
+    /// Without the cap, `parse_in_file`'s doubling window would grow all
+    /// the way to EOF chasing this offset, reading (and, since each
+    /// doubling re-fetches from `offset`, re-reading) most of a 300+ MiB
+    /// file for one bogus object -- exactly the amplification
+    /// `MAX_GROWTH_WINDOW` exists to bound.
+    #[tokio::test]
+    async fn corrupt_offset_in_a_huge_file_errors_within_the_growth_cap_instead_of_reading_to_eof()
+    {
+        let header = b"%PDF-1.7\n".to_vec();
+        let obj1 = b"1 0 obj\n<< /Type /Catalog >>\nendobj\n".to_vec();
+        let obj1_offset = header.len() as u64;
+
+        let mut data = header;
+        data.extend_from_slice(&obj1);
+
+        // `]` can never open a valid `N G obj` header, so the parse fails
+        // immediately at every window size -- the loop keeps regrowing the
+        // window uselessly, exactly like a truly corrupt offset would,
+        // rather than eventually completing on a bigger read.
+        let garbage_offset = data.len() as u64;
+        let garbage_len = MAX_GROWTH_WINDOW as usize + 32 * 1024 * 1024;
+        data.resize(data.len() + garbage_len, b']');
+
+        let xref_offset = data.len();
+        data.extend_from_slice(b"xref\n0 2\n");
+        data.extend_from_slice(b"0000000000 65535 f\r\n");
+        data.extend_from_slice(format!("{obj1_offset:010} {:05} n\r\n", 0).as_bytes());
+        data.extend_from_slice(b"trailer\n<< /Size 2 /Root 1 0 R >>\n");
+        data.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+
+        let bytes_read = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let backend = RecordingBackend {
+            inner: MemBackend::from(data),
+            bytes_read: Arc::clone(&bytes_read),
+        };
+        let doc = AsyncDocument::with_backend(backend)
+            .await
+            .expect("a valid one-object catalog with no /Pages still opens");
+
+        let mut chain = Vec::new();
+        let err = doc
+            .parse_in_file(garbage_offset, &mut chain)
+            .await
+            .expect_err("a run of `]` bytes must never parse as an object");
+        assert!(
+            err.to_string().contains(&garbage_offset.to_string()),
+            "error does not name the offending offset: {err}"
+        );
+
+        // A doubling loop capped at `MAX_GROWTH_WINDOW` reads at most
+        // roughly 2x the cap across all its attempts (each attempt
+        // re-fetches from `offset` rather than accumulating). Anywhere
+        // near the file's true size (well over 300 MiB) would mean the
+        // cap did not apply and the loop ran all the way to EOF instead.
+        let total = bytes_read.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            total < 3 * MAX_GROWTH_WINDOW,
+            "read {total} bytes chasing one bogus offset -- the growth cap did not bound it"
+        );
     }
 
     #[tokio::test]

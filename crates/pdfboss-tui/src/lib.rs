@@ -45,6 +45,29 @@ use crate::tree::TreeReq;
 /// Elements per tree batch message.
 const TREE_BATCH: usize = 64;
 
+/// Turns crossterm's raw terminal-attach failure into an actionable
+/// message when there is no real terminal to attach to, leaving any other
+/// I/O error untouched.
+///
+/// `enable_raw_mode` opens `/dev/tty` whenever stdin isn't itself a tty (a
+/// piped-stdio run under a test harness, a script, or a CI job); with no
+/// controlling terminal at all that open fails `ENXIO` ("Device not
+/// configured" -- raw OS error 6 on macOS, confirmed empirically: opening
+/// `/dev/tty` with no controlling terminal at all reports 6, not 25), and
+/// against a real non-tty device it fails `ENOTTY` ("Inappropriate ioctl
+/// for device", 25 on both macOS and Linux). Neither maps to a stable,
+/// matchable `io::ErrorKind` on stable Rust (macOS reports the
+/// nightly-only `ErrorKind::Uncategorized` here), so the raw OS error
+/// number is the only portable signal available.
+fn friendly_no_tty_error(err: std::io::Error) -> std::io::Error {
+    match err.raw_os_error() {
+        Some(6) | Some(25) => {
+            std::io::Error::new(err.kind(), "pdfboss tui requires an interactive terminal")
+        }
+        _ => err,
+    }
+}
+
 /// Restores the terminal on drop, so panics and early returns never leave
 /// the shell in raw mode.
 struct TerminalGuard;
@@ -60,7 +83,7 @@ impl Drop for TerminalGuard {
 /// or HTTP-backed); `title` labels the status bar. Document-level errors
 /// become status-bar toasts; only terminal I/O errors are returned.
 pub async fn run(doc: AsyncDocument, title: String) -> std::io::Result<()> {
-    enable_raw_mode()?;
+    enable_raw_mode().map_err(friendly_no_tty_error)?;
     // The guard is constructed before `EnterAlternateScreen` (not after) so
     // that an early return from *that* fallible call still restores raw
     // mode: a local already constructed at the point of an early `?` return

@@ -48,6 +48,15 @@ pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
 pdfboss obj     report.pdf 5               # pretty-print object 5
 ```
 
+Explorer subcommands, each accepting a local path or an `http(s)://` URL (range-fetched, never downloaded whole):
+
+```bash
+pdfboss json    report.pdf                    # dump the document as a JSON value tree
+pdfboss hex     report.pdf obj:5              # hexdump the file or a selected element
+pdfboss q       report.pdf '.header.version'  # jq-style queries over the JSON tree
+pdfboss tui     report.pdf                    # interactive terminal explorer
+```
+
 ### Python
 
 ```python
@@ -60,6 +69,14 @@ page = doc[0]
 print(page.width, page.height, page.rotation)
 text = page.extract_text()                 # or doc.extract_text() for all pages
 png  = page.render(scale=2.0)              # PNG bytes
+
+for element in doc.elements():             # lazy: physical + logical, byte spans included
+    print(element.kind, element.span)
+
+# Async access over files or http(s) URLs, without reading the whole document.
+doc = await pdfboss.AsyncDocument.open_url("https://example.com/report.pdf")
+async for element in doc.elements():
+    print(element.kind, element.value)
 ```
 
 ### Rust
@@ -82,7 +99,9 @@ pixmap.save_png("page.png")?;
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
 | `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text extraction |
 | `pdfboss-render` | Anti-aliased vector rasterizer — paths, fills, strokes, clipping, color, images — to RGBA/PNG |
+| `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
+| `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
 **Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and embedded-TrueType glyph outlines · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
@@ -104,6 +123,8 @@ Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks
 Rendered pages paint the outlines of **embedded TrueType** glyphs (Type0/`CIDFontType2` under Identity, and simple `/TrueType` fonts via their `cmap`). Text in other fonts (CFF/Type1 programs, the standard 14, subset fonts without a usable `cmap`) is still positioned but not drawn.
 
 Not yet supported in v0.1 (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · non-TrueType glyph outlines (CFF/Type1) · shadings and tiling patterns · `JPXDecode` (JPEG 2000).
+
+The sync and async APIs are not at parity on encryption: `Document`/`Page` (and the CLI's `info`/`text`/`render`/`obj`) decrypt empty-user-password RC4/AES files transparently, as above. `AsyncDocument` (`pdfboss tui`, any `http(s)://` target, and the Python `AsyncDocument`) currently rejects every encrypted document outright, real password or not — async decryption parity is a tracked follow-up.
 
 ## Development
 
