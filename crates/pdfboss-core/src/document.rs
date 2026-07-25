@@ -8,6 +8,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use crate::crypt::Decryptor;
+use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::geom::Rect;
@@ -51,6 +52,7 @@ pub struct Document {
 
 /// The flattened, inheritance-applied record for one page.
 struct PageRec {
+    obj_ref: Option<ObjRef>,
     media_box: Rect,
     crop_box: Rect,
     rotate: i32,
@@ -191,6 +193,16 @@ impl Document {
         self.version
     }
 
+    /// Raw bytes of the loaded file.
+    pub fn bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The merged cross-reference table and trailer.
+    pub fn xref(&self) -> &Xref {
+        &self.xref
+    }
+
     /// Fetches an indirect object by reference (xref lookup, object-stream
     /// indirection, cached). A generation mismatch between the request and
     /// the file is tolerated (lenient).
@@ -220,14 +232,7 @@ impl Document {
                     .ok()
                     .filter(|&o| o < self.data.len())
                     .ok_or(Error::ObjectNotFound(r.num, r.gen))?;
-                let (_, mut object) = Parser::at(&self.data, offset).parse_indirect(self)?;
-                // Objects stored directly in the file carry encrypted strings
-                // and stream data; decrypt with this object's key. (Objects
-                // living in object streams are decrypted with their container.)
-                if let Some(dec) = &self.decryptor {
-                    dec.decrypt_object(&mut object, r.num, r.gen);
-                }
-                Ok(object)
+                self.object_at_spanned(offset).map(|parsed| parsed.1)
             }
             Some(XrefEntry::InStream { stream_num, index }) => {
                 self.load_from_object_stream(stream_num, index)
@@ -235,11 +240,25 @@ impl Document {
         }
     }
 
-    /// Extracts a compressed object from the object stream `stream_num`,
-    /// decoding and parsing that stream's header at most once.
-    fn load_from_object_stream(&self, stream_num: u32, index: u32) -> Result<Object> {
+    /// Parses the indirect object at `offset`, applying decryption, and
+    /// reports the byte range consumed (`N G obj … endobj`).
+    pub(crate) fn object_at_spanned(&self, offset: usize) -> Result<(ObjRef, Object, Span)> {
+        let mut parser = Parser::at(&self.data, offset);
+        let (r, mut object) = parser.parse_indirect(self)?;
+        // Objects stored directly in the file carry encrypted strings and
+        // stream data; decrypt with this object's key. (Objects living in
+        // object streams are decrypted with their container.)
+        if let Some(dec) = &self.decryptor {
+            dec.decrypt_object(&mut object, r.num, r.gen);
+        }
+        Ok((r, object, Span::new(offset as u64, parser.pos() as u64)))
+    }
+
+    /// The decoded, header-parsed object stream `stream_num`, built at most
+    /// once and cached.
+    pub(crate) fn objstm_handle(&self, stream_num: u32) -> Result<Rc<objstm::ObjStm>> {
         if let Some(stm) = self.objstms.borrow().get(&stream_num) {
-            return stm.object(index);
+            return Ok(Rc::clone(stm));
         }
         let container = self.get(ObjRef {
             num: stream_num,
@@ -261,9 +280,15 @@ impl Document {
             .ok_or(Error::MissingKey("First"))?;
         let decoded = self.stream_data(stream)?;
         let stm = Rc::new(objstm::ObjStm::parse(decoded, n, first)?);
-        let object = stm.object(index)?;
-        self.objstms.borrow_mut().insert(stream_num, stm);
-        Ok(object)
+        self.objstms
+            .borrow_mut()
+            .insert(stream_num, Rc::clone(&stm));
+        Ok(stm)
+    }
+
+    /// Extracts a compressed object from the object stream `stream_num`.
+    fn load_from_object_stream(&self, stream_num: u32, index: u32) -> Result<Object> {
+        self.objstm_handle(stream_num)?.object(index)
     }
 
     /// Chases reference chains with a depth guard of `MAX_RESOLVE_DEPTH`
@@ -347,6 +372,7 @@ impl Document {
             rotate: rec.rotate,
             resources: rec.resources.clone(),
             dict: rec.dict.clone(),
+            obj_ref: rec.obj_ref,
         })
     }
 
@@ -402,7 +428,12 @@ impl Document {
             if depth > MAX_TREE_DEPTH {
                 continue;
             }
-            if let Object::Ref(r) = node {
+            let node_ref = if let Object::Ref(r) = node {
+                Some(r)
+            } else {
+                None
+            };
+            if let Some(r) = node_ref {
                 if !visited.insert(r) {
                     continue; // cycle: this node was already traversed
                 }
@@ -438,7 +469,7 @@ impl Document {
                         stack.push((kid.clone(), inherited.clone(), depth + 1));
                     }
                 }
-                None => pages.push(make_page_rec(dict.clone(), &inherited)),
+                None => pages.push(make_page_rec(node_ref, dict.clone(), &inherited)),
             }
         }
         pages
@@ -488,7 +519,7 @@ impl Document {
 
 /// Builds the final page record from a leaf dictionary and its inherited
 /// attributes, applying the spec defaults.
-fn make_page_rec(dict: Dict, inherited: &Inherited) -> PageRec {
+fn make_page_rec(obj_ref: Option<ObjRef>, dict: Dict, inherited: &Inherited) -> PageRec {
     let media_box = inherited
         .media_box
         .filter(|r| r.width() > 0.0 && r.height() > 0.0)
@@ -499,6 +530,7 @@ fn make_page_rec(dict: Dict, inherited: &Inherited) -> PageRec {
         .filter(|r| r.width() > 0.0 && r.height() > 0.0)
         .unwrap_or(media_box);
     PageRec {
+        obj_ref,
         media_box,
         crop_box,
         rotate: normalize_rotation(inherited.rotate.unwrap_or(0)),
@@ -557,9 +589,17 @@ pub struct Page {
     /// The page's (inherited) `/Resources` dictionary.
     pub resources: Dict,
     dict: Dict,
+    obj_ref: Option<ObjRef>,
 }
 
 impl Page {
+    /// The page's indirect object reference, when the page came from an
+    /// indirect kid in the page tree (pages inlined directly into a `/Kids`
+    /// array have none).
+    pub fn object_ref(&self) -> Option<ObjRef> {
+        self.obj_ref
+    }
+
     /// The page's decoded content: the `/Contents` stream, or all streams
     /// of a `/Contents` array decoded and joined with `b"\n"`. A missing
     /// `/Contents` yields empty content (lenient).
@@ -608,7 +648,9 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfboss_testkit::{multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
+    use crate::parser::{NoResolve, Parser};
+    use crate::xref::XrefEntry;
+    use pdfboss_testkit::{multi_page_doc, objstm_doc, objstm_payload, simple_doc, PdfBuilder};
 
     /// Replaces the first occurrence of `from` with `to`. Splicing happens
     /// after the xref section, so byte offsets stay valid.
@@ -963,5 +1005,288 @@ mod tests {
         // The over-nested Root is rejected or ignored (lenient), but the
         // process survives and no page is fabricated from it.
         assert!(matches!(outcome, Ok(0) | Err(_)));
+    }
+
+    #[test]
+    fn bytes_and_xref_accessors() {
+        let data = simple_doc("accessors");
+        let doc = Document::load(data.clone()).unwrap();
+        assert_eq!(doc.bytes(), &data[..]);
+        assert!(!doc.xref().is_empty());
+        assert!(doc.xref().trailer.get("Root").is_some());
+    }
+
+    #[test]
+    fn object_at_spanned_reparses_identically() {
+        let data = simple_doc("spanned");
+        let doc = Document::load(data).unwrap();
+        for (num, entry) in doc.xref().iter() {
+            let XrefEntry::InFile { offset, gen } = entry else {
+                continue;
+            };
+            let (r, object, span) = doc.object_at_spanned(offset as usize).unwrap();
+            assert_eq!(r.num, num);
+            assert_eq!(r.gen, gen);
+            assert_eq!(span.start, offset);
+            assert!(span.end as usize <= doc.bytes().len());
+            // The bytes at the span parse back to the same object.
+            let slice = &doc.bytes()[span.start as usize..span.end as usize];
+            let (r2, object2) = Parser::new(slice).parse_indirect(&NoResolve).unwrap();
+            assert_eq!(r2, r);
+            assert_eq!(object2, object);
+        }
+    }
+
+    #[test]
+    fn page_object_ref_points_at_a_page_dict() {
+        let doc = Document::load(multi_page_doc(&["one", "two"])).unwrap();
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let r = page.object_ref().expect("builder pages are indirect");
+            let resolved = doc.get(r).unwrap();
+            assert_eq!(
+                resolved
+                    .as_dict()
+                    .unwrap()
+                    .get_name("Type")
+                    .map(|n| n.0.as_str()),
+                Some("Page")
+            );
+        }
+    }
+
+    // --- Minimal Standard-handler (RC4 V2/R3) fixture builder, duplicating
+    // the key-derivation mechanism `crypt::tests` uses under the empty user
+    // password (those helpers are private to that module's tests). Needed
+    // only to pin the decrypt-identity regression test below: RC4's
+    // per-object key depends on the object's num/gen, so it is the cipher
+    // that can actually distinguish "decrypt with the parsed header's
+    // identity" from "decrypt with the caller's requested identity".
+
+    const RC4_FIXTURE_KEY_LEN: usize = 16; // 128-bit key
+    const RC4_FIXTURE_P: i32 = -44;
+    const RC4_FIXTURE_ID0: &[u8] = b"0123456789abcdef";
+    const RC4_FIXTURE_PAD: [u8; 32] = [
+        0x28, 0xBF, 0x4E, 0x5E, 0x4E, 0x75, 0x8A, 0x41, 0x64, 0x00, 0x4E, 0x56, 0xFF, 0xFA, 0x01,
+        0x08, 0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53,
+        0x69, 0x7A,
+    ];
+
+    #[rustfmt::skip]
+    const RC4_FIXTURE_MD5_S: [u32; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+    #[rustfmt::skip]
+    const RC4_FIXTURE_MD5_K: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ];
+
+    fn rc4_fixture_md5(input: &[u8]) -> [u8; 16] {
+        let (mut a0, mut b0, mut c0, mut d0) = (
+            0x6745_2301u32,
+            0xefcd_ab89u32,
+            0x98ba_dcfeu32,
+            0x1032_5476u32,
+        );
+        let mut msg = input.to_vec();
+        let bitlen = (input.len() as u64).wrapping_mul(8);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bitlen.to_le_bytes());
+        for chunk in msg.chunks_exact(64) {
+            let mut m = [0u32; 16];
+            for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
+                *word = u32::from_le_bytes(bytes.try_into().unwrap());
+            }
+            let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
+            for i in 0..64 {
+                let (f, g) = match i {
+                    0..=15 => ((b & c) | (!b & d), i),
+                    16..=31 => ((d & b) | (!d & c), (5 * i + 1) % 16),
+                    32..=47 => (b ^ c ^ d, (3 * i + 5) % 16),
+                    _ => (c ^ (b | !d), (7 * i) % 16),
+                };
+                let f = f
+                    .wrapping_add(a)
+                    .wrapping_add(RC4_FIXTURE_MD5_K[i])
+                    .wrapping_add(m[g]);
+                a = d;
+                d = c;
+                c = b;
+                b = b.wrapping_add(f.rotate_left(RC4_FIXTURE_MD5_S[i]));
+            }
+            a0 = a0.wrapping_add(a);
+            b0 = b0.wrapping_add(b);
+            c0 = c0.wrapping_add(c);
+            d0 = d0.wrapping_add(d);
+        }
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&a0.to_le_bytes());
+        out[4..8].copy_from_slice(&b0.to_le_bytes());
+        out[8..12].copy_from_slice(&c0.to_le_bytes());
+        out[12..16].copy_from_slice(&d0.to_le_bytes());
+        out
+    }
+
+    fn rc4_fixture_rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut s: [u8; 256] = core::array::from_fn(|i| i as u8);
+        let mut j = 0u8;
+        for i in 0..256 {
+            j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
+            s.swap(i, j as usize);
+        }
+        let mut out = Vec::with_capacity(data.len());
+        let (mut i, mut j) = (0u8, 0u8);
+        for &byte in data {
+            i = i.wrapping_add(1);
+            j = j.wrapping_add(s[i as usize]);
+            s.swap(i as usize, j as usize);
+            let k = s[s[i as usize].wrapping_add(s[j as usize]) as usize];
+            out.push(byte ^ k);
+        }
+        out
+    }
+
+    /// `/O` for empty owner and user passwords (Algorithm 3, R3).
+    fn rc4_fixture_owner_entry() -> Vec<u8> {
+        let mut d = rc4_fixture_md5(&RC4_FIXTURE_PAD);
+        for _ in 0..50 {
+            d = rc4_fixture_md5(&d[..RC4_FIXTURE_KEY_LEN]);
+        }
+        let rc4key = d[..RC4_FIXTURE_KEY_LEN].to_vec();
+        let mut o = rc4_fixture_rc4(&rc4key, &RC4_FIXTURE_PAD);
+        for i in 1u8..=19 {
+            let k: Vec<u8> = rc4key.iter().map(|b| b ^ i).collect();
+            o = rc4_fixture_rc4(&k, &o);
+        }
+        o
+    }
+
+    /// File key from `/O` for the empty user password (Algorithm 2, R3).
+    fn rc4_fixture_file_key(o: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(&RC4_FIXTURE_PAD);
+        input.extend_from_slice(o);
+        input.extend_from_slice(&(RC4_FIXTURE_P as u32).to_le_bytes());
+        input.extend_from_slice(RC4_FIXTURE_ID0);
+        let mut d = rc4_fixture_md5(&input);
+        for _ in 0..50 {
+            d = rc4_fixture_md5(&d[..RC4_FIXTURE_KEY_LEN]);
+        }
+        d[..RC4_FIXTURE_KEY_LEN].to_vec()
+    }
+
+    /// `/U` for the empty user password (Algorithm 5, R3).
+    fn rc4_fixture_user_entry(key: &[u8]) -> Vec<u8> {
+        let mut input = Vec::new();
+        input.extend_from_slice(&RC4_FIXTURE_PAD);
+        input.extend_from_slice(RC4_FIXTURE_ID0);
+        let mut x = rc4_fixture_md5(&input).to_vec();
+        x = rc4_fixture_rc4(key, &x);
+        for i in 1u8..=19 {
+            let k: Vec<u8> = key.iter().map(|b| b ^ i).collect();
+            x = rc4_fixture_rc4(&k, &x);
+        }
+        x.resize(32, 0); // trailing padding is arbitrary
+        x
+    }
+
+    fn rc4_fixture_obj_key(key: &[u8], num: u32, gen: u16) -> Vec<u8> {
+        let mut input = key.to_vec();
+        input.extend_from_slice(&num.to_le_bytes()[..3]);
+        input.extend_from_slice(&gen.to_le_bytes()[..2]);
+        rc4_fixture_md5(&input)[..(key.len() + 5).min(16)].to_vec()
+    }
+
+    fn rc4_fixture_hexstr(b: &[u8]) -> String {
+        let mut s = String::from("<");
+        for x in b {
+            s.push_str(&format!("{x:02x}"));
+        }
+        s.push('>');
+        s
+    }
+
+    /// Builds a V2/R3 (128-bit RC4) file, encrypted under the empty
+    /// password, with a single indirect object (`3 0 obj`, i.e. gen 0)
+    /// holding an encrypted string.
+    fn rc4_encrypted_fixture() -> Vec<u8> {
+        let o = rc4_fixture_owner_entry();
+        let key = rc4_fixture_file_key(&o);
+        let u = rc4_fixture_user_entry(&key);
+        let msg = rc4_fixture_rc4(&rc4_fixture_obj_key(&key, 3, 0), b"Top secret message");
+
+        let mut b = PdfBuilder::new().version(1, 4);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.object(3, &format!("<< /Msg {} >>", rc4_fixture_hexstr(&msg)));
+        b.object(
+            9,
+            &format!(
+                "<< /Filter /Standard /V 2 /R 3 /Length 128 /P {} /O {} /U {} >>",
+                RC4_FIXTURE_P,
+                rc4_fixture_hexstr(&o),
+                rc4_fixture_hexstr(&u)
+            ),
+        );
+        let trailer = format!(
+            "/Encrypt 9 0 R /ID [{}{}]",
+            rc4_fixture_hexstr(RC4_FIXTURE_ID0),
+            rc4_fixture_hexstr(RC4_FIXTURE_ID0)
+        );
+        b.trailer_extra(&trailer).build(1)
+    }
+
+    #[test]
+    fn encrypted_generation_mismatch_still_decrypts() {
+        // `object_at_spanned` derives the per-object RC4/AESV2 decrypt key
+        // from the PARSED "N G obj" header at the object's file offset
+        // (`r.num`, `r.gen` from `parser.parse_indirect`), never from the
+        // caller's requested `ObjRef` — mirroring how plain (unencrypted)
+        // lookups already tolerate a generation mismatch
+        // (`generation_mismatch_is_tolerated`). Request object 3 (really
+        // "3 0 obj" in the file) under a deliberately wrong generation: if
+        // decryption instead used the requested (wrong) gen to derive the
+        // RC4 object key, the result would be garbage, not the plaintext.
+        let doc = Document::load(rc4_encrypted_fixture()).expect("empty password opens the file");
+        let obj3 = doc.get(ObjRef { num: 3, gen: 7 }).unwrap();
+        let msg = obj3
+            .as_dict()
+            .unwrap()
+            .get("Msg")
+            .unwrap()
+            .as_str_bytes()
+            .unwrap();
+        assert_eq!(
+            msg, b"Top secret message",
+            "decrypted using the file's real gen (0), not the mismatched request (7)"
+        );
+    }
+
+    #[test]
+    fn objstm_doc_fixture_loads_and_resolves_members() {
+        let data = objstm_doc(&[(7, "<< /Marker (inside) >>")]);
+        let doc = Document::load(data).unwrap();
+        assert_eq!(doc.page_count(), 1);
+        let member = doc.get(ObjRef { num: 7, gen: 0 }).unwrap();
+        let text = member.as_dict().unwrap().get("Marker").unwrap();
+        assert_eq!(text.as_str_bytes(), Some(&b"inside"[..]));
+        // The member really is xref'd into the object stream.
+        assert!(matches!(
+            doc.xref().get(7),
+            Some(XrefEntry::InStream { stream_num: 4, .. })
+        ));
     }
 }

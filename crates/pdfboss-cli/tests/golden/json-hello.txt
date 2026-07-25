@@ -1,0 +1,185 @@
+{
+  "header": {
+    "version": "1.7",
+    "_span": [
+      0,
+      8
+    ],
+    "_kind": "header"
+  },
+  "objects": {
+    "1 0": {
+      "_kind": "object",
+      "_ref": [
+        1,
+        0
+      ],
+      "_span": [
+        15,
+        63
+      ],
+      "_objstm": null,
+      "value": {
+        "Pages": {
+          "_r": [
+            2,
+            0
+          ]
+        },
+        "Type": "Catalog"
+      }
+    },
+    "2 0": {
+      "_kind": "object",
+      "_ref": [
+        2,
+        0
+      ],
+      "_span": [
+        64,
+        120
+      ],
+      "_objstm": null,
+      "value": {
+        "Count": 1,
+        "Kids": [
+          {
+            "_r": [
+              3,
+              0
+            ]
+          }
+        ],
+        "Type": "Pages"
+      }
+    },
+    "3 0": {
+      "_kind": "object",
+      "_ref": [
+        3,
+        0
+      ],
+      "_span": [
+        121,
+        246
+      ],
+      "_objstm": null,
+      "value": {
+        "Contents": {
+          "_r": [
+            4,
+            0
+          ]
+        },
+        "MediaBox": [
+          0,
+          0,
+          612,
+          792
+        ],
+        "Parent": {
+          "_r": [
+            2,
+            0
+          ]
+        },
+        "Resources": {
+          "Font": {
+            "F1": {
+              "_r": [
+                5,
+                0
+              ]
+            }
+          }
+        },
+        "Type": "Page"
+      }
+    },
+    "4 0": {
+      "_kind": "object",
+      "_ref": [
+        4,
+        0
+      ],
+      "_span": [
+        247,
+        340
+      ],
+      "_objstm": null,
+      "value": {
+        "_stream": {
+          "dict": {
+            "Length": 44
+          },
+          "length": 44
+        }
+      }
+    },
+    "5 0": {
+      "_kind": "object",
+      "_ref": [
+        5,
+        0
+      ],
+      "_span": [
+        341,
+        437
+      ],
+      "_objstm": null,
+      "value": {
+        "BaseFont": "Helvetica",
+        "Encoding": "WinAnsiEncoding",
+        "Subtype": "Type1",
+        "Type": "Font"
+      }
+    }
+  },
+  "pages": [
+    {
+      "index": 0,
+      "_ref": [
+        3,
+        0
+      ],
+      "fonts": [
+        {
+          "_ref": [
+            5,
+            0
+          ],
+          "subtype": "Type1",
+          "base_font": "Helvetica"
+        }
+      ],
+      "images": [],
+      "annotations": []
+    }
+  ],
+  "xref": [
+    {
+      "kind": "table",
+      "entries": 6,
+      "_span": [
+        438,
+        567
+      ]
+    }
+  ],
+  "trailer": {
+    "_span": [
+      567,
+      600
+    ],
+    "value": {
+      "Root": {
+        "_r": [
+          1,
+          0
+        ]
+      },
+      "Size": 6
+    }
+  },
+  "startxref": 438
+}

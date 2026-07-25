@@ -1,13 +1,52 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
-mod pretty;
+mod hexdump;
+mod input;
+mod json;
+mod q;
+
+use pdfboss_core::pretty;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use pdfboss_core::{Document, Error, Metadata, ObjRef, Object};
+
+use crate::input::is_url;
+
+/// A fatal CLI failure: message for stderr plus the process exit code.
+/// PDF/IO problems exit 1; invalid jq programs exit 2 (mirroring clap's own
+/// usage-error code and keeping the two failure kinds distinguishable).
+pub struct Failure {
+    pub message: String,
+    pub code: i32,
+}
+
+impl Failure {
+    /// A PDF/IO failure (exit code 1).
+    pub fn new(message: impl Into<String>) -> Failure {
+        Failure {
+            message: message.into(),
+            code: 1,
+        }
+    }
+
+    /// An invalid-program failure (exit code 2).
+    pub fn program(message: impl Into<String>) -> Failure {
+        Failure {
+            message: message.into(),
+            code: 2,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Failure {
+        Failure::new(message)
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +105,82 @@ enum Command {
         /// Generation number (default 0).
         gen: Option<u16>,
     },
+    /// Explore a PDF interactively in the terminal.
+    ///
+    /// Encrypted PDFs are not yet supported over this path (they are
+    /// rejected at open, even under the empty user password that
+    /// `info`/`text`/`render`/`obj` accept).
+    Tui {
+        /// Path or http(s) URL of the PDF.
+        target: String,
+    },
+    /// Dump the document as a JSON value tree (for piping to external tools).
+    Json {
+        /// Path or http(s) URL of the PDF.
+        input: String,
+        /// Embed raw (still encoded) stream data as base64.
+        #[arg(long, conflicts_with = "decode")]
+        raw: bool,
+        /// Embed decoded stream data as base64.
+        #[arg(long)]
+        decode: bool,
+        /// Restrict logical elements to these 1-based pages (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        pages: Option<Vec<usize>>,
+        /// Skip the logical layer (pages/fonts/images/annotations).
+        #[arg(long)]
+        no_logical: bool,
+        /// Include per-page content-stream operators (high volume).
+        #[arg(long)]
+        content_ops: bool,
+    },
+    /// Hexdump the file or a selected element (hexyl-style).
+    Hex {
+        /// Path or http(s) URL of the PDF.
+        input: String,
+        // Not a real intra-doc link: `[,G]` is the CLI's own bracket
+        // notation for an optional generation number, not markdown link
+        // syntax, but rustdoc parses it as one.
+        #[allow(rustdoc::broken_intra_doc_links)]
+        /// obj:N[,G] | header | xref:N | trailer | range:START-END
+        /// (offsets decimal or 0x-hex; xref sections indexed in chain
+        /// order, newest first). Default: the whole file.
+        selector: Option<String>,
+        /// Print labeled element boundaries as the dump crosses them.
+        #[arg(long)]
+        annotate: bool,
+        /// Bytes per row.
+        #[arg(long, default_value_t = 16)]
+        width: usize,
+    },
+    /// Run a jq program over the document's JSON value tree.
+    Q {
+        /// Path or http(s) URL of the PDF.
+        input: String,
+        /// jq program, e.g. '.objects["12 0"]'.
+        program: String,
+        /// Embed raw (still encoded) stream data as base64.
+        #[arg(long, conflicts_with = "decode")]
+        raw: bool,
+        /// Embed decoded stream data as base64.
+        #[arg(long)]
+        decode: bool,
+        /// Hexdump results carrying a `_span` instead of printing JSON.
+        #[arg(long)]
+        hex: bool,
+        /// Print string results raw, without quotes (like jq -r).
+        #[arg(short = 'r')]
+        raw_strings: bool,
+        /// Restrict logical elements to these 1-based pages (comma separated).
+        #[arg(long, value_delimiter = ',')]
+        pages: Option<Vec<usize>>,
+        /// Skip the logical layer (pages/fonts/images/annotations).
+        #[arg(long)]
+        no_logical: bool,
+        /// Include per-page content-stream operators (high volume).
+        #[arg(long)]
+        content_ops: bool,
+    },
 }
 
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
@@ -93,9 +208,9 @@ impl FontsArg {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Info { file } => cmd_info(&file),
-        Command::Text { file, page } => cmd_text(&file, page),
+    let result: Result<(), Failure> = match cli.command {
+        Command::Info { file } => cmd_info(&file).map_err(Failure::from),
+        Command::Text { file, page } => cmd_text(&file, page).map_err(Failure::from),
         Command::Render {
             file,
             page,
@@ -103,12 +218,58 @@ fn main() {
             scale,
             fonts,
             font_dir,
-        } => cmd_render(&file, page, out, scale, fonts, font_dir),
-        Command::Obj { file, num, gen } => cmd_obj(&file, num, gen.unwrap_or(0)),
+        } => cmd_render(&file, page, out, scale, fonts, font_dir).map_err(Failure::from),
+        Command::Obj { file, num, gen } => {
+            cmd_obj(&file, num, gen.unwrap_or(0)).map_err(Failure::from)
+        }
+        Command::Tui { target } => cmd_tui(&target).map_err(Failure::from),
+        Command::Json {
+            input,
+            raw,
+            decode,
+            pages,
+            no_logical,
+            content_ops,
+        } => {
+            let flags = q::value::TreeFlags {
+                raw,
+                decode,
+                pages,
+                no_logical,
+                content_ops,
+            };
+            json::cmd_json(&input, &flags).map_err(Failure::from)
+        }
+        Command::Hex {
+            input,
+            selector,
+            annotate,
+            width,
+        } => hexdump::cmd_hex(&input, selector.as_deref(), annotate, width).map_err(Failure::from),
+        Command::Q {
+            input,
+            program,
+            raw,
+            decode,
+            hex,
+            raw_strings,
+            pages,
+            no_logical,
+            content_ops,
+        } => {
+            let flags = q::value::TreeFlags {
+                raw,
+                decode,
+                pages,
+                no_logical,
+                content_ops,
+            };
+            q::run::cmd_q(&input, &program, &flags, hex, raw_strings)
+        }
     };
-    if let Err(msg) = result {
-        eprintln!("pdfboss: {msg}");
-        std::process::exit(1);
+    if let Err(failure) = result {
+        eprintln!("pdfboss: {}", failure.message);
+        std::process::exit(failure.code);
     }
 }
 
@@ -319,6 +480,53 @@ fn cmd_obj(file: &Path, num: u32, gen: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// `pdfboss tui`: interactive explorer over a local file or an http(s)
+/// URL, on a current-thread tokio runtime (rasterization uses the
+/// runtime's blocking pool; the loop itself is single-threaded).
+fn cmd_tui(target: &str) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let doc = open_async_document(target).await?;
+        pdfboss_tui::run(doc, display_title(target))
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Builds the async document: the HTTP backend for URLs, the file backend
+/// otherwise -- exactly the split `json`/`hex`/`q` already make via
+/// `Input::open` (`pdfboss-aio`'s `http` feature is unconditionally on for
+/// this crate, so there is no cfg gate to make here).
+///
+/// Both branches wrap the aio error with `target`, the same
+/// `format!("{spec}: {err}")` shape `Input::open` uses for its local
+/// `std::io::Error` failures: without it, a missing file or bad URL surfaces
+/// only the layer-prefixed message ("io: No such file or directory") with
+/// no indication of which target failed to open.
+async fn open_async_document(target: &str) -> Result<pdfboss_aio::AsyncDocument, String> {
+    if is_url(target) {
+        return pdfboss_aio::AsyncDocument::open_url(target)
+            .await
+            .map_err(|e| format!("{target}: {e}"));
+    }
+    pdfboss_aio::AsyncDocument::open(target)
+        .await
+        .map_err(|e| format!("{target}: {e}"))
+}
+
+/// The status-bar title: the last path/URL segment, or the whole target.
+fn display_title(target: &str) -> String {
+    target
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(target)
+        .to_string()
+}
+
 /// Converts a 1-based page number into a 0-based index, validating range.
 fn page_index(page: usize, count: usize) -> Result<usize, String> {
     if page == 0 || page > count {
@@ -500,5 +708,122 @@ mod tests {
     #[test]
     fn default_out_names_by_page() {
         assert_eq!(default_out(2), PathBuf::from("page-2.png"));
+    }
+
+    #[test]
+    fn failure_from_string_exits_one() {
+        let failure = Failure::from("boom".to_string());
+        assert_eq!(failure.code, 1);
+        assert_eq!(failure.message, "boom");
+    }
+
+    #[test]
+    fn failure_program_exits_two() {
+        let failure = Failure::program("bad program");
+        assert_eq!(failure.code, 2);
+        assert_eq!(failure.message, "bad program");
+    }
+
+    #[test]
+    fn json_flags_parse() {
+        let cli = Cli::parse_from([
+            "pdfboss",
+            "json",
+            "in.pdf",
+            "--raw",
+            "--pages",
+            "1,3",
+            "--no-logical",
+            "--content-ops",
+        ]);
+        let Command::Json {
+            input,
+            raw,
+            decode,
+            pages,
+            no_logical,
+            content_ops,
+        } = cli.command
+        else {
+            panic!("expected json command");
+        };
+        assert_eq!(input, "in.pdf");
+        assert!(raw && !decode && no_logical && content_ops);
+        assert_eq!(pages, Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn hex_flags_parse() {
+        let cli = Cli::parse_from([
+            "pdfboss",
+            "hex",
+            "in.pdf",
+            "obj:12",
+            "--annotate",
+            "--width",
+            "8",
+        ]);
+        let Command::Hex {
+            input,
+            selector,
+            annotate,
+            width,
+        } = cli.command
+        else {
+            panic!("expected hex command");
+        };
+        assert_eq!(input, "in.pdf");
+        assert_eq!(selector.as_deref(), Some("obj:12"));
+        assert!(annotate);
+        assert_eq!(width, 8);
+    }
+
+    #[test]
+    fn q_flags_parse() {
+        let cli = Cli::parse_from(["pdfboss", "q", "in.pdf", ".header", "--hex", "-r"]);
+        let Command::Q {
+            input,
+            program,
+            raw,
+            decode,
+            hex,
+            raw_strings,
+            ..
+        } = cli.command
+        else {
+            panic!("expected q command");
+        };
+        assert_eq!(input, "in.pdf");
+        assert_eq!(program, ".header");
+        assert!(hex && raw_strings);
+        assert!(!raw && !decode);
+    }
+
+    #[test]
+    fn tui_subcommand_parses() {
+        let cli = Cli::parse_from(["pdfboss", "tui", "in.pdf"]);
+        let Command::Tui { target } = cli.command else {
+            panic!("expected tui command");
+        };
+        assert_eq!(target, "in.pdf");
+    }
+
+    #[test]
+    fn url_detection() {
+        assert!(is_url("https://example.com/a.pdf"));
+        assert!(is_url("http://example.com/a.pdf"));
+        assert!(!is_url("plain.pdf"));
+        assert!(!is_url("dir/httpish.pdf"));
+    }
+
+    #[test]
+    fn display_title_takes_last_segment() {
+        assert_eq!(display_title("dir/sub/file.pdf"), "file.pdf");
+        assert_eq!(display_title("file.pdf"), "file.pdf");
+        assert_eq!(
+            display_title("https://example.com/docs/spec.pdf"),
+            "spec.pdf"
+        );
+        assert_eq!(display_title("trailing/"), "trailing/");
     }
 }

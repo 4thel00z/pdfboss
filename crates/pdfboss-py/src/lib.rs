@@ -10,13 +10,19 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use futures_util::StreamExt;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyIndexError, PyValueError};
+use pyo3::exceptions::{PyException, PyIndexError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::IntoPyObjectExt;
 
+use pdfboss_aio::{AsyncDocument as AioDocument, ElementStream};
+use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, XrefKind};
 use pdfboss_core::Document as CoreDocument;
+use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
+use pdfboss_core::{Dict, ObjRef, Object};
 
 create_exception!(
     pdfboss,
@@ -30,9 +36,123 @@ fn pdf_err(e: impl std::fmt::Display) -> PyErr {
     PdfError::new_err(e.to_string())
 }
 
+/// Maps a core error to [`PdfError`] with the parse-layer prefix used by
+/// the element/async APIs.
+fn parse_err(e: pdfboss_core::Error) -> PyErr {
+    PdfError::new_err(format!("parse: {e}"))
+}
+
+/// Maps an aio error to [`PdfError`], prefixed by the layer it came from
+/// ("parse:", "io:" or "http:").
+fn aio_err(e: pdfboss_aio::Error) -> PyErr {
+    use pdfboss_aio::Error as AioError;
+    let msg = match e {
+        AioError::Core(e) => format!("parse: {e}"),
+        AioError::Io(e) => format!("io: {e}"),
+        AioError::Http { status, msg } => match status {
+            Some(code) => format!("http: {code}: {msg}"),
+            None => format!("http: {msg}"),
+        },
+        AioError::RangeUnsupported => "http: server does not support Range requests".to_string(),
+        AioError::TruncatedRead {
+            offset,
+            wanted,
+            got,
+        } => {
+            format!("io: truncated read at offset {offset}: wanted {wanted} bytes, got {got}")
+        }
+    };
+    PdfError::new_err(msg)
+}
+
+/// Builds the metadata dict; only keys present in the file are included.
+fn metadata_dict(py: Python<'_>, meta: CoreMetadata) -> PyResult<Bound<'_, PyDict>> {
+    let dict = PyDict::new(py);
+    let entries = [
+        ("title", meta.title),
+        ("author", meta.author),
+        ("subject", meta.subject),
+        ("keywords", meta.keywords),
+        ("creator", meta.creator),
+        ("producer", meta.producer),
+        ("creation_date", meta.creation_date),
+        ("mod_date", meta.mod_date),
+    ];
+    for (key, value) in entries {
+        if let Some(value) = value {
+            dict.set_item(key, value)?;
+        }
+    }
+    Ok(dict)
+}
+
+/// The stable Python `kind` string for a core element variant.
+fn kind_str(e: &CoreElement) -> &'static str {
+    match e {
+        CoreElement::Header { .. } => "header",
+        CoreElement::IndirectObject { .. } => "object",
+        CoreElement::XrefSection { .. } => "xref",
+        CoreElement::Trailer { .. } => "trailer",
+        CoreElement::StartXref { .. } => "startxref",
+        CoreElement::Eof { .. } => "eof",
+        CoreElement::Page { .. } => "page",
+        CoreElement::Font { .. } => "font",
+        CoreElement::Image { .. } => "image",
+        CoreElement::Annotation { .. } => "annotation",
+        CoreElement::ContentOp { .. } => "content_op",
+    }
+}
+
 /// Formats a `(major, minor)` header version as `"major.minor"`.
 fn version_string(version: (u8, u8)) -> String {
     format!("{}.{}", version.0, version.1)
+}
+
+/// Converts a core [`Object`] to plain Python data: dict/list/str/bytes/
+/// int/float/bool/None. Names become `str`; strings decode as UTF-8 where
+/// valid, else stay `bytes`; streams become `{"dict": ..., "length": n}`
+/// (raw data length in bytes, data not materialized); indirect references
+/// become `{"ref": (num, gen)}`.
+fn object_to_py<'py>(py: Python<'py>, obj: &Object) -> PyResult<Bound<'py, PyAny>> {
+    match obj {
+        Object::Null => Ok(py.None().into_bound(py)),
+        Object::Bool(b) => (*b).into_bound_py_any(py),
+        Object::Int(i) => (*i).into_bound_py_any(py),
+        Object::Real(r) => (*r).into_bound_py_any(py),
+        Object::String(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => s.into_bound_py_any(py),
+            Err(_) => Ok(PyBytes::new(py, bytes).into_any()),
+        },
+        Object::Name(name) => name.0.as_str().into_bound_py_any(py),
+        Object::Array(items) => {
+            let list = PyList::empty(py);
+            for item in items {
+                list.append(object_to_py(py, item)?)?;
+            }
+            Ok(list.into_any())
+        }
+        Object::Dict(dict) => Ok(dict_to_py(py, dict)?.into_any()),
+        Object::Stream(stream) => {
+            let out = PyDict::new(py);
+            out.set_item("dict", dict_to_py(py, &stream.dict)?)?;
+            out.set_item("length", stream.data.len())?;
+            Ok(out.into_any())
+        }
+        Object::Ref(r) => {
+            let out = PyDict::new(py);
+            out.set_item("ref", (r.num, r.gen))?;
+            Ok(out.into_any())
+        }
+    }
+}
+
+/// Converts a core [`Dict`] to a Python dict with name-string keys.
+fn dict_to_py<'py>(py: Python<'py>, dict: &Dict) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    for (key, value) in dict.iter() {
+        out.set_item(key.0.as_str(), object_to_py(py, value)?)?;
+    }
+    Ok(out)
 }
 
 /// Normalizes a possibly-negative sequence index against `count`.
@@ -129,23 +249,7 @@ impl Document {
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let meta = self.inner.lock().metadata();
-        let dict = PyDict::new(py);
-        let entries = [
-            ("title", meta.title),
-            ("author", meta.author),
-            ("subject", meta.subject),
-            ("keywords", meta.keywords),
-            ("creator", meta.creator),
-            ("producer", meta.producer),
-            ("creation_date", meta.creation_date),
-            ("mod_date", meta.mod_date),
-        ];
-        for (key, value) in entries {
-            if let Some(value) = value {
-                dict.set_item(key, value)?;
-            }
-        }
-        Ok(dict)
+        metadata_dict(py, meta)
     }
 
     fn __len__(&self) -> usize {
@@ -199,6 +303,39 @@ impl Document {
             }
             Ok(out)
         })
+    }
+
+    /// Lazily iterates the document's elements: physical file structure in
+    /// file order, then logical document structure in document order.
+    /// Nothing is parsed or decoded before it is yielded.
+    #[pyo3(signature = (*, physical=true, logical=true, pages=None, content_ops=false))]
+    fn elements(
+        &self,
+        physical: bool,
+        logical: bool,
+        pages: Option<Vec<usize>>,
+        content_ops: bool,
+    ) -> ElementIter {
+        let opts = ElementOpts {
+            physical,
+            logical,
+            pages,
+            content_ops,
+        };
+        let doc = Arc::clone(&self.inner);
+        let iter = {
+            let guard = doc.lock();
+            let core: &CoreDocument = &guard;
+            // SAFETY: the borrow is extended to 'static. The Arc stored in
+            // the returned ElementIter keeps the CoreDocument alive at a
+            // stable heap address (it lives inside the Arc'd
+            // SharedDocument), and ElementIter only advances the iterator
+            // while re-holding the document mutex. See SharedElements.
+            let core: &'static CoreDocument =
+                unsafe { std::mem::transmute::<&CoreDocument, &'static CoreDocument>(core) };
+            SharedElements(Mutex::new(core.elements(opts)))
+        };
+        ElementIter { doc, iter }
     }
 }
 
@@ -305,12 +442,348 @@ impl Page {
     }
 }
 
+/// One element of a PDF: physical file structure (header, indirect
+/// objects, xref sections, trailer, startxref, eof — always with byte
+/// spans) or logical document structure (pages, fonts, images,
+/// annotations, content ops).
+#[pyclass(frozen)]
+struct Element {
+    inner: CoreElement,
+}
+
+#[pymethods]
+impl Element {
+    /// The element kind: "header", "object", "xref", "trailer",
+    /// "startxref", "eof", "page", "font", "image", "annotation" or
+    /// "content_op".
+    #[getter]
+    fn kind(&self) -> &'static str {
+        kind_str(&self.inner)
+    }
+
+    /// Byte range as `(start, end)`, end-exclusive. Physical elements:
+    /// the range in the file. Content ops: the range within the page's
+    /// decoded, concatenated content stream. Other logical elements: None.
+    #[getter]
+    fn span(&self) -> Option<(u64, u64)> {
+        match &self.inner {
+            CoreElement::Header { span, .. }
+            | CoreElement::IndirectObject { span, .. }
+            | CoreElement::XrefSection { span, .. }
+            | CoreElement::Trailer { span, .. }
+            | CoreElement::StartXref { span, .. }
+            | CoreElement::Eof { span } => Some((span.start, span.end)),
+            CoreElement::ContentOp {
+                span_in_content, ..
+            } => Some((span_in_content.start, span_in_content.end)),
+            CoreElement::Page { .. }
+            | CoreElement::Font { .. }
+            | CoreElement::Image { .. }
+            | CoreElement::Annotation { .. } => None,
+        }
+    }
+
+    /// The `(num, gen)` object reference, where applicable.
+    #[getter]
+    fn r#ref(&self) -> Option<(u32, u16)> {
+        match &self.inner {
+            CoreElement::IndirectObject { r, .. }
+            | CoreElement::Page { r, .. }
+            | CoreElement::Font { r, .. }
+            | CoreElement::Image { r, .. }
+            | CoreElement::Annotation { r, .. } => Some((r.num, r.gen)),
+            CoreElement::Header { .. }
+            | CoreElement::XrefSection { .. }
+            | CoreElement::Trailer { .. }
+            | CoreElement::StartXref { .. }
+            | CoreElement::Eof { .. }
+            | CoreElement::ContentOp { .. } => None,
+        }
+    }
+
+    /// The 0-based page index for logical elements, None otherwise.
+    #[getter]
+    fn page(&self) -> Option<usize> {
+        match &self.inner {
+            CoreElement::Page { index, .. } => Some(*index),
+            CoreElement::Font { page, .. } | CoreElement::Image { page, .. } => *page,
+            CoreElement::Annotation { page, .. } | CoreElement::ContentOp { page, .. } => {
+                Some(*page)
+            }
+            CoreElement::Header { .. }
+            | CoreElement::IndirectObject { .. }
+            | CoreElement::XrefSection { .. }
+            | CoreElement::Trailer { .. }
+            | CoreElement::StartXref { .. }
+            | CoreElement::Eof { .. } => None,
+        }
+    }
+
+    /// Lazily converts the element's payload to plain Python data:
+    /// dict/list/str/bytes/int/float/bool/None. Objects and the trailer
+    /// convert fully (names -> str, strings -> str where UTF-8-valid else
+    /// bytes, streams -> {"dict": ..., "length": int}, references ->
+    /// {"ref": (num, gen)}). Header -> the version string; xref ->
+    /// {"kind": ..., "entries": ...}; startxref -> int; font ->
+    /// {"subtype": ..., "base_font": ...}; image -> {"width": ...,
+    /// "height": ...}; annotation -> {"subtype": ...}; content ops -> the
+    /// operator rendered as a string; eof and page -> None.
+    fn value<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.inner {
+            CoreElement::Header { version, .. } => version_string(*version).into_bound_py_any(py),
+            CoreElement::IndirectObject { object, .. } => object_to_py(py, object),
+            CoreElement::XrefSection { kind, entries, .. } => {
+                let out = PyDict::new(py);
+                out.set_item(
+                    "kind",
+                    match kind {
+                        XrefKind::Table => "table",
+                        XrefKind::Stream => "stream",
+                    },
+                )?;
+                out.set_item("entries", *entries)?;
+                Ok(out.into_any())
+            }
+            CoreElement::Trailer { dict, .. } => Ok(dict_to_py(py, dict)?.into_any()),
+            CoreElement::StartXref { offset, .. } => (*offset).into_bound_py_any(py),
+            CoreElement::Eof { .. } | CoreElement::Page { .. } => Ok(py.None().into_bound(py)),
+            CoreElement::Font {
+                subtype, base_font, ..
+            } => {
+                let out = PyDict::new(py);
+                out.set_item("subtype", subtype.0.as_str())?;
+                out.set_item("base_font", base_font.as_ref().map(|n| n.0.as_str()))?;
+                Ok(out.into_any())
+            }
+            CoreElement::Image { width, height, .. } => {
+                let out = PyDict::new(py);
+                out.set_item("width", *width)?;
+                out.set_item("height", *height)?;
+                Ok(out.into_any())
+            }
+            CoreElement::Annotation { subtype, .. } => {
+                let out = PyDict::new(py);
+                out.set_item("subtype", subtype.0.as_str())?;
+                Ok(out.into_any())
+            }
+            CoreElement::ContentOp { op, .. } => format!("{op:?}").into_bound_py_any(py),
+        }
+    }
+}
+
+/// The core element iterator with its document borrow extended to
+/// `'static`, lockable for exclusive advancement.
+///
+/// Safety invariants (upheld by `Document::elements` and `ElementIter`):
+///
+/// - the `Arc<SharedDocument>` stored next to this in `ElementIter` keeps
+///   the borrowed `CoreDocument` alive (at a stable heap address inside
+///   the Arc) for the iterator's whole lifetime, and
+/// - the iterator is only ever advanced while the document mutex is held,
+///   which serializes every touch of the document's interior caches.
+struct SharedElements(Mutex<Elements<'static>>);
+
+// SAFETY: `Elements<'static>` embeds a `&CoreDocument`, which is neither
+// `Send` nor `Sync` because of the document's interior object cache. Per
+// the invariants above, that borrow is only dereferenced under the same
+// mutex that makes `SharedDocument` sound, so moving or sharing this
+// wrapper across threads cannot race.
+unsafe impl Send for SharedElements {}
+unsafe impl Sync for SharedElements {}
+
+impl SharedElements {
+    /// Locks the iterator state. A poisoned lock is recovered, matching
+    /// `SharedDocument::lock`.
+    fn lock(&self) -> MutexGuard<'_, Elements<'static>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Sync iterator over a document's elements, returned by
+/// `Document.elements()`.
+#[pyclass(frozen)]
+struct ElementIter {
+    // Declared before `doc`: fields drop in declaration order, and `iter`
+    // borrows the document (via the 'static-extended `Elements` inside
+    // `SharedElements`), so it must drop before the `Arc` that keeps that
+    // borrowed document alive.
+    iter: SharedElements,
+    doc: Arc<SharedDocument>,
+}
+
+#[pymethods]
+impl ElementIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Advances the underlying core iterator. Releases the GIL while the
+    /// next element is located and parsed. Per-item parse failures raise
+    /// PdfError for that item; iteration may be continued afterwards
+    /// (salvage semantics).
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Element>> {
+        let item = py.allow_threads(|| {
+            let doc = self.doc.lock();
+            let next = self.iter.lock().next();
+            drop(doc);
+            next
+        });
+        match item {
+            None => Ok(None),
+            Some(Ok(element)) => Ok(Some(Element { inner: element })),
+            Some(Err(e)) => Err(parse_err(e)),
+        }
+    }
+}
+
+/// A PDF document opened for async I/O. Constructors and data-fetching
+/// methods are coroutines driven by one global multi-thread tokio
+/// runtime; `page_count`/`version` are sync because the open flow already
+/// parsed the xref chain and page tree index.
+#[pyclass(frozen)]
+struct AsyncDocument {
+    inner: AioDocument,
+}
+
+#[pymethods]
+impl AsyncDocument {
+    /// Opens a PDF file for async access. Coroutine resolving to an
+    /// AsyncDocument. The whole file is never read eagerly.
+    #[staticmethod]
+    fn open(py: Python<'_>, path: PathBuf) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = AioDocument::open(path).await.map_err(aio_err)?;
+            Ok(AsyncDocument { inner })
+        })
+    }
+
+    /// Loads a PDF from bytes already in memory. Coroutine resolving to
+    /// an AsyncDocument.
+    #[staticmethod]
+    fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = AioDocument::from_bytes(data).await.map_err(aio_err)?;
+            Ok(AsyncDocument { inner })
+        })
+    }
+
+    /// Opens a PDF over HTTP using range requests; the whole file is
+    /// never downloaded. The server must honor `Range` (a server that
+    /// ignores it raises PdfError with an "http:" message). Coroutine
+    /// resolving to an AsyncDocument.
+    #[staticmethod]
+    fn open_url(py: Python<'_>, url: String) -> PyResult<Bound<'_, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let inner = AioDocument::open_url(url).await.map_err(aio_err)?;
+            Ok(AsyncDocument { inner })
+        })
+    }
+
+    /// Number of pages in the document.
+    fn page_count(&self) -> usize {
+        self.inner.page_count()
+    }
+
+    /// PDF version from the file header, e.g. "1.7".
+    fn version(&self) -> String {
+        version_string(self.inner.version())
+    }
+
+    /// Document metadata; only keys present in the file are included.
+    /// Coroutine resolving to a dict.
+    fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let meta = inner.metadata().await.map_err(aio_err)?;
+            Python::with_gil(|py| {
+                Ok::<Py<PyAny>, PyErr>(metadata_dict(py, meta)?.into_any().unbind())
+            })
+        })
+    }
+
+    /// Fetches and parses the indirect object `num gen`, returning its
+    /// converted Python value. Coroutine.
+    #[pyo3(signature = (num, gen=0))]
+    fn get_object<'py>(&self, py: Python<'py>, num: u32, gen: u16) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let object = inner
+                .get_object(ObjRef { num, gen })
+                .await
+                .map_err(aio_err)?;
+            Python::with_gil(|py| object_to_py(py, &object).map(Bound::unbind))
+        })
+    }
+
+    /// Streams the document's elements; use with `async for`. Same
+    /// ordering and salvage semantics as `Document.elements`.
+    #[pyo3(signature = (*, physical=true, logical=true, pages=None, content_ops=false))]
+    fn elements(
+        &self,
+        physical: bool,
+        logical: bool,
+        pages: Option<Vec<usize>>,
+        content_ops: bool,
+    ) -> AsyncElementIter {
+        let opts = ElementOpts {
+            physical,
+            logical,
+            pages,
+            content_ops,
+        };
+        AsyncElementIter {
+            stream: Arc::new(tokio::sync::Mutex::new(self.inner.elements(opts))),
+        }
+    }
+}
+
+/// Async iterator over a document's elements, returned by
+/// `AsyncDocument.elements()`. Each `__anext__` is a coroutine driving
+/// the Rust element stream on the tokio runtime, so the asyncio loop is
+/// never blocked.
+///
+/// `ElementStream` is owned and `'static` (it holds a cheap `Arc` clone of
+/// the document, not a borrow of it — see `pdfboss_aio::stream`), so unlike
+/// the sync `ElementIter` this needs no borrow-extension or drop-order
+/// trick: the `Arc<tokio::sync::Mutex<_>>` alone keeps it alive and
+/// serializes advancement across concurrent `__anext__` calls.
+#[pyclass(frozen)]
+struct AsyncElementIter {
+    stream: Arc<tokio::sync::Mutex<ElementStream>>,
+}
+
+#[pymethods]
+impl AsyncElementIter {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Coroutine resolving to the next Element; raises StopAsyncIteration
+    /// when the stream is exhausted. Per-item failures raise PdfError for
+    /// that item and the stream may be continued (salvage semantics).
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream = Arc::clone(&self.stream);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut stream = stream.lock().await;
+            match stream.next().await {
+                Some(Ok(element)) => Ok(Element { inner: element }),
+                Some(Err(e)) => Err(aio_err(e)),
+                None => Err(PyStopAsyncIteration::new_err("element stream exhausted")),
+            }
+        })
+    }
+}
+
 #[pymodule]
 fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("PdfError", m.py().get_type::<PdfError>())?;
     m.add_class::<Document>()?;
     m.add_class::<Page>()?;
+    m.add_class::<Element>()?;
+    m.add_class::<ElementIter>()?;
+    m.add_class::<AsyncDocument>()?;
+    m.add_class::<AsyncElementIter>()?;
     Ok(())
 }
 
@@ -364,5 +837,23 @@ mod tests {
         assert_send_sync::<super::SharedDocument>();
         assert_send_sync::<super::Document>();
         assert_send_sync::<super::Page>();
+        assert_send_sync::<super::Element>();
+        assert_send_sync::<super::ElementIter>();
+        assert_send_sync::<super::AsyncDocument>();
+        assert_send_sync::<super::AsyncElementIter>();
+    }
+
+    #[test]
+    fn kind_str_maps_variants_to_kind_names() {
+        use pdfboss_core::elements::{Element as CoreElement, Span};
+        let span = Span { start: 0, end: 9 };
+        assert_eq!(
+            super::kind_str(&CoreElement::Header {
+                version: (1, 7),
+                span
+            }),
+            "header"
+        );
+        assert_eq!(super::kind_str(&CoreElement::Eof { span }), "eof");
     }
 }

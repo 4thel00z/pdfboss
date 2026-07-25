@@ -17,6 +17,45 @@ fn pdfboss(args: &[&str]) -> Output {
         .expect("failed to launch pdfboss binary")
 }
 
+// `setsid(2)`: detaches the calling process into a new session with no
+// controlling terminal. Declared by hand (rather than pulling in the
+// `libc` crate) since it is the one FFI call this test file needs.
+#[cfg(unix)]
+extern "C" {
+    fn setsid() -> i32;
+}
+
+/// Runs `pdfboss` with no controlling terminal at all, regardless of
+/// whether this test process itself has one.
+///
+/// `Command::output` pipes stdout/stderr but leaves stdin inherited; on
+/// Unix, crossterm's `enable_raw_mode` falls back to opening `/dev/tty` (the
+/// *session's* controlling terminal) whenever stdin isn't itself a tty, so
+/// merely piping stdio is not enough to force the no-tty path -- run under
+/// an interactive `cargo test`, the child would still find the real
+/// terminal via `/dev/tty` and the tui event loop would block on real
+/// keyboard input instead of exiting. `setsid` in a `pre_exec` hook (run in
+/// the forked child, before `exec`) detaches it from any controlling
+/// terminal, so `/dev/tty` reliably fails with `ENXIO`/`ENOTTY` here no
+/// matter where the test suite runs.
+#[cfg(unix)]
+fn pdfboss_without_a_terminal(args: &[&str]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pdfboss"));
+    cmd.args(args);
+    // SAFETY: `setsid` takes no arguments and is async-signal-safe, so it
+    // is sound to call between `fork` and `exec`.
+    unsafe {
+        cmd.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.output().expect("failed to launch pdfboss binary")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -133,4 +172,115 @@ fn out_of_range_page_exits_one() {
     assert_eq!(output.status.code(), Some(1));
     let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(err.contains("out of range"), "unexpected stderr: {err}");
+}
+
+/// A missing `tui` target must fail before any terminal mode change: the
+/// document open happens before `pdfboss_tui::run` (and therefore before
+/// `enable_raw_mode`/`EnterAlternateScreen`) is ever called, so a
+/// non-interactive run (stdin/stdout piped, not a tty, as `Command::output`
+/// always gives us) exits 1 with a plain stderr message and no ANSI
+/// alternate-screen escape sequence on stdout.
+///
+/// `cmd_tui` wraps the open error with the target spec (`{target}: {err}`,
+/// the same shape `Input::open` uses for `json`/`hex`/`q`'s local path), so
+/// the missing path must appear in stderr here too.
+#[test]
+fn tui_missing_file_exits_one_before_terminal_mode_change() {
+    let output = pdfboss(&["tui", "definitely-not-here.pdf"]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!err.is_empty(), "expected an error message");
+    assert!(
+        err.contains("definitely-not-here.pdf"),
+        "path missing from: {err}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "expected no stdout output (no terminal was ever entered): {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // `\x1b[?1049h` is the alternate-screen-enter sequence `EnterAlternateScreen`
+    // writes; its absence confirms raw mode / the alt screen was never touched.
+    assert!(
+        !output.stdout.windows(8).any(|w| w == b"\x1b[?1049h"),
+        "terminal mode was changed before the open failed"
+    );
+}
+
+/// A `tui` target that opens successfully but is run with no controlling
+/// terminal at all must fail with a human-readable message instead of
+/// surfacing crossterm's raw `enable_raw_mode` OS error ("Device not
+/// configured" / "Inappropriate ioctl for device") verbatim.
+#[cfg(unix)]
+#[test]
+fn tui_without_a_terminal_reports_a_friendly_error() {
+    let file = fixture("hello.pdf");
+    let output = pdfboss_without_a_terminal(&["tui", file.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1), "expected exit 1: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("interactive terminal"),
+        "expected the friendly no-tty message, got: {err}"
+    );
+}
+
+/// `json` and `tui` must both reject an encrypted document, not just
+/// `info`/`text`/`render`/`obj`.
+///
+/// The fixture is a syntactically-plausible but *cryptographically
+/// invalid* Standard-handler dict -- the same one
+/// `pdfboss_aio::document::tests::encrypted_documents_are_rejected_at_open`
+/// uses: its `/O` and `/U` strings are literal placeholder text, not real
+/// password hashes, so they can never verify. That means this fixture does
+/// not exercise "real" empty-password decryption (which sync `Document`
+/// does support, per the README) on either side: sync `Document::load`
+/// itself declines it with `Error::Encrypted` before any object is
+/// decrypted (mirroring
+/// `pdfboss_core::crypt::tests::document_load_rejects_when_password_does_not_verify`,
+/// which pins that same reject-on-no-verify behavior for a real V2/R3
+/// handler), and the async path rejects every encrypted document
+/// unconditionally, real or not. So both commands are expected to fail
+/// here for the same underlying reason, and this test honestly pins that
+/// -- it is not proof that `json` opens *real* empty-password-encrypted
+/// files (see `info`/`text`/`render`/`obj`'s own coverage for that).
+#[test]
+fn json_and_tui_both_reject_an_encrypted_document() {
+    let mut b = pdfboss_testkit::PdfBuilder::new().trailer_extra("/Encrypt 9 0 R");
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+    b.object(
+        9,
+        "<< /Filter /Standard /V 1 /R 2 /O (dummydummydummydummydummydummyd) \
+         /U (dummydummydummydummydummydummyd) /P -3904 >>",
+    );
+    let data = b.build(1);
+    let path =
+        std::env::temp_dir().join(format!("pdfboss-cli-encrypted-{}.pdf", std::process::id()));
+    std::fs::write(&path, &data).expect("write encrypted fixture");
+
+    let json_output = pdfboss(&["json", path.to_str().unwrap()]);
+    let tui_output = pdfboss(&["tui", path.to_str().unwrap()]);
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(
+        json_output.status.code(),
+        Some(1),
+        "json over an encrypted document must fail: {json_output:?}"
+    );
+    let json_err = String::from_utf8_lossy(&json_output.stderr);
+    assert!(
+        json_err.contains("encrypted documents are not supported"),
+        "json's error does not mention encryption: {json_err}"
+    );
+
+    assert_eq!(
+        tui_output.status.code(),
+        Some(1),
+        "tui over an encrypted document must fail: {tui_output:?}"
+    );
+    let tui_err = String::from_utf8_lossy(&tui_output.stderr);
+    assert!(
+        tui_err.contains("encrypted documents are not supported"),
+        "tui's error does not mention encryption: {tui_err}"
+    );
 }

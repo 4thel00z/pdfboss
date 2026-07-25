@@ -1,4 +1,5 @@
 import os
+from collections.abc import AsyncIterator, Iterator
 
 __version__: str
 
@@ -7,7 +8,43 @@ class PdfError(Exception):
 
     Covers bad or truncated data, unsupported encryption, stream decode
     failures and I/O errors; the message carries the underlying detail.
+    Messages from the element and async APIs are prefixed by the layer
+    they came from: ``"parse: …"``, ``"io: …"`` or ``"http: …"``.
     """
+
+class Element:
+    """One element of a PDF, yielded by ``Document.elements`` and
+    ``AsyncDocument.elements``: physical file structure (with byte spans)
+    or logical document structure.
+    """
+
+    kind: str                      # "header" | "object" | "xref" | "trailer" |
+                                   # "startxref" | "eof" | "page" | "font" |
+                                   # "image" | "annotation" | "content_op"
+    span: tuple[int, int] | None   # physical byte range; for "content_op" the
+                                   # range within the page's decoded content stream
+    ref: tuple[int, int] | None    # (num, gen) where applicable
+    page: int | None               # logical elements
+    def value(self) -> object:
+        """Lazy conversion to plain Python data:
+        dict/list/str/bytes/int/float/bool/None. PDF names -> str,
+        strings -> str where UTF-8-valid else bytes, streams ->
+        {"dict": ..., "length": int}, references -> {"ref": (num, gen)}.
+        """
+
+class ElementIter:
+    """Lazy sync iterator over elements; each ``__next__`` releases the
+    GIL while the next element is located and parsed."""
+
+    def __iter__(self) -> "ElementIter": ...
+    def __next__(self) -> Element: ...
+
+class AsyncElementIter:
+    """Async iterator over elements; each ``__anext__`` is a coroutine
+    driving the underlying stream, so the event loop is never blocked."""
+
+    def __aiter__(self) -> "AsyncElementIter": ...
+    async def __anext__(self) -> Element: ...
 
 class Document:
     """A loaded PDF document.
@@ -51,6 +88,20 @@ class Document:
 
     def extract_text(self) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``)."""
+
+    def elements(
+        self,
+        *,
+        physical: bool = True,
+        logical: bool = True,
+        pages: list[int] | None = None,
+        content_ops: bool = False,
+    ) -> Iterator[Element]:
+        """Lazily iterates the document's elements: physical file
+        structure in file order, then logical document structure in
+        document order. Nothing is parsed or decoded before it is
+        yielded; each step releases the GIL while parsing.
+        """
 
 class Page:
     """A single page of a document.
@@ -96,4 +147,36 @@ class Page:
         optional ``pdfboss-fonts`` package; if neither is available this
         raises ``ValueError`` (install with ``pip install pdfboss[full]``,
         or pass ``font_dir=...``).
+        """
+
+class AsyncDocument:
+    """A PDF document opened for async I/O.
+
+    Constructors and data-fetching methods are coroutines driven by one
+    global multi-thread tokio runtime; ``page_count``/``version`` are
+    sync because the open flow already parsed the xref chain and page
+    tree. The whole file is never read eagerly — file and HTTP backends
+    fetch only the byte ranges they need.
+    """
+
+    @staticmethod
+    async def open(path: str | os.PathLike) -> "AsyncDocument": ...
+    @staticmethod
+    async def open_url(url: str) -> "AsyncDocument": ...
+    @staticmethod
+    async def from_bytes(data: bytes) -> "AsyncDocument": ...
+    def page_count(self) -> int: ...
+    def version(self) -> str: ...
+    async def metadata(self) -> dict[str, str]: ...
+    async def get_object(self, num: int, gen: int = 0) -> object: ...
+    def elements(
+        self,
+        *,
+        physical: bool = True,
+        logical: bool = True,
+        pages: list[int] | None = None,
+        content_ops: bool = False,
+    ) -> AsyncIterator[Element]:
+        """Streams the document's elements; use with ``async for``. Same
+        ordering and salvage semantics as ``Document.elements``.
         """

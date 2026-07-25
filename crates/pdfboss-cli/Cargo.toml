@@ -1,6 +1,6 @@
 [package]
 name = "pdfboss-cli"
-description = "Command-line interface for pdfboss: info, text, render and obj subcommands"
+description = "Command-line interface for pdfboss: info, text, render, obj, and the json/hex/q/tui explorer subcommands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,19 @@ repository.workspace = true
 pdfboss-core = { path = "../pdfboss-core" }
 pdfboss-text = { path = "../pdfboss-text" }
 pdfboss-render = { path = "../pdfboss-render" }
+pdfboss-aio = { path = "../pdfboss-aio", features = ["http"] }
+pdfboss-tui = { path = "../pdfboss-tui" }
 clap = { version = "4", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+tokio = { version = "1", features = ["rt", "net", "time"] }
+futures-core = "0.3"
+jaq-core = "2"
+jaq-std = "2"
+jaq-json = { version = "1", features = ["serde_json"] }
+
+[dev-dependencies]
+pdfboss-testkit = { path = "../pdfboss-testkit" }
 
 [features]
 # Passthrough so `cargo build -p pdfboss-cli --features substitute-fonts`

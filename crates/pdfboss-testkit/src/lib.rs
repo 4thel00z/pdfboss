@@ -286,6 +286,184 @@ pub fn doc_with_graphics(content: &str) -> Vec<u8> {
     single_page_builder(content.as_bytes()).build(1)
 }
 
+/// A complete one-page document whose catalog (1), page tree (2), and page
+/// (3) — plus every `(num, body)` pair in `extra` — live inside object
+/// stream 4, indexed by cross-reference stream 5. Object numbers 1–5 are
+/// reserved; `extra` numbers must be ≥ 6.
+pub fn objstm_doc(extra: &[(u32, &str)]) -> Vec<u8> {
+    let mut members: Vec<(u32, String)> = vec![
+        (1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()),
+        (2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string()),
+        (
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+        ),
+    ];
+    for (num, body) in extra {
+        assert!(*num >= 6, "extra object numbers must be >= 6");
+        members.push((*num, (*body).to_string()));
+    }
+
+    // Object-stream payload: header of `num offset` pairs, then the bodies.
+    let mut header = String::new();
+    let mut bodies = String::new();
+    for (num, body) in &members {
+        header.push_str(&format!("{} {} ", num, bodies.len()));
+        bodies.push_str(body);
+        bodies.push(' ');
+    }
+    let first = header.len();
+    let payload = format!("{header}{bodies}");
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"%PDF-1.7\n");
+    let objstm_offset = out.len();
+    out.extend_from_slice(
+        format!(
+            "4 0 obj << /Type /ObjStm /N {} /First {} /Length {} >> stream\n",
+            members.len(),
+            first,
+            payload.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(payload.as_bytes());
+    out.extend_from_slice(b"\nendstream endobj\n");
+    let xref_offset = out.len();
+
+    // Cross-reference stream 5: W [1 2 1]; entries for objects 0..=max.
+    let max_num = members.iter().map(|m| m.0).max().unwrap_or(5).max(5);
+    let mut entries: Vec<u8> = Vec::new();
+    for num in 0..=max_num {
+        if num == 0 {
+            entries.extend_from_slice(&[0, 0, 0, 255]); // free head
+        } else if num == 4 {
+            entries.push(1); // in file
+            debug_assert!(
+                objstm_offset <= u16::MAX as usize,
+                "fixture offset exceeds u16 emission width"
+            );
+            entries.extend_from_slice(&(objstm_offset as u16).to_be_bytes());
+            entries.push(0);
+        } else if num == 5 {
+            entries.push(1); // the xref stream itself
+            debug_assert!(
+                xref_offset <= u16::MAX as usize,
+                "fixture offset exceeds u16 emission width"
+            );
+            entries.extend_from_slice(&(xref_offset as u16).to_be_bytes());
+            entries.push(0);
+        } else if let Some(index) = members.iter().position(|m| m.0 == num) {
+            entries.push(2); // in object stream 4
+            entries.extend_from_slice(&4u16.to_be_bytes());
+            debug_assert!(
+                index <= u8::MAX as usize,
+                "fixture member index exceeds u8 emission width"
+            );
+            entries.push(index as u8);
+        } else {
+            entries.extend_from_slice(&[0, 0, 0, 0]); // free gap
+        }
+    }
+    out.extend_from_slice(
+        format!(
+            "5 0 obj << /Type /XRef /Size {} /W [1 2 1] /Root 1 0 R /Length {} >> stream\n",
+            max_num + 1,
+            entries.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(&entries);
+    out.extend_from_slice(b"\nendstream endobj\n");
+    out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    out
+}
+
+/// A hybrid-reference file (ISO 32000 §7.5.8.4): a classic `xref` table
+/// whose trailer carries `/XRefStm`, pointing at a real `/Type /XRef`
+/// cross-reference stream — for readers that understand streams — while
+/// old readers fall back to the table alone.
+///
+/// The table hides the page's content stream (object 4) behind a free
+/// entry; only the hybrid stream reveals its real offset, so a correct
+/// reader must merge the hybrid stream *ahead of* the table (first-seen
+/// entries win) while still emitting the classic section before its hybrid
+/// stream section in physical file order. Catalog(1) -> Pages(2) -> Page(3)
+/// -> Content(4, hidden) -> Font(5); the hybrid stream is object 6.
+///
+/// Adapted (not shared code — each crate builds its own) from the private
+/// fixtures of the same shape in `pdfboss-core`'s
+/// `elements::tests::hybrid_xrefstm_doc` and `pdfboss-aio`'s
+/// `document::tests::hybrid_doc`.
+pub fn hybrid_doc() -> Vec<u8> {
+    let mut data = b"%PDF-1.7\n".to_vec();
+
+    let obj1 = data.len();
+    data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    let obj2 = data.len();
+    data.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    let obj3 = data.len();
+    data.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+    );
+
+    let obj5 = data.len();
+    data.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    );
+
+    // Object 4: the page's content stream. The classic table below marks it
+    // free; only the hybrid stream's entry reveals its real offset.
+    let obj4 = data.len();
+    let content = b"BT /F1 12 Tf 72 720 Td (hybrid) Tj ET";
+    data.extend_from_slice(
+        format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes(),
+    );
+    data.extend_from_slice(content);
+    data.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Object 6: the hybrid `/Type /XRef` stream (`/W [1 4 2]`), carrying
+    // entries only for the objects it alone reveals: object 4 (the hidden
+    // content stream) and itself.
+    let stm_off = data.len();
+    let mut fields = Vec::new();
+    for offset in [obj4, stm_off] {
+        fields.push(1u8);
+        fields.extend_from_slice(&(offset as u32).to_be_bytes());
+        fields.extend_from_slice(&0u16.to_be_bytes());
+    }
+    data.extend_from_slice(
+        format!(
+            "6 0 obj\n<< /Type /XRef /Size 7 /W [1 4 2] /Index [4 1 6 1] \
+             /Root 1 0 R /Length {} >>\nstream\n",
+            fields.len()
+        )
+        .as_bytes(),
+    );
+    data.extend_from_slice(&fields);
+    data.extend_from_slice(b"\nendstream\nendobj\n");
+
+    // Classic table: objects 0..5 (object 6, the hybrid stream, is only
+    // ever described by its own self-entry above). Object 4 is free here —
+    // masked from readers that don't chase `/XRefStm`.
+    let classic_off = data.len();
+    data.extend_from_slice(b"xref\n0 6\n");
+    data.extend_from_slice(b"0000000000 65535 f\r\n"); // 0: free-list head
+    data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(format!("{obj2:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(format!("{obj3:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(b"0000000000 00001 f\r\n"); // 4: hidden
+    data.extend_from_slice(format!("{obj5:010} 00000 n\r\n").as_bytes());
+    data.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R /XRefStm {stm_off} >>\n").as_bytes(),
+    );
+    data.extend_from_slice(format!("startxref\n{classic_off}\n%%EOF\n").as_bytes());
+    data
+}
+
 /// Builds the decoded payload and dictionary entries for an object stream
 /// (`/Type /ObjStm`) holding the given `(number, body)` pairs.
 ///

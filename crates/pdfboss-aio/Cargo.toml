@@ -1,0 +1,28 @@
+[package]
+name = "pdfboss-aio"
+description = "Async, range-fetching PDF access for pdfboss: huge files, many documents, remote HTTP sources (ISO 32000)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pdfboss-core = { path = "../pdfboss-core" }
+tokio = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+thiserror = "2"
+reqwest = { workspace = true, optional = true, features = ["stream"] }
+
+[features]
+# Remote documents over HTTP range requests.
+http = ["dep:reqwest"]
+
+[dev-dependencies]
+pdfboss-testkit = { path = "../pdfboss-testkit" }
+tokio = { workspace = true, features = ["macros", "net", "time"] }
+# Test-only: compresses fixture payloads for the indirect-/DecodeParms
+# parity test (crates/pdfboss-aio/tests/parity.rs), mirroring the mechanism
+# pdfboss-core's own filter tests use to build FlateDecode fixtures.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
