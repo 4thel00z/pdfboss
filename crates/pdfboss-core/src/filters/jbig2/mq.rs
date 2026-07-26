@@ -138,6 +138,17 @@ impl MqContexts {
     pub(crate) fn reset(&mut self) {
         self.0.fill(MqContext::default());
     }
+
+    /// Folds every context's `(index, MPS)` pair into a single value, so that
+    /// tests elsewhere in the codec can compare whole arrays without the
+    /// storage becoming visible outside this module.
+    #[cfg(test)]
+    pub(crate) fn state_digest(&self) -> u64 {
+        self.0.iter().fold(0xcbf2_9ce4_8422_2325, |acc, cx| {
+            let state = u64::from(cx.index) * 2 + u64::from(cx.mps);
+            (acc ^ state).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
 }
 
 /// The MQ arithmetic decoder over one byte stream (T.88 Annex E).

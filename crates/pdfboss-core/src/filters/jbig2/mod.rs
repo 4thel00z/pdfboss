@@ -6,8 +6,9 @@
 //! exactly like any other `/BitsPerComponent 1` `/DeviceGray` sample data.
 //!
 //! Layering, bottom-up: [`mq`] is the binary arithmetic decoder (Annex E);
-//! the integer procedures of Annex A build on top of it.
+//! [`arith_int`] builds the integer procedures on top of it (Annex A).
 
 #![allow(dead_code)] // Consumed by the segment layer, which lands next.
 
+pub(crate) mod arith_int;
 pub(crate) mod mq;
