@@ -7,9 +7,14 @@
 //! whose offsets the segment header carries, so an encoder can point them at
 //! whatever correlates best with the image.
 //!
-//! Everything here is the general path: it reads each template pixel through
-//! the bounds-checked accessor, so any AT offset a stream declares is honoured
-//! and none of them can read outside the bitmap.
+//! Two decoding paths live here and they must agree pixel for pixel. The
+//! general one reads every template pixel through the bounds-checked accessor,
+//! so any AT offset a stream declares is honoured and none of them can read
+//! outside the bitmap. The windowed one applies when the AT pixels sit where
+//! 6.2.5.3 puts them by default, which is what almost every encoder emits: the
+//! template then degenerates into two or three contiguous runs of pixels that
+//! shift one position as `x` advances, so a whole context can be carried
+//! forward with two reads instead of sixteen.
 
 use super::bitmap::Bitmap;
 use super::mq::{MqContexts, MqDecoder};
@@ -75,6 +80,26 @@ impl GenericParams {
             at: NOMINAL_AT[usize::from(template.min(MAX_TEMPLATE))],
             tpgdon: false,
         }
+    }
+
+    /// Whether every AT slot this template actually reads sits at its nominal
+    /// position, which is the precondition for the windowed context update.
+    ///
+    /// Only the slots the template uses are compared: templates 1 to 3 read A1
+    /// alone, and a stream that leaves junk in A2 to A4 — which it may, since
+    /// it never transmits them — must not be pushed onto the slower path for
+    /// it.
+    ///
+    /// A template number outside 0 to 3 has no window geometry, so it is never
+    /// nominal. That keeps the two paths in agreement on a value neither the
+    /// flags parser nor the standard can produce.
+    pub(crate) fn is_nominal(&self) -> bool {
+        if self.template > MAX_TEMPLATE {
+            return false;
+        }
+        let used = if self.template == 0 { 4 } else { 1 };
+        let nominal = NOMINAL_AT[usize::from(self.template)];
+        self.at[..used] == nominal[..used]
     }
 }
 
@@ -161,7 +186,133 @@ pub(crate) fn context_at(bm: &Bitmap, x: u32, y: u32, params: &GenericParams) ->
     }
 }
 
+/// The rows the three windows walk, as offsets from the row being decoded.
+const WINDOW_DY: [i64; 3] = [-2, -1, 0];
+
+/// The contiguous pixel runs each template's context decomposes into when the
+/// AT pixels are at their nominal offsets, as `(leftmost dx, bit width)` for
+/// rows y-2, y-1 and y (T.88 6.2.5.3, figures 4 to 7).
+///
+/// The runs are read left to right into the context's bits in the same order,
+/// so the context is simply the three runs concatenated. Template 3 reads a
+/// single reference row and so has no y-2 run, recorded here as a zero width.
+///
+/// Cross-check against [`context_at`]: template 0's bits 15 to 11 are the
+/// pixels (x-2, y-2) through (x+2, y-2), because nominal A4 is (x-2, y-2) and
+/// nominal A3 is (x+2, y-2); bits 10 to 4 are (x-3, y-1) through (x+3, y-1),
+/// bracketed by nominal A2 and A1; bits 3 to 0 are (x-4, y) through (x-1, y).
+const WINDOW_SPANS: [[(i64, u32); 3]; 4] = [
+    [(-2, 5), (-3, 7), (-4, 4)],
+    [(-1, 4), (-2, 6), (-3, 3)],
+    [(-1, 3), (-2, 5), (-2, 2)],
+    [(0, 0), (-3, 6), (-4, 4)],
+];
+
+/// The context of one pixel, held as shift registers that can be carried to
+/// the next pixel in the row instead of being rebuilt (T.88 6.2.5.7).
+///
+/// With nominal AT pixels each template's neighbourhood is two or three
+/// contiguous runs, one per template row. Moving from `x` to `x + 1` slides
+/// every run one pixel right: the leftmost pixel falls out of the top of the
+/// register and one new pixel enters at the bottom. So a context costs one
+/// read per reference row — two, or one for template 3 — instead of the
+/// sixteen bounds-checked reads [`context_at`] performs, and the pixel
+/// entering the current row's run is the one just decoded, which costs no read
+/// at all.
+///
+/// The windows are only valid for the row they were started on, and only while
+/// they are advanced at every `x` in turn. Rows a typical-prediction run
+/// duplicates are never walked, so nothing has to be kept in step across them:
+/// the next decoded row starts a fresh set.
+pub(crate) struct ContextWindows {
+    /// The three runs, right-aligned in their own widths, for rows y-2, y-1
+    /// and y.
+    words: [u16; 3],
+    /// Width mask per run, which is what discards the pixel leaving on the
+    /// left when the run shifts.
+    masks: [u16; 3],
+    /// The dx, relative to the current x, of the pixel entering each run when
+    /// x advances by one. Always 0 for the current row's run.
+    entering: [i64; 3],
+    /// Left shift placing each run in the assembled context.
+    shifts: [u32; 3],
+    /// The row being decoded, so the reference rows can be located.
+    y: i64,
+}
+
+impl ContextWindows {
+    /// Builds the windows for `x == 0` of row `y`, reading each run's span
+    /// pixel by pixel.
+    ///
+    /// At `x == 0` most of every span lies left of the bitmap and reads as 0,
+    /// as 6.2.5.2 requires; the same is true of the reference rows for `y == 0`
+    /// and `y == 1`. Nothing special-cases those, because this runs once per
+    /// row rather than once per pixel and the general accessor already gives
+    /// the right answer.
+    ///
+    /// An undefined template is clamped rather than indexing out of bounds. It
+    /// is unreachable — [`GenericParams::is_nominal`] refuses those before the
+    /// windowed path is chosen — but the clamp costs nothing and a panic here
+    /// would be reachable from stream data if that ever slipped.
+    pub(crate) fn start(bm: &Bitmap, y: u32, template: u8) -> ContextWindows {
+        let spans = WINDOW_SPANS[usize::from(template.min(MAX_TEMPLATE))];
+        let y = i64::from(y);
+        let mut win = ContextWindows {
+            words: [0; 3],
+            masks: [0; 3],
+            entering: [0; 3],
+            shifts: [0; 3],
+            y,
+        };
+        // Assembled from the bottom row up, so each run's shift is the total
+        // width of the runs below it.
+        let mut shift = 0u32;
+        for row in (0..3usize).rev() {
+            let (left, width) = spans[row];
+            let mut word = 0u16;
+            for step in 0..i64::from(width) {
+                word = (word << 1) | u16::from(bm.get(left + step, y + WINDOW_DY[row]));
+            }
+            win.words[row] = word;
+            win.masks[row] = (1u16 << width) - 1;
+            // The pixel entering on the right is the one just past the run's
+            // rightmost, which is `left + width - 1`.
+            win.entering[row] = left + i64::from(width);
+            win.shifts[row] = shift;
+            shift += width;
+        }
+        win
+    }
+
+    /// The context for the current `x`, the runs concatenated most-significant
+    /// row first.
+    pub(crate) fn value(&self) -> u16 {
+        (self.words[0] << self.shifts[0]) | (self.words[1] << self.shifts[1]) | self.words[2]
+    }
+
+    /// Slides every run one pixel right, moving the windows from `x` to
+    /// `x + 1`.
+    ///
+    /// `just_decoded` is the pixel at `(x, y)`. It is passed rather than read
+    /// back out of the bitmap because it is the one pixel entering a run whose
+    /// value the caller already holds — and a skipped pixel is stored as 0, so
+    /// passing the stored value keeps skip handling out of here entirely.
+    pub(crate) fn advance(&mut self, bm: &Bitmap, x: u32, just_decoded: u8) {
+        let x = i64::from(x);
+        let above = u16::from(bm.get(x + self.entering[0], self.y + WINDOW_DY[0]));
+        let previous = u16::from(bm.get(x + self.entering[1], self.y + WINDOW_DY[1]));
+        self.words[0] = ((self.words[0] << 1) | above) & self.masks[0];
+        self.words[1] = ((self.words[1] << 1) | previous) & self.masks[1];
+        self.words[2] = ((self.words[2] << 1) | u16::from(just_decoded & 1)) & self.masks[2];
+    }
+}
+
 /// Decodes a generic region into a fresh bitmap (T.88 6.2.5.7).
+///
+/// Dispatches on the AT pixel offsets: nominal ones take the windowed context
+/// update, anything else the general path. The two are required to be
+/// indistinguishable in their output, and the test module holds that as an
+/// explicit property over every pixel of every template.
 ///
 /// `cx` is the shared GB context array, of [`GB_CONTEXT_LEN`] entries. Its
 /// state persists across calls by design: a symbol dictionary decodes every
@@ -186,18 +337,34 @@ pub(crate) fn decode_generic_region(
     params: &GenericParams,
     skip: Option<&Bitmap>,
 ) -> Result<Bitmap, Jbig2Error> {
+    if params.is_nominal() {
+        decode_generic_region_windowed(dec, cx, width, height, params, skip)
+    } else {
+        decode_generic_region_general(dec, cx, width, height, params, skip)
+    }
+}
+
+/// Decodes a generic region forming each context from scratch
+/// (T.88 6.2.5.7).
+///
+/// This is the path for a stream that has relocated its AT pixels, and it is
+/// also the reference the windowed path is tested against, so it stays whether
+/// or not a relocated AT pixel is ever seen in the wild. See
+/// [`decode_generic_region`] for what the parameters mean.
+pub(crate) fn decode_generic_region_general(
+    dec: &mut MqDecoder,
+    cx: &mut MqContexts,
+    width: u32,
+    height: u32,
+    params: &GenericParams,
+    skip: Option<&Bitmap>,
+) -> Result<Bitmap, Jbig2Error> {
     let mut bm = Bitmap::new(width, height)?;
     let mut ltp = 0u8;
     for y in 0..height {
-        if params.tpgdon {
-            // The typical-prediction decision toggles LTP; while LTP is 1 each
-            // row is a copy of the one above and carries no coded pixels.
-            let slot = usize::from(TPGD_CONTEXT[usize::from(params.template.min(MAX_TEMPLATE))]);
-            ltp ^= dec.decode(cx.get_mut(slot));
-            if ltp == 1 {
-                bm.duplicate_row(y);
-                continue;
-            }
+        if typical_prediction_repeats_row(dec, cx, params, &mut ltp) {
+            bm.duplicate_row(y);
+            continue;
         }
         for x in 0..width {
             if skip.is_some_and(|s| s.get(i64::from(x), i64::from(y)) == 1) {
@@ -210,6 +377,65 @@ pub(crate) fn decode_generic_region(
         }
     }
     Ok(bm)
+}
+
+/// Decodes a generic region carrying each context forward across the row
+/// (T.88 6.2.5.7), which requires the AT pixels to be nominal.
+///
+/// Row order, the typical-prediction toggle and the skip mask behave exactly
+/// as in [`decode_generic_region_general`]; the only difference is where the
+/// context comes from. A skipped pixel still shifts a 0 into the current row's
+/// run, because that is the value stored for it.
+///
+/// See [`decode_generic_region`] for what the parameters mean.
+fn decode_generic_region_windowed(
+    dec: &mut MqDecoder,
+    cx: &mut MqContexts,
+    width: u32,
+    height: u32,
+    params: &GenericParams,
+    skip: Option<&Bitmap>,
+) -> Result<Bitmap, Jbig2Error> {
+    let mut bm = Bitmap::new(width, height)?;
+    let mut ltp = 0u8;
+    for y in 0..height {
+        if typical_prediction_repeats_row(dec, cx, params, &mut ltp) {
+            bm.duplicate_row(y);
+            continue;
+        }
+        let mut win = ContextWindows::start(&bm, y, params.template);
+        for x in 0..width {
+            let pixel = if skip.is_some_and(|s| s.get(i64::from(x), i64::from(y)) == 1) {
+                0
+            } else {
+                dec.decode(cx.get_mut(usize::from(win.value())))
+            };
+            bm.set(x, y, pixel);
+            win.advance(&bm, x, pixel);
+        }
+    }
+    Ok(bm)
+}
+
+/// Decodes the typical-prediction decision that precedes a row when TPGDON is
+/// set, and reports whether the row is a copy of the one above
+/// (T.88 6.2.5.7).
+///
+/// The decision toggles LTP rather than setting it; while LTP is 1 each row
+/// repeats its predecessor and carries no coded pixels at all. With TPGDON
+/// clear no decision is coded and every row is decoded normally.
+fn typical_prediction_repeats_row(
+    dec: &mut MqDecoder,
+    cx: &mut MqContexts,
+    params: &GenericParams,
+    ltp: &mut u8,
+) -> bool {
+    if !params.tpgdon {
+        return false;
+    }
+    let slot = usize::from(TPGD_CONTEXT[usize::from(params.template.min(MAX_TEMPLATE))]);
+    *ltp ^= dec.decode(cx.get_mut(slot));
+    *ltp == 1
 }
 
 /// Reads the generic region segment flags byte and the AT pixel offsets that
@@ -588,6 +814,181 @@ mod tests {
         for bytes in [vec![0x00u8], vec![0x00, 3, 0xFF], vec![0x02u8, 2]] {
             let mut r = Reader::new(&bytes);
             assert_eq!(parse_generic_flags(&mut r), Err(Jbig2Error::Truncated));
+        }
+    }
+
+    /// The windowed path is only allowed to exist if it is indistinguishable
+    /// from the general one. Check every pixel of a bitmap wide and tall
+    /// enough to exercise both edges and the interior, for all four templates.
+    #[test]
+    fn windowed_contexts_match_the_general_path_exactly() {
+        for seed in [0x1u32, 0xFFFF, 0xA5A5_5A5A] {
+            let bm = pseudo_random_bitmap(41, 17, seed);
+            for template in 0..4u8 {
+                let params = GenericParams::nominal(template);
+                for y in 0..bm.height() {
+                    let mut win = ContextWindows::start(&bm, y, template);
+                    for x in 0..bm.width() {
+                        assert_eq!(
+                            win.value(),
+                            context_at(&bm, x, y, &params),
+                            "template {template} at ({x}, {y}), seed {seed:#x}",
+                        );
+                        let pixel = bm.get(i64::from(x), i64::from(y));
+                        win.advance(&bm, x, pixel);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Narrow and short bitmaps are where a window's initial fill is most
+    /// likely to be wrong, because the whole row is edge.
+    #[test]
+    fn windowed_contexts_match_on_degenerate_shapes() {
+        for (w, h) in [(1u32, 1u32), (1, 9), (9, 1), (2, 2), (3, 8), (8, 3)] {
+            let bm = pseudo_random_bitmap(w, h, w * 31 + h);
+            for template in 0..4u8 {
+                let params = GenericParams::nominal(template);
+                for y in 0..h {
+                    let mut win = ContextWindows::start(&bm, y, template);
+                    for x in 0..w {
+                        assert_eq!(
+                            win.value(),
+                            context_at(&bm, x, y, &params),
+                            "{w}x{h} template {template} at ({x}, {y})",
+                        );
+                        win.advance(&bm, x, bm.get(i64::from(x), i64::from(y)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The worked example the window spans were derived against: for template
+    /// 0 at (4, 3) the three windows hold 0b10100, 0b1001100 and 0b0010, and
+    /// they assemble to the hand-computed 0xA4C2.
+    #[test]
+    fn the_windows_assemble_the_hand_computed_context() {
+        let bm = subject();
+        let mut win = ContextWindows::start(&bm, 3, 0);
+        for x in 0..4u32 {
+            win.advance(&bm, x, bm.get(i64::from(x), 3));
+        }
+        assert_eq!(win.words, [0b10100, 0b100_1100, 0b0010]);
+        assert_eq!(win.value(), 0xA4C2);
+    }
+
+    /// The dispatch itself: nominal parameters must take the fast path,
+    /// anything else must not.
+    #[test]
+    fn is_nominal_recognises_exactly_the_default_at_values() {
+        for template in 0..4u8 {
+            assert!(GenericParams::nominal(template).is_nominal());
+        }
+        // Template 0 checks all four slots.
+        let mut p = GenericParams::nominal(0);
+        p.at[3] = (-1, -2);
+        assert!(!p.is_nominal());
+        // Templates 1 to 3 use only A1, so the unused slots must not matter.
+        let mut p = GenericParams::nominal(2);
+        p.at[1] = (7, 7);
+        p.at[2] = (-7, -7);
+        p.at[3] = (0, 0);
+        assert!(
+            p.is_nominal(),
+            "unused AT slots must not defeat the fast path"
+        );
+        p.at[0] = (1, -1);
+        assert!(!p.is_nominal());
+    }
+
+    /// A template outside 0 to 3 has no window geometry, so it must never
+    /// reach the windowed path however its AT slots are set.
+    #[test]
+    fn an_undefined_template_is_never_nominal() {
+        for template in 4..=u8::MAX {
+            let params = GenericParams {
+                template,
+                at: NOMINAL_AT[0],
+                tpgdon: false,
+            };
+            assert!(!params.is_nominal(), "template {template}");
+        }
+    }
+
+    /// And the end-to-end consequence: both paths decode the same stream to
+    /// the same pixels. The relocated-AT case above already covers the general
+    /// path on its own; this pins that the two agree on one input.
+    #[test]
+    fn both_paths_decode_the_same_stream_identically() {
+        let bm = pseudo_random_bitmap(53, 29, 0xC0FFEE);
+        for template in 0..4u8 {
+            let params = GenericParams::nominal(template);
+            let coded = encode(&bm, &params, None);
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut cx = MqContexts::new(GB_CONTEXT_LEN);
+            let fast =
+                decode_generic_region(&mut dec, &mut cx, 53, 29, &params, None).expect("fast path");
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut cx = MqContexts::new(GB_CONTEXT_LEN);
+            let slow = decode_generic_region_general(&mut dec, &mut cx, 53, 29, &params, None)
+                .expect("general path");
+
+            for y in 0..29u32 {
+                assert_eq!(fast.row(y), slow.row(y), "template {template}, row {y}");
+            }
+        }
+    }
+
+    /// Typical prediction and a skip mask both alter which pixels the windowed
+    /// loop decodes, so the two paths have to agree with those in play too.
+    #[test]
+    fn both_paths_agree_with_typical_prediction_and_a_skip_mask() {
+        let seed = pseudo_random_bitmap(23, 4, 0xBEEF);
+        let mut source = Bitmap::new(23, 18).expect("23x18");
+        for y in 0..18u32 {
+            let src = if (5..11).contains(&y) { 4 } else { y % 4 };
+            for x in 0..23 {
+                source.set(x, y, seed.get(i64::from(x), i64::from(src)));
+            }
+        }
+        let mut skip = Bitmap::new(23, 18).expect("23x18");
+        for y in 0..18u32 {
+            for x in 0..23u32 {
+                skip.set(x, y, u8::from((x + y) % 5 == 0));
+            }
+        }
+        for y in 0..18u32 {
+            for x in 0..23u32 {
+                if skip.get(i64::from(x), i64::from(y)) == 1 {
+                    source.set(x, y, 0);
+                }
+            }
+        }
+
+        for template in 0..4u8 {
+            let mut params = GenericParams::nominal(template);
+            params.tpgdon = true;
+            let coded = encode(&source, &params, Some(&skip));
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut cx = MqContexts::new(GB_CONTEXT_LEN);
+            let fast = decode_generic_region(&mut dec, &mut cx, 23, 18, &params, Some(&skip))
+                .expect("fast path");
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut cx = MqContexts::new(GB_CONTEXT_LEN);
+            let slow =
+                decode_generic_region_general(&mut dec, &mut cx, 23, 18, &params, Some(&skip))
+                    .expect("general path");
+
+            for y in 0..18u32 {
+                assert_eq!(fast.row(y), source.row(y), "template {template}, row {y}");
+                assert_eq!(slow.row(y), source.row(y), "template {template}, row {y}");
+            }
         }
     }
 }
