@@ -301,6 +301,12 @@ impl<'a> MqDecoder<'a> {
     /// rather than by a header field must end its loop here. The
     /// OOB-terminated lists of Annex A are the main such caller, and
     /// [`super::arith_int::decode_int`] folds this in for them.
+    ///
+    /// The wait for it is bounded whatever the input does. A decision that
+    /// skips renormalization takes at least `Qe >= 1` off `A` and must leave
+    /// it at or above 0x8000, so no more than 0x7FFF decisions can pass
+    /// between two shifts; 32 shifts are needed, so the marker fill is spent
+    /// within 2^20 decisions of the lock at the very worst.
     pub(crate) fn is_exhausted(&self) -> bool {
         self.fill_shifts >= MARKER_FILL_SHIFTS
     }
