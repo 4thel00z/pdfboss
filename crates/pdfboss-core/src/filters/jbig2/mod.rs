@@ -8,8 +8,10 @@
 //! Layering, bottom-up: [`mq`] is the binary arithmetic decoder (Annex E);
 //! [`arith_int`] builds the integer procedures on top of it (Annex A);
 //! [`bitmap`] is the bilevel pixel buffer every region decodes into;
-//! [`reader`] is the bounds-checked byte cursor the header parsers run on; and
-//! [`segment`] splits a PDF-embedded stream into the segments of clause 7.
+//! [`reader`] is the bounds-checked byte cursor the header parsers run on;
+//! [`segment`] splits a PDF-embedded stream into the segments of clause 7; and
+//! [`generic`] decodes a region of pixels out of the arithmetic decoder, which
+//! is the procedure every other region type is ultimately built from.
 
 #![allow(dead_code)] // Consumed by the segment layer, which lands next.
 
