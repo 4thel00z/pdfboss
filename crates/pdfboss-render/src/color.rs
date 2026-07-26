@@ -1,7 +1,7 @@
 //! Color spaces: DeviceGray/RGB/CMYK, Indexed, and approximations for the
 //! CIE-based and tint-transform families, converted to RGB.
 
-use pdfboss_core::{Document, Object};
+use pdfboss_core::{Document, Error, Object};
 
 /// Recursion guard for nested color-space definitions (Indexed bases).
 const MAX_DEPTH: u32 = 8;
@@ -123,7 +123,7 @@ impl ColorSpace {
                 };
                 match family.as_str() {
                     "ICCBased" => Self::parse_icc(doc, items.get(1), depth),
-                    "Indexed" | "I" => Self::parse_indexed(doc, items, depth),
+                    f if Self::is_indexed(f) => Self::parse_indexed(doc, items, depth),
                     "Separation" => ColorSpace::Other(1),
                     "DeviceN" => {
                         let n = match items.get(1).map(|o| doc.resolve(o)) {
@@ -170,6 +170,12 @@ impl ColorSpace {
         ColorSpace::DeviceRGB
     }
 
+    /// Whether this is an `/Indexed` space, given the family name of an
+    /// array-form color space (`I` is the inline-image abbreviation).
+    fn is_indexed(family: &str) -> bool {
+        matches!(family, "Indexed" | "I")
+    }
+
     fn parse_indexed(doc: &Document, items: &[Object], depth: u32) -> ColorSpace {
         let base = match items.get(1) {
             Some(b) => Self::parse_at(doc, b, depth + 1),
@@ -184,6 +190,28 @@ impl ColorSpace {
             base: Box::new(base),
             lookup,
         }
+    }
+}
+
+/// The decode failure behind an empty `/Indexed` palette, if the space is
+/// `/Indexed` and its lookup table is a stream that will not decode.
+///
+/// [`ColorSpace::parse`] is lenient and leaves such a space with no palette
+/// at all, which paints every sample black. That looks like a decoded image
+/// but is not one, so the executor asks here and reports it instead.
+pub(crate) fn palette_error(doc: &Document, obj: &Object) -> Option<Error> {
+    let Ok(Object::Array(items)) = doc.resolve(obj) else {
+        return None;
+    };
+    let Ok(Object::Name(family)) = doc.resolve(items.first()?) else {
+        return None;
+    };
+    if !ColorSpace::is_indexed(&family.0) {
+        return None;
+    }
+    match doc.resolve(items.get(3)?) {
+        Ok(Object::Stream(s)) => doc.stream_data(&s).err(),
+        _ => None,
     }
 }
 

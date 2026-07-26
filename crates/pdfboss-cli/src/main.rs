@@ -450,16 +450,31 @@ fn cmd_render(
         glyph_painting: fonts.to_painting(),
         substitutes,
     };
-    let pixmap = pdfboss_render::render_page_with_options(&doc, &p, scale, &opts)
-        .map_err(|e| e.to_string())?;
+    let (pixmap, report) =
+        pdfboss_render::render_page_reporting(&doc, &p, scale, &opts).map_err(|e| e.to_string())?;
     let out = out.unwrap_or_else(|| default_out(page));
     pixmap.save_png(&out).map_err(|e| e.to_string())?;
-    println!(
-        "wrote {} ({} x {} px)",
-        out.display(),
-        pixmap.width,
-        pixmap.height
-    );
+    // Rendering is lenient, so a page whose content pdfboss could not read
+    // still writes a PNG and still exits 0. Say what was lost, on stderr and
+    // in the summary line, rather than reporting a clean render.
+    for warning in report.warnings() {
+        eprintln!("warning: page {page}: {warning}");
+    }
+    match report.summary() {
+        Some(summary) => println!(
+            "wrote {} ({} x {} px) [{}]",
+            out.display(),
+            pixmap.width,
+            pixmap.height,
+            summary
+        ),
+        None => println!(
+            "wrote {} ({} x {} px)",
+            out.display(),
+            pixmap.width,
+            pixmap.height
+        ),
+    }
     Ok(())
 }
 

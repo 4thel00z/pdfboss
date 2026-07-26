@@ -421,21 +421,29 @@ async fn render_preview(
         }
     };
     let render_input = Arc::clone(&bytes);
-    let rendered =
-        tokio::task::spawn_blocking(move || -> Result<pdfboss_render::Pixmap, String> {
+    // The render is lenient: content pdfboss cannot read is skipped, so the
+    // preview can come out blank with no error at all. The report's summary
+    // rides along and becomes a status-bar toast.
+    let rendered = tokio::task::spawn_blocking(
+        move || -> Result<(pdfboss_render::Pixmap, Option<String>), String> {
             let document = pdfboss_core::Document::load(render_input.as_ref().clone())
                 .map_err(|error| error.to_string())?;
             let page_object = document.page(page).map_err(|error| error.to_string())?;
             let (page_w, page_h) = page_object.size();
             let scale = fit_scale(page_w, page_h, max_w, max_h);
-            pdfboss_render::render_page(&document, &page_object, scale)
-                .map_err(|error| error.to_string())
-        })
-        .await;
+            let options = pdfboss_render::RenderOptions::default();
+            let (pixmap, report) =
+                pdfboss_render::render_page_reporting(&document, &page_object, scale, &options)
+                    .map_err(|error| error.to_string())?;
+            Ok((pixmap, report.summary()))
+        },
+    )
+    .await;
     let result = match rendered {
-        Ok(Ok(pixmap)) => Ok(PreviewFrame {
+        Ok(Ok((pixmap, notice))) => Ok(PreviewFrame {
             file_bytes: bytes,
             pixmap,
+            notice,
         }),
         Ok(Err(error)) => Err(error),
         Err(join_error) => Err(join_error.to_string()),

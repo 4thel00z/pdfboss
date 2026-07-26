@@ -2,8 +2,9 @@
 //! `/Decode` arrays, image masks, JPEG, Indexed lookup) and drawing via
 //! inverse mapping with nearest-neighbor sampling.
 //!
-//! Limitation (v0.1): `/SMask` soft masks are ignored; images blend with
-//! the constant fill alpha only.
+//! Limitation (v0.1): `/SMask` and `/Mask` masking is ignored; images blend
+//! with the constant fill alpha only. The executor reports every image whose
+//! dictionary carries one, so the approximation is never silent.
 
 use pdfboss_core::geom::{Matrix, Point, Rect};
 use pdfboss_core::{Dict, Document, Object};
@@ -35,16 +36,33 @@ struct Rgba {
     width: usize,
     height: usize,
     data: Vec<u8>,
+    /// The stream held fewer bytes than the image's dimensions, bit depth
+    /// and component count demand, so the tail of this image came from the
+    /// zero padding [`sample_bits`] reads past the end of the data rather
+    /// than from the image itself.
+    truncated: bool,
+}
+
+/// How much of an image [`draw`] managed to paint.
+pub(crate) enum Drawn {
+    /// Every sample came from the stream.
+    Whole,
+    /// Painted, but the sample data ended early and the rest of the image
+    /// painted as zero samples.
+    Truncated,
+    /// Nothing painted: the image could not be decoded.
+    Nothing,
 }
 
 /// Decodes an image XObject or inline image and composites it onto `pix`.
 ///
 /// `data` must already have its stream filters applied, except that a
-/// trailing `DCTDecode` is passthrough (so `data` is then raw JPEG).
+/// trailing image codec is passthrough (so `data` is then a raw codestream —
+/// see [`passthrough_codec`], and only `DCTDecode` is actually decoded here).
 /// `cs_obj` is the image's `/ColorSpace` value with any resource-name
 /// indirection already resolved by the caller. Undecodable images are
-/// skipped (lenient); the return value reports whether anything was painted,
-/// so the caller can record the miss.
+/// skipped (lenient); the return value says what was painted, so the caller
+/// can record the miss.
 pub(crate) fn draw(
     doc: &Document,
     pix: &mut Pixmap,
@@ -52,13 +70,18 @@ pub(crate) fn draw(
     data: &[u8],
     cs_obj: Option<&Object>,
     p: &DrawParams,
-) -> bool {
+) -> Drawn {
     match decode_rgba(doc, dict, data, cs_obj, p.fill_rgb) {
         Some(img) => {
+            let truncated = img.truncated;
             draw_rgba(pix, &img, p);
-            true
+            if truncated {
+                Drawn::Truncated
+            } else {
+                Drawn::Whole
+            }
         }
-        None => false,
+        None => Drawn::Nothing,
     }
 }
 
@@ -89,21 +112,44 @@ fn floats_of(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// The last entry of the image's `/Filter` chain, which is the codec the
+/// data is still in when the stream filters pass an image codec through
+/// untouched.
+fn trailing_filter(doc: &Document, dict: &Dict) -> Option<String> {
+    let name = match dict.get("Filter").map(|f| doc.resolve(f)) {
+        Some(Ok(Object::Name(n))) => n,
+        Some(Ok(Object::Array(items))) => match items.last().map(|o| doc.resolve(o)) {
+            Some(Ok(Object::Name(n))) => n,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(name.0)
+}
+
 /// Whether the last entry of the image's `/Filter` chain is `DCTDecode`
 /// (whose data the stream filters pass through as raw JPEG).
 fn is_dct(doc: &Document, dict: &Dict) -> bool {
-    let name = match dict.get("Filter").map(|f| doc.resolve(f)) {
-        Some(Ok(Object::Name(n))) => Some(n),
-        Some(Ok(Object::Array(items))) => match items.last().map(|o| doc.resolve(o)) {
-            Some(Ok(Object::Name(n))) => Some(n),
-            _ => None,
-        },
-        _ => None,
-    };
     matches!(
-        name.as_ref().map(|n| n.0.as_str()),
+        trailing_filter(doc, dict).as_deref(),
         Some("DCTDecode" | "DCT")
     )
+}
+
+/// The name of a trailing image codec that the stream filters hand over
+/// undecoded and this module cannot read either, if any. `DCTDecode` is
+/// passed through *and* decoded here, so it never appears; `JPXDecode` is
+/// passed through and not decoded, and treating its codestream bytes as
+/// samples would paint noise while claiming a faithful render.
+pub(crate) fn passthrough_codec(doc: &Document, dict: &Dict) -> Option<String> {
+    let name = trailing_filter(doc, dict)?;
+    matches!(name.as_str(), "JPXDecode").then_some(name)
+}
+
+/// Whether the image is a 1-bit `/ImageMask` stencil, which paints in the
+/// current fill color rather than its own.
+pub(crate) fn is_stencil(doc: &Document, dict: &Dict) -> bool {
+    bool_of(doc, dict, "ImageMask").unwrap_or(false)
 }
 
 /// Reads the big-endian `bpc`-bit sample starting at `bit` in `data`.
@@ -121,6 +167,15 @@ fn sample_bits(data: &[u8], bit: usize, bpc: usize) -> u32 {
     v
 }
 
+/// Whether `data` is shorter than the `height` rows of `row_bits` each that
+/// the image demands: [`sample_bits`] pads the shortfall with zero bits, so
+/// the missing region paints as if the stream had said "black" (or "clear",
+/// for a stencil) rather than as the image's own samples. `row_bits` is
+/// already rounded up to whole bytes by both callers.
+fn short_of_samples(data: &[u8], row_bits: usize, height: usize) -> bool {
+    data.len() < (row_bits / 8).saturating_mul(height)
+}
+
 /// Decodes image `dict` + `data` to RGBA. Returns `None` when the image is
 /// malformed beyond recovery (bad dimensions, unsupported JPEG, ...).
 fn decode_rgba(
@@ -131,6 +186,9 @@ fn decode_rgba(
     fill_rgb: [u8; 3],
 ) -> Option<Rgba> {
     if is_dct(doc, dict) {
+        // A short JPEG is the decoder's business: it either reconstructs
+        // what it has or fails outright, and there is no zero padding of
+        // ours to own up to.
         return decode_jpeg(data);
     }
     let width = num_of(doc, dict, "Width")? as usize;
@@ -140,7 +198,7 @@ fn decode_rgba(
     }
     width.checked_mul(height).filter(|&n| n <= MAX_PIXELS)?;
     let decode = floats_of(doc, dict, "Decode");
-    if bool_of(doc, dict, "ImageMask").unwrap_or(false) {
+    if is_stencil(doc, dict) {
         return Some(decode_stencil(width, height, data, decode, fill_rgb));
     }
     let cs = match cs_obj {
@@ -181,6 +239,7 @@ fn decode_stencil(
         width,
         height,
         data: out,
+        truncated: short_of_samples(data, stride_bits, height),
     }
 }
 
@@ -232,6 +291,7 @@ fn decode_samples(
         width,
         height,
         data: out,
+        truncated: short_of_samples(data, stride_bits, height),
     }
 }
 
@@ -285,6 +345,7 @@ fn decode_jpeg(data: &[u8]) -> Option<Rgba> {
         width: w,
         height: h,
         data: out,
+        truncated: false,
     })
 }
 
@@ -603,6 +664,7 @@ mod tests {
                 255, 0, 0, 255, 0, 255, 0, 255, //
                 0, 0, 255, 255, 255, 255, 255, 255,
             ],
+            truncated: false,
         }
     }
 

@@ -227,6 +227,53 @@ class TestRender:
         assert page.render(fonts="embedded-only")[:8] == PNG_MAGIC
 
 
+def pdf_with_undecodable_image() -> bytes:
+    """A one-page PDF whose only content is an image carrying a filter
+    pdfboss does not implement, so the page rasterizes blank."""
+    bodies = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] "
+        b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length 30 >>\nstream\nq 100 0 0 100 0 0 cm /Im0 Do Q\nendstream",
+        b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 "
+        b"/BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode "
+        b"/Length 8 >>\nstream\n01234567\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for num, body in enumerate(bodies, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % num + body + b"\nendobj\n"
+    startxref = len(out)
+    out += b"xref\n0 %d\n" % (len(bodies) + 1)
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(bodies) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % startxref
+    return bytes(out)
+
+
+class TestRenderReporting:
+    def test_reports_the_dropped_image(self, tmp_path: Path) -> None:
+        path = tmp_path / "dropped-image.pdf"
+        path.write_bytes(pdf_with_undecodable_image())
+        png, warnings = Document(str(path))[0].render_reporting()
+        assert png.startswith(PNG_MAGIC)
+        assert any("JBIG2Decode" in line for line in warnings), warnings
+
+    def test_reports_nothing_for_a_clean_page(self, hello_pdf: Path) -> None:
+        png, warnings = Document(str(hello_pdf))[0].render_reporting()
+        assert png.startswith(PNG_MAGIC)
+        assert warnings == []
+
+    def test_render_still_returns_bytes_alone(self, tmp_path: Path) -> None:
+        path = tmp_path / "dropped-image.pdf"
+        path.write_bytes(pdf_with_undecodable_image())
+        assert Document(str(path))[0].render().startswith(PNG_MAGIC)
+
+
 class TestThreading:
     """Regressions for the pinned threading behavior: ``Document``/``Page``
     are usable from any thread (no ``PanicException``), dropping the last

@@ -139,6 +139,58 @@ fn render_smoke_writes_png() {
 }
 
 #[test]
+fn render_warns_about_a_dropped_image_and_still_succeeds() {
+    // The page's only content is an image whose filter pdfboss cannot
+    // decode, so the PNG comes out blank. Rendering stays lenient -- exit 0,
+    // file written -- but the warning and the annotated summary line are all
+    // that stand between the user and a blank page reported as a clean one.
+    let mut builder = pdfboss_testkit::PdfBuilder::new();
+    builder.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    builder.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    builder.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    builder.stream(4, "", b"q 100 0 0 100 0 0 cm /Im0 Do Q");
+    builder.stream(
+        5,
+        "/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 \
+         /ColorSpace /DeviceGray /Filter /JBIG2Decode",
+        &[0; 8],
+    );
+    let dir = std::env::temp_dir();
+    let pdf = dir.join(format!("pdfboss-cli-skip-{}.pdf", std::process::id()));
+    let out = dir.join(format!("pdfboss-cli-skip-{}.png", std::process::id()));
+    std::fs::write(&pdf, builder.build(1)).expect("write fixture");
+
+    let output = pdfboss(&[
+        "render",
+        pdf.to_str().unwrap(),
+        "--page",
+        "1",
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    let _ = std::fs::remove_file(&pdf);
+    let png_written = std::fs::read(&out).is_ok();
+    let _ = std::fs::remove_file(&out);
+
+    assert!(output.status.success(), "render failed: {output:?}");
+    assert!(png_written, "no PNG written despite exit 0");
+    let warnings = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        warnings.contains("warning: page 1: 1 image skipped: unsupported filter /JBIG2Decode"),
+        "no warning naming the filter in: {warnings}"
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("[1 image skipped]"),
+        "summary line does not mention the skip: {text}"
+    );
+}
+
+#[test]
 fn obj_stream_prints_decoded_length_note() {
     // Walk the low object numbers until we hit the page's content stream;
     // its output must carry the decoded-byte note instead of raw data.

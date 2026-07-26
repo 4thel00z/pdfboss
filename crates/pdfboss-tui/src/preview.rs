@@ -19,6 +19,10 @@ pub const RESIZE_DEBOUNCE_TICKS: u8 = 2;
 pub struct PreviewFrame {
     pub file_bytes: Arc<Vec<u8>>,
     pub pixmap: Pixmap,
+    /// One-line summary of anything the render had to drop, so a preview
+    /// that came out blank because pdfboss could not read the page says so
+    /// instead of looking like an empty page.
+    pub notice: Option<String>,
 }
 
 /// Preview pane model.
@@ -34,6 +38,9 @@ pub struct PreviewState {
     /// Ticks until a resize-deferred re-render fires.
     pub debounce: Option<u8>,
     pub error: Option<String>,
+    /// What the last accepted render had to drop, if anything (see
+    /// [`PreviewFrame::notice`]).
+    pub notice: Option<String>,
 }
 
 impl PreviewState {
@@ -48,6 +55,7 @@ impl PreviewState {
             file_bytes: None,
             debounce: None,
             error: None,
+            notice: None,
         }
     }
 
@@ -57,6 +65,7 @@ impl PreviewState {
         self.page = Some(page);
         self.rendering = true;
         self.error = None;
+        self.notice = None;
         self.debounce = None;
         self.generation
     }
@@ -82,6 +91,7 @@ impl PreviewState {
             Ok(frame) => {
                 self.pixmap = Some(frame.pixmap);
                 self.error = None;
+                self.notice = frame.notice;
             }
             Err(message) => self.error = Some(message),
         }
@@ -227,12 +237,14 @@ mod tests {
         let frame = PreviewFrame {
             file_bytes: Arc::new(vec![1, 2, 3]),
             pixmap: two_by_two(),
+            notice: None,
         };
         assert!(!preview.apply_ready(stale, Ok(frame)));
         assert!(preview.rendering, "stale result leaves the spinner on");
         let frame = PreviewFrame {
             file_bytes: Arc::new(vec![1, 2, 3]),
             pixmap: two_by_two(),
+            notice: None,
         };
         assert!(preview.apply_ready(current, Ok(frame)));
         assert!(!preview.rendering);
@@ -250,6 +262,7 @@ mod tests {
         let frame = PreviewFrame {
             file_bytes: Arc::new(vec![9, 9, 9]),
             pixmap: two_by_two(),
+            notice: None,
         };
         assert!(
             !preview.apply_ready(stale, Ok(frame)),

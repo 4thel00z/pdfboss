@@ -165,12 +165,17 @@ pub fn builtin_fonts_available() -> bool {
 /// `ceil(crop_w * scale) x ceil(crop_h * scale)` (after `/Rotate`), and the
 /// base transform maps the crop box to device space with a y-flip and the
 /// page rotation applied.
+///
+/// Rendering is lenient: content pdfboss cannot read is skipped rather than
+/// failing the render, so a page can come back blank without an error. Use
+/// [`render_page_reporting`] to find out what was dropped.
 pub fn render_page(doc: &Document, page: &Page, scale: f32) -> Result<Pixmap> {
     render_page_with_options(doc, page, scale, &RenderOptions::default())
 }
 
 /// Renders a page like [`render_page`], honoring `opts` (currently the glyph
-/// painting tier). See [`render_page`] for the geometry contract.
+/// painting tier). See [`render_page`] for the geometry contract and for
+/// what leniency means for the pixels you get back.
 pub fn render_page_with_options(
     doc: &Document,
     page: &Page,
@@ -181,8 +186,8 @@ pub fn render_page_with_options(
 }
 
 /// Renders a page like [`render_page_with_options`], additionally returning
-/// a [`RenderReport`] describing any content that had to be dropped. Use
-/// this when a silently blank page would be misleading.
+/// a [`RenderReport`] describing any content that had to be dropped or
+/// approximated. Use this when a silently blank page would be misleading.
 pub fn render_page_reporting(
     doc: &Document,
     page: &Page,
@@ -192,51 +197,224 @@ pub fn render_page_reporting(
     executor::render_page_reporting(doc, page, scale, opts)
 }
 
-/// Why a piece of page content was dropped during rasterization.
+/// Upper bound on the distinct entries a [`RenderReport`] keeps. Repeats of
+/// the same kind and reason only raise an existing entry's count, so this
+/// bounds the report's memory for any page: a stream drawing the same
+/// undecodable image a million times costs one entry, and a stream inventing
+/// endlessly *different* failures stops growing the list here and counts the
+/// rest in [`RenderReport::unlisted`].
+const MAX_SKIPPED: usize = 64;
+
+/// Which piece of page content a render could not reproduce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SkippedKind {
+    /// The page's own content stream: nothing on the page was drawn.
+    PageContents,
+    /// An image XObject or an inline image.
+    Image,
+    /// A form XObject, and with it everything nested inside it.
+    Form,
+    /// A `Do` whose XObject resource is missing, is not a stream, or has no
+    /// subtype this renderer knows how to draw.
+    XObject,
+    /// A shading (`sh`), which this renderer does not paint.
+    Shading,
+    /// A pattern fill or stroke, painted as flat mid-gray instead of the
+    /// pattern's own content.
+    Pattern,
+    /// A mask that was ignored, so content the author masked out painted
+    /// solid: an image `/SMask` or `/Mask`, or an `/ExtGState` `/SMask`.
+    SoftMask,
+    /// A blend mode other than `Normal`, painted as `Normal`.
+    BlendMode,
+    /// An annotation appearance stream: annotations are not painted.
+    Annotation,
+}
+
+impl SkippedKind {
+    /// The noun this kind reads as in [`RenderReport::summary`] and
+    /// [`RenderReport::warnings`], pluralized for `n`.
+    fn noun(self, n: u64) -> &'static str {
+        let one = n == 1;
+        match self {
+            SkippedKind::PageContents if one => "content stream",
+            SkippedKind::PageContents => "content streams",
+            SkippedKind::Image if one => "image",
+            SkippedKind::Image => "images",
+            SkippedKind::Form if one => "form XObject",
+            SkippedKind::Form => "form XObjects",
+            SkippedKind::XObject if one => "XObject",
+            SkippedKind::XObject => "XObjects",
+            SkippedKind::Shading if one => "shading",
+            SkippedKind::Shading => "shadings",
+            SkippedKind::Pattern if one => "pattern",
+            SkippedKind::Pattern => "patterns",
+            SkippedKind::SoftMask if one => "mask",
+            SkippedKind::SoftMask => "masks",
+            SkippedKind::BlendMode if one => "blend mode",
+            SkippedKind::BlendMode => "blend modes",
+            SkippedKind::Annotation if one => "annotation",
+            SkippedKind::Annotation => "annotations",
+        }
+    }
+}
+
+/// Why a piece of page content was dropped or approximated during
+/// rasterization.
 ///
-/// Rendering is lenient: undecodable content is skipped so the rest of the
-/// page still rasterizes. This enum records *what* was skipped so callers
-/// can tell an intentionally blank page from a page whose content pdfboss
-/// could not read.
+/// Rendering is lenient: content pdfboss cannot read is skipped so the rest
+/// of the page still rasterizes. This enum records *why*, so callers can
+/// tell an intentionally blank page from a page whose content pdfboss could
+/// not read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SkipReason {
     /// The stream's `/Filter` chain names a filter pdfboss does not decode.
     UnsupportedFilter(String),
-    /// The filter chain ran but failed (corrupt data, size limit, ...).
+    /// Reading the stream failed, carrying the underlying message: a filter
+    /// that ran but gave up (corrupt data, size limit, ...), or a syntax
+    /// error in a content stream.
     DecodeFailed(String),
-    /// Filters applied cleanly but the samples could not be interpreted as
-    /// an image (bad dimensions, unsupported JPEG, ...).
+    /// Filters applied cleanly but the bytes could not be interpreted (bad
+    /// image dimensions, unparsable content stream, unsupported JPEG, ...).
     Undecodable,
+    /// The stream held fewer samples than the image's dimensions and bit
+    /// depth demand; the missing region painted as zero samples.
+    Truncated,
+    /// A resource the operator names is absent, or is not the kind of object
+    /// the operator needs.
+    Missing,
+    /// pdfboss understands the construct but does not paint it yet, so it
+    /// was omitted or approximated.
+    Unsupported,
+    /// A nesting or size guard stopped the render at this point.
+    LimitExceeded,
 }
 
-/// One image that was dropped instead of painted.
+impl std::fmt::Display for SkipReason {
+    /// The reason as the clause after the colon of a warning line, e.g.
+    /// `unsupported filter /JBIG2Decode`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::UnsupportedFilter(name) => write!(f, "unsupported filter /{name}"),
+            SkipReason::DecodeFailed(msg) => f.write_str(msg),
+            SkipReason::Undecodable => f.write_str("the data could not be interpreted"),
+            SkipReason::Truncated => f.write_str("sample data ended early; the rest painted blank"),
+            SkipReason::Missing => f.write_str("the resource is missing"),
+            SkipReason::Unsupported => f.write_str("not supported yet"),
+            SkipReason::LimitExceeded => f.write_str("a nesting limit stopped the render here"),
+        }
+    }
+}
+
+/// One kind of content dropped for one reason, with how often it happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkippedImage {
-    /// Why this image was dropped.
+#[non_exhaustive]
+pub struct SkippedContent {
+    /// What was dropped.
+    pub kind: SkippedKind,
+    /// Why it was dropped.
     pub reason: SkipReason,
+    /// How many times this exact kind/reason pair came up in the render.
+    pub count: u64,
 }
 
-/// What a page render had to skip. Empty means the page rasterized whole.
+/// What a page render could not reproduce faithfully: content dropped
+/// outright (an undecodable image, an unreadable form) and content painted
+/// as an approximation (a pattern fill as flat gray). Empty means every
+/// construct the render encountered was painted as the page describes it.
+///
+/// Two things are deliberately *not* reported, because they are configured
+/// behavior rather than a failure: text left unpainted by the requested
+/// [`GlyphPainting`] tier, and content clipped or transformed off the page.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RenderReport {
-    /// Images dropped during this render, in the order encountered.
-    pub skipped_images: Vec<SkippedImage>,
+    /// Distinct drops in the order first encountered, at most 64 entries
+    /// (see `count` for repeats and [`RenderReport::unlisted`] for the
+    /// overflow).
+    pub skipped: Vec<SkippedContent>,
+    /// Drops that arrived after `skipped` reached its 64-entry cap and so
+    /// are counted but not described.
+    pub unlisted: u64,
 }
 
 impl RenderReport {
-    /// Whether the page rasterized with nothing dropped.
+    /// Whether the page rasterized with nothing dropped or approximated.
     pub fn is_empty(&self) -> bool {
-        self.skipped_images.is_empty()
+        self.skipped.is_empty() && self.unlisted == 0
     }
 
-    /// A one-line human summary, or `None` when nothing was dropped.
+    /// A one-line human summary counting drops per kind, or `None` when
+    /// nothing was dropped: `"2 images, 1 shading skipped"`.
     pub fn summary(&self) -> Option<String> {
-        match self.skipped_images.len() {
-            0 => None,
-            1 => Some("1 image skipped".to_string()),
-            n => Some(format!("{n} images skipped")),
+        if self.is_empty() {
+            return None;
         }
+        let mut totals: Vec<(SkippedKind, u64)> = Vec::new();
+        for item in &self.skipped {
+            match totals.iter_mut().find(|(kind, _)| *kind == item.kind) {
+                Some((_, n)) => *n = n.saturating_add(item.count),
+                None => totals.push((item.kind, item.count)),
+            }
+        }
+        let mut parts: Vec<String> = totals
+            .iter()
+            .map(|(kind, n)| format!("{n} {}", kind.noun(*n)))
+            .collect();
+        if self.unlisted > 0 {
+            parts.push(format!("{} more", self.unlisted));
+        }
+        Some(format!("{} skipped", parts.join(", ")))
+    }
+
+    /// One human-readable line per distinct drop, for callers that warn
+    /// about them: `"1 image skipped: unsupported filter /JBIG2Decode"`.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .skipped
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} {} skipped: {}",
+                    item.count,
+                    item.kind.noun(item.count),
+                    item.reason
+                )
+            })
+            .collect();
+        if self.unlisted > 0 {
+            out.push(format!(
+                "{} further drops not described (report limit reached)",
+                self.unlisted
+            ));
+        }
+        out
+    }
+
+    /// Records one drop, merging it into an existing entry when the same
+    /// kind and reason already happened. Beyond [`MAX_SKIPPED`] distinct
+    /// entries the drop is only counted, so a page drawing endlessly varied
+    /// broken content cannot grow this report without bound.
+    pub(crate) fn record(&mut self, kind: SkippedKind, reason: SkipReason) {
+        if let Some(item) = self
+            .skipped
+            .iter_mut()
+            .find(|item| item.kind == kind && item.reason == reason)
+        {
+            item.count = item.count.saturating_add(1);
+            return;
+        }
+        if self.skipped.len() >= MAX_SKIPPED {
+            self.unlisted = self.unlisted.saturating_add(1);
+            return;
+        }
+        self.skipped.push(SkippedContent {
+            kind,
+            reason,
+            count: 1,
+        });
     }
 }
 
@@ -278,6 +456,50 @@ mod tests {
         assert_eq!(info.color_type, png::ColorType::Rgba);
         assert_eq!(info.bit_depth, png::BitDepth::Eight);
         assert_eq!(&buf[..info.buffer_size()], &pix.data[..]);
+    }
+
+    #[test]
+    fn report_merges_repeats_and_counts_per_kind() {
+        let mut report = RenderReport::default();
+        assert!(report.is_empty());
+        report.record(SkippedKind::Image, SkipReason::Undecodable);
+        report.record(SkippedKind::Image, SkipReason::Undecodable);
+        report.record(
+            SkippedKind::Image,
+            SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+        );
+        report.record(SkippedKind::Shading, SkipReason::Unsupported);
+
+        assert!(!report.is_empty());
+        assert_eq!(report.skipped.len(), 3, "same kind and reason merge");
+        assert_eq!(report.skipped[0].count, 2);
+        // The summary counts per kind, so the two image reasons add up.
+        assert_eq!(
+            report.summary().as_deref(),
+            Some("3 images, 1 shading skipped"),
+        );
+        assert_eq!(
+            report.warnings(),
+            vec![
+                "2 images skipped: the data could not be interpreted".to_string(),
+                "1 image skipped: unsupported filter /JBIG2Decode".to_string(),
+                "1 shading skipped: not supported yet".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn report_stops_listing_at_the_cap_but_keeps_counting() {
+        let mut report = RenderReport::default();
+        for i in 0..MAX_SKIPPED + 5 {
+            report.record(SkippedKind::Image, SkipReason::DecodeFailed(i.to_string()));
+        }
+        assert_eq!(report.skipped.len(), MAX_SKIPPED);
+        assert_eq!(report.unlisted, 5);
+        assert_eq!(
+            report.summary().as_deref(),
+            Some("64 images, 5 more skipped"),
+        );
     }
 
     #[test]

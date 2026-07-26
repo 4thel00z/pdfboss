@@ -122,7 +122,9 @@ Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks
 
 Rendered pages paint the outlines of **embedded TrueType** glyphs (Type0/`CIDFontType2` under Identity, and simple `/TrueType` fonts via their `cmap`). Text in other fonts (CFF/Type1 programs, the standard 14, subset fonts without a usable `cmap`) is still positioned but not drawn.
 
-Not yet supported in v0.1 (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · non-TrueType glyph outlines (CFF/Type1) · shadings and tiling patterns · `JPXDecode` (JPEG 2000).
+Not yet supported in v0.1 (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · non-TrueType glyph outlines (CFF/Type1) · shadings and tiling patterns · `JPXDecode` (JPEG 2000) · `JBIG2Decode` and `CCITTFaxDecode` images · soft masks and blend modes · annotation appearance streams.
+
+Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render — `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary, the TUI preview raises a status-bar notice, and the libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
 
 The sync and async APIs are not at parity on encryption: `Document`/`Page` (and the CLI's `info`/`text`/`render`/`obj`) decrypt empty-user-password RC4/AES files transparently, as above. `AsyncDocument` (`pdfboss tui`, any `http(s)://` target, and the Python `AsyncDocument`) currently rejects every encrypted document outright, real password or not — async decryption parity is a tracked follow-up.
 

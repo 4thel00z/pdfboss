@@ -285,6 +285,10 @@ impl App {
                 if self.preview.apply_ready(generation, result) {
                     if let Some(error) = self.preview.error.clone() {
                         self.toast(format!("preview: {error}"));
+                    } else if let Some(notice) = self.preview.notice.clone() {
+                        // The page rendered, but not whole: say what was
+                        // lost rather than showing a silently blank preview.
+                        self.toast(format!("preview: {notice}"));
                     }
                 }
                 Vec::new()
@@ -1042,6 +1046,7 @@ mod tests {
                     height: 1,
                     data: vec![0, 0, 0, 255],
                 },
+                notice: None,
             }),
         });
         assert!(cmds.is_empty());
@@ -1052,6 +1057,41 @@ mod tests {
         assert!(
             app.preview.pixmap.is_none(),
             "stale reply must not install its frame"
+        );
+    }
+
+    /// Controller item: a render that dropped content is not an error, so
+    /// it installs its (possibly blank) frame — but the status bar must say
+    /// what was lost instead of leaving a blank preview unexplained.
+    #[test]
+    fn preview_that_dropped_content_toasts_the_summary() {
+        let mut app = loaded_app();
+        let cmds = app.update(key(KeyCode::Char('p')));
+        let generation = match cmds.as_slice() {
+            [Cmd::RenderPreview {
+                generation,
+                page: 0,
+                ..
+            }] => *generation,
+            other => panic!("expected RenderPreview, got {:?}", other),
+        };
+        app.update(Msg::PreviewReady {
+            generation,
+            result: Ok(crate::preview::PreviewFrame {
+                file_bytes: std::sync::Arc::new(Vec::new()),
+                pixmap: pdfboss_render::Pixmap {
+                    width: 1,
+                    height: 1,
+                    data: vec![255, 255, 255, 255],
+                },
+                notice: Some("1 image skipped".to_string()),
+            }),
+        });
+        assert!(app.preview.pixmap.is_some(), "the frame still installs");
+        assert!(
+            app.status_line().contains("1 image skipped"),
+            "status line does not mention the drop: {}",
+            app.status_line()
         );
     }
 

@@ -147,6 +147,23 @@ class Page:
         optional ``pdfboss-fonts`` package; if neither is available this
         raises ``ValueError`` (install with ``pip install pdfboss[full]``,
         or pass ``font_dir=...``).
+
+        Content pdfboss cannot read is skipped rather than raising, so a
+        page can come out blank; ``render_reporting`` says what was lost.
+        """
+
+    def render_reporting(
+        self,
+        scale: float = 1.0,
+        fonts: str = "all-embedded",
+        font_dir: str | None = None,
+    ) -> tuple[bytes, list[str]]:
+        """Renders the page like ``render``, returning ``(png, warnings)``.
+
+        ``warnings`` holds one line per distinct piece of content the
+        render dropped or approximated, e.g. ``"1 image skipped:
+        unsupported filter /JBIG2Decode"``, and is empty when the page
+        rasterized exactly as it describes itself.
         """
 
 class AsyncDocument:

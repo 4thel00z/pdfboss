@@ -3,7 +3,12 @@
 //!
 //! Limitations (v0.1): only embedded-TrueType glyph outlines are painted
 //! (other fonts are positioned but not drawn); `sh` shadings are skipped;
-//! pattern fills paint mid-gray.
+//! pattern fills paint mid-gray; masks and blend modes are ignored;
+//! annotation appearance streams are not drawn. Everything on that list
+//! except the glyph tiers -- which the caller chooses -- is recorded in the
+//! [`RenderReport`] this module returns, along with every content stream and
+//! image leniency drops, so no caller is handed a blank page it cannot
+//! account for.
 
 use pdfboss_core::FastMap;
 use std::rc::Rc;
@@ -13,7 +18,7 @@ use pdfboss_core::filters::decode_stream;
 use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{Dict, Document, Error, Name, Object, Page, Result, Stream};
 
-use crate::color::ColorSpace;
+use crate::color::{self, ColorSpace};
 use crate::glyph::GlyphFont;
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
@@ -24,7 +29,7 @@ use crate::substitute::BuiltinProvider;
 use crate::substitute::{DirProvider, SubstituteProvider};
 use crate::type3::Type3Font;
 use crate::{
-    GlyphPainting, Pixmap, RenderOptions, RenderReport, SkipReason, SkippedImage, SubstituteSource,
+    GlyphPainting, Pixmap, RenderOptions, RenderReport, SkipReason, SkippedKind, SubstituteSource,
 };
 
 /// Maximum `q`/`Q` nesting depth.
@@ -272,8 +277,8 @@ fn base_ctm(crop: pdfboss_core::Rect, rotate: i32, scale: f32) -> Matrix {
 /// Renders `page` from `doc` at `scale` onto a white background. The pixel
 /// size is `ceil(crop_w * scale) x ceil(crop_h * scale)` after `/Rotate`.
 /// Content errors are lenient: an unreadable stream renders blank. The
-/// returned [`RenderReport`] names every image that leniency dropped, so a
-/// caller can tell a blank page from an unreadable one.
+/// returned [`RenderReport`] names everything that leniency dropped or
+/// approximated, so a caller can tell a blank page from an unreadable one.
 pub(crate) fn render_page_reporting(
     doc: &Document,
     page: &Page,
@@ -290,8 +295,25 @@ pub(crate) fn render_page_reporting(
     let ph = (h_pt * scale).ceil().clamp(1.0, MAX_SIDE) as u32;
     let mut pix = Pixmap::new(pw, ph);
     pix.fill([255, 255, 255, 255]);
-    let content = page.content(doc).unwrap_or_default();
-    let ops = parse_content(&content).unwrap_or_default();
+    let mut report = RenderReport::default();
+    // A page whose own `/Contents` will not decode or will not parse
+    // rasterizes blank, which is indistinguishable from an empty page unless
+    // the report says so.
+    let content = match page.content(doc) {
+        Ok(content) => content,
+        Err(e) => {
+            report.record(SkippedKind::PageContents, skip_reason_for(&e));
+            Vec::new()
+        }
+    };
+    let ops = match parse_content(&content) {
+        Ok(ops) => ops,
+        Err(e) => {
+            report.record(SkippedKind::PageContents, skip_reason_for(&e));
+            Vec::new()
+        }
+    };
+    record_annotations(doc, page, &mut report);
     let ctm = base_ctm(page.crop_box.normalize(), page.rotate, scale);
     let provider: Option<Box<dyn SubstituteProvider>> = match &opts.substitutes {
         SubstituteSource::Dir(dir) => Some(Box::new(DirProvider { dir: dir.clone() })),
@@ -312,10 +334,41 @@ pub(crate) fn render_page_reporting(
         provider,
         glyph_blit: Vec::new(),
         clip_cache: FastMap::default(),
-        report: RenderReport::default(),
+        report,
     };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
     Ok((exec.pix, exec.report))
+}
+
+/// Records every annotation this renderer leaves unpainted. Annotation
+/// appearance streams (ISO 32000-1 §12.5.5) are not drawn at all, so a page
+/// whose visible content is a stamp or a filled form field rasterizes blank
+/// and would otherwise have nothing to say for itself. Annotations with no
+/// `/AP` have no appearance to paint, and ones flagged Hidden (bit 2) or
+/// NoView (bit 6) are invisible on screen anyway (§12.5.3), so neither
+/// counts as a drop.
+fn record_annotations(doc: &Document, page: &Page, report: &mut RenderReport) {
+    /// `/F` bits whose annotations are not displayed even by a renderer
+    /// that paints appearance streams.
+    const INVISIBLE: i64 = (1 << 1) | (1 << 5);
+    let Some(annots) = page.dict().get("Annots") else {
+        return;
+    };
+    let Ok(Object::Array(items)) = doc.resolve(annots) else {
+        return;
+    };
+    for item in &items {
+        let Ok(resolved) = doc.resolve(item) else {
+            continue;
+        };
+        let Some(dict) = resolved.as_dict() else {
+            continue;
+        };
+        if dict.get("AP").is_none() || dict.get_int("F").unwrap_or(0) & INVISIBLE != 0 {
+            continue;
+        }
+        report.record(SkippedKind::Annotation, SkipReason::Unsupported);
+    }
 }
 
 /// Executes parsed content operators against a shared pixmap; forms
@@ -614,6 +667,14 @@ impl Executor<'_> {
             }
             None => Vec::new(),
         };
+        // A pattern paints its stand-in gray (see `GState::fill_rgba8`), so
+        // every such paint is an approximation the caller should hear about
+        // -- but only once the path actually covers something.
+        if !polys.is_empty()
+            && ((how.fill.is_some() && gs.fill_pattern) || (how.stroke && gs.stroke_pattern))
+        {
+            self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
+        }
         if let Some(rule) = how.fill {
             fill_path(
                 &mut self.pix,
@@ -1003,8 +1064,9 @@ impl Executor<'_> {
             }
             Op::XObject(name) => self.do_xobject(name, chain, gs, depth),
             Op::InlineImage(img) => self.draw_inline_image(img, chain, gs),
-            // Shadings are out of scope for v0.1.
-            Op::Shading(_) => {}
+            // Shadings are out of scope for v0.1: `sh` paints nothing, so a
+            // page whose visible content is a gradient comes out blank.
+            Op::Shading(_) => self.skip(SkippedKind::Shading, SkipReason::Unsupported),
             // Text and marked content: state-only in v0.1, nothing painted.
             _ => {}
         }
@@ -1075,11 +1137,20 @@ impl Executor<'_> {
     }
 
     /// Applies the `/ca /CA /LW /LC /LJ /D` entries of the named
-    /// `/ExtGState` resource (other entries are ignored in v0.1).
-    fn apply_ext_gstate(&self, name: &Name, chain: &[&Dict], gs: &mut GState) {
+    /// `/ExtGState` resource. Other entries are ignored in v0.1; the two
+    /// that change what the page looks like -- a `/SMask` mask group and a
+    /// non-`Normal` `/BM` blend mode -- are reported so the caller knows the
+    /// render is an approximation.
+    fn apply_ext_gstate(&mut self, name: &Name, chain: &[&Dict], gs: &mut GState) {
         let Some(Object::Dict(dict)) = self.find_res(chain, "ExtGState", &name.0) else {
             return;
         };
+        if ignores_mask(self.doc, &dict) {
+            self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+        }
+        if ignores_blend_mode(self.doc, &dict) {
+            self.skip(SkippedKind::BlendMode, SkipReason::Unsupported);
+        }
         let num = |key: &str| -> Option<f32> {
             let v = self.doc.resolve(dict.get(key)?).ok()?.as_f64()? as f32;
             v.is_finite().then_some(v)
@@ -1134,7 +1205,8 @@ fn floats_from(doc: &Document, obj: Option<&Object>, n: usize) -> Option<Vec<f32
     (out.len() == n).then_some(out)
 }
 
-/// Maps a stream-decode failure onto the reason reported to callers.
+/// Maps a stream-decode or content-parse failure onto the reason reported
+/// to callers.
 fn skip_reason_for(e: &Error) -> SkipReason {
     match e {
         Error::UnsupportedFilter(name) => SkipReason::UnsupportedFilter(name.clone()),
@@ -1142,16 +1214,53 @@ fn skip_reason_for(e: &Error) -> SkipReason {
     }
 }
 
+/// Whether an image dictionary carries masking this renderer ignores: a
+/// `/SMask` alpha channel, or a `/Mask` stencil or color-key array (ISO
+/// 32000-1 8.9.6). What the author masked out paints solid instead, so the
+/// caller reports it rather than passing the result off as the real image.
+fn ignores_mask(doc: &Document, dict: &Dict) -> bool {
+    ["SMask", "Mask"].iter().any(|key| {
+        match dict.get(key).map(|obj| doc.resolve(obj)) {
+            None | Some(Ok(Object::Null)) => false,
+            // `/SMask /None` in particular is the explicit "no mask" value.
+            Some(Ok(Object::Name(n))) => n.0 != "None",
+            _ => true,
+        }
+    })
+}
+
+/// Whether an `/ExtGState` selects a blend mode this renderer does not
+/// apply (ISO 32000-1 11.3.5). Everything composites source-over, so
+/// anything but `Normal` (and its deprecated alias `Compatible`) paints
+/// differently than the page asks for.
+fn ignores_blend_mode(doc: &Document, dict: &Dict) -> bool {
+    // An array-valued `/BM` names the first mode the reader supports.
+    let selected = match dict.get("BM").map(|obj| doc.resolve(obj)) {
+        Some(Ok(Object::Name(n))) => n.0,
+        Some(Ok(Object::Array(items))) => match items.first().map(|obj| doc.resolve(obj)) {
+            Some(Ok(Object::Name(n))) => n.0,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    !matches!(selected.as_str(), "Normal" | "Compatible")
+}
+
 impl Executor<'_> {
     /// Executes `Do`: draws an image XObject or recurses into a form.
     fn do_xobject(&mut self, name: &Name, chain: &[&Dict], gs: &GState, depth: u32) {
         let Some(Object::Stream(stream)) = self.find_res(chain, "XObject", &name.0) else {
+            // The name resolves to nothing, or to something that is not a
+            // stream: whatever it was meant to draw, it is not drawn.
+            self.skip(SkippedKind::XObject, SkipReason::Missing);
             return;
         };
         match stream.dict.get_name("Subtype").map(|n| n.0.as_str()) {
             Some("Image") => self.draw_image_xobject(&stream, chain, gs),
             Some("Form") => self.run_form(&stream, chain, gs, depth),
-            _ => {}
+            // Neither subtype: a `/PS` XObject, or (seen in the wild) an
+            // image whose dictionary omits `/Subtype` entirely.
+            _ => self.skip(SkippedKind::XObject, SkipReason::Unsupported),
         }
     }
 
@@ -1159,14 +1268,26 @@ impl Executor<'_> {
     /// intersected into the clip, own `/Resources` prepended to the chain,
     /// bounded recursion.
     fn run_form(&mut self, stream: &Stream, chain: &[&Dict], gs: &GState, depth: u32) {
+        // Every bail-out below drops the form's whole content subtree --
+        // images, shadings and nested forms included -- so each one is
+        // reported rather than leaving a hole nobody can account for.
         if depth >= MAX_FORM_DEPTH {
+            self.skip(SkippedKind::Form, SkipReason::LimitExceeded);
             return;
         }
-        let Ok(data) = self.doc.stream_data(stream) else {
-            return;
+        let data = match self.doc.stream_data(stream) {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip(SkippedKind::Form, skip_reason_for(&e));
+                return;
+            }
         };
-        let Ok(ops) = parse_content(&data) else {
-            return;
+        let ops = match parse_content(&data) {
+            Ok(ops) => ops,
+            Err(e) => {
+                self.skip(SkippedKind::Form, skip_reason_for(&e));
+                return;
+            }
         };
         let mut inner = gs.clone();
         if let Some(m) = floats_from(self.doc, stream.dict.get("Matrix"), 6) {
@@ -1203,9 +1324,9 @@ impl Executor<'_> {
         self.run(&ops, &inner_chain, inner, depth + 1);
     }
 
-    /// Records that an image could not be painted.
-    fn skip_image(&mut self, reason: SkipReason) {
-        self.report.skipped_images.push(SkippedImage { reason });
+    /// Records one piece of content this render could not reproduce.
+    fn skip(&mut self, kind: SkippedKind, reason: SkipReason) {
+        self.report.record(kind, reason);
     }
 
     /// Draws an image XObject with the current CTM/clip/alpha; the fill
@@ -1214,7 +1335,7 @@ impl Executor<'_> {
         let data = match self.doc.stream_data(stream) {
             Ok(data) => data,
             Err(e) => {
-                self.skip_image(skip_reason_for(&e));
+                self.skip(SkippedKind::Image, skip_reason_for(&e));
                 return;
             }
         };
@@ -1232,7 +1353,7 @@ impl Executor<'_> {
         let data = match decode_stream(&stream, self.doc) {
             Ok(data) => data,
             Err(e) => {
-                self.skip_image(skip_reason_for(&e));
+                self.skip(SkippedKind::Image, skip_reason_for(&e));
                 return;
             }
         };
@@ -1241,8 +1362,33 @@ impl Executor<'_> {
     }
 
     fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
+        // A codec the filter chain passes through untouched (ISO 32000-1
+        // 7.4.9) leaves `data` holding a codestream this crate cannot read.
+        // Painting it would treat the codestream bytes as samples and
+        // report a faithful render, so stop here instead.
+        if let Some(codec) = image::passthrough_codec(self.doc, dict) {
+            self.skip(SkippedKind::Image, SkipReason::UnsupportedFilter(codec));
+            return;
+        }
+        // An `/Indexed` palette stored as a stream that will not decode
+        // leaves the space with no palette at all, painting every sample
+        // black; the image still draws, but not as the page describes it.
+        if let Some(e) = cs_obj
+            .as_ref()
+            .and_then(|o| color::palette_error(self.doc, o))
+        {
+            self.skip(SkippedKind::Image, skip_reason_for(&e));
+        }
+        if ignores_mask(self.doc, dict) {
+            self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+        }
+        if gs.fill_pattern && image::is_stencil(self.doc, dict) {
+            // The stencil paints the pattern's stand-in gray, not the
+            // pattern (see `GState::fill_rgba8`).
+            self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
+        }
         let fill = gs.fill_rgba8();
-        let painted = image::draw(
+        let outcome = image::draw(
             self.doc,
             &mut self.pix,
             dict,
@@ -1255,8 +1401,10 @@ impl Executor<'_> {
                 clip: gs.clip.as_deref(),
             },
         );
-        if !painted {
-            self.skip_image(SkipReason::Undecodable);
+        match outcome {
+            image::Drawn::Whole => {}
+            image::Drawn::Truncated => self.skip(SkippedKind::Image, SkipReason::Truncated),
+            image::Drawn::Nothing => self.skip(SkippedKind::Image, SkipReason::Undecodable),
         }
     }
 
@@ -1647,7 +1795,17 @@ mod tests {
         let doc = Document::load(bytes).expect("load");
         let page = doc.page(0).expect("page 0");
         render_page_reporting(&doc, &page, 1.0, &RenderOptions::default())
-            .expect("render succeeds despite any dropped image")
+            .expect("render succeeds despite any dropped content")
+    }
+
+    /// The report's entries as `(kind, reason, count)` triples, the shape
+    /// most of these assertions want to compare against.
+    fn drops(report: &RenderReport) -> Vec<(SkippedKind, SkipReason, u64)> {
+        report
+            .skipped
+            .iter()
+            .map(|item| (item.kind, item.reason.clone(), item.count))
+            .collect()
     }
 
     #[test]
@@ -1658,13 +1816,20 @@ mod tests {
         let (pix, report) = render_reporting(doc_with_image_filter("JBIG2Decode"));
 
         assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
-        assert_eq!(report.skipped_images.len(), 1, "exactly one drop recorded");
         assert_eq!(
-            report.skipped_images[0].reason,
-            SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+            drops(&report),
+            vec![(
+                SkippedKind::Image,
+                SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+                1,
+            )],
         );
         assert!(!report.is_empty());
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
+        assert_eq!(
+            report.warnings(),
+            vec!["1 image skipped: unsupported filter /JBIG2Decode".to_string()],
+        );
     }
 
     #[test]
@@ -1677,6 +1842,7 @@ mod tests {
         assert_eq!(px(&pix, 18, 50), BLACK, "column 1 sample is black");
         assert!(report.is_empty(), "a decodable image reports no skips");
         assert_eq!(report.summary(), None);
+        assert!(report.warnings().is_empty());
     }
 
     #[test]
@@ -1685,12 +1851,12 @@ mod tests {
                        /F /JBIG2Decode ID 01234567 EI Q";
         let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
         assert_eq!(
-            report
-                .skipped_images
-                .iter()
-                .map(|s| &s.reason)
-                .collect::<Vec<_>>(),
-            vec![&SkipReason::UnsupportedFilter("JBIG2Decode".to_string())],
+            drops(&report),
+            vec![(
+                SkippedKind::Image,
+                SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+                1,
+            )],
         );
     }
 
@@ -1712,18 +1878,17 @@ mod tests {
         );
         let (_, report) = render_reporting(bytes);
         assert_eq!(
-            report
-                .skipped_images
-                .iter()
-                .map(|s| &s.reason)
-                .collect::<Vec<_>>(),
-            vec![&SkipReason::Undecodable],
+            drops(&report),
+            vec![(SkippedKind::Image, SkipReason::Undecodable, 1)],
         );
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
     }
 
     #[test]
-    fn two_drops_pluralize_the_summary() {
+    fn a_repeated_drop_costs_one_entry_and_counts_up() {
+        // Two draws of the same broken image are one entry with count 2 --
+        // the property that keeps a page drawing a million of them from
+        // growing the report a million times over.
         let content = "q 100 0 0 100 0 0 cm /Im0 Do /Im0 Do Q";
         let bytes = small_doc("/XObject << /Im0 5 0 R >>", content.as_bytes(), |b| {
             b.stream(
@@ -1734,8 +1899,328 @@ mod tests {
             );
         });
         let (_, report) = render_reporting(bytes);
-        assert_eq!(report.skipped_images.len(), 2);
+        assert_eq!(report.skipped.len(), 1, "one entry, not one per draw");
+        assert_eq!(report.skipped[0].count, 2);
         assert_eq!(report.summary().as_deref(), Some("2 images skipped"));
+    }
+
+    #[test]
+    fn nested_forms_repeating_a_broken_image_keep_the_report_small() {
+        // Four levels of forms with a fanout of ten each draw the same
+        // undecodable image, so `/Im0 Do` runs 10,000 times from a document
+        // of a few hundred bytes. The report must stay one entry: an entry
+        // per draw would let a page amplify a caller's memory use by the
+        // fanout, on the plain `render_page` path that throws the report
+        // away.
+        const LEVELS: u32 = 4;
+        const FANOUT: u32 = 10;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Resources << /XObject << /F0 10 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/F0 Do");
+        b.stream(
+            5,
+            "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode",
+            &[0; 8],
+        );
+        for level in 0..LEVELS {
+            let (child, child_obj) = if level + 1 < LEVELS {
+                (format!("F{}", level + 1), 11 + level)
+            } else {
+                ("Im0".to_string(), 5)
+            };
+            let content = format!("/{child} Do ").repeat(FANOUT as usize);
+            b.stream(
+                10 + level,
+                &format!(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Resources << /XObject << /{child} {child_obj} 0 R >> >>"
+                ),
+                content.as_bytes(),
+            );
+        }
+        let (_, report) = render_reporting(b.build(1));
+        assert_eq!(report.skipped.len(), 1, "one entry for 10,000 draws");
+        assert_eq!(report.skipped[0].count, u64::from(FANOUT.pow(LEVELS)));
+        assert_eq!(report.unlisted, 0);
+    }
+
+    #[test]
+    fn distinct_drops_stop_at_the_report_cap() {
+        // 70 inline images, each naming a different unsupported filter, so
+        // every drop is a distinct entry. The list stops at 64 and the rest
+        // are counted -- an unbounded `Vec` would have taken all 70.
+        let mut content = String::new();
+        for i in 0..70 {
+            content.push_str(&format!(
+                "BI /W 8 /H 8 /BPC 1 /CS /G /F /Bogus{i}Decode ID 01234567 EI\n"
+            ));
+        }
+        let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
+        assert_eq!(report.skipped.len(), 64, "entry list is capped");
+        assert_eq!(report.unlisted, 6, "the rest are counted, not described");
+        assert!(report
+            .warnings()
+            .last()
+            .expect("a warning per entry plus the overflow line")
+            .starts_with("6 further drops"));
+    }
+
+    #[test]
+    fn undecodable_page_contents_are_reported() {
+        // The page's own `/Contents` names a filter the core cannot run:
+        // the page renders blank, which must not look like a clean render.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        );
+        b.stream(4, "/Filter /CCITTFaxDecode", b"0 0 100 100 re f");
+        let (pix, report) = render_reporting(b.build(1));
+        assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::PageContents,
+                SkipReason::UnsupportedFilter("CCITTFaxDecode".to_string()),
+                1,
+            )],
+        );
+        assert_eq!(
+            report.summary().as_deref(),
+            Some("1 content stream skipped")
+        );
+    }
+
+    #[test]
+    fn undecodable_form_xobject_is_reported() {
+        // The form's content -- and everything it would have drawn -- is
+        // dropped whole, one level below where an image drop is caught.
+        let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /CCITTFaxDecode",
+                b"0 0 100 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "the form painted nothing");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Form,
+                SkipReason::UnsupportedFilter("CCITTFaxDecode".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn unresolvable_and_untyped_xobjects_are_reported() {
+        // `/Im0` is not in the resource dictionary at all; `/X1` is a stream
+        // with no `/Subtype`, so nothing knows how to draw it.
+        let bytes = small_doc("/XObject << /X1 5 0 R >>", b"/Im0 Do /X1 Do", |b| {
+            b.stream(5, "/Width 8 /Height 8", &[0; 8]);
+        });
+        let (_, report) = render_reporting(bytes);
+        assert_eq!(
+            drops(&report),
+            vec![
+                (SkippedKind::XObject, SkipReason::Missing, 1),
+                (SkippedKind::XObject, SkipReason::Unsupported, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn jpx_image_is_reported_instead_of_painted_as_noise() {
+        // The filter chain hands `JPXDecode` data through undecoded (ISO
+        // 32000-1 7.4.9). Painting those bytes as samples would show noise
+        // and claim success, so the image is dropped and reported.
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /JPXDecode",
+                    &[0x42; 192],
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "no noise painted");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Image,
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn image_with_too_few_samples_is_reported() {
+        // 8x8 at 8 bits gray needs 64 bytes; 4 are supplied, so 60 pixels
+        // come from zero padding rather than from the image.
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace /DeviceGray",
+                    &[0xFF; 4],
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 6, 6), [255, 255, 255, 255], "real sample painted");
+        assert_eq!(px(&pix, 50, 50), BLACK, "padding painted black");
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Image, SkipReason::Truncated, 1)],
+        );
+    }
+
+    #[test]
+    fn indexed_image_with_undecodable_palette_is_reported() {
+        // The palette stream will not decode, so the space has no colors at
+        // all and every sample paints black -- a plausible-looking image
+        // that is not the page's image.
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 255 6 0 R]",
+                    &[0; 64],
+                );
+                b.stream(6, "/Filter /CCITTFaxDecode", &[0; 12]);
+            },
+        );
+        let (_, report) = render_reporting(bytes);
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Image,
+                SkipReason::UnsupportedFilter("CCITTFaxDecode".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn shading_operator_is_reported() {
+        let (pix, report) = render_reporting(small_doc("", b"q /Sh0 sh Q", |_| {}));
+        assert_eq!(px(&pix, 50, 50), WHITE, "shadings paint nothing");
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Shading, SkipReason::Unsupported, 1)],
+        );
+    }
+
+    #[test]
+    fn pattern_fill_is_reported_as_an_approximation() {
+        let content = b"/Pattern cs /P0 scn 0 0 100 100 re f";
+        let (pix, report) = render_reporting(small_doc("", content, |_| {}));
+        assert_eq!(px(&pix, 50, 50), [128, 128, 128, 255], "stand-in gray");
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Pattern, SkipReason::Unsupported, 1)],
+        );
+    }
+
+    #[test]
+    fn ignored_soft_mask_and_blend_mode_are_reported() {
+        let resources = "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> \
+                         /BM /Multiply >> >>";
+        let bytes = small_doc(resources, b"/GS0 gs 0 0 100 100 re f", |b| {
+            b.stream(5, "/Type /XObject /Subtype /Form /BBox [0 0 8 8]", b"");
+        });
+        let (_, report) = render_reporting(bytes);
+        assert_eq!(
+            drops(&report),
+            vec![
+                (SkippedKind::SoftMask, SkipReason::Unsupported, 1),
+                (SkippedKind::BlendMode, SkipReason::Unsupported, 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn image_soft_mask_is_reported() {
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace /DeviceGray /SMask 6 0 R",
+                    &[0xFF; 64],
+                );
+                b.stream(
+                    6,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace /DeviceGray",
+                    &[0; 64],
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 50, 50),
+            WHITE,
+            "fully masked content painted anyway"
+        );
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::SoftMask, SkipReason::Unsupported, 1)],
+        );
+    }
+
+    #[test]
+    fn unpainted_annotation_appearance_is_reported() {
+        // One annotation with an appearance stream (never painted), one
+        // hidden (invisible either way) and one with no `/AP` at all.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+             /Annots [5 0 R 6 0 R 7 0 R] >>",
+        );
+        b.stream(4, "", b"");
+        b.object(
+            5,
+            "<< /Type /Annot /Subtype /Stamp /Rect [0 0 10 10] /AP << /N 8 0 R >> >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Annot /Subtype /Stamp /Rect [0 0 10 10] /F 2 /AP << /N 8 0 R >> >>",
+        );
+        b.object(7, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>");
+        b.stream(8, "/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"");
+        let (_, report) = render_reporting(b.build(1));
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Annotation, SkipReason::Unsupported, 1)],
+        );
     }
 
     #[test]

@@ -389,6 +389,9 @@ impl Page {
     /// available this raises `ValueError` with an actionable install
     /// message rather than silently degrading or leaking a raw import
     /// error.
+    ///
+    /// Content pdfboss cannot read is skipped, so a page can come out blank
+    /// without raising. Use `render_reporting` to see what was dropped.
     #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None))]
     fn render<'py>(
         &self,
@@ -397,6 +400,25 @@ impl Page {
         fonts: &str,
         font_dir: Option<String>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let rendered = self.render_reporting(py, scale, fonts, font_dir)?;
+        Ok(rendered.0)
+    }
+
+    /// Renders the page like `render`, returning `(png_bytes, warnings)`.
+    ///
+    /// `warnings` is one human-readable line per distinct piece of content
+    /// the render had to drop or approximate, e.g. `"1 image skipped:
+    /// unsupported filter /JBIG2Decode"`. It is empty when the page
+    /// rasterized exactly as it describes itself, so a blank page is never
+    /// mistaken for a clean render.
+    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None))]
+    fn render_reporting<'py>(
+        &self,
+        py: Python<'py>,
+        scale: f32,
+        fonts: &str,
+        font_dir: Option<String>,
+    ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
         use pdfboss_render::{GlyphPainting, SubstituteSource};
 
         if !scale.is_finite() || scale <= 0.0 {
@@ -432,13 +454,14 @@ impl Page {
             glyph_painting,
             substitutes,
         };
-        let png = py.allow_threads(|| {
+        let (png, warnings) = py.allow_threads(|| {
             let doc = self.doc.lock();
-            let pixmap = pdfboss_render::render_page_with_options(&doc, &self.page, scale, &opts)
-                .map_err(pdf_err)?;
-            pixmap.encode_png().map_err(pdf_err)
+            let (pixmap, report) =
+                pdfboss_render::render_page_reporting(&doc, &self.page, scale, &opts)
+                    .map_err(pdf_err)?;
+            Ok::<_, PyErr>((pixmap.encode_png().map_err(pdf_err)?, report.warnings()))
         })?;
-        Ok(PyBytes::new(py, &png))
+        Ok((PyBytes::new(py, &png), warnings))
     }
 }
 
