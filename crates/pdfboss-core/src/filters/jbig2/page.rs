@@ -33,9 +33,9 @@ const PAGE_INFO_LEN: usize = 19;
 /// (T.88 7.4.8).
 ///
 /// The segment carries far more than this: page width and height, both
-/// resolutions, and the striping field. All of them are read and discarded,
-/// because the caller supplies the page geometry from the PDF image dictionary
-/// and no other field in the segment changes a pixel.
+/// resolutions, and the striping field. None of them is kept. The caller
+/// supplies the page geometry from the PDF image dictionary, and no other field
+/// in the segment changes a pixel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PageInfo {
     /// The value every pixel of the page starts at, from flags bit 2.
@@ -51,6 +51,9 @@ pub(crate) struct PageInfo {
 /// own region information field, which is what this decoder applies. Storing a
 /// value nothing reads would only invite a later reader to believe it mattered.
 pub(crate) fn parse_page_info(data: &[u8]) -> Result<PageInfo, Jbig2Error> {
+    // The two striping bytes that close the segment are never read, so the
+    // whole block is length-checked up front rather than field by field: a
+    // segment too short to hold one is not a page information segment.
     if data.len() < PAGE_INFO_LEN {
         return Err(Jbig2Error::Truncated);
     }
