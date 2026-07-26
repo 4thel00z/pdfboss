@@ -112,13 +112,13 @@ impl Bitmap {
     }
 
     /// The bitmap's width in pixels.
-    #[allow(dead_code)] // Read by the symbol dictionary, which lands later.
+    #[allow(dead_code)] // Read by the text region placement, which lands later.
     pub(crate) fn width(&self) -> u32 {
         self.width
     }
 
     /// The bitmap's height in pixels.
-    #[allow(dead_code)] // Read by the symbol dictionary, which lands later.
+    #[allow(dead_code)] // Read by the text region placement, which lands later.
     pub(crate) fn height(&self) -> u32 {
         self.height
     }

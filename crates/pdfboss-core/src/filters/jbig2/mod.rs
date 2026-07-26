@@ -20,11 +20,11 @@
 //! coded bytes it claims to, so the budget is what ties the cost of decoding to
 //! something the input cannot inflate.
 
-// Every procedure in `arith_int` is consumed by the symbol dictionary and text
-// region decoders, which land in a later change; until then the module is
-// reachable only from its own tests. The allow sits on the module declaration
-// rather than at the root of this file so that the modules still being built
-// keep the lint.
+// The symbol dictionary consumes the height, width and export procedures of
+// `arith_int`; the remaining ten wait for the text region decoder. Until then
+// they are reachable only from this module's own tests. The allow sits on the
+// module declaration rather than at the root of this file so that the modules
+// still being built keep the lint.
 #[allow(dead_code)]
 pub(crate) mod arith_int;
 pub(crate) mod bitmap;
@@ -34,6 +34,13 @@ pub(crate) mod mq;
 pub(crate) mod page;
 pub(crate) mod reader;
 pub(crate) mod segment;
+// Nothing dispatches to the symbol dictionary yet: the page walk gains its arm
+// once the text region that consumes the exported symbols exists.
+#[allow(dead_code)]
+pub(crate) mod symbol_dict;
+
+#[cfg(test)]
+pub(crate) mod testing;
 
 /// A decoding failure inside the JBIG2 codec.
 ///

@@ -250,6 +250,7 @@ mod tests {
     use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::{context_at, GenericParams, GB_CONTEXT_LEN};
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
+    use crate::filters::jbig2::testing::header;
 
     /// Assembles a complete embedded stream: page info, one immediate generic
     /// region carrying `bm` at (`x`, `y`), then end of page and end of file.
@@ -270,7 +271,7 @@ mod tests {
         info.extend_from_slice(&0u32.to_be_bytes()); // y resolution
         info.push(0); // flags: default pixel 0, default operator OR
         info.extend_from_slice(&0u16.to_be_bytes()); // striping
-        out.extend_from_slice(&header(0, 48, 1, info.len() as u32));
+        out.extend_from_slice(&header(0, 48, &[], 1, info.len() as u32));
         out.extend_from_slice(&info);
 
         let params = GenericParams::nominal(0);
@@ -286,11 +287,11 @@ mod tests {
             region.push(dy as u8);
         }
         region.extend_from_slice(&encode_bitmap(bm, &params));
-        out.extend_from_slice(&header(1, 38, 1, region.len() as u32));
+        out.extend_from_slice(&header(1, 38, &[], 1, region.len() as u32));
         out.extend_from_slice(&region);
 
-        out.extend_from_slice(&header(2, 49, 1, 0)); // end of page
-        out.extend_from_slice(&header(3, 51, 1, 0)); // end of file
+        out.extend_from_slice(&header(2, 49, &[], 1, 0)); // end of page
+        out.extend_from_slice(&header(3, 51, &[], 1, 0)); // end of file
         out
     }
 
@@ -313,17 +314,8 @@ mod tests {
             region.push(dx as u8);
             region.push(dy as u8);
         }
-        let mut out = header(number, 38, 1, region.len() as u32);
+        let mut out = header(number, 38, &[], 1, region.len() as u32);
         out.extend_from_slice(&region);
-        out
-    }
-
-    fn header(number: u32, kind: u8, page: u8, len: u32) -> Vec<u8> {
-        let mut out = number.to_be_bytes().to_vec();
-        out.push(kind);
-        out.push(0); // no referred-to segments
-        out.push(page);
-        out.extend_from_slice(&len.to_be_bytes());
         out
     }
 
@@ -453,7 +445,7 @@ mod tests {
             (42, "refinement region"),
             (53, "custom Huffman table"),
         ] {
-            let stream = header(0, kind, 1, 0);
+            let stream = header(0, kind, &[], 1, 0);
             assert_eq!(
                 decode_embedded(&[], &stream, 8, 8),
                 Err(Jbig2Error::Unimplemented(want)),
@@ -473,7 +465,7 @@ mod tests {
         region.extend_from_slice(&0u32.to_be_bytes());
         region.push(0);
         region.push(1); // MMR
-        let mut stream = header(0, 38, 1, region.len() as u32);
+        let mut stream = header(0, 38, &[], 1, region.len() as u32);
         stream.extend_from_slice(&region);
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
@@ -485,14 +477,14 @@ mod tests {
     #[test]
     fn end_of_stripe_profiles_and_extension_are_ignored() {
         let mut stream = Vec::new();
-        let mut eos = header(0, 50, 1, 4);
+        let mut eos = header(0, 50, &[], 1, 4);
         eos.extend_from_slice(&99u32.to_be_bytes());
         stream.extend_from_slice(&eos);
-        stream.extend_from_slice(&header(1, 52, 1, 0));
-        let mut ext = header(2, 62, 1, 4);
+        stream.extend_from_slice(&header(1, 52, &[], 1, 0));
+        let mut ext = header(2, 62, &[], 1, 4);
         ext.extend_from_slice(&[0, 0, 0, 0]);
         stream.extend_from_slice(&ext);
-        stream.extend_from_slice(&header(3, 51, 1, 0));
+        stream.extend_from_slice(&header(3, 51, &[], 1, 0));
         let page = decode_embedded(&[], &stream, 4, 4).expect("page");
         assert_eq!((page.width(), page.height()), (4, 4));
     }
@@ -550,7 +542,7 @@ mod tests {
         region.extend_from_slice(&encode_bitmap(&bm, &params));
         region.extend_from_slice(&bm.height().to_be_bytes());
 
-        let mut stream = header(0, 38, 1, u32::MAX);
+        let mut stream = header(0, 38, &[], 1, u32::MAX);
         stream.extend_from_slice(&region);
 
         let page = decode_embedded(&[], &stream, 8, 4).expect("page");
@@ -616,7 +608,7 @@ mod tests {
         region.extend_from_slice(&[0xFF, 0xAC]); // the 7.2.7 terminator
         region.extend_from_slice(&u32::MAX.to_be_bytes()); // and the row count
 
-        let mut stream = header(0, 38, 1, u32::MAX);
+        let mut stream = header(0, 38, &[], 1, u32::MAX);
         stream.extend_from_slice(&region);
         assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
         assert_eq!(
@@ -691,9 +683,9 @@ mod tests {
     /// by name rather than rendering a blank page.
     #[test]
     fn a_symbol_coded_page_names_what_is_missing() {
-        let mut stream = header(0, 48, 1, 19);
+        let mut stream = header(0, 48, &[], 1, 19);
         stream.extend_from_slice(&[0u8; 19]);
-        stream.extend_from_slice(&header(1, 0, 1, 0)); // symbol dictionary
+        stream.extend_from_slice(&header(1, 0, &[], 1, 0)); // symbol dictionary
         assert_eq!(
             decode_embedded(&[], &stream, 1994, 2832),
             Err(Jbig2Error::Unimplemented("symbol dictionary")),
