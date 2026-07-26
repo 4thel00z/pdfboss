@@ -14,6 +14,15 @@ use super::Jbig2Error;
 /// 600 dpi A4 page is about 35 million pixels; the cap leaves comfortable room
 /// above that while refusing the multi-gigabyte allocation a hostile 32-bit
 /// width and height would otherwise request.
+///
+/// This bounds memory, and only memory. It is emphatically not a bound on how
+/// long a region takes to decode, and reading it as one is a mistake: the
+/// product it tests collapses to zero when either dimension is zero, so a
+/// region no pixels wide passes this cap for *any* height, allocates nothing,
+/// and still costs the decoder a pass over every row it declared. Bounding the
+/// work is the job of the budget in the [`super::budget`] module, which charges
+/// per row as well as per pixel and spans the whole stream rather than one
+/// region.
 pub(crate) const MAX_PIXELS: u64 = 1 << 27;
 
 /// The external combination operator of a region segment (T.88 7.4.1).
@@ -74,7 +83,9 @@ impl Bitmap {
     ///
     /// Fails with [`Jbig2Error::TooLarge`] when the pixel count exceeds
     /// [`MAX_PIXELS`]. A zero width or height is legal and yields an empty
-    /// bitmap: T.88 places no lower bound on a region's dimensions.
+    /// bitmap: T.88 places no lower bound on a region's dimensions, and
+    /// refusing one here would reject a legal stream. What stops a caller
+    /// looping over the rows of such a bitmap is the work budget, not this.
     pub(crate) fn new(width: u32, height: u32) -> Result<Bitmap, Jbig2Error> {
         Bitmap::filled(width, height, 0)
     }
@@ -234,6 +245,16 @@ impl Bitmap {
     #[allow(dead_code)] // Called by the `JBIG2Decode` filter arm, wired later.
     pub(crate) fn pack_rows(&self) -> Vec<u8> {
         let stride = self.width.div_ceil(8) as usize;
+        // A bitmap with no columns packs to no bytes, whatever its height, and
+        // returning here is what stops that height from costing a pass per row.
+        // It can be any `u32`: the allocation cap tests `width * height`, which
+        // is zero for every height once the width is, so a zero-width bitmap of
+        // four billion rows is a bitmap this type will hand out. Height alone
+        // is bounded only when there is at least one column, and then by the
+        // cap — `data` holds `width * height` bytes.
+        if stride == 0 {
+            return Vec::new();
+        }
         let mut out = vec![0u8; stride * self.height as usize];
         for y in 0..self.height {
             let base = y as usize * stride;
@@ -436,5 +457,38 @@ mod tests {
         assert!(bm.pack_rows().is_empty());
         let bm = Bitmap::new(5, 0).expect("5x0");
         assert!(bm.pack_rows().is_empty());
+    }
+
+    /// The cap tests a product, so a zero dimension slips past it at any
+    /// height at all. That is the right answer for an allocation — there is
+    /// nothing to allocate — and it is precisely why this cap cannot double as
+    /// a bound on how much work such a bitmap costs.
+    ///
+    /// Every operation on one has to reach its answer without walking those
+    /// rows. `/Width 0` and `/Height 4294967295` is a pair of numbers an image
+    /// dictionary is free to contain, so this is not a hypothetical shape.
+    #[test]
+    fn a_zero_width_bitmap_of_any_height_costs_nothing_to_use() {
+        let mut bm = Bitmap::new(0, u32::MAX).expect("legal, and empty");
+        assert_eq!((bm.width(), bm.height()), (0, u32::MAX));
+        assert!(bm.row(0).is_empty());
+        assert!(bm.row(u32::MAX - 1).is_empty());
+        assert!(bm.pack_rows().is_empty());
+        bm.duplicate_row(u32::MAX - 1);
+        bm.set(0, u32::MAX - 1, 1);
+        assert_eq!(bm.get(0, i64::from(u32::MAX) - 1), 0);
+
+        // Compositing in either direction has to clip away without walking the
+        // rows either, and the empty bitmap must not disturb a real one.
+        let src = from_rows(&["11", "11"]);
+        bm.combine(&src, 0, 0, CombOp::Or);
+        let mut dst = from_rows(&["00", "00"]);
+        dst.combine(&bm, 0, 0, CombOp::Or);
+        assert_eq!(dst.row(0), &[0, 0]);
+
+        let tall = Bitmap::new(0, u32::MAX).expect("legal, and empty");
+        let mut wide = Bitmap::new(4, 4).expect("4x4");
+        wide.combine(&tall, 0, 0, CombOp::Replace);
+        assert_eq!(wide.row(3), &[0, 0, 0, 0]);
     }
 }
