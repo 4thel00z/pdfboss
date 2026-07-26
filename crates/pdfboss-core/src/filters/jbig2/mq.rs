@@ -535,6 +535,45 @@ mod tests {
         assert_eq!(switches, vec![0, 6, 14]);
     }
 
+    /// Table E.1 is a probability *estimator*, and its transitions have to
+    /// move the estimate in the right direction.
+    ///
+    /// This is the one check on the table that does not restate its numbers.
+    /// Spot-checking rows proves only that two transcriptions of the same
+    /// clause agree, and a round trip proves only that the encoder and the
+    /// decoder read the same table — a row copied into the wrong place, or a
+    /// pair of successors swapped, survives both. It cannot survive this:
+    /// seeing the more probable symbol must never make the less probable one
+    /// more likely, and seeing the less probable one must never make it less
+    /// likely. The three SWITCH rows are exempt on the LPS side, since there
+    /// the two symbols trade places and the new Qe estimates the other one.
+    #[test]
+    fn the_estimator_moves_in_the_right_direction() {
+        for (idx, &(qe, nmps, nlps, switch)) in QE.iter().enumerate() {
+            let after_mps = QE[nmps as usize].0;
+            assert!(
+                after_mps <= qe,
+                "row {idx}: an MPS raised Qe from {qe:#06X} to {after_mps:#06X}"
+            );
+            if switch == 0 {
+                let after_lps = QE[nlps as usize].0;
+                assert!(
+                    after_lps >= qe,
+                    "row {idx}: an LPS lowered Qe from {qe:#06X} to {after_lps:#06X}"
+                );
+            }
+        }
+        // Only the two ends of the chain stand still under an MPS: the skewed
+        // tail, which has nowhere further to go, and the terminal row.
+        let fixed: Vec<usize> = QE
+            .iter()
+            .enumerate()
+            .filter(|(idx, row)| usize::from(row.1) == *idx)
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(fixed, vec![45, 46]);
+    }
+
     /// Qe is the LPS sub-interval, so it can never exceed half of the 0x8000
     /// the interval register is renormalized to, and never reach zero.
     #[test]
