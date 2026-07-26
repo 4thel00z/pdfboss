@@ -26,6 +26,8 @@ const MAX_FILTER_CHAIN: usize = 32;
 pub mod ascii85;
 pub mod ascii_hex;
 pub mod flate;
+// Private: the JBIG2 codec is an implementation detail of `decode_stream`.
+mod jbig2;
 pub mod lzw;
 pub mod predictor;
 pub mod run_length;
