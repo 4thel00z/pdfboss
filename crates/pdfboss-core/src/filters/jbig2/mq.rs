@@ -14,6 +14,11 @@
 //! panic, hang, or read out of bounds; a truncated stream simply decodes an
 //! unbounded run of trailing bits, which the segment layer discards.
 
+/// The encoding side of the same annex, used to round-trip the decoder
+/// against an independent transcription of it.
+#[cfg(test)]
+pub(crate) mod encoder;
+
 /// The 47-state probability estimation table (T.88 Table E.1), as
 /// `(Qe, NMPS, NLPS, SWITCH)`.
 ///
@@ -536,6 +541,79 @@ mod tests {
             for _ in 0..2_000 {
                 let _ = dec.decode(cx.get_mut(1));
             }
+        }
+    }
+
+    /// Every bit coded by the Annex E encoder comes back out of the Annex E
+    /// decoder unchanged, over a run long enough to walk the whole Qe table.
+    ///
+    /// The two sides are separate transcriptions of the same annex — the
+    /// encoder renormalizes after transferring a byte where the decoder
+    /// transfers before shifting, and stuffs bits where the decoder skips
+    /// them — so a slip in Table E.1, in either interval update or in either
+    /// byte procedure shows up as a mismatched bit rather than as two
+    /// self-consistent errors.
+    #[test]
+    fn encoder_round_trips_through_the_decoder() {
+        let mut state: u32 = 0x2545_F491;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        // A skewed source (mostly zeros) drives the states towards the tail of
+        // the table; the context index picks a different context per bit so
+        // the whole array adapts.
+        let bits: Vec<u8> = (0..4_000)
+            .map(|_| u8::from(next() % 16 == 0))
+            .collect::<Vec<u8>>();
+        let indices: Vec<usize> = (0..bits.len()).map(|i| i % 7).collect();
+
+        let mut enc = encoder::MqEncoder::new();
+        let mut enc_cx = MqContexts::new(7);
+        for (bit, index) in bits.iter().zip(&indices) {
+            enc.encode(enc_cx.get_mut(*index), *bit);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = MqContexts::new(7);
+        let decoded: Vec<u8> = indices
+            .iter()
+            .map(|index| dec.decode(dec_cx.get_mut(*index)))
+            .collect();
+        assert_eq!(decoded, bits);
+        // Both sides must have walked their context arrays identically.
+        assert_eq!(dec_cx.state_digest(), enc_cx.state_digest());
+    }
+
+    /// Degenerate bit sequences round-trip too: a long run of one symbol
+    /// drives the state index to the tail of the table and exercises the
+    /// encoder's carry propagation and bit stuffing.
+    #[test]
+    fn degenerate_runs_round_trip() {
+        for pattern in [
+            vec![0u8; 600],
+            vec![1u8; 600],
+            (0..600).map(|i| u8::try_from(i % 2).unwrap_or(0)).collect(),
+            (0..600).map(|i| u8::from(i % 97 == 0)).collect(),
+            vec![],
+            vec![1],
+        ] {
+            let mut enc = encoder::MqEncoder::new();
+            let mut enc_cx = MqContexts::new(1);
+            for bit in &pattern {
+                enc.encode(enc_cx.get_mut(0), *bit);
+            }
+            let coded = enc.finish();
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut dec_cx = MqContexts::new(1);
+            let decoded: Vec<u8> = (0..pattern.len())
+                .map(|_| dec.decode(dec_cx.get_mut(0)))
+                .collect();
+            assert_eq!(decoded, pattern, "run of {} bits", pattern.len());
         }
     }
 

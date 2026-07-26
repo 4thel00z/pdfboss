@@ -333,7 +333,182 @@ impl IntCtxSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filters::jbig2::mq::MqDecoder;
+    use crate::filters::jbig2::mq::{encoder::MqEncoder, MqDecoder};
+
+    /// The six length classes of T.88 A.2, as `(magnitude bits, bias, the
+    /// unary prefix that selects the class after the sign bit)`.
+    const LENGTH_CLASSES: [(u32, u64, &[u8]); 6] = [
+        (2, 0, &[0]),
+        (4, 4, &[1, 0]),
+        (6, 20, &[1, 1, 0]),
+        (8, 84, &[1, 1, 1, 0]),
+        (12, 340, &[1, 1, 1, 1, 0]),
+        (32, 4436, &[1, 1, 1, 1, 1]),
+    ];
+
+    /// Codes one bit into an integer procedure's array, advancing `PREV` the
+    /// way [`decode_int`] will when it reads the bit back.
+    fn code_bit(enc: &mut MqEncoder, cx: &mut IntCtx, prev: &mut usize, bit: u8) {
+        enc.encode(cx.context_mut(*prev), bit);
+        *prev = next_prev(*prev, bit);
+    }
+
+    /// The encoding side of T.88 A.2: a sign bit, the unary length class that
+    /// holds the magnitude, and that class's magnitude bits, most significant
+    /// first. `None` codes OOB — the sign bit over a magnitude of zero.
+    fn encode_int(enc: &mut MqEncoder, cx: &mut IntCtx, value: Option<i32>) {
+        let (sign, magnitude) = match value {
+            None => (1u8, 0u64),
+            Some(v) => (u8::from(v < 0), i64::from(v).unsigned_abs()),
+        };
+        let (bits, offset, prefix) = LENGTH_CLASSES
+            .into_iter()
+            .find(|(bits, offset, _)| magnitude < offset + (1u64 << bits))
+            .unwrap_or(LENGTH_CLASSES[5]);
+
+        let mut prev = 1usize;
+        code_bit(enc, cx, &mut prev, sign);
+        for bit in prefix {
+            code_bit(enc, cx, &mut prev, *bit);
+        }
+        let payload = magnitude.saturating_sub(offset);
+        for shift in (0..bits).rev() {
+            let bit = u8::try_from((payload >> shift) & 1).unwrap_or(0);
+            code_bit(enc, cx, &mut prev, bit);
+        }
+    }
+
+    /// The encoding side of T.88 A.3: `SBSYMCODELEN` bits of the ID, most
+    /// significant first.
+    fn encode_iaid(enc: &mut MqEncoder, cx: &mut IaidCtx, id: u32) {
+        let mut prev = 1usize;
+        for shift in (0..cx.code_len()).rev() {
+            let bit = u8::try_from((id >> shift) & 1).unwrap_or(0);
+            enc.encode(cx.context_mut(prev), bit);
+            prev = (prev << 1) | usize::from(bit);
+        }
+    }
+
+    /// Every value A.2 can carry survives a round trip through the encoding
+    /// side of the same clause: the boundaries of all six length classes,
+    /// both signs, the extremes of [`i32`], and OOB interleaved with the
+    /// value zero it must not be confused with.
+    #[test]
+    fn integers_round_trip_through_annex_a() {
+        let values: Vec<Option<i32>> = vec![
+            Some(0),
+            None,
+            Some(0),
+            Some(1),
+            Some(3),
+            Some(4),
+            Some(19),
+            Some(20),
+            Some(83),
+            Some(84),
+            Some(339),
+            Some(340),
+            Some(4_435),
+            Some(4_436),
+            Some(65_536),
+            Some(i32::MAX),
+            None,
+            Some(-1),
+            Some(-3),
+            Some(-4),
+            Some(-19),
+            Some(-20),
+            Some(-83),
+            Some(-84),
+            Some(-339),
+            Some(-340),
+            Some(-4_435),
+            Some(-4_436),
+            Some(-70_000),
+            Some(i32::MIN),
+            None,
+        ];
+
+        let mut enc = MqEncoder::new();
+        let mut enc_cx = IntCtx::new();
+        for value in &values {
+            encode_int(&mut enc, &mut enc_cx, *value);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = IntCtx::new();
+        let decoded: Vec<Option<i32>> = values
+            .iter()
+            .map(|_| decode_int(&mut dec, &mut dec_cx))
+            .collect();
+        assert_eq!(decoded, values);
+        assert_eq!(dec_cx.state_digest(), enc_cx.state_digest());
+    }
+
+    /// A long pseudo-random run round-trips too, so the context array is
+    /// walked far enough for the magnitude-loop clamp to matter: a value in
+    /// the 32-bit class folds `PREV` back into the upper half of the array
+    /// twenty-three times.
+    #[test]
+    fn long_runs_of_integers_round_trip() {
+        let mut state: u32 = 0x1357_9BDF;
+        let values: Vec<Option<i32>> = (0..500)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                match state % 8 {
+                    0 => None,
+                    1 => Some(0),
+                    2..=4 => Some(i32::try_from(state % 5_000).unwrap_or(0)),
+                    _ => Some(-i32::try_from(state % 100_000).unwrap_or(0)),
+                }
+            })
+            .collect();
+
+        let mut enc = MqEncoder::new();
+        let mut enc_cx = IntCtx::new();
+        for value in &values {
+            encode_int(&mut enc, &mut enc_cx, *value);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = IntCtx::new();
+        let decoded: Vec<Option<i32>> = values
+            .iter()
+            .map(|_| decode_int(&mut dec, &mut dec_cx))
+            .collect();
+        assert_eq!(decoded, values);
+    }
+
+    /// Symbol IDs round-trip at every code length, including the degenerate
+    /// zero-bit code (T.88 A.3).
+    #[test]
+    fn symbol_ids_round_trip_through_annex_a() {
+        for len in 0u32..=10 {
+            let modulus = 1u32 << len;
+            let ids: Vec<u32> = (0..128u32)
+                .map(|i| i.wrapping_mul(37).wrapping_add(5) % modulus)
+                .collect();
+
+            let mut enc = MqEncoder::new();
+            let mut enc_cx = IaidCtx::new(len);
+            for id in &ids {
+                encode_iaid(&mut enc, &mut enc_cx, *id);
+            }
+            let coded = enc.finish();
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut dec_cx = IaidCtx::new(len);
+            let decoded: Vec<u32> = ids
+                .iter()
+                .map(|_| decode_iaid(&mut dec, &mut dec_cx))
+                .collect();
+            assert_eq!(decoded, ids, "code length {len}");
+        }
+    }
 
     /// Decoding through one procedure must leave the other twelve untouched:
     /// each integer procedure owns its own context array (T.88 A.2).
