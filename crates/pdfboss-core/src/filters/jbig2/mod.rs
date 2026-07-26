@@ -13,6 +13,12 @@
 //! [`generic`] decodes a region of pixels out of the arithmetic decoder, which
 //! is the procedure every other region type is ultimately built from; and
 //! [`page`] walks a segment sequence, compositing each region onto the page.
+//!
+//! Cutting across that stack is [`budget`], the allowance of decoding work one
+//! embedded stream is allowed to spend. Every dimension the region decoders
+//! loop over is a number the stream chose, and a region need not carry the
+//! coded bytes it claims to, so the budget is what ties the cost of decoding to
+//! something the input cannot inflate.
 
 // Every procedure in `arith_int` is consumed by the symbol dictionary and text
 // region decoders, which land in a later change; until then the module is
@@ -22,6 +28,7 @@
 #[allow(dead_code)]
 pub(crate) mod arith_int;
 pub(crate) mod bitmap;
+pub(crate) mod budget;
 pub(crate) mod generic;
 pub(crate) mod mq;
 pub(crate) mod page;
@@ -43,6 +50,10 @@ pub(crate) enum Jbig2Error {
     Unimplemented(&'static str),
     /// A declared bitmap exceeds [`bitmap::MAX_PIXELS`].
     TooLarge { width: u32, height: u32 },
+    /// The stream asked for more decoding work than [`budget::MAX_WORK`]
+    /// allows. The stream may be well formed; it is simply more expensive to
+    /// decode than this decoder will pay for.
+    WorkLimit,
 }
 
 impl core::fmt::Display for Jbig2Error {
@@ -54,6 +65,7 @@ impl core::fmt::Display for Jbig2Error {
             Self::TooLarge { width, height } => {
                 write!(f, "JBIG2 bitmap too large: {width} x {height}")
             }
+            Self::WorkLimit => write!(f, "JBIG2 stream exceeds the decoding work limit"),
         }
     }
 }

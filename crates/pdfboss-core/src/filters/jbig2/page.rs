@@ -18,8 +18,17 @@
 //! feature, never a skip. Skipping a symbol dictionary and its text regions
 //! yields a blank page that reports success, and a blank page that reports
 //! success is indistinguishable from a page that is genuinely blank.
+//!
+//! Cost is the third. Nothing in the segment format ties how much decoding a
+//! stream provokes to how many bytes it occupies: a region segment is a few
+//! dozen bytes of header and may declare any dimensions its 32-bit fields can
+//! hold, and Annex D.3 sets no limit on how many such segments follow one
+//! another. So the whole walk — globals and page stream together — draws on a
+//! single work budget, and a stream that asks for more than it is refused
+//! partway through rather than decoded.
 
 use super::bitmap::Bitmap;
+use super::budget::Budget;
 use super::generic::{decode_generic_region, parse_generic_flags, GB_CONTEXT_LEN};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
@@ -84,12 +93,32 @@ pub(crate) fn parse_page_info(data: &[u8]) -> Result<PageInfo, Jbig2Error> {
 /// A stream may legally omit the page information segment, so the page is
 /// allocated on first use with a default pixel value of 0 and replaced if a
 /// page information segment turns up asking for 1.
+///
+/// The stream gets one [`Budget`] for all of it. A stream asking for more
+/// decoding work than that fails with [`Jbig2Error::WorkLimit`] instead of
+/// running for as long as its dimension fields say to.
 #[allow(dead_code)] // The `JBIG2Decode` filter arm is wired up in a later change.
 pub(crate) fn decode_embedded(
     globals: &[u8],
     data: &[u8],
     width: u32,
     height: u32,
+) -> Result<Bitmap, Jbig2Error> {
+    decode_embedded_within(globals, data, width, height, &mut Budget::new())
+}
+
+/// [`decode_embedded`], with the work budget supplied rather than created.
+///
+/// Splitting it out keeps the budget an explicit parameter of the segment walk,
+/// which is what the region types still to come will need in order to share one
+/// allowance with the generic regions — and it lets the exhaustion behaviour be
+/// tested against a small budget instead of by actually spending a full one.
+fn decode_embedded_within(
+    globals: &[u8],
+    data: &[u8],
+    width: u32,
+    height: u32,
+    budget: &mut Budget,
 ) -> Result<Bitmap, Jbig2Error> {
     let global_segments = parse_embedded(globals)?;
     let page_segments = parse_embedded(data)?;
@@ -104,7 +133,7 @@ pub(crate) fn decode_embedded(
                 }
             }
             SegmentKind::ImmediateGenericRegion | SegmentKind::ImmediateLosslessGenericRegion => {
-                let (info, region) = decode_generic_region_segment(segment)?;
+                let (info, region) = decode_generic_region_segment(segment, budget)?;
                 let mut target = match page.take() {
                     Some(existing) => existing,
                     None => Bitmap::new(width, height)?,
@@ -171,6 +200,7 @@ pub(crate) fn decode_embedded(
 /// begins and ends within the segment.
 fn decode_generic_region_segment(
     segment: &Segment<'_>,
+    budget: &mut Budget,
 ) -> Result<(RegionInfo, Bitmap), Jbig2Error> {
     let mut r = Reader::new(segment.data);
     let info = parse_region_info(&mut r)?;
@@ -182,7 +212,11 @@ fn decode_generic_region_segment(
     // 7.2.7: when the header declared an unknown data length, the four bytes
     // after the terminator hold the real number of rows and supersede the
     // height in the region information field — which such a segment is free to
-    // leave at 0xFFFF_FFFF, since the encoder did not know it either.
+    // leave at 0xFFFF_FFFF, since the encoder did not know it either. Those
+    // four bytes are raw stream data with nothing to check them against, which
+    // is exactly why the row count is spent through the budget below rather
+    // than trusted: the standard gives no upper bound on it, so the decoder
+    // has to supply one.
     let height = match segment.header.data_len {
         Some(_) => info.height,
         None => trailing_row_count(segment.data)?,
@@ -190,7 +224,8 @@ fn decode_generic_region_segment(
 
     let mut dec = MqDecoder::new(r.rest());
     let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-    let bitmap = decode_generic_region(&mut dec, &mut cx, info.width, height, &params, None)?;
+    let bitmap =
+        decode_generic_region(&mut dec, &mut cx, budget, info.width, height, &params, None)?;
     Ok((info, bitmap))
 }
 
@@ -212,6 +247,7 @@ fn trailing_row_count(data: &[u8]) -> Result<u32, Jbig2Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::{context_at, GenericParams, GB_CONTEXT_LEN};
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
 
@@ -255,6 +291,30 @@ mod tests {
 
         out.extend_from_slice(&header(2, 49, 1, 0)); // end of page
         out.extend_from_slice(&header(3, 51, 1, 0)); // end of file
+        out
+    }
+
+    /// One immediate generic region segment declaring `width` by `height` and
+    /// carrying no coded data at all.
+    ///
+    /// A stream does not have to supply the bits it asks to have decoded: past
+    /// the end of the data the arithmetic decoder keeps answering (T.88
+    /// E.3.4). That is what makes 31 bytes enough to demand any amount of
+    /// decoding, and it is the shape every cost test below uses.
+    fn empty_region_segment(number: u32, width: u32, height: u32) -> Vec<u8> {
+        let mut region = Vec::new();
+        region.extend_from_slice(&width.to_be_bytes());
+        region.extend_from_slice(&height.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes()); // x
+        region.extend_from_slice(&0u32.to_be_bytes()); // y
+        region.push(0); // OR
+        region.push(0); // MMR 0, template 0, TPGDON 0
+        for (dx, dy) in GenericParams::nominal(0).at {
+            region.push(dx as u8);
+            region.push(dy as u8);
+        }
+        let mut out = header(number, 38, 1, region.len() as u32);
+        out.extend_from_slice(&region);
         out
     }
 
@@ -515,6 +575,114 @@ mod tests {
                 .expect("page info")
                 .default_pixel,
             0,
+        );
+    }
+
+    /// A region no pixels wide allocates nothing, so a cap on the bitmap never
+    /// sees it — and the row loop then runs for as many rows as four
+    /// attacker-chosen bytes say. Thirty-one bytes must not buy four billion
+    /// passes over a page.
+    #[test]
+    fn a_narrow_region_of_enormous_height_is_refused() {
+        for width in [0u32, 1, 2] {
+            let stream = empty_region_segment(0, width, u32::MAX);
+            assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
+            assert_eq!(
+                decode_embedded(&[], &stream, 8, 8),
+                Err(Jbig2Error::WorkLimit),
+                "width {width}",
+            );
+        }
+    }
+
+    /// The same demand made through the unknown-length encoding of 7.2.7,
+    /// where the row count is four raw bytes at the end of the segment with
+    /// nothing in the format to bound them — not even the region information
+    /// field's own height, which such a segment is entitled to leave unset.
+    #[test]
+    fn an_unknown_length_region_cannot_buy_unbounded_rows() {
+        let params = GenericParams::nominal(0);
+        let mut region = Vec::new();
+        region.extend_from_slice(&0u32.to_be_bytes()); // width: allocates nothing
+        region.extend_from_slice(&u32::MAX.to_be_bytes()); // height not yet known
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.push(0); // OR
+        region.push(0); // MMR 0, template 0, TPGDON 0
+        for (dx, dy) in params.at {
+            region.push(dx as u8);
+            region.push(dy as u8);
+        }
+        region.extend_from_slice(&[0xFF, 0xAC]); // the 7.2.7 terminator
+        region.extend_from_slice(&u32::MAX.to_be_bytes()); // and the row count
+
+        let mut stream = header(0, 38, 1, u32::MAX);
+        stream.extend_from_slice(&region);
+        assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// A region at the largest size the allocation cap permits is affordable,
+    /// but only so many of them are: the budget covers the whole stream, so
+    /// repeating the segment cannot repeat the cost indefinitely.
+    ///
+    /// Charged, not decoded — the point of the budget is that the refusal
+    /// happens from the header alone.
+    #[test]
+    fn the_stream_budget_bounds_a_repeated_region() {
+        let mut budget = Budget::new();
+        // 8192 x 16384 is MAX_PIXELS exactly, the largest region there is.
+        assert_eq!(budget.charge_region(8192, 16384), Ok(()));
+        assert_eq!(
+            budget.charge_region(8192, 16384),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// The budget spans the whole walk rather than resetting per segment, so a
+    /// stream of individually affordable regions is refused once their total
+    /// runs out.
+    ///
+    /// The budget is supplied rather than taken from [`decode_embedded`]
+    /// because exhausting the real one requires decoding a real page's worth of
+    /// pixels first, which is precisely the cost this exists to avoid paying.
+    #[test]
+    fn regions_across_a_stream_draw_on_one_budget() {
+        // Every region here costs (16 + ROW_COST) * 16.
+        let each = (16 + ROW_COST) * 16;
+        let mut stream = Vec::new();
+        for number in 0..4u32 {
+            stream.extend_from_slice(&empty_region_segment(number, 16, 16));
+        }
+
+        let mut budget = Budget::with_limit(each * 4);
+        assert!(decode_embedded_within(&[], &stream, 16, 16, &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(each * 4 - 1);
+        assert_eq!(
+            decode_embedded_within(&[], &stream, 16, 16, &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// Globals draw on the same budget as the page's own segments, or a stream
+    /// could have two.
+    #[test]
+    fn globals_draw_on_the_same_budget_as_the_page() {
+        let each = (16 + ROW_COST) * 16;
+        let globals = empty_region_segment(0, 16, 16);
+        let stream = empty_region_segment(1, 16, 16);
+
+        let mut budget = Budget::with_limit(each * 2);
+        assert!(decode_embedded_within(&globals, &stream, 16, 16, &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(each * 2 - 1);
+        assert_eq!(
+            decode_embedded_within(&globals, &stream, 16, 16, &mut budget),
+            Err(Jbig2Error::WorkLimit),
         );
     }
 

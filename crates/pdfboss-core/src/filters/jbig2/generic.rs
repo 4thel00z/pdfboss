@@ -17,6 +17,7 @@
 //! forward with two reads instead of sixteen.
 
 use super::bitmap::Bitmap;
+use super::budget::Budget;
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::Jbig2Error;
@@ -328,23 +329,27 @@ impl ContextWindows {
 /// pixels are stored as 0 and consume no coded bits at all, which is what
 /// keeps the encoder and decoder in step.
 ///
-/// The loop is bounded by `width` and `height` alone, both of which come from
-/// the segment header and are validated by the allocation. Nothing the coded
-/// data can say changes how many pixels are decoded, so no input can make this
-/// run long: it is exactly `width * height` decisions, and that product is
-/// capped before the bitmap is allocated.
+/// `budget` is the stream's remaining allowance of decoding work, and the whole
+/// region is charged against it before the first row is entered. That charge is
+/// what bounds the loops: they run `height` times and `width * height` times
+/// respectively, both figures taken from a segment header a hostile stream
+/// wrote, and the coded data need not exist for them to run — past the end of
+/// the input the arithmetic decoder keeps answering (T.88 E.3.4). The
+/// allocation cap cannot stand in for the charge, because a region no pixels
+/// wide allocates nothing and still walks every row it declares.
 pub(crate) fn decode_generic_region(
     dec: &mut MqDecoder,
     cx: &mut MqContexts,
+    budget: &mut Budget,
     width: u32,
     height: u32,
     params: &GenericParams,
     skip: Option<&Bitmap>,
 ) -> Result<Bitmap, Jbig2Error> {
     if params.is_nominal() {
-        decode_generic_region_windowed(dec, cx, width, height, params, skip)
+        decode_generic_region_windowed(dec, cx, budget, width, height, params, skip)
     } else {
-        decode_generic_region_general(dec, cx, width, height, params, skip)
+        decode_generic_region_general(dec, cx, budget, width, height, params, skip)
     }
 }
 
@@ -355,14 +360,21 @@ pub(crate) fn decode_generic_region(
 /// also the reference the windowed path is tested against, so it stays whether
 /// or not a relocated AT pixel is ever seen in the wild. See
 /// [`decode_generic_region`] for what the parameters mean.
+///
+/// The budget charge lives here rather than in the dispatcher so that it cannot
+/// be walked around: this entry point is reachable on its own, and a path into
+/// the pixel loop that skipped the charge would undo the bound for every caller
+/// that found it.
 pub(crate) fn decode_generic_region_general(
     dec: &mut MqDecoder,
     cx: &mut MqContexts,
+    budget: &mut Budget,
     width: u32,
     height: u32,
     params: &GenericParams,
     skip: Option<&Bitmap>,
 ) -> Result<Bitmap, Jbig2Error> {
+    budget.charge_region(width, height)?;
     let mut bm = Bitmap::new(width, height)?;
     let mut ltp = 0u8;
     for y in 0..height {
@@ -386,20 +398,22 @@ pub(crate) fn decode_generic_region_general(
 /// Decodes a generic region carrying each context forward across the row
 /// (T.88 6.2.5.7), which requires the AT pixels to be nominal.
 ///
-/// Row order, the typical-prediction toggle and the skip mask behave exactly
-/// as in [`decode_generic_region_general`]; the only difference is where the
-/// context comes from. A skipped pixel still shifts a 0 into the current row's
-/// run, because that is the value stored for it.
+/// Row order, the typical-prediction toggle, the skip mask and the budget
+/// charge behave exactly as in [`decode_generic_region_general`]; the only
+/// difference is where the context comes from. A skipped pixel still shifts a 0
+/// into the current row's run, because that is the value stored for it.
 ///
 /// See [`decode_generic_region`] for what the parameters mean.
 fn decode_generic_region_windowed(
     dec: &mut MqDecoder,
     cx: &mut MqContexts,
+    budget: &mut Budget,
     width: u32,
     height: u32,
     params: &GenericParams,
     skip: Option<&Bitmap>,
 ) -> Result<Bitmap, Jbig2Error> {
+    budget.charge_region(width, height)?;
     let mut bm = Bitmap::new(width, height)?;
     let mut ltp = 0u8;
     for y in 0..height {
@@ -625,8 +639,16 @@ mod tests {
         let coded = encode(bm, params, None);
         let mut dec = MqDecoder::new(&coded);
         let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-        decode_generic_region(&mut dec, &mut cx, bm.width(), bm.height(), params, None)
-            .expect("decode")
+        decode_generic_region(
+            &mut dec,
+            &mut cx,
+            &mut Budget::new(),
+            bm.width(),
+            bm.height(),
+            params,
+            None,
+        )
+        .expect("decode")
     }
 
     fn pseudo_random_bitmap(width: u32, height: u32, seed: u32) -> Bitmap {
@@ -714,8 +736,16 @@ mod tests {
         let coded = encode(&source, &params, Some(&skip));
         let mut dec = MqDecoder::new(&coded);
         let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-        let out =
-            decode_generic_region(&mut dec, &mut cx, 24, 12, &params, Some(&skip)).expect("decode");
+        let out = decode_generic_region(
+            &mut dec,
+            &mut cx,
+            &mut Budget::new(),
+            24,
+            12,
+            &params,
+            Some(&skip),
+        )
+        .expect("decode");
         for y in 0..12u32 {
             assert_eq!(out.row(y), source.row(y), "row {y}");
         }
@@ -726,7 +756,8 @@ mod tests {
         let params = GenericParams::nominal(0);
         let mut dec = MqDecoder::new(&[]);
         let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-        let out = decode_generic_region(&mut dec, &mut cx, 0, 0, &params, None).expect("decode");
+        let out = decode_generic_region(&mut dec, &mut cx, &mut Budget::new(), 0, 0, &params, None)
+            .expect("decode");
         assert_eq!((out.width(), out.height()), (0, 0));
     }
 
@@ -747,21 +778,126 @@ mod tests {
                 params.tpgdon = tpgdon;
                 let mut dec = MqDecoder::new(&data);
                 let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-                let out = decode_generic_region(&mut dec, &mut cx, 64, 64, &params, None)
-                    .expect("decode must not fail on garbage, only produce garbage");
+                let out = decode_generic_region(
+                    &mut dec,
+                    &mut cx,
+                    &mut Budget::new(),
+                    64,
+                    64,
+                    &params,
+                    None,
+                )
+                .expect("decode must not fail on garbage, only produce garbage");
                 assert_eq!((out.width(), out.height()), (64, 64));
             }
         }
     }
 
+    /// Decodes with a fresh decoder, context array and full budget, so the
+    /// refusal tests below read as the dimensions they are about.
+    fn decode_dimensions(
+        width: u32,
+        height: u32,
+        params: &GenericParams,
+    ) -> Result<Bitmap, Jbig2Error> {
+        let mut dec = MqDecoder::new(&[]);
+        let mut cx = MqContexts::new(GB_CONTEXT_LEN);
+        decode_generic_region(
+            &mut dec,
+            &mut cx,
+            &mut Budget::new(),
+            width,
+            height,
+            params,
+            None,
+        )
+    }
+
+    /// The two ceilings are distinct and both hold. A region just past the
+    /// allocation cap is refused for its size; one far past it is refused for
+    /// its cost, before a byte is reserved either way.
     #[test]
     fn an_oversized_region_is_refused() {
         let params = GenericParams::nominal(0);
-        let mut dec = MqDecoder::new(&[]);
-        let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-        assert!(
-            decode_generic_region(&mut dec, &mut cx, u32::MAX, u32::MAX, &params, None).is_err()
+        // 8192 x 16385 is one row more than MAX_PIXELS: too big to allocate,
+        // but still affordable, so the allocation cap is what catches it.
+        assert_eq!(
+            decode_dimensions(8192, 16385, &params),
+            Err(Jbig2Error::TooLarge {
+                width: 8192,
+                height: 16385,
+            }),
         );
+        assert_eq!(
+            decode_dimensions(u32::MAX, u32::MAX, &params),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// A region no pixels wide allocates nothing whatever its height, so the
+    /// allocation cap never sees it — yet the decoding procedure still makes a
+    /// pass over every row it declares. The budget is what charges for those
+    /// rows, and it must do so on both decoding paths and with typical
+    /// prediction either way, since each is a separate row loop.
+    #[test]
+    fn a_narrow_region_cannot_declare_unbounded_rows() {
+        for width in [0u32, 1, 2] {
+            for tpgdon in [false, true] {
+                let mut nominal = GenericParams::nominal(0);
+                nominal.tpgdon = tpgdon;
+                assert_eq!(
+                    decode_dimensions(width, u32::MAX, &nominal),
+                    Err(Jbig2Error::WorkLimit),
+                    "windowed path, width {width}, tpgdon {tpgdon}",
+                );
+
+                // A relocated AT pixel selects the general path instead.
+                let mut relocated = nominal;
+                relocated.at[0] = (-2, 0);
+                assert!(!relocated.is_nominal());
+                assert_eq!(
+                    decode_dimensions(width, u32::MAX, &relocated),
+                    Err(Jbig2Error::WorkLimit),
+                    "general path, width {width}, tpgdon {tpgdon}",
+                );
+            }
+        }
+    }
+
+    /// The charge is spent before the loop is entered, so a refused region
+    /// leaves the arithmetic decoder untouched — nothing was decoded to reach
+    /// the refusal.
+    #[test]
+    fn a_refused_region_consumes_no_coded_data() {
+        let params = GenericParams::nominal(0);
+        let coded = [0x55u8; 32];
+        let mut dec = MqDecoder::new(&coded);
+        let mut cx = MqContexts::new(GB_CONTEXT_LEN);
+        let mut budget = Budget::new();
+        assert_eq!(
+            decode_generic_region(&mut dec, &mut cx, &mut budget, 0, u32::MAX, &params, None),
+            Err(Jbig2Error::WorkLimit),
+        );
+        assert_eq!(budget, Budget::new(), "a refused region spends nothing");
+
+        // And the refusal left the decoder and the contexts exactly where they
+        // started: a region decoded through them now yields what a decoder
+        // that never saw the refused region yields.
+        let after = decode_generic_region(&mut dec, &mut cx, &mut budget, 8, 4, &params, None)
+            .expect("8x4");
+        let mut fresh_dec = MqDecoder::new(&coded);
+        let mut fresh_cx = MqContexts::new(GB_CONTEXT_LEN);
+        let expected = decode_generic_region(
+            &mut fresh_dec,
+            &mut fresh_cx,
+            &mut Budget::new(),
+            8,
+            4,
+            &params,
+            None,
+        )
+        .expect("8x4");
+        assert_eq!(after, expected);
     }
 
     #[test]
@@ -934,12 +1070,21 @@ mod tests {
             let mut dec = MqDecoder::new(&coded);
             let mut cx = MqContexts::new(GB_CONTEXT_LEN);
             let fast =
-                decode_generic_region(&mut dec, &mut cx, 53, 29, &params, None).expect("fast path");
+                decode_generic_region(&mut dec, &mut cx, &mut Budget::new(), 53, 29, &params, None)
+                    .expect("fast path");
 
             let mut dec = MqDecoder::new(&coded);
             let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-            let slow = decode_generic_region_general(&mut dec, &mut cx, 53, 29, &params, None)
-                .expect("general path");
+            let slow = decode_generic_region_general(
+                &mut dec,
+                &mut cx,
+                &mut Budget::new(),
+                53,
+                29,
+                &params,
+                None,
+            )
+            .expect("general path");
 
             for y in 0..29u32 {
                 assert_eq!(fast.row(y), slow.row(y), "template {template}, row {y}");
@@ -980,14 +1125,29 @@ mod tests {
 
             let mut dec = MqDecoder::new(&coded);
             let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-            let fast = decode_generic_region(&mut dec, &mut cx, 23, 18, &params, Some(&skip))
-                .expect("fast path");
+            let fast = decode_generic_region(
+                &mut dec,
+                &mut cx,
+                &mut Budget::new(),
+                23,
+                18,
+                &params,
+                Some(&skip),
+            )
+            .expect("fast path");
 
             let mut dec = MqDecoder::new(&coded);
             let mut cx = MqContexts::new(GB_CONTEXT_LEN);
-            let slow =
-                decode_generic_region_general(&mut dec, &mut cx, 23, 18, &params, Some(&skip))
-                    .expect("general path");
+            let slow = decode_generic_region_general(
+                &mut dec,
+                &mut cx,
+                &mut Budget::new(),
+                23,
+                18,
+                &params,
+                Some(&skip),
+            )
+            .expect("general path");
 
             for y in 0..18u32 {
                 assert_eq!(fast.row(y), source.row(y), "template {template}, row {y}");
