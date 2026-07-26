@@ -399,19 +399,6 @@ mod tests {
         }
     }
 
-    /// Decoding is deterministic and context-state evolves per Table E.1:
-    /// after forcing a long run through one context, its index must have
-    /// walked up the NMPS chain and saturated, never left the table.
-    #[test]
-    fn context_state_walks_the_table() {
-        let mut dec = MqDecoder::new(&[0x00; 64]);
-        let mut cx = MqContexts::new(1);
-        for _ in 0..5_000 {
-            let _ = dec.decode(cx.get_mut(0));
-        }
-        assert!(cx.get_mut(0).index() < 47);
-    }
-
     /// An all-zero stream, traced by hand through E.3.5 and E.3.2.
     ///
     /// INITDEC leaves `C = 0`, `CT = 1`, `A = 0x8000`, so `CHIGH` is below Qe
@@ -614,6 +601,145 @@ mod tests {
                 .map(|_| dec.decode(dec_cx.get_mut(0)))
                 .collect();
             assert_eq!(decoded, pattern, "run of {} bits", pattern.len());
+        }
+    }
+
+    /// A single context over a fixed bit pattern: what goes in comes out.
+    ///
+    /// The smallest round trip there is, and the one whose failure mode is
+    /// most legible — a mismatch at bit 0 means INITENC and INITDEC disagree,
+    /// a mismatch only near the end means FLUSH is wrong, and scattered
+    /// mismatches mean the BYTEOUT carry path is wrong.
+    #[test]
+    fn round_trips_a_single_context() {
+        let bits: Vec<u8> = (0..500).map(|i| u8::from(i % 7 == 0)).collect();
+
+        let mut enc = encoder::MqEncoder::new();
+        let mut enc_cx = MqContext::default();
+        for bit in &bits {
+            enc.encode(&mut enc_cx, *bit);
+        }
+        let coded = enc.finish();
+        assert!(!coded.is_empty());
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = MqContexts::new(1);
+        for (i, want) in bits.iter().enumerate() {
+            assert_eq!(dec.decode(dec_cx.get_mut(0)), *want, "bit {i}");
+        }
+    }
+
+    /// A thousand contexts adapting independently is the case a region
+    /// decoder actually presents: consecutive bits are drawn against
+    /// unrelated contexts, so every bit depends on a different row of
+    /// Table E.1 and the interval state carries across all of them.
+    #[test]
+    fn round_trips_across_many_contexts() {
+        let mut state: u32 = 0xACE1_0FF1;
+        let mut next = move || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let plan: Vec<(usize, u8)> = (0..4_000)
+            .map(|_| {
+                let n = next();
+                let index = usize::try_from(n >> 8).unwrap_or(0) % 1_024;
+                (index, u8::from(n & 1 == 0))
+            })
+            .collect();
+
+        let mut enc = encoder::MqEncoder::new();
+        let mut enc_cx = vec![MqContext::default(); 1_024];
+        for (index, bit) in &plan {
+            enc.encode(&mut enc_cx[*index], *bit);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = MqContexts::new(1_024);
+        for (i, (index, want)) in plan.iter().enumerate() {
+            assert_eq!(
+                dec.decode(dec_cx.get_mut(*index)),
+                *want,
+                "bit {i} in context {index}"
+            );
+        }
+    }
+
+    /// A long run of one symbol walks the estimator down to the skewed tail of
+    /// Table E.1 and codes twenty thousand bits into a handful of bytes — the
+    /// property that makes an adaptive coder worth its complexity, and one no
+    /// self-consistent pair of transcriptions could fake.
+    #[test]
+    fn a_constant_run_compresses_and_round_trips() {
+        let mut enc = encoder::MqEncoder::new();
+        let mut enc_cx = MqContext::default();
+        for _ in 0..20_000 {
+            enc.encode(&mut enc_cx, 0);
+        }
+        let coded = enc.finish();
+        assert!(
+            coded.len() < 64,
+            "20 000 identical bits took {} bytes",
+            coded.len()
+        );
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = MqContexts::new(1);
+        for i in 0..20_000 {
+            assert_eq!(dec.decode(dec_cx.get_mut(0)), 0, "bit {i}");
+        }
+    }
+
+    /// The carry path in BYTEOUT is the encoder's sharpest edge: an interval
+    /// that keeps landing just above the byte boundary propagates a carry into
+    /// a byte already emitted. Alternating bits through one context, which
+    /// pins the estimator near the `0x5601` states where each sub-interval is
+    /// about half the register, is the pattern most likely to reach it.
+    #[test]
+    fn round_trips_alternating_bits() {
+        let bits: Vec<u8> = (0..3_000).map(|i| u8::from(i % 2 == 1)).collect();
+
+        let mut enc = encoder::MqEncoder::new();
+        let mut enc_cx = MqContext::default();
+        for bit in &bits {
+            enc.encode(&mut enc_cx, *bit);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = MqContexts::new(1);
+        for (i, want) in bits.iter().enumerate() {
+            assert_eq!(dec.decode(dec_cx.get_mut(0)), *want, "bit {i}");
+        }
+    }
+
+    /// FLUSH ends the code stream with `FF AC` (T.88 E.3.8).
+    ///
+    /// That pair is both the decoder's marker — BYTEIN sees `0xFF` followed by
+    /// a byte above `0x8F` and switches to feeding 1-bits — and the sequence
+    /// the unknown-data-length segment scan of 7.2.7 searches for, so it has
+    /// to be present byte for byte.
+    #[test]
+    fn finish_appends_the_standard_terminator() {
+        let mut enc = encoder::MqEncoder::new();
+        let mut enc_cx = MqContext::default();
+        enc.encode(&mut enc_cx, 1);
+        let coded = enc.finish();
+        assert_eq!(&coded[coded.len() - 2..], &[0xFF, 0xAC]);
+    }
+
+    /// Encoding nothing at all still produces a stream the decoder can read:
+    /// FLUSH is what makes the terminator unconditional, and a zero-symbol
+    /// region is legal.
+    #[test]
+    fn an_empty_encode_still_flushes() {
+        let coded = encoder::MqEncoder::new().finish();
+        assert_eq!(&coded[coded.len() - 2..], &[0xFF, 0xAC]);
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = MqContexts::new(1);
+        for _ in 0..100 {
+            let _ = dec.decode(dec_cx.get_mut(0));
         }
     }
 
