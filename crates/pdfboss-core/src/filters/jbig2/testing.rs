@@ -14,12 +14,13 @@
 //! reading it back is what pins the decoder to the standard's bit order rather
 //! than to itself.
 
-use super::arith_int::encoder::encode_int;
-use super::arith_int::IntCtxSet;
+use super::arith_int::encoder::{encode_iaid, encode_int};
+use super::arith_int::{IaidCtx, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
+use super::text_region::sym_code_len;
 
 /// A short-form segment header (T.88 7.2): number, flags, referred-to
 /// segments, page association, data length.
@@ -143,4 +144,202 @@ pub(crate) fn sample_symbols() -> Vec<Bitmap> {
         glyph(&["11111", "10001", "10001", "11111"]),
         glyph(&["1100", "0110", "0011", "1001", "1111"]),
     ]
+}
+
+/// Two symbols of the same height and different widths, the shape a text
+/// region fixture wants: a placement bug that loses a symbol's width shows up
+/// as a misplaced neighbour rather than as a symbol drawn in the right place.
+pub(crate) fn two_symbols() -> Vec<Bitmap> {
+    vec![
+        glyph(&["101", "010", "101", "010"]),
+        glyph(&["11111", "10001", "10001", "11111"]),
+    ]
+}
+
+/// The text region segment flags a fixture sets (T.88 7.4.4.1.1).
+///
+/// The defaults are the combination a plain line of text uses: one row per
+/// strip, TOPLEFT corners, untransposed, OR composition, a clear background and
+/// no offset on the gaps.
+#[derive(Clone, Copy)]
+pub(crate) struct Shape {
+    /// LOGSBSTRIPS, so SBSTRIPS is `1 << log_strips`.
+    pub(crate) log_strips: u8,
+    /// REFCORNER: 0 BOTTOMLEFT, 1 TOPLEFT, 2 BOTTOMRIGHT, 3 TOPRIGHT.
+    pub(crate) corner: u8,
+    /// TRANSPOSED, which swaps the axes S and T index.
+    pub(crate) transposed: bool,
+    /// SBCOMBOP, two bits here: 0 OR, 1 AND, 2 XOR, 3 XNOR.
+    pub(crate) combop: u8,
+    /// SBDEFPIXEL, the value the region is filled with before any placement.
+    pub(crate) defpixel: bool,
+    /// SBDSOFFSET, added to every gap after the first instance of a strip.
+    pub(crate) dsoffset: i32,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Shape {
+            log_strips: 0,
+            corner: 1, // TOPLEFT
+            transposed: false,
+            combop: 0, // OR
+            defpixel: false,
+            dsoffset: 0,
+        }
+    }
+}
+
+/// Packs a [`Shape`] into the two-byte text region segment flags field
+/// (T.88 7.4.4.1.1), with SBHUFF, REFINE and SBRTEMPLATE all clear.
+///
+/// SBDSOFFSET occupies bits 10 to 14 as a five-bit two's complement number, so
+/// a negative offset is masked to five bits rather than sign-extended into the
+/// SBRTEMPLATE bit above it.
+fn flags_of(shape: Shape) -> u16 {
+    u16::from(shape.log_strips) << 2
+        | u16::from(shape.corner) << 4
+        | u16::from(shape.transposed) << 6
+        | u16::from(shape.combop) << 7
+        | u16::from(shape.defpixel) << 9
+        | ((shape.dsoffset as u16) & 0x1F) << 10
+}
+
+/// One instruction in a text region fixture, in the order T.88 6.4.5 decodes
+/// them.
+pub(crate) enum Op {
+    /// Open a strip: the delta on STRIPT, counted in strips rather than rows.
+    Strip(i32),
+    /// The first instance of the current strip: the delta on FIRSTS, then the
+    /// symbol id.
+    First(i32, u32),
+    /// A later instance of the current strip: the gap from the previous
+    /// instance's far edge, then the symbol id.
+    Next(i32, u32),
+    /// Close the current strip, which an OOB from `IADS` is what does.
+    EndStrip,
+}
+
+/// The seventeen-byte region segment information field every region segment
+/// opens with (T.88 7.4.1), for a region placed at the page origin and
+/// composited with OR.
+fn region_info_bytes(width: u32, height: u32) -> Vec<u8> {
+    let mut out = width.to_be_bytes().to_vec();
+    out.extend_from_slice(&height.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // region X
+    out.extend_from_slice(&0u32.to_be_bytes()); // region Y
+    out.push(0); // external combination operator: OR
+    out
+}
+
+/// Builds the data of an arithmetic text region segment (T.88 7.4.4) placing
+/// the instructions in `ops`.
+///
+/// `initial_dt` is the value of step 2's leading `IADT`, which the procedure
+/// negates: STRIPT starts at `-initial_dt * SBSTRIPS`.
+///
+/// `num_syms` sizes the symbol ID code, and is a parameter rather than being
+/// taken from the symbols themselves so that a fixture can disagree with the
+/// decoder on purpose. Every instance here carries its id immediately after its
+/// S coordinate, which is the layout when SBSTRIPS is 1 and no `IAIT` value
+/// comes between them; [`text_segment_with_curt`] is the builder for the other
+/// case.
+pub(crate) fn text_segment(
+    region: (u32, u32),
+    shape: Shape,
+    instances: u32,
+    num_syms: u32,
+    initial_dt: i32,
+    ops: &[Op],
+) -> Vec<u8> {
+    let mut enc = MqEncoder::new();
+    let mut ints = IntCtxSet::new();
+    let mut iaid = IaidCtx::new(sym_code_len(num_syms));
+
+    encode_int(&mut enc, &mut ints.iadt, Some(initial_dt));
+    for op in ops {
+        match op {
+            Op::Strip(dt) => encode_int(&mut enc, &mut ints.iadt, Some(*dt)),
+            Op::First(dfs, id) => {
+                encode_int(&mut enc, &mut ints.iafs, Some(*dfs));
+                encode_iaid(&mut enc, &mut iaid, *id);
+            }
+            Op::Next(ids, id) => {
+                encode_int(&mut enc, &mut ints.iads, Some(*ids));
+                encode_iaid(&mut enc, &mut iaid, *id);
+            }
+            Op::EndStrip => encode_int(&mut enc, &mut ints.iads, None),
+        }
+    }
+
+    let mut out = region_info_bytes(region.0, region.1);
+    out.extend_from_slice(&flags_of(shape).to_be_bytes());
+    out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
+    out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// One placement in a [`text_segment_with_curt`] strip: the delta on S, the T
+/// offset within the strip, and the symbol id.
+pub(crate) type Placement = (i32, i32, u32);
+
+/// One strip of a [`text_segment_with_curt`] fixture: the delta on STRIPT,
+/// counted in strips, and the placements the strip holds.
+pub(crate) type StripOf<'a> = (i32, &'a [Placement]);
+
+/// [`text_segment`] for a region whose SBSTRIPS is greater than one, where each
+/// instance carries its own T offset within the strip.
+///
+/// The strips are given explicitly because the `IAIT` value falls between the S
+/// coordinate and the symbol id, which the flat instruction list of [`Op`]
+/// folds together. Two builders that each say plainly what they emit read
+/// better than one with an optional value in the middle of its stream.
+pub(crate) fn text_segment_with_curt(
+    region: (u32, u32),
+    shape: Shape,
+    instances: u32,
+    num_syms: u32,
+    initial_dt: i32,
+    strips: &[StripOf<'_>],
+) -> Vec<u8> {
+    let mut enc = MqEncoder::new();
+    let mut ints = IntCtxSet::new();
+    let mut iaid = IaidCtx::new(sym_code_len(num_syms));
+
+    encode_int(&mut enc, &mut ints.iadt, Some(initial_dt));
+    for (dt, placements) in strips {
+        encode_int(&mut enc, &mut ints.iadt, Some(*dt));
+        for (index, (ds, curt, id)) in placements.iter().enumerate() {
+            if index == 0 {
+                encode_int(&mut enc, &mut ints.iafs, Some(*ds));
+            } else {
+                encode_int(&mut enc, &mut ints.iads, Some(*ds));
+            }
+            encode_int(&mut enc, &mut ints.iait, Some(*curt));
+            encode_iaid(&mut enc, &mut iaid, *id);
+        }
+        encode_int(&mut enc, &mut ints.iads, None);
+    }
+
+    let mut out = region_info_bytes(region.0, region.1);
+    out.extend_from_slice(&flags_of(shape).to_be_bytes());
+    out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
+    out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// Asserts that `symbol` was drawn into `region` with its top-left pixel at
+/// `(x, y)`, pixel for pixel.
+///
+/// Reading through [`Bitmap::get`] means a placement that hangs off an edge
+/// compares against the zeros outside the region rather than indexing out of
+/// it, so a symbol expected off-page is checked rather than skipped.
+pub(crate) fn expect_at(region: &Bitmap, symbol: &Bitmap, x: i64, y: i64) {
+    for sy in 0..symbol.height() {
+        for sx in 0..symbol.width() {
+            let want = symbol.get(i64::from(sx), i64::from(sy));
+            let got = region.get(x + i64::from(sx), y + i64::from(sy));
+            assert_eq!(got, want, "symbol pixel ({sx}, {sy}) at region ({x}, {y})");
+        }
+    }
 }

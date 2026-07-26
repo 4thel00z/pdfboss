@@ -20,11 +20,12 @@
 //! coded bytes it claims to, so the budget is what ties the cost of decoding to
 //! something the input cannot inflate.
 
-// The symbol dictionary consumes the height, width and export procedures of
-// `arith_int`; the remaining ten wait for the text region decoder. Until then
-// they are reachable only from this module's own tests. The allow sits on the
-// module declaration rather than at the root of this file so that the modules
-// still being built keep the lint.
+// The symbol dictionary and the text region between them consume nine of the
+// thirteen integer procedures of `arith_int`; the aggregate count and the four
+// refinement procedures wait for refinement coding, and until then are
+// reachable only from this module's own tests. The allow sits on the module
+// declaration rather than at the root of this file so that the modules still
+// being built keep the lint.
 #[allow(dead_code)]
 pub(crate) mod arith_int;
 pub(crate) mod bitmap;
@@ -38,6 +39,11 @@ pub(crate) mod segment;
 // once the text region that consumes the exported symbols exists.
 #[allow(dead_code)]
 pub(crate) mod symbol_dict;
+// Nothing dispatches to the text region yet either: the page walk gains both
+// arms at once, since a text region is meaningless without the dictionary that
+// supplies its symbols.
+#[allow(dead_code)]
+pub(crate) mod text_region;
 
 #[cfg(test)]
 pub(crate) mod testing;
