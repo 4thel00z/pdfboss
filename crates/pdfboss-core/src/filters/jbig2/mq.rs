@@ -11,8 +11,16 @@
 //! The decoder is fed attacker-controlled bytes, so it is written to be
 //! total: reads past the end of the input yield `0xFF` (E.3.4), every
 //! arithmetic step is wrapping, and renormalization is bounded. No input can
-//! panic, hang, or read out of bounds; a truncated stream simply decodes an
-//! unbounded run of trailing bits, which the segment layer discards.
+//! panic, hang, or read out of bounds.
+//!
+//! Totality of each call is not by itself enough. DECODE has no end-of-data
+//! state — once BYTEIN locks onto the marker it keeps handing out decisions
+//! forever, and those decisions settle into a cycle that repeats whatever
+//! values the layers above happen to read from it. A caller whose loop length
+//! comes from the data rather than from a header field would then never see
+//! the value it is waiting for. [`MqDecoder::is_exhausted`] is the signal that
+//! ends such a loop: it reports when the code register can no longer hold a
+//! single bit of the input.
 
 /// The encoding side of the same annex, used to round-trip the decoder
 /// against an independent transcription of it.
@@ -156,6 +164,22 @@ impl MqContexts {
     }
 }
 
+/// Renormalization shifts the marker convention may feed before the coded
+/// data counts as spent (T.88 E.3.4, E.3.8).
+///
+/// Once BYTEIN takes the marker branch, `BP` stops advancing and the same two
+/// bytes are re-examined on every later call, so no further input will ever be
+/// read. The decoder cannot stop there: the code register still holds the tail
+/// of the real input at that moment, and FLUSH (E.3.8) relies on exactly that
+/// to keep the last coded decisions recoverable. `C` is 32 bits wide, so after
+/// 32 shifts under the marker every bit in it was synthesized by the 1-fill
+/// and nothing decoded afterwards can carry information from the input. A
+/// stream flushed per E.3.8 is measurably clear of that: the last decision of
+/// the streams in `a_flushed_stream_lasts_until_its_final_bit` comes back
+/// after five such shifts at worst, so the bound cannot truncate a well-formed
+/// segment.
+const MARKER_FILL_SHIFTS: u32 = 32;
+
 /// The MQ arithmetic decoder over one byte stream (T.88 Annex E).
 ///
 /// Constructed with [`MqDecoder::new`], which performs INITDEC (E.3.5); each
@@ -172,6 +196,14 @@ pub(crate) struct MqDecoder<'a> {
     a: u32,
     /// Count of shifts remaining before the next BYTEIN, `CT`.
     ct: i32,
+    /// Whether BYTEIN has taken the marker branch of E.3.4. That branch leaves
+    /// `BP` where it is, so it is terminal: no byte of the input will be read
+    /// after it, and every later BYTEIN takes it again.
+    marker_locked: bool,
+    /// Renormalization shifts performed since the marker was reached,
+    /// saturating. Once it reaches [`MARKER_FILL_SHIFTS`] the register holds
+    /// nothing but 1-fill.
+    fill_shifts: u32,
 }
 
 impl<'a> MqDecoder<'a> {
@@ -183,6 +215,8 @@ impl<'a> MqDecoder<'a> {
             c: 0,
             a: 0,
             ct: 0,
+            marker_locked: false,
+            fill_shifts: 0,
         };
         dec.c = u32::from(dec.byte(dec.bp)) << 16;
         dec.byte_in();
@@ -207,9 +241,12 @@ impl<'a> MqDecoder<'a> {
     /// never emit that pair, so the decoder stops consuming input and feeds
     /// 1-bits forever. Past the end of the buffer [`MqDecoder::byte`] yields
     /// `0xFF` for both bytes, so a truncated stream lands here and stays here.
+    /// Reaching that branch is recorded, because it is the point after which
+    /// the input can only run out (see [`MqDecoder::is_exhausted`]).
     fn byte_in(&mut self) {
         if self.byte(self.bp) == 0xFF {
             if self.byte(self.bp + 1) > 0x8F {
+                self.marker_locked = true;
                 self.c = self.c.wrapping_add(0xFF00);
                 self.ct = 8;
             } else {
@@ -232,6 +269,9 @@ impl<'a> MqDecoder<'a> {
     /// reached within 16 shifts. The loop is bounded at 16 to make that
     /// termination structural rather than inferred from an invariant, so no
     /// input can hang the decoder.
+    ///
+    /// Shifts taken after the marker was reached are counted: this is the only
+    /// place `C` loses a bit, so it is where the input runs out.
     fn renorm(&mut self) {
         for _ in 0..16 {
             if self.ct == 0 {
@@ -240,10 +280,29 @@ impl<'a> MqDecoder<'a> {
             self.a <<= 1;
             self.c <<= 1;
             self.ct -= 1;
+            if self.marker_locked {
+                self.fill_shifts = self.fill_shifts.saturating_add(1);
+            }
             if self.a & 0x8000 != 0 {
                 break;
             }
         }
+    }
+
+    /// Whether the coded data is spent: BYTEIN has locked onto the marker of
+    /// T.88 E.3.4 and `C` has since been shifted through its full width, so
+    /// every bit the register holds was synthesized by the 1-fill.
+    ///
+    /// Decoding does not stop here — E.3.2 has no end-of-data state and every
+    /// call still returns a bit — but no decision taken past this point
+    /// carries information from the input, and the decoder is by then in a
+    /// cycle: the same contexts, the same registers and therefore the same
+    /// bits, forever. Any caller whose loop length is set by the decoded data
+    /// rather than by a header field must end its loop here. The
+    /// OOB-terminated lists of Annex A are the main such caller, and
+    /// [`super::arith_int::decode_int`] folds this in for them.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.fill_shifts >= MARKER_FILL_SHIFTS
     }
 
     /// MPS_EXCHANGE (T.88 E.3.2): decides the bit when the MPS sub-interval
@@ -332,6 +391,87 @@ mod tests {
         let mut cx = MqContexts::new(512);
         for _ in 0..10_000 {
             let _ = dec.decode(cx.get_mut(7));
+        }
+    }
+
+    /// Every stream runs out, and says so.
+    ///
+    /// Terminating each call is not enough on its own: past the marker the
+    /// decoder cycles, so a caller looking for a particular decision can wait
+    /// for one that never comes. Exhaustion is what ends that wait, so it must
+    /// be reachable from every input — including the ones that produce a
+    /// perfectly steady stream of bits.
+    #[test]
+    fn every_stream_reports_exhaustion() {
+        for data in [
+            vec![],
+            vec![0x00],
+            vec![0x90],
+            vec![0xAA],
+            vec![0xFF],
+            vec![0xFF, 0xAC],
+            vec![0xFF, 0x8F],
+            vec![0x00; 8],
+            vec![0xAA; 8],
+            vec![0x55; 64],
+            vec![0xFF; 64],
+        ] {
+            let mut dec = MqDecoder::new(&data);
+            let mut cx = MqContexts::new(512);
+            let mut reached = None;
+            for step in 0..100_000 {
+                if dec.is_exhausted() {
+                    reached = Some(step);
+                    break;
+                }
+                let _ = dec.decode(cx.get_mut(step % 512));
+            }
+            let at = reached.unwrap_or_else(|| panic!("{data:?} never ran out of data"));
+            // Once spent, spent for good: nothing can put bytes back.
+            for step in 0..1_000 {
+                let _ = dec.decode(cx.get_mut(step % 512));
+                assert!(dec.is_exhausted(), "{data:?} un-exhausted after step {at}");
+            }
+        }
+    }
+
+    /// Exhaustion must not arrive while the stream still has decisions in it.
+    ///
+    /// FLUSH (T.88 E.3.8) ends a stream with the same `FF AC` marker that a
+    /// truncated one runs into, and the decisions coded into the final bytes
+    /// are read back *after* the decoder locks onto it. Declaring the data
+    /// spent too early would drop them, so the check runs before every single
+    /// coded bit rather than only at the end.
+    #[test]
+    fn a_flushed_stream_lasts_until_its_final_bit() {
+        for bits in [
+            (0..3_000)
+                .map(|i| u8::from(i % 2 == 1))
+                .collect::<Vec<u8>>(),
+            (0..2_000).map(|i| u8::from(i % 97 == 0)).collect(),
+            vec![0u8; 4_000],
+            vec![1u8; 4_000],
+            vec![1u8],
+            vec![],
+        ] {
+            let mut enc = encoder::MqEncoder::new();
+            let mut enc_cx = MqContexts::new(3);
+            for (i, bit) in bits.iter().enumerate() {
+                enc.encode(enc_cx.get_mut(i % 3), *bit);
+            }
+            let coded = enc.finish();
+
+            let mut dec = MqDecoder::new(&coded);
+            let mut dec_cx = MqContexts::new(3);
+            for (i, want) in bits.iter().enumerate() {
+                assert!(
+                    !dec.is_exhausted(),
+                    "{} coded bits: exhausted at bit {i} of {}",
+                    bits.len(),
+                    bits.len()
+                );
+                assert_eq!(dec.decode(dec_cx.get_mut(i % 3)), *want, "bit {i}");
+            }
         }
     }
 
