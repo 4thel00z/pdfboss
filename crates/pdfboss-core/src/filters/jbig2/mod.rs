@@ -7,13 +7,17 @@
 //!
 //! Layering, bottom-up: [`mq`] is the binary arithmetic decoder (Annex E);
 //! [`arith_int`] builds the integer procedures on top of it (Annex A);
-//! [`bitmap`] is the bilevel pixel buffer every region decodes into.
+//! [`bitmap`] is the bilevel pixel buffer every region decodes into;
+//! [`reader`] is the bounds-checked byte cursor the header parsers run on; and
+//! [`segment`] splits a PDF-embedded stream into the segments of clause 7.
 
 #![allow(dead_code)] // Consumed by the segment layer, which lands next.
 
 pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod mq;
+pub(crate) mod reader;
+pub(crate) mod segment;
 
 /// A decoding failure inside the JBIG2 codec.
 ///
