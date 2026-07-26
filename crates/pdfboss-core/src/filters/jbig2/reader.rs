@@ -92,7 +92,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The cursor's offset from the start of the input.
-    #[allow(dead_code)] // Locates a symbol dictionary's data, which lands later.
+    #[allow(dead_code)] // Reached from the fixture builders only.
     pub(crate) fn pos(&self) -> usize {
         self.pos
     }

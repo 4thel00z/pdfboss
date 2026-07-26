@@ -74,6 +74,7 @@ impl IntCtx {
     }
 
     /// Returns every context to state 0 / MPS 0.
+    #[allow(dead_code)] // Reached once retained arithmetic contexts are honoured.
     pub(crate) fn reset(&mut self) {
         self.0.reset();
     }
@@ -108,7 +109,7 @@ fn next_prev(prev: usize, bit: u8) -> usize {
 /// The prefix is at most six bits, so `PREV` cannot exceed 127 here and needs
 /// no clamping; that starts in the magnitude loop.
 fn prefix_bit(dec: &mut MqDecoder, cx: &mut IntCtx, prev: &mut usize) -> u8 {
-    let bit = dec.decode(cx.0.get_mut(*prev));
+    let bit = dec.decode(cx.context_mut(*prev));
     *prev = (*prev << 1) | usize::from(bit);
     bit
 }
@@ -157,7 +158,7 @@ pub(crate) fn decode_int(dec: &mut MqDecoder, cx: &mut IntCtx) -> Option<i32> {
 
     let mut value: u32 = 0;
     for _ in 0..bits {
-        let bit = dec.decode(cx.0.get_mut(prev));
+        let bit = dec.decode(cx.context_mut(prev));
         prev = next_prev(prev, bit);
         value = (value << 1) | u32::from(bit);
     }
@@ -213,6 +214,7 @@ impl IaidCtx {
     }
 
     /// Returns every context to state 0 / MPS 0.
+    #[allow(dead_code)] // Reached once retained arithmetic contexts are honoured.
     pub(crate) fn reset(&mut self) {
         self.contexts.reset();
     }
@@ -238,8 +240,8 @@ impl IaidCtx {
 pub(crate) fn decode_iaid(dec: &mut MqDecoder, cx: &mut IaidCtx) -> u32 {
     let mut prev: usize = 1;
     let mut id: u32 = 0;
-    for _ in 0..cx.sym_code_len {
-        let bit = dec.decode(cx.contexts.get_mut(prev));
+    for _ in 0..cx.code_len() {
+        let bit = dec.decode(cx.context_mut(prev));
         prev = (prev << 1) | usize::from(bit);
         id = (id << 1) | u32::from(bit);
     }
@@ -359,6 +361,7 @@ pub(crate) struct IntCtxSet {
     /// `IAEX`: length of an export or non-export run.
     pub(crate) iaex: IntCtx,
     /// `IAAI`: number of symbol instances in an aggregate.
+    #[allow(dead_code)] // Read once aggregate symbol coding is decoded (6.5.8.2).
     pub(crate) iaai: IntCtx,
     /// `IADT`: strip coordinate delta of a text region.
     pub(crate) iadt: IntCtx,
@@ -368,15 +371,26 @@ pub(crate) struct IntCtxSet {
     pub(crate) iads: IntCtx,
     /// `IAIT`: T coordinate of a symbol instance within its strip.
     pub(crate) iait: IntCtx,
+    // The five refinement procedures below are the ones no decoder in this
+    // build reaches: a text region rejects REFINE and a symbol dictionary
+    // rejects SDREFAGG, so nothing decodes the flag or the four offsets of
+    // 6.4.11. They are allocated all the same, because the thirteen arrays are
+    // constructed as one set per segment and a set missing five of them would
+    // have to be assembled differently once refinement lands.
     /// `IARI`: whether a symbol instance carries a refinement.
+    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
     pub(crate) iari: IntCtx,
     /// `IARDW`: width delta of a refined symbol instance.
+    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
     pub(crate) iardw: IntCtx,
     /// `IARDH`: height delta of a refined symbol instance.
+    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
     pub(crate) iardh: IntCtx,
     /// `IARDX`: horizontal offset of a refined symbol instance.
+    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
     pub(crate) iardx: IntCtx,
     /// `IARDY`: vertical offset of a refined symbol instance.
+    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
     pub(crate) iardy: IntCtx,
 }
 
@@ -401,6 +415,12 @@ impl IntCtxSet {
     }
 
     /// Returns all thirteen arrays to state 0 / MPS 0.
+    ///
+    /// Nothing in this build calls it: every segment that needs fresh
+    /// statistics gets a fresh set, and the one place the standard asks for an
+    /// in-place reset is the retained-context flags of a symbol dictionary
+    /// (7.4.3.1.1 bits 8 and 9), which this build reads and ignores.
+    #[allow(dead_code)] // Reached once retained arithmetic contexts are honoured.
     pub(crate) fn reset(&mut self) {
         for cx in self.all_mut() {
             cx.reset();
@@ -408,6 +428,7 @@ impl IntCtxSet {
     }
 
     /// The thirteen arrays in declaration order.
+    #[allow(dead_code)] // Reached from `reset` and from this module's tests.
     fn all_mut(&mut self) -> [&mut IntCtx; 13] {
         [
             &mut self.iadh,
