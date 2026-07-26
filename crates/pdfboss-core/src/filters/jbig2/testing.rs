@@ -20,6 +20,8 @@ use super::bitmap::Bitmap;
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
+use super::reader::Reader;
+use super::segment::parse_header;
 use super::text_region::sym_code_len;
 
 /// A short-form segment header (T.88 7.2): number, flags, referred-to
@@ -55,20 +57,20 @@ pub(crate) fn glyph(rows: &[&str]) -> Bitmap {
     bm
 }
 
-/// Codes one symbol's pixels into `enc` through the shared generic-region
-/// context array `gb` (T.88 6.2.5.7).
+/// Codes one bitmap's pixels into `enc` with the nominal template 0 of a
+/// generic region, through the caller's context array `gb` (T.88 6.2.5.7).
 ///
 /// The array is the caller's rather than this function's for the same reason
 /// the decoder's is: a symbol dictionary codes every symbol through one array,
 /// and the adaptation carried from one symbol to the next is what makes the
 /// coding efficient. A fresh array per symbol would produce bytes the decoder
 /// reads back as noise from the second symbol onward.
-fn encode_symbol(enc: &mut MqEncoder, gb: &mut [MqContext], symbol: &Bitmap) {
+fn encode_pixels(enc: &mut MqEncoder, gb: &mut [MqContext], bm: &Bitmap) {
     let params = GenericParams::nominal(0);
-    for y in 0..symbol.height() {
-        for x in 0..symbol.width() {
-            let ctx = usize::from(context_at(symbol, x, y, &params));
-            enc.encode(&mut gb[ctx], symbol.get(i64::from(x), i64::from(y)));
+    for y in 0..bm.height() {
+        for x in 0..bm.width() {
+            let ctx = usize::from(context_at(bm, x, y, &params));
+            enc.encode(&mut gb[ctx], bm.get(i64::from(x), i64::from(y)));
         }
     }
 }
@@ -105,7 +107,7 @@ pub(crate) fn dictionary_segment(symbols: &[Bitmap], num_input: u32) -> Vec<u8> 
                 Some(symbol.width() as i32 - width),
             );
             width = symbol.width() as i32;
-            encode_symbol(&mut enc, &mut gb, symbol);
+            encode_pixels(&mut enc, &mut gb, symbol);
             index += 1;
         }
         // OOB closes the height class (6.5.5 step 4(c)).
@@ -326,6 +328,38 @@ pub(crate) fn text_segment_with_curt(
     out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
     out.extend_from_slice(&enc.finish());
     out
+}
+
+/// [`text_segment`] for the common page-level fixture: the region covers the
+/// whole page, the flags are the defaults, and SBNUMINSTANCES is counted from
+/// the instructions rather than stated, so a fixture cannot disagree with
+/// itself about how many symbols it places.
+pub(crate) fn text_segment_for_page(page: (u32, u32), num_syms: u32, ops: &[Op]) -> Vec<u8> {
+    let instances = ops
+        .iter()
+        .filter(|op| matches!(op, Op::First(..) | Op::Next(..)))
+        .count() as u32;
+    text_segment(page, Shape::default(), instances, num_syms, 0, ops)
+}
+
+/// The offset just past the segment numbered `number` in an embedded stream.
+///
+/// Splitting a fixture there yields a `/JBIG2Globals` stream and a page stream
+/// that between them hold the same segments in the same order, which is how a
+/// test puts a dictionary in the globals without building it twice. The walk
+/// mirrors the segment splitter's: header, then the data length the header
+/// declared.
+pub(crate) fn split_after_segment(stream: &[u8], number: u32) -> usize {
+    let mut r = Reader::new(stream);
+    while !r.is_empty() {
+        let header = parse_header(&mut r).expect("header");
+        let len = header.data_len.expect("declared data length") as usize;
+        r.take(len).expect("segment data");
+        if header.number == number {
+            return r.pos();
+        }
+    }
+    panic!("no segment numbered {number}");
 }
 
 /// Asserts that `symbol` was drawn into `region` with its top-left pixel at

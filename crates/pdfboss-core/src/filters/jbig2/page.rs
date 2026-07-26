@@ -2,9 +2,16 @@
 //! (T.88 7.4.8, 8.2, Annex D.3).
 //!
 //! One walk over the segment list is the whole procedure. A page information
-//! segment sizes and pre-fills the page; each immediate generic region decodes
-//! into its own bitmap and composites onto it at the coordinates its region
-//! information field gives.
+//! segment sizes and pre-fills the page; each immediate region decodes into its
+//! own bitmap and composites onto it at the coordinates its region information
+//! field gives.
+//!
+//! The walk carries one piece of state between segments: the symbols each
+//! symbol dictionary exported, keyed by its segment number. A text region names
+//! the dictionaries it draws on in its header's referred-to list, and the
+//! concatenation of their exports in that order is the list its symbol IDs
+//! index — so the store has to outlive the segment that filled it, and has to
+//! span the globals stream and the page stream as one sequence.
 //!
 //! Two rules shape everything else here.
 //!
@@ -27,12 +34,16 @@
 //! single work budget, and a stream that asks for more than it is refused
 //! partway through rather than decoded.
 
+use std::collections::HashMap;
+
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 use super::generic::{decode_generic_region, parse_generic_flags, GB_CONTEXT_LEN};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::segment::{parse_embedded, parse_region_info, RegionInfo, Segment, SegmentKind};
+use super::symbol_dict::decode_symbol_dict;
+use super::text_region::decode_text_region;
 use super::Jbig2Error;
 
 /// The length in bytes of the page information segment (T.88 7.4.8).
@@ -123,6 +134,12 @@ fn decode_embedded_within(
     let global_segments = parse_embedded(globals)?;
     let page_segments = parse_embedded(data)?;
 
+    // Exported symbols, keyed by the segment number that exported them. A text
+    // region names the dictionaries it draws on by number (7.4.4.2), and a
+    // dictionary names the ones supplying its own inputs the same way
+    // (7.4.3.1.7), so the store outlives each segment and spans the globals and
+    // the page stream alike.
+    let mut symbols: HashMap<u32, Vec<Bitmap>> = HashMap::new();
     let mut page: Option<Bitmap> = None;
     for segment in global_segments.iter().chain(page_segments.iter()) {
         match segment.header.kind {
@@ -138,13 +155,26 @@ fn decode_embedded_within(
                     Some(existing) => existing,
                     None => Bitmap::new(width, height)?,
                 };
-                // A location above `i32::MAX` cannot be represented as an
-                // offset; clamping puts the region off the right or bottom
-                // edge, where it clips away, rather than wrapping it negative
-                // and painting it over the top-left corner.
-                let x = i32::try_from(info.x).unwrap_or(i32::MAX);
-                let y = i32::try_from(info.y).unwrap_or(i32::MAX);
-                target.combine(&region, x, y, info.op);
+                target.combine(&region, offset(info.x), offset(info.y), info.op);
+                page = Some(target);
+            }
+            SegmentKind::SymbolDictionary => {
+                // The borrow of `symbols` ends with this block, because the
+                // insert that follows needs the map mutably.
+                let exported = {
+                    let inputs = gather_symbols(&symbols, &segment.header.referred_to)?;
+                    decode_symbol_dict(segment.data, &inputs, budget)?
+                };
+                symbols.insert(segment.header.number, exported);
+            }
+            SegmentKind::ImmediateTextRegion | SegmentKind::ImmediateLosslessTextRegion => {
+                let available = gather_symbols(&symbols, &segment.header.referred_to)?;
+                let (info, region) = decode_text_region(segment.data, &available, budget)?;
+                let mut target = match page.take() {
+                    Some(existing) => existing,
+                    None => Bitmap::new(width, height)?,
+                };
+                target.combine(&region, offset(info.x), offset(info.y), info.op);
                 page = Some(target);
             }
             // Segments that carry no pixels for this decoder. End of stripe
@@ -156,13 +186,11 @@ fn decode_embedded_within(
             | SegmentKind::EndOfFile
             | SegmentKind::Profiles
             | SegmentKind::Extension => {}
-            SegmentKind::SymbolDictionary => {
-                return Err(Jbig2Error::Unimplemented("symbol dictionary"))
-            }
-            SegmentKind::IntermediateTextRegion
-            | SegmentKind::ImmediateTextRegion
-            | SegmentKind::ImmediateLosslessTextRegion => {
-                return Err(Jbig2Error::Unimplemented("text region"))
+            // An intermediate region is not composited onto the page: it is
+            // retained in an auxiliary buffer for a later refinement segment to
+            // read, which is a mechanism this build does not have.
+            SegmentKind::IntermediateTextRegion => {
+                return Err(Jbig2Error::Unimplemented("intermediate region"))
             }
             SegmentKind::PatternDictionary => {
                 return Err(Jbig2Error::Unimplemented("pattern dictionary"))
@@ -188,6 +216,42 @@ fn decode_embedded_within(
         Some(page) => Ok(page),
         None => Bitmap::new(width, height),
     }
+}
+
+/// A region's page coordinate as a composition offset.
+///
+/// A location above `i32::MAX` cannot be represented as an offset; clamping
+/// puts the region off the right or bottom edge, where it clips away, rather
+/// than wrapping it negative and painting it over the top-left corner.
+fn offset(coordinate: u32) -> i32 {
+    i32::try_from(coordinate).unwrap_or(i32::MAX)
+}
+
+/// The symbols a segment's referred-to list supplies, concatenated in the order
+/// the list names them (T.88 7.4.3.1.7, 7.4.4.2).
+///
+/// Order is the whole point: a symbol ID indexes this concatenation, so naming
+/// two dictionaries the other way round names different glyphs. Segment numbers
+/// are not sorted here for the same reason.
+///
+/// A number the store does not hold is refused rather than skipped. Within this
+/// build the only segment types a text region or a dictionary may legitimately
+/// refer to are symbol dictionaries — custom table segments are rejected by the
+/// walk above before any region can name one — so a reference that resolves to
+/// nothing is a reference to the wrong thing, and quietly dropping it would
+/// shift every symbol ID after it.
+fn gather_symbols<'a>(
+    store: &'a HashMap<u32, Vec<Bitmap>>,
+    referred_to: &[u32],
+) -> Result<Vec<&'a Bitmap>, Jbig2Error> {
+    let mut out: Vec<&Bitmap> = Vec::new();
+    for number in referred_to {
+        let exported = store.get(number).ok_or(Jbig2Error::Malformed(
+            "referred-to segment is not a symbol dictionary",
+        ))?;
+        out.extend(exported.iter());
+    }
+    Ok(out)
 }
 
 /// Decodes one immediate generic region segment (T.88 7.4.6) into its own
@@ -250,7 +314,10 @@ mod tests {
     use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::{context_at, GenericParams, GB_CONTEXT_LEN};
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
-    use crate::filters::jbig2::testing::header;
+    use crate::filters::jbig2::testing::{
+        dictionary_segment, expect_at, glyph, header, split_after_segment, text_segment_for_page,
+        Op,
+    };
 
     /// Assembles a complete embedded stream: page info, one immediate generic
     /// region carrying `bm` at (`x`, `y`), then end of page and end of file.
@@ -437,8 +504,7 @@ mod tests {
     #[test]
     fn unimplemented_segment_types_are_named_errors() {
         for (kind, want) in [
-            (0u8, "symbol dictionary"),
-            (6, "text region"),
+            (4u8, "intermediate region"),
             (16, "pattern dictionary"),
             (22, "halftone region"),
             (36, "intermediate region"),
@@ -678,17 +744,239 @@ mod tests {
         );
     }
 
-    /// A stream whose first content segment is a symbol dictionary — the shape
-    /// of every page in a text-scanned document — reports the missing feature
-    /// by name rather than rendering a blank page.
+    /// The page information segment of a fixture, sized `page`, with every
+    /// flag clear.
+    fn page_info_segment(number: u32, page: (u32, u32)) -> Vec<u8> {
+        let mut info = Vec::new();
+        info.extend_from_slice(&page.0.to_be_bytes());
+        info.extend_from_slice(&page.1.to_be_bytes());
+        info.extend_from_slice(&0u32.to_be_bytes()); // x resolution
+        info.extend_from_slice(&0u32.to_be_bytes()); // y resolution
+        info.push(0); // default pixel 0, default operator OR
+        info.extend_from_slice(&0u16.to_be_bytes()); // striping
+        let mut out = header(number, 48, &[], 1, info.len() as u32);
+        out.extend_from_slice(&info);
+        out
+    }
+
+    /// The shape of a scanned page: page information, one symbol dictionary,
+    /// then a text region whose header names the dictionary's segment number,
+    /// which is the only way it finds its symbols (T.88 7.4.4.2).
+    fn symbol_coded_stream(page: (u32, u32), symbols: &[Bitmap], ops: &[Op]) -> Vec<u8> {
+        let mut out = page_info_segment(0, page);
+
+        let dict = dictionary_segment(symbols, 0);
+        out.extend_from_slice(&header(1, 0, &[], 1, dict.len() as u32));
+        out.extend_from_slice(&dict);
+
+        let region = text_segment_for_page(page, symbols.len() as u32, ops);
+        out.extend_from_slice(&header(2, 6, &[1], 1, region.len() as u32));
+        out.extend_from_slice(&region);
+
+        out.extend_from_slice(&header(3, 49, &[], 1, 0)); // end of page
+        out
+    }
+
     #[test]
-    fn a_symbol_coded_page_names_what_is_missing() {
-        let mut stream = header(0, 48, &[], 1, 19);
-        stream.extend_from_slice(&[0u8; 19]);
-        stream.extend_from_slice(&header(1, 0, &[], 1, 0)); // symbol dictionary
-        assert_eq!(
-            decode_embedded(&[], &stream, 1994, 2832),
-            Err(Jbig2Error::Unimplemented("symbol dictionary")),
+    fn decodes_a_symbol_coded_page_end_to_end() {
+        let symbols = vec![
+            glyph(&["101", "010", "101", "010"]),
+            glyph(&["11111", "10001", "10001", "11111"]),
+        ];
+        let stream = symbol_coded_stream(
+            (32, 24),
+            &symbols,
+            &[
+                Op::Strip(2),
+                Op::First(1, 0),
+                Op::Next(2, 1),
+                Op::EndStrip,
+                Op::Strip(8),
+                Op::First(-1, 0),
+                Op::EndStrip,
+            ],
         );
+        let page = decode_embedded(&[], &stream, 32, 24).expect("page");
+        expect_at(&page, &symbols[0], 1, 2);
+        expect_at(&page, &symbols[1], 5, 2);
+        expect_at(&page, &symbols[0], 0, 10);
+        assert_eq!(
+            page.get(31, 23),
+            0,
+            "nothing painted outside the placements"
+        );
+    }
+
+    /// A dictionary carried in `/JBIG2Globals` must reach a text region in the
+    /// page's own stream (Annex D.3): the symbol store spans both walks.
+    #[test]
+    fn a_text_region_finds_symbols_in_the_globals_stream() {
+        let symbols = vec![glyph(&["11", "11"])];
+        let full = symbol_coded_stream(
+            (16, 16),
+            &symbols,
+            &[Op::Strip(0), Op::First(3, 0), Op::EndStrip],
+        );
+        // Everything up to and including the dictionary becomes the globals.
+        let (globals, rest) = full.split_at(split_after_segment(&full, 1));
+        let page = decode_embedded(globals, rest, 16, 16).expect("page");
+        expect_at(&page, &symbols[0], 3, 0);
+    }
+
+    /// A text region naming a segment number the stream does not contain has
+    /// no symbols, and must say so rather than painting nothing.
+    #[test]
+    fn a_text_region_with_a_dangling_reference_is_rejected() {
+        let region = text_segment_for_page((8, 8), 1, &[Op::Strip(0), Op::First(0, 0)]);
+        // Segment 1 refers to segment 0, which this stream does not hold: a
+        // well-formed header pointing at nothing.
+        let mut stream = header(1, 6, &[0], 1, region.len() as u32);
+        stream.extend_from_slice(&region);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Malformed(
+                "referred-to segment is not a symbol dictionary",
+            )),
+        );
+    }
+
+    /// A referred-to segment that exists but carries no symbols is the same
+    /// error: the text region would otherwise silently place nothing.
+    #[test]
+    fn a_text_region_referring_to_a_non_dictionary_is_rejected() {
+        let mut stream = page_info_segment(0, (8, 8));
+        let region = text_segment_for_page((8, 8), 1, &[Op::Strip(0), Op::First(0, 0)]);
+        stream.extend_from_slice(&header(1, 6, &[0], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Malformed(
+                "referred-to segment is not a symbol dictionary",
+            )),
+        );
+    }
+
+    /// A text region that names no segment at all has no symbol list to build
+    /// from, which the text region decoder rejects by name.
+    #[test]
+    fn a_text_region_referring_to_nothing_is_rejected() {
+        let region = text_segment_for_page((8, 8), 1, &[Op::Strip(0), Op::First(0, 0)]);
+        let mut stream = header(0, 6, &[], 1, region.len() as u32);
+        stream.extend_from_slice(&region);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Malformed("text region with no symbols")),
+        );
+    }
+
+    /// A dictionary's own referred-to list supplies its input symbols
+    /// (7.4.3.1.7), which it may re-export — so a text region naming only the
+    /// second dictionary still reaches the first one's symbol.
+    #[test]
+    fn a_dictionary_re_exports_symbols_from_the_dictionary_it_refers_to() {
+        let first = [glyph(&["11", "11"])];
+        let second = glyph(&["10", "01"]);
+
+        let mut stream = page_info_segment(0, (16, 16));
+
+        let dict_one = dictionary_segment(&first, 0);
+        stream.extend_from_slice(&header(1, 0, &[], 1, dict_one.len() as u32));
+        stream.extend_from_slice(&dict_one);
+
+        // The second dictionary takes the first's export as its input and
+        // exports both, which `dictionary_segment` cannot express — its runs
+        // always skip the inputs — so this one is built here.
+        let dict_two = re_exporting_dictionary(&second);
+        stream.extend_from_slice(&header(2, 0, &[1], 1, dict_two.len() as u32));
+        stream.extend_from_slice(&dict_two);
+
+        let region = text_segment_for_page(
+            (16, 16),
+            2,
+            &[Op::Strip(0), Op::First(0, 0), Op::Next(2, 1), Op::EndStrip],
+        );
+        stream.extend_from_slice(&header(3, 6, &[2], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 16, 16).expect("page");
+        expect_at(&page, &first[0], 0, 0);
+        expect_at(&page, &second, 3, 0);
+    }
+
+    /// Symbols arrive in referred-to order, not in segment-number order: a
+    /// text region naming its dictionaries the other way round indexes the
+    /// other one's symbol first.
+    #[test]
+    fn symbols_are_concatenated_in_referred_to_order() {
+        let wide = vec![glyph(&["1111", "1111"])];
+        let narrow = vec![glyph(&["11", "11"])];
+
+        // Symbol id 0 must resolve to the *narrow* glyph, which lives in the
+        // dictionary named second by segment number and first by reference.
+        let mut stream = page_info_segment(0, (16, 16));
+        let dict_wide = dictionary_segment(&wide, 0);
+        stream.extend_from_slice(&header(1, 0, &[], 1, dict_wide.len() as u32));
+        stream.extend_from_slice(&dict_wide);
+        let dict_narrow = dictionary_segment(&narrow, 0);
+        stream.extend_from_slice(&header(2, 0, &[], 1, dict_narrow.len() as u32));
+        stream.extend_from_slice(&dict_narrow);
+
+        let region = text_segment_for_page((16, 16), 2, &[Op::Strip(0), Op::First(0, 0)]);
+        stream.extend_from_slice(&header(3, 6, &[2, 1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 16, 16).expect("page");
+        expect_at(&page, &narrow[0], 0, 0);
+        assert_eq!(page.get(2, 0), 0, "the wide glyph was not the one placed");
+    }
+
+    /// A lossless text region (type 7) composites exactly like an immediate
+    /// one; only the encoder's promise about fidelity differs.
+    #[test]
+    fn a_lossless_text_region_paints_too() {
+        let symbols = vec![glyph(&["11", "11"])];
+        let mut stream = page_info_segment(0, (8, 8));
+        let dict = dictionary_segment(&symbols, 0);
+        stream.extend_from_slice(&header(1, 0, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        let region = text_segment_for_page((8, 8), 1, &[Op::Strip(1), Op::First(2, 0)]);
+        stream.extend_from_slice(&header(2, 7, &[1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 8, 8).expect("page");
+        expect_at(&page, &symbols[0], 2, 1);
+    }
+
+    /// A symbol dictionary whose export runs re-export its one input symbol
+    /// alongside its one new symbol (6.5.10): a zero-length skip run flips the
+    /// flag, then a run of two covers both.
+    fn re_exporting_dictionary(new: &Bitmap) -> Vec<u8> {
+        use crate::filters::jbig2::arith_int::encoder::encode_int;
+        use crate::filters::jbig2::arith_int::IntCtxSet;
+        use crate::filters::jbig2::testing::nominal_at_bytes;
+
+        let params = GenericParams::nominal(0);
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        let mut gb = vec![MqContext::default(); GB_CONTEXT_LEN];
+
+        encode_int(&mut enc, &mut ints.iadh, Some(new.height() as i32));
+        encode_int(&mut enc, &mut ints.iadw, Some(new.width() as i32));
+        for y in 0..new.height() {
+            for x in 0..new.width() {
+                let ctx = usize::from(context_at(new, x, y, &params));
+                enc.encode(&mut gb[ctx], new.get(i64::from(x), i64::from(y)));
+            }
+        }
+        encode_int(&mut enc, &mut ints.iadw, None);
+        encode_int(&mut enc, &mut ints.iaex, Some(0)); // zero-length skip
+        encode_int(&mut enc, &mut ints.iaex, Some(2)); // export both
+
+        let mut out = 0u16.to_be_bytes().to_vec(); // arithmetic, template 0
+        out.extend_from_slice(&nominal_at_bytes());
+        out.extend_from_slice(&2u32.to_be_bytes()); // SDNUMEXSYMS
+        out.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+        out.extend_from_slice(&enc.finish());
+        out
     }
 }
