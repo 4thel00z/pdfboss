@@ -6,12 +6,50 @@
 //! exactly like any other `/BitsPerComponent 1` `/DeviceGray` sample data.
 //!
 //! Layering, bottom-up: [`mq`] is the binary arithmetic decoder (Annex E);
-//! [`arith_int`] builds the integer procedures on top of it (Annex A).
+//! [`arith_int`] builds the integer procedures on top of it (Annex A);
+//! [`bitmap`] is the bilevel pixel buffer every region decodes into.
 
 #![allow(dead_code)] // Consumed by the segment layer, which lands next.
 
 pub(crate) mod arith_int;
+pub(crate) mod bitmap;
 pub(crate) mod mq;
+
+/// A decoding failure inside the JBIG2 codec.
+///
+/// These surface to callers as [`crate::error::Error::Decode`]. The variants
+/// exist so tests can assert on the *kind* of failure without matching on
+/// message text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Jbig2Error {
+    /// A field ran past the end of the available bytes.
+    Truncated,
+    /// A field held a value the standard forbids.
+    Malformed(&'static str),
+    /// A construct this build does not yet decode.
+    Unimplemented(&'static str),
+    /// A declared bitmap exceeds [`bitmap::MAX_PIXELS`].
+    TooLarge { width: u32, height: u32 },
+}
+
+impl core::fmt::Display for Jbig2Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Truncated => write!(f, "JBIG2 stream truncated"),
+            Self::Malformed(what) => write!(f, "malformed JBIG2 stream: {what}"),
+            Self::Unimplemented(what) => write!(f, "unsupported JBIG2 feature: {what}"),
+            Self::TooLarge { width, height } => {
+                write!(f, "JBIG2 bitmap too large: {width} x {height}")
+            }
+        }
+    }
+}
+
+impl From<Jbig2Error> for crate::error::Error {
+    fn from(err: Jbig2Error) -> Self {
+        crate::error::Error::Decode(err.to_string())
+    }
+}
 
 /// Drives the arithmetic layers over arbitrary bytes, for the robustness
 /// sweep below.
