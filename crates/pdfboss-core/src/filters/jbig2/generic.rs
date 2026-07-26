@@ -214,11 +214,15 @@ const WINDOW_SPANS: [[(i64, u32); 3]; 4] = [
 /// With nominal AT pixels each template's neighbourhood is two or three
 /// contiguous runs, one per template row. Moving from `x` to `x + 1` slides
 /// every run one pixel right: the leftmost pixel falls out of the top of the
-/// register and one new pixel enters at the bottom. So a context costs one
-/// read per reference row — two, or one for template 3 — instead of the
-/// sixteen bounds-checked reads [`context_at`] performs, and the pixel
-/// entering the current row's run is the one just decoded, which costs no read
-/// at all.
+/// register and one new pixel enters at the bottom. So a context costs two
+/// reads, one per reference row, instead of the sixteen bounds-checked reads
+/// [`context_at`] performs — and the pixel entering the current row's run is
+/// the one just decoded, which costs no read at all.
+///
+/// Template 3 has no y-2 row, so its top run is zero bits wide and its read is
+/// discarded by a zero mask. Branching around it would trade a read for a
+/// mispredictable test on the hot path, and templates other than 0 are rare
+/// enough that the branch would never pay for itself.
 ///
 /// The windows are only valid for the row they were started on, and only while
 /// they are advanced at every `x` in turn. Rows a typical-prediction run
