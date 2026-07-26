@@ -12,3 +12,82 @@
 
 pub(crate) mod arith_int;
 pub(crate) mod mq;
+
+/// Drives the arithmetic layers over arbitrary bytes, for the robustness
+/// sweep below.
+///
+/// The segment layer is what will eventually feed these decoders, and it does
+/// not exist yet, so there is no reachable path from `decode_stream` to assert
+/// against. This hook stands in for it: it interleaves three integer
+/// procedures and a symbol-ID decode against one [`mq::MqDecoder`], which is
+/// the shape every region decoder has — several procedures drawing from a
+/// single arithmetic stream, each adapting its own contexts.
+///
+/// Nothing is asserted about the values. The property under test is that the
+/// call returns at all: any byte string, of any length, must decode to *some*
+/// sequence of integers without panicking, hanging, or reading out of bounds,
+/// because these bytes come from a PDF and a PDF is attacker-controlled. The
+/// marker convention of T.88 E.3.4 is what makes that true past the end of the
+/// buffer.
+#[cfg(test)]
+pub(crate) fn exercise_arithmetic_layers(data: &[u8], rounds: usize) {
+    use std::hint::black_box;
+
+    let mut dec = mq::MqDecoder::new(data);
+    let mut set = arith_int::IntCtxSet::new();
+    let mut iaid = arith_int::IaidCtx::new(8);
+    for _ in 0..rounds {
+        black_box(arith_int::decode_int(&mut dec, &mut set.iadh));
+        black_box(arith_int::decode_int(&mut dec, &mut set.iadw));
+        black_box(arith_int::decode_int(&mut dec, &mut set.iads));
+        black_box(arith_int::decode_iaid(&mut dec, &mut iaid));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic pseudo-random sweep: no input, however malformed, may
+    /// panic, hang, or read out of bounds. The generator is a fixed linear
+    /// congruential sequence so a failure reproduces exactly from the case
+    /// number alone.
+    #[test]
+    fn arithmetic_layers_survive_arbitrary_input() {
+        let mut state: u32 = 0x1234_5678;
+        for case in 0u32..2_000 {
+            let len = (state % 257) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+            exercise_arithmetic_layers(&data, 64);
+            state = state.wrapping_add(case);
+        }
+    }
+
+    /// Degenerate inputs the sweep is unlikely to generate.
+    ///
+    /// `FF 90` and `FF 8F` straddle the marker test of T.88 E.3.4: `0x90` is
+    /// above the `0x8F` threshold and takes the marker path, which leaves `BP`
+    /// where it is and stuffs `0xFF00` into `C`, while `0x8F` is the largest
+    /// byte that still advances `BP`. An off-by-one in that comparison shows up
+    /// here and almost nowhere else.
+    #[test]
+    fn arithmetic_layers_survive_degenerate_input() {
+        for data in [
+            vec![],
+            vec![0x00],
+            vec![0xFF],
+            vec![0xFF, 0xFF, 0xFF, 0xFF],
+            vec![0xFF, 0x90],
+            vec![0xFF, 0x8F],
+            vec![0x00; 4096],
+            vec![0xFF; 4096],
+        ] {
+            exercise_arithmetic_layers(&data, 256);
+        }
+    }
+}
