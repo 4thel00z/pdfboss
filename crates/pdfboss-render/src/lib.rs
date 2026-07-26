@@ -177,7 +177,67 @@ pub fn render_page_with_options(
     scale: f32,
     opts: &RenderOptions,
 ) -> Result<Pixmap> {
-    executor::render_page_with_options(doc, page, scale, opts)
+    executor::render_page_reporting(doc, page, scale, opts).map(|(pix, _)| pix)
+}
+
+/// Renders a page like [`render_page_with_options`], additionally returning
+/// a [`RenderReport`] describing any content that had to be dropped. Use
+/// this when a silently blank page would be misleading.
+pub fn render_page_reporting(
+    doc: &Document,
+    page: &Page,
+    scale: f32,
+    opts: &RenderOptions,
+) -> Result<(Pixmap, RenderReport)> {
+    executor::render_page_reporting(doc, page, scale, opts)
+}
+
+/// Why a piece of page content was dropped during rasterization.
+///
+/// Rendering is lenient: undecodable content is skipped so the rest of the
+/// page still rasterizes. This enum records *what* was skipped so callers
+/// can tell an intentionally blank page from a page whose content pdfboss
+/// could not read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkipReason {
+    /// The stream's `/Filter` chain names a filter pdfboss does not decode.
+    UnsupportedFilter(String),
+    /// The filter chain ran but failed (corrupt data, size limit, ...).
+    DecodeFailed(String),
+    /// Filters applied cleanly but the samples could not be interpreted as
+    /// an image (bad dimensions, unsupported JPEG, ...).
+    Undecodable,
+}
+
+/// One image that was dropped instead of painted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedImage {
+    /// Why this image was dropped.
+    pub reason: SkipReason,
+}
+
+/// What a page render had to skip. Empty means the page rasterized whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderReport {
+    /// Images dropped during this render, in the order encountered.
+    pub skipped_images: Vec<SkippedImage>,
+}
+
+impl RenderReport {
+    /// Whether the page rasterized with nothing dropped.
+    pub fn is_empty(&self) -> bool {
+        self.skipped_images.is_empty()
+    }
+
+    /// A one-line human summary, or `None` when nothing was dropped.
+    pub fn summary(&self) -> Option<String> {
+        match self.skipped_images.len() {
+            0 => None,
+            1 => Some("1 image skipped".to_string()),
+            n => Some(format!("{n} images skipped")),
+        }
+    }
 }
 
 #[cfg(test)]

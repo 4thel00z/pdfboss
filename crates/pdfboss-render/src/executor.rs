@@ -11,7 +11,7 @@ use std::rc::Rc;
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
 use pdfboss_core::filters::decode_stream;
 use pdfboss_core::geom::{Matrix, Point};
-use pdfboss_core::{Dict, Document, Name, Object, Page, Result, Stream};
+use pdfboss_core::{Dict, Document, Error, Name, Object, Page, Result, Stream};
 
 use crate::color::ColorSpace;
 use crate::glyph::GlyphFont;
@@ -23,7 +23,9 @@ use crate::stroke::stroke_path;
 use crate::substitute::BuiltinProvider;
 use crate::substitute::{DirProvider, SubstituteProvider};
 use crate::type3::Type3Font;
-use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
+use crate::{
+    GlyphPainting, Pixmap, RenderOptions, RenderReport, SkipReason, SkippedImage, SubstituteSource,
+};
 
 /// Maximum `q`/`Q` nesting depth.
 const MAX_GSTATE_DEPTH: usize = 64;
@@ -269,13 +271,15 @@ fn base_ctm(crop: pdfboss_core::Rect, rotate: i32, scale: f32) -> Matrix {
 
 /// Renders `page` from `doc` at `scale` onto a white background. The pixel
 /// size is `ceil(crop_w * scale) x ceil(crop_h * scale)` after `/Rotate`.
-/// Content errors are lenient: an unreadable stream renders blank.
-pub(crate) fn render_page_with_options(
+/// Content errors are lenient: an unreadable stream renders blank. The
+/// returned [`RenderReport`] names every image that leniency dropped, so a
+/// caller can tell a blank page from an unreadable one.
+pub(crate) fn render_page_reporting(
     doc: &Document,
     page: &Page,
     scale: f32,
     opts: &RenderOptions,
-) -> Result<Pixmap> {
+) -> Result<(Pixmap, RenderReport)> {
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
@@ -308,9 +312,10 @@ pub(crate) fn render_page_with_options(
         provider,
         glyph_blit: Vec::new(),
         clip_cache: FastMap::default(),
+        report: RenderReport::default(),
     };
     exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
-    Ok(exec.pix)
+    Ok((exec.pix, exec.report))
 }
 
 /// Executes parsed content operators against a shared pixmap; forms
@@ -341,6 +346,10 @@ struct Executor<'a> {
     /// device-space geometry regardless of which resource scope drew it).
     /// See [`MAX_CLIP_CACHE`].
     clip_cache: FastMap<ClipKey, Rc<Mask>>,
+    /// Content this render dropped rather than painted, accumulated across
+    /// the page (forms and Type3 CharProcs included, since they run through
+    /// the same [`Executor`]).
+    report: RenderReport,
 }
 
 impl Executor<'_> {
@@ -1125,6 +1134,14 @@ fn floats_from(doc: &Document, obj: Option<&Object>, n: usize) -> Option<Vec<f32
     (out.len() == n).then_some(out)
 }
 
+/// Maps a stream-decode failure onto the reason reported to callers.
+fn skip_reason_for(e: &Error) -> SkipReason {
+    match e {
+        Error::UnsupportedFilter(name) => SkipReason::UnsupportedFilter(name.clone()),
+        other => SkipReason::DecodeFailed(other.to_string()),
+    }
+}
+
 impl Executor<'_> {
     /// Executes `Do`: draws an image XObject or recurses into a form.
     fn do_xobject(&mut self, name: &Name, chain: &[&Dict], gs: &GState, depth: u32) {
@@ -1186,11 +1203,20 @@ impl Executor<'_> {
         self.run(&ops, &inner_chain, inner, depth + 1);
     }
 
+    /// Records that an image could not be painted.
+    fn skip_image(&mut self, reason: SkipReason) {
+        self.report.skipped_images.push(SkippedImage { reason });
+    }
+
     /// Draws an image XObject with the current CTM/clip/alpha; the fill
     /// color paints through `/ImageMask` stencils.
     fn draw_image_xobject(&mut self, stream: &Stream, chain: &[&Dict], gs: &GState) {
-        let Ok(data) = self.doc.stream_data(stream) else {
-            return;
+        let data = match self.doc.stream_data(stream) {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip_image(skip_reason_for(&e));
+                return;
+            }
         };
         let cs_obj = self.image_colorspace(&stream.dict, chain);
         self.blit_image(&stream.dict, &data, cs_obj, gs);
@@ -1203,8 +1229,12 @@ impl Executor<'_> {
             dict: img.dict.clone(),
             data: img.data.clone(),
         };
-        let Ok(data) = decode_stream(&stream, self.doc) else {
-            return;
+        let data = match decode_stream(&stream, self.doc) {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip_image(skip_reason_for(&e));
+                return;
+            }
         };
         let cs_obj = self.image_colorspace(&img.dict, chain);
         self.blit_image(&img.dict, &data, cs_obj, gs);
@@ -1212,7 +1242,7 @@ impl Executor<'_> {
 
     fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
         let fill = gs.fill_rgba8();
-        image::draw(
+        let painted = image::draw(
             self.doc,
             &mut self.pix,
             dict,
@@ -1225,6 +1255,9 @@ impl Executor<'_> {
                 clip: gs.clip.as_deref(),
             },
         );
+        if !painted {
+            self.skip_image(SkipReason::Undecodable);
+        }
     }
 
     /// The image's `/ColorSpace` value with resource-name indirection
@@ -1249,6 +1282,9 @@ impl Executor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The crate-root wrapper, exercised here so these tests keep covering the
+    // exact entry point external callers use.
+    use crate::render_page_with_options;
     use crate::{GlyphPainting, RenderOptions};
     use pdfboss_testkit::{doc_with_graphics, PdfBuilder};
 
@@ -1555,6 +1591,151 @@ mod tests {
         assert_eq!(px(&pix, 75, 25), blue, "inverted: row 0 sample 1 painted");
         assert_eq!(px(&pix, 25, 75), blue, "inverted: row 1 sample 0 painted");
         assert_eq!(px(&pix, 75, 75), WHITE, "inverted: row 1 sample 1 clear");
+    }
+
+    /// Wraps `raw` in a zlib stream (RFC 1950) carrying a single stored
+    /// (uncompressed) deflate block (RFC 1951 §3.2.4) — genuine
+    /// `/FlateDecode` input without a compressor in this crate.
+    fn zlib_stored(raw: &[u8]) -> Vec<u8> {
+        // CMF 0x78 (deflate, 32K window) with FLG 0x01: no preset dictionary
+        // and (0x78 << 8) | 0x01 is the multiple of 31 the header check wants.
+        let mut out = vec![0x78, 0x01];
+        let len = raw.len() as u16;
+        out.push(0x01); // BFINAL = 1, BTYPE = 00 (stored)
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(!len).to_le_bytes());
+        out.extend_from_slice(raw);
+        // Adler-32 of the uncompressed data, big-endian.
+        let (mut low, mut high) = (1u32, 0u32);
+        for &byte in raw {
+            low = (low + u32::from(byte)) % 65521;
+            high = (high + low) % 65521;
+        }
+        out.extend_from_slice(&((high << 16) | low).to_be_bytes());
+        out
+    }
+
+    /// A one-page document whose only content is an 8x8 one-bit gray image
+    /// XObject carrying `/Filter /<filter>`. `FlateDecode` gets genuinely
+    /// encoded samples; any other name gets bytes that filter never reads.
+    fn doc_with_image_filter(filter: &str) -> Vec<u8> {
+        let samples = [0b1010_1010u8; 8];
+        let data = if filter == "FlateDecode" {
+            zlib_stored(&samples)
+        } else {
+            samples.to_vec()
+        };
+        small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    &format!(
+                        "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                         /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /{filter}"
+                    ),
+                    &data,
+                );
+            },
+        )
+    }
+
+    /// Renders page 0 of `bytes` with the default options, returning the
+    /// pixmap and the report of everything the render had to drop.
+    fn render_reporting(bytes: Vec<u8>) -> (Pixmap, RenderReport) {
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page 0");
+        render_page_reporting(&doc, &page, 1.0, &RenderOptions::default())
+            .expect("render succeeds despite any dropped image")
+    }
+
+    #[test]
+    fn unsupported_image_filter_is_reported() {
+        // The page's only content is `/Im0 Do`, where Im0 carries a filter
+        // the core does not implement. The page must still render (lenient),
+        // but the drop must be reported.
+        let (pix, report) = render_reporting(doc_with_image_filter("JBIG2Decode"));
+
+        assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
+        assert_eq!(report.skipped_images.len(), 1, "exactly one drop recorded");
+        assert_eq!(
+            report.skipped_images[0].reason,
+            SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+        );
+        assert!(!report.is_empty());
+        assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
+    }
+
+    #[test]
+    fn clean_page_reports_nothing() {
+        let (pix, report) = render_reporting(doc_with_image_filter("FlateDecode"));
+        // The 0b10101010 rows alternate white/black across the 8 columns the
+        // image stretches over the 100pt page -- proof the image really
+        // painted, so the empty report is not vacuous.
+        assert_eq!(px(&pix, 6, 50), WHITE, "column 0 sample is white");
+        assert_eq!(px(&pix, 18, 50), BLACK, "column 1 sample is black");
+        assert!(report.is_empty(), "a decodable image reports no skips");
+        assert_eq!(report.summary(), None);
+    }
+
+    #[test]
+    fn unsupported_inline_image_filter_is_reported() {
+        let content = "q 100 0 0 100 0 0 cm BI /W 8 /H 8 /BPC 1 /CS /G \
+                       /F /JBIG2Decode ID 01234567 EI Q";
+        let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
+        assert_eq!(
+            report
+                .skipped_images
+                .iter()
+                .map(|s| &s.reason)
+                .collect::<Vec<_>>(),
+            vec![&SkipReason::UnsupportedFilter("JBIG2Decode".to_string())],
+        );
+    }
+
+    #[test]
+    fn image_that_decodes_but_cannot_be_interpreted_is_reported() {
+        // Filters apply cleanly (there are none); `/Width 0` makes the
+        // samples uninterpretable as an image.
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 0 /Height 8 \
+                     /BitsPerComponent 1 /ColorSpace /DeviceGray",
+                    &[0; 8],
+                );
+            },
+        );
+        let (_, report) = render_reporting(bytes);
+        assert_eq!(
+            report
+                .skipped_images
+                .iter()
+                .map(|s| &s.reason)
+                .collect::<Vec<_>>(),
+            vec![&SkipReason::Undecodable],
+        );
+        assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
+    }
+
+    #[test]
+    fn two_drops_pluralize_the_summary() {
+        let content = "q 100 0 0 100 0 0 cm /Im0 Do /Im0 Do Q";
+        let bytes = small_doc("/XObject << /Im0 5 0 R >>", content.as_bytes(), |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode",
+                &[0; 8],
+            );
+        });
+        let (_, report) = render_reporting(bytes);
+        assert_eq!(report.skipped_images.len(), 2);
+        assert_eq!(report.summary().as_deref(), Some("2 images skipped"));
     }
 
     #[test]

@@ -43,7 +43,8 @@ struct Rgba {
 /// trailing `DCTDecode` is passthrough (so `data` is then raw JPEG).
 /// `cs_obj` is the image's `/ColorSpace` value with any resource-name
 /// indirection already resolved by the caller. Undecodable images are
-/// skipped (lenient).
+/// skipped (lenient); the return value reports whether anything was painted,
+/// so the caller can record the miss.
 pub(crate) fn draw(
     doc: &Document,
     pix: &mut Pixmap,
@@ -51,9 +52,13 @@ pub(crate) fn draw(
     data: &[u8],
     cs_obj: Option<&Object>,
     p: &DrawParams,
-) {
-    if let Some(img) = decode_rgba(doc, dict, data, cs_obj, p.fill_rgb) {
-        draw_rgba(pix, &img, p);
+) -> bool {
+    match decode_rgba(doc, dict, data, cs_obj, p.fill_rgb) {
+        Some(img) => {
+            draw_rgba(pix, &img, p);
+            true
+        }
+        None => false,
     }
 }
 
