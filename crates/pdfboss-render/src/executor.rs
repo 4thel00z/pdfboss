@@ -1362,14 +1362,11 @@ impl Executor<'_> {
     }
 
     fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
-        // A codec the filter chain passes through untouched (ISO 32000-1
-        // 7.4.9) leaves `data` holding a codestream this crate cannot read.
-        // Painting it would treat the codestream bytes as samples and
-        // report a faithful render, so stop here instead.
-        if let Some(codec) = image::passthrough_codec(self.doc, dict) {
-            self.skip(SkippedKind::Image, SkipReason::UnsupportedFilter(codec));
-            return;
-        }
+        // `data` is decoded samples or a raw JPEG: the filter chain passes
+        // only `DCTDecode` through (ISO 32000-1 7.4.9) and rejects every
+        // other codec, so no codestream reaches the sample reader. That
+        // rejection surfaces above, where `stream_data` fails.
+        //
         // An `/Indexed` palette stored as a stream that will not decode
         // leaves the space with no palette at all, painting every sample
         // black; the image still draws, but not as the page describes it.
@@ -2042,9 +2039,11 @@ mod tests {
 
     #[test]
     fn jpx_image_is_reported_instead_of_painted_as_noise() {
-        // The filter chain hands `JPXDecode` data through undecoded (ISO
-        // 32000-1 7.4.9). Painting those bytes as samples would show noise
-        // and claim success, so the image is dropped and reported.
+        // Nothing here decodes a JPEG 2000 codestream, so the filter chain
+        // refuses to hand one over as if it were stream data (ISO 32000-1
+        // 7.4.9). Were it passed through, the 0x42 bytes below would paint
+        // as gray samples and the render would claim success; instead the
+        // image is dropped and named in the report.
         let bytes = small_doc(
             "/XObject << /Im0 5 0 R >>",
             b"q 100 0 0 100 0 0 cm /Im0 Do Q",
@@ -2066,6 +2065,11 @@ mod tests {
                 SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
+        );
+        assert_eq!(
+            report.warnings(),
+            vec!["1 image skipped: unsupported filter /JPXDecode".to_string()],
+            "the caller can name what went missing",
         );
     }
 

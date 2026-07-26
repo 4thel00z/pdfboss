@@ -56,9 +56,11 @@ pub(crate) enum Drawn {
 
 /// Decodes an image XObject or inline image and composites it onto `pix`.
 ///
-/// `data` must already have its stream filters applied, except that a
-/// trailing image codec is passthrough (so `data` is then a raw codestream —
-/// see [`passthrough_codec`], and only `DCTDecode` is actually decoded here).
+/// `data` must already have its stream filters applied, except for a
+/// trailing `DCTDecode`: that is the one codec the filter chain passes
+/// through (ISO 32000-1 7.4.9), leaving `data` a raw JPEG, which this module
+/// decodes. Every other codec is rejected there, so `data` never arrives as
+/// a codestream this module would otherwise read as samples.
 /// `cs_obj` is the image's `/ColorSpace` value with any resource-name
 /// indirection already resolved by the caller. Undecodable images are
 /// skipped (lenient); the return value says what was painted, so the caller
@@ -134,16 +136,6 @@ fn is_dct(doc: &Document, dict: &Dict) -> bool {
         trailing_filter(doc, dict).as_deref(),
         Some("DCTDecode" | "DCT")
     )
-}
-
-/// The name of a trailing image codec that the stream filters hand over
-/// undecoded and this module cannot read either, if any. `DCTDecode` is
-/// passed through *and* decoded here, so it never appears; `JPXDecode` is
-/// passed through and not decoded, and treating its codestream bytes as
-/// samples would paint noise while claiming a faithful render.
-pub(crate) fn passthrough_codec(doc: &Document, dict: &Dict) -> Option<String> {
-    let name = trailing_filter(doc, dict)?;
-    matches!(name.as_str(), "JPXDecode").then_some(name)
 }
 
 /// Whether the image is a 1-bit `/ImageMask` stencil, which paints in the
