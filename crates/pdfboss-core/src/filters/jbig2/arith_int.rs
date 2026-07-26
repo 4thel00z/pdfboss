@@ -10,7 +10,7 @@
 //! and dictionary decoder. Symbol IDs use a fourteenth, differently shaped
 //! procedure (A.3), here [`IaidCtx`] and [`decode_iaid`].
 //!
-//! Two properties matter to every caller:
+//! Three properties matter to every caller:
 //!
 //! * **OOB is not zero.** A.2's out-of-band value is the sign bit set with a
 //!   magnitude of zero — the one bit pattern the value coding leaves spare,
@@ -18,6 +18,12 @@
 //!   terminator, so [`decode_int`] returns [`Option`] and `None` means OOB.
 //!   `Some(0)` and `None` differ by a single decoded bit; conflating them
 //!   turns every terminator into a legitimate value.
+//! * **OOB always arrives.** The lists of A.2 are terminated by the data, not
+//!   by a count, so `repeat { V = decode; if OOB break }` is the shape of
+//!   every caller (6.5.5, 6.4.5). A stream that runs out cannot be left
+//!   producing values: past the end of the coded data the arithmetic decoder
+//!   settles into a cycle, and a cycle that never yields OOB is a loop that
+//!   never ends. An exhausted decoder therefore reads as OOB, permanently.
 //! * **The context index is clamped.** During the magnitude loop the index
 //!   would otherwise grow one bit per decoded bit, up to 32 of them
 //!   (A.2, step 4). Folding it back into the upper half of the array is what
@@ -114,7 +120,21 @@ fn prefix_bit(dec: &mut MqDecoder, cx: &mut IntCtx, prev: &mut usize) -> u8 {
 /// A magnitude too large to be an [`i32`] is reported the same way: such a
 /// value cannot be a valid coordinate or count, and OOB is the one answer
 /// every caller already handles.
+///
+/// An exhausted stream ([`MqDecoder::is_exhausted`]) reads as OOB too, and
+/// from then on every call does. This is what bounds the caller's loop. Past
+/// the end of the coded data the arithmetic decoder does not stop: it cycles,
+/// often through a single state, so the values it returns simply repeat — for
+/// most inputs a value rather than the terminator, which leaves a spec-shaped
+/// `repeat until OOB` running forever. Nothing is lost by ending it there,
+/// because those values were synthesized by the marker fill of T.88 E.3.4 and
+/// carry no bit of the input. A caller that needs to tell a truncated segment
+/// from a properly terminated list can ask the decoder directly.
 pub(crate) fn decode_int(dec: &mut MqDecoder, cx: &mut IntCtx) -> Option<i32> {
+    if dec.is_exhausted() {
+        return None;
+    }
+
     let mut prev: usize = 1;
     let sign = prefix_bit(dec, cx, &mut prev);
 
@@ -210,6 +230,11 @@ impl IaidCtx {
 /// A.3 states the result as `PREV - 2^SBSYMCODELEN`; accumulating the ID
 /// alongside `PREV` gives the same value — `PREV` is that leading one bit
 /// followed by the ID — without a subtraction that could underflow.
+///
+/// There is no OOB here: A.3 codes a fixed number of bits and every caller
+/// draws a symbol ID a counted number of times, so this procedure cannot end
+/// a loop and does not test for an exhausted stream. A caller that wants to
+/// stop at the end of the coded data asks [`MqDecoder::is_exhausted`].
 pub(crate) fn decode_iaid(dec: &mut MqDecoder, cx: &mut IaidCtx) -> u32 {
     let mut prev: usize = 1;
     let mut id: u32 = 0;
@@ -683,6 +708,10 @@ mod tests {
 
     /// A truncated stream decodes an unbounded run of trailing bits rather
     /// than panicking; `decode_int` must inherit that from the MQ layer.
+    ///
+    /// Returning from each call is the weaker half of totality. The half that
+    /// matters to a caller is that the list ends, which
+    /// `integer_lists_terminate_on_every_input` is what checks.
     #[test]
     fn decode_int_terminates_on_empty_input() {
         let mut dec = MqDecoder::new(&[]);
@@ -705,6 +734,135 @@ mod tests {
                 let _ = decode_int(&mut dec, &mut cx);
             }
         }
+    }
+
+    /// Inputs whose decoded values, not whose length, decide when a caller
+    /// stops: every single byte, the degenerate fills, and a pseudo-random
+    /// spread of lengths.
+    ///
+    /// A single byte is enough to reach the decoder's post-marker cycle, so
+    /// the short cases are the interesting ones rather than a formality.
+    fn terminator_corpus() -> Vec<Vec<u8>> {
+        let mut corpus: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0xFF, 0xAC],
+            vec![0xFF, 0x90],
+            vec![0xFF, 0x8F],
+            vec![0x00; 8],
+            vec![0xAA; 8],
+            vec![0x55; 8],
+            vec![0xFF; 8],
+            vec![0x00; 64],
+            vec![0xAA, 0x55, 0xAA, 0x55],
+        ];
+        corpus.extend((0u32..256).map(|b| vec![u8::try_from(b).unwrap_or(0)]));
+        let mut state: u32 = 0x0BAD_F00D;
+        corpus.extend((0u32..512).map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let len = (state >> 20) as usize % 40;
+            (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    u8::try_from(state >> 24).unwrap_or(0)
+                })
+                .collect()
+        }));
+        corpus
+    }
+
+    /// The list loop of T.88 6.5.5 step 4(c) — `repeat { DW = decode IADW; if
+    /// OOB break }` — ends on every input.
+    ///
+    /// This is the property the fixed-round sweeps cannot see. Each call
+    /// returns, so nothing panics, but what ends a caller's loop is the
+    /// *value*, and once the coded data is spent the decoder cycles: the same
+    /// registers and contexts, so the same value, forever. For most inputs
+    /// that value is not the terminator, and a loop waiting for one would run
+    /// until the process was killed. The limit here is generous enough that
+    /// only a loop that genuinely never ends can reach it.
+    #[test]
+    fn integer_lists_terminate_on_every_input() {
+        for data in terminator_corpus() {
+            let mut dec = MqDecoder::new(&data);
+            let mut cx = IntCtx::new();
+            let mut read = 0usize;
+            while decode_int(&mut dec, &mut cx).is_some() {
+                read += 1;
+                assert!(
+                    read < 100_000,
+                    "no terminator in {data:?} after {read} values"
+                );
+            }
+        }
+    }
+
+    /// Once the coded data is spent, OOB is all there is.
+    ///
+    /// Terminating one list is not enough: a symbol dictionary nests them, one
+    /// width list per height class (6.5.5), and a text region nests a symbol
+    /// list inside a strip list (6.4.5). Every one of those loops ends only if
+    /// the terminator keeps coming, so an exhausted stream must never go back
+    /// to producing values.
+    #[test]
+    fn an_exhausted_stream_yields_nothing_but_oob() {
+        for data in terminator_corpus() {
+            let mut dec = MqDecoder::new(&data);
+            let mut set = IntCtxSet::new();
+            let mut spun = 0usize;
+            while !dec.is_exhausted() {
+                let _ = decode_int(&mut dec, &mut set.iadh);
+                spun += 1;
+                assert!(spun < 100_000, "{data:?} never ran out of data");
+            }
+            for step in 0..256 {
+                for cx in set.all_mut() {
+                    assert_eq!(
+                        decode_int(&mut dec, cx),
+                        None,
+                        "{data:?} produced a value at step {step} past the end"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fabricated terminator must not arrive early: a list coded per A.2
+    /// comes back whole, values and terminator alike.
+    ///
+    /// This is the other side of `integer_lists_terminate_on_every_input`. A
+    /// decoder that answered OOB too eagerly would pass that test and truncate
+    /// every real symbol dictionary, so the two are only meaningful together.
+    #[test]
+    fn a_coded_list_survives_to_its_own_terminator() {
+        let mut state: u32 = 0x5EED_1234;
+        let mut values: Vec<Option<i32>> = (0..600)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                Some(i32::try_from(state % 200_000).unwrap_or(0) - 100_000)
+            })
+            .collect();
+        values.push(None);
+
+        let mut enc = MqEncoder::new();
+        let mut enc_cx = IntCtx::new();
+        for value in &values {
+            encode_int(&mut enc, &mut enc_cx, *value);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = IntCtx::new();
+        let mut decoded: Vec<Option<i32>> = Vec::new();
+        loop {
+            let value = decode_int(&mut dec, &mut dec_cx);
+            decoded.push(value);
+            if value.is_none() {
+                break;
+            }
+        }
+        assert_eq!(decoded, values);
     }
 
     /// The leading bits an integer procedure draws from `data`, walking

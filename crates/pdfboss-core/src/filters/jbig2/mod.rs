@@ -29,6 +29,10 @@ pub(crate) mod mq;
 /// because these bytes come from a PDF and a PDF is attacker-controlled. The
 /// marker convention of T.88 E.3.4 is what makes that true past the end of the
 /// buffer.
+///
+/// A fixed round count is deliberately the weaker check. It cannot see a
+/// braid that keeps returning values forever, because it stops counting first;
+/// `the_braid_runs_out_of_data` below is the one that runs to the end.
 #[cfg(test)]
 pub(crate) fn exercise_arithmetic_layers(data: &[u8], rounds: usize) {
     use std::hint::black_box;
@@ -64,6 +68,50 @@ mod tests {
                 })
                 .collect();
             exercise_arithmetic_layers(&data, 64);
+            state = state.wrapping_add(case);
+        }
+    }
+
+    /// The braid a region decoder actually runs — several integer procedures
+    /// and a symbol ID drawing from one arithmetic stream — reaches the end of
+    /// its data, whatever the data is.
+    ///
+    /// The sweeps above stop after a fixed number of rounds, which is exactly
+    /// how a decoder that never stops on its own goes unnoticed: past the end
+    /// of the input the arithmetic layer cycles, and the values the braid
+    /// reads out of that cycle repeat without ever including a terminator. A
+    /// symbol dictionary looping on those would never finish its height class.
+    /// Here the loop condition is the decoder's own, so a braid that cannot
+    /// finish trips the limit instead of being cut short by it.
+    #[test]
+    fn the_braid_runs_out_of_data() {
+        let mut state: u32 = 0x2B7E_1516;
+        for case in 0u32..600 {
+            let len = (state % 33) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+
+            let mut dec = mq::MqDecoder::new(&data);
+            let mut set = arith_int::IntCtxSet::new();
+            let mut iaid = arith_int::IaidCtx::new(8);
+            let mut rounds = 0usize;
+            while !dec.is_exhausted() {
+                let _ = arith_int::decode_int(&mut dec, &mut set.iadh);
+                let _ = arith_int::decode_int(&mut dec, &mut set.iadw);
+                let _ = arith_int::decode_int(&mut dec, &mut set.iads);
+                let _ = arith_int::decode_iaid(&mut dec, &mut iaid);
+                rounds += 1;
+                assert!(rounds < 100_000, "case {case} never ran out of data");
+            }
+            // The height-class loop of 6.5.5 ends here and stays ended.
+            for _ in 0..64 {
+                assert_eq!(arith_int::decode_int(&mut dec, &mut set.iadw), None);
+                let _ = arith_int::decode_iaid(&mut dec, &mut iaid);
+            }
             state = state.wrapping_add(case);
         }
     }
