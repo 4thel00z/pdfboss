@@ -424,19 +424,19 @@ mod tests {
         ] {
             let mut dec = MqDecoder::new(&data);
             let mut cx = MqContexts::new(512);
-            let mut reached = None;
+            let mut spent = false;
             for step in 0..100_000 {
                 if dec.is_exhausted() {
-                    reached = Some(step);
+                    spent = true;
                     break;
                 }
                 let _ = dec.decode(cx.get_mut(step % 512));
             }
-            let at = reached.unwrap_or_else(|| panic!("{data:?} never ran out of data"));
-            // Once spent, spent for good: nothing can put bytes back.
+            assert!(spent, "{data:?} never ran out of data");
+            // Once spent, spent for good: nothing can put the bytes back.
             for step in 0..1_000 {
                 let _ = dec.decode(cx.get_mut(step % 512));
-                assert!(dec.is_exhausted(), "{data:?} un-exhausted after step {at}");
+                assert!(dec.is_exhausted(), "{data:?} refilled at step {step}");
             }
         }
     }
