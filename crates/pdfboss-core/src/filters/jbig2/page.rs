@@ -42,7 +42,7 @@ use super::generic::{decode_generic_region, parse_generic_flags, GB_CONTEXT_LEN}
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::segment::{parse_embedded, parse_region_info, RegionInfo, Segment, SegmentKind};
-use super::symbol_dict::decode_symbol_dict;
+use super::symbol_dict::{decode_symbol_dict, MAX_SYMBOLS};
 use super::text_region::decode_text_region;
 use super::Jbig2Error;
 
@@ -108,7 +108,6 @@ pub(crate) fn parse_page_info(data: &[u8]) -> Result<PageInfo, Jbig2Error> {
 /// The stream gets one [`Budget`] for all of it. A stream asking for more
 /// decoding work than that fails with [`Jbig2Error::WorkLimit`] instead of
 /// running for as long as its dimension fields say to.
-#[allow(dead_code)] // The `JBIG2Decode` filter arm is wired up in a later change.
 pub(crate) fn decode_embedded(
     globals: &[u8],
     data: &[u8],
@@ -240,6 +239,15 @@ fn offset(coordinate: u32) -> i32 {
 /// walk above before any region can name one — so a reference that resolves to
 /// nothing is a reference to the wrong thing, and quietly dropping it would
 /// shift every symbol ID after it.
+///
+/// The running total is capped at [`MAX_SYMBOLS`] as the list is walked, before
+/// the next dictionary's symbols are appended. Nothing stops a header naming
+/// one dictionary many times — the referred-to cap of the segment parser allows
+/// tens of thousands of entries, each four bytes — so without this a few
+/// hundred kilobytes of referred-to numbers would multiply one decoded
+/// dictionary into billions of references. Both consumers refuse an input list
+/// longer than this anyway; checking here is what keeps the refusal from
+/// arriving after the allocation.
 fn gather_symbols<'a>(
     store: &'a HashMap<u32, Vec<Bitmap>>,
     referred_to: &[u32],
@@ -249,6 +257,9 @@ fn gather_symbols<'a>(
         let exported = store.get(number).ok_or(Jbig2Error::Malformed(
             "referred-to segment is not a symbol dictionary",
         ))?;
+        if out.len().saturating_add(exported.len()) > MAX_SYMBOLS as usize {
+            return Err(Jbig2Error::Malformed("symbol count exceeds the limit"));
+        }
         out.extend(exported.iter());
     }
     Ok(out)
@@ -866,6 +877,28 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed("text region with no symbols")),
+        );
+    }
+
+    /// A referred-to list may name the same dictionary as often as it likes,
+    /// and the segment format allows tens of thousands of entries in four bytes
+    /// each — so the gathered list is capped before it is built, not after.
+    ///
+    /// Eight symbols repeated 8 193 times is 65 544, one dictionary's worth
+    /// past the limit. The same header shape at the format's own maximum would
+    /// ask for billions of references from a few hundred kilobytes of input.
+    #[test]
+    fn a_repeated_referred_to_segment_cannot_multiply_the_symbol_list() {
+        let exported: Vec<Bitmap> = (0..8).map(|_| glyph(&["1"])).collect();
+        let store = HashMap::from([(1u32, exported)]);
+
+        let within = vec![1u32; 8_192];
+        assert_eq!(gather_symbols(&store, &within).map(|v| v.len()), Ok(65_536));
+
+        let beyond = vec![1u32; 8_193];
+        assert_eq!(
+            gather_symbols(&store, &beyond).map(|v| v.len()),
+            Err(Jbig2Error::Malformed("symbol count exceeds the limit")),
         );
     }
 

@@ -1,9 +1,10 @@
 //! JBIG2 (ISO/IEC 14492 / ITU-T T.88) decoding.
 //!
-//! Implemented from the published standard. The entry point is the
-//! `JBIG2Decode` arm of [`crate::filters::decode_stream`], which returns
-//! packed 1-bit-per-pixel rows so the image layer can treat the result
-//! exactly like any other `/BitsPerComponent 1` `/DeviceGray` sample data.
+//! Implemented from the published standard. The entry point is
+//! [`decode_pdf_stream`], reached from the `JBIG2Decode` arm of
+//! [`crate::filters::decode_stream`], which returns packed 1-bit-per-pixel rows
+//! so the image layer can treat the result exactly like any other
+//! `/BitsPerComponent 1` `/DeviceGray` sample data.
 //!
 //! Layering, bottom-up: [`mq`] is the binary arithmetic decoder (Annex E);
 //! [`arith_int`] builds the integer procedures on top of it (Annex A);
@@ -11,8 +12,10 @@
 //! [`reader`] is the bounds-checked byte cursor the header parsers run on;
 //! [`segment`] splits a PDF-embedded stream into the segments of clause 7;
 //! [`generic`] decodes a region of pixels out of the arithmetic decoder, which
-//! is the procedure every other region type is ultimately built from; and
-//! [`page`] walks a segment sequence, compositing each region onto the page.
+//! is the procedure every other region type is ultimately built from;
+//! [`symbol_dict`] and [`text_region`] are the pair a scanned page of text is
+//! actually made of; and [`page`] walks a segment sequence, compositing each
+//! region onto the page.
 //!
 //! Cutting across that stack is [`budget`], the allowance of decoding work one
 //! embedded stream is allowed to spend. Every dimension the region decoders
@@ -20,13 +23,6 @@
 //! coded bytes it claims to, so the budget is what ties the cost of decoding to
 //! something the input cannot inflate.
 
-// The symbol dictionary and the text region between them consume nine of the
-// thirteen integer procedures of `arith_int`; the aggregate count and the four
-// refinement procedures wait for refinement coding, and until then are
-// reachable only from this module's own tests. The allow sits on the module
-// declaration rather than at the root of this file so that the modules still
-// being built keep the lint.
-#[allow(dead_code)]
 pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod budget;
@@ -35,18 +31,15 @@ pub(crate) mod mq;
 pub(crate) mod page;
 pub(crate) mod reader;
 pub(crate) mod segment;
-// Nothing dispatches to the symbol dictionary yet: the page walk gains its arm
-// once the text region that consumes the exported symbols exists.
-#[allow(dead_code)]
 pub(crate) mod symbol_dict;
-// Nothing dispatches to the text region yet either: the page walk gains both
-// arms at once, since a text region is meaningless without the dictionary that
-// supplies its symbols.
-#[allow(dead_code)]
 pub(crate) mod text_region;
 
 #[cfg(test)]
 pub(crate) mod testing;
+
+use crate::error::Error;
+use crate::object::{Dict, Object};
+use crate::parser::Resolve;
 
 /// A decoding failure inside the JBIG2 codec.
 ///
@@ -83,22 +76,103 @@ impl core::fmt::Display for Jbig2Error {
     }
 }
 
-impl From<Jbig2Error> for crate::error::Error {
+impl From<Jbig2Error> for Error {
     fn from(err: Jbig2Error) -> Self {
-        crate::error::Error::Decode(err.to_string())
+        Error::Decode(err.to_string())
+    }
+}
+
+/// Decodes a `JBIG2Decode` stream to 1-bit `/DeviceGray` sample data
+/// (ISO 32000-1 7.4.7).
+///
+/// `dict` is the image XObject's own dictionary, which is where the page
+/// geometry comes from: an embedded JBIG2 stream carries no dimensions the
+/// decoder may trust, so `/Width` and `/Height` decide how large a page the
+/// segments are composited onto. `parms` is this filter's entry in
+/// `/DecodeParms`, whose `/JBIG2Globals` names a second stream of segments
+/// shared between pages (T.88 Annex D.3); those are walked first, on the same
+/// work budget.
+///
+/// The returned bytes are inverted relative to the coded pixels. JBIG2 codes a
+/// 1 as ink and `/DeviceGray` reads a 0 sample as black, so the two conventions
+/// are reconciled here — see [`bitmap::Bitmap::to_pdf_samples`], which is the
+/// only place in the codec that flips a bit for this reason.
+pub(crate) fn decode_pdf_stream(
+    data: &[u8],
+    parms: Option<&Dict>,
+    dict: &Dict,
+    resolver: &dyn Resolve,
+) -> crate::error::Result<Vec<u8>> {
+    let width = dimension(dict, "Width", resolver)?;
+    let height = dimension(dict, "Height", resolver)?;
+    let globals = match parms.and_then(|p| p.get("JBIG2Globals")) {
+        // The decode parameters have already been resolved, so a reference to
+        // the globals stream arrives here as the stream itself.
+        Some(Object::Stream(stream)) => {
+            if has_jbig2_filter(&stream.dict, resolver) {
+                // Globals that are themselves JBIG2-coded would send
+                // `decode_stream` back through this function, and a document
+                // is free to make that cycle unbounded.
+                return Err(Error::Decode(
+                    "/JBIG2Globals must not itself be JBIG2-coded".into(),
+                ));
+            }
+            super::decode_stream(stream, resolver)?
+        }
+        // No globals is the ordinary case: a self-contained page stream.
+        _ => Vec::new(),
+    };
+    let page = page::decode_embedded(&globals, data, width, height)?;
+    Ok(page.to_pdf_samples())
+}
+
+/// Reads `/Width` or `/Height` off the image dictionary as a positive pixel
+/// count.
+///
+/// Both are required entries of an image XObject (ISO 32000-1 Table 89) and
+/// both are integers there; a real is accepted and truncated, since a producer
+/// that writes `8.0` has still said eight. Zero, negative and out-of-range
+/// values are refused rather than clamped: there is no page to decode onto, and
+/// a silently resized one would place every region wrongly.
+fn dimension(dict: &Dict, key: &'static str, resolver: &dyn Resolve) -> crate::error::Result<u32> {
+    let value = match super::resolve_value(dict.get(key), resolver) {
+        Some(Object::Int(v)) => v,
+        Some(Object::Real(v)) if v.is_finite() => v as i64,
+        _ => return Err(Error::MissingKey(key)),
+    };
+    match u32::try_from(value) {
+        Ok(v) if v > 0 => Ok(v),
+        _ => Err(Error::Decode(format!(
+            "JBIG2 image /{key} of {value} is not a pixel count"
+        ))),
+    }
+}
+
+/// Whether a stream's own `/Filter` chain names `JBIG2Decode`.
+///
+/// Only the name matters, not its position: a globals stream is refused for
+/// carrying the filter at all, so there is nothing to gain from working out
+/// whether the chain would have reached it.
+fn has_jbig2_filter(dict: &Dict, resolver: &dyn Resolve) -> bool {
+    let named = |obj: Option<Object>| matches!(obj, Some(Object::Name(n)) if n.0 == "JBIG2Decode");
+    match super::resolve_value(dict.get("Filter"), resolver) {
+        Some(Object::Array(items)) => items
+            .iter()
+            .any(|item| named(super::resolve_value(Some(item), resolver))),
+        other => named(other),
     }
 }
 
 /// Drives the arithmetic layers over arbitrary bytes, for the robustness
 /// sweep below.
 ///
-/// The integer procedures are consumed by the symbol dictionary and text
-/// region decoders, neither of which exists yet, so no segment [`page`] can
-/// dispatch reaches them. This hook stands in for that caller: it interleaves
-/// three integer procedures and a symbol-ID decode against one
+/// It interleaves three integer procedures and a symbol-ID decode against one
 /// [`mq::MqDecoder`], which is the shape every region decoder has — several
 /// procedures drawing from a single arithmetic stream, each adapting its own
-/// contexts.
+/// contexts. Reaching that shape directly, rather than through a segment,
+/// is what lets the sweep put arbitrary bytes into it: a real symbol
+/// dictionary's coded data is preceded by a header that would reject almost
+/// all of them before the arithmetic layer saw a byte.
 ///
 /// Nothing is asserted about the values. The property under test is that the
 /// call returns at all: any byte string, of any length, must decode to *some*

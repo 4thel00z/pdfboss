@@ -362,8 +362,34 @@ pub(crate) fn split_after_segment(stream: &[u8], number: u32) -> usize {
     panic!("no segment numbered {number}");
 }
 
+/// An embedded stream (T.88 Annex D.3) holding one immediate generic region
+/// that covers the page, with the page's width and height.
+///
+/// The pixels are fixed so that a test can state the sample bytes by hand:
+/// eight columns and two rows, the first row `10000000` and the second
+/// `01010101`. Packed as JBIG2 codes them that is `80 55`; inverted for
+/// `/DeviceGray` it is `7F AA`. None of those four bytes is a palindrome or
+/// the complement of its neighbour, so neither a dropped inversion nor a
+/// reversed bit order can produce them by accident.
+pub(crate) fn generic_region_stream() -> (Vec<u8>, u32, u32) {
+    let bm = glyph(&["10000000", "01010101"]);
+
+    let mut enc = MqEncoder::new();
+    let mut gb = vec![MqContext::default(); GB_CONTEXT_LEN];
+    encode_pixels(&mut enc, &mut gb, &bm);
+
+    let mut region = region_info_bytes(bm.width(), bm.height());
+    region.push(0); // MMR 0, template 0, TPGDON 0
+    region.extend_from_slice(&nominal_at_bytes());
+    region.extend_from_slice(&enc.finish());
+
+    let mut out = header(0, 38, &[], 1, region.len() as u32);
+    out.extend_from_slice(&region);
+    out.extend_from_slice(&header(1, 49, &[], 1, 0)); // end of page
+    (out, bm.width(), bm.height())
+}
+
 /// Asserts that `symbol` was drawn into `region` with its top-left pixel at
-/// `(x, y)`, pixel for pixel.
 ///
 /// Reading through [`Bitmap::get`] means a placement that hangs off an edge
 /// compares against the zeros outside the region rather than indexing out of

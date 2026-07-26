@@ -1,7 +1,14 @@
 //! Stream filters (ISO 32000 §7.4): FlateDecode, LZWDecode, ASCIIHexDecode,
-//! ASCII85Decode, RunLengthDecode, plus PNG/TIFF predictors. `DCTDecode` is
-//! passthrough (decoded at the image layer); `JPXDecode`, `Crypt` and the
-//! rest are unsupported.
+//! ASCII85Decode, RunLengthDecode, JBIG2Decode, plus PNG/TIFF predictors.
+//! `DCTDecode` is passthrough (decoded at the image layer); `JPXDecode`,
+//! `Crypt` and the rest are unsupported.
+//!
+//! `JBIG2Decode` (§7.4.7) is decoded here rather than at the image layer,
+//! because what comes out of the codec is ordinary 1-bit `/DeviceGray` sample
+//! data: nothing downstream needs to know the image was JBIG2-coded at all.
+//! It is the one filter that reads the image dictionary it belongs to, since
+//! an embedded JBIG2 stream takes its page geometry from `/Width` and
+//! `/Height`.
 //!
 //! Passthrough is reserved for codecs a consumer of the decoded bytes can
 //! actually read. `JPXDecode` (§7.4.9) is not one of them: nothing in this
@@ -92,9 +99,10 @@ fn parms_at(parms: Option<&Object>, index: usize, resolver: &dyn Resolve) -> Opt
 
 /// Applies the stream's `/Filter` chain (name or array) with the matching
 /// `/DecodeParms` (dict, array, or null) in order and returns the decoded
-/// bytes. The one passthrough filter, `DCTDecode`, is only accepted as the
-/// last element of the chain; `JPXDecode`, `Crypt` and unknown filters yield
-/// [`Error::UnsupportedFilter`].
+/// bytes. Two filters are accepted only as the last element of the chain: the
+/// passthrough `DCTDecode`, and `JBIG2Decode`, whose codec reads the stream
+/// dictionary the chain belongs to. `JPXDecode`, `Crypt` and unknown filters
+/// yield [`Error::UnsupportedFilter`].
 pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>> {
     let filter = resolve_value(stream.dict.get("Filter"), resolver);
     // Filters keep their original position so that `/DecodeParms` arrays
@@ -134,6 +142,13 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
             "ASCIIHexDecode" | "AHx" => ascii_hex::decode(&data)?,
             "ASCII85Decode" | "A85" => ascii85::decode(&data)?,
             "RunLengthDecode" | "RL" => run_length::decode(&data)?,
+            // JBIG2 is decoded to samples here: the result is 1-bit
+            // `/DeviceGray` data like any other, so the image layer has
+            // nothing left to do. Only as the last filter, since the codec
+            // reads the bytes of the stream itself, not of a later stage.
+            "JBIG2Decode" if pos == last => {
+                jbig2::decode_pdf_stream(&data, parms, &stream.dict, resolver)?
+            }
             // JPEG stays encoded; the image layer decodes it. No other
             // codec may be handed back undecoded: a caller cannot tell
             // codestream bytes from decoded samples, and would paint them.
@@ -492,6 +507,231 @@ mod tests {
             decode_stream(&s, &NoResolve),
             Err(Error::Decode(_))
         ));
+    }
+
+    /// A `JBIG2Decode` stream decodes to packed 1-bit `/DeviceGray` samples
+    /// with ink as 0 (ISO 32000-1 §7.4.7).
+    ///
+    /// The fixture's two rows are `10000000` and `01010101`, so the samples
+    /// are the complement of those bits, byte for byte. Asserting them
+    /// literally is what makes a missing — or a doubled — inversion a failure
+    /// rather than a plausible-looking page.
+    #[test]
+    fn jbig2_stream_decodes_to_inverted_packed_samples() {
+        let (data, width, height) = jbig2::testing::generic_region_stream();
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("Width", Object::Int(i64::from(width))),
+                ("Height", Object::Int(i64::from(height))),
+            ],
+            &data,
+        );
+        assert_eq!(
+            decode_stream(&s, &NoResolve).unwrap(),
+            vec![0b0111_1111, 0b1010_1010],
+        );
+    }
+
+    /// The segments may equally arrive through `/JBIG2Globals`, which is how a
+    /// document shares one symbol dictionary across its pages (T.88 Annex D.3).
+    #[test]
+    fn jbig2_globals_are_decoded_before_the_page_stream() {
+        let (data, width, height) = jbig2::testing::generic_region_stream();
+        // Everything but the trailing end-of-page segment moves into globals,
+        // leaving the page stream with only that segment: the pixels can then
+        // only have come from the globals.
+        let split = data.len() - 11;
+        let globals = Stream {
+            dict: Dict::new(),
+            data: data[..split].to_vec(),
+        };
+        let parms = make_dict(vec![("JBIG2Globals", Object::Stream(globals))]);
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("DecodeParms", Object::Dict(parms)),
+                ("Width", Object::Int(i64::from(width))),
+                ("Height", Object::Int(i64::from(height))),
+            ],
+            &data[split..],
+        );
+        assert_eq!(
+            decode_stream(&s, &NoResolve).unwrap(),
+            vec![0b0111_1111, 0b1010_1010],
+        );
+    }
+
+    /// `/JBIG2Globals` is nearly always an indirect reference, since the point
+    /// of it is to be shared between the images of many pages.
+    #[test]
+    fn jbig2_globals_are_resolved_through_a_reference() {
+        let (data, width, height) = jbig2::testing::generic_region_stream();
+        let split = data.len() - 11;
+        let globals = Stream {
+            dict: Dict::new(),
+            data: data[..split].to_vec(),
+        };
+        let parms = make_dict(vec![(
+            "JBIG2Globals",
+            Object::Ref(ObjRef { num: 4, gen: 0 }),
+        )]);
+        let mut map = HashMap::new();
+        map.insert((4, 0), Object::Stream(globals));
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("DecodeParms", Object::Dict(parms)),
+                ("Width", Object::Int(i64::from(width))),
+                ("Height", Object::Int(i64::from(height))),
+            ],
+            &data[split..],
+        );
+        assert_eq!(
+            decode_stream(&s, &MapResolve(map)).unwrap(),
+            vec![0b0111_1111, 0b1010_1010],
+        );
+    }
+
+    /// Globals that are themselves JBIG2-coded would send `decode_stream` back
+    /// into the codec, and a document may make that cycle unbounded.
+    #[test]
+    fn jbig2_globals_may_not_be_jbig2_coded() {
+        let inner = Stream {
+            dict: make_dict(vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("Width", Object::Int(8)),
+                ("Height", Object::Int(8)),
+            ]),
+            data: Vec::new(),
+        };
+        let parms = make_dict(vec![("JBIG2Globals", Object::Stream(inner))]);
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("DecodeParms", Object::Dict(parms)),
+                ("Width", Object::Int(8)),
+                ("Height", Object::Int(8)),
+            ],
+            b"",
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// Without `/Width` and `/Height` there is no page to decode onto.
+    #[test]
+    fn jbig2_without_dimensions_is_a_decode_error() {
+        let s = make_stream(vec![("Filter", Object::Name(name("JBIG2Decode")))], b"");
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::MissingKey("Width")),
+        ));
+    }
+
+    /// A dimension of zero is not a small page, it is not a page.
+    #[test]
+    fn jbig2_with_a_zero_dimension_is_a_decode_error() {
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("Width", Object::Int(8)),
+                ("Height", Object::Int(0)),
+            ],
+            b"",
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// The dimensions may be indirect, like any other dictionary value.
+    #[test]
+    fn jbig2_dimensions_are_resolved_through_references() {
+        let (data, width, height) = jbig2::testing::generic_region_stream();
+        let mut map = HashMap::new();
+        map.insert((9, 0), Object::Int(i64::from(width)));
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("Width", Object::Ref(ObjRef { num: 9, gen: 0 })),
+                ("Height", Object::Int(i64::from(height))),
+            ],
+            &data,
+        );
+        assert_eq!(
+            decode_stream(&s, &MapResolve(map)).unwrap(),
+            vec![0b0111_1111, 0b1010_1010],
+        );
+    }
+
+    /// A malformed JBIG2 stream is a decode error, not samples.
+    #[test]
+    fn jbig2_garbage_is_a_decode_error() {
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("JBIG2Decode"))),
+                ("Width", Object::Int(8)),
+                ("Height", Object::Int(8)),
+            ],
+            &[0u8; 8],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// `JBIG2Decode` reads the stream's own bytes, so it cannot sit before
+    /// another filter in the chain.
+    #[test]
+    fn jbig2_not_last_is_unsupported() {
+        let s = make_stream(
+            vec![
+                (
+                    "Filter",
+                    Object::Array(vec![
+                        Object::Name(name("JBIG2Decode")),
+                        Object::Name(name("FlateDecode")),
+                    ]),
+                ),
+                ("Width", Object::Int(8)),
+                ("Height", Object::Int(8)),
+            ],
+            b"x",
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::UnsupportedFilter(n)) if n == "JBIG2Decode"
+        ));
+    }
+
+    /// An earlier stage may still compress the embedded stream, which is how
+    /// the segments usually arrive.
+    #[test]
+    fn flate_then_jbig2_decodes() {
+        let (data, width, height) = jbig2::testing::generic_region_stream();
+        let s = make_stream(
+            vec![
+                (
+                    "Filter",
+                    Object::Array(vec![
+                        Object::Name(name("FlateDecode")),
+                        Object::Name(name("JBIG2Decode")),
+                    ]),
+                ),
+                ("Width", Object::Int(i64::from(width))),
+                ("Height", Object::Int(i64::from(height))),
+            ],
+            &zlib(&data),
+        );
+        assert_eq!(
+            decode_stream(&s, &NoResolve).unwrap(),
+            vec![0b0111_1111, 0b1010_1010],
+        );
     }
 
     #[test]

@@ -153,7 +153,6 @@ impl Bitmap {
 
     /// Row `y` as a slice of one byte per pixel, or an empty slice outside the
     /// bitmap.
-    #[allow(dead_code)] // Read by the halftone grid walk, which lands later.
     pub(crate) fn row(&self, y: u32) -> &[u8] {
         if y >= self.height {
             return &[];
@@ -240,7 +239,6 @@ impl Bitmap {
     /// not know whether it is destined for a page, a symbol dictionary, or a
     /// refinement reference, so inverting here would corrupt every use that is
     /// not the last one.
-    #[allow(dead_code)] // Called by the `JBIG2Decode` filter arm, wired later.
     pub(crate) fn pack_rows(&self) -> Vec<u8> {
         let stride = self.width.div_ceil(8) as usize;
         // A bitmap with no columns packs to no bytes, whatever its height, and
@@ -263,6 +261,26 @@ impl Bitmap {
                     }
                 }
             }
+        }
+        out
+    }
+
+    /// Packs to the sample data a `/BitsPerComponent 1` `/DeviceGray` image
+    /// expects (ISO 32000-1 7.4.7), inverting as it goes.
+    ///
+    /// This is the one place the two conventions meet. JBIG2 calls a 1 pixel
+    /// foreground — ink — while `/DeviceGray` reads a 0 sample as black. So the
+    /// bits are inverted here, and nowhere else in the codec;
+    /// [`Bitmap::pack_rows`] stays polarity-neutral because a symbol bitmap and
+    /// a refinement reference are read back as JBIG2 pixels, not as samples.
+    ///
+    /// The padding bits at the end of a row become 1, which reads as white. The
+    /// image layer takes only `width` samples from each row, so their value is
+    /// unobservable; white is the one that keeps a hex dump legible.
+    pub(crate) fn to_pdf_samples(&self) -> Vec<u8> {
+        let mut out = self.pack_rows();
+        for byte in &mut out {
+            *byte = !*byte;
         }
         out
     }
@@ -415,6 +433,24 @@ mod tests {
     fn pack_rows_of_an_exact_byte_width() {
         let bm = from_rows(&["10110010"]);
         assert_eq!(bm.pack_rows(), vec![0b1011_0010]);
+    }
+
+    /// Sample data inverts and packing does not, which is the whole of the
+    /// polarity contract between this type and the filter boundary.
+    #[test]
+    fn pdf_samples_invert_jbig2_polarity() {
+        let bm = from_rows(&["10000000", "01010101"]);
+        assert_eq!(bm.pack_rows(), vec![0b1000_0000, 0b0101_0101]);
+        // A JBIG2 foreground 1 is a `/DeviceGray` sample 0, which is black.
+        assert_eq!(bm.to_pdf_samples(), vec![0b0111_1111, 0b1010_1010]);
+    }
+
+    /// The bits past the last column of a row are padding, and come out white.
+    #[test]
+    fn pdf_sample_padding_bits_are_white() {
+        let bm = from_rows(&["101"]);
+        assert_eq!(bm.pack_rows(), vec![0b1010_0000]);
+        assert_eq!(bm.to_pdf_samples(), vec![0b0101_1111]);
     }
 
     #[test]
