@@ -221,6 +221,100 @@ pub(crate) fn decode_iaid(dec: &mut MqDecoder, cx: &mut IaidCtx) -> u32 {
     id
 }
 
+/// The encoding side of Annex A, for building coded fixtures (T.88 A.2, A.3).
+///
+/// A symbol dictionary or text region is a braid of integer procedures and
+/// generic-region bits sharing one arithmetic decoder, which is not something
+/// that can realistically be authored by hand. Coding a fixture through these
+/// and reading it back through [`decode_int`] and [`decode_iaid`] is how the
+/// layers above are tested; it also pins the value each bit pattern denotes,
+/// which the decode side alone cannot assert about itself.
+///
+/// Compiled only under `cfg(test)`: nothing shipped encodes.
+#[cfg(test)]
+pub(crate) mod encoder {
+    use super::{next_prev, IaidCtx, IntCtx};
+    use crate::filters::jbig2::mq::encoder::MqEncoder;
+
+    /// The six length classes of T.88 A.2, as `(magnitude bits, bias, the
+    /// unary prefix that selects the class after the sign bit)`.
+    ///
+    /// The biases tile the non-negative integers without a gap or an overlap:
+    /// each class starts where the previous one runs out, so every magnitude
+    /// has exactly one encoding and [`encode_int`] can take the first class
+    /// that holds it.
+    const LENGTH_CLASSES: [(u32, u64, &[u8]); 6] = [
+        (2, 0, &[0]),
+        (4, 4, &[1, 0]),
+        (6, 20, &[1, 1, 0]),
+        (8, 84, &[1, 1, 1, 0]),
+        (12, 340, &[1, 1, 1, 1, 0]),
+        (32, 4436, &[1, 1, 1, 1, 1]),
+    ];
+
+    /// Codes one bit into an integer procedure's array, advancing `PREV` the
+    /// way [`decode_int`](super::decode_int) will when it reads the bit back.
+    ///
+    /// [`next_prev`] is applied to the prefix bits as well as the magnitude
+    /// ones. That is the same walk: below 256 it is a plain shift, and the
+    /// sign bit plus a unary class prefix is at most six bits, so `PREV` never
+    /// reaches the clamp before the magnitude loop starts.
+    fn code_bit(enc: &mut MqEncoder, cx: &mut IntCtx, prev: &mut usize, bit: u8) {
+        enc.encode(cx.context_mut(*prev), bit);
+        *prev = next_prev(*prev, bit);
+    }
+
+    /// Encodes one integer with the arithmetic integer procedure (T.88 A.2):
+    /// a sign bit, the unary length class that holds the magnitude, and that
+    /// class's magnitude bits, most significant first.
+    ///
+    /// `None` encodes OOB, which is the sign bit set over a magnitude of zero.
+    /// `Some(0)` must therefore take the positive branch — a negative zero is
+    /// the terminator, not a value.
+    ///
+    /// The magnitude is widened to [`u64`] before the class bias is removed:
+    /// `i32::MIN` has a magnitude of 2^31, which the 32-bit class carries only
+    /// once its bias of 4436 is subtracted, and the comparison against the
+    /// last class's ceiling of `4436 + 2^32` does not fit a [`u32`] either.
+    pub(crate) fn encode_int(enc: &mut MqEncoder, cx: &mut IntCtx, value: Option<i32>) {
+        let (sign, magnitude) = match value {
+            None => (1u8, 0u64),
+            Some(v) => (u8::from(v < 0), i64::from(v).unsigned_abs()),
+        };
+        let (bits, offset, prefix) = LENGTH_CLASSES
+            .into_iter()
+            .find(|(bits, offset, _)| magnitude < offset + (1u64 << bits))
+            .unwrap_or(LENGTH_CLASSES[5]);
+
+        let mut prev = 1usize;
+        code_bit(enc, cx, &mut prev, sign);
+        for bit in prefix {
+            code_bit(enc, cx, &mut prev, *bit);
+        }
+        let payload = magnitude.saturating_sub(offset);
+        for shift in (0..bits).rev() {
+            let bit = u8::try_from((payload >> shift) & 1).unwrap_or(0);
+            code_bit(enc, cx, &mut prev, bit);
+        }
+    }
+
+    /// Encodes one symbol ID (T.88 A.3): `SBSYMCODELEN` bits, most
+    /// significant first.
+    ///
+    /// `PREV` is a plain shift here, with no clamp — A.3 draws exactly
+    /// `code_len` bits and the array is sized `2^(code_len + 1)`, so the walk
+    /// cannot leave it. IDs at or above `1 << code_len` are truncated to their
+    /// low bits, which is the only thing a `code_len`-bit code can carry.
+    pub(crate) fn encode_iaid(enc: &mut MqEncoder, cx: &mut IaidCtx, id: u32) {
+        let mut prev = 1usize;
+        for shift in (0..cx.code_len()).rev() {
+            let bit = u8::try_from((id >> shift) & 1).unwrap_or(0);
+            enc.encode(cx.context_mut(prev), bit);
+            prev = (prev << 1) | usize::from(bit);
+        }
+    }
+}
+
 /// The thirteen integer procedures of T.88 Annex A, named as the standard
 /// names them.
 ///
@@ -332,62 +426,9 @@ impl IntCtxSet {
 
 #[cfg(test)]
 mod tests {
+    use super::encoder::{encode_iaid, encode_int};
     use super::*;
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqDecoder};
-
-    /// The six length classes of T.88 A.2, as `(magnitude bits, bias, the
-    /// unary prefix that selects the class after the sign bit)`.
-    const LENGTH_CLASSES: [(u32, u64, &[u8]); 6] = [
-        (2, 0, &[0]),
-        (4, 4, &[1, 0]),
-        (6, 20, &[1, 1, 0]),
-        (8, 84, &[1, 1, 1, 0]),
-        (12, 340, &[1, 1, 1, 1, 0]),
-        (32, 4436, &[1, 1, 1, 1, 1]),
-    ];
-
-    /// Codes one bit into an integer procedure's array, advancing `PREV` the
-    /// way [`decode_int`] will when it reads the bit back.
-    fn code_bit(enc: &mut MqEncoder, cx: &mut IntCtx, prev: &mut usize, bit: u8) {
-        enc.encode(cx.context_mut(*prev), bit);
-        *prev = next_prev(*prev, bit);
-    }
-
-    /// The encoding side of T.88 A.2: a sign bit, the unary length class that
-    /// holds the magnitude, and that class's magnitude bits, most significant
-    /// first. `None` codes OOB — the sign bit over a magnitude of zero.
-    fn encode_int(enc: &mut MqEncoder, cx: &mut IntCtx, value: Option<i32>) {
-        let (sign, magnitude) = match value {
-            None => (1u8, 0u64),
-            Some(v) => (u8::from(v < 0), i64::from(v).unsigned_abs()),
-        };
-        let (bits, offset, prefix) = LENGTH_CLASSES
-            .into_iter()
-            .find(|(bits, offset, _)| magnitude < offset + (1u64 << bits))
-            .unwrap_or(LENGTH_CLASSES[5]);
-
-        let mut prev = 1usize;
-        code_bit(enc, cx, &mut prev, sign);
-        for bit in prefix {
-            code_bit(enc, cx, &mut prev, *bit);
-        }
-        let payload = magnitude.saturating_sub(offset);
-        for shift in (0..bits).rev() {
-            let bit = u8::try_from((payload >> shift) & 1).unwrap_or(0);
-            code_bit(enc, cx, &mut prev, bit);
-        }
-    }
-
-    /// The encoding side of T.88 A.3: `SBSYMCODELEN` bits of the ID, most
-    /// significant first.
-    fn encode_iaid(enc: &mut MqEncoder, cx: &mut IaidCtx, id: u32) {
-        let mut prev = 1usize;
-        for shift in (0..cx.code_len()).rev() {
-            let bit = u8::try_from((id >> shift) & 1).unwrap_or(0);
-            enc.encode(cx.context_mut(prev), bit);
-            prev = (prev << 1) | usize::from(bit);
-        }
-    }
 
     /// Every value A.2 can carry survives a round trip through the encoding
     /// side of the same clause: the boundaries of all six length classes,
@@ -411,6 +452,7 @@ mod tests {
             Some(4_435),
             Some(4_436),
             Some(65_536),
+            Some(100_000),
             Some(i32::MAX),
             None,
             Some(-1),
@@ -425,6 +467,7 @@ mod tests {
             Some(-4_435),
             Some(-4_436),
             Some(-70_000),
+            Some(-100_000),
             Some(i32::MIN),
             None,
         ];
@@ -444,6 +487,73 @@ mod tests {
             .collect();
         assert_eq!(decoded, values);
         assert_eq!(dec_cx.state_digest(), enc_cx.state_digest());
+    }
+
+    /// Zero and OOB differ by a single decoded bit — the sign set over a
+    /// magnitude of nothing — and every caller reads OOB as a list
+    /// terminator. Confusing the two turns each terminator into a legitimate
+    /// value, so the distinction gets a test of its own rather than only
+    /// riding along inside a larger sweep.
+    #[test]
+    fn zero_and_oob_are_distinguishable() {
+        let mut enc = MqEncoder::new();
+        let mut enc_cx = IntCtx::new();
+        encode_int(&mut enc, &mut enc_cx, Some(0));
+        encode_int(&mut enc, &mut enc_cx, None);
+        encode_int(&mut enc, &mut enc_cx, Some(0));
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = IntCtx::new();
+        assert_eq!(decode_int(&mut dec, &mut dec_cx), Some(0));
+        assert_eq!(decode_int(&mut dec, &mut dec_cx), None);
+        assert_eq!(decode_int(&mut dec, &mut dec_cx), Some(0));
+    }
+
+    /// Several procedures braided into one arithmetic stream come back in the
+    /// same braid.
+    ///
+    /// This is the shape a symbol dictionary or text region actually has: one
+    /// MQ decoder, thirteen context arrays, and a decode order fixed by the
+    /// clause rather than by the data. Each array must adapt only on the bits
+    /// drawn against it, so a value coded through `IADH` and a value coded
+    /// through `IADW` between two `IADH` values must not disturb one another.
+    /// Repeating a value through the same procedure also pins that the
+    /// adaptation is applied — the second `Some(7)` costs fewer bits than the
+    /// first and still decodes the same.
+    #[test]
+    fn round_trips_interleaved_procedures() {
+        let plan: [(usize, Option<i32>); 9] = [
+            (0, Some(7)),
+            (1, Some(-3)),
+            (0, Some(7)),
+            (2, None),
+            (1, Some(1_200)),
+            (0, Some(0)),
+            (2, Some(-1)),
+            (1, None),
+            (0, Some(42)),
+        ];
+
+        let mut enc = MqEncoder::new();
+        let mut enc_cx = [IntCtx::new(), IntCtx::new(), IntCtx::new()];
+        for (which, value) in &plan {
+            encode_int(&mut enc, &mut enc_cx[*which], *value);
+        }
+        let coded = enc.finish();
+
+        let mut dec = MqDecoder::new(&coded);
+        let mut dec_cx = [IntCtx::new(), IntCtx::new(), IntCtx::new()];
+        for (i, (which, want)) in plan.iter().enumerate() {
+            assert_eq!(decode_int(&mut dec, &mut dec_cx[*which]), *want, "step {i}");
+        }
+        for (which, (enc_one, dec_one)) in enc_cx.iter().zip(&dec_cx).enumerate() {
+            assert_eq!(
+                dec_one.state_digest(),
+                enc_one.state_digest(),
+                "procedure {which} adapted differently on the two sides"
+            );
+        }
     }
 
     /// A long pseudo-random run round-trips too, so the context array is
@@ -487,7 +597,7 @@ mod tests {
     /// zero-bit code (T.88 A.3).
     #[test]
     fn symbol_ids_round_trip_through_annex_a() {
-        for len in 0u32..=10 {
+        for len in 0u32..=12 {
             let modulus = 1u32 << len;
             let ids: Vec<u32> = (0..128u32)
                 .map(|i| i.wrapping_mul(37).wrapping_add(5) % modulus)
