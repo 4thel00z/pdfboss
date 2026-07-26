@@ -1,5 +1,6 @@
-//! Segment headers (T.88 7.2), the segment type table (7.3), and the
-//! PDF-embedded segment sequence of Annex D.3.
+//! Segment headers (T.88 7.2), the segment type table (7.3), the region
+//! segment information field (7.4.1), and the PDF-embedded segment sequence of
+//! Annex D.3.
 //!
 //! A `JBIG2Decode` stream is not a JBIG2 file: there is no file header, no
 //! page count and no random-access index. Annex D.3 defines it as the bare
@@ -11,6 +12,7 @@
 //! Every field here is read from a PDF stream, so every field is bounds-checked
 //! and every count is capped before it sizes an allocation.
 
+use super::bitmap::CombOp;
 use super::reader::Reader;
 use super::Jbig2Error;
 
@@ -24,12 +26,8 @@ use super::Jbig2Error;
 /// short header and a gigabyte of `Vec`.
 pub(crate) const MAX_REFERRED_TO: u32 = 65_536;
 
-/// The fixed part of a region segment's data (T.88 7.4.1): width, height, X, Y
-/// and the external combination operator flags.
-///
-/// Only the unknown-length scan needs it here — it has to step over the block
-/// to reach the generic region flags — so the length is all this module knows
-/// about it.
+/// The length in bytes of the region segment information field (T.88 7.4.1):
+/// four four-byte coordinates and a flags byte.
 const REGION_INFO_LEN: usize = 17;
 
 /// The kind of a segment, from the type field of T.88 7.3, Table 34.
@@ -147,6 +145,52 @@ pub(crate) struct Segment<'a> {
     pub(crate) header: SegmentHeader,
     /// The segment's data, borrowed from the input.
     pub(crate) data: &'a [u8],
+}
+
+/// The region segment information field every region segment's data opens with
+/// (T.88 7.4.1).
+///
+/// The coordinates place the region on the page; the operator says how its
+/// pixels combine with what is already there. A generic, text, halftone or
+/// refinement region all start with this same block, which is why it is parsed
+/// here rather than in any one region decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RegionInfo {
+    /// The region's width in pixels.
+    pub(crate) width: u32,
+    /// The region's height in pixels.
+    pub(crate) height: u32,
+    /// The X coordinate of the region's left edge on the page.
+    pub(crate) x: u32,
+    /// The Y coordinate of the region's top edge on the page.
+    pub(crate) y: u32,
+    /// The external combination operator, from bits 0 to 2 of the flags byte.
+    pub(crate) op: CombOp,
+}
+
+/// Parses the region segment information field from `r` (T.88 7.4.1).
+///
+/// On success the cursor sits on the first byte of the region-type-specific
+/// data that follows. Bits 3 to 7 of the flags byte are reserved: a stream that
+/// sets one is using an extension whose effect on the pixels this decoder
+/// cannot see, so it is refused rather than masked off.
+pub(crate) fn parse_region_info(r: &mut Reader<'_>) -> Result<RegionInfo, Jbig2Error> {
+    let width = r.u32()?;
+    let height = r.u32()?;
+    let x = r.u32()?;
+    let y = r.u32()?;
+    let flags = r.u8()?;
+    if flags & 0xF8 != 0 {
+        return Err(Jbig2Error::Malformed("reserved region flag bits"));
+    }
+    let op = CombOp::from_bits(flags & 0x07)?;
+    Ok(RegionInfo {
+        width,
+        height,
+        x,
+        y,
+        op,
+    })
 }
 
 /// Parses one segment header from `r` (T.88 7.2).
@@ -602,6 +646,68 @@ mod tests {
         seg.extend_from_slice(&9u32.to_be_bytes());
         for cut in 0..seg.len() {
             let _ = parse_embedded(&seg[..cut]);
+        }
+    }
+
+    /// The 7.4.1 block, field by field, with the operator taken from the low
+    /// three bits of the flags byte.
+    #[test]
+    fn parses_a_region_information_field() {
+        let mut bytes = 40u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&30u32.to_be_bytes());
+        bytes.extend_from_slice(&7u32.to_be_bytes());
+        bytes.extend_from_slice(&9u32.to_be_bytes());
+        bytes.push(2); // XOR
+        bytes.push(0xEE); // one byte of the region's own data
+        let mut r = Reader::new(&bytes);
+        let info = parse_region_info(&mut r).expect("region info");
+        assert_eq!(info.width, 40);
+        assert_eq!(info.height, 30);
+        assert_eq!(info.x, 7);
+        assert_eq!(info.y, 9);
+        assert_eq!(info.op, CombOp::Xor);
+        // The cursor sits on the first byte after the fixed block.
+        assert_eq!(r.pos(), REGION_INFO_LEN);
+        assert_eq!(r.u8(), Ok(0xEE));
+    }
+
+    /// Bits 3 to 7 of the flags byte are reserved. A stream that sets one is
+    /// using an extension this decoder cannot see, so its pixels cannot be
+    /// trusted either.
+    #[test]
+    fn rejects_reserved_region_flag_bits() {
+        for bit in 3..8u8 {
+            let mut bytes = vec![0u8; 16];
+            bytes.push(1 << bit);
+            let mut r = Reader::new(&bytes);
+            assert_eq!(
+                parse_region_info(&mut r),
+                Err(Jbig2Error::Malformed("reserved region flag bits")),
+                "bit {bit}",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_reserved_region_combination_operator() {
+        for op in 5..8u8 {
+            let mut bytes = vec![0u8; 16];
+            bytes.push(op);
+            let mut r = Reader::new(&bytes);
+            assert_eq!(
+                parse_region_info(&mut r),
+                Err(Jbig2Error::Malformed("reserved combination operator")),
+                "operator {op}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_region_information_field_is_truncated() {
+        for len in 0..REGION_INFO_LEN {
+            let bytes = vec![0u8; len];
+            let mut r = Reader::new(&bytes);
+            assert_eq!(parse_region_info(&mut r), Err(Jbig2Error::Truncated));
         }
     }
 

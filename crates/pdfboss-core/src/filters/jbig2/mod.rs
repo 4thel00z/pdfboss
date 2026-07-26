@@ -19,6 +19,7 @@ pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod generic;
 pub(crate) mod mq;
+pub(crate) mod page;
 pub(crate) mod reader;
 pub(crate) mod segment;
 
