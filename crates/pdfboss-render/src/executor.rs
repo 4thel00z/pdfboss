@@ -1810,14 +1810,14 @@ mod tests {
         // The page's only content is `/Im0 Do`, where Im0 carries a filter
         // the core does not implement. The page must still render (lenient),
         // but the drop must be reported.
-        let (pix, report) = render_reporting(doc_with_image_filter("JBIG2Decode"));
+        let (pix, report) = render_reporting(doc_with_image_filter("JPXDecode"));
 
         assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
         );
@@ -1825,7 +1825,7 @@ mod tests {
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
         assert_eq!(
             report.warnings(),
-            vec!["1 image skipped: unsupported filter /JBIG2Decode".to_string()],
+            vec!["1 image skipped: unsupported filter /JPXDecode".to_string()],
         );
     }
 
@@ -1845,13 +1845,13 @@ mod tests {
     #[test]
     fn unsupported_inline_image_filter_is_reported() {
         let content = "q 100 0 0 100 0 0 cm BI /W 8 /H 8 /BPC 1 /CS /G \
-                       /F /JBIG2Decode ID 01234567 EI Q";
+                       /F /JPXDecode ID 01234567 EI Q";
         let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JBIG2Decode".to_string()),
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
         );
@@ -1891,7 +1891,7 @@ mod tests {
             b.stream(
                 5,
                 "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode",
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JPXDecode",
                 &[0; 8],
             );
         });
@@ -1923,7 +1923,7 @@ mod tests {
         b.stream(
             5,
             "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JBIG2Decode",
+             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JPXDecode",
             &[0; 8],
         );
         for level in 0..LEVELS {

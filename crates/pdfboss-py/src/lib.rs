@@ -408,7 +408,7 @@ impl Page {
     ///
     /// `warnings` is one human-readable line per distinct piece of content
     /// the render had to drop or approximate, e.g. `"1 image skipped:
-    /// unsupported filter /JBIG2Decode"`. It is empty when the page
+    /// unsupported filter /JPXDecode"`. It is empty when the page
     /// rasterized exactly as it describes itself, so a blank page is never
     /// mistaken for a clean render.
     #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None))]
