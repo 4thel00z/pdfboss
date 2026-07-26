@@ -102,11 +102,13 @@ pub(crate) struct MqContext {
 
 impl MqContext {
     /// The context's current row in [`QE`].
+    #[allow(dead_code)] // Read by the test-only encoder and by later decoders.
     pub(crate) fn index(&self) -> u8 {
         self.index
     }
 
     /// The context's current more-probable-symbol sense, 0 or 1.
+    #[allow(dead_code)] // Read by the test-only encoder and by later decoders.
     pub(crate) fn mps(&self) -> u8 {
         self.mps
     }
@@ -148,6 +150,7 @@ impl MqContexts {
 
     /// Returns every context to state 0 / MPS 0, as required when a segment
     /// declares that its arithmetic statistics are not retained.
+    #[allow(dead_code)] // Called by the symbol dictionary, which lands later.
     pub(crate) fn reset(&mut self) {
         self.0.fill(MqContext::default());
     }
@@ -307,6 +310,7 @@ impl<'a> MqDecoder<'a> {
     /// it at or above 0x8000, so no more than 0x7FFF decisions can pass
     /// between two shifts; 32 shifts are needed, so the marker fill is spent
     /// within 2^20 decisions of the lock at the very worst.
+    #[allow(dead_code)] // Ends the OOB-terminated lists of the later decoders.
     pub(crate) fn is_exhausted(&self) -> bool {
         self.fill_shifts >= MARKER_FILL_SHIFTS
     }

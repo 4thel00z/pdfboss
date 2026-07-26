@@ -9,12 +9,17 @@
 //! [`arith_int`] builds the integer procedures on top of it (Annex A);
 //! [`bitmap`] is the bilevel pixel buffer every region decodes into;
 //! [`reader`] is the bounds-checked byte cursor the header parsers run on;
-//! [`segment`] splits a PDF-embedded stream into the segments of clause 7; and
+//! [`segment`] splits a PDF-embedded stream into the segments of clause 7;
 //! [`generic`] decodes a region of pixels out of the arithmetic decoder, which
-//! is the procedure every other region type is ultimately built from.
+//! is the procedure every other region type is ultimately built from; and
+//! [`page`] walks a segment sequence, compositing each region onto the page.
 
-#![allow(dead_code)] // Consumed by the segment layer, which lands next.
-
+// Every procedure in `arith_int` is consumed by the symbol dictionary and text
+// region decoders, which land in a later change; until then the module is
+// reachable only from its own tests. The allow sits on the module declaration
+// rather than at the root of this file so that the modules still being built
+// keep the lint.
+#[allow(dead_code)]
 pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod generic;
@@ -62,12 +67,13 @@ impl From<Jbig2Error> for crate::error::Error {
 /// Drives the arithmetic layers over arbitrary bytes, for the robustness
 /// sweep below.
 ///
-/// The segment layer is what will eventually feed these decoders, and it does
-/// not exist yet, so there is no reachable path from `decode_stream` to assert
-/// against. This hook stands in for it: it interleaves three integer
-/// procedures and a symbol-ID decode against one [`mq::MqDecoder`], which is
-/// the shape every region decoder has — several procedures drawing from a
-/// single arithmetic stream, each adapting its own contexts.
+/// The integer procedures are consumed by the symbol dictionary and text
+/// region decoders, neither of which exists yet, so no segment [`page`] can
+/// dispatch reaches them. This hook stands in for that caller: it interleaves
+/// three integer procedures and a symbol-ID decode against one
+/// [`mq::MqDecoder`], which is the shape every region decoder has — several
+/// procedures drawing from a single arithmetic stream, each adapting its own
+/// contexts.
 ///
 /// Nothing is asserted about the values. The property under test is that the
 /// call returns at all: any byte string, of any length, must decode to *some*

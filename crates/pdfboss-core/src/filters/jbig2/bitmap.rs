@@ -101,11 +101,13 @@ impl Bitmap {
     }
 
     /// The bitmap's width in pixels.
+    #[allow(dead_code)] // Read by the symbol dictionary, which lands later.
     pub(crate) fn width(&self) -> u32 {
         self.width
     }
 
     /// The bitmap's height in pixels.
+    #[allow(dead_code)] // Read by the symbol dictionary, which lands later.
     pub(crate) fn height(&self) -> u32 {
         self.height
     }
@@ -142,6 +144,7 @@ impl Bitmap {
 
     /// Row `y` as a slice of one byte per pixel, or an empty slice outside the
     /// bitmap.
+    #[allow(dead_code)] // Read by the halftone grid walk, which lands later.
     pub(crate) fn row(&self, y: u32) -> &[u8] {
         if y >= self.height {
             return &[];
@@ -228,6 +231,7 @@ impl Bitmap {
     /// not know whether it is destined for a page, a symbol dictionary, or a
     /// refinement reference, so inverting here would corrupt every use that is
     /// not the last one.
+    #[allow(dead_code)] // Called by the `JBIG2Decode` filter arm, wired later.
     pub(crate) fn pack_rows(&self) -> Vec<u8> {
         let stride = self.width.div_ceil(8) as usize;
         let mut out = vec![0u8; stride * self.height as usize];
