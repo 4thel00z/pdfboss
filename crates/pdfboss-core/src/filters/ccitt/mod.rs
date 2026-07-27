@@ -15,12 +15,18 @@
 
 use std::fmt;
 
-// Only these modules' own tests read from them so far; the row decoder that
-// will is the next layer up.
+// The callers that will reach the decoder — the PDF filter and the JBIG2
+// generic region — are not wired up yet, so nothing outside the tests reads
+// from these modules for the moment.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod bits;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod codes;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod decoder;
+
+#[cfg(test)]
+pub(crate) mod testing;
 
 /// A failure decoding a T.4 or T.6 stream.
 ///
@@ -40,9 +46,26 @@ pub(crate) enum CcittError {
     /// A run that would extend past the end of the row, or a chain of make-up
     /// codes describing a run wider than any row this build will decode.
     RunTooLong,
-    /// A construct this build does not decode (the two-dimensional extension
-    /// escape of ITU-T T.6 §2.2).
+    /// A decoded construct that cannot be applied to the row it appears in —
+    /// most importantly a coding mode that would leave the row's reference
+    /// position where it was, which is how a corrupt stream asks to be decoded
+    /// forever.
+    Malformed(&'static str),
+    /// A construct this build does not decode, such as the two-dimensional
+    /// extension escape of ITU-T T.6 §2.2.
     Unimplemented(&'static str),
+    /// A parameter the caller supplied that cannot describe an image.
+    ///
+    /// This is the caller's mistake rather than the stream's: it is settled
+    /// before a bit is read.
+    BadParameter(&'static str),
+    /// An image whose declared size is past what this build will allocate.
+    TooLarge {
+        /// The refused width, in pixels.
+        width: u32,
+        /// The refused height, in pixels.
+        height: u32,
+    },
 }
 
 impl fmt::Display for CcittError {
@@ -50,7 +73,12 @@ impl fmt::Display for CcittError {
         match self {
             CcittError::UnknownCode => f.write_str("no such facsimile code"),
             CcittError::RunTooLong => f.write_str("run length past the end of the row"),
+            CcittError::Malformed(what) => write!(f, "malformed facsimile stream: {what}"),
             CcittError::Unimplemented(what) => write!(f, "unsupported facsimile coding: {what}"),
+            CcittError::BadParameter(what) => write!(f, "unusable facsimile parameter: {what}"),
+            CcittError::TooLarge { width, height } => {
+                write!(f, "facsimile image too large: {width} by {height}")
+            }
         }
     }
 }

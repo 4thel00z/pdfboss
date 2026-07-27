@@ -123,6 +123,18 @@ impl<'a> BitReader<'a> {
         self.pos >= self.end()
     }
 
+    /// How many bits are left unread.
+    ///
+    /// This is what distinguishes a stream that stopped from a stream that is
+    /// wrong. Because [`BitReader::peek`] zero-fills, a lookup that fails with
+    /// fewer bits left than the widest code could have succeeded had the data
+    /// continued — so the failure is the end of the data, not corruption — while
+    /// a lookup that fails with a full window in hand read something that is
+    /// genuinely not a code.
+    pub(crate) fn remaining(&self) -> usize {
+        self.end().saturating_sub(self.pos)
+    }
+
     /// The current position, in bits from the start of the data.
     pub(crate) fn bit_pos(&self) -> usize {
         self.pos
@@ -226,6 +238,16 @@ mod tests {
         assert!(r.is_exhausted());
         assert_eq!(r.read_bit(), None);
         assert_eq!(r.bit_pos(), 8);
+    }
+
+    #[test]
+    fn remaining_counts_down_to_zero_and_stops() {
+        let mut r = BitReader::new(&[0x00, 0x00]);
+        assert_eq!(r.remaining(), 16);
+        r.skip(5);
+        assert_eq!(r.remaining(), 11);
+        r.skip(u32::MAX);
+        assert_eq!(r.remaining(), 0);
     }
 
     #[test]

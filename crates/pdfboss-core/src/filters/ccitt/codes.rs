@@ -44,7 +44,7 @@ pub(crate) struct Code {
 ///
 /// Thirteen is the longest code T.4 assigns (the black extended make-ups), so
 /// one peek this wide always contains whichever code comes next in full.
-const WINDOW_BITS: u32 = 13;
+pub(crate) const WINDOW_BITS: u32 = 13;
 
 /// The width of the peek every mode lookup takes (T.6 §2.2, Table 4).
 const MODE_WINDOW_BITS: u32 = 7;
@@ -313,7 +313,12 @@ pub(crate) enum Mode {
 /// Ordered as the specification lists them rather than by length: the lookup
 /// matches on the peeked window, and the set is prefix-free, so order carries
 /// no meaning.
-const MODE_CODES: &[(u16, u8, Mode)] = &[
+///
+/// Visible to the crate so that the test encoder writes the same patterns this
+/// reader accepts. That makes a round trip blind to a mistyped mode code, which
+/// is why the patterns are also checked directly against Table 4 by this
+/// module's tests.
+pub(crate) const MODE_CODES: &[(u16, u8, Mode)] = &[
     (0b1, 1, Mode::Vertical(0)),
     (0b011, 3, Mode::Vertical(1)),
     (0b010, 3, Mode::Vertical(-1)),
@@ -406,6 +411,7 @@ pub(crate) fn read_mode(r: &mut BitReader) -> Result<Mode, CcittError> {
 mod tests {
     use super::*;
     use crate::filters::ccitt::bits::BitReader;
+    use crate::filters::ccitt::testing::{ext_lookup, lookup, pack, push_code, push_run};
 
     /// A code, its length and a name, in the shape the structural checks want.
     type Entry = (u16, u8, String);
@@ -450,54 +456,6 @@ mod tests {
             }
         }
         None
-    }
-
-    fn lookup(white: bool, run: u16) -> Code {
-        let table = if white { WHITE_CODES } else { BLACK_CODES };
-        match table.iter().find(|c| c.run == run) {
-            Some(code) => *code,
-            None => panic!("no code for run {run}"),
-        }
-    }
-
-    fn ext_lookup(run: u16) -> Code {
-        match EXT_MAKEUP_CODES.iter().find(|c| c.run == run) {
-            Some(code) => *code,
-            None => panic!("no extended make-up for run {run}"),
-        }
-    }
-
-    fn push_code(bits: &mut Vec<u8>, code: Code) {
-        for i in (0..code.len).rev() {
-            bits.push(((code.bits >> i) & 1) as u8);
-        }
-    }
-
-    fn pack(bits: &[u8]) -> Vec<u8> {
-        let mut out = vec![0u8; bits.len().div_ceil(8)];
-        for (i, bit) in bits.iter().enumerate() {
-            if *bit == 1 {
-                out[i / 8] |= 1 << (7 - (i % 8));
-            }
-        }
-        out
-    }
-
-    /// Writes `run` the way an encoder would: the widest make-up that fits,
-    /// then the terminating code for what is left.
-    fn encode_run(bits: &mut Vec<u8>, white: bool, run: u16) {
-        let mut remaining = run;
-        if remaining >= 64 {
-            let makeup = (remaining / 64) * 64;
-            let makeup = if makeup > 2560 { 2560 } else { makeup };
-            if makeup > 1728 {
-                push_code(bits, ext_lookup(makeup));
-            } else {
-                push_code(bits, lookup(white, makeup));
-            }
-            remaining -= makeup;
-        }
-        push_code(bits, lookup(white, remaining));
     }
 
     #[test]
@@ -754,7 +712,7 @@ mod tests {
         for white in [true, false] {
             for run in 0..=2623u16 {
                 let mut bits = Vec::new();
-                encode_run(&mut bits, white, run);
+                push_run(&mut bits, white, u32::from(run));
                 let bytes = pack(&bits);
                 let mut r = BitReader::new(&bytes);
                 assert_eq!(
