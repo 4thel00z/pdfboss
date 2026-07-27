@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.6.0](https://github.com/4thel00z/pdfboss/compare/v0.5.0...v0.6.0) (2026-07-27)
+
+
+### Features
+
+* **core:** add an MSB-first bit reader for fax coding ([27ef2ba](https://github.com/4thel00z/pdfboss/commit/27ef2bae67f8f060bfc23cf33f8ad5358c04e058))
+* **core:** add JBIG2 arithmetic integer decoding procedures ([ff86342](https://github.com/4thel00z/pdfboss/commit/ff86342d38c88f2b0f3c07cc1a6e69bca34a8e3a))
+* **core:** add the JBIG2 bilevel bitmap and composition operators ([c60b56c](https://github.com/4thel00z/pdfboss/commit/c60b56c5829c7dbb0cd37791c279dfb2a153cd91))
+* **core:** add the JBIG2 MQ arithmetic decoder ([98e85b8](https://github.com/4thel00z/pdfboss/commit/98e85b8bae71f290342c9228049faf56866c777f))
+* **core:** add the T.4 run-length code tables ([36b8dae](https://github.com/4thel00z/pdfboss/commit/36b8daee8b5d8ccbc5fb49b216ef0221761faa4e))
+* **core:** assemble JBIG2 pages from embedded segment streams ([0e0feb7](https://github.com/4thel00z/pdfboss/commit/0e0feb7fcf8279a7e780e7b964ba5ae4d2ddd0e0))
+* **core:** decode arithmetic JBIG2 symbol dictionaries ([5208910](https://github.com/4thel00z/pdfboss/commit/5208910ad2d77c5fce088e623c6b05f06cb199f7))
+* **core:** decode arithmetic JBIG2 text regions ([d12a319](https://github.com/4thel00z/pdfboss/commit/d12a319dca8fbdd9c198453b45b76cd6499930ed))
+* **core:** decode CCITTFaxDecode streams ([9a96b1d](https://github.com/4thel00z/pdfboss/commit/9a96b1df7887b1314ae7cf9f51d8d4858d2074a4))
+* **core:** decode JBIG2 generic regions for all four templates ([48f022b](https://github.com/4thel00z/pdfboss/commit/48f022b1e4ec881973283ef564e2631aa9e9a1e7))
+* **core:** decode JBIG2Decode streams to 1-bit DeviceGray samples ([ab22639](https://github.com/4thel00z/pdfboss/commit/ab22639d6e477a69973e450834262e6229034d7e))
+* **core:** decode MMR-coded JBIG2 generic regions ([3f1ab08](https://github.com/4thel00z/pdfboss/commit/3f1ab08bdb4f0f5e0bcdf00818cf05bbd0fd5020))
+* **core:** decode one-dimensional and mixed fax coding ([e09b354](https://github.com/4thel00z/pdfboss/commit/e09b3549e12ac91920e92834d60acb4cf89584e5))
+* **core:** decode two-dimensional fax rows ([9057070](https://github.com/4thel00z/pdfboss/commit/9057070298d5643429ba4269184e4afacc02b9fb))
+* **core:** dispatch JBIG2 symbol dictionaries and text regions ([5aada44](https://github.com/4thel00z/pdfboss/commit/5aada44afbe8de5d5c7cd3571acd23f4791d597b))
+* **core:** let the MQ decoder report that the coded data is spent ([dcb1696](https://github.com/4thel00z/pdfboss/commit/dcb1696bc6e7853f26bbcfd418d6061e5bd4f492))
+* **core:** parse JBIG2 segment headers and embedded streams ([b95b3b8](https://github.com/4thel00z/pdfboss/commit/b95b3b83a88408786990dd934eaffc1680b7b22c))
+* **render:** report images dropped during rasterization ([3b28ff7](https://github.com/4thel00z/pdfboss/commit/3b28ff7306bd2e768fbb2bce37d8d269014f9472))
+
+
+### Bug Fixes
+
+* **core:** bound facsimile decoding by each dimension, not just by area ([4088f9a](https://github.com/4thel00z/pdfboss/commit/4088f9a0f37ef26f3ae91342836ca212ae1cc538))
+* **core:** bound JBIG2 decoding work with a per-stream budget ([3af8507](https://github.com/4thel00z/pdfboss/commit/3af8507a4bac7a42c4d8b5d66ff8a8551c73f55f))
+* **core:** charge the work budget for every JBIG2 symbol, not just its pixels ([383ef68](https://github.com/4thel00z/pdfboss/commit/383ef68fecb9df2c5512b4270f68ef70c2bceb64))
+* **core:** make the Annex A list terminator reachable on every input ([91fbd2b](https://github.com/4thel00z/pdfboss/commit/91fbd2b65816e6e82222e916e83b3939746db959))
+* **core:** reject JPXDecode instead of painting the codestream as pixels ([7a73864](https://github.com/4thel00z/pdfboss/commit/7a7386414f98003a455dd9439e5d9d40dbc59bd5))
+* **core:** stop a zero-width bitmap from costing a pass per row to pack ([28bcfa4](https://github.com/4thel00z/pdfboss/commit/28bcfa4c4ebd48b1cf9a0e147d15a9afef4c2df7))
+* **render:** report every drop, bound the report, and surface it to callers ([bf45bc2](https://github.com/4thel00z/pdfboss/commit/bf45bc25a10bccde8c9d71a916ba29cca8137700))
+
+
+### Performance Improvements
+
+* **core:** form JBIG2 contexts incrementally for nominal AT pixels ([3a7a5f8](https://github.com/4thel00z/pdfboss/commit/3a7a5f86f65b01a95b7c0de03f713ad4a0db703a))
+* **core:** step over white bytes when materialising a buffered row ([bccfbbb](https://github.com/4thel00z/pdfboss/commit/bccfbbb5800b0b532caf473f62a59cd0789b0ad5))
+* **render:** convert one-component samples through a lookup table ([bb74698](https://github.com/4thel00z/pdfboss/commit/bb74698a17c8b1474c9514281bd4529d2ad118e4))
+
+
+### Documentation
+
+* benchmark scanned-document rendering ([32dbf47](https://github.com/4thel00z/pdfboss/commit/32dbf47cf4c2bcb48abdc2a80e53451919633ae9))
+* **core:** bound the wait for the MQ end-of-data signal ([637ab2a](https://github.com/4thel00z/pdfboss/commit/637ab2ac25101945f60299a7dd7e042ac36c8dc2))
+* **core:** describe the row loop the fax decoder now runs ([754035f](https://github.com/4thel00z/pdfboss/commit/754035fbaf175663ceb35fd65c1310f368a4c478))
+* **core:** place generic region decoding in the JBIG2 module layering ([623f880](https://github.com/4thel00z/pdfboss/commit/623f880baeddc44d4a233099064c6c50d9c3989b))
+* **core:** say precisely which page information fields are read ([18326ce](https://github.com/4thel00z/pdfboss/commit/18326ce99c9bee94e6331829dbf081d005b953a6))
+* **core:** say what the fax row decoder does not yet read ([64574ac](https://github.com/4thel00z/pdfboss/commit/64574acc60a7ea1566ae3543441666aa135faf2f))
+* **core:** state the windowed context update's true read count ([10dfe80](https://github.com/4thel00z/pdfboss/commit/10dfe804ec55a4bbe6fc73fd6a2989e1dd87c93c))
+* **core:** state which Table 11 entries the fax filter reads ([719f4e2](https://github.com/4thel00z/pdfboss/commit/719f4e2a8f398028817bd8d335b6bc937e5a1b93))
+* state what JBIG2Decode covers and where it stops ([e99a3e3](https://github.com/4thel00z/pdfboss/commit/e99a3e37a33e2fa8ac7e0e6fe0fbd92972ae8620))
+
 ## [0.5.0](https://github.com/4thel00z/pdfboss/compare/v0.4.1...v0.5.0) (2026-07-25)
 
 
