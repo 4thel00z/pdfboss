@@ -42,7 +42,8 @@ const BEFORE_ROW: i64 = -1;
 pub(crate) struct Params {
     /// Pixels per row. Zero cannot describe an image and is refused.
     pub(crate) columns: u32,
-    /// Rows in the image, or 0 for "as many as the data holds".
+    /// Rows in the image. ISO 32000-1 gives 0 the meaning "as many as the data
+    /// holds", which this build does not yet infer.
     pub(crate) rows: u32,
     /// Below zero selects pure two-dimensional coding; 0 pure
     /// one-dimensional; above zero a mixture, each row carrying a bit that
@@ -62,6 +63,11 @@ pub(crate) struct Params {
 /// bit pattern that is *not* the end of the data but matches no code is
 /// corruption, and is reported: guessing at it would displace every pixel
 /// below.
+///
+/// What is decoded here is the pure two-dimensional form — the whole of what a
+/// JBIG2 generic region uses. The parameters selecting the other forms a PDF
+/// stream may ask for are refused rather than ignored, because ignoring one
+/// reads the wrong bits into a plausible-looking image.
 pub(crate) fn decode(data: &[u8], params: &Params) -> Result<Bitmap, CcittError> {
     if params.columns == 0 {
         return Err(CcittError::BadParameter("an image with no columns"));
