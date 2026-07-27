@@ -104,9 +104,11 @@ pixmap.save_png("page.png")?;
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
-**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JBIG2Decode scans — arithmetic-coded generic regions, symbol dictionaries and text regions, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and embedded-TrueType glyph outlines · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
+**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · CCITTFaxDecode scans — Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans — arithmetic-coded generic regions, symbol dictionaries and text regions, MMR-coded generic regions, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and embedded-TrueType glyph outlines · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
 
 ## Benchmarks
+
+### Text and parsing
 
 Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, aggregated over the files every library handled; pages/sec, higher is faster):
 
@@ -118,13 +120,30 @@ Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, 
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
+### Scanned documents
+
+Scans are the other half of the world's PDFs, and they are a different workload: one full-page bilevel image per page, JBIG2- or CCITT-coded, with no text operators at all. Rendering **is** comparable there — with no glyphs to paint, every library draws the same picture — so it gets its own benchmark, over a 544-page JBIG2 book (1994 × 2832 samples per page) rasterized to PNG at 1:1.
+
+| Library | pages/sec | Ink on page 1 |
+|---|--:|--:|
+| pdfplumber (via pdfium) | 59.6 | 4.87% |
+| PyMuPDF | 56.2 | 4.82% |
+| pypdfium2 | 55.9 | 4.85% |
+| pdfboss | 42.7 | 4.83% |
+
+**Here pdfboss is the slowest of the four, at roughly 0.7× the C-backed renderers** — and the only one of them with no C in it. About two thirds of its time is the JBIG2 arithmetic decoder, which is the honest cost of decoding the format rather than delegating it.
+
+The ink column is what makes the timings mean anything: a library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel — each downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
+
+Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
+
 ## Limitations
 
 Rendered pages paint the outlines of **embedded TrueType** glyphs (Type0/`CIDFontType2` under Identity, and simple `/TrueType` fonts via their `cmap`). Text in other fonts (CFF/Type1 programs, the standard 14, subset fonts without a usable `cmap`) is still positioned but not drawn.
 
-`JBIG2Decode` covers the arithmetic half of the format: generic regions (all four templates, with TPGDON), symbol dictionaries, and text regions. That is what scanners actually emit, but it is not the whole standard, and the rest is refused rather than approximated — a stream using Huffman-coded symbol dictionaries or text regions, custom Huffman tables, refinement or aggregate coding, MMR, pattern dictionaries or halftone regions fails with a message naming the feature, so a scan that will not decode says why on the first try.
+`JBIG2Decode` covers the arithmetic half of the format plus MMR: generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries, and text regions. That is what scanners actually emit, but it is not the whole standard, and the rest is refused rather than approximated — a stream using Huffman-coded symbol dictionaries or text regions, custom Huffman tables, refinement or aggregate coding, pattern dictionaries or halftone regions fails with a message naming the feature, so a scan that will not decode says why on the first try.
 
-Not yet supported in v0.1 (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · non-TrueType glyph outlines (CFF/Type1) · shadings and tiling patterns · `JPXDecode` (JPEG 2000) · `CCITTFaxDecode` images · the JBIG2 features listed above · soft masks and blend modes · annotation appearance streams.
+Not yet supported (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · non-TrueType glyph outlines (CFF/Type1) · shadings and tiling patterns · `JPXDecode` (JPEG 2000) · the JBIG2 features listed above · soft masks and blend modes · annotation appearance streams.
 
 Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render — `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary, the TUI preview raises a status-bar notice, and the libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
 
