@@ -32,6 +32,9 @@ const MAX_FILTER_CHAIN: usize = 32;
 
 pub mod ascii85;
 pub mod ascii_hex;
+// Private: the facsimile codec is an implementation detail of `decode_stream`
+// and of the JBIG2 generic region.
+mod ccitt;
 pub mod flate;
 // Private: the JBIG2 codec is an implementation detail of `decode_stream`.
 mod jbig2;
