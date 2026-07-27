@@ -1041,6 +1041,43 @@ mod tests {
         ));
     }
 
+    /// Unlike `JBIG2Decode` and `DCTDecode`, the fax filter reads nothing but
+    /// the bytes handed to it, so it is not confined to the end of the chain.
+    /// A chain that puts a stage after it therefore fails in *that* stage,
+    /// rather than the fax filter being reported as an unsupported filter it is
+    /// not.
+    #[test]
+    fn ccitt_before_another_filter_fails_in_the_later_stage() {
+        let bm = bitmap_from_rows(&["11110000"]);
+        let s = make_stream(
+            vec![
+                (
+                    "Filter",
+                    Object::Array(vec![
+                        Object::Name(name("CCITTFaxDecode")),
+                        Object::Name(name("FlateDecode")),
+                    ]),
+                ),
+                (
+                    "DecodeParms",
+                    Object::Array(vec![
+                        Object::Dict(make_dict(vec![
+                            ("K", Object::Int(-1)),
+                            ("Columns", Object::Int(8)),
+                            ("Rows", Object::Int(1)),
+                        ])),
+                        Object::Null,
+                    ]),
+                ),
+            ],
+            &encode_g4(&bm),
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_)),
+        ));
+    }
+
     /// Corruption inside a stream that has not run out is an error, not a
     /// guess: a run length that would leave the row it is in cannot be
     /// honoured, and honouring it would write over the row below.
