@@ -41,6 +41,25 @@ use super::Jbig2Error;
 /// of the three counts drives a loop or an allocation.
 pub(crate) const MAX_SYMBOLS: u32 = 65_536;
 
+/// What one symbol costs beyond the pixels it is made of, in the units
+/// [`Budget`] counts.
+///
+/// Two things a symbol always costs are invisible to a charge computed from its
+/// dimensions. It takes at least one arithmetic width decode to bring into
+/// existence, and a symbol with no rows has no pixels for that charge to land
+/// on — `height * (width + ROW_COST)` is zero when the height is — so without a
+/// fixed price a dictionary of tens of thousands of rowless symbols is decoded
+/// for nothing. And a symbol that is exported is *kept*: the page walk holds
+/// every dictionary's exports until the last segment is read, so unlike a
+/// region's pixels the space is never given back mid-stream.
+///
+/// The figure is not an accounting of either. It is the price that ties the
+/// number of symbols a stream may bring into existence to the one allowance the
+/// stream has: at this rate [`MAX_WORK`](super::budget::MAX_WORK) buys 524 288
+/// of them, which is eight times what the symbol ID code can even address and a
+/// few tens of megabytes of bookkeeping if a stream insists on all of them.
+pub(crate) const SYMBOL_COST: u64 = 512;
+
 /// How much slack the two coded-data loops are given over the smallest number
 /// of iterations that could express the same dictionary.
 ///
@@ -61,10 +80,14 @@ const LOOP_SLACK: usize = 2;
 /// the export runs of 6.5.10 ahead of the symbols coded here.
 ///
 /// `budget` is the embedded stream's remaining allowance of decoding work, the
-/// same one the page's regions draw on. Every symbol bitmap is charged against
-/// it from the dimensions the coded data declared, before its pixel loop is
-/// entered: a dictionary need not carry the bits it asks to have decoded, so
-/// the cost has to be bounded by something other than the segment's length.
+/// same one the page's regions draw on. Every symbol this dictionary yields is
+/// charged against it — from the dimensions the coded data declared, before its
+/// pixel loop is entered, plus [`SYMBOL_COST`] for existing at all. Both halves
+/// are needed. A dictionary need not carry the bits it asks to have decoded, so
+/// the cost cannot be bounded by the segment's length; and a symbol may cost no
+/// pixels, either because its height class has no rows or because it was copied
+/// from the input list rather than coded, so it cannot be bounded by pixels
+/// alone.
 pub(crate) fn decode_symbol_dict(
     data: &[u8],
     input_symbols: &[&Bitmap],
@@ -89,10 +112,19 @@ pub(crate) fn decode_symbol_dict(
     // the whole of 6.5.10's "exported set". An exported input symbol is copied
     // because the caller keeps its dictionary; an exported new symbol is moved,
     // since a run visits each index once and nothing else will want it.
+    //
+    // The copy is charged like a symbol that had just been decoded, and for the
+    // same reason: this segment codes nothing to obtain it, so the price of a
+    // bitmap here is whatever the caller's referred-to list decided. Naming one
+    // dictionary again and again is a legal way to write that list, and each
+    // occurrence contributes its exports afresh, so an uncharged copy would let
+    // four bytes of segment number duplicate an entire decoded symbol.
     let mut exported: Vec<Bitmap> = Vec::new();
     let mut flags = flags.into_iter();
     for symbol in input_symbols {
         if flags.next().unwrap_or(false) {
+            budget.charge(SYMBOL_COST)?;
+            budget.charge_region(symbol.width(), symbol.height())?;
             exported.push((*symbol).clone());
         }
     }
@@ -238,6 +270,13 @@ fn decode_height_classes(
             if (new_symbols.len() as u32) >= header.num_new {
                 return Err(Jbig2Error::Malformed("more symbols coded than declared"));
             }
+            // The generic region decoder charges for the symbol's pixels, which
+            // is nothing at all when the height class has no rows — and a
+            // rowless symbol still costs the width decode that produced it and
+            // a bitmap the caller may keep for the rest of the stream. Hence
+            // the fixed price here, before the region charge and before any of
+            // its pixels are read.
+            budget.charge(SYMBOL_COST)?;
             new_symbols.push(decode_generic_region(
                 dec,
                 gb,
@@ -310,8 +349,12 @@ mod tests {
     use crate::filters::jbig2::mq::encoder::MqEncoder;
     use crate::filters::jbig2::mq::MqContext;
     use crate::filters::jbig2::testing::{
-        dictionary_segment, glyph, nominal_at_bytes, sample_symbols,
+        dictionary_segment, glyph, nominal_at_bytes, reexport_segment, rowless_dictionary_segment,
+        sample_symbols,
     };
+
+    /// What one 4 x 4 symbol costs: the fixed per-symbol price and its rows.
+    const FOUR_BY_FOUR: u64 = SYMBOL_COST + (4 + ROW_COST) * 4;
 
     /// Decodes with the allowance a real embedded stream gets.
     fn decode(data: &[u8], inputs: &[&Bitmap]) -> Result<Vec<Bitmap>, Jbig2Error> {
@@ -649,6 +692,53 @@ mod tests {
         );
     }
 
+    /// A symbol with no rows decodes no pixels, so a charge computed from its
+    /// dimensions comes to nothing — and a dictionary can declare a great many
+    /// of them in a few dozen bytes, each costing an arithmetic width decode
+    /// and a bitmap that outlives the segment. The fixed per-symbol price is
+    /// what stops that being free.
+    #[test]
+    fn a_symbol_with_no_rows_is_still_charged() {
+        let segment = rowless_dictionary_segment(64);
+        assert!(segment.len() < 96, "the demand is {} bytes", segment.len());
+
+        let mut budget = Budget::with_limit(SYMBOL_COST * 64);
+        assert_eq!(
+            decode_symbol_dict(&segment, &[], &mut budget),
+            Ok(Vec::new())
+        );
+
+        let mut budget = Budget::with_limit(SYMBOL_COST * 64 - 1);
+        assert_eq!(
+            decode_symbol_dict(&segment, &[], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// Re-exporting an input symbol copies it, and the copy costs what the
+    /// original did.
+    ///
+    /// Nothing else bounds those copies. A dictionary codes no data at all to
+    /// make one — the export runs are the whole segment — and the caller's
+    /// referred-to list decides how many input symbols there are to copy, so an
+    /// uncharged copy is a bitmap conjured out of a four-byte segment number.
+    #[test]
+    fn re_exporting_an_input_symbol_is_charged_for_the_copy() {
+        let inputs = [glyph(&["1010", "0101", "1010", "0101"])];
+        let refs: Vec<&Bitmap> = inputs.iter().collect();
+        let segment = reexport_segment(1);
+
+        let mut budget = Budget::with_limit(FOUR_BY_FOUR);
+        let got = decode_symbol_dict(&segment, &refs, &mut budget).expect("dictionary");
+        assert_same(&got[0], &inputs[0], 0);
+
+        let mut budget = Budget::with_limit(FOUR_BY_FOUR - 1);
+        assert_eq!(
+            decode_symbol_dict(&segment, &refs, &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
     /// Every symbol draws on the one budget the stream was given, so a
     /// dictionary cannot buy unbounded decoding by splitting the demand across
     /// many small symbols.
@@ -656,8 +746,8 @@ mod tests {
     fn symbols_across_a_dictionary_draw_on_one_budget() {
         let symbols: Vec<Bitmap> = (0..8).map(|_| glyph(&["11", "11"])).collect();
         let segment = dictionary_segment(&symbols, 0);
-        // Each 2 x 2 symbol costs (2 + ROW_COST) * 2.
-        let each = (2 + ROW_COST) * 2;
+        // Each 2 x 2 symbol costs the per-symbol price and (2 + ROW_COST) * 2.
+        let each = SYMBOL_COST + (2 + ROW_COST) * 2;
 
         let mut budget = Budget::with_limit(each * 8);
         assert!(decode_symbol_dict(&segment, &[], &mut budget).is_ok());

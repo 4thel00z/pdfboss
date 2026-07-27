@@ -19,6 +19,13 @@
 //! ceilings alone leave the total growing linearly with segment count at a
 //! ruinous ratio to the bytes that buy it.
 //!
+//! Decoding is not the only thing that costs, either. A symbol dictionary may
+//! re-export the symbols it was handed instead of coding any of its own
+//! (6.5.10), which copies a bitmap without decoding a pixel of it, and the
+//! symbols a dictionary exports are held for the rest of the segment walk
+//! rather than composited and dropped. So what is charged here is not "pixels
+//! decoded" but "bitmaps brought into existence", whichever way they arrived.
+//!
 //! Hence one budget per stream, charged from the declared dimensions *before*
 //! the decoding loop is entered. The charge is structural — it reads the
 //! header, never the coded data — so a region that cannot be afforded is

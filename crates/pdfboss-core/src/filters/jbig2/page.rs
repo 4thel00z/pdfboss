@@ -325,9 +325,10 @@ mod tests {
     use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::{context_at, GenericParams, GB_CONTEXT_LEN};
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
+    use crate::filters::jbig2::symbol_dict::SYMBOL_COST;
     use crate::filters::jbig2::testing::{
-        dictionary_segment, expect_at, glyph, header, split_after_segment, text_segment_for_page,
-        Op,
+        dictionary_segment, expect_at, glyph, header, reexport_segment, rowless_dictionary_segment,
+        split_after_segment, text_segment_for_page, Op,
     };
 
     /// Assembles a complete embedded stream: page info, one immediate generic
@@ -899,6 +900,65 @@ mod tests {
         assert_eq!(
             gather_symbols(&store, &beyond).map(|v| v.len()),
             Err(Jbig2Error::Malformed("symbol count exceeds the limit")),
+        );
+    }
+
+    /// Capping the gathered list bounds how many symbols a single dictionary
+    /// sees, not how many bitmaps a stream ends up holding: every symbol a
+    /// dictionary re-exports is a copy, and the copies are what the store keeps.
+    ///
+    /// So the copies are charged one by one. Here one 4 x 4 symbol is decoded
+    /// and then named four times over by a segment that codes nothing at all,
+    /// and the stream pays five symbols' worth — which is what stops the same
+    /// shape at the referred-to list's own maximum from turning one bitmap into
+    /// 65 536 of them.
+    #[test]
+    fn naming_one_dictionary_repeatedly_cannot_multiply_its_symbols() {
+        let symbol = glyph(&["1010", "0101", "1010", "0101"]);
+        let source = dictionary_segment(std::slice::from_ref(&symbol), 0);
+        let copier = reexport_segment(4);
+
+        let mut stream = header(1, 0, &[], 1, source.len() as u32);
+        stream.extend_from_slice(&source);
+        stream.extend_from_slice(&header(2, 0, &[1, 1, 1, 1], 1, copier.len() as u32));
+        stream.extend_from_slice(&copier);
+
+        // The original, then four copies of it, at the same price each.
+        let total = (SYMBOL_COST + (4 + ROW_COST) * 4) * 5;
+
+        let mut budget = Budget::with_limit(total);
+        assert!(decode_embedded_within(&[], &stream, 8, 8, &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(total - 1);
+        assert_eq!(
+            decode_embedded_within(&[], &stream, 8, 8, &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// The same bound one level up, for the cheapest symbols there are: a
+    /// dictionary of rowless symbols costs almost nothing to write and nothing
+    /// at all to decode, and Annex D.3 puts no limit on how many segments follow
+    /// one another, so without a per-symbol charge a stream's cost would grow
+    /// with its length rather than stopping at the allowance.
+    #[test]
+    fn a_stream_of_rowless_dictionaries_runs_out_of_budget() {
+        let dict = rowless_dictionary_segment(64);
+        let mut stream = Vec::new();
+        for number in 0..8u32 {
+            stream.extend_from_slice(&header(number, 0, &[], 1, dict.len() as u32));
+            stream.extend_from_slice(&dict);
+        }
+
+        let each = SYMBOL_COST * 64;
+
+        let mut budget = Budget::with_limit(each * 8);
+        assert!(decode_embedded_within(&[], &stream, 8, 8, &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(each * 8 - 1);
+        assert_eq!(
+            decode_embedded_within(&[], &stream, 8, 8, &mut budget),
+            Err(Jbig2Error::WorkLimit),
         );
     }
 

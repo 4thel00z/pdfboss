@@ -127,6 +127,62 @@ pub(crate) fn dictionary_segment(symbols: &[Bitmap], num_input: u32) -> Vec<u8> 
     out
 }
 
+/// Builds the data of a symbol dictionary segment (T.88 7.4.3) that codes no
+/// symbols of its own and re-exports all `num_input` symbols its referred-to
+/// dictionaries supplied (6.5.10).
+///
+/// Eighteen bytes of header and a handful of coded ones, whatever `num_input`
+/// is — which is the point of it. A referred-to list may name the same
+/// dictionary over and over, and every occurrence contributes that dictionary's
+/// exports to the input list again, so this is the smallest segment that asks
+/// for one decoded bitmap to be copied an arbitrary number of times.
+pub(crate) fn reexport_segment(num_input: u32) -> Vec<u8> {
+    let mut enc = MqEncoder::new();
+    let mut ints = IntCtxSet::new();
+    // A zero-length "not exported" run flips the flag without consuming an
+    // index, so the single run after it covers the whole input list.
+    encode_int(&mut enc, &mut ints.iaex, Some(0));
+    encode_int(&mut enc, &mut ints.iaex, Some(num_input as i32));
+
+    let mut out = 0u16.to_be_bytes().to_vec(); // arithmetic, template 0
+    out.extend_from_slice(&nominal_at_bytes());
+    out.extend_from_slice(&num_input.to_be_bytes()); // SDNUMEXSYMS
+    out.extend_from_slice(&0u32.to_be_bytes()); // SDNUMNEWSYMS
+    out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// Builds the data of a symbol dictionary segment (T.88 7.4.3) coding `count`
+/// symbols one pixel wide and no pixels tall, none of them exported.
+///
+/// A symbol with no rows codes no pixel decisions whatever its width, so the
+/// whole dictionary is one height class delta, `count` width deltas of nearly
+/// no entropy, the OOB that closes the class and one export run. That fits tens
+/// of thousands of symbols into a few dozen bytes, which makes it the cheapest
+/// demand a dictionary can make and the fixture the per-symbol charge is
+/// measured against.
+pub(crate) fn rowless_dictionary_segment(count: u32) -> Vec<u8> {
+    let mut enc = MqEncoder::new();
+    let mut ints = IntCtxSet::new();
+    // The running height starts at zero and stays there, so the class delta is
+    // zero as well.
+    encode_int(&mut enc, &mut ints.iadh, Some(0));
+    // The first symbol widens the running width to one; the rest repeat it.
+    for index in 0..count {
+        encode_int(&mut enc, &mut ints.iadw, Some(i32::from(index == 0)));
+    }
+    encode_int(&mut enc, &mut ints.iadw, None);
+    // One run over every symbol, with the flag still on "not exported".
+    encode_int(&mut enc, &mut ints.iaex, Some(count as i32));
+
+    let mut out = 0u16.to_be_bytes().to_vec(); // arithmetic, template 0
+    out.extend_from_slice(&nominal_at_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes()); // SDNUMEXSYMS
+    out.extend_from_slice(&count.to_be_bytes()); // SDNUMNEWSYMS
+    out.extend_from_slice(&enc.finish());
+    out
+}
+
 /// The four AT pixel pairs of template 0 at their nominal offsets, as the
 /// eight signed bytes a segment header carries them in (T.88 7.4.3.1.2).
 pub(crate) fn nominal_at_bytes() -> Vec<u8> {
