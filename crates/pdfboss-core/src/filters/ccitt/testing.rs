@@ -229,6 +229,12 @@ pub(crate) struct Layout {
     /// End-of-line patterns to write after the last row. Two of them are the
     /// end-of-facsimile block of T.6 §2.2.1; six are T.4's return to control.
     pub(crate) trailing_eols: usize,
+    /// Whether each trailing end-of-line pattern carries a tag bit after it,
+    /// as T.4 §4.2.3 writes the return to control of a mixed stream. Without
+    /// it the terminator is a bare run of patterns, which producers also emit;
+    /// the two reach a decoder differently, since a tag bit read out of the
+    /// terminator lands the cursor in the middle of the next pattern.
+    pub(crate) trailing_tags: bool,
 }
 
 /// Encodes a bitmap row by row, each row coded as `one_dimensional` says.
@@ -265,6 +271,9 @@ pub(crate) fn encode_g3(bm: &Bitmap, layout: Layout, one_dimensional: &[bool]) -
     }
     for _ in 0..layout.trailing_eols {
         push_eol(&mut bits);
+        if layout.trailing_tags {
+            bits.push(1);
+        }
     }
     pack(&bits)
 }

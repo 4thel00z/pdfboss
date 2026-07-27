@@ -933,6 +933,88 @@ mod tests {
         }
     }
 
+    /// A stream may simply be followed by zero bytes: T.88 §6.2.6 lets a JBIG2
+    /// MMR region end that way, and a buffer padded to a byte or a boundary
+    /// ends that way by accident. Twelve zero bits are not a row, and reading
+    /// them as one fails an image that decoded perfectly — the zeros are too
+    /// many to be dismissed as the data merely running out mid-code.
+    #[test]
+    fn zero_bytes_after_the_last_row_end_the_image_rather_than_failing_it() {
+        let bm = bitmap_from_rows(&["0011110000", "1100001111", "0000111100"]);
+        let mut data = encode_g4(&bm);
+        data.extend_from_slice(&[0x00; 4]);
+        assert_decodes_to(&bm, &data, &g4(10, 3));
+        assert_decodes_to(&bm, &data, &g4(10, 0));
+    }
+
+    /// Fill exists only before an end-of-line pattern, so a stream that has no
+    /// such patterns has no fill either, and a long run of zeros in one is the
+    /// end of its image rather than something to step over. A decoder that
+    /// stepped over it would resume on whatever followed and decode that as
+    /// rows.
+    #[test]
+    fn a_long_run_of_zeros_ends_a_stream_that_cannot_contain_fill() {
+        let bm = bitmap_from_rows(&["0011110000", "1100001111"]);
+        let mut data = encode_g4(&bm);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0xFF]);
+        assert_decodes_to(&bm, &data, &g4(10, 0));
+    }
+
+    /// A terminator ends the image even when bytes follow it, and only then is
+    /// it doing any work: a stream may be padded out, or carry data the image
+    /// does not, and a decoder that reads on turns those bytes into rows.
+    #[test]
+    fn data_after_a_terminator_is_not_decoded_as_rows() {
+        let bm = bitmap_from_rows(&["0011110000", "1100001111"]);
+        let layout = Layout {
+            trailing_eols: 2,
+            ..Layout::default()
+        };
+        let mut data = encode_g3(&bm, layout, &[]);
+        data.extend_from_slice(&[0xFF; 4]);
+        assert_decodes_to(&bm, &data, &g3(10, 0));
+    }
+
+    /// The same, with mixed coding: the terminator has to be recognised
+    /// *before* the tag bit is read, or the read lands inside the second
+    /// pattern and everything after it is decoded as image.
+    #[test]
+    fn a_bare_end_of_facsimile_block_ends_a_mixed_stream() {
+        let bm = bitmap_from_rows(&["0011110000", "1100001111"]);
+        let layout = Layout {
+            tagged: true,
+            trailing_eols: 2,
+            ..Layout::default()
+        };
+        let mut data = encode_g3(&bm, layout, &[true, false]);
+        data.extend_from_slice(&[0xFF; 4]);
+        let params = Params { k: 4, ..g3(10, 0) };
+        assert_decodes_to(&bm, &data, &params);
+    }
+
+    /// T.4 §4.2.3 writes the return to control of a mixed stream as six
+    /// end-of-line patterns each carrying a tag bit, so no two of them are
+    /// adjacent and the count alone cannot recognise it.
+    #[test]
+    fn a_tagged_return_to_control_ends_a_mixed_stream() {
+        let bm = bitmap_from_rows(&["0011110000", "1100001111"]);
+        let layout = Layout {
+            end_of_line: true,
+            tagged: true,
+            trailing_eols: 6,
+            trailing_tags: true,
+            ..Layout::default()
+        };
+        let mut data = encode_g3(&bm, layout, &[true, false]);
+        data.extend_from_slice(&[0xFF; 4]);
+        let params = Params {
+            k: 4,
+            end_of_line: true,
+            ..g3(10, 0)
+        };
+        assert_decodes_to(&bm, &data, &params);
+    }
+
     /// A terminator before the stated row count leaves the rest of the image
     /// white rather than failing it.
     #[test]
