@@ -262,21 +262,30 @@ fn decode_samples(
         .collect();
     let stride_bits = (ncomp * bpc * width).div_ceil(8) * 8;
     let mut out = vec![0u8; width * height * 4];
-    let mut comps = [0.0f32; 8];
-    for y in 0..height {
-        for x in 0..width {
-            let bit0 = y * stride_bits + x * ncomp * bpc;
-            for (c, comp) in comps.iter_mut().enumerate().take(ncomp) {
-                let raw = sample_bits(data, bit0 + c * bpc, bpc) as f32;
-                let (d0, d1) = ranges[c];
-                *comp = d0 + raw * (d1 - d0) / max;
+    if ncomp == 1 && bpc <= 8 {
+        // One component of at most eight bits admits at most 256 distinct
+        // samples, so `/Decode` and the color conversion run once per value
+        // instead of once per pixel. Bilevel scans are the extreme case:
+        // two conversions replace one per pixel.
+        let lut = sample_lut(cs, bpc, ranges[0], max);
+        paint_from_lut(&mut out, width, height, data, bpc, &lut);
+    } else {
+        let mut comps = [0.0f32; 8];
+        for y in 0..height {
+            for x in 0..width {
+                let bit0 = y * stride_bits + x * ncomp * bpc;
+                for (c, comp) in comps.iter_mut().enumerate().take(ncomp) {
+                    let raw = sample_bits(data, bit0 + c * bpc, bpc) as f32;
+                    let (d0, d1) = ranges[c];
+                    *comp = d0 + raw * (d1 - d0) / max;
+                }
+                let rgb = cs.to_rgb(&comps[..ncomp]);
+                let off = (y * width + x) * 4;
+                for (i, v) in rgb.iter().enumerate() {
+                    out[off + i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                }
+                out[off + 3] = 255;
             }
-            let rgb = cs.to_rgb(&comps[..ncomp]);
-            let off = (y * width + x) * 4;
-            for (i, v) in rgb.iter().enumerate() {
-                out[off + i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            }
-            out[off + 3] = 255;
         }
     }
     Rgba {
@@ -284,6 +293,56 @@ fn decode_samples(
         height,
         data: out,
         truncated: short_of_samples(data, stride_bits, height),
+    }
+}
+
+/// The opaque RGBA pixel each raw sample value of a one-component image
+/// decodes to, indexed by that value. Built with the same `/Decode` mapping
+/// and color conversion the general path applies per pixel, so the two agree
+/// pixel for pixel.
+fn sample_lut(cs: &ColorSpace, bpc: usize, range: (f32, f32), max: f32) -> Vec<[u8; 4]> {
+    let (d0, d1) = range;
+    (0..1usize << bpc)
+        .map(|raw| {
+            let rgb = cs.to_rgb(&[d0 + raw as f32 * (d1 - d0) / max]);
+            let mut px = [0u8, 0, 0, 255];
+            for (slot, v) in px.iter_mut().zip(rgb) {
+                *slot = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+            px
+        })
+        .collect()
+}
+
+/// Expands `bpc`-bit single-component samples into `out` through `lut`, one
+/// packed row at a time. Rows are byte-aligned (ISO 32000-1 8.9.5.2), so a
+/// row's samples never straddle the row boundary; bytes past the end of
+/// `data` read as 0, matching [`sample_bits`].
+fn paint_from_lut(
+    out: &mut [u8],
+    width: usize,
+    height: usize,
+    data: &[u8],
+    bpc: usize,
+    lut: &[[u8; 4]],
+) {
+    let row_bytes = (width * bpc).div_ceil(8);
+    // `bpc` reaches 8 here, where the mask is 255: widen before subtracting.
+    let mask = ((1u16 << bpc) - 1) as u8;
+    for y in 0..height {
+        let row = data.get(y * row_bytes..).unwrap_or(&[]);
+        let dst = &mut out[y * width * 4..(y + 1) * width * 4];
+        let mut x = 0;
+        for i in 0..row_bytes {
+            let byte = row.get(i).copied().unwrap_or(0);
+            let mut shift = 8;
+            while shift >= bpc && x < width {
+                shift -= bpc;
+                let px = lut[usize::from((byte >> shift) & mask)];
+                dst[x * 4..x * 4 + 4].copy_from_slice(&px);
+                x += 1;
+            }
+        }
     }
 }
 
@@ -481,6 +540,54 @@ mod tests {
         let img = decode_rgba(&doc, &d, &[0x80, 0x00], None, [0; 3]).unwrap();
         let [r, ..] = rgba_at(&img, 0, 0);
         assert!((127..=129).contains(&r), "16-bit mid gray {r}");
+    }
+
+    #[test]
+    fn the_lookup_table_paints_what_per_pixel_conversion_would() {
+        // The table is only an optimization for one-component images, so it
+        // must agree with the general path's formula everywhere -- including
+        // past the end of short data, where samples read as 0, and at a
+        // width that leaves spare bits in the last byte of every row.
+        let cs = ColorSpace::DeviceGray;
+        let width = 13;
+        let height = 3;
+        for bpc in [1usize, 2, 4, 8] {
+            let row_bytes = (width * bpc).div_ceil(8);
+            let full: Vec<u8> = (0..row_bytes * height)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            // The truncated case stops mid-row, so the padding starts at a
+            // sample boundary that is not a row boundary.
+            for data in [&full[..], &full[..row_bytes + 1]] {
+                for range in [(0.0f32, 1.0f32), (1.0, 0.0), (0.25, 0.75)] {
+                    let max = ((1u32 << bpc) - 1) as f32;
+                    let lut = sample_lut(&cs, bpc, range, max);
+                    let mut got = vec![0u8; width * height * 4];
+                    paint_from_lut(&mut got, width, height, data, bpc, &lut);
+
+                    let stride_bits = row_bytes * 8;
+                    for y in 0..height {
+                        for x in 0..width {
+                            let raw = sample_bits(data, y * stride_bits + x * bpc, bpc) as f32;
+                            let (d0, d1) = range;
+                            let rgb = cs.to_rgb(&[d0 + raw * (d1 - d0) / max]);
+                            let mut want = [0u8, 0, 0, 255];
+                            for (slot, v) in want.iter_mut().zip(rgb) {
+                                *slot = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                            }
+                            let off = (y * width + x) * 4;
+                            assert_eq!(
+                                got[off..off + 4],
+                                want,
+                                "bpc {bpc} range {range:?} at ({x},{y}) \
+                                 with {} bytes",
+                                data.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
