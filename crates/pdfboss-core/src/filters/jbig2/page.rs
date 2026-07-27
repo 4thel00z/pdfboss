@@ -714,6 +714,45 @@ mod tests {
         }
     }
 
+    /// An MMR region may be written that way too, and its terminator is a
+    /// different pair of bytes: `00 00` rather than `FF AC` (7.2.7). The height
+    /// still comes from the four bytes after it, and the facsimile decoder
+    /// still has to stop before reading either as image data.
+    #[test]
+    fn an_unknown_length_mmr_region_takes_its_height_from_the_row_count() {
+        let bm = bitmap_from_rows(&["01111110", "01000010", "01011010", "01111110"]);
+        let coded = encode_g4(&bm);
+        assert!(
+            !coded.windows(2).any(|pair| pair == [0x00, 0x00]),
+            "the fixture must not contain the terminator it is delimited by",
+        );
+
+        let mut region = Vec::new();
+        region.extend_from_slice(&bm.width().to_be_bytes());
+        region.extend_from_slice(&u32::MAX.to_be_bytes()); // height not yet known
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.push(0); // OR
+        region.push(1); // MMR 1, no AT bytes
+        region.extend_from_slice(&coded);
+        region.extend_from_slice(&[0x00, 0x00]); // the terminator, then the count
+        region.extend_from_slice(&bm.height().to_be_bytes());
+
+        let mut stream = header(0, 38, &[], 1, u32::MAX);
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 8, 4).expect("page");
+        for y in 0..4u32 {
+            for x in 0..8u32 {
+                assert_eq!(
+                    page.get(i64::from(x), i64::from(y)),
+                    bm.get(i64::from(x), i64::from(y)),
+                    "({x}, {y})",
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_short_page_information_segment_is_truncated() {
         for len in 0..19 {
