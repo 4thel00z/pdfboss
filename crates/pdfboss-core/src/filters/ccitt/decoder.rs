@@ -46,8 +46,8 @@ pub(crate) struct Params {
     /// Pixels per row. Zero cannot describe an image and is refused.
     pub(crate) columns: u32,
     /// Rows in the image, or 0 for "as many as the data holds", which is what
-    /// ISO 32000-1 gives that value to mean. An inferred count is capped at
-    /// what could be allocated anyway; see `inferred_row_cap`.
+    /// ISO 32000-1 gives that value to mean. An inferred count is capped by
+    /// both of the bounds a stated one is held to; see `inferred_row_cap`.
     pub(crate) rows: u32,
     /// Below zero selects pure two-dimensional coding; 0 pure
     /// one-dimensional; above zero a mixture, each row carrying a bit that

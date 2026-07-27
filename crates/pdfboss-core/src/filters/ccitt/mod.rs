@@ -176,12 +176,14 @@ pub(crate) fn decode_pdf_stream(data: &[u8], parms: Option<&Dict>) -> Result<Vec
 /// decoded. The figure is the bitmap allocation cap, because a decode that
 /// could not be stored is work that could only end in a refusal.
 ///
-/// Where there is no declared height the same number bounds the count: the row
-/// counter stops once the rows it has found would fill this many pixels. That
-/// pass is bounded a second way as well, structurally — no row can be coded in
-/// fewer bits than the shortest code, so a stream of `n` bytes holds fewer than
-/// `8n` rows however it is written — but the pixel bound is the one that does
-/// not depend on the code tables being what this build thinks they are.
+/// Where there is no declared height this number bounds the height that gets
+/// inferred: the row loop stops once the rows it has read would fill this many
+/// pixels. That loop is bounded a second way as well, structurally — no row can
+/// be coded in fewer bits than the shortest code, so a stream of `n` bytes
+/// holds fewer than `8n` rows however it is written — but the pixel bound is
+/// the one that does not depend on the code tables being what this build thinks
+/// they are, and [`MAX_IMAGE_SIDE`] bounds it a third time for the shapes a
+/// pixel count cannot describe.
 const MAX_IMAGE_PIXELS: u64 = MAX_PIXELS;
 
 /// The largest either dimension of a facsimile image may be, in pixels.
