@@ -1041,6 +1041,48 @@ mod tests {
         ));
     }
 
+    /// An image can be short enough that its area is unremarkable and still be
+    /// far too wide to decode, because what a width buys is not area: it is the
+    /// decoder's row state, at eight bytes per column against the bitmap's one
+    /// byte per pixel. These dimensions multiply to exactly the allocation cap,
+    /// so the area test passes them; the per-side cap is what refuses them.
+    #[test]
+    fn ccitt_a_wide_short_image_inside_the_allocation_cap_is_still_refused() {
+        let s = ccitt_stream(
+            vec![0u8; 8],
+            vec![
+                ("K", Object::Int(-1)),
+                ("Columns", Object::Int(1 << 26)),
+                ("Rows", Object::Int(2)),
+            ],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// The mirror shape, which the area test passes for the same reason and
+    /// which no stream needs to send: a column of pixels a hundred and
+    /// thirty-four million rows tall. Its packed output is eight times its
+    /// area, since every row pads seven bits to reach a byte, and an empty
+    /// stream is enough to ask for it.
+    #[test]
+    fn ccitt_a_tall_narrow_image_inside_the_allocation_cap_is_still_refused() {
+        let s = ccitt_stream(
+            Vec::new(),
+            vec![
+                ("K", Object::Int(-1)),
+                ("Columns", Object::Int(1)),
+                ("Rows", Object::Int(1 << 27)),
+            ],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
     /// Unlike `JBIG2Decode` and `DCTDecode`, the fax filter reads nothing but
     /// the bytes handed to it, so it is not confined to the end of the chain.
     /// A chain that puts a stage after it therefore fails in *that* stage,

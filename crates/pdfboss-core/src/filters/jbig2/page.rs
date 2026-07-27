@@ -787,17 +787,35 @@ mod tests {
     /// arm reaches a different decoder through a different bit reader, so it is
     /// a second place the charge could have been left out — and a region no
     /// pixels wide still allocates nothing there either.
+    ///
+    /// What refuses these is the facsimile codec's per-side cap, asked before
+    /// the budget is charged, because a facsimile row costs bytes in proportion
+    /// to the width and the budget counts pixels. Which of the two ceilings
+    /// answers matters less than that thirty-one bytes buy no passes at all;
+    /// the case below pins the budget itself on this arm.
     #[test]
     fn a_narrow_mmr_region_of_enormous_height_is_refused() {
         for width in [0u32, 1, 2] {
             let stream = empty_mmr_region_segment(0, width, u32::MAX);
             assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
-            assert_eq!(
-                decode_embedded(&[], &stream, 8, 8),
-                Err(Jbig2Error::WorkLimit),
+            assert!(
+                decode_embedded(&[], &stream, 8, 8).is_err(),
                 "width {width}",
             );
         }
+    }
+
+    /// The budget itself, on the MMR arm, with dimensions inside every other
+    /// ceiling: 65536 by 65536 is the largest square both sides of the per-side
+    /// cap allow, and it is far past what one stream may spend.
+    #[test]
+    fn an_mmr_region_within_the_side_caps_still_answers_to_the_budget() {
+        let stream = empty_mmr_region_segment(0, 1 << 16, 1 << 16);
+        assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::WorkLimit),
+        );
     }
 
     /// And MMR regions spend the *stream's* budget, not one of their own: a

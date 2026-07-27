@@ -21,7 +21,7 @@
 
 use super::bits::BitReader;
 use super::codes::{read_mode, read_run, Mode, EOL_BITS, EOL_LEN, WINDOW_BITS};
-use super::CcittError;
+use super::{CcittError, MAX_IMAGE_SIDE};
 use crate::filters::jbig2::bitmap::{Bitmap, MAX_PIXELS};
 
 /// Where `a0` sits before the first changing element of a row.
@@ -81,22 +81,51 @@ pub(crate) struct Params {
 /// bit pattern that is *not* the end of the data but matches no code is
 /// corruption, and is reported: guessing at it would displace every pixel
 /// below.
+///
+/// # What bounds the cost
+///
+/// Both dimensions are checked against `MAX_IMAGE_SIDE` before anything is
+/// allocated, and every caller's own product cap still applies on top. The
+/// per-side check is the one that matters here rather than in the callers,
+/// because the row state this decoder keeps is not proportional to the image:
+/// it is proportional to the row *width* alone, at eight bytes per pixel of
+/// width against the bitmap's one, so a product cap that admits any aspect
+/// ratio admits a short, absurdly wide image whose row state dwarfs the bitmap
+/// the product cap was sizing.
 pub(crate) fn decode(data: &[u8], params: &Params) -> Result<Bitmap, CcittError> {
-    if params.columns == 0 {
+    check_dimensions(params.columns, params.rows)?;
+    match params.rows {
+        // 0 is not a height but a request to take one from the data, so the
+        // bitmap cannot be allocated until the rows have been read.
+        0 => Rows::new(data, params).paint_inferred(),
+        // A stated height is allocated before a bit is read, so an image too
+        // large to hold is refused for free.
+        stated => Rows::new(data, params).paint(stated),
+    }
+}
+
+/// Refuses dimensions no facsimile decode may be attempted at.
+///
+/// Separate from [`decode`] so that a caller holding a resource of its own can
+/// ask the question before committing that resource. The JBIG2 generic region
+/// is the caller that needs it: it charges a shared work budget from the
+/// declared dimensions, and a region refused for its shape should leave that
+/// budget untouched rather than spend it on a decode that never happened.
+///
+/// A row count of 0 passes, because for the `CCITTFaxDecode` filter it is not a
+/// height at all but a request to take the height from the data (ISO 32000-1
+/// Table 11). Callers for whom 0 is a real height refuse it themselves.
+pub(crate) fn check_dimensions(columns: u32, rows: u32) -> Result<(), CcittError> {
+    if columns == 0 {
         return Err(CcittError::BadParameter("an image with no columns"));
     }
-    // A stated height is allocated before a bit is read, so an image too large
-    // to hold is refused for free. An unstated one has to be counted first, and
-    // counting means decoding: the rows are read twice, once to find how many
-    // there are and once to paint them. That costs a second pass over the same
-    // bits and keeps the memory at one bitmap, where buffering the rows of the
-    // first pass would cost several times it — a changing-element list is four
-    // bytes per element against the bitmap's one byte per pixel.
-    let height = match params.rows {
-        0 => Rows::new(data, params).count()?,
-        stated => stated,
-    };
-    Rows::new(data, params).paint(height)
+    if columns > MAX_IMAGE_SIDE || rows > MAX_IMAGE_SIDE {
+        return Err(CcittError::TooLarge {
+            width: columns,
+            height: rows,
+        });
+    }
+    Ok(())
 }
 
 /// A facsimile stream being read: the bit cursor, the layout it is read under,
@@ -154,26 +183,58 @@ impl<'a> Rows<'a> {
         Ok(out)
     }
 
-    /// Counts the rows the stream holds, for a stream that does not state a
-    /// height.
+    /// Decodes a stream that does not state a height (`/Rows 0`, ISO 32000-1
+    /// Table 11), whose height is however many rows the data turns out to hold.
     ///
-    /// Bounded twice over: by `inferred_row_cap`, and by every row consuming at
-    /// least one bit of a finite stream. The second bound is checked rather
-    /// than assumed, because it rests on properties of two other functions —
-    /// no mode code and no run code is empty — and this loop should terminate
-    /// whatever they do.
-    fn count(mut self) -> Result<u32, CcittError> {
+    /// The bitmap cannot be allocated until that count is known, and the count
+    /// is not known until the rows have been decoded, so the rows are held in a
+    /// buffer until the last one has been read. The buffer is *packed*, one bit
+    /// per pixel, for the reason the bitmap is not: at a byte per pixel it
+    /// would be a second copy of the image, where at a bit per pixel it is an
+    /// eighth of one, bounded by `MAX_PIXELS / 8` however wide or tall the
+    /// image turns out to be.
+    ///
+    /// Decoding once and buffering is what this does instead of counting the
+    /// rows in one pass and painting them in a second. The two-pass form needs
+    /// no buffer, but it decodes every row twice — and `/Rows 0` is the Table
+    /// 11 default, so that is the cost an unspecified stream pays. Two-
+    /// dimensional coding leaves no cheaper way to count: a row is coded
+    /// against the row above it, so a row cannot be measured without being
+    /// decoded.
+    ///
+    /// The loop is bounded twice over: by `inferred_row_cap`, and by every row
+    /// consuming at least one bit of a finite stream. The second bound is
+    /// checked rather than assumed, because it rests on properties of two other
+    /// functions — no mode code and no run code is empty — and this loop should
+    /// terminate whatever they do.
+    fn paint_inferred(mut self) -> Result<Bitmap, CcittError> {
         let cap = inferred_row_cap(self.columns);
-        let mut height = 0;
+        let stride = (self.columns as usize).div_ceil(8);
+        let mut packed: Vec<u8> = Vec::new();
+        let mut height: u32 = 0;
         while height < cap {
             let before = self.r.bit_pos();
             if !self.next_row()? || self.r.bit_pos() == before {
                 break;
             }
+            let base = packed.len();
+            packed.resize(base + stride, 0);
+            pack_row(&mut packed[base..], &self.coding, self.columns);
             height += 1;
             std::mem::swap(&mut self.reference, &mut self.coding);
         }
-        Ok(height)
+        // The lists are the largest thing still live, and nothing below reads
+        // them; dropping them now keeps them out of the bitmap's peak.
+        self.reference = Vec::new();
+        self.coding = Vec::new();
+        let mut out = Bitmap::new(self.columns, height).map_err(|_| CcittError::TooLarge {
+            width: self.columns,
+            height,
+        })?;
+        for (y, row) in packed.chunks_exact(stride.max(1)).enumerate() {
+            unpack_row(&mut out, y as u32, row);
+        }
+        Ok(out)
     }
 
     /// Decodes the next row into `self.coding`, reporting whether there was
@@ -290,12 +351,20 @@ impl<'a> Rows<'a> {
 /// height (`/Rows 0`, ISO 32000-1 Table 11).
 ///
 /// Without a stated height the row count is whatever the data says, which for
-/// attacker-supplied data is not a bound at all. The bound applied is the one
-/// the bitmap itself would apply: a row count past this could not be allocated,
-/// so counting further would only be work done before a refusal.
+/// attacker-supplied data is not a bound at all. Two bounds are applied, and
+/// the smaller wins.
+///
+/// The first is the one the bitmap itself would apply: a row count past
+/// `MAX_PIXELS / columns` could not be allocated, so decoding further would
+/// only be work done before a refusal.
+///
+/// The second is `MAX_IMAGE_SIDE`, the same per-side bound a stated height is
+/// held to. Without it a one-pixel-wide image could infer a hundred million
+/// rows — a shape no scanner produces, and one the first bound alone waves
+/// through because its product is what the first bound measures.
 fn inferred_row_cap(columns: u32) -> u32 {
     let cap = MAX_PIXELS / u64::from(columns.max(1));
-    u32::try_from(cap).unwrap_or(u32::MAX)
+    u32::try_from(cap).unwrap_or(u32::MAX).min(MAX_IMAGE_SIDE)
 }
 
 /// Decodes one one-dimensionally coded row into `out` as a changing-element
@@ -461,21 +530,59 @@ fn push_change(out: &mut Vec<u32>, position: u32) {
 
 /// Paints a finished row's changing-element list into the bitmap.
 ///
-/// The list starts from white, so the span from an even-indexed element to the
-/// next one is black and the span after an odd-indexed one is white. An
-/// odd-length list leaves its last black run open to the end of the row. The
-/// bitmap arrives white, so only the black spans are written.
+/// The bitmap arrives white, so only the black spans are written.
 fn paint_row(out: &mut Bitmap, y: u32, changes: &[u32]) {
     let columns = out.width();
-    for pair in changes.chunks(2) {
-        let Some(&start) = pair.first() else {
-            continue;
-        };
-        let end = pair.get(1).copied().unwrap_or(columns).min(columns);
+    for (start, end) in black_spans(changes, columns) {
         for x in start..end {
             out.set(x, y, 1);
         }
     }
+}
+
+/// Writes a finished row's changing-element list into `dst` as packed bits,
+/// MSB first, a set bit being black.
+///
+/// This is the same row in the same polarity as [`paint_row`] writes, only an
+/// eighth the size, which is what makes it affordable to hold every row of an
+/// image whose height is not known until the last one has been read. Bits past
+/// the last column are padding and stay clear, which is white — the value they
+/// already had, since [`unpack_row`] never reads them.
+fn pack_row(dst: &mut [u8], changes: &[u32], columns: u32) {
+    for (start, end) in black_spans(changes, columns) {
+        for x in start..end {
+            if let Some(byte) = dst.get_mut(x as usize / 8) {
+                *byte |= 0x80 >> (x % 8);
+            }
+        }
+    }
+}
+
+/// Paints a row [`pack_row`] wrote into the bitmap.
+///
+/// The bitmap arrives white, so only the set bits are written, exactly as
+/// [`paint_row`] writes only the black spans.
+fn unpack_row(out: &mut Bitmap, y: u32, packed: &[u8]) {
+    for x in 0..out.width() {
+        let Some(byte) = packed.get(x as usize / 8) else {
+            break;
+        };
+        if byte & (0x80 >> (x % 8)) != 0 {
+            out.set(x, y, 1);
+        }
+    }
+}
+
+/// The half-open column spans a changing-element list paints black.
+///
+/// The list starts from white, so the span from an even-indexed element to the
+/// next one is black and the span after an odd-indexed one is white. An
+/// odd-length list leaves its last black run open to the end of the row.
+fn black_spans(changes: &[u32], columns: u32) -> impl Iterator<Item = (u32, u32)> + '_ {
+    changes.chunks(2).filter_map(move |pair| {
+        let &start = pair.first()?;
+        Some((start, pair.get(1).copied().unwrap_or(columns).min(columns)))
+    })
 }
 
 #[cfg(test)]
@@ -695,6 +802,69 @@ mod tests {
                 height: 1 << 12,
             }),
         );
+    }
+
+    /// The per-side cap is what the area cap cannot do, and it is applied here
+    /// rather than in the callers so that both of them get it. An image whose
+    /// area is affordable can still be a shape that is not: the row state costs
+    /// eight bytes per column whatever the row count, and the packed output
+    /// costs a whole byte per row whatever the column count.
+    #[test]
+    fn a_shape_past_the_per_side_cap_is_refused_even_within_the_area_cap() {
+        let over = MAX_IMAGE_SIDE + 1;
+        for (width, height) in [(over, 1), (1, over), (1 << 26, 2), (2, 1 << 26)] {
+            assert_eq!(
+                decode(&[], &g4(width, height)),
+                Err(CcittError::TooLarge { width, height }),
+                "{width} x {height}",
+            );
+            // Each of these is inside the area cap, so that alone would let it
+            // through — which is the defect the per-side cap exists for.
+            assert!(u64::from(width) * u64::from(height) <= MAX_PIXELS);
+        }
+    }
+
+    /// The largest shape both caps allow is still decodable, so the per-side
+    /// cap has not quietly closed the door on real images.
+    #[test]
+    fn the_largest_shape_both_caps_allow_still_decodes() {
+        let bm = decode(&[], &g4(MAX_IMAGE_SIDE, 1)).expect("a single maximal row");
+        assert_eq!((bm.width(), bm.height()), (MAX_IMAGE_SIDE, 1));
+        let tall = decode(&[], &g4(1, MAX_IMAGE_SIDE)).expect("a single maximal column");
+        assert_eq!((tall.width(), tall.height()), (1, MAX_IMAGE_SIDE));
+    }
+
+    /// An unstated height decodes the rows once, not twice, and must land on
+    /// exactly the image a stated height lands on — the buffering that replaced
+    /// the counting pass is not allowed to change a pixel.
+    #[test]
+    fn an_inferred_height_reproduces_the_stated_height_decode() {
+        // Widths on and off a byte boundary, since the buffer packs to bytes
+        // and a row whose last byte is partly padding is where that shows.
+        for columns in [1u32, 7, 8, 9, 16, 23] {
+            let rows: Vec<String> = (0..6)
+                .map(|y| {
+                    (0..columns)
+                        .map(|x| if (x + y) % 3 == 0 { '1' } else { '0' })
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+            let bm = bitmap_from_rows(&refs);
+            let data = encode_g4(&bm);
+            let stated = decode(&data, &g4(columns, 6)).expect("stated height");
+            let inferred = decode(&data, &g4(columns, 0)).expect("inferred height");
+            assert_eq!(stated, bm, "{columns} columns");
+            assert_eq!(inferred, stated, "{columns} columns");
+        }
+    }
+
+    /// A stream holding no rows at all infers a height of zero rather than
+    /// failing, which is the empty end of the same path.
+    #[test]
+    fn an_inferred_height_of_no_rows_is_an_empty_image() {
+        let bm = decode(&[], &g4(8, 0)).expect("an empty stream");
+        assert_eq!((bm.width(), bm.height()), (8, 0));
     }
 
     /// Pure one-dimensional parameters for a stream of the given shape.
@@ -1033,13 +1203,22 @@ mod tests {
         );
     }
 
-    /// The height inferred for a stream that does not state one is capped at
-    /// what the bitmap allocation would allow anyway, so no stream can ask for
-    /// an unbounded row count.
+    /// The height inferred for a stream that does not state one is capped by
+    /// both bounds at once, so no stream can ask for an unbounded row count and
+    /// none can ask for a sliver of an image either.
     #[test]
-    fn an_inferred_height_cannot_exceed_the_allocation_cap() {
-        assert_eq!(u64::from(inferred_row_cap(1)), MAX_PIXELS);
-        assert_eq!(u64::from(inferred_row_cap(64)) * 64, MAX_PIXELS);
+    fn an_inferred_height_cannot_exceed_either_cap() {
+        // Narrow enough that the area cap alone would allow 2^27 rows.
+        assert_eq!(inferred_row_cap(1), MAX_IMAGE_SIDE);
+        // Wide enough that the area cap is the binding one.
+        let wide = MAX_IMAGE_SIDE;
+        assert_eq!(
+            u64::from(inferred_row_cap(wide)) * u64::from(wide),
+            MAX_PIXELS
+        );
+        assert!(inferred_row_cap(wide) < MAX_IMAGE_SIDE);
+        // A width past the per-side cap never reaches this, but were it to, the
+        // area cap must not divide its way to a usable row count.
         assert_eq!(inferred_row_cap(u32::MAX), 0);
     }
 

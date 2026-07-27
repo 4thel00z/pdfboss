@@ -17,7 +17,7 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 use crate::filters::jbig2::bitmap::{Bitmap, MAX_PIXELS};
-use crate::filters::{bool_parm, int_parm};
+use crate::filters::{bool_parm, int_parm, MAX_DECODED_LEN};
 use crate::object::Dict;
 use decoder::Params;
 
@@ -98,8 +98,10 @@ impl From<CcittError> for Error {
 ///   pure one-dimensional, above zero a mixture in which each row carries a bit
 ///   saying which it is.
 /// - `/Columns` (default 1728) and `/Rows` (default 0, meaning "as many as the
-///   data holds") are the image's dimensions. See [`MAX_IMAGE_PIXELS`] for what
-///   bounds them.
+///   data holds") are the image's dimensions. Each is bounded on its own by
+///   [`MAX_IMAGE_SIDE`] and their product by [`MAX_IMAGE_PIXELS`]; both bounds
+///   are needed, and the first is the one that bounds what the decode costs
+///   beyond the bitmap.
 /// - `/EncodedByteAlign` (default false) starts each row on a byte boundary.
 /// - `/BlackIs1` (default false) is the polarity switch; see [`pack_samples`].
 ///
@@ -137,10 +139,25 @@ pub(crate) fn decode_pdf_stream(data: &[u8], parms: Option<&Dict>) -> Result<Vec
         byte_align: bool_parm(parms, "EncodedByteAlign", false),
     };
     // Both dimensions are settled above, so the bitmap the decoder allocates is
-    // bounded before a bit of the coded data is read.
+    // bounded before a bit of the coded data is read. Each side is bounded by
+    // MAX_IMAGE_SIDE as it is read; what is left to check is their product.
     if u64::from(params.columns) * u64::from(params.rows) > MAX_IMAGE_PIXELS {
         return Err(Error::Decode(format!(
             "CCITTFaxDecode image of {} by {} pixels exceeds the decoding limit",
+            params.columns, params.rows,
+        )));
+    }
+    // The chain-wide output bound, applied here rather than left to the guard
+    // that runs after the stage returns. That guard sees only what the stage
+    // handed back, which is the smallest thing the stage held: the bitmap it
+    // was packed from is eight times it, and the row state larger again. The
+    // two caps above already imply this one — they bound the output at about
+    // 16 MiB — so it is a backstop, and its job is to make loosening either of
+    // them a refusal here rather than a breach of the contract in the parent
+    // module.
+    if packed_len(params.columns, params.rows) > MAX_DECODED_LEN as u64 {
+        return Err(Error::Decode(format!(
+            "CCITTFaxDecode image of {} by {} pixels would decode past the size limit",
             params.columns, params.rows,
         )));
     }
@@ -166,6 +183,46 @@ pub(crate) fn decode_pdf_stream(data: &[u8], parms: Option<&Dict>) -> Result<Vec
 /// `8n` rows however it is written — but the pixel bound is the one that does
 /// not depend on the code tables being what this build thinks they are.
 const MAX_IMAGE_PIXELS: u64 = MAX_PIXELS;
+
+/// The largest either dimension of a facsimile image may be, in pixels.
+///
+/// A product cap alone is not enough, because it says nothing about the shape
+/// of the image that fills it, and two costs here scale with a single
+/// dimension rather than with the product.
+///
+/// The row state of the decoder is the larger of them. A row is decoded into a
+/// changing-element list of up to `columns + 1` four-byte positions, and two
+/// such lists are live at once — the row being decoded and the row it is coded
+/// against. That is eight bytes per pixel of *width*, against the bitmap's one
+/// byte per pixel of area, so under a product cap alone an image two rows tall
+/// and sixty-seven million columns wide would allocate half a gigabyte of row
+/// state to describe a bitmap of a hundred and twenty-eight megabytes. The
+/// other is the packed output, whose rows are padded to whole bytes: at one
+/// column per row the padding is seven eighths of it, so a product cap's worth
+/// of pixels becomes eight times as many bytes.
+///
+/// Bounding each side at 65536 removes both. It is far above any image a
+/// scanner produces — a 600 dpi scan of the largest ISO paper size is under
+/// 30000 pixels on its long side, and the widths T.4 §2.2.1 lists for
+/// facsimile itself stop at 2432 — and it holds the row state under half a
+/// megabyte and the padding waste under a part in eight thousand.
+pub(crate) const MAX_IMAGE_SIDE: u32 = 1 << 16;
+
+/// How many bytes an image of these dimensions packs into.
+///
+/// Rows are padded to a whole byte, which is why this is not the pixel count
+/// over eight: the padding is what makes a tall, narrow image cost far more
+/// bytes than its area suggests.
+///
+/// A row count of 0 is `/Rows` asking for the count to be taken from the data
+/// (ISO 32000-1 Table 11), and yields 0 here. That is not a hole: an inferred
+/// count is bounded by `decoder::inferred_row_cap`, which is the smaller of
+/// the area cap over the width and [`MAX_IMAGE_SIDE`], so the largest output an
+/// inferred height can produce is `MAX_IMAGE_PIXELS / 8 + MAX_IMAGE_SIDE`
+/// bytes — about 16 MiB, well inside [`MAX_DECODED_LEN`].
+fn packed_len(columns: u32, rows: u32) -> u64 {
+    u64::from(columns).div_ceil(8) * u64::from(rows)
+}
 
 /// Packs a decoded page into the 1-bit samples the image layer expects,
 /// applying `/BlackIs1`.
@@ -205,13 +262,19 @@ fn pack_samples(page: &Bitmap, black_is_1: bool) -> Vec<u8> {
 /// Reads `/Columns` (ISO 32000-1 Table 11, default 1728) as a usable row width.
 ///
 /// Zero is refused rather than clamped: a row of no pixels is not a narrow
-/// image. So is a width past [`MAX_IMAGE_PIXELS`], which could not hold even one
-/// row — left to the decoder it would yield an image of no rows at all, which
-/// reads downstream as a blank page rather than as the refusal it is.
+/// image. So is a width past [`MAX_IMAGE_SIDE`] — left to the decoder it would
+/// yield an image of no rows at all, which reads downstream as a blank page
+/// rather than as the refusal it is.
+///
+/// The bound is the per-side one and not [`MAX_IMAGE_PIXELS`], because a width
+/// is one side and not an area. Checking a width against a pixel *count* is
+/// how a stream declaring sixty-seven million columns gets past a cap meant to
+/// stop it: the product it forms with a small row count is well inside the
+/// area bound, while the row state that width alone buys is not.
 fn columns_parm(parms: Option<&Dict>) -> Result<u32> {
     let stated = int_parm(parms, "Columns", 1728);
     match u32::try_from(stated) {
-        Ok(columns) if columns >= 1 && u64::from(columns) <= MAX_IMAGE_PIXELS => Ok(columns),
+        Ok(columns) if (1..=MAX_IMAGE_SIDE).contains(&columns) => Ok(columns),
         _ => Err(Error::Decode(format!(
             "CCITTFaxDecode /Columns {stated} is not a usable row width"
         ))),
@@ -222,11 +285,14 @@ fn columns_parm(parms: Option<&Dict>) -> Result<u32> {
 /// means the count is to be taken from the data.
 ///
 /// A negative count describes nothing and is refused; so is one past
-/// [`MAX_IMAGE_PIXELS`], which no width could accompany.
+/// [`MAX_IMAGE_SIDE`]. As with the width, the bound is the per-side one: a
+/// column of a hundred and thirty-four million rows fits inside the area cap
+/// and is not an image, and its output — a byte per row, seven eighths of it
+/// padding — is eight times the area cap in bytes.
 fn rows_parm(parms: Option<&Dict>) -> Result<u32> {
     let stated = int_parm(parms, "Rows", 0);
     match u32::try_from(stated) {
-        Ok(rows) if u64::from(rows) <= MAX_IMAGE_PIXELS => Ok(rows),
+        Ok(rows) if rows <= MAX_IMAGE_SIDE => Ok(rows),
         _ => Err(Error::Decode(format!(
             "CCITTFaxDecode /Rows {stated} is not a usable row count"
         ))),

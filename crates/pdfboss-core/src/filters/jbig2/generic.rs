@@ -473,14 +473,31 @@ fn decode_generic_region_windowed(
 /// information field, and a region of no rows contributes no pixels to a page
 /// in any case.
 ///
-/// A row width of zero is refused too, by the codec itself, for the same reason
-/// it refuses one from a PDF: a row of no pixels is not a narrow image.
+/// A row width of zero is refused too, for the same reason the codec refuses
+/// one from a PDF: a row of no pixels is not a narrow image.
+///
+/// # Why the budget is not the only ceiling here
+///
+/// The budget prices a region in pixel decisions, and that is the right unit
+/// for the arithmetic paths, where a row costs a byte of bitmap per pixel and
+/// nothing else. It is the wrong unit for this one. A facsimile row is decoded
+/// through two changing-element lists of four-byte positions, both live at
+/// once, so the *bytes* a row costs are eight times its pixels — and the lists
+/// are sized by the width alone, not by the area the budget is measuring. A
+/// region of sixty-seven million columns and two rows charges half the
+/// allowance and would allocate half a gigabyte of lists over a bitmap of a
+/// hundred and twenty-eight megabytes.
+///
+/// So the codec's per-side cap is asked first, before the budget is charged.
+/// Refusing before charging keeps the invariant the other refusals here hold
+/// to: a region that is never decoded spends nothing.
 pub(crate) fn decode_mmr_region(
     data: &[u8],
     budget: &mut Budget,
     width: u32,
     height: u32,
 ) -> Result<Bitmap, Jbig2Error> {
+    facsimile::check_dimensions(width, height)?;
     budget.charge_region(width, height)?;
     if height == 0 {
         return Err(Jbig2Error::Malformed("MMR region of no rows"));
@@ -1254,17 +1271,43 @@ mod tests {
     /// any decoding, exactly as on the arithmetic paths — a region no pixels
     /// wide allocates nothing whatever its height, so the allocation cap never
     /// sees it.
+    ///
+    /// The dimensions here are both inside the per-side cap, so it is the
+    /// budget and nothing else that refuses them; and every one of them is a
+    /// region whose bitmap would also be refused, which is the point — the
+    /// budget must not be reachable only through the allocation cap.
     #[test]
     fn an_mmr_region_cannot_declare_unbounded_rows() {
-        for width in [0u32, 1, 2] {
+        for width in [4089u32, 8192, 1 << 16] {
             let mut budget = Budget::new();
             assert_eq!(
-                decode_mmr_region(&[0xFFu8; 64], &mut budget, width, u32::MAX),
+                decode_mmr_region(&[0xFFu8; 64], &mut budget, width, 1 << 16),
                 Err(Jbig2Error::WorkLimit),
                 "width {width}",
             );
             assert_eq!(budget, Budget::new(), "a refused region spends nothing");
         }
+    }
+
+    /// A region whose *shape* is unaffordable even though its area is not. The
+    /// budget prices pixels, and the changing-element lists of a facsimile row
+    /// are priced by the width alone at eight bytes a column, so a region two
+    /// rows tall and sixty-seven million columns wide charges under half the
+    /// allowance and would allocate half a gigabyte. The per-side cap is what
+    /// refuses it, and it does so before the budget is touched.
+    #[test]
+    fn a_wide_short_mmr_region_the_budget_can_afford_is_still_refused() {
+        let mut budget = Budget::new();
+        // Priced the way the budget prices it, to show the charge would pass.
+        assert!(Budget::new().charge_region(1 << 26, 2).is_ok());
+        assert_eq!(
+            decode_mmr_region(&[], &mut budget, 1 << 26, 2),
+            Err(Jbig2Error::TooLarge {
+                width: 1 << 26,
+                height: 2,
+            }),
+        );
+        assert_eq!(budget, Budget::new(), "a refused region spends nothing");
     }
 
     /// The allocation cap is the second ceiling and still applies: a region the
