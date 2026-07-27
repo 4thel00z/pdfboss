@@ -20,7 +20,9 @@
 //! every other implementation on earth. Two independent derivations of the same
 //! quantity is what makes the round trip evidence of anything.
 
-use super::codes::{Code, Mode, BLACK_CODES, EXT_MAKEUP_CODES, MODE_CODES, WHITE_CODES};
+use super::codes::{
+    Code, Mode, BLACK_CODES, EOL_BITS, EOL_LEN, EXT_MAKEUP_CODES, MODE_CODES, WHITE_CODES,
+};
 use crate::filters::jbig2::bitmap::Bitmap;
 
 /// Builds a bitmap from rows of `'1'` (black, a set pixel) and anything else
@@ -76,6 +78,11 @@ pub(crate) fn push_bits(bits: &mut Vec<u8>, pattern: u16, len: u8) {
 /// Appends one variable-length code.
 pub(crate) fn push_code(bits: &mut Vec<u8>, code: Code) {
     push_bits(bits, code.bits, code.len);
+}
+
+/// Appends one end-of-line pattern: eleven zero bits and a one (T.4 §4.1.1).
+pub(crate) fn push_eol(bits: &mut Vec<u8>) {
+    push_bits(bits, EOL_BITS, EOL_LEN);
 }
 
 /// Appends one two-dimensional mode code (T.6 §2.2, Table 4).
@@ -197,6 +204,120 @@ fn encode_row_2d(bits: &mut Vec<u8>, bm: &Bitmap, y: u32, tally: &mut ModeTally)
             push_run(bits, !white, a2 - a1);
             a0 = i64::from(a2);
         }
+    }
+}
+
+/// What a test stream puts around its rows.
+///
+/// The fields are the ISO 32000-1 Table 11 parameters that decide what sits
+/// *between* rows, so a fixture is described in the same words the decoder's
+/// parameters use, plus the two the encoder alone needs: how much fill to
+/// write, and how a stream ends.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Layout {
+    /// Write an end-of-line pattern before every row (T.4 §4.1.1).
+    pub(crate) end_of_line: bool,
+    /// Pad with zero bits so every row begins on a byte boundary.
+    pub(crate) byte_align: bool,
+    /// Write a bit before every row saying whether that row is coded
+    /// one-dimensionally (T.4 §4.2.3). This is what `/K` above zero selects.
+    pub(crate) tagged: bool,
+    /// Zero bits to write before each end-of-line pattern. T.4 §4.1.1 allows
+    /// them so a row occupies a minimum transmission time; they carry nothing
+    /// and a decoder must step over them.
+    pub(crate) fill_bits: usize,
+    /// End-of-line patterns to write after the last row. Two of them are the
+    /// end-of-facsimile block of T.6 §2.2.1; six are T.4's return to control.
+    pub(crate) trailing_eols: usize,
+}
+
+/// Encodes a bitmap row by row, each row coded as `one_dimensional` says.
+///
+/// `one_dimensional` is indexed by row; a row past its end is coded
+/// one-dimensionally, so passing an empty slice yields a pure T.4 stream.
+///
+/// Every row is coded against the bitmap's own previous row, whichever way
+/// that row was written, because that is what a decoder reconstructs — mixing
+/// the two forms and still agreeing on the reference line is the whole point of
+/// the per-row tag.
+pub(crate) fn encode_g3(bm: &Bitmap, layout: Layout, one_dimensional: &[bool]) -> Vec<u8> {
+    let mut bits = Vec::new();
+    let mut tally = ModeTally::default();
+    for y in 0..bm.height() {
+        if layout.byte_align {
+            while bits.len() % 8 != 0 {
+                bits.push(0);
+            }
+        }
+        if layout.end_of_line {
+            bits.extend(std::iter::repeat_n(0u8, layout.fill_bits));
+            push_eol(&mut bits);
+        }
+        let one_d = one_dimensional.get(y as usize).copied().unwrap_or(true);
+        if layout.tagged {
+            bits.push(u8::from(one_d));
+        }
+        if one_d {
+            encode_row_1d(&mut bits, bm, y);
+        } else {
+            encode_row_2d(&mut bits, bm, y, &mut tally);
+        }
+    }
+    for _ in 0..layout.trailing_eols {
+        push_eol(&mut bits);
+    }
+    pack(&bits)
+}
+
+/// Encodes a bitmap as pure one-dimensional rows: no end-of-line patterns, no
+/// byte alignment, no terminator — the form `/K` of 0 selects.
+pub(crate) fn encode_g3_1d(bm: &Bitmap) -> Vec<u8> {
+    encode_g3(bm, Layout::default(), &[])
+}
+
+/// [`encode_g3_1d`] with an end-of-line pattern before every row.
+pub(crate) fn encode_g3_1d_with_eol(bm: &Bitmap) -> Vec<u8> {
+    encode_g3(
+        bm,
+        Layout {
+            end_of_line: true,
+            ..Layout::default()
+        },
+        &[],
+    )
+}
+
+/// [`encode_g3_1d`] with every row starting on a byte boundary.
+pub(crate) fn encode_g3_1d_byte_aligned(bm: &Bitmap) -> Vec<u8> {
+    encode_g3(
+        bm,
+        Layout {
+            byte_align: true,
+            ..Layout::default()
+        },
+        &[],
+    )
+}
+
+/// Codes one row as the alternating run lengths of T.4 §4.1.2, white first.
+///
+/// The leading white run is written even when it is empty, which is how a row
+/// beginning with a black pixel is coded and the case a decoder is most likely
+/// to get wrong. Runs are derived from the pixels here rather than from the
+/// decoder's changing-element list, for the same reason `b1` is: two
+/// independent derivations are what make a round trip evidence of anything.
+fn encode_row_1d(bits: &mut Vec<u8>, bm: &Bitmap, y: u32) {
+    let columns = bm.width();
+    let mut at: u32 = 0;
+    let mut white = true;
+    while at < columns {
+        let mut run = 0u32;
+        while at + run < columns && (bm.get(i64::from(at + run), i64::from(y)) == 0) == white {
+            run += 1;
+        }
+        push_run(bits, white, run);
+        at += run;
+        white = !white;
     }
 }
 

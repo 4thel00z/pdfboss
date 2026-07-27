@@ -20,9 +20,9 @@
 //! know which the caller asked for.
 
 use super::bits::BitReader;
-use super::codes::{read_mode, read_run, Mode, WINDOW_BITS};
+use super::codes::{read_mode, read_run, Mode, EOL_BITS, EOL_LEN, WINDOW_BITS};
 use super::CcittError;
-use crate::filters::jbig2::bitmap::Bitmap;
+use crate::filters::jbig2::bitmap::{Bitmap, MAX_PIXELS};
 
 /// Where `a0` sits before the first changing element of a row.
 ///
@@ -33,6 +33,9 @@ use crate::filters::jbig2::bitmap::Bitmap;
 /// of every row comes out one pixel short.
 const BEFORE_ROW: i64 = -1;
 
+/// The width of the end-of-line pattern, as the bit reader counts widths.
+const EOL_WINDOW: u32 = EOL_LEN as u32;
+
 /// How a facsimile stream is laid out, from ISO 32000-1 Table 11.
 ///
 /// The JBIG2 use of this codec (ITU-T T.88 §6.2.6) is one particular setting of
@@ -42,14 +45,23 @@ const BEFORE_ROW: i64 = -1;
 pub(crate) struct Params {
     /// Pixels per row. Zero cannot describe an image and is refused.
     pub(crate) columns: u32,
-    /// Rows in the image. ISO 32000-1 gives 0 the meaning "as many as the data
-    /// holds", which this build does not yet infer.
+    /// Rows in the image, or 0 for "as many as the data holds", which is what
+    /// ISO 32000-1 gives that value to mean. An inferred count is capped at
+    /// what could be allocated anyway; see `inferred_row_cap`.
     pub(crate) rows: u32,
     /// Below zero selects pure two-dimensional coding; 0 pure
     /// one-dimensional; above zero a mixture, each row carrying a bit that
-    /// says which it is.
+    /// says which it is. Above zero, T.4 also gives the value itself a
+    /// meaning — how many two-dimensional rows may follow a one-dimensional
+    /// one — but that is advisory, and what decides how a row is read is the
+    /// bit in front of it.
     pub(crate) k: i32,
     /// Whether rows are separated by end-of-line patterns.
+    ///
+    /// This does **not** decide whether the pattern is recognised: producers
+    /// disagree about the flag, so an end-of-line pattern is stepped over
+    /// wherever it appears. What the flag decides is whether *fill* may
+    /// precede one — see `Rows::consume_eol`.
     pub(crate) end_of_line: bool,
     /// Whether each row starts on a byte boundary.
     pub(crate) byte_align: bool,
@@ -57,65 +69,274 @@ pub(crate) struct Params {
 
 /// Decodes a facsimile stream into a bitmap in which a set pixel is black.
 ///
+/// All three forms ISO 32000-1 Table 11 selects between are read here: pure
+/// two-dimensional coding (`k` below zero, which is also the whole of what a
+/// JBIG2 generic region uses), pure one-dimensional coding (`k` of 0), and the
+/// mixture in which every row carries a bit saying which it is (`k` above
+/// zero).
+///
 /// Truncation is not an error. A stream that stops in the middle yields the
 /// rows it did decode and white ones after them, because a page that is mostly
 /// readable is worth more than an error — real scanners produce such files. A
 /// bit pattern that is *not* the end of the data but matches no code is
 /// corruption, and is reported: guessing at it would displace every pixel
 /// below.
-///
-/// What is decoded here is the pure two-dimensional form — the whole of what a
-/// JBIG2 generic region uses. The parameters selecting the other forms a PDF
-/// stream may ask for are refused rather than ignored, because ignoring one
-/// reads the wrong bits into a plausible-looking image.
 pub(crate) fn decode(data: &[u8], params: &Params) -> Result<Bitmap, CcittError> {
     if params.columns == 0 {
         return Err(CcittError::BadParameter("an image with no columns"));
     }
-    if params.rows == 0 {
-        return Err(CcittError::Unimplemented("a stream of unstated length"));
-    }
-    if params.k >= 0 {
-        return Err(CcittError::Unimplemented("one-dimensional coding"));
-    }
-    if params.end_of_line {
-        return Err(CcittError::Unimplemented("end-of-line delimited rows"));
-    }
-    if params.byte_align {
-        return Err(CcittError::Unimplemented("byte-aligned rows"));
-    }
+    // A stated height is allocated before a bit is read, so an image too large
+    // to hold is refused for free. An unstated one has to be counted first, and
+    // counting means decoding: the rows are read twice, once to find how many
+    // there are and once to paint them. That costs a second pass over the same
+    // bits and keeps the memory at one bitmap, where buffering the rows of the
+    // first pass would cost several times it — a changing-element list is four
+    // bytes per element against the bitmap's one byte per pixel.
+    let height = match params.rows {
+        0 => Rows::new(data, params).count()?,
+        stated => stated,
+    };
+    Rows::new(data, params).paint(height)
+}
 
-    // Allocated before anything is decoded, and from the declared dimensions,
-    // so an image too large to hold is refused without a bit being read. It is
-    // also what bounds the outer loop: with at least one column, the pixel cap
-    // the allocation applies is a bound on the row count too.
-    let mut out = Bitmap::new(params.columns, params.rows).map_err(|_| CcittError::TooLarge {
-        width: params.columns,
-        height: params.rows,
-    })?;
+/// A facsimile stream being read: the bit cursor, the layout it is read under,
+/// and the two changing-element lists the rows alternate between.
+struct Rows<'a> {
+    r: BitReader<'a>,
+    /// Pixels per row, never 0 — [`decode`] refuses that before constructing
+    /// this.
+    columns: u32,
+    /// See [`Params::k`].
+    k: i32,
+    /// Whether fill bits may precede an end-of-line pattern.
+    fill: bool,
+    /// Whether every row begins on a byte boundary.
+    byte_align: bool,
+    /// The row above the one being decoded, as changing-element positions. It
+    /// is empty for row 0, which is the all-white row T.6 §2.2 imagines above
+    /// the image.
+    reference: Vec<u32>,
+    /// The row being decoded, in the same form. The two are swapped once a row
+    /// is finished, so the row just read becomes the next one's reference.
+    coding: Vec<u32>,
+}
 
-    let mut r = BitReader::new(data);
-    // Two lists, swapped each row: the row just finished becomes the reference
-    // for the next one. Row 0's reference is empty, which is the all-white row
-    // T.6 §2.2 imagines above the image.
-    let mut reference: Vec<u32> = Vec::new();
-    let mut coding: Vec<u32> = Vec::new();
-    for y in 0..params.rows {
-        if r.is_exhausted() {
-            break;
+impl<'a> Rows<'a> {
+    /// A reader over `data`, positioned at its first bit.
+    fn new(data: &'a [u8], params: &Params) -> Rows<'a> {
+        Rows {
+            r: BitReader::new(data),
+            columns: params.columns,
+            k: params.k,
+            fill: params.end_of_line,
+            byte_align: params.byte_align,
+            reference: Vec::new(),
+            coding: Vec::new(),
         }
-        match decode_row_2d(&mut r, &reference, params.columns, &mut coding) {
-            Ok(()) => {}
+    }
+
+    /// Decodes the stream into a bitmap `height` rows tall.
+    ///
+    /// A stream holding fewer rows than that leaves the rest white, which is
+    /// what makes both truncation and an early terminator harmless.
+    fn paint(mut self, height: u32) -> Result<Bitmap, CcittError> {
+        let mut out = Bitmap::new(self.columns, height).map_err(|_| CcittError::TooLarge {
+            width: self.columns,
+            height,
+        })?;
+        for y in 0..height {
+            if !self.next_row()? {
+                break;
+            }
+            paint_row(&mut out, y, &self.coding);
+            std::mem::swap(&mut self.reference, &mut self.coding);
+        }
+        Ok(out)
+    }
+
+    /// Counts the rows the stream holds, for a stream that does not state a
+    /// height.
+    ///
+    /// Bounded twice over: by `inferred_row_cap`, and by every row consuming at
+    /// least one bit of a finite stream. The second bound is checked rather
+    /// than assumed, because it rests on properties of two other functions —
+    /// no mode code and no run code is empty — and this loop should terminate
+    /// whatever they do.
+    fn count(mut self) -> Result<u32, CcittError> {
+        let cap = inferred_row_cap(self.columns);
+        let mut height = 0;
+        while height < cap {
+            let before = self.r.bit_pos();
+            if !self.next_row()? || self.r.bit_pos() == before {
+                break;
+            }
+            height += 1;
+            std::mem::swap(&mut self.reference, &mut self.coding);
+        }
+        Ok(height)
+    }
+
+    /// Decodes the next row into `self.coding`, reporting whether there was
+    /// one.
+    fn next_row(&mut self) -> Result<bool, CcittError> {
+        let Some(one_dimensional) = self.start_row() else {
+            return Ok(false);
+        };
+        let outcome = if one_dimensional {
+            decode_row_1d(&mut self.r, self.columns, &mut self.coding)
+        } else {
+            decode_row_2d(&mut self.r, &self.reference, self.columns, &mut self.coding)
+        };
+        match outcome {
+            Ok(()) => Ok(true),
             // A failure with less than a full code window left is the data
             // running out mid-code, not a stream that is wrong. The rows
             // already decoded stand; the partial one is dropped.
-            Err(_) if r.remaining() < WINDOW_BITS as usize => break,
-            Err(err) => return Err(err),
+            Err(_) if self.r.remaining() < WINDOW_BITS as usize => Ok(false),
+            Err(err) => Err(err),
         }
-        paint_row(&mut out, y, &coding);
-        std::mem::swap(&mut reference, &mut coding);
     }
-    Ok(out)
+
+    /// Steps over whatever separates one row from the next and reports how the
+    /// row that follows is coded, or reports that the stream is over.
+    ///
+    /// The order is the one ISO 32000-1 Table 11 implies and T.4 §4.2.3 fixes:
+    /// byte alignment first, since it pads out the previous row; then any
+    /// end-of-line pattern; then, in mixed coding, the bit that says how this
+    /// row is written.
+    fn start_row(&mut self) -> Option<bool> {
+        if self.byte_align {
+            self.r.align_to_byte();
+        }
+        if self.r.is_exhausted() {
+            return None;
+        }
+        // Two end-of-line patterns with no row between them terminate the
+        // data: that is the end-of-facsimile block of T.6 §2.2.1, and the
+        // opening pair of T.4's return to control.
+        if self.consume_eols() >= 2 {
+            return None;
+        }
+        // In mixed coding the bit before a row says how the row is coded (T.4
+        // §4.2.3): 1 for one-dimensional, 0 for two-dimensional. It sits after
+        // the end-of-line pattern when there is one, and directly before the
+        // row when there is not.
+        let one_dimensional = match self.k {
+            k if k < 0 => false,
+            0 => true,
+            _ => self.r.read_bit()? == 1,
+        };
+        // Whatever follows now has to be a row, and twelve zero bits are not
+        // one: no run code and no mode code has more than seven leading zeros.
+        // So this is the padding in the last byte, trailing fill, or the second
+        // half of a terminator whose first half the tag bit above stepped into
+        // — in every case, the end of the image rather than a row to decode.
+        let window = self.r.peek(EOL_WINDOW);
+        if window == 0 || window == u32::from(EOL_BITS) {
+            return None;
+        }
+        Some(one_dimensional)
+    }
+
+    /// Consumes consecutive end-of-line patterns, reporting how many there
+    /// were, and stopping at two.
+    ///
+    /// Two is as many as any caller has to tell apart: one separates rows, and
+    /// two end the data.
+    fn consume_eols(&mut self) -> u32 {
+        let mut count = 0;
+        while self.consume_eol() {
+            count += 1;
+            if count >= 2 {
+                break;
+            }
+        }
+        count
+    }
+
+    /// Consumes one end-of-line pattern, and any fill before it, if the cursor
+    /// is on one (T.4 §4.1.1). Reports whether it did.
+    ///
+    /// The pattern is recognised whether or not `/EndOfLine` was set. Producers
+    /// disagree about that flag, and a decoder that trusts it reads a row
+    /// separator as image data — twelve bits of displacement that ruins every
+    /// row after.
+    ///
+    /// What the flag does decide is *fill*: a run of zero bits padding a row
+    /// out to a minimum transmission time, which T.4 §4.1.1 puts only before an
+    /// end-of-line pattern. A stream without those patterns has no fill, and a
+    /// long run of zeros in one is instead the padding in its last byte — which
+    /// the caller has to see as the end of the data rather than step over.
+    fn consume_eol(&mut self) -> bool {
+        if self.r.peek(EOL_WINDOW) == u32::from(EOL_BITS) {
+            self.r.skip(EOL_WINDOW);
+            return true;
+        }
+        if !self.fill || self.r.peek(EOL_WINDOW) != 0 {
+            return false;
+        }
+        // Twelve zero bits begin no code in either table, so consuming them
+        // cannot eat a row. The loop ends on the data, which is finite.
+        while let Some(bit) = self.r.read_bit() {
+            if bit == 1 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The most rows this build will infer for a stream that does not state its
+/// height (`/Rows 0`, ISO 32000-1 Table 11).
+///
+/// Without a stated height the row count is whatever the data says, which for
+/// attacker-supplied data is not a bound at all. The bound applied is the one
+/// the bitmap itself would apply: a row count past this could not be allocated,
+/// so counting further would only be work done before a refusal.
+fn inferred_row_cap(columns: u32) -> u32 {
+    let cap = MAX_PIXELS / u64::from(columns.max(1));
+    u32::try_from(cap).unwrap_or(u32::MAX)
+}
+
+/// Decodes one one-dimensionally coded row into `out` as a changing-element
+/// list (T.4 §4.1.2).
+///
+/// A row is runs of alternating colour, white first, each read from the table
+/// for its own colour. The leading white run may be empty — that is how a row
+/// beginning with a black pixel is written, and it is the common case for any
+/// image with ink at its left edge — so the colour alternates once per *run*,
+/// whether or not the run wrote a pixel.
+///
+/// The row ends when the accumulated position reaches `columns`. Past `columns`
+/// is corruption rather than a long run: a run cannot leave the row it is in,
+/// and honouring one would write over the row below.
+///
+/// Unlike a two-dimensional row, nothing here refers to the row above, so this
+/// one both starts and ends independent of its neighbours — which is the whole
+/// reason T.4 keeps it, and the reason a mixed stream can resynchronise on it.
+fn decode_row_1d(r: &mut BitReader, columns: u32, out: &mut Vec<u32>) -> Result<(), CcittError> {
+    out.clear();
+    let mut at: u32 = 0;
+    let mut white = true;
+    // Only the leading run may be empty, so a row cannot need more runs than it
+    // has columns. That makes the loop's termination structural rather than
+    // dependent on the decoded lengths being sane: a stream of empty runs stops
+    // here instead of being read forever.
+    let mut runs: u32 = 0;
+    while at < columns {
+        runs = runs.saturating_add(1);
+        if runs > columns.saturating_add(2) {
+            return Err(CcittError::Malformed("a row that never reaches its end"));
+        }
+        let run = read_run(r, white)?;
+        at = at.checked_add(run).ok_or(CcittError::RunTooLong)?;
+        if at > columns {
+            return Err(CcittError::RunTooLong);
+        }
+        push_change(out, at);
+        white = !white;
+    }
+    Ok(())
 }
 
 /// Decodes one two-dimensionally coded row into `out` as a changing-element
@@ -260,8 +481,12 @@ fn paint_row(out: &mut Bitmap, y: u32, changes: &[u32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::jbig2::bitmap::MAX_PIXELS;
+
     use crate::filters::ccitt::testing::{
-        bitmap_from_rows, encode_g4, encode_g4_tallied, pack, push_mode, push_run,
+        bitmap_from_rows, encode_g3, encode_g3_1d, encode_g3_1d_byte_aligned,
+        encode_g3_1d_with_eol, encode_g4, encode_g4_tallied, lookup, pack, push_code, push_mode,
+        push_run, Layout,
     };
 
     /// Asserts that decoding `data` reproduces `bm` exactly.
@@ -472,37 +697,289 @@ mod tests {
         );
     }
 
-    /// What this build reads is the pure two-dimensional form. The parameters
-    /// that select the other forms are reported rather than ignored, because
-    /// ignoring one decodes the wrong bits into a plausible-looking image.
-    #[test]
-    fn the_forms_this_build_does_not_decode_are_reported() {
-        let cases = [
-            Params { k: 0, ..g4(10, 4) },
-            Params { k: 4, ..g4(10, 4) },
-            Params {
-                end_of_line: true,
-                ..g4(10, 4)
-            },
-            Params {
-                byte_align: true,
-                ..g4(10, 4)
-            },
-            g4(10, 0),
-        ];
-        for params in cases {
-            assert!(
-                matches!(decode(&[], &params), Err(CcittError::Unimplemented(_))),
-                "{params:?}",
-            );
+    /// Pure one-dimensional parameters for a stream of the given shape.
+    fn g3(columns: u32, rows: u32) -> Params {
+        Params {
+            columns,
+            rows,
+            k: 0,
+            end_of_line: false,
+            byte_align: false,
         }
     }
 
+    /// Asserts that decoding `data` under `params` reproduces `bm` exactly.
+    fn assert_decodes_to(bm: &Bitmap, data: &[u8], params: &Params) {
+        let out = decode(data, params).expect("decode");
+        assert_eq!((out.width(), out.height()), (bm.width(), bm.height()));
+        for y in 0..bm.height() {
+            assert_eq!(out.row(y), bm.row(y), "row {y}");
+        }
+    }
+
+    #[test]
+    fn round_trips_pure_one_dimensional_coding() {
+        let bm = bitmap_from_rows(&["0011110000", "1111111111", "0000000000", "1010101010"]);
+        assert_decodes_to(&bm, &encode_g3_1d(&bm), &g3(10, 4));
+    }
+
+    /// A row written out by hand against T.4 Table 1, so that the round trip
+    /// above is anchored to the published table rather than only to the
+    /// encoder beside it: white 2 is `0111`, black 4 is `011`, white 2 is
+    /// `0111`. Eleven bits, zero filled: `0111_0110`, `111_00000`.
+    #[test]
+    fn a_hand_written_one_dimensional_row_decodes() {
+        let out = decode(&[0x76, 0xE0], &g3(8, 1)).expect("decode");
+        assert_eq!(out.row(0), [0, 0, 1, 1, 1, 1, 0, 0]);
+    }
+
+    /// A row beginning with black is written as an empty white run and then
+    /// the black one. White 0 is `00110101`, black 4 is `011`, white 4 is
+    /// `1011`: fifteen bits, `0011_0101`, `0111_0110`.
+    #[test]
+    fn a_one_dimensional_row_beginning_with_black_decodes() {
+        let out = decode(&[0x35, 0x76], &g3(8, 1)).expect("decode");
+        assert_eq!(out.row(0), [1, 1, 1, 1, 0, 0, 0, 0]);
+    }
+
+    /// A make-up code carries a multiple of 64 and the terminating code after
+    /// it the remainder; the two add (T.4 §4.1.2).
+    #[test]
+    fn a_one_dimensional_make_up_code_adds_to_its_terminating_code() {
+        let mut bits = Vec::new();
+        push_run(&mut bits, true, 70);
+        push_run(&mut bits, false, 10);
+        let data = pack(&bits);
+        let out = decode(&data, &g3(80, 1)).expect("decode");
+        assert_eq!(out.row(0)[..70], [0u8; 70]);
+        assert_eq!(out.row(0)[70..], [1u8; 10]);
+    }
+
+    /// A make-up code alone is a malformed row, not a run of 64: T.4 §4.1.2
+    /// requires a terminating code of the same colour to close it.
+    #[test]
+    fn a_make_up_code_without_a_terminating_code_is_rejected() {
+        let mut bits = Vec::new();
+        push_code(&mut bits, lookup(true, 64));
+        // Zeros are in neither table, and there are enough of them behind the
+        // failure that it cannot be read as the stream simply having stopped.
+        bits.extend(std::iter::repeat_n(0u8, 64));
+        let data = pack(&bits);
+        assert_eq!(decode(&data, &g3(80, 1)), Err(CcittError::UnknownCode));
+    }
+
+    /// A one-dimensional run cannot leave the row it is in.
+    #[test]
+    fn a_one_dimensional_run_past_the_row_end_is_rejected() {
+        let mut bits = Vec::new();
+        push_run(&mut bits, true, 1728);
+        bits.extend(std::iter::repeat_n(0u8, 64));
+        let data = pack(&bits);
+        assert_eq!(decode(&data, &g3(10, 1)), Err(CcittError::RunTooLong));
+    }
+
+    /// Only the leading white run of a row may be empty. A stream of empty
+    /// runs would otherwise be decoded forever; the row loop refuses it.
+    #[test]
+    fn a_one_dimensional_row_that_never_reaches_its_end_is_refused() {
+        let mut bits = Vec::new();
+        for _ in 0..40 {
+            push_run(&mut bits, true, 0);
+            push_run(&mut bits, false, 0);
+        }
+        bits.extend(std::iter::repeat_n(0u8, 64));
+        let data = pack(&bits);
+        assert!(matches!(
+            decode(&data, &g3(10, 1)),
+            Err(CcittError::Malformed(_)),
+        ));
+    }
+
+    /// With `/K` above zero each row carries a bit saying how it is coded, so
+    /// a reference row produced one-dimensionally has to serve a
+    /// two-dimensional row after it.
+    #[test]
+    fn mixed_coding_follows_the_per_row_bit() {
+        let bm = bitmap_from_rows(&["0011110000", "0011110000", "1100001111", "1100001111"]);
+        let layout = Layout {
+            end_of_line: true,
+            tagged: true,
+            ..Layout::default()
+        };
+        let data = encode_g3(&bm, layout, &[true, false, true, false]);
+        let params = Params {
+            columns: 10,
+            rows: 4,
+            k: 4,
+            end_of_line: true,
+            byte_align: false,
+        };
+        assert_decodes_to(&bm, &data, &params);
+    }
+
+    /// The tag bit is a property of mixed coding, not of end-of-line patterns:
+    /// a producer may write `/K` above zero with `/EndOfLine` false, and the
+    /// bit still precedes every row.
+    #[test]
+    fn mixed_coding_without_end_of_line_patterns_follows_the_tag_bit() {
+        let bm = bitmap_from_rows(&["1100001111", "1100001111", "0011110000"]);
+        let layout = Layout {
+            tagged: true,
+            ..Layout::default()
+        };
+        let data = encode_g3(&bm, layout, &[true, false, true]);
+        let params = Params {
+            columns: 10,
+            rows: 3,
+            k: 2,
+            end_of_line: false,
+            byte_align: false,
+        };
+        assert_decodes_to(&bm, &data, &params);
+    }
+
+    #[test]
+    fn end_of_line_patterns_are_consumed() {
+        let bm = bitmap_from_rows(&["0011110000", "1111000011"]);
+        let params = Params {
+            columns: 10,
+            rows: 2,
+            k: 0,
+            end_of_line: true,
+            byte_align: false,
+        };
+        assert_decodes_to(&bm, &encode_g3_1d_with_eol(&bm), &params);
+    }
+
+    /// An end-of-line pattern is legal even when `/EndOfLine` says otherwise:
+    /// producers disagree about that flag, so the pattern is recognised
+    /// wherever it appears rather than only where it was promised.
+    #[test]
+    fn an_unexpected_end_of_line_is_tolerated() {
+        let bm = bitmap_from_rows(&["0011110000", "1111000011"]);
+        assert_decodes_to(&bm, &encode_g3_1d_with_eol(&bm), &g3(10, 2));
+    }
+
+    /// Fill is a run of zero bits before an end-of-line pattern, padding a row
+    /// out to a minimum transmission time (T.4 §4.1.1). It carries nothing.
+    #[test]
+    fn fill_bits_before_an_end_of_line_are_skipped() {
+        let bm = bitmap_from_rows(&["0011110000", "1111000011", "0000111100"]);
+        let layout = Layout {
+            end_of_line: true,
+            fill_bits: 21,
+            ..Layout::default()
+        };
+        let params = Params {
+            columns: 10,
+            rows: 3,
+            k: 0,
+            end_of_line: true,
+            byte_align: false,
+        };
+        assert_decodes_to(&bm, &encode_g3(&bm, layout, &[]), &params);
+    }
+
+    #[test]
+    fn byte_aligned_rows_round_trip() {
+        let bm = bitmap_from_rows(&["0011110000", "1111000011", "0000111100"]);
+        let params = Params {
+            columns: 10,
+            rows: 3,
+            k: 0,
+            end_of_line: false,
+            byte_align: true,
+        };
+        assert_decodes_to(&bm, &encode_g3_1d_byte_aligned(&bm), &params);
+    }
+
+    /// With `/Rows` of 0 the height is however many rows the data holds.
+    #[test]
+    fn an_unknown_row_count_decodes_until_the_data_ends() {
+        let bm = bitmap_from_rows(&["0011110000", "1111000011", "0000111100", "1010101010"]);
+        assert_decodes_to(&bm, &encode_g3_1d(&bm), &g3(10, 0));
+    }
+
+    /// The same, two-dimensionally: the terminator a JBIG2 MMR region may end
+    /// with is a run of zero bits, which is not the start of any row.
+    #[test]
+    fn an_unknown_row_count_works_for_two_dimensional_coding() {
+        let bm = bitmap_from_rows(&["0011110000", "0011111000", "0000110000", "1111111111"]);
+        assert_decodes_to(&bm, &encode_g4(&bm), &g4(10, 0));
+    }
+
+    /// A stream that decodes no rows at all is an image of no height rather
+    /// than an error.
+    #[test]
+    fn an_unknown_row_count_over_no_data_is_an_empty_image() {
+        let out = decode(&[], &g3(10, 0)).expect("decode");
+        assert_eq!((out.width(), out.height()), (10, 0));
+    }
+
+    /// Two end-of-line patterns with no row between them end the data: the
+    /// end-of-facsimile block of T.6 §2.2.1, and the opening pair of T.4's
+    /// return to control.
+    #[test]
+    fn an_end_of_facsimile_block_ends_the_image() {
+        let bm = bitmap_from_rows(&["0011110000"; 3]);
+        for trailing_eols in [2, 6] {
+            let layout = Layout {
+                trailing_eols,
+                ..Layout::default()
+            };
+            let data = encode_g3(&bm, layout, &[]);
+            let out = decode(&data, &g3(10, 0)).expect("decode");
+            assert_eq!(out.height(), 3, "{trailing_eols} trailing patterns");
+        }
+    }
+
+    /// A terminator before the stated row count leaves the rest of the image
+    /// white rather than failing it.
+    #[test]
+    fn an_end_of_block_leaves_the_stated_rows_after_it_white() {
+        let bm = bitmap_from_rows(&["1111111111"; 3]);
+        let layout = Layout {
+            trailing_eols: 2,
+            ..Layout::default()
+        };
+        let out = decode(&encode_g3(&bm, layout, &[]), &g3(10, 5)).expect("decode");
+        assert_eq!(out.row(2), [1; 10], "the last coded row survived");
+        assert_eq!(
+            out.row(3),
+            [0; 10],
+            "the rows past the terminator are white"
+        );
+    }
+
+    /// The height inferred for a stream that does not state one is capped at
+    /// what the bitmap allocation would allow anyway, so no stream can ask for
+    /// an unbounded row count.
+    #[test]
+    fn an_inferred_height_cannot_exceed_the_allocation_cap() {
+        assert_eq!(u64::from(inferred_row_cap(1)), MAX_PIXELS);
+        assert_eq!(u64::from(inferred_row_cap(64)) * 64, MAX_PIXELS);
+        assert_eq!(inferred_row_cap(u32::MAX), 0);
+    }
+
     /// Every byte string is either an image or an error, never a panic and
-    /// never a hang.
+    /// never a hang — under every combination of the layout parameters, since
+    /// each selects a different path through the row loop.
     #[test]
     fn arbitrary_bytes_never_panic_or_hang() {
         let mut state = 0xFEED_FACEu32;
+        let layouts = [
+            g4(32, 16),
+            g3(32, 16),
+            Params { k: 4, ..g3(32, 16) },
+            Params {
+                end_of_line: true,
+                byte_align: true,
+                ..g3(32, 16)
+            },
+            g4(32, 0),
+            g3(32, 0),
+            Params { k: 4, ..g3(32, 0) },
+        ];
         for _ in 0..2_000 {
             let len = (state % 97) as usize;
             let data: Vec<u8> = (0..len)
@@ -511,9 +988,13 @@ mod tests {
                     (state >> 24) as u8
                 })
                 .collect();
-            let outcome = decode(&data, &g4(32, 16));
-            if let Ok(bm) = outcome {
-                assert_eq!((bm.width(), bm.height()), (32, 16));
+            for params in &layouts {
+                if let Ok(bm) = decode(&data, params) {
+                    assert_eq!(bm.width(), params.columns);
+                    if params.rows != 0 {
+                        assert_eq!(bm.height(), params.rows);
+                    }
+                }
             }
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         }
