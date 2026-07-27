@@ -1,14 +1,22 @@
 //! Stream filters (ISO 32000 §7.4): FlateDecode, LZWDecode, ASCIIHexDecode,
-//! ASCII85Decode, RunLengthDecode, JBIG2Decode, plus PNG/TIFF predictors.
-//! `DCTDecode` is passthrough (decoded at the image layer); `JPXDecode`,
-//! `Crypt` and the rest are unsupported.
+//! ASCII85Decode, RunLengthDecode, CCITTFaxDecode, JBIG2Decode, plus PNG/TIFF
+//! predictors. `DCTDecode` is passthrough (decoded at the image layer);
+//! `JPXDecode`, `Crypt` and the rest are unsupported.
 //!
-//! `JBIG2Decode` (§7.4.7) is decoded here rather than at the image layer,
-//! because what comes out of the codec is ordinary 1-bit `/DeviceGray` sample
-//! data: nothing downstream needs to know the image was JBIG2-coded at all.
-//! It is the one filter that reads the image dictionary it belongs to, since
-//! an embedded JBIG2 stream takes its page geometry from `/Width` and
-//! `/Height`.
+//! The two bilevel codecs, `CCITTFaxDecode` (§7.4.6) and `JBIG2Decode`
+//! (§7.4.7), are decoded here rather than at the image layer, because what
+//! comes out of either is ordinary 1-bit `/DeviceGray` sample data: nothing
+//! downstream needs to know the image was coded that way at all. `JBIG2Decode`
+//! is the one filter that reads the image dictionary it belongs to, since an
+//! embedded JBIG2 stream takes its page geometry from `/Width` and `/Height`;
+//! `CCITTFaxDecode` takes its geometry from its own `/DecodeParms` instead.
+//!
+//! The two also disagree about polarity, which is worth stating in one place
+//! because both arms are in this file. JBIG2 defines a 1 pixel as ink and
+//! `/DeviceGray` reads a 0 sample as black, so the `JBIG2Decode` arm always
+//! inverts. `CCITTFaxDecode` has `/BlackIs1`, whose default of false already
+//! means "0 bits are black" — the `/DeviceGray` convention — so that arm
+//! inverts by default and does *not* invert when `/BlackIs1` is set.
 //!
 //! Passthrough is reserved for codecs a consumer of the decoded bytes can
 //! actually read. `JPXDecode` (§7.4.9) is not one of them: nothing in this
@@ -59,6 +67,17 @@ pub(crate) fn int_parm(parms: Option<&Dict>, key: &str, default: i64) -> i64 {
     }
 }
 
+/// Reads a boolean-valued entry from an optional parameter dictionary,
+/// coercing integers (nonzero is true, matching the coercion [`int_parm`] makes
+/// in the other direction); anything else yields `default`.
+pub(crate) fn bool_parm(parms: Option<&Dict>, key: &str, default: bool) -> bool {
+    match parms.and_then(|d| d.get(key)) {
+        Some(Object::Bool(v)) => *v,
+        Some(Object::Int(v)) => *v != 0,
+        _ => default,
+    }
+}
+
 /// Chases indirect references through `resolver` (bounded depth to break
 /// reference cycles); direct objects are cloned. Returns `None` when a
 /// reference cannot be resolved.
@@ -104,8 +123,11 @@ fn parms_at(parms: Option<&Object>, index: usize, resolver: &dyn Resolve) -> Opt
 /// `/DecodeParms` (dict, array, or null) in order and returns the decoded
 /// bytes. Two filters are accepted only as the last element of the chain: the
 /// passthrough `DCTDecode`, and `JBIG2Decode`, whose codec reads the stream
-/// dictionary the chain belongs to. `JPXDecode`, `Crypt` and unknown filters
-/// yield [`Error::UnsupportedFilter`].
+/// dictionary the chain belongs to. `CCITTFaxDecode` is not among them — it
+/// consumes only the bytes it is handed, so it decodes at any position, and a
+/// chain that puts something after it fails in that later stage rather than
+/// being reported as an unsupported filter it is not. `JPXDecode`, `Crypt` and
+/// unknown filters yield [`Error::UnsupportedFilter`].
 pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>> {
     let filter = resolve_value(stream.dict.get("Filter"), resolver);
     // Filters keep their original position so that `/DecodeParms` arrays
@@ -145,6 +167,13 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
             "ASCIIHexDecode" | "AHx" => ascii_hex::decode(&data)?,
             "ASCII85Decode" | "A85" => ascii85::decode(&data)?,
             "RunLengthDecode" | "RL" => run_length::decode(&data)?,
+            // Fax coding decodes to samples here for the same reason JBIG2
+            // does: what the codec produces is ordinary 1-bit `/DeviceGray`
+            // data, and nothing downstream needs to know the image was faxed.
+            // Unlike JBIG2 it reads no part of the stream dictionary, only the
+            // bytes handed to it and its own `/DecodeParms`, so it is not
+            // restricted to the end of the chain.
+            "CCITTFaxDecode" | "CCF" => ccitt::decode_pdf_stream(&data, parms)?,
             // JBIG2 is decoded to samples here: the result is 1-bit
             // `/DeviceGray` data like any other, so the image layer has
             // nothing left to do. Only as the last filter, since the codec
@@ -170,6 +199,12 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::ccitt::codes::Mode;
+    use crate::filters::ccitt::testing::{
+        bitmap_from_rows, encode_g3_1d, encode_g3_1d_byte_aligned, encode_g4, pack, push_mode,
+        push_run,
+    };
+    use crate::filters::jbig2::bitmap::Bitmap;
     use crate::object::ObjRef;
     use crate::parser::NoResolve;
     use flate2::write::ZlibEncoder;
@@ -357,9 +392,12 @@ mod tests {
 
     #[test]
     fn unknown_filter_is_unsupported() {
-        let s = make_stream(vec![("Filter", Object::Name(name("CCITTFaxDecode")))], b"x");
+        let s = make_stream(
+            vec![("Filter", Object::Name(name("NotAFilterDecode")))],
+            b"x",
+        );
         match decode_stream(&s, &NoResolve) {
-            Err(Error::UnsupportedFilter(n)) => assert_eq!(n, "CCITTFaxDecode"),
+            Err(Error::UnsupportedFilter(n)) => assert_eq!(n, "NotAFilterDecode"),
             other => panic!("expected UnsupportedFilter, got {other:?}"),
         }
     }
@@ -735,6 +773,299 @@ mod tests {
             decode_stream(&s, &NoResolve).unwrap(),
             vec![0b0111_1111, 0b1010_1010],
         );
+    }
+
+    /// A `CCITTFaxDecode` stream over `data`. An empty `parms` omits
+    /// `/DecodeParms` entirely, which is how the ISO 32000-1 Table 11 defaults
+    /// are exercised.
+    fn ccitt_stream(data: Vec<u8>, parms: Vec<(&str, Object)>) -> Stream {
+        let mut entries = vec![("Filter", Object::Name(name("CCITTFaxDecode")))];
+        if !parms.is_empty() {
+            entries.push(("DecodeParms", Object::Dict(make_dict(parms))));
+        }
+        make_stream(entries, &data)
+    }
+
+    /// Decodes `bm` as a pure two-dimensional stream through the filter, with
+    /// `extra` added to the parameter dictionary.
+    fn decode_g4(bm: &Bitmap, extra: Vec<(&str, Object)>) -> Result<Vec<u8>> {
+        let mut parms = vec![
+            ("K", Object::Int(-1)),
+            ("Columns", Object::Int(i64::from(bm.width()))),
+            ("Rows", Object::Int(i64::from(bm.height()))),
+        ];
+        parms.extend(extra);
+        decode_stream(&ccitt_stream(encode_g4(bm), parms), &NoResolve)
+    }
+
+    /// `/BlackIs1` is the fax filter's polarity switch, and it points the
+    /// opposite way to `JBIG2Decode`'s unconditional inversion (ISO 32000-1
+    /// Table 11). Both arms live in this file, so both directions are pinned
+    /// here.
+    ///
+    /// The fixture's rows are `11110000` and `00001111` with black written as
+    /// `1`. `/BlackIs1` false — the default — means a 0 bit is black in the
+    /// decoded output, so the samples are the complement of those rows;
+    /// `/BlackIs1` true means they are the rows themselves. Stating both by
+    /// hand is what separates a missing inversion from a doubled one, since
+    /// each alone produces a perfectly plausible image.
+    #[test]
+    fn ccitt_black_is_1_selects_the_output_polarity() {
+        let bm = bitmap_from_rows(&["11110000", "00001111"]);
+        let expected_default = vec![0b0000_1111, 0b1111_0000];
+        let expected_black_is_1 = vec![0b1111_0000, 0b0000_1111];
+
+        assert_eq!(
+            decode_g4(&bm, vec![]).expect("decode"),
+            expected_default,
+            "the default is /BlackIs1 false: black is a 0 sample",
+        );
+        assert_eq!(
+            decode_g4(&bm, vec![("BlackIs1", Object::Bool(false))]).expect("decode"),
+            expected_default,
+            "stating the default changes nothing",
+        );
+        assert_eq!(
+            decode_g4(&bm, vec![("BlackIs1", Object::Bool(true))]).expect("decode"),
+            expected_black_is_1,
+            "/BlackIs1 keeps black as a 1 sample",
+        );
+    }
+
+    /// An all-black row is the shortest statement of the polarity, and the one
+    /// a reader can check without counting bits.
+    #[test]
+    fn ccitt_an_all_black_row_defaults_to_zero_samples() {
+        let bm = bitmap_from_rows(&["11111111"]);
+        assert_eq!(decode_g4(&bm, vec![]).expect("decode"), vec![0x00]);
+        assert_eq!(
+            decode_g4(&bm, vec![("BlackIs1", Object::Bool(true))]).expect("decode"),
+            vec![0xFF],
+        );
+    }
+
+    /// A row whose width is not a whole number of bytes is padded out to one,
+    /// and the padding has to read as *white* under both polarities. Padding
+    /// that inverts with the image grows a black stripe down the right edge of
+    /// every fax page whose width is not a multiple of eight — which is most of
+    /// them.
+    #[test]
+    fn ccitt_row_padding_reads_as_white_under_both_polarities() {
+        let bm = bitmap_from_rows(&["1010"]);
+        assert_eq!(
+            decode_g4(&bm, vec![]).expect("decode"),
+            vec![0b0101_1111],
+            "black 1010, then four white padding bits, which are 1 by default",
+        );
+        assert_eq!(
+            decode_g4(&bm, vec![("BlackIs1", Object::Bool(true))]).expect("decode"),
+            vec![0b1010_0000],
+            "and 0 under /BlackIs1, which is white there",
+        );
+    }
+
+    /// `/CCF` is the abbreviation ISO 32000-1 §8.9.7 gives the filter inside an
+    /// inline image, and it names the same codec.
+    #[test]
+    fn ccitt_abbreviated_filter_name_is_accepted() {
+        let bm = bitmap_from_rows(&["11110000"]);
+        let s = make_stream(
+            vec![
+                ("Filter", Object::Name(name("CCF"))),
+                (
+                    "DecodeParms",
+                    Object::Dict(make_dict(vec![
+                        ("K", Object::Int(-1)),
+                        ("Columns", Object::Int(8)),
+                        ("Rows", Object::Int(1)),
+                        ("BlackIs1", Object::Bool(true)),
+                    ])),
+                ),
+            ],
+            &encode_g4(&bm),
+        );
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), vec![0b1111_0000]);
+    }
+
+    /// Scanners routinely compress the coded bytes as well, so the filter has
+    /// to work as the second stage of a chain, with its parameters at the
+    /// matching index of the `/DecodeParms` array.
+    #[test]
+    fn flate_then_ccitt_decodes() {
+        let bm = bitmap_from_rows(&["11110000", "00001111"]);
+        let parms = make_dict(vec![
+            ("K", Object::Int(-1)),
+            ("Columns", Object::Int(8)),
+            ("Rows", Object::Int(2)),
+            ("BlackIs1", Object::Bool(true)),
+        ]);
+        let s = make_stream(
+            vec![
+                (
+                    "Filter",
+                    Object::Array(vec![
+                        Object::Name(name("FlateDecode")),
+                        Object::Name(name("CCITTFaxDecode")),
+                    ]),
+                ),
+                (
+                    "DecodeParms",
+                    Object::Array(vec![Object::Null, Object::Dict(parms)]),
+                ),
+            ],
+            &zlib(&encode_g4(&bm)),
+        );
+        assert_eq!(
+            decode_stream(&s, &NoResolve).unwrap(),
+            vec![0b1111_0000, 0b0000_1111],
+        );
+    }
+
+    /// With no `/DecodeParms` at all every Table 11 default applies: `/K` 0, so
+    /// pure one-dimensional coding; `/Columns` 1728; `/Rows` 0, so the height
+    /// comes from the data; `/BlackIs1` false; `/EncodedByteAlign` false;
+    /// `/EndOfLine` false.
+    #[test]
+    fn ccitt_defaults_match_the_specification() {
+        let mut bm = Bitmap::new(1728, 3).expect("fixture");
+        for y in 0..3 {
+            for x in 0..8 {
+                bm.set(x, y, 1);
+            }
+        }
+        let out = decode_stream(&ccitt_stream(encode_g3_1d(&bm), vec![]), &NoResolve)
+            .expect("decode with every default");
+        let stride = 1728 / 8;
+        assert_eq!(out.len(), stride * 3, "1728 columns, three rows inferred");
+        for y in 0..3 {
+            let row = &out[y * stride..(y + 1) * stride];
+            assert_eq!(row[0], 0x00, "row {y} starts with eight black samples");
+            assert!(
+                row[1..].iter().all(|b| *b == 0xFF),
+                "row {y} is white after them",
+            );
+        }
+    }
+
+    /// `/K` 0 with `/EncodedByteAlign` — the other end of the parameter space
+    /// from the pure two-dimensional case, and the combination a fax machine's
+    /// own output takes.
+    #[test]
+    fn ccitt_one_dimensional_byte_aligned_rows_decode() {
+        let bm = bitmap_from_rows(&["11110000", "00111100", "00001111"]);
+        let s = ccitt_stream(
+            encode_g3_1d_byte_aligned(&bm),
+            vec![
+                ("K", Object::Int(0)),
+                ("Columns", Object::Int(8)),
+                ("Rows", Object::Int(3)),
+                ("EncodedByteAlign", Object::Bool(true)),
+                ("BlackIs1", Object::Bool(true)),
+            ],
+        );
+        assert_eq!(
+            decode_stream(&s, &NoResolve).unwrap(),
+            vec![0b1111_0000, 0b0011_1100, 0b0000_1111],
+        );
+    }
+
+    /// `/Rows` 0 — the default — means the height is however many rows the data
+    /// holds.
+    #[test]
+    fn ccitt_an_unstated_row_count_is_inferred_from_the_data() {
+        let bm = bitmap_from_rows(&["11110000"; 5]);
+        let s = ccitt_stream(
+            encode_g4(&bm),
+            vec![
+                ("K", Object::Int(-1)),
+                ("Columns", Object::Int(8)),
+                ("BlackIs1", Object::Bool(true)),
+            ],
+        );
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), vec![0b1111_0000; 5]);
+    }
+
+    /// A row of no pixels is not a narrow image, it is not an image.
+    #[test]
+    fn ccitt_zero_columns_is_a_decode_error() {
+        let s = ccitt_stream(vec![0u8; 8], vec![("Columns", Object::Int(0))]);
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// `/Rows` counts rows, so a negative value describes nothing.
+    #[test]
+    fn ccitt_a_negative_row_count_is_a_decode_error() {
+        let s = ccitt_stream(
+            vec![0u8; 8],
+            vec![("Columns", Object::Int(8)), ("Rows", Object::Int(-1))],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// Both dimensions come from the file, so both are refused from the
+    /// declared values before any allocation is attempted — eight bytes of
+    /// input must not be able to ask for a hundred-gigapixel bitmap.
+    #[test]
+    fn ccitt_an_image_past_the_allocation_cap_is_refused() {
+        let s = ccitt_stream(
+            vec![0u8; 8],
+            vec![
+                ("K", Object::Int(-1)),
+                ("Columns", Object::Int(100_000)),
+                ("Rows", Object::Int(100_000)),
+            ],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// A single row wider than the whole allocation cap is refused too, rather
+    /// than quietly yielding an image of no rows.
+    #[test]
+    fn ccitt_a_row_wider_than_the_allocation_cap_is_refused() {
+        let s = ccitt_stream(
+            vec![0u8; 8],
+            vec![("K", Object::Int(-1)), ("Columns", Object::Int(1 << 28))],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
+    }
+
+    /// Corruption inside a stream that has not run out is an error, not a
+    /// guess: a run length that would leave the row it is in cannot be
+    /// honoured, and honouring it would write over the row below.
+    #[test]
+    fn ccitt_a_run_past_the_row_end_is_a_decode_error() {
+        // Horizontal mode, then a white run of 1728 and a black run of 0, in a
+        // row ten pixels wide. The trailing zero bits are there so the failure
+        // is read as corruption rather than as the data running out mid-code.
+        let mut bits = Vec::new();
+        push_mode(&mut bits, Mode::Horizontal);
+        push_run(&mut bits, true, 1728);
+        push_run(&mut bits, false, 0);
+        bits.extend(std::iter::repeat_n(0u8, 24));
+        let s = ccitt_stream(
+            pack(&bits),
+            vec![
+                ("K", Object::Int(-1)),
+                ("Columns", Object::Int(10)),
+                ("Rows", Object::Int(1)),
+            ],
+        );
+        assert!(matches!(
+            decode_stream(&s, &NoResolve),
+            Err(Error::Decode(_))
+        ));
     }
 
     #[test]

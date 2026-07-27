@@ -1980,14 +1980,14 @@ mod tests {
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
         );
-        b.stream(4, "/Filter /CCITTFaxDecode", b"0 0 100 100 re f");
+        b.stream(4, "/Filter /JPXDecode", b"0 0 100 100 re f");
         let (pix, report) = render_reporting(b.build(1));
         assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::PageContents,
-                SkipReason::UnsupportedFilter("CCITTFaxDecode".to_string()),
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
         );
@@ -2004,7 +2004,7 @@ mod tests {
         let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
             b.stream(
                 5,
-                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /CCITTFaxDecode",
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /JPXDecode",
                 b"0 0 100 100 re f",
             );
         });
@@ -2014,7 +2014,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Form,
-                SkipReason::UnsupportedFilter("CCITTFaxDecode".to_string()),
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
         );
@@ -2113,7 +2113,7 @@ mod tests {
                      /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 255 6 0 R]",
                     &[0; 64],
                 );
-                b.stream(6, "/Filter /CCITTFaxDecode", &[0; 12]);
+                b.stream(6, "/Filter /JPXDecode", &[0; 12]);
             },
         );
         let (_, report) = render_reporting(bytes);
@@ -2121,7 +2121,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("CCITTFaxDecode".to_string()),
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
         );
