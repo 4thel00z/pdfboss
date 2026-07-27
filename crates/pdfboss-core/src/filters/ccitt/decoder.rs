@@ -546,8 +546,7 @@ fn paint_row(out: &mut Bitmap, y: u32, changes: &[u32]) {
 /// This is the same row in the same polarity as [`paint_row`] writes, only an
 /// eighth the size, which is what makes it affordable to hold every row of an
 /// image whose height is not known until the last one has been read. Bits past
-/// the last column are padding and stay clear, which is white — the value they
-/// already had, since [`unpack_row`] never reads them.
+/// the last column are padding and stay clear, which is white.
 fn pack_row(dst: &mut [u8], changes: &[u32], columns: u32) {
     for (start, end) in black_spans(changes, columns) {
         for x in start..end {
@@ -562,13 +561,28 @@ fn pack_row(dst: &mut [u8], changes: &[u32], columns: u32) {
 ///
 /// The bitmap arrives white, so only the set bits are written, exactly as
 /// [`paint_row`] writes only the black spans.
+///
+/// Whole white bytes are stepped over rather than tested bit by bit, which is
+/// what keeps this proportional to the ink on the row rather than to its
+/// width. The difference is not a micro-optimisation: a facsimile page is
+/// mostly white, and a row coded as a single vertical mode code — one bit for
+/// an entire white row — must not cost a pass over every pixel it covers to
+/// paint, or the cheapest row in the format becomes the most expensive one to
+/// store.
+///
+/// Bits past the last column are padding, which [`pack_row`] leaves clear, and
+/// a set bit there would in any case be dropped by the bitmap's own bounds
+/// check rather than wrap onto the next row.
 fn unpack_row(out: &mut Bitmap, y: u32, packed: &[u8]) {
-    for x in 0..out.width() {
-        let Some(byte) = packed.get(x as usize / 8) else {
-            break;
-        };
-        if byte & (0x80 >> (x % 8)) != 0 {
-            out.set(x, y, 1);
+    for (index, &byte) in packed.iter().enumerate() {
+        if byte == 0 {
+            continue;
+        }
+        let base = (index as u32).saturating_mul(8);
+        for bit in 0..8u32 {
+            if byte & (0x80 >> bit) != 0 {
+                out.set(base.saturating_add(bit), y, 1);
+            }
         }
     }
 }
