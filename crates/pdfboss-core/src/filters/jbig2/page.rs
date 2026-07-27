@@ -38,7 +38,9 @@ use std::collections::HashMap;
 
 use super::bitmap::Bitmap;
 use super::budget::Budget;
-use super::generic::{decode_generic_region, parse_generic_flags, GB_CONTEXT_LEN};
+use super::generic::{
+    decode_generic_region, decode_mmr_region, parse_generic_flags, GB_CONTEXT_LEN,
+};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::segment::{parse_embedded, parse_region_info, RegionInfo, Segment, SegmentKind};
@@ -269,10 +271,16 @@ fn gather_symbols<'a>(
 /// bitmap, returning it alongside the region information field that says where
 /// it goes.
 ///
-/// Each generic region segment gets a fresh arithmetic decoder and a fresh
-/// context array: unlike the symbol dictionary, which codes every symbol of a
-/// height class through one shared array, a generic region segment's coded data
-/// begins and ends within the segment.
+/// Each arithmetically coded generic region segment gets a fresh arithmetic
+/// decoder and a fresh context array: unlike the symbol dictionary, which codes
+/// every symbol of a height class through one shared array, a generic region
+/// segment's coded data begins and ends within the segment.
+///
+/// The flags byte may instead say the region is MMR-coded (6.2.6), in which
+/// case the data after it is a facsimile bit stream rather than an arithmetic
+/// one and no AT bytes precede it. Everything outside the region's own pixels —
+/// where it goes, how tall it is when the header did not say, and what it costs
+/// — is settled the same way for both codings.
 fn decode_generic_region_segment(
     segment: &Segment<'_>,
     budget: &mut Budget,
@@ -280,9 +288,6 @@ fn decode_generic_region_segment(
     let mut r = Reader::new(segment.data);
     let info = parse_region_info(&mut r)?;
     let (mmr, params) = parse_generic_flags(&mut r)?;
-    if mmr {
-        return Err(Jbig2Error::Unimplemented("MMR coding"));
-    }
 
     // 7.2.7: when the header declared an unknown data length, the four bytes
     // after the terminator hold the real number of rows and supersede the
@@ -296,6 +301,16 @@ fn decode_generic_region_segment(
         Some(_) => info.height,
         None => trailing_row_count(segment.data)?,
     };
+
+    if mmr {
+        // The terminator and row count of an unknown-length segment are still
+        // in this slice, and are simply never reached: the facsimile decoder
+        // stops after the rows it was asked for.
+        return Ok((
+            info,
+            decode_mmr_region(r.rest(), budget, info.width, height)?,
+        ));
+    }
 
     let mut dec = MqDecoder::new(r.rest());
     let mut cx = MqContexts::new(GB_CONTEXT_LEN);
@@ -322,6 +337,7 @@ fn trailing_row_count(data: &[u8]) -> Result<u32, Jbig2Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::ccitt::testing::{bitmap_from_rows, encode_g4};
     use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::{context_at, GenericParams, GB_CONTEXT_LEN};
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
@@ -393,6 +409,26 @@ mod tests {
             region.push(dx as u8);
             region.push(dy as u8);
         }
+        let mut out = header(number, 38, &[], 1, region.len() as u32);
+        out.extend_from_slice(&region);
+        out
+    }
+
+    /// The same demand with the MMR flag set: no AT bytes, and a facsimile bit
+    /// stream that is not there either.
+    ///
+    /// The facsimile decoder stops as soon as the bits run out, so what an
+    /// MMR region buys with an enormous declared height is not decoding but the
+    /// bitmap and the row walk that precede it — which is exactly why the
+    /// charge has to be made from the header rather than from the data.
+    fn empty_mmr_region_segment(number: u32, width: u32, height: u32) -> Vec<u8> {
+        let mut region = Vec::new();
+        region.extend_from_slice(&width.to_be_bytes());
+        region.extend_from_slice(&height.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes()); // x
+        region.extend_from_slice(&0u32.to_be_bytes()); // y
+        region.push(0); // OR
+        region.push(1); // MMR 1, no AT bytes
         let mut out = header(number, 38, &[], 1, region.len() as u32);
         out.extend_from_slice(&region);
         out
@@ -532,23 +568,66 @@ mod tests {
         }
     }
 
-    /// MMR coding lives in a later build and must say so rather than decoding
-    /// noise.
+    /// An immediate generic region whose MMR flag is set carries a
+    /// two-dimensional facsimile stream instead of arithmetically coded pixels,
+    /// and no AT bytes at all (T.88 6.2.6, 7.4.6.2). Its pixels must reach the
+    /// page at the offset its region information field gives, the same as any
+    /// other region's.
     #[test]
-    fn an_mmr_generic_region_is_an_unimplemented_error() {
+    fn a_page_with_an_mmr_region_decodes() {
+        let bm = bitmap_from_rows(&[
+            "01111110", "01000010", "01011010", "01000010", "01111110", "00011000",
+        ]);
+        let (x, y) = (2u32, 3u32);
+
         let mut region = Vec::new();
-        region.extend_from_slice(&8u32.to_be_bytes());
-        region.extend_from_slice(&8u32.to_be_bytes());
-        region.extend_from_slice(&0u32.to_be_bytes());
-        region.extend_from_slice(&0u32.to_be_bytes());
-        region.push(0);
-        region.push(1); // MMR
+        region.extend_from_slice(&bm.width().to_be_bytes());
+        region.extend_from_slice(&bm.height().to_be_bytes());
+        region.extend_from_slice(&x.to_be_bytes());
+        region.extend_from_slice(&y.to_be_bytes());
+        region.push(0); // OR
+        region.push(1); // MMR 1: no AT bytes follow
+        region.extend_from_slice(&encode_g4(&bm));
         let mut stream = header(0, 38, &[], 1, region.len() as u32);
         stream.extend_from_slice(&region);
-        assert_eq!(
-            decode_embedded(&[], &stream, 8, 8),
-            Err(Jbig2Error::Unimplemented("MMR coding")),
-        );
+
+        let page = decode_embedded(&[], &stream, 16, 16).expect("page");
+        for row in 0..16u32 {
+            for col in 0..16u32 {
+                let want = bm.get(i64::from(col) - i64::from(x), i64::from(row) - i64::from(y));
+                assert_eq!(
+                    page.get(i64::from(col), i64::from(row)),
+                    want,
+                    "({col}, {row})",
+                );
+            }
+        }
+    }
+
+    /// The polarity relationship, end to end: an MMR region and an
+    /// arithmetically coded one carrying the same image must composite to the
+    /// same page. A set pixel is ink in both codings, so neither path may
+    /// invert — the one inversion this decoder performs is at the filter
+    /// boundary, on the assembled page.
+    #[test]
+    fn an_mmr_region_and_an_arithmetic_region_paint_the_same_page() {
+        let bm = checker(8, 8);
+
+        let mut region = Vec::new();
+        region.extend_from_slice(&bm.width().to_be_bytes());
+        region.extend_from_slice(&bm.height().to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.extend_from_slice(&0u32.to_be_bytes());
+        region.push(0); // OR
+        region.push(1); // MMR 1
+        region.extend_from_slice(&encode_g4(&bm));
+        let mut stream = header(0, 38, &[], 1, region.len() as u32);
+        stream.extend_from_slice(&region);
+
+        let mmr = decode_embedded(&[], &stream, 16, 16).expect("mmr page");
+        let arithmetic = decode_embedded(&[], &stream_with_region(16, 16, &bm, 0, 0, 0), 16, 16)
+            .expect("arithmetic page");
+        assert_eq!(mmr, arithmetic);
     }
 
     /// Informational segments are consumed without complaint.
@@ -663,6 +742,43 @@ mod tests {
                 "width {width}",
             );
         }
+    }
+
+    /// A region coded the other way must be refused on the same terms. The MMR
+    /// arm reaches a different decoder through a different bit reader, so it is
+    /// a second place the charge could have been left out — and a region no
+    /// pixels wide still allocates nothing there either.
+    #[test]
+    fn a_narrow_mmr_region_of_enormous_height_is_refused() {
+        for width in [0u32, 1, 2] {
+            let stream = empty_mmr_region_segment(0, width, u32::MAX);
+            assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
+            assert_eq!(
+                decode_embedded(&[], &stream, 8, 8),
+                Err(Jbig2Error::WorkLimit),
+                "width {width}",
+            );
+        }
+    }
+
+    /// And MMR regions spend the *stream's* budget, not one of their own: a
+    /// second allowance for the second coding would let a stream have both.
+    #[test]
+    fn mmr_regions_draw_on_the_same_budget_as_arithmetic_ones() {
+        // Every region here costs (16 + ROW_COST) * 16, whichever way it is
+        // coded, because the charge is made from the declared dimensions.
+        let each = (16 + ROW_COST) * 16;
+        let mut stream = empty_mmr_region_segment(0, 16, 16);
+        stream.extend_from_slice(&empty_region_segment(1, 16, 16));
+
+        let mut budget = Budget::with_limit(each * 2);
+        assert!(decode_embedded_within(&[], &stream, 16, 16, &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(each * 2 - 1);
+        assert_eq!(
+            decode_embedded_within(&[], &stream, 16, 16, &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
     }
 
     /// The same demand made through the unknown-length encoding of 7.2.7,

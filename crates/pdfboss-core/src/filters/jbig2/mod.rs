@@ -17,6 +17,14 @@
 //! actually made of; and [`page`] walks a segment sequence, compositing each
 //! region onto the page.
 //!
+//! One region coding is not decoded here at all. A generic region may say that
+//! its pixels are coded with the two-dimensional facsimile scheme of ITU-T T.6
+//! rather than arithmetically (6.2.6), and that scheme is the whole of the
+//! `CCITTFaxDecode` filter as well, so it lives in the sibling `ccitt` module
+//! and [`generic`] calls into it. The two share the same [`bitmap::Bitmap`] and
+//! the same convention that a set pixel is ink, so nothing is converted at the
+//! join.
+//!
 //! Cutting across that stack is [`budget`], the allowance of decoding work one
 //! embedded stream is allowed to spend. Every dimension the region decoders
 //! loop over is a number the stream chose, and a region need not carry the
@@ -38,6 +46,7 @@ pub(crate) mod text_region;
 pub(crate) mod testing;
 
 use crate::error::Error;
+use crate::filters::ccitt::CcittError;
 use crate::object::{Dict, Object};
 use crate::parser::Resolve;
 
@@ -79,6 +88,29 @@ impl core::fmt::Display for Jbig2Error {
 impl From<Jbig2Error> for Error {
     fn from(err: Jbig2Error) -> Self {
         Error::Decode(err.to_string())
+    }
+}
+
+impl From<CcittError> for Jbig2Error {
+    /// Restates a facsimile decoding failure as a JBIG2 one, for the MMR arm of
+    /// a generic region (6.2.6).
+    ///
+    /// Every variant has a counterpart, and the interesting one is
+    /// `BadParameter`. In the facsimile codec that names a mistake by whoever
+    /// called it — the row width and count arrive as arguments there, from a
+    /// PDF parameter dictionary. Here they arrive from the region information
+    /// field of the segment, so the same complaint is a statement about the
+    /// stream, and it becomes [`Jbig2Error::Malformed`].
+    fn from(err: CcittError) -> Jbig2Error {
+        match err {
+            CcittError::UnknownCode => Jbig2Error::Malformed("no such MMR code"),
+            CcittError::RunTooLong => Jbig2Error::Malformed("MMR run past the end of the row"),
+            CcittError::Malformed(what) | CcittError::BadParameter(what) => {
+                Jbig2Error::Malformed(what)
+            }
+            CcittError::Unimplemented(what) => Jbig2Error::Unimplemented(what),
+            CcittError::TooLarge { width, height } => Jbig2Error::TooLarge { width, height },
+        }
     }
 }
 

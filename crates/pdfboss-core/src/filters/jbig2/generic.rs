@@ -15,12 +15,20 @@
 //! template then degenerates into two or three contiguous runs of pixels that
 //! shift one position as `x` advances, so a whole context can be carried
 //! forward with two reads instead of sixteen.
+//!
+//! A generic region need not be arithmetically coded at all. When its MMR flag
+//! is set (6.2.6) the pixels are written with the two-dimensional facsimile
+//! coding of ITU-T T.6 instead, and neither the templates nor the adaptive
+//! pixels above have anything to do with it: [`decode_mmr_region`] hands the
+//! region to the facsimile codec beside this one, which the `CCITTFaxDecode`
+//! filter also uses.
 
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::Jbig2Error;
+use crate::filters::ccitt::decoder as facsimile;
 
 /// Number of arithmetic contexts a generic region addresses.
 ///
@@ -435,6 +443,58 @@ fn decode_generic_region_windowed(
     Ok(bm)
 }
 
+/// Decodes a generic region coded with the two-dimensional facsimile scheme of
+/// ITU-T T.6 (T.88 6.2.6), which is what the MMR flag of the segment's flags
+/// byte selects.
+///
+/// Nothing about the region is arithmetic: `data` is a bit stream of run-length
+/// codes, and the AT pixels and the typical-prediction flag are absent from the
+/// segment header because neither has any meaning here. What the region
+/// contributes is the row width and the row count; the coding itself is the
+/// same one the `CCITTFaxDecode` filter reads, so it is decoded by the same
+/// module, with the layout 6.2.6 fixes — pure two-dimensional, no end-of-line
+/// patterns, no byte alignment.
+///
+/// **No polarity conversion happens here, and none may be added.** A set pixel
+/// is black in the facsimile codec and ink in JBIG2; those are the same thing.
+/// The single inversion that reconciles ink with `/DeviceGray` is applied to the
+/// assembled page at the filter boundary.
+///
+/// `budget` is charged from the declared dimensions before any decoding, for
+/// the reasons set out on [`decode_generic_region`] and in the budget module:
+/// a region declares what it costs and need not carry the bits to back it up.
+/// Two further points are particular to this path.
+///
+/// A row count of zero is refused rather than passed on. In the facsimile codec
+/// that value means "as many rows as the data holds" (ISO 32000-1 Table 11),
+/// which is a count taken from the coded data — and a count taken from the data
+/// is one the charge, computed from the declared height of zero, has not paid
+/// for. JBIG2 never uses that encoding: 7.4.6.1 states the height in the region
+/// information field, and a region of no rows contributes no pixels to a page
+/// in any case.
+///
+/// A row width of zero is refused too, by the codec itself, for the same reason
+/// it refuses one from a PDF: a row of no pixels is not a narrow image.
+pub(crate) fn decode_mmr_region(
+    data: &[u8],
+    budget: &mut Budget,
+    width: u32,
+    height: u32,
+) -> Result<Bitmap, Jbig2Error> {
+    budget.charge_region(width, height)?;
+    if height == 0 {
+        return Err(Jbig2Error::Malformed("MMR region of no rows"));
+    }
+    let layout = facsimile::Params {
+        columns: width,
+        rows: height,
+        k: -1,
+        end_of_line: false,
+        byte_align: false,
+    };
+    Ok(facsimile::decode(data, &layout)?)
+}
+
 /// Decodes the typical-prediction decision that precedes a row when TPGDON is
 /// set, and reports whether the row is a copy of the one above
 /// (T.88 6.2.5.7).
@@ -499,6 +559,7 @@ pub(crate) fn parse_generic_flags(r: &mut Reader<'_>) -> Result<(bool, GenericPa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::ccitt::testing::{bitmap_from_rows, encode_g4};
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
 
     /// The 8x4 subject bitmap the hand-computed context vectors are taken
@@ -1153,6 +1214,141 @@ mod tests {
                 assert_eq!(fast.row(y), source.row(y), "template {template}, row {y}");
                 assert_eq!(slow.row(y), source.row(y), "template {template}, row {y}");
             }
+        }
+    }
+
+    /// A JBIG2 MMR region is a pure two-dimensional facsimile stream: no
+    /// end-of-line patterns, no byte alignment, and the region's own width and
+    /// height as the row width and the row count (T.88 6.2.6).
+    #[test]
+    fn an_mmr_region_decodes() {
+        let bm = bitmap_from_rows(&[
+            "0000000000",
+            "0011111000",
+            "0011111000",
+            "0000110000",
+            "1111111111",
+            "0000000000",
+        ]);
+        let out = decode_mmr_region(&encode_g4(&bm), &mut Budget::new(), bm.width(), bm.height())
+            .expect("mmr region");
+        assert_eq!(out, bm);
+    }
+
+    /// The MMR flag selects a different *coding* of a region, not a different
+    /// image and not a different polarity: a set pixel is ink under both. So
+    /// the two decoders must agree bit for bit. The inversion that reconciles
+    /// JBIG2's convention with `/DeviceGray` happens once, at the filter
+    /// boundary, and a second one here would show up as these two disagreeing.
+    #[test]
+    fn mmr_and_arithmetic_coding_of_one_image_agree() {
+        let bm = pseudo_random_bitmap(43, 21, 0x2468);
+        let arithmetic = round_trip(&bm, &GenericParams::nominal(0));
+        let mmr = decode_mmr_region(&encode_g4(&bm), &mut Budget::new(), bm.width(), bm.height())
+            .expect("mmr region");
+        assert_eq!(mmr, arithmetic);
+        assert_eq!(mmr, bm, "and both are the image that was coded");
+    }
+
+    /// The shared work budget is charged from the declared dimensions before
+    /// any decoding, exactly as on the arithmetic paths — a region no pixels
+    /// wide allocates nothing whatever its height, so the allocation cap never
+    /// sees it.
+    #[test]
+    fn an_mmr_region_cannot_declare_unbounded_rows() {
+        for width in [0u32, 1, 2] {
+            let mut budget = Budget::new();
+            assert_eq!(
+                decode_mmr_region(&[0xFFu8; 64], &mut budget, width, u32::MAX),
+                Err(Jbig2Error::WorkLimit),
+                "width {width}",
+            );
+            assert_eq!(budget, Budget::new(), "a refused region spends nothing");
+        }
+    }
+
+    /// The allocation cap is the second ceiling and still applies: a region the
+    /// budget can afford but no bitmap can hold is refused for its size.
+    #[test]
+    fn an_oversized_mmr_region_is_refused() {
+        // 8192 x 16385 is one row more than MAX_PIXELS, and costs about half
+        // the budget, so the size is what catches it.
+        assert_eq!(
+            decode_mmr_region(&[], &mut Budget::new(), 8192, 16385),
+            Err(Jbig2Error::TooLarge {
+                width: 8192,
+                height: 16385,
+            }),
+        );
+    }
+
+    /// A region declaring no rows is refused here rather than handed to the
+    /// codec, where a row count of 0 means "as many rows as the data holds"
+    /// (ISO 32000-1 Table 11). Rows counted from the data are rows the budget
+    /// charge — taken from the declared height, and so zero — never paid for,
+    /// which is exactly the shape of bypass this module has shipped twice
+    /// before.
+    #[test]
+    fn an_mmr_region_of_no_rows_is_refused() {
+        let bm = bitmap_from_rows(&["0011", "1100", "0110"]);
+        let mut budget = Budget::new();
+        assert_eq!(
+            decode_mmr_region(&encode_g4(&bm), &mut budget, bm.width(), 0),
+            Err(Jbig2Error::Malformed("MMR region of no rows")),
+        );
+        assert_eq!(budget, Budget::new(), "nothing was decoded to reach it");
+    }
+
+    /// What the refusal above is protecting against, stated as a fact about the
+    /// codec rather than as a comment on it: asked for zero rows, the facsimile
+    /// decoder counts them out of the data. Forwarding a declared height of
+    /// zero would therefore turn a region charged for no rows at all into as
+    /// many rows as its bytes could describe.
+    #[test]
+    fn the_facsimile_codec_reads_a_zero_row_count_as_count_them_yourself() {
+        let bm = bitmap_from_rows(&["1010", "0101", "1100", "0011", "1111"]);
+        let counted = facsimile::decode(
+            &encode_g4(&bm),
+            &facsimile::Params {
+                columns: bm.width(),
+                rows: 0,
+                k: -1,
+                end_of_line: false,
+                byte_align: false,
+            },
+        )
+        .expect("facsimile");
+        assert_eq!(
+            counted.height(),
+            bm.height(),
+            "the row count came from the data, not from the parameter",
+        );
+    }
+
+    /// A region no pixels wide is refused as well, rather than decoding rows
+    /// that hold nothing.
+    #[test]
+    fn an_mmr_region_of_no_columns_is_refused() {
+        assert!(matches!(
+            decode_mmr_region(&[0xFFu8; 32], &mut Budget::new(), 0, 4),
+            Err(Jbig2Error::Malformed(_)),
+        ));
+    }
+
+    /// Region data is attacker-controlled, so arbitrary bytes under a plausible
+    /// declared size must yield pixels or an error, never a panic or a hang.
+    #[test]
+    fn arbitrary_mmr_bytes_decode_without_hanging() {
+        let mut state: u32 = 0xC0FF_EE01;
+        for _ in 0..500 {
+            let len = (state % 97) as usize;
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+            let _ = decode_mmr_region(&data, &mut Budget::new(), 32, 16);
         }
     }
 }
