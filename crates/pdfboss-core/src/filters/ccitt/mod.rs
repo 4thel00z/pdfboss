@@ -91,40 +91,43 @@ impl From<CcittError> for Error {
 /// Decodes a `CCITTFaxDecode` stream into packed 1-bit samples (ISO 32000-1
 /// §7.4.6).
 ///
-/// Every entry of Table 11 is accounted for here, and four of the eight change
-/// what comes out:
+/// Every entry of Table 11 is accounted for. Five of the eight decide the
+/// image:
 ///
-/// - `/K` selects the coding: below zero pure two-dimensional, 0 pure
-///   one-dimensional, above zero a mixture in which each row says which it is.
+/// - `/K` (default 0) selects the coding: below zero pure two-dimensional, 0
+///   pure one-dimensional, above zero a mixture in which each row carries a bit
+///   saying which it is.
 /// - `/Columns` (default 1728) and `/Rows` (default 0, meaning "as many as the
 ///   data holds") are the image's dimensions. See [`MAX_IMAGE_PIXELS`] for what
 ///   bounds them.
 /// - `/EncodedByteAlign` (default false) starts each row on a byte boundary.
 /// - `/BlackIs1` (default false) is the polarity switch; see [`pack_samples`].
 ///
-/// The remaining three are read by the codec's own structure rather than from
-/// the dictionary, and the reason is the same for all three: producers set them
-/// inconsistently, and a decoder that trusts the flag over the bits reads a row
-/// separator as image data.
+/// `/EndOfLine` (default false) decides less than it appears to. It is read and
+/// passed on, but not to decide whether an end-of-line pattern is *recognised*:
+/// producers set the flag inconsistently, and a decoder that trusts it over the
+/// bits reads a row separator as twelve bits of image data, which ruins every
+/// row after. The pattern is stepped over wherever it appears. What the flag
+/// genuinely settles is whether *fill* bits may precede one, and that is what it
+/// is passed on for.
 ///
-/// - `/EndOfLine` (default false) claims end-of-line patterns separate the
-///   rows. The pattern is stepped over wherever it appears regardless. What the
-///   flag genuinely decides — whether *fill* bits may precede one — is passed
-///   through to the row decoder.
+/// The last two decide nothing here, and are not read:
+///
 /// - `/EndOfBlock` (default true) claims an end-of-facsimile block terminates
 ///   the data. That block is two consecutive end-of-line patterns, which are
 ///   not a row under any coding, so it ends the image whether or not the flag
-///   claims it. The one case where the flag would settle something is
-///   `/EndOfBlock` false together with `/Rows` 0, which states neither a height
-///   nor a terminator; counting the rows the data holds is the only answer
-///   available there, and it is the answer `/Rows` 0 already asks for.
+///   claims it — the same reasoning as for `/EndOfLine`. The one case where the
+///   flag could settle something is `/EndOfBlock` false together with `/Rows`
+///   0, which states neither a height nor a terminator; counting the rows the
+///   data holds is both the only answer available there and the one `/Rows` 0
+///   already asks for.
 /// - `/DamagedRowsBeforeError` (default 0) raises the number of damaged rows
 ///   tolerated before the decode fails. Table 11 gives it meaning only when
 ///   `/EndOfLine` is true and `/K` is non-negative, because tolerating a
 ///   damaged row means resynchronising on the next end-of-line pattern and
 ///   inventing the pixels in between. This build does not invent pixels: it
-///   reports the damage, which is the behaviour of the default and stricter
-///   than any other value asks for.
+///   reports the damage, which is what the default asks for and stricter than
+///   what any other value asks for.
 pub(crate) fn decode_pdf_stream(data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>> {
     let params = Params {
         columns: columns_parm(parms)?,
