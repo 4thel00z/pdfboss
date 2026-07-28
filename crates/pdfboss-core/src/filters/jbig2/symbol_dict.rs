@@ -28,6 +28,7 @@ use super::arith_int::{decode_int, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 use super::generic::{decode_generic_region, GenericParams, GB_CONTEXT_LEN};
+use super::huffman::Table;
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::Jbig2Error;
@@ -71,6 +72,14 @@ pub(crate) const SYMBOL_COST: u64 = 512;
 /// here and there entirely alone.
 const LOOP_SLACK: usize = 2;
 
+/// What a dictionary is told when its Huffman table selectors and its
+/// referred-to table segments do not account for one another (T.88 7.4.2.1.6).
+///
+/// One message for both directions, because both are the same mistake seen
+/// from opposite ends: a selector reading "user-supplied" with no table segment
+/// left to bind, and a table segment nothing selected.
+const TABLE_COUNT_DISAGREES: &str = "Huffman table count disagrees with the dictionary flags";
+
 /// Decodes a symbol dictionary segment's data (T.88 7.4.2), returning the
 /// symbols it exports.
 ///
@@ -78,6 +87,10 @@ const LOOP_SLACK: usize = 2;
 /// segments, concatenated in the order the referred-to list gives them
 /// (SDINSYMS). They may be re-exported by this dictionary, so they take part in
 /// the export runs of 6.5.10 ahead of the symbols coded here.
+///
+/// `tables` are the Huffman tables the referred-to code table segments carry,
+/// in the order the referred-to list names them, which is the order the
+/// selectors of 7.4.2.1.6 bind them in.
 ///
 /// `budget` is the embedded stream's remaining allowance of decoding work, the
 /// same one the page's regions draw on. Every symbol this dictionary yields is
@@ -91,10 +104,11 @@ const LOOP_SLACK: usize = 2;
 pub(crate) fn decode_symbol_dict(
     data: &[u8],
     input_symbols: &[&Bitmap],
+    tables: &[&Table],
     budget: &mut Budget,
 ) -> Result<Vec<Bitmap>, Jbig2Error> {
     let mut r = Reader::new(data);
-    let header = parse_header(&mut r)?;
+    let header = parse_header(&mut r, tables)?;
     let num_input = u32::try_from(input_symbols.len())
         .map_err(|_| Jbig2Error::Malformed("symbol count exceeds the limit"))?;
     if num_input > MAX_SYMBOLS || num_input.saturating_add(header.num_new) > MAX_SYMBOLS {
@@ -172,7 +186,7 @@ struct DictHeader {
 /// segment walk for a case no encoder in practice emits. Bits 13 to 15 are
 /// reserved; they select no field, so a stream that sets one still describes a
 /// dictionary that can be read.
-fn parse_header(r: &mut Reader<'_>) -> Result<DictHeader, Jbig2Error> {
+fn parse_header(r: &mut Reader<'_>, tables: &[&Table]) -> Result<DictHeader, Jbig2Error> {
     let flags = r.u16()?;
     if flags & 0x0001 != 0 {
         return Err(Jbig2Error::Unimplemented("Huffman-coded symbol dictionary"));
@@ -181,6 +195,14 @@ fn parse_header(r: &mut Reader<'_>) -> Result<DictHeader, Jbig2Error> {
         return Err(Jbig2Error::Unimplemented(
             "refinement/aggregate symbol coding",
         ));
+    }
+    // 7.4.2.1.6: the number of selectors reading "user-supplied table" must
+    // equal the number of table segments referred to, and with SDHUFF clear
+    // every one of those selectors must itself be 0. A referred-to table is
+    // therefore bound to nothing, which is a header describing a dictionary
+    // other than the one it carries.
+    if !tables.is_empty() {
+        return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
     }
     let template = ((flags >> 10) & 0x3) as u8;
 
@@ -358,7 +380,17 @@ mod tests {
 
     /// Decodes with the allowance a real embedded stream gets.
     fn decode(data: &[u8], inputs: &[&Bitmap]) -> Result<Vec<Bitmap>, Jbig2Error> {
-        decode_symbol_dict(data, inputs, &mut Budget::new())
+        decode_within(data, inputs, &mut Budget::new())
+    }
+
+    /// Decodes a dictionary that refers to no code table segment, which is
+    /// every fixture whose Huffman tables are the standard ones.
+    fn decode_within(
+        data: &[u8],
+        inputs: &[&Bitmap],
+        budget: &mut Budget,
+    ) -> Result<Vec<Bitmap>, Jbig2Error> {
+        decode_symbol_dict(data, inputs, &[], budget)
     }
 
     fn assert_same(got: &Bitmap, want: &Bitmap, which: usize) {
@@ -687,7 +719,7 @@ mod tests {
         segment.extend_from_slice(&enc.finish());
         assert!(segment.len() < 64, "the demand is {} bytes", segment.len());
         assert_eq!(
-            decode_symbol_dict(&segment, &[], &mut Budget::with_limit(1 << 20)),
+            decode_within(&segment, &[], &mut Budget::with_limit(1 << 20)),
             Err(Jbig2Error::WorkLimit),
         );
     }
@@ -703,14 +735,11 @@ mod tests {
         assert!(segment.len() < 96, "the demand is {} bytes", segment.len());
 
         let mut budget = Budget::with_limit(SYMBOL_COST * 64);
-        assert_eq!(
-            decode_symbol_dict(&segment, &[], &mut budget),
-            Ok(Vec::new())
-        );
+        assert_eq!(decode_within(&segment, &[], &mut budget), Ok(Vec::new()));
 
         let mut budget = Budget::with_limit(SYMBOL_COST * 64 - 1);
         assert_eq!(
-            decode_symbol_dict(&segment, &[], &mut budget),
+            decode_within(&segment, &[], &mut budget),
             Err(Jbig2Error::WorkLimit),
         );
     }
@@ -729,12 +758,12 @@ mod tests {
         let segment = reexport_segment(1);
 
         let mut budget = Budget::with_limit(FOUR_BY_FOUR);
-        let got = decode_symbol_dict(&segment, &refs, &mut budget).expect("dictionary");
+        let got = decode_within(&segment, &refs, &mut budget).expect("dictionary");
         assert_same(&got[0], &inputs[0], 0);
 
         let mut budget = Budget::with_limit(FOUR_BY_FOUR - 1);
         assert_eq!(
-            decode_symbol_dict(&segment, &refs, &mut budget),
+            decode_within(&segment, &refs, &mut budget),
             Err(Jbig2Error::WorkLimit),
         );
     }
@@ -750,11 +779,11 @@ mod tests {
         let each = SYMBOL_COST + (2 + ROW_COST) * 2;
 
         let mut budget = Budget::with_limit(each * 8);
-        assert!(decode_symbol_dict(&segment, &[], &mut budget).is_ok());
+        assert!(decode_within(&segment, &[], &mut budget).is_ok());
 
         let mut budget = Budget::with_limit(each * 8 - 1);
         assert_eq!(
-            decode_symbol_dict(&segment, &[], &mut budget),
+            decode_within(&segment, &[], &mut budget),
             Err(Jbig2Error::WorkLimit),
         );
     }
@@ -775,7 +804,7 @@ mod tests {
                     (state >> 24) as u8
                 })
                 .collect();
-            let _ = decode_symbol_dict(&data, &[], &mut Budget::with_limit(1 << 16));
+            let _ = decode_within(&data, &[], &mut Budget::with_limit(1 << 16));
         }
     }
 
@@ -783,7 +812,7 @@ mod tests {
     fn every_truncation_of_a_valid_segment_errors_cleanly() {
         let segment = dictionary_segment(&sample_symbols(), 0);
         for cut in 0..segment.len() {
-            let _ = decode_symbol_dict(&segment[..cut], &[], &mut Budget::with_limit(1 << 16));
+            let _ = decode_within(&segment[..cut], &[], &mut Budget::with_limit(1 << 16));
         }
     }
 }

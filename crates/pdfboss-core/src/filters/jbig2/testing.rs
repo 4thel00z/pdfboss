@@ -18,6 +18,7 @@ use super::arith_int::encoder::{encode_iaid, encode_int};
 use super::arith_int::{IaidCtx, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
+use super::huffman::encoder::BitWriter;
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
 use super::reader::Reader;
@@ -180,6 +181,39 @@ pub(crate) fn rowless_dictionary_segment(count: u32) -> Vec<u8> {
     out.extend_from_slice(&0u32.to_be_bytes()); // SDNUMEXSYMS
     out.extend_from_slice(&count.to_be_bytes()); // SDNUMNEWSYMS
     out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// Builds the data of a code table segment (T.88 7.4.13, whose syntax is
+/// Annex B.2) holding one ordinary range line that covers `low` and the fifteen
+/// values above it behind a one-bit prefix.
+///
+/// The lower range table line is left unused — a PREFLEN of 0 says a line is
+/// never used (B.3) — and the upper range line takes the other one-bit code, so
+/// the two assigned codes fill the code space exactly. HTOOB is 0, which is
+/// what the SDHUFFDH, SDHUFFBMSIZE and SDHUFFAGGINST selectors require of a
+/// user-supplied table (7.4.2.1.6).
+///
+/// The table this decodes to is deliberately unlike any standard one: a value
+/// in range costs a `0` bit and four more, where Table B.4 spends its `0` on
+/// the single value 1. A fixture that binds this and is decoded with a standard
+/// table instead does not merely read a different number, it desynchronises.
+pub(crate) fn code_table_segment(low: i32) -> Vec<u8> {
+    // B.2.1: HTOOB in bit 0, HTPS − 1 in bits 1 to 3, HTRS − 1 in bits 4 to 6.
+    let htps = 3u8;
+    let htrs = 5u8;
+    let mut out = vec![((htps - 1) << 1) | ((htrs - 1) << 4)];
+    // B.2.2 and B.2.3, both signed four-byte fields. HTHIGH is one past the
+    // last value the ordinary lines cover.
+    out.extend_from_slice(&(low as u32).to_be_bytes());
+    out.extend_from_slice(&((low + 16) as u32).to_be_bytes());
+
+    let mut w = BitWriter::default();
+    w.push(1, htps); // B.2 step 5a: PREFLEN of the one ordinary line
+    w.push(4, htrs); // B.2 step 5b: RANGELEN, so the line covers 16 values
+    w.push(0, htps); // B.2 step 6: the lower range line, unused
+    w.push(1, htps); // B.2 step 8: the upper range line
+    out.extend_from_slice(&w.finish());
     out
 }
 

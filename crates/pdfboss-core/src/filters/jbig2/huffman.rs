@@ -844,23 +844,27 @@ static TABLE_B15: [Line; 13] = [
     Line::upper(7, 25),
 ];
 
+/// The encoder side of Annex B. Test-only.
+///
+/// A table is a decoder here, so the only way to state a test's input is to
+/// write the bits an encoder would have produced. That is not something the
+/// fixtures can do by hand — a Huffman symbol dictionary's coded data
+/// interleaves three tables, a run of raw bit fields and an MMR bitmap — so
+/// they build it through this instead, and a round trip is then evidence that
+/// the decoder reads back what the standard says an encoder writes.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Writes bits most significant first, mirroring [`BitReader`].
-    ///
-    /// The encoder side of a Huffman table is not part of the decoder, so this
-    /// exists only to make round-trips expressible: a value goes in as a
-    /// prefix followed by an offset field, and must come back out as itself.
+pub(crate) mod encoder {
+    /// Writes bits most significant first, mirroring
+    /// [`BitReader`](super::BitReader).
     #[derive(Default)]
-    struct BitWriter {
+    pub(crate) struct BitWriter {
         bytes: Vec<u8>,
         used: u32,
     }
 
     impl BitWriter {
-        fn push(&mut self, value: u32, len: u8) {
+        /// Appends the low `len` bits of `value`, most significant first.
+        pub(crate) fn push(&mut self, value: u32, len: u8) {
             for i in (0..u32::from(len)).rev() {
                 if self.used.is_multiple_of(8) {
                     self.bytes.push(0);
@@ -873,11 +877,34 @@ mod tests {
             }
         }
 
-        /// The bits written, padded to a byte with zeros.
-        fn finish(self) -> Vec<u8> {
+        /// Pads with zero bits to the next byte boundary, which is what
+        /// "skip over any bits remaining in the last byte" asks of an encoder
+        /// (T.88 6.5.9 steps 2 and 5).
+        pub(crate) fn align(&mut self) {
+            while !self.used.is_multiple_of(8) {
+                self.push(0, 1);
+            }
+        }
+
+        /// Appends whole bytes, which requires the cursor to be byte-aligned.
+        pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
+            assert!(self.used.is_multiple_of(8), "unaligned byte field");
+            for byte in bytes {
+                self.push(u32::from(*byte), 8);
+            }
+        }
+
+        /// The bits written, the last byte padded with zeros.
+        pub(crate) fn finish(self) -> Vec<u8> {
             self.bytes
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encoder::BitWriter;
+    use super::*;
 
     /// Formats a code as the spec prints it: exactly `len` binary digits.
     fn bits_of(code: u32, len: u8) -> String {

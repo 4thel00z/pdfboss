@@ -6,12 +6,14 @@
 //! own bitmap and composites onto it at the coordinates its region information
 //! field gives.
 //!
-//! The walk carries one piece of state between segments: the symbols each
-//! symbol dictionary exported, keyed by its segment number. A text region names
-//! the dictionaries it draws on in its header's referred-to list, and the
-//! concatenation of their exports in that order is the list its symbol IDs
-//! index — so the store has to outlive the segment that filled it, and has to
-//! span the globals stream and the page stream as one sequence.
+//! The walk carries two pieces of state between segments: the symbols each
+//! symbol dictionary exported, and the Huffman table each code table segment
+//! carries, both keyed by segment number. A text region names the dictionaries
+//! it draws on in its header's referred-to list, and the concatenation of their
+//! exports in that order is the list its symbol IDs index; a dictionary or a
+//! region coded with the Huffman variant names its custom tables the same way
+//! (7.4.2.1.6). So both stores have to outlive the segment that filled them,
+//! and have to span the globals stream and the page stream as one sequence.
 //!
 //! Two rules shape everything else here.
 //!
@@ -41,6 +43,7 @@ use super::budget::Budget;
 use super::generic::{
     decode_generic_region, decode_mmr_region, parse_generic_flags, GB_CONTEXT_LEN,
 };
+use super::huffman::{parse_table_segment, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::segment::{parse_embedded, parse_region_info, RegionInfo, Segment, SegmentKind};
@@ -141,6 +144,11 @@ fn decode_embedded_within(
     // (7.4.2.2), so the store outlives each segment and spans the globals and
     // the page stream alike.
     let mut symbols: HashMap<u32, Vec<Bitmap>> = HashMap::new();
+    // Custom Huffman tables, keyed the same way and for the same reason: a
+    // Huffman-coded dictionary or region binds one table segment per selector
+    // set to "user-supplied", in the order its referred-to list names them
+    // (7.4.2.1.6).
+    let mut tables: HashMap<u32, Table> = HashMap::new();
     let mut page: Option<Bitmap> = None;
     for segment in global_segments.iter().chain(page_segments.iter()) {
         match segment.header.kind {
@@ -163,14 +171,15 @@ fn decode_embedded_within(
                 // The borrow of `symbols` ends with this block, because the
                 // insert that follows needs the map mutably.
                 let exported = {
-                    let inputs = gather_symbols(&symbols, &segment.header.referred_to)?;
-                    decode_symbol_dict(segment.data, &inputs, budget)?
+                    let inputs =
+                        gather_referred_to(&symbols, &tables, &segment.header.referred_to)?;
+                    decode_symbol_dict(segment.data, &inputs.symbols, &inputs.tables, budget)?
                 };
                 symbols.insert(segment.header.number, exported);
             }
             SegmentKind::ImmediateTextRegion | SegmentKind::ImmediateLosslessTextRegion => {
-                let available = gather_symbols(&symbols, &segment.header.referred_to)?;
-                let (info, region) = decode_text_region(segment.data, &available, budget)?;
+                let inputs = gather_referred_to(&symbols, &tables, &segment.header.referred_to)?;
+                let (info, region) = decode_text_region(segment.data, &inputs.symbols, budget)?;
                 let mut target = match page.take() {
                     Some(existing) => existing,
                     None => Bitmap::new(width, height)?,
@@ -209,7 +218,13 @@ fn decode_embedded_within(
             | SegmentKind::ImmediateLosslessRefinementRegion => {
                 return Err(Jbig2Error::Unimplemented("refinement region"))
             }
-            SegmentKind::Tables => return Err(Jbig2Error::Unimplemented("custom Huffman table")),
+            // A code table segment carries no pixels and names no region: it
+            // holds one Huffman table (7.4.13, whose syntax is Annex B.2) for
+            // the segments that refer to it by number to bind.
+            SegmentKind::Tables => {
+                let table = parse_table_segment(segment.data, budget)?;
+                tables.insert(segment.header.number, table);
+            }
         }
     }
 
@@ -228,41 +243,64 @@ fn offset(coordinate: u32) -> i32 {
     i32::try_from(coordinate).unwrap_or(i32::MAX)
 }
 
-/// The symbols a segment's referred-to list supplies, concatenated in the order
-/// the list names them (T.88 7.4.2.2, 7.4.3.2).
+/// What a segment's referred-to list supplies to the segment that names it.
+struct Referred<'a> {
+    /// SDINSYMS, or the text region's SBSYMS: every referred-to dictionary's
+    /// exports, concatenated in the order the list names the dictionaries
+    /// (T.88 7.4.2.2, 7.4.3.2).
+    symbols: Vec<&'a Bitmap>,
+    /// The custom Huffman tables, in the order the list names the table
+    /// segments, which is the order the selectors of 7.4.2.1.6 and 7.4.3.1.6
+    /// consume them in.
+    tables: Vec<&'a Table>,
+}
+
+/// Splits a segment's referred-to list into the symbols and the tables it
+/// supplies (T.88 7.4.2.2, 7.4.3.2, 7.4.2.1.6).
 ///
-/// Order is the whole point: a symbol ID indexes this concatenation, so naming
-/// two dictionaries the other way round names different glyphs. Segment numbers
-/// are not sorted here for the same reason.
+/// Order is the whole point, and the two orders are independent: a symbol ID
+/// indexes the concatenated symbols, so naming two dictionaries the other way
+/// round names different glyphs, while the *n*-th table segment named binds to
+/// the *n*-th selector set to "user-supplied", however many dictionaries are
+/// interleaved with them. Segment numbers are not sorted here for either
+/// reason.
 ///
-/// A number the store does not hold is refused rather than skipped. Within this
-/// build the only segment types a text region or a dictionary may legitimately
-/// refer to are symbol dictionaries — custom table segments are rejected by the
-/// walk above before any region can name one — so a reference that resolves to
-/// nothing is a reference to the wrong thing, and quietly dropping it would
-/// shift every symbol ID after it.
+/// A number neither store holds is refused rather than skipped: it is a
+/// reference to a segment that supplies nothing, and quietly dropping it would
+/// shift every symbol ID and every table binding after it.
 ///
-/// The running total is capped at [`MAX_SYMBOLS`] as the list is walked, before
-/// the next dictionary's symbols are appended. Nothing stops a header naming
-/// one dictionary many times — the referred-to cap of the segment parser allows
-/// tens of thousands of entries, each four bytes — so without this a few
+/// The running symbol total is capped at [`MAX_SYMBOLS`] as the list is walked,
+/// before the next dictionary's symbols are appended. Nothing stops a header
+/// naming one dictionary many times — the referred-to cap of the segment parser
+/// allows tens of thousands of entries, each four bytes — so without this a few
 /// hundred kilobytes of referred-to numbers would multiply one decoded
 /// dictionary into billions of references. Both consumers refuse an input list
 /// longer than this anyway; checking here is what keeps the refusal from
-/// arriving after the allocation.
-fn gather_symbols<'a>(
-    store: &'a HashMap<u32, Vec<Bitmap>>,
+/// arriving after the allocation. The tables need no such cap: a repeated table
+/// segment number contributes a borrow rather than a copy, and the consumers
+/// bind at most a handful of them before refusing the rest.
+fn gather_referred_to<'a>(
+    symbols: &'a HashMap<u32, Vec<Bitmap>>,
+    tables: &'a HashMap<u32, Table>,
     referred_to: &[u32],
-) -> Result<Vec<&'a Bitmap>, Jbig2Error> {
-    let mut out: Vec<&Bitmap> = Vec::new();
+) -> Result<Referred<'a>, Jbig2Error> {
+    let mut out = Referred {
+        symbols: Vec::new(),
+        tables: Vec::new(),
+    };
     for number in referred_to {
-        let exported = store.get(number).ok_or(Jbig2Error::Malformed(
-            "referred-to segment is not a symbol dictionary",
-        ))?;
-        if out.len().saturating_add(exported.len()) > MAX_SYMBOLS as usize {
-            return Err(Jbig2Error::Malformed("symbol count exceeds the limit"));
+        if let Some(exported) = symbols.get(number) {
+            if out.symbols.len().saturating_add(exported.len()) > MAX_SYMBOLS as usize {
+                return Err(Jbig2Error::Malformed("symbol count exceeds the limit"));
+            }
+            out.symbols.extend(exported.iter());
+        } else if let Some(table) = tables.get(number) {
+            out.tables.push(table);
+        } else {
+            return Err(Jbig2Error::Malformed(
+                "referred-to segment supplies neither symbols nor a table",
+            ));
         }
-        out.extend(exported.iter());
     }
     Ok(out)
 }
@@ -343,8 +381,8 @@ mod tests {
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
     use crate::filters::jbig2::symbol_dict::SYMBOL_COST;
     use crate::filters::jbig2::testing::{
-        dictionary_segment, expect_at, glyph, header, reexport_segment, rowless_dictionary_segment,
-        split_after_segment, text_segment_for_page, Op,
+        code_table_segment, dictionary_segment, expect_at, glyph, header, reexport_segment,
+        rowless_dictionary_segment, split_after_segment, text_segment_for_page, Op,
     };
 
     /// Assembles a complete embedded stream: page info, one immediate generic
@@ -557,7 +595,6 @@ mod tests {
             (22, "halftone region"),
             (36, "intermediate region"),
             (42, "refinement region"),
-            (53, "custom Huffman table"),
         ] {
             let stream = header(0, kind, &[], 1, 0);
             assert_eq!(
@@ -566,6 +603,58 @@ mod tests {
                 "segment type {kind}",
             );
         }
+    }
+
+    /// A code table segment (type 53) carries no pixels and composites nothing,
+    /// so a stream holding one and nothing else decodes to a blank page rather
+    /// than to a refusal: the table is kept for whichever later segment refers
+    /// to it (T.88 7.4.13).
+    #[test]
+    fn a_code_table_segment_is_kept_rather_than_refused() {
+        let table = code_table_segment(0);
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 53, &[], 1, table.len() as u32));
+        stream.extend_from_slice(&table);
+        let page = decode_embedded(&[], &stream, 8, 8).expect("page");
+        assert_eq!((page.width(), page.height()), (8, 8));
+        assert_eq!(page.get(0, 0), 0);
+    }
+
+    /// A table segment whose bytes are not a table is a malformed stream, not a
+    /// segment to skip: something later in the stream is going to bind it.
+    #[test]
+    fn a_malformed_code_table_segment_is_refused() {
+        // B.2.1 reserves bit 7 of the flags byte.
+        let table = vec![0x80u8, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        let mut stream = header(1, 53, &[], 1, table.len() as u32);
+        stream.extend_from_slice(&table);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Malformed(
+                "reserved bit set in the Huffman table flags"
+            )),
+        );
+    }
+
+    /// A referred-to list is split by what each segment supplies, so a
+    /// dictionary that names a table segment gets it as a table rather than as
+    /// a missing dictionary — and an arithmetic dictionary, all of whose
+    /// selectors must read "standard table" (T.88 7.4.2.1.6), has bound it to
+    /// nothing.
+    #[test]
+    fn an_arithmetic_dictionary_may_not_refer_to_a_table_segment() {
+        let table = code_table_segment(0);
+        let dict = dictionary_segment(&[glyph(&["11", "11"])], 0);
+        let mut stream = header(1, 53, &[], 1, table.len() as u32);
+        stream.extend_from_slice(&table);
+        stream.extend_from_slice(&header(2, 0, &[1], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Malformed(
+                "Huffman table count disagrees with the dictionary flags"
+            )),
+        );
     }
 
     /// An immediate generic region whose MMR flag is set carries a
@@ -1020,7 +1109,7 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed(
-                "referred-to segment is not a symbol dictionary",
+                "referred-to segment supplies neither symbols nor a table",
             )),
         );
     }
@@ -1036,7 +1125,7 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed(
-                "referred-to segment is not a symbol dictionary",
+                "referred-to segment supplies neither symbols nor a table",
             )),
         );
     }
@@ -1066,12 +1155,17 @@ mod tests {
         let exported: Vec<Bitmap> = (0..8).map(|_| glyph(&["1"])).collect();
         let store = HashMap::from([(1u32, exported)]);
 
+        let tables = HashMap::new();
+
         let within = vec![1u32; 8_192];
-        assert_eq!(gather_symbols(&store, &within).map(|v| v.len()), Ok(65_536));
+        assert_eq!(
+            gather_referred_to(&store, &tables, &within).map(|r| r.symbols.len()),
+            Ok(65_536),
+        );
 
         let beyond = vec![1u32; 8_193];
         assert_eq!(
-            gather_symbols(&store, &beyond).map(|v| v.len()),
+            gather_referred_to(&store, &tables, &beyond).map(|r| r.symbols.len()),
             Err(Jbig2Error::Malformed("symbol count exceeds the limit")),
         );
     }
