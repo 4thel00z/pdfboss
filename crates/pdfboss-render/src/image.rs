@@ -463,9 +463,19 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba, p: &DrawParams) {
             if let Some(mask) = p.clip {
                 a *= f32::from(mask.coverage(px, py)) / 255.0;
             }
-            if a > 0.0 {
-                let off = ((py * pix.width + px) * 4) as usize;
-                composite_over(&mut pix.data[off..off + 4], [s[0], s[1], s[2]], a);
+            if a <= 0.0 {
+                continue;
+            }
+            let off = ((py * pix.width + px) * 4) as usize;
+            let dst = &mut pix.data[off..off + 4];
+            if a >= 1.0 {
+                // An opaque source covers whatever is under it: source-over
+                // reduces to a copy. Taking it through the general formula
+                // would spend three divides to arrive at these same four
+                // bytes, and a scanned page is opaque over its whole extent.
+                dst.copy_from_slice(&[s[0], s[1], s[2], 255]);
+            } else {
+                composite_over(dst, [s[0], s[1], s[2]], a);
             }
         }
     }
@@ -815,6 +825,30 @@ mod tests {
         assert!((127..=129).contains(&r), "50% blend r {r}");
         assert!((127..=129).contains(&g), "50% blend g {g}");
         assert_eq!(pix_at(&pix, 7, 1), [255, 255, 255, 255], "clipped column");
+    }
+
+    /// [`draw_rgba`] short-circuits a fully opaque source to a copy instead of
+    /// calling [`composite_over`]. That is only sound if the general formula
+    /// returns the very same bytes at alpha 1, whatever is underneath, so this
+    /// checks it does — over a spread of destination colors and alphas.
+    #[test]
+    fn an_opaque_source_composites_to_a_plain_copy() {
+        for &under in &[
+            [0, 0, 0, 0],
+            [255, 255, 255, 255],
+            [17, 200, 3, 128],
+            [9, 9, 9, 1],
+        ] {
+            for &rgb in &[[0, 0, 0], [255, 255, 255], [12, 34, 56]] {
+                let mut dst = under;
+                composite_over(&mut dst, rgb, 1.0);
+                assert_eq!(
+                    dst,
+                    [rgb[0], rgb[1], rgb[2], 255],
+                    "opaque {rgb:?} over {under:?}"
+                );
+            }
+        }
     }
 
     #[test]
