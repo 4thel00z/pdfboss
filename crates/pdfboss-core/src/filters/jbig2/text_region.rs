@@ -35,7 +35,7 @@
 use super::arith_int::{decode_iaid, decode_int, IaidCtx, IntCtxSet};
 use super::bitmap::{Bitmap, CombOp};
 use super::budget::Budget;
-use super::huffman::{from_code_lengths, read_bits, standard, take_custom, Table};
+use super::huffman::{from_code_lengths, read_bits, standard, take_custom, Table, Unused};
 use super::mq::MqDecoder;
 use super::reader::Reader;
 use super::segment::{parse_region_info, RegionInfo};
@@ -446,8 +446,11 @@ fn decode_symbol_id_codes(
     let lengths = read_symbol_code_lengths(bits, &runs, num_syms)?;
     // Step 6.
     bits.align_to_byte();
-    // Step 7.
-    from_code_lengths(&lengths)
+    // Step 7. A list in which every length is 0 assigns no code and is
+    // conforming: SBSYMCODES is read only by 6.4.10, which a region whose
+    // SBNUMINSTANCES is 0 never reaches, so refusing it would refuse a region
+    // that legitimately paints nothing but SBDEFPIXEL.
+    from_code_lengths(&lengths, Unused::Permitted)
 }
 
 /// Reads the thirty-five run code lengths (T.88 7.4.3.1.7 step 1).
@@ -464,8 +467,13 @@ fn read_run_code_lengths(bits: &mut BitReader) -> Result<[u8; RUN_CODES], Jbig2E
 
 /// Reads the thirty-five run code lengths and assigns their codes
 /// (T.88 7.4.3.1.7 steps 1 and 2).
+///
+/// Unlike the symbol ID table these lengths go on to describe, this one is
+/// always read from: step 3 decodes a run code before step 5 can decide there
+/// are none left to read, and SBNUMSYMS is at least 1. So a set of lengths that
+/// assigns no code at all is refused here.
 fn read_run_code_table(bits: &mut BitReader) -> Result<Table, Jbig2Error> {
-    from_code_lengths(&read_run_code_lengths(bits)?)
+    from_code_lengths(&read_run_code_lengths(bits)?, Unused::Refused)
 }
 
 /// Run-length decodes the SBNUMSYMS symbol ID code lengths
@@ -817,7 +825,7 @@ mod tests {
     use super::*;
     use crate::filters::jbig2::bitmap::Bitmap;
     use crate::filters::jbig2::budget::{Budget, ROW_COST};
-    use crate::filters::jbig2::huffman::encoder::BitWriter;
+    use crate::filters::jbig2::huffman::encoder::{push_value, BitWriter};
     use crate::filters::jbig2::huffman::parse_table_segment;
     use crate::filters::jbig2::testing::{
         code_table_segment, expect_at, glyph, huffman_text_segment, text_segment,
@@ -1153,7 +1161,7 @@ mod tests {
         let run_lengths = read_run_code_lengths(&mut bits).expect("run code lengths");
         assert_eq!(run_lengths, RUN_LENGTHS);
 
-        let runs = from_code_lengths(&run_lengths).expect("run code table");
+        let runs = from_code_lengths(&run_lengths, Unused::Refused).expect("run code table");
         let lengths = read_symbol_code_lengths(&mut bits, &runs, 32).expect("symbol code lengths");
         assert_eq!(lengths, SYMBOL_LENGTHS);
 
@@ -1542,6 +1550,57 @@ mod tests {
             decode_text_region(&data, &syms, &[], &mut Budget::with_limit(1 << 20)),
             Err(Jbig2Error::WorkLimit),
         );
+    }
+
+    /// A symbol ID code length list in which every length is zero assigns no
+    /// code at all, and that is a table B.3 defines rather than one it refuses:
+    /// "the PREFLEN value 0 indicates that the table line is never used", so
+    /// LENMAX in step 2 is 0 and step 3's loop never runs. 7.4.3.1.7 step 7
+    /// asks for B.3 over the lengths just decoded and imposes nothing further.
+    ///
+    /// Such a list is conforming precisely when nothing reads the table.
+    /// SBSYMCODES has one consumer, 6.4.10, and 6.4.5 step 3 a) ends the walk
+    /// before the first strip when SBNUMINSTANCES is 0 — while step 2's leading
+    /// STRIPT is still read. Example 2's encoder derives the lengths from
+    /// per-symbol usage counts, so a region that uses no symbol is exactly the
+    /// case that produces this. What the region decodes to is step 1's bitmap,
+    /// left at SBDEFPIXEL.
+    #[test]
+    fn a_region_that_places_nothing_may_assign_no_symbol_codes() {
+        let symbols = two_symbols();
+        let refs: Vec<&Bitmap> = symbols.iter().collect();
+
+        let mut w = BitWriter::default();
+        // Step 1: RUNCODE0 alone is given a length, so B.3 hands it the one-bit
+        // code 0 and the other thirty-four run codes none.
+        for code in 0..RUN_CODES {
+            w.push(u32::from(code == 0), 4);
+        }
+        // Steps 3 and 4: RUNCODE0 once per symbol, each saying "the symbol ID
+        // code length is 0".
+        w.push(0, 1);
+        w.push(0, 1);
+        // Step 6.
+        w.align();
+        // 6.4.5 step 2's leading STRIPT, read whatever SBNUMINSTANCES says.
+        push_value(&mut w, &standard(11).expect("Table B.11"), Some(1));
+
+        let mut data = vec![0u8; 17];
+        data[3] = 8; // width 8
+        data[7] = 8; // height 8
+                     // SBHUFF, and SBDEFPIXEL 1 so the rectangle it fills shows.
+        data.extend_from_slice(&0x0201u16.to_be_bytes());
+        data.extend_from_slice(&0u16.to_be_bytes()); // all-standard tables
+        data.extend_from_slice(&0u32.to_be_bytes()); // SBNUMINSTANCES
+        data.extend_from_slice(&w.finish());
+
+        let (info, region) = decode(&data, &refs).expect("text region");
+        assert_eq!((info.width, info.height), (8, 8));
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(region.get(x, y), 1, "({x}, {y}) is not SBDEFPIXEL");
+            }
+        }
     }
 
     /// The symbol ID table of 7.4.3.1.7 is a line per symbol, and 7.4.3.1.5

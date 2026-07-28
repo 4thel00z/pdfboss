@@ -19,7 +19,7 @@ use super::arith_int::{IaidCtx, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
 use super::huffman::encoder::{push_value, BitWriter};
-use super::huffman::{from_code_lengths, standard, Table};
+use super::huffman::{from_code_lengths, standard, Table, Unused};
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
 use super::reader::Reader;
@@ -608,7 +608,7 @@ pub(crate) fn huffman_text_segment(
     let ds = standard(8).expect("Table B.8");
     let dt = standard(11).expect("Table B.11");
     let lengths = symbol_code_lengths(num_syms);
-    let codes = from_code_lengths(&lengths).expect("symbol ID codes");
+    let codes = from_code_lengths(&lengths, Unused::Refused).expect("symbol ID codes");
 
     let mut w = BitWriter::default();
     push_symbol_id_table(&mut w, &lengths);

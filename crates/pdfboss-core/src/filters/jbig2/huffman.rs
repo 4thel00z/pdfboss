@@ -162,6 +162,34 @@ struct LengthSlot {
     count: u32,
 }
 
+/// Whether a set of prefix lengths that assigns no code at all is a table its
+/// caller can be handed (B.3).
+///
+/// B.3 is total on such a set rather than refusing it: "the PREFLEN value 0
+/// indicates that the table line is never used", so LENMAX in step 2 is 0, the
+/// assignment loop of step 3 never runs, and every line ends up as one that
+/// "has not been assigned any code". The question is therefore never whether
+/// the table is well formed. It is whether anything is going to read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unused {
+    /// Refuse it. Where a table is bound to a value the decoding procedure
+    /// always reads, one that codes nothing means a stream that cannot be
+    /// decoded, and saying so once where the table is built is clearer than
+    /// saying it at the first read.
+    Refused,
+    /// Accept it. SBSYMCODES (7.4.3.1.7 step 7) has exactly one consumer,
+    /// 6.4.10, and 6.4.5 step 3 a) ends the walk before the first strip when
+    /// SBNUMINSTANCES is 0 — so a region that places nothing never asks this
+    /// table for anything, and an encoder deriving code lengths from per-symbol
+    /// usage counts gives every symbol a length of 0 for it.
+    ///
+    /// Nothing downstream has to defend against one either: [`Table::decode`]
+    /// runs [`Table::matched_line`] over `1..=max_len`, which is empty when no
+    /// code was assigned, so it reports "no such Huffman code" at once without
+    /// consuming a bit.
+    Permitted,
+}
+
 /// A Huffman table: its lines, and the prefix codes B.3 assigned to them.
 #[derive(Clone, Debug)]
 pub(crate) struct Table {
@@ -186,8 +214,9 @@ impl Table {
     /// Every rejection this decoder makes about the *shape* of a table happens
     /// here, so that the three ways a table can arrive — standard, custom
     /// segment, symbol ID list — cannot each grow their own idea of what is
-    /// acceptable.
-    fn new(lines: Vec<Line>) -> Result<Table, Jbig2Error> {
+    /// acceptable. `unused` is the one thing they do not agree on, and it is a
+    /// question about the caller rather than about the table; see [`Unused`].
+    fn new(lines: Vec<Line>, unused: Unused) -> Result<Table, Jbig2Error> {
         for line in &lines {
             if line.range_len > MAX_RANGE_LEN {
                 return Err(Jbig2Error::Malformed("Huffman range longer than a value"));
@@ -216,11 +245,7 @@ impl Table {
             }
         }
 
-        // A table in which every line is unused can never decode anything, and
-        // a caller handed one would ask it for a value in a loop and be told
-        // "no such code" forever. Refusing it once, here, is cheaper than
-        // making every caller defend against it.
-        if order.is_empty() {
+        if order.is_empty() && unused == Unused::Refused {
             return Err(Jbig2Error::Malformed("Huffman table assigns no codes"));
         }
 
@@ -398,15 +423,17 @@ fn assign_prefix_codes(pref_lens: &[u8]) -> Result<Vec<u32>, Jbig2Error> {
 /// every other table uses rather than a second implementation for this case.
 ///
 /// A length of 0 is a line B.3 assigns no code, which is exactly what
-/// 7.4.3.1.7 means by an unused run code or an unused symbol.
-pub(crate) fn from_code_lengths(lengths: &[u8]) -> Result<Table, Jbig2Error> {
+/// 7.4.3.1.7 means by an unused run code or an unused symbol. Whether a list in
+/// which *every* length is 0 may be handed back is the caller's to say, because
+/// only the caller knows what reads the result: see [`Unused`].
+pub(crate) fn from_code_lengths(lengths: &[u8], unused: Unused) -> Result<Table, Jbig2Error> {
     let mut lines = Vec::with_capacity(lengths.len());
     for (index, &pref_len) in lengths.iter().enumerate() {
         let value = i32::try_from(index)
             .map_err(|_| Jbig2Error::Malformed("Huffman code list longer than a value"))?;
         lines.push(Line::normal(pref_len, 0, value));
     }
-    Table::new(lines)
+    Table::new(lines, unused)
 }
 
 /// The next referred-to table segment's table, in the binding order of
@@ -569,8 +596,10 @@ pub(crate) fn parse_table_segment(data: &[u8], budget: &mut Budget) -> Result<Ta
         lines.push(Line::oob(oob_pref_len));
     }
 
-    // B.2 step 11.
-    Table::new(lines)
+    // B.2 step 11. A custom table is bound by 7.4.2.1.6 and 7.4.3.1.6 to a
+    // selector whose value the decoding procedure reads, so one that codes
+    // nothing is refused here rather than at the read.
+    Table::new(lines, Unused::Refused)
 }
 
 /// One of the fifteen standard tables of B.5, numbered as the specification
@@ -603,7 +632,7 @@ pub(crate) fn standard(number: u8) -> Result<Table, Jbig2Error> {
         15 => &TABLE_B15,
         _ => return Err(Jbig2Error::Malformed("no such standard Huffman table")),
     };
-    Table::new(lines.to_vec())
+    Table::new(lines.to_vec(), Unused::Refused)
 }
 
 // The fifteen tables of B.5, one source line per table line, in the order the
@@ -1116,30 +1145,47 @@ mod tests {
     #[test]
     fn a_range_longer_than_a_value_is_refused() {
         assert_eq!(
-            Table::new(vec![Line::normal(1, 33, 0)]).map(|_| ()),
+            Table::new(vec![Line::normal(1, 33, 0)], Unused::Refused).map(|_| ()),
             Err(Jbig2Error::Malformed("Huffman range longer than a value")),
         );
-        assert!(Table::new(vec![Line::normal(1, 32, 0)]).is_ok());
+        assert!(Table::new(vec![Line::normal(1, 32, 0)], Unused::Refused).is_ok());
     }
 
+    /// B.3 assigns nothing to a set of lengths that is all zeros, and whether
+    /// that is an error depends on what was going to read the table. A caller
+    /// that always reads gets a refusal; one that may not read at all gets the
+    /// table, and it answers every request with "no such Huffman code" without
+    /// consuming a bit — so an all-zero table cannot spin a caller's loop.
     #[test]
-    fn a_table_that_assigns_no_codes_is_refused() {
+    fn a_table_that_assigns_no_codes_is_refused_only_where_something_reads_it() {
+        let lines = vec![Line::normal(0, 4, 0), Line::normal(0, 4, 16)];
         assert_eq!(
-            Table::new(vec![Line::normal(0, 4, 0), Line::normal(0, 4, 16)]).map(|_| ()),
+            Table::new(lines.clone(), Unused::Refused).map(|_| ()),
             Err(Jbig2Error::Malformed("Huffman table assigns no codes")),
         );
+
+        let table = Table::new(lines, Unused::Permitted).expect("B.3 assigns no code to a zero");
+        let mut bits = BitReader::new(&[0xFF]);
+        assert_eq!(
+            table.decode(&mut bits),
+            Err(Jbig2Error::Malformed("no such Huffman code")),
+        );
+        assert_eq!(bits.remaining(), 8, "no bit was consumed");
     }
 
     /// The table of the B.4 worked example, built by hand: three ranges, an
     /// unused lower range line and an upper range line. This is Table B.1.
     fn worked_example_table() -> Table {
-        Table::new(vec![
-            Line::normal(1, 4, 0),
-            Line::normal(2, 8, 16),
-            Line::normal(3, 16, 272),
-            Line::lower(0, -1),
-            Line::upper(3, 65808),
-        ])
+        Table::new(
+            vec![
+                Line::normal(1, 4, 0),
+                Line::normal(2, 8, 16),
+                Line::normal(3, 16, 272),
+                Line::lower(0, -1),
+                Line::upper(3, 65808),
+            ],
+            Unused::Refused,
+        )
         .expect("the encoding printed in B.4")
     }
 
@@ -1161,11 +1207,14 @@ mod tests {
     /// every negative value on the wrong side of zero.
     #[test]
     fn the_lower_range_line_subtracts() {
-        let table = Table::new(vec![
-            Line::normal(1, 4, 0),
-            Line::lower(2, -1),
-            Line::upper(2, 16),
-        ])
+        let table = Table::new(
+            vec![
+                Line::normal(1, 4, 0),
+                Line::lower(2, -1),
+                Line::upper(2, 16),
+            ],
+            Unused::Refused,
+        )
         .expect("legal");
         assert_eq!(round_trip(&table, 1, 0), Ok(Some(-1)));
         assert_eq!(round_trip(&table, 1, 41), Ok(Some(-42)));
@@ -1176,7 +1225,8 @@ mod tests {
     /// its prefix is the next value rather than a field belonging to it.
     #[test]
     fn oob_consumes_only_its_prefix() {
-        let table = Table::new(vec![Line::normal(1, 4, 0), Line::oob(2)]).expect("legal");
+        let table =
+            Table::new(vec![Line::normal(1, 4, 0), Line::oob(2)], Unused::Refused).expect("legal");
         assert!(table.has_oob());
         let mut data = BitWriter::default();
         // 10, then 0 followed by 0111.
@@ -1213,11 +1263,14 @@ mod tests {
     #[test]
     fn an_unmatched_prefix_is_malformed() {
         // Three lines of length 2 leave the fourth 2-bit pattern unassigned.
-        let table = Table::new(vec![
-            Line::normal(2, 0, 0),
-            Line::normal(2, 0, 1),
-            Line::normal(2, 0, 2),
-        ])
+        let table = Table::new(
+            vec![
+                Line::normal(2, 0, 0),
+                Line::normal(2, 0, 1),
+                Line::normal(2, 0, 2),
+            ],
+            Unused::Refused,
+        )
         .expect("legal");
         let mut bits = BitReader::new(&[0xFF]);
         assert_eq!(
@@ -1238,7 +1291,11 @@ mod tests {
                 "Huffman value outside the codable range"
             )),
         );
-        let low = Table::new(vec![Line::normal(1, 0, 0), Line::lower(1, -1)]).expect("legal");
+        let low = Table::new(
+            vec![Line::normal(1, 0, 0), Line::lower(1, -1)],
+            Unused::Refused,
+        )
+        .expect("legal");
         assert_eq!(
             round_trip(&low, 1, u32::MAX),
             Err(Jbig2Error::Malformed(
@@ -1252,8 +1309,16 @@ mod tests {
     /// different code.
     #[test]
     fn line_order_decides_which_line_gets_which_code() {
-        let a = Table::new(vec![Line::normal(1, 0, 10), Line::normal(1, 0, 20)]).expect("legal");
-        let b = Table::new(vec![Line::normal(1, 0, 20), Line::normal(1, 0, 10)]).expect("legal");
+        let a = Table::new(
+            vec![Line::normal(1, 0, 10), Line::normal(1, 0, 20)],
+            Unused::Refused,
+        )
+        .expect("legal");
+        let b = Table::new(
+            vec![Line::normal(1, 0, 20), Line::normal(1, 0, 10)],
+            Unused::Refused,
+        )
+        .expect("legal");
         let mut bits = BitReader::new(&[0x00]);
         assert_eq!(a.decode(&mut bits), Ok(Some(10)));
         let mut bits = BitReader::new(&[0x00]);
