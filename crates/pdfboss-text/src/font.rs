@@ -3,6 +3,7 @@
 //! fonts (2-byte codes, `/ToUnicode`, descendant `/W` + `/DW`).
 
 use crate::cmap::ToUnicode;
+use crate::sfnt;
 use pdfboss_core::{Dict, Document, Object};
 use pdfboss_encoding as encodings;
 use std::collections::HashMap;
@@ -24,6 +25,11 @@ pub struct Font {
     default_width: f32,
     /// The code that triggers word spacing (single-byte code 32).
     space_code: Option<u32>,
+    /// The font states no `/Encoding`, but its embedded program advertises a
+    /// Microsoft `cmap` — so codes StandardEncoding leaves undefined are read
+    /// as WinAnsiEncoding. See [`Font::decode_into`] for why that evidence is
+    /// required rather than assumed.
+    winansi_high_codes: bool,
 }
 
 /// Resolves `dict[key]`, treating resolution failures and `null` as absent.
@@ -44,6 +50,7 @@ impl Font {
             widths: HashMap::new(),
             default_width: 500.0,
             space_code: Some(32),
+            winansi_high_codes: false,
         }
     }
 
@@ -93,10 +100,41 @@ impl Font {
     }
 
     /// Decodes one code to Unicode, appending to `out`. Priority:
-    /// `/ToUnicode`, then the `/Encoding`-derived table, then StandardEncoding
+    /// `/ToUnicode`, then the `/Encoding`-derived table, then StandardEncoding,
+    /// then WinAnsiEncoding for the codes StandardEncoding leaves undefined
     /// (simple fonts), then U+FFFD. The common single-glyph paths push one
     /// `char` with no allocation; only a multi-unit `/ToUnicode` mapping copies
     /// a string.
+    ///
+    /// # Why WinAnsiEncoding needs evidence before it is consulted
+    ///
+    /// A simple font carrying neither `/ToUnicode` nor `/Encoding` leaves the
+    /// text with no mapping the file states outright, and ISO 32000-1 9.6.6.4
+    /// sends the reader to the font program's own built-in encoding. For the
+    /// subset TrueType fonts that dominate real documents that route stops
+    /// short of Unicode: the `cmap` maps a code to a *glyph index*, and with a
+    /// version 3.0 `post` table carrying no glyph names, nothing in the font
+    /// says which character that glyph draws.
+    ///
+    /// What the program does say is which platform it was built for, and that
+    /// is the whole basis for the guess made here. A Microsoft `cmap` subtable
+    /// means the producer indexed the subset by Windows code points, so the
+    /// codes StandardEncoding leaves undefined — 0x80 to 0x9F, where Windows
+    /// documents keep their curly quotes and dashes — are WinAnsiEncoding's.
+    ///
+    /// Absent that evidence the guess is not made, because measuring it against
+    /// a 259-file corpus showed it is a coin flip: of the documents it changed,
+    /// it read some degree signs and apostrophes correctly and turned a
+    /// Macintosh-encoded bulletin's apostrophes into `Õ` and its em dashes into
+    /// `Ñ`, and four documents' Symbol and dingbat fonts into thorns and
+    /// slashed Os. Every one of those fonts was **non-embedded** — the file
+    /// offered nothing to read — so requiring a font program is what separates
+    /// the case with evidence from the case without it. U+FFFD is the worse
+    /// answer only when something better is actually known.
+    ///
+    /// Even with the evidence this only ever fills gaps: it is reached solely
+    /// for codes StandardEncoding leaves undefined, so no mapping that already
+    /// resolved can change.
     pub fn decode_into(&self, code: u32, out: &mut String) {
         if let Some(c) = self.to_unicode.as_ref() {
             if let Some(s) = c.lookup(code) {
@@ -110,7 +148,12 @@ impl Font {
                     out.push(c);
                     return;
                 }
-                if let Some(c) = encodings::standard(byte) {
+                let fallback = encodings::standard(byte).or_else(|| {
+                    self.winansi_high_codes
+                        .then(|| encodings::win_ansi(byte))
+                        .flatten()
+                });
+                if let Some(c) = fallback {
                     out.push(c);
                     return;
                 }
@@ -130,6 +173,46 @@ impl Font {
     /// True when showing `code` applies word spacing (`Tw`).
     pub fn is_space(&self, code: u32) -> bool {
         self.space_code == Some(code)
+    }
+
+    /// Whether `/BaseFont` names a face whose glyphs are pictures rather than
+    /// letters, for which no byte-to-character encoding means anything.
+    ///
+    /// The name is matched on its family part: a subset prefix (six capitals
+    /// and a plus sign, ISO 32000-1 9.6.4) and any `,Bold` style suffix are
+    /// stripped first, so `JOGDGG+Wingdings` and `Symbol,Italic` both match.
+    fn is_picture_font(doc: &Document, dict: &Dict) -> bool {
+        /// Families whose code points index a picture set. Anything absent
+        /// from this list is treated as text, which is the safe direction:
+        /// the worst case is a code that stays U+FFFD.
+        const PICTURE_FAMILIES: [&str; 7] = [
+            "symbol",
+            "zapfdingbats",
+            "dingbats",
+            "wingdings",
+            "wingdings2",
+            "wingdings3",
+            "webdings",
+        ];
+        let Some(name) = rv(doc, dict, "BaseFont").and_then(|o| o.as_name().map(|n| n.0.clone()))
+        else {
+            return false;
+        };
+        let family = name
+            .split_once('+')
+            .map_or(name.as_str(), |(prefix, rest)| {
+                if prefix.len() == 6 && prefix.bytes().all(|b| b.is_ascii_uppercase()) {
+                    rest
+                } else {
+                    name.as_str()
+                }
+            })
+            .split(&[',', '-'][..])
+            .next()
+            .unwrap_or_default()
+            .replace(' ', "")
+            .to_ascii_lowercase();
+        PICTURE_FAMILIES.contains(&family.as_str())
     }
 
     /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
@@ -160,6 +243,10 @@ impl Font {
             .map(|w| w as f32)
             .unwrap_or(500.0);
 
+        // Only a font that states no `/Encoding` has anything to gain here, and
+        // only then is the embedded program worth inflating.
+        let winansi_high_codes = encoding.is_none() && Font::built_for_windows(doc, dict);
+
         Font {
             simple: true,
             to_unicode,
@@ -167,7 +254,53 @@ impl Font {
             widths,
             default_width,
             space_code: Some(32),
+            winansi_high_codes,
         }
+    }
+
+    /// Whether the font's embedded program advertises a Microsoft `cmap`,
+    /// which is the evidence [`Font::decode_into`] requires before reading a
+    /// code StandardEncoding leaves undefined as WinAnsiEncoding.
+    ///
+    /// A font with no program at all answers `false`: there is nothing to read,
+    /// and the measurement recorded on `decode_into` is that guessing without
+    /// it goes wrong about as often as it goes right. A program advertising
+    /// only a Macintosh subtable answers `false` too — those are the documents
+    /// the guess actively damaged.
+    ///
+    /// A picture font answers `false` by name, which deserves an explanation
+    /// because naming fonts is exactly the sort of special-casing that usually
+    /// signals a missing principle. Here there is no principle left to find. A
+    /// Wingdings subset and a Times New Roman subset from the same producer are
+    /// structurally identical: both symbolic, both `/FontFile2`, both carrying a
+    /// Macintosh and a Microsoft subtable, and both mapping the private-use
+    /// range 0xF020 to 0xF0FF rather than raw codes — that last was measured
+    /// against a real pair of them, in the hope it would separate the two, and
+    /// it does not. With no glyph names and no Unicode subtable, nothing inside
+    /// either font says whether its glyphs are letters or pictures. The
+    /// `/BaseFont` name is the only thing left that does.
+    fn built_for_windows(doc: &Document, dict: &Dict) -> bool {
+        if Font::is_picture_font(doc, dict) {
+            return false;
+        }
+        let Some(descriptor) = rv(doc, dict, "FontDescriptor").and_then(|o| o.as_dict().cloned())
+        else {
+            return false;
+        };
+        // `/FontFile` is a Type 1 program, which is not an sfnt and carries no
+        // `cmap`; only the two sfnt-bearing entries are worth reading.
+        for key in ["FontFile2", "FontFile3"] {
+            let Some(data) = rv(doc, &descriptor, key)
+                .and_then(|o| o.as_stream().and_then(|s| doc.stream_data(s).ok()))
+            else {
+                continue;
+            };
+            let platforms = sfnt::cmap_platforms(&data);
+            if platforms.microsoft {
+                return true;
+            }
+        }
+        false
     }
 
     /// Builds the 256-entry Unicode table from `/Encoding`: a base table
@@ -241,6 +374,8 @@ impl Font {
             widths,
             default_width,
             space_code: None,
+            // Two-byte codes never reach the single-byte fallbacks.
+            winansi_high_codes: false,
         }
     }
 
@@ -294,9 +429,10 @@ mod tests {
     use pdfboss_core::ObjRef;
     use pdfboss_testkit::PdfBuilder;
 
-    /// Builds a document whose object 5 is `font_body`; `extra` objects
-    /// (e.g. ToUnicode streams) can reference or be referenced by it.
-    fn font_from(font_body: &str, extra: &[(u32, &[u8])]) -> Font {
+    /// Builds a document whose object 5 is `font_body`. `extra` adds stream
+    /// objects (ToUnicode CMaps, font programs) and `objects` adds plain
+    /// ones (font descriptors); either can reference or be referenced by it.
+    fn font_from(font_body: &str, extra: &[(u32, &[u8])], objects: &[(u32, &str)]) -> Font {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -309,6 +445,9 @@ mod tests {
         for &(num, data) in extra {
             b.stream(num, "", data);
         }
+        for &(num, body) in objects {
+            b.object(num, body);
+        }
         let doc = Document::load(b.build(1)).unwrap();
         let obj = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
         Font::load(&doc, obj.as_dict().unwrap())
@@ -320,6 +459,7 @@ mod tests {
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
              /Encoding /WinAnsiEncoding >>",
             &[],
+            &[],
         );
         assert!(f.simple);
         assert_eq!(f.decode(65), "A");
@@ -330,6 +470,143 @@ mod tests {
         assert_eq!(f.codes(b"AB"), vec![65, 66]);
     }
 
+    /// A minimal sfnt whose `cmap` advertises exactly `platforms`. Enough for
+    /// [`Font::built_for_windows`], which reads no further than the subtable
+    /// records.
+    fn sfnt_program(platforms: &[(u16, u16)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&[0; 6]);
+        out.extend_from_slice(b"cmap");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&28u32.to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(platforms.len() as u16).to_be_bytes());
+        for &(pid, eid) in platforms {
+            out.extend_from_slice(&pid.to_be_bytes());
+            out.extend_from_slice(&eid.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+        }
+        out
+    }
+
+    /// A TrueType subset stating no `/Encoding` and no `/ToUnicode`, whose
+    /// embedded program says it was built for Windows. Its curly quotes and
+    /// dashes sit at codes StandardEncoding does not define, and used to
+    /// extract as U+FFFD.
+    #[test]
+    fn an_embedded_windows_font_reads_its_high_codes_as_winansi() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /OPPEKN+TimesNewRoman \
+             /FirstChar 32 /LastChar 215 /FontDescriptor 7 0 R >>",
+            &[(6, &sfnt_program(&[(1, 0), (3, 0)]))],
+            &[(7, "<< /Type /FontDescriptor /Flags 6 /FontFile2 6 0 R >>")],
+        );
+        assert_eq!(f.decode(0x92), "\u{2019}", "right single quote");
+        assert_eq!(f.decode(0x96), "\u{2013}", "en dash");
+        assert_eq!(f.decode(0x97), "\u{2014}", "em dash");
+    }
+
+    /// The guess requires evidence. A font with no program at all offers none,
+    /// and measuring the guess without it against a real corpus turned one
+    /// document's apostrophes into `Õ` and four documents' dingbats into
+    /// thorns — so these codes stay U+FFFD rather than become plausible-looking
+    /// nonsense.
+    #[test]
+    fn a_font_with_no_program_does_not_guess_at_its_high_codes() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /TimesNewRoman \
+             /FirstChar 32 /LastChar 215 >>",
+            &[],
+            &[],
+        );
+        assert_eq!(f.decode(0x92), "\u{FFFD}");
+        assert_eq!(f.decode(0x96), "\u{FFFD}");
+    }
+
+    /// A dingbat face is structurally indistinguishable from a text subset by
+    /// the same producer, so it is excluded by name. Reading its bullets as
+    /// WinAnsi turned a real document's list markers into `Ø`.
+    #[test]
+    fn a_picture_font_does_not_guess_at_its_high_codes() {
+        for base in [
+            "/JOGDGG+Wingdings",
+            "/Wingdings",
+            "/Symbol,Italic",
+            "/ZapfDingbats",
+            "/Webdings",
+        ] {
+            let f = font_from(
+                &format!(
+                    "<< /Type /Font /Subtype /TrueType /BaseFont {base} \
+                     /FontDescriptor 7 0 R >>"
+                ),
+                &[(6, &sfnt_program(&[(1, 0), (3, 0)]))],
+                &[(7, "<< /Type /FontDescriptor /Flags 4 /FontFile2 6 0 R >>")],
+            );
+            assert!(!f.winansi_high_codes, "{base} must not guess");
+            assert_eq!(f.decode(0xD8), "\u{FFFD}", "{base}");
+        }
+    }
+
+    /// The name check keys on the family, so a text face is not excluded just
+    /// for containing a picture family's name inside a longer one.
+    #[test]
+    fn the_picture_font_names_do_not_swallow_text_faces() {
+        for base in ["/ABCDEF+SymbolicSans", "/Wingding", "/TimesNewRoman,Bold"] {
+            let f = font_from(
+                &format!(
+                    "<< /Type /Font /Subtype /TrueType /BaseFont {base} \
+                     /FontDescriptor 7 0 R >>"
+                ),
+                &[(6, &sfnt_program(&[(3, 0)]))],
+                &[(7, "<< /Type /FontDescriptor /Flags 6 /FontFile2 6 0 R >>")],
+            );
+            assert!(f.winansi_high_codes, "{base} is a text face");
+        }
+    }
+
+    /// Nor does a program built for the Macintosh: 0x92 is `í` there, not an
+    /// apostrophe, so WinAnsiEncoding would be actively wrong.
+    #[test]
+    fn a_macintosh_only_font_does_not_guess_at_its_high_codes() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /Palatino \
+             /FirstChar 32 /LastChar 215 /FontDescriptor 7 0 R >>",
+            &[(6, &sfnt_program(&[(1, 0)]))],
+            &[(7, "<< /Type /FontDescriptor /Flags 34 /FontFile2 6 0 R >>")],
+        );
+        assert_eq!(f.decode(0x92), "\u{FFFD}");
+        assert_eq!(f.decode(0xD5), "\u{FFFD}");
+    }
+
+    /// The fallback fills gaps and nothing else: every code StandardEncoding
+    /// defines must still decode to what it says, even for the font that is
+    /// allowed to guess, or a font that was reading correctly would quietly
+    /// change meaning.
+    #[test]
+    fn the_winansi_fallback_never_overrides_standard_encoding() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /OPPEKN+TimesNewRoman \
+             /FontDescriptor 7 0 R >>",
+            &[(6, &sfnt_program(&[(3, 0)]))],
+            &[(7, "<< /Type /FontDescriptor /Flags 6 /FontFile2 6 0 R >>")],
+        );
+        assert!(f.winansi_high_codes, "this font is allowed to guess");
+        for byte in 0..=255u8 {
+            let Some(want) = encodings::standard(byte) else {
+                continue;
+            };
+            assert_eq!(
+                f.decode(u32::from(byte)),
+                want.to_string(),
+                "code {byte:#04X} must keep its StandardEncoding character",
+            );
+        }
+    }
+
     #[test]
     fn differences_and_widths() {
         let f = font_from(
@@ -337,6 +614,7 @@ mod tests {
              /Encoding << /BaseEncoding /WinAnsiEncoding \
              /Differences [65 /alpha /uni0042] >> \
              /FirstChar 65 /Widths [600 700] >>",
+            &[],
             &[],
         );
         assert_eq!(f.decode(65), "\u{3B1}"); // /alpha
@@ -353,6 +631,7 @@ mod tests {
             "<< /Type /Font /Subtype /TrueType /BaseFont /X \
              /FontDescriptor << /Type /FontDescriptor /MissingWidth 300 >> >>",
             &[],
+            &[],
         );
         assert_eq!(f.width(65), 300.0);
     }
@@ -363,6 +642,7 @@ mod tests {
             "<< /Type /Font /Subtype /Type1 /BaseFont /X \
              /Encoding /WinAnsiEncoding /ToUnicode 6 0 R >>",
             &[(6, b"1 beginbfchar <41> <0058> endbfchar")],
+            &[],
         );
         assert_eq!(f.decode(0x41), "X"); // ToUnicode wins over WinAnsi 'A'
         assert_eq!(f.decode(0x42), "B"); // falls through to WinAnsi
@@ -377,6 +657,7 @@ mod tests {
              /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 \
              /DW 800 /W [1 [500 600] 10 12 250] >>] /ToUnicode 6 0 R >>",
             &[(6, cmap)],
+            &[],
         );
         assert!(!f.simple);
         assert_eq!(f.codes(b"\x00\x01\x00\x02"), vec![1, 2]);
@@ -398,6 +679,7 @@ mod tests {
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
              /FirstChar 4294967295 /Widths [600 700] >>",
             &[],
+            &[],
         );
         assert_eq!(f.width(u32::MAX), 600.0);
         assert_eq!(f.width(65), 500.0); // overflowed entry dropped
@@ -409,12 +691,14 @@ mod tests {
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
              /Encoding << /Differences [4294967295 /a /b] >> >>",
             &[],
+            &[],
         );
         assert_eq!(f.decode(65), "A"); // base table untouched, no panic
                                        // Same start code reached via a Real that saturates to u32::MAX.
         let g = font_from(
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
              /Encoding << /Differences [5000000000.0 /a /b] >> >>",
+            &[],
             &[],
         );
         assert_eq!(g.decode(65), "A");
@@ -428,6 +712,7 @@ mod tests {
             "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
              /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 \
              /DW 800 /W [4294967295 [10 20]] >>] >>",
+            &[],
             &[],
         );
         assert_eq!(f.width(u32::MAX), 10.0);

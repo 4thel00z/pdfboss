@@ -4,6 +4,7 @@
 mod cmap;
 mod extract;
 mod font;
+mod sfnt;
 
 use pdfboss_core::{Document, Page, Result};
 
