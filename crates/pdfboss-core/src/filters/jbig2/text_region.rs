@@ -130,15 +130,16 @@ pub(crate) fn decode_text_region(
     budget.charge_region(info.width, info.height)?;
     let mut region = Bitmap::filled(info.width, info.height, params.def_pixel)?;
 
-    let mut dec = MqDecoder::new(r.rest());
     Walk {
-        dec: &mut dec,
+        values: Arithmetic {
+            dec: MqDecoder::new(r.rest()),
+            ints: IntCtxSet::new(),
+            iaid: IaidCtx::new(sym_code_len(num_syms)),
+        },
         region: &mut region,
         symbols,
         params: &params,
         budget,
-        ints: IntCtxSet::new(),
-        iaid: IaidCtx::new(sym_code_len(num_syms)),
     }
     .run()?;
     Ok((info, region))
@@ -212,16 +213,73 @@ fn parse_params(r: &mut Reader<'_>) -> Result<TextParams, Jbig2Error> {
     })
 }
 
+/// Where a text region's coded values come from (T.88 6.4.6 to 6.4.10).
+///
+/// The walk of 6.4.5 is one procedure over six reads, and each of those six
+/// clauses defines the read twice over — once for the arithmetic variant of the
+/// format and once for the Huffman one. Naming them here is what keeps the
+/// placement arithmetic, which is the same either way and is the part that goes
+/// subtly wrong, separate from whatever is feeding it.
+///
+/// `Ok(None)` is OOB. Only 6.4.8's is meaningful — it is what closes a strip —
+/// but every read is given the same shape so that the walk, rather than the
+/// source, decides what an unexpected one means.
+trait Values {
+    /// 6.4.6, before the multiplication by SBSTRIPS the caller applies. Serves
+    /// both the initial STRIPT of 6.4.5 step 2 and each strip's delta.
+    fn delta_t(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.7: the S coordinate of a strip's first instance, as a delta on
+    /// FIRSTS.
+    fn first_s(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.8: the gap to a later instance of the strip. OOB closes the strip.
+    fn delta_s(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.9: an instance's T coordinate within its strip.
+    fn curt(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.10: an instance's symbol ID.
+    fn symbol_id(&mut self) -> Result<u32, Jbig2Error>;
+}
+
+/// The arithmetic value source: the integer procedures of Annex A, all drawing
+/// on one decoder and each adapting its own contexts across the whole region.
+struct Arithmetic<'d> {
+    /// The one arithmetic decoder every coded value of the region comes from.
+    dec: MqDecoder<'d>,
+    /// The integer procedures of Annex A, adapting across the whole region.
+    ints: IntCtxSet,
+    /// The symbol ID procedure of A.3, sized by SBSYMCODELEN.
+    iaid: IaidCtx,
+}
+
+impl Values for Arithmetic<'_> {
+    fn delta_t(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iadt))
+    }
+
+    fn first_s(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iafs))
+    }
+
+    fn delta_s(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iads))
+    }
+
+    fn curt(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iait))
+    }
+
+    fn symbol_id(&mut self) -> Result<u32, Jbig2Error> {
+        Ok(decode_iaid(&mut self.dec, &mut self.iaid))
+    }
+}
+
 /// The state a text region's strip walk carries (T.88 6.4.5).
 ///
-/// One arithmetic decoder, one set of integer procedures and one symbol ID
-/// array serve the whole region, all three adapting as the walk proceeds, and
-/// every placement touches all of them. Bundling them is what lets the walk's
-/// two loops and the placement of a single instance be read separately without
-/// threading eight parameters between them.
-struct Walk<'a, 'd> {
-    /// The one arithmetic decoder every coded value of the region comes from.
-    dec: &'a mut MqDecoder<'d>,
+/// The value source is owned rather than borrowed because it is the walk's
+/// alone: everything the region reads is read through it, in order, and nothing
+/// else in the segment shares the cursor it sits on.
+struct Walk<'a, V> {
+    /// Where the coded values come from.
+    values: V,
     /// SBREGBITMAP, the region being painted.
     region: &'a mut Bitmap,
     /// SBSYMS, the symbols the coded ids index.
@@ -230,13 +288,9 @@ struct Walk<'a, 'd> {
     params: &'a TextParams,
     /// The embedded stream's remaining allowance of decoding work.
     budget: &'a mut Budget,
-    /// The integer procedures of Annex A, adapting across the whole region.
-    ints: IntCtxSet,
-    /// The symbol ID procedure of A.3, sized by SBSYMCODELEN.
-    iaid: IaidCtx,
 }
 
-impl Walk<'_, '_> {
+impl<V: Values> Walk<'_, V> {
     /// Walks the strips, compositing every symbol instance the region declares
     /// (T.88 6.4.5).
     ///
@@ -252,7 +306,7 @@ impl Walk<'_, '_> {
         // 6.4.5 step 2: the leading strip offset is negated, so a region whose
         // first strip starts above its own top edge says so with a positive
         // value here.
-        let initial = decode_int(self.dec, &mut self.ints.iadt).ok_or(Jbig2Error::Malformed(
+        let initial = self.values.delta_t()?.ok_or(Jbig2Error::Malformed(
             "unexpected OOB decoding the leading strip offset",
         ))?;
         let mut strip_t = i64::from(initial).saturating_mul(strips).saturating_neg();
@@ -262,7 +316,7 @@ impl Walk<'_, '_> {
         let mut placed: u32 = 0;
 
         while placed < self.params.instances {
-            let delta = decode_int(self.dec, &mut self.ints.iadt).ok_or(Jbig2Error::Malformed(
+            let delta = self.values.delta_t()?.ok_or(Jbig2Error::Malformed(
                 "unexpected OOB decoding a strip offset",
             ))?;
             // The delta counts strips, not rows (6.4.5 step 3(b)).
@@ -270,7 +324,7 @@ impl Walk<'_, '_> {
 
             // 6.4.5 step 3(c)(i): a strip's first instance gives its S
             // coordinate as a delta on FIRSTS.
-            let dfs = decode_int(self.dec, &mut self.ints.iafs).ok_or(Jbig2Error::Malformed(
+            let dfs = self.values.first_s()?.ok_or(Jbig2Error::Malformed(
                 "unexpected OOB decoding a first S coordinate",
             ))?;
             first_s = first_s.saturating_add(i64::from(dfs));
@@ -286,7 +340,7 @@ impl Walk<'_, '_> {
                 // Every later instance of the strip gives the gap from the far
                 // edge of the one just placed, offset by SBDSOFFSET; an OOB
                 // closes the strip.
-                let Some(ids) = decode_int(self.dec, &mut self.ints.iads) else {
+                let Some(ids) = self.values.delta_s()? else {
                     break;
                 };
                 curs = curs
@@ -305,13 +359,13 @@ impl Walk<'_, '_> {
         let curt = if self.params.strips == 1 {
             0
         } else {
-            decode_int(self.dec, &mut self.ints.iait).ok_or(Jbig2Error::Malformed(
+            self.values.curt()?.ok_or(Jbig2Error::Malformed(
                 "unexpected OOB decoding a T coordinate",
             ))?
         };
         let ti = strip_t.saturating_add(i64::from(curt));
 
-        let id = decode_iaid(self.dec, &mut self.iaid);
+        let id = self.values.symbol_id()?;
         // The code length is the bit width of the largest id, so a symbol count
         // that is not a power of two leaves ids the code can express and the
         // list cannot answer. Refusing those keeps the lookup in bounds.
