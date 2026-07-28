@@ -63,6 +63,25 @@ pub(crate) const MAX_INSTANCES: u32 = 1 << 22;
 /// placements a stream may make to the one allowance the stream has.
 pub(crate) const INSTANCE_COST: u64 = 64;
 
+/// What one line of a region's symbol ID Huffman table costs, in the units
+/// [`Budget`] counts (T.88 7.4.3.1.7).
+///
+/// 7.4.3.1.5 puts that table in the header of *every* text region segment with
+/// SBHUFF set, and 7.4.3.1.7 gives it a line per symbol of SBSYMS — a count the
+/// referred-to dictionaries fixed, which this segment merely names. So one
+/// dictionary's exports can be made to buy the run-code decoding and the B.3
+/// assignment over all of them again in each of any number of later segments,
+/// none of which need be longer than a few hundred bytes. The charge the
+/// dictionary made for the symbols themselves pays for the first such table and
+/// for none of the rest.
+///
+/// The figure is a bound on what building a line costs rather than a
+/// measurement of it. B.3's assignment and the by-length index the matcher
+/// needs each make a pass over every line per prefix length, and prefixes run
+/// to 32 bits here, so a line's share is on the order of thirty-two steps —
+/// every one of them cheaper than the pixel decision the budget counts in.
+pub(crate) const SYMBOL_CODE_COST: u64 = 32;
+
 /// What a text region is told when its Huffman table selectors and its
 /// referred-to table segments do not account for one another
 /// (T.88 7.4.3.1.6).
@@ -183,7 +202,7 @@ pub(crate) fn decode_text_region(
             // exported. It shares the cursor with the coded data that follows
             // it, which is what step 6's byte alignment exists to settle.
             let mut bits = BitReader::new(r.rest());
-            let codes = decode_symbol_id_codes(&mut bits, num_syms)?;
+            let codes = decode_symbol_id_codes(&mut bits, num_syms, budget)?;
             Walk {
                 values: Huffman {
                     bits,
@@ -408,11 +427,21 @@ fn bind_tables(flags: u16, tables: &[&Table]) -> Result<TextTables, Jbig2Error> 
 /// byte alignment, which is what makes the region's coded data begin on a byte
 /// boundary however many bits the run codes happened to take.
 ///
-/// Nothing here is charged against the work budget. Both loops are bounded by
-/// SBNUMSYMS, which is the length of the symbol list the referred-to
-/// dictionaries produced, and every one of those symbols was charged for as it
-/// was decoded or copied — so the size of this field is already paid for.
-fn decode_symbol_id_codes(bits: &mut BitReader, num_syms: u32) -> Result<Table, Jbig2Error> {
+/// The field is charged for by the line, from SBNUMSYMS, before any of it is
+/// read. It is tempting to call it already paid for, on the grounds that every
+/// symbol it names was charged for when a dictionary decoded or copied it; that
+/// argument holds for the symbols and not for this table. The symbols are
+/// charged once, where they are made. The table over them is built again by
+/// every segment that refers to that dictionary, and Annex D.3 puts no limit on
+/// how many segments an embedded stream holds — so the number of times B.3 is
+/// run over SBNUMSYMS lines is a function of the stream's length, not of
+/// anything the dictionary paid for.
+fn decode_symbol_id_codes(
+    bits: &mut BitReader,
+    num_syms: u32,
+    budget: &mut Budget,
+) -> Result<Table, Jbig2Error> {
+    budget.charge(SYMBOL_CODE_COST.saturating_mul(u64::from(num_syms)))?;
     let runs = read_run_code_table(bits)?;
     let lengths = read_symbol_code_lengths(bits, &runs, num_syms)?;
     // Step 6.
@@ -1140,7 +1169,8 @@ mod tests {
         // symbol 9. Reading the field whole must reach the same table and stop
         // on the same byte boundary.
         let mut whole = BitReader::new(&EXAMPLE);
-        let codes = decode_symbol_id_codes(&mut whole, 32).expect("symbol ID codes");
+        let codes =
+            decode_symbol_id_codes(&mut whole, 32, &mut Budget::new()).expect("symbol ID codes");
         assert!(whole.is_exhausted());
         let mut ids = BitReader::new(&[0b0000_0101, 0b0000_0000]);
         assert_eq!(codes.decode(&mut ids), Ok(Some(8)));
@@ -1510,6 +1540,39 @@ mod tests {
         data.extend_from_slice(&1u32.to_be_bytes());
         assert_eq!(
             decode_text_region(&data, &syms, &[], &mut Budget::with_limit(1 << 20)),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// The symbol ID table of 7.4.3.1.7 is a line per symbol, and 7.4.3.1.5
+    /// puts one in every Huffman text region segment, so what pays for it
+    /// cannot be the charge the dictionary made when it decoded the symbols.
+    ///
+    /// The region here declares no pixels and places nothing, so
+    /// [`Budget::charge_region`] and [`INSTANCE_COST`] both come to zero: the
+    /// table is the only thing left that can spend anything.
+    #[test]
+    fn the_symbol_id_table_draws_on_the_stream_budget() {
+        let symbols = vec![glyph(&["1"]); 64];
+        let refs: Vec<&Bitmap> = symbols.iter().collect();
+        let data = huffman_text_segment((0, 0), Shape::default(), 0, 64, 1, &[], None);
+        let table_cost = SYMBOL_CODE_COST * 64;
+
+        let mut budget = Budget::with_limit(table_cost);
+        assert!(decode_text_region(&data, &refs, &[], &mut budget).is_ok());
+        let mut budget = Budget::with_limit(table_cost - 1);
+        assert_eq!(
+            decode_text_region(&data, &refs, &[], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+
+        // The defect this guards: a second region naming the same dictionary
+        // builds the same table over again, and has to pay over again.
+        let mut budget = Budget::with_limit(2 * table_cost);
+        assert!(decode_text_region(&data, &refs, &[], &mut budget).is_ok());
+        assert!(decode_text_region(&data, &refs, &[], &mut budget).is_ok());
+        assert_eq!(
+            decode_text_region(&data, &refs, &[], &mut budget),
             Err(Jbig2Error::WorkLimit),
         );
     }
