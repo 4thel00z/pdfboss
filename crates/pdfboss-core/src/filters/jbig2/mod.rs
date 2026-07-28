@@ -51,6 +51,7 @@ pub(crate) mod huffman;
 pub(crate) mod mq;
 pub(crate) mod page;
 pub(crate) mod reader;
+pub(crate) mod refinement;
 pub(crate) mod segment;
 pub(crate) mod symbol_dict;
 pub(crate) mod text_region;
