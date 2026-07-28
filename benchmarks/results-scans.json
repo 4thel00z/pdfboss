@@ -2,25 +2,25 @@
   "document_pages": 544,
   "pages_rendered": 100,
   "scale": 1.0,
-  "repeat": 3,
+  "repeat": 5,
   "libraries": {
     "pdfboss": {
-      "time": 2.3428479169961065,
+      "time": 1.860651874987525,
       "pages": 100,
       "ink_percent": 4.83438130496954
     },
     "PyMuPDF": {
-      "time": 1.7779711249750108,
+      "time": 2.8541272090078564,
       "pages": 100,
       "ink_percent": 4.817404817404817
     },
     "pypdfium2": {
-      "time": 1.7895243340171874,
+      "time": 3.054278208001051,
       "pages": 100,
       "ink_percent": 4.850051908875439
     },
     "pdfplumber": {
-      "time": 1.6776667920639738,
+      "time": 2.814724958006991,
       "pages": 100,
       "ink_percent": 4.867354867354868
     }

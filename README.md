@@ -126,12 +126,14 @@ Scans are the other half of the world's PDFs, and they are a different workload:
 
 | Library | pages/sec | Ink on page 1 |
 |---|--:|--:|
-| pdfplumber (via pdfium) | 59.6 | 4.87% |
-| PyMuPDF | 56.2 | 4.82% |
-| pypdfium2 | 55.9 | 4.85% |
-| pdfboss | 42.7 | 4.83% |
+| pdfboss | 53.7 | 4.83% |
+| pdfplumber (via pdfium) | 35.5 | 4.87% |
+| PyMuPDF | 35.0 | 4.82% |
+| pypdfium2 | 32.7 | 4.85% |
 
-**Here pdfboss is the slowest of the four, at roughly 0.7× the C-backed renderers** — and the only one of them with no C in it. About two thirds of its time is the JBIG2 arithmetic decoder, which is the honest cost of decoding the format rather than delegating it.
+**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers** — and the only one of them with no C in it. Compare the four rows against each other rather than against another machine's: all four are timed in one pass, and the ratio between them held to within 3% across runs whose absolute numbers varied by a fifth.
+
+What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation feeding it, and that part is a serial dependency chain — every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded — so it neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
 
 The ink column is what makes the timings mean anything: a library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel — each downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
 
