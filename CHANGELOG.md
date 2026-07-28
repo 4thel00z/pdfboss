@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/4thel00z/pdfboss/compare/v0.7.1...v0.7.2) (2026-07-28)
+
+
+### Bug Fixes
+
+* **text:** read a Windows subset's high codes instead of dropping them ([b66765b](https://github.com/4thel00z/pdfboss/commit/b66765bd57396b7dcb6059ef19085b684571372f))
+
 ## [0.7.1](https://github.com/4thel00z/pdfboss/compare/v0.7.0...v0.7.1) (2026-07-28)
 
 
