@@ -173,13 +173,14 @@ fn decode_embedded_within(
                 // insert that follows needs the map mutably.
                 let exported = {
                     let inputs =
-                        gather_referred_to(&symbols, &tables, &segment.header.referred_to)?;
+                        gather_referred_to(&symbols, &tables, &segment.header.referred_to, budget)?;
                     decode_symbol_dict(segment.data, &inputs.symbols, &inputs.tables, budget)?
                 };
                 symbols.insert(segment.header.number, exported);
             }
             SegmentKind::ImmediateTextRegion | SegmentKind::ImmediateLosslessTextRegion => {
-                let inputs = gather_referred_to(&symbols, &tables, &segment.header.referred_to)?;
+                let inputs =
+                    gather_referred_to(&symbols, &tables, &segment.header.referred_to, budget)?;
                 let (info, region) =
                     decode_text_region(segment.data, &inputs.symbols, &inputs.tables, budget)?;
                 let mut target = match page.take() {
@@ -281,10 +282,20 @@ struct Referred<'a> {
 /// arriving after the allocation. The tables need no such cap: a repeated table
 /// segment number contributes a borrow rather than a copy, and the consumers
 /// bind at most a handful of them before refusing the rest.
+///
+/// The symbols are charged for, by the symbol, even though they are borrowed
+/// rather than copied. What the cap above bounds is one list; what `budget`
+/// bounds is all of them together, and the two are not the same question — a
+/// segment names a whole dictionary's exports with four bytes, so the list is
+/// as long as SBNUMSYMS however short the segment is, and every later segment
+/// that names the same dictionary builds it over again. A unit per symbol is
+/// far above what appending a borrow costs and far below anything a document
+/// would notice.
 fn gather_referred_to<'a>(
     symbols: &'a HashMap<u32, Vec<Bitmap>>,
     tables: &'a HashMap<u32, Table>,
     referred_to: &[u32],
+    budget: &mut Budget,
 ) -> Result<Referred<'a>, Jbig2Error> {
     let mut out = Referred {
         symbols: Vec::new(),
@@ -295,6 +306,7 @@ fn gather_referred_to<'a>(
             if out.symbols.len().saturating_add(exported.len()) > MAX_SYMBOLS as usize {
                 return Err(Jbig2Error::Malformed("symbol count exceeds the limit"));
             }
+            budget.charge(exported.len() as u64)?;
             out.symbols.extend(exported.iter());
         } else if let Some(table) = tables.get(number) {
             out.tables.push(table);
@@ -388,6 +400,24 @@ mod tests {
         rowless_dictionary_segment, split_after_segment, text_segment_for_page, Collective, Op,
         Placement, Shape,
     };
+
+    /// Handing a segment the symbols its header names is work the segment buys
+    /// with four bytes of referred-to number: 7.4.3.2 sizes the list by what
+    /// the named dictionaries exported, which nothing in the naming segment
+    /// bounds, and every segment that names a dictionary builds it again.
+    #[test]
+    fn the_symbols_a_segment_refers_to_are_charged_for() {
+        let mut symbols = HashMap::new();
+        symbols.insert(1u32, vec![glyph(&["1"]); 64]);
+        let tables = HashMap::new();
+
+        let mut budget = Budget::with_limit(64);
+        assert!(gather_referred_to(&symbols, &tables, &[1], &mut budget).is_ok());
+        assert!(matches!(
+            gather_referred_to(&symbols, &tables, &[1], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        ));
+    }
 
     /// Assembles a complete embedded stream: page info, one immediate generic
     /// region carrying `bm` at (`x`, `y`), then end of page and end of file.
@@ -1239,13 +1269,15 @@ mod tests {
 
         let within = vec![1u32; 8_192];
         assert_eq!(
-            gather_referred_to(&store, &tables, &within).map(|r| r.symbols.len()),
+            gather_referred_to(&store, &tables, &within, &mut Budget::new())
+                .map(|r| r.symbols.len()),
             Ok(65_536),
         );
 
         let beyond = vec![1u32; 8_193];
         assert_eq!(
-            gather_referred_to(&store, &tables, &beyond).map(|r| r.symbols.len()),
+            gather_referred_to(&store, &tables, &beyond, &mut Budget::new())
+                .map(|r| r.symbols.len()),
             Err(Jbig2Error::Malformed("symbol count exceeds the limit")),
         );
     }
@@ -1258,7 +1290,8 @@ mod tests {
     /// and then named four times over by a segment that codes nothing at all,
     /// and the stream pays five symbols' worth — which is what stops the same
     /// shape at the referred-to list's own maximum from turning one bitmap into
-    /// 65 536 of them.
+    /// 65 536 of them. Each of the four namings costs a unit besides, for its
+    /// place in the list handed to the dictionary.
     #[test]
     fn naming_one_dictionary_repeatedly_cannot_multiply_its_symbols() {
         let symbol = glyph(&["1010", "0101", "1010", "0101"]);
@@ -1270,8 +1303,9 @@ mod tests {
         stream.extend_from_slice(&header(2, 0, &[1, 1, 1, 1], 1, copier.len() as u32));
         stream.extend_from_slice(&copier);
 
-        // The original, then four copies of it, at the same price each.
-        let total = (SYMBOL_COST + (4 + ROW_COST) * 4) * 5;
+        // The original, then four copies of it at the same price each, and a
+        // unit for every entry of the copier's referred-to list.
+        let total = (SYMBOL_COST + (4 + ROW_COST) * 4) * 5 + 4;
 
         let mut budget = Budget::with_limit(total);
         assert!(decode_embedded_within(&[], &stream, 8, 8, &mut budget).is_ok());
