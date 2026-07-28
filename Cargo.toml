@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0" # x-release-please-version
+version = "0.7.1" # x-release-please-version
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/4thel00z/pdfboss"
@@ -24,12 +24,12 @@ keywords = ["pdf", "iso-32000"]
 # Inter-crate dependencies carry an explicit `version` (required by
 # `cargo publish`) alongside the local `path`. The markers keep them in
 # lockstep with the workspace version at release time.
-pdfboss-core = { path = "crates/pdfboss-core", version = "0.7.0" } # x-release-please-version
-pdfboss-encoding = { path = "crates/pdfboss-encoding", version = "0.7.0" } # x-release-please-version
-pdfboss-text = { path = "crates/pdfboss-text", version = "0.7.0" } # x-release-please-version
-pdfboss-render = { path = "crates/pdfboss-render", version = "0.7.0" } # x-release-please-version
-pdfboss-aio = { path = "crates/pdfboss-aio", version = "0.7.0" } # x-release-please-version
-pdfboss-tui = { path = "crates/pdfboss-tui", version = "0.7.0" } # x-release-please-version
+pdfboss-core = { path = "crates/pdfboss-core", version = "0.7.1" } # x-release-please-version
+pdfboss-encoding = { path = "crates/pdfboss-encoding", version = "0.7.1" } # x-release-please-version
+pdfboss-text = { path = "crates/pdfboss-text", version = "0.7.1" } # x-release-please-version
+pdfboss-render = { path = "crates/pdfboss-render", version = "0.7.1" } # x-release-please-version
+pdfboss-aio = { path = "crates/pdfboss-aio", version = "0.7.1" } # x-release-please-version
+pdfboss-tui = { path = "crates/pdfboss-tui", version = "0.7.1" } # x-release-please-version
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "sync", "io-util"] }
 futures-core = "0.3"

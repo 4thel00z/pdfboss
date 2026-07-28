@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.1](https://github.com/4thel00z/pdfboss/compare/v0.7.0...v0.7.1) (2026-07-28)
+
+
+### Performance Improvements
+
+* **core:** read a generic region's reference rows as slices ([0dca72e](https://github.com/4thel00z/pdfboss/commit/0dca72e25b22acc766c45be6d37d2418e399cdbd))
+* **core:** work a row at a time when composing and packing bitmaps ([5348280](https://github.com/4thel00z/pdfboss/commit/5348280b7d88bff69cec01418234da66574111d9))
+* **render:** copy an opaque image pixel instead of blending it ([79671bb](https://github.com/4thel00z/pdfboss/commit/79671bbd0d63fae01afb7a046c8ce211a0b10f4f))
+* **render:** sample a one-component image where it is drawn ([ad59df0](https://github.com/4thel00z/pdfboss/commit/ad59df0ad0af52e2732076e30ef27a93942657f5))
+
+
+### Documentation
+
+* remeasure the scan benchmark after the rendering work ([eb8694f](https://github.com/4thel00z/pdfboss/commit/eb8694f103b07a222d7eac0ff3b78a9d9f36e7d9))
+
 ## [0.7.0](https://github.com/4thel00z/pdfboss/compare/v0.6.0...v0.7.0) (2026-07-28)
 
 
