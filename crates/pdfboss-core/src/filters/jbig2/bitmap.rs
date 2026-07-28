@@ -202,26 +202,47 @@ impl Bitmap {
 
         let dst_stride = self.width as usize;
         let src_stride = src.width as usize;
+        // The overlap is a rectangle, so every row of it is the same length
+        // and starts at the same column in each bitmap. Resolving the two row
+        // slices once per row, rather than indexing per pixel, is what lets
+        // the operator below run over bytes instead of over pixels: the page
+        // of a scan is composed from regions covering millions of them.
+        let span = (x1 - x0) as usize;
+        let src_x0 = (x0 - off_x) as usize;
         for dst_y in y0..y1 {
-            let src_y = dst_y - off_y;
-            let dst_base = dst_y as usize * dst_stride;
-            let src_base = src_y as usize * src_stride;
-            for dst_x in x0..x1 {
-                let src_x = dst_x - off_x;
-                let dst_idx = dst_base + dst_x as usize;
-                let src_idx = src_base + src_x as usize;
-                let (Some(&src_pixel), Some(dst_pixel)) =
-                    (src.data.get(src_idx), self.data.get_mut(dst_idx))
-                else {
-                    continue;
-                };
-                *dst_pixel = match op {
-                    CombOp::Or => *dst_pixel | src_pixel,
-                    CombOp::And => *dst_pixel & src_pixel,
-                    CombOp::Xor => *dst_pixel ^ src_pixel,
-                    CombOp::Xnor => 1 - (*dst_pixel ^ src_pixel),
-                    CombOp::Replace => src_pixel,
-                };
+            let src_y = (dst_y - off_y) as usize;
+            let dst_start = dst_y as usize * dst_stride + x0 as usize;
+            let src_start = src_y * src_stride + src_x0;
+            let (Some(dst_row), Some(src_row)) = (
+                self.data.get_mut(dst_start..dst_start + span),
+                src.data.get(src_start..src_start + span),
+            ) else {
+                continue;
+            };
+            // The operator is fixed for the whole call, so it is matched per
+            // row and never per pixel.
+            match op {
+                CombOp::Or => {
+                    for (d, &s) in dst_row.iter_mut().zip(src_row) {
+                        *d |= s;
+                    }
+                }
+                CombOp::And => {
+                    for (d, &s) in dst_row.iter_mut().zip(src_row) {
+                        *d &= s;
+                    }
+                }
+                CombOp::Xor => {
+                    for (d, &s) in dst_row.iter_mut().zip(src_row) {
+                        *d ^= s;
+                    }
+                }
+                CombOp::Xnor => {
+                    for (d, &s) in dst_row.iter_mut().zip(src_row) {
+                        *d = 1 - (*d ^ s);
+                    }
+                }
+                CombOp::Replace => dst_row.copy_from_slice(src_row),
             }
         }
     }
@@ -254,11 +275,30 @@ impl Bitmap {
         let mut out = vec![0u8; stride * self.height as usize];
         for y in 0..self.height {
             let base = y as usize * stride;
-            for (x, &pixel) in self.row(y).iter().enumerate() {
-                if pixel != 0 {
-                    if let Some(byte) = out.get_mut(base + x / 8) {
-                        *byte |= 0x80 >> (x % 8);
-                    }
+            let row = self.row(y);
+            let Some(dst) = out.get_mut(base..base + stride) else {
+                continue;
+            };
+            // Eight source pixels make one output byte, so the row is walked in
+            // groups of eight and each group folded into a byte. Doing it a
+            // pixel at a time costs a bounds check and a variable shift per
+            // pixel, and a full page of a scan has millions of them.
+            let mut groups = row.chunks_exact(8);
+            for (byte, group) in dst.iter_mut().zip(&mut groups) {
+                *byte = group
+                    .iter()
+                    .fold(0u8, |acc, &pixel| (acc << 1) | u8::from(pixel != 0));
+            }
+            // A row whose width is not a multiple of eight ends in a partial
+            // byte, whose remaining low bits stay 0 — the padding this
+            // function's contract leaves clear.
+            let rest = groups.remainder();
+            if !rest.is_empty() {
+                if let Some(byte) = dst.get_mut(row.len() / 8) {
+                    *byte = rest
+                        .iter()
+                        .fold(0u8, |acc, &pixel| (acc << 1) | u8::from(pixel != 0))
+                        << (8 - rest.len());
                 }
             }
         }
@@ -451,6 +491,35 @@ mod tests {
         let bm = from_rows(&["101"]);
         assert_eq!(bm.pack_rows(), vec![0b1010_0000]);
         assert_eq!(bm.to_pdf_samples(), vec![0b0101_1111]);
+    }
+
+    /// [`Bitmap::pack_rows`] folds eight pixels at a time and handles the
+    /// partial trailing byte separately, so the widths that matter are the
+    /// ones either side of a byte boundary. This checks every one of them from
+    /// 1 to 20 against the definition a pixel at a time.
+    #[test]
+    fn packing_by_groups_agrees_with_packing_a_pixel_at_a_time() {
+        for width in 1..=20u32 {
+            let rows: Vec<String> = (0..3u32)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| if (x * 7 + y * 3) % 5 < 2 { '1' } else { '0' })
+                        .collect()
+                })
+                .collect();
+            let bm = from_rows(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+
+            let stride = width.div_ceil(8) as usize;
+            let mut want = vec![0u8; stride * 3];
+            for (y, row) in rows.iter().enumerate() {
+                for (x, ch) in row.bytes().enumerate() {
+                    if ch == b'1' {
+                        want[y * stride + x / 8] |= 0x80 >> (x % 8);
+                    }
+                }
+            }
+            assert_eq!(bm.pack_rows(), want, "width {width}");
+        }
     }
 
     #[test]
