@@ -264,7 +264,7 @@ impl Table {
     /// stream means "the data ended", so the end of the data must be an error
     /// or a truncated segment decodes to a plausible wrong answer.
     pub(crate) fn decode(&self, bits: &mut BitReader) -> Result<Option<i32>, Jbig2Error> {
-        let line = *self.matched_line(bits)?;
+        let line = self.matched_line(bits)?;
         if line.kind == Kind::Oob {
             // B.4 step 3. There is no range on this line, so step 2 reads
             // nothing for it.
@@ -272,11 +272,12 @@ impl Table {
         }
         let offset = i64::from(read_bits(bits, line.range_len)?);
         let low = i64::from(line.range_low);
-        let value = match line.kind {
-            // B.4 step 4.
-            Kind::Lower => low - offset,
-            // B.4 step 5.
-            Kind::Normal | Kind::Oob => low + offset,
+        // B.4 steps 4 and 5. The lower range table line is the only one that
+        // counts down from its RANGELOW.
+        let value = if line.kind == Kind::Lower {
+            low - offset
+        } else {
+            low + offset
         };
         // B.2: the smallest value a table described by this Recommendation can
         // encode is −2 147 483 648 and the largest is 2 147 483 647. A 32-bit
@@ -296,7 +297,7 @@ impl Table {
     /// search: after reading `L` bits the accumulator either falls inside the
     /// block of codes of length `L` or it does not, and one comparison
     /// settles it.
-    fn matched_line(&self, bits: &mut BitReader) -> Result<&Line, Jbig2Error> {
+    fn matched_line(&self, bits: &mut BitReader) -> Result<Line, Jbig2Error> {
         let mut code = 0u32;
         for len in 1..=self.max_len {
             let bit = bits.read_bit().ok_or(Jbig2Error::Truncated)?;
@@ -316,6 +317,7 @@ impl Table {
                     .order
                     .get(position)
                     .and_then(|index| self.lines.get(*index as usize))
+                    .copied()
                     .ok_or(Jbig2Error::Malformed("no such Huffman code"));
             }
         }
