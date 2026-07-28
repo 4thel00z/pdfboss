@@ -32,15 +32,72 @@ pub(crate) struct DrawParams<'a> {
 
 /// A decoded RGBA image, row 0 at the image's top edge (the `v = 1` side
 /// of the unit square).
-struct Rgba {
+struct Rgba<'a> {
     width: usize,
     height: usize,
-    data: Vec<u8>,
+    pixels: Pixels<'a>,
     /// The stream held fewer bytes than the image's dimensions, bit depth
     /// and component count demand, so the tail of this image came from the
     /// zero padding [`sample_bits`] reads past the end of the data rather
     /// than from the image itself.
     truncated: bool,
+}
+
+/// Where an [`Rgba`] keeps its pixels.
+enum Pixels<'a> {
+    /// One converted RGBA quad per pixel, in row-major order.
+    Quads(Vec<u8>),
+    /// Packed one-component samples, still in the stream's own layout,
+    /// alongside the table each sample value converts through.
+    ///
+    /// Converting up front would cost four bytes per source pixel, and a
+    /// scan holds far more of those than the page it is drawn onto has room
+    /// for: a bilevel page image of 1994 by 2832 samples occupies 690 KiB
+    /// packed and 22 MiB expanded, of which a 1:1 render reads about one
+    /// pixel in eighteen. So this variant converts on the way out, where the
+    /// count is the destination's rather than the source's.
+    Packed {
+        data: &'a [u8],
+        bpc: usize,
+        row_bytes: usize,
+        lut: Vec<[u8; 4]>,
+    },
+}
+
+impl Rgba<'_> {
+    /// The pixel at column `i`, row `j`, which both callers have already
+    /// clamped into range.
+    ///
+    /// Out-of-range coordinates and samples past the end of the data yield a
+    /// transparent black pixel and a zero sample respectively, which is what
+    /// [`sample_bits`] does for the same reason: short data is lenient.
+    fn at(&self, i: usize, j: usize) -> [u8; 4] {
+        match &self.pixels {
+            Pixels::Quads(data) => {
+                let off = (j * self.width + i) * 4;
+                data.get(off..off + 4)
+                    .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                    .unwrap_or([0; 4])
+            }
+            Pixels::Packed {
+                data,
+                bpc,
+                row_bytes,
+                lut,
+            } => {
+                let bit = i * bpc;
+                let byte = data.get(j * row_bytes + bit / 8).copied().unwrap_or(0);
+                // Rows are byte-aligned (ISO 32000-1 8.9.5.2), so a sample
+                // never straddles the row boundary and the shift is fixed by
+                // the sample's own offset within its byte.
+                let shift = 8 - bpc - bit % 8;
+                let mask = ((1u16 << bpc) - 1) as u8;
+                lut.get(usize::from((byte >> shift) & mask))
+                    .copied()
+                    .unwrap_or([0; 4])
+            }
+        }
+    }
 }
 
 /// How much of an image [`draw`] managed to paint.
@@ -170,13 +227,13 @@ fn short_of_samples(data: &[u8], row_bits: usize, height: usize) -> bool {
 
 /// Decodes image `dict` + `data` to RGBA. Returns `None` when the image is
 /// malformed beyond recovery (bad dimensions, unsupported JPEG, ...).
-fn decode_rgba(
+fn decode_rgba<'a>(
     doc: &Document,
     dict: &Dict,
-    data: &[u8],
+    data: &'a [u8],
     cs_obj: Option<&Object>,
     fill_rgb: [u8; 3],
-) -> Option<Rgba> {
+) -> Option<Rgba<'a>> {
     if is_dct(doc, dict) {
         // A short JPEG is the decoder's business: it either reconstructs
         // what it has or fails outright, and there is no zero padding of
@@ -213,7 +270,7 @@ fn decode_stencil(
     data: &[u8],
     decode: Option<Vec<f32>>,
     fill_rgb: [u8; 3],
-) -> Rgba {
+) -> Rgba<'static> {
     let invert = matches!(decode.as_deref(), Some([d0, d1, ..]) if d0 > d1);
     let stride_bits = width.div_ceil(8) * 8;
     let mut out = vec![0u8; width * height * 4];
@@ -230,7 +287,7 @@ fn decode_stencil(
     Rgba {
         width,
         height,
-        data: out,
+        pixels: Pixels::Quads(out),
         truncated: short_of_samples(data, stride_bits, height),
     }
 }
@@ -239,14 +296,14 @@ fn decode_stencil(
 /// through its `/Decode` range (default `[0 1]`, or `[0 2^bpc-1]` for
 /// Indexed) and the results converted to RGB via the color space. Rows are
 /// byte-aligned; missing bytes read as 0.
-fn decode_samples(
+fn decode_samples<'a>(
     width: usize,
     height: usize,
-    data: &[u8],
+    data: &'a [u8],
     cs: &ColorSpace,
     bpc: usize,
     decode: Option<Vec<f32>>,
-) -> Rgba {
+) -> Rgba<'a> {
     let ncomp = cs.components().clamp(1, 8);
     let max = ((1u32 << bpc) - 1) as f32;
     let default_hi = if matches!(cs, ColorSpace::Indexed { .. }) {
@@ -261,38 +318,49 @@ fn decode_samples(
         })
         .collect();
     let stride_bits = (ncomp * bpc * width).div_ceil(8) * 8;
-    let mut out = vec![0u8; width * height * 4];
+    let truncated = short_of_samples(data, stride_bits, height);
     if ncomp == 1 && bpc <= 8 {
         // One component of at most eight bits admits at most 256 distinct
         // samples, so `/Decode` and the color conversion run once per value
-        // instead of once per pixel. Bilevel scans are the extreme case:
-        // two conversions replace one per pixel.
-        let lut = sample_lut(cs, bpc, ranges[0], max);
-        paint_from_lut(&mut out, width, height, data, bpc, &lut);
-    } else {
-        let mut comps = [0.0f32; 8];
-        for y in 0..height {
-            for x in 0..width {
-                let bit0 = y * stride_bits + x * ncomp * bpc;
-                for (c, comp) in comps.iter_mut().enumerate().take(ncomp) {
-                    let raw = sample_bits(data, bit0 + c * bpc, bpc) as f32;
-                    let (d0, d1) = ranges[c];
-                    *comp = d0 + raw * (d1 - d0) / max;
-                }
-                let rgb = cs.to_rgb(&comps[..ncomp]);
-                let off = (y * width + x) * 4;
-                for (i, v) in rgb.iter().enumerate() {
-                    out[off + i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                }
-                out[off + 3] = 255;
+        // rather than once per pixel, and the samples themselves are left
+        // packed for [`Rgba::at`] to read. Bilevel scans are the extreme
+        // case: two conversions replace one per pixel, over data that is
+        // never expanded at all.
+        return Rgba {
+            width,
+            height,
+            pixels: Pixels::Packed {
+                data,
+                bpc,
+                row_bytes: (width * bpc).div_ceil(8),
+                lut: sample_lut(cs, bpc, ranges[0], max),
+            },
+            truncated,
+        };
+    }
+    let mut out = vec![0u8; width * height * 4];
+    let mut comps = [0.0f32; 8];
+    for y in 0..height {
+        for x in 0..width {
+            let bit0 = y * stride_bits + x * ncomp * bpc;
+            for (c, comp) in comps.iter_mut().enumerate().take(ncomp) {
+                let raw = sample_bits(data, bit0 + c * bpc, bpc) as f32;
+                let (d0, d1) = ranges[c];
+                *comp = d0 + raw * (d1 - d0) / max;
             }
+            let rgb = cs.to_rgb(&comps[..ncomp]);
+            let off = (y * width + x) * 4;
+            for (i, v) in rgb.iter().enumerate() {
+                out[off + i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+            }
+            out[off + 3] = 255;
         }
     }
     Rgba {
         width,
         height,
-        data: out,
-        truncated: short_of_samples(data, stride_bits, height),
+        pixels: Pixels::Quads(out),
+        truncated,
     }
 }
 
@@ -314,43 +382,11 @@ fn sample_lut(cs: &ColorSpace, bpc: usize, range: (f32, f32), max: f32) -> Vec<[
         .collect()
 }
 
-/// Expands `bpc`-bit single-component samples into `out` through `lut`, one
-/// packed row at a time. Rows are byte-aligned (ISO 32000-1 8.9.5.2), so a
-/// row's samples never straddle the row boundary; bytes past the end of
-/// `data` read as 0, matching [`sample_bits`].
-fn paint_from_lut(
-    out: &mut [u8],
-    width: usize,
-    height: usize,
-    data: &[u8],
-    bpc: usize,
-    lut: &[[u8; 4]],
-) {
-    let row_bytes = (width * bpc).div_ceil(8);
-    // `bpc` reaches 8 here, where the mask is 255: widen before subtracting.
-    let mask = ((1u16 << bpc) - 1) as u8;
-    for y in 0..height {
-        let row = data.get(y * row_bytes..).unwrap_or(&[]);
-        let dst = &mut out[y * width * 4..(y + 1) * width * 4];
-        let mut x = 0;
-        for i in 0..row_bytes {
-            let byte = row.get(i).copied().unwrap_or(0);
-            let mut shift = 8;
-            while shift >= bpc && x < width {
-                shift -= bpc;
-                let px = lut[usize::from((byte >> shift) & mask)];
-                dst[x * 4..x * 4 + 4].copy_from_slice(&px);
-                x += 1;
-            }
-        }
-    }
-}
-
 /// Decodes a raw JPEG (`DCTDecode` payload) to RGBA. Gray, RGB, and CMYK
 /// pixel layouts are supported; CMYK JPEGs are assumed to carry
 /// Adobe-style inverted ink values (the common case) and are un-inverted
 /// before conversion. `/Decode` arrays are not applied to JPEG data.
-fn decode_jpeg(data: &[u8]) -> Option<Rgba> {
+fn decode_jpeg<'a>(data: &[u8]) -> Option<Rgba<'a>> {
     let mut dec = jpeg_decoder::Decoder::new(data);
     // The dimensions come from the JPEG's own SOF marker, not the trusted
     // PDF dictionary, so parse only the header first and validate them
@@ -395,7 +431,7 @@ fn decode_jpeg(data: &[u8]) -> Option<Rgba> {
     Some(Rgba {
         width: w,
         height: h,
-        data: out,
+        pixels: Pixels::Quads(out),
         truncated: false,
     })
 }
@@ -433,7 +469,7 @@ fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// unit square through `p.ctm`, sampling nearest-neighbor (image row 0 at
 /// the `v = 1` edge), and compositing source-over with the constant alpha
 /// and clip mask.
-fn draw_rgba(pix: &mut Pixmap, img: &Rgba, p: &DrawParams) {
+fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
     let Some(inv) = p.ctm.invert() else {
         return;
     };
@@ -458,7 +494,7 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba, p: &DrawParams) {
             }
             let i = ((u.x * img.width as f32) as usize).min(img.width - 1);
             let j = (((1.0 - u.y) * img.height as f32) as usize).min(img.height - 1);
-            let s = &img.data[(j * img.width + i) * 4..][..4];
+            let s = img.at(i, j);
             let mut a = f32::from(s[3]) / 255.0 * alpha;
             if let Some(mask) = p.clip {
                 a *= f32::from(mask.coverage(px, py)) / 255.0;
@@ -506,8 +542,8 @@ mod tests {
         Parser::new(src).parse_object(&NoResolve).unwrap()
     }
 
-    fn rgba_at(img: &Rgba, x: usize, y: usize) -> [u8; 4] {
-        img.data[(y * img.width + x) * 4..][..4].try_into().unwrap()
+    fn rgba_at(img: &Rgba<'_>, x: usize, y: usize) -> [u8; 4] {
+        img.at(x, y)
     }
 
     #[test]
@@ -571,9 +607,8 @@ mod tests {
             for data in [&full[..], &full[..row_bytes + 1]] {
                 for range in [(0.0f32, 1.0f32), (1.0, 0.0), (0.25, 0.75)] {
                     let max = ((1u32 << bpc) - 1) as f32;
-                    let lut = sample_lut(&cs, bpc, range, max);
-                    let mut got = vec![0u8; width * height * 4];
-                    paint_from_lut(&mut got, width, height, data, bpc, &lut);
+                    let decode = Some(vec![range.0, range.1]);
+                    let got = decode_samples(width, height, data, &cs, bpc, decode);
 
                     let stride_bits = row_bytes * 8;
                     for y in 0..height {
@@ -585,9 +620,8 @@ mod tests {
                             for (slot, v) in want.iter_mut().zip(rgb) {
                                 *slot = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                             }
-                            let off = (y * width + x) * 4;
                             assert_eq!(
-                                got[off..off + 4],
+                                got.at(x, y),
                                 want,
                                 "bpc {bpc} range {range:?} at ({x},{y}) \
                                  with {} bytes",
@@ -700,7 +734,8 @@ mod tests {
             b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
                /ColorSpace /DeviceGray >>",
         );
-        let img = decode_rgba(&doc, &d, &tiny_jpeg(), None, [0; 3]).expect("jpeg decodes");
+        let jpeg = tiny_jpeg();
+        let img = decode_rgba(&doc, &d, &jpeg, None, [0; 3]).expect("jpeg decodes");
         assert_eq!((img.width, img.height), (1, 1));
         let [r, g, b, a] = rgba_at(&img, 0, 0);
         assert_eq!((r, g), (r, r), "gray");
@@ -764,15 +799,15 @@ mod tests {
         }
     }
 
-    fn quad_image() -> Rgba {
+    fn quad_image() -> Rgba<'static> {
         // Row 0: red, green; row 1: blue, white.
         Rgba {
             width: 2,
             height: 2,
-            data: vec![
+            pixels: Pixels::Quads(vec![
                 255, 0, 0, 255, 0, 255, 0, 255, //
                 0, 0, 255, 255, 255, 255, 255, 255,
-            ],
+            ]),
             truncated: false,
         }
     }
