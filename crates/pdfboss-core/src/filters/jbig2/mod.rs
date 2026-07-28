@@ -13,9 +13,11 @@
 //! [`segment`] splits a PDF-embedded stream into the segments of clause 7;
 //! [`generic`] decodes a region of pixels out of the arithmetic decoder, which
 //! is the procedure every other region type is ultimately built from;
-//! [`symbol_dict`] and [`text_region`] are the pair a scanned page of text is
-//! actually made of; and [`page`] walks a segment sequence, compositing each
-//! region onto the page.
+//! [`huffman`] is the prefix-code table machinery of Annex B, which the
+//! Huffman variant of the format uses wherever the arithmetic variant reaches
+//! for [`arith_int`]; [`symbol_dict`] and [`text_region`] are the pair a
+//! scanned page of text is actually made of; and [`page`] walks a segment
+//! sequence, compositing each region onto the page.
 //!
 //! One region coding is not decoded here at all. A generic region may say that
 //! its pixels are coded with the two-dimensional facsimile scheme of ITU-T T.6
@@ -35,6 +37,7 @@ pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod budget;
 pub(crate) mod generic;
+pub(crate) mod huffman;
 pub(crate) mod mq;
 pub(crate) mod page;
 pub(crate) mod reader;
