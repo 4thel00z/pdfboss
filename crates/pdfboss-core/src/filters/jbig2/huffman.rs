@@ -31,6 +31,8 @@
 // attribute would have to be repeated on every item in the file.
 #![allow(dead_code)]
 
+use super::budget::Budget;
+use super::reader::Reader;
 use super::Jbig2Error;
 use crate::filters::ccitt::bits::BitReader;
 
@@ -49,6 +51,30 @@ const MAX_PREFIX_LEN: u8 = 32;
 /// step 2 reads RANGELEN bits into a single offset, so 32 is both the largest
 /// the standard uses and the largest that fits the value it is added to.
 const MAX_RANGE_LEN: u8 = 32;
+
+/// The most ordinary range lines one custom table may declare.
+///
+/// B.2 step 5 repeats until CURRANGELOW reaches HTHIGH, advancing by
+/// 2^RANGELEN each time. With RANGELEN 0 and HTHIGH at `i32::MAX`, thirteen
+/// bytes of header ask for two billion iterations, and the segment need not
+/// carry a single bit of the data those lines would read. So the count is
+/// bounded from the header *before* the loop is entered rather than discovered
+/// inside it. The figure is generous: the largest standard table has 22 lines.
+const MAX_TABLE_LINES: u64 = 1 << 12;
+
+/// What one declared table line costs against the embedded stream's work
+/// budget.
+///
+/// A table is not spent when it is parsed. A code table segment's table is
+/// held for the rest of the segment walk, because any later region may refer
+/// to it, so what is being paid for here is a line's existence rather than its
+/// decoding. Bounding one segment's line count bounds one table; Annex D.3
+/// puts no limit on how many segments an embedded stream holds, so the total
+/// has to be tied to the single allowance the stream has. At this rate
+/// [`MAX_WORK`](super::budget::MAX_WORK) buys a little over a million lines,
+/// which is 256 tables of the maximum size and a few tens of megabytes of
+/// bookkeeping if a stream insists on all of them.
+const LINE_COST: u64 = 256;
 
 /// What a table line does with the offset that follows its prefix (B.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,6 +410,119 @@ fn read_bits(bits: &mut BitReader, n: u8) -> Result<u32, Jbig2Error> {
     let value = bits.peek(n);
     bits.skip(n);
     Ok(value)
+}
+
+/// Decodes a code table segment into a table.
+///
+/// 7.4.13 gives this segment type no syntax of its own — "a code table
+/// segment's syntax is described in Annex B" — so this is B.2 steps 1 to 11
+/// and nothing else: the flags byte, the two signed bounds, the ordinary range
+/// lines, then the lower, upper and optional out-of-band lines, and finally
+/// the code assignment of B.3.
+///
+/// `budget` is the embedded stream's allowance of decoding work, the same one
+/// the region decoders draw on. It is charged from the header, before the line
+/// loop, for the reason [`MAX_TABLE_LINES`] exists: the number of lines a
+/// table declares is a function of fields a hostile stream chooses freely, and
+/// the segment need not carry the bits those lines would read.
+pub(crate) fn parse_table_segment(data: &[u8], budget: &mut Budget) -> Result<Table, Jbig2Error> {
+    let mut r = Reader::new(data);
+
+    // B.2 step 1, whose field is B.2.1.
+    let flags = r.u8()?;
+    if flags & 0x80 != 0 {
+        return Err(Jbig2Error::Malformed(
+            "reserved bit set in the Huffman table flags",
+        ));
+    }
+    let htoob = flags & 1 == 1;
+    let htps = ((flags >> 1) & 0x07) + 1;
+    let htrs = ((flags >> 4) & 0x07) + 1;
+
+    // B.2 steps 2 and 3: two signed four-byte fields (B.2.2, B.2.3). HTHIGH is
+    // one larger than the upper bound of the last ordinary line.
+    let htlow = r.u32()? as i32;
+    let hthigh = r.u32()? as i32;
+
+    // Two header quantities bound the loop before it starts. Every line
+    // advances CURRANGELOW by at least one, 2^0 being the smallest step, so
+    // the loop cannot outrun the span HTLOW..HTHIGH; and step 5 decodes a line
+    // before it first tests, so even an empty span yields one line.
+    let span = i64::from(hthigh).saturating_sub(i64::from(htlow));
+    let max_lines = span.clamp(1, MAX_TABLE_LINES as i64) as u64;
+
+    // The charge is bounded a third way, by the bits the segment carries:
+    // every line reads HTPS + HTRS of them, so a header promising thousands of
+    // lines out of a handful of bytes is charged for the handful. The three
+    // trailing lines of steps 6 to 10 are charged alongside them.
+    let per_line = u64::from(htps) + u64::from(htrs);
+    let affordable = (r.remaining() as u64).saturating_mul(8) / per_line;
+    budget.charge(LINE_COST.saturating_mul(max_lines.min(affordable).saturating_add(3)))?;
+
+    let mut bits = BitReader::new(r.rest());
+    let mut lines: Vec<Line> = Vec::new();
+    // B.2 step 4.
+    let mut cur_range_low = i64::from(htlow);
+    let mut covered = false;
+    for _ in 0..max_lines {
+        // B.2 steps 5a and 5b. HTPS and HTRS are at most 8 (B.2.1), so both
+        // fields fit a byte.
+        let pref_len = read_bits(&mut bits, htps)? as u8;
+        let range_len = read_bits(&mut bits, htrs)? as u8;
+        if range_len > MAX_RANGE_LEN {
+            // Checked here as well as in `Table::new`, because the step below
+            // shifts by it.
+            return Err(Jbig2Error::Malformed("Huffman range longer than a value"));
+        }
+        // B.2 step 5c. CURRANGELOW is still inside the codable range whenever
+        // it is used: it starts at HTLOW and the moment it passes `i32::MAX`
+        // it has also passed HTHIGH, which ends the loop.
+        let range_low = i32::try_from(cur_range_low)
+            .map_err(|_| Jbig2Error::Malformed("Huffman table line outside the codable range"))?;
+        lines.push(Line::normal(pref_len, range_len, range_low));
+        cur_range_low = cur_range_low.saturating_add(1i64 << range_len);
+        // B.2 step 5d.
+        if cur_range_low >= i64::from(hthigh) {
+            covered = true;
+            break;
+        }
+    }
+    if !covered {
+        // Only reachable when the cap, rather than the span, ended the loop:
+        // after `span` lines CURRANGELOW has necessarily reached HTHIGH.
+        return Err(Jbig2Error::Malformed("too many Huffman table lines"));
+    }
+
+    // B.2 steps 6 and 7: the lower range table line, counting down from
+    // HTLOW − 1.
+    let low_pref_len = read_bits(&mut bits, htps)? as u8;
+    let low_range_low = match i32::try_from(i64::from(htlow) - 1) {
+        Ok(value) => value,
+        // HTLOW − 1 leaves the codable range only when HTLOW is `i32::MIN`, in
+        // which case this line could encode nothing B.2 admits. That is only
+        // an error if the table means to use it, which a PREFLEN of 0 says it
+        // does not.
+        Err(_) if low_pref_len == 0 => i32::MIN,
+        Err(_) => {
+            return Err(Jbig2Error::Malformed(
+                "Huffman lower range line below the codable range",
+            ))
+        }
+    };
+    lines.push(Line::lower(low_pref_len, low_range_low));
+
+    // B.2 steps 8 and 9: the upper range table line, counting up from HTHIGH.
+    let high_pref_len = read_bits(&mut bits, htps)? as u8;
+    lines.push(Line::upper(high_pref_len, hthigh));
+
+    // B.2 step 10.
+    if htoob {
+        let oob_pref_len = read_bits(&mut bits, htps)? as u8;
+        lines.push(Line::oob(oob_pref_len));
+    }
+
+    // B.2 step 11.
+    Table::new(lines)
 }
 
 /// One of the fifteen standard tables of B.5, numbered as the specification
@@ -1164,5 +1303,272 @@ mod tests {
                 Err(Jbig2Error::Malformed("no such standard Huffman table")),
             );
         }
+    }
+
+    /// Assembles a code table segment: the flags byte of B.2.1, the two signed
+    /// bounds, and a body of already-packed table line bits.
+    fn table_segment(
+        htoob: bool,
+        htps: u8,
+        htrs: u8,
+        htlow: i32,
+        hthigh: i32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let flags = u8::from(htoob) | ((htps - 1) << 1) | ((htrs - 1) << 4);
+        let mut out = vec![flags];
+        out.extend_from_slice(&(htlow as u32).to_be_bytes());
+        out.extend_from_slice(&(hthigh as u32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// The byte string B.4 prints as an example of an encoded table.
+    const WORKED_EXAMPLE: [u8; 13] = [
+        0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x10, 0x49, 0x23, 0x81, 0x80,
+    ];
+
+    /// The mandatory golden vector for B.2: the worked example of B.4, decoded
+    /// to the intermediate arrays the specification prints for it.
+    ///
+    /// Every number asserted here is on the page. Together they pin the flags
+    /// decode, the two bounds, the line loop's termination test, the lower and
+    /// upper range lines and B.3, against a vector this decoder had no hand in
+    /// choosing.
+    #[test]
+    fn the_worked_example_of_b4_decodes_to_the_arrays_it_prints() {
+        let mut budget = Budget::new();
+        let table =
+            parse_table_segment(&WORKED_EXAMPLE, &mut budget).expect("the encoding B.4 prints");
+
+        // "After decoding these table lines, the value of NTEMP is 5."
+        assert_eq!(table.lines.len(), 5);
+        let pref_lens: Vec<u8> = table.lines.iter().map(|line| line.pref_len).collect();
+        let range_lens: Vec<u8> = table.lines.iter().map(|line| line.range_len).collect();
+        let range_lows: Vec<i32> = table.lines.iter().map(|line| line.range_low).collect();
+        assert_eq!(pref_lens, vec![1, 2, 3, 0, 3]);
+        assert_eq!(range_lens, vec![4, 8, 16, 32, 32]);
+        assert_eq!(range_lows, vec![0, 16, 272, -1, 65808]);
+
+        // "Applying the algorithm of B.3 to this yields the array of codes, in
+        // binary, 0 10 110 X 111", the X being the lower range table line,
+        // which a PREFLEN of 0 leaves without a code.
+        let codes = assign_prefix_codes(&pref_lens).expect("a legal set of lengths");
+        assert_eq!(bits_of(codes[0], 1), "0");
+        assert_eq!(bits_of(codes[1], 2), "10");
+        assert_eq!(bits_of(codes[2], 3), "110");
+        assert_eq!(bits_of(codes[4], 3), "111");
+
+        // The flags byte 0x42 sets HTOOB to 0.
+        assert!(!table.has_oob());
+    }
+
+    /// B.4 introduces that byte string as "the encoding for Table B.1", so the
+    /// custom table it decodes to and the transcribed standard table must be
+    /// the same table. This checks one transcription against the other.
+    #[test]
+    fn the_worked_example_is_an_encoding_of_table_b1() {
+        let mut budget = Budget::new();
+        let custom =
+            parse_table_segment(&WORKED_EXAMPLE, &mut budget).expect("the encoding B.4 prints");
+        let standard_b1 = standard(1).expect("Table B.1");
+        // The custom encoding carries its unused lower range line explicitly;
+        // B.5 prints Table B.1 with that line omitted, which says the same
+        // thing.
+        let used: Vec<Line> = custom
+            .lines
+            .iter()
+            .copied()
+            .filter(|line| line.pref_len > 0)
+            .collect();
+        assert_eq!(used, standard_b1.lines);
+    }
+
+    /// HTOOB in the flags byte adds the out-of-band line of B.2 step 10, and
+    /// the table then decodes all three of an ordinary value, the upper escape
+    /// and OOB.
+    #[test]
+    fn a_custom_table_can_code_for_oob() {
+        let mut body = BitWriter::default();
+        // One ordinary line: PREFLEN 1, RANGELEN 2, covering 0 to 3.
+        body.push(1, 4);
+        body.push(2, 4);
+        // The lower range line is unused; the upper and out-of-band lines take
+        // the two codes of length 2.
+        body.push(0, 4);
+        body.push(2, 4);
+        body.push(2, 4);
+        let data = table_segment(true, 4, 4, 0, 4, &body.finish());
+
+        let mut budget = Budget::new();
+        let table = parse_table_segment(&data, &mut budget).expect("a legal table");
+        assert!(table.has_oob());
+        assert_eq!(table.lines.len(), 4);
+        assert_eq!(round_trip(&table, 0, 3), Ok(Some(3)));
+        assert_eq!(round_trip(&table, 2, 7), Ok(Some(11)));
+        assert_eq!(round_trip(&table, 3, 0), Ok(None));
+    }
+
+    #[test]
+    fn a_reserved_flag_bit_is_refused() {
+        let data = table_segment(false, 1, 1, 0, 1, &[0x00]);
+        let mut poisoned = data.clone();
+        poisoned[0] |= 0x80;
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&poisoned, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Malformed(
+                "reserved bit set in the Huffman table flags"
+            )),
+        );
+    }
+
+    #[test]
+    fn a_segment_shorter_than_its_header_is_truncated() {
+        for len in 0..9 {
+            let mut budget = Budget::new();
+            assert_eq!(
+                parse_table_segment(&WORKED_EXAMPLE[..len], &mut budget).map(|_| ()),
+                Err(Jbig2Error::Truncated),
+                "{len} bytes",
+            );
+        }
+    }
+
+    /// A segment that stops in the middle of a table line is truncated, not a
+    /// table with fewer lines.
+    #[test]
+    fn a_segment_that_runs_out_mid_line_is_truncated() {
+        // HTPS and HTRS of 8 make a line sixteen bits wide; one byte is half a
+        // line.
+        let data = table_segment(false, 8, 8, 0, 1_000, &[0x01]);
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Truncated),
+        );
+        // And a body long enough for the lines but not for the two escape
+        // prefixes that follow them.
+        let data = table_segment(false, 8, 8, 0, 1, &[0x01, 0x00]);
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Truncated),
+        );
+    }
+
+    #[test]
+    fn a_segment_declaring_an_over_long_range_is_refused() {
+        let mut body = BitWriter::default();
+        body.push(1, 1);
+        body.push(33, 6);
+        let data = table_segment(false, 1, 6, 0, 1, &body.finish());
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Malformed("Huffman range longer than a value")),
+        );
+    }
+
+    #[test]
+    fn a_segment_whose_prefixes_over_subscribe_is_refused() {
+        let mut body = BitWriter::default();
+        // Two ordinary lines and both escape lines, all with PREFLEN 1: four
+        // codes competing for the two of length one.
+        body.push(1, 4);
+        body.push(0, 1);
+        body.push(1, 4);
+        body.push(0, 1);
+        body.push(1, 4);
+        body.push(1, 4);
+        let data = table_segment(false, 4, 1, 0, 2, &body.finish());
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Malformed(
+                "Huffman code lengths over-subscribe the code space"
+            )),
+        );
+    }
+
+    /// The work-budget hazard of B.2 step 5, from both directions.
+    ///
+    /// A header naming a span of four billion with a step of one asks for two
+    /// billion lines. Whether the segment carries the bits for them or not,
+    /// the answer must be a named error and it must arrive at once — the loop
+    /// is bounded before it is entered, so neither the span nor the body
+    /// length decides how long this takes.
+    #[test]
+    fn a_table_spanning_the_whole_range_is_refused_rather_than_iterated() {
+        // Bits for far more lines than the cap allows: HTPS and HTRS of 1 make
+        // each line two bits, and every line advances CURRANGELOW by one.
+        let data = table_segment(false, 1, 1, i32::MIN, i32::MAX, &[0x00; 2048]);
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Malformed("too many Huffman table lines")),
+        );
+
+        // The same header with almost no body: the lines run out before the
+        // cap does, and that is a truncation.
+        let data = table_segment(false, 1, 1, i32::MIN, i32::MAX, &[0x00; 4]);
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Truncated),
+        );
+    }
+
+    /// The cap is on the line count itself, not only on the span, so a table
+    /// whose span is modest but whose lines are numerous is refused too.
+    #[test]
+    fn more_lines_than_the_cap_allows_are_refused() {
+        let data = table_segment(false, 1, 1, 0, 100_000, &[0x00; 2048]);
+        let mut budget = Budget::new();
+        assert_eq!(
+            parse_table_segment(&data, &mut budget).map(|_| ()),
+            Err(Jbig2Error::Malformed("too many Huffman table lines")),
+        );
+    }
+
+    /// A table is charged before it is built, from the header, so a stream
+    /// that repeats one is stopped even though every individual table is
+    /// small and well formed.
+    #[test]
+    fn tables_are_charged_against_the_stream_budget() {
+        let mut budget = Budget::with_limit(0);
+        assert_eq!(
+            parse_table_segment(&WORKED_EXAMPLE, &mut budget).map(|_| ()),
+            Err(Jbig2Error::WorkLimit),
+        );
+
+        let mut budget = Budget::new();
+        let mut parsed = 0u32;
+        loop {
+            match parse_table_segment(&WORKED_EXAMPLE, &mut budget) {
+                Ok(_) => parsed += 1,
+                Err(Jbig2Error::WorkLimit) => break,
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+            assert!(parsed < 10_000_000, "the budget never ran out");
+        }
+        assert!(parsed > 0, "one table has to be affordable");
+    }
+
+    /// HTHIGH at or below HTLOW still yields one ordinary line: B.2 step 5
+    /// decodes a line before it first tests, so the loop cannot run zero
+    /// times.
+    #[test]
+    fn an_empty_span_still_yields_one_line() {
+        let mut body = BitWriter::default();
+        body.push(1, 4);
+        body.push(0, 4);
+        body.push(0, 4);
+        body.push(2, 4);
+        let data = table_segment(false, 4, 4, 5, 5, &body.finish());
+        let mut budget = Budget::new();
+        let table = parse_table_segment(&data, &mut budget).expect("a legal table");
+        assert_eq!(table.lines.len(), 3);
+        assert_eq!(round_trip(&table, 0, 0), Ok(Some(5)));
     }
 }
