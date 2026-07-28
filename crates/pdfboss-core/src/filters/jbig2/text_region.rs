@@ -172,7 +172,7 @@ pub(crate) fn decode_text_region(
 ) -> Result<(RegionInfo, Bitmap), Jbig2Error> {
     let mut r = Reader::new(data);
     let info = parse_region_info(&mut r)?;
-    let params = parse_params(&mut r, tables)?;
+    let params = parse_params(&mut r, tables, budget)?;
     if symbols.is_empty() {
         return Err(Jbig2Error::Malformed("text region with no symbols"));
     }
@@ -300,7 +300,11 @@ struct TextTables {
 ///
 /// Bit 15, SBRTEMPLATE, selects the template refinement uses; with REFINE
 /// refused above it selects nothing, so it is not examined.
-fn parse_params(r: &mut Reader<'_>, tables: &[&Table]) -> Result<TextParams, Jbig2Error> {
+fn parse_params(
+    r: &mut Reader<'_>,
+    tables: &[&Table],
+    budget: &mut Budget,
+) -> Result<TextParams, Jbig2Error> {
     let flags = r.u16()?;
     if flags & 0x0002 != 0 {
         return Err(Jbig2Error::Unimplemented("text region symbol refinement"));
@@ -316,7 +320,7 @@ fn parse_params(r: &mut Reader<'_>, tables: &[&Table]) -> Result<TextParams, Jbi
         }
         Coding::Arithmetic
     } else {
-        Coding::Huffman(Box::new(bind_tables(r.u16()?, tables)?))
+        Coding::Huffman(Box::new(bind_tables(r.u16()?, tables, budget)?))
     };
     let log_strips = ((flags >> 2) & 0x3) as u8;
     let strips = 1i32 << log_strips;
@@ -369,7 +373,11 @@ fn parse_params(r: &mut Reader<'_>, tables: &[&Table]) -> Result<TextParams, Jbi
 /// it by construction. It is what catches two custom tables bound the wrong way
 /// round: SBHUFFDS's OOB is the only thing that closes a strip, so a table
 /// without one would run a strip until the segment ran out.
-fn bind_tables(flags: u16, tables: &[&Table]) -> Result<TextTables, Jbig2Error> {
+fn bind_tables(
+    flags: u16,
+    tables: &[&Table],
+    budget: &mut Budget,
+) -> Result<TextTables, Jbig2Error> {
     // Bit 15.
     if flags & 0x8000 != 0 {
         return Err(Jbig2Error::Malformed(
@@ -388,7 +396,7 @@ fn bind_tables(flags: u16, tables: &[&Table]) -> Result<TextTables, Jbig2Error> 
     let fs = match flags & 0x3 {
         0 => standard(6)?,
         1 => standard(7)?,
-        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
+        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
         _ => return Err(Jbig2Error::Malformed("reserved SBHUFFFS selection")),
     };
     // Bits 2 and 3: SBHUFFDS.
@@ -396,14 +404,14 @@ fn bind_tables(flags: u16, tables: &[&Table]) -> Result<TextTables, Jbig2Error> 
         0 => standard(8)?,
         1 => standard(9)?,
         2 => standard(10)?,
-        _ => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
+        _ => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
     };
     // Bits 4 and 5: SBHUFFDT.
     let dt = match (flags >> 4) & 0x3 {
         0 => standard(11)?,
         1 => standard(12)?,
         2 => standard(13)?,
-        _ => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
+        _ => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
     };
     if used != tables.len() {
         return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
@@ -1601,6 +1609,47 @@ mod tests {
                 assert_eq!(region.get(x, y), 1, "({x}, {y}) is not SBDEFPIXEL");
             }
         }
+    }
+
+    /// A custom table is copied into the region that binds it, and the region
+    /// names it with a referred-to number rather than carrying it — so the copy
+    /// is as large as the table however short the segment is, 7.4.3.1.6 lets
+    /// one segment ask for three of them, and every later segment naming the
+    /// same table segment asks again. The copy is charged by the line.
+    ///
+    /// The three charges a region makes before it reads a bit of coded data are
+    /// pinned together here, in the order they happen: the table copy from
+    /// 7.4.3.1.6, then the region from its declared size, then the symbol ID
+    /// table of 7.4.3.1.7.
+    #[test]
+    fn binding_a_custom_table_is_charged_by_the_line() {
+        let table = parse_table_segment(&code_table_segment(0), &mut Budget::new())
+            .expect("code table segment");
+        let symbol = glyph(&["1"]);
+        let syms = [&symbol];
+        // SBHUFFFS reading "user-supplied", against the fixture's three-line
+        // table: one ordinary line and the two escape lines of B.2 steps 6 to 9.
+        let data = huffman_header(0x0003);
+
+        let mut budget = Budget::with_limit(2);
+        assert_eq!(
+            decode_text_region(&data, &syms, &[&table], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+
+        let total = 3 + 8 * (8 + ROW_COST) + SYMBOL_CODE_COST;
+        let mut budget = Budget::with_limit(total - 1);
+        assert_eq!(
+            decode_text_region(&data, &syms, &[&table], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+        // Paid for in full, the header runs on into coded data that is not
+        // there rather than being refused.
+        let mut budget = Budget::with_limit(total);
+        assert_eq!(
+            decode_text_region(&data, &syms, &[&table], &mut budget),
+            Err(Jbig2Error::Truncated),
+        );
     }
 
     /// The symbol ID table of 7.4.3.1.7 is a line per symbol, and 7.4.3.1.5

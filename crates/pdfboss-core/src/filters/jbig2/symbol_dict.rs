@@ -118,7 +118,7 @@ pub(crate) fn decode_symbol_dict(
     budget: &mut Budget,
 ) -> Result<Vec<Bitmap>, Jbig2Error> {
     let mut r = Reader::new(data);
-    let header = parse_header(&mut r, tables)?;
+    let header = parse_header(&mut r, tables, budget)?;
     let num_input = u32::try_from(input_symbols.len())
         .map_err(|_| Jbig2Error::Malformed("symbol count exceeds the limit"))?;
     if num_input > MAX_SYMBOLS || num_input.saturating_add(header.num_new) > MAX_SYMBOLS {
@@ -265,7 +265,11 @@ struct HuffmanTables {
 /// Huffman branch refuses rather than ignores. Bits 13 to 15 are reserved; they
 /// select no field, so a stream that sets one still describes a dictionary that
 /// can be read.
-fn parse_header(r: &mut Reader<'_>, tables: &[&Table]) -> Result<DictHeader, Jbig2Error> {
+fn parse_header(
+    r: &mut Reader<'_>,
+    tables: &[&Table],
+    budget: &mut Budget,
+) -> Result<DictHeader, Jbig2Error> {
     let flags = r.u16()?;
     if flags & 0x0002 != 0 {
         return Err(Jbig2Error::Unimplemented(
@@ -301,7 +305,7 @@ fn parse_header(r: &mut Reader<'_>, tables: &[&Table]) -> Result<DictHeader, Jbi
                 "Huffman dictionary sets an arithmetic-only flag",
             ));
         }
-        Coding::Huffman(Box::new(bind_tables(flags, tables)?))
+        Coding::Huffman(Box::new(bind_tables(flags, tables, budget)?))
     };
 
     let num_ex = r.u32()?;
@@ -329,27 +333,31 @@ fn parse_header(r: &mut Reader<'_>, tables: &[&Table]) -> Result<DictHeader, Jbi
 /// construction. It is what catches two custom tables bound the wrong way
 /// round: SDHUFFDW's OOB is the only thing that closes a height class, so a
 /// table without one would run a class until the segment ran out.
-fn bind_tables(flags: u16, tables: &[&Table]) -> Result<HuffmanTables, Jbig2Error> {
+fn bind_tables(
+    flags: u16,
+    tables: &[&Table],
+    budget: &mut Budget,
+) -> Result<HuffmanTables, Jbig2Error> {
     let mut used = 0usize;
     // Bits 2 and 3: SDHUFFDH.
     let dh = match (flags >> 2) & 0x3 {
         0 => standard(4)?,
         1 => standard(5)?,
-        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
+        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
         _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDH selection")),
     };
     // Bits 4 and 5: SDHUFFDW.
     let dw = match (flags >> 4) & 0x3 {
         0 => standard(2)?,
         1 => standard(3)?,
-        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
+        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
         _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDW selection")),
     };
     // Bit 6: SDHUFFBMSIZE.
     let bmsize = if flags & 0x0040 == 0 {
         standard(1)?
     } else {
-        take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?
+        take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?
     };
     // Bit 7: SDHUFFAGGINST, which 7.4.2.1.1 requires to be 0 while SDREFAGG is
     // 0. Since SDREFAGG = 1 is refused, no table is ever bound to it, and a

@@ -469,16 +469,22 @@ pub(crate) fn from_code_lengths(lengths: &[u8], unused: Unused) -> Result<Table,
 /// the caller calls that disagreement, since a dictionary and a text region
 /// each name their own flags word in the complaint.
 ///
-/// The table is cloned rather than borrowed. A table is a few dozen lines, it
-/// is cloned at most three times per segment, and the alternative is a lifetime
-/// threaded through every header and decoding function for the sake of a copy
-/// that does not show up in a profile.
+/// The table is cloned rather than borrowed, because the alternative is a
+/// lifetime threaded through every header and decoding function. For the few
+/// dozen lines a table usually has that copy does not show up in a profile, but
+/// [`MAX_TABLE_LINES`] admits four thousand of them, and a segment names one
+/// with a referred-to number rather than by carrying it — so the copy is
+/// charged by the line, at a unit each. One table segment can otherwise be
+/// bound by every later segment in the stream, three times over apiece, for
+/// nothing.
 pub(crate) fn take_custom(
     tables: &[&Table],
     used: &mut usize,
     missing: &'static str,
+    budget: &mut Budget,
 ) -> Result<Table, Jbig2Error> {
     let table = tables.get(*used).ok_or(Jbig2Error::Malformed(missing))?;
+    budget.charge(table.lines.len() as u64)?;
     *used += 1;
     Ok((*table).clone())
 }
