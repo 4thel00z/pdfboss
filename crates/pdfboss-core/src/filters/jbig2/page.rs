@@ -381,8 +381,9 @@ mod tests {
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
     use crate::filters::jbig2::symbol_dict::SYMBOL_COST;
     use crate::filters::jbig2::testing::{
-        code_table_segment, dictionary_segment, expect_at, glyph, header, reexport_segment,
-        rowless_dictionary_segment, split_after_segment, text_segment_for_page, Op,
+        code_table_segment, dictionary_segment, expect_at, glyph, header,
+        huffman_dictionary_segment, reexport_segment, rowless_dictionary_segment,
+        split_after_segment, text_segment_for_page, Collective, Op,
     };
 
     /// Assembles a complete embedded stream: page info, one immediate generic
@@ -634,6 +635,41 @@ mod tests {
                 "reserved bit set in the Huffman table flags"
             )),
         );
+    }
+
+    /// A code table segment, a Huffman symbol dictionary that binds it through
+    /// the referred-to list, and a text region that places the symbols: the
+    /// whole path from a table segment to pixels on the page.
+    ///
+    /// The dictionary's SDHUFFDH is the custom table, so this fails unless the
+    /// table segment was parsed, kept, matched to the dictionary by segment
+    /// number and bound to the right selector (T.88 7.4.13, 7.4.2.1.6).
+    #[test]
+    fn a_huffman_dictionary_binds_a_table_segment_and_paints() {
+        let table_data = code_table_segment(0);
+        let table = parse_table_segment(&table_data, &mut Budget::new()).expect("code table");
+        let symbols = vec![
+            glyph(&["101", "010", "101", "010"]),
+            glyph(&["11111", "10001", "10001", "11111"]),
+        ];
+        let dict = huffman_dictionary_segment(&symbols, Collective::Mmr, Some(&table));
+        let region = text_segment_for_page(
+            (32, 24),
+            symbols.len() as u32,
+            &[Op::Strip(2), Op::First(1, 0), Op::Next(2, 1), Op::EndStrip],
+        );
+
+        let mut stream = page_info_segment(0, (32, 24));
+        stream.extend_from_slice(&header(1, 53, &[], 1, table_data.len() as u32));
+        stream.extend_from_slice(&table_data);
+        stream.extend_from_slice(&header(2, 0, &[1], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(3, 6, &[2], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 32, 24).expect("page");
+        expect_at(&page, &symbols[0], 1, 2);
+        expect_at(&page, &symbols[1], 5, 2);
     }
 
     /// A referred-to list is split by what each segment supplies, so a

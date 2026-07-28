@@ -18,12 +18,14 @@ use super::arith_int::encoder::{encode_iaid, encode_int};
 use super::arith_int::{IaidCtx, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
-use super::huffman::encoder::BitWriter;
+use super::huffman::encoder::{push_value, BitWriter};
+use super::huffman::{standard, Table};
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
 use super::reader::Reader;
 use super::segment::parse_header;
 use super::text_region::sym_code_len;
+use crate::filters::ccitt::testing::encode_g4;
 
 /// A short-form segment header (T.88 7.2): number, flags, referred-to
 /// segments, page association, data length.
@@ -181,6 +183,122 @@ pub(crate) fn rowless_dictionary_segment(count: u32) -> Vec<u8> {
     out.extend_from_slice(&0u32.to_be_bytes()); // SDNUMEXSYMS
     out.extend_from_slice(&count.to_be_bytes()); // SDNUMNEWSYMS
     out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// How a Huffman dictionary fixture stores a height class collective bitmap
+/// (T.88 6.5.9).
+#[derive(Clone, Copy)]
+pub(crate) enum Collective {
+    /// BMSIZE 0: the rows are stored raw, each padded to a byte boundary.
+    Uncompressed,
+    /// BMSIZE nonzero: the class is MMR-coded, and BMSIZE counts its bytes.
+    Mmr,
+}
+
+/// Builds the data of a Huffman-coded symbol dictionary segment (T.88 7.4.2)
+/// carrying `symbols`, all of them exported.
+///
+/// `symbols` must be ordered as an encoder orders them, ascending by height and
+/// by width within a height, and the deltas the standard tables can express add
+/// one more requirement: Table B.4 codes a delta height of 1 upwards, so two
+/// height classes may not have the same height, and Table B.2 codes a delta
+/// width of 0 upwards.
+///
+/// `dh` overrides SDHUFFDH with a user-supplied table, which sets that selector
+/// to 3 and makes the segment's referred-to list responsible for carrying the
+/// code table segment it came from (7.4.2.1.6). `None` selects standard
+/// Table B.4.
+///
+/// Figure 22 is the whole point of the builder: the delta widths of a class all
+/// precede its pixels, and the pixels arrive as one bitmap holding every symbol
+/// of the class side by side.
+pub(crate) fn huffman_dictionary_segment(
+    symbols: &[Bitmap],
+    collective: Collective,
+    dh: Option<&Table>,
+) -> Vec<u8> {
+    let standard_dh = standard(4).expect("Table B.4");
+    let dh_table = dh.unwrap_or(&standard_dh);
+    let dw = standard(2).expect("Table B.2");
+    // Table B.1 serves twice over: as SDHUFFBMSIZE with that selector left at 0
+    // (7.4.2.1.1), and as the table EXRUNLENGTH is always read with when SDHUFF
+    // is 1 (6.5.10 step 2).
+    let b1 = standard(1).expect("Table B.1");
+
+    let mut w = BitWriter::default();
+    let mut height = 0i32;
+    let mut index = 0usize;
+    while index < symbols.len() {
+        let class_height = symbols[index].height() as i32;
+        push_value(&mut w, dh_table, Some(class_height - height));
+        height = class_height;
+
+        let mut width = 0i32;
+        let first = index;
+        while index < symbols.len() && symbols[index].height() as i32 == height {
+            push_value(&mut w, &dw, Some(symbols[index].width() as i32 - width));
+            width = symbols[index].width() as i32;
+            index += 1;
+        }
+        // OOB closes the height class (6.5.5 step 4 c) i)).
+        push_value(&mut w, &dw, None);
+
+        // 6.5.9: the size in bytes, then a byte boundary, then the bitmap, then
+        // another byte boundary.
+        let joined = side_by_side(&symbols[first..index]);
+        match collective {
+            Collective::Uncompressed => {
+                push_value(&mut w, &b1, Some(0));
+                w.align();
+                for y in 0..joined.height() {
+                    for x in 0..joined.width() {
+                        w.push(u32::from(joined.get(i64::from(x), i64::from(y))), 1);
+                    }
+                    w.align();
+                }
+            }
+            Collective::Mmr => {
+                let coded = encode_g4(&joined);
+                push_value(&mut w, &b1, Some(coded.len() as i32));
+                w.align();
+                w.push_bytes(&coded);
+            }
+        }
+    }
+
+    // 6.5.10: a zero-length "not exported" run, then one export run covering
+    // every new symbol, both read with Table B.1.
+    push_value(&mut w, &b1, Some(0));
+    push_value(&mut w, &b1, Some(symbols.len() as i32));
+
+    // 7.4.2.1.1: SDHUFF, and SDHUFFDH set to 3 when the caller supplied a
+    // table. No AT flags follow, whatever the template bits would have said
+    // (7.4.2.1.2).
+    let flags = 0x0001u16 | if dh.is_some() { 3 << 2 } else { 0 };
+    let mut out = flags.to_be_bytes().to_vec();
+    out.extend_from_slice(&(symbols.len() as u32).to_be_bytes()); // SDNUMEXSYMS
+    out.extend_from_slice(&(symbols.len() as u32).to_be_bytes()); // SDNUMNEWSYMS
+    out.extend_from_slice(&w.finish());
+    out
+}
+
+/// The bitmaps of one height class concatenated left to right with no gaps,
+/// which is what a collective bitmap holds (T.88 6.5.9).
+fn side_by_side(symbols: &[Bitmap]) -> Bitmap {
+    let width = symbols.iter().map(|s| s.width()).sum();
+    let height = symbols.first().map_or(0, |s| s.height());
+    let mut out = Bitmap::new(width, height).expect("fixture bitmaps are small");
+    let mut left = 0u32;
+    for symbol in symbols {
+        assert_eq!(symbol.height(), height, "a height class of two heights");
+        for y in 0..height {
+            for x in 0..symbol.width() {
+                out.set(left + x, y, symbol.get(i64::from(x), i64::from(y)));
+            }
+        }
+        left += symbol.width();
+    }
     out
 }
 

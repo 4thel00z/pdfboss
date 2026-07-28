@@ -21,17 +21,27 @@
 //! Finally the dictionary says which symbols it passes on, as run lengths over
 //! the input symbols followed by the new ones (6.5.10).
 //!
-//! Huffman-coded dictionaries (SDHUFF) and refinement/aggregate coding
-//! (SDREFAGG) are refused by name rather than approximated.
+//! With SDHUFF set the same structure is coded with the prefix codes of
+//! Annex B instead — `SDHUFFDH` for the height deltas, `SDHUFFDW` for the width
+//! deltas, Table B.1 for the export runs — and one thing changes shape. A
+//! height class no longer interleaves widths with bitmaps: the widths all come
+//! first, and the symbols of the class arrive together in a single **collective
+//! bitmap**, MMR-coded or stored raw, which is cut back into symbols by the
+//! widths already read (6.5.9, figure 22). That is the construct the whole
+//! Huffman variant needed the facsimile decoder for.
+//!
+//! Refinement/aggregate coding (SDREFAGG) is refused by name rather than
+//! approximated.
 
 use super::arith_int::{decode_int, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::budget::Budget;
-use super::generic::{decode_generic_region, GenericParams, GB_CONTEXT_LEN};
-use super::huffman::Table;
+use super::generic::{decode_generic_region, decode_mmr_region, GenericParams, GB_CONTEXT_LEN};
+use super::huffman::{standard, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::Jbig2Error;
+use crate::filters::ccitt::bits::BitReader;
 
 /// The most symbols one dictionary may hold, counting its inputs, its new
 /// symbols and its exports separately.
@@ -115,11 +125,40 @@ pub(crate) fn decode_symbol_dict(
         return Err(Jbig2Error::Malformed("symbol count exceeds the limit"));
     }
 
-    let mut dec = MqDecoder::new(r.rest());
-    let mut gb = MqContexts::new(GB_CONTEXT_LEN);
-    let mut ints = IntCtxSet::new();
-    let new_symbols = decode_height_classes(&mut dec, &mut gb, &mut ints, &header, budget)?;
-    let flags = decode_export_flags(&mut dec, &mut ints, input_symbols.len() + new_symbols.len())?;
+    // Both codings decode the same two things in the same order — the new
+    // symbols, then the export flags over the inputs and the new ones — out of
+    // a cursor of their own over the bytes the header left.
+    let (new_symbols, flags) = match &header.coding {
+        Coding::Arithmetic(params) => {
+            let mut dec = MqDecoder::new(r.rest());
+            let mut gb = MqContexts::new(GB_CONTEXT_LEN);
+            let mut ints = IntCtxSet::new();
+            let new_symbols = decode_height_classes(
+                &mut dec,
+                &mut gb,
+                &mut ints,
+                params,
+                header.num_new,
+                budget,
+            )?;
+            let total = input_symbols.len() + new_symbols.len();
+            let flags = decode_export_flags(total, || Ok(decode_int(&mut dec, &mut ints.iaex)))?;
+            (new_symbols, flags)
+        }
+        Coding::Huffman(tables) => {
+            let coded = r.rest();
+            let mut bits = BitReader::new(coded);
+            let new_symbols =
+                decode_huffman_height_classes(coded, &mut bits, tables, header.num_new, budget)?;
+            let total = input_symbols.len() + new_symbols.len();
+            // 6.5.10 step 2: the export runs are read with Table B.1 whenever
+            // SDHUFF is 1, whatever tables the dictionary selected for its own
+            // height and width deltas.
+            let runs = standard(1)?;
+            let flags = decode_export_flags(total, || runs.decode(&mut bits))?;
+            (new_symbols, flags)
+        }
+    };
 
     // The flags run over the input symbols and then the new ones, in that
     // order, one flag each — so walking the two lists against one iterator is
@@ -158,64 +197,112 @@ pub(crate) fn decode_symbol_dict(
 /// The fields of a symbol dictionary segment that precede its coded data
 /// (T.88 7.4.2.1).
 struct DictHeader {
-    /// The generic region parameters every symbol bitmap is coded with:
-    /// SDTEMPLATE and SDAT, with typical prediction off (6.5.8.1).
-    params: GenericParams,
+    /// SDHUFF, and with it whatever the chosen coding needs in order to read
+    /// the data that follows.
+    coding: Coding,
     /// SDNUMEXSYMS, the number of symbols the dictionary exports.
     num_ex: u32,
     /// SDNUMNEWSYMS, the number of symbols coded in this segment.
     num_new: u32,
 }
 
+/// How a dictionary's coded data is written (T.88 7.4.2.1.1, bit 0).
+///
+/// The flag decides more than which decoder reads the integers: it decides
+/// which fields the header itself carries, and how a height class is laid out
+/// (6.5.5). Holding the two sets of parameters in one enum is what keeps a
+/// dictionary from being read with half of each.
+enum Coding {
+    /// SDHUFF = 0. The generic region parameters every symbol bitmap is coded
+    /// with: SDTEMPLATE and SDAT, with typical prediction off (6.5.8.1).
+    Arithmetic(GenericParams),
+    /// SDHUFF = 1, with the tables 7.4.2.1.6 bound to the selectors. Boxed
+    /// because three tables are a kilobyte and a half of lines and length
+    /// slots, which every arithmetic dictionary would otherwise carry around
+    /// as the size of this enum.
+    Huffman(Box<HuffmanTables>),
+}
+
+/// The Huffman tables a dictionary decodes its integers with (T.88 7.4.2.1.6).
+///
+/// SDHUFFAGGINST is absent because nothing can select it: 7.4.2.1.1 requires
+/// its field to be 0 while SDREFAGG is 0, and SDREFAGG = 1 is refused before
+/// the tables are bound at all.
+struct HuffmanTables {
+    /// SDHUFFDH, the delta on the running height class height (6.5.6).
+    dh: Table,
+    /// SDHUFFDW, the delta on the running symbol width, whose OOB closes the
+    /// height class (6.5.7).
+    dw: Table,
+    /// SDHUFFBMSIZE, the size in bytes of a height class collective bitmap
+    /// (6.5.9).
+    bmsize: Table,
+}
+
 /// Parses the symbol dictionary flags and the fields that follow them
-/// (T.88 7.4.2.1.1 to 7.4.2.1.5).
+/// (T.88 7.4.2.1.1 to 7.4.2.1.6).
 ///
-/// The two coding modes this build does not implement are refused before a
-/// single further byte is read, because the layout of everything after the
-/// flags depends on them: a Huffman dictionary carries no AT pixels, so reading
-/// them would leave the cursor eight bytes into the wrong field and turn an
-/// unsupported stream into a plausible-looking wrong answer.
+/// The one coding mode this build does not implement is refused before a single
+/// further byte is read, because the layout of everything after the flags
+/// depends on it.
 ///
-/// Bits 2 to 7 select Huffman tables and are meaningless with SDHUFF clear, so
-/// they are not examined at all. Bits 8 and 9 — "bitmap coding context used"
-/// and "retained" — ask for the arithmetic context array to be carried in from,
-/// or handed on to, another dictionary segment. Both are accepted and ignored:
-/// they change nothing for a dictionary that codes its symbols within one
-/// segment, which is every dictionary that does not deliberately split itself,
-/// and honouring them would mean keeping a context array alive across the
-/// segment walk for a case no encoder in practice emits. Bits 13 to 15 are
-/// reserved; they select no field, so a stream that sets one still describes a
-/// dictionary that can be read.
+/// SDHUFF decides that layout too, which is why the two branches part company
+/// here rather than later. **A Huffman dictionary carries no AT flags** —
+/// 7.4.2.1.2 makes that field present only when SDHUFF is 0 — so reading them
+/// anyway would leave the cursor eight bytes into SDNUMEXSYMS and turn a
+/// perfectly good stream into a plausible-looking wrong answer.
+///
+/// Bits 8 and 9 — "bitmap coding context used" and "retained" — ask for the
+/// arithmetic context array to be carried in from, or handed on to, another
+/// dictionary segment. With SDHUFF clear both are accepted and ignored: they
+/// change nothing for a dictionary that codes its symbols within one segment,
+/// which is every dictionary that does not deliberately split itself, and
+/// honouring them would mean keeping a context array alive across the segment
+/// walk for a case no encoder in practice emits. With SDHUFF set there is no
+/// such array to carry, and 7.4.2.1.1 requires both bits to be 0 along with
+/// SDTEMPLATE; a stream that sets one is far more likely to be a header being
+/// read at the wrong offset than a dictionary meaning something by it, so the
+/// Huffman branch refuses rather than ignores. Bits 13 to 15 are reserved; they
+/// select no field, so a stream that sets one still describes a dictionary that
+/// can be read.
 fn parse_header(r: &mut Reader<'_>, tables: &[&Table]) -> Result<DictHeader, Jbig2Error> {
     let flags = r.u16()?;
-    if flags & 0x0001 != 0 {
-        return Err(Jbig2Error::Unimplemented("Huffman-coded symbol dictionary"));
-    }
     if flags & 0x0002 != 0 {
         return Err(Jbig2Error::Unimplemented(
             "refinement/aggregate symbol coding",
         ));
     }
-    // 7.4.2.1.6: the number of selectors reading "user-supplied table" must
-    // equal the number of table segments referred to, and with SDHUFF clear
-    // every one of those selectors must itself be 0. A referred-to table is
-    // therefore bound to nothing, which is a header describing a dictionary
-    // other than the one it carries.
-    if !tables.is_empty() {
-        return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
-    }
-    let template = ((flags >> 10) & 0x3) as u8;
+    let coding = if flags & 0x0001 == 0 {
+        // 7.4.2.1.6: the number of selectors reading "user-supplied table" must
+        // equal the number of table segments referred to, and with SDHUFF clear
+        // every one of those selectors must itself be 0. A referred-to table is
+        // therefore bound to nothing, which is a header describing a dictionary
+        // other than the one it carries.
+        if !tables.is_empty() {
+            return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
+        }
+        let template = ((flags >> 10) & 0x3) as u8;
 
-    // 7.4.2.1.2: eight AT bytes for template 0, two for the rest. The slots a
-    // template does not use keep their nominal offsets, so the parameters
-    // always describe a complete neighbourhood.
-    let mut params = GenericParams::nominal(template);
-    let at_pairs = if template == 0 { 4 } else { 1 };
-    for slot in params.at.iter_mut().take(at_pairs) {
-        let dx = r.i8()?;
-        let dy = r.i8()?;
-        *slot = (dx, dy);
-    }
+        // 7.4.2.1.2: eight AT bytes for template 0, two for the rest. The slots
+        // a template does not use keep their nominal offsets, so the parameters
+        // always describe a complete neighbourhood.
+        let mut params = GenericParams::nominal(template);
+        let at_pairs = if template == 0 { 4 } else { 1 };
+        for slot in params.at.iter_mut().take(at_pairs) {
+            let dx = r.i8()?;
+            let dy = r.i8()?;
+            *slot = (dx, dy);
+        }
+        Coding::Arithmetic(params)
+    } else {
+        // Bits 8 to 11, all of which 7.4.2.1.1 pins to 0 here.
+        if flags & 0x0F00 != 0 {
+            return Err(Jbig2Error::Malformed(
+                "Huffman dictionary sets an arithmetic-only flag",
+            ));
+        }
+        Coding::Huffman(Box::new(bind_tables(flags, tables)?))
+    };
 
     let num_ex = r.u32()?;
     let num_new = r.u32()?;
@@ -223,10 +310,81 @@ fn parse_header(r: &mut Reader<'_>, tables: &[&Table]) -> Result<DictHeader, Jbi
         return Err(Jbig2Error::Malformed("symbol count exceeds the limit"));
     }
     Ok(DictHeader {
-        params,
+        coding,
         num_ex,
         num_new,
     })
+}
+
+/// Resolves the Huffman table selectors of T.88 7.4.2.1.1 against the standard
+/// tables and the referred-to code table segments (7.4.2.1.6).
+///
+/// The customs are taken in the order the clause lists the selectors —
+/// SDHUFFDH, SDHUFFDW, SDHUFFBMSIZE, SDHUFFAGGINST — one referred-to table
+/// segment per selector reading "user-supplied", and the count of those
+/// selectors must be exactly the count of table segments referred to.
+///
+/// The OOB requirement is checked for every table rather than only for the
+/// custom ones, which costs nothing because the standard tables satisfy it by
+/// construction. It is what catches two custom tables bound the wrong way
+/// round: SDHUFFDW's OOB is the only thing that closes a height class, so a
+/// table without one would run a class until the segment ran out.
+fn bind_tables(flags: u16, tables: &[&Table]) -> Result<HuffmanTables, Jbig2Error> {
+    let mut used = 0usize;
+    // Bits 2 and 3: SDHUFFDH.
+    let dh = match (flags >> 2) & 0x3 {
+        0 => standard(4)?,
+        1 => standard(5)?,
+        3 => take_custom(tables, &mut used)?,
+        _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDH selection")),
+    };
+    // Bits 4 and 5: SDHUFFDW.
+    let dw = match (flags >> 4) & 0x3 {
+        0 => standard(2)?,
+        1 => standard(3)?,
+        3 => take_custom(tables, &mut used)?,
+        _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDW selection")),
+    };
+    // Bit 6: SDHUFFBMSIZE.
+    let bmsize = if flags & 0x0040 == 0 {
+        standard(1)?
+    } else {
+        take_custom(tables, &mut used)?
+    };
+    // Bit 7: SDHUFFAGGINST, which 7.4.2.1.1 requires to be 0 while SDREFAGG is
+    // 0. Since SDREFAGG = 1 is refused, no table is ever bound to it, and a
+    // stream that selects one has named a table segment this dictionary would
+    // never read.
+    if flags & 0x0080 != 0 {
+        return Err(Jbig2Error::Malformed(
+            "SDHUFFAGGINST selected without aggregate coding",
+        ));
+    }
+    if used != tables.len() {
+        return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
+    }
+    if !dw.has_oob() {
+        return Err(Jbig2Error::Malformed("SDHUFFDW cannot code OOB"));
+    }
+    if dh.has_oob() || bmsize.has_oob() {
+        return Err(Jbig2Error::Malformed("SDHUFFDH or SDHUFFBMSIZE codes OOB"));
+    }
+    Ok(HuffmanTables { dh, dw, bmsize })
+}
+
+/// The next referred-to table segment's table, in the binding order of
+/// T.88 7.4.2.1.6.
+///
+/// The table is cloned rather than borrowed. A table is a few dozen lines, it
+/// is cloned at most three times per dictionary segment, and the alternative is
+/// a lifetime threaded through the header, the coding enum and every decoding
+/// function below for the sake of a copy that does not show up in a profile.
+fn take_custom(tables: &[&Table], used: &mut usize) -> Result<Table, Jbig2Error> {
+    let table = tables
+        .get(*used)
+        .ok_or(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES))?;
+    *used += 1;
+    Ok((*table).clone())
 }
 
 /// Decodes the new symbols of a dictionary, height class by height class
@@ -246,7 +404,8 @@ fn decode_height_classes(
     dec: &mut MqDecoder<'_>,
     gb: &mut MqContexts,
     ints: &mut IntCtxSet,
-    header: &DictHeader,
+    params: &GenericParams,
+    num_new: u32,
     budget: &mut Budget,
 ) -> Result<Vec<Bitmap>, Jbig2Error> {
     let mut new_symbols: Vec<Bitmap> = Vec::new();
@@ -256,14 +415,10 @@ fn decode_height_classes(
     // that the check is a comparison rather than a cast that has already lost
     // the sign.
     let mut height: i64 = 0;
-    // One class per symbol is the most a dictionary needs, since a class holds
-    // at least one symbol unless it is empty; the slack covers the empty ones.
-    let max_classes = (header.num_new as usize)
-        .saturating_mul(LOOP_SLACK)
-        .saturating_add(LOOP_SLACK);
+    let max_classes = max_height_classes(num_new);
     let mut classes = 0usize;
 
-    while (new_symbols.len() as u32) < header.num_new {
+    while (new_symbols.len() as u32) < num_new {
         classes += 1;
         if classes > max_classes {
             return Err(Jbig2Error::Malformed("too many symbol height classes"));
@@ -272,11 +427,7 @@ fn decode_height_classes(
             "unexpected OOB decoding a height class",
         ))?;
         height += i64::from(delta);
-        if height < 0 {
-            return Err(Jbig2Error::Malformed("negative symbol height class"));
-        }
-        let class_height =
-            u32::try_from(height).map_err(|_| Jbig2Error::Malformed("symbol too tall"))?;
+        let class_height = checked_class_height(height)?;
 
         // OOB closes the height class, and an exhausted decoder reads as OOB,
         // so a truncated segment ends the class rather than looping on
@@ -284,12 +435,8 @@ fn decode_height_classes(
         let mut width: i64 = 0;
         while let Some(delta) = decode_int(dec, &mut ints.iadw) {
             width += i64::from(delta);
-            if width < 0 {
-                return Err(Jbig2Error::Malformed("negative symbol width"));
-            }
-            let symbol_width =
-                u32::try_from(width).map_err(|_| Jbig2Error::Malformed("symbol too wide"))?;
-            if (new_symbols.len() as u32) >= header.num_new {
+            let symbol_width = checked_symbol_width(width)?;
+            if (new_symbols.len() as u32) >= num_new {
                 return Err(Jbig2Error::Malformed("more symbols coded than declared"));
             }
             // The generic region decoder charges for the symbol's pixels, which
@@ -305,12 +452,244 @@ fn decode_height_classes(
                 budget,
                 symbol_width,
                 class_height,
-                &header.params,
+                params,
                 None,
             )?);
         }
     }
     Ok(new_symbols)
+}
+
+/// Decodes the new symbols of a Huffman-coded dictionary, height class by
+/// height class (T.88 6.5.5, figure 22).
+///
+/// The walk is the one above with the bitmaps moved: a class is a delta height,
+/// then the delta widths of every symbol in it, then — once the OOB from
+/// SDHUFFDW has closed the class — a single collective bitmap holding all of
+/// those symbols side by side, which step 4 d) cuts up by the widths just read.
+/// So the widths are accumulated rather than spent as they arrive, and nothing
+/// is pushed to `new_symbols` until the class closes.
+///
+/// `coded` is the segment's data from the end of its header, and `bits` a
+/// cursor into it; the collective bitmap needs both, because its MMR form is a
+/// byte-aligned run of exactly BMSIZE bytes handed to a decoder that reads
+/// bytes rather than sharing this cursor.
+///
+/// The loop bounds are the arithmetic walk's, for the same reasons, with one
+/// difference behind them: exhausting the data here is
+/// [`Jbig2Error::Truncated`] from the table rather than the OOB an exhausted
+/// arithmetic decoder synthesises, so a truncated segment cannot close a class
+/// by accident.
+fn decode_huffman_height_classes(
+    coded: &[u8],
+    bits: &mut BitReader,
+    tables: &HuffmanTables,
+    num_new: u32,
+    budget: &mut Budget,
+) -> Result<Vec<Bitmap>, Jbig2Error> {
+    let mut new_symbols: Vec<Bitmap> = Vec::new();
+    let mut height: i64 = 0;
+    let max_classes = max_height_classes(num_new);
+    let mut classes = 0usize;
+
+    while (new_symbols.len() as u32) < num_new {
+        classes += 1;
+        if classes > max_classes {
+            return Err(Jbig2Error::Malformed("too many symbol height classes"));
+        }
+        // 6.5.6.
+        let delta = tables.dh.decode(bits)?.ok_or(Jbig2Error::Malformed(
+            "unexpected OOB decoding a height class",
+        ))?;
+        height += i64::from(delta);
+        let class_height = checked_class_height(height)?;
+
+        // 6.5.5 step 4 c): the widths of the class, and TOTWIDTH with them.
+        // Both are needed after the loop, the widths to cut the collective
+        // bitmap and TOTWIDTH to size it.
+        let mut width: i64 = 0;
+        let mut total: u64 = 0;
+        let mut widths: Vec<u32> = Vec::new();
+        while let Some(delta) = tables.dw.decode(bits)? {
+            width += i64::from(delta);
+            let symbol_width = checked_symbol_width(width)?;
+            if (new_symbols.len() + widths.len()) as u64 >= u64::from(num_new) {
+                return Err(Jbig2Error::Malformed("more symbols coded than declared"));
+            }
+            // Charged where the arithmetic walk charges it — as the symbol is
+            // brought into existence, before anything is allocated for it — so
+            // that a class of ten thousand one-pixel symbols costs the same
+            // either way. It is also what bounds this loop when the class has
+            // no rows for the region charge to land on.
+            budget.charge(SYMBOL_COST)?;
+            total = total.saturating_add(u64::from(symbol_width));
+            widths.push(symbol_width);
+        }
+        let total_width =
+            u32::try_from(total).map_err(|_| Jbig2Error::Malformed("height class too wide"))?;
+
+        // 6.5.5 step 4 d). The bitmap holds the symbols concatenated left to
+        // right with no gaps, so each one is the columns from where the
+        // previous ended.
+        let collective = decode_collective_bitmap(
+            coded,
+            bits,
+            &tables.bmsize,
+            total_width,
+            class_height,
+            budget,
+        )?;
+        let mut left = 0u32;
+        for symbol_width in widths {
+            new_symbols.push(columns_of(&collective, left, symbol_width)?);
+            left += symbol_width;
+        }
+    }
+    Ok(new_symbols)
+}
+
+/// How many height classes a dictionary declaring `num_new` symbols may spend
+/// (T.88 6.5.5).
+///
+/// One class per symbol is the most a dictionary needs, since a class holds at
+/// least one symbol unless it is empty; the slack covers the empty ones. An
+/// empty class advances nothing, so without a cap a stream of them is a loop
+/// whose length the coded data chooses.
+fn max_height_classes(num_new: u32) -> usize {
+    (num_new as usize)
+        .saturating_mul(LOOP_SLACK)
+        .saturating_add(LOOP_SLACK)
+}
+
+/// HCHEIGHT after a delta has been added to it (T.88 6.5.5 step 4 b)).
+///
+/// The running height is accumulated in `i64` because the deltas are signed and
+/// a malformed stream is free to drive it negative; this is where that becomes
+/// a refusal rather than an enormous unsigned dimension.
+fn checked_class_height(height: i64) -> Result<u32, Jbig2Error> {
+    if height < 0 {
+        return Err(Jbig2Error::Malformed("negative symbol height class"));
+    }
+    u32::try_from(height).map_err(|_| Jbig2Error::Malformed("symbol too tall"))
+}
+
+/// SYMWIDTH after a delta has been added to it (T.88 6.5.5 step 4 c) i)).
+fn checked_symbol_width(width: i64) -> Result<u32, Jbig2Error> {
+    if width < 0 {
+        return Err(Jbig2Error::Malformed("negative symbol width"));
+    }
+    u32::try_from(width).map_err(|_| Jbig2Error::Malformed("symbol too wide"))
+}
+
+/// The `width` columns of `collective` starting at column `left`, as a bitmap
+/// of their own (T.88 6.5.5 step 4 d)).
+fn columns_of(collective: &Bitmap, left: u32, width: u32) -> Result<Bitmap, Jbig2Error> {
+    let mut symbol = Bitmap::new(width, collective.height())?;
+    for y in 0..collective.height() {
+        for x in 0..width {
+            symbol.set(
+                x,
+                y,
+                collective.get(i64::from(left) + i64::from(x), i64::from(y)),
+            );
+        }
+    }
+    Ok(symbol)
+}
+
+/// Decodes one height class collective bitmap (T.88 6.5.9).
+///
+/// The field is the symbols of a height class concatenated left to right,
+/// preceded by its own size in bytes, and it comes in two forms. A BMSIZE of 0
+/// means the rows are stored raw, each padded to a byte boundary; anything else
+/// is that many bytes of MMR-coded data, which is the same facsimile coding a
+/// generic region may carry (6.2.6) and is decoded by the same function — the
+/// one that already refuses impossible dimensions and charges the bitmap
+/// against the work budget before allocating it.
+///
+/// Both byte alignments of the clause matter and both are here: step 2 aligns
+/// before the bitmap, step 5 after it. The second one is not "wherever the MMR
+/// decoder stopped" but exactly BMSIZE bytes on from the first, which is what
+/// lets an encoder omit the EOFB that would otherwise say where the data ended.
+fn decode_collective_bitmap(
+    coded: &[u8],
+    bits: &mut BitReader,
+    bmsize_table: &Table,
+    width: u32,
+    height: u32,
+    budget: &mut Budget,
+) -> Result<Bitmap, Jbig2Error> {
+    // 6.5.9 step 1.
+    let size = bmsize_table.decode(bits)?.ok_or(Jbig2Error::Malformed(
+        "unexpected OOB decoding a collective bitmap size",
+    ))?;
+    let size = usize::try_from(size)
+        .map_err(|_| Jbig2Error::Malformed("negative collective bitmap size"))?;
+    // 6.5.9 step 2.
+    bits.align_to_byte();
+
+    if size == 0 {
+        // 6.5.9 step 3. The rows are already byte-aligned, so step 5 has
+        // nothing left to skip.
+        return read_uncompressed(bits, width, height, budget);
+    }
+
+    // 6.5.9 step 4, with the parameters of Table 19. `decode_mmr_region`
+    // charges this region against the budget from these dimensions before it
+    // allocates a row of it, so nothing is charged here.
+    let start = bits.bit_pos() / 8;
+    let end = start.checked_add(size).ok_or(Jbig2Error::Truncated)?;
+    let data = coded.get(start..end).ok_or(Jbig2Error::Truncated)?;
+    let bitmap = decode_mmr_region(data, budget, width, height);
+    // 6.5.9 step 5.
+    skip_bytes(bits, size);
+    bitmap
+}
+
+/// Reads a collective bitmap stored uncompressed (T.88 6.5.9 step 3).
+///
+/// The field is HCHEIGHT rows of `ceil(TOTWIDTH / 8)` bytes, each row padded
+/// out to its byte boundary with 0 bits. Unlike the MMR form there is nothing
+/// to decode, which is exactly why the size has to be checked first: a class
+/// declaring a hundred million rows of raw pixels costs nothing to write and
+/// the bitmap would be allocated before a byte of it was found to be missing.
+fn read_uncompressed(
+    bits: &mut BitReader,
+    width: u32,
+    height: u32,
+    budget: &mut Budget,
+) -> Result<Bitmap, Jbig2Error> {
+    let stride = u64::from(width).div_ceil(8);
+    let needed = stride.saturating_mul(u64::from(height));
+    if (bits.remaining() as u64) / 8 < needed {
+        return Err(Jbig2Error::Truncated);
+    }
+    budget.charge_region(width, height)?;
+    let mut bitmap = Bitmap::new(width, height)?;
+    for y in 0..height {
+        for x in 0..width {
+            let bit = bits.read_bit().ok_or(Jbig2Error::Truncated)?;
+            bitmap.set(x, y, bit);
+        }
+        // The 0 to 7 padding bits that carry the row to a byte boundary.
+        bits.align_to_byte();
+    }
+    Ok(bitmap)
+}
+
+/// Advances the bit cursor over `bytes` whole bytes.
+///
+/// A single [`BitReader::skip`] takes a `u32` count of bits, which 512 MiB of
+/// segment data would overflow. The stepping loop runs once for anything
+/// smaller and keeps the cursor exact for anything larger, rather than leaving
+/// the position to a saturating cast.
+fn skip_bytes(bits: &mut BitReader, bytes: usize) {
+    let mut left = (bytes as u64).saturating_mul(8);
+    while left > 0 {
+        let step = left.min(u64::from(u32::MAX));
+        bits.skip(step as u32);
+        left -= step;
+    }
 }
 
 /// Decodes the export flags of a dictionary (T.88 6.5.10), one per symbol over
@@ -327,10 +706,14 @@ fn decode_height_classes(
 /// the count: a partition of `total` entries never needs more than one run per
 /// entry plus a leading empty one, so a stream offering more than that is
 /// spending runs that fill nothing.
+///
+/// `next_run` is the only thing the two codings disagree about here: 6.5.10
+/// step 2 reads EXRUNLENGTH with the IAEX arithmetic procedure when SDHUFF is
+/// 0 and with Table B.1 when it is 1. Everything the runs then describe is the
+/// same, so the walk is threaded with its source rather than written twice.
 fn decode_export_flags(
-    dec: &mut MqDecoder<'_>,
-    ints: &mut IntCtxSet,
     total: usize,
+    mut next_run: impl FnMut() -> Result<Option<i32>, Jbig2Error>,
 ) -> Result<Vec<bool>, Jbig2Error> {
     let mut flags = vec![false; total];
     let max_runs = total.saturating_mul(LOOP_SLACK).saturating_add(LOOP_SLACK);
@@ -342,7 +725,7 @@ fn decode_export_flags(
         if runs > max_runs {
             return Err(Jbig2Error::Malformed("too many symbol export runs"));
         }
-        let run = decode_int(dec, &mut ints.iaex).ok_or(Jbig2Error::Malformed(
+        let run = next_run()?.ok_or(Jbig2Error::Malformed(
             "unexpected OOB decoding export flags",
         ))?;
         let run = usize::try_from(run).map_err(|_| Jbig2Error::Malformed("negative export run"))?;
@@ -368,11 +751,13 @@ mod tests {
     use crate::filters::jbig2::arith_int::encoder::encode_int;
     use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::context_at;
+    use crate::filters::jbig2::huffman::encoder::{push_value, BitWriter};
+    use crate::filters::jbig2::huffman::parse_table_segment;
     use crate::filters::jbig2::mq::encoder::MqEncoder;
     use crate::filters::jbig2::mq::MqContext;
     use crate::filters::jbig2::testing::{
-        dictionary_segment, glyph, nominal_at_bytes, reexport_segment, rowless_dictionary_segment,
-        sample_symbols,
+        code_table_segment, dictionary_segment, glyph, huffman_dictionary_segment,
+        nominal_at_bytes, reexport_segment, rowless_dictionary_segment, sample_symbols, Collective,
     };
 
     /// What one 4 x 4 symbol costs: the fixed per-symbol price and its rows.
@@ -523,18 +908,267 @@ mod tests {
     }
 
     #[test]
-    fn huffman_and_refagg_report_themselves() {
-        for (flags, want) in [
-            (0x0001u16, "Huffman-coded symbol dictionary"),
-            (0x0002, "refinement/aggregate symbol coding"),
-        ] {
-            let mut segment = flags.to_be_bytes().to_vec();
-            segment.extend_from_slice(&[0u8; 16]);
+    fn refagg_reports_itself() {
+        let mut segment = 0x0002u16.to_be_bytes().to_vec();
+        segment.extend_from_slice(&[0u8; 16]);
+        assert_eq!(
+            decode(&segment, &[]),
+            Err(Jbig2Error::Unimplemented(
+                "refinement/aggregate symbol coding"
+            )),
+        );
+    }
+
+    /// The Huffman variant of the same dictionary, across two height classes,
+    /// with its collective bitmaps stored raw (T.88 6.5.9 step 3).
+    #[test]
+    fn decodes_huffman_symbols_across_height_classes() {
+        let want = sample_symbols();
+        let segment = huffman_dictionary_segment(&want, Collective::Uncompressed, None);
+        let got = decode(&segment, &[]).expect("dictionary");
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_same(g, w, i);
+        }
+    }
+
+    /// The same dictionary with its collective bitmaps MMR-coded (6.5.9
+    /// step 4), which is the form the NOTE calls the usual one.
+    ///
+    /// The two forms must produce the same symbols, and the MMR one must be
+    /// read as exactly BMSIZE bytes: the fixture's classes carry no EOFB, so a
+    /// decoder that resumed wherever the facsimile decoder happened to stop
+    /// would find the next height class at the wrong bit.
+    #[test]
+    fn decodes_huffman_symbols_from_an_mmr_collective_bitmap() {
+        let want = sample_symbols();
+        let segment = huffman_dictionary_segment(&want, Collective::Mmr, None);
+        let got = decode(&segment, &[]).expect("dictionary");
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_same(g, w, i);
+        }
+    }
+
+    /// A height class holds its symbols side by side with no gaps, so the
+    /// widths read before the bitmap are the only thing that says where one
+    /// symbol ends and the next begins (6.5.5 step 4 d)).
+    ///
+    /// Three symbols of one height and three different widths is the case that
+    /// separates a correct split from an off-by-one: every symbol here has ink
+    /// in its first and last column, so a boundary out by a pixel loses a
+    /// column from one symbol and gains a blank one on its neighbour.
+    #[test]
+    fn a_height_class_is_split_by_the_widths_it_declared() {
+        let want = vec![
+            glyph(&["1", "1", "1"]),
+            glyph(&["11", "01", "11"]),
+            glyph(&["101", "111", "101"]),
+        ];
+        for collective in [Collective::Uncompressed, Collective::Mmr] {
+            let segment = huffman_dictionary_segment(&want, collective, None);
+            let got = decode(&segment, &[]).expect("dictionary");
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_same(g, w, i);
+            }
+        }
+    }
+
+    /// A user-supplied table reaches the selector it was bound to
+    /// (7.4.2.1.6). The table segment is parsed by the code that will parse it
+    /// in a real stream, so this pins the binding rather than a fixture's idea
+    /// of one.
+    ///
+    /// The custom table codes 0 to 15 behind a `0` bit and four more, where
+    /// Table B.4 spends its `0` on the single value 1 — so a dictionary decoded
+    /// with the standard table instead does not merely read a different height,
+    /// it loses the bit alignment and fails.
+    #[test]
+    fn a_custom_table_is_bound_to_its_selector() {
+        let table =
+            parse_table_segment(&code_table_segment(0), &mut Budget::new()).expect("code table");
+        let want = sample_symbols();
+        let segment = huffman_dictionary_segment(&want, Collective::Uncompressed, Some(&table));
+
+        let refs = [&table];
+        let got = decode_symbol_dict(&segment, &[], &refs, &mut Budget::new()).expect("dictionary");
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_same(g, w, i);
+        }
+
+        // The same segment with nothing to bind is a header that disagrees with
+        // its own referred-to list.
+        assert_eq!(
+            decode(&segment, &[]),
+            Err(Jbig2Error::Malformed(
+                "Huffman table count disagrees with the dictionary flags"
+            )),
+        );
+    }
+
+    /// A Huffman dictionary carries no AT flags (7.4.2.1.2), so the eight bytes
+    /// an arithmetic one spends on them are SDNUMEXSYMS and SDNUMNEWSYMS here.
+    ///
+    /// The check is on the counts rather than on the symbols: reading AT bytes
+    /// that are not there would take SDNUMEXSYMS from the coded data and leave
+    /// the two counts holding whatever the height classes were.
+    #[test]
+    fn a_huffman_dictionary_carries_no_at_flags() {
+        let want = sample_symbols();
+        let segment = huffman_dictionary_segment(&want, Collective::Uncompressed, None);
+        assert_eq!(&segment[2..6], &(want.len() as u32).to_be_bytes());
+        assert_eq!(&segment[6..10], &(want.len() as u32).to_be_bytes());
+    }
+
+    /// The flags 7.4.2.1.1 pins to 0 for a Huffman dictionary are refused
+    /// rather than ignored, because a header setting one is far more likely to
+    /// be read at the wrong offset than to mean anything by it.
+    #[test]
+    fn a_huffman_dictionary_may_not_set_the_arithmetic_flags() {
+        let want = sample_symbols();
+        let good = huffman_dictionary_segment(&want, Collective::Uncompressed, None);
+        // Bit 8 "context used", bit 9 "context retained", bits 10 and 11
+        // SDTEMPLATE.
+        for bit in [8u16, 9, 10, 11] {
+            let mut segment = good.clone();
+            let flags = u16::from_be_bytes([segment[0], segment[1]]) | (1 << bit);
+            segment[..2].copy_from_slice(&flags.to_be_bytes());
             assert_eq!(
                 decode(&segment, &[]),
-                Err(Jbig2Error::Unimplemented(want)),
-                "flags {flags:#06x}",
+                Err(Jbig2Error::Malformed(
+                    "Huffman dictionary sets an arithmetic-only flag"
+                )),
+                "bit {bit}",
             );
+        }
+    }
+
+    /// The value 2 is not permitted for either of the two-bit table selectors
+    /// (7.4.2.1.1), and SDHUFFAGGINST must be 0 while SDREFAGG is.
+    #[test]
+    fn the_selectors_the_standard_forbids_are_refused() {
+        let want = sample_symbols();
+        let good = huffman_dictionary_segment(&want, Collective::Uncompressed, None);
+        for (bits, want) in [
+            (2u16 << 2, "reserved SDHUFFDH selection"),
+            (2 << 4, "reserved SDHUFFDW selection"),
+            (1 << 7, "SDHUFFAGGINST selected without aggregate coding"),
+        ] {
+            let mut segment = good.clone();
+            let flags = u16::from_be_bytes([segment[0], segment[1]]) | bits;
+            segment[..2].copy_from_slice(&flags.to_be_bytes());
+            assert_eq!(
+                decode(&segment, &[]),
+                Err(Jbig2Error::Malformed(want)),
+                "flag bits {bits:#06x}",
+            );
+        }
+    }
+
+    /// SDHUFFDW must be able to code OOB and the other selectors must not
+    /// (7.4.2.1.6): OOB is the only thing that closes a height class, so a
+    /// table bound to the wrong slot would read a class until the segment ran
+    /// out.
+    #[test]
+    fn a_custom_table_bound_to_the_wrong_slot_is_refused() {
+        // The fixture's table has no OOB line, which is what SDHUFFDH and
+        // SDHUFFBMSIZE require and what SDHUFFDW forbids.
+        let table =
+            parse_table_segment(&code_table_segment(0), &mut Budget::new()).expect("code table");
+        let refs = [&table];
+        let mut segment = (0x0001u16 | (3 << 4)).to_be_bytes().to_vec(); // SDHUFFDW custom
+        segment.extend_from_slice(&1u32.to_be_bytes());
+        segment.extend_from_slice(&1u32.to_be_bytes());
+        assert_eq!(
+            decode_symbol_dict(&segment, &[], &refs, &mut Budget::new()),
+            Err(Jbig2Error::Malformed("SDHUFFDW cannot code OOB")),
+        );
+    }
+
+    /// No truncation of a Huffman dictionary decodes to a shorter dictionary.
+    ///
+    /// This is the asymmetry with the arithmetic path, and the reason the
+    /// tables report exhaustion rather than OOB: there, an exhausted decoder
+    /// synthesises bits forever (T.88 E.3.4), a height class closes on the OOB
+    /// that falls out of them, and a segment cut in half can read as a
+    /// well-formed short one. Nothing in a prefix-coded stream means "the data
+    /// ended", so every prefix of this one has to fail.
+    #[test]
+    fn no_truncation_of_a_huffman_dictionary_decodes() {
+        let segment = huffman_dictionary_segment(&sample_symbols(), Collective::Uncompressed, None);
+        assert_eq!(decode(&segment, &[]).map(|s| s.len()), Ok(3));
+        for cut in 0..segment.len() {
+            assert!(decode(&segment[..cut], &[]).is_err(), "cut at {cut}");
+        }
+    }
+
+    /// A collective bitmap declaring more bytes than the segment holds is
+    /// refused rather than decoded from whatever is there (6.5.9 step 4).
+    ///
+    /// Built by hand because the point is the field, not the pixels: one class
+    /// of one 2 x 2 symbol, whose BMSIZE says two hundred bytes of MMR data
+    /// follow and which then ends.
+    #[test]
+    fn a_collective_bitmap_larger_than_the_segment_is_refused() {
+        let dh = standard(4).expect("Table B.4");
+        let dw = standard(2).expect("Table B.2");
+        let bmsize = standard(1).expect("Table B.1");
+        let mut w = BitWriter::default();
+        push_value(&mut w, &dh, Some(2)); // HCHEIGHT 2
+        push_value(&mut w, &dw, Some(2)); // SYMWIDTH 2
+        push_value(&mut w, &dw, None); // OOB closes the class
+        push_value(&mut w, &bmsize, Some(200));
+        w.align();
+
+        let mut segment = 0x0001u16.to_be_bytes().to_vec();
+        segment.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+        segment.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+        segment.extend_from_slice(&w.finish());
+        assert!(segment.len() < 200, "the demand must exceed the segment");
+        assert_eq!(decode(&segment, &[]), Err(Jbig2Error::Truncated));
+    }
+
+    /// Every symbol of a Huffman dictionary is charged the same as an
+    /// arithmetic one, so neither coding is the cheap way to conjure bitmaps.
+    #[test]
+    fn huffman_symbols_are_charged_like_arithmetic_ones() {
+        // Both symbols are two rows tall, so they share one height class and
+        // one collective bitmap five pixels wide.
+        let symbols: Vec<Bitmap> = vec![glyph(&["11", "11"]), glyph(&["111", "111"])];
+        let segment = huffman_dictionary_segment(&symbols, Collective::Uncompressed, None);
+        let total = SYMBOL_COST * 2 + (5 + ROW_COST) * 2;
+
+        let mut budget = Budget::with_limit(total);
+        assert!(decode_within(&segment, &[], &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(total - 1);
+        assert_eq!(
+            decode_within(&segment, &[], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// The Huffman path must survive arbitrary bytes exactly as the arithmetic
+    /// one does. The flags word is forced to SDHUFF so the sweep reaches the
+    /// height class walk rather than being turned away at the first bit.
+    #[test]
+    fn arbitrary_huffman_bytes_error_rather_than_panicking() {
+        let mut state: u32 = 0x6C1D_930B;
+        for _ in 0..2_000 {
+            let len = (state % 193) as usize;
+            let mut data: Vec<u8> = (0..len)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect();
+            if data.len() >= 2 {
+                data[0] = 0;
+                data[1] = 1;
+            }
+            let _ = decode_symbol_dict(&data, &[], &[], &mut Budget::with_limit(1 << 16));
         }
     }
 

@@ -24,13 +24,6 @@
 //! its height class collective bitmap (6.5.9), so having one notion of "where
 //! we are in the bits" is what makes that handoff exact.
 
-// Nothing outside this module's own tests reaches any of it yet. The first
-// caller is phase B of the Huffman plan (`SDHUFF = 1` symbol dictionaries) and
-// the second is phase C (`SBHUFF = 1` text regions); until those land the
-// module is dead by construction rather than by oversight, and a narrower
-// attribute would have to be repeated on every item in the file.
-#![allow(dead_code)]
-
 use super::budget::Budget;
 use super::reader::Reader;
 use super::Jbig2Error;
@@ -854,6 +847,8 @@ static TABLE_B15: [Line; 13] = [
 /// the decoder reads back what the standard says an encoder writes.
 #[cfg(test)]
 pub(crate) mod encoder {
+    use super::{assign_prefix_codes, Kind, Table};
+
     /// Writes bits most significant first, mirroring
     /// [`BitReader`](super::BitReader).
     #[derive(Default)]
@@ -898,6 +893,58 @@ pub(crate) mod encoder {
         pub(crate) fn finish(self) -> Vec<u8> {
             self.bytes
         }
+    }
+
+    /// Emits `value` through `table`, as the prefix of the line that covers it
+    /// followed by that line's offset field (B.4 read backwards). `None` emits
+    /// the out-of-band line.
+    ///
+    /// The line is found by searching, which is only possible because a table's
+    /// ranges are disjoint: the ordinary lines are laid end to end from HTLOW,
+    /// the lower line counts down from HTLOW − 1 and the upper counts up from
+    /// HTHIGH, so at most one line can hold any value and the first match is
+    /// the only match.
+    pub(crate) fn push_value(w: &mut BitWriter, table: &Table, value: Option<i32>) {
+        let lens: Vec<u8> = table.lines.iter().map(|line| line.pref_len).collect();
+        let codes = assign_prefix_codes(&lens).expect("the table was built, so its lengths assign");
+        let (index, offset) = match value {
+            None => (oob_line(table), 0),
+            Some(value) => line_for(table, value),
+        };
+        let line = table.lines[index];
+        w.push(codes[index], line.pref_len);
+        if line.kind != Kind::Oob {
+            w.push(offset, line.range_len);
+        }
+    }
+
+    /// The index of the table's out-of-band line (B.2 step 10).
+    fn oob_line(table: &Table) -> usize {
+        table
+            .lines
+            .iter()
+            .position(|line| line.kind == Kind::Oob && line.pref_len > 0)
+            .expect("the table codes OOB")
+    }
+
+    /// The index of the line covering `value`, and the offset within it.
+    fn line_for(table: &Table, value: i32) -> (usize, u32) {
+        for (index, line) in table.lines.iter().enumerate() {
+            // A PREFLEN of 0 means the line is never used, so it codes nothing
+            // however well its range fits.
+            if line.pref_len == 0 {
+                continue;
+            }
+            let offset = match line.kind {
+                Kind::Oob => continue,
+                Kind::Lower => i64::from(line.range_low) - i64::from(value),
+                Kind::Normal => i64::from(value) - i64::from(line.range_low),
+            };
+            if (0..1i64 << line.range_len).contains(&offset) {
+                return (index, offset as u32);
+            }
+        }
+        panic!("no line of this table codes {value}");
     }
 }
 
