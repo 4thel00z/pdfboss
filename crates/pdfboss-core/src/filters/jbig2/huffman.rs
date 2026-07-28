@@ -386,6 +386,323 @@ fn read_bits(bits: &mut BitReader, n: u8) -> Result<u32, Jbig2Error> {
     Ok(value)
 }
 
+/// One of the fifteen standard tables of B.5, numbered as the specification
+/// numbers them: `standard(1)` is Table B.1, standard Huffman table A.
+///
+/// A selector field in a symbol dictionary or text region header picks one of
+/// these by number (7.4.2.1.1, 7.4.3.1.2), which is why the accessor is by
+/// number rather than by a name per table.
+///
+/// The arrays below are constants, and this module's tests re-derive every one
+/// of their prefix codes and compare them against the bit strings the
+/// specification prints, so the only failure a caller can reach here is a
+/// `number` outside 1 to 15 — a mis-mapped selector rather than a bad stream.
+pub(crate) fn standard(number: u8) -> Result<Table, Jbig2Error> {
+    let lines: &[Line] = match number {
+        1 => &TABLE_B1,
+        2 => &TABLE_B2,
+        3 => &TABLE_B3,
+        4 => &TABLE_B4,
+        5 => &TABLE_B5,
+        6 => &TABLE_B6,
+        7 => &TABLE_B7,
+        8 => &TABLE_B8,
+        9 => &TABLE_B9,
+        10 => &TABLE_B10,
+        11 => &TABLE_B11,
+        12 => &TABLE_B12,
+        13 => &TABLE_B13,
+        14 => &TABLE_B14,
+        15 => &TABLE_B15,
+        _ => return Err(Jbig2Error::Malformed("no such standard Huffman table")),
+    };
+    Table::new(lines.to_vec())
+}
+
+// The fifteen tables of B.5, one source line per table line, in the order the
+// specification prints them. That order carries meaning — B.3 breaks ties
+// between equal prefix lengths by it — so the arrays are laid out to be read
+// beside the page rather than sorted into anything tidier.
+//
+// The arguments are PREFLEN, RANGELEN and RANGELOW, which are the second,
+// third and first columns of the printed tables; `Line::lower` and
+// `Line::upper` take no RANGELEN because B.2 steps 7 and 9 fix it at 32, and
+// `Line::oob` takes only PREFLEN because that line has no range at all. Where
+// the specification omits a lower or upper range line it is saying the line
+// has PREFLEN 0 and is never used, and an unused line takes no part in the
+// code assignment, so those are omitted here too.
+//
+// RANGELOW is the low end of the printed VAL column, and for the lower range
+// line it is HTLOW − 1: Table B.3 runs from −256, so its lower line carries
+// −257 and codes (−257 − VAL), exactly as the Encoding column says.
+
+/// Table B.1, standard Huffman table A. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B1: [Line; 4] = [
+    Line::normal(1, 4, 0),
+    Line::normal(2, 8, 16),
+    Line::normal(3, 16, 272),
+    Line::upper(3, 65808),
+];
+
+/// Table B.2, standard Huffman table B. HTOOB is 1.
+#[rustfmt::skip]
+static TABLE_B2: [Line; 7] = [
+    Line::normal(1, 0, 0),
+    Line::normal(2, 0, 1),
+    Line::normal(3, 0, 2),
+    Line::normal(4, 3, 3),
+    Line::normal(5, 6, 11),
+    Line::upper(6, 75),
+    Line::oob(6),
+];
+
+/// Table B.3, standard Huffman table C. HTOOB is 1.
+#[rustfmt::skip]
+static TABLE_B3: [Line; 9] = [
+    Line::normal(8, 8, -256),
+    Line::normal(1, 0, 0),
+    Line::normal(2, 0, 1),
+    Line::normal(3, 0, 2),
+    Line::normal(4, 3, 3),
+    Line::normal(5, 6, 11),
+    Line::lower(8, -257),
+    Line::upper(7, 75),
+    Line::oob(6),
+];
+
+/// Table B.4, standard Huffman table D. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B4: [Line; 6] = [
+    Line::normal(1, 0, 1),
+    Line::normal(2, 0, 2),
+    Line::normal(3, 0, 3),
+    Line::normal(4, 3, 4),
+    Line::normal(5, 6, 12),
+    Line::upper(5, 76),
+];
+
+/// Table B.5, standard Huffman table E. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B5: [Line; 8] = [
+    Line::normal(7, 8, -255),
+    Line::normal(1, 0, 1),
+    Line::normal(2, 0, 2),
+    Line::normal(3, 0, 3),
+    Line::normal(4, 3, 4),
+    Line::normal(5, 6, 12),
+    Line::lower(7, -256),
+    Line::upper(6, 76),
+];
+
+/// Table B.6, standard Huffman table F. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B6: [Line; 14] = [
+    Line::normal(5, 10, -2048),
+    Line::normal(4, 9, -1024),
+    Line::normal(4, 8, -512),
+    Line::normal(4, 7, -256),
+    Line::normal(5, 6, -128),
+    Line::normal(5, 5, -64),
+    Line::normal(4, 5, -32),
+    Line::normal(2, 7, 0),
+    Line::normal(3, 7, 128),
+    Line::normal(3, 8, 256),
+    Line::normal(4, 9, 512),
+    Line::normal(4, 10, 1024),
+    Line::lower(6, -2049),
+    Line::upper(6, 2048),
+];
+
+/// Table B.7, standard Huffman table G. HTOOB is 0.
+///
+/// The printed VAL column gives the sixth line as −64 . . . −32, which
+/// overlaps the line below it; RANGELEN 5 covers 32 values, and the Encoding
+/// column reads 11011 + (VAL + 64) in 5 bits, so the line is −64 . . . −33 and
+/// RANGELOW is −64. Only RANGELOW is transcribed here, so the discrepancy in
+/// the printed upper bound does not reach the code.
+#[rustfmt::skip]
+static TABLE_B7: [Line; 15] = [
+    Line::normal(4, 9, -1024),
+    Line::normal(3, 8, -512),
+    Line::normal(4, 7, -256),
+    Line::normal(5, 6, -128),
+    Line::normal(5, 5, -64),
+    Line::normal(4, 5, -32),
+    Line::normal(4, 5, 0),
+    Line::normal(5, 5, 32),
+    Line::normal(5, 6, 64),
+    Line::normal(4, 7, 128),
+    Line::normal(3, 8, 256),
+    Line::normal(3, 9, 512),
+    Line::normal(3, 10, 1024),
+    Line::lower(5, -1025),
+    Line::upper(5, 2048),
+];
+
+/// Table B.8, standard Huffman table H. HTOOB is 1.
+#[rustfmt::skip]
+static TABLE_B8: [Line; 21] = [
+    Line::normal(8, 3, -15),
+    Line::normal(9, 1, -7),
+    Line::normal(8, 1, -5),
+    Line::normal(9, 0, -3),
+    Line::normal(7, 0, -2),
+    Line::normal(4, 0, -1),
+    Line::normal(2, 1, 0),
+    Line::normal(5, 0, 2),
+    Line::normal(6, 0, 3),
+    Line::normal(3, 4, 4),
+    Line::normal(6, 1, 20),
+    Line::normal(4, 4, 22),
+    Line::normal(4, 5, 38),
+    Line::normal(5, 6, 70),
+    Line::normal(5, 7, 134),
+    Line::normal(6, 7, 262),
+    Line::normal(7, 8, 390),
+    Line::normal(6, 10, 646),
+    Line::lower(9, -16),
+    Line::upper(9, 1670),
+    Line::oob(2),
+];
+
+/// Table B.9, standard Huffman table I. HTOOB is 1.
+#[rustfmt::skip]
+static TABLE_B9: [Line; 22] = [
+    Line::normal(8, 4, -31),
+    Line::normal(9, 2, -15),
+    Line::normal(8, 2, -11),
+    Line::normal(9, 1, -7),
+    Line::normal(7, 1, -5),
+    Line::normal(4, 1, -3),
+    Line::normal(3, 1, -1),
+    Line::normal(3, 1, 1),
+    Line::normal(5, 1, 3),
+    Line::normal(6, 1, 5),
+    Line::normal(3, 5, 7),
+    Line::normal(6, 2, 39),
+    Line::normal(4, 5, 43),
+    Line::normal(4, 6, 75),
+    Line::normal(5, 7, 139),
+    Line::normal(5, 8, 267),
+    Line::normal(6, 8, 523),
+    Line::normal(7, 9, 779),
+    Line::normal(6, 11, 1291),
+    Line::lower(9, -32),
+    Line::upper(9, 3339),
+    Line::oob(2),
+];
+
+/// Table B.10, standard Huffman table J. HTOOB is 1.
+#[rustfmt::skip]
+static TABLE_B10: [Line; 21] = [
+    Line::normal(7, 4, -21),
+    Line::normal(8, 0, -5),
+    Line::normal(7, 0, -4),
+    Line::normal(5, 0, -3),
+    Line::normal(2, 2, -2),
+    Line::normal(5, 0, 2),
+    Line::normal(6, 0, 3),
+    Line::normal(7, 0, 4),
+    Line::normal(8, 0, 5),
+    Line::normal(2, 6, 6),
+    Line::normal(5, 5, 70),
+    Line::normal(6, 5, 102),
+    Line::normal(6, 6, 134),
+    Line::normal(6, 7, 198),
+    Line::normal(6, 8, 326),
+    Line::normal(6, 9, 582),
+    Line::normal(6, 10, 1094),
+    Line::normal(7, 11, 2118),
+    Line::lower(8, -22),
+    Line::upper(8, 4166),
+    Line::oob(2),
+];
+
+/// Table B.11, standard Huffman table K. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B11: [Line; 13] = [
+    Line::normal(1, 0, 1),
+    Line::normal(2, 1, 2),
+    Line::normal(4, 0, 4),
+    Line::normal(4, 1, 5),
+    Line::normal(5, 1, 7),
+    Line::normal(5, 2, 9),
+    Line::normal(6, 2, 13),
+    Line::normal(7, 2, 17),
+    Line::normal(7, 3, 21),
+    Line::normal(7, 4, 29),
+    Line::normal(7, 5, 45),
+    Line::normal(7, 6, 77),
+    Line::upper(7, 141),
+];
+
+/// Table B.12, standard Huffman table L. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B12: [Line; 13] = [
+    Line::normal(1, 0, 1),
+    Line::normal(2, 0, 2),
+    Line::normal(3, 1, 3),
+    Line::normal(5, 0, 5),
+    Line::normal(5, 1, 6),
+    Line::normal(6, 1, 8),
+    Line::normal(7, 0, 10),
+    Line::normal(7, 1, 11),
+    Line::normal(7, 2, 13),
+    Line::normal(7, 3, 17),
+    Line::normal(7, 4, 25),
+    Line::normal(8, 5, 41),
+    Line::upper(8, 73),
+];
+
+/// Table B.13, standard Huffman table M. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B13: [Line; 13] = [
+    Line::normal(1, 0, 1),
+    Line::normal(3, 0, 2),
+    Line::normal(4, 0, 3),
+    Line::normal(5, 0, 4),
+    Line::normal(4, 1, 5),
+    Line::normal(3, 3, 7),
+    Line::normal(6, 1, 15),
+    Line::normal(6, 2, 17),
+    Line::normal(6, 3, 21),
+    Line::normal(6, 4, 29),
+    Line::normal(6, 5, 45),
+    Line::normal(7, 6, 77),
+    Line::upper(7, 141),
+];
+
+/// Table B.14, standard Huffman table N. HTOOB is 0.
+///
+/// The only table with neither escape line: it codes −2 to 2 and nothing else.
+#[rustfmt::skip]
+static TABLE_B14: [Line; 5] = [
+    Line::normal(3, 0, -2),
+    Line::normal(3, 0, -1),
+    Line::normal(1, 0, 0),
+    Line::normal(3, 0, 1),
+    Line::normal(3, 0, 2),
+];
+
+/// Table B.15, standard Huffman table O. HTOOB is 0.
+#[rustfmt::skip]
+static TABLE_B15: [Line; 13] = [
+    Line::normal(7, 4, -24),
+    Line::normal(6, 2, -8),
+    Line::normal(5, 1, -4),
+    Line::normal(4, 0, -2),
+    Line::normal(3, 0, -1),
+    Line::normal(1, 0, 0),
+    Line::normal(3, 0, 1),
+    Line::normal(4, 0, 2),
+    Line::normal(5, 1, 3),
+    Line::normal(6, 2, 5),
+    Line::normal(7, 4, 9),
+    Line::lower(7, -25),
+    Line::upper(7, 25),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +990,179 @@ mod tests {
         assert_eq!(a.decode(&mut bits), Ok(Some(10)));
         let mut bits = BitReader::new(&[0x00]);
         assert_eq!(b.decode(&mut bits), Ok(Some(20)));
+    }
+
+    /// The `Encoding` column of B.5: the prefix bit string the specification
+    /// prints for each line of each standard table, in the printed order.
+    ///
+    /// This is deliberately a *second* transcription of the same fifteen
+    /// tables, taken from a different column of the same page. Transcribing
+    /// PREFLEN wrongly is otherwise a silent mistake — the table still decodes,
+    /// it decodes a different value — and for it to survive this fixture the
+    /// same slip would have to be made twice, in two different notations, in
+    /// exactly the same place.
+    #[rustfmt::skip]
+    static PRINTED_ENCODINGS: [&[&str]; 15] = [
+        // Table B.1
+        &["0", "10", "110", "111"],
+        // Table B.2
+        &["0", "10", "110", "1110", "11110", "111110", "111111"],
+        // Table B.3
+        &["11111110", "0", "10", "110", "1110", "11110", "11111111", "1111110",
+          "111110"],
+        // Table B.4
+        &["0", "10", "110", "1110", "11110", "11111"],
+        // Table B.5
+        &["1111110", "0", "10", "110", "1110", "11110", "1111111", "111110"],
+        // Table B.6
+        &["11100", "1000", "1001", "1010", "11101", "11110", "1011", "00",
+          "010", "011", "1100", "1101", "111110", "111111"],
+        // Table B.7
+        &["1000", "000", "1001", "11010", "11011", "1010", "1011", "11100",
+          "11101", "1100", "001", "010", "011", "11110", "11111"],
+        // Table B.8
+        &["11111100", "111111100", "11111101", "111111101", "1111100", "1010",
+          "00", "11010", "111010", "100", "111011", "1011", "1100", "11011",
+          "11100", "111100", "1111101", "111101", "111111110", "111111111",
+          "01"],
+        // Table B.9
+        &["11111100", "111111100", "11111101", "111111101", "1111100", "1010",
+          "010", "011", "11010", "111010", "100", "111011", "1011", "1100",
+          "11011", "11100", "111100", "1111101", "111101", "111111110",
+          "111111111", "00"],
+        // Table B.10
+        &["1111010", "11111100", "1111011", "11000", "00", "11001", "110110",
+          "1111100", "11111101", "01", "11010", "110111", "111000", "111001",
+          "111010", "111011", "111100", "1111101", "11111110", "11111111",
+          "10"],
+        // Table B.11
+        &["0", "10", "1100", "1101", "11100", "11101", "111100", "1111010",
+          "1111011", "1111100", "1111101", "1111110", "1111111"],
+        // Table B.12
+        &["0", "10", "110", "11100", "11101", "111100", "1111010", "1111011",
+          "1111100", "1111101", "1111110", "11111110", "11111111"],
+        // Table B.13
+        &["0", "100", "1100", "11100", "1101", "101", "111010", "111011",
+          "111100", "111101", "111110", "1111110", "1111111"],
+        // Table B.14
+        &["100", "101", "0", "110", "111"],
+        // Table B.15
+        &["1111100", "111100", "11100", "1100", "100", "0", "101", "1101",
+          "11101", "111101", "1111101", "1111110", "1111111"],
+    ];
+
+    /// The mandatory golden vector for the standard tables: B.3, run over the
+    /// PREFLEN column this module transcribed, must reproduce the `Encoding`
+    /// column the specification printed, bit for bit, for all fifteen.
+    #[test]
+    fn standard_tables_reproduce_their_printed_encodings() {
+        for (index, printed) in PRINTED_ENCODINGS.iter().enumerate() {
+            let number = index as u8 + 1;
+            let table = standard(number).expect("a standard table number");
+            assert_eq!(
+                table.lines.len(),
+                printed.len(),
+                "B.{number} has a different number of lines than the page does",
+            );
+            let lens: Vec<u8> = table.lines.iter().map(|line| line.pref_len).collect();
+            let codes = assign_prefix_codes(&lens).expect("a standard table assigns");
+            for (line, want) in printed.iter().enumerate() {
+                assert_eq!(
+                    bits_of(codes[line], lens[line]),
+                    *want,
+                    "B.{number} line {line}",
+                );
+            }
+        }
+    }
+
+    /// All fifteen are *complete* codes: the prefix lengths satisfy Kraft's
+    /// relation with equality, so every bit string of the right shape decodes
+    /// to something and no code space is wasted.
+    ///
+    /// This was computed for all fifteen before being asserted, and it holds
+    /// uniformly. It is not a property of Huffman tables in general — B.2 lets
+    /// a custom table leave lines unused with a PREFLEN of 0, and such a table
+    /// sums to less than one — so it is pinned only for the standard set,
+    /// where it is an independent check on the transcribed lengths: moving one
+    /// line's PREFLEN by one breaks the sum.
+    #[test]
+    fn every_standard_table_is_a_complete_code() {
+        for number in 1..=15u8 {
+            let table = standard(number).expect("a standard table number");
+            // Summed over a common denominator of 2^32 so the arithmetic is
+            // exact; no standard table has an unused line, which is what makes
+            // the shift below well defined for every one of them.
+            let mut total = 0u64;
+            for line in &table.lines {
+                assert!(line.pref_len > 0, "B.{number} has an unused line");
+                total += 1u64 << (32 - line.pref_len);
+            }
+            assert_eq!(total, 1u64 << 32, "B.{number} is not a complete code");
+        }
+    }
+
+    /// HTOOB, as each table's header line gives it.
+    #[test]
+    fn standard_tables_carry_the_printed_htoob() {
+        for number in 1..=15u8 {
+            let table = standard(number).expect("a standard table number");
+            assert_eq!(
+                table.has_oob(),
+                matches!(number, 2 | 3 | 8 | 9 | 10),
+                "B.{number}",
+            );
+        }
+    }
+
+    /// Every line of every standard table round-trips: the first value of its
+    /// range, the second, and the last, back through the decoder as itself.
+    ///
+    /// The escape lines carry a 32-bit offset, which reaches past both ends of
+    /// what B.2 says a table may encode, so the ones that do are expected to
+    /// be refused rather than wrapped — that arm of the loop is as much the
+    /// point as the equalities are.
+    #[test]
+    fn standard_tables_round_trip_the_ends_of_every_range() {
+        for number in 1..=15u8 {
+            let table = standard(number).expect("a standard table number");
+            for (index, line) in table.lines.iter().enumerate() {
+                if line.kind == Kind::Oob {
+                    assert_eq!(round_trip(&table, index, 0), Ok(None), "B.{number} OOB");
+                    continue;
+                }
+                let last = match line.range_len {
+                    32 => u32::MAX,
+                    n => (1u32 << n) - 1,
+                };
+                for offset in [0, last.min(1), last] {
+                    let low = i64::from(line.range_low);
+                    let want = match line.kind {
+                        Kind::Lower => low - i64::from(offset),
+                        Kind::Normal | Kind::Oob => low + i64::from(offset),
+                    };
+                    let got = round_trip(&table, index, offset);
+                    let expected = match i32::try_from(want) {
+                        Ok(value) => Ok(Some(value)),
+                        Err(_) => Err(Jbig2Error::Malformed(
+                            "Huffman value outside the codable range",
+                        )),
+                    };
+                    assert_eq!(got, expected, "B.{number} line {index} offset {offset}");
+                }
+            }
+        }
+    }
+
+    /// A selector that names no standard table is a mistake in the caller, and
+    /// is reported rather than silently resolved to a neighbouring table.
+    #[test]
+    fn there_is_no_standard_table_outside_one_to_fifteen() {
+        for number in [0u8, 16, 255] {
+            assert_eq!(
+                standard(number).map(|_| ()),
+                Err(Jbig2Error::Malformed("no such standard Huffman table")),
+            );
+        }
     }
 }
