@@ -67,7 +67,31 @@ const MAX_TABLE_LINES: u64 = 1 << 12;
 /// [`MAX_WORK`](super::budget::MAX_WORK) buys a little over a million lines,
 /// which is 256 tables of the maximum size and a few tens of megabytes of
 /// bookkeeping if a stream insists on all of them.
+///
+/// What it does *not* price is the part of a table that has no lines in it; see
+/// [`TABLE_COST`].
 const LINE_COST: u64 = 256;
+
+/// What one retained table costs on top of its lines.
+///
+/// [`LINE_COST`] is the whole story for a table with many lines and misses the
+/// point entirely for a table with few. A [`Table`] carries a length slot per
+/// prefix length whatever it holds, so some four hundred bytes of every one of
+/// them is fixed, and that is the part a segment gets for nothing when it
+/// declares the smallest table B.2 admits: thirteen bytes of segment, one
+/// ordinary line, four lines' worth of charge. Pricing lines alone therefore
+/// makes the emptiest table the best value per budget unit, which is the
+/// opposite of what the retention being paid for actually costs — and
+/// retention is what this is: the tables are kept in the page's store for the
+/// whole walk, where a region's pixels are composited and dropped.
+///
+/// A flat price per table is what closes that, in the same way
+/// [`SYMBOL_COST`](super::symbol_dict::SYMBOL_COST) prices a symbol that is
+/// kept rather than the pixels that made it. At this rate
+/// [`MAX_WORK`](super::budget::MAX_WORK) affords some sixteen thousand tables,
+/// four orders of magnitude past any real document, and it leaves the
+/// maximum-size case [`LINE_COST`] was chosen for essentially unchanged.
+const TABLE_COST: u64 = 1 << 14;
 
 /// What a table line does with the offset that follows its prefix (B.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -529,10 +553,12 @@ pub(crate) fn parse_table_segment(data: &[u8], budget: &mut Budget) -> Result<Ta
     // The charge is bounded a third way, by the bits the segment carries:
     // every line reads HTPS + HTRS of them, so a header promising thousands of
     // lines out of a handful of bytes is charged for the handful. The three
-    // trailing lines of steps 6 to 10 are charged alongside them.
+    // trailing lines of steps 6 to 10 are charged alongside them, and the table
+    // they will hang off is charged whatever they come to.
     let per_line = u64::from(htps) + u64::from(htrs);
     let affordable = (r.remaining() as u64).saturating_mul(8) / per_line;
-    budget.charge(LINE_COST.saturating_mul(max_lines.min(affordable).saturating_add(3)))?;
+    let lines_charged = max_lines.min(affordable).saturating_add(3);
+    budget.charge(TABLE_COST.saturating_add(LINE_COST.saturating_mul(lines_charged)))?;
 
     let mut bits = BitReader::new(r.rest());
     let mut lines: Vec<Line> = Vec::new();
@@ -1747,6 +1773,41 @@ mod tests {
             assert!(parsed < 10_000_000, "the budget never ran out");
         }
         assert!(parsed > 0, "one table has to be affordable");
+    }
+
+    /// What a retained table costs is not all in its lines.
+    ///
+    /// A [`Table`] carries one length slot per prefix length however few lines
+    /// it holds, so nearly four hundred bytes of it are fixed — and a table
+    /// segment's table is kept for the whole segment walk, since any later
+    /// segment may refer to it. Priced by the line alone, the cheapest table
+    /// per budget unit is therefore the emptiest one, and the smallest table
+    /// B.2 admits is charged four lines' worth for thirteen bytes of segment.
+    #[test]
+    fn the_emptiest_tables_cannot_be_hoarded() {
+        // B.2.1: HTOOB 0, with HTPS and HTRS at their minimum of 1. HTHIGH one
+        // above HTLOW holds step 5 to a single ordinary line, so the body is
+        // that line's PREFLEN and RANGELEN and the two escape lines' PREFLEN:
+        // 1 and 0, then 1 and 0, in the top four bits of one byte.
+        let data = table_segment(false, 1, 1, 0, 1, &[0b1010_0000]);
+        assert!(parse_table_segment(&data, &mut Budget::new()).is_ok());
+
+        let mut budget = Budget::new();
+        let mut parsed = 0u64;
+        while parse_table_segment(&data, &mut budget).is_ok() {
+            parsed += 1;
+            assert!(parsed < 1 << 20, "the budget never ran out");
+        }
+        let retained = parsed.saturating_mul(size_of::<Table>() as u64);
+        assert!(
+            retained < 16 << 20,
+            "{parsed} tables from {} bytes retain {retained} bytes of fixed \
+             structure alone, before their lines or the store holding them",
+            parsed.saturating_mul(data.len() as u64 + 11),
+        );
+        // And the cap has to stay far above anything a document would carry:
+        // eight selectors per text region is the most that can even be bound.
+        assert!(parsed > 4096, "only {parsed} tables were affordable");
     }
 
     /// HTHIGH at or below HTLOW still yields one ordinary line: B.2 step 5
