@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.7.0](https://github.com/4thel00z/pdfboss/compare/v0.6.0...v0.7.0) (2026-07-28)
+
+
+### Features
+
+* **core:** add the Annex B Huffman table machinery ([6789c50](https://github.com/4thel00z/pdfboss/commit/6789c50fa89a44752cd2f2a675de6c0c805214f8))
+* **core:** add the standard Huffman tables ([90627f8](https://github.com/4thel00z/pdfboss/commit/90627f8057da910305481a515d603c4b68571e7d))
+* **core:** decode Huffman-coded symbol dictionaries ([a68b0a5](https://github.com/4thel00z/pdfboss/commit/a68b0a5b220d07eb1074a126d5039c99cd12ad25))
+* **core:** decode Huffman-coded text regions ([4947f06](https://github.com/4thel00z/pdfboss/commit/4947f06d52c3a6a67d304990be1f72d54a07c165))
+* **core:** keep the Huffman tables a segment refers to ([2c79544](https://github.com/4thel00z/pdfboss/commit/2c7954419d49816c3fc070c8e597cd88a80cb313))
+* **core:** parse custom Huffman table segments ([935f21a](https://github.com/4thel00z/pdfboss/commit/935f21a8ccd30aec766efc32f3b6197fe0a5bc41))
+
+
+### Bug Fixes
+
+* **core:** charge a Huffman text region for its symbol ID table ([8c6789f](https://github.com/4thel00z/pdfboss/commit/8c6789fca3365a33eff693b038affc3751204f85))
+* **core:** charge for the custom tables a segment's selectors copy ([c9a5b3f](https://github.com/4thel00z/pdfboss/commit/c9a5b3fc828691f6d365455ae00e0bfc6ca0b2b4))
+* **core:** charge for the symbol list a segment's referred-to names build ([e0e01cd](https://github.com/4thel00z/pdfboss/commit/e0e01cddf51f80020f525e7f1e2f1706ec39055d))
+* **core:** decode a text region that assigns no symbol ID codes ([8311c5d](https://github.com/4thel00z/pdfboss/commit/8311c5d1e782d476e1e3da315e02d87a796cbfff))
+* **core:** price a retained Huffman table, not only its lines ([f361927](https://github.com/4thel00z/pdfboss/commit/f361927db2a909fa6af248bfdf7eb1b0c9a8ab0f))
+
+
+### Documentation
+
+* **core:** correct the segment-syntax clause numbers ([2744597](https://github.com/4thel00z/pdfboss/commit/2744597d542052589ad9b1a50f6187f8ded43779))
+* **core:** state the rule the budget's charges follow ([a2b25bd](https://github.com/4thel00z/pdfboss/commit/a2b25bd5108339c1fa9c8da452d723a49085eef8))
+* say that Huffman symbol dictionaries decode ([74e446d](https://github.com/4thel00z/pdfboss/commit/74e446da14c5b409a5cc9e1716283b277231524a))
+* state what JBIG2Decode covers after Huffman text regions ([7a723ad](https://github.com/4thel00z/pdfboss/commit/7a723add1f919caac952a62d080a36c41b537dc8))
+
 ## [0.6.0](https://github.com/4thel00z/pdfboss/compare/v0.5.0...v0.6.0) (2026-07-27)
 
 
