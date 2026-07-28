@@ -26,6 +26,17 @@
 //! rather than composited and dropped. So what is charged here is not "pixels
 //! decoded" but "bitmaps brought into existence", whichever way they arrived.
 //!
+//! Nor is a bitmap the only such thing, and the rule is worth stating in place
+//! of a list that will drift: a segment is charged for whatever it asks for
+//! whose size is fixed by something other than its own length. Four bytes of
+//! referred-to number stand for a whole dictionary's exports or a whole table's
+//! lines; SBNUMSYMS, which sizes the symbol ID table every Huffman text region
+//! carries (7.4.3.1.7), belongs to the dictionaries a region names and not to
+//! the region; a code table segment's table is kept for the rest of the walk
+//! rather than spent. Each of those is a lever a short segment pulls on a large
+//! quantity, and one left unpriced is enough to make the total below grow with
+//! the stream instead of stopping.
+//!
 //! Hence one budget per stream, charged from the declared dimensions *before*
 //! the decoding loop is entered. The charge is structural — it reads the
 //! header, never the coded data — so a region that cannot be afforded is
