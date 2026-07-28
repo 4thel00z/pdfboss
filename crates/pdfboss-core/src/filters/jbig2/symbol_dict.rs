@@ -1130,6 +1130,65 @@ mod tests {
         assert_eq!(decode(&segment, &[]), Err(Jbig2Error::Truncated));
     }
 
+    /// A height class declaring more pixels than the stream's whole allowance
+    /// is refused from the dimensions, before a bitmap is allocated for it.
+    ///
+    /// The demand is a couple of dozen bytes — one delta height, one delta
+    /// width and a BMSIZE of 1 — and none of it is proportional to the pixels
+    /// asked for, which is exactly why the charge cannot wait for the data.
+    #[test]
+    fn an_enormous_collective_bitmap_is_refused_by_the_budget() {
+        let dh = standard(4).expect("Table B.4");
+        let dw = standard(2).expect("Table B.2");
+        let b1 = standard(1).expect("Table B.1");
+        let mut w = BitWriter::default();
+        push_value(&mut w, &dh, Some(60_000));
+        push_value(&mut w, &dw, Some(60_000));
+        push_value(&mut w, &dw, None);
+        push_value(&mut w, &b1, Some(1)); // one byte of MMR for 3.6e9 pixels
+        w.align();
+        w.push_bytes(&[0x00]);
+
+        let mut segment = 0x0001u16.to_be_bytes().to_vec();
+        segment.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+        segment.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+        segment.extend_from_slice(&w.finish());
+        assert!(segment.len() < 64, "the demand is {} bytes", segment.len());
+        assert_eq!(decode(&segment, &[]), Err(Jbig2Error::WorkLimit));
+    }
+
+    /// A Huffman height class that codes no symbol is well formed and advances
+    /// nothing, so a stream of them is refused rather than looped on — the same
+    /// cap the arithmetic walk has, reached the same way.
+    ///
+    /// Each class here still reads a collective bitmap, because 6.5.5 step 4 d)
+    /// asks for one whether or not the class took a symbol; with TOTWIDTH 0 and
+    /// BMSIZE 0 that is a bitmap of no columns and no bytes.
+    #[test]
+    fn a_stream_of_empty_huffman_height_classes_is_refused() {
+        let dh = standard(4).expect("Table B.4");
+        let dw = standard(2).expect("Table B.2");
+        let b1 = standard(1).expect("Table B.1");
+        let mut w = BitWriter::default();
+        for _ in 0..64 {
+            // Table B.4 codes no delta below 1, so the class height climbs; it
+            // is the symbol count that stays where it was.
+            push_value(&mut w, &dh, Some(1));
+            push_value(&mut w, &dw, None);
+            push_value(&mut w, &b1, Some(0));
+            w.align();
+        }
+
+        let mut segment = 0x0001u16.to_be_bytes().to_vec();
+        segment.extend_from_slice(&1u32.to_be_bytes()); // SDNUMEXSYMS
+        segment.extend_from_slice(&1u32.to_be_bytes()); // SDNUMNEWSYMS
+        segment.extend_from_slice(&w.finish());
+        assert_eq!(
+            decode(&segment, &[]),
+            Err(Jbig2Error::Malformed("too many symbol height classes")),
+        );
+    }
+
     /// Every symbol of a Huffman dictionary is charged the same as an
     /// arithmetic one, so neither coding is the cheap way to conjure bitmaps.
     #[test]
