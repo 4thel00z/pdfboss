@@ -195,9 +195,6 @@ pub(crate) fn context_at(bm: &Bitmap, x: u32, y: u32, params: &GenericParams) ->
     }
 }
 
-/// The rows the three windows walk, as offsets from the row being decoded.
-const WINDOW_DY: [i64; 3] = [-2, -1, 0];
-
 /// The contiguous pixel runs each template's context decomposes into when the
 /// AT pixels are at their nominal offsets, as `(leftmost dx, bit width)` for
 /// rows y-2, y-1 and y (T.88 6.2.5.3, figures 3 to 6).
@@ -249,8 +246,19 @@ pub(crate) struct ContextWindows {
     entering: [i64; 3],
     /// Left shift placing each run in the assembled context.
     shifts: [u32; 3],
-    /// The row being decoded, so the reference rows can be located.
-    y: i64,
+}
+
+/// The pixel at `x` of a reference row, or 0 outside it.
+///
+/// A run reaches up to four pixels left of the current one, so `x` is signed
+/// and negative at the start of every row; a row above the top edge arrives
+/// here as an empty slice. Both read as 0, which is what T.88 6.2.5.2 says
+/// the surroundings of a region are.
+fn pixel_at(row: &[u8], x: i64) -> u16 {
+    if x < 0 {
+        return 0;
+    }
+    u16::from(row.get(x as usize).copied().unwrap_or(0))
 }
 
 impl ContextWindows {
@@ -267,15 +275,16 @@ impl ContextWindows {
     /// is unreachable — [`GenericParams::is_nominal`] refuses those before the
     /// windowed path is chosen — but the clamp costs nothing and a panic here
     /// would be reachable from stream data if that ever slipped.
-    pub(crate) fn start(bm: &Bitmap, y: u32, template: u8) -> ContextWindows {
+    pub(crate) fn start(two_up: &[u8], one_up: &[u8], template: u8) -> ContextWindows {
         let spans = WINDOW_SPANS[usize::from(template.min(MAX_TEMPLATE))];
-        let y = i64::from(y);
+        // The current row's run ends at x-1, so at x == 0 every pixel of it
+        // lies left of the bitmap and reads as 0 whatever the row holds.
+        let rows: [&[u8]; 3] = [two_up, one_up, &[]];
         let mut win = ContextWindows {
             words: [0; 3],
             masks: [0; 3],
             entering: [0; 3],
             shifts: [0; 3],
-            y,
         };
         // Assembled from the bottom row up, so each run's shift is the total
         // width of the runs below it.
@@ -284,7 +293,7 @@ impl ContextWindows {
             let (left, width) = spans[row];
             let mut word = 0u16;
             for step in 0..i64::from(width) {
-                word = (word << 1) | u16::from(bm.get(left + step, y + WINDOW_DY[row]));
+                word = (word << 1) | pixel_at(rows[row], left + step);
             }
             win.words[row] = word;
             win.masks[row] = (1u16 << width) - 1;
@@ -310,10 +319,10 @@ impl ContextWindows {
     /// back out of the bitmap because it is the one pixel entering a run whose
     /// value the caller already holds — and a skipped pixel is stored as 0, so
     /// passing the stored value keeps skip handling out of here entirely.
-    pub(crate) fn advance(&mut self, bm: &Bitmap, x: u32, just_decoded: u8) {
+    pub(crate) fn advance(&mut self, two_up: &[u8], one_up: &[u8], x: u32, just_decoded: u8) {
         let x = i64::from(x);
-        let above = u16::from(bm.get(x + self.entering[0], self.y + WINDOW_DY[0]));
-        let previous = u16::from(bm.get(x + self.entering[1], self.y + WINDOW_DY[1]));
+        let above = pixel_at(two_up, x + self.entering[0]);
+        let previous = pixel_at(one_up, x + self.entering[1]);
         self.words[0] = ((self.words[0] << 1) | above) & self.masks[0];
         self.words[1] = ((self.words[1] << 1) | previous) & self.masks[1];
         self.words[2] = ((self.words[2] << 1) | u16::from(just_decoded & 1)) & self.masks[2];
@@ -429,15 +438,18 @@ fn decode_generic_region_windowed(
             bm.duplicate_row(y);
             continue;
         }
-        let mut win = ContextWindows::start(&bm, y, params.template);
+        let (two_up, one_up, current) = bm.reference_rows(y);
+        let mut win = ContextWindows::start(two_up, one_up, params.template);
         for x in 0..width {
             let pixel = if skip.is_some_and(|s| s.get(i64::from(x), i64::from(y)) == 1) {
                 0
             } else {
                 dec.decode(cx.get_mut(usize::from(win.value())))
             };
-            bm.set(x, y, pixel);
-            win.advance(&bm, x, pixel);
+            if let Some(slot) = current.get_mut(x as usize) {
+                *slot = u8::from(pixel != 0);
+            }
+            win.advance(two_up, one_up, x, pixel);
         }
     }
     Ok(bm)
@@ -1035,6 +1047,16 @@ mod tests {
         }
     }
 
+    /// The two reference rows above `y`, for the tests that drive
+    /// [`ContextWindows`] directly from a bitmap they only read.
+    fn rows_above(bm: &Bitmap, y: u32) -> (&[u8], &[u8]) {
+        let row = |back: u32| match y.checked_sub(back) {
+            Some(r) => bm.row(r),
+            None => &[][..],
+        };
+        (row(2), row(1))
+    }
+
     /// The windowed path is only allowed to exist if it is indistinguishable
     /// from the general one. Check every pixel of a bitmap wide and tall
     /// enough to exercise both edges and the interior, for all four templates.
@@ -1045,7 +1067,8 @@ mod tests {
             for template in 0..4u8 {
                 let params = GenericParams::nominal(template);
                 for y in 0..bm.height() {
-                    let mut win = ContextWindows::start(&bm, y, template);
+                    let (two_up, one_up) = rows_above(&bm, y);
+                    let mut win = ContextWindows::start(two_up, one_up, template);
                     for x in 0..bm.width() {
                         assert_eq!(
                             win.value(),
@@ -1053,7 +1076,7 @@ mod tests {
                             "template {template} at ({x}, {y}), seed {seed:#x}",
                         );
                         let pixel = bm.get(i64::from(x), i64::from(y));
-                        win.advance(&bm, x, pixel);
+                        win.advance(two_up, one_up, x, pixel);
                     }
                 }
             }
@@ -1069,14 +1092,15 @@ mod tests {
             for template in 0..4u8 {
                 let params = GenericParams::nominal(template);
                 for y in 0..h {
-                    let mut win = ContextWindows::start(&bm, y, template);
+                    let (two_up, one_up) = rows_above(&bm, y);
+                    let mut win = ContextWindows::start(two_up, one_up, template);
                     for x in 0..w {
                         assert_eq!(
                             win.value(),
                             context_at(&bm, x, y, &params),
                             "{w}x{h} template {template} at ({x}, {y})",
                         );
-                        win.advance(&bm, x, bm.get(i64::from(x), i64::from(y)));
+                        win.advance(two_up, one_up, x, bm.get(i64::from(x), i64::from(y)));
                     }
                 }
             }
@@ -1089,9 +1113,10 @@ mod tests {
     #[test]
     fn the_windows_assemble_the_hand_computed_context() {
         let bm = subject();
-        let mut win = ContextWindows::start(&bm, 3, 0);
+        let (two_up, one_up) = rows_above(&bm, 3);
+        let mut win = ContextWindows::start(two_up, one_up, 0);
         for x in 0..4u32 {
-            win.advance(&bm, x, bm.get(i64::from(x), 3));
+            win.advance(two_up, one_up, x, bm.get(i64::from(x), 3));
         }
         assert_eq!(win.words, [0b10100, 0b100_1100, 0b0010]);
         assert_eq!(win.value(), 0xA4C2);

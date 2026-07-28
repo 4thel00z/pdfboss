@@ -162,6 +162,38 @@ impl Bitmap {
         self.data.get(start..start + stride).unwrap_or(&[])
     }
 
+    /// The two rows above `y` and row `y` itself, the first two shared and the
+    /// last exclusive.
+    ///
+    /// A generic region reads its context from the two rows above the one it
+    /// is decoding and writes only to that row, so those borrows can coexist
+    /// — and handing them out as slices is what keeps the inner loop from
+    /// paying for the general [`Bitmap::get`] on every pixel it reads. Rows
+    /// above the top edge come back empty, which reads as the all-zero
+    /// surroundings T.88 6.2.5.2 requires.
+    pub(crate) fn reference_rows(&mut self, y: u32) -> (&[u8], &[u8], &mut [u8]) {
+        let stride = self.width as usize;
+        let start = y as usize * stride;
+        if stride == 0 || y >= self.height || start >= self.data.len() {
+            return (&[], &[], &mut []);
+        }
+        let (past, rest) = self.data.split_at_mut(start);
+        let current = match rest.get_mut(..stride) {
+            Some(row) => row,
+            None => &mut [],
+        };
+        let past: &[u8] = past;
+        let two_up = match (y as usize).checked_sub(2) {
+            Some(r) => past.get(r * stride..r * stride + stride).unwrap_or(&[]),
+            None => &[],
+        };
+        let one_up = match (y as usize).checked_sub(1) {
+            Some(r) => past.get(r * stride..r * stride + stride).unwrap_or(&[]),
+            None => &[],
+        };
+        (two_up, one_up, current)
+    }
+
     /// Copies row `y - 1` over row `y`.
     ///
     /// This is the typical-prediction path of T.88 6.2.5.7: when LTP is 1 the
