@@ -75,7 +75,7 @@ fn encode_pixels(enc: &mut MqEncoder, gb: &mut [MqContext], bm: &Bitmap) {
     }
 }
 
-/// Builds the data of an arithmetic symbol dictionary segment (T.88 7.4.3)
+/// Builds the data of an arithmetic symbol dictionary segment (T.88 7.4.2)
 /// carrying `symbols`, all of them exported.
 ///
 /// `symbols` must be ordered as an encoder orders them: ascending by height,
@@ -127,7 +127,7 @@ pub(crate) fn dictionary_segment(symbols: &[Bitmap], num_input: u32) -> Vec<u8> 
     out
 }
 
-/// Builds the data of a symbol dictionary segment (T.88 7.4.3) that codes no
+/// Builds the data of a symbol dictionary segment (T.88 7.4.2) that codes no
 /// symbols of its own and re-exports all `num_input` symbols its referred-to
 /// dictionaries supplied (6.5.10).
 ///
@@ -152,7 +152,7 @@ pub(crate) fn reexport_segment(num_input: u32) -> Vec<u8> {
     out
 }
 
-/// Builds the data of a symbol dictionary segment (T.88 7.4.3) coding `count`
+/// Builds the data of a symbol dictionary segment (T.88 7.4.2) coding `count`
 /// symbols one pixel wide and no pixels tall, none of them exported.
 ///
 /// A symbol with no rows codes no pixel decisions whatever its width, so the
@@ -184,7 +184,7 @@ pub(crate) fn rowless_dictionary_segment(count: u32) -> Vec<u8> {
 }
 
 /// The four AT pixel pairs of template 0 at their nominal offsets, as the
-/// eight signed bytes a segment header carries them in (T.88 7.4.3.1.2).
+/// eight signed bytes a segment header carries them in (T.88 7.4.2.1.2).
 pub(crate) fn nominal_at_bytes() -> Vec<u8> {
     let mut out = Vec::new();
     for (dx, dy) in NOMINAL_AT[0] {
@@ -214,7 +214,7 @@ pub(crate) fn two_symbols() -> Vec<Bitmap> {
     ]
 }
 
-/// The text region segment flags a fixture sets (T.88 7.4.4.1.1).
+/// The text region segment flags a fixture sets (T.88 7.4.3.1.1).
 ///
 /// The defaults are the combination a plain line of text uses: one row per
 /// strip, TOPLEFT corners, untransposed, OR composition, a clear background and
@@ -249,7 +249,7 @@ impl Default for Shape {
 }
 
 /// Packs a [`Shape`] into the two-byte text region segment flags field
-/// (T.88 7.4.4.1.1), with SBHUFF, REFINE and SBRTEMPLATE all clear.
+/// (T.88 7.4.3.1.1), with SBHUFF, REFINE and SBRTEMPLATE all clear.
 ///
 /// SBDSOFFSET occupies bits 10 to 14 as a five-bit two's complement number, so
 /// a negative offset is masked to five bits rather than sign-extended into the
@@ -290,7 +290,7 @@ fn region_info_bytes(width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-/// Builds the data of an arithmetic text region segment (T.88 7.4.4) placing
+/// Builds the data of an arithmetic text region segment (T.88 7.4.3) placing
 /// the instructions in `ops`.
 ///
 /// `initial_dt` is the value of step 2's leading `IADT`, which the procedure

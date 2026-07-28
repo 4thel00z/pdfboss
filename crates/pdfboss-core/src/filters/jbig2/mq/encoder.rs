@@ -1,4 +1,4 @@
-//! A test-only MQ arithmetic *encoder* (ITU-T T.88 Annex E, E.3.6 to E.3.9).
+//! A test-only MQ arithmetic *encoder* (ITU-T T.88 Annex E, E.2.3 to E.2.9).
 //!
 //! The decoder in the parent module is checked against its own inverse. The
 //! encoding procedures — INITENC, CODE0/CODE1, BYTEOUT, RENORME, SETBITS and
@@ -14,7 +14,7 @@
 
 use super::MqContext;
 
-/// The MQ encoder over a growing output buffer (T.88 E.3.6).
+/// The MQ encoder over a growing output buffer (T.88 E.2).
 ///
 /// The registers are the encoder's own: `A` is the interval, `C` the code
 /// register — three bits wider than the decoder's use of it, since the
@@ -34,7 +34,7 @@ pub(crate) struct MqEncoder {
 }
 
 impl MqEncoder {
-    /// INITENC (T.88 E.3.8).
+    /// INITENC (T.88 E.2.8).
     ///
     /// `CT` starts at 12 because the code register is filled 12 bits above
     /// the byte boundary; the standard's 13 applies when the byte preceding
@@ -71,7 +71,7 @@ impl MqEncoder {
         self.ct = 8;
     }
 
-    /// BYTEOUT (T.88 E.3.7): moves the completed bits of `C` into the output,
+    /// BYTEOUT (T.88 E.2.7): moves the completed bits of `C` into the output,
     /// propagating a carry into the byte already emitted and stuffing a
     /// seven-bit byte after any `0xFF` so that no `0xFF` is ever followed by
     /// a byte above `0x8F` inside the code stream.
@@ -94,7 +94,7 @@ impl MqEncoder {
         }
     }
 
-    /// RENORME (T.88 E.3.9): shifts until `A` regains its most significant
+    /// RENORME (T.88 E.2.6): shifts until `A` regains its most significant
     /// bit, emitting a byte each time `CT` runs out. Unlike the decoder's
     /// RENORMD the byte transfer follows the shift.
     fn renorm(&mut self) {
@@ -111,7 +111,7 @@ impl MqEncoder {
         }
     }
 
-    /// CODEMPS (T.88 E.3.2): codes the more probable symbol, renormalizing
+    /// CODEMPS (T.88 E.2.4): codes the more probable symbol, renormalizing
     /// and advancing the state only when `A` loses its most significant bit.
     fn code_mps(&mut self, cx: &mut MqContext) {
         let (qe, nmps, _, _) = cx.row();
@@ -130,7 +130,7 @@ impl MqEncoder {
         }
     }
 
-    /// CODELPS (T.88 E.3.2): codes the less probable symbol, which always
+    /// CODELPS (T.88 E.2.4): codes the less probable symbol, which always
     /// renormalizes and always advances the state.
     fn code_lps(&mut self, cx: &mut MqContext) {
         let (qe, _, nlps, switch) = cx.row();
@@ -148,7 +148,7 @@ impl MqEncoder {
         self.renorm();
     }
 
-    /// CODE0 / CODE1 (T.88 E.3.2): codes one bit against `cx`.
+    /// CODE0 / CODE1 (T.88 E.2.3): codes one bit against `cx`.
     pub(crate) fn encode(&mut self, cx: &mut MqContext, bit: u8) {
         if bit == cx.mps {
             self.code_mps(cx);
@@ -157,7 +157,7 @@ impl MqEncoder {
         }
     }
 
-    /// SETBITS (T.88 E.3.8): pushes `C` as high inside the final interval as
+    /// SETBITS (T.88 E.2.9): pushes `C` as high inside the final interval as
     /// it will go, so the trailing bits the decoder invents cannot carry it
     /// out again.
     fn set_bits(&mut self) {
@@ -168,7 +168,7 @@ impl MqEncoder {
         }
     }
 
-    /// FLUSH (T.88 E.3.8): completes the code stream and returns it.
+    /// FLUSH (T.88 E.2.9): completes the code stream and returns it.
     ///
     /// The trailing `0xFF 0xAC` is the marker the standard appends; the
     /// decoder's BYTEIN recognizes it and switches to feeding 1-bits, which

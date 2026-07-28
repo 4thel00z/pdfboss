@@ -184,7 +184,7 @@ impl Bitmap {
     /// Composites `src` onto this bitmap with its top-left corner at `(x, y)`,
     /// clipped to this bitmap's extent.
     ///
-    /// This is the general region composition of T.88 6.1 and 7.4.1. A region
+    /// This is the general region composition of T.88 8.2 and 7.4.1.5. A region
     /// may legitimately be placed so that it hangs off any edge of the page, so
     /// the overlap is computed once, up front, in `i64` — an offset of
     /// `i32::MIN` plus a `u32` width has no room to wrap there — and the inner

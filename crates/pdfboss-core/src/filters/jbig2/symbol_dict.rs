@@ -1,4 +1,4 @@
-//! Symbol dictionary segments (T.88 6.5, 7.4.3).
+//! Symbol dictionary segments (T.88 6.5, 7.4.2).
 //!
 //! A scanned page of text is not coded as pixels. The encoder finds the
 //! connected components on the scan, clusters the ones that look alike, and
@@ -71,7 +71,7 @@ pub(crate) const SYMBOL_COST: u64 = 512;
 /// here and there entirely alone.
 const LOOP_SLACK: usize = 2;
 
-/// Decodes a symbol dictionary segment's data (T.88 7.4.3), returning the
+/// Decodes a symbol dictionary segment's data (T.88 7.4.2), returning the
 /// symbols it exports.
 ///
 /// `input_symbols` are the symbols exported by the referred-to dictionary
@@ -142,7 +142,7 @@ pub(crate) fn decode_symbol_dict(
 }
 
 /// The fields of a symbol dictionary segment that precede its coded data
-/// (T.88 7.4.3.1).
+/// (T.88 7.4.2.1).
 struct DictHeader {
     /// The generic region parameters every symbol bitmap is coded with:
     /// SDTEMPLATE and SDAT, with typical prediction off (6.5.8.1).
@@ -154,7 +154,7 @@ struct DictHeader {
 }
 
 /// Parses the symbol dictionary flags and the fields that follow them
-/// (T.88 7.4.3.1.1 to 7.4.3.1.4).
+/// (T.88 7.4.2.1.1 to 7.4.2.1.5).
 ///
 /// The two coding modes this build does not implement are refused before a
 /// single further byte is read, because the layout of everything after the
@@ -184,7 +184,7 @@ fn parse_header(r: &mut Reader<'_>) -> Result<DictHeader, Jbig2Error> {
     }
     let template = ((flags >> 10) & 0x3) as u8;
 
-    // 7.4.3.1.2: eight AT bytes for template 0, two for the rest. The slots a
+    // 7.4.2.1.2: eight AT bytes for template 0, two for the rest. The slots a
     // template does not use keep their nominal offsets, so the parameters
     // always describe a complete neighbourhood.
     let mut params = GenericParams::nominal(template);

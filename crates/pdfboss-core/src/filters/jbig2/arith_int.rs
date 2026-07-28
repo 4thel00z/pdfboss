@@ -347,8 +347,8 @@ pub(crate) mod encoder {
 ///
 /// Every symbol dictionary and region decoder carries one of these for the
 /// duration of a segment. The names are the standard's: `IADH` and `IADW` are
-/// the height and width deltas of a symbol dictionary (6.5.5, 6.5.6), `IAEX`
-/// and `IAAI` its export runs and aggregate counts (6.5.8, 6.5.10), and the
+/// the height and width deltas of a symbol dictionary (6.5.6, 6.5.7), `IAEX`
+/// and `IAAI` its export runs and aggregate counts (6.5.10, 6.5.8.2.1), and the
 /// remaining nine drive text regions — strip offsets, first symbol and
 /// subsequent symbol coordinates, the refinement flag and its four offsets
 /// (6.4.5 onward).
@@ -419,7 +419,7 @@ impl IntCtxSet {
     /// Nothing in this build calls it: every segment that needs fresh
     /// statistics gets a fresh set, and the one place the standard asks for an
     /// in-place reset is the retained-context flags of a symbol dictionary
-    /// (7.4.3.1.1 bits 8 and 9), which this build reads and ignores.
+    /// (7.4.2.1.1 bits 8 and 9), which this build reads and ignores.
     #[allow(dead_code)] // Reached once retained arithmetic contexts are honoured.
     pub(crate) fn reset(&mut self) {
         for cx in self.all_mut() {

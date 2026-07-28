@@ -2,7 +2,7 @@
 //!
 //! A generic region is a rectangle of pixels decoded one at a time, each
 //! against an adaptive arithmetic context formed from the pixels already
-//! decoded around it. Four templates (6.2.5.3, figures 4 to 7) select which
+//! decoded around it. Four templates (6.2.5.3, figures 3 to 6) select which
 //! neighbours take part; each template reserves one to four *adaptive* slots
 //! whose offsets the segment header carries, so an encoder can point them at
 //! whatever correlates best with the image.
@@ -65,7 +65,7 @@ pub(crate) const TPGD_CONTEXT: [u16; 4] = [0x9B25, 0x0795, 0x00E5, 0x0195];
 const MAX_TEMPLATE: u8 = 3;
 
 /// The parameters of a generic region decoding procedure that come from the
-/// segment header (T.88 6.2.5.1, 7.4.6.2).
+/// segment header (T.88 6.2.2, 7.4.6.2 and 7.4.6.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GenericParams {
     /// GBTEMPLATE, 0 to 3. Selects the pixel neighbourhood.
@@ -113,7 +113,7 @@ impl GenericParams {
 }
 
 /// Forms the arithmetic coding context for the pixel at `(x, y)`
-/// (T.88 6.2.5.7, figures 4 through 7).
+/// (T.88 6.2.5.7, figures 3 through 6).
 ///
 /// Bits run most-significant first, top template row to bottom, left to right
 /// within each row, with the AT pixels in the slots the figures assign them:
@@ -200,7 +200,7 @@ const WINDOW_DY: [i64; 3] = [-2, -1, 0];
 
 /// The contiguous pixel runs each template's context decomposes into when the
 /// AT pixels are at their nominal offsets, as `(leftmost dx, bit width)` for
-/// rows y-2, y-1 and y (T.88 6.2.5.3, figures 4 to 7).
+/// rows y-2, y-1 and y (T.88 6.2.5.3, figures 3 to 6).
 ///
 /// The runs are read left to right into the context's bits in the same order,
 /// so the context is simply the three runs concatenated. Template 3 reads a
@@ -534,7 +534,7 @@ fn typical_prediction_repeats_row(
 }
 
 /// Reads the generic region segment flags byte and the AT pixel offsets that
-/// follow it (T.88 7.4.6.2), returning `(MMR, parameters)`.
+/// follow it (T.88 7.4.6.2 and 7.4.6.3), returning `(MMR, parameters)`.
 ///
 /// Bit 0 is MMR, bits 1 to 2 are GBTEMPLATE, bit 3 is TPGDON, and bits 4 to 7
 /// are reserved: a stream setting them is not one this decoder understands, so
@@ -556,7 +556,7 @@ pub(crate) fn parse_generic_flags(r: &mut Reader<'_>) -> Result<(bool, GenericPa
     let mut params = GenericParams::nominal(template);
     params.tpgdon = tpgdon;
 
-    // 7.4.6.2: eight AT bytes for template 0, two for the rest, none at all
+    // 7.4.6.3: eight AT bytes for template 0, two for the rest, none at all
     // when the region is MMR-coded.
     let at_pairs = if mmr {
         0

@@ -87,11 +87,11 @@ pub(crate) const QE: [(u16, u8, u8, u8); 47] = [
 ];
 
 /// One adaptive context: an index into [`QE`] and the current sense of the
-/// more probable symbol (T.88 E.3.1).
+/// more probable symbol — `I(CX)` and `MPS(CX)` in T.88 E.3.2.
 ///
 /// Contexts start at index 0 with MPS 0, which is the initialization every
 /// JBIG2 segment applies to a freshly allocated or reset context array
-/// (T.88 E.3.5).
+/// (T.88 E.3.7).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct MqContext {
     /// Row of [`QE`] this context currently estimates from, always `0..=46`.
@@ -136,7 +136,7 @@ pub(crate) struct MqContexts(Vec<MqContext>);
 
 impl MqContexts {
     /// Allocates `len` contexts, all initialized to state 0 / MPS 0
-    /// (T.88 E.3.5). A zero length is rounded up to one entry so that
+    /// (T.88 E.3.7). A zero length is rounded up to one entry so that
     /// [`MqContexts::get_mut`] always has something to return.
     pub(crate) fn new(len: usize) -> Self {
         Self(vec![MqContext::default(); len.max(1)])
@@ -168,16 +168,16 @@ impl MqContexts {
 }
 
 /// Renormalization shifts the marker convention may feed before the coded
-/// data counts as spent (T.88 E.3.4, E.3.8).
+/// data counts as spent (T.88 E.3.4, E.2.9).
 ///
 /// Once BYTEIN takes the marker branch, `BP` stops advancing and the same two
 /// bytes are re-examined on every later call, so no further input will ever be
 /// read. The decoder cannot stop there: the code register still holds the tail
-/// of the real input at that moment, and FLUSH (E.3.8) relies on exactly that
+/// of the real input at that moment, and FLUSH (E.2.9) relies on exactly that
 /// to keep the last coded decisions recoverable. `C` is 32 bits wide, so after
 /// 32 shifts under the marker every bit in it was synthesized by the 1-fill
 /// and nothing decoded afterwards can carry information from the input. A
-/// stream flushed per E.3.8 is measurably clear of that: the last decision of
+/// stream flushed per E.2.9 is measurably clear of that: the last decision of
 /// the streams in `a_flushed_stream_lasts_until_its_final_bit` comes back
 /// after five such shifts at worst, so the bound cannot truncate a well-formed
 /// segment.
@@ -446,7 +446,7 @@ mod tests {
 
     /// Exhaustion must not arrive while the stream still has decisions in it.
     ///
-    /// FLUSH (T.88 E.3.8) ends a stream with the same `FF AC` marker that a
+    /// FLUSH (T.88 E.2.9) ends a stream with the same `FF AC` marker that a
     /// truncated one runs into, and the decisions coded into the final bytes
     /// are read back *after* the decoder locks onto it. Declaring the data
     /// spent too early would drop them, so the check runs before every single
@@ -491,7 +491,7 @@ mod tests {
         let _ = cx.get_mut(99_999);
     }
 
-    /// Fresh contexts start at state 0 with MPS 0 (T.88 E.3.5).
+    /// Fresh contexts start at state 0 with MPS 0 (T.88 E.3.7).
     #[test]
     fn contexts_start_at_state_zero() {
         let cx = MqContext::default();
@@ -902,7 +902,7 @@ mod tests {
         }
     }
 
-    /// FLUSH ends the code stream with `FF AC` (T.88 E.3.8).
+    /// FLUSH ends the code stream with `FF AC` (T.88 E.2.9).
     ///
     /// That pair is both the decoder's marker — BYTEIN sees `0xFF` followed by
     /// a byte above `0x8F` and switches to feeding 1-bits — and the sequence

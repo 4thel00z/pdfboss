@@ -30,7 +30,7 @@ pub(crate) const MAX_REFERRED_TO: u32 = 65_536;
 /// four four-byte coordinates and a flags byte.
 const REGION_INFO_LEN: usize = 17;
 
-/// The kind of a segment, from the type field of T.88 7.3, Table 34.
+/// The kind of a segment, from the type field of T.88 7.3.
 ///
 /// "Immediate" means the region composites straight onto the page;
 /// "intermediate" means it is retained in an auxiliary buffer for a later
@@ -309,7 +309,7 @@ fn unknown_length_extent(kind: SegmentKind, data: &[u8]) -> Result<usize, Jbig2E
     let mmr = flags & 1;
     let template = (flags >> 1) & 3;
 
-    // 7.4.6.2 — AT pixels are present only for arithmetic coding: four pairs
+    // 7.4.6.3 — AT pixels are present only for arithmetic coding: four pairs
     // of signed bytes for template 0, one pair otherwise.
     let at_len = match (mmr, template) {
         (1, _) => 0,
@@ -711,7 +711,7 @@ mod tests {
         }
     }
 
-    /// Exactly the rows of the 7.3 table are accepted; every other value of
+    /// Exactly the entries of the 7.3 list are accepted; every other value of
     /// the six-bit type field is rejected.
     #[test]
     fn segment_kind_covers_the_whole_type_field() {

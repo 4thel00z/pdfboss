@@ -49,7 +49,7 @@ impl<'a> Reader<'a> {
 
     /// One byte, read as a two's-complement signed value.
     ///
-    /// The AT pixel offsets of T.88 7.4.6.2 are signed bytes.
+    /// The AT pixel offsets of T.88 7.4.6.3 are signed bytes.
     pub(crate) fn i8(&mut self) -> Result<i8, Jbig2Error> {
         Ok(self.u8()? as i8)
     }

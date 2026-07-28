@@ -1,4 +1,4 @@
-//! Text region segments (T.88 6.4, 7.4.4).
+//! Text region segments (T.88 6.4, 7.4.3).
 //!
 //! A text region is the placement list a symbol dictionary exists to serve: a
 //! sequence of (symbol, position) pairs, coded as small integers because every
@@ -52,7 +52,7 @@ pub(crate) const MAX_INSTANCES: u32 = 1 << 22;
 /// placements a stream may make to the one allowance the stream has.
 pub(crate) const INSTANCE_COST: u64 = 64;
 
-/// Which corner of a symbol its coded coordinate names (T.88 7.4.4.1.1,
+/// Which corner of a symbol its coded coordinate names (T.88 7.4.3.1.1,
 /// REFCORNER).
 ///
 /// The discriminants are the field's own encoding, which is why the ordering
@@ -71,7 +71,7 @@ pub(crate) enum RefCorner {
 }
 
 impl RefCorner {
-    /// Decodes the two-bit REFCORNER field of T.88 7.4.4.1.1.
+    /// Decodes the two-bit REFCORNER field of T.88 7.4.3.1.1.
     ///
     /// All four values are defined, so there is nothing to reject; bits above
     /// the low two belong to other fields and are masked away.
@@ -86,7 +86,7 @@ impl RefCorner {
 }
 
 /// SBSYMCODELEN: the number of bits an arithmetic text region spends on a
-/// symbol ID (T.88 7.4.4.5).
+/// symbol ID (T.88 7.4.3.2, Table 31).
 ///
 /// It is the width of the largest id, `ceil(log2(SBNUMSYMS))`, which is 0 when
 /// there is exactly one symbol — a region with a single symbol codes no id bits
@@ -100,7 +100,7 @@ pub(crate) fn sym_code_len(num_syms: u32) -> u32 {
     }
 }
 
-/// Decodes a text region segment's data (T.88 7.4.4), returning where the
+/// Decodes a text region segment's data (T.88 7.4.3), returning where the
 /// region goes and the pixels that go there.
 ///
 /// `symbols` are the symbols exported by the referred-to dictionary segments,
@@ -145,7 +145,7 @@ pub(crate) fn decode_text_region(
 }
 
 /// The fields of a text region segment that precede its coded data
-/// (T.88 7.4.4.1).
+/// (T.88 7.4.3.1).
 struct TextParams {
     /// SBSTRIPS, the number of rows one strip spans: `1 << LOGSBSTRIPS`, so 1,
     /// 2, 4 or 8.
@@ -165,7 +165,7 @@ struct TextParams {
 }
 
 /// Parses the text region segment flags and the instance count that follows
-/// them (T.88 7.4.4.1.1 and 7.4.4.1.7).
+/// them (T.88 7.4.3.1.1 and 7.4.3.1.4).
 ///
 /// The two coding modes this build does not implement are refused before any
 /// further byte is read, because the layout after the flags depends on them: a
@@ -188,7 +188,7 @@ fn parse_params(r: &mut Reader<'_>) -> Result<TextParams, Jbig2Error> {
     let corner = RefCorner::from_bits(((flags >> 4) & 0x3) as u8);
     let transposed = flags & 0x0040 != 0;
     // Two bits here rather than the three a region information field carries,
-    // so REPLACE is unreachable — 7.4.4.1.1 does not offer it.
+    // so REPLACE is unreachable — 7.4.3.1.1 does not offer it.
     let comb_op = CombOp::from_bits(((flags >> 7) & 0x3) as u8)?;
     let def_pixel = u8::from(flags & 0x0200 != 0);
     // SBDSOFFSET is five bits of two's complement, so it sign-extends from bit
@@ -301,7 +301,7 @@ impl Walk<'_, '_> {
     /// takes after it (T.88 6.4.5 step 3(c)).
     fn place_one(&mut self, curs: i64, strip_t: i64) -> Result<i64, Jbig2Error> {
         // 6.4.5 step 3(c)(iii): a one-row strip has nowhere to offset within,
-        // and 6.4.8 codes no IAIT value for it.
+        // and 6.4.9 codes no IAIT value for it.
         let curt = if self.params.strips == 1 {
             0
         } else {
@@ -323,7 +323,7 @@ impl Walk<'_, '_> {
         self.budget.charge(INSTANCE_COST)?;
         self.budget.charge_region(symbol.width(), symbol.height())?;
 
-        // 6.4.5 steps 3(c)(vi) and (ix): CURS always finishes on the symbol's
+        // 6.4.5 steps 3(c)(vi) and (x): CURS always finishes on the symbol's
         // far edge along the strip. Which end of the symbol that is depends on
         // the corner, so the advance happens either before the draw or after it
         // — never both, never neither. The two conditions are complements,
@@ -456,7 +456,7 @@ mod tests {
     }
 
     /// All eight TRANSPOSED by REFCORNER combinations, against coordinates
-    /// derived by hand from 6.4.5 steps 3(c)(vi), (viii) and (ix).
+    /// derived by hand from 6.4.5 steps 3(c)(vi), (viii) and (x).
     ///
     /// One instance of a 3 by 2 symbol, FIRSTS = 4 and STRIPT = 5. Where two
     /// rows agree it is not a coincidence: the advance of step (vi) and the

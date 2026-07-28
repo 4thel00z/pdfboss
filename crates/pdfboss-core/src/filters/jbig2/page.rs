@@ -136,9 +136,9 @@ fn decode_embedded_within(
     let page_segments = parse_embedded(data)?;
 
     // Exported symbols, keyed by the segment number that exported them. A text
-    // region names the dictionaries it draws on by number (7.4.4.2), and a
+    // region names the dictionaries it draws on by number (7.4.3.2), and a
     // dictionary names the ones supplying its own inputs the same way
-    // (7.4.3.1.7), so the store outlives each segment and spans the globals and
+    // (7.4.2.2), so the store outlives each segment and spans the globals and
     // the page stream alike.
     let mut symbols: HashMap<u32, Vec<Bitmap>> = HashMap::new();
     let mut page: Option<Bitmap> = None;
@@ -179,7 +179,7 @@ fn decode_embedded_within(
                 page = Some(target);
             }
             // Segments that carry no pixels for this decoder. End of stripe
-            // (7.4.9) states the Y coordinate of a stripe's last row, which is
+            // (7.4.10) states the Y coordinate of a stripe's last row, which is
             // informational once the caller has supplied the page height;
             // profiles and extensions carry no image data at all.
             SegmentKind::EndOfPage
@@ -229,7 +229,7 @@ fn offset(coordinate: u32) -> i32 {
 }
 
 /// The symbols a segment's referred-to list supplies, concatenated in the order
-/// the list names them (T.88 7.4.3.1.7, 7.4.4.2).
+/// the list names them (T.88 7.4.2.2, 7.4.3.2).
 ///
 /// Order is the whole point: a symbol ID indexes this concatenation, so naming
 /// two dictionaries the other way round names different glyphs. Segment numbers
@@ -570,9 +570,9 @@ mod tests {
 
     /// An immediate generic region whose MMR flag is set carries a
     /// two-dimensional facsimile stream instead of arithmetically coded pixels,
-    /// and no AT bytes at all (T.88 6.2.6, 7.4.6.2). Its pixels must reach the
-    /// page at the offset its region information field gives, the same as any
-    /// other region's.
+    /// and no AT bytes at all (T.88 6.2.6, 7.4.6.2, 7.4.6.3). Its pixels must
+    /// reach the page at the offset its region information field gives, the
+    /// same as any other region's.
     #[test]
     fn a_page_with_an_mmr_region_decodes() {
         let bm = bitmap_from_rows(&[
@@ -946,7 +946,7 @@ mod tests {
 
     /// The shape of a scanned page: page information, one symbol dictionary,
     /// then a text region whose header names the dictionary's segment number,
-    /// which is the only way it finds its symbols (T.88 7.4.4.2).
+    /// which is the only way it finds its symbols (T.88 7.4.3.2).
     fn symbol_coded_stream(page: (u32, u32), symbols: &[Bitmap], ops: &[Op]) -> Vec<u8> {
         let mut out = page_info_segment(0, page);
 
@@ -1136,7 +1136,7 @@ mod tests {
     }
 
     /// A dictionary's own referred-to list supplies its input symbols
-    /// (7.4.3.1.7), which it may re-export — so a text region naming only the
+    /// (7.4.2.2), which it may re-export — so a text region naming only the
     /// second dictionary still reaches the first one's symbol.
     #[test]
     fn a_dictionary_re_exports_symbols_from_the_dictionary_it_refers_to() {
