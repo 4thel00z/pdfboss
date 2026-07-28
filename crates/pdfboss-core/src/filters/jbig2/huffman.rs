@@ -385,6 +385,53 @@ fn assign_prefix_codes(pref_lens: &[u8]) -> Result<Vec<u32>, Jbig2Error> {
     Ok(codes)
 }
 
+/// A table over the indices of `lengths`: the line at index `i` carries the
+/// prefix length `lengths[i]` and decodes to the value `i`.
+///
+/// This is the shape both halves of T.88 7.4.3.1.7 ask for. Step 2 assigns
+/// codes to RUNCODE0 through RUNCODE34 from thirty-five lengths and step 7
+/// assigns SBSYMCODES from SBNUMSYMS of them, and in each the decoded value is
+/// the position of the code that matched — 6.4.10 says as much of the symbol
+/// IDs: "IDI is the index of the entry in SBSYMCODES that is read". Expressing
+/// that as ordinary range lines of RANGELEN 0 whose RANGELOW is the index means
+/// B.3, the canonical matcher and the over-subscription check are the ones
+/// every other table uses rather than a second implementation for this case.
+///
+/// A length of 0 is a line B.3 assigns no code, which is exactly what
+/// 7.4.3.1.7 means by an unused run code or an unused symbol.
+pub(crate) fn from_code_lengths(lengths: &[u8]) -> Result<Table, Jbig2Error> {
+    let mut lines = Vec::with_capacity(lengths.len());
+    for (index, &pref_len) in lengths.iter().enumerate() {
+        let value = i32::try_from(index)
+            .map_err(|_| Jbig2Error::Malformed("Huffman code list longer than a value"))?;
+        lines.push(Line::normal(pref_len, 0, value));
+    }
+    Table::new(lines)
+}
+
+/// The next referred-to table segment's table, in the binding order of
+/// T.88 7.4.2.1.6 and 7.4.3.1.6.
+///
+/// Both clauses say the same thing about the same list: the *n*-th table
+/// segment a segment refers to binds to the *n*-th selector reading
+/// "user-supplied", and the two counts must agree exactly. `missing` is what
+/// the caller calls that disagreement, since a dictionary and a text region
+/// each name their own flags word in the complaint.
+///
+/// The table is cloned rather than borrowed. A table is a few dozen lines, it
+/// is cloned at most three times per segment, and the alternative is a lifetime
+/// threaded through every header and decoding function for the sake of a copy
+/// that does not show up in a profile.
+pub(crate) fn take_custom(
+    tables: &[&Table],
+    used: &mut usize,
+    missing: &'static str,
+) -> Result<Table, Jbig2Error> {
+    let table = tables.get(*used).ok_or(Jbig2Error::Malformed(missing))?;
+    *used += 1;
+    Ok((*table).clone())
+}
+
 /// Reads `n` bits as an unsigned integer, most significant first.
 ///
 /// Unlike [`BitReader::peek`], which zero-fills past the end so that a
@@ -393,11 +440,17 @@ fn assign_prefix_codes(pref_lens: &[u8]) -> Result<Vec<u32>, Jbig2Error> {
 /// whose width the stream itself declared, and a field that is not there is a
 /// truncated segment.
 ///
+/// It is shared with the text region parser, whose symbol ID table reads
+/// four-bit run code lengths and the extra bits of a run (7.4.3.1.7), and
+/// whose T coordinate is `log2(SBSTRIPS)` bits read straight from the stream
+/// (6.4.9). Those are the same "a field the stream declared" reads as the ones
+/// below, and they must fail the same way.
+///
 /// `n` is clamped to [`MAX_RANGE_LEN`], which no caller exceeds — the prefix
 /// and range size fields are at most 8 bits wide (B.2.1) and RANGELEN is
 /// checked when the table is built — so the clamp is only there to keep the
 /// shift inside the reader in range without a branch.
-fn read_bits(bits: &mut BitReader, n: u8) -> Result<u32, Jbig2Error> {
+pub(crate) fn read_bits(bits: &mut BitReader, n: u8) -> Result<u32, Jbig2Error> {
     let n = u32::from(n.min(MAX_RANGE_LEN));
     if bits.remaining() < n as usize {
         return Err(Jbig2Error::Truncated);

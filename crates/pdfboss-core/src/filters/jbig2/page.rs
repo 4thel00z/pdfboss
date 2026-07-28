@@ -12,7 +12,8 @@
 //! it draws on in its header's referred-to list, and the concatenation of their
 //! exports in that order is the list its symbol IDs index; a dictionary or a
 //! region coded with the Huffman variant names its custom tables the same way
-//! (7.4.2.1.6). So both stores have to outlive the segment that filled them,
+//! (7.4.2.1.6, 7.4.3.1.6). So both stores have to outlive the segment that
+//! filled them,
 //! and have to span the globals stream and the page stream as one sequence.
 //!
 //! Two rules shape everything else here.
@@ -179,7 +180,8 @@ fn decode_embedded_within(
             }
             SegmentKind::ImmediateTextRegion | SegmentKind::ImmediateLosslessTextRegion => {
                 let inputs = gather_referred_to(&symbols, &tables, &segment.header.referred_to)?;
-                let (info, region) = decode_text_region(segment.data, &inputs.symbols, budget)?;
+                let (info, region) =
+                    decode_text_region(segment.data, &inputs.symbols, &inputs.tables, budget)?;
                 let mut target = match page.take() {
                     Some(existing) => existing,
                     None => Bitmap::new(width, height)?,
@@ -382,8 +384,9 @@ mod tests {
     use crate::filters::jbig2::symbol_dict::SYMBOL_COST;
     use crate::filters::jbig2::testing::{
         code_table_segment, dictionary_segment, expect_at, glyph, header,
-        huffman_dictionary_segment, reexport_segment, rowless_dictionary_segment,
-        split_after_segment, text_segment_for_page, Collective, Op,
+        huffman_dictionary_segment, huffman_text_segment, reexport_segment,
+        rowless_dictionary_segment, split_after_segment, text_segment_for_page, Collective, Op,
+        Placement, Shape,
     };
 
     /// Assembles a complete embedded stream: page info, one immediate generic
@@ -665,6 +668,47 @@ mod tests {
         stream.extend_from_slice(&header(2, 0, &[1], 1, dict.len() as u32));
         stream.extend_from_slice(&dict);
         stream.extend_from_slice(&header(3, 6, &[2], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 32, 24).expect("page");
+        expect_at(&page, &symbols[0], 1, 2);
+        expect_at(&page, &symbols[1], 5, 2);
+    }
+
+    /// A Huffman symbol dictionary and a Huffman text region, decoded end to
+    /// end as an embedded stream: not one arithmetic decoder in the whole
+    /// thing.
+    ///
+    /// The two halves meet at the symbol list. The dictionary's height class
+    /// arrives as one MMR-coded collective bitmap cut back into symbols by the
+    /// widths that preceded it (6.5.9), and the region then names those symbols
+    /// through a symbol ID table it coded for itself (7.4.3.1.7) — so a symbol
+    /// cut one column wide, or an ID table read one bit out of step, misplaces
+    /// pixels the assertion can see.
+    #[test]
+    fn a_huffman_dictionary_and_a_huffman_text_region_decode_end_to_end() {
+        let symbols = vec![
+            glyph(&["101", "010", "101", "010"]),
+            glyph(&["11111", "10001", "10001", "11111"]),
+        ];
+        let dict = huffman_dictionary_segment(&symbols, Collective::Mmr, None);
+        // Table B.11 codes no value below 1, so STRIPT starts at −1 and the
+        // strip's delta of 3 carries it to row 2.
+        let strip: [Placement; 2] = [(1, 0, 0), (2, 0, 1)];
+        let region = huffman_text_segment(
+            (32, 24),
+            Shape::default(),
+            2,
+            symbols.len() as u32,
+            1,
+            &[(3, &strip[..])],
+            None,
+        );
+
+        let mut stream = page_info_segment(0, (32, 24));
+        stream.extend_from_slice(&header(1, 0, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 6, &[1], 1, region.len() as u32));
         stream.extend_from_slice(&region);
 
         let page = decode_embedded(&[], &stream, 32, 24).expect("page");

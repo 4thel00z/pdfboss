@@ -37,7 +37,7 @@ use super::arith_int::{decode_int, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 use super::generic::{decode_generic_region, decode_mmr_region, GenericParams, GB_CONTEXT_LEN};
-use super::huffman::{standard, Table};
+use super::huffman::{standard, take_custom, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::Jbig2Error;
@@ -335,21 +335,21 @@ fn bind_tables(flags: u16, tables: &[&Table]) -> Result<HuffmanTables, Jbig2Erro
     let dh = match (flags >> 2) & 0x3 {
         0 => standard(4)?,
         1 => standard(5)?,
-        3 => take_custom(tables, &mut used)?,
+        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
         _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDH selection")),
     };
     // Bits 4 and 5: SDHUFFDW.
     let dw = match (flags >> 4) & 0x3 {
         0 => standard(2)?,
         1 => standard(3)?,
-        3 => take_custom(tables, &mut used)?,
+        3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?,
         _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDW selection")),
     };
     // Bit 6: SDHUFFBMSIZE.
     let bmsize = if flags & 0x0040 == 0 {
         standard(1)?
     } else {
-        take_custom(tables, &mut used)?
+        take_custom(tables, &mut used, TABLE_COUNT_DISAGREES)?
     };
     // Bit 7: SDHUFFAGGINST, which 7.4.2.1.1 requires to be 0 while SDREFAGG is
     // 0. Since SDREFAGG = 1 is refused, no table is ever bound to it, and a
@@ -370,21 +370,6 @@ fn bind_tables(flags: u16, tables: &[&Table]) -> Result<HuffmanTables, Jbig2Erro
         return Err(Jbig2Error::Malformed("SDHUFFDH or SDHUFFBMSIZE codes OOB"));
     }
     Ok(HuffmanTables { dh, dw, bmsize })
-}
-
-/// The next referred-to table segment's table, in the binding order of
-/// T.88 7.4.2.1.6.
-///
-/// The table is cloned rather than borrowed. A table is a few dozen lines, it
-/// is cloned at most three times per dictionary segment, and the alternative is
-/// a lifetime threaded through the header, the coding enum and every decoding
-/// function below for the sake of a copy that does not show up in a profile.
-fn take_custom(tables: &[&Table], used: &mut usize) -> Result<Table, Jbig2Error> {
-    let table = tables
-        .get(*used)
-        .ok_or(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES))?;
-    *used += 1;
-    Ok((*table).clone())
 }
 
 /// Decodes the new symbols of a dictionary, height class by height class

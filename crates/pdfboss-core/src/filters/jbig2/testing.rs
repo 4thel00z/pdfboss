@@ -19,7 +19,7 @@ use super::arith_int::{IaidCtx, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
 use super::huffman::encoder::{push_value, BitWriter};
-use super::huffman::{standard, Table};
+use super::huffman::{from_code_lengths, standard, Table};
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
 use super::reader::Reader;
@@ -535,6 +535,111 @@ pub(crate) fn text_segment_with_curt(
     out.extend_from_slice(&flags_of(shape).to_be_bytes());
     out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
     out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// The symbol ID code lengths a Huffman text region fixture uses: the same
+/// length for every symbol, wide enough to tell them apart
+/// (T.88 7.4.3.1.7 step 7).
+///
+/// With `n` equal lengths of `ceil(log2 n)` bits, B.3 hands symbol *i* the code
+/// *i*, so a fixture's symbol IDs are the numbers a reader expects to see in
+/// the bits. One bit is the floor: B.3 assigns no zero-length code, so a region
+/// with a single symbol still spends a bit naming it — unlike the arithmetic
+/// variant, where [`sym_code_len`] of one symbol is 0 and no bits are coded.
+pub(crate) fn symbol_code_lengths(num_syms: u32) -> Vec<u8> {
+    let len = sym_code_len(num_syms).max(1) as u8;
+    vec![len; num_syms as usize]
+}
+
+/// Writes the symbol ID Huffman decoding table of T.88 7.4.3.1.7 for
+/// `lengths`, ending on the byte boundary step 6 asks for.
+///
+/// Every one of the thirty-five run codes is given a six-bit length, which is
+/// legal — 35 codes fit in 64 — and makes B.3 assign RUNCODE*n* the six-bit
+/// binary of *n*. So the fixture writes one run code per symbol, as a plain
+/// six-bit number, and needs no Huffman tree of its own to state what an
+/// encoder would have emitted. RUNCODE32 to RUNCODE34, the three that compress
+/// runs, are deliberately never used here: a fixture that leaned on them would
+/// be asserting the decoder's own reading of Table 29 rather than a placement.
+fn push_symbol_id_table(w: &mut BitWriter, lengths: &[u8]) {
+    // Step 1: thirty-five four-bit run code lengths.
+    for _ in 0..35 {
+        w.push(6, 4);
+    }
+    // Steps 3 and 4: RUNCODE<len> says "the next symbol ID code length is len".
+    for &len in lengths {
+        assert!(len < 32, "a run code names lengths 0 to 31");
+        w.push(u32::from(len), 6);
+    }
+    // Step 6.
+    w.align();
+}
+
+/// Builds the data of a Huffman-coded text region segment (T.88 7.4.3),
+/// placing the instances of `strips`.
+///
+/// The header is the one 7.4.3.1 lays out with SBHUFF set: the ordinary flags,
+/// then a Huffman flags word, then SBNUMINSTANCES, then the symbol ID table —
+/// which is where a parser that reads the instance count straight after the
+/// flags goes wrong, since it takes the table selectors for the top half of it.
+///
+/// The standard tables this selects put one requirement on the caller. Tables
+/// B.11, B.12 and B.13, the three SBHUFFDT may name, code no value below 1, so
+/// `initial_dt` and every strip's delta must be positive; STRIPT reaches 0 by
+/// starting at −1 × SBSTRIPS and being advanced by one strip, which is what an
+/// encoder using these tables does.
+///
+/// `fs` overrides SBHUFFFS with a user-supplied table, which sets that selector
+/// to 3 and makes the segment's referred-to list responsible for carrying the
+/// code table segment it came from (7.4.3.1.6). `None` selects standard
+/// Table B.6.
+pub(crate) fn huffman_text_segment(
+    region: (u32, u32),
+    shape: Shape,
+    instances: u32,
+    num_syms: u32,
+    initial_dt: i32,
+    strips: &[StripOf<'_>],
+    fs: Option<&Table>,
+) -> Vec<u8> {
+    let standard_fs = standard(6).expect("Table B.6");
+    let fs_table = fs.unwrap_or(&standard_fs);
+    let ds = standard(8).expect("Table B.8");
+    let dt = standard(11).expect("Table B.11");
+    let lengths = symbol_code_lengths(num_syms);
+    let codes = from_code_lengths(&lengths).expect("symbol ID codes");
+
+    let mut w = BitWriter::default();
+    push_symbol_id_table(&mut w, &lengths);
+
+    // 6.4.5 step 2, then the strips.
+    push_value(&mut w, &dt, Some(initial_dt));
+    for (delta, placements) in strips {
+        push_value(&mut w, &dt, Some(*delta));
+        for (index, (ds_value, curt, id)) in placements.iter().enumerate() {
+            if index == 0 {
+                push_value(&mut w, fs_table, Some(*ds_value));
+            } else {
+                push_value(&mut w, &ds, Some(*ds_value));
+            }
+            // 6.4.9: nothing at all when SBSTRIPS is 1.
+            if shape.log_strips > 0 {
+                w.push(*curt as u32, shape.log_strips);
+            }
+            push_value(&mut w, &codes, Some(*id as i32));
+        }
+        // OOB closes the strip (6.4.8).
+        push_value(&mut w, &ds, None);
+    }
+
+    let mut out = region_info_bytes(region.0, region.1);
+    out.extend_from_slice(&(flags_of(shape) | 0x0001).to_be_bytes());
+    // 7.4.3.1.2, with every refinement selector 0 as SBREFINE requires.
+    let huffman_flags: u16 = if fs.is_some() { 3 } else { 0 };
+    out.extend_from_slice(&huffman_flags.to_be_bytes());
+    out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
+    out.extend_from_slice(&w.finish());
     out
 }
 
