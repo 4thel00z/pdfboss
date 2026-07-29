@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/4thel00z/pdfboss/compare/v0.7.2...v0.8.0) (2026-07-29)
+
+
+### Features
+
+* **core:** add generic refinement region decoding, not yet reachable ([554c340](https://github.com/4thel00z/pdfboss/commit/554c340c81fca59802da93c845e503db1b3053ee))
+
 ## [0.7.2](https://github.com/4thel00z/pdfboss/compare/v0.7.1...v0.7.2) (2026-07-28)
 
 
