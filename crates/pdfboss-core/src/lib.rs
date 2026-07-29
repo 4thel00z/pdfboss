@@ -4,7 +4,7 @@
 //! specification (ISO 32000).
 
 pub mod content;
-mod crypt;
+pub mod crypt;
 pub mod document;
 pub mod elements;
 pub mod error;
@@ -19,6 +19,7 @@ pub mod pretty;
 pub mod source;
 pub mod xref;
 
+pub use crypt::Decryptor;
 pub use document::{Document, Metadata, Page};
 pub use elements::{Element, ElementOpts, Span, XrefKind};
 pub use error::{Error, Result};
