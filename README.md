@@ -98,13 +98,13 @@ pixmap.save_png("page.png")?;
 |---|---|
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
 | `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text extraction |
-| `pdfboss-render` | Anti-aliased vector rasterizer — paths, fills, strokes, clipping, color, images — to RGBA/PNG |
+| `pdfboss-render` | Anti-aliased vector rasterizer — paths, fills, strokes, clipping, color, images, glyph outlines — to RGBA/PNG |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
-**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · CCITTFaxDecode scans — Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans — generic regions, symbol dictionaries and text regions, arithmetic- or Huffman-coded, MMR-coded generic regions and collective bitmaps, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and embedded-TrueType glyph outlines · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
+**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · CCITTFaxDecode scans — Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans — generic regions, symbol dictionaries and text regions, arithmetic- or Huffman-coded, MMR-coded generic regions and collective bitmaps, immediate generic refinement regions, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
 
 ## Benchmarks
 
@@ -116,7 +116,7 @@ Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, 
   <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 1,539 pages/s versus PyMuPDF's 279 (≈5.5×), and 25–80× the pure-Python readers. On open + parse it reaches 19,114 pages/s versus PyMuPDF's 3,766 (≈5×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Rendering is not compared — pdfboss's rasterizer does not yet paint every glyph, so timing it against full renderers would be misleading.
+**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 1,539 pages/s versus PyMuPDF's 279 (≈5.5×), and 25–80× the pure-Python readers. On open + parse it reaches 19,114 pages/s versus PyMuPDF's 3,766 (≈5×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Rendering is not compared on this corpus — a few faces still go unpainted (see Limitations), so timing it against full renderers would flatter pdfboss for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair precisely because a scan has no glyphs in it.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
@@ -141,11 +141,13 @@ Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
 ## Limitations
 
-Rendered pages paint the outlines of **embedded TrueType** glyphs (Type0/`CIDFontType2` under Identity, and simple `/TrueType` fonts via their `cmap`). Text in other fonts (CFF/Type1 programs, the standard 14, subset fonts without a usable `cmap`) is still positioned but not drawn.
+Glyph painting is staged in tiers, selected with `--fonts`. The default, `all-embedded`, paints every embedded font program — TrueType, CFF, Type1 and Type3. `embedded-only` restricts that to TrueType, and `full` additionally substitutes a replacement face for a **non-embedded** simple font, from either a directory you supply or the compiled-in OFL Croscore set (behind the `substitute-fonts` feature). Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
+
+What still does not paint: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank at every tier rather than borrowing an unrelated face's glyphs. A bold *sans* substitute is not visually distinct from regular weight. And non-embedded text left unpainted at `all-embedded` is not yet advanced through the AFM tables, so its positioning drifts.
 
 `JBIG2Decode` covers generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant, immediate generic refinement regions (both templates, with TPGRON), and custom code table segments. That is what scanners actually emit, but it is not the whole standard, and the rest is refused rather than approximated — a stream using refinement inside a symbol dictionary or a text region, an intermediate region of any kind, pattern dictionaries or halftone regions fails with a message naming the feature, so a scan that will not decode says why on the first try.
 
-Not yet supported (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · non-TrueType glyph outlines (CFF/Type1) · shadings and tiling patterns · `JPXDecode` (JPEG 2000) · the JBIG2 features listed above · soft masks and blend modes · annotation appearance streams.
+Not yet supported (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · shadings and tiling patterns · `JPXDecode` (JPEG 2000) · the JBIG2 features listed above · the unpainted faces listed above · soft masks and blend modes · annotation appearance streams.
 
 Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render — `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary, the TUI preview raises a status-bar notice, and the libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
 
