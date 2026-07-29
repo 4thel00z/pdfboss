@@ -14,7 +14,9 @@
 //! future built over [`Immediate`] resolves every leaf against a
 //! [`std::future::Ready`] and so completes on its first poll, never reaching
 //! the parking path — but that is an optimisation, not a precondition. Any
-//! future is driven correctly.
+//! future whose wakeup does not depend on an external reactor is driven
+//! correctly; one that does will park forever, so see [`block_on`]'s own
+//! documentation before handing it a future from elsewhere.
 //!
 //! Nothing here needs an async runtime: `Future`, `Pin`, `Box`, `Arc`,
 //! `Wake` and `std::future::ready` are all in the standard library, so
@@ -22,15 +24,24 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use crate::error::Result;
 use crate::object::{ObjRef, Object, Stream};
 
-/// Reference-chase depth limit for the provided [`ObjectSource::resolve`] and
-/// for [`resolve_with`], matching `Document::resolve`.
-const MAX_RESOLVE_DEPTH: usize = 32;
+/// Reference-chase depth limit for every reference chase in the crate:
+/// [`resolve_sync_with`], [`resolve_with`], the provided
+/// [`ObjectSource::resolve`] and [`crate::document::Document::resolve`].
+///
+/// This is a denial-of-service guard — a file can encode a reference chain of
+/// any length, and a malicious one can encode a cycle — so it is deliberately
+/// one definition. It is public because the cap is part of the observable
+/// contract: a caller that hands `pdfboss` a legitimately deep chain needs to
+/// know where the crate stops chasing and reports
+/// [`crate::error::Error::CircularReference`] instead.
+pub const MAX_RESOLVE_DEPTH: usize = 32;
 
 /// A boxed future, as returned by every [`AsyncObjectSource`] method.
 ///
@@ -48,9 +59,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Reads indirect objects and decodes streams, with the whole file already
 /// available.
 ///
-/// Implement `get` and `stream_data`; `resolve` has a provided
-/// implementation over `get`. An implementor whose reference chasing has its
-/// own semantics — as `Document`'s does — should override `resolve` too.
+/// Implement `get` and `stream_data`; `resolve` has a provided implementation
+/// that chases reference chains through `get` via [`resolve_sync_with`]. An
+/// implementor should override `resolve` only if its chasing genuinely
+/// differs; one that just wants the shared chase — as `Document` does — needs
+/// nothing.
 pub trait ObjectSource {
     /// Fetches an indirect object by reference.
     fn get(&self, r: ObjRef) -> Result<Object>;
@@ -59,30 +72,17 @@ pub trait ObjectSource {
     /// filter parameters against this source.
     fn stream_data(&self, s: &Stream) -> Result<Vec<u8>>;
 
-    /// Chases reference chains, depth-capped at `MAX_RESOLVE_DEPTH`.
+    /// Chases reference chains, depth-capped at [`MAX_RESOLVE_DEPTH`].
     ///
     /// Lenient: a reference to a missing or unreadable object resolves to
     /// [`Object::Null`]. Exceeding the depth cap is
     /// [`crate::error::Error::CircularReference`].
+    ///
+    /// The loop itself lives in [`resolve_sync_with`], which this delegates
+    /// to; an implementor overriding this method should delegate there too
+    /// unless its chasing genuinely differs.
     fn resolve(&self, o: &Object) -> Result<Object> {
-        let mut current = o.clone();
-        let mut last_num = 0;
-        for _ in 0..MAX_RESOLVE_DEPTH {
-            match current {
-                Object::Ref(r) => {
-                    last_num = r.num;
-                    current = match self.get(r) {
-                        Ok(object) => object,
-                        Err(crate::error::Error::CircularReference(n)) => {
-                            return Err(crate::error::Error::CircularReference(n))
-                        }
-                        Err(_) => return Ok(Object::Null),
-                    };
-                }
-                other => return Ok(other),
-            }
-        }
-        Err(crate::error::Error::CircularReference(last_num))
+        resolve_sync_with(self, o)
     }
 }
 
@@ -121,7 +121,7 @@ pub trait AsyncObjectSource {
     /// filter parameters against this source.
     fn stream_data<'a>(&'a self, s: &'a Stream) -> BoxFuture<'a, Result<Vec<u8>>>;
 
-    /// Chases reference chains, depth-capped at `MAX_RESOLVE_DEPTH`.
+    /// Chases reference chains, depth-capped at [`MAX_RESOLVE_DEPTH`].
     ///
     /// Lenient in the same way as [`ObjectSource::resolve`]: a reference to a
     /// missing or unreadable object resolves to [`Object::Null`].
@@ -135,8 +135,51 @@ pub trait AsyncObjectSource {
     fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>>;
 }
 
+/// Chases reference chains against a synchronous source, depth-capped at
+/// [`MAX_RESOLVE_DEPTH`].
+///
+/// This is the one canonical synchronous chase: the provided
+/// [`ObjectSource::resolve`] and [`crate::document::Document::resolve`] both
+/// delegate here, so their leniency and their error reporting cannot drift
+/// apart. [`resolve_with`] is the same algorithm awaiting its fetches.
+///
+/// Lenient: a reference whose target is missing or unreadable resolves to
+/// [`Object::Null`], because a real-world file routinely dangles a reference
+/// into nothing and ISO 32000 makes such a reference equivalent to `null`.
+/// A non-reference is returned unchanged without a fetch.
+///
+/// # Errors
+///
+/// Returns [`crate::error::Error::CircularReference`] when the chain exceeds
+/// `MAX_RESOLVE_DEPTH` hops — naming the last reference followed — or when
+/// the underlying source reports one, which is propagated unchanged rather
+/// than flattened to `Null`.
+pub fn resolve_sync_with<S>(src: &S, o: &Object) -> Result<Object>
+where
+    S: ObjectSource + ?Sized,
+{
+    let mut current = o.clone();
+    let mut last_num = 0;
+    for _ in 0..MAX_RESOLVE_DEPTH {
+        match current {
+            Object::Ref(r) => {
+                last_num = r.num;
+                current = match src.get(r) {
+                    Ok(object) => object,
+                    Err(crate::error::Error::CircularReference(n)) => {
+                        return Err(crate::error::Error::CircularReference(n))
+                    }
+                    Err(_) => return Ok(Object::Null),
+                };
+            }
+            other => return Ok(other),
+        }
+    }
+    Err(crate::error::Error::CircularReference(last_num))
+}
+
 /// Chases reference chains against an asynchronous source, depth-capped at
-/// `MAX_RESOLVE_DEPTH`.
+/// [`MAX_RESOLVE_DEPTH`].
 ///
 /// Lenient in the same way as [`ObjectSource::resolve`]: a reference to a
 /// missing or unreadable object resolves to [`Object::Null`]. An implementor
@@ -202,16 +245,49 @@ impl<S: ObjectSource> AsyncObjectSource for Immediate<S> {
     }
 }
 
-/// Unparks the thread blocked inside [`block_on`].
-struct ThreadWaker(std::thread::Thread);
+/// Unparks the thread blocked inside one particular [`block_on`] call.
+///
+/// `notified` is what makes the wakeup belong to that call rather than to the
+/// thread at large. Unpark tokens are per-thread and not counted: a single
+/// token satisfies the next `park` whoever set it, so without a per-call flag
+/// a nested `block_on` would consume the outer call's token and leave the
+/// outer call parked forever, and a waker clone outliving its call could
+/// leave a token behind for an unrelated later `park` to swallow.
+struct ThreadWaker {
+    thread: std::thread::Thread,
+    notified: AtomicBool,
+}
+
+impl ThreadWaker {
+    /// Records the wakeup and unparks, but only on the `false -> true`
+    /// transition, so however many times a future wakes this waker at most
+    /// one unpark token is outstanding.
+    fn notify(&self) {
+        // `swap` rather than a load-then-store: the read-modify-write is what
+        // makes the transition test atomic, so two concurrent wakers cannot
+        // both observe `false` and both unpark.
+        //
+        // `Release` publishes everything the waking side wrote before waking
+        // — the state that made the future ready. It pairs with the `Acquire`
+        // swap in `block_on`'s park loop below, giving the driver a
+        // happens-before edge to that state before it re-polls. `park`/
+        // `unpark` synchronize on their own, but the flag is what the loop
+        // actually trusts to decide it may stop waiting, so the edge has to
+        // exist on the flag too. Nothing needs to be acquired *from* the flag
+        // here, so the read half stays relaxed.
+        if !self.notified.swap(true, Ordering::Release) {
+            self.thread.unpark();
+        }
+    }
+}
 
 impl Wake for ThreadWaker {
     fn wake(self: Arc<Self>) {
-        self.0.unpark();
+        self.notify();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
+        self.notify();
     }
 }
 
@@ -220,18 +296,43 @@ impl Wake for ThreadWaker {
 /// This is how the synchronous entry points run the shared asynchronous
 /// implementation. A future built over [`Immediate`] resolves every leaf
 /// against a [`std::future::Ready`], so it completes on its first poll and
-/// the parking path below is never entered; any other future is driven
-/// correctly rather than panicking.
+/// the parking path below is never entered.
+///
+/// Any other future is driven correctly *provided something eventually wakes
+/// it*. This is a bare driver, not a runtime: it owns no reactor, no timer
+/// wheel and no I/O registration. A future that returns
+/// [`Poll::Pending`] while waiting on a wakeup that only an external reactor
+/// could deliver — a socket becoming readable, a timer firing — **blocks this
+/// thread forever**. Such a future belongs on the runtime that owns its
+/// reactor; pass it to that runtime's own driver instead.
+///
+/// Nesting is safe: an inner `block_on` on the same thread cannot steal the
+/// outer call's wakeup, because each call waits on a flag private to itself
+/// rather than on the thread's shared unpark token.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    // The `Arc` is kept alongside the `Waker` so the loop can read and clear
+    // the flag the waker sets; `Waker::from` would otherwise consume it.
+    let waker_state = Arc::new(ThreadWaker {
+        thread: std::thread::current(),
+        notified: AtomicBool::new(false),
+    });
+    let waker = Waker::from(Arc::clone(&waker_state));
     let mut cx = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
     loop {
         match future.as_mut().poll(&mut cx) {
             Poll::Ready(value) => return value,
-            // `park` may return spuriously, so re-poll rather than assume a
-            // wake means readiness.
-            Poll::Pending => std::thread::park(),
+            // Wait for *this* call's wakeup, consuming it as it is observed.
+            // Checking before the first `park` is what keeps a wake that
+            // arrived during the poll from being lost; looping is what
+            // absorbs both a spurious `park` return and an unpark token left
+            // by something else. `Acquire` pairs with the `Release` in
+            // `ThreadWaker::notify`.
+            Poll::Pending => {
+                while !waker_state.notified.swap(false, Ordering::Acquire) {
+                    std::thread::park();
+                }
+            }
         }
     }
 }
@@ -246,7 +347,8 @@ mod tests {
     use crate::error::{Error, Result};
     use crate::object::{ObjRef, Object, Stream};
     use crate::source::{
-        block_on, resolve_with, AsyncObjectSource, BoxFuture, Immediate, ObjectSource,
+        block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
+        ObjectSource, MAX_RESOLVE_DEPTH,
     };
 
     /// Fetches the fixture's page content stream, which `simple_doc` writes as
@@ -390,6 +492,163 @@ mod tests {
         );
     }
 
+    /// The synchronous mirror of `SelfReferential`. Reaching the cap is
+    /// unreachable through a real `Document`, whose own re-entrancy guard
+    /// fires first, so this stub is what exercises `resolve_sync_with`'s loop.
+    struct SyncSelfReferential;
+
+    impl ObjectSource for SyncSelfReferential {
+        fn get(&self, r: ObjRef) -> Result<Object> {
+            Ok(Object::Ref(r))
+        }
+
+        fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+            Ok(s.data.clone())
+        }
+    }
+
+    /// Reports a cycle for every fetch, so the propagating branch is covered.
+    struct CircularSource;
+
+    impl ObjectSource for CircularSource {
+        fn get(&self, r: ObjRef) -> Result<Object> {
+            Err(Error::CircularReference(r.num))
+        }
+
+        fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+            Ok(s.data.clone())
+        }
+    }
+
+    /// Fails every fetch for a reason that is *not* a cycle, so the lenient
+    /// branch is covered.
+    struct UnreadableSource;
+
+    impl ObjectSource for UnreadableSource {
+        fn get(&self, _: ObjRef) -> Result<Object> {
+            Err(Error::MissingKey("Length"))
+        }
+
+        fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+            Ok(s.data.clone())
+        }
+    }
+
+    /// A finite chain: object `n` refers to object `n - 1`, and object 0 is a
+    /// direct integer. Chasing from `Ref(k)` therefore terminates after a
+    /// known number of hops, which is what lets the cap be measured.
+    struct Chain;
+
+    impl ObjectSource for Chain {
+        fn get(&self, r: ObjRef) -> Result<Object> {
+            if r.num == 0 {
+                Ok(Object::Int(0))
+            } else {
+                Ok(Object::Ref(ObjRef {
+                    num: r.num - 1,
+                    gen: 0,
+                }))
+            }
+        }
+
+        fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+            Ok(s.data.clone())
+        }
+    }
+
+    /// `resolve_sync_with` must stop at the depth cap and name the last
+    /// reference it followed, rather than looping forever.
+    #[test]
+    fn resolve_sync_with_stops_at_the_depth_cap() {
+        let chain = Object::Ref(ObjRef { num: 7, gen: 0 });
+        let err = resolve_sync_with(&SyncSelfReferential, &chain).unwrap_err();
+        assert!(
+            matches!(err, Error::CircularReference(7)),
+            "a self-referential chain must exhaust the cap and report \
+             CircularReference for the last reference seen, got {err:?}"
+        );
+    }
+
+    /// A non-reference passes straight through `resolve_sync_with` without a
+    /// fetch.
+    #[test]
+    fn resolve_sync_with_returns_a_direct_object_unchanged() {
+        assert_eq!(
+            resolve_sync_with(&SyncSelfReferential, &Object::Int(42)).unwrap(),
+            Object::Int(42)
+        );
+    }
+
+    /// The two halves of the shared chase's error handling, both load-bearing
+    /// for `Document::resolve`: an unreadable target becomes `Null`, while a
+    /// cycle reported by the source propagates unchanged.
+    #[test]
+    fn resolve_sync_with_is_lenient_but_propagates_cycles() {
+        let r = Object::Ref(ObjRef { num: 5, gen: 0 });
+        assert_eq!(
+            resolve_sync_with(&UnreadableSource, &r).unwrap(),
+            Object::Null,
+            "a fetch failing for any reason other than a cycle must flatten \
+             to Null"
+        );
+        assert!(matches!(
+            resolve_sync_with(&CircularSource, &r).unwrap_err(),
+            Error::CircularReference(5)
+        ));
+    }
+
+    /// The provided `ObjectSource::resolve` must *be* the shared chase, not a
+    /// second copy of it: same answer on a direct object and same cap error.
+    #[test]
+    fn the_provided_resolve_is_the_shared_chase() {
+        let direct = Object::Int(9);
+        assert_eq!(
+            ObjectSource::resolve(&SyncSelfReferential, &direct).unwrap(),
+            resolve_sync_with(&SyncSelfReferential, &direct).unwrap()
+        );
+
+        let chain = Object::Ref(ObjRef { num: 3, gen: 0 });
+        assert!(matches!(
+            ObjectSource::resolve(&SyncSelfReferential, &chain).unwrap_err(),
+            Error::CircularReference(3)
+        ));
+    }
+
+    /// The synchronous and asynchronous chases must share one cap, which is
+    /// the point of `MAX_RESOLVE_DEPTH` having a single definition. Chasing
+    /// the longest chain that fits succeeds both ways; one hop more fails both
+    /// ways, with the same reference named.
+    #[test]
+    fn both_chases_share_one_depth_cap() {
+        // From `Ref(k)` the loop follows k + 1 references and spends one more
+        // iteration returning the direct object it lands on: k + 2 iterations
+        // for a cap of MAX_RESOLVE_DEPTH.
+        let longest = u32::try_from(MAX_RESOLVE_DEPTH - 2).expect("the cap fits in a u32");
+        let fits = Object::Ref(ObjRef {
+            num: longest,
+            gen: 0,
+        });
+        let too_long = Object::Ref(ObjRef {
+            num: longest + 1,
+            gen: 0,
+        });
+
+        assert_eq!(resolve_sync_with(&Chain, &fits).unwrap(), Object::Int(0));
+        assert_eq!(
+            block_on(resolve_with(&Immediate(&Chain), &fits)).unwrap(),
+            Object::Int(0)
+        );
+
+        assert!(matches!(
+            resolve_sync_with(&Chain, &too_long).unwrap_err(),
+            Error::CircularReference(0)
+        ));
+        assert!(matches!(
+            block_on(resolve_with(&Immediate(&Chain), &too_long)).unwrap_err(),
+            Error::CircularReference(0)
+        ));
+    }
+
     /// The parking path must actually resume. This future returns Pending
     /// once — waking itself first, so the unpark token is already set and the
     /// test cannot deadlock — then Ready.
@@ -418,6 +677,73 @@ mod tests {
             7,
             "block_on must re-poll after parking rather than panicking or hanging"
         );
+    }
+
+    /// A nested `block_on` on the same thread must not consume the outer
+    /// call's wakeup. The outer future arms its own waker and then, still
+    /// inside that same poll, runs a complete nested driver before yielding.
+    /// Unpark tokens are per-thread and not counted, so a driver that trusted
+    /// `park` alone let the inner call swallow the outer wake and left the
+    /// outer call parked forever. Driven on a worker thread with a bounded
+    /// wait, so a regression fails this test instead of hanging the suite.
+    #[test]
+    fn nested_block_on_does_not_strand_the_outer_call() {
+        /// Yields once, waking itself first so the nested driver has a wakeup
+        /// to observe.
+        struct SelfWaking {
+            yielded: bool,
+        }
+
+        impl Future for SelfWaking {
+            type Output = u32;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+                if self.yielded {
+                    return Poll::Ready(7);
+                }
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+
+        struct Outer {
+            polled: bool,
+            inner: u32,
+        }
+
+        impl Future for Outer {
+            type Output = u32;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
+                if self.polled {
+                    return Poll::Ready(self.inner);
+                }
+                self.polled = true;
+                cx.waker().wake_by_ref();
+                self.inner = block_on(SelfWaking { yielded: false });
+                Poll::Pending
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(block_on(Outer {
+                polled: false,
+                inner: 0,
+            }));
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(inner) => assert_eq!(
+                inner, 7,
+                "the nested block_on must have run its future to completion"
+            ),
+            Err(e) => panic!(
+                "the outer block_on never finished ({e:?}): the nested call \
+                 consumed its wakeup"
+            ),
+        }
     }
 
     /// `BoxFuture` promises `Send`, which the asynchronous API depends on to

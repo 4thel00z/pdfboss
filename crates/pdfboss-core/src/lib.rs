@@ -26,4 +26,7 @@ pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
-pub use source::{block_on, resolve_with, AsyncObjectSource, BoxFuture, Immediate, ObjectSource};
+pub use source::{
+    block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
+    ObjectSource, MAX_RESOLVE_DEPTH,
+};
