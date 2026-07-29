@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use super::bitmap::Bitmap;
+use super::bitmap::{Bitmap, CombOp};
 use super::budget::Budget;
 use super::generic::{
     decode_generic_region, decode_mmr_region, parse_generic_flags, GB_CONTEXT_LEN,
@@ -47,6 +47,9 @@ use super::generic::{
 use super::huffman::{parse_table_segment, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
+use super::refinement::{
+    decode_refinement_region, Reference, RefinementParams, GR_CONTEXT_LEN, NOMINAL_AT,
+};
 use super::segment::{parse_embedded, parse_region_info, RegionInfo, Segment, SegmentKind};
 use super::symbol_dict::{decode_symbol_dict, MAX_SYMBOLS};
 use super::text_region::decode_text_region;
@@ -216,10 +219,21 @@ fn decode_embedded_within(
             SegmentKind::IntermediateGenericRegion => {
                 return Err(Jbig2Error::Unimplemented("intermediate region"))
             }
-            SegmentKind::IntermediateRefinementRegion
-            | SegmentKind::ImmediateRefinementRegion
+            // An intermediate refinement region, like any other intermediate
+            // region, is retained for a later segment rather than composited,
+            // and there is no auxiliary buffer here to retain it in.
+            SegmentKind::IntermediateRefinementRegion => {
+                return Err(Jbig2Error::Unimplemented("intermediate region"))
+            }
+            SegmentKind::ImmediateRefinementRegion
             | SegmentKind::ImmediateLosslessRefinementRegion => {
-                return Err(Jbig2Error::Unimplemented("refinement region"))
+                let mut target = match page.take() {
+                    Some(existing) => existing,
+                    None => Bitmap::new(width, height)?,
+                };
+                let (info, region) = decode_refinement_region_segment(segment, &target, budget)?;
+                target.combine(&region, offset(info.x), offset(info.y), info.op);
+                page = Some(target);
             }
             // A code table segment carries no pixels and names no region: it
             // holds one Huffman table (7.4.13, whose syntax is Annex B.2) for
@@ -369,6 +383,79 @@ fn decode_generic_region_segment(
     let bitmap =
         decode_generic_region(&mut dec, &mut cx, budget, info.width, height, &params, None)?;
     Ok((info, bitmap))
+}
+
+/// Decodes a generic refinement region segment (T.88 7.4.7.5).
+///
+/// The reference is the page buffer restricted to this segment's own box, as
+/// 7.4.7.4 directs for a segment that refers to no other region segment. The
+/// other case it describes — reading the auxiliary buffer of a referred-to
+/// region segment — cannot arise here: the only segments that fill such a
+/// buffer are the intermediate regions, and every one of those is refused
+/// before it can be retained.
+///
+/// 7.4.7.5 also says the external combination operator "must be REPLACE" in
+/// this case. That is not enforced. It is a constraint on encoders, and a
+/// stream that composites its refinement with OR is still telling this decoder
+/// exactly what it means; rejecting it would lose a page over a technicality
+/// that costs nothing to honour.
+fn decode_refinement_region_segment(
+    segment: &Segment<'_>,
+    page: &Bitmap,
+    budget: &mut Budget,
+) -> Result<(RegionInfo, Bitmap), Jbig2Error> {
+    let mut r = Reader::new(segment.data);
+    let info = parse_region_info(&mut r)?;
+    let params = parse_refinement_flags(&mut r)?;
+
+    // Lifting the region's own rectangle out of the page: composing the page
+    // onto an empty bitmap of the region's size, shifted so that the region's
+    // top-left lands at the origin. Whatever falls outside the page stays 0,
+    // which is what 6.3.5.2 asks of an out-of-bounds reference pixel anyway.
+    let mut reference = Bitmap::new(info.width, info.height)?;
+    reference.combine(page, -offset(info.x), -offset(info.y), CombOp::Replace);
+
+    let mut dec = MqDecoder::new(r.rest());
+    let mut cx = MqContexts::new(GR_CONTEXT_LEN);
+    let bitmap = decode_refinement_region(
+        &mut dec,
+        &mut cx,
+        budget,
+        info.width,
+        info.height,
+        Reference::aligned(&reference),
+        &params,
+    )?;
+    Ok((info, bitmap))
+}
+
+/// Parses the generic refinement region segment flags and AT flags
+/// (T.88 7.4.7.2 and 7.4.7.3).
+fn parse_refinement_flags(r: &mut Reader<'_>) -> Result<RefinementParams, Jbig2Error> {
+    let flags = r.u8()?;
+    if flags & 0xFC != 0 {
+        return Err(Jbig2Error::Malformed(
+            "reserved refinement region flag bits",
+        ));
+    }
+    let template = flags & 1;
+    let tpgron = flags & 2 != 0;
+    // 7.4.7.3: the four AT bytes are present only for template 0. Template 1
+    // has no adaptive pixels, so reading them would consume coded data.
+    let at = if template == 0 {
+        let x1 = r.i8()?;
+        let y1 = r.i8()?;
+        let x2 = r.i8()?;
+        let y2 = r.i8()?;
+        [(x1, y1), (x2, y2)]
+    } else {
+        NOMINAL_AT
+    };
+    Ok(RefinementParams {
+        template,
+        at,
+        tpgron,
+    })
 }
 
 /// The four-byte row count that closes an unknown-length generic region
@@ -628,7 +715,7 @@ mod tests {
             (16, "pattern dictionary"),
             (22, "halftone region"),
             (36, "intermediate region"),
-            (42, "refinement region"),
+            (40, "intermediate region"),
         ] {
             let stream = header(0, kind, &[], 1, 0);
             assert_eq!(
@@ -637,6 +724,107 @@ mod tests {
                 "segment type {kind}",
             );
         }
+    }
+
+    /// An immediate refinement region segment (type 42) refines what is already
+    /// on the page, which 7.4.7.4 makes its reference when the segment names no
+    /// other region segment. This builds a page whose only content is the
+    /// reference shape, then refines it into a different shape, and checks the
+    /// page ends up holding the refined one.
+    #[test]
+    fn an_immediate_refinement_region_refines_the_page_beneath_it() {
+        use super::super::refinement::encode_refinement_at;
+
+        // The page's default pixel value makes every pixel 1 (7.4.8.5 bit 2),
+        // so the reference the refinement reads is a solid block. Encoding
+        // against that and decoding against anything else would not agree,
+        // which is what makes this a test of where the reference came from.
+        let reference = glyph(&["11111", "11111", "11111", "11111"]);
+        let target = glyph(&["01110", "01110", "01110", "00010"]);
+        let params = RefinementParams {
+            template: 1,
+            at: NOMINAL_AT,
+            tpgron: false,
+        };
+        let (coded, _) = encode_refinement_at(&target, &reference, &params, 0, 0);
+
+        // Region information field, then the flags byte. Template 1 carries no
+        // AT bytes (7.4.7.3), and REPLACE overwrites the reference rather than
+        // OR-ing with it, so the result is the refinement alone.
+        let mut data = Vec::new();
+        data.extend_from_slice(&5u32.to_be_bytes());
+        data.extend_from_slice(&4u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.push(4); // external combination operator REPLACE
+        data.push(1); // GRTEMPLATE 1, TPGRON 0
+        data.extend_from_slice(&coded);
+
+        let mut info = Vec::new();
+        info.extend_from_slice(&5u32.to_be_bytes());
+        info.extend_from_slice(&4u32.to_be_bytes());
+        info.extend_from_slice(&0u32.to_be_bytes());
+        info.extend_from_slice(&0u32.to_be_bytes());
+        info.push(4); // default pixel value 1
+        info.extend_from_slice(&0u16.to_be_bytes());
+        let mut stream = header(0, 48, &[], 1, info.len() as u32);
+        stream.extend_from_slice(&info);
+        stream.extend_from_slice(&header(2, 42, &[], 1, data.len() as u32));
+        stream.extend_from_slice(&data);
+
+        let page = decode_embedded(&[], &stream, 5, 4).expect("page");
+        for y in 0..4u32 {
+            for x in 0..5u32 {
+                assert_eq!(
+                    page.get(i64::from(x), i64::from(y)),
+                    target.get(i64::from(x), i64::from(y)),
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    /// An intermediate refinement region (type 40) is retained for a later
+    /// segment rather than composited, and there is no buffer here to retain
+    /// it in, so it is refused by name rather than quietly treated as
+    /// immediate.
+    #[test]
+    fn an_intermediate_refinement_region_is_still_refused() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.push(0);
+        data.push(1);
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 40, &[], 1, data.len() as u32));
+        stream.extend_from_slice(&data);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Unimplemented("intermediate region")),
+        );
+    }
+
+    /// Bits 2 to 7 of the refinement flags byte are reserved (7.4.7.2).
+    #[test]
+    fn reserved_refinement_flag_bits_are_refused() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        data.push(4);
+        data.push(0x04); // a reserved bit
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 42, &[], 1, data.len() as u32));
+        stream.extend_from_slice(&data);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            Err(Jbig2Error::Malformed(
+                "reserved refinement region flag bits"
+            )),
+        );
     }
 
     /// A code table segment (type 53) carries no pixels and composites nothing,

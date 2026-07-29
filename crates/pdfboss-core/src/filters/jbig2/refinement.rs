@@ -9,15 +9,15 @@
 //! Two templates exist (6.3.5.3): template 0 gathers thirteen pixels and has
 //! two adaptive pixels, template 1 gathers ten and has none.
 //!
-//! Nothing outside this module's own tests calls it yet. The three places that
-//! will — the refinement region segment of 7.4.7, the refinement/aggregate
-//! symbol coding of 6.5.8.2, and the text region symbol refinement of 6.4.11 —
-//! all still refuse their streams, and each is wired up in turn. The procedure
-//! lands first because all three need exactly this and nothing else.
-#![allow(dead_code)]
+//! The refinement region segment of 7.4.7 reaches this. The two other callers
+//! the standard defines — the refinement/aggregate symbol coding of 6.5.8.2 and
+//! the text region symbol refinement of 6.4.11 — still refuse their streams,
+//! and are wired up in turn.
 
 use super::bitmap::Bitmap;
 use super::budget::Budget;
+#[cfg(test)]
+use super::mq::{encoder::MqEncoder, MqContext};
 use super::mq::{MqContexts, MqDecoder};
 use super::Jbig2Error;
 
@@ -154,6 +154,11 @@ pub(crate) struct RefinementParams {
 impl RefinementParams {
     /// The parameters an encoder gets by leaving the AT pixels where 6.3.5.3
     /// puts them, with typical prediction off.
+    ///
+    /// Only the tests build parameters this way. Every real caller reads them
+    /// from a segment header — 7.4.7.3 for a refinement region, and the SDRAT
+    /// and SBRAT fields for the two coding procedures that embed refinement.
+    #[cfg(test)]
     pub(crate) fn nominal(template: u8) -> RefinementParams {
         RefinementParams {
             template,
@@ -256,10 +261,86 @@ fn uniform_reference(reference: &Bitmap, x: i64, y: i64) -> Option<u8> {
 }
 
 #[cfg(test)]
+/// The encoder side of 6.3.5.6, used only by these tests. It has to make
+/// exactly the decisions the decoder expects to read, including skipping
+/// the pixels typical prediction covers.
+/// Returns the coded bytes and the number of pixels coded explicitly —
+/// the ones typical prediction did not cover.
+pub(crate) fn encode_refinement_at(
+    target: &Bitmap,
+    reference: &Bitmap,
+    params: &RefinementParams,
+    dx: i32,
+    dy: i32,
+) -> (Vec<u8>, usize) {
+    let taps = taps_for(params.template);
+    let sltp_cx = usize::from(sltp_context(params.template));
+    let mut cx = vec![MqContext::default(); GR_CONTEXT_LEN];
+    let mut enc = MqEncoder::new();
+    let (dx, dy) = (i64::from(dx), i64::from(dy));
+    let mut ltp = false;
+    let mut explicit = 0usize;
+
+    for y in 0..target.height() {
+        if params.tpgron {
+            // Turn typical prediction on for a row when it would save
+            // work: every pixel the 3x3 rule covers must already match.
+            let ry = i64::from(y) - dy;
+            let want = (0..target.width()).all(|x| {
+                let rx = i64::from(x) - dx;
+                match uniform_reference(reference, rx, ry) {
+                    Some(v) => v == target.get(i64::from(x), i64::from(y)),
+                    None => true,
+                }
+            });
+            let sltp = want != ltp;
+            enc.encode(&mut cx[sltp_cx], u8::from(sltp));
+            ltp = want;
+        }
+        let ry = i64::from(y) - dy;
+        for x in 0..target.width() {
+            let rx = i64::from(x) - dx;
+            let pixel = target.get(i64::from(x), i64::from(y));
+            if ltp && uniform_reference(reference, rx, ry).is_some() {
+                continue;
+            }
+            let mut context = 0usize;
+            for tap in taps {
+                let value = match *tap {
+                    Tap::Region(tx, ty) => read_decoded(target, x, y, tx, ty),
+                    Tap::Reference(tx, ty) => reference.get(rx + tx, ry + ty),
+                    Tap::RegionAt(n) => {
+                        let (ax, ay) = params.at[n];
+                        read_decoded(target, x, y, i64::from(ax), i64::from(ay))
+                    }
+                    Tap::ReferenceAt(n) => {
+                        let (ax, ay) = params.at[n];
+                        reference.get(rx + i64::from(ax), ry + i64::from(ay))
+                    }
+                };
+                context = (context << 1) | usize::from(value);
+            }
+            enc.encode(&mut cx[context], pixel);
+            explicit += 1;
+        }
+    }
+    (enc.finish(), explicit)
+}
+
+/// A template pixel of the region being decoded, as the decoder would see
+/// it: pixels the raster order has not reached yet read as 0.
+#[cfg(test)]
+fn read_decoded(target: &Bitmap, x: u32, y: u32, tx: i64, ty: i64) -> u8 {
+    let (px, py) = (i64::from(x) + tx, i64::from(y) + ty);
+    if py > i64::from(y) || (py == i64::from(y) && px >= i64::from(x)) {
+        return 0;
+    }
+    target.get(px, py)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filters::jbig2::mq::encoder::MqEncoder;
-    use crate::filters::jbig2::mq::MqContext;
 
     fn bitmap_from(rows: &[&str]) -> Bitmap {
         let mut bm = Bitmap::new(rows[0].len() as u32, rows.len() as u32).expect("small");
@@ -589,81 +670,5 @@ mod tests {
         params: &RefinementParams,
     ) -> Vec<u8> {
         encode_refinement_at(target, reference, params, 0, 0).0
-    }
-
-    /// The encoder side of 6.3.5.6, used only by these tests. It has to make
-    /// exactly the decisions the decoder expects to read, including skipping
-    /// the pixels typical prediction covers.
-    /// Returns the coded bytes and the number of pixels coded explicitly —
-    /// the ones typical prediction did not cover.
-    fn encode_refinement_at(
-        target: &Bitmap,
-        reference: &Bitmap,
-        params: &RefinementParams,
-        dx: i32,
-        dy: i32,
-    ) -> (Vec<u8>, usize) {
-        let taps = taps_for(params.template);
-        let sltp_cx = usize::from(sltp_context(params.template));
-        let mut cx = vec![MqContext::default(); GR_CONTEXT_LEN];
-        let mut enc = MqEncoder::new();
-        let (dx, dy) = (i64::from(dx), i64::from(dy));
-        let mut ltp = false;
-        let mut explicit = 0usize;
-
-        for y in 0..target.height() {
-            if params.tpgron {
-                // Turn typical prediction on for a row when it would save
-                // work: every pixel the 3x3 rule covers must already match.
-                let ry = i64::from(y) - dy;
-                let want = (0..target.width()).all(|x| {
-                    let rx = i64::from(x) - dx;
-                    match uniform_reference(reference, rx, ry) {
-                        Some(v) => v == target.get(i64::from(x), i64::from(y)),
-                        None => true,
-                    }
-                });
-                let sltp = want != ltp;
-                enc.encode(&mut cx[sltp_cx], u8::from(sltp));
-                ltp = want;
-            }
-            let ry = i64::from(y) - dy;
-            for x in 0..target.width() {
-                let rx = i64::from(x) - dx;
-                let pixel = target.get(i64::from(x), i64::from(y));
-                if ltp && uniform_reference(reference, rx, ry).is_some() {
-                    continue;
-                }
-                let mut context = 0usize;
-                for tap in taps {
-                    let value = match *tap {
-                        Tap::Region(tx, ty) => read_decoded(target, x, y, tx, ty),
-                        Tap::Reference(tx, ty) => reference.get(rx + tx, ry + ty),
-                        Tap::RegionAt(n) => {
-                            let (ax, ay) = params.at[n];
-                            read_decoded(target, x, y, i64::from(ax), i64::from(ay))
-                        }
-                        Tap::ReferenceAt(n) => {
-                            let (ax, ay) = params.at[n];
-                            reference.get(rx + i64::from(ax), ry + i64::from(ay))
-                        }
-                    };
-                    context = (context << 1) | usize::from(value);
-                }
-                enc.encode(&mut cx[context], pixel);
-                explicit += 1;
-            }
-        }
-        (enc.finish(), explicit)
-    }
-
-    /// A template pixel of the region being decoded, as the decoder would see
-    /// it: pixels the raster order has not reached yet read as 0.
-    fn read_decoded(target: &Bitmap, x: u32, y: u32, tx: i64, ty: i64) -> u8 {
-        let (px, py) = (i64::from(x) + tx, i64::from(y) + ty);
-        if py > i64::from(y) || (py == i64::from(y) && px >= i64::from(x)) {
-            return 0;
-        }
-        target.get(px, py)
     }
 }
