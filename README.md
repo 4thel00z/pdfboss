@@ -116,7 +116,7 @@ Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, 
   <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 1,539 pages/s versus PyMuPDF's 279 (≈5.5×), and 25–80× the pure-Python readers. On open + parse it reaches 19,114 pages/s versus PyMuPDF's 3,766 (≈5×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Rendering is not compared on this corpus — a few faces still go unpainted (see Limitations), so timing it against full renderers would flatter pdfboss for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair precisely because a scan has no glyphs in it.
+**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 2,972 pages/s versus PyMuPDF's 420 (≈7×), and 34–177× the pure-Python readers. On open + parse it reaches 294,000 pages/s versus PyMuPDF's 93,000 (≈3×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front, so opening is close to free and the ratio says more about what the others do eagerly than about pdfboss. Rendering is not compared on this corpus — a few faces still go unpainted (see Limitations), so timing it against full renderers would flatter pdfboss for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair precisely because a scan has no glyphs in it.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
@@ -126,12 +126,12 @@ Scans are the other half of the world's PDFs, and they are a different workload:
 
 | Library | pages/sec | Ink on page 1 |
 |---|--:|--:|
-| pdfboss | 53.7 | 4.83% |
-| pdfplumber (via pdfium) | 35.5 | 4.87% |
-| PyMuPDF | 35.0 | 4.82% |
-| pypdfium2 | 32.7 | 4.85% |
+| pdfboss | 81.4 | 4.83% |
+| pdfplumber (via pdfium) | 54.4 | 4.87% |
+| pypdfium2 | 51.8 | 4.85% |
+| PyMuPDF | 50.5 | 4.82% |
 
-**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers** — and the only one of them with no C in it. Compare the four rows against each other rather than against another machine's: all four are timed in one pass, and the ratio between them held to within 3% across runs whose absolute numbers varied by a fifth.
+**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers** — and the only one of them with no C in it. Compare the four rows against each other rather than against another machine's: all four are timed in one pass, and that ratio has come out between 1.50× and 1.56× on every run, across absolute numbers that varied by half as the machine warmed and cooled.
 
 What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation feeding it, and that part is a serial dependency chain — every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded — so it neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
 
