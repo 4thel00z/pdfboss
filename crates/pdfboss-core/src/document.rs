@@ -611,6 +611,35 @@ pub struct Page {
 }
 
 impl Page {
+    /// Builds a page from already-resolved attributes.
+    ///
+    /// [`Document::page`] resolves page-tree inheritance itself; this is for
+    /// a caller that has done that resolution some other way — notably the
+    /// asynchronous API, which flattens the page tree while reading it — and
+    /// needs the same [`Page`] type back.
+    ///
+    /// `rotate` is stored as given; normalize it to `{0, 90, 180, 270}`
+    /// beforehand if the source value is untrusted.
+    pub fn from_parts(
+        index: usize,
+        media_box: Rect,
+        crop_box: Rect,
+        rotate: i32,
+        resources: Dict,
+        dict: Dict,
+        obj_ref: Option<ObjRef>,
+    ) -> Page {
+        Page {
+            index,
+            media_box,
+            crop_box,
+            rotate,
+            resources,
+            dict,
+            obj_ref,
+        }
+    }
+
     /// The page's indirect object reference, when the page came from an
     /// indirect kid in the page tree (pages inlined directly into a `/Kids`
     /// array have none).
@@ -666,6 +695,7 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::Name;
     use crate::parser::{NoResolve, Parser};
     use crate::xref::XrefEntry;
     use pdfboss_testkit::{multi_page_doc, objstm_doc, objstm_payload, simple_doc, PdfBuilder};
@@ -1306,5 +1336,31 @@ mod tests {
             doc.xref().get(7),
             Some(XrefEntry::InStream { stream_num: 4, .. })
         ));
+    }
+
+    /// A page built from parts must expose the same accessors as one that
+    /// came out of the page tree — this is the constructor aio uses.
+    #[test]
+    fn page_from_parts_exposes_its_accessors() {
+        let mut dict = Dict::default();
+        dict.insert(Name("Type".into()), Object::Name(Name("Page".into())));
+        let media = Rect::new(0.0, 0.0, 200.0, 400.0);
+        let obj_ref = ObjRef { num: 7, gen: 0 };
+
+        let page = Page::from_parts(
+            3,
+            media,
+            media,
+            90,
+            Dict::default(),
+            dict.clone(),
+            Some(obj_ref),
+        );
+
+        assert_eq!(page.index, 3);
+        assert_eq!(page.object_ref(), Some(obj_ref));
+        assert_eq!(page.dict(), &dict);
+        // /Rotate 90 swaps the reported page size.
+        assert_eq!(page.size(), (400.0, 200.0));
     }
 }
