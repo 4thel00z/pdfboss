@@ -25,4 +25,4 @@ pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
-pub use source::ObjectSource;
+pub use source::{block_on_ready, AsyncObjectSource, BoxFuture, Immediate, ObjectSource};
