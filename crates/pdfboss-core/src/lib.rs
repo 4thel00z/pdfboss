@@ -16,6 +16,7 @@ pub mod object;
 pub mod objstm;
 pub mod parser;
 pub mod pretty;
+pub mod source;
 pub mod xref;
 
 pub use document::{Document, Metadata, Page};
@@ -24,3 +25,4 @@ pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
+pub use source::ObjectSource;

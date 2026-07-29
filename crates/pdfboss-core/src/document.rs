@@ -561,6 +561,24 @@ impl Resolve for Document {
     }
 }
 
+/// Forwards to the inherent methods, so reading a document through the trait
+/// is bit-identical to reading it directly. `resolve` is overridden rather
+/// than inherited because `Document::resolve`'s leniency and its
+/// `CircularReference` reporting are load-bearing (see its doc comment).
+impl crate::source::ObjectSource for Document {
+    fn get(&self, r: ObjRef) -> Result<Object> {
+        Document::get(self, r)
+    }
+
+    fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+        Document::stream_data(self, s)
+    }
+
+    fn resolve(&self, o: &Object) -> Result<Object> {
+        Document::resolve(self, o)
+    }
+}
+
 /// Document information from the trailer `/Info` dictionary. Only present,
 /// well-formed entries are populated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
