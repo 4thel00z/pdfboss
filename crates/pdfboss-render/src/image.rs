@@ -7,7 +7,7 @@
 //! dictionary carries one, so the approximation is never silent.
 
 use pdfboss_core::geom::{Matrix, Point, Rect};
-use pdfboss_core::{Dict, Document, Object};
+use pdfboss_core::{block_on, AsyncObjectSource, Dict, Document, Immediate, Object};
 
 use crate::color::ColorSpace;
 use crate::raster::Mask;
@@ -111,6 +111,63 @@ pub(crate) enum Drawn {
     Nothing,
 }
 
+/// Everything image decoding reads from the document, resolved up front so
+/// the decode itself is pure computation over the sample data.
+///
+/// This split is what keeps I/O out of the pixel loops: the executor awaits
+/// one metadata read, and everything after it — sample unpacking, `/Decode`
+/// mapping, color conversion, compositing — runs without touching the
+/// source again. The fields are read unconditionally even though a JPEG's
+/// decode never looks at `/Width` and a stencil's never at `/ColorSpace`;
+/// every read is lenient and pure, so the only cost is a few extra dict
+/// resolves per image.
+pub(crate) struct ImageMeta {
+    /// The data is still a raw JPEG: the trailing `/Filter` entry is
+    /// `DCTDecode`, the one codec the stream filters pass through.
+    dct: bool,
+    width: Option<f64>,
+    height: Option<f64>,
+    /// A 1-bit `/ImageMask` stencil, which paints in the current fill color
+    /// rather than its own.
+    pub(crate) stencil: bool,
+    decode: Option<Vec<f32>>,
+    /// The parsed `/ColorSpace`, or `None` when the image carried none
+    /// (samples then read as gray).
+    cs: Option<ColorSpace>,
+    bpc: Option<f64>,
+}
+
+impl ImageMeta {
+    /// Reads the metadata synchronously; [`ImageMeta::read_with`] over
+    /// [`Immediate`].
+    pub(crate) fn read(doc: &Document, dict: &Dict, cs_obj: Option<&Object>) -> ImageMeta {
+        block_on(Self::read_with(&Immediate(doc), dict, cs_obj))
+    }
+
+    /// Resolves every dictionary entry the decode consults. `cs_obj` is the
+    /// image's `/ColorSpace` value with any resource-name indirection
+    /// already resolved by the caller.
+    pub(crate) async fn read_with<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+        cs_obj: Option<&Object>,
+    ) -> ImageMeta {
+        let cs = match cs_obj {
+            Some(obj) => Some(ColorSpace::parse_with(src, obj).await),
+            None => None,
+        };
+        ImageMeta {
+            dct: is_dct(src, dict).await,
+            width: num_of(src, dict, "Width").await,
+            height: num_of(src, dict, "Height").await,
+            stencil: bool_of(src, dict, "ImageMask").await.unwrap_or(false),
+            decode: floats_of(src, dict, "Decode").await,
+            cs,
+            bpc: num_of(src, dict, "BitsPerComponent").await,
+        }
+    }
+}
+
 /// Decodes an image XObject or inline image and composites it onto `pix`.
 ///
 /// `data` must already have its stream filters applied, except for a
@@ -118,19 +175,10 @@ pub(crate) enum Drawn {
 /// through (ISO 32000-1 7.4.9), leaving `data` a raw JPEG, which this module
 /// decodes. Every other codec is rejected there, so `data` never arrives as
 /// a codestream this module would otherwise read as samples.
-/// `cs_obj` is the image's `/ColorSpace` value with any resource-name
-/// indirection already resolved by the caller. Undecodable images are
-/// skipped (lenient); the return value says what was painted, so the caller
-/// can record the miss.
-pub(crate) fn draw(
-    doc: &Document,
-    pix: &mut Pixmap,
-    dict: &Dict,
-    data: &[u8],
-    cs_obj: Option<&Object>,
-    p: &DrawParams,
-) -> Drawn {
-    match decode_rgba(doc, dict, data, cs_obj, p.fill_rgb) {
+/// Undecodable images are skipped (lenient); the return value says what was
+/// painted, so the caller can record the miss.
+pub(crate) fn draw(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> Drawn {
+    match decode_rgba(meta, data, p.fill_rgb) {
         Some(img) => {
             let truncated = img.truncated;
             draw_rgba(pix, &img, p);
@@ -145,24 +193,24 @@ pub(crate) fn draw(
 }
 
 /// Reads a numeric dictionary entry, chasing references.
-fn num_of(doc: &Document, dict: &Dict, key: &str) -> Option<f64> {
-    doc.resolve(dict.get(key)?).ok()?.as_f64()
+async fn num_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<f64> {
+    src.resolve(dict.get(key)?).await.ok()?.as_f64()
 }
 
 /// Reads a boolean dictionary entry, chasing references.
-fn bool_of(doc: &Document, dict: &Dict, key: &str) -> Option<bool> {
-    doc.resolve(dict.get(key)?).ok()?.as_bool()
+async fn bool_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<bool> {
+    src.resolve(dict.get(key)?).await.ok()?.as_bool()
 }
 
 /// Reads an array of finite numbers, chasing references at both levels.
-fn floats_of(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<f32>> {
-    let arr = match doc.resolve(dict.get(key)?) {
+async fn floats_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Vec<f32>> {
+    let arr = match src.resolve(dict.get(key)?).await {
         Ok(Object::Array(a)) => a,
         _ => return None,
     };
     let mut out = Vec::with_capacity(arr.len());
     for item in &arr {
-        let v = doc.resolve(item).ok()?.as_f64()? as f32;
+        let v = src.resolve(item).await.ok()?.as_f64()? as f32;
         if !v.is_finite() {
             return None;
         }
@@ -174,13 +222,17 @@ fn floats_of(doc: &Document, dict: &Dict, key: &str) -> Option<Vec<f32>> {
 /// The last entry of the image's `/Filter` chain, which is the codec the
 /// data is still in when the stream filters pass an image codec through
 /// untouched.
-fn trailing_filter(doc: &Document, dict: &Dict) -> Option<String> {
-    let name = match dict.get("Filter").map(|f| doc.resolve(f)) {
-        Some(Ok(Object::Name(n))) => n,
-        Some(Ok(Object::Array(items))) => match items.last().map(|o| doc.resolve(o)) {
-            Some(Ok(Object::Name(n))) => n,
-            _ => return None,
-        },
+async fn trailing_filter<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<String> {
+    let filter = dict.get("Filter")?;
+    let name = match src.resolve(filter).await {
+        Ok(Object::Name(n)) => n,
+        Ok(Object::Array(items)) => {
+            let last = items.last()?;
+            match src.resolve(last).await {
+                Ok(Object::Name(n)) => n,
+                _ => return None,
+            }
+        }
         _ => return None,
     };
     Some(name.0)
@@ -188,17 +240,11 @@ fn trailing_filter(doc: &Document, dict: &Dict) -> Option<String> {
 
 /// Whether the last entry of the image's `/Filter` chain is `DCTDecode`
 /// (whose data the stream filters pass through as raw JPEG).
-fn is_dct(doc: &Document, dict: &Dict) -> bool {
+async fn is_dct<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
     matches!(
-        trailing_filter(doc, dict).as_deref(),
+        trailing_filter(src, dict).await.as_deref(),
         Some("DCTDecode" | "DCT")
     )
-}
-
-/// Whether the image is a 1-bit `/ImageMask` stencil, which paints in the
-/// current fill color rather than its own.
-pub(crate) fn is_stencil(doc: &Document, dict: &Dict) -> bool {
-    bool_of(doc, dict, "ImageMask").unwrap_or(false)
 }
 
 /// Reads the big-endian `bpc`-bit sample starting at `bit` in `data`.
@@ -225,40 +271,33 @@ fn short_of_samples(data: &[u8], row_bits: usize, height: usize) -> bool {
     data.len() < (row_bits / 8).saturating_mul(height)
 }
 
-/// Decodes image `dict` + `data` to RGBA. Returns `None` when the image is
-/// malformed beyond recovery (bad dimensions, unsupported JPEG, ...).
-fn decode_rgba<'a>(
-    doc: &Document,
-    dict: &Dict,
-    data: &'a [u8],
-    cs_obj: Option<&Object>,
-    fill_rgb: [u8; 3],
-) -> Option<Rgba<'a>> {
-    if is_dct(doc, dict) {
+/// Decodes an image's `data` to RGBA under its resolved metadata. Pure —
+/// every document read happened in [`ImageMeta::read_with`]. Returns `None`
+/// when the image is malformed beyond recovery (bad dimensions, unsupported
+/// JPEG, ...).
+fn decode_rgba<'a>(meta: &ImageMeta, data: &'a [u8], fill_rgb: [u8; 3]) -> Option<Rgba<'a>> {
+    if meta.dct {
         // A short JPEG is the decoder's business: it either reconstructs
         // what it has or fails outright, and there is no zero padding of
         // ours to own up to.
         return decode_jpeg(data);
     }
-    let width = num_of(doc, dict, "Width")? as usize;
-    let height = num_of(doc, dict, "Height")? as usize;
+    let width = meta.width? as usize;
+    let height = meta.height? as usize;
     if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
         return None;
     }
     width.checked_mul(height).filter(|&n| n <= MAX_PIXELS)?;
-    let decode = floats_of(doc, dict, "Decode");
-    if is_stencil(doc, dict) {
+    let decode = meta.decode.as_deref();
+    if meta.stencil {
         return Some(decode_stencil(width, height, data, decode, fill_rgb));
     }
-    let cs = match cs_obj {
-        Some(obj) => ColorSpace::parse(doc, obj),
-        None => ColorSpace::DeviceGray,
-    };
-    let bpc = match num_of(doc, dict, "BitsPerComponent").map(|v| v as i64) {
+    let cs = meta.cs.as_ref().unwrap_or(&ColorSpace::DeviceGray);
+    let bpc = match meta.bpc.map(|v| v as i64) {
         Some(v @ (1 | 2 | 4 | 8 | 16)) => v as usize,
         _ => 8,
     };
-    Some(decode_samples(width, height, data, &cs, bpc, decode))
+    Some(decode_samples(width, height, data, cs, bpc, decode))
 }
 
 /// Decodes a 1-bit `/ImageMask` stencil: samples that map to 0 through the
@@ -268,10 +307,10 @@ fn decode_stencil(
     width: usize,
     height: usize,
     data: &[u8],
-    decode: Option<Vec<f32>>,
+    decode: Option<&[f32]>,
     fill_rgb: [u8; 3],
 ) -> Rgba<'static> {
-    let invert = matches!(decode.as_deref(), Some([d0, d1, ..]) if d0 > d1);
+    let invert = matches!(decode, Some([d0, d1, ..]) if d0 > d1);
     let stride_bits = width.div_ceil(8) * 8;
     let mut out = vec![0u8; width * height * 4];
     for y in 0..height {
@@ -302,7 +341,7 @@ fn decode_samples<'a>(
     data: &'a [u8],
     cs: &ColorSpace,
     bpc: usize,
-    decode: Option<Vec<f32>>,
+    decode: Option<&[f32]>,
 ) -> Rgba<'a> {
     let ncomp = cs.components().clamp(1, 8);
     let max = ((1u32 << bpc) - 1) as f32;
@@ -312,7 +351,7 @@ fn decode_samples<'a>(
         1.0
     };
     let ranges: Vec<(f32, f32)> = (0..ncomp)
-        .map(|c| match &decode {
+        .map(|c| match decode {
             Some(d) if d.len() >= 2 * (c + 1) => (d[2 * c], d[2 * c + 1]),
             _ => (0.0, default_hi),
         })
@@ -546,6 +585,19 @@ mod tests {
         img.at(x, y)
     }
 
+    /// The pre-split decode signature, kept so every assertion below stays
+    /// byte-identical: metadata resolution and the pure decode are exercised
+    /// together, exactly as `draw` composes them.
+    fn decode_rgba<'a>(
+        doc: &Document,
+        dict: &Dict,
+        data: &'a [u8],
+        cs_obj: Option<&Object>,
+        fill_rgb: [u8; 3],
+    ) -> Option<Rgba<'a>> {
+        super::decode_rgba(&ImageMeta::read(doc, dict, cs_obj), data, fill_rgb)
+    }
+
     #[test]
     fn sample_bits_all_depths() {
         let data = [0b1011_0110, 0b0101_0011];
@@ -607,8 +659,8 @@ mod tests {
             for data in [&full[..], &full[..row_bytes + 1]] {
                 for range in [(0.0f32, 1.0f32), (1.0, 0.0), (0.25, 0.75)] {
                     let max = ((1u32 << bpc) - 1) as f32;
-                    let decode = Some(vec![range.0, range.1]);
-                    let got = decode_samples(width, height, data, &cs, bpc, decode);
+                    let decode = [range.0, range.1];
+                    let got = decode_samples(width, height, data, &cs, bpc, Some(&decode));
 
                     let stride_bits = row_bytes * 8;
                     for y in 0..height {

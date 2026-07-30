@@ -1394,18 +1394,17 @@ impl Executor<'_> {
         if ignores_mask(self.doc, dict) {
             self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
         }
-        if gs.fill_pattern && image::is_stencil(self.doc, dict) {
+        let meta = image::ImageMeta::read(self.doc, dict, cs_obj.as_ref());
+        if gs.fill_pattern && meta.stencil {
             // The stencil paints the pattern's stand-in gray, not the
             // pattern (see `GState::fill_rgba8`).
             self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
         }
         let fill = gs.fill_rgba8();
         let outcome = image::draw(
-            self.doc,
             &mut self.pix,
-            dict,
+            &meta,
             data,
-            cs_obj.as_ref(),
             &DrawParams {
                 ctm: gs.ctm,
                 alpha: gs.fill_alpha,
