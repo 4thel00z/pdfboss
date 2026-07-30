@@ -251,8 +251,17 @@ impl<S: ObjectSource> AsyncObjectSource for Immediate<S> {
 /// thread at large. Unpark tokens are per-thread and not counted: a single
 /// token satisfies the next `park` whoever set it, so without a per-call flag
 /// a nested `block_on` would consume the outer call's token and leave the
-/// outer call parked forever, and a waker clone outliving its call could
-/// leave a token behind for an unrelated later `park` to swallow.
+/// outer call parked forever.
+///
+/// A stray token in the other direction is accepted deliberately. Because
+/// [`block_on`] must test this flag before parking to survive a nested call
+/// stealing the thread's single token, a wake that arrives during a poll can
+/// leave its token unconsumed, and a `Waker` clone outliving its call can set
+/// one afterwards. Either way a later unrelated `park` on this thread may
+/// return spuriously — which the standard library permits, and which is
+/// strictly better than the hang the opposite order produces. [`block_on`]'s
+/// `Poll::Ready` arm drains the token in the common case; the two remaining
+/// paths are documented there and cannot be closed from inside the call.
 struct ThreadWaker {
     thread: std::thread::Thread,
     notified: AtomicBool,
@@ -321,12 +330,40 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     loop {
         match future.as_mut().poll(&mut cx) {
-            Poll::Ready(value) => return value,
-            // Wait for *this* call's wakeup, consuming it as it is observed.
-            // Checking before the first `park` is what keeps a wake that
-            // arrived during the poll from being lost; looping is what
-            // absorbs both a spurious `park` return and an unpark token left
-            // by something else. `Acquire` pairs with the `Release` in
+            Poll::Ready(value) => {
+                // A future may legally wake and then complete in the same
+                // poll, which leaves the flag set and an unpark token
+                // outstanding that no `park` above ever consumed. Drain it,
+                // so a completed call cannot make an unrelated later `park`
+                // on this thread return spuriously. `park_timeout` with a
+                // zero duration consumes a waiting token and returns at once
+                // either way, so this never blocks.
+                if waker_state.notified.swap(false, Ordering::Acquire) {
+                    std::thread::park_timeout(std::time::Duration::ZERO);
+                }
+                return value;
+            }
+            // Wait for *this* call's wakeup, testing the flag BEFORE parking.
+            // That order is load-bearing and the alternative deadlocks.
+            //
+            // An unpark token is a single per-thread boolean, not a count. So
+            // when this future woke during its own poll and then, still inside
+            // that poll, drove a nested `block_on` whose future also parked,
+            // the nested call consumed the one token — including the share
+            // this call was relying on. Our flag is set but no token remains.
+            // Parking first would block forever;
+            // `nested_block_on_does_not_strand_the_outer_call` is that
+            // deadlock, and it fails within its 30 s budget if this is
+            // reordered.
+            //
+            // The cost of testing first is that when nobody stole the token it
+            // goes unconsumed, so a later unrelated `park` on this thread can
+            // return spuriously. That is permitted by the standard library and
+            // is strictly preferable to a hang; the `Poll::Ready` arm drains
+            // the token in the common case anyway.
+            //
+            // Looping absorbs a spurious `park` return: the flag is still
+            // false, so it parks again. `Acquire` pairs with the `Release` in
             // `ThreadWaker::notify`.
             Poll::Pending => {
                 while !waker_state.notified.swap(false, Ordering::Acquire) {
