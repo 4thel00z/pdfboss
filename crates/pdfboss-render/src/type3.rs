@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use pdfboss_core::FastMap;
+use pdfboss_core::{block_on, AsyncObjectSource, Immediate};
 
 use pdfboss_core::geom::Matrix;
 use pdfboss_core::{Dict, Document, Object};
@@ -49,15 +50,22 @@ impl Type3Font {
     /// entry, or `/Encoding` degrades to fewer mappings rather than failing
     /// the whole load (except the two required entries above).
     pub(crate) fn load(doc: &Document, font: &Dict) -> Option<Type3Font> {
-        let font_matrix = parse_font_matrix(doc, font)?;
-        let char_procs = parse_char_procs(doc, font)?;
-        let encoding = parse_encoding(doc, font);
-        let widths = parse_widths(doc, font);
-        let resources = font
-            .get("Resources")
-            .and_then(|o| doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned())
-            .map(Arc::new);
+        block_on(Self::load_with(&Immediate(doc), font))
+    }
+
+    /// [`Type3Font::load`] against any object source; the synchronous form is
+    /// this one over [`Immediate`].
+    pub(crate) async fn load_with<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<Type3Font> {
+        let font_matrix = parse_font_matrix(src, font).await?;
+        let char_procs_obj = src.resolve(font.get("CharProcs")?).await.ok()?;
+        let char_procs = parse_char_procs(&char_procs_obj)?;
+        let encoding = parse_encoding(src, font).await;
+        let widths = parse_widths(src, font).await;
+        let resources = match font.get("Resources") {
+            Some(o) => src.resolve(o).await.ok().and_then(|o| o.as_dict().cloned()),
+            None => None,
+        }
+        .map(Arc::new);
 
         Some(Type3Font {
             font_matrix,
@@ -99,15 +107,15 @@ impl Type3Font {
 /// resolved and finite. `None` on anything else (missing, wrong length,
 /// unresolvable entry, or a non-finite value) -- Type3 has no default matrix
 /// to fall back to.
-fn parse_font_matrix(doc: &Document, font: &Dict) -> Option<Matrix> {
-    let resolved = doc.resolve(font.get("FontMatrix")?).ok()?;
+async fn parse_font_matrix<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<Matrix> {
+    let resolved = src.resolve(font.get("FontMatrix")?).await.ok()?;
     let items = resolved.as_array()?;
     if items.len() != 6 {
         return None;
     }
     let mut nums = [0.0f64; 6];
     for (slot, item) in nums.iter_mut().zip(items) {
-        let v = doc.resolve(item).ok()?.as_f64()?;
+        let v = src.resolve(item).await.ok()?.as_f64()?;
         if !v.is_finite() {
             return None;
         }
@@ -126,8 +134,7 @@ fn parse_font_matrix(doc: &Document, font: &Dict) -> Option<Matrix> {
 /// Parses `/CharProcs` into a glyph-name -> (unresolved) stream-object map.
 /// `None` if `/CharProcs` is absent, not a dictionary, or resolves to an
 /// empty dictionary -- a Type3 font with no CharProcs can paint nothing.
-fn parse_char_procs(doc: &Document, font: &Dict) -> Option<FastMap<String, Object>> {
-    let resolved = doc.resolve(font.get("CharProcs")?).ok()?;
+fn parse_char_procs(resolved: &Object) -> Option<FastMap<String, Object>> {
     let dict = resolved.as_dict()?;
     if dict.is_empty() {
         return None;
@@ -146,9 +153,9 @@ fn parse_char_procs(doc: &Document, font: &Dict) -> Option<FastMap<String, Objec
 /// /StandardEncoding` -- Type3's implicit base per ISO 32000-1 §9.6.5.2. A
 /// `/BaseEncoding` naming anything else leaves those codes `None`; this is a
 /// documented v1 limit, not a panic path.
-fn parse_encoding(doc: &Document, font: &Dict) -> Box<[Option<String>; 256]> {
-    let diffs = differences(doc, font);
-    let fallback = allows_standard_fallback(doc, font);
+async fn parse_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> Box<[Option<String>; 256]> {
+    let diffs = differences(src, font).await;
+    let fallback = allows_standard_fallback(src, font).await;
 
     let mut table: Box<[Option<String>; 256]> = Box::new(std::array::from_fn(|_| None));
     for (code, slot) in table.iter_mut().enumerate() {
@@ -166,10 +173,12 @@ fn parse_encoding(doc: &Document, font: &Dict) -> Box<[Option<String>; 256]> {
 /// `/Encoding` is absent, is a dictionary with no `/BaseEncoding` key, or has
 /// `/BaseEncoding /StandardEncoding`; false when `/BaseEncoding` names
 /// anything else.
-fn allows_standard_fallback(doc: &Document, font: &Dict) -> bool {
-    match font.get("Encoding").map(|o| doc.resolve(o)) {
-        None => true,
-        Some(Ok(Object::Dict(d))) => match d.get_name("BaseEncoding") {
+async fn allows_standard_fallback<S: AsyncObjectSource>(src: &S, font: &Dict) -> bool {
+    let Some(enc) = font.get("Encoding") else {
+        return true;
+    };
+    match src.resolve(enc).await {
+        Ok(Object::Dict(d)) => match d.get_name("BaseEncoding") {
             None => true,
             Some(name) => name.0 == "StandardEncoding",
         },
@@ -180,21 +189,25 @@ fn allows_standard_fallback(doc: &Document, font: &Dict) -> bool {
 /// Parses `/Widths` + `/FirstChar` into a code -> glyph-space-width map
 /// (mirrors `glyph.rs::simple_widths`'s shape, but keeps the raw glyph-space
 /// number -- no `/1000` scaling, which happens at paint time instead).
-fn parse_widths(doc: &Document, font: &Dict) -> FastMap<u32, f32> {
-    let first = font
-        .get("FirstChar")
-        .and_then(|o| doc.resolve(o).ok())
-        .and_then(|o| o.as_int())
-        .unwrap_or(0)
-        .max(0) as u32;
+async fn parse_widths<S: AsyncObjectSource>(src: &S, font: &Dict) -> FastMap<u32, f32> {
+    let first = match font.get("FirstChar") {
+        Some(o) => src.resolve(o).await.ok().and_then(|o| o.as_int()),
+        None => None,
+    }
+    .unwrap_or(0)
+    .max(0) as u32;
 
     let mut map = FastMap::default();
-    if let Some(Ok(Object::Array(items))) = font.get("Widths").map(|o| doc.resolve(o)) {
+    let widths = match font.get("Widths") {
+        Some(o) => src.resolve(o).await.ok(),
+        None => None,
+    };
+    if let Some(Object::Array(items)) = widths {
         for (i, item) in items.iter().enumerate() {
             let Some(code) = first.checked_add(i as u32) else {
                 break; // /FirstChar so large the codes overflow u32
             };
-            if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+            if let Some(w) = src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
                 map.insert(code, w as f32);
             }
         }

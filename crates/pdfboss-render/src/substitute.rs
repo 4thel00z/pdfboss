@@ -37,7 +37,7 @@
 //! paints nothing) is deferred -- the AFM tables exist and feed the
 //! `Full`-tier substitute advance now, not any earlier tier.
 
-use pdfboss_core::{Dict, Document};
+use pdfboss_core::{AsyncObjectSource, Dict};
 
 /// The three families a substitute request maps a non-embedded font to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,10 @@ impl FaceRequest {
     /// Derives a request from `/BaseFont` (subset prefix stripped, matched
     /// case-insensitively) and the font's `FontDescriptor /Flags`. `None` for
     /// Symbol/ZapfDingbats, which have no license-clean substitute in v1.
-    pub(crate) fn from_font_dict(doc: &Document, font: &Dict) -> Option<FaceRequest> {
+    pub(crate) async fn from_font_dict<S: AsyncObjectSource>(
+        src: &S,
+        font: &Dict,
+    ) -> Option<FaceRequest> {
         let base = font
             .get_name("BaseFont")
             .map(|n| n.0.as_str())
@@ -110,12 +113,11 @@ impl FaceRequest {
             return None;
         }
 
-        let flags = font
-            .get("FontDescriptor")
-            .and_then(|o| doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned())
-            .and_then(|fd| fd.get_int("Flags"))
-            .unwrap_or(0);
+        let descriptor = match font.get("FontDescriptor") {
+            Some(o) => src.resolve(o).await.ok().and_then(|o| o.as_dict().cloned()),
+            None => None,
+        };
+        let flags = descriptor.and_then(|fd| fd.get_int("Flags")).unwrap_or(0);
 
         let family = if flags & FLAG_FIXED_PITCH != 0
             || lower.contains("courier")
@@ -268,7 +270,10 @@ mod tests {
             .as_dict()
             .cloned()
             .expect("font is a dict");
-        FaceRequest::from_font_dict(&doc, &font)
+        pdfboss_core::block_on(FaceRequest::from_font_dict(
+            &pdfboss_core::Immediate(&doc),
+            &font,
+        ))
     }
 
     #[test]

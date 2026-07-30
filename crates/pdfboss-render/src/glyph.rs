@@ -22,7 +22,7 @@
 use pdfboss_core::FastMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use pdfboss_core::{Dict, Document, Matrix, Object};
+use pdfboss_core::{block_on, AsyncObjectSource, Dict, Document, Immediate, Matrix, Object};
 
 use crate::cff::CffFont;
 use crate::path::{PathBuilder, Subpath};
@@ -166,6 +166,17 @@ impl GlyphFont {
         painting: GlyphPainting,
         provider: Option<&dyn SubstituteProvider>,
     ) -> Option<GlyphFont> {
+        block_on(Self::load_with(&Immediate(doc), font, painting, provider))
+    }
+
+    /// [`GlyphFont::load`] against any object source; the synchronous form is
+    /// this one over [`Immediate`].
+    pub(crate) async fn load_with<S: AsyncObjectSource>(
+        src: &S,
+        font: &Dict,
+        painting: GlyphPainting,
+        provider: Option<&dyn SubstituteProvider>,
+    ) -> Option<GlyphFont> {
         // Embedded TrueType paints at every tier. CFF and Type1 (simple
         // Type1/MMType1 fonts, and CIDFontType0 descendants for CFF) join at
         // `AllEmbedded`+. `Full`-tier substitution (`substitute_at_full`) is
@@ -175,13 +186,16 @@ impl GlyphFont {
         // (the executor's `/CharProcs` path) falls into the `_` catch-all,
         // which also never substitutes.
         match font.get_name("Subtype").map(|n| n.0.as_str()) {
-            Some("Type0") => load_type0(doc, font, painting),
-            Some("TrueType") => {
-                load_simple(doc, font).or_else(|| substitute_at_full(doc, font, painting, provider))
-            }
+            Some("Type0") => load_type0(src, font, painting).await,
+            Some("TrueType") => match load_simple(src, font).await {
+                Some(f) => Some(f),
+                None => substitute_at_full(src, font, painting, provider).await,
+            },
             Some("Type1") | Some("MMType1") if painting.paints_all_embedded() => {
-                load_simple_type1_or_cff(doc, font)
-                    .or_else(|| substitute_at_full(doc, font, painting, provider))
+                match load_simple_type1_or_cff(src, font).await {
+                    Some(f) => Some(f),
+                    None => substitute_at_full(src, font, painting, provider).await,
+                }
             }
             _ => None,
         }
@@ -322,13 +336,13 @@ fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<Subpath> {
 /// `post` table, then the Adobe Glyph List: name -> Unicode -> `cmap`); then the
 /// base `/Encoding` character -> `cmap`; and finally the raw byte, then the
 /// symbol range `0xF000 + code`, through the font's `cmap`.
-fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
-    let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
-    let program = stream_bytes(doc, descriptor.get("FontFile2")?)?;
+async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
+    let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
     let tt = TrueType::parse(program)?;
 
-    let base = base_encoding(doc, font);
-    let diffs = differences(doc, font);
+    let base = base_encoding(src, font).await;
+    let diffs = differences(src, font).await;
 
     let mut table = Box::new([0u16; 256]);
     for (code, slot) in table.iter_mut().enumerate() {
@@ -362,9 +376,17 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
-        widths: simple_widths(doc, font),
+        widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
+}
+
+/// Resolves `dict[key]`, treating an absent key and a failed resolution the
+/// same way. The loaders below borrow their source; only the executor's
+/// entry point owns one (see `pdfboss_core::source`'s "Signing a shared
+/// algorithm").
+async fn rv<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Object> {
+    src.resolve(dict.get(key)?).await.ok()
 }
 
 /// Parses a simple font's `/Widths` + `/FirstChar` (keyed by character
@@ -372,36 +394,37 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
 /// iff `/Widths` is an array, regardless of whether any entry resolves --
 /// once a font declares widths, an unresolved entry still falls back to
 /// `default`, not to the embedded program's own advance.
-fn simple_widths(doc: &Document, font: &Dict) -> WidthMap {
-    let first = font
-        .get("FirstChar")
-        .and_then(|o| doc.resolve(o).ok())
+async fn simple_widths<S: AsyncObjectSource>(src: &S, font: &Dict) -> WidthMap {
+    let first = rv(src, font, "FirstChar")
+        .await
         .and_then(|o| o.as_int())
         .unwrap_or(0)
         .max(0) as u32;
 
     let mut map = FastMap::default();
     let mut declared = false;
-    if let Some(Ok(Object::Array(items))) = font.get("Widths").map(|o| doc.resolve(o)) {
+    if let Some(Object::Array(items)) = rv(src, font, "Widths").await {
         declared = true;
         for (i, item) in items.iter().enumerate() {
             let Some(code) = first.checked_add(i as u32) else {
                 break; // /FirstChar so large the codes overflow u32
             };
-            if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+            if let Some(w) = src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
                 map.insert(code, w as f32);
             }
         }
     }
 
-    let default = font
-        .get("FontDescriptor")
-        .and_then(|o| doc.resolve(o).ok())
-        .and_then(|o| o.as_dict().cloned())
-        .and_then(|fd| fd.get("MissingWidth").and_then(|o| doc.resolve(o).ok()))
-        .and_then(|o| o.as_f64())
-        .map(|w| w as f32)
-        .unwrap_or(0.0);
+    let descriptor = rv(src, font, "FontDescriptor")
+        .await
+        .and_then(|o| o.as_dict().cloned());
+    let default = match &descriptor {
+        Some(fd) => rv(src, fd, "MissingWidth")
+            .await
+            .and_then(|o| o.as_f64())
+            .map_or(0.0, |w| w as f32),
+        None => 0.0,
+    };
 
     WidthMap {
         map,
@@ -423,9 +446,9 @@ fn simple_widths(doc: &Document, font: &Dict) -> WidthMap {
 /// name through the Adobe Glyph List. CFF has no `cmap`, so unlike the
 /// TrueType loader there is no raw-byte/symbol-range fallback: an unresolved
 /// code is left at `.notdef` (gid 0).
-fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
-    let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
-    let program = stream_bytes(doc, descriptor.get("FontFile3")?)?;
+async fn load_cff_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
+    let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
     let cff = CffFont::parse(program)?;
 
     let mut by_unicode: FastMap<char, u16> = FastMap::default();
@@ -441,8 +464,8 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
 
-    let base = base_encoding(doc, font);
-    let diffs = differences(doc, font);
+    let base = base_encoding(src, font).await;
+    let diffs = differences(src, font).await;
 
     let mut table = Box::new([0u16; 256]);
     for (code, slot) in table.iter_mut().enumerate() {
@@ -466,7 +489,7 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
-        widths: simple_widths(doc, font),
+        widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
 }
@@ -477,13 +500,13 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
 /// to a raw Type1 charstring program (`FontFile`) only when there is no
 /// `FontFile3`. A descriptor with neither (or no descriptor at all) yields
 /// `None`.
-fn load_simple_type1_or_cff(doc: &Document, font: &Dict) -> Option<GlyphFont> {
-    let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
+async fn load_simple_type1_or_cff<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
     if descriptor.get("FontFile3").is_some() {
-        return load_cff_simple(doc, font);
+        return load_cff_simple(src, font).await;
     }
     if descriptor.get("FontFile").is_some() {
-        return load_type1_simple(doc, font);
+        return load_type1_simple(src, font).await;
     }
     None
 }
@@ -505,9 +528,9 @@ fn load_simple_type1_or_cff(doc: &Document, font: &Dict) -> Option<GlyphFont> {
 /// (`builtin_name`), for a font that ships its own encoding and the PDF
 /// gives none. Type1 has no `cmap`, so as with CFF an unresolved code is
 /// left at `.notdef` (gid 0).
-fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
-    let descriptor = resolve_dict(doc, font.get("FontDescriptor")?)?;
-    let program = stream_bytes(doc, descriptor.get("FontFile")?)?;
+async fn load_type1_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
+    let program = stream_bytes(src, descriptor.get("FontFile")?).await?;
     let t1 = Type1Font::parse(program)?;
 
     let mut by_unicode: FastMap<char, u16> = FastMap::default();
@@ -523,8 +546,8 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
 
-    let base = base_encoding(doc, font);
-    let diffs = differences(doc, font);
+    let base = base_encoding(src, font).await;
+    let diffs = differences(src, font).await;
 
     let mut table = Box::new([0u16; 256]);
     for (code, slot) in table.iter_mut().enumerate() {
@@ -557,7 +580,7 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
-        widths: simple_widths(doc, font),
+        widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
 }
@@ -576,10 +599,13 @@ fn resolve_name(tt: &TrueType, name: &str) -> Option<u16> {
 /// Selects the base-encoding accessor (code → char) from a font's `/Encoding`
 /// name or its `/BaseEncoding`. Returns `None` when the font has no `/Encoding`
 /// (leaving the raw-byte fallback in charge, as before).
-fn base_encoding(doc: &Document, font: &Dict) -> Option<fn(u8) -> Option<char>> {
-    let name = match font.get("Encoding").map(|o| doc.resolve(o)) {
-        Some(Ok(Object::Name(n))) => n.0,
-        Some(Ok(Object::Dict(d))) => d
+async fn base_encoding<S: AsyncObjectSource>(
+    src: &S,
+    font: &Dict,
+) -> Option<fn(u8) -> Option<char>> {
+    let name = match rv(src, font, "Encoding").await {
+        Some(Object::Name(n)) => n.0,
+        Some(Object::Dict(d)) => d
             .get_name("BaseEncoding")
             .map(|n| n.0.clone())
             .unwrap_or_else(|| "StandardEncoding".to_string()),
@@ -594,12 +620,12 @@ fn base_encoding(doc: &Document, font: &Dict) -> Option<fn(u8) -> Option<char>> 
 
 /// Parses `/Encoding /Differences` into a code → glyph-name map (empty when
 /// `/Encoding` is not a dictionary or has no `/Differences`).
-pub(crate) fn differences(doc: &Document, font: &Dict) -> FastMap<u8, String> {
+pub(crate) async fn differences<S: AsyncObjectSource>(src: &S, font: &Dict) -> FastMap<u8, String> {
     let mut out = FastMap::default();
-    let Some(Ok(Object::Dict(enc))) = font.get("Encoding").map(|o| doc.resolve(o)) else {
+    let Some(Object::Dict(enc)) = rv(src, font, "Encoding").await else {
         return out;
     };
-    let Some(Ok(arr)) = enc.get("Differences").map(|o| doc.resolve(o)) else {
+    let Some(arr) = rv(src, &enc, "Differences").await else {
         return out;
     };
     let Some(items) = arr.as_array() else {
@@ -631,10 +657,10 @@ pub(crate) fn differences(doc: &Document, font: &Dict) -> FastMap<u8, String> {
 /// (`pdfboss_encoding::standard_encoding_name`), not for WinAnsi or
 /// MacRoman, so a WinAnsi/MacRoman code must not claim an AFM width through
 /// this path (it falls through to the substitute's own `hmtx` instead).
-fn is_standard_encoding(doc: &Document, font: &Dict) -> bool {
-    let name = match font.get("Encoding").map(|o| doc.resolve(o)) {
-        Some(Ok(Object::Name(n))) => n.0,
-        Some(Ok(Object::Dict(d))) => d
+async fn is_standard_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> bool {
+    let name = match rv(src, font, "Encoding").await {
+        Some(Object::Name(n)) => n.0,
+        Some(Object::Dict(d)) => d
             .get_name("BaseEncoding")
             .map(|n| n.0.clone())
             .unwrap_or_else(|| "StandardEncoding".to_string()),
@@ -651,15 +677,15 @@ fn is_standard_encoding(doc: &Document, font: &Dict) -> bool {
 /// (`TrueType`, `Type1`, `MMType1`) -- never called for `Type0` (whose
 /// two-byte codes a 1-byte substitute table would mis-split) or `Type3`
 /// (whose glyphs paint via `/CharProcs`, not an outline).
-fn substitute_at_full(
-    doc: &Document,
+async fn substitute_at_full<S: AsyncObjectSource>(
+    src: &S,
     font: &Dict,
     painting: GlyphPainting,
     provider: Option<&dyn SubstituteProvider>,
 ) -> Option<GlyphFont> {
     if painting == GlyphPainting::Full {
         if let Some(provider) = provider {
-            return load_substitute(doc, font, provider);
+            return load_substitute(src, font, provider).await;
         }
     }
     None
@@ -688,12 +714,12 @@ fn substitute_at_full(
 /// table wired up here, so it simply gets no `afm_widths` entry and falls
 /// through to the substitute's own `hmtx` -- metric-compatible with the
 /// standard 14, so a near-identical advance even then.
-fn load_substitute(
-    doc: &Document,
+async fn load_substitute<S: AsyncObjectSource>(
+    src: &S,
     font: &Dict,
     provider: &dyn SubstituteProvider,
 ) -> Option<GlyphFont> {
-    let req = FaceRequest::from_font_dict(doc, font)?;
+    let req = FaceRequest::from_font_dict(src, font).await?;
     let bytes = provider.face(&req)?;
     let tt = TrueType::parse(bytes)?;
 
@@ -715,11 +741,11 @@ fn load_substitute(
     // `cmap` gets a real code -> char accessor instead of none at all. A
     // `/Differences` entry (checked first, below) still takes precedence
     // over this default, exactly as it does over an explicit `/Encoding`.
-    let base = base_encoding(doc, font).or_else(|| {
+    let base = base_encoding(src, font).await.or_else(|| {
         pdfboss_encoding::is_standard_14(base_font)
             .then_some(pdfboss_encoding::standard as fn(u8) -> Option<char>)
     });
-    let diffs = differences(doc, font);
+    let diffs = differences(src, font).await;
 
     let mut table = Box::new([0u16; 256]);
     for (code, slot) in table.iter_mut().enumerate() {
@@ -742,7 +768,7 @@ fn load_substitute(
         }
     }
 
-    let widths = simple_widths(doc, font);
+    let widths = simple_widths(src, font).await;
 
     // AFM-14 advances: only for a recognized standard-14 /BaseFont. Codes
     // with no resolvable glyph name (WinAnsi/MacRoman, which have no
@@ -750,7 +776,7 @@ fn load_substitute(
     // through to the substitute's own hmtx for them.
     let mut afm_widths = FastMap::default();
     if pdfboss_encoding::is_standard_14(base_font) {
-        let standard_ok = is_standard_encoding(doc, font);
+        let standard_ok = is_standard_encoding(src, font).await;
         for code in 0u32..256 {
             let name = diffs.get(&(code as u8)).map(String::as_str).or_else(|| {
                 standard_ok
@@ -778,13 +804,17 @@ fn load_substitute(
 /// Loads a `/Type0` composite font by dispatching on its descendant's
 /// `/Subtype`: `CIDFontType2` (embedded TrueType) paints at every tier;
 /// `CIDFontType0` (embedded CFF) joins once `painting` reaches `AllEmbedded`.
-fn load_type0(doc: &Document, font: &Dict, painting: GlyphPainting) -> Option<GlyphFont> {
-    let descendants = doc.resolve(font.get("DescendantFonts")?).ok()?;
+async fn load_type0<S: AsyncObjectSource>(
+    src: &S,
+    font: &Dict,
+    painting: GlyphPainting,
+) -> Option<GlyphFont> {
+    let descendants = src.resolve(font.get("DescendantFonts")?).await.ok()?;
     let first = descendants.as_array()?.first()?;
-    let cid = resolve_dict(doc, first)?;
+    let cid = resolve_dict(src, first).await?;
     match cid.get_name("Subtype").map(|n| n.0.as_str()) {
-        Some("CIDFontType2") => load_type0_truetype(doc, &cid),
-        Some("CIDFontType0") if painting.paints_all_embedded() => load_cff_cid(doc, &cid),
+        Some("CIDFontType2") => load_type0_truetype(src, &cid).await,
+        Some("CIDFontType0") if painting.paints_all_embedded() => load_cff_cid(src, &cid).await,
         _ => None,
     }
 }
@@ -792,16 +822,16 @@ fn load_type0(doc: &Document, font: &Dict, painting: GlyphPainting) -> Option<Gl
 /// Loads a `CIDFontType2` descendant (embedded TrueType), reading its
 /// `/CIDToGIDMap`. Codes are assumed two bytes (`Identity-H`/`Identity-V`
 /// encoding, the embedded-subset norm).
-fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
-    let descriptor = resolve_dict(doc, cid.get("FontDescriptor")?)?;
-    let program = stream_bytes(doc, descriptor.get("FontFile2")?)?;
+async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
+    let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
     let tt = TrueType::parse(program)?;
 
     // /CIDToGIDMap: /Identity (or absent) means GID == CID; a stream is a
     // big-endian u16 table indexed by CID.
-    let map = match cid.get("CIDToGIDMap").map(|o| doc.resolve(o)) {
-        Some(Ok(Object::Stream(s))) => {
-            let bytes = doc.stream_data(&s).ok()?;
+    let map = match rv(src, cid, "CIDToGIDMap").await {
+        Some(Object::Stream(s)) => {
+            let bytes = src.stream_data(&s).await.ok()?;
             Some(
                 bytes
                     .chunks_exact(2)
@@ -816,7 +846,7 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
-        widths: cid_widths(doc, cid),
+        widths: cid_widths(src, cid).await,
         afm_widths: FastMap::default(),
     })
 }
@@ -825,22 +855,18 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
 /// under the `Identity-H`/`Identity-V` encoding these loaders assume).
 /// `declared` is true iff either key is present, so a descendant with
 /// neither (uncommon, but not forbidden) leaves the fallback in charge.
-fn cid_widths(doc: &Document, cid: &Dict) -> WidthMap {
+async fn cid_widths<S: AsyncObjectSource>(src: &S, cid: &Dict) -> WidthMap {
     let mut default = 1000.0;
     let mut declared = false;
-    if let Some(dw) = cid
-        .get("DW")
-        .and_then(|o| doc.resolve(o).ok())
-        .and_then(|o| o.as_f64())
-    {
+    if let Some(dw) = rv(src, cid, "DW").await.and_then(|o| o.as_f64()) {
         default = dw as f32;
         declared = true;
     }
 
     let mut map = FastMap::default();
-    if let Some(Ok(Object::Array(items))) = cid.get("W").map(|o| doc.resolve(o)) {
+    if let Some(Object::Array(items)) = rv(src, cid, "W").await {
         declared = true;
-        parse_cid_width_array(doc, &items, &mut map);
+        parse_cid_width_array(src, &items, &mut map).await;
     }
 
     WidthMap {
@@ -865,11 +891,15 @@ const MAX_CID_WIDTH_ENTRIES: usize = 1_000_000;
 /// `MAX_CID_WIDTH_ENTRIES` (not merely each range), so a hostile array with
 /// many ranges can't allocate unbounded memory; a font that hits the cap is
 /// malformed, so parsing simply stops and keeps whatever was parsed so far.
-fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut FastMap<u32, f32>) {
-    let resolved: Vec<Object> = items
-        .iter()
-        .map(|o| doc.resolve(o).unwrap_or(Object::Null))
-        .collect();
+async fn parse_cid_width_array<S: AsyncObjectSource>(
+    src: &S,
+    items: &[Object],
+    map: &mut FastMap<u32, f32>,
+) {
+    let mut resolved: Vec<Object> = Vec::with_capacity(items.len());
+    for item in items {
+        resolved.push(src.resolve(item).await.unwrap_or(Object::Null));
+    }
     let mut i = 0;
     while i < resolved.len() {
         if map.len() >= MAX_CID_WIDTH_ENTRIES {
@@ -889,7 +919,7 @@ fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut FastMap<u32
                     let Some(code) = first.checked_add(j as u32) else {
                         break; // start CID so large the CIDs overflow u32
                     };
-                    if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+                    if let Some(w) = src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
                         map.insert(code, w as f32);
                     }
                 }
@@ -920,12 +950,12 @@ fn parse_cid_width_array(doc: &Document, items: &[Object], map: &mut FastMap<u32
 /// `/CIDToGIDMap` is a `CIDFontType2`-only key (it maps into a `glyf`
 /// program); a `CIDFontType0` descendant is not expected to carry one, so it
 /// is not consulted here.
-fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
-    let descriptor = resolve_dict(doc, cid.get("FontDescriptor")?)?;
-    let program = stream_bytes(doc, descriptor.get("FontFile3")?)?;
+async fn load_cff_cid<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
+    let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
+    let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
     let cff = CffFont::parse(program)?;
     let cid_to_gid = cff.cid_to_gid();
-    let widths = cid_widths(doc, cid);
+    let widths = cid_widths(src, cid).await;
     Some(GlyphFont {
         outline_cache: Mutex::new(FastMap::default()),
         flat_cache: Mutex::new(FastMap::default()),
@@ -937,14 +967,14 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
 }
 
 /// Resolves an object to an owned dictionary.
-fn resolve_dict(doc: &Document, obj: &Object) -> Option<Dict> {
-    doc.resolve(obj).ok()?.as_dict().cloned()
+async fn resolve_dict<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Dict> {
+    src.resolve(obj).await.ok()?.as_dict().cloned()
 }
 
 /// Resolves an object to a stream and returns its decoded bytes.
-fn stream_bytes(doc: &Document, obj: &Object) -> Option<Vec<u8>> {
-    match doc.resolve(obj).ok()? {
-        Object::Stream(s) => doc.stream_data(&s).ok(),
+async fn stream_bytes<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Vec<u8>> {
+    match src.resolve(obj).await.ok()? {
+        Object::Stream(s) => src.stream_data(&s).await.ok(),
         _ => None,
     }
 }
