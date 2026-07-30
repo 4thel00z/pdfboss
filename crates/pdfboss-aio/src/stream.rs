@@ -15,7 +15,7 @@ use pdfboss_core::elements::{Element, ElementOpts};
 use pdfboss_core::xref::XrefEntry;
 use pdfboss_core::{Dict, Name, ObjRef, Object};
 
-use crate::document::{AsyncDocument, PageRecord};
+use crate::document::AsyncDocument;
 use crate::error::{Error, Result};
 
 /// Async counterpart of core's sync element iterator. `Send + 'static`
@@ -400,13 +400,15 @@ fn dict_u32(dict: &Dict, key: &str) -> u32 {
 /// images and unknown-operator drops) can never diverge from core.
 async fn content_ops(state: &mut StreamState, page: usize) {
     let doc = state.doc.clone();
-    let Some(record) = doc.page_record(page) else {
+    let Ok(core_page) = doc.page(page) else {
         return;
     };
-    let decoded = match page_content(&doc, &record).await {
+    // The shared implementation both APIs use; the duplicate that used to
+    // live in this file is gone, so the two cannot drift.
+    let decoded = match pdfboss_core::page_content_with(&doc, &core_page).await {
         Ok(decoded) => decoded,
         Err(err) => {
-            state.pending.push_back(Err(err));
+            state.pending.push_back(Err(Error::Core(err)));
             return;
         }
     };
@@ -421,44 +423,6 @@ async fn content_ops(state: &mut StreamState, page: usize) {
             }
         }
         Err(err) => state.pending.push_back(Err(Error::Core(err))),
-    }
-}
-
-/// The page's decoded content: the `/Contents` stream, or all streams of a
-/// `/Contents` array decoded and joined with `b"\n"`, mirroring the sync
-/// page API. A missing `/Contents` yields empty content (lenient).
-///
-/// **This duplicates [`pdfboss_core::page_content_with`] and is temporary.**
-/// The core function is the shared implementation both APIs are meant to reach;
-/// this one survives only because routing here through it requires an
-/// `AsyncObjectSource` implementation for [`AsyncDocument`], which in turn
-/// requires a core error variant able to carry this crate's transport failures
-/// (`Http`, `RangeUnsupported`, `TruncatedRead` have no core counterpart
-/// today). Both land together, and this function is deleted then. Until it is,
-/// any change to one body must be mirrored in the other.
-async fn page_content(doc: &AsyncDocument, record: &PageRecord) -> Result<Vec<u8>> {
-    let Some(contents) = record.dict.get("Contents") else {
-        return Ok(Vec::new());
-    };
-    match doc.resolve(contents).await? {
-        Object::Stream(ref s) => doc.decode_stream(s).await,
-        Object::Array(items) => {
-            let mut out = Vec::new();
-            let mut first = true;
-            for item in &items {
-                let part = doc.resolve(item).await?;
-                let Some(stream) = part.as_stream() else {
-                    continue; // non-stream entries are skipped (lenient)
-                };
-                if !first {
-                    out.push(b'\n');
-                }
-                out.extend_from_slice(&doc.decode_stream(stream).await?);
-                first = false;
-            }
-            Ok(out)
-        }
-        _ => Ok(Vec::new()),
     }
 }
 

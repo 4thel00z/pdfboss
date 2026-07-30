@@ -240,3 +240,111 @@ async fn indirect_decode_parms_reference_decodes_identically() {
         "indirect /DecodeParms must decode identically on both sides"
     );
 }
+
+/// A three-level tree whose `/MediaBox` (A4), `/Rotate` and `/CropBox` are
+/// declared on `/Pages` nodes, never on the leaf: the attributes only reach
+/// the page by inheritance (ISO 32000-1 7.7.3.4).
+fn inherited_attrs_doc() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 \
+         /MediaBox [0 0 595 842] /Rotate 90 >>",
+    );
+    // An intermediate node overrides /Rotate and adds a /CropBox.
+    b.object(
+        3,
+        "<< /Type /Pages /Parent 2 0 R /Kids [4 0 R] /Count 1 \
+         /Rotate 180 /CropBox [10 10 300 400] >>",
+    );
+    b.object(4, "<< /Type /Page /Parent 3 0 R /Contents 5 0 R >>");
+    b.stream(5, "", b"BT ET");
+    b.object(6, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>");
+    b.stream(7, "", b"BT ET");
+    b.build(1)
+}
+
+/// Every page attribute the two APIs hand out must be identical: media box,
+/// crop box, rotation, size, object reference and dictionary. The fixture
+/// declares everything on `/Pages` nodes, so a traversal that fails to
+/// inherit reports US Letter for an A4 page — silently, which is why this
+/// compares every field rather than probing one.
+#[tokio::test]
+async fn pages_agree_with_the_sync_document() {
+    let mut cases = fixtures();
+    cases.push(("inherited_attrs", inherited_attrs_doc()));
+    for (name, bytes) in cases {
+        let sync_doc = Document::load(bytes.clone()).expect("sync load");
+        let async_doc = AsyncDocument::from_bytes(bytes).await.expect("async open");
+        assert_eq!(
+            sync_doc.page_count(),
+            async_doc.page_count(),
+            "{name}: page counts"
+        );
+        for i in 0..sync_doc.page_count() {
+            let s = sync_doc.page(i).expect("sync page");
+            let a = async_doc.page(i).expect("async page");
+            assert_eq!(s.media_box, a.media_box, "{name} page {i}: media box");
+            assert_eq!(s.crop_box, a.crop_box, "{name} page {i}: crop box");
+            assert_eq!(s.rotate, a.rotate, "{name} page {i}: rotation");
+            assert_eq!(s.size(), a.size(), "{name} page {i}: size");
+            assert_eq!(
+                s.object_ref(),
+                a.object_ref(),
+                "{name} page {i}: object ref"
+            );
+            assert_eq!(s.dict(), a.dict(), "{name} page {i}: dict");
+            assert_eq!(s.resources, a.resources, "{name} page {i}: resources");
+        }
+        let oob = async_doc.page(sync_doc.page_count());
+        assert!(oob.is_err(), "{name}: out-of-bounds page errs");
+    }
+}
+
+/// The whole point of the parity workstream, exercised end to end: the SAME
+/// text-extraction and rendering implementations run over an
+/// `AsyncDocument`, produce byte-identical output to the synchronous API,
+/// and do so from inside `tokio::spawn` — which is the `Send + 'static`
+/// gate enforced by a real runtime rather than a type assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_algorithms_run_over_the_async_document() {
+    let bytes = multi_page_doc(&["alpha", "beta", "gamma"]);
+    let sync_doc = Document::load(bytes.clone()).expect("sync load");
+    let async_doc = AsyncDocument::from_bytes(bytes).await.expect("async open");
+
+    for i in 0..sync_doc.page_count() {
+        let sync_page = sync_doc.page(i).expect("sync page");
+        let expected_text = pdfboss_text::extract_text(&sync_doc, &sync_page).expect("sync text");
+        let (expected_pix, _) = pdfboss_render::render_page_reporting(
+            &sync_doc,
+            &sync_page,
+            1.0,
+            &pdfboss_render::RenderOptions::default(),
+        )
+        .expect("sync render");
+
+        let doc = async_doc.clone();
+        let handle = tokio::spawn(async move {
+            let page = doc.page(i).expect("async page");
+            let text = pdfboss_text::extract_text_with(doc.clone(), &page)
+                .await
+                .expect("async text");
+            let (pix, _) = pdfboss_render::render_page_reporting_with(
+                doc,
+                &page,
+                1.0,
+                &pdfboss_render::RenderOptions::default(),
+            )
+            .await
+            .expect("async render");
+            (text, pix)
+        });
+        let (text, pix) = handle.await.expect("spawned task");
+        assert_eq!(text, expected_text, "page {i}: extracted text");
+        assert_eq!(
+            pix.data, expected_pix.data,
+            "page {i}: rendered pixels must be byte-identical"
+        );
+    }
+}

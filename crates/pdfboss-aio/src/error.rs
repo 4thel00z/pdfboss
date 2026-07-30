@@ -61,6 +61,21 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// The adapter that lets [`crate::AsyncDocument`] speak a shared algorithm's
+/// `pdfboss_core::Result`: parse-layer errors unwrap back to the original
+/// core variant, and the genuinely transport-level remainder renders into
+/// [`pdfboss_core::Error::Transport`], message intact. Nothing is lost that a
+/// shared algorithm could act on — leniency decisions key off the parse
+/// variants, which survive unwrapped.
+impl From<Error> for pdfboss_core::Error {
+    fn from(e: Error) -> pdfboss_core::Error {
+        match e {
+            Error::Core(inner) => inner,
+            transport => pdfboss_core::Error::Transport(transport.to_string()),
+        }
+    }
+}
+
 /// Marker payload smuggled through `std::io::Error` by backends whose
 /// trait methods can only return `io::Result`; recovered by
 /// [`From<std::io::Error>`] above. Only the HTTP backend produces these.

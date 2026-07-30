@@ -34,6 +34,17 @@ pub enum Error {
     PageNotFound(usize, usize),
     #[error("circular reference involving object {0}")]
     CircularReference(u32),
+    /// A transport-layer failure from an asynchronous byte source — an I/O
+    /// error, an HTTP failure, a refused range request, a short read.
+    ///
+    /// Carried as a rendered message so this crate stays free of transport
+    /// types. Produced when a source whose own error type is richer (the
+    /// asynchronous document's) crosses a shared-algorithm boundary that
+    /// speaks this `Result`; the adapter unwraps its parse-layer errors back
+    /// to the original variant and renders only the genuinely transport-level
+    /// remainder into this one.
+    #[error("transport: {0}")]
+    Transport(String),
     #[error("{0}")]
     Other(String),
 }

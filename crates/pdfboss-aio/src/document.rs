@@ -13,7 +13,7 @@ use pdfboss_core::lexer::{Lexer, Token};
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::parser::{NoResolve, Parser, Resolve};
 use pdfboss_core::xref::XrefEntry;
-use pdfboss_core::{Dict, Metadata, ObjRef, Object, Stream};
+use pdfboss_core::{AsyncObjectSource, Dict, Metadata, ObjRef, Object, Page, Stream};
 
 use crate::backend::{Backend, BoxFuture, FileBackend, MemBackend};
 use crate::cache::CachedBackend;
@@ -228,6 +228,25 @@ pub(crate) struct PageRecord {
     /// Consumed, with `dict` above, by the logical element layer (Plan 02
     /// task 12).
     pub(crate) resources: Dict,
+    /// Inherited `/MediaBox`, still raw: `None` when no node on the path
+    /// declared one. Defaults apply in [`Page::from_tree_attrs`], not here,
+    /// so this record cannot disagree with the synchronous walk about what
+    /// "the file said nothing" means.
+    pub(crate) media_box: Option<pdfboss_core::Rect>,
+    /// Inherited `/CropBox`, raw as above.
+    pub(crate) crop_box: Option<pdfboss_core::Rect>,
+    /// Inherited `/Rotate`, raw as above.
+    pub(crate) rotate: Option<i32>,
+}
+
+/// Attributes inherited down the page tree (ISO 32000 §7.7.3.4), carried
+/// raw; defaults apply in [`Page::from_tree_attrs`].
+#[derive(Clone, Default)]
+struct InheritedAttrs {
+    resources: Dict,
+    media_box: Option<pdfboss_core::Rect>,
+    crop_box: Option<pdfboss_core::Rect>,
+    rotate: Option<i32>,
 }
 
 /// Page-tree traversal depth cap, mirroring the sync document model.
@@ -694,6 +713,33 @@ impl AsyncDocument {
             backend: Arc::clone(&self.inner.backend),
             len: self.inner.file_len,
         }
+    }
+}
+
+/// What lets every shared algorithm run over an asynchronous document:
+/// `page_content_with`, `extract_text_with`, `render_page_reporting_with`
+/// all take any `AsyncObjectSource`, and this is the genuinely asynchronous
+/// one. `AsyncDocument` is an `Arc` handle, so cloning one to hand to an
+/// entry point by value is two atomic increments.
+///
+/// The trait speaks core's `Result`, so this crate's transport failures
+/// cross the boundary as [`pdfboss_core::Error::Transport`] (parse-layer
+/// errors unwrap back to their original variant — see the `From` impl in
+/// `crate::error`). Leniency inside the shared algorithms keys off the parse
+/// variants, which survive the crossing unchanged.
+impl AsyncObjectSource for AsyncDocument {
+    fn get(&self, r: ObjRef) -> BoxFuture<'_, pdfboss_core::Result<Object>> {
+        Box::pin(async move { self.get_object(r).await.map_err(Into::into) })
+    }
+
+    fn stream_data<'a>(&'a self, s: &'a Stream) -> BoxFuture<'a, pdfboss_core::Result<Vec<u8>>> {
+        Box::pin(async move { self.decode_stream(s).await.map_err(Into::into) })
+    }
+
+    fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, pdfboss_core::Result<Object>> {
+        // The inherent `resolve` wins the name lookup here, so this forwards
+        // the document's own lenient chain-chasing, not the shared loop.
+        Box::pin(async move { self.resolve(o).await.map_err(Into::into) })
     }
 }
 
@@ -1233,6 +1279,35 @@ impl AsyncDocument {
         self.inner.pages.get().map_or(0, Vec::len)
     }
 
+    /// The page at 0-based `index`, as the same [`Page`] type the
+    /// synchronous document hands out — built by [`Page::from_tree_attrs`],
+    /// the one implementation of page defaulting, over attributes this
+    /// document resolved while flattening the tree at open. Synchronous
+    /// because everything it needs is already resolved.
+    ///
+    /// With a `Page` in hand, every shared algorithm runs over this
+    /// document directly: `extract_text_with(doc.clone(), &page)`,
+    /// `render_page_reporting_with(doc.clone(), &page, ..)`, and
+    /// `page_content_with(&doc, &page)` — the document is an `Arc` handle,
+    /// so the clone is two atomic increments.
+    pub fn page(&self, index: usize) -> Result<Page> {
+        let Some(record) = self.page_record(index) else {
+            return Err(Error::Core(pdfboss_core::Error::PageNotFound(
+                index,
+                self.page_count(),
+            )));
+        };
+        Ok(Page::from_tree_attrs(
+            index,
+            Some(record.resources),
+            record.media_box,
+            record.crop_box,
+            record.rotate,
+            record.dict,
+            record.r,
+        ))
+    }
+
     /// The flattened record for the page at 0-based `index`. Consumed by
     /// the logical element layer (Plan 02 tasks 11-12).
     pub(crate) fn page_record(&self, index: usize) -> Option<PageRecord> {
@@ -1261,8 +1336,9 @@ impl AsyncDocument {
             return pages;
         };
         let mut visited: HashSet<ObjRef> = HashSet::new();
-        let mut stack: Vec<(Object, Dict, usize)> = vec![(tree_root, Dict::new(), 0)];
-        while let Some((node, inherited_resources, depth)) = stack.pop() {
+        let mut stack: Vec<(Object, InheritedAttrs, usize)> =
+            vec![(tree_root, InheritedAttrs::default(), 0)];
+        while let Some((node, mut inherited, depth)) = stack.pop() {
             if depth > MAX_TREE_DEPTH {
                 continue;
             }
@@ -1278,16 +1354,22 @@ impl AsyncDocument {
             let Some(dict) = resolved.as_dict() else {
                 continue;
             };
-            let resources = match dict.get("Resources") {
-                Some(value) => match self.resolve_with_chain(value, &mut chain).await {
-                    Ok(resolved_resources) => resolved_resources
-                        .as_dict()
-                        .cloned()
-                        .unwrap_or(inherited_resources),
-                    Err(_) => inherited_resources,
-                },
-                None => inherited_resources,
-            };
+            if let Some(value) = dict.get("Resources") {
+                if let Ok(res) = self.resolve_with_chain(value, &mut chain).await {
+                    if let Some(res) = res.as_dict() {
+                        inherited.resources = res.clone();
+                    }
+                }
+            }
+            if let Some(mb) = self.rect_value(dict, "MediaBox", &mut chain).await {
+                inherited.media_box = Some(mb);
+            }
+            if let Some(cb) = self.rect_value(dict, "CropBox", &mut chain).await {
+                inherited.crop_box = Some(cb);
+            }
+            if let Some(rot) = self.int_value(dict, "Rotate", &mut chain).await {
+                inherited.rotate = Some(rot);
+            }
             let is_page = dict.get_name("Type").is_some_and(|n| n.0 == "Page");
             let kids = if is_page {
                 None
@@ -1298,17 +1380,59 @@ impl AsyncDocument {
                 Some(kids) => {
                     // Reverse push so pop order matches document order.
                     for kid in kids.iter().rev() {
-                        stack.push((kid.clone(), resources.clone(), depth + 1));
+                        stack.push((kid.clone(), inherited.clone(), depth + 1));
                     }
                 }
                 None => pages.push(PageRecord {
                     r: node_ref,
                     dict: dict.clone(),
-                    resources,
+                    resources: inherited.resources.clone(),
+                    media_box: inherited.media_box,
+                    crop_box: inherited.crop_box,
+                    rotate: inherited.rotate,
                 }),
             }
         }
         pages
+    }
+
+    /// Resolves `dict[key]` to a normalized rectangle: a four-number array
+    /// whose elements may themselves be references, mirroring the synchronous
+    /// walk's reading exactly.
+    async fn rect_value(
+        &self,
+        dict: &Dict,
+        key: &str,
+        chain: &mut Vec<u32>,
+    ) -> Option<pdfboss_core::Rect> {
+        let items = self.array_value(dict, key, chain).await?;
+        if items.len() != 4 {
+            return None;
+        }
+        let mut coords = [0.0f32; 4];
+        for (slot, item) in coords.iter_mut().zip(&items) {
+            let n = self.resolve_with_chain(item, chain).await.ok()?.as_f64()?;
+            if !n.is_finite() {
+                return None;
+            }
+            *slot = n as f32;
+        }
+        Some(pdfboss_core::Rect::new(coords[0], coords[1], coords[2], coords[3]).normalize())
+    }
+
+    /// Resolves `dict[key]` to an integer (reals truncate, lenient),
+    /// mirroring the synchronous walk's reading exactly.
+    async fn int_value(&self, dict: &Dict, key: &str, chain: &mut Vec<u32>) -> Option<i32> {
+        let v = self
+            .resolve_with_chain(dict.get(key)?, chain)
+            .await
+            .ok()?
+            .as_f64()?;
+        if v.is_finite() {
+            Some(v as i32)
+        } else {
+            None
+        }
     }
 
     /// Resolves `dict[key]` to an array, if present and well-formed.

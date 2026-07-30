@@ -18,9 +18,6 @@ use crate::parser::{Parser, Resolve};
 use crate::source::{block_on, AsyncObjectSource, Immediate};
 use crate::xref::{load_xref, Xref, XrefEntry};
 
-/// Default page size when `/MediaBox` is absent or invalid: US Letter.
-const US_LETTER: Rect = Page::US_LETTER;
-
 /// Page-tree traversal depth cap.
 const MAX_TREE_DEPTH: usize = 256;
 
@@ -1066,7 +1063,11 @@ mod tests {
         assert_eq!(doc.page(1).unwrap().rotate, 270, "-90 normalizes to 270");
         let odd = doc.page(2).unwrap();
         assert_eq!(odd.rotate, 0, "non-multiple of 90 falls back to 0");
-        assert_eq!(odd.media_box, US_LETTER, "degenerate media box defaults");
+        assert_eq!(
+            odd.media_box,
+            Page::US_LETTER,
+            "degenerate media box defaults"
+        );
     }
 
     #[test]
