@@ -2347,15 +2347,10 @@ mod tests {
 
     /// Builds a one-page 200x200 doc showing a `/Type3` font (object 5) whose
     /// `/boxglyph` CharProc (object 6) is `charproc`. `font_extra` is spliced
-    /// into the font dict (e.g. `/FirstChar`+`/Widths`); `char_res` optionally
-    /// gives the CharProc stream its own `/Resources` (for self-reference).
-    /// Code 65 maps to `/boxglyph` via `/Differences`.
-    fn type3_doc(
-        charproc: &str,
-        font_extra: &str,
-        char_res: Option<&str>,
-        content: &[u8],
-    ) -> Vec<u8> {
+    /// into the font dict — `/FirstChar`+`/Widths`, and `/Resources` for the
+    /// fixtures that need the font to carry its own. Code 65 maps to `/boxglyph`
+    /// via `/Differences`.
+    fn type3_doc(charproc: &str, font_extra: &str, content: &[u8]) -> Vec<u8> {
         let mut b = PdfBuilder::new().version(1, 5);
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -2374,14 +2369,14 @@ mod tests {
                  /CharProcs << /boxglyph 6 0 R >> {font_extra} >>"
             ),
         );
-        b.stream(6, char_res.unwrap_or(""), charproc.as_bytes());
+        b.stream(6, "", charproc.as_bytes());
         b.build(1)
     }
 
     /// A Type3 fixture whose `charproc` paints under `/FirstChar 65 /Widths
     /// [1000]`.
     fn type3_page_doc(charproc: &str, content: &[u8]) -> Vec<u8> {
-        type3_doc(charproc, "/FirstChar 65 /Widths [1000]", None, content)
+        type3_doc(charproc, "/FirstChar 65 /Widths [1000]", content)
     }
 
     /// A Type3 fixture painting the standard box glyph with the given
@@ -2390,19 +2385,24 @@ mod tests {
         type3_doc(
             "1000 0 d0 100 0 500 700 re f",
             &format!("/FirstChar 65 /Widths [{width}]"),
-            None,
             content,
         )
     }
 
     /// A Type3 fixture whose CharProc paints the box AND shows code 65 in the
-    /// same font (via its own `/Resources /F0` pointing back at the font) --
-    /// self-referential, so it must be depth-bounded.
+    /// same font, via the font's own `/Resources /F0` pointing back at the font
+    /// -- self-referential, so it must be depth-bounded.
+    ///
+    /// The `/Resources` goes on the **font** dictionary because that is where
+    /// ISO 32000-1 9.6.5 puts a Type3 glyph's resources; a CharProc is a content
+    /// stream, not a form XObject, and has none of its own. This fixture used to
+    /// place it on the CharProc stream's dictionary, where `Type3Font::load` never
+    /// looks, and still recursed — because `/F0` also resolves through the page's
+    /// chain. It passed for a reason this comment misdescribed.
     fn type3_recursive_doc() -> Vec<u8> {
         type3_doc(
             "1000 0 d0 100 0 500 700 re f BT /F0 100 Tf <41> Tj ET",
-            "/FirstChar 65 /Widths [1000]",
-            Some("/Resources << /Font << /F0 5 0 R >> >>"),
+            "/FirstChar 65 /Widths [1000] /Resources << /Font << /F0 5 0 R >> >>",
             b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
         )
     }
@@ -2437,6 +2437,48 @@ mod tests {
             "self-referential Type3 must be depth-bounded, not hang/overflow"
         );
         assert!(dark_at(&pix, 55, 115), "the box still paints");
+    }
+
+    /// A Type3 CharProc resolves names through the **font's** own `/Resources`,
+    /// prepended to the surrounding chain (ISO 32000-1 9.6.5). The form XObject
+    /// this glyph draws is named nowhere else — the page's `/Resources` carries
+    /// only `/Font` — so the box paints only if that prepend happens.
+    ///
+    /// Nothing covered that before. The one fixture carrying a CharProc
+    /// `/Resources` put it on the stream dictionary, which `Type3Font::load` never
+    /// reads, and reached its font through the page's chain instead.
+    #[test]
+    fn a_char_proc_resolves_names_from_the_fonts_own_resources() {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        // The page names the font and nothing else, so there is no /XObject entry
+        // anywhere in the chain the CharProc would otherwise inherit.
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+             /FontMatrix [0.001 0 0 0.001 0 0] \
+             /Encoding << /Differences [65 /boxglyph] >> \
+             /CharProcs << /boxglyph 6 0 R >> /FirstChar 65 /Widths [1000] \
+             /Resources << /XObject << /Fx 7 0 R >> >> >>",
+        );
+        b.stream(6, "", b"1000 0 d0 /Fx Do");
+        b.stream(
+            7,
+            "/Type /XObject /Subtype /Form /BBox [0 0 1000 1000]",
+            b"100 0 500 700 re f",
+        );
+        let pix = render_at_tier(&b.build(1), GlyphPainting::AllEmbedded);
+        assert!(
+            dark_at(&pix, 55, 115),
+            "the CharProc's form must resolve through the font's own /Resources"
+        );
     }
 
     #[test]
