@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.9.0](https://github.com/4thel00z/pdfboss/compare/v0.8.0...v0.9.0) (2026-07-30)
+
+
+### Features
+
+* **aio:** decrypt empty-password files, closing divergence A1 ([46bfbca](https://github.com/4thel00z/pdfboss/commit/46bfbcac9d4bce9484909b743eb1c841fbb0b847))
+* **aio:** pages and every shared algorithm over the async document ([767286c](https://github.com/4thel00z/pdfboss/commit/767286c8a9cab6cfc0a8b7b7d40f3e24dfd9ad21))
+* **core:** add a synchronous object-source trait ([d76238a](https://github.com/4thel00z/pdfboss/commit/d76238a3627adfd04ea53ffded6f2fea36d7932f))
+* **core:** add an asynchronous object-source trait and its synchronous driver ([36f2943](https://github.com/4thel00z/pdfboss/commit/36f2943a93a3d5bc1eba96f5a39df87c01b9a103))
+* **core:** build a page from already-resolved attributes ([c84e913](https://github.com/4thel00z/pdfboss/commit/c84e9133759c23450c0848a352f038a2db971875))
+* **core:** decode an immediate generic refinement region segment ([651b3ea](https://github.com/4thel00z/pdfboss/commit/651b3ea488f39ee928e2f0e0cda6bf2583dabebe))
+* **core:** make a reference to an async source a source ([73d973a](https://github.com/4thel00z/pdfboss/commit/73d973af814aa213da97a1cfd7195784bfd89b36))
+* **core:** make the standard-handler decryptor public ([8e17293](https://github.com/4thel00z/pdfboss/commit/8e17293e2642c5a26f07415733a4dabc249e545a))
+* **core:** share one implementation of page defaulting ([5a3110a](https://github.com/4thel00z/pdfboss/commit/5a3110abb2cb58a69955086d40b57b253e3f3d82))
+* **core:** share one page-content implementation between both APIs ([1d0dde3](https://github.com/4thel00z/pdfboss/commit/1d0dde3c5791b6b3eca4896c9649bf0fb8d8ce8f))
+* **py:** the full async page surface, at parity with the sync one ([60f3a8f](https://github.com/4thel00z/pdfboss/commit/60f3a8f0dbb0003e74fc8ef701b3bd57e5bec3e2))
+* **render:** render any page from any object source ([829ca44](https://github.com/4thel00z/pdfboss/commit/829ca442b03f9cf9a706eca1db6f75f0eacd1f79))
+* **text:** extract text and spans from any object source ([ef030da](https://github.com/4thel00z/pdfboss/commit/ef030dae609290048f94502bcc607d0a810e2fbe))
+
+
+### Bug Fixes
+
+* **core:** dedupe the resolve loop and harden the blocking driver ([d1dee70](https://github.com/4thel00z/pdfboss/commit/d1dee707ee9edb881244fe10d41649bd98e29b97))
+* **core:** drain a stranded unpark token and document what cannot be drained ([004db34](https://github.com/4thel00z/pdfboss/commit/004db3430878d38abc5214f3e915e5e205f7e77f))
+* **core:** drive the shared implementation with a real blocking driver ([3e038df](https://github.com/4thel00z/pdfboss/commit/3e038df883a2ddc0624101a7f5e6b516ba8d1a51))
+* **text:** look a form's resources up along the chain ([662115c](https://github.com/4thel00z/pdfboss/commit/662115cff30d0476d1ffdf2860a249fb6354d671))
+
+
+### Performance Improvements
+
+* fan every page out across the cores ([a8154b0](https://github.com/4thel00z/pdfboss/commit/a8154b0b2e4a56d19b954765d6d09c5dbfe04164))
+* **py:** let per-page calls run in parallel from the caller's threads ([cafc96f](https://github.com/4thel00z/pdfboss/commit/cafc96f384e8c20057cda0e1d87559870bc76b04))
+* **text:** stop cloning the font handle on every shown string ([97253fe](https://github.com/4thel00z/pdfboss/commit/97253fec399c9100f87b9c6347901e70d43041f4))
+
+
+### Documentation
+
+* **core:** pin the source-ownership rule for shared algorithms ([b79a575](https://github.com/4thel00z/pdfboss/commit/b79a5751a83a49534526f11c0319ed0fe88e726e))
+* correct what the renderer actually paints ([df39f5a](https://github.com/4thel00z/pdfboss/commit/df39f5ada9a997cc4b0d3c785eae8e7ceb0b5f77))
+* remeasure both benchmarks ([bc639bb](https://github.com/4thel00z/pdfboss/commit/bc639bbc66dc07f293d36b3897d8873bd4fc7ae9))
+* remeasure both benchmarks on an idle machine ([9e1580e](https://github.com/4thel00z/pdfboss/commit/9e1580e33ae0241fae271ce61bbce744c1cf8f28))
+
 ## [0.8.0](https://github.com/4thel00z/pdfboss/compare/v0.7.2...v0.8.0) (2026-07-29)
 
 
