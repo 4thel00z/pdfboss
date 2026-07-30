@@ -8,11 +8,15 @@
 
 use std::sync::Arc;
 
+use pdfboss_core::AsyncObjectSource;
 use pdfboss_core::FastMap;
-use pdfboss_core::{block_on, AsyncObjectSource, Immediate};
+#[cfg(test)]
+use pdfboss_core::{block_on, Immediate};
 
 use pdfboss_core::geom::Matrix;
-use pdfboss_core::{Dict, Document, Object};
+#[cfg(test)]
+use pdfboss_core::Document;
+use pdfboss_core::{Dict, Object};
 
 use crate::glyph::differences;
 
@@ -49,6 +53,7 @@ impl Type3Font {
     /// is `Option`/bounds-checked, so a malformed `/Widths`, `/CharProcs`
     /// entry, or `/Encoding` degrades to fewer mappings rather than failing
     /// the whole load (except the two required entries above).
+    #[cfg(test)]
     pub(crate) fn load(doc: &Document, font: &Dict) -> Option<Type3Font> {
         block_on(Self::load_with(&Immediate(doc), font))
     }

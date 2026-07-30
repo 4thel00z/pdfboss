@@ -14,9 +14,11 @@ use pdfboss_core::FastMap;
 use std::sync::Arc;
 
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
-use pdfboss_core::filters::decode_stream;
 use pdfboss_core::geom::{Matrix, Point};
-use pdfboss_core::{Dict, Document, Error, Name, Object, Page, Result, Stream};
+use pdfboss_core::{
+    block_on, page_content_with, AsyncObjectSource, Dict, Document, Error, Immediate, Name, Object,
+    Page, Result, Stream,
+};
 
 use crate::color::{self, ColorSpace};
 use crate::glyph::GlyphFont;
@@ -285,6 +287,31 @@ pub(crate) fn render_page_reporting(
     scale: f32,
     opts: &RenderOptions,
 ) -> Result<(Pixmap, RenderReport)> {
+    block_on(render_page_reporting_with(
+        Immediate(doc),
+        page,
+        scale,
+        opts,
+    ))
+}
+
+/// [`render_page_reporting`] against any object source, awaiting whatever
+/// I/O the source needs to read the page. This is the implementation; the
+/// synchronous form is this function over [`Immediate`], driven to
+/// completion on the calling thread, so the two cannot disagree about what a
+/// page looks like.
+///
+/// The source is taken by value and the page by reference — the combination
+/// a consumer needs to spawn the result. The future is `Send` over a source
+/// that is `Send + Sync`, and `'static` as long as the borrow of `page` is
+/// created inside the consumer's own `async move` block, which owns the
+/// page. See `pdfboss_core::source`'s "Signing a shared algorithm".
+pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    scale: f32,
+    opts: &RenderOptions,
+) -> Result<(Pixmap, RenderReport)> {
     let scale = if scale.is_finite() && scale > 0.0 {
         scale
     } else {
@@ -299,7 +326,7 @@ pub(crate) fn render_page_reporting(
     // A page whose own `/Contents` will not decode or will not parse
     // rasterizes blank, which is indistinguishable from an empty page unless
     // the report says so.
-    let content = match page.content(doc) {
+    let content = match page_content_with(&src, page).await {
         Ok(content) => content,
         Err(e) => {
             report.record(SkippedKind::PageContents, skip_reason_for(&e));
@@ -313,7 +340,7 @@ pub(crate) fn render_page_reporting(
             Vec::new()
         }
     };
-    record_annotations(doc, page, &mut report);
+    record_annotations(&src, page, &mut report).await;
     let ctm = base_ctm(page.crop_box.normalize(), page.rotate, scale);
     let provider: Option<Box<dyn SubstituteProvider>> = match &opts.substitutes {
         SubstituteSource::Dir(dir) => Some(Box::new(DirProvider { dir: dir.clone() })),
@@ -327,21 +354,24 @@ pub(crate) fn render_page_reporting(
         SubstituteSource::None => None,
     };
     let mut exec = Executor {
-        doc,
+        src: &src,
         pix,
         painting: opts.glyph_painting,
         color_locked: false,
         provider,
         glyph_blit: Vec::new(),
         clip_cache: FastMap::default(),
+        charproc_cache: FastMap::default(),
         report,
     };
-    exec.run(
-        &ops,
-        &[Arc::new(page.resources.clone())],
+    let root = Frame::new(
+        ops.into(),
+        vec![Arc::new(page.resources.clone())],
         GState::new(ctm),
         0,
+        FrameKind::PageOrForm,
     );
+    exec.run(root).await;
     Ok((exec.pix, exec.report))
 }
 
@@ -352,18 +382,18 @@ pub(crate) fn render_page_reporting(
 /// `/AP` have no appearance to paint, and ones flagged Hidden (bit 2) or
 /// NoView (bit 6) are invisible on screen anyway (§12.5.3), so neither
 /// counts as a drop.
-fn record_annotations(doc: &Document, page: &Page, report: &mut RenderReport) {
+async fn record_annotations<S: AsyncObjectSource>(src: &S, page: &Page, report: &mut RenderReport) {
     /// `/F` bits whose annotations are not displayed even by a renderer
     /// that paints appearance streams.
     const INVISIBLE: i64 = (1 << 1) | (1 << 5);
     let Some(annots) = page.dict().get("Annots") else {
         return;
     };
-    let Ok(Object::Array(items)) = doc.resolve(annots) else {
+    let Ok(Object::Array(items)) = src.resolve(annots).await else {
         return;
     };
     for item in &items {
-        let Ok(resolved) = doc.resolve(item) else {
+        let Ok(resolved) = src.resolve(item).await else {
             continue;
         };
         let Some(dict) = resolved.as_dict() else {
@@ -376,10 +406,16 @@ fn record_annotations(doc: &Document, page: &Page, report: &mut RenderReport) {
     }
 }
 
-/// Executes parsed content operators against a shared pixmap; forms
-/// recurse through [`Executor::run`] with their own resource chain.
-struct Executor<'a> {
-    doc: &'a Document,
+/// Upper bound on distinct parsed CharProcs kept per page render. A real
+/// Type3 font has at most 256 mapped codes, so this is never approached
+/// honestly; past the cap a glyph re-parses uncached, bounding memory
+/// against a hostile file minting CharProcs.
+const MAX_CHARPROC_CACHE: usize = 1024;
+
+/// Executes parsed content operators against a shared pixmap; forms and
+/// Type3 CharProcs run as frames on [`Executor::run`]'s explicit stack.
+struct Executor<'a, S> {
+    src: &'a S,
     pix: Pixmap,
     painting: GlyphPainting,
     /// Set while painting a `d1` (uncolored) Type3 CharProc: ISO 32000-1
@@ -404,211 +440,354 @@ struct Executor<'a> {
     /// device-space geometry regardless of which resource scope drew it).
     /// See [`MAX_CLIP_CACHE`].
     clip_cache: FastMap<ClipKey, Arc<Mask>>,
+    /// Parsed Type3 CharProc content, keyed by the CharProc stream's object
+    /// reference and shared across the page. Body text repeats a small
+    /// alphabet, so the same CharProc used to be fetched and re-parsed for
+    /// every occurrence of its code; parsing is context-free, so one parse
+    /// serves them all. See [`MAX_CHARPROC_CACHE`].
+    charproc_cache: FastMap<pdfboss_core::ObjRef, Arc<[Op]>>,
     /// Content this render dropped rather than painted, accumulated across
     /// the page (forms and Type3 CharProcs included, since they run through
     /// the same [`Executor`]).
     report: RenderReport,
 }
 
-impl Executor<'_> {
-    /// Runs `ops` with resource lookups walking `chain` (innermost first).
-    /// `depth` counts form recursion. All failures are lenient skips.
-    fn run(&mut self, ops: &[Op], chain: &[Arc<Dict>], base: GState, depth: u32) {
-        let mut gs = base;
-        let mut stack: Vec<GState> = Vec::new();
-        let mut path: Option<PathBuilder> = None;
-        let mut pending_clip: Option<FillRule> = None;
-        let mut ts = TextState::default();
-        let mut fonts: FastMap<String, Option<Arc<GlyphFont>>> = FastMap::default();
-        for op in ops {
-            match op {
-                Op::Save => {
-                    if stack.len() < MAX_GSTATE_DEPTH {
-                        stack.push(gs.clone());
-                    }
-                }
-                Op::Restore => {
-                    if let Some(prev) = stack.pop() {
-                        gs = prev;
-                    }
-                }
-                Op::Concat(m) => {
-                    if finite_matrix(m) {
-                        gs.ctm = m.concat(gs.ctm);
-                    }
-                }
-                Op::SetLineWidth(w) => {
-                    if w.is_finite() && *w >= 0.0 {
-                        gs.line_width = *w;
-                    }
-                }
-                Op::SetLineCap(c) => gs.line_cap = *c,
-                Op::SetLineJoin(j) => gs.line_join = *j,
-                Op::SetMiterLimit(m) => {
-                    if m.is_finite() {
-                        gs.miter_limit = *m;
-                    }
-                }
-                Op::SetDash(d, phase) => {
-                    if all_finite(d) && phase.is_finite() {
-                        gs.dash = d.clone();
-                        gs.dash_phase = *phase;
-                    }
-                }
-                Op::SetExtGState(name) => self.apply_ext_gstate(name, chain, &mut gs),
-                Op::SetRenderingIntent(_) | Op::SetFlatness(_) => {}
+/// One suspended operator stream on the executor's stack: what to execute,
+/// how far it has got, and every piece of state that stream owns.
+///
+/// This is what the recursion into a form XObject or a Type3 CharProc
+/// became. A recursive `async fn` must box itself, and coercing the box to a
+/// `Send` future needs `S: Sync` — which `Immediate<&Document>` cannot
+/// supply — so boxing would cost the synchronous caller the shared
+/// implementation. A stack of frames uses no `dyn`, so auto traits stay
+/// inferred per instantiation: the future is `Send` over an asynchronous
+/// source and merely non-`Send` over a synchronous one.
+struct Frame {
+    /// Shared so a handle can outlive pushes onto the frame stack. Cloned
+    /// once per visit to the frame, never per operator.
+    ops: Arc<[Op]>,
+    /// Resource dictionaries, innermost first. Owned — a form's `/Resources`
+    /// and a Type3 font's both come from below the frame that reads them.
+    chain: Vec<Arc<Dict>>,
+    /// Index of the next operator to execute.
+    pc: usize,
+    /// Form/CharProc nesting depth, carried explicitly and checked against
+    /// [`MAX_FORM_DEPTH`]. Never derived from the stack's length: Type3
+    /// sibling glyphs run as consecutive frames at the SAME depth, so the
+    /// two quantities genuinely differ.
+    depth: u32,
+    gs: GState,
+    /// The `q`/`Q` stack. Per frame, exactly as each recursive call had its
+    /// own: a form's unbalanced `Q` must not pop its caller's state, and
+    /// [`MAX_GSTATE_DEPTH`] caps each stream, not the page.
+    saved: Vec<GState>,
+    path: Option<PathBuilder>,
+    pending_clip: Option<FillRule>,
+    ts: TextState,
+    /// Loaded fonts by resource name. Per frame, never hoisted: `/F0` names
+    /// different fonts in different resource scopes.
+    fonts: FastMap<String, Option<Arc<GlyphFont>>>,
+    /// Type3 glyphs planned by a show operator and not yet painted. Drained
+    /// one CharProc frame at a time before the next operator runs.
+    pending_glyphs: std::collections::VecDeque<Type3Glyph>,
+    /// The font the pending glyphs paint from.
+    pending_t3: Option<Arc<Type3Font>>,
+    /// What this frame owes on the way out.
+    kind: FrameKind,
+}
 
-                // Path construction (user space; the builder applies the
-                // CTM captured when the path starts).
-                Op::MoveTo(x, y) => {
-                    if all_finite(&[*x, *y]) {
-                        builder(&mut path, &gs).move_to(*x, *y);
-                    }
-                }
-                Op::LineTo(x, y) => {
-                    if all_finite(&[*x, *y]) {
-                        builder(&mut path, &gs).line_to(*x, *y);
-                    }
-                }
-                Op::CurveTo(x1, y1, x2, y2, x3, y3) => {
-                    if all_finite(&[*x1, *y1, *x2, *y2, *x3, *y3]) {
-                        builder(&mut path, &gs).curve_to(*x1, *y1, *x2, *y2, *x3, *y3);
-                    }
-                }
-                Op::CurveToV(x2, y2, x3, y3) => {
-                    if all_finite(&[*x2, *y2, *x3, *y3]) {
-                        builder(&mut path, &gs).curve_to_v(*x2, *y2, *x3, *y3);
-                    }
-                }
-                Op::CurveToY(x1, y1, x3, y3) => {
-                    if all_finite(&[*x1, *y1, *x3, *y3]) {
-                        builder(&mut path, &gs).curve_to_y(*x1, *y1, *x3, *y3);
-                    }
-                }
-                Op::ClosePath => {
-                    if let Some(pb) = path.as_mut() {
-                        pb.close();
-                    }
-                }
-                Op::Rect(x, y, w, h) => {
-                    if all_finite(&[*x, *y, *w, *h]) {
-                        builder(&mut path, &gs).rect(*x, *y, *w, *h);
-                    }
-                }
+/// What kind of content stream a [`Frame`] is running, and therefore what
+/// its pop restores.
+enum FrameKind {
+    /// A page or form XObject content stream. Pops restore nothing. In
+    /// particular the color lock is deliberately NOT saved here: a form
+    /// invoked inside a `d1` CharProc inherits the lock, because the
+    /// recursive `run_form` never touched it — the harness pins those
+    /// pixels.
+    PageOrForm,
+    /// A Type3 CharProc. Its pop restores the executor's color lock to what
+    /// it was before this glyph pushed (ISO 32000-1 9.6.5.2: a `d1` glyph's
+    /// own color operators are ignored; a `d0` glyph nested inside a `d1`
+    /// one regains color control for its own subtree).
+    CharProc { saved_lock: bool },
+}
 
-                // Path painting: fill first, then stroke; a pending W/W*
-                // clip takes effect after any of these (including n).
-                Op::Stroke => self.paint(&mut gs, &mut path, &mut pending_clip, PAINT_STROKE),
-                Op::CloseStroke => self.paint(
-                    &mut gs,
-                    &mut path,
-                    &mut pending_clip,
-                    Paint {
-                        close: true,
-                        ..PAINT_STROKE
-                    },
-                ),
-                Op::Fill => self.paint(&mut gs, &mut path, &mut pending_clip, PAINT_FILL),
-                Op::FillEvenOdd => self.paint(&mut gs, &mut path, &mut pending_clip, PAINT_FILL_EO),
-                Op::FillStroke => self.paint(&mut gs, &mut path, &mut pending_clip, PAINT_BOTH),
-                Op::FillStrokeEvenOdd => {
-                    self.paint(&mut gs, &mut path, &mut pending_clip, PAINT_BOTH_EO)
-                }
-                Op::CloseFillStroke => self.paint(
-                    &mut gs,
-                    &mut path,
-                    &mut pending_clip,
-                    Paint {
-                        close: true,
-                        ..PAINT_BOTH
-                    },
-                ),
-                Op::CloseFillStrokeEvenOdd => self.paint(
-                    &mut gs,
-                    &mut path,
-                    &mut pending_clip,
-                    Paint {
-                        close: true,
-                        ..PAINT_BOTH_EO
-                    },
-                ),
-                Op::EndPath => self.paint(&mut gs, &mut path, &mut pending_clip, PAINT_NONE),
-                Op::ClipNonZero => pending_clip = Some(FillRule::NonZero),
-                Op::ClipEvenOdd => pending_clip = Some(FillRule::EvenOdd),
+impl Frame {
+    fn new(
+        ops: Arc<[Op]>,
+        chain: Vec<Arc<Dict>>,
+        gs: GState,
+        depth: u32,
+        kind: FrameKind,
+    ) -> Frame {
+        Frame {
+            ops,
+            chain,
+            pc: 0,
+            depth,
+            gs,
+            saved: Vec::new(),
+            path: None,
+            pending_clip: None,
+            ts: TextState::default(),
+            fonts: FastMap::default(),
+            pending_glyphs: std::collections::VecDeque::new(),
+            pending_t3: None,
+            kind,
+        }
+    }
+}
 
-                // Text: a minimal show-string state machine that paints
-                // embedded TrueType glyph outlines (other fonts stay unpainted).
-                Op::BeginText => {
-                    ts.tm = Matrix::identity();
-                    ts.tlm = Matrix::identity();
+impl<S: AsyncObjectSource> Executor<'_, S> {
+    /// Executes a frame and every form XObject and Type3 CharProc it
+    /// invokes. All failures are lenient skips.
+    ///
+    /// Exactly one child is pushed at a time — a form inline at its `Do`,
+    /// so its skips land in report order, or one Type3 glyph from the
+    /// pending queue — and a child runs to completion before its parent's
+    /// next operator, which is the recursive version's depth-first order.
+    async fn run(&mut self, root: Frame) {
+        let mut frames = vec![root];
+        'frames: while let Some(mut frame) = frames.pop() {
+            // Planned Type3 glyphs paint before the next operator, one
+            // CharProc frame per pass; a glyph whose stream will not resolve
+            // or parse is the same silent skip it always was.
+            while let Some(glyph) = frame.pending_glyphs.pop_front() {
+                let Some(t3) = frame.pending_t3.clone() else {
+                    break;
+                };
+                let child = self.char_proc_frame(&glyph, &t3, &frame).await;
+                if let Some(child) = child {
+                    frames.push(frame);
+                    frames.push(child);
+                    continue 'frames;
                 }
-                Op::SetCharSpacing(v) if v.is_finite() => ts.char_spacing = *v,
-                Op::SetWordSpacing(v) if v.is_finite() => ts.word_spacing = *v,
-                Op::SetHorizScaling(v) if v.is_finite() => ts.horiz = v / 100.0,
-                Op::SetLeading(v) if v.is_finite() => ts.leading = *v,
-                Op::SetTextRise(v) if v.is_finite() => ts.rise = *v,
-                Op::SetFont(name, size) => {
-                    ts.size = if size.is_finite() { *size } else { 0.0 };
-                    ts.font = self.glyph_font(&name.0, chain, &mut fonts);
-                    // Type3 is the fallback when no outline font loads: a
-                    // `/Type3` dict at a tier that paints embedded programs.
-                    // The invariant (at most one of font/type3) holds because
-                    // this only runs when `ts.font` is `None`.
-                    ts.type3 = if ts.font.is_some() {
-                        None
-                    } else {
-                        self.type3_font(&name.0, chain)
-                    };
-                }
-                Op::SetTextMatrix(m) if finite_matrix(m) => {
-                    ts.tm = *m;
-                    ts.tlm = *m;
-                }
-                Op::TextMove(tx, ty) if all_finite(&[*tx, *ty]) => {
-                    ts.tlm = Matrix::translate(*tx, *ty).concat(ts.tlm);
-                    ts.tm = ts.tlm;
-                }
-                Op::TextMoveSetLeading(tx, ty) if all_finite(&[*tx, *ty]) => {
-                    ts.leading = -*ty;
-                    ts.tlm = Matrix::translate(*tx, *ty).concat(ts.tlm);
-                    ts.tm = ts.tlm;
-                }
-                Op::TextNextLine => {
-                    ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
-                    ts.tm = ts.tlm;
-                }
-                Op::ShowText(s) => self.show_text(&gs, &mut ts, s, chain, depth),
-                Op::ShowTextAdjusted(items) => {
-                    for item in items {
-                        match item {
-                            TextItem::Str(s) => self.show_text(&gs, &mut ts, s, chain, depth),
-                            TextItem::Offset(n) => {
-                                let tx = -n / 1000.0 * ts.size * ts.horiz;
-                                if tx.is_finite() {
-                                    ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
+            }
+            frame.pending_t3 = None;
+
+            // Cloned once per visit, so the handle outlives the `&mut frame`
+            // borrows below without an atomic pair per operator.
+            let ops = Arc::clone(&frame.ops);
+            let mut spawned: Option<Frame> = None;
+            'ops: while frame.pc < ops.len() {
+                let op = &ops[frame.pc];
+                frame.pc += 1;
+                let frame = &mut frame;
+                match op {
+                    Op::Save => {
+                        if frame.saved.len() < MAX_GSTATE_DEPTH {
+                            frame.saved.push(frame.gs.clone());
+                        }
+                    }
+                    Op::Restore => {
+                        if let Some(prev) = frame.saved.pop() {
+                            frame.gs = prev;
+                        }
+                    }
+                    Op::Concat(m) => {
+                        if finite_matrix(m) {
+                            frame.gs.ctm = m.concat(frame.gs.ctm);
+                        }
+                    }
+                    Op::SetLineWidth(w) => {
+                        if w.is_finite() && *w >= 0.0 {
+                            frame.gs.line_width = *w;
+                        }
+                    }
+                    Op::SetLineCap(c) => frame.gs.line_cap = *c,
+                    Op::SetLineJoin(j) => frame.gs.line_join = *j,
+                    Op::SetMiterLimit(m) => {
+                        if m.is_finite() {
+                            frame.gs.miter_limit = *m;
+                        }
+                    }
+                    Op::SetDash(d, phase) => {
+                        if all_finite(d) && phase.is_finite() {
+                            frame.gs.dash = d.clone();
+                            frame.gs.dash_phase = *phase;
+                        }
+                    }
+                    Op::SetExtGState(name) => self.apply_ext_gstate_op(name, frame).await,
+                    Op::SetRenderingIntent(_) | Op::SetFlatness(_) => {}
+
+                    // Path construction (user space; the builder applies the
+                    // CTM captured when the path starts).
+                    Op::MoveTo(x, y) => {
+                        if all_finite(&[*x, *y]) {
+                            builder(&mut frame.path, &frame.gs).move_to(*x, *y);
+                        }
+                    }
+                    Op::LineTo(x, y) => {
+                        if all_finite(&[*x, *y]) {
+                            builder(&mut frame.path, &frame.gs).line_to(*x, *y);
+                        }
+                    }
+                    Op::CurveTo(x1, y1, x2, y2, x3, y3) => {
+                        if all_finite(&[*x1, *y1, *x2, *y2, *x3, *y3]) {
+                            builder(&mut frame.path, &frame.gs)
+                                .curve_to(*x1, *y1, *x2, *y2, *x3, *y3);
+                        }
+                    }
+                    Op::CurveToV(x2, y2, x3, y3) => {
+                        if all_finite(&[*x2, *y2, *x3, *y3]) {
+                            builder(&mut frame.path, &frame.gs).curve_to_v(*x2, *y2, *x3, *y3);
+                        }
+                    }
+                    Op::CurveToY(x1, y1, x3, y3) => {
+                        if all_finite(&[*x1, *y1, *x3, *y3]) {
+                            builder(&mut frame.path, &frame.gs).curve_to_y(*x1, *y1, *x3, *y3);
+                        }
+                    }
+                    Op::ClosePath => {
+                        if let Some(pb) = frame.path.as_mut() {
+                            pb.close();
+                        }
+                    }
+                    Op::Rect(x, y, w, h) => {
+                        if all_finite(&[*x, *y, *w, *h]) {
+                            builder(&mut frame.path, &frame.gs).rect(*x, *y, *w, *h);
+                        }
+                    }
+
+                    // Path painting: fill first, then stroke; a pending W/W*
+                    // clip takes effect after any of these (including n).
+                    Op::Stroke => self.paint_frame(frame, PAINT_STROKE),
+                    Op::CloseStroke => self.paint_frame(
+                        frame,
+                        Paint {
+                            close: true,
+                            ..PAINT_STROKE
+                        },
+                    ),
+                    Op::Fill => self.paint_frame(frame, PAINT_FILL),
+                    Op::FillEvenOdd => self.paint_frame(frame, PAINT_FILL_EO),
+                    Op::FillStroke => self.paint_frame(frame, PAINT_BOTH),
+                    Op::FillStrokeEvenOdd => self.paint_frame(frame, PAINT_BOTH_EO),
+                    Op::CloseFillStroke => self.paint_frame(
+                        frame,
+                        Paint {
+                            close: true,
+                            ..PAINT_BOTH
+                        },
+                    ),
+                    Op::CloseFillStrokeEvenOdd => self.paint_frame(
+                        frame,
+                        Paint {
+                            close: true,
+                            ..PAINT_BOTH_EO
+                        },
+                    ),
+                    Op::EndPath => self.paint_frame(frame, PAINT_NONE),
+                    Op::ClipNonZero => frame.pending_clip = Some(FillRule::NonZero),
+                    Op::ClipEvenOdd => frame.pending_clip = Some(FillRule::EvenOdd),
+
+                    // Text: a minimal show-string state machine that paints
+                    // embedded TrueType glyph outlines (other fonts stay unpainted).
+                    Op::BeginText => {
+                        frame.ts.tm = Matrix::identity();
+                        frame.ts.tlm = Matrix::identity();
+                    }
+                    Op::SetCharSpacing(v) if v.is_finite() => frame.ts.char_spacing = *v,
+                    Op::SetWordSpacing(v) if v.is_finite() => frame.ts.word_spacing = *v,
+                    Op::SetHorizScaling(v) if v.is_finite() => frame.ts.horiz = v / 100.0,
+                    Op::SetLeading(v) if v.is_finite() => frame.ts.leading = *v,
+                    Op::SetTextRise(v) if v.is_finite() => frame.ts.rise = *v,
+                    Op::SetFont(name, size) => {
+                        frame.ts.size = if size.is_finite() { *size } else { 0.0 };
+                        frame.ts.font = self
+                            .glyph_font(&name.0, &frame.chain, &mut frame.fonts)
+                            .await;
+                        // Type3 is the fallback when no outline font loads: a
+                        // `/Type3` dict at a tier that paints embedded programs.
+                        // The invariant (at most one of font/type3) holds because
+                        // this only runs when `frame.ts.font` is `None`.
+                        frame.ts.type3 = if frame.ts.font.is_some() {
+                            None
+                        } else {
+                            self.type3_font(&name.0, &frame.chain).await
+                        };
+                    }
+                    Op::SetTextMatrix(m) if finite_matrix(m) => {
+                        frame.ts.tm = *m;
+                        frame.ts.tlm = *m;
+                    }
+                    Op::TextMove(tx, ty) if all_finite(&[*tx, *ty]) => {
+                        frame.ts.tlm = Matrix::translate(*tx, *ty).concat(frame.ts.tlm);
+                        frame.ts.tm = frame.ts.tlm;
+                    }
+                    Op::TextMoveSetLeading(tx, ty) if all_finite(&[*tx, *ty]) => {
+                        frame.ts.leading = -*ty;
+                        frame.ts.tlm = Matrix::translate(*tx, *ty).concat(frame.ts.tlm);
+                        frame.ts.tm = frame.ts.tlm;
+                    }
+                    Op::TextNextLine => {
+                        frame.ts.tlm =
+                            Matrix::translate(0.0, -frame.ts.leading).concat(frame.ts.tlm);
+                        frame.ts.tm = frame.ts.tlm;
+                    }
+                    Op::ShowText(s) => {
+                        self.show_text(frame, s);
+                        if !frame.pending_glyphs.is_empty() {
+                            break 'ops;
+                        }
+                    }
+                    Op::ShowTextAdjusted(items) => {
+                        for item in items {
+                            match item {
+                                TextItem::Str(s) => self.show_text(frame, s),
+                                TextItem::Offset(n) => {
+                                    let tx = -n / 1000.0 * frame.ts.size * frame.ts.horiz;
+                                    if tx.is_finite() {
+                                        frame.ts.tm =
+                                            Matrix::translate(tx, 0.0).concat(frame.ts.tm);
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                Op::NextLineShowText(s) => {
-                    ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
-                    ts.tm = ts.tlm;
-                    self.show_text(&gs, &mut ts, s, chain, depth);
-                }
-                Op::NextLineShowTextSpaced(aw, ac, s) => {
-                    if aw.is_finite() {
-                        ts.word_spacing = *aw;
+                    Op::NextLineShowText(s) => {
+                        frame.ts.tlm =
+                            Matrix::translate(0.0, -frame.ts.leading).concat(frame.ts.tlm);
+                        frame.ts.tm = frame.ts.tlm;
+                        self.show_text(frame, s);
                     }
-                    if ac.is_finite() {
-                        ts.char_spacing = *ac;
+                    Op::NextLineShowTextSpaced(aw, ac, s) => {
+                        if aw.is_finite() {
+                            frame.ts.word_spacing = *aw;
+                        }
+                        if ac.is_finite() {
+                            frame.ts.char_spacing = *ac;
+                        }
+                        frame.ts.tlm =
+                            Matrix::translate(0.0, -frame.ts.leading).concat(frame.ts.tlm);
+                        frame.ts.tm = frame.ts.tlm;
+                        self.show_text(frame, s);
                     }
-                    ts.tlm = Matrix::translate(0.0, -ts.leading).concat(ts.tlm);
-                    ts.tm = ts.tlm;
-                    self.show_text(&gs, &mut ts, s, chain, depth);
-                }
 
-                other => self.run_color_or_misc(other, chain, &mut gs, depth),
+                    other => {
+                        spawned = self.run_color_or_misc(other, frame).await;
+                    }
+                }
+                // A `Do`/CharProc pushed a child, or a show operator planned
+                // Type3 glyphs: either way this frame suspends here and the
+                // child (or the glyph queue) runs before its next operator.
+                if spawned.is_some() || !frame.pending_glyphs.is_empty() {
+                    break;
+                }
+            }
+            if let Some(child) = spawned {
+                frames.push(frame);
+                frames.push(child);
+                continue 'frames;
+            }
+            if !frame.pending_glyphs.is_empty() {
+                frames.push(frame);
+                continue 'frames;
+            }
+            // The frame is done; a CharProc restores the color lock its
+            // glyph saved.
+            if let FrameKind::CharProc { saved_lock } = frame.kind {
+                self.color_locked = saved_lock;
             }
         }
     }
@@ -653,7 +832,18 @@ const PAINT_BOTH_EO: Paint = Paint {
     ..PAINT_FILL_EO
 };
 
-impl Executor<'_> {
+impl<S: AsyncObjectSource> Executor<'_, S> {
+    /// [`Executor::paint`] on a frame's own path, pending clip and state.
+    fn paint_frame(&mut self, frame: &mut Frame, how: Paint) {
+        let Frame {
+            gs,
+            path,
+            pending_clip,
+            ..
+        } = frame;
+        self.paint(gs, path, pending_clip, how);
+    }
+
     /// Fills and/or strokes the current path, applies any pending clip
     /// from `W`/`W*`, and resets the path.
     fn paint(
@@ -738,7 +928,7 @@ impl Executor<'_> {
 
     /// Resolves and caches a paintable font by resource name (`None` for fonts
     /// whose glyphs cannot be drawn).
-    fn glyph_font(
+    async fn glyph_font(
         &self,
         name: &str,
         chain: &[Arc<Dict>],
@@ -747,12 +937,16 @@ impl Executor<'_> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
-        let loaded = self
+        let dict = self
             .find_res(chain, "Font", name)
-            .and_then(|o| o.as_dict().cloned())
-            .and_then(|d| {
-                GlyphFont::load(self.doc, &d, self.painting, self.provider.as_deref()).map(Arc::new)
-            });
+            .await
+            .and_then(|o| o.as_dict().cloned());
+        let loaded = match dict {
+            Some(d) => GlyphFont::load_with(self.src, &d, self.painting, self.provider.as_deref())
+                .await
+                .map(Arc::new),
+            None => None,
+        };
         cache.insert(name.to_string(), loaded.clone());
         loaded
     }
@@ -760,17 +954,18 @@ impl Executor<'_> {
     /// Resolves a `/Type3` font resource for painting, or `None` when the tier
     /// forbids embedded programs, the name is missing, or the resource is not a
     /// `/Type3` dict. Called only after the outline loader declined the name.
-    fn type3_font(&self, name: &str, chain: &[Arc<Dict>]) -> Option<Arc<Type3Font>> {
+    async fn type3_font(&self, name: &str, chain: &[Arc<Dict>]) -> Option<Arc<Type3Font>> {
         if !self.painting.paints_all_embedded() {
             return None;
         }
         let dict = self
             .find_res(chain, "Font", name)
+            .await
             .and_then(|o| o.as_dict().cloned())?;
         if dict.get_name("Subtype").map(|n| n.0.as_str()) != Some("Type3") {
             return None;
         }
-        Type3Font::load(self.doc, &dict).map(Arc::new)
+        Type3Font::load_with(self.src, &dict).await.map(Arc::new)
     }
 
     /// Paints a cached, origin-relative flattened glyph outline at device
@@ -804,20 +999,24 @@ impl Executor<'_> {
 
     /// Paints one show-string's glyphs and advances the text matrix. Codes with
     /// no drawable glyph still advance, so surrounding text stays positioned.
-    /// `chain`/`depth` thread the resource chain and form-recursion depth
-    /// through to a Type3 glyph's CharProc (which re-enters [`Executor::run`]).
-    fn show_text(
-        &mut self,
-        gs: &GState,
-        ts: &mut TextState,
-        bytes: &[u8],
-        chain: &[Arc<Dict>],
-        depth: u32,
-    ) {
-        if ts.type3.is_some() {
-            self.show_text_type3(gs, ts, bytes, chain, depth);
+    ///
+    /// Synchronous on purpose: an outline font is already loaded, so no I/O
+    /// enters the per-glyph loop; and a Type3 string only *plans* here — its
+    /// CharProc frames are pushed by the driver, one at a time, before the
+    /// frame's next operator.
+    fn show_text(&mut self, frame: &mut Frame, bytes: &[u8]) {
+        if let Some(t3) = frame.ts.type3.clone() {
+            // The depth guard bounds a self-referential glyph: each CharProc
+            // frame is pushed at `depth + 1`, so painting stops at
+            // `MAX_FORM_DEPTH` while the advances still happen.
+            let paint = frame.depth < MAX_FORM_DEPTH;
+            let planned = type3_glyph_plan(&mut frame.ts, &t3, bytes, frame.gs.ctm, paint);
+            frame.pending_glyphs.extend(planned);
+            frame.pending_t3 = Some(t3);
             return;
         }
+        let gs = &frame.gs;
+        let ts = &mut frame.ts;
         let Some(font) = ts.font.clone() else {
             return;
         };
@@ -881,35 +1080,12 @@ impl Executor<'_> {
         }
     }
 
-    /// Paints a `/Type3` show-string: each one-byte code's CharProc runs as a
-    /// nested content stream (ISO 32000-1 §9.6.5). Planning is pure and
-    /// happens up front in [`type3_glyph_plan`]; this drives the planned
-    /// CharProcs through the executor.
-    fn show_text_type3(
-        &mut self,
-        gs: &GState,
-        ts: &mut TextState,
-        bytes: &[u8],
-        chain: &[Arc<Dict>],
-        depth: u32,
-    ) {
-        let Some(t3) = ts.type3.clone() else {
-            return;
-        };
-        // The depth guard bounds a self-referential glyph (one that shows
-        // itself, directly or via a form): each CharProc re-entry increments
-        // `depth`, so painting stops at `MAX_FORM_DEPTH`.
-        let plan = type3_glyph_plan(ts, &t3, bytes, gs.ctm, depth < MAX_FORM_DEPTH);
-        for glyph in plan {
-            self.run_char_proc(&glyph.proc_obj, &t3, chain, gs, glyph.ctm, depth);
-        }
-    }
-
-    /// Runs one Type3 CharProc: resolve its stream, parse it, and re-enter
-    /// [`Executor::run`] with the glyph CTM, the font's own `/Resources`
-    /// prepended to `chain`, and `depth + 1`. Inherits the caller's clip,
-    /// alpha, and fill color (the color a `d0` glyph paints in). Every failure
-    /// is a silent skip, matching the caller's still-advance leniency.
+    /// Builds the frame for one Type3 CharProc: resolve its stream, parse
+    /// it, and frame it with the glyph CTM, the font's own `/Resources`
+    /// prepended to the parent's chain, and `depth + 1`. Inherits the
+    /// caller's clip, alpha, and fill color (the color a `d0` glyph paints
+    /// in). Every failure is `None` — a silent skip, matching the
+    /// still-advance leniency of the planner.
     ///
     /// ISO 32000-1 §9.6.5.2: the CharProc's *first* operator is `d0`
     /// (colored) or `d1` (uncolored). A `d1` glyph "shall not specify any
@@ -920,36 +1096,58 @@ impl Executor<'_> {
     /// `d0` glyph nested inside a `d1` glyph regains color control for its
     /// own subtree, while a `d1` nested inside a `d1` stays locked, and the
     /// lock never leaks into sibling or outer content.
-    fn run_char_proc(
+    async fn char_proc_frame(
         &mut self,
-        proc_obj: &Object,
+        glyph: &Type3Glyph,
         t3: &Type3Font,
-        chain: &[Arc<Dict>],
-        base: &GState,
-        glyph_ctm: Matrix,
-        depth: u32,
-    ) {
-        let Ok(Object::Stream(stream)) = self.doc.resolve(proc_obj) else {
-            return;
+        parent: &Frame,
+    ) -> Option<Frame> {
+        let cached = match &glyph.proc_obj {
+            Object::Ref(r) => self.charproc_cache.get(r).cloned(),
+            _ => None,
         };
-        let Ok(data) = self.doc.stream_data(&stream) else {
-            return;
+        let ops: Arc<[Op]> = match cached {
+            Some(ops) => ops,
+            None => {
+                let Ok(Object::Stream(stream)) = self.src.resolve(&glyph.proc_obj).await else {
+                    return None;
+                };
+                let Ok(data) = self.src.stream_data(&stream).await else {
+                    return None;
+                };
+                let Ok(ops) = parse_content(&data) else {
+                    return None;
+                };
+                let ops: Arc<[Op]> = ops.into();
+                if let Object::Ref(r) = &glyph.proc_obj {
+                    if self.charproc_cache.len() < MAX_CHARPROC_CACHE {
+                        self.charproc_cache.insert(*r, Arc::clone(&ops));
+                    }
+                }
+                ops
+            }
         };
-        let Ok(ops) = parse_content(&data) else {
-            return;
-        };
-        let mut inner = base.clone();
-        inner.ctm = glyph_ctm;
-        let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
+        let mut inner = parent.gs.clone();
+        inner.ctm = glyph.ctm;
+        let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(parent.chain.len() + 1);
         if let Some(d) = t3.resources() {
             inner_chain.push(Arc::clone(d));
         }
-        inner_chain.extend_from_slice(chain);
+        inner_chain.extend_from_slice(&parent.chain);
         let is_d1 = matches!(ops.first(), Some(Op::SetGlyphWidthBBox(..)));
+        // Setting the lock here is sound only because the driver pushes the
+        // returned frame unconditionally; its pop restores `saved_lock`. On
+        // `None` the lock is untouched, exactly as the recursive version's
+        // early returns left it.
         let saved_lock = self.color_locked;
         self.color_locked = is_d1;
-        self.run(&ops, &inner_chain, inner, depth + 1);
-        self.color_locked = saved_lock;
+        Some(Frame::new(
+            ops,
+            inner_chain,
+            inner,
+            parent.depth + 1,
+            FrameKind::CharProc { saved_lock },
+        ))
     }
 
     /// Dispatches color, XObject, and marked-content operators (the remainder
@@ -960,7 +1158,7 @@ impl Executor<'_> {
     /// §9.6.5.2): the glyph keeps the fill/stroke color inherited from the
     /// text graphics state instead of applying its own. XObject, inline
     /// image, shading, and marked-content ops are unaffected by the lock.
-    fn run_color_or_misc(&mut self, op: &Op, chain: &[Arc<Dict>], gs: &mut GState, depth: u32) {
+    async fn run_color_or_misc(&mut self, op: &Op, frame: &mut Frame) -> Option<Frame> {
         if self.color_locked {
             match op {
                 Op::SetFillColorSpace(_)
@@ -974,26 +1172,29 @@ impl Executor<'_> {
                 | Op::SetFillRGB(_, _, _)
                 | Op::SetStrokeRGB(_, _, _)
                 | Op::SetFillCMYK(_, _, _, _)
-                | Op::SetStrokeCMYK(_, _, _, _) => return,
+                | Op::SetStrokeCMYK(_, _, _, _) => return None,
                 _ => {}
             }
         }
         match op {
             Op::SetFillColorSpace(name) => {
-                let (cs, pattern) = self.resolve_colorspace(name, chain);
+                let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                let gs = &mut frame.gs;
                 gs.fill_rgb = initial_color(&cs);
                 gs.fill_space = cs;
                 gs.fill_pattern = pattern;
             }
             Op::SetStrokeColorSpace(name) => {
-                let (cs, pattern) = self.resolve_colorspace(name, chain);
+                let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                let gs = &mut frame.gs;
                 gs.stroke_rgb = initial_color(&cs);
                 gs.stroke_space = cs;
                 gs.stroke_pattern = pattern;
             }
-            Op::SetFillColor(c) => gs.fill_rgb = gs.fill_space.to_rgb(c),
-            Op::SetStrokeColor(c) => gs.stroke_rgb = gs.stroke_space.to_rgb(c),
+            Op::SetFillColor(c) => frame.gs.fill_rgb = frame.gs.fill_space.to_rgb(c),
+            Op::SetStrokeColor(c) => frame.gs.stroke_rgb = frame.gs.stroke_space.to_rgb(c),
             Op::SetFillColorN(c, pattern_name) => {
+                let gs = &mut frame.gs;
                 if pattern_name.is_some() {
                     gs.fill_pattern = true;
                 } else if !gs.fill_pattern {
@@ -1001,6 +1202,7 @@ impl Executor<'_> {
                 }
             }
             Op::SetStrokeColorN(c, pattern_name) => {
+                let gs = &mut frame.gs;
                 if pattern_name.is_some() {
                     gs.stroke_pattern = true;
                 } else if !gs.stroke_pattern {
@@ -1008,43 +1210,56 @@ impl Executor<'_> {
                 }
             }
             Op::SetFillGray(g) => {
+                let gs = &mut frame.gs;
                 gs.fill_space = ColorSpace::DeviceGray;
                 gs.fill_pattern = false;
                 gs.fill_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
             }
             Op::SetStrokeGray(g) => {
+                let gs = &mut frame.gs;
                 gs.stroke_space = ColorSpace::DeviceGray;
                 gs.stroke_pattern = false;
                 gs.stroke_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
             }
             Op::SetFillRGB(r, g, b) => {
+                let gs = &mut frame.gs;
                 gs.fill_space = ColorSpace::DeviceRGB;
                 gs.fill_pattern = false;
                 gs.fill_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
             }
             Op::SetStrokeRGB(r, g, b) => {
+                let gs = &mut frame.gs;
                 gs.stroke_space = ColorSpace::DeviceRGB;
                 gs.stroke_pattern = false;
                 gs.stroke_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
             }
             Op::SetFillCMYK(c, m, y, k) => {
+                let gs = &mut frame.gs;
                 gs.fill_space = ColorSpace::DeviceCMYK;
                 gs.fill_pattern = false;
                 gs.fill_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
             }
             Op::SetStrokeCMYK(c, m, y, k) => {
+                let gs = &mut frame.gs;
                 gs.stroke_space = ColorSpace::DeviceCMYK;
                 gs.stroke_pattern = false;
                 gs.stroke_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
             }
-            Op::XObject(name) => self.do_xobject(name, chain, gs, depth),
-            Op::InlineImage(img) => self.draw_inline_image(img, chain, gs),
+            Op::XObject(name) => {
+                return self
+                    .do_xobject(name, &frame.chain, &frame.gs, frame.depth)
+                    .await;
+            }
+            Op::InlineImage(img) => {
+                self.draw_inline_image(img, &frame.chain, &frame.gs).await;
+            }
             // Shadings are out of scope for v0.1: `sh` paints nothing, so a
             // page whose visible content is a gradient comes out blank.
             Op::Shading(_) => self.skip(SkippedKind::Shading, SkipReason::Unsupported),
             // Text and marked content: state-only in v0.1, nothing painted.
             _ => {}
         }
+        None
     }
 }
 
@@ -1125,7 +1340,7 @@ fn initial_color(cs: &ColorSpace) -> [f32; 3] {
     }
 }
 
-impl Executor<'_> {
+impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Looks up `/category/name` in the resource chain (innermost dict
     /// first), resolving references at every step.
     ///
@@ -1138,18 +1353,18 @@ impl Executor<'_> {
     /// and `run_char_proc` reaches into the `Type3Font` its caller happens to hold
     /// — so neither could survive being stored in a work-stack frame, which is how
     /// the asynchronous path has to express this recursion.
-    fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
+    async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
         for res in chain {
             let Some(cat) = res.get(category) else {
                 continue;
             };
-            let Ok(Object::Dict(dict)) = self.doc.resolve(cat) else {
+            let Ok(Object::Dict(dict)) = self.src.resolve(cat).await else {
                 continue;
             };
             let Some(value) = dict.get(name) else {
                 continue;
             };
-            if let Ok(obj) = self.doc.resolve(value) {
+            if let Ok(obj) = self.src.resolve(value).await {
                 if !obj.is_null() {
                     return Some(obj);
                 }
@@ -1161,7 +1376,7 @@ impl Executor<'_> {
     /// Resolves a `cs`/`CS` operand: a device space name directly, the
     /// `/Pattern` space as a mid-gray flag, anything else through the
     /// `/ColorSpace` resource dictionary. Returns `(space, is_pattern)`.
-    fn resolve_colorspace(&self, name: &Name, chain: &[Arc<Dict>]) -> (ColorSpace, bool) {
+    async fn resolve_colorspace(&self, name: &Name, chain: &[Arc<Dict>]) -> (ColorSpace, bool) {
         match name.0.as_str() {
             "Pattern" => return (ColorSpace::DeviceGray, true),
             "DeviceGray" | "G" | "CalGray" => return (ColorSpace::DeviceGray, false),
@@ -1169,7 +1384,7 @@ impl Executor<'_> {
             "DeviceCMYK" | "CMYK" => return (ColorSpace::DeviceCMYK, false),
             _ => {}
         }
-        match self.find_res(chain, "ColorSpace", &name.0) {
+        match self.find_res(chain, "ColorSpace", &name.0).await {
             Some(obj) => {
                 // `[/Pattern base]` resource entries are pattern spaces too.
                 if let Object::Array(items) = &obj {
@@ -1179,7 +1394,7 @@ impl Executor<'_> {
                         }
                     }
                 }
-                (ColorSpace::parse(self.doc, &obj), false)
+                (ColorSpace::parse_with(self.src, &obj).await, false)
             }
             None => (ColorSpace::DeviceGray, false),
         }
@@ -1190,45 +1405,55 @@ impl Executor<'_> {
     /// that change what the page looks like -- a `/SMask` mask group and a
     /// non-`Normal` `/BM` blend mode -- are reported so the caller knows the
     /// render is an approximation.
-    fn apply_ext_gstate(&mut self, name: &Name, chain: &[Arc<Dict>], gs: &mut GState) {
-        let Some(Object::Dict(dict)) = self.find_res(chain, "ExtGState", &name.0) else {
+    async fn apply_ext_gstate_op(&mut self, name: &Name, frame: &mut Frame) {
+        let Some(Object::Dict(dict)) = self.find_res(&frame.chain, "ExtGState", &name.0).await
+        else {
             return;
         };
-        if ignores_mask(self.doc, &dict) {
+        if ignores_mask(self.src, &dict).await {
             self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
         }
-        if ignores_blend_mode(self.doc, &dict) {
+        if ignores_blend_mode(self.src, &dict).await {
             self.skip(SkippedKind::BlendMode, SkipReason::Unsupported);
         }
-        let num = |key: &str| -> Option<f32> {
-            let v = self.doc.resolve(dict.get(key)?).ok()?.as_f64()? as f32;
-            v.is_finite().then_some(v)
-        };
-        if let Some(ca) = num("ca") {
+        let gs = &mut frame.gs;
+        if let Some(ca) = dict_f32(self.src, &dict, "ca").await {
             gs.fill_alpha = ca.clamp(0.0, 1.0);
         }
-        if let Some(ca) = num("CA") {
+        if let Some(ca) = dict_f32(self.src, &dict, "CA").await {
             gs.stroke_alpha = ca.clamp(0.0, 1.0);
         }
-        if let Some(lw) = num("LW") {
+        if let Some(lw) = dict_f32(self.src, &dict, "LW").await {
             if lw >= 0.0 {
                 gs.line_width = lw;
             }
         }
-        if let Some(lc) = num("LC") {
+        if let Some(lc) = dict_f32(self.src, &dict, "LC").await {
             gs.line_cap = lc as i32;
         }
-        if let Some(lj) = num("LJ") {
+        if let Some(lj) = dict_f32(self.src, &dict, "LJ").await {
             gs.line_join = lj as i32;
         }
-        if let Some(Ok(Object::Array(items))) = dict.get("D").map(|o| self.doc.resolve(o)) {
-            if let (Some(Ok(Object::Array(lens))), Some(phase)) = (
-                items.first().map(|o| self.doc.resolve(o)),
-                items
-                    .get(1)
-                    .and_then(|o| self.doc.resolve(o).ok()?.as_f64()),
-            ) {
-                let dash: Vec<f32> = lens.iter().filter_map(|o| num_f32(self.doc, o)).collect();
+        let d = match dict.get("D") {
+            Some(o) => self.src.resolve(o).await.ok(),
+            None => None,
+        };
+        if let Some(Object::Array(items)) = d {
+            let lens = match items.first() {
+                Some(o) => self.src.resolve(o).await.ok(),
+                None => None,
+            };
+            let phase = match items.get(1) {
+                Some(o) => self.src.resolve(o).await.ok().and_then(|o| o.as_f64()),
+                None => None,
+            };
+            if let (Some(Object::Array(lens)), Some(phase)) = (lens, phase) {
+                let mut dash: Vec<f32> = Vec::with_capacity(lens.len());
+                for o in &lens {
+                    if let Some(v) = num_f32(self.src, o).await {
+                        dash.push(v);
+                    }
+                }
                 if dash.len() == lens.len() && (phase as f32).is_finite() {
                     gs.dash = dash;
                     gs.dash_phase = phase as f32;
@@ -1239,18 +1464,32 @@ impl Executor<'_> {
 }
 
 /// Resolves an object to a finite `f32`.
-fn num_f32(doc: &Document, obj: &Object) -> Option<f32> {
-    let v = doc.resolve(obj).ok()?.as_f64()? as f32;
+async fn num_f32<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<f32> {
+    let v = src.resolve(obj).await.ok()?.as_f64()? as f32;
     v.is_finite().then_some(v)
 }
 
+/// Resolves `dict[key]` to a finite `f32`.
+async fn dict_f32<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<f32> {
+    num_f32(src, dict.get(key)?).await
+}
+
 /// Reads the first `n` finite numbers of a (possibly indirect) array.
-fn floats_from(doc: &Document, obj: Option<&Object>, n: usize) -> Option<Vec<f32>> {
-    let arr = match doc.resolve(obj?) {
+async fn floats_from<S: AsyncObjectSource>(
+    src: &S,
+    obj: Option<&Object>,
+    n: usize,
+) -> Option<Vec<f32>> {
+    let arr = match src.resolve(obj?).await {
         Ok(Object::Array(a)) if a.len() >= n => a,
         _ => return None,
     };
-    let out: Vec<f32> = arr.iter().take(n).filter_map(|o| num_f32(doc, o)).collect();
+    let mut out: Vec<f32> = Vec::with_capacity(n);
+    for o in arr.iter().take(n) {
+        if let Some(v) = num_f32(src, o).await {
+            out.push(v);
+        }
+    }
     (out.len() == n).then_some(out)
 }
 
@@ -1267,79 +1506,116 @@ fn skip_reason_for(e: &Error) -> SkipReason {
 /// `/SMask` alpha channel, or a `/Mask` stencil or color-key array (ISO
 /// 32000-1 8.9.6). What the author masked out paints solid instead, so the
 /// caller reports it rather than passing the result off as the real image.
-fn ignores_mask(doc: &Document, dict: &Dict) -> bool {
-    ["SMask", "Mask"].iter().any(|key| {
-        match dict.get(key).map(|obj| doc.resolve(obj)) {
-            None | Some(Ok(Object::Null)) => false,
+async fn ignores_mask<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
+    for key in ["SMask", "Mask"] {
+        let Some(obj) = dict.get(key) else {
+            continue;
+        };
+        let ignored = match src.resolve(obj).await {
+            Ok(Object::Null) => false,
             // `/SMask /None` in particular is the explicit "no mask" value.
-            Some(Ok(Object::Name(n))) => n.0 != "None",
+            Ok(Object::Name(n)) => n.0 != "None",
             _ => true,
+        };
+        if ignored {
+            return true;
         }
-    })
+    }
+    false
 }
 
 /// Whether an `/ExtGState` selects a blend mode this renderer does not
 /// apply (ISO 32000-1 11.3.5). Everything composites source-over, so
 /// anything but `Normal` (and its deprecated alias `Compatible`) paints
 /// differently than the page asks for.
-fn ignores_blend_mode(doc: &Document, dict: &Dict) -> bool {
+async fn ignores_blend_mode<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
+    let Some(bm) = dict.get("BM") else {
+        return false;
+    };
     // An array-valued `/BM` names the first mode the reader supports.
-    let selected = match dict.get("BM").map(|obj| doc.resolve(obj)) {
-        Some(Ok(Object::Name(n))) => n.0,
-        Some(Ok(Object::Array(items))) => match items.first().map(|obj| doc.resolve(obj)) {
-            Some(Ok(Object::Name(n))) => n.0,
-            _ => return false,
-        },
+    let selected = match src.resolve(bm).await {
+        Ok(Object::Name(n)) => n.0,
+        Ok(Object::Array(items)) => {
+            let Some(first) = items.first() else {
+                return false;
+            };
+            match src.resolve(first).await {
+                Ok(Object::Name(n)) => n.0,
+                _ => return false,
+            }
+        }
         _ => return false,
     };
     !matches!(selected.as_str(), "Normal" | "Compatible")
 }
 
-impl Executor<'_> {
-    /// Executes `Do`: draws an image XObject or recurses into a form.
-    fn do_xobject(&mut self, name: &Name, chain: &[Arc<Dict>], gs: &GState, depth: u32) {
-        let Some(Object::Stream(stream)) = self.find_res(chain, "XObject", &name.0) else {
+impl<S: AsyncObjectSource> Executor<'_, S> {
+    /// Executes `Do`: draws an image XObject inline, or builds the frame for
+    /// a form, which the driver pushes. Every await and every skip happens
+    /// here at the `Do`, so the order-sensitive report reads exactly as the
+    /// recursive version wrote it.
+    async fn do_xobject(
+        &mut self,
+        name: &Name,
+        chain: &[Arc<Dict>],
+        gs: &GState,
+        depth: u32,
+    ) -> Option<Frame> {
+        let Some(Object::Stream(stream)) = self.find_res(chain, "XObject", &name.0).await else {
             // The name resolves to nothing, or to something that is not a
             // stream: whatever it was meant to draw, it is not drawn.
             self.skip(SkippedKind::XObject, SkipReason::Missing);
-            return;
+            return None;
         };
         match stream.dict.get_name("Subtype").map(|n| n.0.as_str()) {
-            Some("Image") => self.draw_image_xobject(&stream, chain, gs),
-            Some("Form") => self.run_form(&stream, chain, gs, depth),
+            Some("Image") => {
+                self.draw_image_xobject(&stream, chain, gs).await;
+                None
+            }
+            Some("Form") => self.form_frame(&stream, chain, gs, depth).await,
             // Neither subtype: a `/PS` XObject, or (seen in the wild) an
             // image whose dictionary omits `/Subtype` entirely.
-            _ => self.skip(SkippedKind::XObject, SkipReason::Unsupported),
+            _ => {
+                self.skip(SkippedKind::XObject, SkipReason::Unsupported);
+                None
+            }
         }
     }
 
-    /// Runs a form XObject: `/Matrix` concatenated before the CTM, `/BBox`
-    /// intersected into the clip, own `/Resources` prepended to the chain,
-    /// bounded recursion.
-    fn run_form(&mut self, stream: &Stream, chain: &[Arc<Dict>], gs: &GState, depth: u32) {
+    /// Builds the frame for a form XObject: `/Matrix` concatenated before
+    /// the CTM, `/BBox` intersected into the clip, own `/Resources` prepended
+    /// to the chain, depth-bounded. `None` where the recursive version bailed
+    /// out, with the identical report entry.
+    async fn form_frame(
+        &mut self,
+        stream: &Stream,
+        chain: &[Arc<Dict>],
+        gs: &GState,
+        depth: u32,
+    ) -> Option<Frame> {
         // Every bail-out below drops the form's whole content subtree --
         // images, shadings and nested forms included -- so each one is
         // reported rather than leaving a hole nobody can account for.
         if depth >= MAX_FORM_DEPTH {
             self.skip(SkippedKind::Form, SkipReason::LimitExceeded);
-            return;
+            return None;
         }
-        let data = match self.doc.stream_data(stream) {
+        let data = match self.src.stream_data(stream).await {
             Ok(data) => data,
             Err(e) => {
                 self.skip(SkippedKind::Form, skip_reason_for(&e));
-                return;
+                return None;
             }
         };
         let ops = match parse_content(&data) {
             Ok(ops) => ops,
             Err(e) => {
                 self.skip(SkippedKind::Form, skip_reason_for(&e));
-                return;
+                return None;
             }
         };
         let mut inner = gs.clone();
-        if let Some(m) = floats_from(self.doc, stream.dict.get("Matrix"), 6) {
+        if let Some(m) = floats_from(self.src, stream.dict.get("Matrix"), 6).await {
             let matrix = Matrix {
                 a: m[0],
                 b: m[1],
@@ -1350,7 +1626,7 @@ impl Executor<'_> {
             };
             inner.ctm = matrix.concat(inner.ctm);
         }
-        if let Some(b) = floats_from(self.doc, stream.dict.get("BBox"), 4) {
+        if let Some(b) = floats_from(self.src, stream.dict.get("BBox"), 4).await {
             let (x0, x1) = (b[0].min(b[2]), b[0].max(b[2]));
             let (y0, y1) = (b[1].min(b[3]), b[1].max(b[3]));
             let mut pb = PathBuilder::new(inner.ctm);
@@ -1361,16 +1637,25 @@ impl Executor<'_> {
                 None => rasterized,
             });
         }
-        let own_res = match stream.dict.get("Resources").map(|o| self.doc.resolve(o)) {
-            Some(Ok(Object::Dict(d))) => Some(d),
-            _ => None,
+        let own_res = match stream.dict.get("Resources") {
+            Some(o) => match self.src.resolve(o).await {
+                Ok(Object::Dict(d)) => Some(d),
+                _ => None,
+            },
+            None => None,
         };
         let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
         if let Some(d) = own_res {
             inner_chain.push(Arc::new(d));
         }
         inner_chain.extend_from_slice(chain);
-        self.run(&ops, &inner_chain, inner, depth + 1);
+        Some(Frame::new(
+            ops.into(),
+            inner_chain,
+            inner,
+            depth + 1,
+            FrameKind::PageOrForm,
+        ))
     }
 
     /// Records one piece of content this render could not reproduce.
@@ -1380,37 +1665,41 @@ impl Executor<'_> {
 
     /// Draws an image XObject with the current CTM/clip/alpha; the fill
     /// color paints through `/ImageMask` stencils.
-    fn draw_image_xobject(&mut self, stream: &Stream, chain: &[Arc<Dict>], gs: &GState) {
-        let data = match self.doc.stream_data(stream) {
+    async fn draw_image_xobject(&mut self, stream: &Stream, chain: &[Arc<Dict>], gs: &GState) {
+        let data = match self.src.stream_data(stream).await {
             Ok(data) => data,
             Err(e) => {
                 self.skip(SkippedKind::Image, skip_reason_for(&e));
                 return;
             }
         };
-        let cs_obj = self.image_colorspace(&stream.dict, chain);
-        self.blit_image(&stream.dict, &data, cs_obj, gs);
+        let cs_obj = self.image_colorspace(&stream.dict, chain).await;
+        self.blit_image(&stream.dict, &data, cs_obj, gs).await;
     }
 
     /// Draws an inline image: its filters (abbreviations included) are
     /// applied here, then it follows the XObject path.
-    fn draw_inline_image(&mut self, img: &ImageParams, chain: &[Arc<Dict>], gs: &GState) {
+    async fn draw_inline_image(&mut self, img: &ImageParams, chain: &[Arc<Dict>], gs: &GState) {
         let stream = Stream {
             dict: img.dict.clone(),
             data: img.data.clone(),
         };
-        let data = match decode_stream(&stream, self.doc) {
+        // `stream_data` on a synthetic stream applies exactly the filter
+        // chain `decode_stream` would: the synchronous `Document::stream_data`
+        // IS `decode_stream(s, self)`, and an asynchronous source decodes the
+        // same way.
+        let data = match self.src.stream_data(&stream).await {
             Ok(data) => data,
             Err(e) => {
                 self.skip(SkippedKind::Image, skip_reason_for(&e));
                 return;
             }
         };
-        let cs_obj = self.image_colorspace(&img.dict, chain);
-        self.blit_image(&img.dict, &data, cs_obj, gs);
+        let cs_obj = self.image_colorspace(&img.dict, chain).await;
+        self.blit_image(&img.dict, &data, cs_obj, gs).await;
     }
 
-    fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
+    async fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
         // `data` is decoded samples or a raw JPEG: the filter chain passes
         // only `DCTDecode` through (ISO 32000-1 7.4.9) and rejects every
         // other codec, so no codestream reaches the sample reader. That
@@ -1419,16 +1708,17 @@ impl Executor<'_> {
         // An `/Indexed` palette stored as a stream that will not decode
         // leaves the space with no palette at all, painting every sample
         // black; the image still draws, but not as the page describes it.
-        if let Some(e) = cs_obj
-            .as_ref()
-            .and_then(|o| color::palette_error(self.doc, o))
-        {
+        let palette_err = match cs_obj.as_ref() {
+            Some(o) => color::palette_error_with(self.src, o).await,
+            None => None,
+        };
+        if let Some(e) = palette_err {
             self.skip(SkippedKind::Image, skip_reason_for(&e));
         }
-        if ignores_mask(self.doc, dict) {
+        if ignores_mask(self.src, dict).await {
             self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
         }
-        let meta = image::ImageMeta::read(self.doc, dict, cs_obj.as_ref());
+        let meta = image::ImageMeta::read_with(self.src, dict, cs_obj.as_ref()).await;
         if gs.fill_pattern && meta.stencil {
             // The stencil paints the pattern's stand-in gray, not the
             // pattern (see `GState::fill_rgba8`).
@@ -1455,15 +1745,15 @@ impl Executor<'_> {
 
     /// The image's `/ColorSpace` value with resource-name indirection
     /// resolved: a non-device name is looked up in `/ColorSpace` resources.
-    fn image_colorspace(&self, dict: &Dict, chain: &[Arc<Dict>]) -> Option<Object> {
-        let resolved = self.doc.resolve(dict.get("ColorSpace")?).ok()?;
+    async fn image_colorspace(&self, dict: &Dict, chain: &[Arc<Dict>]) -> Option<Object> {
+        let resolved = self.src.resolve(dict.get("ColorSpace")?).await.ok()?;
         if let Object::Name(n) = &resolved {
             let device = matches!(
                 n.0.as_str(),
                 "DeviceGray" | "DeviceRGB" | "DeviceCMYK" | "G" | "RGB" | "CMYK"
             );
             if !device {
-                if let Some(from_res) = self.find_res(chain, "ColorSpace", &n.0) {
+                if let Some(from_res) = self.find_res(chain, "ColorSpace", &n.0).await {
                     return Some(from_res);
                 }
             }

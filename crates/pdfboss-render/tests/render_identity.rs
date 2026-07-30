@@ -534,3 +534,75 @@ fn every_glyph_of_a_long_type3_string_paints() {
         );
     }
 }
+
+/// An asynchronous source that answers everything with `null`.
+///
+/// The heap field is load-bearing: rustc const-promotes a reference to a unit
+/// struct to `&'static`, so a unit stub would satisfy the `'static` assertion
+/// below even under a by-reference signature the assertion exists to reject.
+/// A `Vec` cannot be promoted. It is `Send + Sync` because the executor
+/// borrows its source across awaits, so the owning future is `Send` only when
+/// the source is `Sync` — as every genuinely asynchronous source already is.
+struct NullSource {
+    payload: Vec<u8>,
+}
+
+impl pdfboss_core::AsyncObjectSource for NullSource {
+    fn get(&self, _r: pdfboss_core::ObjRef) -> pdfboss_core::BoxFuture<'_, PdfResult<Object>> {
+        Box::pin(std::future::ready(Ok(Object::Null)))
+    }
+
+    fn stream_data<'a>(
+        &'a self,
+        _s: &'a pdfboss_core::Stream,
+    ) -> pdfboss_core::BoxFuture<'a, PdfResult<Vec<u8>>> {
+        Box::pin(std::future::ready(Ok(self.payload.clone())))
+    }
+
+    fn resolve<'a>(&'a self, o: &'a Object) -> pdfboss_core::BoxFuture<'a, PdfResult<Object>> {
+        Box::pin(pdfboss_core::resolve_with(self, o))
+    }
+}
+
+use pdfboss_core::{Object, Result as PdfResult};
+use pdfboss_render::render_page_reporting_with;
+
+/// The async render entry point must produce a future a runtime's `spawn`
+/// and the Python bindings will both accept: `Send + 'static`.
+///
+/// The `async move` block is the shape a consumer actually writes — it owns
+/// the source and the page, and the borrow `render_page_reporting_with`
+/// takes is created inside it. The document is dropped first to show the
+/// page stands alone. Both halves of the gate were verified to bite:
+/// borrowing the page from outside the block fails with `E0597 ... borrowed
+/// for 'static`, and substituting `Immediate<Document>` (owned, so
+/// `'static`, but `!Sync` through its object cache) fails with `E0277
+/// Rc<Object> cannot be sent between threads safely`.
+#[test]
+fn the_async_render_entry_point_yields_a_spawnable_future() {
+    fn assert_send_static<F: std::future::Future + Send + 'static>(_: &F) {}
+
+    let doc = Document::load(pdfboss_testkit::simple_doc("Hello")).unwrap();
+    let page = doc.page(0).unwrap();
+    drop(doc);
+
+    let fut = async move {
+        render_page_reporting_with(
+            NullSource {
+                payload: Vec::new(),
+            },
+            &page,
+            1.0,
+            &RenderOptions::default(),
+        )
+        .await
+    };
+    assert_send_static(&fut);
+
+    // A source that resolves everything to null yields a page with empty
+    // contents: a blank pixmap sized from the page, and nothing reported.
+    // Driving it proves the wiring is reachable; the type is the gate.
+    let (pix, report) = pdfboss_core::block_on(fut).expect("render");
+    assert_eq!((pix.width, pix.height), (612, 792));
+    assert!(report.is_empty(), "a null page has nothing to report");
+}

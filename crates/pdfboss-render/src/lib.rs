@@ -46,7 +46,7 @@ mod type3;
 
 use std::path::{Path, PathBuf};
 
-use pdfboss_core::{Document, Error, Page, Result};
+use pdfboss_core::{AsyncObjectSource, Document, Error, Page, Result};
 
 /// An RGBA8 raster image with straight (non-premultiplied) alpha, row-major
 /// from the top-left.
@@ -195,6 +195,25 @@ pub fn render_page_reporting(
     opts: &RenderOptions,
 ) -> Result<(Pixmap, RenderReport)> {
     executor::render_page_reporting(doc, page, scale, opts)
+}
+
+/// Renders a page like [`render_page_reporting`] against any object source,
+/// awaiting whatever I/O the source needs — this is the asynchronous entry
+/// point, and the synchronous ones above are this implementation over
+/// `pdfboss_core::Immediate`, so the two APIs cannot render differently.
+///
+/// The source is taken by value and the page by reference, which is the
+/// combination a consumer needs to spawn the result: the future is `Send`
+/// over a source that is `Send + Sync`, and `'static` as long as the borrow
+/// of `page` is created inside the consumer's own `async move` block, which
+/// owns the page. See `pdfboss_core::source`'s "Signing a shared algorithm".
+pub async fn render_page_reporting_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    scale: f32,
+    opts: &RenderOptions,
+) -> Result<(Pixmap, RenderReport)> {
+    executor::render_page_reporting_with(src, page, scale, opts).await
 }
 
 /// Upper bound on the distinct entries a [`RenderReport`] keeps. Repeats of

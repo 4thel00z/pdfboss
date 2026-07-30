@@ -7,7 +7,9 @@
 //! dictionary carries one, so the approximation is never silent.
 
 use pdfboss_core::geom::{Matrix, Point, Rect};
-use pdfboss_core::{block_on, AsyncObjectSource, Dict, Document, Immediate, Object};
+#[cfg(test)]
+use pdfboss_core::{block_on, Document, Immediate};
+use pdfboss_core::{AsyncObjectSource, Dict, Object};
 
 use crate::color::ColorSpace;
 use crate::raster::Mask;
@@ -140,6 +142,7 @@ pub(crate) struct ImageMeta {
 impl ImageMeta {
     /// Reads the metadata synchronously; [`ImageMeta::read_with`] over
     /// [`Immediate`].
+    #[cfg(test)]
     pub(crate) fn read(doc: &Document, dict: &Dict, cs_obj: Option<&Object>) -> ImageMeta {
         block_on(Self::read_with(&Immediate(doc), dict, cs_obj))
     }

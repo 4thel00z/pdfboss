@@ -22,7 +22,9 @@
 use pdfboss_core::FastMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use pdfboss_core::{block_on, AsyncObjectSource, Dict, Document, Immediate, Matrix, Object};
+#[cfg(test)]
+use pdfboss_core::{block_on, Document, Immediate};
+use pdfboss_core::{AsyncObjectSource, Dict, Matrix, Object};
 
 use crate::cff::CffFont;
 use crate::path::{PathBuilder, Subpath};
@@ -160,6 +162,7 @@ impl GlyphFont {
     /// takes precedence when the font actually carries one -- substitution
     /// is strictly the non-embedded last resort, tried only once every
     /// embedded loader below has declined.
+    #[cfg(test)]
     pub(crate) fn load(
         doc: &Document,
         font: &Dict,
