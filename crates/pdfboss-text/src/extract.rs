@@ -6,7 +6,7 @@ use crate::font::Font;
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{Dict, Document, Matrix, Object, Page, Point, Result};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Maximum form-XObject recursion depth.
 const MAX_FORM_DEPTH: usize = 16;
@@ -36,7 +36,7 @@ pub fn page_spans(doc: &Document, page: &Page) -> Result<Vec<RawSpan>> {
     let mut exec = Executor {
         doc,
         spans: Vec::new(),
-        fallback: Rc::new(Font::fallback()),
+        fallback: Arc::new(Font::fallback()),
         forms: 0,
     };
     exec.run(&ops, &[&page.resources], GState::new(), 0);
@@ -54,7 +54,7 @@ struct GState {
     horiz_scale: f32,
     leading: f32,
     rise: f32,
-    font: Option<Rc<Font>>,
+    font: Option<Arc<Font>>,
     font_name: String,
     size: f32,
 }
@@ -83,7 +83,7 @@ fn finite(m: &Matrix) -> bool {
 struct Executor<'a> {
     doc: &'a Document,
     spans: Vec<RawSpan>,
-    fallback: Rc<Font>,
+    fallback: Arc<Font>,
     /// Form-XObject invocations so far, checked against
     /// `MAX_FORM_INVOCATIONS`.
     forms: usize,
@@ -117,13 +117,18 @@ impl Executor<'_> {
 
     /// Loads (with per-stream caching) the font resource `name` from the
     /// active resource chain, falling back to a default font.
-    fn font(&self, chain: &[&Dict], name: &str, cache: &mut HashMap<String, Rc<Font>>) -> Rc<Font> {
+    fn font(
+        &self,
+        chain: &[&Dict],
+        name: &str,
+        cache: &mut HashMap<String, Arc<Font>>,
+    ) -> Arc<Font> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
         let loaded = self
             .find_res(chain, "Font", name)
-            .and_then(|resolved| Some(Rc::new(Font::load(self.doc, resolved.as_dict()?))))
+            .and_then(|resolved| Some(Arc::new(Font::load(self.doc, resolved.as_dict()?))))
             .unwrap_or_else(|| self.fallback.clone());
         cache.insert(name.to_string(), loaded.clone());
         loaded
@@ -136,7 +141,7 @@ impl Executor<'_> {
         let mut stack: Vec<GState> = Vec::new();
         let mut tm = Matrix::identity();
         let mut tlm = Matrix::identity();
-        let mut fonts: HashMap<String, Rc<Font>> = HashMap::new();
+        let mut fonts: HashMap<String, Arc<Font>> = HashMap::new();
         for op in ops {
             match op {
                 Op::Save => stack.push(gs.clone()),
@@ -530,5 +535,22 @@ mod tests {
             "fan-out not bounded: {} spans",
             spans.len()
         );
+    }
+
+    /// A loaded font and the state that carries it must both be shareable across
+    /// threads: the shared asynchronous implementation is driven on a runtime
+    /// free to move its future between them, and `Arc<T>` is `Send` only when
+    /// `T` is `Send + Sync`.
+    ///
+    /// Nothing in this crate has interior mutability, so this holds as soon as
+    /// the handle is an `Arc`. The assertion exists to stop a later `Rc` or
+    /// `RefCell` taking it away silently — which is exactly how the renderer's
+    /// glyph cache came to block a spawnable future.
+    #[test]
+    fn loaded_fonts_are_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Font>();
+        assert_send_sync::<Arc<Font>>();
+        assert_send_sync::<GState>();
     }
 }
