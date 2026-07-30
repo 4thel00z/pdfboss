@@ -249,6 +249,13 @@ pub enum SkippedKind {
     BlendMode,
     /// An annotation appearance stream: annotations are not painted.
     Annotation,
+    /// A character code a *loaded* font has no glyph for: the code advanced
+    /// the text position but painted nothing. A single-byte code 0x20 is
+    /// exempt — a space paints nothing whether or not the font maps it —
+    /// while a two-byte 0x20 is a real CID and is reported. Text whose font
+    /// never loaded at all (the [`GlyphPainting`] tier, or a load failure)
+    /// is configured behavior and stays unreported.
+    Glyph,
 }
 
 impl SkippedKind {
@@ -275,6 +282,8 @@ impl SkippedKind {
             SkippedKind::BlendMode => "blend modes",
             SkippedKind::Annotation if one => "annotation",
             SkippedKind::Annotation => "annotations",
+            SkippedKind::Glyph if one => "glyph",
+            SkippedKind::Glyph => "glyphs",
         }
     }
 }
@@ -309,6 +318,17 @@ pub enum SkipReason {
     Unsupported,
     /// A nesting or size guard stopped the render at this point.
     LimitExceeded,
+    /// A loaded font has no glyph for a character code the page draws, so
+    /// the code advanced the text position without painting. One value per
+    /// distinct `(font, code)` pair, so the report counts occurrences
+    /// instead of listing them.
+    NoGlyph {
+        /// The character code exactly as the show operator carried it.
+        code: u32,
+        /// The font's `/BaseFont` name, or its `Tf` resource name when the
+        /// dictionary has none.
+        font: String,
+    },
 }
 
 impl std::fmt::Display for SkipReason {
@@ -323,6 +343,9 @@ impl std::fmt::Display for SkipReason {
             SkipReason::Missing => f.write_str("the resource is missing"),
             SkipReason::Unsupported => f.write_str("not supported yet"),
             SkipReason::LimitExceeded => f.write_str("a nesting limit stopped the render here"),
+            SkipReason::NoGlyph { code, font } => {
+                write!(f, "no glyph for code {code} in /{font}")
+            }
         }
     }
 }
@@ -346,7 +369,9 @@ pub struct SkippedContent {
 ///
 /// Two things are deliberately *not* reported, because they are configured
 /// behavior rather than a failure: text left unpainted by the requested
-/// [`GlyphPainting`] tier, and content clipped or transformed off the page.
+/// [`GlyphPainting`] tier — its font never loaded — and content clipped or
+/// transformed off the page. A code a *loaded* font has no glyph for is a
+/// real loss and IS reported, as [`SkippedKind::Glyph`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RenderReport {

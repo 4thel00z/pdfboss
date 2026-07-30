@@ -160,13 +160,19 @@ impl GState {
     }
 }
 
+/// A loaded, paintable outline font paired with the name report entries
+/// know it by — its `/BaseFont`, or the `Tf` resource name when the
+/// dictionary has none — or `None` for a font whose glyphs cannot be drawn
+/// (the [`crate::GlyphPainting`] tier, or a load failure).
+type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>)>;
+
 /// Text-showing state within a `BT`/`ET` block. Held per content stream (not
 /// saved by `q`/`Q`), matching how the extractor tracks text.
 struct TextState {
     /// Text matrix and line matrix.
     tm: Matrix,
     tlm: Matrix,
-    font: Option<Arc<GlyphFont>>,
+    font: LoadedFont,
     /// A `/Type3` font whose glyphs paint by re-entering the executor per
     /// CharProc (ISO 32000-1 §9.6.5). Invariant: at most one of `font`
     /// (outline) / `type3` is `Some`.
@@ -484,9 +490,10 @@ struct Frame {
     path: Option<PathBuilder>,
     pending_clip: Option<FillRule>,
     ts: TextState,
-    /// Loaded fonts by resource name. Per frame, never hoisted: `/F0` names
-    /// different fonts in different resource scopes.
-    fonts: FastMap<String, Option<Arc<GlyphFont>>>,
+    /// Loaded fonts by resource name, each with its report label (see
+    /// [`LoadedFont`]). Per frame, never hoisted: `/F0` names different
+    /// fonts in different resource scopes.
+    fonts: FastMap<String, LoadedFont>,
     /// Type3 glyphs planned by a show operator and not yet painted. Drained
     /// one CharProc frame at a time before the next operator runs.
     pending_glyphs: std::collections::VecDeque<Type3Glyph>,
@@ -926,14 +933,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         mask
     }
 
-    /// Resolves and caches a paintable font by resource name (`None` for fonts
-    /// whose glyphs cannot be drawn).
+    /// Resolves and caches a paintable font by resource name, paired with
+    /// its report label (see [`LoadedFont`]).
     async fn glyph_font(
         &self,
         name: &str,
         chain: &[Arc<Dict>],
-        cache: &mut FastMap<String, Option<Arc<GlyphFont>>>,
-    ) -> Option<Arc<GlyphFont>> {
+        cache: &mut FastMap<String, LoadedFont>,
+    ) -> LoadedFont {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
@@ -941,10 +948,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .find_res(chain, "Font", name)
             .await
             .and_then(|o| o.as_dict().cloned());
+        let label: Arc<str> = dict
+            .as_ref()
+            .and_then(|d| d.get_name("BaseFont"))
+            .map_or(name, |n| n.0.as_str())
+            .into();
         let loaded = match dict {
             Some(d) => GlyphFont::load_with(self.src, &d, self.painting, self.provider.as_deref())
                 .await
-                .map(Arc::new),
+                .map(|f| (Arc::new(f), label)),
             None => None,
         };
         cache.insert(name.to_string(), loaded.clone());
@@ -1017,7 +1029,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
         let gs = &frame.gs;
         let ts = &mut frame.ts;
-        let Some(font) = ts.font.clone() else {
+        let Some((font, label)) = ts.font.clone() else {
             return;
         };
         let upm = font.units_per_em();
@@ -1064,6 +1076,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 if !polys.is_empty() {
                     self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
                 }
+            } else if gid == 0 && !(n == 1 && code == 32) {
+                // A loaded font with no glyph for this code: the advance
+                // below still happens, so surrounding text stays positioned,
+                // but nothing painted here — report it so a lossy render is
+                // never mistaken for a clean one. The single-byte space is
+                // exempt because a space paints nothing whether or not the
+                // font maps it; a two-byte 0x20 is a real CID, not a space.
+                self.skip(
+                    SkippedKind::Glyph,
+                    SkipReason::NoGlyph {
+                        code,
+                        font: label.to_string(),
+                    },
+                );
             }
 
             // Advance: (w0·Tfs + Tc + Tw[single-byte space]) · Th.
@@ -1768,6 +1794,7 @@ mod tests {
     // The crate-root wrapper, exercised here so these tests keep covering the
     // exact entry point external callers use.
     use crate::render_page_with_options;
+    use crate::type1::tests::build_type1_box_fixture;
     use crate::{GlyphPainting, RenderOptions};
     use pdfboss_testkit::{doc_with_graphics, PdfBuilder};
 
@@ -2141,6 +2168,101 @@ mod tests {
             .iter()
             .map(|item| (item.kind, item.reason.clone(), item.count))
             .collect()
+    }
+
+    /// A one-page 200x200 document showing `content` with `/F0`, a simple
+    /// `/Type1` font over the embedded box-glyph program. Only code 128 maps
+    /// to a glyph (via `/Differences`); every other code resolves to gid 0.
+    fn doc_with_type1_box_font(content: &[u8]) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /TheBoxFont \
+             /FontDescriptor 6 0 R \
+             /Encoding << /Differences [128 /theboxglyphname] >> >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /TheBoxFont /Flags 4 /FontFile 7 0 R >>",
+        );
+        b.stream(7, "", &build_type1_box_fixture("theboxglyphname"));
+        b.build(1)
+    }
+
+    #[test]
+    fn code_without_a_glyph_in_a_loaded_font_is_reported() {
+        // Code 65 maps to no glyph in the box font: the show operator
+        // advances but paints nothing, and the report must say so, naming
+        // both the code and the font so the warning is actionable.
+        let (_, report) = render_reporting(doc_with_type1_box_font(
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        ));
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Glyph,
+                SkipReason::NoGlyph {
+                    code: 65,
+                    font: "TheBoxFont".to_string(),
+                },
+                1
+            )]
+        );
+        assert_eq!(
+            report.warnings(),
+            vec!["1 glyph skipped: no glyph for code 65 in /TheBoxFont"]
+        );
+    }
+
+    #[test]
+    fn repeated_unmappable_code_is_one_entry_with_the_count() {
+        // The same unmappable code three times must merge into one entry
+        // counted 3, not three lines.
+        let (_, report) = render_reporting(doc_with_type1_box_font(
+            b"BT /F0 100 Tf 20 50 Td <414141> Tj ET",
+        ));
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Glyph,
+                SkipReason::NoGlyph {
+                    code: 65,
+                    font: "TheBoxFont".to_string(),
+                },
+                3
+            )]
+        );
+        assert_eq!(
+            report.warnings(),
+            vec!["3 glyphs skipped: no glyph for code 65 in /TheBoxFont"]
+        );
+    }
+
+    #[test]
+    fn drawn_glyph_and_single_byte_space_report_nothing() {
+        // Code 128 paints the box glyph; the single-byte space (code 32)
+        // maps to no glyph but would paint nothing even if the font mapped
+        // it, so a warning there would be pure noise.
+        let (pix, report) = render_reporting(doc_with_type1_box_font(
+            b"BT /F0 100 Tf 20 50 Td <8020> Tj ET",
+        ));
+        // (55,115) is the known interior point of the box glyph shown at
+        // 100pt from origin (20,50) on a 200x200 page.
+        let interior = ((115 * pix.width + 55) * 4) as usize;
+        assert!(pix.data[interior] < 128, "the mapped box glyph must paint");
+        assert!(
+            report.is_empty(),
+            "a drawn glyph and a bare space are clean: {:?}",
+            report.warnings()
+        );
     }
 
     #[test]
