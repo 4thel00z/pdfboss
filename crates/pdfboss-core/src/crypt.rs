@@ -7,6 +7,11 @@
 //! primitives — MD5, RC4, AES and the SHA-2 family — are implemented here from
 //! their published specifications so the crate needs no cryptographic
 //! dependency.
+//!
+//! This is low-level API: [`crate::Document`] applies it automatically when
+//! opening an encrypted file, and most callers never name [`Decryptor`]
+//! directly. It is public for code that drives object reads itself, as the
+//! asynchronous API does.
 
 use crate::object::{Dict, Object};
 
@@ -29,7 +34,7 @@ enum Cipher {
 
 /// A configured Standard-handler decryptor for a document opened with the empty
 /// user password.
-pub(crate) struct Decryptor {
+pub struct Decryptor {
     /// The file key (`n` bytes for RC4/AESV2, 32 for AESV3).
     key: Vec<u8>,
     cipher: Cipher,
@@ -40,7 +45,18 @@ impl Decryptor {
     /// `/ID` element, assuming the empty user password. Returns `None` when the
     /// handler or its parameters are unsupported, or the empty password does
     /// not open the file (so the caller can report it as unsupported).
-    pub(crate) fn from_standard(enc: &Dict, id0: &[u8]) -> Option<Decryptor> {
+    ///
+    /// This is low-level: [`crate::Document`] configures decryption itself, and
+    /// a caller only reaches for this when driving object reads directly — as
+    /// the asynchronous API does.
+    ///
+    /// ```
+    /// use pdfboss_core::{Decryptor, Dict};
+    ///
+    /// // An empty dictionary names no handler, so there is nothing to build.
+    /// assert!(Decryptor::from_standard(&Dict::default(), &[]).is_none());
+    /// ```
+    pub fn from_standard(enc: &Dict, id0: &[u8]) -> Option<Decryptor> {
         if enc.get_name("Filter").map(|n| n.0.as_str()) != Some("Standard") {
             return None;
         }
@@ -87,7 +103,20 @@ impl Decryptor {
     /// Decrypts one indirect object's strings and stream data in place. Objects
     /// extracted from object streams are already plaintext and must not be
     /// passed here.
-    pub(crate) fn decrypt_object(&self, obj: &mut Object, num: u32, gen: u16) {
+    ///
+    /// Low-level, like [`Decryptor::from_standard`]: [`crate::Document`] applies
+    /// this itself as it loads objects, and a caller only reaches for it when
+    /// driving object reads directly — as the asynchronous API does.
+    ///
+    /// ```
+    /// use pdfboss_core::{Decryptor, Object};
+    ///
+    /// // Reachable from outside the crate; exercising it needs an encrypted
+    /// // document, so this only pins the signature and the visibility.
+    /// let apply: fn(&Decryptor, &mut Object, u32, u16) = Decryptor::decrypt_object;
+    /// let _ = apply;
+    /// ```
+    pub fn decrypt_object(&self, obj: &mut Object, num: u32, gen: u16) {
         let key = match self.cipher {
             Cipher::Aesv3 => self.key.clone(), // one file key for every object
             Cipher::Rc4 | Cipher::Aesv2 => self.object_key(num, gen),

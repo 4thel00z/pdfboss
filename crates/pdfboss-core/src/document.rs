@@ -20,9 +20,6 @@ use crate::xref::{load_xref, Xref, XrefEntry};
 /// Default page size when `/MediaBox` is absent or invalid: US Letter.
 const US_LETTER: Rect = Rect::new(0.0, 0.0, 612.0, 792.0);
 
-/// Reference-chase depth limit for [`Document::resolve`].
-const MAX_RESOLVE_DEPTH: usize = 32;
-
 /// Page-tree traversal depth cap.
 const MAX_TREE_DEPTH: usize = 256;
 
@@ -291,28 +288,18 @@ impl Document {
         self.objstm_handle(stream_num)?.object(index)
     }
 
-    /// Chases reference chains with a depth guard of `MAX_RESOLVE_DEPTH`
-    /// (beyond that: [`Error::CircularReference`]); a reference to a missing
-    /// or unreadable object resolves to `Null` (lenient).
+    /// Chases reference chains with a depth guard of
+    /// [`MAX_RESOLVE_DEPTH`](crate::source::MAX_RESOLVE_DEPTH) (beyond that:
+    /// [`Error::CircularReference`], naming the last reference followed); a
+    /// reference to a missing or unreadable object resolves to `Null`
+    /// (lenient).
+    ///
+    /// The loop is [`crate::source::resolve_sync_with`], shared with the
+    /// provided [`crate::source::ObjectSource::resolve`], so the two cannot
+    /// drift apart. It reaches `Document::get` through this type's
+    /// `ObjectSource` implementation, which forwards to it unchanged.
     pub fn resolve(&self, o: &Object) -> Result<Object> {
-        let mut current = o.clone();
-        let mut last_num = 0;
-        for _ in 0..MAX_RESOLVE_DEPTH {
-            match current {
-                Object::Ref(r) => {
-                    last_num = r.num;
-                    current = match self.get(r) {
-                        Ok(object) => object,
-                        Err(Error::CircularReference(n)) => {
-                            return Err(Error::CircularReference(n))
-                        }
-                        Err(_) => return Ok(Object::Null),
-                    };
-                }
-                other => return Ok(other),
-            }
-        }
-        Err(Error::CircularReference(last_num))
+        crate::source::resolve_sync_with(self, o)
     }
 
     /// Decodes a stream's data through its filter chain, resolving indirect
@@ -561,6 +548,27 @@ impl Resolve for Document {
     }
 }
 
+/// Forwards to the inherent methods, so reading a document through the trait
+/// is bit-identical to reading it directly. `resolve` is forwarded too, even
+/// though the provided implementation is now the same shared chase
+/// ([`crate::source::resolve_sync_with`]) that the inherent method delegates
+/// to: routing it through the inherent method keeps the two entry points a
+/// single call, so they cannot drift should `Document::resolve` ever grow
+/// document-specific behaviour.
+impl crate::source::ObjectSource for Document {
+    fn get(&self, r: ObjRef) -> Result<Object> {
+        Document::get(self, r)
+    }
+
+    fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+        Document::stream_data(self, s)
+    }
+
+    fn resolve(&self, o: &Object) -> Result<Object> {
+        Document::resolve(self, o)
+    }
+}
+
 /// Document information from the trailer `/Info` dictionary. Only present,
 /// well-formed entries are populated.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -579,7 +587,11 @@ pub struct Metadata {
 ///
 /// Defaults: `media_box` falls back to US Letter (612x792) when absent or
 /// invalid, `crop_box` falls back to (and is intersected with) `media_box`,
-/// and `rotate` is normalized to one of {0, 90, 180, 270}.
+/// and `rotate` is normalized to one of {0, 90, 180, 270}. Every construction
+/// path normalizes `rotate` — [`Document::page`] and [`Page::from_parts`]
+/// alike — so the invariant holds however a `Page` was built. `rotate` is a
+/// public field, so a caller may still overwrite it afterwards; [`Page::size`]
+/// reads it modulo a full turn and so stays correct if they do.
 pub struct Page {
     /// 0-based page index.
     pub index: usize,
@@ -593,6 +605,39 @@ pub struct Page {
 }
 
 impl Page {
+    /// Builds a page from already-resolved attributes.
+    ///
+    /// [`Document::page`] resolves page-tree inheritance itself; this is for
+    /// a caller that has done that resolution some other way — notably the
+    /// asynchronous API, which flattens the page tree while reading it — and
+    /// needs the same [`Page`] type back.
+    ///
+    /// `rotate` is normalized here to one of `{0, 90, 180, 270}` exactly as
+    /// [`Document::page`] normalizes it, so a caller may pass a raw `/Rotate`
+    /// straight through: a negative or over-a-full-turn multiple of 90 is
+    /// reduced, and a value that is not a multiple of 90 falls back to 0
+    /// (lenient). The caller does not have to pre-normalize, and the [`Page`]
+    /// invariant holds whichever constructor built it.
+    pub fn from_parts(
+        index: usize,
+        media_box: Rect,
+        crop_box: Rect,
+        rotate: i32,
+        resources: Dict,
+        dict: Dict,
+        obj_ref: Option<ObjRef>,
+    ) -> Page {
+        Page {
+            index,
+            media_box,
+            crop_box,
+            rotate: normalize_rotation(rotate),
+            resources,
+            dict,
+            obj_ref,
+        }
+    }
+
     /// The page's indirect object reference, when the page came from an
     /// indirect kid in the page tree (pages inlined directly into a `/Kids`
     /// array have none).
@@ -629,10 +674,18 @@ impl Page {
         }
     }
 
-    /// Crop-box width and height, swapped when `/Rotate` is 90 or 270.
+    /// Crop-box width and height, swapped when `/Rotate` is a quarter turn.
+    ///
+    /// Both constructors normalize `rotate`, but the field is public and so
+    /// can be overwritten with a raw `/Rotate`; the rotation is therefore read
+    /// modulo a full turn rather than compared against 90 and 270 exactly, so
+    /// that -90 and 450 swap the dimensions just as 270 and 90 do. For an
+    /// already-normalized value this is the same test as before: 0, 90, 180
+    /// and 270 are unchanged by `rem_euclid(360)`.
     pub fn size(&self) -> (f32, f32) {
         let (w, h) = (self.crop_box.width(), self.crop_box.height());
-        if self.rotate == 90 || self.rotate == 270 {
+        let turn = self.rotate.rem_euclid(360);
+        if turn == 90 || turn == 270 {
             (h, w)
         } else {
             (w, h)
@@ -648,6 +701,7 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object::Name;
     use crate::parser::{NoResolve, Parser};
     use crate::xref::XrefEntry;
     use pdfboss_testkit::{multi_page_doc, objstm_doc, objstm_payload, simple_doc, PdfBuilder};
@@ -1288,5 +1342,90 @@ mod tests {
             doc.xref().get(7),
             Some(XrefEntry::InStream { stream_num: 4, .. })
         ));
+    }
+
+    /// A page built from parts must expose the same accessors as one that
+    /// came out of the page tree — this is the constructor aio uses.
+    #[test]
+    fn page_from_parts_exposes_its_accessors() {
+        let mut dict = Dict::default();
+        dict.insert(Name("Type".into()), Object::Name(Name("Page".into())));
+        let media = Rect::new(0.0, 0.0, 200.0, 400.0);
+        let obj_ref = ObjRef { num: 7, gen: 0 };
+
+        let page = Page::from_parts(
+            3,
+            media,
+            media,
+            90,
+            Dict::default(),
+            dict.clone(),
+            Some(obj_ref),
+        );
+
+        assert_eq!(page.index, 3);
+        assert_eq!(page.object_ref(), Some(obj_ref));
+        assert_eq!(page.dict(), &dict);
+        // /Rotate 90 swaps the reported page size.
+        assert_eq!(page.size(), (400.0, 200.0));
+    }
+
+    /// `from_parts` normalizes `/Rotate` just as the page tree does, so an
+    /// unnormalized quarter-turn stores — and reports the size of — its
+    /// canonical equivalent.
+    #[test]
+    fn page_from_parts_normalizes_rotation() {
+        let media = Rect::new(0.0, 0.0, 200.0, 400.0);
+        let build = |rotate: i32| {
+            Page::from_parts(
+                0,
+                media,
+                media,
+                rotate,
+                Dict::default(),
+                Dict::default(),
+                None,
+            )
+        };
+
+        for (given, canonical) in [(-90, 270), (450, 90), (540, 180), (720, 0), (-360, 0)] {
+            let page = build(given);
+            assert_eq!(
+                page.rotate, canonical,
+                "from_parts must normalize /Rotate {given} to {canonical}"
+            );
+            assert_eq!(
+                page.size(),
+                build(canonical).size(),
+                "/Rotate {given} must report the same size as {canonical}"
+            );
+        }
+    }
+
+    /// `rotate` is a public field, so `size()` cannot rely on the constructor
+    /// having normalized it: any multiple of 90 must be read modulo a full
+    /// turn. The already-canonical values are listed too, pinning that this
+    /// is unchanged for them.
+    #[test]
+    fn page_size_handles_unnormalized_rotation() {
+        let media = Rect::new(0.0, 0.0, 200.0, 400.0);
+        let mut page = Page::from_parts(0, media, media, 0, Dict::default(), Dict::default(), None);
+
+        for rotate in [90, 270, -90, -270, 450, 630] {
+            page.rotate = rotate;
+            assert_eq!(
+                page.size(),
+                (400.0, 200.0),
+                "/Rotate {rotate} is a quarter turn and must swap the size"
+            );
+        }
+        for rotate in [0, 180, -180, 360, 540, 720] {
+            page.rotate = rotate;
+            assert_eq!(
+                page.size(),
+                (200.0, 400.0),
+                "/Rotate {rotate} is a half turn and must leave the size alone"
+            );
+        }
     }
 }
