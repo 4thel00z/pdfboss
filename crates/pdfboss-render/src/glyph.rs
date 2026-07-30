@@ -530,7 +530,9 @@ async fn load_simple_type1_or_cff<S: AsyncObjectSource>(src: &S, font: &Dict) ->
 /// separate built-in encoding -- the font's own built-in `/Encoding` array
 /// (`builtin_name`), for a font that ships its own encoding and the PDF
 /// gives none. Type1 has no `cmap`, so as with CFF an unresolved code is
-/// left at `.notdef` (gid 0).
+/// left at `.notdef` (gid 0). `Type1Font::parse` guarantees gid 0 IS
+/// `.notdef` (synthesizing an empty one when the program lists a real glyph
+/// first), so the `g != 0` filters below never discard a resolved glyph.
 async fn load_type1_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile")?).await?;
@@ -989,7 +991,10 @@ mod tests {
 
     use crate::cff::tests::{build_box_glyph_fixture, build_box_glyph_fixture_cid};
     use crate::truetype::tests::build_font;
-    use crate::type1::tests::{build_type1_box_fixture, build_type1_box_fixture_standard_encoding};
+    use crate::type1::tests::{
+        build_type1_box_fixture, build_type1_box_fixture_standard_encoding,
+        build_type1_box_fixture_without_notdef,
+    };
     use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
 
     /// A font is shared as `Arc<GlyphFont>` while a page paints, and
@@ -1464,6 +1469,21 @@ mod tests {
     /// charstring program via `FontFile` (rather than a CFF `FontFile3`
     /// program).
     fn simple_type1_font_doc(encoding: &str, content: &[u8]) -> Vec<u8> {
+        simple_type1_font_doc_with_program(
+            encoding,
+            content,
+            &build_type1_box_fixture("theboxglyphname"),
+        )
+    }
+
+    /// Like [`simple_type1_font_doc`], but the caller supplies the embedded
+    /// `FontFile` program bytes -- for fixtures other than the default
+    /// `.notdef`-leading box font.
+    fn simple_type1_font_doc_with_program(
+        encoding: &str,
+        content: &[u8],
+        program: &[u8],
+    ) -> Vec<u8> {
         let mut b = PdfBuilder::new().version(1, 5);
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -1484,7 +1504,7 @@ mod tests {
             6,
             "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile 7 0 R >>",
         );
-        b.stream(7, "", &build_type1_box_fixture("theboxglyphname"));
+        b.stream(7, "", program);
         b.build(1)
     }
 
@@ -1505,6 +1525,25 @@ mod tests {
         assert!(
             !dark_pixel_at(&pix, 55, 115),
             "embedded Type1 must not paint at EmbeddedTrueTypeOnly (tier gate)"
+        );
+    }
+
+    #[test]
+    fn type1_first_listed_glyph_without_notdef_still_paints() {
+        // A subset-shaped FontFile whose CharStrings lists the box glyph
+        // FIRST and has no `.notdef` at all. Before the synthetic-`.notdef`
+        // prepend in `parse_charstrings`, that glyph got gid 0 and every
+        // lookup tier's `g != 0` filter silently dropped it -- the font's
+        // first-listed glyph was unpaintable everywhere it appeared.
+        let bytes = simple_type1_font_doc_with_program(
+            "/Encoding << /Differences [128 /theboxglyphname] >>",
+            b"BT /F0 100 Tf 20 50 Td <80> Tj ET",
+            &build_type1_box_fixture_without_notdef("theboxglyphname"),
+        );
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "the first-listed glyph of a .notdef-less Type1 subset must paint"
         );
     }
 

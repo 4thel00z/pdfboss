@@ -226,9 +226,10 @@ const MAX_SUBR_INDEX: usize = 65_536;
 /// charstring and (for a later task) interpret that charstring into an
 /// outline.
 pub(crate) struct Type1Font {
-    /// Decrypted charstring bytes per glyph, indexed by gid (gid 0 ==
-    /// ".notdef" when the font defines it; otherwise CharStrings appearance
-    /// order).
+    /// Decrypted charstring bytes per glyph, indexed by gid: gid 0 is always
+    /// `.notdef` -- the font's own when it leads CharStrings, otherwise a
+    /// synthetic empty one (see `parse_charstrings`) -- and real glyphs
+    /// follow in CharStrings appearance order.
     charstrings: Vec<Vec<u8>>,
     /// gid -> glyph name, parallel to `charstrings`.
     names: Vec<String>,
@@ -1066,12 +1067,17 @@ fn parse_subrs(private: &[u8], len_iv: usize) -> Vec<Vec<u8>> {
 /// Parses the decrypted private portion's `/CharStrings <count> dict dup
 /// begin` block (spec ch. 8): repeated `/<name> <len> RD <len bytes> ND`
 /// entries (terminator -- `ND`/`|-`/`noaccess def` -- not itself inspected,
-/// same leniency convention as [`parse_subrs`]). gid is assignment order: a
-/// literal `.notdef` entry keeps its natural order rather than being forced
-/// to gid 0 (the loader treats gid 0 as "not found"; a real `.notdef`
-/// charstring landing elsewhere is harmless). Each blob is decrypted with
-/// `decrypt(_, CHARSTRING_KEY, len_iv)`; a blob that fails to decrypt is
-/// skipped. Accepts at most [`MAX_GLYPHS`] entries.
+/// same leniency convention as [`parse_subrs`]). gid is assignment order,
+/// EXCEPT that gid 0 is always `.notdef`: every consumer (glyph.rs's
+/// `g != 0` filters, the executor's paint loop) treats gid 0 as "not
+/// found", so when the first parsed entry is any other glyph -- common in
+/// subsets, which list glyphs in usage order -- a synthetic empty `.notdef`
+/// charstring is prepended at gid 0 and the parsed entries shift up by one
+/// (a real `.notdef` landing later is harmless: it stays addressable by
+/// name). A program whose first entry IS `.notdef` parses byte-for-byte
+/// unchanged. Each blob is decrypted with `decrypt(_, CHARSTRING_KEY,
+/// len_iv)`; a blob that fails to decrypt is skipped. Accepts at most
+/// [`MAX_GLYPHS`] entries, the synthetic slot included.
 fn parse_charstrings(
     private: &[u8],
     len_iv: usize,
@@ -1108,7 +1114,18 @@ fn parse_charstrings(
             i = end;
             continue;
         };
-        let gid = charstrings.len() as u16; // charstrings.len() < MAX_GLYPHS <= u16::MAX + 1
+        if charstrings.is_empty() && name != ".notdef" {
+            // Claim gid 0 for the synthetic `.notdef` (empty charstring ->
+            // `glyph_path` yields no segments) before the first real glyph
+            // lands there; see the doc comment.
+            charstrings.push(Vec::new());
+            names.push(".notdef".to_string());
+            name_to_gid.insert(".notdef".to_string(), 0);
+        }
+        // The loop-top MAX_GLYPHS check saw len < MAX_GLYPHS; the synthetic
+        // slot is only ever added at len == 0, so len < MAX_GLYPHS <=
+        // u16::MAX + 1 still holds here.
+        let gid = charstrings.len() as u16;
         charstrings.push(decoded);
         names.push(name.to_string());
         name_to_gid.insert(name.to_string(), gid);
@@ -1539,6 +1556,71 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parse_synthesizes_notdef_at_gid_zero_when_first_entry_is_a_real_glyph() {
+        // A subsetted font that lists a real glyph first and carries no
+        // `.notdef` at all: every consumer (glyph.rs's `g != 0` filters, the
+        // executor's paint loop) treats gid 0 as unpaintable, so the real
+        // glyph must be pushed off gid 0 by a synthetic empty `.notdef`.
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("box", box_charstring())],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        let gid = f.gid_for_name("box").expect("gid");
+        assert_ne!(gid, 0, "a real glyph must never occupy gid 0");
+        assert!(
+            !f.glyph_path(gid).is_empty(),
+            "the real glyph's outline survives the shift"
+        );
+        assert_eq!(f.name_for_gid(0), Some(".notdef"));
+        assert!(
+            f.glyph_path(0).is_empty(),
+            "the synthetic .notdef at gid 0 paints nothing"
+        );
+        assert_eq!(f.num_glyphs(), 2);
+    }
+
+    #[test]
+    fn parse_keeps_a_leading_notdef_at_gid_zero_unshifted() {
+        // A font that already lists `.notdef` first is untouched: no second
+        // synthetic slot, gids exactly as listed.
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[(".notdef", stub_charstring()), ("box", box_charstring())],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        assert_eq!(f.num_glyphs(), 2);
+        assert_eq!(f.gid_for_name(".notdef"), Some(0));
+        assert_eq!(f.gid_for_name("box"), Some(1));
+    }
+
+    #[test]
+    fn parse_shifts_a_late_notdef_along_with_the_rest() {
+        // `.notdef` present but not first: the synthetic slot is still
+        // prepended (only a LEADING `.notdef` claims gid 0), and the real
+        // one keeps its shifted, addressable-by-name position.
+        let prog = build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[],
+            &[("box", box_charstring()), (".notdef", stub_charstring())],
+            &[],
+            4,
+        );
+        let f = Type1Font::parse(prog).expect("parse");
+        assert_eq!(f.num_glyphs(), 3);
+        assert_eq!(f.name_for_gid(0), Some(".notdef"));
+        assert!(f.glyph_path(0).is_empty());
+        assert_eq!(f.gid_for_name("box"), Some(1));
+        assert_eq!(f.name_for_gid(2), Some(".notdef"));
+    }
+
+    #[test]
     fn parse_tolerates_truncated_charstring_blob() {
         // Declare a length longer than the bytes actually present; parse must
         // not panic.
@@ -1597,6 +1679,22 @@ pub(crate) mod tests {
                 (".notdef", stub_charstring()),
                 (glyph_name, box_charstring()),
             ],
+            &[],
+            4,
+        )
+    }
+
+    /// Like [`build_type1_box_fixture`], but the program carries NO
+    /// `.notdef` at all: `glyph_name` is the FIRST (and only) CharStrings
+    /// entry, the shape of a subsetted font listing glyphs in usage order.
+    /// Exercises `parse_charstrings`' synthetic-`.notdef` prepend from the
+    /// loader side -- without it the box glyph lands on gid 0 and every
+    /// `g != 0` filter in `glyph.rs` discards it.
+    pub(crate) fn build_type1_box_fixture_without_notdef(glyph_name: &str) -> Vec<u8> {
+        build_type1_program(
+            "[0.001 0 0 0.001 0 0]",
+            &[(128u8, glyph_name)],
+            &[(glyph_name, box_charstring())],
             &[],
             4,
         )
