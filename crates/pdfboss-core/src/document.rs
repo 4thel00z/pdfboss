@@ -19,7 +19,7 @@ use crate::source::{block_on, AsyncObjectSource, Immediate};
 use crate::xref::{load_xref, Xref, XrefEntry};
 
 /// Default page size when `/MediaBox` is absent or invalid: US Letter.
-const US_LETTER: Rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+const US_LETTER: Rect = Page::US_LETTER;
 
 /// Page-tree traversal depth cap.
 const MAX_TREE_DEPTH: usize = 256;
@@ -506,24 +506,26 @@ impl Document {
 }
 
 /// Builds the final page record from a leaf dictionary and its inherited
-/// attributes, applying the spec defaults.
+/// attributes. The defaults live in [`Page::from_tree_attrs`] — the one
+/// implementation of page defaulting, shared with the asynchronous API —
+/// and this only reshapes its output into the index-less cache record.
 fn make_page_rec(obj_ref: Option<ObjRef>, dict: Dict, inherited: &Inherited) -> PageRec {
-    let media_box = inherited
-        .media_box
-        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
-        .unwrap_or(US_LETTER);
-    let crop_box = inherited
-        .crop_box
-        .and_then(|c| c.intersect(media_box))
-        .filter(|r| r.width() > 0.0 && r.height() > 0.0)
-        .unwrap_or(media_box);
-    PageRec {
-        obj_ref,
-        media_box,
-        crop_box,
-        rotate: normalize_rotation(inherited.rotate.unwrap_or(0)),
-        resources: inherited.resources.clone().unwrap_or_default(),
+    let page = Page::from_tree_attrs(
+        0,
+        inherited.resources.clone(),
+        inherited.media_box,
+        inherited.crop_box,
+        inherited.rotate,
         dict,
+        obj_ref,
+    );
+    PageRec {
+        obj_ref: page.obj_ref,
+        media_box: page.media_box,
+        crop_box: page.crop_box,
+        rotate: page.rotate,
+        resources: page.resources,
+        dict: page.dict,
     }
 }
 
@@ -634,6 +636,52 @@ impl Page {
             crop_box,
             rotate: normalize_rotation(rotate),
             resources,
+            dict,
+            obj_ref,
+        }
+    }
+
+    /// The default media box for a page that declares none: US Letter
+    /// (612 by 792 points). Public because the default is part of the
+    /// observable contract — a caller comparing two APIs' pages needs to
+    /// know which rectangle "the file said nothing" maps to.
+    pub const US_LETTER: Rect = Rect::new(0.0, 0.0, 612.0, 792.0);
+
+    /// Builds a page from raw, possibly missing page-tree attributes,
+    /// applying the same defaults [`Document::page`] applies (ISO 32000
+    /// §7.7.3.3): a missing or degenerate `/MediaBox` reads as
+    /// [`Page::US_LETTER`], `/CropBox` clips to the media box and falls back
+    /// to it, a missing `/Rotate` reads as 0 and is normalized, and missing
+    /// `/Resources` read as empty.
+    ///
+    /// This is the one implementation of page defaulting. The synchronous
+    /// tree walk routes through it, and a caller that resolved inheritance
+    /// some other way — notably the asynchronous API, which flattens the
+    /// page tree while reading it — gets the identical `Page` back, so the
+    /// two APIs cannot disagree about what an attribute-less page looks
+    /// like.
+    pub fn from_tree_attrs(
+        index: usize,
+        resources: Option<Dict>,
+        media_box: Option<Rect>,
+        crop_box: Option<Rect>,
+        rotate: Option<i32>,
+        dict: Dict,
+        obj_ref: Option<ObjRef>,
+    ) -> Page {
+        let media_box = media_box
+            .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+            .unwrap_or(Page::US_LETTER);
+        let crop_box = crop_box
+            .and_then(|c| c.intersect(media_box))
+            .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+            .unwrap_or(media_box);
+        Page {
+            index,
+            media_box,
+            crop_box,
+            rotate: normalize_rotation(rotate.unwrap_or(0)),
+            resources: resources.unwrap_or_default(),
             dict,
             obj_ref,
         }
