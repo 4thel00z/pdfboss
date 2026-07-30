@@ -1,9 +1,11 @@
 //! Color spaces: DeviceGray/RGB/CMYK, Indexed, and approximations for the
 //! CIE-based and tint-transform families, converted to RGB.
 
-use pdfboss_core::{Document, Error, Object};
+use pdfboss_core::{block_on, AsyncObjectSource, Document, Error, Immediate, Object};
 
-/// Recursion guard for nested color-space definitions (Indexed bases).
+/// Nesting guard for color-space definitions that defer to another one
+/// (Indexed bases, ICCBased `/Alternate` chains): levels `0..=MAX_DEPTH`
+/// are read, anything deeper reads as `DeviceGray`.
 const MAX_DEPTH: u32 = 8;
 
 /// A color space reduced to what the rasterizer can paint.
@@ -106,37 +108,113 @@ impl ColorSpace {
     ///
     /// [`Other`]: ColorSpace::Other
     pub(crate) fn parse(doc: &Document, obj: &Object) -> ColorSpace {
-        Self::parse_at(doc, obj, 0)
+        block_on(Self::parse_with(&Immediate(doc), obj))
     }
 
-    fn parse_at(doc: &Document, obj: &Object, depth: u32) -> ColorSpace {
-        if depth > MAX_DEPTH {
-            return ColorSpace::DeviceGray;
-        }
-        let obj = doc.resolve(obj).unwrap_or(Object::Null);
-        match &obj {
-            Object::Name(n) => Self::from_name(&n.0),
-            Object::Array(items) if !items.is_empty() => {
-                let family = match doc.resolve(&items[0]) {
-                    Ok(Object::Name(n)) => n.0,
-                    _ => return ColorSpace::DeviceGray,
-                };
-                match family.as_str() {
-                    "ICCBased" => Self::parse_icc(doc, items.get(1), depth),
-                    f if Self::is_indexed(f) => Self::parse_indexed(doc, items, depth),
-                    "Separation" => ColorSpace::Other(1),
-                    "DeviceN" => {
-                        let n = match items.get(1).map(|o| doc.resolve(o)) {
-                            Some(Ok(Object::Array(names))) => names.len().max(1),
-                            _ => 1,
-                        };
-                        ColorSpace::Other(n)
-                    }
-                    other => Self::from_name(other),
+    /// [`ColorSpace::parse`] against any object source; the synchronous form
+    /// is this one over [`Immediate`].
+    ///
+    /// A loop, not a recursion, and that is load-bearing: a recursive
+    /// `async fn` must box itself, and the boxed future poisons the auto-trait
+    /// inference the shared executor depends on. The recursion this replaced
+    /// was linear — every level defers to at most one other space (an
+    /// `ICCBased` `/Alternate`, or an `/Indexed` base) — so one iteration per
+    /// level covers it. Descending through `/Indexed` pushes its palette;
+    /// whatever the loop finally resolves to gets wrapped in the pending
+    /// palettes, innermost last.
+    pub(crate) async fn parse_with<S: AsyncObjectSource>(src: &S, obj: &Object) -> ColorSpace {
+        let mut palettes: Vec<Vec<u8>> = Vec::new();
+        let mut current: Object = obj.clone();
+        // If the loop runs out of levels while still descending, this is the
+        // answer — the same one the recursion's depth guard gave.
+        let mut result = ColorSpace::DeviceGray;
+        for _ in 0..=MAX_DEPTH {
+            let resolved = src.resolve(&current).await.unwrap_or(Object::Null);
+            match &resolved {
+                Object::Name(n) => {
+                    result = Self::from_name(&n.0);
+                    break;
                 }
+                Object::Array(items) if !items.is_empty() => {
+                    let family = match src.resolve(&items[0]).await {
+                        Ok(Object::Name(n)) => n.0,
+                        _ => break, // stays DeviceGray
+                    };
+                    match family.as_str() {
+                        "ICCBased" => {
+                            let stream = match items.get(1) {
+                                Some(o) => src.resolve(o).await.ok(),
+                                None => None,
+                            };
+                            if let Some(Object::Stream(s)) = stream {
+                                if let Some(n) = s.dict.get_int("N") {
+                                    result = match n {
+                                        1 => ColorSpace::DeviceGray,
+                                        3 => ColorSpace::DeviceRGB,
+                                        4 => ColorSpace::DeviceCMYK,
+                                        n => ColorSpace::Other(n.clamp(1, 32) as usize),
+                                    };
+                                    break;
+                                }
+                                if let Some(alt) = s.dict.get("Alternate") {
+                                    current = alt.clone();
+                                    continue;
+                                }
+                            }
+                            result = ColorSpace::DeviceRGB;
+                            break;
+                        }
+                        f if Self::is_indexed(f) => {
+                            let lookup = match items.get(3) {
+                                Some(o) => match src.resolve(o).await {
+                                    Ok(Object::String(bytes)) => bytes,
+                                    Ok(Object::Stream(s)) => {
+                                        src.stream_data(&s).await.unwrap_or_default()
+                                    }
+                                    _ => Vec::new(),
+                                },
+                                None => Vec::new(),
+                            };
+                            palettes.push(lookup);
+                            match items.get(1) {
+                                Some(base) => {
+                                    current = base.clone();
+                                    continue;
+                                }
+                                None => break, // base stays DeviceGray
+                            }
+                        }
+                        "Separation" => {
+                            result = ColorSpace::Other(1);
+                            break;
+                        }
+                        "DeviceN" => {
+                            let n = match items.get(1) {
+                                Some(o) => match src.resolve(o).await {
+                                    Ok(Object::Array(names)) => names.len().max(1),
+                                    _ => 1,
+                                },
+                                None => 1,
+                            };
+                            result = ColorSpace::Other(n);
+                            break;
+                        }
+                        other => {
+                            result = Self::from_name(other);
+                            break;
+                        }
+                    }
+                }
+                _ => break, // stays DeviceGray
             }
-            _ => ColorSpace::DeviceGray,
         }
+        for lookup in palettes.into_iter().rev() {
+            result = ColorSpace::Indexed {
+                base: Box::new(result),
+                lookup,
+            };
+        }
+        result
     }
 
     /// Maps a bare color-space name (including the inline-image
@@ -152,44 +230,10 @@ impl ColorSpace {
         }
     }
 
-    fn parse_icc(doc: &Document, stream_obj: Option<&Object>, depth: u32) -> ColorSpace {
-        let resolved = stream_obj.map(|o| doc.resolve(o));
-        if let Some(Ok(Object::Stream(s))) = resolved {
-            if let Some(n) = s.dict.get_int("N") {
-                return match n {
-                    1 => ColorSpace::DeviceGray,
-                    3 => ColorSpace::DeviceRGB,
-                    4 => ColorSpace::DeviceCMYK,
-                    n => ColorSpace::Other(n.clamp(1, 32) as usize),
-                };
-            }
-            if let Some(alt) = s.dict.get("Alternate") {
-                return Self::parse_at(doc, alt, depth + 1);
-            }
-        }
-        ColorSpace::DeviceRGB
-    }
-
     /// Whether this is an `/Indexed` space, given the family name of an
     /// array-form color space (`I` is the inline-image abbreviation).
     fn is_indexed(family: &str) -> bool {
         matches!(family, "Indexed" | "I")
-    }
-
-    fn parse_indexed(doc: &Document, items: &[Object], depth: u32) -> ColorSpace {
-        let base = match items.get(1) {
-            Some(b) => Self::parse_at(doc, b, depth + 1),
-            None => ColorSpace::DeviceGray,
-        };
-        let lookup = match items.get(3).map(|o| doc.resolve(o)) {
-            Some(Ok(Object::String(bytes))) => bytes,
-            Some(Ok(Object::Stream(s))) => doc.stream_data(&s).unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        ColorSpace::Indexed {
-            base: Box::new(base),
-            lookup,
-        }
     }
 }
 
@@ -200,17 +244,26 @@ impl ColorSpace {
 /// at all, which paints every sample black. That looks like a decoded image
 /// but is not one, so the executor asks here and reports it instead.
 pub(crate) fn palette_error(doc: &Document, obj: &Object) -> Option<Error> {
-    let Ok(Object::Array(items)) = doc.resolve(obj) else {
+    block_on(palette_error_with(&Immediate(doc), obj))
+}
+
+/// [`palette_error`] against any object source; the synchronous form is this
+/// one over [`Immediate`].
+pub(crate) async fn palette_error_with<S: AsyncObjectSource>(
+    src: &S,
+    obj: &Object,
+) -> Option<Error> {
+    let Ok(Object::Array(items)) = src.resolve(obj).await else {
         return None;
     };
-    let Ok(Object::Name(family)) = doc.resolve(items.first()?) else {
+    let Ok(Object::Name(family)) = src.resolve(items.first()?).await else {
         return None;
     };
     if !ColorSpace::is_indexed(&family.0) {
         return None;
     }
-    match doc.resolve(items.get(3)?) {
-        Ok(Object::Stream(s)) => doc.stream_data(&s).err(),
+    match src.resolve(items.get(3)?).await {
+        Ok(Object::Stream(s)) => src.stream_data(&s).await.err(),
         _ => None,
     }
 }
@@ -357,6 +410,36 @@ mod tests {
             other => panic!("expected Indexed, got {other:?}"),
         }
         assert_eq!(cs.to_rgb(&[2.0]), [0.0, 0.0, 1.0]);
+    }
+
+    /// An `/Indexed` space whose base is itself `/Indexed`. Each level pushes a
+    /// palette on the way down, and the wrap on the way out must apply them
+    /// innermost-last: the outer palette's single entry selects the inner
+    /// palette's red.
+    #[test]
+    fn a_nested_indexed_base_wraps_in_definition_order() {
+        let doc = test_doc();
+        let cs = ColorSpace::parse(
+            &doc,
+            &obj(b"[/Indexed [/Indexed /DeviceRGB 0 <FF0000>] 0 <00>]"),
+        );
+        assert_eq!(cs.to_rgb(&[0.0]), [1.0, 0.0, 0.0]);
+    }
+
+    /// An `ICCBased` stream with no `/N` whose `/Alternate` refers back to the
+    /// same space. The nesting guard has to terminate this and read it as
+    /// gray; without the guard this loops forever on a two-object file.
+    #[test]
+    fn a_circular_alternate_chain_terminates_as_gray() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.object(7, "[/ICCBased 8 0 R]");
+        b.stream(8, "/Alternate 7 0 R", b"");
+        let doc = Document::load(b.build(1)).unwrap();
+        let cs = ColorSpace::parse(&doc, &obj(b"7 0 R"));
+        assert_eq!(cs, ColorSpace::DeviceGray);
     }
 
     #[test]
