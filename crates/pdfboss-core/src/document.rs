@@ -15,6 +15,7 @@ use crate::geom::Rect;
 use crate::object::{decode_text_string, Dict, ObjRef, Object, Stream};
 use crate::objstm;
 use crate::parser::{Parser, Resolve};
+use crate::source::{block_on, AsyncObjectSource, Immediate};
 use crate::xref::{load_xref, Xref, XrefEntry};
 
 /// Default page size when `/MediaBox` is absent or invalid: US Letter.
@@ -648,30 +649,13 @@ impl Page {
     /// The page's decoded content: the `/Contents` stream, or all streams
     /// of a `/Contents` array decoded and joined with `b"\n"`. A missing
     /// `/Contents` yields empty content (lenient).
+    ///
+    /// This drives [`page_content_with`] to completion on the calling thread.
+    /// There is one implementation of the algorithm, so this and the
+    /// asynchronous API cannot drift apart in what they consider a page's
+    /// content to be.
     pub fn content(&self, doc: &Document) -> Result<Vec<u8>> {
-        let Some(contents) = self.dict.get("Contents") else {
-            return Ok(Vec::new());
-        };
-        match doc.resolve(contents)? {
-            Object::Stream(ref s) => doc.stream_data(s),
-            Object::Array(items) => {
-                let mut out = Vec::new();
-                let mut first = true;
-                for item in &items {
-                    let part = doc.resolve(item)?;
-                    let Some(stream) = part.as_stream() else {
-                        continue; // non-stream entries are skipped (lenient)
-                    };
-                    if !first {
-                        out.push(b'\n');
-                    }
-                    out.extend_from_slice(&doc.stream_data(stream)?);
-                    first = false;
-                }
-                Ok(out)
-            }
-            _ => Ok(Vec::new()),
-        }
+        block_on(page_content_with(Immediate(doc), self))
     }
 
     /// Crop-box width and height, swapped when `/Rotate` is a quarter turn.
@@ -698,6 +682,64 @@ impl Page {
     }
 }
 
+/// A page's decoded content, awaiting each fetch: the `/Contents` stream, or
+/// all streams of a `/Contents` array decoded and joined with `b"\n"`. A
+/// missing `/Contents` yields empty content (lenient).
+///
+/// This is the only implementation of that algorithm. [`Page::content`] is a
+/// [`block_on`] wrapper over it, which is what stops the synchronous and
+/// asynchronous APIs from disagreeing about what a page's content is.
+///
+/// # Choosing this signature
+///
+/// `src` is taken **by value** rather than by reference. A future holding
+/// `&'a S` is `Send` but never `'static`, and the asynchronous consumers —
+/// spawning onto a runtime, or crossing into the Python bindings — need both.
+/// By value costs nothing in practice: an asynchronous document is an `Arc`
+/// handle, and [`Immediate`] over a borrowed document is `Copy`.
+///
+/// There is deliberately **no `Send` or `Sync` bound** on `S`. Auto traits are
+/// inferred per instantiation, so this one function yields a `Send` future over
+/// a genuinely asynchronous source and a non-`Send` future over
+/// `Immediate<&Document>` — which is what is wanted, because [`block_on`]
+/// drives the latter on the calling thread and never sends it anywhere. A
+/// `S: Sync` bound would exclude `Immediate<&Document>` outright; that is also
+/// why this calls `src.resolve` directly rather than
+/// [`crate::source::resolve_with`], which does require `Sync`.
+///
+/// The returned future is `'static` only when the caller owns the [`Page`]
+/// inside its own `async` block — the `&Page` borrow is what otherwise
+/// prevents it.
+///
+/// # Errors
+///
+/// Propagates whatever `src` reports for a fetch or a stream decode.
+pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Result<Vec<u8>> {
+    let Some(contents) = page.dict.get("Contents") else {
+        return Ok(Vec::new());
+    };
+    match src.resolve(contents).await? {
+        Object::Stream(ref s) => src.stream_data(s).await,
+        Object::Array(items) => {
+            let mut out = Vec::new();
+            let mut first = true;
+            for item in &items {
+                let part = src.resolve(item).await?;
+                let Some(stream) = part.as_stream() else {
+                    continue; // non-stream entries are skipped (lenient)
+                };
+                if !first {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(&src.stream_data(stream).await?);
+                first = false;
+            }
+            Ok(out)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +747,28 @@ mod tests {
     use crate::parser::{NoResolve, Parser};
     use crate::xref::XrefEntry;
     use pdfboss_testkit::{multi_page_doc, objstm_doc, objstm_payload, simple_doc, PdfBuilder};
+
+    /// The synchronous accessor delegates to the asynchronous one, so the two
+    /// cannot report different content for the same page. This asserts the
+    /// equality directly rather than trusting the delegation to stay in place.
+    #[test]
+    fn async_page_content_matches_the_sync_accessor() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("load");
+        let mut saw_content = false;
+        for index in 0..3 {
+            let page = doc.page(index).expect("page");
+            let direct = page.content(&doc).expect("sync content");
+            let awaited =
+                block_on(page_content_with(Immediate(&doc), &page)).expect("async content");
+            assert_eq!(direct, awaited, "page {index}");
+            saw_content |= !direct.is_empty();
+        }
+        // Without this the loop above would pass on three empty vectors.
+        assert!(
+            saw_content,
+            "fixture must give at least one page real content"
+        );
+    }
 
     /// Replaces the first occurrence of `from` with `to`. Splicing happens
     /// after the xref section, so byte offsets stay valid.

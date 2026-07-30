@@ -427,6 +427,15 @@ async fn content_ops(state: &mut StreamState, page: usize) {
 /// The page's decoded content: the `/Contents` stream, or all streams of a
 /// `/Contents` array decoded and joined with `b"\n"`, mirroring the sync
 /// page API. A missing `/Contents` yields empty content (lenient).
+///
+/// **This duplicates [`pdfboss_core::page_content_with`] and is temporary.**
+/// The core function is the shared implementation both APIs are meant to reach;
+/// this one survives only because routing here through it requires an
+/// `AsyncObjectSource` implementation for [`AsyncDocument`], which in turn
+/// requires a core error variant able to carry this crate's transport failures
+/// (`Http`, `RangeUnsupported`, `TruncatedRead` have no core counterpart
+/// today). Both land together, and this function is deleted then. Until it is,
+/// any change to one body must be mirrored in the other.
 async fn page_content(doc: &AsyncDocument, record: &PageRecord) -> Result<Vec<u8>> {
     let Some(contents) = record.dict.get("Contents") else {
         return Ok(Vec::new());
