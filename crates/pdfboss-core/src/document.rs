@@ -770,6 +770,22 @@ mod tests {
         );
     }
 
+    /// The composition every page-reading algorithm actually uses: the caller
+    /// owns its source so that its own future can be `'static`, and reaches this
+    /// helper — which owns its source for the same reason — by handing out a
+    /// reference. That works because `&S` is itself an `AsyncObjectSource`.
+    #[test]
+    fn a_shared_helper_is_reachable_from_a_caller_that_owns_its_source() {
+        let doc = Document::load(simple_doc("Hello")).expect("load");
+        let page = doc.page(0).expect("page");
+
+        let owner = Immediate(&doc);
+        let through_reference = block_on(page_content_with(&owner, &page)).expect("async content");
+
+        assert_eq!(through_reference, page.content(&doc).expect("sync content"));
+        assert!(!through_reference.is_empty());
+    }
+
     /// Replaces the first occurrence of `from` with `to`. Splicing happens
     /// after the xref section, so byte offsets stay valid.
     fn replace_once(data: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {

@@ -28,11 +28,20 @@
 //! rules. They are not stylistic: each one is what makes a single
 //! implementation serve both a synchronous and an asynchronous caller.
 //!
-//! 1. **Take the source by value** — `src: S`, never `&S`. A future holding
-//!    `&'a S` is `Send` but never `'static`, and the asynchronous consumers
-//!    (spawning onto a runtime, crossing into the Python bindings) need both.
-//!    It costs nothing: an asynchronous document is an `Arc` handle, and
+//! 1. **Entry points take the source by value** — `src: S`, never `&S`. A future
+//!    holding `&'a S` is `Send` but never `'static`, and the asynchronous
+//!    consumers (spawning onto a runtime, crossing into the Python bindings) need
+//!    both. It costs nothing: an asynchronous document is an `Arc` handle, and
 //!    [`Immediate`] over a borrowed document is `Copy`.
+//!
+//!    An entry point is a function a consumer awaits directly. Helpers *inside*
+//!    one take `&S`, because the entry point owns the source and a future may
+//!    borrow across its own awaits freely — the `'static` question is settled at
+//!    the outermost boundary, not at every internal call. That does put `S: Sync`
+//!    on the entry point's future being `Send`, which costs nothing either:
+//!    [`resolve_with`] already requires `Sync` of every genuinely asynchronous
+//!    source. One entry point calling another passes `&src`, which works because
+//!    `&S` is itself an [`AsyncObjectSource`].
 //! 2. **Put no `Send` or `Sync` bound on the function.** Auto traits are
 //!    inferred per instantiation, so one function yields a `Send` future over
 //!    an asynchronous source and a non-`Send` future over
@@ -156,6 +165,34 @@ pub trait AsyncObjectSource {
     /// deliberately not `Sync`. An implementor that *is* `Sync` should
     /// delegate to [`resolve_with`].
     fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>>;
+}
+
+/// A shared reference to an asynchronous source is itself one, forwarding every
+/// method — the counterpart of the [`ObjectSource`] impl above.
+///
+/// This is what makes "# Signing a shared algorithm" rule 1 cheap rather than
+/// merely mandatory. An entry point owns its source so that its future can be
+/// `'static`, and it still needs to hand that source to shared helpers which own
+/// theirs for the same reason — [`crate::document::page_content_with`] is the one
+/// every page-reading algorithm starts with. Without this impl the owner's only
+/// options are to copy the helper's body or to give the helper a `&S` signature
+/// that no consumer can spawn.
+///
+/// All three methods forward explicitly because [`AsyncObjectSource::resolve`]
+/// has no default body, and forwarding is what keeps the wrapped implementor's
+/// own reference chasing rather than substituting the shared loop over `get`.
+impl<T: AsyncObjectSource + ?Sized> AsyncObjectSource for &T {
+    fn get(&self, r: ObjRef) -> BoxFuture<'_, Result<Object>> {
+        (**self).get(r)
+    }
+
+    fn stream_data<'a>(&'a self, s: &'a Stream) -> BoxFuture<'a, Result<Vec<u8>>> {
+        (**self).stream_data(s)
+    }
+
+    fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>> {
+        (**self).resolve(o)
+    }
 }
 
 /// Chases reference chains against a synchronous source, depth-capped at
@@ -627,6 +664,26 @@ mod tests {
         let got = block_on(fetch_one(Immediate(&doc), r)).unwrap();
 
         assert_eq!(got, expected);
+    }
+
+    /// What lets one by-value entry point call another. An algorithm that owns
+    /// its source — which rule 1 requires of every entry point — can only reach a
+    /// shared helper with the same by-value signature by handing out `&src`, so
+    /// `&S` has to be a source in its own right. Without this the choice is
+    /// between duplicating the helper and giving it a signature no consumer can
+    /// spawn.
+    #[test]
+    fn a_reference_to_a_source_is_a_source() {
+        let stub = OwnedStub {
+            payload: vec![7, 7],
+        };
+        let r = ObjRef { num: 1, gen: 0 };
+
+        let borrowed = block_on(fetch_one(&stub, r)).unwrap();
+        let owned = block_on(fetch_one(stub, r)).unwrap();
+
+        assert_eq!(borrowed, Object::Int(2));
+        assert_eq!(borrowed, owned);
     }
 
     /// The synchronous mirror of `SelfReferential`. Reaching the cap is
