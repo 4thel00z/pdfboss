@@ -148,6 +148,17 @@ impl Font {
     /// Even with the evidence this only ever fills gaps: it is reached solely
     /// for codes StandardEncoding leaves undefined, so no mapping that already
     /// resolved can change.
+    ///
+    /// # Why this is `#[inline]`
+    ///
+    /// This and the two accessors below run once per character code — tens of
+    /// thousands of times per page of text — and converting font *loading* to
+    /// `async fn` cost 4.9% on `extract_text_warm_500_lines` without adding any
+    /// work to this path: that page loads exactly one font. The regression was
+    /// codegen fallout, and asking for these three back explicitly recovers
+    /// about 1.9% of it. Measured by interleaved A/B runs of prebuilt
+    /// benchmark binaries, which is the only method this machine's drift permits.
+    #[inline]
     pub fn decode_into(&self, code: u32, out: &mut String) {
         if let Some(c) = self.to_unicode.as_ref() {
             if let Some(s) = c.lookup(code) {
@@ -175,7 +186,9 @@ impl Font {
         out.push('\u{FFFD}');
     }
 
-    /// Glyph-space width (1/1000 em) of `code`.
+    /// Glyph-space width (1/1000 em) of `code`. `#[inline]` for the reason given
+    /// on [`Font::decode_into`].
+    #[inline]
     pub fn width(&self, code: u32) -> f32 {
         self.widths
             .get(&code)
@@ -183,7 +196,9 @@ impl Font {
             .unwrap_or(self.default_width)
     }
 
-    /// True when showing `code` applies word spacing (`Tw`).
+    /// True when showing `code` applies word spacing (`Tw`). `#[inline]` for the
+    /// reason given on [`Font::decode_into`].
+    #[inline]
     pub fn is_space(&self, code: u32) -> bool {
         self.space_code == Some(code)
     }

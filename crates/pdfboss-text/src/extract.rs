@@ -207,46 +207,40 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// renderer, this executor has no state to restore after a nested stream.
     async fn run(&mut self, root: Frame) {
         let mut frames = vec![root];
-        while !frames.is_empty() {
-            let top = frames.len() - 1;
-            // Cloned once per visit to this frame rather than once per operator.
-            // The handle has to outlive the `&mut frames[top]` borrows below, and
-            // an atomic pair per operator would be a real tax on a loop that
-            // runs thousands of times per page.
-            let ops = Arc::clone(&frames[top].ops);
-            // `frames.len() == top + 1` is exactly "the last operator did not
-            // enter a form". When one does, this leaves and the outer loop picks
-            // up the child; when the child finishes it pops and this resumes.
-            while frames.len() == top + 1 {
-                let pc = frames[top].pc;
-                if pc >= ops.len() {
-                    frames.pop();
-                    break;
-                }
-                frames[top].pc = pc + 1;
-                match &ops[pc] {
+        // The running frame is held as a local rather than indexed in place, which
+        // costs a move per visit and saves cloning the resource chain and the
+        // graphics state on every `Do`. It is not a speed fix: reaching the frame
+        // through `frames[top]` on each operator was measured against this shape
+        // and the two are indistinguishable on `extract_text_warm_500_lines`.
+        'frames: while let Some(mut frame) = frames.pop() {
+            // Cloned once per visit rather than once per operator: the handle has
+            // to outlive the `&mut frame` borrows below.
+            let ops = Arc::clone(&frame.ops);
+            while frame.pc < ops.len() {
+                let op = &ops[frame.pc];
+                frame.pc += 1;
+                match op {
                     Op::SetFont(name, size) => {
-                        let frame = &mut frames[top];
-                        // `chain` and `fonts` are disjoint fields of the frame,
-                        // which is why frames are reached by index here rather
-                        // than through `last_mut`.
                         let loaded = self.font(&frame.chain, &name.0, &mut frame.fonts).await;
                         frame.gs.font = Some(loaded);
                         frame.gs.font_name = name.0.clone();
                         frame.gs.size = *size;
                     }
                     Op::XObject(name) => {
-                        // Copied out so `&mut self` and `&mut frames` never
-                        // overlap. Every field taken is an `Arc` or a scalar.
-                        let (chain, gs, depth) = {
-                            let frame = &frames[top];
-                            (frame.chain.clone(), frame.gs.clone(), frame.depth)
-                        };
-                        if let Some(child) = self.form_frame(&name.0, &chain, &gs, depth).await {
+                        let entered = self
+                            .form_frame(&name.0, &frame.chain, &frame.gs, frame.depth)
+                            .await;
+                        if let Some(child) = entered {
+                            // The caller goes back underneath its form: the form
+                            // runs to completion, then the caller resumes at the
+                            // operator after its `Do`. That is the depth-first
+                            // order the recursive version emitted.
+                            frames.push(frame);
                             frames.push(child);
+                            continue 'frames;
                         }
                     }
-                    op => self.step(&mut frames[top], op),
+                    op => self.step(&mut frame, op),
                 }
             }
         }
@@ -290,11 +284,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 frame.tlm = Matrix::translate(0.0, -frame.gs.leading).concat(frame.tlm);
                 frame.tm = frame.tlm;
             }
-            Op::ShowText(s) => self.show(&frame.gs, &mut frame.tm, s),
+            Op::ShowText(s) => self.emit(frame, s),
             Op::ShowTextAdjusted(items) => {
                 for item in items {
                     match item {
-                        TextItem::Str(s) => self.show(&frame.gs, &mut frame.tm, s),
+                        TextItem::Str(s) => self.emit(frame, s),
                         TextItem::Offset(n) => {
                             let tx = -n / 1000.0 * frame.gs.size * frame.gs.horiz_scale;
                             if tx.is_finite() {
@@ -307,14 +301,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             Op::NextLineShowText(s) => {
                 frame.tlm = Matrix::translate(0.0, -frame.gs.leading).concat(frame.tlm);
                 frame.tm = frame.tlm;
-                self.show(&frame.gs, &mut frame.tm, s);
+                self.emit(frame, s);
             }
             Op::NextLineShowTextSpaced(aw, ac, s) => {
                 frame.gs.word_spacing = *aw;
                 frame.gs.char_spacing = *ac;
                 frame.tlm = Matrix::translate(0.0, -frame.gs.leading).concat(frame.tlm);
                 frame.tm = frame.tlm;
-                self.show(&frame.gs, &mut frame.tm, s);
+                self.emit(frame, s);
             }
             // Text render mode 3 (invisible) is still extracted, so `Tr` and
             // everything else is a no-op here.
@@ -322,11 +316,25 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
+    /// Shows one string, appending the span it produces (if any) to the page.
+    fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
+        if let Some(span) = self.show(&frame.gs, &mut frame.tm, bytes) {
+            self.spans.push(span);
+        }
+    }
+
     /// Shows one string: decodes each code, advances the text matrix by
-    /// `(w/1000·Tfs + Tc + Tw[code 32]) · Tz/100`, and emits a span whose
-    /// origin is `(0, Ts)` under `Tm · CTM`.
-    fn show(&mut self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) {
-        let font = gs.font.clone().unwrap_or_else(|| self.fallback.clone());
+    /// `(w/1000·Tfs + Tc + Tw[code 32]) · Tz/100`, and returns a span whose
+    /// origin is `(0, Ts)` under `Tm · CTM`. `None` when there is nothing worth
+    /// recording — no decoded text, or an origin that is not finite.
+    ///
+    /// Returning the span rather than pushing it is what lets the active font be
+    /// borrowed instead of cloned. `Tj` is the hottest operator on a text page and
+    /// the handle is an `Arc` now, so cloning it there costs two atomic updates
+    /// per shown string; borrowing `self.fallback` is only possible while nothing
+    /// holds `&mut self.spans`.
+    fn show(&self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) -> Option<RawSpan> {
+        let font: &Font = gs.font.as_deref().unwrap_or(&self.fallback);
         let start = tm.concat(gs.ctm);
         let origin = start.apply(Point { x: 0.0, y: gs.rise });
         // Device-space font size: the length of the text-space vertical
@@ -347,16 +355,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         let end = tm.concat(gs.ctm).apply(Point { x: 0.0, y: gs.rise });
-        if !text.is_empty() && origin.x.is_finite() && origin.y.is_finite() {
-            self.spans.push(RawSpan {
-                text,
-                x: origin.x,
-                y: origin.y,
-                end_x: end.x,
-                size: if size.is_finite() { size } else { 0.0 },
-                font: gs.font_name.clone(),
-            });
-        }
+        (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| RawSpan {
+            text,
+            x: origin.x,
+            y: origin.y,
+            end_x: end.x,
+            size: if size.is_finite() { size } else { 0.0 },
+            font: gs.font_name.clone(),
+        })
     }
 
     /// Builds the frame for a form XObject invocation: its content stream, its
