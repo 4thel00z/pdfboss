@@ -20,8 +20,7 @@
 //! than guessing.
 
 use pdfboss_core::FastMap;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pdfboss_core::{Dict, Document, Matrix, Object};
 
@@ -34,7 +33,7 @@ use crate::GlyphPainting;
 
 /// Memoized flattened glyphs, keyed by `gid` plus the exact bits of the
 /// transform's linear part `(a, b, c, d)`. See [`GlyphFont::flat_cache`].
-type FlatCache = FastMap<(u16, [u32; 4]), Rc<Vec<Subpath>>>;
+type FlatCache = FastMap<(u16, [u32; 4]), Arc<Vec<Subpath>>>;
 
 /// Upper bound on distinct `(gid, linear)` entries kept per font. Real pages
 /// use a handful of sizes, so this is never approached in practice; the cap
@@ -116,11 +115,14 @@ pub(crate) struct GlyphFont {
     /// Per-glyph outline memo. A glyph's outline (`Vec<Seg>` in font units)
     /// is transform-independent, so a code point repeated across a page --
     /// the common case in body text -- reparses/reinterprets its charstring
-    /// only once. Interior mutability keeps `outline` a `&self` accessor;
-    /// rendering is single-threaded (`GlyphFont` lives behind an `Rc`), so a
-    /// `RefCell` suffices. The stored `Rc<[Seg]>` is handed back by cheap
-    /// refcount clone rather than copying the segment vector.
-    outline_cache: RefCell<FastMap<u16, Rc<[Seg]>>>,
+    /// only once. Interior mutability is what keeps `outline` a `&self`
+    /// accessor, and it has to be a `Mutex` rather than a `RefCell`: a font is
+    /// shared as `Arc<GlyphFont>`, `Arc<T>` is only `Send` when `T` is `Send +
+    /// Sync`, and no cell type is ever `Sync`. Rasterization still holds the
+    /// lock only across a map lookup or insert, never while parsing. The
+    /// stored `Arc<[Seg]>` is handed back by cheap refcount clone rather than
+    /// copying the segment vector.
+    outline_cache: Mutex<FastMap<u16, Arc<[Seg]>>>,
     /// Per-glyph *flattened* device-space outline memo, keyed by `gid` plus
     /// the exact bits of the transform's linear part `(a, b, c, d)`. The
     /// value is the glyph flattened with translation zeroed; the caller adds
@@ -132,8 +134,20 @@ pub(crate) struct GlyphFont {
     /// the parse and the Bezier flattening. The exact-bits key means a
     /// cached entry is only ever reused for a genuinely identical linear map,
     /// so the flattening (whose subdivision tolerance is in device pixels)
-    /// stays correct.
-    flat_cache: RefCell<FlatCache>,
+    /// stays correct. A `Mutex` for the same reason as `outline_cache`.
+    flat_cache: Mutex<FlatCache>,
+}
+
+/// Locks a glyph cache, recovering from poisoning instead of panicking.
+///
+/// Poisoning is unreachable in practice — the only code that ever runs while
+/// one of these locks is held is a map lookup or insert — but recovering is
+/// also the *correct* response if it somehow happened: every entry is a pure
+/// function of its key, so a map left behind by a panicking thread holds only
+/// valid entries. That makes a panic on this path pointless, and this path
+/// runs once per glyph.
+fn lock_cache<T>(cache: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    cache.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl GlyphFont {
@@ -188,22 +202,22 @@ impl GlyphFont {
     }
 
     /// The glyph's outline as path segments in font units, memoized per
-    /// `gid` (see [`GlyphFont::outline_cache`]). The returned `Rc<[Seg]>` is
+    /// `gid` (see [`GlyphFont::outline_cache`]). The returned `Arc<[Seg]>` is
     /// shared with the cache: callers read it (via `build_glyph`) and drop
     /// it, never mutating it.
-    pub(crate) fn outline(&self, gid: u16) -> Rc<[Seg]> {
-        if let Some(cached) = self.outline_cache.borrow().get(&gid) {
-            return Rc::clone(cached);
+    pub(crate) fn outline(&self, gid: u16) -> Arc<[Seg]> {
+        if let Some(cached) = lock_cache(&self.outline_cache).get(&gid) {
+            return Arc::clone(cached);
         }
-        let segs: Rc<[Seg]> = match &self.outlines {
+        // The lock is released before the charstring is interpreted: parsing
+        // is the expensive part and holds nothing shared.
+        let segs: Arc<[Seg]> = match &self.outlines {
             Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.glyph_path(gid),
             Outlines::Cff(cff) => cff.glyph_path(gid),
             Outlines::Type1(t1) => t1.glyph_path(gid),
         }
         .into();
-        self.outline_cache
-            .borrow_mut()
-            .insert(gid, Rc::clone(&segs));
+        lock_cache(&self.outline_cache).insert(gid, Arc::clone(&segs));
         segs
     }
 
@@ -216,7 +230,7 @@ impl GlyphFont {
     /// is bitwise-identical to transforming with the full matrix, since
     /// `(a·x + c·y) + 0.0 == a·x + c·y` and the flattener's subdivision test
     /// is translation-invariant.
-    pub(crate) fn flattened(&self, gid: u16, linear: Matrix) -> Rc<Vec<Subpath>> {
+    pub(crate) fn flattened(&self, gid: u16, linear: Matrix) -> Arc<Vec<Subpath>> {
         let key = (
             gid,
             [
@@ -226,17 +240,19 @@ impl GlyphFont {
                 linear.d.to_bits(),
             ],
         );
-        if let Some(cached) = self.flat_cache.borrow().get(&key) {
-            return Rc::clone(cached);
+        if let Some(cached) = lock_cache(&self.flat_cache).get(&key) {
+            return Arc::clone(cached);
         }
+        // This lock is released before `outline` takes the other one, so the
+        // two are never held at once, and the flattening itself runs unlocked.
         let segs = self.outline(gid);
-        let polys = Rc::new(build_glyph(&segs, linear));
+        let polys = Arc::new(build_glyph(&segs, linear));
         // Only grow the cache while it is under the cap; past it, hand back
         // the freshly flattened glyph without retaining it, so a hostile
         // stream minting unbounded distinct keys cannot blow up memory.
-        let mut cache = self.flat_cache.borrow_mut();
+        let mut cache = lock_cache(&self.flat_cache);
         if cache.len() < MAX_FLAT_CACHE {
-            cache.insert(key, Rc::clone(&polys));
+            cache.insert(key, Arc::clone(&polys));
         }
         polys
     }
@@ -342,8 +358,8 @@ fn load_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        outline_cache: RefCell::new(FastMap::default()),
-        flat_cache: RefCell::new(FastMap::default()),
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -446,8 +462,8 @@ fn load_cff_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        outline_cache: RefCell::new(FastMap::default()),
-        flat_cache: RefCell::new(FastMap::default()),
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -537,8 +553,8 @@ fn load_type1_simple(doc: &Document, font: &Dict) -> Option<GlyphFont> {
         }
     }
     Some(GlyphFont {
-        outline_cache: RefCell::new(FastMap::default()),
-        flat_cache: RefCell::new(FastMap::default()),
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
         widths: simple_widths(doc, font),
@@ -750,8 +766,8 @@ fn load_substitute(
     }
 
     Some(GlyphFont {
-        outline_cache: RefCell::new(FastMap::default()),
-        flat_cache: RefCell::new(FastMap::default()),
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Substitute(tt),
         kind: GlyphKind::Simple(table),
         widths,
@@ -796,8 +812,8 @@ fn load_type0_truetype(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
         _ => None, // Identity
     };
     Some(GlyphFont {
-        outline_cache: RefCell::new(FastMap::default()),
-        flat_cache: RefCell::new(FastMap::default()),
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
         widths: cid_widths(doc, cid),
@@ -911,8 +927,8 @@ fn load_cff_cid(doc: &Document, cid: &Dict) -> Option<GlyphFont> {
     let cid_to_gid = cff.cid_to_gid();
     let widths = cid_widths(doc, cid);
     Some(GlyphFont {
-        outline_cache: RefCell::new(FastMap::default()),
-        flat_cache: RefCell::new(FastMap::default()),
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
         widths,
@@ -942,6 +958,22 @@ mod tests {
     use crate::truetype::tests::build_font;
     use crate::type1::tests::{build_type1_box_fixture, build_type1_box_fixture_standard_encoding};
     use crate::{GlyphPainting, Pixmap, RenderOptions, SubstituteSource};
+
+    /// A font is shared as `Arc<GlyphFont>` while a page paints, and
+    /// `Arc<T>: Send` requires `T: Send + Sync`. The asynchronous render path
+    /// holds such a handle across every await it performs, so this property is
+    /// what lets that future be handed to a thread pool at all. Asserting it
+    /// here means the build breaks if either cache reverts to a non-`Sync`
+    /// container or to a non-atomic handle.
+    #[test]
+    fn glyph_fonts_are_shareable_across_threads() {
+        use super::{FlatCache, GlyphFont};
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<GlyphFont>();
+        assert_send_sync::<std::sync::Arc<GlyphFont>>();
+        assert_send_sync::<FlatCache>();
+    }
 
     /// The flattened-glyph cache flattens under the transform's linear part
     /// only and re-adds the per-occurrence translation. This must be exactly
@@ -1015,7 +1047,7 @@ mod tests {
             );
         }
         assert!(
-            gf.flat_cache.borrow().len() <= MAX_FLAT_CACHE,
+            super::lock_cache(&gf.flat_cache).len() <= MAX_FLAT_CACHE,
             "flat_cache must not grow past MAX_FLAT_CACHE"
         );
     }
