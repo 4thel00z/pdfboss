@@ -4,7 +4,9 @@
 
 use crate::font::Font;
 use pdfboss_core::content::{parse_content, Op, TextItem};
-use pdfboss_core::{block_on, Dict, Document, Immediate, Matrix, Object, Page, Point, Result};
+use pdfboss_core::{
+    page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page, Point, Result,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,16 +32,27 @@ pub struct RawSpan {
 
 /// Runs the page's content stream (and any form XObjects) and collects
 /// every shown string as a [`RawSpan`], in emission order.
-pub fn page_spans(doc: &Document, page: &Page) -> Result<Vec<RawSpan>> {
-    let content = page.content(doc)?;
+///
+/// The source is taken by value so that the returned future can be `'static`;
+/// `page` is borrowed, which does not stand in the way, because a caller that
+/// owns its page creates the borrow inside its own `async move` block. See
+/// `pdfboss_core::source`'s "Signing a shared algorithm".
+pub async fn page_spans_with<S: AsyncObjectSource>(src: S, page: &Page) -> Result<Vec<RawSpan>> {
+    let content = page_content_with(&src, page).await?;
     let ops = parse_content(&content)?;
     let mut exec = Executor {
-        doc,
+        src: &src,
         spans: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
     };
-    exec.run(&ops, &[&page.resources], GState::new(), 0);
+    let root = Frame::new(
+        ops.into(),
+        vec![Arc::new(page.resources.clone())],
+        GState::new(),
+        0,
+    );
+    exec.run(root).await;
     Ok(exec.spans)
 }
 
@@ -80,8 +93,56 @@ fn finite(m: &Matrix) -> bool {
     [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite())
 }
 
-struct Executor<'a> {
-    doc: &'a Document,
+/// One suspended operator stream: what to execute, how far it has got, and
+/// every piece of state that stream owns.
+///
+/// This is what the recursion into a form XObject became. A recursive `async fn`
+/// has to box itself, and coercing that box to a `Send` future requires
+/// `S: Sync` — which `Immediate<&Document>` cannot supply, so boxing would cost
+/// the synchronous caller the shared implementation entirely. A stack of these
+/// uses no `dyn`, so auto traits stay inferred per instantiation: the future is
+/// `Send` over an asynchronous source and merely non-`Send` over a synchronous
+/// one, which is correct for both.
+struct Frame {
+    /// Shared rather than owned so a handle can be held while the frame stack is
+    /// pushed onto. Cloned once per visit to the frame, never per operator.
+    ops: Arc<[Op]>,
+    /// Resource dictionaries, innermost first. Owned, because a form's own
+    /// `/Resources` is read out of its stream dictionary and so outlives nothing
+    /// already on the stack.
+    chain: Vec<Arc<Dict>>,
+    /// Index of the next operator to execute.
+    pc: usize,
+    /// Form-XObject nesting depth, checked against `MAX_FORM_DEPTH`.
+    depth: usize,
+    gs: GState,
+    /// The `q`/`Q` stack, per operator stream.
+    saved: Vec<GState>,
+    tm: Matrix,
+    tlm: Matrix,
+    /// Loaded fonts, per operator stream: every form invocation starts with an
+    /// empty cache, as it did when each invocation was its own `run` call.
+    fonts: HashMap<String, Arc<Font>>,
+}
+
+impl Frame {
+    fn new(ops: Arc<[Op]>, chain: Vec<Arc<Dict>>, gs: GState, depth: usize) -> Frame {
+        Frame {
+            ops,
+            chain,
+            pc: 0,
+            depth,
+            gs,
+            saved: Vec::new(),
+            tm: Matrix::identity(),
+            tlm: Matrix::identity(),
+            fonts: HashMap::new(),
+        }
+    }
+}
+
+struct Executor<'a, S> {
+    src: &'a S,
     spans: Vec<RawSpan>,
     fallback: Arc<Font>,
     /// Form-XObject invocations so far, checked against
@@ -89,7 +150,7 @@ struct Executor<'a> {
     forms: usize,
 }
 
-impl Executor<'_> {
+impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Looks up `/category/name` in the resource chain, innermost dictionary
     /// first (ISO 32000 §7.8.3).
     ///
@@ -98,16 +159,16 @@ impl Executor<'_> {
     /// renderer's `find_res`; the two crates must agree on which resource a
     /// name refers to, or the same file extracts different text than it
     /// paints.
-    fn find_res(&self, chain: &[&Dict], category: &str, name: &str) -> Option<Object> {
+    async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
         for res in chain {
             let Some(cat) = res.get(category) else {
                 continue;
             };
-            let Ok(Object::Dict(dict)) = self.doc.resolve(cat) else {
+            let Ok(Object::Dict(dict)) = self.src.resolve(cat).await else {
                 continue;
             };
             if let Some(value) = dict.get(name) {
-                if let Ok(obj) = self.doc.resolve(value) {
+                if let Ok(obj) = self.src.resolve(value).await {
                     return Some(obj);
                 }
             }
@@ -117,111 +178,147 @@ impl Executor<'_> {
 
     /// Loads (with per-stream caching) the font resource `name` from the
     /// active resource chain, falling back to a default font.
-    fn font(
+    async fn font(
         &self,
-        chain: &[&Dict],
+        chain: &[Arc<Dict>],
         name: &str,
         cache: &mut HashMap<String, Arc<Font>>,
     ) -> Arc<Font> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
-        // Font loading is already the shared asynchronous implementation while
-        // this executor is still synchronous, so it is driven here. The
-        // `block_on` goes away when `run` becomes a work stack; until then it is
-        // free, because every future over `Immediate` completes on first poll.
-        let loaded = self
-            .find_res(chain, "Font", name)
-            .and_then(|resolved| {
-                Some(Arc::new(block_on(Font::load(
-                    &Immediate(self.doc),
-                    resolved.as_dict()?,
-                ))))
-            })
-            .unwrap_or_else(|| self.fallback.clone());
+        let resolved = self.find_res(chain, "Font", name).await;
+        let loaded = match resolved.as_ref().and_then(|o| o.as_dict()) {
+            Some(dict) => Arc::new(Font::load(self.src, dict).await),
+            // No such resource, or one that is not a dictionary: the fallback
+            // font keeps the text extractable rather than failing the page.
+            None => self.fallback.clone(),
+        };
         cache.insert(name.to_string(), loaded.clone());
         loaded
     }
 
-    /// Executes one operator stream. `q`/`Q` and `cm` maintain the CTM;
-    /// text operators maintain Tm/Tlm; shown strings become spans.
-    fn run(&mut self, ops: &[Op], chain: &[&Dict], initial: GState, depth: usize) {
-        let mut gs = initial;
-        let mut stack: Vec<GState> = Vec::new();
-        let mut tm = Matrix::identity();
-        let mut tlm = Matrix::identity();
-        let mut fonts: HashMap<String, Arc<Font>> = HashMap::new();
-        for op in ops {
-            match op {
-                Op::Save => stack.push(gs.clone()),
-                Op::Restore => {
-                    if let Some(saved) = stack.pop() {
-                        gs = saved;
+    /// Executes an operator stream and every form XObject it invokes.
+    ///
+    /// A form invocation pushes a frame and leaves the inner loop, so the form
+    /// runs to completion before its caller's next operator — the same
+    /// depth-first order the recursive version emitted, which is what keeps span
+    /// order identical. Nothing is owed on the way back out: unlike the
+    /// renderer, this executor has no state to restore after a nested stream.
+    async fn run(&mut self, root: Frame) {
+        let mut frames = vec![root];
+        while !frames.is_empty() {
+            let top = frames.len() - 1;
+            // Cloned once per visit to this frame rather than once per operator.
+            // The handle has to outlive the `&mut frames[top]` borrows below, and
+            // an atomic pair per operator would be a real tax on a loop that
+            // runs thousands of times per page.
+            let ops = Arc::clone(&frames[top].ops);
+            // `frames.len() == top + 1` is exactly "the last operator did not
+            // enter a form". When one does, this leaves and the outer loop picks
+            // up the child; when the child finishes it pops and this resumes.
+            while frames.len() == top + 1 {
+                let pc = frames[top].pc;
+                if pc >= ops.len() {
+                    frames.pop();
+                    break;
+                }
+                frames[top].pc = pc + 1;
+                match &ops[pc] {
+                    Op::SetFont(name, size) => {
+                        let frame = &mut frames[top];
+                        // `chain` and `fonts` are disjoint fields of the frame,
+                        // which is why frames are reached by index here rather
+                        // than through `last_mut`.
+                        let loaded = self.font(&frame.chain, &name.0, &mut frame.fonts).await;
+                        frame.gs.font = Some(loaded);
+                        frame.gs.font_name = name.0.clone();
+                        frame.gs.size = *size;
                     }
+                    Op::XObject(name) => {
+                        // Copied out so `&mut self` and `&mut frames` never
+                        // overlap. Every field taken is an `Arc` or a scalar.
+                        let (chain, gs, depth) = {
+                            let frame = &frames[top];
+                            (frame.chain.clone(), frame.gs.clone(), frame.depth)
+                        };
+                        if let Some(child) = self.form_frame(&name.0, &chain, &gs, depth).await {
+                            frames.push(child);
+                        }
+                    }
+                    op => self.step(&mut frames[top], op),
                 }
-                Op::Concat(m) if finite(m) => gs.ctm = m.concat(gs.ctm),
-                Op::BeginText => {
-                    tm = Matrix::identity();
-                    tlm = Matrix::identity();
+            }
+        }
+    }
+
+    /// Applies one operator that needs no I/O — everything except `Tf` and `Do`.
+    /// `q`/`Q` and `cm` maintain the CTM; text operators maintain Tm/Tlm; shown
+    /// strings become spans.
+    fn step(&mut self, frame: &mut Frame, op: &Op) {
+        match op {
+            Op::Save => frame.saved.push(frame.gs.clone()),
+            Op::Restore => {
+                if let Some(saved) = frame.saved.pop() {
+                    frame.gs = saved;
                 }
-                Op::SetCharSpacing(v) => gs.char_spacing = *v,
-                Op::SetWordSpacing(v) => gs.word_spacing = *v,
-                Op::SetHorizScaling(v) => gs.horiz_scale = v / 100.0,
-                Op::SetLeading(v) => gs.leading = *v,
-                Op::SetTextRise(v) => gs.rise = *v,
-                Op::SetFont(name, size) => {
-                    gs.font = Some(self.font(chain, &name.0, &mut fonts));
-                    gs.font_name = name.0.clone();
-                    gs.size = *size;
-                }
-                Op::TextMove(tx, ty) => {
-                    tlm = Matrix::translate(*tx, *ty).concat(tlm);
-                    tm = tlm;
-                }
-                Op::TextMoveSetLeading(tx, ty) => {
-                    gs.leading = -ty;
-                    tlm = Matrix::translate(*tx, *ty).concat(tlm);
-                    tm = tlm;
-                }
-                Op::SetTextMatrix(m) if finite(m) => {
-                    tm = *m;
-                    tlm = *m;
-                }
-                Op::TextNextLine => {
-                    tlm = Matrix::translate(0.0, -gs.leading).concat(tlm);
-                    tm = tlm;
-                }
-                Op::ShowText(s) => self.show(&gs, &mut tm, s),
-                Op::ShowTextAdjusted(items) => {
-                    for item in items {
-                        match item {
-                            TextItem::Str(s) => self.show(&gs, &mut tm, s),
-                            TextItem::Offset(n) => {
-                                let tx = -n / 1000.0 * gs.size * gs.horiz_scale;
-                                if tx.is_finite() {
-                                    tm = Matrix::translate(tx, 0.0).concat(tm);
-                                }
+            }
+            Op::Concat(m) if finite(m) => frame.gs.ctm = m.concat(frame.gs.ctm),
+            Op::BeginText => {
+                frame.tm = Matrix::identity();
+                frame.tlm = Matrix::identity();
+            }
+            Op::SetCharSpacing(v) => frame.gs.char_spacing = *v,
+            Op::SetWordSpacing(v) => frame.gs.word_spacing = *v,
+            Op::SetHorizScaling(v) => frame.gs.horiz_scale = v / 100.0,
+            Op::SetLeading(v) => frame.gs.leading = *v,
+            Op::SetTextRise(v) => frame.gs.rise = *v,
+            Op::TextMove(tx, ty) => {
+                frame.tlm = Matrix::translate(*tx, *ty).concat(frame.tlm);
+                frame.tm = frame.tlm;
+            }
+            Op::TextMoveSetLeading(tx, ty) => {
+                frame.gs.leading = -ty;
+                frame.tlm = Matrix::translate(*tx, *ty).concat(frame.tlm);
+                frame.tm = frame.tlm;
+            }
+            Op::SetTextMatrix(m) if finite(m) => {
+                frame.tm = *m;
+                frame.tlm = *m;
+            }
+            Op::TextNextLine => {
+                frame.tlm = Matrix::translate(0.0, -frame.gs.leading).concat(frame.tlm);
+                frame.tm = frame.tlm;
+            }
+            Op::ShowText(s) => self.show(&frame.gs, &mut frame.tm, s),
+            Op::ShowTextAdjusted(items) => {
+                for item in items {
+                    match item {
+                        TextItem::Str(s) => self.show(&frame.gs, &mut frame.tm, s),
+                        TextItem::Offset(n) => {
+                            let tx = -n / 1000.0 * frame.gs.size * frame.gs.horiz_scale;
+                            if tx.is_finite() {
+                                frame.tm = Matrix::translate(tx, 0.0).concat(frame.tm);
                             }
                         }
                     }
                 }
-                Op::NextLineShowText(s) => {
-                    tlm = Matrix::translate(0.0, -gs.leading).concat(tlm);
-                    tm = tlm;
-                    self.show(&gs, &mut tm, s);
-                }
-                Op::NextLineShowTextSpaced(aw, ac, s) => {
-                    gs.word_spacing = *aw;
-                    gs.char_spacing = *ac;
-                    tlm = Matrix::translate(0.0, -gs.leading).concat(tlm);
-                    tm = tlm;
-                    self.show(&gs, &mut tm, s);
-                }
-                Op::XObject(name) => self.form_xobject(&name.0, chain, &gs, depth),
-                // Text render mode 3 (invisible) is still extracted, so
-                // `Tr` and everything else is a no-op here.
-                _ => {}
             }
+            Op::NextLineShowText(s) => {
+                frame.tlm = Matrix::translate(0.0, -frame.gs.leading).concat(frame.tlm);
+                frame.tm = frame.tlm;
+                self.show(&frame.gs, &mut frame.tm, s);
+            }
+            Op::NextLineShowTextSpaced(aw, ac, s) => {
+                frame.gs.word_spacing = *aw;
+                frame.gs.char_spacing = *ac;
+                frame.tlm = Matrix::translate(0.0, -frame.gs.leading).concat(frame.tlm);
+                frame.tm = frame.tlm;
+                self.show(&frame.gs, &mut frame.tm, s);
+            }
+            // Text render mode 3 (invisible) is still extracted, so `Tr` and
+            // everything else is a no-op here.
+            _ => {}
         }
     }
 
@@ -262,77 +359,83 @@ impl Executor<'_> {
         }
     }
 
-    /// Executes a form XObject: recurses into its content with its own
-    /// `/Resources` **prepended to** the caller's chain, `/Matrix` prepended
-    /// to the CTM, a depth cap, and a total-invocation budget.
-    fn form_xobject(&mut self, name: &str, chain: &[&Dict], gs: &GState, depth: usize) {
+    /// Builds the frame for a form XObject invocation: its content stream, its
+    /// own `/Resources` **prepended to** the caller's chain, and `/Matrix`
+    /// prepended to the CTM — under a depth cap and a total-invocation budget.
+    ///
+    /// `None` wherever the recursive version simply returned: over budget, no
+    /// such resource, not a form, or content that will not parse. The
+    /// invocation is counted before any of those checks, exactly as before, so
+    /// a page of unreadable forms still exhausts its budget.
+    async fn form_frame(
+        &mut self,
+        name: &str,
+        chain: &[Arc<Dict>],
+        gs: &GState,
+        depth: usize,
+    ) -> Option<Frame> {
         if depth >= MAX_FORM_DEPTH || self.forms >= MAX_FORM_INVOCATIONS {
-            return;
+            return None;
         }
         self.forms += 1;
-        let Some(stream) = self
+        let stream = self
             .find_res(chain, "XObject", name)
-            .and_then(|o| o.as_stream().cloned())
-        else {
-            return;
-        };
+            .await
+            .and_then(|o| o.as_stream().cloned())?;
         let is_form = stream
             .dict
             .get_name("Subtype")
             .is_some_and(|n| n.0 == "Form");
         if !is_form {
-            return; // images and other XObjects carry no text
+            return None; // images and other XObjects carry no text
         }
-        let Ok(data) = self.doc.stream_data(&stream) else {
-            return;
-        };
-        let Ok(ops) = parse_content(&data) else {
-            return;
-        };
+        let data = self.src.stream_data(&stream).await.ok()?;
+        let ops = parse_content(&data).ok()?;
         // The form's own /Resources shadows the caller's for the names it
         // defines and falls through for the ones it does not, so it is
         // prepended rather than substituted. A form that declares
         // /Resources without a /Font (or without the /XObject naming a
         // nested form) still reaches the page's.
-        let own_res = stream
-            .dict
-            .get("Resources")
-            .and_then(|o| self.doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned());
-        let mut inner_chain: Vec<&Dict> = Vec::with_capacity(chain.len() + 1);
-        if let Some(res) = own_res.as_ref() {
-            inner_chain.push(res);
+        let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
+        if let Some(own) = self.own_resources(&stream.dict).await {
+            inner_chain.push(Arc::new(own));
         }
         inner_chain.extend_from_slice(chain);
 
         let mut inner = gs.clone();
-        if let Some(m) = form_matrix(self.doc, &stream.dict) {
+        if let Some(m) = self.form_matrix(&stream.dict).await {
             inner.ctm = m.concat(inner.ctm);
         }
-        self.run(&ops, &inner_chain, inner, depth + 1);
+        Some(Frame::new(ops.into(), inner_chain, inner, depth + 1))
     }
-}
 
-/// Reads a `/Matrix` entry (six numbers) from a form XObject dictionary.
-fn form_matrix(doc: &Document, dict: &Dict) -> Option<Matrix> {
-    let obj = doc.resolve(dict.get("Matrix")?).ok()?;
-    let arr = obj.as_array()?;
-    let mut v = [0.0f32; 6];
-    for (slot, item) in v.iter_mut().zip(arr.iter()) {
-        *slot = doc.resolve(item).ok()?.as_f64()? as f32;
+    /// A stream dictionary's own `/Resources`, when it has a usable one.
+    async fn own_resources(&self, dict: &Dict) -> Option<Dict> {
+        let obj = dict.get("Resources")?;
+        self.src.resolve(obj).await.ok()?.as_dict().cloned()
     }
-    if arr.len() < 6 {
-        return None;
+
+    /// Reads a `/Matrix` entry (six numbers) from a form XObject dictionary.
+    async fn form_matrix(&self, dict: &Dict) -> Option<Matrix> {
+        let obj = self.src.resolve(dict.get("Matrix")?).await.ok()?;
+        let arr = obj.as_array()?;
+        let mut v = [0.0f32; 6];
+        for (slot, item) in v.iter_mut().zip(arr.iter()) {
+            *slot = self.src.resolve(item).await.ok()?.as_f64()? as f32;
+        }
+        if arr.len() < 6 {
+            return None;
+        }
+        let m = Matrix {
+            a: v[0],
+            b: v[1],
+            c: v[2],
+            d: v[3],
+            e: v[4],
+            f: v[5],
+        };
+        finite(&m).then_some(m)
     }
-    let m = Matrix {
-        a: v[0],
-        b: v[1],
-        c: v[2],
-        d: v[3],
-        e: v[4],
-        f: v[5],
-    };
-    finite(&m).then_some(m)
 }
 
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
@@ -388,7 +491,16 @@ pub fn layout(spans: &[RawSpan]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pdfboss_core::{block_on, Document, Immediate};
     use pdfboss_testkit::doc_with_graphics;
+
+    /// The synchronous spans accessor. Production has no use for one — the public
+    /// entry points in `lib.rs` wrap [`page_spans_with`] themselves — but it is
+    /// the same `block_on` over `Immediate`, so every test below still asserts on
+    /// exactly what a synchronous caller receives.
+    fn page_spans(doc: &Document, page: &Page) -> Result<Vec<RawSpan>> {
+        block_on(page_spans_with(Immediate(doc), page))
+    }
 
     /// Extracted, laid-out text of a one-page document with `content` as
     /// its raw content stream (12pt /F1 with default widths of 500).
@@ -544,6 +656,60 @@ mod tests {
             "fan-out not bounded: {} spans",
             spans.len()
         );
+    }
+
+    /// Emission order is depth-first and in stream order: a form's spans land
+    /// between the spans of the operators either side of its `Do`, at every
+    /// level of nesting.
+    ///
+    /// This is what an explicit frame stack most easily gets wrong, and until now
+    /// nothing tested it. `form_xobject_recursion` invokes its only form as the
+    /// last operator on the page, so it cannot see a form's spans arriving late;
+    /// `form_xobject_fanout_is_bounded` emits the same string from every leaf, so
+    /// it cannot see siblings arriving reversed. Both stay green under a stack
+    /// that defers children to the end.
+    ///
+    /// `page_spans` rather than `text_of`, because layout sorts by position and
+    /// would hide the very thing being asserted.
+    #[test]
+    fn form_spans_are_emitted_where_the_do_appears() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> \
+             /XObject << /Fa 6 0 R /Fi 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf 72 720 Td (A) Tj ET /Fa Do BT /F1 12 Tf 72 660 Td (E) Tj ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        // The outer form shows a string, descends, then shows another: its second
+        // span must follow the nested form's.
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792]",
+            b"BT /F1 12 Tf 72 700 Td (B) Tj ET /Fi Do BT /F1 12 Tf 72 680 Td (D) Tj ET",
+        );
+        b.stream(
+            7,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792]",
+            b"BT /F1 12 Tf 72 690 Td (C) Tj ET",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = page_spans(&doc, &page).unwrap();
+        let order: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(order, ["A", "B", "C", "D", "E"]);
     }
 
     /// A loaded font and the state that carries it must both be shareable across

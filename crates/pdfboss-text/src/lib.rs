@@ -6,7 +6,7 @@ mod extract;
 mod font;
 mod sfnt;
 
-use pdfboss_core::{Document, Page, Result};
+use pdfboss_core::{block_on, Document, Immediate, Page, Result};
 
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,14 +27,14 @@ pub struct TextSpan {
 /// into lines, lines ordered top to bottom and joined with `\n`, spaces
 /// inserted at horizontal gaps.
 pub fn extract_text(doc: &Document, page: &Page) -> Result<String> {
-    let spans = extract::page_spans(doc, page)?;
+    let spans = block_on(extract::page_spans_with(Immediate(doc), page))?;
     Ok(extract::layout(&spans))
 }
 
 /// Extracts the page's raw text spans (position, size and font per span),
 /// before any layout pass.
 pub fn extract_spans(doc: &Document, page: &Page) -> Result<Vec<TextSpan>> {
-    Ok(extract::page_spans(doc, page)?
+    Ok(block_on(extract::page_spans_with(Immediate(doc), page))?
         .into_iter()
         .map(|s| TextSpan {
             text: s.text,
