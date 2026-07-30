@@ -6,6 +6,8 @@
 //! Painting itself -- running each CharProc as a nested content stream -- is
 //! a later plan; this module only parses the font dictionary.
 
+use std::sync::Arc;
+
 use pdfboss_core::FastMap;
 
 use pdfboss_core::geom::Matrix;
@@ -34,7 +36,10 @@ pub(crate) struct Type3Font {
     /// The font's own `/Resources` dictionary (used to resolve names
     /// referenced inside its CharProcs), or `None` if the font dict has none
     /// -- the executor then falls back to the surrounding resource chain.
-    resources: Option<Dict>,
+    ///
+    /// Shared rather than owned outright so the executor can prepend it to a
+    /// resource chain that outlives the borrow of this font.
+    resources: Option<Arc<Dict>>,
 }
 
 impl Type3Font {
@@ -51,7 +56,8 @@ impl Type3Font {
         let resources = font
             .get("Resources")
             .and_then(|o| doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned());
+            .and_then(|o| o.as_dict().cloned())
+            .map(Arc::new);
 
         Some(Type3Font {
             font_matrix,
@@ -84,7 +90,7 @@ impl Type3Font {
     }
 
     /// The font's own `/Resources` dict, or `None`.
-    pub(crate) fn resources(&self) -> Option<&Dict> {
+    pub(crate) fn resources(&self) -> Option<&Arc<Dict>> {
         self.resources.as_ref()
     }
 }

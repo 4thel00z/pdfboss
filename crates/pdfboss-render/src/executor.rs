@@ -336,7 +336,12 @@ pub(crate) fn render_page_reporting(
         clip_cache: FastMap::default(),
         report,
     };
-    exec.run(&ops, &[&page.resources], GState::new(ctm), 0);
+    exec.run(
+        &ops,
+        &[Arc::new(page.resources.clone())],
+        GState::new(ctm),
+        0,
+    );
     Ok((exec.pix, exec.report))
 }
 
@@ -408,7 +413,7 @@ struct Executor<'a> {
 impl Executor<'_> {
     /// Runs `ops` with resource lookups walking `chain` (innermost first).
     /// `depth` counts form recursion. All failures are lenient skips.
-    fn run(&mut self, ops: &[Op], chain: &[&Dict], base: GState, depth: u32) {
+    fn run(&mut self, ops: &[Op], chain: &[Arc<Dict>], base: GState, depth: u32) {
         let mut gs = base;
         let mut stack: Vec<GState> = Vec::new();
         let mut path: Option<PathBuilder> = None;
@@ -736,7 +741,7 @@ impl Executor<'_> {
     fn glyph_font(
         &self,
         name: &str,
-        chain: &[&Dict],
+        chain: &[Arc<Dict>],
         cache: &mut FastMap<String, Option<Arc<GlyphFont>>>,
     ) -> Option<Arc<GlyphFont>> {
         if let Some(f) = cache.get(name) {
@@ -755,7 +760,7 @@ impl Executor<'_> {
     /// Resolves a `/Type3` font resource for painting, or `None` when the tier
     /// forbids embedded programs, the name is missing, or the resource is not a
     /// `/Type3` dict. Called only after the outline loader declined the name.
-    fn type3_font(&self, name: &str, chain: &[&Dict]) -> Option<Arc<Type3Font>> {
+    fn type3_font(&self, name: &str, chain: &[Arc<Dict>]) -> Option<Arc<Type3Font>> {
         if !self.painting.paints_all_embedded() {
             return None;
         }
@@ -806,7 +811,7 @@ impl Executor<'_> {
         gs: &GState,
         ts: &mut TextState,
         bytes: &[u8],
-        chain: &[&Dict],
+        chain: &[Arc<Dict>],
         depth: u32,
     ) {
         if ts.type3.is_some() {
@@ -887,7 +892,7 @@ impl Executor<'_> {
         gs: &GState,
         ts: &mut TextState,
         bytes: &[u8],
-        chain: &[&Dict],
+        chain: &[Arc<Dict>],
         depth: u32,
     ) {
         let Some(t3) = ts.type3.clone() else {
@@ -949,7 +954,7 @@ impl Executor<'_> {
         &mut self,
         proc_obj: &Object,
         t3: &Type3Font,
-        chain: &[&Dict],
+        chain: &[Arc<Dict>],
         base: &GState,
         glyph_ctm: Matrix,
         depth: u32,
@@ -965,9 +970,9 @@ impl Executor<'_> {
         };
         let mut inner = base.clone();
         inner.ctm = glyph_ctm;
-        let mut inner_chain: Vec<&Dict> = Vec::with_capacity(chain.len() + 1);
+        let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
         if let Some(d) = t3.resources() {
-            inner_chain.push(d);
+            inner_chain.push(Arc::clone(d));
         }
         inner_chain.extend_from_slice(chain);
         let is_d1 = matches!(ops.first(), Some(Op::SetGlyphWidthBBox(..)));
@@ -985,7 +990,7 @@ impl Executor<'_> {
     /// §9.6.5.2): the glyph keeps the fill/stroke color inherited from the
     /// text graphics state instead of applying its own. XObject, inline
     /// image, shading, and marked-content ops are unaffected by the lock.
-    fn run_color_or_misc(&mut self, op: &Op, chain: &[&Dict], gs: &mut GState, depth: u32) {
+    fn run_color_or_misc(&mut self, op: &Op, chain: &[Arc<Dict>], gs: &mut GState, depth: u32) {
         if self.color_locked {
             match op {
                 Op::SetFillColorSpace(_)
@@ -1089,7 +1094,17 @@ fn initial_color(cs: &ColorSpace) -> [f32; 3] {
 impl Executor<'_> {
     /// Looks up `/category/name` in the resource chain (innermost dict
     /// first), resolving references at every step.
-    fn find_res(&self, chain: &[&Dict], category: &str, name: &str) -> Option<Object> {
+    ///
+    /// # Why the chain owns its entries
+    ///
+    /// `Arc<Dict>` rather than `&Dict`, which buys nothing while `run` is
+    /// recursive: both chains are built one stack frame below the `run` that reads
+    /// them. It is what makes the chain outlive that frame. Both build sites
+    /// currently push something local — `run_form`'s `own_res` is a local `Dict`,
+    /// and `run_char_proc` reaches into the `Type3Font` its caller happens to hold
+    /// — so neither could survive being stored in a work-stack frame, which is how
+    /// the asynchronous path has to express this recursion.
+    fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
         for res in chain {
             let Some(cat) = res.get(category) else {
                 continue;
@@ -1112,7 +1127,7 @@ impl Executor<'_> {
     /// Resolves a `cs`/`CS` operand: a device space name directly, the
     /// `/Pattern` space as a mid-gray flag, anything else through the
     /// `/ColorSpace` resource dictionary. Returns `(space, is_pattern)`.
-    fn resolve_colorspace(&self, name: &Name, chain: &[&Dict]) -> (ColorSpace, bool) {
+    fn resolve_colorspace(&self, name: &Name, chain: &[Arc<Dict>]) -> (ColorSpace, bool) {
         match name.0.as_str() {
             "Pattern" => return (ColorSpace::DeviceGray, true),
             "DeviceGray" | "G" | "CalGray" => return (ColorSpace::DeviceGray, false),
@@ -1141,7 +1156,7 @@ impl Executor<'_> {
     /// that change what the page looks like -- a `/SMask` mask group and a
     /// non-`Normal` `/BM` blend mode -- are reported so the caller knows the
     /// render is an approximation.
-    fn apply_ext_gstate(&mut self, name: &Name, chain: &[&Dict], gs: &mut GState) {
+    fn apply_ext_gstate(&mut self, name: &Name, chain: &[Arc<Dict>], gs: &mut GState) {
         let Some(Object::Dict(dict)) = self.find_res(chain, "ExtGState", &name.0) else {
             return;
         };
@@ -1248,7 +1263,7 @@ fn ignores_blend_mode(doc: &Document, dict: &Dict) -> bool {
 
 impl Executor<'_> {
     /// Executes `Do`: draws an image XObject or recurses into a form.
-    fn do_xobject(&mut self, name: &Name, chain: &[&Dict], gs: &GState, depth: u32) {
+    fn do_xobject(&mut self, name: &Name, chain: &[Arc<Dict>], gs: &GState, depth: u32) {
         let Some(Object::Stream(stream)) = self.find_res(chain, "XObject", &name.0) else {
             // The name resolves to nothing, or to something that is not a
             // stream: whatever it was meant to draw, it is not drawn.
@@ -1267,7 +1282,7 @@ impl Executor<'_> {
     /// Runs a form XObject: `/Matrix` concatenated before the CTM, `/BBox`
     /// intersected into the clip, own `/Resources` prepended to the chain,
     /// bounded recursion.
-    fn run_form(&mut self, stream: &Stream, chain: &[&Dict], gs: &GState, depth: u32) {
+    fn run_form(&mut self, stream: &Stream, chain: &[Arc<Dict>], gs: &GState, depth: u32) {
         // Every bail-out below drops the form's whole content subtree --
         // images, shadings and nested forms included -- so each one is
         // reported rather than leaving a hole nobody can account for.
@@ -1316,9 +1331,9 @@ impl Executor<'_> {
             Some(Ok(Object::Dict(d))) => Some(d),
             _ => None,
         };
-        let mut inner_chain: Vec<&Dict> = Vec::with_capacity(chain.len() + 1);
-        if let Some(d) = &own_res {
-            inner_chain.push(d);
+        let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
+        if let Some(d) = own_res {
+            inner_chain.push(Arc::new(d));
         }
         inner_chain.extend_from_slice(chain);
         self.run(&ops, &inner_chain, inner, depth + 1);
@@ -1331,7 +1346,7 @@ impl Executor<'_> {
 
     /// Draws an image XObject with the current CTM/clip/alpha; the fill
     /// color paints through `/ImageMask` stencils.
-    fn draw_image_xobject(&mut self, stream: &Stream, chain: &[&Dict], gs: &GState) {
+    fn draw_image_xobject(&mut self, stream: &Stream, chain: &[Arc<Dict>], gs: &GState) {
         let data = match self.doc.stream_data(stream) {
             Ok(data) => data,
             Err(e) => {
@@ -1345,7 +1360,7 @@ impl Executor<'_> {
 
     /// Draws an inline image: its filters (abbreviations included) are
     /// applied here, then it follows the XObject path.
-    fn draw_inline_image(&mut self, img: &ImageParams, chain: &[&Dict], gs: &GState) {
+    fn draw_inline_image(&mut self, img: &ImageParams, chain: &[Arc<Dict>], gs: &GState) {
         let stream = Stream {
             dict: img.dict.clone(),
             data: img.data.clone(),
@@ -1407,7 +1422,7 @@ impl Executor<'_> {
 
     /// The image's `/ColorSpace` value with resource-name indirection
     /// resolved: a non-device name is looked up in `/ColorSpace` resources.
-    fn image_colorspace(&self, dict: &Dict, chain: &[&Dict]) -> Option<Object> {
+    fn image_colorspace(&self, dict: &Dict, chain: &[Arc<Dict>]) -> Option<Object> {
         let resolved = self.doc.resolve(dict.get("ColorSpace")?).ok()?;
         if let Object::Name(n) = &resolved {
             let device = matches!(
