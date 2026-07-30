@@ -389,11 +389,10 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
             // flattened tree, not the declared `/Count`, which on a damaged
             // file may not match what the tree yields) and returns them in
             // page order.
-            let parts =
-                pdfboss_core::map_pages(&doc, |doc, page| pdfboss_text::extract_text(doc, page))
-                    .into_iter()
-                    .map(|text| text.map_err(|e| e.to_string()))
-                    .collect::<Result<Vec<String>, String>>()?;
+            let parts = pdfboss_core::map_pages(&doc, pdfboss_text::extract_text)
+                .into_iter()
+                .map(|text| text.map_err(|e| e.to_string()))
+                .collect::<Result<Vec<String>, String>>()?;
             parts.join("\u{c}")
         }
     };

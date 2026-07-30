@@ -379,3 +379,44 @@ class TestPageFanOut:
         doc = Document(str(three_pages_pdf))
         parts = doc.extract_text().split("\f")
         assert parts == [doc[i].extract_text() for i in range(doc.page_count)]
+
+
+class TestThreadedPageCalls:
+    """Per-page calls hold no shared lock: whatever mix of threads calls
+    ``render``/``extract_text``, the bytes must equal a sequential loop's."""
+
+    def test_threaded_renders_match_sequential(self, three_pages_pdf):
+        doc = Document(str(three_pages_pdf))
+        expected = [doc[i].render(scale=1.5) for i in range(doc.page_count)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            threaded = list(
+                pool.map(lambda i: doc[i].render(scale=1.5), range(doc.page_count))
+            )
+        assert threaded == expected
+
+    def test_one_page_object_shared_across_threads(self, three_pages_pdf):
+        # A single Page instance is itself safe to hammer from many threads.
+        page = Document(str(three_pages_pdf))[1]
+        expected = page.render(scale=1.0)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            renders = list(pool.map(lambda i: page.render(scale=1.0), range(16)))
+        assert renders == [expected] * 16
+
+    def test_threaded_text_matches_sequential(self, three_pages_pdf):
+        doc = Document(str(three_pages_pdf))
+        expected = [doc[i].extract_text() for i in range(doc.page_count)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            threaded = list(
+                pool.map(lambda i: doc[i].extract_text(), range(doc.page_count))
+            )
+        assert threaded == expected
+
+    def test_page_outlives_its_document(self, three_pages_pdf):
+        # The page carries the document's shareable core, so dropping the
+        # Document (and collecting it) must not invalidate the page.
+        doc = Document(str(three_pages_pdf))
+        page = doc[2]
+        expected = page.render(scale=1.0)
+        del doc
+        gc.collect()
+        assert page.render(scale=1.0) == expected

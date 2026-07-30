@@ -1,11 +1,12 @@
 //! Python bindings for pdfboss, compiled as the extension module
 //! `pdfboss._pdfboss` and re-exported by the `pdfboss` package shim.
 //!
-//! `Document` and `Page` are frozen pyclasses that share the parsed
-//! document through an [`Arc`], so they may be used from any Python thread.
-//! Access to the underlying document model is serialized by an internal
-//! lock, and text extraction and rendering release the GIL while the
-//! CPU-bound work runs.
+//! `Document` and `Page` are frozen pyclasses usable from any Python
+//! thread. Cheap structural access goes through a lock around one shared
+//! parsed document; text extraction and rendering release the GIL and run
+//! on a private materialization of the document's shareable core
+//! ([`DocumentSeed`]), so heavy calls on different threads run truly in
+//! parallel instead of serializing on that lock.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -22,7 +23,7 @@ use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, Xref
 use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
-use pdfboss_core::{Dict, ObjRef, Object};
+use pdfboss_core::{Dict, DocumentSeed, ObjRef, Object};
 
 create_exception!(
     pdfboss,
@@ -236,7 +237,11 @@ fn resolve_render_options(
     })
 }
 
-/// wrapped value, and the [`Mutex`] serializes those calls.
+/// The one parsed document behind a [`Document`], shared by reference
+/// from every handle that needs it. [`CoreDocument`] is single-threaded
+/// by design (interior caches), so it never escapes this wrapper except
+/// as a [`DocumentSeed`]; all direct access borrows the wrapped value,
+/// and the [`Mutex`] serializes those calls.
 struct SharedDocument(Mutex<CoreDocument>);
 
 // SAFETY: see the type-level comment — the non-thread-safe interior state
@@ -309,7 +314,7 @@ impl Document {
         // Accept an arbitrary Python object so that an index too large to
         // fit in `isize` surfaces as IndexError (the documented behavior)
         // rather than the OverflowError pyo3 would raise while coercing.
-        let page = {
+        let (seed, page) = {
             let doc = self.inner.lock();
             let count = doc.page_count();
             let idx = index
@@ -321,12 +326,12 @@ impl Document {
                     "page index {index} out of range ({count} pages)"
                 )));
             };
-            doc.page(idx).map_err(pdf_err)?
+            let page = doc.page(idx).map_err(pdf_err)?;
+            // `doc.page` just forced the page tree, so seeding here only
+            // clones a few `Arc`s and the key material.
+            (doc.seed(), page)
         };
-        Ok(Page {
-            doc: Arc::clone(&self.inner),
-            page,
-        })
+        Ok(Page { seed, page })
     }
 
     /// Extracts text from all pages, joined by form feed ("\f").
@@ -337,12 +342,13 @@ impl Document {
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         let inner = &self.inner;
         py.allow_threads(move || {
-            let doc = inner.lock();
+            // The lock is held only long enough to seed; the fan-out runs
+            // on a private materialization.
+            let doc = CoreDocument::from_seed(inner.lock().seed());
             // `map_pages` visits exactly the materializable pages — the
             // flattened tree, not the declared `/Count`, which on a damaged
             // file can exceed (or fall short of) what the tree yields.
-            let texts =
-                pdfboss_core::map_pages(&doc, |doc, page| pdfboss_text::extract_text(doc, page));
+            let texts = pdfboss_core::map_pages(&doc, pdfboss_text::extract_text);
             let mut out = String::new();
             for (i, text) in texts.into_iter().enumerate() {
                 if i > 0 {
@@ -357,8 +363,9 @@ impl Document {
     /// Renders every page (or the 0-based `pages` given, in the order given)
     /// to PNG bytes, fanned out across the machine's cores — same arguments
     /// and leniency as `Page.render`, one PNG per page. For a multi-page
-    /// document this is the fast path: per-page `render` calls run one page
-    /// at a time, this runs them all at once.
+    /// document this is the convenient fast path: one call renders them all
+    /// at once, where per-page `render` calls only parallelize if you run
+    /// them from your own threads.
     #[pyo3(signature = (pages=None, scale=1.0, fonts="all-embedded", font_dir=None))]
     fn render_pages<'py>(
         &self,
@@ -371,7 +378,9 @@ impl Document {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
         let inner = &self.inner;
         let pngs = py.allow_threads(move || {
-            let doc = inner.lock();
+            // The lock is held only long enough to seed; the fan-out runs
+            // on a private materialization.
+            let doc = CoreDocument::from_seed(inner.lock().seed());
             let outcomes = match &pages {
                 None => pdfboss_core::map_pages(&doc, |doc, page| {
                     let (pix, _) = pdfboss_render::render_page_reporting(doc, page, scale, &opts)?;
@@ -465,7 +474,10 @@ impl Document {
 /// A single page of a document.
 #[pyclass(frozen)]
 struct Page {
-    doc: Arc<SharedDocument>,
+    /// The document's shareable core. Every text or render call
+    /// materializes its own private document from this, so per-page work
+    /// holds no lock and runs concurrently across Python threads.
+    seed: DocumentSeed,
     page: CorePage,
 }
 
@@ -495,16 +507,21 @@ impl Page {
         self.page.rotate
     }
 
-    /// Extracts the page's text. Releases the GIL while the extraction runs.
+    /// Extracts the page's text. Releases the GIL and runs on a private
+    /// materialization of the document, so extractions of different pages
+    /// proceed in parallel when called from multiple Python threads.
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         py.allow_threads(|| {
-            let doc = self.doc.lock();
+            let doc = CoreDocument::from_seed(self.seed.clone());
             pdfboss_text::extract_text(&doc, &self.page).map_err(pdf_err)
         })
     }
 
     /// Renders the page and returns PNG bytes. Releases the GIL while the
-    /// rasterization and PNG encoding run.
+    /// rasterization and PNG encoding run, on a private materialization of
+    /// the document — no lock is held, so renders called from multiple
+    /// Python threads run truly in parallel (or let
+    /// `Document.render_pages` do the fan-out for you).
     ///
     /// `fonts="full"` substitutes replacement faces for non-embedded fonts.
     /// Faces come from an explicit `font_dir=...`, or else are discovered by
@@ -544,7 +561,7 @@ impl Page {
     ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
         let (png, warnings) = py.allow_threads(|| {
-            let doc = self.doc.lock();
+            let doc = CoreDocument::from_seed(self.seed.clone());
             let (pixmap, report) =
                 pdfboss_render::render_page_reporting(&doc, &self.page, scale, &opts)
                     .map_err(pdf_err)?;
