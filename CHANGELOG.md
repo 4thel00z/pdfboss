@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0](https://github.com/4thel00z/pdfboss/compare/v0.10.0...v0.11.0) (2026-07-30)
+
+
+### Features
+
+* **render:** report codes that resolve to no glyph ([6a4598a](https://github.com/4thel00z/pdfboss/commit/6a4598aaf6353e1efe8db5f6cdf60104110b285e))
+
+
+### Bug Fixes
+
+* **render:** claim gid 0 for .notdef in every Type1 font ([bfe5c70](https://github.com/4thel00z/pdfboss/commit/bfe5c70e44a1240388f7aae4ee2d5a4713c5a529))
+
 ## [0.10.0](https://github.com/4thel00z/pdfboss/compare/v0.9.0...v0.10.0) (2026-07-30)
 
 
