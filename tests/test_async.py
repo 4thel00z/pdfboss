@@ -292,6 +292,17 @@ def range_server(hello_pdf: Path) -> Iterator[str]:
 
 
 @pytest.fixture
+def three_pages_range_server(three_pages_pdf: Path) -> Iterator[tuple[str, Path]]:
+    handler = type(
+        "ThreePagesRangeHandler",
+        (RangeRequestHandler,),
+        {"payload": three_pages_pdf.read_bytes()},
+    )
+    for url in serve(handler):
+        yield url, three_pages_pdf
+
+
+@pytest.fixture
 def no_range_server(hello_pdf: Path) -> Iterator[str]:
     handler = type(
         "HelloNoRangeHandler",
@@ -394,3 +405,26 @@ class TestAsyncPageParity:
         sync_png2, sync_warnings = sync_doc[0].render_reporting(scale=1.5)
         assert png2 == sync_png2
         assert warnings == sync_warnings
+
+    @pytest.mark.asyncio
+    async def test_render_pages_matches_sync_byte_for_byte(self, three_pages_pdf):
+        sync_doc = Document(str(three_pages_pdf))
+        doc = await AsyncDocument.open(str(three_pages_pdf))
+        assert await doc.render_pages(scale=1.5) == sync_doc.render_pages(scale=1.5)
+
+    @pytest.mark.asyncio
+    async def test_render_pages_honors_an_explicit_selection(self, three_pages_pdf):
+        sync_doc = Document(str(three_pages_pdf))
+        doc = await AsyncDocument.open(str(three_pages_pdf))
+        subset = await doc.render_pages(pages=[2, 0], scale=1.0)
+        assert subset == sync_doc.render_pages(pages=[2, 0], scale=1.0)
+
+    @pytest.mark.asyncio
+    async def test_render_pages_works_over_http(self, three_pages_range_server):
+        # The fan-out must hold over a range-fetching source too: the
+        # workers share one HTTP-backed document and still agree with the
+        # sync render of the same bytes.
+        url, pdf_path = three_pages_range_server
+        sync_doc = Document(str(pdf_path))
+        doc = await AsyncDocument.open_url(url)
+        assert await doc.render_pages() == sync_doc.render_pages()

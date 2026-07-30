@@ -201,6 +201,18 @@ class AsyncDocument:
     def __getitem__(self, index: int) -> "AsyncPage": ...
     def page(self, index: int) -> "AsyncPage": ...
     async def extract_text(self) -> str: ...
+    async def render_pages(
+        self,
+        pages: list[int] | None = None,
+        scale: float = 1.0,
+        fonts: str = "all-embedded",
+        font_dir: str | None = None,
+    ) -> list[bytes]:
+        """Renders every page (or the 0-based ``pages`` given, in the order
+        given) to PNG bytes — the async twin of ``Document.render_pages``,
+        fanned out across the cores as tokio tasks so the asyncio loop
+        stays free. Works over any source, including ``open_url``."""
+
     async def metadata(self) -> dict[str, str]: ...
     async def get_object(self, num: int, gen: int = 0) -> object: ...
     def elements(

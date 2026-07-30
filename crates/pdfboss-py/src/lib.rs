@@ -880,6 +880,93 @@ impl AsyncDocument {
         })
     }
 
+    /// Renders every page (or the 0-based `pages` given, in the order given)
+    /// to PNG bytes — the async twin of `Document.render_pages`, same
+    /// arguments, same leniency, one PNG per page. Coroutine resolving to a
+    /// list of bytes.
+    ///
+    /// The fan-out shape matches the sync one: one worker per core, each
+    /// pulling the next page index from a shared counter so a slow page
+    /// never idles the others — except the workers are tokio tasks, so the
+    /// asyncio loop stays free and it works over any source, including
+    /// `open_url` documents (each worker range-fetches what its page needs).
+    #[pyo3(signature = (pages=None, scale=1.0, fonts="all-embedded", font_dir=None))]
+    fn render_pages<'py>(
+        &self,
+        py: Python<'py>,
+        pages: Option<Vec<usize>>,
+        scale: f32,
+        fonts: &str,
+        font_dir: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let selection: Arc<Vec<usize>> = Arc::new(match pages {
+                Some(wanted) => wanted,
+                None => (0..inner.page_count()).collect(),
+            });
+            let opts = Arc::new(opts);
+            let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let workers = std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(selection.len().max(1));
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let (inner, opts, next, selection) = (
+                    inner.clone(),
+                    Arc::clone(&opts),
+                    Arc::clone(&next),
+                    Arc::clone(&selection),
+                );
+                handles.push(tokio::spawn(async move {
+                    let mut done: Vec<(usize, PyResult<Vec<u8>>)> = Vec::new();
+                    loop {
+                        let s = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if s >= selection.len() {
+                            break;
+                        }
+                        let outcome = match inner.page(selection[s]).map_err(aio_err) {
+                            Err(e) => Err(e),
+                            Ok(page) => pdfboss_render::render_page_reporting_with(
+                                inner.clone(),
+                                &page,
+                                scale,
+                                &opts,
+                            )
+                            .await
+                            .and_then(|(pix, _)| pix.encode_png())
+                            .map_err(pdf_err),
+                        };
+                        done.push((s, outcome));
+                    }
+                    done
+                }));
+            }
+            let mut pngs: Vec<Option<Vec<u8>>> = vec![None; selection.len()];
+            for handle in handles {
+                let done = handle
+                    .await
+                    .map_err(|e| PdfError::new_err(format!("render worker failed: {e}")))?;
+                for (s, outcome) in done {
+                    pngs[s] = Some(outcome?);
+                }
+            }
+            Python::with_gil(|py| {
+                let list: Vec<Py<PyAny>> = pngs
+                    .into_iter()
+                    .map(|png| {
+                        PyBytes::new(py, &png.expect("every slot was dispatched"))
+                            .into_any()
+                            .unbind()
+                    })
+                    .collect();
+                Ok::<Vec<Py<PyAny>>, PyErr>(list)
+            })
+        })
+    }
+
     /// Document metadata; only keys present in the file are included.
     /// Coroutine resolving to a dict.
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
