@@ -4,7 +4,7 @@
 
 use crate::font::Font;
 use pdfboss_core::content::{parse_content, Op, TextItem};
-use pdfboss_core::{Dict, Document, Matrix, Page, Point, Result};
+use pdfboss_core::{Dict, Document, Matrix, Object, Page, Point, Result};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -39,7 +39,7 @@ pub fn page_spans(doc: &Document, page: &Page) -> Result<Vec<RawSpan>> {
         fallback: Rc::new(Font::fallback()),
         forms: 0,
     };
-    exec.run(&ops, &page.resources, GState::new(), 0);
+    exec.run(&ops, &[&page.resources], GState::new(), 0);
     Ok(exec.spans)
 }
 
@@ -90,27 +90,40 @@ struct Executor<'a> {
 }
 
 impl Executor<'_> {
+    /// Looks up `/category/name` in the resource chain, innermost dictionary
+    /// first (ISO 32000 §7.8.3).
+    ///
+    /// A nested form's own `/Resources` shadows its caller's for the names it
+    /// defines and falls through for the ones it does not. This mirrors the
+    /// renderer's `find_res`; the two crates must agree on which resource a
+    /// name refers to, or the same file extracts different text than it
+    /// paints.
+    fn find_res(&self, chain: &[&Dict], category: &str, name: &str) -> Option<Object> {
+        for res in chain {
+            let Some(cat) = res.get(category) else {
+                continue;
+            };
+            let Ok(Object::Dict(dict)) = self.doc.resolve(cat) else {
+                continue;
+            };
+            if let Some(value) = dict.get(name) {
+                if let Ok(obj) = self.doc.resolve(value) {
+                    return Some(obj);
+                }
+            }
+        }
+        None
+    }
+
     /// Loads (with per-stream caching) the font resource `name` from the
-    /// active resource dictionary, falling back to a default font.
-    fn font(
-        &self,
-        resources: &Dict,
-        name: &str,
-        cache: &mut HashMap<String, Rc<Font>>,
-    ) -> Rc<Font> {
+    /// active resource chain, falling back to a default font.
+    fn font(&self, chain: &[&Dict], name: &str, cache: &mut HashMap<String, Rc<Font>>) -> Rc<Font> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
-        let loaded = resources
-            .get("Font")
-            .and_then(|o| self.doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned())
-            .and_then(|fonts| {
-                let entry = fonts.get(name)?;
-                let resolved = self.doc.resolve(entry).ok()?;
-                let dict = resolved.as_dict()?;
-                Some(Rc::new(Font::load(self.doc, dict)))
-            })
+        let loaded = self
+            .find_res(chain, "Font", name)
+            .and_then(|resolved| Some(Rc::new(Font::load(self.doc, resolved.as_dict()?))))
             .unwrap_or_else(|| self.fallback.clone());
         cache.insert(name.to_string(), loaded.clone());
         loaded
@@ -118,7 +131,7 @@ impl Executor<'_> {
 
     /// Executes one operator stream. `q`/`Q` and `cm` maintain the CTM;
     /// text operators maintain Tm/Tlm; shown strings become spans.
-    fn run(&mut self, ops: &[Op], resources: &Dict, initial: GState, depth: usize) {
+    fn run(&mut self, ops: &[Op], chain: &[&Dict], initial: GState, depth: usize) {
         let mut gs = initial;
         let mut stack: Vec<GState> = Vec::new();
         let mut tm = Matrix::identity();
@@ -143,7 +156,7 @@ impl Executor<'_> {
                 Op::SetLeading(v) => gs.leading = *v,
                 Op::SetTextRise(v) => gs.rise = *v,
                 Op::SetFont(name, size) => {
-                    gs.font = Some(self.font(resources, &name.0, &mut fonts));
+                    gs.font = Some(self.font(chain, &name.0, &mut fonts));
                     gs.font_name = name.0.clone();
                     gs.size = *size;
                 }
@@ -190,7 +203,7 @@ impl Executor<'_> {
                     tm = tlm;
                     self.show(&gs, &mut tm, s);
                 }
-                Op::XObject(name) => self.form_xobject(&name.0, resources, &gs, depth),
+                Op::XObject(name) => self.form_xobject(&name.0, chain, &gs, depth),
                 // Text render mode 3 (invisible) is still extracted, so
                 // `Tr` and everything else is a no-op here.
                 _ => {}
@@ -236,21 +249,15 @@ impl Executor<'_> {
     }
 
     /// Executes a form XObject: recurses into its content with its own
-    /// `/Resources` (falling back to the caller's), `/Matrix` prepended
+    /// `/Resources` **prepended to** the caller's chain, `/Matrix` prepended
     /// to the CTM, a depth cap, and a total-invocation budget.
-    fn form_xobject(&mut self, name: &str, resources: &Dict, gs: &GState, depth: usize) {
+    fn form_xobject(&mut self, name: &str, chain: &[&Dict], gs: &GState, depth: usize) {
         if depth >= MAX_FORM_DEPTH || self.forms >= MAX_FORM_INVOCATIONS {
             return;
         }
         self.forms += 1;
-        let Some(stream) = resources
-            .get("XObject")
-            .and_then(|o| self.doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned())
-            .and_then(|xd| {
-                let entry = xd.get(name)?;
-                self.doc.resolve(entry).ok()
-            })
+        let Some(stream) = self
+            .find_res(chain, "XObject", name)
             .and_then(|o| o.as_stream().cloned())
         else {
             return;
@@ -268,17 +275,27 @@ impl Executor<'_> {
         let Ok(ops) = parse_content(&data) else {
             return;
         };
-        let form_resources = stream
+        // The form's own /Resources shadows the caller's for the names it
+        // defines and falls through for the ones it does not, so it is
+        // prepended rather than substituted. A form that declares
+        // /Resources without a /Font (or without the /XObject naming a
+        // nested form) still reaches the page's.
+        let own_res = stream
             .dict
             .get("Resources")
             .and_then(|o| self.doc.resolve(o).ok())
-            .and_then(|o| o.as_dict().cloned())
-            .unwrap_or_else(|| resources.clone());
+            .and_then(|o| o.as_dict().cloned());
+        let mut inner_chain: Vec<&Dict> = Vec::with_capacity(chain.len() + 1);
+        if let Some(res) = own_res.as_ref() {
+            inner_chain.push(res);
+        }
+        inner_chain.extend_from_slice(chain);
+
         let mut inner = gs.clone();
         if let Some(m) = form_matrix(self.doc, &stream.dict) {
             inner.ctm = m.concat(inner.ctm);
         }
-        self.run(&ops, &form_resources, inner, depth + 1);
+        self.run(&ops, &inner_chain, inner, depth + 1);
     }
 }
 

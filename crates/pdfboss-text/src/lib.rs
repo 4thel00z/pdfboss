@@ -154,6 +154,81 @@ mod tests {
         assert!((spans[1].y - 700.0).abs() < 1e-3); // form matrix applied
     }
 
+    /// A form XObject that carries its own `/Resources` **without** a `/Font`
+    /// entry must still find the page's font. Resource lookup is a chain,
+    /// innermost first with a per-name fallback (ISO 32000 §8.10.2 and
+    /// §7.8.3) — not replace-or-inherit.
+    ///
+    /// `/Differences` is what makes the failure visible rather than silent:
+    /// through the page's `/F1`, byte 65 decodes to alpha; through the
+    /// fallback font it stays `"A"`. Without the chain the text is still
+    /// extracted, just decoded with the wrong font, which is why no existing
+    /// test caught this.
+    #[test]
+    fn form_with_partial_resources_still_sees_the_page_font() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> /XObject << /Fx 6 0 R >> >> \
+             /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/Fx Do");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Custom \
+             /Encoding << /BaseEncoding /WinAnsiEncoding \
+             /Differences [65 /alpha] >> >>",
+        );
+        // Own /Resources present, but it defines no /Font at all.
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+             /Resources << /ProcSet [/PDF /Text] >>",
+            b"BT /F1 12 Tf 72 720 Td (A) Tj ET",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(page_text(&doc, 0), "\u{3B1}");
+    }
+
+    /// The same chain rule for a nested form: an inner form named only in the
+    /// page's `/XObject` must be reachable from a form that has its own
+    /// `/Resources` without an `/XObject` entry.
+    #[test]
+    fn form_with_partial_resources_still_sees_the_page_xobject() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> \
+             /XObject << /Outer 6 0 R /Inner 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/Outer Do");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        // Outer has its own /Resources naming neither /Inner nor /Font.
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+             /Resources << /ProcSet [/PDF /Text] >>",
+            b"/Inner Do",
+        );
+        b.stream(
+            7,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792]",
+            b"BT /F1 12 Tf 72 720 Td (deep) Tj ET",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(page_text(&doc, 0), "deep");
+    }
+
     #[test]
     fn extract_spans_sane_positions() {
         let doc = Document::load(simple_doc("Hi")).unwrap();
