@@ -357,3 +357,25 @@ class TestThreading:
         # With the GIL held for the whole render the ticker only runs at
         # call boundaries (~1-2 ticks); with it released it runs freely.
         assert ticks >= 10
+
+
+class TestPageFanOut:
+    """The parallel page fan-out must be invisible in the output: bulk
+    results agree byte for byte with per-page calls, whatever the worker
+    count or completion order."""
+
+    def test_render_pages_matches_per_page_render(self, three_pages_pdf):
+        doc = Document(str(three_pages_pdf))
+        bulk = doc.render_pages(scale=1.5)
+        assert bulk == [doc[i].render(scale=1.5) for i in range(doc.page_count)]
+
+    def test_render_pages_honors_an_explicit_selection(self, three_pages_pdf):
+        doc = Document(str(three_pages_pdf))
+        # An explicit list renders exactly those pages, in the order given.
+        subset = doc.render_pages(pages=[2, 0], scale=1.0)
+        assert subset == [doc[2].render(scale=1.0), doc[0].render(scale=1.0)]
+
+    def test_extract_text_joins_pages_in_order(self, three_pages_pdf):
+        doc = Document(str(three_pages_pdf))
+        parts = doc.extract_text().split("\f")
+        assert parts == [doc[i].extract_text() for i in range(doc.page_count)]

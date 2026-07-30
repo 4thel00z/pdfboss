@@ -34,6 +34,7 @@ enum Cipher {
 
 /// A configured Standard-handler decryptor for a document opened with the empty
 /// user password.
+#[derive(Clone)]
 pub struct Decryptor {
     /// The file key (`n` bytes for RC4/AESV2, 32 for AESV3).
     key: Vec<u8>,

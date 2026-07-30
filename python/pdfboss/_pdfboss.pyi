@@ -86,6 +86,16 @@ class Document:
         """The page at ``index`` (0-based; negative indexes count from the
         end). Raises ``IndexError`` when out of range."""
 
+    def render_pages(
+        self,
+        pages: list[int] | None = None,
+        scale: float = 1.0,
+        fonts: str = "all-embedded",
+        font_dir: str | None = None,
+    ) -> list[bytes]:
+        """Renders every page (or the 0-based ``pages`` given, in the order
+        given) to PNG bytes, fanned out across the machine's cores."""
+
     def extract_text(self) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``)."""
 

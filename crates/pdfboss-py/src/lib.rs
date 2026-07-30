@@ -330,28 +330,102 @@ impl Document {
     }
 
     /// Extracts text from all pages, joined by form feed ("\f").
-    /// Releases the GIL while the extraction runs.
+    /// Releases the GIL and fans the pages out across the machine's cores:
+    /// each worker thread holds its own fork of the document (shared bytes
+    /// and cross-reference table, private caches), pulling page indexes from
+    /// a shared counter so a slow page never idles the other cores.
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         let inner = &self.inner;
         py.allow_threads(move || {
             let doc = inner.lock();
+            // `map_pages` visits exactly the materializable pages — the
+            // flattened tree, not the declared `/Count`, which on a damaged
+            // file can exceed (or fall short of) what the tree yields.
+            let texts =
+                pdfboss_core::map_pages(&doc, |doc, page| pdfboss_text::extract_text(doc, page));
             let mut out = String::new();
-            // Drive iteration by successful page lookups rather than by
-            // `page_count()`: the count is the declared `/Count`, which on a
-            // damaged file can exceed (or fall short of) the pages the tree
-            // actually yields. `page(i)` fails only past the last real page,
-            // so this visits exactly the materializable pages.
-            let mut i = 0;
-            while let Ok(page) = doc.page(i) {
+            for (i, text) in texts.into_iter().enumerate() {
                 if i > 0 {
                     out.push('\u{c}');
                 }
-                let text = pdfboss_text::extract_text(&doc, &page).map_err(pdf_err)?;
-                out.push_str(&text);
-                i += 1;
+                out.push_str(&text.map_err(pdf_err)?);
             }
             Ok(out)
         })
+    }
+
+    /// Renders every page (or the 0-based `pages` given, in the order given)
+    /// to PNG bytes, fanned out across the machine's cores — same arguments
+    /// and leniency as `Page.render`, one PNG per page. For a multi-page
+    /// document this is the fast path: per-page `render` calls run one page
+    /// at a time, this runs them all at once.
+    #[pyo3(signature = (pages=None, scale=1.0, fonts="all-embedded", font_dir=None))]
+    fn render_pages<'py>(
+        &self,
+        py: Python<'py>,
+        pages: Option<Vec<usize>>,
+        scale: f32,
+        fonts: &str,
+        font_dir: Option<String>,
+    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        let inner = &self.inner;
+        let pngs = py.allow_threads(move || {
+            let doc = inner.lock();
+            let outcomes = match &pages {
+                None => pdfboss_core::map_pages(&doc, |doc, page| {
+                    let (pix, _) = pdfboss_render::render_page_reporting(doc, page, scale, &opts)?;
+                    pix.encode_png()
+                }),
+                Some(wanted) => {
+                    // An explicit list renders exactly those pages, in the
+                    // order given. The fan-out still runs over the whole
+                    // selection: each worker resolves its own page index.
+                    let selection: Vec<usize> = wanted.clone();
+                    let seed = doc.seed();
+                    let next = std::sync::atomic::AtomicUsize::new(0);
+                    let slots: Vec<std::sync::OnceLock<Result<Vec<u8>, pdfboss_core::Error>>> = (0
+                        ..selection.len())
+                        .map(|_| std::sync::OnceLock::new())
+                        .collect();
+                    let workers = std::thread::available_parallelism()
+                        .map(std::num::NonZeroUsize::get)
+                        .unwrap_or(1)
+                        .min(selection.len().max(1));
+                    std::thread::scope(|scope| {
+                        for _ in 0..workers {
+                            let seed = seed.clone();
+                            let (next, slots, selection, opts) = (&next, &slots, &selection, &opts);
+                            scope.spawn(move || {
+                                let worker = pdfboss_core::Document::from_seed(seed);
+                                loop {
+                                    let s = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if s >= selection.len() {
+                                        break;
+                                    }
+                                    let outcome = worker.page(selection[s]).and_then(|page| {
+                                        let (pix, _) = pdfboss_render::render_page_reporting(
+                                            &worker, &page, scale, opts,
+                                        )?;
+                                        pix.encode_png()
+                                    });
+                                    slots[s].set(outcome).ok();
+                                }
+                            });
+                        }
+                    });
+                    slots
+                        .into_iter()
+                        .map(|slot| slot.into_inner().expect("every slot was dispatched"))
+                        .collect()
+                }
+            };
+            outcomes
+                .into_iter()
+                .map(|png| png.map_err(pdf_err))
+                .collect::<PyResult<Vec<Vec<u8>>>>()
+        })?;
+        Ok(pngs.into_iter().map(|png| PyBytes::new(py, &png)).collect())
     }
 
     /// Lazily iterates the document's elements: physical file structure in
