@@ -21,6 +21,29 @@
 //! Nothing here needs an async runtime: `Future`, `Pin`, `Box`, `Arc`,
 //! `Wake` and `std::future::ready` are all in the standard library, so
 //! `pdfboss-core` stays free of executor dependencies.
+//!
+//! # Signing a shared algorithm
+//!
+//! Every algorithm written against [`AsyncObjectSource`] follows the same three
+//! rules. They are not stylistic: each one is what makes a single
+//! implementation serve both a synchronous and an asynchronous caller.
+//!
+//! 1. **Take the source by value** — `src: S`, never `&S`. A future holding
+//!    `&'a S` is `Send` but never `'static`, and the asynchronous consumers
+//!    (spawning onto a runtime, crossing into the Python bindings) need both.
+//!    It costs nothing: an asynchronous document is an `Arc` handle, and
+//!    [`Immediate`] over a borrowed document is `Copy`.
+//! 2. **Put no `Send` or `Sync` bound on the function.** Auto traits are
+//!    inferred per instantiation, so one function yields a `Send` future over
+//!    an asynchronous source and a non-`Send` future over
+//!    `Immediate<&Document>` — which is correct, because [`block_on`] drives
+//!    the latter on the calling thread and never sends it anywhere.
+//! 3. **Call `src.resolve(o)`, not [`resolve_with`]**, unless the algorithm
+//!    genuinely needs `S: Sync` for other reasons. `resolve_with` requires
+//!    `Sync` and so excludes `Immediate<&Document>`; reaching for it out of
+//!    habit silently breaks the synchronous path.
+//!
+//! [`crate::document::page_content_with`] is the reference example.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -315,6 +338,14 @@ impl Wake for ThreadWaker {
 /// thread forever**. Such a future belongs on the runtime that owns its
 /// reactor; pass it to that runtime's own driver instead.
 ///
+/// One case fails louder than blocking, and is worth naming because the type
+/// system does not catch it. A future built over the *asynchronous* document
+/// API is not merely unwakeable here — that crate reads files through its
+/// runtime's blocking pool, so driving one of its futures outside a runtime
+/// context **panics** rather than hanging. `block_on` is for futures built over
+/// [`Immediate`]; hand anything from the asynchronous API to the runtime that
+/// owns it.
+///
 /// Nesting is safe: an inner `block_on` on the same thread cannot steal the
 /// outer call's wakeup, because each call waits on a flag private to itself
 /// rather than on the thread's shared unpark token.
@@ -527,6 +558,75 @@ mod tests {
             block_on(resolve_with(&SelfReferential, &direct)).unwrap(),
             Object::Int(42)
         );
+    }
+
+    /// An owned source holding heap state, standing in for a real asynchronous
+    /// document (which owns an `Arc`). The heap field is load-bearing for the
+    /// test below: a unit struct would be const-promoted, so `&UnitStub` would
+    /// be a `&'static` reference and would satisfy a `'static` assertion even
+    /// under a by-reference signature — making the assertion useless as a gate.
+    /// A `Vec` cannot be promoted, so the borrow is genuinely non-`'static`.
+    struct OwnedStub {
+        payload: Vec<u8>,
+    }
+
+    impl AsyncObjectSource for OwnedStub {
+        fn get(&self, _r: ObjRef) -> BoxFuture<'_, Result<Object>> {
+            Box::pin(std::future::ready(Ok(Object::Int(
+                self.payload.len() as i64
+            ))))
+        }
+
+        fn stream_data<'a>(&'a self, s: &'a Stream) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(std::future::ready(Ok(s.data.clone())))
+        }
+
+        fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>> {
+            Box::pin(resolve_with(self, o))
+        }
+    }
+
+    /// Stands in for a shared algorithm: generic over the source, taking it by
+    /// value, and carrying no `Send` or `Sync` bound of its own.
+    async fn fetch_one<S: AsyncObjectSource>(src: S, r: ObjRef) -> Result<Object> {
+        src.get(r).await
+    }
+
+    /// An algorithm that owns its source produces a future a runtime's `spawn`
+    /// and the Python bindings will both accept. Taking `&S` instead produces
+    /// one that is `Send` but borrowed, which both reject — so this is what
+    /// keeps the by-value rule in the module documentation enforceable rather
+    /// than advisory. Confirmed to be a real gate, not a tautology: changing
+    /// `fetch_one` to take `src: &S` makes this stop compiling with `E0716
+    /// temporary value dropped while borrowed`. That check only works because
+    /// `OwnedStub` holds heap state — see its own note.
+    #[test]
+    fn an_owned_source_yields_a_spawnable_future() {
+        fn assert_send_static<F: Future + Send + 'static>(_: &F) {}
+
+        let future = fetch_one(
+            OwnedStub {
+                payload: vec![1, 2, 3],
+            },
+            ObjRef { num: 3, gen: 0 },
+        );
+        assert_send_static(&future);
+        assert!(block_on(future).is_ok());
+    }
+
+    /// The same generic function must still serve a synchronous caller, whose
+    /// source is neither `Send` nor `'static`. Auto traits are inferred per
+    /// instantiation, so no bound on the function has to choose between the two
+    /// callers — which is the whole premise of sharing one implementation.
+    #[test]
+    fn the_same_function_serves_a_borrowed_synchronous_source() {
+        let doc = Document::load(pdfboss_testkit::simple_doc("Hello")).unwrap();
+        let r = ObjRef { num: 1, gen: 0 };
+        let expected = ObjectSource::get(&doc, r).unwrap();
+
+        let got = block_on(fetch_one(Immediate(&doc), r)).unwrap();
+
+        assert_eq!(got, expected);
     }
 
     /// The synchronous mirror of `SelfReferential`. Reaching the cap is
