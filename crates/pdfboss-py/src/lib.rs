@@ -187,6 +187,55 @@ fn glyph_painting_from_str(s: &str) -> PyResult<pdfboss_render::GlyphPainting> {
 /// state is fully encapsulated — no reference-counted pointer or `RefCell`
 /// borrow ever escapes the core API (cached objects are handed out as deep
 /// clones) — so every touch of it happens inside a method call on the
+/// Validates a render request and resolves it to [`RenderOptions`]: the
+/// glyph-painting tier from `fonts`, and — at the `full` tier — a substitute
+/// face directory from `font_dir` or the optional `pdfboss-fonts` data
+/// package. The package import needs the GIL, so this runs on the calling
+/// thread, before any `allow_threads`/coroutine boundary; both the sync and
+/// the async render route through it, so the two cannot diverge in how they
+/// read these arguments.
+fn resolve_render_options(
+    py: Python<'_>,
+    scale: f32,
+    fonts: &str,
+    font_dir: Option<String>,
+) -> PyResult<pdfboss_render::RenderOptions> {
+    use pdfboss_render::{GlyphPainting, SubstituteSource};
+
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(PyValueError::new_err(
+            "scale must be a positive, finite number",
+        ));
+    }
+    let glyph_painting = glyph_painting_from_str(fonts)?;
+    let substitutes = if glyph_painting == GlyphPainting::Full {
+        if let Some(dir) = font_dir {
+            SubstituteSource::Dir(dir.into())
+        } else {
+            // The binding discovers the pdfboss-fonts data package.
+            match py.import("pdfboss_fonts") {
+                Ok(module) => {
+                    let dir: String = module.getattr("font_dir")?.call0()?.extract()?;
+                    SubstituteSource::Dir(dir.into())
+                }
+                Err(_) => {
+                    return Err(PyValueError::new_err(
+                        "fonts=\"full\" requires the pdfboss-fonts package; \
+                         install it with `pip install pdfboss[full]`, or pass \
+                         an explicit font_dir=...",
+                    ));
+                }
+            }
+        }
+    } else {
+        SubstituteSource::None
+    };
+    Ok(pdfboss_render::RenderOptions {
+        glyph_painting,
+        substitutes,
+    })
+}
+
 /// wrapped value, and the [`Mutex`] serializes those calls.
 struct SharedDocument(Mutex<CoreDocument>);
 
@@ -419,41 +468,7 @@ impl Page {
         fonts: &str,
         font_dir: Option<String>,
     ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
-        use pdfboss_render::{GlyphPainting, SubstituteSource};
-
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(PyValueError::new_err(
-                "scale must be a positive, finite number",
-            ));
-        }
-        let glyph_painting = glyph_painting_from_str(fonts)?;
-        let substitutes = if glyph_painting == GlyphPainting::Full {
-            if let Some(dir) = font_dir {
-                SubstituteSource::Dir(dir.into())
-            } else {
-                // The binding discovers the pdfboss-fonts data package. The
-                // import needs the GIL, so this runs before `allow_threads`.
-                match py.import("pdfboss_fonts") {
-                    Ok(module) => {
-                        let dir: String = module.getattr("font_dir")?.call0()?.extract()?;
-                        SubstituteSource::Dir(dir.into())
-                    }
-                    Err(_) => {
-                        return Err(PyValueError::new_err(
-                            "fonts=\"full\" requires the pdfboss-fonts package; \
-                             install it with `pip install pdfboss[full]`, or pass \
-                             an explicit font_dir=...",
-                        ));
-                    }
-                }
-            }
-        } else {
-            SubstituteSource::None
-        };
-        let opts = pdfboss_render::RenderOptions {
-            glyph_painting,
-            substitutes,
-        };
+        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
         let (png, warnings) = py.allow_threads(|| {
             let doc = self.doc.lock();
             let (pixmap, report) =
@@ -702,14 +717,76 @@ impl AsyncDocument {
         })
     }
 
-    /// Number of pages in the document.
+    /// Number of pages in the document. A property, exactly like the sync
+    /// `Document.page_count`: the open flow already parsed the page tree, so
+    /// nothing here awaits.
+    #[getter]
     fn page_count(&self) -> usize {
         self.inner.page_count()
     }
 
-    /// PDF version from the file header, e.g. "1.7".
+    /// PDF version from the file header, e.g. "1.7". A property, like the
+    /// sync `Document.version`.
+    #[getter]
     fn version(&self) -> String {
         version_string(self.inner.version())
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.page_count()
+    }
+
+    fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<AsyncPage> {
+        // Mirrors the sync `Document.__getitem__`: negative indexes count
+        // from the end, and anything unrepresentable is IndexError.
+        let count = self.inner.page_count();
+        let idx = index
+            .extract::<isize>()
+            .ok()
+            .and_then(|i| normalize_index(i, count));
+        let Some(idx) = idx else {
+            return Err(PyIndexError::new_err(format!(
+                "page index {index} out of range ({count} pages)"
+            )));
+        };
+        let page = self.inner.page(idx).map_err(aio_err)?;
+        Ok(AsyncPage {
+            doc: self.inner.clone(),
+            page,
+        })
+    }
+
+    /// The page at 0-based `index`. Synchronous — the page tree and its
+    /// inherited attributes were resolved at open — and negative indexes are
+    /// NOT accepted here (use subscription, `doc[-1]`, for that), mirroring
+    /// the sync `Document.page` split.
+    fn page(&self, index: usize) -> PyResult<AsyncPage> {
+        let page = self.inner.page(index).map_err(aio_err)?;
+        Ok(AsyncPage {
+            doc: self.inner.clone(),
+            page,
+        })
+    }
+
+    /// Extracts text from all pages, joined by form feed ("\f"), like the
+    /// sync `Document.extract_text`. Coroutine; the extraction runs on the
+    /// tokio runtime, so the asyncio loop is never blocked.
+    fn extract_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut out = String::new();
+            for i in 0..inner.page_count() {
+                if i > 0 {
+                    out.push('\u{c}');
+                }
+                let page = inner.page(i).map_err(aio_err)?;
+                let text = pdfboss_text::extract_text_with(inner.clone(), &page)
+                    .await
+                    .map_err(pdf_err)?;
+                out.push_str(&text);
+            }
+            Ok(out)
+        })
     }
 
     /// Document metadata; only keys present in the file are included.
@@ -760,6 +837,107 @@ impl AsyncDocument {
     }
 }
 
+/// A single page of an async document. Attributes are synchronous — the
+/// page tree and its inherited attributes were resolved at open — while
+/// `extract_text` and the render methods are coroutines, driving the SAME
+/// shared implementations the sync `Page` drives, over the async document's
+/// range-fetching reads.
+#[pyclass(frozen)]
+struct AsyncPage {
+    doc: AioDocument,
+    page: CorePage,
+}
+
+#[pymethods]
+impl AsyncPage {
+    /// 0-based page index.
+    #[getter]
+    fn number(&self) -> usize {
+        self.page.index
+    }
+
+    /// Page width in points (after rotation).
+    #[getter]
+    fn width(&self) -> f32 {
+        self.page.size().0
+    }
+
+    /// Page height in points (after rotation).
+    #[getter]
+    fn height(&self) -> f32 {
+        self.page.size().1
+    }
+
+    /// Page rotation in degrees: 0, 90, 180 or 270.
+    #[getter]
+    fn rotation(&self) -> i32 {
+        self.page.rotate
+    }
+
+    /// Extracts the page's text. Coroutine resolving to str.
+    fn extract_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            pdfboss_text::extract_text_with(doc, &page)
+                .await
+                .map_err(pdf_err)
+        })
+    }
+
+    /// Renders the page and resolves to PNG bytes; same arguments and
+    /// leniency as the sync `Page.render`. Coroutine.
+    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None))]
+    fn render<'py>(
+        &self,
+        py: Python<'py>,
+        scale: f32,
+        fonts: &str,
+        font_dir: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (pixmap, _) = pdfboss_render::render_page_reporting_with(doc, &page, scale, &opts)
+                .await
+                .map_err(pdf_err)?;
+            let png = pixmap.encode_png().map_err(pdf_err)?;
+            Python::with_gil(|py| {
+                Ok::<Py<PyAny>, PyErr>(PyBytes::new(py, &png).into_any().unbind())
+            })
+        })
+    }
+
+    /// Renders the page like `render`, resolving to `(png_bytes, warnings)`;
+    /// same reporting semantics as the sync `Page.render_reporting`.
+    /// Coroutine.
+    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None))]
+    fn render_reporting<'py>(
+        &self,
+        py: Python<'py>,
+        scale: f32,
+        fonts: &str,
+        font_dir: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (pixmap, report) =
+                pdfboss_render::render_page_reporting_with(doc, &page, scale, &opts)
+                    .await
+                    .map_err(pdf_err)?;
+            let png = pixmap.encode_png().map_err(pdf_err)?;
+            let warnings = report.warnings();
+            Python::with_gil(|py| {
+                let bytes = PyBytes::new(py, &png).into_any().unbind();
+                Ok::<(Py<PyAny>, Vec<String>), PyErr>((bytes, warnings))
+            })
+        })
+    }
+}
+
 /// Async iterator over a document's elements, returned by
 /// `AsyncDocument.elements()`. Each `__anext__` is a coroutine driving
 /// the Rust element stream on the tokio runtime, so the asyncio loop is
@@ -802,6 +980,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("PdfError", m.py().get_type::<PdfError>())?;
     m.add_class::<Document>()?;
+    m.add_class::<AsyncPage>()?;
     m.add_class::<Page>()?;
     m.add_class::<Element>()?;
     m.add_class::<ElementIter>()?;

@@ -592,6 +592,7 @@ pub struct Metadata {
 /// alike — so the invariant holds however a `Page` was built. `rotate` is a
 /// public field, so a caller may still overwrite it afterwards; [`Page::size`]
 /// reads it modulo a full turn and so stays correct if they do.
+#[derive(Clone)]
 pub struct Page {
     /// 0-based page index.
     pub index: usize,

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import pdfboss
 from pdfboss import AsyncDocument, Document, Element, PdfError
 
 
@@ -19,27 +20,27 @@ class TestAsyncOpen:
     @pytest.mark.asyncio
     async def test_open_by_pathlike(self, hello_pdf: Path) -> None:
         doc = await AsyncDocument.open(hello_pdf)
-        assert doc.page_count() == 1
+        assert doc.page_count == 1
 
     @pytest.mark.asyncio
     async def test_open_by_str(self, hello_pdf: Path) -> None:
         doc = await AsyncDocument.open(str(hello_pdf))
-        assert doc.page_count() == 1
+        assert doc.page_count == 1
 
     @pytest.mark.asyncio
     async def test_from_bytes(self, hello_pdf: Path) -> None:
         doc = await AsyncDocument.from_bytes(hello_pdf.read_bytes())
-        assert doc.page_count() == 1
+        assert doc.page_count == 1
 
     @pytest.mark.asyncio
     async def test_version_matches_sync(self, hello_pdf: Path) -> None:
         doc = await AsyncDocument.open(hello_pdf)
-        assert doc.version() == Document(str(hello_pdf)).version
+        assert doc.version == Document(str(hello_pdf)).version
 
     @pytest.mark.asyncio
     async def test_xref_stream_file_opens(self, xref_stream_pdf: Path) -> None:
         doc = await AsyncDocument.open(xref_stream_pdf)
-        assert doc.page_count() == 1
+        assert doc.page_count == 1
 
     @pytest.mark.asyncio
     async def test_missing_file_raises_prefixed_pdf_error(
@@ -94,7 +95,7 @@ class TestAsyncDocumentQueries:
             AsyncDocument.open(hello_pdf),
             AsyncDocument.open(three_pages_pdf),
         )
-        assert [d.page_count() for d in docs] == [1, 3]
+        assert [d.page_count for d in docs] == [1, 3]
 
 
 def element_key(element: Element) -> tuple[object, ...]:
@@ -306,8 +307,8 @@ class TestOpenUrl:
         self, range_server: str, hello_pdf: Path
     ) -> None:
         doc = await AsyncDocument.open_url(range_server)
-        assert doc.page_count() == 1
-        assert doc.version() == Document(str(hello_pdf)).version
+        assert doc.page_count == 1
+        assert doc.version == Document(str(hello_pdf)).version
 
     @pytest.mark.asyncio
     async def test_open_url_element_parity(
@@ -347,3 +348,49 @@ class TestOpenUrl:
         with pytest.raises(PdfError) as exc:
             await AsyncDocument.open_url("http://127.0.0.1:9/doc.pdf")
         assert str(exc.value).startswith("http:")
+
+
+class TestAsyncPageParity:
+    """The async page surface must agree with the sync one byte for byte:
+    same attributes, same extracted text, same rendered PNG."""
+
+    @pytest.mark.asyncio
+    async def test_page_attributes_match_sync(self, hello_pdf):
+        sync_doc = Document(str(hello_pdf))
+        doc = await AsyncDocument.open(str(hello_pdf))
+        assert len(doc) == sync_doc.page_count
+        for i in range(len(doc)):
+            sync_page = sync_doc[i]
+            page = doc[i]
+            assert page.number == sync_page.number
+            assert page.width == sync_page.width
+            assert page.height == sync_page.height
+            assert page.rotation == sync_page.rotation
+
+    @pytest.mark.asyncio
+    async def test_negative_index_counts_from_the_end(self, hello_pdf):
+        doc = await AsyncDocument.open(str(hello_pdf))
+        assert doc[-1].number == len(doc) - 1
+        with pytest.raises(IndexError):
+            doc[len(doc)]
+        with pytest.raises(pdfboss.PdfError):
+            doc.page(len(doc))
+
+    @pytest.mark.asyncio
+    async def test_extract_text_matches_sync(self, hello_pdf):
+        sync_doc = Document(str(hello_pdf))
+        doc = await AsyncDocument.open(str(hello_pdf))
+        assert await doc.extract_text() == sync_doc.extract_text()
+        assert await doc[0].extract_text() == sync_doc[0].extract_text()
+
+    @pytest.mark.asyncio
+    async def test_render_matches_sync_byte_for_byte(self, hello_pdf):
+        sync_doc = Document(str(hello_pdf))
+        doc = await AsyncDocument.open(str(hello_pdf))
+        sync_png = sync_doc[0].render(scale=1.5)
+        png = await doc[0].render(scale=1.5)
+        assert png == sync_png
+        png2, warnings = await doc[0].render_reporting(scale=1.5)
+        sync_png2, sync_warnings = sync_doc[0].render_reporting(scale=1.5)
+        assert png2 == sync_png2
+        assert warnings == sync_warnings

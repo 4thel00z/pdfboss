@@ -170,10 +170,11 @@ class AsyncDocument:
     """A PDF document opened for async I/O.
 
     Constructors and data-fetching methods are coroutines driven by one
-    global multi-thread tokio runtime; ``page_count``/``version`` are
-    sync because the open flow already parsed the xref chain and page
-    tree. The whole file is never read eagerly — file and HTTP backends
-    fetch only the byte ranges they need.
+    global multi-thread tokio runtime; ``page_count``/``version`` and page
+    access are sync (properties/plain calls, mirroring ``Document``)
+    because the open flow already parsed the xref chain and page tree.
+    The whole file is never read eagerly — file and HTTP backends fetch
+    only the byte ranges they need.
     """
 
     @staticmethod
@@ -182,8 +183,14 @@ class AsyncDocument:
     async def open_url(url: str) -> "AsyncDocument": ...
     @staticmethod
     async def from_bytes(data: bytes) -> "AsyncDocument": ...
+    @property
     def page_count(self) -> int: ...
+    @property
     def version(self) -> str: ...
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> "AsyncPage": ...
+    def page(self, index: int) -> "AsyncPage": ...
+    async def extract_text(self) -> str: ...
     async def metadata(self) -> dict[str, str]: ...
     async def get_object(self, num: int, gen: int = 0) -> object: ...
     def elements(
@@ -197,3 +204,34 @@ class AsyncDocument:
         """Streams the document's elements; use with ``async for``. Same
         ordering and salvage semantics as ``Document.elements``.
         """
+
+class AsyncPage:
+    """A single page of an async document.
+
+    Attributes are synchronous — the page tree and its inherited
+    attributes were resolved at open — while ``extract_text`` and the
+    render methods are coroutines driving the same shared implementations
+    the sync ``Page`` drives, over range-fetching reads.
+    """
+
+    @property
+    def number(self) -> int: ...
+    @property
+    def width(self) -> float: ...
+    @property
+    def height(self) -> float: ...
+    @property
+    def rotation(self) -> int: ...
+    async def extract_text(self) -> str: ...
+    async def render(
+        self,
+        scale: float = 1.0,
+        fonts: str = "all-embedded",
+        font_dir: str | None = None,
+    ) -> bytes: ...
+    async def render_reporting(
+        self,
+        scale: float = 1.0,
+        fonts: str = "all-embedded",
+        font_dir: str | None = None,
+    ) -> tuple[bytes, list[str]]: ...
