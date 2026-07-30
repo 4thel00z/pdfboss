@@ -882,11 +882,9 @@ impl Executor<'_> {
     }
 
     /// Paints a `/Type3` show-string: each one-byte code's CharProc runs as a
-    /// nested content stream (ISO 32000-1 §9.6.5). The glyph matrix mirrors the
-    /// outline path with `/FontMatrix` in place of the `1/upm` scale, so glyph
-    /// space maps through text space, the text state, and the CTM to device.
-    /// Codes with no CharProc, a non-finite matrix, or a depth at the recursion
-    /// limit still advance, keeping surrounding text positioned.
+    /// nested content stream (ISO 32000-1 §9.6.5). Planning is pure and
+    /// happens up front in [`type3_glyph_plan`]; this drives the planned
+    /// CharProcs through the executor.
     fn show_text_type3(
         &mut self,
         gs: &GState,
@@ -898,40 +896,12 @@ impl Executor<'_> {
         let Some(t3) = ts.type3.clone() else {
             return;
         };
-        let font_matrix = t3.font_matrix();
-        for &byte in bytes {
-            let code = u32::from(byte);
-
-            // glyph space -> text space (/FontMatrix), -> the text-scaling
-            // params, -> user space (Tm) -> device (CTM): the outline chain
-            // with `font_matrix` substituted for `scale(1/upm)`.
-            let params = Matrix {
-                a: ts.size * ts.horiz,
-                b: 0.0,
-                c: 0.0,
-                d: ts.size,
-                e: 0.0,
-                f: ts.rise,
-            };
-            let glyph_ctm = font_matrix.concat(params).concat(ts.tm).concat(gs.ctm);
-
-            // The depth guard bounds a self-referential glyph (one that shows
-            // itself, directly or via a form): each CharProc re-entry increments
-            // `depth`, so painting stops at `MAX_FORM_DEPTH`.
-            if depth < MAX_FORM_DEPTH && finite_matrix(&glyph_ctm) {
-                if let Some(proc_obj) = t3.char_proc(code).cloned() {
-                    self.run_char_proc(&proc_obj, &t3, chain, gs, glyph_ctm, depth);
-                }
-            }
-
-            // Advance: the glyph-space width becomes a text-space displacement
-            // via the matrix x-scale, then (w0·Tfs + Tc + Tw[space]) · Th.
-            let w0 = t3.width(code).unwrap_or(0.0) * font_matrix.a;
-            let word = if code == 32 { ts.word_spacing } else { 0.0 };
-            let tx = (w0 * ts.size + ts.char_spacing + word) * ts.horiz;
-            if tx.is_finite() {
-                ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
-            }
+        // The depth guard bounds a self-referential glyph (one that shows
+        // itself, directly or via a form): each CharProc re-entry increments
+        // `depth`, so painting stops at `MAX_FORM_DEPTH`.
+        let plan = type3_glyph_plan(ts, &t3, bytes, gs.ctm, depth < MAX_FORM_DEPTH);
+        for glyph in plan {
+            self.run_char_proc(&glyph.proc_obj, &t3, chain, gs, glyph.ctm, depth);
         }
     }
 
@@ -1076,6 +1046,70 @@ impl Executor<'_> {
             _ => {}
         }
     }
+}
+
+/// One planned Type3 glyph invocation: the CharProc to run (stored as given,
+/// possibly an indirect reference, resolved at paint time) and the device
+/// matrix its content stream runs under.
+struct Type3Glyph {
+    proc_obj: Object,
+    ctm: Matrix,
+}
+
+/// Plans a `/Type3` show-string: which CharProcs run under which glyph CTMs,
+/// advancing the text matrix as it goes. Pure — the whole plan is knowable
+/// before any glyph paints, because the advance comes from the font's
+/// `/Widths` entry, never from the `wx` operand of the CharProc's `d0`/`d1`
+/// (whose only consumer is the color-lock check at paint time). Were that
+/// not so, this function could not exist and every glyph's position would
+/// wait on the previous glyph's content stream.
+///
+/// Codes with no CharProc, a non-finite matrix, or `paint` false (the caller
+/// is at the recursion limit) still advance, keeping surrounding text
+/// positioned.
+fn type3_glyph_plan(
+    ts: &mut TextState,
+    t3: &Type3Font,
+    bytes: &[u8],
+    ctm: Matrix,
+    paint: bool,
+) -> Vec<Type3Glyph> {
+    let font_matrix = t3.font_matrix();
+    let mut planned = Vec::new();
+    for &byte in bytes {
+        let code = u32::from(byte);
+
+        // glyph space -> text space (/FontMatrix), -> the text-scaling
+        // params, -> user space (Tm) -> device (CTM): the outline chain
+        // with `font_matrix` substituted for `scale(1/upm)`.
+        let params = Matrix {
+            a: ts.size * ts.horiz,
+            b: 0.0,
+            c: 0.0,
+            d: ts.size,
+            e: 0.0,
+            f: ts.rise,
+        };
+        let glyph_ctm = font_matrix.concat(params).concat(ts.tm).concat(ctm);
+        if paint && finite_matrix(&glyph_ctm) {
+            if let Some(proc_obj) = t3.char_proc(code).cloned() {
+                planned.push(Type3Glyph {
+                    proc_obj,
+                    ctm: glyph_ctm,
+                });
+            }
+        }
+
+        // Advance: the glyph-space width becomes a text-space displacement
+        // via the matrix x-scale, then (w0·Tfs + Tc + Tw[space]) · Th.
+        let w0 = t3.width(code).unwrap_or(0.0) * font_matrix.a;
+        let word = if code == 32 { ts.word_spacing } else { 0.0 };
+        let tx = (w0 * ts.size + ts.char_spacing + word) * ts.horiz;
+        if tx.is_finite() {
+            ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
+        }
+    }
+    planned
 }
 
 /// The initial color after selecting a color space: black for the device
