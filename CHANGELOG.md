@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/4thel00z/pdfboss/compare/v0.9.0...v0.10.0) (2026-07-30)
+
+
+### Features
+
+* **py:** give the async document the same bulk page fan-out ([f71099c](https://github.com/4thel00z/pdfboss/commit/f71099c1f7765d1c15ffcd38116101ec588c8b09))
+
 ## [0.9.0](https://github.com/4thel00z/pdfboss/compare/v0.8.0...v0.9.0) (2026-07-30)
 
 
