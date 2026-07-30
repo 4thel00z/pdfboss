@@ -57,7 +57,15 @@ pub(crate) struct FaceRequest {
 }
 
 /// A source of substitute face programs, keyed by [`FaceRequest`].
-pub(crate) trait SubstituteProvider {
+///
+/// Providers must be shareable across threads. A provider is held by the
+/// executor for the whole of a page render and consulted whenever a
+/// non-embedded font needs a face, so it travels inside the render future and
+/// has to survive being handed to a thread pool. Stating the requirement as a
+/// supertrait is what keeps it a single-point contract: `&dyn
+/// SubstituteProvider` and `Box<dyn SubstituteProvider>` then carry it
+/// implicitly, and no parameter or field has to spell it out.
+pub(crate) trait SubstituteProvider: Send + Sync {
     /// Returns the face's raw font program bytes, or `None` if this provider
     /// has no face for `req` (a missing directory or file, say).
     fn face(&self, req: &FaceRequest) -> Option<Vec<u8>>;
@@ -214,6 +222,19 @@ mod tests {
     use pdfboss_testkit::PdfBuilder;
 
     use super::*;
+
+    /// A provider is consulted from inside the render future, so the trait
+    /// object it is reached through has to be shareable across threads. Both
+    /// implementors satisfy this already; asserting it on the `dyn` form is
+    /// what turns that coincidence into a contract a future implementor
+    /// cannot quietly break.
+    #[test]
+    fn providers_are_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync + ?Sized>() {}
+        assert_send_sync::<dyn SubstituteProvider>();
+        assert_send_sync::<Box<dyn SubstituteProvider>>();
+        assert_send_sync::<DirProvider>();
+    }
 
     /// Builds a minimal one-page PDF with a simple font (object 5, the given
     /// `/BaseFont`) whose `FontDescriptor` (object 6) carries `flags`, and
