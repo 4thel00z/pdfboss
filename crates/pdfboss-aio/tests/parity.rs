@@ -348,3 +348,44 @@ async fn shared_algorithms_run_over_the_async_document() {
         );
     }
 }
+
+/// An RC4-encrypted document (Standard handler, empty user password) opens
+/// asynchronously and decrypts identically to the synchronous document:
+/// strings, stream data, and extracted text.
+#[tokio::test]
+async fn encrypted_documents_decrypt_identically() {
+    let bytes = pdfboss_testkit::encrypted_rc4_doc("Top secret message");
+    let sync_doc = Document::load(bytes.clone()).expect("sync opens the file");
+    let async_doc = AsyncDocument::from_bytes(bytes)
+        .await
+        .expect("async opens the file");
+
+    // The encrypted /Msg string decrypts to the plaintext on both sides.
+    let msg_ref = ObjRef { num: 6, gen: 0 };
+    let sync_msg = sync_doc.get(msg_ref).expect("sync object");
+    let async_msg = async_doc.get_object(msg_ref).await.expect("async object");
+    assert_eq!(sync_msg, async_msg, "decrypted dictionaries agree");
+    assert_eq!(
+        async_msg
+            .as_dict()
+            .unwrap()
+            .get("Msg")
+            .unwrap()
+            .as_str_bytes(),
+        Some(b"Top secret message".as_slice()),
+        "the string decrypts to its plaintext"
+    );
+
+    // The encrypted content stream decrypts, so text extraction agrees.
+    let sync_page = sync_doc.page(0).expect("sync page");
+    let async_page = async_doc.page(0).expect("async page");
+    let sync_text = pdfboss_text::extract_text(&sync_doc, &sync_page).expect("sync text");
+    let async_text = pdfboss_text::extract_text_with(async_doc.clone(), &async_page)
+        .await
+        .expect("async text");
+    assert_eq!(sync_text, "Top secret message");
+    assert_eq!(
+        sync_text, async_text,
+        "extraction agrees on encrypted files"
+    );
+}

@@ -5,6 +5,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+mod crypt;
+pub use crypt::encrypted_rc4_doc;
+
 /// A lightweight reference to an object added to a [`PdfBuilder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjRefLite {
@@ -219,7 +222,7 @@ fn page_body(parent: u32, contents: u32, font: u32) -> String {
 }
 
 /// Content-stream operators that show `text` at (72, 720) in 12pt `/F1`.
-fn show_text_content(text: &str) -> String {
+pub(crate) fn show_text_content(text: &str) -> String {
     format!("BT /F1 12 Tf 72 720 Td ({}) Tj ET", escape_text(text))
 }
 

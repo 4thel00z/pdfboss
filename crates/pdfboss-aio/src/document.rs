@@ -610,16 +610,22 @@ pub(crate) struct DocumentInner {
     /// The flattened page tree, set exactly once at the end of the open
     /// flow (fetching only catalog and tree nodes).
     pub(crate) pages: std::sync::OnceLock<Vec<PageRecord>>,
+    /// Present when the file uses the Standard security handler and opens
+    /// under the empty user password; decrypts strings and stream data as
+    /// objects are parsed from the file, exactly as the synchronous
+    /// document does. Set exactly once during the open flow, before any
+    /// content object is fetched.
+    pub(crate) decryptor: std::sync::OnceLock<pdfboss_core::Decryptor>,
 }
 
 impl AsyncDocument {
     /// Opens a file through a [`FileBackend`] wrapped in a
     /// [`CachedBackend`] with default capacity.
     ///
-    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
-    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
-    /// `Document` transparently decrypts files opened under the empty user
-    /// password, but async decryption parity is a tracked follow-up.
+    /// Files encrypted with the Standard security handler under the empty
+    /// user password are decrypted transparently, exactly as the
+    /// synchronous document decrypts them; a file that requires a real
+    /// password is rejected with [`pdfboss_core::Error::Encrypted`].
     pub async fn open(path: impl AsRef<Path>) -> Result<AsyncDocument> {
         let backend = FileBackend::open(path).await.map_err(Error::from)?;
         AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend))).await
@@ -627,20 +633,18 @@ impl AsyncDocument {
 
     /// Opens an in-memory document through an uncached [`MemBackend`].
     ///
-    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
-    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
-    /// `Document` transparently decrypts files opened under the empty user
-    /// password, but async decryption parity is a tracked follow-up.
+    /// Decrypts empty-password Standard-handler files transparently, like
+    /// [`AsyncDocument::open`]; a required password is rejected with
+    /// [`pdfboss_core::Error::Encrypted`].
     pub async fn from_bytes(bytes: impl Into<Bytes>) -> Result<AsyncDocument> {
         AsyncDocument::from_arc(Arc::new(MemBackend::from(bytes.into()))).await
     }
 
     /// Opens a document over any backend, as-is (no cache is added).
     ///
-    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
-    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
-    /// `Document` transparently decrypts files opened under the empty user
-    /// password, but async decryption parity is a tracked follow-up.
+    /// Decrypts empty-password Standard-handler files transparently, like
+    /// [`AsyncDocument::open`]; a required password is rejected with
+    /// [`pdfboss_core::Error::Encrypted`].
     pub async fn with_backend(backend: impl Backend) -> Result<AsyncDocument> {
         AsyncDocument::from_arc(Arc::new(backend)).await
     }
@@ -648,10 +652,9 @@ impl AsyncDocument {
     /// Opens a remote document over HTTP range requests, wrapped in a
     /// [`CachedBackend`] with default capacity.
     ///
-    /// Encrypted documents (a non-null `/Encrypt` trailer entry) are
-    /// rejected with [`pdfboss_core::Error::Encrypted`]: core's sync
-    /// `Document` transparently decrypts files opened under the empty user
-    /// password, but async decryption parity is a tracked follow-up.
+    /// Decrypts empty-password Standard-handler files transparently, like
+    /// [`AsyncDocument::open`]; a required password is rejected with
+    /// [`pdfboss_core::Error::Encrypted`].
     #[cfg(feature = "http")]
     pub async fn open_url(url: impl reqwest::IntoUrl) -> Result<AsyncDocument> {
         let backend = crate::backend::HttpBackend::new(url).await?;
@@ -670,14 +673,7 @@ impl AsyncDocument {
         let header_span = header_span_in(&head);
         let (startxref, eof_span) = find_tail(&fetcher).await?;
         let (xref, sections) = load_xref_chain(&fetcher, startxref.offset).await?;
-        // A non-null /Encrypt trailer entry means every object in the file
-        // is still encrypted; mirrors the check shape in core's
-        // `Document::load`, but async decryption is not implemented (see
-        // the constructors' doc comments), so the document is rejected
-        // outright rather than opened with garbage reads.
-        if xref.trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
-            return Err(Error::Core(pdfboss_core::Error::Encrypted));
-        }
+        let encrypted = xref.trailer.get("Encrypt").is_some_and(|o| !o.is_null());
         let inner = DocumentInner {
             backend,
             file_len,
@@ -690,16 +686,71 @@ impl AsyncDocument {
             objects: std::sync::Mutex::new(HashMap::new()),
             objstms: tokio::sync::Mutex::new(HashMap::new()),
             pages: std::sync::OnceLock::new(),
+            decryptor: std::sync::OnceLock::new(),
         };
         let doc = AsyncDocument {
             inner: Arc::new(inner),
         };
+        if encrypted {
+            doc.setup_decryption().await?;
+        }
         let pages = doc.flatten_pages().await;
         doc.inner
             .pages
             .set(pages)
             .expect("page index is set exactly once at open");
         Ok(doc)
+    }
+
+    /// Configures decryption for an encrypted file, mirroring the
+    /// synchronous document: the Standard handler with RC4 (`/V` 1-2),
+    /// AESV2 (`/V` 4) and AESV3 (`/V` 5) under the empty user password; a
+    /// required password is reported as
+    /// [`pdfboss_core::Error::Encrypted`]. Runs before any content object
+    /// is fetched, and reads `/Encrypt` and `/ID` while decryption is still
+    /// off — both are stored unencrypted.
+    async fn setup_decryption(&self) -> Result<()> {
+        let enc_obj = self
+            .inner
+            .xref
+            .trailer
+            .get("Encrypt")
+            .cloned()
+            .unwrap_or(Object::Null);
+        let enc = self.resolve(&enc_obj).await?;
+        let enc_dict = enc
+            .as_dict()
+            .ok_or(Error::Core(pdfboss_core::Error::Encrypted))?;
+        let id0: Vec<u8> = self
+            .inner
+            .xref
+            .trailer
+            .get("ID")
+            .and_then(Object::as_array)
+            .and_then(<[Object]>::first)
+            .and_then(Object::as_str_bytes)
+            .unwrap_or(&[])
+            .to_vec();
+        match pdfboss_core::Decryptor::from_standard(enc_dict, &id0) {
+            Some(dec) => {
+                self.inner
+                    .decryptor
+                    .set(dec)
+                    .map_err(|_| Error::Core(pdfboss_core::Error::Encrypted))?;
+                // Objects fetched while resolving /Encrypt were cached
+                // without decryption; drop them so they are re-read through
+                // the decrypting path if referenced again. The container
+                // cache too, for the same reason.
+                self.inner
+                    .objects
+                    .lock()
+                    .expect("object cache mutex")
+                    .clear();
+                self.inner.objstms.lock().await.clear();
+                Ok(())
+            }
+            None => Err(Error::Core(pdfboss_core::Error::Encrypted)),
+        }
     }
 
     /// The PDF version from the header, e.g. `(1, 7)`.
@@ -1010,7 +1061,7 @@ impl AsyncDocument {
             let probe = LengthProbe::new(known_length);
             let mut parser = Parser::at(&buf, 0);
             match parser.parse_indirect(&probe) {
-                Ok((_, object)) => {
+                Ok((parsed_ref, mut object)) => {
                     let end = parser.pos();
                     if end + PARSE_SLACK <= buf.len() || at_eof {
                         if let Some(missing) = probe.missing() {
@@ -1026,6 +1077,15 @@ impl AsyncDocument {
                             // stands, exactly as in the sync parser.
                         }
                         if at_eof || !stream_dishonors_length(&object, known_length) {
+                            // Objects stored directly in the file carry
+                            // encrypted strings and stream data; decrypt with
+                            // the object's OWN header numbers, exactly as the
+                            // synchronous parse does. (Objects living in
+                            // object streams are decrypted with their
+                            // container, which passes through here.)
+                            if let Some(dec) = self.inner.decryptor.get() {
+                                dec.decrypt_object(&mut object, parsed_ref.num, parsed_ref.gen);
+                            }
                             return Ok((
                                 Span {
                                     start: offset,
@@ -2387,11 +2447,9 @@ mod tests {
 
     #[tokio::test]
     async fn encrypted_documents_are_rejected_at_open() {
-        // A non-null /Encrypt trailer entry must reject the document before
-        // any object is read through it — otherwise every read would return
-        // still-encrypted garbage. The referenced object (9) is a
-        // plausible-but-dummy Standard-handler dict; its contents are never
-        // inspected because the check runs on the raw trailer entry itself.
+        // The dummy /U entry cannot verify under the empty user password, so
+        // this stands in for a genuinely password-protected file: the open
+        // must decline rather than decrypt with a wrong key.
         let mut b = pdfboss_testkit::PdfBuilder::new().trailer_extra("/Encrypt 9 0 R");
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
