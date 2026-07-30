@@ -6,7 +6,7 @@ mod extract;
 mod font;
 mod sfnt;
 
-use pdfboss_core::{block_on, Document, Immediate, Page, Result};
+use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Result};
 
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,14 +27,41 @@ pub struct TextSpan {
 /// into lines, lines ordered top to bottom and joined with `\n`, spaces
 /// inserted at horizontal gaps.
 pub fn extract_text(doc: &Document, page: &Page) -> Result<String> {
-    let spans = block_on(extract::page_spans_with(Immediate(doc), page))?;
+    block_on(extract_text_with(Immediate(doc), page))
+}
+
+/// [`extract_text`] against any object source, awaiting whatever I/O the
+/// source needs to read the page.
+///
+/// This is the implementation; [`extract_text`] is this function over
+/// [`Immediate`], driven to completion on the calling thread. The two cannot
+/// disagree about what a document says, because there is only one of them.
+///
+/// The source is taken by value and the page by reference. That combination is
+/// what a consumer needs to spawn the result: the future is `Send` over a source
+/// that is `Send + Sync`, and `'static` as long as the borrow of `page` is
+/// created inside the consumer's own `async move` block, which owns the page.
+/// See `pdfboss_core::source`'s "Signing a shared algorithm".
+pub async fn extract_text_with<S: AsyncObjectSource>(src: S, page: &Page) -> Result<String> {
+    let spans = extract::page_spans_with(src, page).await?;
     Ok(extract::layout(&spans))
 }
 
 /// Extracts the page's raw text spans (position, size and font per span),
 /// before any layout pass.
 pub fn extract_spans(doc: &Document, page: &Page) -> Result<Vec<TextSpan>> {
-    Ok(block_on(extract::page_spans_with(Immediate(doc), page))?
+    block_on(extract_spans_with(Immediate(doc), page))
+}
+
+/// [`extract_spans`] against any object source, awaiting whatever I/O the
+/// source needs to read the page. Signed like [`extract_text_with`], for the
+/// same reasons.
+pub async fn extract_spans_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+) -> Result<Vec<TextSpan>> {
+    Ok(extract::page_spans_with(src, page)
+        .await?
         .into_iter()
         .map(|s| TextSpan {
             text: s.text,
@@ -49,7 +76,9 @@ pub fn extract_spans(doc: &Document, page: &Page) -> Result<Vec<TextSpan>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pdfboss_core::{resolve_with, BoxFuture, ObjRef, Object, Stream};
     use pdfboss_testkit::{multi_page_doc, simple_doc, PdfBuilder};
+    use std::future::Future;
 
     fn page_text(doc: &Document, index: usize) -> String {
         let page = doc.page(index).unwrap();
@@ -256,6 +285,84 @@ mod tests {
         assert_eq!(spans[0].text, "top");
         assert_eq!(spans[1].text, "bottom");
         assert!(spans.iter().all(|s| s.size > 0.0 && s.x >= 0.0));
+    }
+
+    /// An asynchronous source that answers everything with `null`.
+    ///
+    /// The heap field is load-bearing rather than decorative. rustc const-promotes
+    /// a reference to a unit struct to `&'static`, so a unit stub would satisfy
+    /// the `'static` assertion below even under a signature that assertion exists
+    /// to reject — a test that cannot fail. A `Vec` cannot be promoted.
+    ///
+    /// It is also deliberately `Send + Sync`. The helpers inside the shared
+    /// implementation borrow the source across their awaits, so the owning future
+    /// is `Send` only when the source is `Sync`; every genuinely asynchronous
+    /// source already is, because `resolve_with` requires it.
+    struct NullSource {
+        payload: Vec<u8>,
+    }
+
+    impl AsyncObjectSource for NullSource {
+        fn get(&self, _r: ObjRef) -> BoxFuture<'_, Result<Object>> {
+            Box::pin(std::future::ready(Ok(Object::Null)))
+        }
+
+        fn stream_data<'a>(&'a self, _s: &'a Stream) -> BoxFuture<'a, Result<Vec<u8>>> {
+            Box::pin(std::future::ready(Ok(self.payload.clone())))
+        }
+
+        fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>> {
+            Box::pin(resolve_with(self, o))
+        }
+    }
+
+    /// Both asynchronous entry points must produce futures a runtime's `spawn`
+    /// and the Python bindings will accept, which means `Send + 'static`.
+    ///
+    /// The `async move` block is the shape a consumer actually writes: it owns
+    /// the source and the page, and the borrow of the page that
+    /// `extract_text_with` takes is created inside it. That is what makes the
+    /// future `'static` despite the `&Page` parameter — and asserting it here also
+    /// pins `Page: Send + Sync`, since the block holds one across its awaits.
+    ///
+    /// Every other test in this crate now drives this same implementation through
+    /// `block_on`, so behaviour is covered by the exact-string assertions above.
+    /// What none of them can see is this type, which is the entire point of the
+    /// exercise. The document is dropped first to show the page stands alone.
+    #[test]
+    fn the_async_entry_points_yield_spawnable_futures() {
+        fn assert_send_static<F: Future + Send + 'static>(_: &F) {}
+
+        let doc = Document::load(simple_doc("Hello")).unwrap();
+        let text_page = doc.page(0).unwrap();
+        let spans_page = doc.page(0).unwrap();
+        drop(doc);
+
+        let text = async move {
+            extract_text_with(
+                NullSource {
+                    payload: Vec::new(),
+                },
+                &text_page,
+            )
+            .await
+        };
+        let spans = async move {
+            extract_spans_with(
+                NullSource {
+                    payload: Vec::new(),
+                },
+                &spans_page,
+            )
+            .await
+        };
+        assert_send_static(&text);
+        assert_send_static(&spans);
+
+        // A source that resolves everything to null yields a page with no
+        // contents, so driving these only proves the wiring is reachable.
+        assert_eq!(block_on(text).unwrap(), "");
+        assert!(block_on(spans).unwrap().is_empty());
     }
 
     #[test]
