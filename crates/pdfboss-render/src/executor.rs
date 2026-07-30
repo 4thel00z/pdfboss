@@ -11,7 +11,7 @@
 //! account for.
 
 use pdfboss_core::FastMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
 use pdfboss_core::filters::decode_stream;
@@ -109,11 +109,11 @@ struct GState {
     fill_alpha: f32,
     /// Constant stroke alpha (`CA`).
     stroke_alpha: f32,
-    /// Active clip as a device-space coverage mask. Shared behind an `Rc` so
+    /// Active clip as a device-space coverage mask. Shared behind an `Arc` so
     /// that saving state (`q`) and entering a form clone the graphics state
     /// without copying the full-page mask buffer; a new clip always builds a
     /// fresh `Mask`, so this is effectively clone-on-write.
-    clip: Option<Rc<Mask>>,
+    clip: Option<Arc<Mask>>,
 }
 
 impl GState {
@@ -164,11 +164,11 @@ struct TextState {
     /// Text matrix and line matrix.
     tm: Matrix,
     tlm: Matrix,
-    font: Option<Rc<GlyphFont>>,
+    font: Option<Arc<GlyphFont>>,
     /// A `/Type3` font whose glyphs paint by re-entering the executor per
     /// CharProc (ISO 32000-1 §9.6.5). Invariant: at most one of `font`
     /// (outline) / `type3` is `Some`.
-    type3: Option<Rc<Type3Font>>,
+    type3: Option<Arc<Type3Font>>,
     size: f32,
     char_spacing: f32,
     word_spacing: f32,
@@ -398,7 +398,7 @@ struct Executor<'a> {
     /// page render (including nested forms — a repeated clip means the same
     /// device-space geometry regardless of which resource scope drew it).
     /// See [`MAX_CLIP_CACHE`].
-    clip_cache: FastMap<ClipKey, Rc<Mask>>,
+    clip_cache: FastMap<ClipKey, Arc<Mask>>,
     /// Content this render dropped rather than painted, accumulated across
     /// the page (forms and Type3 CharProcs included, since they run through
     /// the same [`Executor`]).
@@ -414,7 +414,7 @@ impl Executor<'_> {
         let mut path: Option<PathBuilder> = None;
         let mut pending_clip: Option<FillRule> = None;
         let mut ts = TextState::default();
-        let mut fonts: FastMap<String, Option<Rc<GlyphFont>>> = FastMap::default();
+        let mut fonts: FastMap<String, Option<Arc<GlyphFont>>> = FastMap::default();
         for op in ops {
             match op {
                 Op::Save => {
@@ -701,7 +701,7 @@ impl Executor<'_> {
         if let Some(rule) = pending.take() {
             let rasterized = self.rasterize_clip(&polys, rule);
             gs.clip = Some(match &gs.clip {
-                Some(old) => Rc::new(Mask::intersected(&rasterized, old)),
+                Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
                 None => rasterized,
             });
         }
@@ -714,19 +714,19 @@ impl Executor<'_> {
     /// the scanline rasterizer over the same geometry every time is pure
     /// waste). The returned mask is pre-intersection — the caller still
     /// applies any enclosing clip on top.
-    fn rasterize_clip(&mut self, polys: &[Subpath], rule: FillRule) -> Rc<Mask> {
+    fn rasterize_clip(&mut self, polys: &[Subpath], rule: FillRule) -> Arc<Mask> {
         let key = ClipKey::new(polys, rule);
         if let Some(cached) = self.clip_cache.get(&key) {
-            return Rc::clone(cached);
+            return Arc::clone(cached);
         }
-        let mask = Rc::new(Mask::from_path(
+        let mask = Arc::new(Mask::from_path(
             self.pix.width,
             self.pix.height,
             polys,
             rule,
         ));
         if self.clip_cache.len() < MAX_CLIP_CACHE {
-            self.clip_cache.insert(key, Rc::clone(&mask));
+            self.clip_cache.insert(key, Arc::clone(&mask));
         }
         mask
     }
@@ -737,8 +737,8 @@ impl Executor<'_> {
         &self,
         name: &str,
         chain: &[&Dict],
-        cache: &mut FastMap<String, Option<Rc<GlyphFont>>>,
-    ) -> Option<Rc<GlyphFont>> {
+        cache: &mut FastMap<String, Option<Arc<GlyphFont>>>,
+    ) -> Option<Arc<GlyphFont>> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
@@ -746,7 +746,7 @@ impl Executor<'_> {
             .find_res(chain, "Font", name)
             .and_then(|o| o.as_dict().cloned())
             .and_then(|d| {
-                GlyphFont::load(self.doc, &d, self.painting, self.provider.as_deref()).map(Rc::new)
+                GlyphFont::load(self.doc, &d, self.painting, self.provider.as_deref()).map(Arc::new)
             });
         cache.insert(name.to_string(), loaded.clone());
         loaded
@@ -755,7 +755,7 @@ impl Executor<'_> {
     /// Resolves a `/Type3` font resource for painting, or `None` when the tier
     /// forbids embedded programs, the name is missing, or the resource is not a
     /// `/Type3` dict. Called only after the outline loader declined the name.
-    fn type3_font(&self, name: &str, chain: &[&Dict]) -> Option<Rc<Type3Font>> {
+    fn type3_font(&self, name: &str, chain: &[&Dict]) -> Option<Arc<Type3Font>> {
         if !self.painting.paints_all_embedded() {
             return None;
         }
@@ -765,7 +765,7 @@ impl Executor<'_> {
         if dict.get_name("Subtype").map(|n| n.0.as_str()) != Some("Type3") {
             return None;
         }
-        Type3Font::load(self.doc, &dict).map(Rc::new)
+        Type3Font::load(self.doc, &dict).map(Arc::new)
     }
 
     /// Paints a cached, origin-relative flattened glyph outline at device
@@ -1308,7 +1308,7 @@ impl Executor<'_> {
             pb.rect(x0, y0, x1 - x0, y1 - y0);
             let rasterized = self.rasterize_clip(&pb.finish(), FillRule::NonZero);
             inner.clip = Some(match &inner.clip {
-                Some(old) => Rc::new(Mask::intersected(&rasterized, old)),
+                Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
                 None => rasterized,
             });
         }
@@ -2337,6 +2337,30 @@ mod tests {
             ..Default::default()
         };
         render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
+    }
+
+    /// Every handle the renderer shares has to be shareable across threads: the
+    /// asynchronous render path hands its future to a runtime free to move it
+    /// between them, and `Arc<T>` is `Send` only when `T` is `Send + Sync`. All
+    /// three of these are plain data, so the handle type was the only thing in the
+    /// way.
+    ///
+    /// `Executor` is deliberately absent. It holds `&Document`, which is `!Sync`
+    /// through its `Rc` object cache, and stays absent until the executor becomes
+    /// generic over an object source.
+    #[test]
+    fn every_shared_render_handle_is_shareable_across_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Mask>();
+        assert_send_sync::<Type3Font>();
+        assert_send_sync::<GlyphFont>();
+        assert_send_sync::<Arc<Mask>>();
+        assert_send_sync::<Arc<Type3Font>>();
+        assert_send_sync::<Arc<GlyphFont>>();
+        // The two states that carry those handles through the operator loop, and
+        // so through a form or CharProc frame.
+        assert_send_sync::<GState>();
+        assert_send_sync::<TextState>();
     }
 
     /// True iff the pixel at `(x, y)` is dark on all three channels.

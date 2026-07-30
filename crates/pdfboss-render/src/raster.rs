@@ -145,7 +145,7 @@ impl Mask {
     }
 
     /// Like [`Mask::intersect`], but takes both masks by reference and
-    /// returns a fresh one — lets a caller holding `a` behind an `Rc` (e.g. a
+    /// returns a fresh one — lets a caller holding `a` behind an `Arc` (e.g. a
     /// cached rasterization) compute the overlap without first cloning `a`'s
     /// full buffer just to shrink it back down.
     pub(crate) fn intersected(a: &Mask, b: &Mask) -> Mask {
