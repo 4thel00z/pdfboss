@@ -4,7 +4,7 @@
 
 use crate::cmap::ToUnicode;
 use crate::sfnt;
-use pdfboss_core::{Dict, Document, Object};
+use pdfboss_core::{AsyncObjectSource, Dict, Object};
 use pdfboss_encoding as encodings;
 use std::collections::HashMap;
 
@@ -33,9 +33,14 @@ pub struct Font {
 }
 
 /// Resolves `dict[key]`, treating resolution failures and `null` as absent.
-fn rv(doc: &Document, dict: &Dict, key: &str) -> Option<Object> {
+///
+/// Every function in this module borrows its source rather than owning it: they
+/// are helpers reached from an entry point that already owns one, and the
+/// `'static` question is settled at that boundary. See
+/// `pdfboss_core::source`'s "Signing a shared algorithm".
+async fn rv<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Object> {
     let obj = dict.get(key)?;
-    let resolved = doc.resolve(obj).ok()?;
+    let resolved = src.resolve(obj).await.ok()?;
     (!resolved.is_null()).then_some(resolved)
 }
 
@@ -56,19 +61,27 @@ impl Font {
 
     /// Loads a font from its (resolved) font dictionary. Lenient: anything
     /// missing or malformed degrades to defaults rather than failing.
-    pub fn load(doc: &Document, dict: &Dict) -> Font {
-        let is_type0 = rv(doc, dict, "Subtype")
-            .and_then(|o| o.as_name().map(|n| n.0.clone()))
-            .is_some_and(|n| n == "Type0");
-        let to_unicode = rv(doc, dict, "ToUnicode")
-            .and_then(|o| o.as_stream().and_then(|s| doc.stream_data(s).ok()))
-            .map(|data| ToUnicode::parse(&data))
-            .filter(|c| !c.is_empty());
+    pub async fn load<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Font {
+        let subtype = rv(src, dict, "Subtype").await;
+        let is_type0 = subtype
+            .as_ref()
+            .and_then(|o| o.as_name())
+            .is_some_and(|n| n.0 == "Type0");
+        let to_unicode = Font::load_to_unicode(src, dict).await;
         if is_type0 {
-            Font::load_type0(doc, dict, to_unicode)
+            Font::load_type0(src, dict, to_unicode).await
         } else {
-            Font::load_simple(doc, dict, to_unicode)
+            Font::load_simple(src, dict, to_unicode).await
         }
+    }
+
+    /// Reads and parses `/ToUnicode`, treating an empty CMap as absent so that
+    /// the lower-priority mappings still get their chance.
+    async fn load_to_unicode<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<ToUnicode> {
+        let obj = rv(src, dict, "ToUnicode").await?;
+        let data = src.stream_data(obj.as_stream()?).await.ok()?;
+        let cmap = ToUnicode::parse(&data);
+        (!cmap.is_empty()).then_some(cmap)
     }
 
     /// Splits a show-string into character codes (1 or 2 bytes each).
@@ -181,7 +194,7 @@ impl Font {
     /// The name is matched on its family part: a subset prefix (six capitals
     /// and a plus sign, ISO 32000-1 9.6.4) and any `,Bold` style suffix are
     /// stripped first, so `JOGDGG+Wingdings` and `Symbol,Italic` both match.
-    fn is_picture_font(doc: &Document, dict: &Dict) -> bool {
+    async fn is_picture_font<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
         /// Families whose code points index a picture set. Anything absent
         /// from this list is treated as text, which is the safe direction:
         /// the worst case is a code that stays U+FFFD.
@@ -194,7 +207,9 @@ impl Font {
             "wingdings3",
             "webdings",
         ];
-        let Some(name) = rv(doc, dict, "BaseFont").and_then(|o| o.as_name().map(|n| n.0.clone()))
+        let Some(name) = rv(src, dict, "BaseFont")
+            .await
+            .and_then(|o| o.as_name().map(|n| n.0.clone()))
         else {
             return false;
         };
@@ -217,35 +232,43 @@ impl Font {
 
     /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
     /// plus `/Differences`, widths from `/FirstChar` + `/Widths`.
-    fn load_simple(doc: &Document, dict: &Dict, to_unicode: Option<ToUnicode>) -> Font {
-        let encoding = Font::load_encoding(doc, dict);
+    async fn load_simple<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+        to_unicode: Option<ToUnicode>,
+    ) -> Font {
+        let encoding = Font::load_encoding(src, dict).await;
 
         let mut widths = HashMap::new();
-        let first = rv(doc, dict, "FirstChar")
+        let first = rv(src, dict, "FirstChar")
+            .await
             .and_then(|o| o.as_int())
             .unwrap_or(0)
             .max(0) as u32;
-        if let Some(Object::Array(items)) = rv(doc, dict, "Widths") {
+        if let Some(Object::Array(items)) = rv(src, dict, "Widths").await {
             for (i, item) in items.iter().enumerate() {
                 let Some(code) = first.checked_add(i as u32) else {
                     break; // /FirstChar so large the codes overflow u32
                 };
-                if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+                if let Some(w) = src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
                     widths.insert(code, w as f32);
                 }
             }
         }
-        let default_width = rv(doc, dict, "FontDescriptor")
-            .and_then(|o| {
-                let fd = o.as_dict()?.clone();
-                rv(doc, &fd, "MissingWidth")?.as_f64()
-            })
-            .map(|w| w as f32)
-            .unwrap_or(500.0);
+        let descriptor = rv(src, dict, "FontDescriptor")
+            .await
+            .and_then(|o| o.as_dict().cloned());
+        let default_width = match &descriptor {
+            Some(fd) => rv(src, fd, "MissingWidth")
+                .await
+                .and_then(|o| o.as_f64())
+                .map_or(500.0, |w| w as f32),
+            None => 500.0,
+        };
 
         // Only a font that states no `/Encoding` has anything to gain here, and
         // only then is the embedded program worth inflating.
-        let winansi_high_codes = encoding.is_none() && Font::built_for_windows(doc, dict);
+        let winansi_high_codes = encoding.is_none() && Font::built_for_windows(src, dict).await;
 
         Font {
             simple: true,
@@ -279,20 +302,22 @@ impl Font {
     /// it does not. With no glyph names and no Unicode subtable, nothing inside
     /// either font says whether its glyphs are letters or pictures. The
     /// `/BaseFont` name is the only thing left that does.
-    fn built_for_windows(doc: &Document, dict: &Dict) -> bool {
-        if Font::is_picture_font(doc, dict) {
+    async fn built_for_windows<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
+        if Font::is_picture_font(src, dict).await {
             return false;
         }
-        let Some(descriptor) = rv(doc, dict, "FontDescriptor").and_then(|o| o.as_dict().cloned())
+        let Some(descriptor) = rv(src, dict, "FontDescriptor")
+            .await
+            .and_then(|o| o.as_dict().cloned())
         else {
             return false;
         };
         // `/FontFile` is a Type 1 program, which is not an sfnt and carries no
         // `cmap`; only the two sfnt-bearing entries are worth reading.
         for key in ["FontFile2", "FontFile3"] {
-            let Some(data) = rv(doc, &descriptor, key)
-                .and_then(|o| o.as_stream().and_then(|s| doc.stream_data(s).ok()))
-            else {
+            // Absent, not a stream, and undecodable all mean the same thing
+            // here: this entry says nothing, try the next one.
+            let Some(data) = Font::sfnt_program(src, &descriptor, key).await else {
                 continue;
             };
             let platforms = sfnt::cmap_platforms(&data);
@@ -303,16 +328,29 @@ impl Font {
         false
     }
 
+    /// Decoded bytes of `descriptor[key]` when it is a readable stream.
+    async fn sfnt_program<S: AsyncObjectSource>(
+        src: &S,
+        descriptor: &Dict,
+        key: &str,
+    ) -> Option<Vec<u8>> {
+        let obj = rv(src, descriptor, key).await?;
+        src.stream_data(obj.as_stream()?).await.ok()
+    }
+
     /// Builds the 256-entry Unicode table from `/Encoding`: a base table
     /// (named directly or via `/BaseEncoding`, default Standard) with
     /// `/Differences` glyph names applied on top.
-    fn load_encoding(doc: &Document, dict: &Dict) -> Option<Box<[Option<char>; 256]>> {
-        let enc = rv(doc, dict, "Encoding")?;
+    async fn load_encoding<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+    ) -> Option<Box<[Option<char>; 256]>> {
+        let enc = rv(src, dict, "Encoding").await?;
         let base_name = match &enc {
             Object::Name(n) => Some(n.0.clone()),
-            Object::Dict(d) => {
-                rv(doc, d, "BaseEncoding").and_then(|o| o.as_name().map(|n| n.0.clone()))
-            }
+            Object::Dict(d) => rv(src, d, "BaseEncoding")
+                .await
+                .and_then(|o| o.as_name().map(|n| n.0.clone())),
             _ => None,
         };
         let base: fn(u8) -> Option<char> = match base_name.as_deref() {
@@ -325,10 +363,10 @@ impl Font {
             *slot = base(code as u8);
         }
         if let Object::Dict(d) = &enc {
-            if let Some(Object::Array(diffs)) = rv(doc, d, "Differences") {
+            if let Some(Object::Array(diffs)) = rv(src, d, "Differences").await {
                 let mut code: u32 = 0;
                 for item in &diffs {
-                    match doc.resolve(item).ok() {
+                    match src.resolve(item).await.ok() {
                         Some(Object::Int(n)) => code = n.max(0) as u32,
                         Some(Object::Real(n)) => code = n.max(0.0) as u32,
                         Some(Object::Name(name)) => {
@@ -348,22 +386,21 @@ impl Font {
     /// Loads a Type0/CID font: 2-byte codes (Identity or `-H`/`-V` CMap
     /// names; any other encoding CMap is treated as 2-byte too), Unicode
     /// via `/ToUnicode` only, widths from the descendant's `/W` + `/DW`.
-    fn load_type0(doc: &Document, dict: &Dict, to_unicode: Option<ToUnicode>) -> Font {
-        let descendant = rv(doc, dict, "DescendantFonts")
-            .and_then(|o| {
-                let arr = o.as_array()?.to_vec();
-                doc.resolve(arr.first()?).ok()
-            })
-            .and_then(|o| o.as_dict().cloned());
+    async fn load_type0<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+        to_unicode: Option<ToUnicode>,
+    ) -> Font {
+        let descendant = Font::load_descendant(src, dict).await;
 
         let mut widths = HashMap::new();
         let mut default_width = 1000.0;
         if let Some(desc) = &descendant {
-            if let Some(dw) = rv(doc, desc, "DW").and_then(|o| o.as_f64()) {
+            if let Some(dw) = rv(src, desc, "DW").await.and_then(|o| o.as_f64()) {
                 default_width = dw as f32;
             }
-            if let Some(Object::Array(w)) = rv(doc, desc, "W") {
-                Font::parse_cid_widths(doc, &w, &mut widths);
+            if let Some(Object::Array(w)) = rv(src, desc, "W").await {
+                Font::parse_cid_widths(src, &w, &mut widths).await;
             }
         }
 
@@ -379,14 +416,26 @@ impl Font {
         }
     }
 
+    /// The first entry of `/DescendantFonts`, which is where a Type0 font keeps
+    /// its widths. ISO 32000-1 9.7.4 allows the array exactly one element.
+    async fn load_descendant<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<Dict> {
+        let obj = rv(src, dict, "DescendantFonts").await?;
+        let first = obj.as_array()?.first()?.clone();
+        src.resolve(&first).await.ok()?.as_dict().cloned()
+    }
+
     /// Parses a CID `/W` array: `c [w1 w2 …]` gives consecutive widths
     /// from CID `c`; `c1 c2 w` gives every CID in `c1..=c2` width `w`
     /// (ranges capped at 65536 entries).
-    fn parse_cid_widths(doc: &Document, items: &[Object], widths: &mut HashMap<u32, f32>) {
-        let resolved: Vec<Object> = items
-            .iter()
-            .map(|o| doc.resolve(o).unwrap_or(Object::Null))
-            .collect();
+    async fn parse_cid_widths<S: AsyncObjectSource>(
+        src: &S,
+        items: &[Object],
+        widths: &mut HashMap<u32, f32>,
+    ) {
+        let mut resolved: Vec<Object> = Vec::with_capacity(items.len());
+        for item in items {
+            resolved.push(src.resolve(item).await.unwrap_or(Object::Null));
+        }
         let mut i = 0;
         while i < resolved.len() {
             let Some(first) = resolved[i].as_int() else {
@@ -400,7 +449,7 @@ impl Font {
                         let Some(cid) = first.checked_add(j as u32) else {
                             break; // start CID so large the CIDs overflow u32
                         };
-                        if let Some(w) = doc.resolve(item).ok().and_then(|o| o.as_f64()) {
+                        if let Some(w) = src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
                             widths.insert(cid, w as f32);
                         }
                     }
@@ -426,7 +475,7 @@ impl Font {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfboss_core::ObjRef;
+    use pdfboss_core::{block_on, Document, Immediate, ObjRef};
     use pdfboss_testkit::PdfBuilder;
 
     /// Builds a document whose object 5 is `font_body`. `extra` adds stream
@@ -450,7 +499,10 @@ mod tests {
         }
         let doc = Document::load(b.build(1)).unwrap();
         let obj = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
-        Font::load(&doc, obj.as_dict().unwrap())
+        // Loading is the shared asynchronous implementation; a synchronous
+        // caller reaches it the same way the public entry points do. Every
+        // assertion below is unaffected by that.
+        block_on(Font::load(&Immediate(&doc), obj.as_dict().unwrap()))
     }
 
     #[test]

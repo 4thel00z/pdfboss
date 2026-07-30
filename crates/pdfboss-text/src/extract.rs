@@ -4,7 +4,7 @@
 
 use crate::font::Font;
 use pdfboss_core::content::{parse_content, Op, TextItem};
-use pdfboss_core::{Dict, Document, Matrix, Object, Page, Point, Result};
+use pdfboss_core::{block_on, Dict, Document, Immediate, Matrix, Object, Page, Point, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -126,9 +126,18 @@ impl Executor<'_> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
+        // Font loading is already the shared asynchronous implementation while
+        // this executor is still synchronous, so it is driven here. The
+        // `block_on` goes away when `run` becomes a work stack; until then it is
+        // free, because every future over `Immediate` completes on first poll.
         let loaded = self
             .find_res(chain, "Font", name)
-            .and_then(|resolved| Some(Arc::new(Font::load(self.doc, resolved.as_dict()?))))
+            .and_then(|resolved| {
+                Some(Arc::new(block_on(Font::load(
+                    &Immediate(self.doc),
+                    resolved.as_dict()?,
+                ))))
+            })
             .unwrap_or_else(|| self.fallback.clone());
         cache.insert(name.to_string(), loaded.clone());
         loaded
