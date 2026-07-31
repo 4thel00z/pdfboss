@@ -7,6 +7,7 @@
 //! carry them).
 
 use crate::error::{JpxError, Result};
+use crate::JpxWarning;
 
 /// What the leading bytes of the input identify (the container sniff).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -148,8 +149,8 @@ pub(crate) struct Container<'a> {
     /// or the whole input for raw codestreams.
     pub codestream: &'a [u8],
     /// Soft findings (skipped boxes, rreq presence, jpx compatibility
-    /// brand, trailing garbage).
-    pub warnings: Vec<String>,
+    /// brand, trailing garbage), classified per [`JpxWarning::data_loss`].
+    pub warnings: Vec<JpxWarning>,
 }
 
 /// Sniffs and, for JP2 files, walks the box structure (I.4: LBox/TBox with
@@ -342,9 +343,10 @@ fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
                 // like the identical truncated RAW codestream.
                 if codestream.is_none() {
                     if let Some(payload) = jp2c_payload_to_eof(data, offset) {
-                        warnings.push(
-                            "jp2c box length overruns the file; codestream truncated to EOF".into(),
-                        );
+                        // Truncation: the missing tail is missing pixels.
+                        warnings.push(JpxWarning::loss(
+                            "jp2c box length overruns the file; codestream truncated to EOF",
+                        ));
                         codestream = Some(payload);
                         break;
                     }
@@ -352,7 +354,9 @@ fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
                 // Everything needed to decode is in hand: a broken
                 // trailing box is a soft finding, not a hard error.
                 if header.is_some() && codestream.is_some() {
-                    warnings.push(format!("trailing garbage after the codestream: {err}"));
+                    warnings.push(JpxWarning::note(format!(
+                        "trailing garbage after the codestream: {err}"
+                    )));
                     break;
                 }
                 return Err(err);
@@ -364,26 +368,29 @@ fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
             }
             TYPE_JP2H => {
                 // I.5.3: one and only one JP2 Header box.
-                warnings.push("duplicate jp2h box skipped".into());
+                warnings.push(JpxWarning::note("duplicate jp2h box skipped"));
             }
             TYPE_JP2C if codestream.is_none() => {
                 if header.is_none() {
                     // I.5.4 forbids a codestream before the JP2 Header
                     // box; keep reading so the header can still be found.
-                    warnings.push("jp2c box appears before the jp2h box".into());
+                    warnings.push(JpxWarning::note("jp2c box appears before the jp2h box"));
                 }
                 codestream = Some(next.payload);
             }
             TYPE_JP2C => {
                 // I.5.4: readers shall ignore codestreams after the first.
-                warnings.push("extra jp2c box ignored".into());
+                warnings.push(JpxWarning::note("extra jp2c box ignored"));
             }
             TYPE_RREQ => {
-                warnings.push("reader-requirements (rreq) box skipped".into());
+                warnings.push(JpxWarning::note("reader-requirements (rreq) box skipped"));
             }
             other => {
                 // I.8: skip and ignore boxes not defined by the spec.
-                warnings.push(format!("unknown box '{}' skipped", type_name(other)));
+                warnings.push(JpxWarning::note(format!(
+                    "unknown box '{}' skipped",
+                    type_name(other)
+                )));
             }
         }
         offset = next.end;
@@ -401,7 +408,7 @@ fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
 /// readable; the JPX brands (or a JP2/JPX compatibility entry) are
 /// accepted read-only with a warning; anything else is not a file this
 /// reader may interpret.
-fn check_ftyp(payload: &[u8], warnings: &mut Vec<String>) -> Result<()> {
+fn check_ftyp(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<()> {
     if payload.len() < 8 {
         return Err(malformed(
             "ftyp box too short for its brand and minor version",
@@ -410,7 +417,7 @@ fn check_ftyp(payload: &[u8], warnings: &mut Vec<String>) -> Result<()> {
     let brand = [payload[0], payload[1], payload[2], payload[3]];
     // MinV shall be zero, but readers shall continue regardless (I.5.2).
     if be32(&payload[4..]) != 0 {
-        warnings.push("ftyp minor version is not zero".into());
+        warnings.push(JpxWarning::note("ftyp minor version is not zero"));
     }
     let mut chunks = payload[8..].chunks_exact(4);
     let mut compatible = false;
@@ -421,28 +428,28 @@ fn check_ftyp(payload: &[u8], warnings: &mut Vec<String>) -> Result<()> {
         jpx_compatible = jpx_compatible || code == BRAND_JPX || code == BRAND_JPXB;
     }
     if !chunks.remainder().is_empty() {
-        warnings.push(format!(
+        warnings.push(JpxWarning::note(format!(
             "ftyp compatibility list has {} trailing bytes",
             chunks.remainder().len()
-        ));
+        )));
     }
     if brand == BRAND_JP2 {
         return Ok(());
     }
     if brand == BRAND_JPX || brand == BRAND_JPXB {
-        warnings.push(format!(
+        warnings.push(JpxWarning::note(format!(
             "JPX brand '{}': reading the JP2-compatible subset",
             type_name(brand)
-        ));
+        )));
         return Ok(());
     }
     // I.5.2: with a foreign brand, a 'jp2\040' compatibility entry means a
     // JP2 reader can still interpret the file.
     if compatible || jpx_compatible {
-        warnings.push(format!(
+        warnings.push(JpxWarning::note(format!(
             "unknown brand '{}' with a JP2-compatible entry: reading as JP2",
             type_name(brand)
-        ));
+        )));
         return Ok(());
     }
     Err(malformed(format!(
@@ -453,7 +460,7 @@ fn check_ftyp(payload: &[u8], warnings: &mut Vec<String>) -> Result<()> {
 
 /// Walks the JP2 Header superbox (I.5.3): ihdr first, then bpcc, colr,
 /// pclr, cmap, cdef in any order; res and unknown boxes are skipped.
-fn parse_jp2h(payload: &[u8], warnings: &mut Vec<String>) -> Result<Jp2Header> {
+fn parse_jp2h(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<Jp2Header> {
     // I.5.3.1: the contents shall start with the Image Header box.
     let ihdr = read_box(payload, 0)?;
     if ihdr.kind != TYPE_IHDR {
@@ -496,21 +503,24 @@ fn parse_jp2h(payload: &[u8], warnings: &mut Vec<String>) -> Result<Jp2Header> {
             }
             TYPE_BPCC | TYPE_PCLR | TYPE_CMAP | TYPE_CDEF => {
                 // I.5.3.2/I.5.3.4/I.5.3.5/I.5.3.6: at most one of each.
-                warnings.push(format!("duplicate {} box skipped", type_name(next.kind)));
+                warnings.push(JpxWarning::note(format!(
+                    "duplicate {} box skipped",
+                    type_name(next.kind)
+                )));
             }
             TYPE_IHDR => {
                 // I.5.3.1: instances elsewhere shall be ignored.
-                warnings.push("extra ihdr box skipped".into());
+                warnings.push(JpxWarning::note("extra ihdr box skipped"));
             }
             TYPE_RES => {
                 // I.5.3.7: grid resolution only; nothing this decoder
                 // needs.
             }
             other => {
-                warnings.push(format!(
+                warnings.push(JpxWarning::note(format!(
                     "unknown box '{}' inside jp2h skipped",
                     type_name(other)
-                ));
+                )));
             }
         }
         offset = next.end;
@@ -522,7 +532,9 @@ fn parse_jp2h(payload: &[u8], warnings: &mut Vec<String>) -> Result<Jp2Header> {
     }
     // I.5.3.2: bpcc shall not be found when the depth is constant.
     if bit_depth != 255 && !component_depths.is_empty() {
-        warnings.push("bpcc box present although ihdr BPC is uniform".into());
+        warnings.push(JpxWarning::note(
+            "bpcc box present although ihdr BPC is uniform",
+        ));
         component_depths.clear();
     }
     let color = color.ok_or_else(|| malformed("jp2h has no usable colr box"))?;
@@ -548,7 +560,7 @@ fn parse_jp2h(payload: &[u8], warnings: &mut Vec<String>) -> Result<Jp2Header> {
         {
             return Err(malformed("cmap palette mapping without a pclr box"));
         }
-        warnings.push("cmap box present without a pclr box".into());
+        warnings.push(JpxWarning::note("cmap box present without a pclr box"));
     }
     Ok(Jp2Header {
         height,
@@ -565,7 +577,7 @@ fn parse_jp2h(payload: &[u8], warnings: &mut Vec<String>) -> Result<Jp2Header> {
 
 /// Image Header box payload (I.5.3.1, exactly 14 bytes): HEIGHT, WIDTH,
 /// NC, BPC, C, UnkC, IPR.
-fn parse_ihdr(payload: &[u8], warnings: &mut Vec<String>) -> Result<(u32, u32, u16, u8)> {
+fn parse_ihdr(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<(u32, u32, u16, u8)> {
     // I.5.3.1: the box length shall be 22 bytes -> 14 payload bytes.
     if payload.len() != 14 {
         return Err(malformed(format!(
@@ -596,10 +608,16 @@ fn parse_ihdr(payload: &[u8], warnings: &mut Vec<String>) -> Result<(u32, u32, u
     // UnkC and IPR (Table I.5): only 0 and 1 are defined; the decoder
     // needs neither, so odd values are soft findings.
     if payload[12] > 1 {
-        warnings.push(format!("ihdr UnkC = {} is reserved", payload[12]));
+        warnings.push(JpxWarning::note(format!(
+            "ihdr UnkC = {} is reserved",
+            payload[12]
+        )));
     }
     if payload[13] > 1 {
-        warnings.push(format!("ihdr IPR = {} is reserved", payload[13]));
+        warnings.push(JpxWarning::note(format!(
+            "ihdr IPR = {} is reserved",
+            payload[13]
+        )));
     }
     Ok((height, width, num_components, bit_depth))
 }
@@ -638,7 +656,7 @@ fn parse_bpcc(payload: &[u8], num_components: u16) -> Result<Vec<u8>> {
 /// Colour Specification box payload (I.5.3.3): METH, PREC, APPROX, then
 /// EnumCS (METH = 1) or an ICC profile (METH = 2). Reserved METH values
 /// make the whole box ignorable (Table I.9), reported as `None`.
-fn parse_colr(payload: &[u8], warnings: &mut Vec<String>) -> Result<Option<ColorSpec>> {
+fn parse_colr(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<Option<ColorSpec>> {
     if payload.len() < 3 {
         return Err(malformed("colr box shorter than METH/PREC/APPROX"));
     }
@@ -650,7 +668,9 @@ fn parse_colr(payload: &[u8], warnings: &mut Vec<String>) -> Result<Option<Color
             }
             if payload.len() > 7 {
                 // I.5.3.3: EnumCS shall be the last field in the box.
-                warnings.push("colr METH 1 has trailing bytes after EnumCS".into());
+                warnings.push(JpxWarning::note(
+                    "colr METH 1 has trailing bytes after EnumCS",
+                ));
             }
             Ok(Some(ColorSpec::Enumerated(be32(&payload[3..]))))
         }
@@ -659,7 +679,9 @@ fn parse_colr(payload: &[u8], warnings: &mut Vec<String>) -> Result<Option<Color
         })),
         other => {
             // Table I.9: reserved METH -> ignore the entire box.
-            warnings.push(format!("colr METH {other} is reserved; box ignored"));
+            warnings.push(JpxWarning::note(format!(
+                "colr METH {other} is reserved; box ignored"
+            )));
             Ok(None)
         }
     }
@@ -744,7 +766,7 @@ fn parse_pclr(payload: &[u8]) -> Result<Palette> {
 fn parse_cmap(
     payload: &[u8],
     num_components: u16,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<JpxWarning>,
 ) -> Result<Vec<ComponentMapping>> {
     if payload.is_empty() || !payload.len().is_multiple_of(4) {
         return Err(malformed(format!(
@@ -768,9 +790,9 @@ fn parse_cmap(
         }
         // I.5.3.5: PCOL shall be 0 for direct use.
         if mapping_type == 0 && palette_column != 0 {
-            warnings.push(format!(
+            warnings.push(JpxWarning::note(format!(
                 "cmap direct-use entry carries PCOL = {palette_column}"
-            ));
+            )));
         }
         entries.push(ComponentMapping {
             component,
@@ -1256,7 +1278,7 @@ mod tests {
                     container
                         .warnings
                         .iter()
-                        .any(|warning| warning.contains("truncated to EOF")),
+                        .any(|warning| warning.message.contains("truncated to EOF")),
                     "prefix of {len} bytes lacks the truncation note: {:?}",
                     container.warnings
                 );

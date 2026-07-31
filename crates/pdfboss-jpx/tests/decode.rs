@@ -686,6 +686,14 @@ fn run_case(name: &str) {
         expected_channels(&case.mode),
         "{name}: component count"
     );
+    // The pre-normalization source depth per channel: 16 for the I;16
+    // case, 8 everywhere else in the committed zoo.
+    let expected_depth = if case.mode == "I;16" { 16 } else { 8 };
+    assert_eq!(
+        image.component_depths,
+        vec![expected_depth; usize::from(image.components)],
+        "{name}: component depths"
+    );
     if case.irreversible {
         // 9-7 path: match the independent decode within +/-2 per sample
         // and PSNR >= 38 dB.
@@ -915,7 +923,7 @@ fn a_tile_with_no_tile_parts_warns_and_renders_as_background() {
         image
             .warnings
             .iter()
-            .any(|w| w.contains("1 tile(s) have no tile-parts")),
+            .any(|w| w.data_loss && w.message.contains("1 tile(s) have no tile-parts")),
         "missing the data-loss note: {:?}",
         image.warnings
     );
@@ -956,7 +964,7 @@ fn truncated_jp2_container_degrades_like_a_truncated_codestream() {
         image
             .warnings
             .iter()
-            .any(|w| w.contains("codestream truncated to EOF")),
+            .any(|w| w.data_loss && w.message.contains("codestream truncated to EOF")),
         "missing the truncation note: {:?}",
         image.warnings
     );
@@ -990,8 +998,11 @@ fn short_quantization_list_derives_instead_of_failing() {
     let image = decode(&spliced, &DecodeLimits::default())
         .unwrap_or_else(|e| panic!("short SPqcd must not hard-fail: {e}"));
     assert!(
-        image.warnings.iter().any(|w| w.contains("(E-5)")),
-        "expected the E-5 derivation note: {:?}",
+        image
+            .warnings
+            .iter()
+            .any(|w| !w.data_loss && w.message.contains("(E-5)")),
+        "expected the benign E-5 derivation note: {:?}",
         image.warnings
     );
 }
@@ -1104,6 +1115,11 @@ fn corrupt_first_packet_of_a_later_tile_zeroes_only_that_tile() {
         1,
         "one warning for the zeroed tile: {:?}",
         image.warnings
+    );
+    assert!(
+        image.warnings[0].data_loss,
+        "a zeroed tile is pixel loss: {:?}",
+        image.warnings[0]
     );
     let oracle = read_oracle(&fixture_dir().join(&case.source));
     // Tile 1 covers [128, 256) x [0, 128) per Equations (B-7)..(B-10).

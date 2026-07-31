@@ -9,6 +9,7 @@
 
 use crate::error::{JpxError, Result};
 use crate::DecodeLimits;
+use crate::JpxWarning;
 
 // Marker codes (Table A.2), in decimal: every marker is 0xFF00 (65280) plus
 // the low byte given in the table.
@@ -487,8 +488,9 @@ pub(crate) struct Codestream<'a> {
     /// Tile-parts in appearance order. Psot = 0 (final tile-part running
     /// to EOC) is resolved to a concrete body slice during the scan.
     pub tile_parts: Vec<TilePart<'a>>,
-    /// Soft findings: unknown markers skipped, a missing EOC, etc.
-    pub warnings: Vec<String>,
+    /// Soft findings: unknown markers skipped, a missing EOC, etc.,
+    /// classified per [`JpxWarning::data_loss`].
+    pub warnings: Vec<JpxWarning>,
 }
 
 /// Bounds-checked big-endian cursor over untrusted bytes. Every failed
@@ -609,13 +611,15 @@ fn component_index(r: &mut Reader<'_>, csiz: u16, what: &str) -> Result<u16> {
 
 /// Parses the SIZ payload (A.5.1, Table A.9). `limits` bounds the
 /// component count before the component list is allocated.
-fn parse_siz(payload: &[u8], limits: &DecodeLimits, warnings: &mut Vec<String>) -> Result<Siz> {
+fn parse_siz(payload: &[u8], limits: &DecodeLimits, warnings: &mut Vec<JpxWarning>) -> Result<Siz> {
     let mut r = Reader::new(payload);
     let rsiz = r.u16("SIZ")?;
     if rsiz > 2 {
         // Table A.10 defines 0..=2; anything else is a capability this
         // decoder does not know, kept as a soft finding.
-        warnings.push(format!("SIZ: reserved Rsiz capability {rsiz} (Table A.10)"));
+        warnings.push(JpxWarning::note(format!(
+            "SIZ: reserved Rsiz capability {rsiz} (Table A.10)"
+        )));
     }
     let xsiz = r.u32("SIZ")?;
     let ysiz = r.u32("SIZ")?;
@@ -887,7 +891,7 @@ fn parse_qcc(payload: &[u8], csiz: u16) -> Result<Qcc> {
 
 /// Parses an RGN payload (A.6.3, Figure A.12). Reserved ROI styles
 /// (Table A.25 defines only 0, maxshift) are skipped with a warning.
-fn parse_rgn(payload: &[u8], csiz: u16, warnings: &mut Vec<String>) -> Result<Option<Rgn>> {
+fn parse_rgn(payload: &[u8], csiz: u16, warnings: &mut Vec<JpxWarning>) -> Result<Option<Rgn>> {
     let mut r = Reader::new(payload);
     let component = component_index(&mut r, csiz, "RGN")?;
     let srgn = r.u8("RGN")?;
@@ -899,9 +903,11 @@ fn parse_rgn(payload: &[u8], csiz: u16, warnings: &mut Vec<String>) -> Result<Op
         )));
     }
     if srgn != 0 {
-        warnings.push(format!(
+        // An ROI scaling of unknown semantics stays applied to the
+        // coefficients: the affected pixels cannot be trusted.
+        warnings.push(JpxWarning::loss(format!(
             "RGN: reserved ROI style {srgn} skipped (Table A.25)"
-        ));
+        )));
         return Ok(None);
     }
     Ok(Some(Rgn { component, shift }))
@@ -1025,19 +1031,19 @@ fn record_override<T>(
     csiz: u16,
     kind: &str,
     context: &str,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<JpxWarning>,
 ) {
     let component = key(&parsed);
     if component >= csiz {
-        warnings.push(format!(
+        warnings.push(JpxWarning::note(format!(
             "{context}: {kind} for component {component} beyond Csiz = {csiz} dropped"
-        ));
+        )));
         return;
     }
     if let Some(existing) = list.iter_mut().find(|entry| key(entry) == component) {
-        warnings.push(format!(
+        warnings.push(JpxWarning::note(format!(
             "{context}: duplicate {kind} for component {component}; the last wins"
-        ));
+        )));
         *existing = parsed;
     } else {
         list.push(parsed);
@@ -1051,17 +1057,17 @@ fn scan_tile_part_header(
     r: &mut Reader<'_>,
     csiz: u16,
     sot: Sot,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<JpxWarning>,
 ) -> Result<TileOverrides> {
     let mut overrides = TileOverrides::default();
     let context = format!("tile {} part {}", sot.tile_index, sot.tile_part_index);
     // A.6.1..A.6.5: coding and quantization markers belong in the
     // TPsot = 0 header only; later appearances warn but are honoured.
-    let late_check = |kind: &str, warnings: &mut Vec<String>| {
+    let late_check = |kind: &str, warnings: &mut Vec<JpxWarning>| {
         if sot.tile_part_index > 0 {
-            warnings.push(format!(
+            warnings.push(JpxWarning::note(format!(
                 "{context}: {kind} in a non-first tile-part header honoured leniently (A.6)"
-            ));
+            )));
         }
     };
     loop {
@@ -1072,7 +1078,9 @@ fn scan_tile_part_header(
                 late_check("COD", warnings);
                 let parsed = parse_cod(segment_payload(r, "COD")?)?;
                 if overrides.cod.replace(parsed).is_some() {
-                    warnings.push(format!("{context}: duplicate COD; the last wins (A.6.1)"));
+                    warnings.push(JpxWarning::note(format!(
+                        "{context}: duplicate COD; the last wins (A.6.1)"
+                    )));
                 }
             }
             COC => {
@@ -1092,7 +1100,9 @@ fn scan_tile_part_header(
                 late_check("QCD", warnings);
                 let parsed = parse_qcd(segment_payload(r, "QCD")?)?;
                 if overrides.qcd.replace(parsed).is_some() {
-                    warnings.push(format!("{context}: duplicate QCD; the last wins (A.6.4)"));
+                    warnings.push(JpxWarning::note(format!(
+                        "{context}: duplicate QCD; the last wins (A.6.4)"
+                    )));
                 }
             }
             QCC => {
@@ -1137,14 +1147,16 @@ fn scan_tile_part_header(
                 segment_payload(r, "COM")?;
             }
             TLM | PLM | CRG | PPM | SOP => {
-                warnings.push(format!(
+                warnings.push(JpxWarning::note(format!(
                     "{context}: {} not allowed in a tile-part header skipped (Table A.2)",
                     marker_name(marker)
-                ));
+                )));
                 segment_payload(r, marker_name(marker))?;
             }
             EPH => {
-                warnings.push(format!("{context}: stray EPH skipped (A.8.2)"));
+                warnings.push(JpxWarning::note(format!(
+                    "{context}: stray EPH skipped (A.8.2)"
+                )));
             }
             RESERVED_NO_SEGMENT_FIRST..=RESERVED_NO_SEGMENT_LAST => {
                 // A.1.3: reserved markers without parameters are skipped.
@@ -1161,7 +1173,9 @@ fn scan_tile_part_header(
                         "{context}: byte-aligned garbage {other} where a marker was expected (A.1.2)"
                     )));
                 }
-                warnings.push(format!("{context}: unknown marker {other} skipped"));
+                warnings.push(JpxWarning::note(format!(
+                    "{context}: unknown marker {other} skipped"
+                )));
                 segment_payload(r, "unknown segment")?;
             }
         }
@@ -1275,7 +1289,7 @@ pub(crate) fn parse_codestream<'a>(
                 // A.6.6: at most one POC per header; extras concatenate
                 // leniently with a warning.
                 if !poc.is_empty() {
-                    warnings.push("main header: more than one POC (A.6.6)".into());
+                    warnings.push(JpxWarning::note("main header: more than one POC (A.6.6)"));
                 }
                 poc.extend(parse_poc(segment_payload(&mut r, "POC")?, csiz, csiz)?);
             }
@@ -1286,14 +1300,14 @@ pub(crate) fn parse_codestream<'a>(
                 segment_payload(&mut r, marker_name(marker))?;
             }
             PLT | PPT | SOP => {
-                warnings.push(format!(
+                warnings.push(JpxWarning::note(format!(
                     "main header: {} not allowed here skipped (Table A.2)",
                     marker_name(marker)
-                ));
+                )));
                 segment_payload(&mut r, marker_name(marker))?;
             }
             EPH => {
-                warnings.push("main header: stray EPH skipped (A.8.2)".into());
+                warnings.push(JpxWarning::note("main header: stray EPH skipped (A.8.2)"));
             }
             SOD | EOC => {
                 return Err(malformed(format!(
@@ -1310,7 +1324,9 @@ pub(crate) fn parse_codestream<'a>(
                         "main header: byte-aligned garbage {other} where a marker was expected (A.1.2)"
                     )));
                 }
-                warnings.push(format!("main header: unknown marker {other} skipped"));
+                warnings.push(JpxWarning::note(format!(
+                    "main header: unknown marker {other} skipped"
+                )));
                 segment_payload(&mut r, "unknown segment")?;
             }
         }
@@ -1342,7 +1358,10 @@ pub(crate) fn parse_codestream<'a>(
         let overrides = match scan_tile_part_header(&mut r, csiz, sot, &mut warnings) {
             Ok(overrides) => overrides,
             Err(e) => {
-                warnings.push(format!("tile-part header abandoned, tail truncated: {e}"));
+                // The rest of the codestream is dropped: pixel loss.
+                warnings.push(JpxWarning::loss(format!(
+                    "tile-part header abandoned, tail truncated: {e}"
+                )));
                 break;
             }
         };
@@ -1354,7 +1373,9 @@ pub(crate) fn parse_codestream<'a>(
             if data.len() >= body_start + 2 && data[data.len() - 2..] == EOC.to_be_bytes() {
                 data.len() - 2
             } else {
-                warnings.push("codestream: missing EOC after the final tile-part (A.4.4)".into());
+                warnings.push(JpxWarning::note(
+                    "codestream: missing EOC after the final tile-part (A.4.4)",
+                ));
                 data.len()
             }
         } else {
@@ -1363,17 +1384,20 @@ pub(crate) fn parse_codestream<'a>(
             match sot_start.checked_add(psot as usize) {
                 Some(end) if end >= body_start && end <= data.len() => end,
                 Some(end) if end > data.len() => {
-                    warnings.push(format!(
+                    // Truncation: whatever the overrun swallowed is gone.
+                    warnings.push(JpxWarning::loss(format!(
                         "tile {}: Psot {psot} overruns the codestream; body truncated",
                         sot.tile_index
-                    ));
+                    )));
                     data.len()
                 }
                 _ => {
-                    warnings.push(format!(
+                    // Keeping the tail as body swallows every later
+                    // tile-part: their tiles lose data.
+                    warnings.push(JpxWarning::loss(format!(
                         "tile {}: Psot {psot} ends before its own SOD; tail kept as body",
                         sot.tile_index
-                    ));
+                    )));
                     data.len()
                 }
             }
@@ -1388,24 +1412,26 @@ pub(crate) fn parse_codestream<'a>(
         }
         r.pos = body_end;
         if r.at_end() {
-            warnings.push("codestream: missing EOC (A.4.4)".into());
+            warnings.push(JpxWarning::note("codestream: missing EOC (A.4.4)"));
             break;
         }
         let marker_start = r.pos;
         let marker = match r.u16("codestream") {
             Ok(marker) => marker,
             Err(_) => {
-                warnings.push("codestream: lone trailing byte after a tile-part".into());
+                warnings.push(JpxWarning::note(
+                    "codestream: lone trailing byte after a tile-part",
+                ));
                 break;
             }
         };
         match marker {
             EOC => {
                 if !r.at_end() {
-                    warnings.push(format!(
+                    warnings.push(JpxWarning::note(format!(
                         "codestream: {} bytes after EOC ignored (A.4.4)",
                         r.remaining()
-                    ));
+                    )));
                 }
                 break;
             }
@@ -1415,14 +1441,18 @@ pub(crate) fn parse_codestream<'a>(
                     sot_start = marker_start;
                 }
                 Err(e) => {
-                    warnings.push(format!("tile-part abandoned, tail truncated: {e}"));
+                    // The rest of the codestream is dropped: pixel loss.
+                    warnings.push(JpxWarning::loss(format!(
+                        "tile-part abandoned, tail truncated: {e}"
+                    )));
                     break;
                 }
             },
             other => {
-                warnings.push(format!(
+                // The rest of the codestream is dropped: pixel loss.
+                warnings.push(JpxWarning::loss(format!(
                     "codestream: expected SOT or EOC, found {other}; tail truncated"
-                ));
+                )));
                 break;
             }
         }
@@ -2259,7 +2289,7 @@ mod tests {
 
         // Only the reserved-style RGN warned; the skip segments are silent.
         assert_eq!(cs.warnings.len(), 1, "{:?}", cs.warnings);
-        assert!(cs.warnings[0].contains("RGN"), "{:?}", cs.warnings);
+        assert!(cs.warnings[0].message.contains("RGN"), "{:?}", cs.warnings);
     }
 
     #[test]
@@ -2319,7 +2349,9 @@ mod tests {
         assert_eq!(cs.tile_parts.len(), 2);
         assert!(cs.tile_parts[1].overrides.cod.is_some());
         assert!(
-            cs.warnings.iter().any(|w| w.contains("COD")),
+            cs.warnings
+                .iter()
+                .any(|warning| warning.message.contains("COD")),
             "{:?}",
             cs.warnings
         );
@@ -2351,7 +2383,9 @@ mod tests {
         assert_eq!(cs.tile_parts.len(), 1);
         assert_eq!(cs.tile_parts[0].body, [9, 9]);
         assert!(
-            cs.warnings.iter().any(|w| w.contains("EOC")),
+            cs.warnings
+                .iter()
+                .any(|warning| warning.message.contains("EOC")),
             "{:?}",
             cs.warnings
         );

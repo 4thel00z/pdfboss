@@ -8,7 +8,7 @@ use crate::dequant::{CoefficientCanvas, TileComponentCanvas};
 use crate::error::{JpxError, Result};
 use crate::geometry::Rect;
 use crate::markers::{Siz, SizComponent};
-use crate::{ColorKind, DecodeLimits, DecodedImage};
+use crate::{ColorKind, DecodeLimits, DecodedImage, JpxWarning};
 
 /// Inverse RCT per T.800 G.2.2, Equations (G-6)..(G-8). Integer exact:
 /// `div_euclid(4)` IS the floor division the corner brackets denote (the
@@ -136,14 +136,16 @@ fn identity_channels(components: &[SizComponent]) -> Vec<Channel> {
 fn build_channels(
     siz: &Siz,
     header: Option<&Jp2Header>,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<JpxWarning>,
 ) -> (Vec<Channel>, Option<Palette>) {
     let Some(header) = header else {
         return (identity_channels(&siz.components), None);
     };
     if header.component_mapping.is_empty() {
         if header.palette.is_some() {
-            warnings.push("pclr without a cmap box ignored (I.5.3.4 requires both)".into());
+            warnings.push(JpxWarning::note(
+                "pclr without a cmap box ignored (I.5.3.4 requires both)",
+            ));
         }
         return (identity_channels(&siz.components), None);
     }
@@ -157,7 +159,9 @@ fn build_channels(
         if consistent {
             Some(palette.clone())
         } else {
-            warnings.push("pclr box internally inconsistent (Table I.12); palette ignored".into());
+            warnings.push(JpxWarning::note(
+                "pclr box internally inconsistent (Table I.12); palette ignored",
+            ));
             None
         }
     });
@@ -170,10 +174,11 @@ fn build_channels(
     for (index, mapping) in header.component_mapping.iter().enumerate() {
         let component = usize::from(mapping.component);
         let Some(spec) = siz.components.get(component) else {
-            warnings.push(format!(
+            // A zero-filled channel is missing pixels.
+            warnings.push(JpxWarning::loss(format!(
                 "cmap channel {index}: codestream component {component} does not exist; \
                  channel zero-filled"
-            ));
+            )));
             channels.push(zero_channel);
             continue;
         };
@@ -195,26 +200,29 @@ fn build_channels(
                         signed: raw & 128 != 0,
                     }),
                     None => {
-                        warnings.push(format!(
+                        // A zero-filled channel is missing pixels.
+                        warnings.push(JpxWarning::loss(format!(
                             "cmap channel {index}: palette column {column} out of range; \
                              channel zero-filled"
-                        ));
+                        )));
                         channels.push(zero_channel);
                     }
                 }
             }
             (1, None) => {
-                warnings.push(format!(
+                // Palette indices shown as intensities are WRONG pixels:
+                // the intended colours are unknowable without the palette.
+                warnings.push(JpxWarning::loss(format!(
                     "cmap channel {index}: palette mapping without a usable pclr box; \
                      component {component} used directly"
-                ));
+                )));
                 channels.push(direct);
             }
             (other, _) => {
-                warnings.push(format!(
+                warnings.push(JpxWarning::note(format!(
                     "cmap channel {index}: reserved MTYP {other} (Table I.14); \
                      component {component} used directly"
-                ));
+                )));
                 channels.push(direct);
             }
         }
@@ -249,19 +257,20 @@ enum WorkCanvas {
 /// path, inverse ICT (G.3.2) on the irreversible one. G.2/G.3 demand the
 /// three components share separation and depth, so mismatched rects or
 /// mixed canvas kinds skip the transform with a warning (fail-soft).
-fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<String>) {
+fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<JpxWarning>) {
     let [first, second, third, ..] = work else {
-        warnings.push(
-            "MCT signalled with fewer than three components; transform skipped (G.2/G.3)".into(),
-        );
+        // A skipped component transform leaves wrong colours behind.
+        warnings.push(JpxWarning::loss(
+            "MCT signalled with fewer than three components; transform skipped (G.2/G.3)",
+        ));
         return;
     };
     if first.0 != second.0 || first.0 != third.0 {
-        warnings.push(
+        // A skipped component transform leaves wrong colours behind.
+        warnings.push(JpxWarning::loss(
             "MCT components disagree on their tile-component rects \
-             (G.2/G.3 demand identical separations); transform skipped"
-                .into(),
-        );
+             (G.2/G.3 demand identical separations); transform skipped",
+        ));
         return;
     }
     match (&mut first.1, &mut second.1, &mut third.1) {
@@ -283,11 +292,11 @@ fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<String>
                 *y2 = i2;
             }
         }
-        _ => warnings.push(
+        // A skipped component transform leaves wrong colours behind.
+        _ => warnings.push(JpxWarning::loss(
             "MCT components mix reversible and irreversible canvases; transform skipped \
-             (Table A.17 pairs the RCT with the 5-3 filter and the ICT with the 9-7)"
-                .into(),
-        ),
+             (Table A.17 pairs the RCT with the 5-3 filter and the ICT with the 9-7)",
+        )),
     }
 }
 
@@ -326,7 +335,7 @@ pub(crate) struct ImageAssembler {
     buffer: Vec<u8>,
     /// Soft findings from `new`/`push_tile`/`finish`, appended after the
     /// decode-wide warnings handed to `finish`.
-    warnings: Vec<String>,
+    warnings: Vec<JpxWarning>,
 }
 
 impl ImageAssembler {
@@ -351,20 +360,20 @@ impl ImageAssembler {
         // are taken from the header as-is.
         if let Some(header) = header {
             if (header.width, header.height) != (region.width(), region.height()) {
-                warnings.push(format!(
+                warnings.push(JpxWarning::note(format!(
                     "ihdr claims {}x{} but the SIZ image region is {}x{}; SIZ wins",
                     header.width,
                     header.height,
                     region.width(),
                     region.height()
-                ));
+                )));
             }
             if usize::from(header.num_components) != siz.components.len() {
-                warnings.push(format!(
+                warnings.push(JpxWarning::note(format!(
                     "ihdr NC = {} but SIZ Csiz = {}; SIZ wins",
                     header.num_components,
                     siz.components.len()
-                ));
+                )));
             }
             // ihdr BPC / bpcc store depth - 1 in the low 7 bits plus a sign
             // MSB (I.5.3.1/I.5.3.2) — the same encoding as Ssiz.
@@ -384,7 +393,9 @@ impl ImageAssembler {
                     .any(|spec| siz_raw(spec) != header.bit_depth)
             };
             if mismatch {
-                warnings.push("ihdr/bpcc bit depth disagrees with SIZ Ssiz; SIZ wins".into());
+                warnings.push(JpxWarning::note(
+                    "ihdr/bpcc bit depth disagrees with SIZ Ssiz; SIZ wins",
+                ));
             }
         }
         let (channels, palette) = build_channels(siz, header, &mut warnings);
@@ -450,13 +461,14 @@ impl ImageAssembler {
             return Ok(());
         }
         if canvases.len() != self.components.len() {
-            self.warnings.push(format!(
+            // A skipped tile is missing pixels.
+            self.warnings.push(JpxWarning::loss(format!(
                 "tile at ({}, {}): {} component canvases for {} components; tile skipped",
                 tile.x0,
                 tile.y0,
                 canvases.len(),
                 self.components.len()
-            ));
+            )));
             return Ok(());
         }
         // Widen every canvas for transform arithmetic; a canvas whose
@@ -470,14 +482,15 @@ impl ImageAssembler {
                 CoefficientCanvas::Irreversible(values) => values.len(),
             } as u64;
             if actual != expected {
-                self.warnings.push(format!(
+                // A zero-filled component is missing pixels.
+                self.warnings.push(JpxWarning::loss(format!(
                     "tile at ({}, {}): component {index} canvas holds {actual} samples \
                      for a {}x{} rect; component zero-filled",
                     tile.x0,
                     tile.y0,
                     canvas.rect.width(),
                     canvas.rect.height()
-                ));
+                )));
                 work.push((
                     Rect {
                         x0: 0,
@@ -503,9 +516,11 @@ impl ImageAssembler {
         match mct {
             0 => {}
             1 => apply_inverse_mct(&mut work, &mut self.warnings),
-            other => self.warnings.push(format!(
+            // Whatever transform the reserved value meant stays applied:
+            // the colours cannot be trusted.
+            other => self.warnings.push(JpxWarning::loss(format!(
                 "reserved SGcod MCT value {other} ignored (Table A.17)"
-            )),
+            ))),
         }
         // Integerize, inverse DC level shift (G-2) and clamp per component.
         let planes: Vec<(Rect, Vec<i64>)> = work
@@ -634,17 +649,16 @@ impl ImageAssembler {
                 continue;
             }
             if usize::from(def.channel) >= self.channels.len() {
-                self.warnings.push(format!(
+                self.warnings.push(JpxWarning::note(format!(
                     "cdef opacity channel {} does not exist; ignored",
                     def.channel
-                ));
+                )));
                 continue;
             }
             if def.kind == 2 {
-                self.warnings.push(
-                    "cdef declares premultiplied opacity (Typ 2); samples are left premultiplied"
-                        .into(),
-                );
+                self.warnings.push(JpxWarning::note(
+                    "cdef declares premultiplied opacity (Typ 2); samples are left premultiplied",
+                ));
             }
             return Some(def.channel as u8);
         }
@@ -661,9 +675,9 @@ impl ImageAssembler {
                 3 => ColorKind::Rgb,
                 4 => ColorKind::Cmyk,
                 count => {
-                    self.warnings.push(format!(
+                    self.warnings.push(JpxWarning::note(format!(
                         "raw codestream with {count} components has no colour interpretation"
-                    ));
+                    )));
                     // EnumCS 0 is reserved (Table I.10); it stands in for
                     // "unknown" here since no colr box exists to cite.
                     ColorKind::Other {
@@ -680,10 +694,9 @@ impl ImageAssembler {
                     self.convert_sycc_to_rgb();
                     ColorKind::Rgb
                 } else {
-                    self.warnings.push(
-                        "colr declares sYCC but fewer than three channels exist; left unconverted"
-                            .into(),
-                    );
+                    self.warnings.push(JpxWarning::note(
+                        "colr declares sYCC but fewer than three channels exist; left unconverted",
+                    ));
                     ColorKind::Other {
                         enumeration: 18,
                         components: colour,
@@ -691,19 +704,19 @@ impl ImageAssembler {
                 }
             }
             Some(ColorSpec::Enumerated(enumeration)) => {
-                self.warnings.push(format!(
+                self.warnings.push(JpxWarning::note(format!(
                     "colr enumeration {enumeration} is not converted (Table I.10 defines 16/17/18)"
-                ));
+                )));
                 ColorKind::Other {
                     enumeration,
                     components: colour,
                 }
             }
             Some(ColorSpec::Icc { profile_len }) => {
-                self.warnings.push(format!(
+                self.warnings.push(JpxWarning::note(format!(
                     "colr carries an ICC profile ({profile_len} bytes) the decoder does not \
                      interpret; colour guessed from {colour} colour channels"
-                ));
+                )));
                 ColorKind::IccGuess { components: colour }
             }
         }
@@ -716,8 +729,9 @@ impl ImageAssembler {
     /// is the closest in-spec approximation, and the output is flagged as
     /// approximate.
     fn convert_sycc_to_rgb(&mut self) {
-        self.warnings
-            .push("sYCC converted to RGB with the G.3.2 matrix (approximate)".into());
+        self.warnings.push(JpxWarning::note(
+            "sYCC converted to RGB with the G.3.2 matrix (approximate)",
+        ));
         let stride = self.channels.len();
         for pixel in self.buffer.chunks_mut(stride) {
             let y = f64::from(pixel[0]);
@@ -732,7 +746,7 @@ impl ImageAssembler {
     }
 
     /// Finalizes the image, attaching the accumulated `warnings`.
-    pub(crate) fn finish(mut self, warnings: Vec<String>) -> Result<DecodedImage> {
+    pub(crate) fn finish(mut self, warnings: Vec<JpxWarning>) -> Result<DecodedImage> {
         let mut all = warnings;
         let color = self.resolve_color();
         let alpha_index = self.resolve_alpha();
@@ -743,6 +757,10 @@ impl ImageAssembler {
             // new() rejected channel counts above 255.
             components: self.channels.len() as u8,
             samples: self.buffer,
+            // The pre-normalization source depth per output channel: the
+            // palette column's depth for palette-mapped channels, the
+            // component's Ssiz depth otherwise (DecodedImage contract).
+            component_depths: self.channels.iter().map(|channel| channel.depth).collect(),
             color,
             alpha_index,
             warnings: all,
@@ -1052,6 +1070,10 @@ mod tests {
             .unwrap();
         let image = assembler.finish(Vec::new()).unwrap();
         assert_eq!(image.components, 2);
+        // component_depths reports the PALETTE COLUMN depths (Table I.13),
+        // not the 8-bit index component's — the contract that lets a PDF
+        // renderer reverse the normalization (ISO 32000 7.4.9).
+        assert_eq!(image.component_depths, vec![8, 4]);
         // Column 0 (8-bit) passes through; column 1 (4-bit) scales by
         // round(v*255/15) = v*17:
         //   idx 0 -> (10, 1*17 = 17);   idx 1 -> (20,  5*17 = 85)
@@ -1238,7 +1260,7 @@ mod tests {
         let image = assembler.finish(Vec::new()).unwrap();
         assert_eq!(image.samples, vec![100, 128, 25]);
         assert!(
-            image.warnings.iter().any(|w| w.contains("mix")),
+            image.warnings.iter().any(|w| w.message.contains("mix")),
             "warnings: {:?}",
             image.warnings
         );
@@ -1271,7 +1293,10 @@ mod tests {
         let image = assembler.finish(Vec::new()).unwrap();
         assert_eq!(image.color, ColorKind::Rgb);
         assert!(
-            image.warnings.iter().any(|w| w.contains("approximate")),
+            image
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("approximate")),
             "warnings: {:?}",
             image.warnings
         );
@@ -1343,7 +1368,7 @@ mod tests {
         let assembler = ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
         let image = assembler.finish(Vec::new()).unwrap();
         assert!(
-            image.warnings.iter().any(|w| w.contains("ICC")),
+            image.warnings.iter().any(|w| w.message.contains("ICC")),
             "warnings: {:?}",
             image.warnings
         );
@@ -1395,7 +1420,10 @@ mod tests {
         let image = assembler.finish(Vec::new()).unwrap();
         assert_eq!(image.alpha_index, Some(3));
         assert!(
-            image.warnings.iter().any(|w| w.contains("premultiplied")),
+            image
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("premultiplied")),
             "warnings: {:?}",
             image.warnings
         );
@@ -1444,7 +1472,12 @@ mod tests {
         assert_eq!((image.width, image.height), (6, 4));
         assert_eq!(image.components, 1);
         assert!(
-            image.warnings.iter().filter(|w| w.contains("SIZ")).count() >= 2,
+            image
+                .warnings
+                .iter()
+                .filter(|w| w.message.contains("SIZ"))
+                .count()
+                >= 2,
             "warnings: {:?}",
             image.warnings
         );
@@ -1460,7 +1493,10 @@ mod tests {
         let image = assembler.finish(Vec::new()).unwrap();
         assert_eq!(image.samples, vec![0, 0]);
         assert!(
-            image.warnings.iter().any(|w| w.contains("tile skipped")),
+            image
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("tile skipped")),
             "warnings: {:?}",
             image.warnings
         );

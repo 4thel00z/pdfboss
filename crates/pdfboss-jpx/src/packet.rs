@@ -7,6 +7,7 @@ use crate::geometry::{BandKind, Rect, TileComponentGeometry};
 use crate::markers::{ComponentCoding, PocSegment, ProgressionOrder};
 use crate::tagtree::{BitReader, TagTree};
 use crate::DecodeLimits;
+use crate::JpxWarning;
 
 /// One component's inputs to Tier-2: its Annex B partition plus its
 /// resolved coding parameters.
@@ -132,8 +133,9 @@ pub(crate) struct TilePackets {
     /// [`TileDecodeContext::components`]).
     pub components: Vec<ComponentPackets>,
     /// Soft findings: corrupt packet headers zero the rest of their scope
-    /// and are reported here (leniency doctrine).
-    pub warnings: Vec<String>,
+    /// and are reported here (leniency doctrine), classified per
+    /// [`JpxWarning::data_loss`].
+    pub warnings: Vec<JpxWarning>,
     /// Packets this tile parsed successfully. The decode stage sums the
     /// count across tiles because the hard/soft leniency boundary is per
     /// IMAGE (crate docs), not per tile.
@@ -395,7 +397,7 @@ struct Tier2<'a, 'b> {
     body_pos: usize,
     components: Vec<ComponentPackets>,
     state: Vec<Vec<BandParseState>>,
-    warnings: Vec<String>,
+    warnings: Vec<JpxWarning>,
     /// Nsop counts every packet whether or not an SOP appears (A.8.1).
     nsop_expected: u32,
     sop_warned: bool,
@@ -427,9 +429,10 @@ impl Tier2<'_, '_> {
             ),
             None => "packet progression".to_string(),
         };
-        self.warnings.push(format!(
+        // Zeroed packets are missing pixels.
+        self.warnings.push(JpxWarning::loss(format!(
             "{scope}: {error}; the remaining packets of this tile are treated as empty"
-        ));
+        )));
         Ok(())
     }
 
@@ -459,10 +462,11 @@ impl Tier2<'_, '_> {
         let number = u32::from(window[4]) * 256 + u32::from(window[5]);
         if number != expected {
             if !self.sop_warned {
-                self.warnings.push(format!(
+                // Resynchronization keeps decoding every packet: benign.
+                self.warnings.push(JpxWarning::note(format!(
                     "SOP sequence number {number} where {expected} was expected; \
                      resynchronizing (A.8.1)"
-                ));
+                )));
                 self.sop_warned = true;
             }
             self.nsop_expected = number.wrapping_add(1);
@@ -484,8 +488,10 @@ impl Tier2<'_, '_> {
         if self.headers.get(at..at.saturating_add(2)) == Some([255u8, 146].as_slice()) {
             self.header_pos = at + 2;
         } else if !self.eph_warned {
-            self.warnings
-                .push("EPH marker signalled but missing after a packet header (A.8.2)".into());
+            // The header already parsed; only the marker is absent.
+            self.warnings.push(JpxWarning::note(
+                "EPH marker signalled but missing after a packet header (A.8.2)",
+            ));
             self.eph_warned = true;
         }
     }
@@ -1450,7 +1456,7 @@ mod tests {
             packed_headers: None,
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
-        assert_eq!(outcome.packets.warnings, Vec::<String>::new());
+        assert_eq!(outcome.packets.warnings, Vec::<JpxWarning>::new());
         assert_eq!(outcome.body_end, 31);
         assert_eq!(outcome.header_end, 31);
 
@@ -1500,7 +1506,7 @@ mod tests {
             packed_headers: Some(&headers),
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
-        assert_eq!(outcome.packets.warnings, Vec::<String>::new());
+        assert_eq!(outcome.packets.warnings, Vec::<JpxWarning>::new());
         assert_eq!(outcome.header_end, 5);
         assert_eq!(outcome.body_end, 8);
         let band = &outcome.packets.components[0].bands[0];
@@ -1563,7 +1569,7 @@ mod tests {
             packed_headers: None,
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
-        assert_eq!(outcome.packets.warnings, Vec::<String>::new());
+        assert_eq!(outcome.packets.warnings, Vec::<JpxWarning>::new());
         assert_eq!(outcome.body_end, 436);
         let block = &outcome.packets.components[0].bands[0].blocks[0];
         assert_eq!(
@@ -1619,7 +1625,7 @@ mod tests {
             packed_headers: None,
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
-        assert_eq!(outcome.packets.warnings, Vec::<String>::new());
+        assert_eq!(outcome.packets.warnings, Vec::<JpxWarning>::new());
         assert_eq!(outcome.body_end, 8);
         let block = &outcome.packets.components[0].bands[0].blocks[0];
         assert_eq!(block.missing_msbs, 2);
@@ -1662,7 +1668,7 @@ mod tests {
             packed_headers: None,
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
-        assert_eq!(outcome.packets.warnings, Vec::<String>::new());
+        assert_eq!(outcome.packets.warnings, Vec::<JpxWarning>::new());
         assert_eq!(outcome.body_end, 11);
         assert_eq!(outcome.header_end, 11);
         let block = &outcome.packets.components[0].bands[0].blocks[0];
@@ -1690,7 +1696,7 @@ mod tests {
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings.len(), 1);
-        assert!(outcome.packets.warnings[0].contains("SOP"));
+        assert!(outcome.packets.warnings[0].message.contains("SOP"));
         let block = &outcome.packets.components[0].bands[0].blocks[0];
         assert_eq!(segment_tuples(block), vec![(7, 2, 1, false)]);
     }
@@ -1790,7 +1796,7 @@ mod tests {
         };
         let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings.len(), 1);
-        assert!(outcome.packets.warnings[0].contains("layer 1"));
+        assert!(outcome.packets.warnings[0].message.contains("layer 1"));
         let band = &outcome.packets.components[0].bands[0];
         assert_eq!(segment_tuples(&band.blocks[0]), vec![(5, 4, 3, false)]);
         assert_eq!(segment_tuples(&band.blocks[1]), vec![(9, 4, 2, false)]);
@@ -2353,7 +2359,7 @@ mod tests {
             "rgb-prog-cprl.jp2",
         ] {
             for (packets, header_end, body_end, len) in parse_zoo_tiles(name) {
-                assert_eq!(packets.warnings, Vec::<String>::new(), "{name}");
+                assert_eq!(packets.warnings, Vec::<JpxWarning>::new(), "{name}");
                 assert_eq!(body_end, len, "{name}");
                 assert_eq!(header_end, len, "{name}");
                 assert!(assert_segments_within(name, &packets, len) > 0, "{name}");
@@ -2365,7 +2371,7 @@ mod tests {
     fn zoo_layers_fixture_accumulates_segments_across_three_layers() {
         let outcomes = parse_zoo_tiles("rgb-layers.jp2");
         for (packets, header_end, body_end, len) in &outcomes {
-            assert_eq!(packets.warnings, Vec::<String>::new());
+            assert_eq!(packets.warnings, Vec::<JpxWarning>::new());
             assert_eq!(*body_end, *len);
             assert_eq!(*header_end, *len);
         }
@@ -2398,7 +2404,7 @@ mod tests {
             "rgb-cb16.jp2",
         ] {
             for (packets, header_end, body_end, len) in parse_zoo_tiles(name) {
-                assert_eq!(packets.warnings, Vec::<String>::new(), "{name}");
+                assert_eq!(packets.warnings, Vec::<JpxWarning>::new(), "{name}");
                 assert_eq!(body_end, len, "{name}");
                 assert_eq!(header_end, len, "{name}");
                 assert_segments_within(name, &packets, len);

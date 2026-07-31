@@ -95,8 +95,15 @@ fn real_world_streams_decode_within_the_documented_warnings() {
 
         for warning in &image.warnings {
             assert!(
-                warning_allowed(warning),
+                warning_allowed(&warning.message),
                 "{}: warning outside the allow-list: {warning:?}",
+                case.file
+            );
+            // Every allowed warning is a benign note: these streams
+            // decode all of their pixels.
+            assert!(
+                !warning.data_loss,
+                "{}: allow-listed warning claims data loss: {warning:?}",
                 case.file
             );
         }

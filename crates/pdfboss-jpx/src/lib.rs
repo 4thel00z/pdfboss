@@ -95,6 +95,42 @@ pub enum ColorKind {
     },
 }
 
+/// One soft finding attached to a [`DecodedImage`] (leniency doctrine).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JpxWarning {
+    /// Human-readable description, citing the ITU-T T.800 clause where
+    /// one applies. Free-form: consumers must not parse it.
+    pub message: String,
+    /// The machine-readable contract: `true` means decoded pixels are
+    /// wrong or missing — a corrupt code-block kept partially decoded,
+    /// zeroed packets or tiles, a skipped component transform, stream
+    /// truncation, dropped or out-of-range tile-parts, or a zero-filled
+    /// channel. `false` means a benign note that left every decoded
+    /// sample intact: compatibility tolerances, header disagreements
+    /// resolved by precedence, colour approximations, the Equation (E-5)
+    /// fallback. Consumers judging whether the pixels can be trusted
+    /// must key on this field, never on `message` text.
+    pub data_loss: bool,
+}
+
+impl JpxWarning {
+    /// A benign note: every decoded sample is intact.
+    pub(crate) fn note(message: impl Into<String>) -> JpxWarning {
+        JpxWarning {
+            message: message.into(),
+            data_loss: false,
+        }
+    }
+
+    /// A data-loss finding: decoded pixels are wrong or missing.
+    pub(crate) fn loss(message: impl Into<String>) -> JpxWarning {
+        JpxWarning {
+            message: message.into(),
+            data_loss: true,
+        }
+    }
+}
+
 /// A fully decoded image.
 #[derive(Clone, Debug)]
 pub struct DecodedImage {
@@ -108,13 +144,22 @@ pub struct DecodedImage {
     /// Interleaved samples, 8-bit normalized, row-major,
     /// `width * height * components` bytes.
     pub samples: Vec<u8>,
+    /// Per output channel (parallel to the `samples` interleaving, alpha
+    /// included): the bit depth of the channel's source BEFORE the 8-bit
+    /// normalization — the component's Ssiz depth (T.800 Table A.11) for
+    /// direct channels, the palette column's depth (Table I.13) for
+    /// palette-mapped ones. The machine-readable contract for reversing
+    /// the normalization, e.g. recovering palette indices for a PDF
+    /// Indexed colorspace (ISO 32000 7.4.9). Length equals `components`.
+    pub component_depths: Vec<u8>,
     /// Colour interpretation of the colour channels.
     pub color: ColorKind,
     /// Channel index of the opacity channel, when the JP2 cdef box defines
     /// one (T.800 I.5.3.6, association 0 with type 1 or 2).
     pub alpha_index: Option<u8>,
-    /// Soft failures encountered after headers parsed (leniency doctrine).
-    pub warnings: Vec<String>,
+    /// Soft failures encountered after headers parsed (leniency
+    /// doctrine); each one is classified by [`JpxWarning::data_loss`].
+    pub warnings: Vec<JpxWarning>,
 }
 
 /// Decodes a JPEG 2000 image (JP2 file or raw codestream) into 8-bit
@@ -146,21 +191,27 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
     for (pos, part) in cs.tile_parts.iter().enumerate() {
         let index = u64::from(part.sot.tile_index);
         if index >= tile_total {
-            warnings.push(format!("tile-part for out-of-range tile {index} skipped"));
+            // Its packets never paint: whatever tile they belonged to is
+            // damaged, so this is pixel loss.
+            warnings.push(JpxWarning::loss(format!(
+                "tile-part for out-of-range tile {index} skipped"
+            )));
             continue;
         }
         tiles[index as usize].push((pos, part));
     }
     if let Some(warning) = tnsot_compatibility_warning(&tiles) {
-        warnings.push(warning);
+        // Compatibility tolerance: the surplus tile-parts DECODE, so no
+        // pixel is lost.
+        warnings.push(JpxWarning::note(warning));
     }
     // Tiles the codestream never delivered render as background — pixels
     // are missing, so the condition must be visible to the caller.
     let missing_tiles = tiles.iter().filter(|parts| parts.is_empty()).count();
     if missing_tiles > 0 {
-        warnings.push(format!(
+        warnings.push(JpxWarning::loss(format!(
             "{missing_tiles} tile(s) have no tile-parts; rendered as background"
-        ));
+        )));
     }
 
     // PPM packed headers split per tile-part appearance order (A.7.4).
@@ -192,9 +243,10 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
             .windows(2)
             .any(|pair| pair[0].1.sot.tile_part_index > pair[1].1.sot.tile_part_index)
         {
-            warnings.push(format!(
+            // Every part still decodes, just in appearance order: benign.
+            warnings.push(JpxWarning::note(format!(
                 "tile {tile_index}: tile-parts out of TPsot order; using appearance order"
-            ));
+            )));
         }
 
         let part_refs: Vec<&markers::TilePart<'_>> = parts.iter().map(|(_, part)| *part).collect();
@@ -269,12 +321,10 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
         };
         let mut packets = packet::read_tile_packets(&ctx, limits, image_packets_decoded)?;
         image_packets_decoded |= packets.packets_decoded > 0;
-        warnings.extend(
-            packets
-                .warnings
-                .drain(..)
-                .map(|warning| format!("tile {tile_index}: {warning}")),
-        );
+        warnings.extend(packets.warnings.drain(..).map(|warning| JpxWarning {
+            message: format!("tile {tile_index}: {}", warning.message),
+            data_loss: warning.data_loss,
+        }));
 
         let mut canvases = Vec::with_capacity(ctx.components.len());
         for (index, context) in ctx.components.iter().enumerate() {
@@ -289,12 +339,13 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
                     let coefficients = t1::decode_code_block(block, &bitstream)?;
                     if coefficients.corrupt {
                         // One warning per damaged block; its partially
-                        // decoded coefficients stay (leniency doctrine).
-                        warnings.push(format!(
+                        // decoded coefficients stay (leniency doctrine),
+                        // and the missing passes are pixel loss.
+                        warnings.push(JpxWarning::loss(format!(
                             "tile {tile_index} component {index}: corrupt code-block \
                              [{}, {}) x [{}, {}) kept partially decoded",
                             block.rect.x0, block.rect.x1, block.rect.y0, block.rect.y1,
-                        ));
+                        )));
                     }
                     blocks.push(coefficients);
                 }
@@ -318,11 +369,12 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
         assembler.push_tile(tile_rect, tile_coding.mct, canvases)?;
     }
     if short_quant_components > 0 {
-        warnings.push(format!(
+        // The (E-5) fallback decodes every coefficient: benign.
+        warnings.push(JpxWarning::note(format!(
             "{short_quant_components} tile-component(s) signal fewer QCD/QCC sub-band \
              entries than their decomposition describes; missing step sizes derived \
              from the first entry via Equation (E-5)"
-        ));
+        )));
     }
     assembler.finish(warnings)
 }
