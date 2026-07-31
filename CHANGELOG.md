@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/4thel00z/pdfboss/compare/v0.11.0...v0.12.0) (2026-07-31)
+
+
+### Features
+
+* cleanroom JPEG 2000 decoder for JPXDecode image streams ([b8962d7](https://github.com/4thel00z/pdfboss/commit/b8962d72474ede11a58b9c6cc1c9b41dc4337198))
+
 ## [0.11.0](https://github.com/4thel00z/pdfboss/compare/v0.10.0...v0.11.0) (2026-07-30)
 
 
