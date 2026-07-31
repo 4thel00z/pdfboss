@@ -20,7 +20,9 @@ pub mod source;
 pub mod xref;
 
 pub use crypt::Decryptor;
-pub use document::{map_pages, page_content_with, Document, DocumentSeed, Metadata, Page};
+pub use document::{
+    content_stream_data_with, map_pages, page_content_with, Document, DocumentSeed, Metadata, Page,
+};
 pub use elements::{Element, ElementOpts, Span, XrefKind};
 pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};

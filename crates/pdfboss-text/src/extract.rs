@@ -5,7 +5,8 @@
 use crate::font::Font;
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
-    page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page, Point, Result,
+    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page,
+    Point, Result,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -395,7 +396,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if !is_form {
             return None; // images and other XObjects carry no text
         }
-        let data = self.src.stream_data(&stream).await.ok()?;
+        // Through the content chokepoint, not raw stream_data: a form whose
+        // trailing /Filter is an image codec holds passthrough bytes, not
+        // operators (see `content_stream_data_with`).
+        let data = content_stream_data_with(self.src, &stream).await.ok()?;
         let ops = parse_content(&data).ok()?;
         // The form's own /Resources shadows the caller's for the names it
         // defines and falls through for the ones it does not, so it is

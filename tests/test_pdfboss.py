@@ -237,7 +237,7 @@ def pdf_with_undecodable_image() -> bytes:
         b"/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
         b"<< /Length 30 >>\nstream\nq 100 0 0 100 0 0 cm /Im0 Do Q\nendstream",
         b"<< /Type /XObject /Subtype /Image /Width 8 /Height 8 "
-        b"/BitsPerComponent 8 /ColorSpace /DeviceGray /Filter /JPXDecode "
+        b"/BitsPerComponent 8 /ColorSpace /DeviceGray /Filter /Crypt "
         b"/Length 8 >>\nstream\n01234567\nendstream",
     ]
     out = bytearray(b"%PDF-1.7\n")
@@ -261,7 +261,7 @@ class TestRenderReporting:
         path.write_bytes(pdf_with_undecodable_image())
         png, warnings = Document(str(path))[0].render_reporting()
         assert png.startswith(PNG_MAGIC)
-        assert any("JPXDecode" in line for line in warnings), warnings
+        assert any("Crypt" in line for line in warnings), warnings
 
     def test_reports_nothing_for_a_clean_page(self, hello_pdf: Path) -> None:
         png, warnings = Document(str(hello_pdf))[0].render_reporting()

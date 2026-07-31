@@ -16,8 +16,8 @@ use std::sync::Arc;
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
 use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{
-    block_on, page_content_with, AsyncObjectSource, Dict, Document, Error, Immediate, Name, Object,
-    Page, Result, Stream,
+    block_on, content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Document,
+    Error, Immediate, Name, Object, Page, Result, Stream,
 };
 
 use crate::color::{self, ColorSpace};
@@ -1138,7 +1138,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 let Ok(Object::Stream(stream)) = self.src.resolve(&glyph.proc_obj).await else {
                     return None;
                 };
-                let Ok(data) = self.src.stream_data(&stream).await else {
+                // Through the content chokepoint: a CharProc labelled with
+                // an image codec is passthrough bytes, refused rather than
+                // parsed (silently, like every other CharProc fetch
+                // failure).
+                let Ok(data) = content_stream_data_with(self.src, &stream).await else {
                     return None;
                 };
                 let Ok(ops) = parse_content(&data) else {
@@ -1626,7 +1630,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Form, SkipReason::LimitExceeded);
             return None;
         }
-        let data = match self.src.stream_data(stream).await {
+        // Through the content chokepoint, not raw `stream_data`: a form
+        // whose trailing filter is an image codec holds passthrough bytes
+        // no content parser may read (ISO 32000-1 7.4.9), and the refusal
+        // reports like any other unsupported filter.
+        let data = match content_stream_data_with(self.src, stream).await {
             Ok(data) => data,
             Err(e) => {
                 self.skip(SkippedKind::Form, skip_reason_for(&e));
@@ -1726,10 +1734,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     async fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
-        // `data` is decoded samples or a raw JPEG: the filter chain passes
-        // only `DCTDecode` through (ISO 32000-1 7.4.9) and rejects every
-        // other codec, so no codestream reaches the sample reader. That
-        // rejection surfaces above, where `stream_data` fails.
+        // `data` is decoded samples, a raw JPEG, or a JPEG 2000 file: the
+        // filter chain passes only `DCTDecode` and `JPXDecode` through
+        // (ISO 32000-1 7.4.9) and rejects every other codec, so nothing
+        // reaches the sample reader that the image layer cannot decode.
+        // That rejection surfaces above, where `stream_data` fails.
         //
         // An `/Indexed` palette stored as a stream that will not decode
         // leaves the space with no palette at all, painting every sample
@@ -1766,6 +1775,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             image::Drawn::Whole => {}
             image::Drawn::Truncated => self.skip(SkippedKind::Image, SkipReason::Truncated),
             image::Drawn::Nothing => self.skip(SkippedKind::Image, SkipReason::Undecodable),
+            image::Drawn::Failed(reason) => {
+                self.skip(SkippedKind::Image, SkipReason::DecodeFailed(reason))
+            }
+            // The image painted, but not whole: one entry per distinct loss,
+            // so the caller knows the render is an approximation.
+            image::Drawn::Degraded(notes) => {
+                for note in notes {
+                    self.skip(SkippedKind::Image, SkipReason::DecodeFailed(note));
+                }
+            }
         }
     }
 
@@ -2270,14 +2289,14 @@ mod tests {
         // The page's only content is `/Im0 Do`, where Im0 carries a filter
         // the core does not implement. The page must still render (lenient),
         // but the drop must be reported.
-        let (pix, report) = render_reporting(doc_with_image_filter("JPXDecode"));
+        let (pix, report) = render_reporting(doc_with_image_filter("Crypt"));
 
         assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2285,7 +2304,7 @@ mod tests {
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
         assert_eq!(
             report.warnings(),
-            vec!["1 image skipped: unsupported filter /JPXDecode".to_string()],
+            vec!["1 image skipped: unsupported filter /Crypt".to_string()],
         );
     }
 
@@ -2305,13 +2324,13 @@ mod tests {
     #[test]
     fn unsupported_inline_image_filter_is_reported() {
         let content = "q 100 0 0 100 0 0 cm BI /W 8 /H 8 /BPC 1 /CS /G \
-                       /F /JPXDecode ID 01234567 EI Q";
+                       /F /Crypt ID 01234567 EI Q";
         let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2351,7 +2370,7 @@ mod tests {
             b.stream(
                 5,
                 "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JPXDecode",
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
                 &[0; 8],
             );
         });
@@ -2383,7 +2402,7 @@ mod tests {
         b.stream(
             5,
             "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JPXDecode",
+             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
             &[0; 8],
         );
         for level in 0..LEVELS {
@@ -2440,14 +2459,14 @@ mod tests {
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
         );
-        b.stream(4, "/Filter /JPXDecode", b"0 0 100 100 re f");
+        b.stream(4, "/Filter /Crypt", b"0 0 100 100 re f");
         let (pix, report) = render_reporting(b.build(1));
         assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::PageContents,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2464,7 +2483,7 @@ mod tests {
         let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
             b.stream(
                 5,
-                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /JPXDecode",
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /Crypt",
                 b"0 0 100 100 re f",
             );
         });
@@ -2474,9 +2493,91 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Form,
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn jpx_labelled_page_contents_are_refused_not_parsed() {
+        // The filter chain passes JPXDecode bytes through still encoded for
+        // the IMAGE layer (ISO 32000-1 7.4.9); a page /Contents stream so
+        // labelled must be refused, never handed to the content parser.
+        // The stream below is deliberately valid operator syntax, so a
+        // renderer that parses the passthrough WOULD paint the page red:
+        // white pixels are the proof the bytes were refused, not chewed.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        );
+        b.stream(4, "/Filter /JPXDecode", b"1 0 0 rg 0 0 100 100 re f");
+        let (pix, report) = render_reporting(b.build(1));
+        assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::PageContents,
                 SkipReason::UnsupportedFilter("JPXDecode".to_string()),
                 1,
             )],
+        );
+    }
+
+    #[test]
+    fn dct_labelled_form_content_is_refused_not_parsed() {
+        // The same wart with the other passthrough codec, one level down: a
+        // form XObject whose trailing filter is DCTDecode holds raw JPEG
+        // bytes no content parser may read.
+        let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /DCTDecode",
+                b"1 0 0 rg 0 0 100 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "the form painted nothing");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Form,
+                SkipReason::UnsupportedFilter("DCTDecode".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn jpx_labelled_charproc_is_skipped_not_parsed() {
+        // A Type3 CharProc is the third content consumer. Its failures are
+        // silent by contract (the glyph advances unpainted, like every other
+        // CharProc fetch failure), so the proof is pixels alone: the box the
+        // ops would paint stays white.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+             /FontMatrix [0.001 0 0 0.001 0 0] \
+             /Encoding << /Differences [65 /boxglyph] >> \
+             /CharProcs << /boxglyph 6 0 R >> /FirstChar 65 /Widths [1000] >>",
+        );
+        b.stream(6, "/Filter /JPXDecode", b"1000 0 d0 100 0 500 700 re f");
+        let (pix, _) = render_reporting(b.build(1));
+        assert!(
+            !dark_at(&pix, 55, 115),
+            "the CharProc bytes must not be parsed as content"
         );
     }
 
@@ -2498,12 +2599,12 @@ mod tests {
     }
 
     #[test]
-    fn jpx_image_is_reported_instead_of_painted_as_noise() {
-        // Nothing here decodes a JPEG 2000 codestream, so the filter chain
-        // refuses to hand one over as if it were stream data (ISO 32000-1
-        // 7.4.9). Were it passed through, the 0x42 bytes below would paint
-        // as gray samples and the render would claim success; instead the
-        // image is dropped and named in the report.
+    fn a_garbage_jpx_stream_is_reported_instead_of_painted_as_noise() {
+        // The filter chain passes JPXDecode through for the image layer to
+        // decode (ISO 32000-1 7.4.9). The 0x42 bytes below are no JPEG 2000
+        // file, so the decode fails; were they painted as gray samples the
+        // render would claim success, so the drop must carry the decoder's
+        // reason instead.
         let bytes = small_doc(
             "/XObject << /Im0 5 0 R >>",
             b"q 100 0 0 100 0 0 cm /Im0 Do Q",
@@ -2518,18 +2619,13 @@ mod tests {
         );
         let (pix, report) = render_reporting(bytes);
         assert_eq!(px(&pix, 50, 50), WHITE, "no noise painted");
-        assert_eq!(
-            drops(&report),
-            vec![(
-                SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
-                1,
-            )],
-        );
-        assert_eq!(
-            report.warnings(),
-            vec!["1 image skipped: unsupported filter /JPXDecode".to_string()],
-            "the caller can name what went missing",
+        assert_eq!(report.skipped.len(), 1);
+        let drop = &report.skipped[0];
+        assert_eq!((drop.kind, drop.count), (SkippedKind::Image, 1));
+        assert!(
+            matches!(&drop.reason, SkipReason::DecodeFailed(msg) if msg.contains("JPXDecode")),
+            "the caller can name what went missing: {:?}",
+            drop.reason
         );
     }
 
@@ -2573,7 +2669,7 @@ mod tests {
                      /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 255 6 0 R]",
                     &[0; 64],
                 );
-                b.stream(6, "/Filter /JPXDecode", &[0; 12]);
+                b.stream(6, "/Filter /Crypt", &[0; 12]);
             },
         );
         let (_, report) = render_reporting(bytes);
@@ -2581,7 +2677,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
