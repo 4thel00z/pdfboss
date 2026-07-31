@@ -222,6 +222,38 @@ mod tests {
         assert_eq!(page_text(&doc, 0), "\u{3B1}");
     }
 
+    /// A conforming file may make any dictionary value indirect (ISO 32000-1
+    /// 7.3.8.1), `/Subtype` included. The form dispatch resolves it rather
+    /// than requiring a direct name — a form declared through a reference
+    /// used to be dropped as "not a form", burning its invocation-budget
+    /// slot and silently losing its whole text subtree.
+    #[test]
+    fn a_form_whose_subtype_is_indirect_still_extracts() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> /XObject << /Fx 6 0 R >> >> \
+             /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/Fx Do");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.stream(
+            6,
+            "/Type /XObject /Subtype 8 0 R /BBox [0 0 612 792]",
+            b"BT /F1 12 Tf 72 720 Td (via ref) Tj ET",
+        );
+        b.object(8, "/Form");
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(page_text(&doc, 0), "via ref");
+    }
+
     /// The same chain rule for a nested form: an inner form named only in the
     /// page's `/XObject` must be reachable from a form that has its own
     /// `/Resources` without an `/XObject` entry.

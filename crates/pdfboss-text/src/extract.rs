@@ -385,14 +385,28 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             return None;
         }
         self.forms += 1;
+        // Moved out, not cloned: `find_res` hands back an owned object, and
+        // a form's stream carries its whole content body.
         let stream = self
             .find_res(chain, "XObject", name)
             .await
-            .and_then(|o| o.as_stream().cloned())?;
-        let is_form = stream
-            .dict
-            .get_name("Subtype")
-            .is_some_and(|n| n.0 == "Form");
+            .and_then(|o| match o {
+                Object::Stream(s) => Some(s),
+                _ => None,
+            })?;
+        // `/Subtype` may be indirect like any dictionary value (ISO 32000-1
+        // 7.3.8.1): a direct name answers on the spot, a reference resolves.
+        let is_form = match stream.dict.get("Subtype") {
+            Some(Object::Name(n)) => n.0 == "Form",
+            Some(indirect @ Object::Ref(_)) => self
+                .src
+                .resolve(indirect)
+                .await
+                .ok()
+                .and_then(|o| o.as_name().map(|n| n.0 == "Form"))
+                .unwrap_or(false),
+            _ => false,
+        };
         if !is_form {
             return None; // images and other XObjects carry no text
         }
