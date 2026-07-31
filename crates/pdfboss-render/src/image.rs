@@ -560,9 +560,10 @@ fn draw_jpx(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> 
 /// - a channel the codestream marks as opacity is never a colour channel;
 ///   `/SMaskInData` 1 or 2 additionally turns it into per-pixel alpha, and
 ///   2 un-premultiplies the colour samples by it first;
-/// - `/Decode` applies to the decoded samples exactly as for any other
-///   image, while the dict's `/BitsPerComponent` is ignored: the decoder
-///   already normalized every sample to 8 bits.
+/// - `/Decode` is ignored — 7.4.9: "Decode shall be ignored, except in the
+///   case where the image is treated as a mask" — and so is the dict's
+///   `/BitsPerComponent`: the decoder already normalized every sample to
+///   8 bits.
 ///
 /// `Err` is a reason to skip the image. The `Vec<String>` collects material
 /// degradation: decoder warnings that cost pixels, plus this function's own
@@ -681,9 +682,12 @@ fn jpx_rgba(
         );
     }
 
-    // The same `/Decode` mapping and colour conversion every other image
-    // gets, at the decoder's normalized 8 bits per component.
-    let converted = decode_samples(width, height, &color_data, cs, 8, meta.decode.as_deref());
+    // The same colour conversion every other image gets, at the decoder's
+    // normalized 8 bits per component — but with no `/Decode` mapping:
+    // ISO 32000-1 7.4.9 says "Decode shall be ignored, except in the case
+    // where the image is treated as a mask", and this function never
+    // handles the mask case.
+    let converted = decode_samples(width, height, &color_data, cs, 8, None);
     let mut quads = owned_quads(converted);
     if masking {
         for (px, &a) in quads.chunks_exact_mut(4).zip(&alpha_data) {
@@ -1115,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn jpx_gray_maps_to_device_gray_and_honors_decode() {
+    fn jpx_gray_maps_to_device_gray_and_ignores_decode() {
         let doc = test_doc();
         let image = || jpx_image(2, 1, 1, vec![0, 255], pdfboss_jpx::ColorKind::Gray, None);
 
@@ -1125,12 +1129,14 @@ mod tests {
         assert_eq!(rgba_at(&img, 0, 0), [0, 0, 0, 255]);
         assert_eq!(rgba_at(&img, 1, 0), [255, 255, 255, 255]);
 
-        // `/Decode [1 0]` inverts, exactly as it would any other image;
-        // `/BitsPerComponent 1` is ignored — the samples are 8-bit.
+        // ISO 32000-1 7.4.9: "Decode shall be ignored, except in the case
+        // where the image is treated as a mask" — the `[1 0]` array must
+        // NOT invert a JPX image. `/BitsPerComponent 1` is ignored too:
+        // the samples are the decoder's normalized 8-bit.
         let meta = jpx_meta(&doc, b"<< /Decode [1 0] /BitsPerComponent 1 >>", None);
         let (img, _) = jpx_rgba(&meta, image()).expect("gray decodes");
-        assert_eq!(rgba_at(&img, 0, 0), [255, 255, 255, 255]);
-        assert_eq!(rgba_at(&img, 1, 0), [0, 0, 0, 255]);
+        assert_eq!(rgba_at(&img, 0, 0), [0, 0, 0, 255]);
+        assert_eq!(rgba_at(&img, 1, 0), [255, 255, 255, 255]);
     }
 
     #[test]
