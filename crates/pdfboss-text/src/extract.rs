@@ -6,7 +6,7 @@ use crate::font::Font;
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page,
-    Point, Result,
+    Point,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,21 +31,135 @@ pub struct RawSpan {
     pub font: String,
 }
 
+/// What extraction could not read. Extraction is lenient the way rendering
+/// is — content that will not fetch, decode, or parse yields no text rather
+/// than an error — and this report is what keeps that leniency accountable:
+/// an empty result with an empty report really is an empty page.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractReport {
+    /// Every piece of content that yielded no text, in encounter order.
+    pub skipped: Vec<SkippedText>,
+}
+
+impl ExtractReport {
+    /// True when every operator stream was fetched, parsed, and executed —
+    /// nothing the extraction saw was left out of the result.
+    pub fn is_complete(&self) -> bool {
+        self.skipped.is_empty()
+    }
+
+    fn record(&mut self, kind: SkippedTextKind, cause: SkipCause) {
+        self.skipped.push(SkippedText { kind, cause });
+    }
+}
+
+/// One piece of content whose text (if any) is missing from the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedText {
+    pub kind: SkippedTextKind,
+    pub cause: SkipCause,
+}
+
+/// Which kind of operator stream was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedTextKind {
+    /// The page's own `/Contents` — the whole page yielded no text.
+    PageContents,
+    /// A form XObject: its text and its entire subtree (nested forms
+    /// included) are absent.
+    Form,
+    /// An XObject name that resolved to nothing usable; whether it held
+    /// text cannot be known.
+    XObject,
+}
+
+impl std::fmt::Display for SkippedTextKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SkippedTextKind::PageContents => "the page contents",
+            SkippedTextKind::Form => "a form XObject",
+            SkippedTextKind::XObject => "an XObject",
+        })
+    }
+}
+
+/// Why the stream was skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipCause {
+    /// A `/Filter` this library cannot run — including the two passthrough
+    /// image codecs, whose still-encoded bytes no content parser may read
+    /// (ISO 32000-1 7.4.9). A stream so labelled that nonetheless holds
+    /// valid operators is skipped all the same: the label, not the bytes,
+    /// is what decides, exactly as in rendering.
+    UnsupportedFilter(String),
+    /// The stream would not fetch or decode.
+    Unreadable,
+    /// The decoded bytes did not parse as content operators.
+    Parse,
+    /// The named resource is missing, or is not a stream.
+    Missing,
+    /// Form nesting depth or the per-page invocation budget was exhausted.
+    LimitExceeded,
+}
+
+impl std::fmt::Display for SkipCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipCause::UnsupportedFilter(name) => write!(f, "unsupported filter /{name}"),
+            SkipCause::Unreadable => f.write_str("stream would not read"),
+            SkipCause::Parse => f.write_str("content would not parse"),
+            SkipCause::Missing => f.write_str("missing resource"),
+            SkipCause::LimitExceeded => f.write_str("form limit exceeded"),
+        }
+    }
+}
+
+/// Maps a fetch/decode error onto its cause, keeping the filter name — the
+/// one detail a caller can act on (the same split rendering reports).
+fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
+    match error {
+        pdfboss_core::Error::UnsupportedFilter(name) => SkipCause::UnsupportedFilter(name.clone()),
+        _ => SkipCause::Unreadable,
+    }
+}
+
 /// Runs the page's content stream (and any form XObjects) and collects
-/// every shown string as a [`RawSpan`], in emission order.
+/// every shown string as a [`RawSpan`], in emission order, along with the
+/// report of what could not be read.
+///
+/// Lenient like rendering: a `/Contents` that will not fetch, decode, or
+/// parse contributes no spans and one report entry, never an error — the
+/// twin of `render_page_reporting`'s blank-page-with-a-report behavior.
 ///
 /// The source is taken by value so that the returned future can be `'static`;
 /// `page` is borrowed, which does not stand in the way, because a caller that
 /// owns its page creates the borrow inside its own `async move` block. See
 /// `pdfboss_core::source`'s "Signing a shared algorithm".
-pub async fn page_spans_with<S: AsyncObjectSource>(src: S, page: &Page) -> Result<Vec<RawSpan>> {
-    let content = page_content_with(&src, page).await?;
-    let ops = parse_content(&content)?;
+pub async fn page_spans_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+) -> (Vec<RawSpan>, ExtractReport) {
+    let mut report = ExtractReport::default();
+    let content = match page_content_with(&src, page).await {
+        Ok(content) => content,
+        Err(e) => {
+            report.record(SkippedTextKind::PageContents, cause_for(&e));
+            Vec::new()
+        }
+    };
+    let ops = match parse_content(&content) {
+        Ok(ops) => ops,
+        Err(_) => {
+            report.record(SkippedTextKind::PageContents, SkipCause::Parse);
+            Vec::new()
+        }
+    };
     let mut exec = Executor {
         src: &src,
         spans: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
+        report,
     };
     let root = Frame::new(
         ops.into(),
@@ -54,7 +168,7 @@ pub async fn page_spans_with<S: AsyncObjectSource>(src: S, page: &Page) -> Resul
         0,
     );
     exec.run(root).await;
-    Ok(exec.spans)
+    (exec.spans, exec.report)
 }
 
 /// The graphics-state parameters text extraction cares about. Saved and
@@ -149,6 +263,8 @@ struct Executor<'a, S> {
     /// Form-XObject invocations so far, checked against
     /// `MAX_FORM_INVOCATIONS`.
     forms: usize,
+    /// What could not be read; carried out alongside the spans.
+    report: ExtractReport,
 }
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
@@ -370,10 +486,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// own `/Resources` **prepended to** the caller's chain, and `/Matrix`
     /// prepended to the CTM — under a depth cap and a total-invocation budget.
     ///
-    /// `None` wherever the recursive version simply returned: over budget, no
-    /// such resource, not a form, or content that will not parse. The
-    /// invocation is counted before any of those checks, exactly as before, so
-    /// a page of unreadable forms still exhausts its budget.
+    /// `None` on five ways out, each reported except the one that is normal:
+    /// depth or budget exhausted (`LimitExceeded`); no such resource, or one
+    /// that is not a stream (`Missing`); not a form — images and other
+    /// XObjects carry no text, so this is silent; a fetch the chokepoint
+    /// refuses (`UnsupportedFilter`, image codecs included) or that fails to
+    /// decode (`Unreadable`); and content that will not parse (`Parse`). The
+    /// invocation is counted before any of those checks, so a page of
+    /// unreadable forms still exhausts its budget.
     async fn form_frame(
         &mut self,
         name: &str,
@@ -382,18 +502,21 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         depth: usize,
     ) -> Option<Frame> {
         if depth >= MAX_FORM_DEPTH || self.forms >= MAX_FORM_INVOCATIONS {
+            self.report
+                .record(SkippedTextKind::Form, SkipCause::LimitExceeded);
             return None;
         }
         self.forms += 1;
         // Moved out, not cloned: `find_res` hands back an owned object, and
         // a form's stream carries its whole content body.
-        let stream = self
-            .find_res(chain, "XObject", name)
-            .await
-            .and_then(|o| match o {
-                Object::Stream(s) => Some(s),
-                _ => None,
-            })?;
+        let stream = match self.find_res(chain, "XObject", name).await {
+            Some(Object::Stream(s)) => s,
+            _ => {
+                self.report
+                    .record(SkippedTextKind::XObject, SkipCause::Missing);
+                return None;
+            }
+        };
         // `/Subtype` may be indirect like any dictionary value (ISO 32000-1
         // 7.3.8.1): a direct name answers on the spot, a reference resolves.
         let is_form = match stream.dict.get("Subtype") {
@@ -412,9 +535,22 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
         // Through the content chokepoint, not raw stream_data: a form whose
         // trailing /Filter is an image codec holds passthrough bytes, not
-        // operators (see `content_stream_data_with`).
-        let data = content_stream_data_with(self.src, &stream).await.ok()?;
-        let ops = parse_content(&data).ok()?;
+        // operators (see `content_stream_data_with`). The refusal is a
+        // report entry, the same accountable skip rendering records.
+        let data = match content_stream_data_with(self.src, &stream).await {
+            Ok(data) => data,
+            Err(e) => {
+                self.report.record(SkippedTextKind::Form, cause_for(&e));
+                return None;
+            }
+        };
+        let ops = match parse_content(&data) {
+            Ok(ops) => ops,
+            Err(_) => {
+                self.report.record(SkippedTextKind::Form, SkipCause::Parse);
+                return None;
+            }
+        };
         // The form's own /Resources shadows the caller's for the names it
         // defines and falls through for the ones it does not, so it is
         // prepended rather than substituted. A form that declares
@@ -521,9 +657,12 @@ mod tests {
     /// The synchronous spans accessor. Production has no use for one — the public
     /// entry points in `lib.rs` wrap [`page_spans_with`] themselves — but it is
     /// the same `block_on` over `Immediate`, so every test below still asserts on
-    /// exactly what a synchronous caller receives.
-    fn page_spans(doc: &Document, page: &Page) -> Result<Vec<RawSpan>> {
-        block_on(page_spans_with(Immediate(doc), page))
+    /// exactly what a synchronous caller receives. The report is asserted
+    /// complete: no test here expects to lose content.
+    fn page_spans(doc: &Document, page: &Page) -> Vec<RawSpan> {
+        let (spans, report) = block_on(page_spans_with(Immediate(doc), page));
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        spans
     }
 
     /// Extracted, laid-out text of a one-page document with `content` as
@@ -531,14 +670,14 @@ mod tests {
     fn text_of(content: &str) -> String {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
-        layout(&page_spans(&doc, &page).unwrap())
+        layout(&page_spans(&doc, &page))
     }
 
     /// Raw spans of the same setup.
     fn spans_of(content: &str) -> Vec<RawSpan> {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
-        page_spans(&doc, &page).unwrap()
+        page_spans(&doc, &page)
     }
 
     #[test]
@@ -673,13 +812,23 @@ mod tests {
         }
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = page_spans(&doc, &page).unwrap();
+        // Raw call: exhausting the budget is this test's point, so the
+        // report is legitimately incomplete here.
+        let (spans, report) = block_on(page_spans_with(Immediate(&doc), &page));
         assert!(!spans.is_empty()); // nested forms still extract text
         assert!(
             spans.len() <= MAX_FORM_INVOCATIONS,
             "fan-out not bounded: {} spans",
             spans.len()
         );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .all(|s| s.cause == SkipCause::LimitExceeded),
+            "only the budget may cut this page short: {report:?}"
+        );
+        assert!(!report.is_complete(), "the cut-off must be visible");
     }
 
     /// Emission order is depth-first and in stream order: a form's spans land
@@ -731,7 +880,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = page_spans(&doc, &page).unwrap();
+        let spans = page_spans(&doc, &page);
         let order: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(order, ["A", "B", "C", "D", "E"]);
     }

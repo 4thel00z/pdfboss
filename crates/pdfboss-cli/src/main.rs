@@ -374,14 +374,19 @@ fn scan_version(data: &[u8]) -> Option<(u8, u8)> {
 }
 
 /// `pdfboss text`: one page (1-based `--page`) or all pages joined by
-/// form feed.
+/// form feed. Extraction is lenient — content that will not read yields
+/// no text rather than an error — so anything skipped is surfaced as a
+/// stderr warning instead of vanishing.
 fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
     let doc = Document::open(file).map_err(|e| e.to_string())?;
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
-            pdfboss_text::extract_text(&doc, &page).map_err(|e| e.to_string())?
+            let (text, report) =
+                pdfboss_text::extract_text_reporting(&doc, &page).map_err(|e| e.to_string())?;
+            warn_skips(n, &report);
+            text
         }
         None => {
             // Fanned out across the cores, one document fork per worker;
@@ -389,15 +394,32 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
             // flattened tree, not the declared `/Count`, which on a damaged
             // file may not match what the tree yields) and returns them in
             // page order.
-            let parts = pdfboss_core::map_pages(&doc, pdfboss_text::extract_text)
+            let parts = pdfboss_core::map_pages(&doc, pdfboss_text::extract_text_reporting)
                 .into_iter()
-                .map(|text| text.map_err(|e| e.to_string()))
+                .enumerate()
+                .map(|(index, outcome)| {
+                    let (text, report) = outcome.map_err(|e| e.to_string())?;
+                    warn_skips(index + 1, &report);
+                    Ok(text)
+                })
                 .collect::<Result<Vec<String>, String>>()?;
             parts.join("\u{c}")
         }
     };
     println!("{text}");
     Ok(())
+}
+
+/// One stderr line per skipped stream, 1-based page numbers matching
+/// `--page`. Warnings, not errors: the text on stdout is still everything
+/// that could be read.
+fn warn_skips(page_no: usize, report: &pdfboss_text::ExtractReport) {
+    for skip in &report.skipped {
+        eprintln!(
+            "warning: page {page_no}: skipped {} ({})",
+            skip.kind, skip.cause
+        );
+    }
 }
 
 /// Resolves `--fonts`/`--font-dir` into a [`pdfboss_render::SubstituteSource`].

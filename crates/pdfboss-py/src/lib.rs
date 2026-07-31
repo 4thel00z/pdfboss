@@ -339,6 +339,11 @@ impl Document {
     /// each worker thread holds its own fork of the document (shared bytes
     /// and cross-reference table, private caches), pulling page indexes from
     /// a shared counter so a slow page never idles the other cores.
+    ///
+    /// Per-page lenient like rendering: a page whose content will not
+    /// fetch, decode, or parse contributes an empty string rather than
+    /// failing the whole document. An error here means the document
+    /// itself could not be read.
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         let inner = &self.inner;
         py.allow_threads(move || {
@@ -860,8 +865,11 @@ impl AsyncDocument {
     }
 
     /// Extracts text from all pages, joined by form feed ("\f"), like the
-    /// sync `Document.extract_text`. Coroutine; the extraction runs on the
-    /// tokio runtime, so the asyncio loop is never blocked.
+    /// sync `Document.extract_text` — including its per-page leniency: a
+    /// page whose content will not read contributes an empty string, and
+    /// an error means the document itself could not be read. Coroutine;
+    /// the extraction runs on the tokio runtime, so the asyncio loop is
+    /// never blocked.
     fn extract_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
