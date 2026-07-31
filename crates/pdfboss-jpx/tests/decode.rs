@@ -887,6 +887,85 @@ fn single_byte_mutations_never_panic() {
 }
 
 // ---------------------------------------------------------------------
+// Hostile-input regressions: hand-built codestreams (T.800 Annex A
+// syntax) that must fail fast on a limit instead of allocating.
+// ---------------------------------------------------------------------
+
+/// One marker segment: marker code, Lmar = payload + 2 (T.800 A.1.2).
+fn marker_segment(marker: u16, payload: &[u8]) -> Vec<u8> {
+    let mut v = marker.to_be_bytes().to_vec();
+    v.extend(u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+/// SIZ payload (Table A.9): a square single-tile grid of `size` x `size`
+/// with zero offsets and one 8-bit unsigned component at unit separation.
+fn siz_payload(size: u32) -> Vec<u8> {
+    let mut v = 0u16.to_be_bytes().to_vec(); // Rsiz
+    for value in [size, size, 0, 0, size, size, 0, 0] {
+        v.extend(value.to_be_bytes());
+    }
+    v.extend(1u16.to_be_bytes()); // Csiz
+    v.extend([7, 1, 1]); // Ssiz = 7 (8-bit unsigned), XRsiz = YRsiz = 1
+    v
+}
+
+/// A precinct/code-block decompression bomb: PPx = PPy = 0 at r = 0 is
+/// spec-legal (Table A.21 allows zero exponents at the lowest resolution
+/// level), and with NL = 0 it makes EVERY reference-grid sample its own
+/// 1x1 precinct holding its own 1x1 code-block. An ~80-byte codestream
+/// declaring 8192 x 8192 then describes 2 x 67M precinct/code-block
+/// bookkeeping records (gigabytes) while passing max_pixels.
+fn precinct_bomb_codestream() -> Vec<u8> {
+    const SOC: u16 = 65359; // 0xFF4F (Table A.4)
+    const SIZ: u16 = 65361; // 0xFF51 (Table A.9)
+    const COD: u16 = 65362; // 0xFF52 (Table A.12)
+    const QCD: u16 = 65372; // 0xFF5C (Table A.27)
+    const SOT: u16 = 65424; // 0xFF90 (Table A.5)
+    const SOD: u16 = 65427; // 0xFF93 (Table A.7)
+    const EOC: u16 = 65497; // 0xFFD9 (Table A.8)
+    let mut v = SOC.to_be_bytes().to_vec();
+    v.extend(marker_segment(SIZ, &siz_payload(8192)));
+    // COD (Figure A.9): Scod = 1 (explicit precincts), LRCP, 1 layer, no
+    // MCT, NL = 0, 4x4 code-blocks (signalled 0 = xcb - 2), style 0, 5-3
+    // wavelet, one Table A.21 precinct byte 0 (PPx = PPy = 0 at r = 0).
+    v.extend(marker_segment(COD, &[1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0]));
+    // QCD (Table A.28): no quantization, 2 guard bits, one exponent 8.
+    v.extend(marker_segment(QCD, &[64, 64]));
+    // A single empty tile-part running to EOC (Psot = 0, A.4.2).
+    let mut sot = 0u16.to_be_bytes().to_vec();
+    sot.extend(0u32.to_be_bytes());
+    sot.extend([0, 1]); // TPsot = 0, TNsot = 1
+    v.extend(marker_segment(SOT, &sot));
+    v.extend(SOD.to_be_bytes());
+    v.extend(EOC.to_be_bytes());
+    v
+}
+
+#[test]
+fn precinct_bomb_trips_a_limit_before_allocating() {
+    // Memory sanity: pre-fix this stream allocated ~5.4 GB of per-block
+    // and tag-tree metadata over ~17 s. The partition-cost check must
+    // reject it arithmetically — no geometry allocation, well under a
+    // second — via the documented metadata charge against
+    // max_decoded_bytes.
+    let data = precinct_bomb_codestream();
+    assert!(data.len() < 100, "the bomb must stay tiny: {}", data.len());
+    let started = std::time::Instant::now();
+    let result = decode(&data, &DecodeLimits::default());
+    assert!(
+        matches!(result, Err(JpxError::LimitExceeded { .. })),
+        "expected LimitExceeded, got {result:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "the limit check must run in arithmetic time, took {:?}",
+        started.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------
 // Per-case end-to-end tests over the wired decoder pipeline.
 // ---------------------------------------------------------------------
 

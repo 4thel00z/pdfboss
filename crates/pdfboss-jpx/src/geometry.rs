@@ -443,6 +443,106 @@ fn band_geometry(tc: Rect, level: u8, kind: BandKind, ctx: &ResolutionContext) -
     }
 }
 
+/// Bytes charged against [`crate::DecodeLimits::max_decoded_bytes`] for
+/// every precinct-band slot the partition describes: each one allocates a
+/// [`PrecinctBand`], a Tier-2 precinct parse record and two tag trees —
+/// comfortably more than this deliberate floor of the real cost.
+const PRECINCT_METADATA_BYTES: u64 = 64;
+
+/// Bytes charged per code-block: each block allocates a geometry `Rect`,
+/// a Tier-2 seam record, a parse-state record and two tag-tree leaves
+/// (plus ~1/3 interior nodes each) — again well above this floor.
+const BLOCK_METADATA_BYTES: u64 = 64;
+
+/// Code-block partition cells covering `[a0, a1)` at cell exponent `e`
+/// (B.7: the partition is anchored at 0 with span `2^e`), i.e.
+/// `ceil(a1 / 2^e) - floor(a0 / 2^e)`; zero for a degenerate interval.
+fn partition_cells(a0: u32, a1: u32, e: u8) -> u64 {
+    if a1 <= a0 {
+        return 0;
+    }
+    ceil_div(u64::from(a1), 1u64 << e) - (u64::from(a0) >> e)
+}
+
+/// The metadata bytes the Annex B partition of one tile-component costs,
+/// computed arithmetically — from the same (B-14)/(B-15)/(B-16) and
+/// (B-17)/(B-18) equations as [`tile_component_geometry`] — WITHOUT
+/// allocating anything. The caller checks the summed cost against
+/// `DecodeLimits::max_decoded_bytes` BEFORE building the geometry.
+///
+/// Why this is exact for code-blocks: (B-17)/(B-18) cap the code-block
+/// exponents by the precinct exponents in band coordinates, and both
+/// partitions anchor at coordinate 0 of the band, so no code-block ever
+/// straddles a precinct boundary — the per-precinct enumeration of
+/// [`tile_component_geometry`] produces exactly the partition cells that
+/// cover the band rect, which is what [`partition_cells`] counts.
+///
+/// Rationale for charging metadata against `max_decoded_bytes`: PPx = PPy
+/// = 0 at r = 0 is spec-legal (Table A.21), so a tiny codestream can
+/// declare one 1x1 precinct + 1x1 code-block PER REFERENCE-GRID SAMPLE —
+/// gigabytes of bookkeeping for an image whose decoded output is far
+/// smaller. A code-block describes at least one coefficient and its
+/// bookkeeping costs far more than the 64-byte floors above, so any
+/// partition whose metadata charge alone exceeds the decoded-output budget
+/// is decodable only by raising the limits — the caller controls both.
+pub(crate) fn partition_metadata_cost(
+    tile: Rect,
+    component: &SizComponent,
+    style: &CodingStyle,
+) -> Result<u64> {
+    let rect = component_rect(tile, component.xrsiz, component.yrsiz)?;
+    let levels = style.decomposition_levels;
+    if levels > 32 {
+        return Err(JpxError::Malformed(
+            "COD/COC: more than 32 decomposition levels (Table A.15)".into(),
+        ));
+    }
+    if !style.precincts.is_empty() && style.precincts.len() != usize::from(levels) + 1 {
+        return Err(JpxError::Malformed(
+            "COD/COC: precinct size list is not NL + 1 entries (Table A.21)".into(),
+        ));
+    }
+    let mut cost = 0u64;
+    for r in 0..=levels {
+        // (B-14) resolution rect.
+        let divisor = 1u64 << u32::from(levels - r);
+        let res = Rect {
+            x0: ceil_div(u64::from(rect.x0), divisor) as u32,
+            y0: ceil_div(u64::from(rect.y0), divisor) as u32,
+            x1: ceil_div(u64::from(rect.x1), divisor) as u32,
+            y1: ceil_div(u64::from(rect.y1), divisor) as u32,
+        };
+        let (ppx, ppy) = precinct_exponents(style, r)?;
+        let precincts = u64::from(precinct_count(res.x0, res.x1, ppx))
+            * u64::from(precinct_count(res.y0, res.y1, ppy));
+        // (B-17)/(B-18) code-block exponents in band coordinates.
+        let (xcb, ycb, level, kinds): (u8, u8, u8, &[BandKind]) = if r == 0 {
+            (
+                style.code_block_width_exp.min(ppx),
+                style.code_block_height_exp.min(ppy),
+                levels,
+                &[BandKind::Ll],
+            )
+        } else {
+            (
+                style.code_block_width_exp.min(ppx - 1),
+                style.code_block_height_exp.min(ppy - 1),
+                levels - r + 1,
+                &[BandKind::Hl, BandKind::Lh, BandKind::Hh],
+            )
+        };
+        for kind in kinds {
+            let band = band_rect(rect, level, *kind);
+            let blocks =
+                partition_cells(band.x0, band.x1, xcb) * partition_cells(band.y0, band.y1, ycb);
+            cost = cost
+                .saturating_add(precincts.saturating_mul(PRECINCT_METADATA_BYTES))
+                .saturating_add(blocks.saturating_mul(BLOCK_METADATA_BYTES));
+        }
+    }
+    Ok(cost)
+}
+
 /// One resolution level of the Annex B partition: the (B-14) rect, the
 /// (B-16) precinct grid and the level's bands (B.9 order).
 fn resolution_geometry(
@@ -1295,5 +1395,79 @@ mod tests {
             y1: 8,
         };
         assert!(component_rect(area, 0, 1).is_err());
+    }
+
+    // ---- partition_metadata_cost (the decode-limit precheck) ------------
+
+    /// Recomputes the metadata charge from an actually-built partition.
+    fn measured_metadata_cost(geometry: &TileComponentGeometry) -> u64 {
+        let mut cost = 0u64;
+        for resolution in &geometry.resolutions {
+            for band in &resolution.bands {
+                for precinct in &band.precincts {
+                    cost += PRECINCT_METADATA_BYTES;
+                    cost += BLOCK_METADATA_BYTES * precinct.blocks.len() as u64;
+                }
+            }
+        }
+        cost
+    }
+
+    #[test]
+    fn partition_metadata_cost_matches_the_built_partition() {
+        // Configurations spanning maximal precincts, explicit precinct
+        // lists, sub-sampling, offsets, partial tiles and empty bands.
+        let subsampled = SizComponent {
+            depth: 8,
+            signed: false,
+            xrsiz: 2,
+            yrsiz: 2,
+        };
+        let cases = [
+            (
+                rect(0, 0, 128, 128),
+                unit_component(),
+                coding_style(5, 6, 6, &[]),
+            ),
+            (
+                rect(512, 256, 523, 311),
+                unit_component(),
+                coding_style(5, 6, 6, &[]),
+            ),
+            (
+                rect(5, 3, 101, 69),
+                unit_component(),
+                coding_style(2, 3, 2, &[(3, 3), (4, 4), (4, 3)]),
+            ),
+            (
+                rect(152, 234, 548, 531),
+                subsampled,
+                coding_style(3, 5, 3, &[(0, 0), (6, 5), (6, 5), (7, 7)]),
+            ),
+            (
+                rect(0, 0, 97, 61),
+                unit_component(),
+                coding_style(0, 6, 6, &[(2, 2)]),
+            ),
+        ];
+        for (tile, component, style) in cases {
+            let cost = partition_metadata_cost(tile, &component, &style).unwrap();
+            let geometry = tile_component_geometry(tile, &component, &style).unwrap();
+            assert_eq!(cost, measured_metadata_cost(&geometry), "tile {tile:?}");
+        }
+    }
+
+    #[test]
+    fn partition_metadata_cost_flags_the_1x1_precinct_bomb() {
+        // Table A.21 allows PPx = PPy = 0 at r = 0; with NL = 0 every
+        // reference-grid sample becomes its own precinct AND code-block,
+        // so an 8192 x 8192 declaration charges 2 * 64 bytes per sample —
+        // past the default 1 GiB max_decoded_bytes while max_pixels
+        // (1 << 26 of 1 << 27) still passes.
+        let style = coding_style(0, 4, 4, &[(0, 0)]);
+        let cost =
+            partition_metadata_cost(rect(0, 0, 8192, 8192), &unit_component(), &style).unwrap();
+        assert_eq!(cost, 2 * 64 * 8192 * 8192);
+        assert!(cost > crate::DecodeLimits::default().max_decoded_bytes);
     }
 }

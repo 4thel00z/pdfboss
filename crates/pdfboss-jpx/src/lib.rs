@@ -42,7 +42,15 @@ pub struct DecodeLimits {
     pub max_components: u16,
     /// Maximum tile count `numXtiles * numYtiles` (Equation (B-5)).
     pub max_tiles: u32,
-    /// Maximum bytes of decoded output, checked before allocation.
+    /// Maximum bytes of decoded output, checked before allocation. Also
+    /// charged against: header-driven bookkeeping — Tier-2 codeword
+    /// segment records, and a 64-byte floor per precinct slot and per
+    /// code-block of every tile's Annex B partition (computed
+    /// arithmetically before the partition is built). Spec-legal headers
+    /// (PPx = PPy = 0 at r = 0, Table A.21) can otherwise describe
+    /// gigabytes of per-block metadata from a few dozen bytes; a
+    /// partition whose bookkeeping alone dwarfs any decodable output
+    /// fails fast with `LimitExceeded`.
     pub max_decoded_bytes: u64,
 }
 
@@ -184,9 +192,32 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
             continue;
         }
 
-        let mut components = Vec::with_capacity(siz.components.len());
+        // Bound the tile's Tier-2 bookkeeping BEFORE any of it is
+        // allocated: the precinct/code-block counts follow arithmetically
+        // from the Annex B partition equations, and spec-legal headers
+        // (PPx = PPy = 0 at r = 0, Table A.21) can describe gigabytes of
+        // per-block metadata from a few dozen bytes. The cost is charged
+        // against max_decoded_bytes (see partition_metadata_cost).
+        let mut codings = Vec::with_capacity(siz.components.len());
+        let mut metadata_cost = 0u64;
         for (index, component) in siz.components.iter().enumerate() {
             let coding = markers::resolve_component_coding(&cs.main, &overrides, index as u16)?;
+            metadata_cost = metadata_cost.saturating_add(geometry::partition_metadata_cost(
+                tile_rect,
+                component,
+                &coding.style,
+            )?);
+            codings.push(coding);
+        }
+        if metadata_cost > limits.max_decoded_bytes {
+            return Err(JpxError::LimitExceeded {
+                what: "max_decoded_bytes",
+                actual: metadata_cost,
+                limit: limits.max_decoded_bytes,
+            });
+        }
+        let mut components = Vec::with_capacity(siz.components.len());
+        for (component, coding) in siz.components.iter().zip(codings) {
             let geometry = geometry::tile_component_geometry(tile_rect, component, &coding.style)?;
             components.push(packet::ComponentContext {
                 geometry,
