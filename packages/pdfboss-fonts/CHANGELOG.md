@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/4thel00z/pdfboss/compare/pdfboss-fonts-v0.2.0...pdfboss-fonts-v0.3.0) (2026-07-31)
+
+
+### Features
+
+* cleanroom JPEG 2000 decoder for JPXDecode image streams ([b8962d7](https://github.com/4thel00z/pdfboss/commit/b8962d72474ede11a58b9c6cc1c9b41dc4337198))
+
 ## [0.2.0](https://github.com/4thel00z/pdfboss/compare/pdfboss-fonts-v0.1.0...pdfboss-fonts-v0.2.0) (2026-07-15)
 
 
