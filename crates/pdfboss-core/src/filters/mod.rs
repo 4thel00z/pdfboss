@@ -231,13 +231,33 @@ pub fn is_image_codec(name: &str) -> bool {
 /// `trailing_filter_reads_the_chain_like_decode_stream` pins the
 /// agreement.
 pub async fn trailing_filter_with<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<Name> {
-    let filter = dict.get("Filter")?;
-    match src.resolve(filter).await.ok()? {
-        Object::Name(n) => Some(n),
+    // The overwhelmingly common shapes — a bare name, or an array of bare
+    // names — are read straight off the dictionary. Each `resolve` is a
+    // boxed future plus an owned-Object clone, and this gate runs in front
+    // of every content fetch (up to once per form invocation), so the
+    // resolve is reserved for values that actually contain a reference.
+    let owned;
+    let filter = match dict.get("Filter")? {
+        Object::Ref(_) => {
+            owned = src.resolve(dict.get("Filter")?).await.ok()?;
+            &owned
+        }
+        direct => direct,
+    };
+    match filter {
+        Object::Name(n) => Some(n.clone()),
         Object::Array(items) => {
             for item in items.iter().rev() {
-                if let Ok(Object::Name(n)) = src.resolve(item).await {
-                    return Some(n);
+                match item {
+                    Object::Name(n) => return Some(n.clone()),
+                    Object::Ref(_) => {
+                        if let Ok(Object::Name(n)) = src.resolve(item).await {
+                            return Some(n);
+                        }
+                    }
+                    // Not a name and not a road to one: skipped, exactly
+                    // as decode_stream skips it.
+                    _ => {}
                 }
             }
             None
@@ -370,6 +390,90 @@ mod tests {
                 trailing.is_some(),
                 "passthrough recognition of {filter:?}"
             );
+        }
+    }
+
+    /// A direct `/Filter` value costs the gate no `resolve` round-trip.
+    /// The overwhelmingly common shapes — a bare name, or an array of bare
+    /// names — are read straight off the dictionary; the boxed resolve
+    /// future (plus its owned-Object clone) is reserved for values that
+    /// actually contain a reference. Every content fetch pays this gate,
+    /// up to once per form invocation, which is what makes the fast path
+    /// worth pinning.
+    #[test]
+    fn direct_filter_values_cost_the_gate_no_resolve() {
+        use crate::source::{block_on, resolve_with, AsyncObjectSource, BoxFuture};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts `resolve` calls — each one is a boxed future plus an
+        /// owned-Object clone, which is the cost the fast path exists to
+        /// avoid, whether or not a fetch follows.
+        struct CountingSource {
+            map: HashMap<(u32, u16), Object>,
+            resolves: AtomicUsize,
+        }
+
+        impl AsyncObjectSource for CountingSource {
+            fn get(&self, r: ObjRef) -> BoxFuture<'_, Result<Object>> {
+                let got = self
+                    .map
+                    .get(&(r.num, r.gen))
+                    .cloned()
+                    .ok_or_else(|| Error::Decode("missing object".into()));
+                Box::pin(std::future::ready(got))
+            }
+
+            fn stream_data<'a>(&'a self, s: &'a Stream) -> BoxFuture<'a, Result<Vec<u8>>> {
+                Box::pin(std::future::ready(Ok(s.data.clone())))
+            }
+
+            fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>> {
+                self.resolves.fetch_add(1, Ordering::Relaxed);
+                Box::pin(resolve_with(self, o))
+            }
+        }
+
+        let map = HashMap::from([((7u32, 0u16), Object::Name(name("JPXDecode")))]);
+        let direct: Vec<(Object, Option<&str>)> = vec![
+            (Object::Name(name("DCTDecode")), Some("DCTDecode")),
+            (
+                Object::Array(vec![
+                    Object::Name(name("FlateDecode")),
+                    Object::Name(name("DCTDecode")),
+                ]),
+                Some("DCTDecode"),
+            ),
+            (Object::Array(vec![Object::Null]), None),
+            (Object::Int(3), None),
+        ];
+        for (filter, expected) in direct {
+            let src = CountingSource {
+                map: map.clone(),
+                resolves: AtomicUsize::new(0),
+            };
+            let dict = make_dict(vec![("Filter", filter.clone())]);
+            let got = block_on(trailing_filter_with(&src, &dict));
+            assert_eq!(got.map(|n| n.0), expected.map(str::to_string));
+            assert_eq!(
+                src.resolves.load(Ordering::Relaxed),
+                0,
+                "direct value {filter:?} must not resolve"
+            );
+        }
+        // The reference shapes still resolve — the fast path must not
+        // have cost them their answer.
+        for filter in [
+            Object::Ref(ObjRef { num: 7, gen: 0 }),
+            Object::Array(vec![Object::Ref(ObjRef { num: 7, gen: 0 })]),
+        ] {
+            let src = CountingSource {
+                map: map.clone(),
+                resolves: AtomicUsize::new(0),
+            };
+            let dict = make_dict(vec![("Filter", filter)]);
+            let got = block_on(trailing_filter_with(&src, &dict));
+            assert_eq!(got.map(|n| n.0), Some("JPXDecode".to_string()));
+            assert!(src.resolves.load(Ordering::Relaxed) > 0);
         }
     }
 
