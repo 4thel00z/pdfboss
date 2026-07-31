@@ -29,6 +29,12 @@ pub(crate) struct CodeBlockCoefficients {
     /// Per-sample count Nb(u, v) of decoded magnitude bit-planes (D.2) —
     /// the reconstruction parameter r of E.1.1.2/E.1.2.2 needs it.
     pub decoded_planes: Vec<u8>,
+    /// Entropy corruption was detected (a segment ran dry mid-pass, a D.5
+    /// segmentation-symbol mismatch, pass counts disagreeing with the
+    /// termination layout, or a codeword range outside the tile body):
+    /// the coefficients keep everything decoded up to that point, and the
+    /// caller reports one warning per corrupt block (leniency doctrine).
+    pub corrupt: bool,
 }
 
 /// One band's worth of decoded code-blocks, assembled by the orchestration
@@ -293,8 +299,12 @@ struct TermSegment {
 /// terminated group gets its own fresh entropy decoder (D.4). A
 /// contribution pointing outside the tile bit stream is corrupt: its
 /// entire half-assembled group is dropped and decoding stops at the last
-/// cleanly assembled segment (leniency doctrine).
-fn terminated_segments(contributions: &[CodeBlockSegment], bitstream: &[u8]) -> Vec<TermSegment> {
+/// cleanly assembled segment (leniency doctrine); the second return
+/// reports whether that happened.
+fn terminated_segments(
+    contributions: &[CodeBlockSegment],
+    bitstream: &[u8],
+) -> (Vec<TermSegment>, bool) {
     let mut segments = Vec::new();
     let mut bytes: Vec<u8> = Vec::new();
     let mut passes = 0u64;
@@ -304,7 +314,7 @@ fn terminated_segments(contributions: &[CodeBlockSegment], bitstream: &[u8]) -> 
             .checked_add(part.len)
             .and_then(|end| bitstream.get(part.start..end));
         let Some(data) = data else {
-            return segments;
+            return (segments, true);
         };
         bytes.extend_from_slice(data);
         passes += u64::from(part.passes);
@@ -321,7 +331,7 @@ fn terminated_segments(contributions: &[CodeBlockSegment], bitstream: &[u8]) -> 
         // its end continue from synthesized 0xFF bytes (D.4.1).
         segments.push(TermSegment { bytes, passes });
     }
-    segments
+    (segments, false)
 }
 
 /// The bit source for one pass: the MQ coder (Annex C) or the raw
@@ -676,8 +686,10 @@ fn cleanup_pass(
 ///
 /// Contract: never panics on hostile data — corrupt entropy data ends the
 /// affected pass early, leaving the remaining coefficients at their
-/// current (zero-extended) state; the caller decides whether that warrants
-/// a warning. A block with no segments decodes to all-zero coefficients.
+/// current (zero-extended) state and raising
+/// [`CodeBlockCoefficients::corrupt`] so the caller can warn once per
+/// damaged block. A block with no segments decodes to all-zero
+/// coefficients.
 pub(crate) fn decode_code_block(
     input: &CodeBlockInput,
     bitstream: &[u8],
@@ -690,7 +702,7 @@ pub(crate) fn decode_code_block(
         )));
     }
     let mut state = BlockState::new(width, height, input.style & STYLE_VCAUSAL != 0);
-    let segments = terminated_segments(&input.segments, bitstream);
+    let (segments, mut corrupt) = terminated_segments(&input.segments, bitstream);
 
     // How many passes the block can meaningfully carry: Mb magnitude
     // bit-planes (E-2) minus the signalled all-zero ones (B.10.5) leaves
@@ -701,6 +713,9 @@ pub(crate) fn decode_code_block(
     let available = u64::from(mb.saturating_sub(input.missing_msbs));
     let budget = if available == 0 { 0 } else { 3 * available - 2 };
     let signalled: u64 = segments.iter().map(|segment| segment.passes).sum();
+    if signalled > budget {
+        corrupt = true;
+    }
     let scheduled = signalled.min(budget);
 
     let bypass = input.style & STYLE_BYPASS != 0;
@@ -735,12 +750,14 @@ pub(crate) fn decode_code_block(
             }
         }
         let Some(active) = coder.as_mut() else {
+            corrupt = true;
             break;
         };
         if matches!(active, Coder::Raw(_)) != raw {
             // Every arithmetic<->raw switch coincides with a termination
             // in a valid stream (Table D.9); a mid-segment switch means
             // the pass counts and termination flags disagree — corrupt.
+            corrupt = true;
             break;
         }
         passes_left -= 1;
@@ -750,6 +767,7 @@ pub(crate) fn decode_code_block(
             contexts = initial_contexts();
         }
         let Some(weight) = plane_bit_weight(mb, input.missing_msbs, plane) else {
+            corrupt = true;
             break;
         };
         // Nb(u, v) after this plane counts the signalled all-zero planes
@@ -780,6 +798,7 @@ pub(crate) fn decode_code_block(
         if !clean {
             // Corruption ends the block here; everything decoded so far
             // stays (the seam contract's leniency doctrine).
+            corrupt = true;
             break;
         }
     }
@@ -789,6 +808,7 @@ pub(crate) fn decode_code_block(
         magnitudes: state.magnitudes,
         negative: state.negative,
         decoded_planes: state.decoded_planes,
+        corrupt,
     })
 }
 
@@ -1213,6 +1233,7 @@ mod tests {
         assert_eq!(block.magnitudes, vec![1]);
         assert_eq!(block.negative, vec![true]);
         assert_eq!(block.decoded_planes, vec![1]);
+        assert!(!block.corrupt);
 
         // The same bytes split across an unterminated contribution and a
         // terminated one concatenate back into one codeword segment
@@ -1338,6 +1359,7 @@ mod tests {
         let block = decode_code_block(&input, &bytes).expect("kept partial block");
         assert_eq!(block.magnitudes, vec![0]);
         assert_eq!(block.decoded_planes, vec![1]);
+        assert!(block.corrupt, "the mismatch must flag the block corrupt");
     }
 
     /// D.6 selective bypass plumbing on a 1 x 1 block with Mb = 5 and 13
@@ -1401,6 +1423,7 @@ mod tests {
         assert_eq!(block.magnitudes, vec![1]);
         assert_eq!(block.negative, vec![true]);
         assert_eq!(block.decoded_planes, vec![5]);
+        assert!(!block.corrupt);
     }
 
     /// A block that never contributed to any packet decodes to all-zero
@@ -1413,6 +1436,7 @@ mod tests {
         assert_eq!(block.magnitudes, vec![0; 6]);
         assert_eq!(block.negative, vec![false; 6]);
         assert_eq!(block.decoded_planes, vec![0; 6]);
+        assert!(!block.corrupt, "an absent block is normal, not corrupt");
     }
 
     /// Table A.18 bounds code-blocks to 2^12 samples (xcb + ycb <= 12); a
@@ -1449,5 +1473,33 @@ mod tests {
         let block = decode_code_block(&input, &[1, 2, 3]).expect("kept zero block");
         assert_eq!(block.magnitudes, vec![0; 4]);
         assert_eq!(block.decoded_planes, vec![0; 4]);
+        assert!(block.corrupt, "the dropped contribution must be flagged");
+    }
+
+    /// More passes than the 3 * (Mb - P) - 2 budget of D.3 can carry mean
+    /// the pass counts disagree with the plane budget: the extra passes
+    /// never run and the block is flagged corrupt.
+    #[test]
+    fn passes_beyond_the_plane_budget_flag_corruption() {
+        // Mb = 1: budget is exactly one cleanup pass; four are signalled.
+        let bytes = search_bytes(1, 3, &initial_contexts(), |decoder, contexts| {
+            decoder.decode(&mut contexts[0]) == 0
+        });
+        let input = block_input(
+            1,
+            1,
+            1,
+            0,
+            0,
+            vec![CodeBlockSegment {
+                start: 0,
+                len: bytes.len(),
+                passes: 4,
+                terminated: true,
+            }],
+        );
+        let block = decode_code_block(&input, &bytes).expect("kept the budgeted pass");
+        assert_eq!(block.decoded_planes, vec![1]);
+        assert!(block.corrupt);
     }
 }

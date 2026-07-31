@@ -6,6 +6,7 @@ use crate::error::{JpxError, Result};
 use crate::geometry::{BandKind, Rect, TileComponentGeometry};
 use crate::markers::{ComponentCoding, QuantizationStyle, SizComponent, WaveletKind};
 use crate::t1::{BandCoefficients, CodeBlockCoefficients};
+use crate::DecodeLimits;
 
 /// The coefficient storage of one tile-component canvas.
 // Constructed by the dequant stage; the variants are the frozen seam.
@@ -48,12 +49,14 @@ pub(crate) struct TileComponentCanvas {
 /// code-block into the interleaved canvas (F.3.3).
 ///
 /// `component` supplies RI (Table A.11 depth) for the Equation (E-4)
-/// dynamic range.
+/// dynamic range; `limits.max_decoded_bytes` bounds the canvas allocation
+/// before it happens.
 pub(crate) fn dequantize_tile_component(
     geometry: &TileComponentGeometry,
     coding: &ComponentCoding,
     component: &SizComponent,
     bands: &[BandCoefficients],
+    limits: &DecodeLimits,
 ) -> Result<TileComponentCanvas> {
     // RI (Table A.11) already contains any sign bit, so signedness never
     // enters the (E-4) dynamic range; it matters again at the G.1.2 level
@@ -61,15 +64,26 @@ pub(crate) fn dequantize_tile_component(
     // colour stage lands.
     let _ = component.signed;
     let rect = geometry.rect;
-    // The canvas covers the (B-12) tile-component rect; its pixel count is
-    // bounded upstream by the max_pixels limit check over the SIZ image
-    // region, so only address-space overflow needs rejecting here.
-    let count = usize::try_from(u64::from(rect.width()) * u64::from(rect.height()))
-        .ok()
-        .filter(|count| count.checked_mul(4).is_some())
+    // The canvas covers the (B-12) tile-component rect at 4 bytes per
+    // coefficient (i32 or f32); the byte count is bounded by
+    // max_decoded_bytes BEFORE the allocation happens.
+    let bytes = (u64::from(rect.width()) * u64::from(rect.height()))
+        .checked_mul(4)
         .ok_or_else(|| {
             JpxError::Malformed("tile-component canvas exceeds the address space".into())
         })?;
+    if bytes > limits.max_decoded_bytes {
+        return Err(JpxError::LimitExceeded {
+            what: "max_decoded_bytes",
+            actual: bytes,
+            limit: limits.max_decoded_bytes,
+        });
+    }
+    let count = usize::try_from(bytes / 4).map_err(|error| {
+        JpxError::Malformed(format!(
+            "tile-component canvas exceeds the address space: {error}"
+        ))
+    })?;
     // E.1.2 applies only when the 5-3 filter (Table A.20 value 1) is paired
     // with the no-quantization style (Table A.28): only then is the whole
     // dequant -> DWT pipeline integer-exact. Any other pairing dequantizes
@@ -410,6 +424,7 @@ mod tests {
             magnitudes: vec![0; count],
             negative: vec![false; count],
             decoded_planes: vec![0; count],
+            corrupt: false,
         }
     }
 
@@ -500,8 +515,14 @@ mod tests {
             let mut block = zero_block(tile);
             set_sample(&mut block, 0, 0, 1, false, mb);
             let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
-            let canvas =
-                dequantize_tile_component(&geometry, &coding, &component(depth), &bands).unwrap();
+            let canvas = dequantize_tile_component(
+                &geometry,
+                &coding,
+                &component(depth),
+                &bands,
+                &DecodeLimits::default(),
+            )
+            .unwrap();
             assert_eq!(
                 floats(&canvas),
                 &[expected],
@@ -568,7 +589,14 @@ mod tests {
             set_sample(&mut block, rect.x0, rect.y0, 1, false, mb);
             bands.push(one_band(kind, level, rect, block));
         }
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         let values = floats(&canvas);
         for (kind, level, x, y, delta) in cases {
             assert_eq!(
@@ -612,7 +640,14 @@ mod tests {
         set_sample(&mut block, 4, 0, 0, false, 5);
         set_sample(&mut block, 5, 0, 0, true, 0);
         let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(ints(&canvas), &[5, -5, 12, -12, 0, 0]);
     }
 
@@ -650,7 +685,14 @@ mod tests {
         set_sample(&mut block, 4, 0, 0, false, 5);
         set_sample(&mut block, 5, 0, 0, true, 0);
         let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(floats(&canvas), &[7.5, -7.5, 18.0, -18.0, 0.0, 0.0]);
     }
 
@@ -697,7 +739,14 @@ mod tests {
             set_sample(&mut block, rect.x0, rect.y0, 1, false, mb);
             bands.push(one_band(kind, 1, rect, block));
         }
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         let values = floats(&canvas);
         for (kind, index, expected) in cases {
             assert_eq!(values[index], expected, "{kind:?}");
@@ -751,7 +800,14 @@ mod tests {
             set_sample(&mut block, rect.x0, rect.y0, 1, false, mb);
             bands.push(one_band(kind, 1, rect, block));
         }
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         let values = floats(&canvas);
         for (kind, index, expected) in cases {
             assert_eq!(values[index], expected, "{kind:?}");
@@ -811,7 +867,14 @@ mod tests {
         set_sample(&mut block, 3, 0, 32, true, 2);
         set_sample(&mut block, 4, 0, 0, false, 6);
         let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(ints(&canvas), &[5, 5, 6, -5, 0]);
     }
 
@@ -973,7 +1036,14 @@ mod tests {
             set_sample(&mut block, ub, vb, marker as u32, false, 8);
             bands.push(one_band(kind, level, rect, block));
         }
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(canvas.rect, tile);
         assert_eq!(canvas.levels, 2);
         let values = ints(&canvas);
@@ -1019,8 +1089,14 @@ mod tests {
         let mut block = zero_block(tile);
         set_sample(&mut block, 0, 0, 3, false, 9);
         let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
-        let canvas =
-            dequantize_tile_component(&geometry, &coding_mixed, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding_mixed,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(floats(&canvas), &[3.0]);
 
         // 9-7 wavelet + no-quantization style -> f32 with Delta = 1
@@ -1037,8 +1113,14 @@ mod tests {
         let mut block = zero_block(tile);
         set_sample(&mut block, 0, 0, 8, false, 5);
         let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
-        let canvas =
-            dequantize_tile_component(&geometry, &coding_ranged, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding_ranged,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(floats(&canvas), &[12.0]);
     }
 
@@ -1068,7 +1150,13 @@ mod tests {
         let rect = band_rect_of(&geometry, BandKind::Hh, 1);
         let bands = vec![one_band(BandKind::Hh, 1, rect, zero_block(rect))];
         assert!(matches!(
-            dequantize_tile_component(&geometry, &coding, &component(8), &bands),
+            dequantize_tile_component(
+                &geometry,
+                &coding,
+                &component(8),
+                &bands,
+                &DecodeLimits::default()
+            ),
             Err(JpxError::Malformed(_))
         ));
     }
@@ -1102,7 +1190,101 @@ mod tests {
         set_sample(&mut block, 1, 0, 2, false, 8);
         set_sample(&mut block, 2, 0, 3, false, 8);
         let bands = vec![one_band(BandKind::Ll, 0, hostile, block)];
-        let canvas = dequantize_tile_component(&geometry, &coding, &component(8), &bands).unwrap();
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(ints(&canvas), &[1, 2]);
+    }
+
+    /// `max_decoded_bytes` bounds the coefficient canvas BEFORE it is
+    /// allocated: a 5 x 1 tile-component needs 20 bytes of i32.
+    #[test]
+    fn max_decoded_bytes_bounds_the_canvas_allocation() {
+        let tile = Rect {
+            x0: 0,
+            y0: 0,
+            x1: 5,
+            y1: 1,
+        };
+        let geometry = geometry_for(tile, 0, WaveletKind::Reversible53);
+        let coding = coding(
+            0,
+            WaveletKind::Reversible53,
+            1,
+            QuantizationStyle::None { exponents: vec![8] },
+            None,
+        );
+        let bands = vec![one_band(BandKind::Ll, 0, tile, zero_block(tile))];
+        let tight = DecodeLimits {
+            max_decoded_bytes: 19,
+            ..DecodeLimits::default()
+        };
+        assert!(matches!(
+            dequantize_tile_component(&geometry, &coding, &component(8), &bands, &tight),
+            Err(JpxError::LimitExceeded {
+                what: "max_decoded_bytes",
+                actual: 20,
+                limit: 19,
+            })
+        ));
+        let exact = DecodeLimits {
+            max_decoded_bytes: 20,
+            ..DecodeLimits::default()
+        };
+        dequantize_tile_component(&geometry, &coding, &component(8), &bands, &exact).unwrap();
+    }
+
+    /// The RGN composition across the seams (H.1/H.2): Tier-2 hands
+    /// Tier-1 the plane budget WITH the maxshift folded in — M'b = Mb + s
+    /// per (H-3), `packet::band_magnitude_bits` — so Tier-1 magnitudes
+    /// arrive at the coded weights, while this stage resolves the
+    /// UNSHIFTED Mb from the very same markers ((E-2), `band_parameters`)
+    /// and undoes the shift per H.1. Fully decoded (Nb = M'b) ROI and
+    /// background samples must therefore reconstruct exactly. (There is
+    /// no RGN fixture in the committed zoo, so the composition is pinned
+    /// here by construction.)
+    #[test]
+    fn rgn_streams_compose_across_the_tier2_and_dequant_seams() {
+        let shift = 3u8;
+        let coding = coding(
+            0,
+            WaveletKind::Reversible53,
+            1,
+            QuantizationStyle::None { exponents: vec![3] },
+            Some(shift),
+        );
+        // Tier-2's coded budget for every block of the band:
+        // M'b = (G + eps - 1) + s = (1 + 3 - 1) + 3 = 6 (E-2, H-3).
+        let coded_planes = crate::packet::band_magnitude_bits(&coding, 0, 0, 0);
+        assert_eq!(coded_planes, 6);
+        let tile = Rect {
+            x0: 0,
+            y0: 0,
+            x1: 2,
+            y1: 1,
+        };
+        let geometry = geometry_for(tile, 0, WaveletKind::Reversible53);
+        let mut block = zero_block(tile);
+        // An ROI sample of value 5, up-shifted by the encoder per (H-4)
+        // and fully decoded through all M'b coded planes...
+        set_sample(&mut block, 0, 0, 5 << shift, false, coded_planes);
+        // ...and a background sample of value -5, coded unshifted (its
+        // magnitude stays below 2^s by the maxshift construction).
+        set_sample(&mut block, 1, 0, 5, true, coded_planes);
+        let bands = vec![one_band(BandKind::Ll, 0, tile, block)];
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(ints(&canvas), &[5, -5]);
     }
 }

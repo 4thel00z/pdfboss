@@ -287,8 +287,15 @@ fn band_exponent(coding: &ComponentCoding, levels: u8, level: u8, flat: usize) -
 }
 
 /// Mb = G + eps_b - 1 (Equation (E-2)), raised by the RGN maxshift when
-/// one is in force (A.6.3, H.2); clamped to the seam's u8.
-fn band_magnitude_bits(coding: &ComponentCoding, levels: u8, level: u8, flat: usize) -> u8 {
+/// one is in force (A.6.3, H.2) to M'b = Mb + s (H-3); clamped to the
+/// seam's u8. `pub(crate)` so the dequantization stage can pin the H.1
+/// composition (coded weights here, unshifted Mb there) in a test.
+pub(crate) fn band_magnitude_bits(
+    coding: &ComponentCoding,
+    levels: u8,
+    level: u8,
+    flat: usize,
+) -> u8 {
     let exponent = band_exponent(coding, levels, level, flat);
     let mb = (u32::from(coding.quant.guard_bits) + exponent).saturating_sub(1)
         + u32::from(coding.roi_shift.unwrap_or(0));
@@ -1919,7 +1926,13 @@ mod tests {
 
         // B.12.1.1: for l { for r { for c { for k } } }; Nmax = 2 so r = 2
         // only carries c1 packets.
-        let lrcp = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Lrcp, 2, Vec::new());
+        let lrcp = collect_sequence(
+            &components,
+            rect(0, 0, 32, 32),
+            ProgressionOrder::Lrcp,
+            2,
+            Vec::new(),
+        );
         let expected_layer0 = [
             (0, 0, 0, 0),
             (0, 0, 0, 1),
@@ -1941,7 +1954,13 @@ mod tests {
         assert_eq!(&lrcp[11..], &expected_layer1[..]);
 
         // B.12.1.2: for r { for l { for c { for k } } }.
-        let rlcp = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Rlcp, 2, Vec::new());
+        let rlcp = collect_sequence(
+            &components,
+            rect(0, 0, 32, 32),
+            ProgressionOrder::Rlcp,
+            2,
+            Vec::new(),
+        );
         let expected = [
             (0, 0, 0, 0),
             (0, 0, 0, 1),
@@ -1979,7 +1998,13 @@ mod tests {
         let components = progression_components();
 
         // B.12.1.3 RPCL: for r { for y { for x { for c } } }, layers last.
-        let rpcl = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Rpcl, 2, Vec::new());
+        let rpcl = collect_sequence(
+            &components,
+            rect(0, 0, 32, 32),
+            ProgressionOrder::Rpcl,
+            2,
+            Vec::new(),
+        );
         let expected_rpcl = [
             // r = 0: (0,0) c0 k0 then c1 k0; (0,16) k1; (16,0) k2; (16,16) k3.
             (0, 0, 0, 0),
@@ -2010,7 +2035,13 @@ mod tests {
         assert_eq!(rpcl, expected_rpcl);
 
         // B.12.1.4 PCRL: for y { for x { for c { for r } } }.
-        let pcrl = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Pcrl, 2, Vec::new());
+        let pcrl = collect_sequence(
+            &components,
+            rect(0, 0, 32, 32),
+            ProgressionOrder::Pcrl,
+            2,
+            Vec::new(),
+        );
         let expected_pcrl = [
             (0, 0, 0, 0),
             (1, 0, 0, 0),
@@ -2039,7 +2070,13 @@ mod tests {
 
         // B.12.1.5 CPRL: for c { for y { for x { for r } } } — all of c0's
         // spatial walk first, then c1's three resolutions at (0, 0).
-        let cprl = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Cprl, 2, Vec::new());
+        let cprl = collect_sequence(
+            &components,
+            rect(0, 0, 32, 32),
+            ProgressionOrder::Cprl,
+            2,
+            Vec::new(),
+        );
         let expected_cprl = [
             (0, 0, 0, 0),
             (1, 0, 0, 0),

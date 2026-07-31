@@ -231,7 +231,17 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
             for band in &component_packets.bands {
                 let mut blocks = Vec::with_capacity(band.blocks.len());
                 for block in &band.blocks {
-                    blocks.push(t1::decode_code_block(block, &bitstream)?);
+                    let coefficients = t1::decode_code_block(block, &bitstream)?;
+                    if coefficients.corrupt {
+                        // One warning per damaged block; its partially
+                        // decoded coefficients stay (leniency doctrine).
+                        warnings.push(format!(
+                            "tile {tile_index} component {index}: corrupt code-block \
+                             [{}, {}) x [{}, {}) kept partially decoded",
+                            block.rect.x0, block.rect.x1, block.rect.y0, block.rect.y1,
+                        ));
+                    }
+                    blocks.push(coefficients);
                 }
                 bands.push(t1::BandCoefficients {
                     kind: band.kind,
@@ -245,6 +255,7 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
                 &context.coding,
                 &siz.components[index],
                 &bands,
+                limits,
             )?;
             dwt::inverse(&mut canvas)?;
             canvases.push(canvas);
