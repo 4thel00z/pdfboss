@@ -5,11 +5,11 @@
 //! - irreversible 9-7 cases: within +/-2 per sample AND PSNR >= 38 dB
 //!   against `<name>.pillow.png` (an independent decode of the same file).
 //!
-//! The per-case tests are `#[ignore]`d until the decoder pipeline is
-//! wired; the orchestration stage removes the ignores and nothing else.
+//! The per-case tests ran `#[ignore]`d until the decoder pipeline was
+//! wired; the orchestration stage removed the ignores and nothing else.
 //! The support code below (JSON manifest parsing, PNG oracle reading,
 //! comparison metrics) is fully functional and self-tested by the
-//! non-ignored tests, so it stays untouched later.
+//! harness self-tests, so it stays untouched.
 
 use pdfboss_jpx::{decode, DecodeLimits, JpxError};
 use std::path::{Path, PathBuf};
@@ -887,14 +887,12 @@ fn single_byte_mutations_never_panic() {
 }
 
 // ---------------------------------------------------------------------
-// Per-case end-to-end tests, ignored until the decoder pipeline is wired.
-// The orchestration stage removes the ignores and nothing else.
+// Per-case end-to-end tests over the wired decoder pipeline.
 // ---------------------------------------------------------------------
 
 macro_rules! zoo_case {
     ($test_name:ident, $case:literal) => {
         #[test]
-        #[ignore = "decoder not wired yet"]
         fn $test_name() {
             run_case($case);
         }
