@@ -1,10 +1,12 @@
 //! Image XObject and inline-image decoding to RGBA (bit depths 1-16,
-//! `/Decode` arrays, image masks, JPEG, Indexed lookup) and drawing via
-//! inverse mapping with nearest-neighbor sampling.
+//! `/Decode` arrays, image masks, JPEG, JPEG 2000, Indexed lookup) and
+//! drawing via inverse mapping with nearest-neighbor sampling.
 //!
 //! Limitation (v0.1): `/SMask` and `/Mask` masking is ignored; images blend
 //! with the constant fill alpha only. The executor reports every image whose
-//! dictionary carries one, so the approximation is never silent.
+//! dictionary carries one, so the approximation is never silent. The alpha a
+//! JPEG 2000 codestream carries *inside* itself (`/SMaskInData`, ISO 32000-1
+//! 7.4.9) IS applied, since it arrives with the samples.
 
 use pdfboss_core::geom::{Matrix, Point, Rect};
 #[cfg(test)]
@@ -111,6 +113,12 @@ pub(crate) enum Drawn {
     Truncated,
     /// Nothing painted: the image could not be decoded.
     Nothing,
+    /// Nothing painted: the decode failed for a reason worth naming to the
+    /// caller (a malformed JPEG 2000 codestream, a colour-space mismatch).
+    Failed(String),
+    /// Painted, but materially degraded: each note describes pixels the
+    /// decoder lost or had to approximate.
+    Degraded(Vec<String>),
 }
 
 /// Everything image decoding reads from the document, resolved up front so
@@ -125,8 +133,15 @@ pub(crate) enum Drawn {
 /// resolves per image.
 pub(crate) struct ImageMeta {
     /// The data is still a raw JPEG: the trailing `/Filter` entry is
-    /// `DCTDecode`, the one codec the stream filters pass through.
+    /// `DCTDecode`, one of the two codecs the stream filters pass through.
     dct: bool,
+    /// The data is still a JPEG 2000 file or codestream: the trailing
+    /// `/Filter` entry is `JPXDecode`, the other passed-through codec.
+    jpx: bool,
+    /// `/SMaskInData` (ISO 32000-1 Table 89, JPXDecode only): 1 or 2 asks
+    /// that the codestream's own opacity channel mask the image; 2 says the
+    /// colour samples are premultiplied by it. Absent reads as 0.
+    smask_in_data: i64,
     width: Option<f64>,
     height: Option<f64>,
     /// A 1-bit `/ImageMask` stencil, which paints in the current fill color
@@ -161,6 +176,11 @@ impl ImageMeta {
         };
         ImageMeta {
             dct: is_dct(src, dict).await,
+            jpx: is_jpx(src, dict).await,
+            smask_in_data: num_of(src, dict, "SMaskInData")
+                .await
+                .map(|v| v as i64)
+                .unwrap_or(0),
             width: num_of(src, dict, "Width").await,
             height: num_of(src, dict, "Height").await,
             stencil: bool_of(src, dict, "ImageMask").await.unwrap_or(false),
@@ -174,13 +194,17 @@ impl ImageMeta {
 /// Decodes an image XObject or inline image and composites it onto `pix`.
 ///
 /// `data` must already have its stream filters applied, except for a
-/// trailing `DCTDecode`: that is the one codec the filter chain passes
-/// through (ISO 32000-1 7.4.9), leaving `data` a raw JPEG, which this module
-/// decodes. Every other codec is rejected there, so `data` never arrives as
-/// a codestream this module would otherwise read as samples.
+/// trailing `DCTDecode` or `JPXDecode`: those are the two codecs the filter
+/// chain passes through (ISO 32000-1 7.4.9), leaving `data` a raw JPEG or a
+/// JPEG 2000 file, which this module decodes. Every other codec is rejected
+/// there, so `data` never arrives as a codestream this module would
+/// otherwise read as samples.
 /// Undecodable images are skipped (lenient); the return value says what was
 /// painted, so the caller can record the miss.
 pub(crate) fn draw(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> Drawn {
+    if meta.jpx {
+        return draw_jpx(pix, meta, data, p);
+    }
     match decode_rgba(meta, data, p.fill_rgb) {
         Some(img) => {
             let truncated = img.truncated;
@@ -222,7 +246,7 @@ async fn floats_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Opt
     Some(out)
 }
 
-/// The last entry of the image's `/Filter` chain, which is the codec the
+/// The last entry of the image's `/Filter` chain, which names the codec the
 /// data is still in when the stream filters pass an image codec through
 /// untouched.
 async fn trailing_filter<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<String> {
@@ -247,6 +271,17 @@ async fn is_dct<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
     matches!(
         trailing_filter(src, dict).await.as_deref(),
         Some("DCTDecode" | "DCT")
+    )
+}
+
+/// Whether the last entry of the image's `/Filter` chain is `JPXDecode`
+/// (whose data the stream filters pass through as a JPEG 2000 file or raw
+/// codestream). There is no abbreviated form: ISO 32000-1 Table 94 defines
+/// none, JPXDecode not being an inline-image filter.
+async fn is_jpx<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
+    matches!(
+        trailing_filter(src, dict).await.as_deref(),
+        Some("JPXDecode")
     )
 }
 
@@ -476,6 +511,232 @@ fn decode_jpeg<'a>(data: &[u8]) -> Option<Rgba<'a>> {
         pixels: Pixels::Quads(out),
         truncated: false,
     })
+}
+
+/// JPEG 2000 decode bounds mapped from this module's own image guards: the
+/// same pixel cap ([`MAX_PIXELS`]), a component count bounded by what a PDF
+/// colour space can consume (`ColorSpace::components` is clamped to 8) plus
+/// one opacity channel, and decoded bytes bounded by the RGBA expansion
+/// this module allocates anyway (4 bytes per pixel at the pixel cap).
+fn jpx_limits() -> pdfboss_jpx::DecodeLimits {
+    pdfboss_jpx::DecodeLimits {
+        max_pixels: MAX_PIXELS as u64,
+        max_components: 9,
+        max_decoded_bytes: (MAX_PIXELS as u64) * 4,
+        ..pdfboss_jpx::DecodeLimits::default()
+    }
+}
+
+/// Decodes and paints a `JPXDecode` image. Failures skip the image with a
+/// named reason; decoder warnings that cost pixels surface as degradation
+/// notes on an image that still painted.
+fn draw_jpx(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> Drawn {
+    let decoded = match pdfboss_jpx::decode(data, &jpx_limits()) {
+        Ok(decoded) => decoded,
+        Err(e) => return Drawn::Failed(format!("JPXDecode: {e}")),
+    };
+    let (img, notes) = match jpx_rgba(meta, decoded) {
+        Ok(converted) => converted,
+        Err(reason) => return Drawn::Failed(reason),
+    };
+    draw_rgba(pix, &img, p);
+    if notes.is_empty() {
+        Drawn::Whole
+    } else {
+        Drawn::Degraded(notes)
+    }
+}
+
+/// Interprets a decoded JPEG 2000 image under the PDF image dictionary
+/// (ISO 32000-1 7.4.9):
+///
+/// - the dict's `/ColorSpace`, when present, overrides the codestream's
+///   colour declaration, and its component count must match the colour
+///   channels the codestream carries;
+/// - without one, the codestream's declaration maps to the matching device
+///   space, or — for a declaration the decoder does not interpret (an ICC
+///   profile, an unconverted enumeration) — is approximated by channel
+///   count, with a note saying so;
+/// - a channel the codestream marks as opacity is never a colour channel;
+///   `/SMaskInData` 1 or 2 additionally turns it into per-pixel alpha, and
+///   2 un-premultiplies the colour samples by it first;
+/// - `/Decode` applies to the decoded samples exactly as for any other
+///   image, while the dict's `/BitsPerComponent` is ignored: the decoder
+///   already normalized every sample to 8 bits.
+///
+/// `Err` is a reason to skip the image. The `Vec<String>` collects material
+/// degradation: decoder warnings that cost pixels, plus this function's own
+/// approximation notes.
+fn jpx_rgba(
+    meta: &ImageMeta,
+    img: pdfboss_jpx::DecodedImage,
+) -> Result<(Rgba<'static>, Vec<String>), String> {
+    let width = img.width as usize;
+    let height = img.height as usize;
+    if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
+        return Err(format!("JPXDecode: bad dimensions {width}x{height}"));
+    }
+    width
+        .checked_mul(height)
+        .filter(|&n| n <= MAX_PIXELS)
+        .ok_or_else(|| format!("JPXDecode: {width}x{height} exceeds the pixel cap"))?;
+    let components = usize::from(img.components);
+    if components == 0 || img.samples.len() < width * height * components {
+        return Err("JPXDecode: the decoder returned too few samples".to_string());
+    }
+    let alpha = img.alpha_index.map(usize::from).filter(|&a| a < components);
+    let color_count = components - usize::from(alpha.is_some());
+    if color_count == 0 {
+        return Err("JPXDecode: the codestream carries only an opacity channel".to_string());
+    }
+
+    let mut notes = material_jpx_warnings(&img.warnings);
+
+    let mapped;
+    let cs: &ColorSpace = match meta.cs.as_ref() {
+        Some(cs) => {
+            // The image dictionary wins over the codestream (7.4.9), but it
+            // can only reinterpret the channels that are there.
+            if cs.components() != color_count {
+                return Err(format!(
+                    "JPXDecode: /ColorSpace expects {} component(s) but the codestream \
+                     carries {color_count} colour channel(s)",
+                    cs.components()
+                ));
+            }
+            cs
+        }
+        None => {
+            mapped = match img.color {
+                pdfboss_jpx::ColorKind::Gray => ColorSpace::DeviceGray,
+                pdfboss_jpx::ColorKind::Rgb => ColorSpace::DeviceRGB,
+                pdfboss_jpx::ColorKind::Cmyk => ColorSpace::DeviceCMYK,
+                // An ICC profile or an enumeration the decoder does not
+                // convert (T.800 I.5.3.3): approximate by channel count,
+                // and own up to the guess.
+                _ => {
+                    notes.push(format!(
+                        "JPXDecode: colour approximated from {color_count} channel(s); \
+                         the codestream's colour declaration is not interpreted"
+                    ));
+                    match color_count {
+                        1 => ColorSpace::DeviceGray,
+                        3 => ColorSpace::DeviceRGB,
+                        4 => ColorSpace::DeviceCMYK,
+                        n => {
+                            return Err(format!(
+                                "JPXDecode: no colour space for {n} colour channel(s)"
+                            ))
+                        }
+                    }
+                }
+            };
+            if mapped.components() != color_count {
+                return Err(format!(
+                    "JPXDecode: the codestream declares {} colour but carries \
+                     {color_count} colour channel(s)",
+                    mapped.components()
+                ));
+            }
+            &mapped
+        }
+    };
+
+    // A marked opacity channel never reaches the colour conversion; it
+    // becomes per-pixel alpha only when /SMaskInData asks for masking.
+    let masking = alpha.is_some() && matches!(meta.smask_in_data, 1 | 2);
+    let premultiplied = masking && meta.smask_in_data == 2;
+    let mut color_data = Vec::with_capacity(width * height * color_count);
+    let mut alpha_data = Vec::with_capacity(if masking { width * height } else { 0 });
+    let mut zero_alpha_color = false;
+    for px in img.samples.chunks_exact(components) {
+        let a = alpha.map_or(255, |i| px[i]);
+        for (i, &s) in px.iter().enumerate() {
+            if Some(i) == alpha {
+                continue;
+            }
+            color_data.push(if premultiplied {
+                // 7.4.9: stored colour is colour x alpha; divide it back
+                // out. At alpha 0 there is no colour to recover — a nonzero
+                // sample there is malformed and clamps to 0, once noted.
+                if a == 0 {
+                    zero_alpha_color |= s != 0;
+                    0
+                } else {
+                    ((u32::from(s) * 255 + u32::from(a) / 2) / u32::from(a)).min(255) as u8
+                }
+            } else {
+                s
+            });
+        }
+        if masking {
+            alpha_data.push(a);
+        }
+    }
+    if zero_alpha_color {
+        notes.push(
+            "JPXDecode: premultiplied colour under zero opacity clamped to zero \
+             (/SMaskInData 2)"
+                .to_string(),
+        );
+    }
+
+    // The same `/Decode` mapping and colour conversion every other image
+    // gets, at the decoder's normalized 8 bits per component.
+    let converted = decode_samples(width, height, &color_data, cs, 8, meta.decode.as_deref());
+    let mut quads = owned_quads(converted);
+    if masking {
+        for (px, &a) in quads.chunks_exact_mut(4).zip(&alpha_data) {
+            px[3] = a;
+        }
+    }
+    Ok((
+        Rgba {
+            width,
+            height,
+            pixels: Pixels::Quads(quads),
+            truncated: false,
+        },
+        notes,
+    ))
+}
+
+/// Expands a decoded image to one owned RGBA quad per pixel. The general
+/// path already is that; the packed one-component path converts through its
+/// own lookup table, so the two agree pixel for pixel.
+fn owned_quads(img: Rgba<'_>) -> Vec<u8> {
+    if let Pixels::Quads(quads) = img.pixels {
+        return quads;
+    }
+    let mut out = vec![0u8; img.width * img.height * 4];
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let off = (y * img.width + x) * 4;
+            out[off..off + 4].copy_from_slice(&img.at(x, y));
+        }
+    }
+    out
+}
+
+/// The decoder warnings that mean pixels were actually lost or misread — a
+/// corrupt code-block, a tile or channel zeroed, a skipped component
+/// transform — as opposed to advisory notes about tolerated stream quirks
+/// (the TNsot tile-part count, a skipped rreq box), which would only be
+/// noise in a render report.
+fn material_jpx_warnings(warnings: &[String]) -> Vec<String> {
+    const MATERIAL: [&str; 6] = [
+        "corrupt code-block",
+        "treated as empty",
+        "zero-filled",
+        "tile skipped",
+        "out-of-range tile",
+        "transform skipped",
+    ];
+    warnings
+        .iter()
+        .filter(|w| MATERIAL.iter().any(|m| w.contains(m)))
+        .map(|w| format!("JPXDecode: {w}"))
+        .collect()
 }
 
 /// Converts one Adobe-inverted CMYK pixel (stored as `255 - ink`) to RGB
@@ -826,6 +1087,188 @@ mod tests {
         let sof = j.windows(2).position(|w| w == [0xFF, 0xC0]).expect("SOF0");
         j[sof + 5..sof + 9].copy_from_slice(&[0, 0, 0, 0]);
         assert!(decode_rgba(&doc, &d, &j, None, [0; 3]).is_none());
+    }
+
+    /// A decoded JPEG 2000 image as the `pdfboss-jpx` crate would hand it
+    /// over, with no warnings; the interpretation tests below drive
+    /// [`jpx_rgba`] with these directly, so every dictionary combination is
+    /// exercised without a codestream fixture per case.
+    fn jpx_image(
+        width: u32,
+        height: u32,
+        components: u8,
+        samples: Vec<u8>,
+        color: pdfboss_jpx::ColorKind,
+        alpha_index: Option<u8>,
+    ) -> pdfboss_jpx::DecodedImage {
+        pdfboss_jpx::DecodedImage {
+            width,
+            height,
+            components,
+            samples,
+            color,
+            alpha_index,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// An [`ImageMeta`] resolved from dictionary source, as the executor
+    /// builds it for a JPX image.
+    fn jpx_meta(doc: &Document, dict_src: &[u8], cs_src: Option<&[u8]>) -> ImageMeta {
+        let cs = cs_src.map(obj);
+        ImageMeta::read(doc, &dict(dict_src), cs.as_ref())
+    }
+
+    #[test]
+    fn jpx_gray_maps_to_device_gray_and_honors_decode() {
+        let doc = test_doc();
+        let image = || jpx_image(2, 1, 1, vec![0, 255], pdfboss_jpx::ColorKind::Gray, None);
+
+        let meta = jpx_meta(&doc, b"<< >>", None);
+        let (img, notes) = jpx_rgba(&meta, image()).expect("gray decodes");
+        assert!(notes.is_empty(), "no degradation: {notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 0, 0, 255]);
+        assert_eq!(rgba_at(&img, 1, 0), [255, 255, 255, 255]);
+
+        // `/Decode [1 0]` inverts, exactly as it would any other image;
+        // `/BitsPerComponent 1` is ignored — the samples are 8-bit.
+        let meta = jpx_meta(&doc, b"<< /Decode [1 0] /BitsPerComponent 1 >>", None);
+        let (img, _) = jpx_rgba(&meta, image()).expect("gray decodes");
+        assert_eq!(rgba_at(&img, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(rgba_at(&img, 1, 0), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn jpx_dict_colorspace_overrides_the_codestream() {
+        // The codestream declares an enumeration nothing converts; the
+        // dictionary's /DeviceRGB wins (ISO 32000-1 7.4.9) and, being
+        // authoritative, is no guess: no note.
+        let doc = test_doc();
+        let color = pdfboss_jpx::ColorKind::Other {
+            enumeration: 9,
+            components: 3,
+        };
+        let image = jpx_image(1, 1, 3, vec![255, 0, 10], color, None);
+        let meta = jpx_meta(&doc, b"<< >>", Some(b"/DeviceRGB"));
+        let (img, notes) = jpx_rgba(&meta, image).expect("rgb decodes");
+        assert!(notes.is_empty(), "an override is not a guess: {notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0), [255, 0, 10, 255]);
+    }
+
+    #[test]
+    fn jpx_colorspace_component_mismatch_is_a_named_failure() {
+        let doc = test_doc();
+        let image = jpx_image(1, 1, 1, vec![7], pdfboss_jpx::ColorKind::Gray, None);
+        let meta = jpx_meta(&doc, b"<< >>", Some(b"/DeviceRGB"));
+        let reason = match jpx_rgba(&meta, image) {
+            Err(reason) => reason,
+            Ok(..) => panic!("1 channel is not RGB"),
+        };
+        assert!(
+            reason.contains("3 component(s)") && reason.contains("1 colour channel(s)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn jpx_uninterpreted_color_is_approximated_by_channel_count_with_a_note() {
+        let doc = test_doc();
+        let color = pdfboss_jpx::ColorKind::IccGuess { components: 3 };
+        let image = jpx_image(1, 1, 3, vec![0, 255, 0], color, None);
+        let meta = jpx_meta(&doc, b"<< >>", None);
+        let (img, notes) = jpx_rgba(&meta, image).expect("3 channels read as RGB");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 255, 0, 255]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("colour approximated"), "{notes:?}");
+    }
+
+    #[test]
+    fn jpx_alpha_channel_masks_only_when_smask_in_data_asks() {
+        let doc = test_doc();
+        // One RGBA pixel: red at half opacity, alpha in channel 3.
+        let image = || {
+            jpx_image(
+                1,
+                1,
+                4,
+                vec![255, 0, 0, 128],
+                pdfboss_jpx::ColorKind::Rgb,
+                Some(3),
+            )
+        };
+
+        // /SMaskInData absent: the opacity channel still never reaches the
+        // colour conversion (the pixel is red, not a 4-channel misread),
+        // but it does not mask either (ISO 32000-1 Table 89, value 0).
+        let meta = jpx_meta(&doc, b"<< >>", None);
+        let (img, _) = jpx_rgba(&meta, image()).expect("decodes");
+        assert_eq!(rgba_at(&img, 0, 0), [255, 0, 0, 255]);
+
+        // /SMaskInData 1: the channel becomes per-pixel alpha as stored.
+        let meta = jpx_meta(&doc, b"<< /SMaskInData 1 >>", None);
+        let (img, notes) = jpx_rgba(&meta, image()).expect("decodes");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0), [255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn jpx_premultiplied_color_is_divided_back_out() {
+        let doc = test_doc();
+        // Premultiplied half-opacity red: stored colour = 255 * 128 / 255.
+        let image = jpx_image(
+            1,
+            1,
+            4,
+            vec![128, 0, 0, 128],
+            pdfboss_jpx::ColorKind::Rgb,
+            Some(3),
+        );
+        let meta = jpx_meta(&doc, b"<< /SMaskInData 2 >>", None);
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert!(
+            notes.is_empty(),
+            "a clean division is not a loss: {notes:?}"
+        );
+        assert_eq!(rgba_at(&img, 0, 0), [255, 0, 0, 128]);
+    }
+
+    #[test]
+    fn jpx_premultiplied_color_under_zero_alpha_clamps_with_one_note() {
+        let doc = test_doc();
+        // Two malformed pixels (colour where alpha says none): one note.
+        let image = jpx_image(
+            2,
+            1,
+            2,
+            vec![9, 0, 17, 0],
+            pdfboss_jpx::ColorKind::Gray,
+            Some(1),
+        );
+        let meta = jpx_meta(&doc, b"<< /SMaskInData 2 >>", None);
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 0, 0, 0], "clamped, fully clear");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("zero opacity"), "{notes:?}");
+    }
+
+    #[test]
+    fn jpx_material_warnings_surface_and_advisory_ones_do_not() {
+        let doc = test_doc();
+        let mut image = jpx_image(1, 1, 1, vec![0], pdfboss_jpx::ColorKind::Gray, None);
+        image.warnings = vec![
+            "2 tile(s) ship more tile-parts than their declared TNsot; \
+             the count is advisory (T.800 A.4.2)"
+                .to_string(),
+            "reader-requirements (rreq) box skipped".to_string(),
+            "tile 0 component 1: corrupt code-block [0, 32) x [0, 32) \
+             kept partially decoded"
+                .to_string(),
+        ];
+        let meta = jpx_meta(&doc, b"<< >>", None);
+        let (_, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("corrupt code-block"), "{notes:?}");
+        assert!(notes[0].starts_with("JPXDecode: "), "{notes:?}");
     }
 
     #[test]

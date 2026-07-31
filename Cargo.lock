@@ -1262,6 +1262,7 @@ dependencies = [
  "jpeg-decoder",
  "pdfboss-core",
  "pdfboss-encoding",
+ "pdfboss-jpx",
  "pdfboss-testkit",
  "png",
 ]

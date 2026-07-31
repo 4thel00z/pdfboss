@@ -1726,10 +1726,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     async fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
-        // `data` is decoded samples or a raw JPEG: the filter chain passes
-        // only `DCTDecode` through (ISO 32000-1 7.4.9) and rejects every
-        // other codec, so no codestream reaches the sample reader. That
-        // rejection surfaces above, where `stream_data` fails.
+        // `data` is decoded samples, a raw JPEG, or a JPEG 2000 file: the
+        // filter chain passes only `DCTDecode` and `JPXDecode` through
+        // (ISO 32000-1 7.4.9) and rejects every other codec, so nothing
+        // reaches the sample reader that the image layer cannot decode.
+        // That rejection surfaces above, where `stream_data` fails.
         //
         // An `/Indexed` palette stored as a stream that will not decode
         // leaves the space with no palette at all, painting every sample
@@ -1766,6 +1767,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             image::Drawn::Whole => {}
             image::Drawn::Truncated => self.skip(SkippedKind::Image, SkipReason::Truncated),
             image::Drawn::Nothing => self.skip(SkippedKind::Image, SkipReason::Undecodable),
+            image::Drawn::Failed(reason) => {
+                self.skip(SkippedKind::Image, SkipReason::DecodeFailed(reason))
+            }
+            // The image painted, but not whole: one entry per distinct loss,
+            // so the caller knows the render is an approximation.
+            image::Drawn::Degraded(notes) => {
+                for note in notes {
+                    self.skip(SkippedKind::Image, SkipReason::DecodeFailed(note));
+                }
+            }
         }
     }
 
@@ -2270,14 +2281,14 @@ mod tests {
         // The page's only content is `/Im0 Do`, where Im0 carries a filter
         // the core does not implement. The page must still render (lenient),
         // but the drop must be reported.
-        let (pix, report) = render_reporting(doc_with_image_filter("JPXDecode"));
+        let (pix, report) = render_reporting(doc_with_image_filter("Crypt"));
 
         assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2285,7 +2296,7 @@ mod tests {
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
         assert_eq!(
             report.warnings(),
-            vec!["1 image skipped: unsupported filter /JPXDecode".to_string()],
+            vec!["1 image skipped: unsupported filter /Crypt".to_string()],
         );
     }
 
@@ -2305,13 +2316,13 @@ mod tests {
     #[test]
     fn unsupported_inline_image_filter_is_reported() {
         let content = "q 100 0 0 100 0 0 cm BI /W 8 /H 8 /BPC 1 /CS /G \
-                       /F /JPXDecode ID 01234567 EI Q";
+                       /F /Crypt ID 01234567 EI Q";
         let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2351,7 +2362,7 @@ mod tests {
             b.stream(
                 5,
                 "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JPXDecode",
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
                 &[0; 8],
             );
         });
@@ -2383,7 +2394,7 @@ mod tests {
         b.stream(
             5,
             "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /JPXDecode",
+             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
             &[0; 8],
         );
         for level in 0..LEVELS {
@@ -2440,14 +2451,14 @@ mod tests {
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
         );
-        b.stream(4, "/Filter /JPXDecode", b"0 0 100 100 re f");
+        b.stream(4, "/Filter /Crypt", b"0 0 100 100 re f");
         let (pix, report) = render_reporting(b.build(1));
         assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::PageContents,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2464,7 +2475,7 @@ mod tests {
         let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
             b.stream(
                 5,
-                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /JPXDecode",
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /Crypt",
                 b"0 0 100 100 re f",
             );
         });
@@ -2474,7 +2485,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Form,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
@@ -2498,12 +2509,12 @@ mod tests {
     }
 
     #[test]
-    fn jpx_image_is_reported_instead_of_painted_as_noise() {
-        // Nothing here decodes a JPEG 2000 codestream, so the filter chain
-        // refuses to hand one over as if it were stream data (ISO 32000-1
-        // 7.4.9). Were it passed through, the 0x42 bytes below would paint
-        // as gray samples and the render would claim success; instead the
-        // image is dropped and named in the report.
+    fn a_garbage_jpx_stream_is_reported_instead_of_painted_as_noise() {
+        // The filter chain passes JPXDecode through for the image layer to
+        // decode (ISO 32000-1 7.4.9). The 0x42 bytes below are no JPEG 2000
+        // file, so the decode fails; were they painted as gray samples the
+        // render would claim success, so the drop must carry the decoder's
+        // reason instead.
         let bytes = small_doc(
             "/XObject << /Im0 5 0 R >>",
             b"q 100 0 0 100 0 0 cm /Im0 Do Q",
@@ -2518,18 +2529,13 @@ mod tests {
         );
         let (pix, report) = render_reporting(bytes);
         assert_eq!(px(&pix, 50, 50), WHITE, "no noise painted");
-        assert_eq!(
-            drops(&report),
-            vec![(
-                SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
-                1,
-            )],
-        );
-        assert_eq!(
-            report.warnings(),
-            vec!["1 image skipped: unsupported filter /JPXDecode".to_string()],
-            "the caller can name what went missing",
+        assert_eq!(report.skipped.len(), 1);
+        let drop = &report.skipped[0];
+        assert_eq!((drop.kind, drop.count), (SkippedKind::Image, 1));
+        assert!(
+            matches!(&drop.reason, SkipReason::DecodeFailed(msg) if msg.contains("JPXDecode")),
+            "the caller can name what went missing: {:?}",
+            drop.reason
         );
     }
 
@@ -2573,7 +2579,7 @@ mod tests {
                      /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 255 6 0 R]",
                     &[0; 64],
                 );
-                b.stream(6, "/Filter /JPXDecode", &[0; 12]);
+                b.stream(6, "/Filter /Crypt", &[0; 12]);
             },
         );
         let (_, report) = render_reporting(bytes);
@@ -2581,7 +2587,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
         );
