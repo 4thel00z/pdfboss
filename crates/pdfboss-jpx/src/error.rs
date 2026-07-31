@@ -31,10 +31,9 @@ pub enum JpxError {
         /// The configured bound.
         limit: u64,
     },
-    /// The codestream uses a feature outside the supported profile (fail
-    /// soft, T.800 features listed as out of scope), or reaches a decoder
-    /// stage that is not implemented yet — scaffold stubs return
-    /// `Unsupported("decoder scaffold")`.
+    /// The codestream uses a feature outside the supported profile
+    /// (T.800 features this decoder lists as out of scope). The string
+    /// names the feature.
     Unsupported(&'static str),
 }
 

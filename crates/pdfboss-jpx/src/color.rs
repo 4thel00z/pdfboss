@@ -7,7 +7,7 @@ use crate::boxes::{ChannelDefinition, ColorSpec, Jp2Header, Palette};
 use crate::dequant::{CoefficientCanvas, TileComponentCanvas};
 use crate::error::{JpxError, Result};
 use crate::geometry::Rect;
-use crate::markers::{Siz, SizComponent};
+use crate::markers::{Siz, SizComponent, WaveletKind};
 use crate::{ColorKind, DecodeLimits, DecodedImage, JpxWarning};
 
 /// Inverse RCT per T.800 G.2.2, Equations (G-6)..(G-8). Integer exact:
@@ -16,6 +16,17 @@ use crate::{ColorKind, DecodeLimits, DecodedImage, JpxWarning};
 fn inverse_rct(y0: i64, y1: i64, y2: i64) -> (i64, i64, i64) {
     // (G-6): I1 = Y0 - floor((Y2 + Y1) / 4).
     let i1 = y0 - (y2 + y1).div_euclid(4);
+    // (G-7): I0 = Y2 + I1;  (G-8): I2 = Y1 + I1.
+    (y2 + i1, i1, y1 + i1)
+}
+
+/// Inverse RCT on non-integer canvases: the (G-6)..(G-8) formulas with
+/// `f64::floor` standing in for the corner brackets. Needed when Table
+/// A.17 pairs the RCT with the 5-3 filter but signalled quantization put
+/// the coefficients on the f64 path.
+fn inverse_rct_f64(y0: f64, y1: f64, y2: f64) -> (f64, f64, f64) {
+    // (G-6): I1 = Y0 - floor((Y2 + Y1) / 4).
+    let i1 = y0 - ((y2 + y1) / 4.0).floor();
     // (G-7): I0 = Y2 + I1;  (G-8): I2 = Y1 + I1.
     (y2 + i1, i1, y1 + i1)
 }
@@ -252,12 +263,20 @@ enum WorkCanvas {
     Float(Vec<f64>),
 }
 
-/// Undoes the Table A.17 multiple component transformation in place on the
-/// first three tile-components: inverse RCT (G.2.2) on the reversible
-/// path, inverse ICT (G.3.2) on the irreversible one. G.2/G.3 demand the
-/// three components share separation and depth, so mismatched rects or
-/// mixed canvas kinds skip the transform with a warning (fail-soft).
-fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<JpxWarning>) {
+/// Undoes the Table A.17 multiple component transformation in place on
+/// the first three tile-components. WHICH transform is decided by the
+/// filter those components signalled — Table A.17 pairs the RCT with the
+/// 5-3 wavelet and the ICT with the 9-7 — never by the canvas arithmetic:
+/// a 5-3 tile with signalled quantization runs on f64 canvases yet still
+/// takes the RCT (via its floor-division f64 form). `wavelet` is the
+/// common filter of components 0..3, `None` when they disagree — an
+/// illegal pairing under G.2.1/G.3.1, skipped with a warning. G.2/G.3
+/// also demand identical separations, so mismatched rects skip too.
+fn apply_inverse_mct(
+    work: &mut [(Rect, WorkCanvas)],
+    wavelet: Option<WaveletKind>,
+    warnings: &mut Vec<JpxWarning>,
+) {
     let [first, second, third, ..] = work else {
         // A skipped component transform leaves wrong colours behind.
         warnings.push(JpxWarning::loss(
@@ -273,8 +292,16 @@ fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<JpxWarn
         ));
         return;
     }
-    match (&mut first.1, &mut second.1, &mut third.1) {
-        (WorkCanvas::Int(a), WorkCanvas::Int(b), WorkCanvas::Int(c)) => {
+    let Some(wavelet) = wavelet else {
+        // A skipped component transform leaves wrong colours behind.
+        warnings.push(JpxWarning::loss(
+            "MCT components disagree on their wavelet filter, so Table A.17 \
+             pairs no transform with them (G.2.1/G.3.1); transform skipped",
+        ));
+        return;
+    };
+    match (wavelet, &mut first.1, &mut second.1, &mut third.1) {
+        (WaveletKind::Reversible53, WorkCanvas::Int(a), WorkCanvas::Int(b), WorkCanvas::Int(c)) => {
             // 5-3 reversible path: inverse RCT (G-6)..(G-8).
             for ((y0, y1), y2) in a.iter_mut().zip(b.iter_mut()).zip(c.iter_mut()) {
                 let (i0, i1, i2) = inverse_rct(*y0, *y1, *y2);
@@ -283,7 +310,27 @@ fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<JpxWarn
                 *y2 = i2;
             }
         }
-        (WorkCanvas::Float(a), WorkCanvas::Float(b), WorkCanvas::Float(c)) => {
+        (
+            WaveletKind::Reversible53,
+            WorkCanvas::Float(a),
+            WorkCanvas::Float(b),
+            WorkCanvas::Float(c),
+        ) => {
+            // Still the RCT (Table A.17 keys on the FILTER): signalled
+            // quantization put the 5-3 coefficients on the f64 path.
+            for ((y0, y1), y2) in a.iter_mut().zip(b.iter_mut()).zip(c.iter_mut()) {
+                let (i0, i1, i2) = inverse_rct_f64(*y0, *y1, *y2);
+                *y0 = i0;
+                *y1 = i1;
+                *y2 = i2;
+            }
+        }
+        (
+            WaveletKind::Irreversible97,
+            WorkCanvas::Float(a),
+            WorkCanvas::Float(b),
+            WorkCanvas::Float(c),
+        ) => {
             // 9-7 irreversible path: inverse ICT (G-12)..(G-14).
             for ((y0, y1), y2) in a.iter_mut().zip(b.iter_mut()).zip(c.iter_mut()) {
                 let (i0, i1, i2) = inverse_ict(*y0, *y1, *y2);
@@ -292,7 +339,10 @@ fn apply_inverse_mct(work: &mut [(Rect, WorkCanvas)], warnings: &mut Vec<JpxWarn
                 *y2 = i2;
             }
         }
-        // A skipped component transform leaves wrong colours behind.
+        // Mixed canvas kinds under one filter (per-component quantization
+        // styles differ), or an integer canvas claiming the 9-7 (cannot
+        // arise: the integer path requires the 5-3). A skipped component
+        // transform leaves wrong colours behind.
         _ => warnings.push(JpxWarning::loss(
             "MCT components mix reversible and irreversible canvases; transform skipped \
              (Table A.17 pairs the RCT with the 5-3 filter and the ICT with the 9-7)",
@@ -440,13 +490,17 @@ impl ImageAssembler {
     }
 
     /// Composites one decoded tile. `tile` is the reference-grid tile rect
-    /// (B-7..B-10); `mct` is the tile's Table A.17 flag; `canvases` arrive
-    /// in codestream component order, each at its absolute tile-component
-    /// rect (B-12) on its own component grid.
+    /// (B-7..B-10); `mct` is the tile's Table A.17 flag; `mct_wavelet` is
+    /// the common wavelet filter of components 0..3 (`None` when they
+    /// disagree or fewer than three exist), which selects the transform
+    /// Table A.17 pairs with the flag; `canvases` arrive in codestream
+    /// component order, each at its absolute tile-component rect (B-12)
+    /// on its own component grid.
     pub(crate) fn push_tile(
         &mut self,
         tile: Rect,
         mct: u8,
+        mct_wavelet: Option<WaveletKind>,
         canvases: Vec<TileComponentCanvas>,
     ) -> Result<()> {
         // Clip to the image region (B-1); tiles never exceed it when the
@@ -515,7 +569,7 @@ impl ImageAssembler {
         // Undo the multiple component transformation (Table A.17).
         match mct {
             0 => {}
-            1 => apply_inverse_mct(&mut work, &mut self.warnings),
+            1 => apply_inverse_mct(&mut work, mct_wavelet, &mut self.warnings),
             // Whatever transform the reserved value meant stays applied:
             // the colours cannot be trusted.
             other => self.warnings.push(JpxWarning::loss(format!(
@@ -1062,6 +1116,7 @@ mod tests {
             .push_tile(
                 rect(0, 0, 5, 1),
                 0,
+                None,
                 vec![reversible(
                     rect(0, 0, 5, 1),
                     &[-128, -127, -126, -125, -119],
@@ -1101,6 +1156,7 @@ mod tests {
             .push_tile(
                 rect(4, 1, 8, 5),
                 0,
+                None,
                 vec![reversible(rect(4, 1, 8, 5), &values)],
             )
             .unwrap();
@@ -1109,6 +1165,7 @@ mod tests {
             .push_tile(
                 rect(2, 1, 4, 5),
                 0,
+                None,
                 vec![reversible(rect(2, 1, 4, 5), &[-121; 8])],
             )
             .unwrap();
@@ -1146,6 +1203,7 @@ mod tests {
             .push_tile(
                 rect(2, 1, 4, 5),
                 0,
+                None,
                 vec![reversible(rect(2, 1, 4, 5), &[-121; 8])],
             )
             .unwrap();
@@ -1173,6 +1231,7 @@ mod tests {
             .push_tile(
                 rect(0, 0, 4, 2),
                 0,
+                None,
                 vec![reversible(rect(0, 0, 2, 2), &[-118, -108, -98, -88])],
             )
             .unwrap();
@@ -1199,6 +1258,7 @@ mod tests {
             .push_tile(
                 rect(0, 0, 1, 1),
                 1,
+                Some(WaveletKind::Reversible53),
                 vec![
                     reversible(rect(0, 0, 1, 1), &[-72]),
                     reversible(rect(0, 0, 1, 1), &[-25]),
@@ -1228,6 +1288,7 @@ mod tests {
             .push_tile(
                 rect(0, 0, 1, 1),
                 1,
+                Some(WaveletKind::Irreversible97),
                 vec![
                     irreversible(rect(0, 0, 1, 1), &[-3.8]),
                     irreversible(rect(0, 0, 1, 1), &[-41.87472]),
@@ -1250,6 +1311,7 @@ mod tests {
             .push_tile(
                 rect(0, 0, 1, 1),
                 1,
+                Some(WaveletKind::Reversible53),
                 vec![
                     reversible(rect(0, 0, 1, 1), &[-28]),
                     irreversible(rect(0, 0, 1, 1), &[0.4]),
@@ -1283,6 +1345,7 @@ mod tests {
             .push_tile(
                 rect(0, 0, 2, 1),
                 0,
+                None,
                 vec![
                     reversible(rect(0, 0, 2, 1), &[-28, -78]),
                     reversible(rect(0, 0, 2, 1), &[0, 100]),
@@ -1488,7 +1551,7 @@ mod tests {
         let siz = siz_for(2, 1, 0, 0, 2, 1, vec![component(8, false, 1, 1)]);
         let mut assembler = ImageAssembler::new(&siz, None, &DecodeLimits::default()).unwrap();
         assembler
-            .push_tile(rect(0, 0, 2, 1), 0, Vec::new())
+            .push_tile(rect(0, 0, 2, 1), 0, None, Vec::new())
             .unwrap();
         let image = assembler.finish(Vec::new()).unwrap();
         assert_eq!(image.samples, vec![0, 0]);

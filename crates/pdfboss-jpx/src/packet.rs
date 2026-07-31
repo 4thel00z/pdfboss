@@ -209,19 +209,33 @@ fn decode_tile_packets(
     };
     let volumes = plan_volumes(&ctx.components, ctx.progression, ctx.layers, &ctx.poc);
     let mut sequencer = PacketSequencer::new(&ctx.components, ctx.tile_rect, volumes, budget);
+    let mut aborted = false;
     loop {
         let step = match sequencer.next_packet() {
             Ok(step) => step,
             Err(error) => {
                 tier2.soften(error, None)?;
+                aborted = true;
                 break;
             }
         };
         let Some((layer, slot)) = step else { break };
         if let Err(error) = tier2.parse_packet(slot, layer) {
             tier2.soften(error, Some((layer, slot)))?;
+            aborted = true;
             break;
         }
+    }
+    // Diagnostic: every expected packet decoded, yet body bytes remain —
+    // the progression description (COD/POC, A.6.6/B.12) ends before the
+    // bit stream does. Those bytes were never going to paint anything,
+    // so no pixel the description promised is lost.
+    let leftover = ctx.bitstream.len().saturating_sub(tier2.body_pos);
+    if !aborted && leftover > 0 {
+        tier2.warnings.push(JpxWarning::note(format!(
+            "{leftover} tile-body byte(s) after the last expected packet left unread \
+             (the progression description ends early; A.6.6/B.12)"
+        )));
     }
     Ok(Tier2Outcome {
         packets: TilePackets {
@@ -1801,6 +1815,37 @@ mod tests {
         assert_eq!(segment_tuples(&band.blocks[0]), vec![(5, 4, 3, false)]);
         assert_eq!(segment_tuples(&band.blocks[1]), vec![(9, 4, 2, false)]);
         assert_eq!(outcome.body_end, 13);
+    }
+
+    #[test]
+    fn unconsumed_tail_bytes_get_a_diagnostic_note() {
+        // Figure B.13's layer-0 packet followed by three bytes no packet
+        // claims: the progression description (one layer) ends before the
+        // tile body does — a POC/COD under-description. Diagnostic only:
+        // every packet the description promised did decode.
+        let mut stream = bit_bytes("1 111 000111 1100 0 0100 1 01 10 10 00100 0 0 0");
+        stream.extend_from_slice(&[101, 102, 103, 104, 111, 112, 113, 114]);
+        stream.extend_from_slice(&[9, 9, 9]);
+        let ctx = TileDecodeContext {
+            components: vec![figure_b13_component()],
+            tile_rect: rect(0, 0, 48, 32),
+            progression: ProgressionOrder::Lrcp,
+            layers: 1,
+            poc: Vec::new(),
+            sop_markers: false,
+            eph_markers: false,
+            bitstream: &stream,
+            packed_headers: None,
+        };
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
+        assert_eq!(outcome.body_end, 13);
+        assert_eq!(outcome.packets.warnings.len(), 1, "{:?}", outcome.packets);
+        let warning = &outcome.packets.warnings[0];
+        assert!(!warning.data_loss, "{warning:?}");
+        assert!(
+            warning.message.contains("3 tile-body byte(s)"),
+            "{warning:?}"
+        );
     }
 
     #[test]

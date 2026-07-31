@@ -249,8 +249,11 @@ fn initial_contexts() -> [MqContext; CONTEXT_COUNT] {
 /// Raw (bypassed) bit reader for D.6: bits come MSB first straight from
 /// the codeword segment; a byte following an 0xFF carries a stuffed bit in
 /// its most significant position, which is discarded ("this routine throws
-/// out the first bit after an 0xFF byte value"). Exhaustion is `None`:
-/// running dry mid-pass is corruption, not padding.
+/// out the first bit after an 0xFF byte value"). Reads past the segment
+/// end continue from synthesized 0xFF bytes: D.4.1 has the decoder extend
+/// the bit stream "with 0xFF bytes, as necessary, until all symbols have
+/// been decoded", and D.6 NOTE 2 relies on exactly that to make truncated
+/// raw segments legal — mirroring the MQ coder's C.3.4 padding in mq.rs.
 struct RawBits<'a> {
     data: &'a [u8],
     position: usize,
@@ -270,10 +273,14 @@ impl<'a> RawBits<'a> {
         }
     }
 
-    fn next_bit(&mut self) -> Option<u32> {
+    fn next_bit(&mut self) -> u32 {
         if self.remaining == 0 {
-            let byte = *self.data.get(self.position)?;
-            self.position += 1;
+            // Past the segment end the stream extends with 0xFF bytes
+            // (D.4.1); the unstuffing below applies to them like any
+            // other byte, so every padded byte after the first yields
+            // seven 1-bits.
+            let byte = self.data.get(self.position).copied().unwrap_or(255);
+            self.position = self.position.saturating_add(1);
             self.current = byte;
             // A stuffed bit occupies the MSB after an 0xFF byte (D.6);
             // starting at 7 remaining bits discards it.
@@ -281,7 +288,7 @@ impl<'a> RawBits<'a> {
             self.previous_was_ff = byte == 255;
         }
         self.remaining -= 1;
-        Some(u32::from(self.current >> self.remaining) & 1)
+        u32::from(self.current >> self.remaining) & 1
     }
 }
 
@@ -480,9 +487,9 @@ fn significance_bit(
     coder: &mut Coder<'_>,
     contexts: &mut [MqContext; CONTEXT_COUNT],
     label: usize,
-) -> Option<u32> {
+) -> u32 {
     match coder {
-        Coder::Mq(mq) => Some(mq.decode(&mut contexts[label])),
+        Coder::Mq(mq) => mq.decode(&mut contexts[label]),
         Coder::Raw(raw) => raw.next_bit(),
     }
 }
@@ -496,14 +503,14 @@ fn decode_sign(
     state: &BlockState,
     x: usize,
     y: usize,
-) -> Option<bool> {
+) -> bool {
     match coder {
         Coder::Mq(mq) => {
             let (h0, h1, v0, v1) = state.sign_neighbors(x, y);
             let (label, xor) = sign_context(h0, h1, v0, v1);
-            Some((mq.decode(&mut contexts[label]) ^ xor) == 1)
+            (mq.decode(&mut contexts[label]) ^ xor) == 1
         }
-        Coder::Raw(raw) => Some(raw.next_bit()? == 1),
+        Coder::Raw(raw) => raw.next_bit() == 1,
     }
 }
 
@@ -516,19 +523,20 @@ fn refinement_bit(
     x: usize,
     y: usize,
     i: usize,
-) -> Option<u32> {
+) -> u32 {
     match coder {
         Coder::Mq(mq) => {
             let (sh, sv, sd) = state.neighbor_sums(x, y);
             let label = refinement_context(sh + sv + sd, !state.refined[i]);
-            Some(mq.decode(&mut contexts[label]))
+            mq.decode(&mut contexts[label])
         }
         Coder::Raw(raw) => raw.next_bit(),
     }
 }
 
 /// D.3.1: decodes the significance propagation pass of one bit-plane.
-/// Returns false when the (raw) segment ran dry mid-pass — corruption.
+/// Never fails: both coders pad past a truncated segment (C.3.4 for the
+/// MQ coder, D.4.1/D.6 NOTE 2 for the raw one).
 fn significance_pass(
     state: &mut BlockState,
     coder: &mut Coder<'_>,
@@ -536,7 +544,7 @@ fn significance_pass(
     band: BandKind,
     weight: u32,
     planes: u8,
-) -> bool {
+) {
     // A new plane starts here: the visited flags describe THIS plane's
     // significance propagation from now on (D.3.3, D.3.4).
     state.visited.fill(false);
@@ -551,20 +559,14 @@ fn significance_pass(
         if label == 0 {
             continue;
         }
-        let Some(bit) = significance_bit(coder, contexts, label) else {
-            return false;
-        };
+        let bit = significance_bit(coder, contexts, label);
         state.visited[i] = true;
         state.record(i, bit, weight, planes);
         if bit == 1 {
             state.significant[i] = true;
-            let Some(negative) = decode_sign(coder, contexts, state, x, y) else {
-                return false;
-            };
-            state.negative[i] = negative;
+            state.negative[i] = decode_sign(coder, contexts, state, x, y);
         }
     }
-    true
 }
 
 /// D.3.3: decodes the magnitude refinement pass of one bit-plane — every
@@ -576,19 +578,16 @@ fn refinement_pass(
     contexts: &mut [MqContext; CONTEXT_COUNT],
     weight: u32,
     planes: u8,
-) -> bool {
+) {
     for (x, y) in scan_positions(state.width, state.height) {
         let i = state.at(x, y);
         if !state.significant[i] || state.visited[i] {
             continue;
         }
-        let Some(bit) = refinement_bit(coder, contexts, state, x, y, i) else {
-            return false;
-        };
+        let bit = refinement_bit(coder, contexts, state, x, y, i);
         state.refined[i] = true;
         state.record(i, bit, weight, planes);
     }
-    true
 }
 
 /// D.3.4: decodes the cleanup pass of one bit-plane — everything not yet
@@ -774,16 +773,20 @@ pub(crate) fn decode_code_block(
         // too (D.2.1); the u8 seam saturates on hostile counts.
         let planes = (u64::from(input.missing_msbs) + u64::from(plane) + 1).min(255) as u8;
         let clean = match kind {
-            PassKind::SignificancePropagation => significance_pass(
-                &mut state,
-                active,
-                &mut contexts,
-                input.band,
-                weight,
-                planes,
-            ),
+            PassKind::SignificancePropagation => {
+                significance_pass(
+                    &mut state,
+                    active,
+                    &mut contexts,
+                    input.band,
+                    weight,
+                    planes,
+                );
+                true
+            }
             PassKind::MagnitudeRefinement => {
-                refinement_pass(&mut state, active, &mut contexts, weight, planes)
+                refinement_pass(&mut state, active, &mut contexts, weight, planes);
+                true
             }
             PassKind::Cleanup => cleanup_pass(
                 &mut state,
@@ -1169,22 +1172,26 @@ mod tests {
     ///   255 = 11111111 -> follows 80: eight bits as-is
     ///   255 = 11111111 -> follows 0xFF: drop MSB, seven 1s
     ///    37 = 00100101 -> follows 0xFF: drop MSB, 0100101
-    /// = 45 bits, then the segment is dry and reads yield None.
+    /// = 45 bits; past the segment end the reader pads with synthesized
+    /// 0xFF bytes (D.4.1, D.6 NOTE 2). The first padding byte follows the
+    /// non-FF byte 37, so all eight 1s arrive; every later one follows an
+    /// 0xFF, dropping its stuffed MSB — 1-bits forever, never an abort.
     #[test]
-    fn raw_bits_unstuff_after_ff() {
+    fn raw_bits_unstuff_after_ff_and_pad_past_the_end() {
         let data = [179u8, 255, 80, 255, 255, 37];
         let mut reader = RawBits::new(&data);
         let want = concat!("10110011", "11111111", "1010000", "11111111", "1111111", "0100101");
         let got: String = (0..45)
-            .map(|_| match reader.next_bit() {
-                Some(0) => '0',
-                Some(1) => '1',
-                got => panic!("raw bit was {got:?}"),
-            })
+            .map(|_| char::from(b'0' + reader.next_bit() as u8))
             .collect();
         assert_eq!(got, want);
-        assert_eq!(reader.next_bit(), None, "the 46th bit must not exist");
-        assert_eq!(RawBits::new(&[]).next_bit(), None);
+        for i in 0..30 {
+            assert_eq!(reader.next_bit(), 1, "padding bit {i}");
+        }
+        let mut empty = RawBits::new(&[]);
+        for i in 0..20 {
+            assert_eq!(empty.next_bit(), 1, "empty-segment padding bit {i}");
+        }
     }
 
     /// D.7 vertically causal formation: a 1 x 5 block puts row 4 in the

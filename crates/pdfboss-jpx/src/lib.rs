@@ -78,7 +78,8 @@ pub enum ColorKind {
     /// Three-channel RGB (EnumCS 16 sRGB, sYCC already converted, or 3
     /// components).
     Rgb,
-    /// Four-channel CMYK (from an ICC guess over 4 colour channels).
+    /// Four-channel CMYK: the component-count guess for a RAW codestream
+    /// with four channels (no colr box exists to say otherwise).
     Cmyk,
     /// An ICC profile the decoder does not interpret: colour approximated
     /// by component count (T.800 I.5.3.3 METH 2); a warning records it.
@@ -299,6 +300,18 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
                 yrsiz: component.yrsiz,
             });
         }
+        // Table A.17 keys the MCT on the FILTER of the components it
+        // spans (0..3): resolve their common wavelet, `None` when they
+        // disagree (an illegal pairing the colour stage warns about).
+        let mct_wavelet = if components.len() >= 3 {
+            let wavelet = components[0].coding.style.wavelet;
+            components[1..3]
+                .iter()
+                .all(|component| component.coding.style.wavelet == wavelet)
+                .then_some(wavelet)
+        } else {
+            None
+        };
 
         // Packets flow across tile-part boundaries: concatenate bodies in
         // decoding order (B.11).
@@ -366,7 +379,7 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
             dwt::inverse(&mut canvas)?;
             canvases.push(canvas);
         }
-        assembler.push_tile(tile_rect, tile_coding.mct, canvases)?;
+        assembler.push_tile(tile_rect, tile_coding.mct, mct_wavelet, canvases)?;
     }
     if short_quant_components > 0 {
         // The (E-5) fallback decodes every coefficient: benign.
