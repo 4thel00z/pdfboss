@@ -16,8 +16,8 @@ use std::sync::Arc;
 use pdfboss_core::content::{parse_content, ImageParams, Op, TextItem};
 use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{
-    block_on, page_content_with, AsyncObjectSource, Dict, Document, Error, Immediate, Name, Object,
-    Page, Result, Stream,
+    block_on, content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Document,
+    Error, Immediate, Name, Object, Page, Result, Stream,
 };
 
 use crate::color::{self, ColorSpace};
@@ -1138,7 +1138,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 let Ok(Object::Stream(stream)) = self.src.resolve(&glyph.proc_obj).await else {
                     return None;
                 };
-                let Ok(data) = self.src.stream_data(&stream).await else {
+                // Through the content chokepoint: a CharProc labelled with
+                // an image codec is passthrough bytes, refused rather than
+                // parsed (silently, like every other CharProc fetch
+                // failure).
+                let Ok(data) = content_stream_data_with(self.src, &stream).await else {
                     return None;
                 };
                 let Ok(ops) = parse_content(&data) else {
@@ -1626,7 +1630,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Form, SkipReason::LimitExceeded);
             return None;
         }
-        let data = match self.src.stream_data(stream).await {
+        // Through the content chokepoint, not raw `stream_data`: a form
+        // whose trailing filter is an image codec holds passthrough bytes
+        // no content parser may read (ISO 32000-1 7.4.9), and the refusal
+        // reports like any other unsupported filter.
+        let data = match content_stream_data_with(self.src, stream).await {
             Ok(data) => data,
             Err(e) => {
                 self.skip(SkippedKind::Form, skip_reason_for(&e));
@@ -2488,6 +2496,88 @@ mod tests {
                 SkipReason::UnsupportedFilter("Crypt".to_string()),
                 1,
             )],
+        );
+    }
+
+    #[test]
+    fn jpx_labelled_page_contents_are_refused_not_parsed() {
+        // The filter chain passes JPXDecode bytes through still encoded for
+        // the IMAGE layer (ISO 32000-1 7.4.9); a page /Contents stream so
+        // labelled must be refused, never handed to the content parser.
+        // The stream below is deliberately valid operator syntax, so a
+        // renderer that parses the passthrough WOULD paint the page red:
+        // white pixels are the proof the bytes were refused, not chewed.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        );
+        b.stream(4, "/Filter /JPXDecode", b"1 0 0 rg 0 0 100 100 re f");
+        let (pix, report) = render_reporting(b.build(1));
+        assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::PageContents,
+                SkipReason::UnsupportedFilter("JPXDecode".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn dct_labelled_form_content_is_refused_not_parsed() {
+        // The same wart with the other passthrough codec, one level down: a
+        // form XObject whose trailing filter is DCTDecode holds raw JPEG
+        // bytes no content parser may read.
+        let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /DCTDecode",
+                b"1 0 0 rg 0 0 100 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "the form painted nothing");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Form,
+                SkipReason::UnsupportedFilter("DCTDecode".to_string()),
+                1,
+            )],
+        );
+    }
+
+    #[test]
+    fn jpx_labelled_charproc_is_skipped_not_parsed() {
+        // A Type3 CharProc is the third content consumer. Its failures are
+        // silent by contract (the glyph advances unpainted, like every other
+        // CharProc fetch failure), so the proof is pixels alone: the box the
+        // ops would paint stays white.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+             /FontMatrix [0.001 0 0 0.001 0 0] \
+             /Encoding << /Differences [65 /boxglyph] >> \
+             /CharProcs << /boxglyph 6 0 R >> /FirstChar 65 /Widths [1000] >>",
+        );
+        b.stream(6, "/Filter /JPXDecode", b"1000 0 d0 100 0 500 700 re f");
+        let (pix, _) = render_reporting(b.build(1));
+        assert!(
+            !dark_at(&pix, 55, 115),
+            "the CharProc bytes must not be parsed as content"
         );
     }
 

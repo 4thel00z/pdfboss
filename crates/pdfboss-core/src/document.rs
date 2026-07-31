@@ -914,7 +914,7 @@ pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
         return Ok(Vec::new());
     };
     match src.resolve(contents).await? {
-        Object::Stream(ref s) => src.stream_data(s).await,
+        Object::Stream(ref s) => content_stream_data_with(&src, s).await,
         Object::Array(items) => {
             let mut out = Vec::new();
             let mut first = true;
@@ -926,13 +926,36 @@ pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
                 if !first {
                     out.push(b'\n');
                 }
-                out.extend_from_slice(&src.stream_data(stream).await?);
+                out.extend_from_slice(&content_stream_data_with(&src, stream).await?);
                 first = false;
             }
             Ok(out)
         }
         _ => Ok(Vec::new()),
     }
+}
+
+/// Fetches and decodes one CONTENT stream — page `/Contents`, a form
+/// XObject, a Type3 CharProc, a pattern cell: anything whose bytes feed a
+/// content parser rather than an image decoder.
+///
+/// This is [`AsyncObjectSource::stream_data`] with one refusal in front:
+/// a stream whose trailing `/Filter` entry is an image codec (`DCTDecode`,
+/// `JPXDecode`) fails with [`Error::UnsupportedFilter`] instead of handing
+/// back the passthrough. `decode_stream` leaves those bytes ENCODED for
+/// the image layer (ISO 32000-1 7.4.9); a content parser fed the raw
+/// codestream would chew binary garbage into operators — typically a blank
+/// page with a clean report — so the refusal here is what turns the
+/// mislabelled stream into the same reported skip as any other filter this
+/// library cannot run. Same calling convention as [`page_content_with`]
+/// (`src` by value; see that function's docs).
+pub async fn content_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
+    if let Some(name) = filters::trailing_filter_with(&src, &s.dict).await {
+        if filters::is_image_codec(&name.0) {
+            return Err(Error::UnsupportedFilter(name.0));
+        }
+    }
+    src.stream_data(s).await
 }
 
 #[cfg(test)]
@@ -963,6 +986,37 @@ mod tests {
             saw_content,
             "fixture must give at least one page real content"
         );
+    }
+
+    /// A page `/Contents` stream whose trailing filter is an image codec is
+    /// refused, never parsed: `decode_stream` would pass its bytes through
+    /// STILL ENCODED (ISO 32000-1 7.4.9 reserves that for the image layer),
+    /// and the stream below is deliberately valid operator syntax to prove
+    /// the refusal happens on the label, not on the bytes. The error is the
+    /// same `UnsupportedFilter` any genuinely undecodable filter raises, so
+    /// every caller reports it identically.
+    #[test]
+    fn image_codec_page_contents_are_refused_not_returned() {
+        for codec in ["JPXDecode", "DCTDecode"] {
+            let mut b = PdfBuilder::new();
+            b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+            b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            b.object(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+            );
+            b.stream(
+                4,
+                &format!("/Filter /{codec}"),
+                b"1 0 0 rg 0 0 100 100 re f",
+            );
+            let doc = Document::load(b.build(1)).expect("load");
+            let page = doc.page(0).expect("page");
+            match page.content(&doc) {
+                Err(Error::UnsupportedFilter(n)) => assert_eq!(n, codec),
+                other => panic!("{codec} content must be refused, got {other:?}"),
+            }
+        }
     }
 
     /// The composition every page-reading algorithm actually uses: the caller
