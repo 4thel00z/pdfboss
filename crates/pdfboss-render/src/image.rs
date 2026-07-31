@@ -529,13 +529,20 @@ fn jpx_limits() -> pdfboss_jpx::DecodeLimits {
 
 /// Decodes and paints a `JPXDecode` image. Failures skip the image with a
 /// named reason; decoder warnings that cost pixels surface as degradation
-/// notes on an image that still painted.
+/// notes on an image that still painted. Under `/ImageMask true` the
+/// decoded channel is a stencil painting the current fill colour
+/// (ISO 32000-1 7.4.9), never the image's own.
 fn draw_jpx(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> Drawn {
     let decoded = match pdfboss_jpx::decode(data, &jpx_limits()) {
         Ok(decoded) => decoded,
         Err(e) => return Drawn::Failed(format!("JPXDecode: {e}")),
     };
-    let (img, notes) = match jpx_rgba(meta, decoded) {
+    let converted = if meta.stencil {
+        jpx_stencil(meta, &decoded, p.fill_rgb)
+    } else {
+        jpx_rgba(meta, decoded)
+    };
+    let (img, notes) = match converted {
         Ok(converted) => converted,
         Err(reason) => return Drawn::Failed(reason),
     };
@@ -545,6 +552,64 @@ fn draw_jpx(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> 
     } else {
         Drawn::Degraded(notes)
     }
+}
+
+/// The dimension and sample-count guards shared by the image and stencil
+/// interpretations of a decoded codestream. `Err` is a reason to skip.
+fn jpx_dimensions(img: &pdfboss_jpx::DecodedImage) -> Result<(usize, usize), String> {
+    let width = img.width as usize;
+    let height = img.height as usize;
+    if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
+        return Err(format!("JPXDecode: bad dimensions {width}x{height}"));
+    }
+    width
+        .checked_mul(height)
+        .filter(|&n| n <= MAX_PIXELS)
+        .ok_or_else(|| format!("JPXDecode: {width}x{height} exceeds the pixel cap"))?;
+    let components = usize::from(img.components);
+    if components == 0 || img.samples.len() < width * height * components {
+        return Err("JPXDecode: the decoder returned too few samples".to_string());
+    }
+    Ok((width, height))
+}
+
+/// Interprets a decoded codestream under `/ImageMask true` — ISO 32000-1
+/// 7.4.9: "If the image is a stencil mask [...] the JPEG2000 data shall
+/// provide a single colour channel with 1-bit samples." The channel is
+/// repacked to the 1-bit layout [`decode_stencil`] reads, so the stencil
+/// semantics — `/Decode`, which 7.4.9 keeps for masks alone, selecting
+/// whether a 0 or a 1 sample paints `fill_rgb` — are exactly the shared
+/// ones. A conforming 1-bit channel normalizes to samples of exactly 0
+/// or 255; the midpoint threshold is exact for those and still sensible
+/// for a (malformed) deeper channel. More than one channel cannot be a
+/// stencil at all: a named failure, and the caller skips the image.
+fn jpx_stencil(
+    meta: &ImageMeta,
+    img: &pdfboss_jpx::DecodedImage,
+    fill_rgb: [u8; 3],
+) -> Result<(Rgba<'static>, Vec<String>), String> {
+    let (width, height) = jpx_dimensions(img)?;
+    if img.components != 1 {
+        return Err(format!(
+            "JPXDecode: /ImageMask true but the codestream carries {} channels \
+             where ISO 32000-1 7.4.9 demands a single one",
+            img.components
+        ));
+    }
+    let notes = material_jpx_warnings(&img.warnings);
+    let row_bytes = width.div_ceil(8);
+    let mut packed = vec![0u8; row_bytes * height];
+    for y in 0..height {
+        for x in 0..width {
+            if img.samples[y * width + x] >= 128 {
+                packed[y * row_bytes + x / 8] |= 128 >> (x % 8);
+            }
+        }
+    }
+    Ok((
+        decode_stencil(width, height, &packed, meta.decode.as_deref(), fill_rgb),
+        notes,
+    ))
 }
 
 /// Interprets a decoded JPEG 2000 image under the PDF image dictionary
@@ -572,19 +637,8 @@ fn jpx_rgba(
     meta: &ImageMeta,
     img: pdfboss_jpx::DecodedImage,
 ) -> Result<(Rgba<'static>, Vec<String>), String> {
-    let width = img.width as usize;
-    let height = img.height as usize;
-    if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
-        return Err(format!("JPXDecode: bad dimensions {width}x{height}"));
-    }
-    width
-        .checked_mul(height)
-        .filter(|&n| n <= MAX_PIXELS)
-        .ok_or_else(|| format!("JPXDecode: {width}x{height} exceeds the pixel cap"))?;
+    let (width, height) = jpx_dimensions(&img)?;
     let components = usize::from(img.components);
-    if components == 0 || img.samples.len() < width * height * components {
-        return Err("JPXDecode: the decoder returned too few samples".to_string());
-    }
     let alpha = img.alpha_index.map(usize::from).filter(|&a| a < components);
     let color_count = components - usize::from(alpha.is_some());
     if color_count == 0 {
@@ -1279,6 +1333,45 @@ mod tests {
         let (_, notes) = jpx_rgba(&meta, image).expect("decodes");
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0], "JPXDecode: tile 3 rendered as background");
+    }
+
+    #[test]
+    fn jpx_stencil_paints_fill_where_the_sample_maps_to_zero() {
+        // ISO 32000-1 7.4.9: a 1-bit channel normalizes to samples of 0 or
+        // 255. The default /Decode paints the 0 samples in the fill colour
+        // and leaves the 1 samples untouched; [1 0] flips that.
+        let doc = test_doc();
+        let image = || {
+            let mut image = jpx_image(2, 1, 1, vec![0, 255], pdfboss_jpx::ColorKind::Gray, None);
+            image.component_depths = vec![1];
+            image
+        };
+
+        let meta = jpx_meta(&doc, b"<< /ImageMask true >>", None);
+        let (img, notes) = jpx_stencil(&meta, &image(), [10, 20, 30]).expect("stencils");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0), [10, 20, 30, 255], "0 paints fill");
+        assert_eq!(rgba_at(&img, 1, 0), [0, 0, 0, 0], "1 stays clear");
+
+        let meta = jpx_meta(&doc, b"<< /ImageMask true /Decode [1 0] >>", None);
+        let (img, _) = jpx_stencil(&meta, &image(), [10, 20, 30]).expect("stencils");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 0, 0, 0], "inverted: 0 clear");
+        assert_eq!(rgba_at(&img, 1, 0), [10, 20, 30, 255], "inverted: 1 paints");
+    }
+
+    #[test]
+    fn jpx_stencil_rejects_a_multichannel_codestream() {
+        let doc = test_doc();
+        let image = jpx_image(1, 1, 3, vec![1, 2, 3], pdfboss_jpx::ColorKind::Rgb, None);
+        let meta = jpx_meta(&doc, b"<< /ImageMask true >>", None);
+        let reason = match jpx_stencil(&meta, &image, [0; 3]) {
+            Err(reason) => reason,
+            Ok(..) => panic!("three channels are not a stencil"),
+        };
+        assert!(
+            reason.contains("3 channels") && reason.contains("ImageMask"),
+            "{reason}"
+        );
     }
 
     #[test]
