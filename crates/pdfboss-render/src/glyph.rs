@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 #[cfg(test)]
 use pdfboss_core::{block_on, Document, Immediate};
-use pdfboss_core::{AsyncObjectSource, Dict, Matrix, Object};
+use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Matrix, Object};
 
 use crate::cff::CffFont;
 use crate::path::{PathBuilder, Subpath};
@@ -833,17 +833,24 @@ async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Optio
     let tt = TrueType::parse(program)?;
 
     // /CIDToGIDMap: /Identity (or absent) means GID == CID; a stream is a
-    // big-endian u16 table indexed by CID.
+    // big-endian u16 table indexed by CID, fetched through the checked
+    // fetch — chunking a passthrough codestream into u16s would paint
+    // every glyph of the font from a nonsense table. A refused or
+    // unreadable map keeps the font loaded with an EMPTY table rather
+    // than failing the load or falling back to Identity: every CID then
+    // resolves to gid 0, so each drawn code is a reported NoGlyph skip
+    // (its advance still applies) instead of a silent drop or a wrong
+    // glyph.
     let map = match rv(src, cid, "CIDToGIDMap").await {
-        Some(Object::Stream(s)) => {
-            let bytes = src.stream_data(&s).await.ok()?;
-            Some(
+        Some(Object::Stream(s)) => match decoded_stream_data_with(src, &s).await {
+            Ok(bytes) => Some(
                 bytes
                     .chunks_exact(2)
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect(),
-            )
-        }
+            ),
+            Err(_) => Some(Vec::new()),
+        },
         _ => None, // Identity
     };
     Some(GlyphFont {
@@ -976,10 +983,14 @@ async fn resolve_dict<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Dic
     src.resolve(obj).await.ok()?.as_dict().cloned()
 }
 
-/// Resolves an object to a stream and returns its decoded bytes.
+/// Resolves an object to a stream and returns its decoded bytes. Fetched
+/// through the checked fetch, not raw `stream_data`: every caller here
+/// hands the bytes to a font-program parser, and a stream whose trailing
+/// `/Filter` is an image codec holds a passthrough codestream no parser
+/// may read. Refusal reads as any other unreadable program: `None`.
 async fn stream_bytes<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Vec<u8>> {
     match src.resolve(obj).await.ok()? {
-        Object::Stream(s) => src.stream_data(&s).await.ok(),
+        Object::Stream(s) => decoded_stream_data_with(src, &s).await.ok(),
         _ => None,
     }
 }
@@ -1390,6 +1401,85 @@ mod tests {
             "second glyph must paint at the /W-implied origin (135,115), not \
              stacked on the first glyph as the program's 0 advance would give"
         );
+    }
+
+    /// One page drawing `<00010001>` through a Type0/CIDFontType2 whose
+    /// `/CIDToGIDMap` stream carries `map_dict` around `map_bytes`.
+    fn cid_map_doc(map_dict: &str, map_bytes: &[u8]) -> Document {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <00010001> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+             /FontDescriptor 7 0 R /CIDToGIDMap 9 0 R /DW 1000 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
+        );
+        b.stream(8, "", &build_font());
+        b.stream(9, map_dict, map_bytes);
+        Document::load(b.build(1)).expect("load")
+    }
+
+    /// A `/CIDToGIDMap` whose trailing `/Filter` is an image codec is
+    /// refused — chunking a passthrough codestream into u16s would paint
+    /// every glyph of the font from a nonsense table. The refusal keeps
+    /// the font loaded over an empty table, so each drawn code lands on
+    /// gid 0 and is reported as a NoGlyph skip instead of dropping
+    /// silently (the pre-refusal shape: a clean report over wrong ink).
+    /// The bytes are a deliberately valid table, so the label decides.
+    #[test]
+    fn an_image_codec_cid_to_gid_map_reports_every_drawn_glyph() {
+        let doc = cid_map_doc("/Filter /DCTDecode", &[0, 0, 0, 1]);
+        let page = doc.page(0).expect("page");
+        let (pix, report) =
+            crate::render_page_reporting(&doc, &page, 1.0, &RenderOptions::default())
+                .expect("render");
+        assert!(!dark_pixel_at(&pix, 55, 115), "no garbage glyph painted");
+        let drops: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.kind, s.reason.clone(), s.count))
+            .collect();
+        assert_eq!(
+            drops,
+            vec![(
+                crate::SkippedKind::Glyph,
+                crate::SkipReason::NoGlyph {
+                    code: 1,
+                    font: "X".to_string(),
+                },
+                2,
+            )],
+        );
+    }
+
+    /// The inverse: a benign trailing filter on the map decodes and the
+    /// glyphs paint — refusal is about the image codecs, not about
+    /// `/Filter` being present at all.
+    #[test]
+    fn a_filtered_cid_to_gid_map_still_paints() {
+        // CID 0 -> gid 0, CID 1 -> gid 1, hex-encoded.
+        let doc = cid_map_doc("/Filter /ASCIIHexDecode", b"00000001>");
+        let page = doc.page(0).expect("page");
+        let (pix, report) =
+            crate::render_page_reporting(&doc, &page, 1.0, &RenderOptions::default())
+                .expect("render");
+        assert!(dark_pixel_at(&pix, 55, 115), "the mapped glyph paints");
+        assert!(report.skipped.is_empty(), "nothing skipped: {report:?}");
     }
 
     #[test]
