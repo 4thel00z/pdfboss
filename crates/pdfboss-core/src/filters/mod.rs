@@ -1,7 +1,7 @@
 //! Stream filters (ISO 32000 §7.4): FlateDecode, LZWDecode, ASCIIHexDecode,
 //! ASCII85Decode, RunLengthDecode, CCITTFaxDecode, JBIG2Decode, plus PNG/TIFF
-//! predictors. `DCTDecode` is passthrough (decoded at the image layer);
-//! `JPXDecode`, `Crypt` and the rest are unsupported.
+//! predictors. `DCTDecode` and `JPXDecode` are passthrough (decoded at the
+//! image layer); `Crypt` and the rest are unsupported.
 //!
 //! The two bilevel codecs, `CCITTFaxDecode` (§7.4.6) and `JBIG2Decode`
 //! (§7.4.7), are decoded here rather than at the image layer, because what
@@ -19,10 +19,11 @@
 //! inverts by default and does *not* invert when `/BlackIs1` is set.
 //!
 //! Passthrough is reserved for codecs a consumer of the decoded bytes can
-//! actually read. `JPXDecode` (§7.4.9) is not one of them: nothing in this
-//! workspace decodes a JPEG 2000 codestream, so passing it through would
-//! hand back bytes indistinguishable from decoded stream data and let an
-//! image be painted from its own codestream. It is rejected instead.
+//! actually read. Both image codecs qualify: the render image layer decodes
+//! a raw JPEG (`DCTDecode`) itself and a JPEG 2000 codestream (`JPXDecode`,
+//! §7.4.9) through `pdfboss-jpx`. Every other codec is rejected rather than
+//! handed back, because a caller cannot tell an undecoded codestream from
+//! decoded stream data and would paint it as pixel samples.
 
 use crate::error::{Error, Result};
 use crate::object::{Dict, Name, Object, Stream};
@@ -121,13 +122,13 @@ fn parms_at(parms: Option<&Object>, index: usize, resolver: &dyn Resolve) -> Opt
 
 /// Applies the stream's `/Filter` chain (name or array) with the matching
 /// `/DecodeParms` (dict, array, or null) in order and returns the decoded
-/// bytes. Two filters are accepted only as the last element of the chain: the
-/// passthrough `DCTDecode`, and `JBIG2Decode`, whose codec reads the stream
-/// dictionary the chain belongs to. `CCITTFaxDecode` is not among them — it
-/// consumes only the bytes it is handed, so it decodes at any position, and a
-/// chain that puts something after it fails in that later stage rather than
-/// being reported as an unsupported filter it is not. `JPXDecode`, `Crypt` and
-/// unknown filters yield [`Error::UnsupportedFilter`].
+/// bytes. Three filters are accepted only as the last element of the chain:
+/// the passthroughs `DCTDecode` and `JPXDecode`, and `JBIG2Decode`, whose
+/// codec reads the stream dictionary the chain belongs to. `CCITTFaxDecode`
+/// is not among them — it consumes only the bytes it is handed, so it decodes
+/// at any position, and a chain that puts something after it fails in that
+/// later stage rather than being reported as an unsupported filter it is not.
+/// `Crypt` and unknown filters yield [`Error::UnsupportedFilter`].
 pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>> {
     let filter = resolve_value(stream.dict.get("Filter"), resolver);
     // Filters keep their original position so that `/DecodeParms` arrays
@@ -181,10 +182,13 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
             "JBIG2Decode" if pos == last => {
                 jbig2::decode_pdf_stream(&data, parms, &stream.dict, resolver)?
             }
-            // JPEG stays encoded; the image layer decodes it. No other
-            // codec may be handed back undecoded: a caller cannot tell
-            // codestream bytes from decoded samples, and would paint them.
+            // JPEG and JPEG 2000 stay encoded; the image layer decodes
+            // them. No other codec may be handed back undecoded: a caller
+            // cannot tell codestream bytes from decoded samples, and would
+            // paint them. (`JPXDecode` has no inline-image abbreviation:
+            // ISO 32000-1 Table 94 defines none.)
             "DCTDecode" | "DCT" if pos == last => data,
+            "JPXDecode" if pos == last => data,
             other => return Err(Error::UnsupportedFilter(other.to_string())),
         };
         // Defense in depth: the expanding decoders cap their own output,
@@ -444,24 +448,19 @@ mod tests {
     }
 
     #[test]
-    fn jpx_is_unsupported_even_as_the_last_filter() {
-        // JPEG 2000 codestreams are not decoded anywhere in the workspace,
-        // so handing the bytes back as if they were decoded stream data
-        // would let a caller paint a codestream as pixel samples.
-        let s = make_stream(
-            vec![("Filter", Object::Name(name("JPXDecode")))],
-            b"\x00\x00\x00\x0cjP  \r\n\x87\n",
-        );
-        match decode_stream(&s, &NoResolve) {
-            Err(Error::UnsupportedFilter(n)) => assert_eq!(n, "JPXDecode"),
-            other => panic!("expected UnsupportedFilter, got {other:?}"),
-        }
+    fn jpx_passthrough_when_last() {
+        // JPEG 2000 data stays encoded here and is decoded at the image
+        // layer, exactly like DCTDecode (ISO 32000-1 7.4.9).
+        let jp2 = b"\x00\x00\x00\x0cjP  \r\n\x87\n";
+        let s = make_stream(vec![("Filter", Object::Name(name("JPXDecode")))], jp2);
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), jp2);
     }
 
     #[test]
-    fn flate_then_jpx_is_unsupported() {
-        // The rejection survives an earlier stage: the chain runs FlateDecode
-        // first and still refuses to hand the codestream on.
+    fn flate_then_jpx_passthrough() {
+        // The passthrough survives an earlier stage: the chain runs
+        // FlateDecode and hands the still-encoded codestream on.
+        let jp2 = b"\x00\x00\x00\x0cjP  \r\n\x87\n";
         let s = make_stream(
             vec![(
                 "Filter",
@@ -470,12 +469,9 @@ mod tests {
                     Object::Name(name("JPXDecode")),
                 ]),
             )],
-            &zlib(b"\x00\x00\x00\x0cjP  \r\n\x87\n"),
+            &zlib(jp2),
         );
-        assert!(matches!(
-            decode_stream(&s, &NoResolve),
-            Err(Error::UnsupportedFilter(n)) if n == "JPXDecode"
-        ));
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), jp2);
     }
 
     #[test]
