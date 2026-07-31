@@ -9,9 +9,11 @@
 //! metadata.
 //!
 //! Contract: header-level problems (bad signature, unparsable SIZ/COD,
-//! exceeded [`DecodeLimits`]) are hard errors. Once the first tile begins
-//! decoding, the decoder is lenient — a corrupt packet or code-block
-//! zeroes the remainder of its scope, appends one warning to
+//! exceeded [`DecodeLimits`]) are hard errors, and so is corruption that
+//! prevents ANY packet of the image from decoding. Once the first packet
+//! of the image has decoded, the decoder is lenient — a corrupt packet or
+//! code-block zeroes the remainder of its scope (at most its own tile;
+//! sibling tiles keep decoding), appends one warning to
 //! [`DecodedImage::warnings`], and decoding continues. Output samples are
 //! 8-bit: 16-bit sources are right-shifted to 8, signed samples are
 //! level-shifted per T.800 G.1.2. The decoder never panics on hostile
@@ -163,6 +165,9 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
     };
 
     let mut assembler = color::ImageAssembler::new(siz, container.header.as_ref(), limits)?;
+    // The hard/soft leniency boundary is per image: once ANY tile decodes
+    // a packet, later corruption softens (crate docs).
+    let mut image_packets_decoded = false;
     for (tile_index, parts) in tiles.iter().enumerate() {
         if parts.is_empty() {
             // A tile without tile-parts renders as background (leniency).
@@ -246,8 +251,14 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
             bitstream: &bitstream,
             packed_headers: packed_headers.as_deref(),
         };
-        let mut packets = packet::read_tile_packets(&ctx, limits)?;
-        warnings.append(&mut packets.warnings);
+        let mut packets = packet::read_tile_packets(&ctx, limits, image_packets_decoded)?;
+        image_packets_decoded |= packets.packets_decoded > 0;
+        warnings.extend(
+            packets
+                .warnings
+                .drain(..)
+                .map(|warning| format!("tile {tile_index}: {warning}")),
+        );
 
         let mut canvases = Vec::with_capacity(ctx.components.len());
         for (index, context) in ctx.components.iter().enumerate() {

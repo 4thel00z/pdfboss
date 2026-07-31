@@ -943,6 +943,84 @@ fn precinct_bomb_codestream() -> Vec<u8> {
     v
 }
 
+/// File offset of the first body byte (just past SOD, T.800 A.4.3) of
+/// the TPsot = 0 tile-part whose SOT (Table A.5) declares tile `tile`.
+fn tile_part_body_offset(data: &[u8], tile: u16) -> usize {
+    let mut pos = 0;
+    while pos + 12 <= data.len() {
+        // SOT = 0xFF90 with the fixed Lsot = 10 (Table A.5).
+        if data[pos] == 255
+            && data[pos + 1] == 144
+            && data[pos + 2] == 0
+            && data[pos + 3] == 10
+            && u16::from(data[pos + 4]) * 256 + u16::from(data[pos + 5]) == tile
+            && data[pos + 10] == 0
+        {
+            let mut sod = pos + 12;
+            while sod + 2 <= data.len() {
+                // SOD = 0xFF93 (Table A.7).
+                if data[sod] == 255 && data[sod + 1] == 147 {
+                    return sod + 2;
+                }
+                sod += 1;
+            }
+        }
+        pos += 1;
+    }
+    panic!("tile {tile} tile-part not found");
+}
+
+#[test]
+fn corrupt_first_packet_of_a_later_tile_zeroes_only_that_tile() {
+    // The leniency boundary is per IMAGE (crate docs): rgb-tiled.jp2
+    // carries 15 tiles (5 x 3 grid of 128 x 128 over 523 x 311, one
+    // tile-part each, reversible, no MCT). Corrupting the first 8 body
+    // bytes of tile 1 garbles that tile's FIRST packet — since tile 0
+    // already decoded packets, the decode must NOT hard-fail: tile 1 is
+    // zeroed with one data-loss warning and the other 14 tiles stay
+    // bit-exact against the source oracle.
+    let case = case_by_name("rgb-tiled");
+    let mut data = std::fs::read(fixture_dir().join(&case.file)).unwrap();
+    let body = tile_part_body_offset(&data, 1);
+    for byte in &mut data[body..body + 8] {
+        *byte = 255;
+    }
+    let image = decode(&data, &DecodeLimits::default())
+        .unwrap_or_else(|e| panic!("per-image leniency violated: {e}"));
+    assert_eq!(
+        image.warnings.len(),
+        1,
+        "one warning for the zeroed tile: {:?}",
+        image.warnings
+    );
+    let oracle = read_oracle(&fixture_dir().join(&case.source));
+    // Tile 1 covers [128, 256) x [0, 128) per Equations (B-7)..(B-10).
+    let stride = case.width as usize * 3;
+    let mut inside_diffs = 0usize;
+    for y in 0..case.height as usize {
+        for x in 0..case.width as usize {
+            let at = y * stride + x * 3;
+            let inside = (128..256).contains(&x) && y < 128;
+            if inside {
+                // Zeroed coefficients level-shift to mid-grey (G.1.2).
+                if image.samples[at..at + 3] != [128, 128, 128] {
+                    inside_diffs += 1;
+                }
+            } else {
+                assert_eq!(
+                    image.samples[at..at + 3],
+                    oracle.samples[at..at + 3],
+                    "sample outside the corrupt tile drifted at ({x}, {y})"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        inside_diffs, 0,
+        "the corrupt tile must render as background"
+    );
+}
+
 #[test]
 fn precinct_bomb_trips_a_limit_before_allocating() {
     // Memory sanity: pre-fix this stream allocated ~5.4 GB of per-block

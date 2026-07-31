@@ -1,8 +1,9 @@
 //! Error surface for the decoder.
 //!
 //! Contract (see the crate docs): header-level problems are hard errors;
-//! once the first tile begins decoding, corruption degrades to warnings on
-//! the [`crate::DecodedImage`] instead.
+//! once the first packet of the image decodes, corruption degrades to
+//! warnings on the [`crate::DecodedImage`] instead — whichever tile it
+//! strikes.
 
 use std::fmt;
 
@@ -18,8 +19,8 @@ pub enum JpxError {
     /// marker).
     NotJpeg2000,
     /// A structurally invalid box (Annex I) or marker segment (Annex A)
-    /// before the first tile decoded. The string names the offending
-    /// structure and what was wrong with it.
+    /// before the first packet of the image decoded. The string names the
+    /// offending structure and what was wrong with it.
     Malformed(String),
     /// A `DecodeLimits` bound was exceeded. `what` names the bound.
     LimitExceeded {

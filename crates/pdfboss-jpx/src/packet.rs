@@ -134,6 +134,10 @@ pub(crate) struct TilePackets {
     /// Soft findings: corrupt packet headers zero the rest of their scope
     /// and are reported here (leniency doctrine).
     pub warnings: Vec<String>,
+    /// Packets this tile parsed successfully. The decode stage sums the
+    /// count across tiles because the hard/soft leniency boundary is per
+    /// IMAGE (crate docs), not per tile.
+    pub packets_decoded: u64,
 }
 
 /// Reads every packet of one tile in progression order (B.12: the five
@@ -141,15 +145,18 @@ pub(crate) struct TilePackets {
 /// length, inclusion tag trees, zero bit-planes, pass counts, lengths) and
 /// accumulating each code-block's codeword segments across layers.
 ///
-/// After the first packet, corruption degrades to warnings: the remaining
-/// packets of the damaged scope are treated as empty and decoding
-/// continues (a partial image beats none). `limits` bounds every
-/// allocation derived from header counts.
+/// Corruption degrades to warnings once any packet of the IMAGE has
+/// decoded — `prior_packets` says whether an earlier tile got that far,
+/// [`Tier2::soften`] holds the boundary — and the remaining packets of the
+/// damaged scope are treated as empty while decoding continues (a partial
+/// image beats none). `limits` bounds every allocation derived from header
+/// counts.
 pub(crate) fn read_tile_packets(
     ctx: &TileDecodeContext<'_>,
     limits: &DecodeLimits,
+    prior_packets: bool,
 ) -> Result<TilePackets> {
-    decode_tile_packets(ctx, limits).map(|outcome| outcome.packets)
+    decode_tile_packets(ctx, limits, prior_packets).map(|outcome| outcome.packets)
 }
 
 /// [`read_tile_packets`] plus the final cursor positions, so tests can
@@ -168,7 +175,11 @@ struct Tier2Outcome {
     body_end: usize,
 }
 
-fn decode_tile_packets(ctx: &TileDecodeContext<'_>, limits: &DecodeLimits) -> Result<Tier2Outcome> {
+fn decode_tile_packets(
+    ctx: &TileDecodeContext<'_>,
+    limits: &DecodeLimits,
+    prior_packets: bool,
+) -> Result<Tier2Outcome> {
     let headers = ctx.packed_headers.unwrap_or(ctx.bitstream);
     let (components, state, slot_total) = build_state(ctx);
     // The iteration budget: every real packet costs at least one header
@@ -190,6 +201,7 @@ fn decode_tile_packets(ctx: &TileDecodeContext<'_>, limits: &DecodeLimits) -> Re
         nsop_expected: 0,
         sop_warned: false,
         eph_warned: false,
+        prior_packets,
         packets_done: 0,
         segment_count: 0,
     };
@@ -213,6 +225,7 @@ fn decode_tile_packets(ctx: &TileDecodeContext<'_>, limits: &DecodeLimits) -> Re
         packets: TilePackets {
             components: tier2.components,
             warnings: tier2.warnings,
+            packets_decoded: tier2.packets_done,
         },
         header_end: tier2.header_pos,
         body_end: tier2.body_pos,
@@ -405,16 +418,24 @@ struct Tier2<'a, 'b> {
     nsop_expected: u32,
     sop_warned: bool,
     eph_warned: bool,
+    /// An earlier tile of this image already decoded packets: the hard
+    /// error window (crate docs: "before ANY packet of the image") is
+    /// closed even while this tile's own count is still zero.
+    prior_packets: bool,
     packets_done: u64,
     segment_count: u64,
 }
 
 impl Tier2<'_, '_> {
-    /// Applies the leniency doctrine to a mid-tile failure: before the
-    /// first packet (or on a limit breach) the error stays hard; afterwards
-    /// it becomes a warning and the remaining packets stay empty.
+    /// Applies the leniency doctrine to a mid-decode failure: before the
+    /// first packet of the IMAGE (or on a limit breach) the error stays
+    /// hard; afterwards it becomes a warning, the remaining packets of
+    /// this tile stay empty, and decoding continues with the next tile —
+    /// a corrupt tile must not discard its decoded siblings.
     fn soften(&mut self, error: JpxError, at: Option<(u32, Slot)>) -> Result<()> {
-        if self.packets_done == 0 || matches!(error, JpxError::LimitExceeded { .. }) {
+        if (self.packets_done == 0 && !self.prior_packets)
+            || matches!(error, JpxError::LimitExceeded { .. })
+        {
             return Err(error);
         }
         let scope = match at {
@@ -1445,7 +1466,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings, Vec::<String>::new());
         assert_eq!(outcome.body_end, 31);
         assert_eq!(outcome.header_end, 31);
@@ -1495,7 +1516,7 @@ mod tests {
             bitstream: &bodies,
             packed_headers: Some(&headers),
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings, Vec::<String>::new());
         assert_eq!(outcome.header_end, 5);
         assert_eq!(outcome.body_end, 8);
@@ -1558,7 +1579,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings, Vec::<String>::new());
         assert_eq!(outcome.body_end, 436);
         let block = &outcome.packets.components[0].bands[0].blocks[0];
@@ -1614,7 +1635,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings, Vec::<String>::new());
         assert_eq!(outcome.body_end, 8);
         let block = &outcome.packets.components[0].bands[0].blocks[0];
@@ -1657,7 +1678,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings, Vec::<String>::new());
         assert_eq!(outcome.body_end, 11);
         assert_eq!(outcome.header_end, 11);
@@ -1684,7 +1705,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings.len(), 1);
         assert!(outcome.packets.warnings[0].contains("SOP"));
         let block = &outcome.packets.components[0].bands[0].blocks[0];
@@ -1707,9 +1728,36 @@ mod tests {
             packed_headers: None,
         };
         assert!(matches!(
-            decode_tile_packets(&ctx, &DecodeLimits::default()),
+            decode_tile_packets(&ctx, &DecodeLimits::default(), false),
             Err(JpxError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn corruption_in_a_later_tiles_first_packet_softens() {
+        // The same corrupt-from-the-first-packet tile as above, but an
+        // earlier tile of the image already decoded packets: the leniency
+        // boundary is per IMAGE (crate docs), so this tile degrades to
+        // one warning and an all-empty packet set instead of discarding
+        // its decoded siblings.
+        let ctx = TileDecodeContext {
+            components: vec![sop_eph_component()],
+            tile_rect: rect(0, 0, 16, 16),
+            progression: ProgressionOrder::Lrcp,
+            layers: 1,
+            poc: Vec::new(),
+            sop_markers: false,
+            eph_markers: false,
+            bitstream: &[],
+            packed_headers: None,
+        };
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), true).unwrap();
+        assert_eq!(outcome.packets.packets_decoded, 0);
+        assert_eq!(outcome.packets.warnings.len(), 1);
+        assert!(outcome.packets.components[0]
+            .bands
+            .iter()
+            .all(|band| band.blocks.iter().all(|block| block.segments.is_empty())));
     }
 
     #[test]
@@ -1732,7 +1780,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        match decode_tile_packets(&ctx, &DecodeLimits::default()) {
+        match decode_tile_packets(&ctx, &DecodeLimits::default(), false) {
             Err(JpxError::Malformed(message)) => assert!(message.contains("overrun")),
             other => panic!("expected a hard body-overrun error, got {other:?}"),
         }
@@ -1757,7 +1805,7 @@ mod tests {
             bitstream: &stream,
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         assert_eq!(outcome.packets.warnings.len(), 1);
         assert!(outcome.packets.warnings[0].contains("layer 1"));
         let band = &outcome.packets.components[0].bands[0];
@@ -1787,7 +1835,7 @@ mod tests {
             packed_headers: None,
         };
         assert!(matches!(
-            decode_tile_packets(&ctx, &limits),
+            decode_tile_packets(&ctx, &limits, false),
             Err(JpxError::LimitExceeded {
                 what: "max_decoded_bytes",
                 ..
@@ -1824,7 +1872,7 @@ mod tests {
             bitstream: &[],
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         let bands = &outcome.packets.components[0].bands;
         assert_eq!(bands.len(), 7);
         let bits: Vec<u8> = bands
@@ -1881,7 +1929,7 @@ mod tests {
             bitstream: &[],
             packed_headers: None,
         };
-        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default()).unwrap();
+        let outcome = decode_tile_packets(&ctx, &DecodeLimits::default(), false).unwrap();
         let bits: Vec<u8> = outcome.packets.components[0]
             .bands
             .iter()
@@ -2278,7 +2326,7 @@ mod tests {
                 bitstream: &bitstream,
                 packed_headers: None,
             };
-            let outcome = decode_tile_packets(&ctx, &limits).unwrap();
+            let outcome = decode_tile_packets(&ctx, &limits, false).unwrap();
             outcomes.push((
                 outcome.packets,
                 outcome.header_end,
