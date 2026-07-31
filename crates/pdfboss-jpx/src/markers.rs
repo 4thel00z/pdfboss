@@ -406,10 +406,11 @@ pub(crate) struct Sot {
     pub tile_part_length: u32,
     /// TPsot: tile-part index within the tile, from 0.
     pub tile_part_index: u8,
-    /// TNsot: declared tile-part count; 0 = not signalled here. ADVISORY
-    /// ONLY (Table A.6): real-world streams ship more parts than declared,
-    /// so extra parts are decoded, never rejected; the decode stage warns
-    /// once per codestream.
+    /// TNsot: declared tile-part count; 0 = not signalled here. A.4.2
+    /// allows only the CORRECT count or zero, but real-world streams ship
+    /// more parts than declared; extra parts are decoded anyway as a
+    /// deliberate compatibility choice, and the decode stage warns once
+    /// per codestream.
     pub tile_part_count: u8,
 }
 
@@ -1333,10 +1334,11 @@ pub(crate) fn parse_codestream<'a>(
     let mut sot = first_sot;
     let mut sot_start = first_sot_start;
     loop {
-        // TNsot is ADVISORY (Table A.6): measured real-world streams
-        // declare fewer tile-parts than they ship, so a surplus index
-        // parses and decodes, never rejects. The decode stage summarizes
-        // the condition in one warning per codestream.
+        // A.4.2 makes TNsot normative (the correct count or zero), but
+        // measured real-world streams declare fewer tile-parts than they
+        // ship; a surplus index parses and decodes anyway (compatibility
+        // choice). The decode stage summarizes the violation in one
+        // warning per codestream.
         let overrides = match scan_tile_part_header(&mut r, csiz, sot, &mut warnings) {
             Ok(overrides) => overrides,
             Err(e) => {
@@ -2016,11 +2018,12 @@ mod tests {
     }
 
     #[test]
-    fn tnsot_declared_count_is_advisory() {
+    fn tnsot_undercount_is_tolerated_for_compatibility() {
         // The measured real-world shape: TNsot declares five tile-parts but
-        // six ship (TPsot 0..=5). Extra parts parse silently, never a
+        // six ship (TPsot 0..=5) — a violation of A.4.2, which allows only
+        // the correct count or zero. Extra parts parse anyway, never a
         // rejection, and keep their appearance order; the decode stage owns
-        // the one-per-codestream advisory summary.
+        // the one-per-codestream compatibility summary.
         let mut s = tiny_main_header();
         for tpsot in 0..6u8 {
             s.extend(tile_part(0, 15, tpsot, 5, &[tpsot]));

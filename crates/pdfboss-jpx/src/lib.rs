@@ -137,9 +137,10 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
     let tile_total = u64::from(tiles_wide) * u64::from(tiles_high);
 
     // Group tile-parts by tile, keeping codestream appearance order within
-    // each tile. TNsot is ADVISORY (Table A.6): real-world streams ship
-    // more tile-parts than declared, so extras decode instead of rejecting,
-    // recorded in one summary warning per codestream.
+    // each tile. A.4.2 requires TNsot to be the correct count or zero, but
+    // real-world streams ship MORE tile-parts than declared; the extras
+    // decode anyway (deliberate compatibility choice), recorded in one
+    // summary warning per codestream.
     let mut tiles: Vec<Vec<(usize, &markers::TilePart<'_>)>> =
         (0..tile_total).map(|_| Vec::new()).collect();
     for (pos, part) in cs.tile_parts.iter().enumerate() {
@@ -150,8 +151,16 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
         }
         tiles[index as usize].push((pos, part));
     }
-    if let Some(warning) = tnsot_advisory_warning(&tiles) {
+    if let Some(warning) = tnsot_compatibility_warning(&tiles) {
         warnings.push(warning);
+    }
+    // Tiles the codestream never delivered render as background — pixels
+    // are missing, so the condition must be visible to the caller.
+    let missing_tiles = tiles.iter().filter(|parts| parts.is_empty()).count();
+    if missing_tiles > 0 {
+        warnings.push(format!(
+            "{missing_tiles} tile(s) have no tile-parts; rendered as background"
+        ));
     }
 
     // PPM packed headers split per tile-part appearance order (A.7.4).
@@ -173,7 +182,8 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
     let mut short_quant_components = 0u64;
     for (tile_index, parts) in tiles.iter().enumerate() {
         if parts.is_empty() {
-            // A tile without tile-parts renders as background (leniency).
+            // A tile without tile-parts renders as background; the
+            // summary warning above already recorded the data loss.
             continue;
         }
         // A.4.2 requires TPsot order within a tile; be lenient and keep the
@@ -318,13 +328,16 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
 }
 
 /// One summary warning per codestream when tiles ship more tile-parts
-/// than their declared TNsot. The count is advisory (T.800 Table A.6),
-/// so the surplus decodes; only this note records it (A.4.2 leniency).
+/// than their declared TNsot. T.800 A.4.2 allows exactly two TNsot
+/// values — the CORRECT tile-part count or zero — so these streams
+/// violate the spec; decoding the surplus anyway is this crate's
+/// deliberate compatibility choice (real-world encoders produce them),
+/// and this note records both facts.
 ///
 /// A tile counts as affected when it holds more parts than some declared
 /// TNsot, or when a TPsot index reaches the declared count (a surplus
 /// index can appear even in a truncated tile that kept few parts).
-fn tnsot_advisory_warning(tiles: &[Vec<(usize, &markers::TilePart<'_>)>]) -> Option<String> {
+fn tnsot_compatibility_warning(tiles: &[Vec<(usize, &markers::TilePart<'_>)>]) -> Option<String> {
     let affected = tiles
         .iter()
         .filter(|parts| {
@@ -339,8 +352,9 @@ fn tnsot_advisory_warning(tiles: &[Vec<(usize, &markers::TilePart<'_>)>]) -> Opt
         return None;
     }
     Some(format!(
-        "{affected} tile(s) ship more tile-parts than their declared TNsot; \
-         the count is advisory (T.800 A.4.2)"
+        "{affected} tile(s) ship more tile-parts than their declared TNsot \
+         (violates T.800 A.4.2); tolerated for compatibility with \
+         real-world encoders"
     ))
 }
 
@@ -512,8 +526,8 @@ mod tests {
         ));
     }
 
-    /// A minimal tile-part carrying only the SOT fields the advisory
-    /// summary inspects.
+    /// A minimal tile-part carrying only the SOT fields the TNsot
+    /// compatibility summary inspects.
     fn part(tile_part_index: u8, tile_part_count: u8) -> markers::TilePart<'static> {
         markers::TilePart {
             sot: markers::Sot {
@@ -545,7 +559,7 @@ mod tests {
             vec![part(0, 0), part(1, 0)],
             vec![],
         ];
-        assert_eq!(tnsot_advisory_warning(&grouped(&tiles)), None);
+        assert_eq!(tnsot_compatibility_warning(&grouped(&tiles)), None);
     }
 
     #[test]
@@ -559,10 +573,11 @@ mod tests {
             vec![part(0, 1)],
         ];
         assert_eq!(
-            tnsot_advisory_warning(&grouped(&tiles)).as_deref(),
+            tnsot_compatibility_warning(&grouped(&tiles)).as_deref(),
             Some(
-                "2 tile(s) ship more tile-parts than their declared TNsot; \
-                 the count is advisory (T.800 A.4.2)"
+                "2 tile(s) ship more tile-parts than their declared TNsot \
+                 (violates T.800 A.4.2); tolerated for compatibility with \
+                 real-world encoders"
             )
         );
     }

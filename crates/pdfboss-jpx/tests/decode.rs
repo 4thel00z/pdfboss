@@ -892,6 +892,79 @@ fn single_byte_mutations_never_panic() {
 // ---------------------------------------------------------------------
 
 #[test]
+fn a_tile_with_no_tile_parts_warns_and_renders_as_background() {
+    // Splice tile 1's only tile-part out of rgb-tiled.jp2: the tile grid
+    // still describes 15 tiles, so tile 1 simply never receives data.
+    // Those pixels are LOST — the decode must say so instead of silently
+    // skipping the tile, and every other tile stays bit-exact.
+    let case = case_by_name("rgb-tiled");
+    let data = std::fs::read(fixture_dir().join(&case.file)).unwrap();
+    // Fixture layout, asserted before splicing: jp2c box header at
+    // offset 77 (I.4).
+    assert_eq!(&data[81..85], b"jp2c");
+    let lbox = u32::from_be_bytes(data[77..81].try_into().unwrap());
+    let sot = tile_part_sot_offset(&data, 1);
+    let psot = u32::from_be_bytes(data[sot + 6..sot + 10].try_into().unwrap());
+    let mut spliced = Vec::with_capacity(data.len() - psot as usize);
+    spliced.extend_from_slice(&data[..77]);
+    spliced.extend((lbox - psot).to_be_bytes());
+    spliced.extend_from_slice(&data[81..sot]);
+    spliced.extend_from_slice(&data[sot + psot as usize..]);
+    let image = decode(&spliced, &DecodeLimits::default()).unwrap();
+    assert!(
+        image
+            .warnings
+            .iter()
+            .any(|w| w.contains("1 tile(s) have no tile-parts")),
+        "missing the data-loss note: {:?}",
+        image.warnings
+    );
+    // Tile 1 covers [128, 256) x [0, 128): never pushed, so its samples
+    // keep the buffer's zero fill; everything else matches the oracle.
+    let oracle = read_oracle(&fixture_dir().join(&case.source));
+    let stride = case.width as usize * 3;
+    for y in 0..case.height as usize {
+        for x in 0..case.width as usize {
+            let at = y * stride + x * 3;
+            if (128..256).contains(&x) && y < 128 {
+                assert_eq!(&image.samples[at..at + 3], &[0, 0, 0], "({x}, {y})");
+            } else {
+                assert_eq!(
+                    image.samples[at..at + 3],
+                    oracle.samples[at..at + 3],
+                    "sample outside the missing tile drifted at ({x}, {y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn truncated_jp2_container_degrades_like_a_truncated_codestream() {
+    // Cutting a .jp2 at ~60% leaves a final jp2c box whose declared LBox
+    // overruns EOF. The box layer must degrade that one failure to
+    // "truncated to EOF" and hand the partial codestream to the marker
+    // layer, which already handles truncation leniently — the identical
+    // truncated RAW codestream decodes that way today.
+    let case = case_by_name("rgb-53-jp2");
+    let data = std::fs::read(fixture_dir().join(&case.file)).unwrap();
+    let cut = data.len() * 60 / 100;
+    let image = decode(&data[..cut], &DecodeLimits::default())
+        .unwrap_or_else(|e| panic!("truncated container must fail soft: {e}"));
+    assert_eq!((image.width, image.height), (case.width, case.height));
+    assert!(
+        image
+            .warnings
+            .iter()
+            .any(|w| w.contains("codestream truncated to EOF")),
+        "missing the truncation note: {:?}",
+        image.warnings
+    );
+    // Partial image: the surviving prefix still paints real content.
+    assert!(image.samples.iter().any(|&sample| sample != 0));
+}
+
+#[test]
 fn short_quantization_list_derives_instead_of_failing() {
     // T.800 Equation (E-5) lets a truncated per-band step-size list
     // derive its missing entries from the first one. gray-53-jp2.jp2
@@ -975,9 +1048,9 @@ fn precinct_bomb_codestream() -> Vec<u8> {
     v
 }
 
-/// File offset of the first body byte (just past SOD, T.800 A.4.3) of
-/// the TPsot = 0 tile-part whose SOT (Table A.5) declares tile `tile`.
-fn tile_part_body_offset(data: &[u8], tile: u16) -> usize {
+/// File offset of the SOT marker (T.800 Table A.5) of the TPsot = 0
+/// tile-part declaring tile `tile`.
+fn tile_part_sot_offset(data: &[u8], tile: u16) -> usize {
     let mut pos = 0;
     while pos + 12 <= data.len() {
         // SOT = 0xFF90 with the fixed Lsot = 10 (Table A.5).
@@ -988,18 +1061,25 @@ fn tile_part_body_offset(data: &[u8], tile: u16) -> usize {
             && u16::from(data[pos + 4]) * 256 + u16::from(data[pos + 5]) == tile
             && data[pos + 10] == 0
         {
-            let mut sod = pos + 12;
-            while sod + 2 <= data.len() {
-                // SOD = 0xFF93 (Table A.7).
-                if data[sod] == 255 && data[sod + 1] == 147 {
-                    return sod + 2;
-                }
-                sod += 1;
-            }
+            return pos;
         }
         pos += 1;
     }
     panic!("tile {tile} tile-part not found");
+}
+
+/// File offset of the first body byte (just past SOD, T.800 A.4.3) of
+/// the TPsot = 0 tile-part whose SOT (Table A.5) declares tile `tile`.
+fn tile_part_body_offset(data: &[u8], tile: u16) -> usize {
+    let mut sod = tile_part_sot_offset(data, tile) + 12;
+    while sod + 2 <= data.len() {
+        // SOD = 0xFF93 (Table A.7).
+        if data[sod] == 255 && data[sod + 1] == 147 {
+            return sod + 2;
+        }
+        sod += 1;
+    }
+    panic!("tile {tile} tile-part has no SOD");
 }
 
 #[test]

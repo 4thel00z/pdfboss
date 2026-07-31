@@ -7,12 +7,13 @@
 //! directory or a file is missing, the test passes trivially with a note
 //! — CI has no streams.
 //!
-//! Why these streams matter: a widely-used independent codec rejects them
-//! because it treats TNsot (the declared tile-part count) as binding.
-//! T.800 Table A.6 makes TNsot informational and A.4.2 does not license
-//! rejection, so decoding them IS the point of this crate's leniency
-//! doctrine. The expected dimensions below were verified against the SIZ
-//! bytes (T.800 A.5.1) independently of any decoder.
+//! Why these streams matter: they ship more tile-parts than their
+//! declared TNsot, which violates T.800 A.4.2 (TNsot must be the correct
+//! count or zero), so a strict decoder rejects them. Tolerating the
+//! surplus is this crate's deliberate compatibility choice — decoding
+//! these streams IS the point of its leniency doctrine. The expected
+//! dimensions below were verified against the SIZ bytes (T.800 A.5.1)
+//! independently of any decoder.
 
 use pdfboss_jpx::{decode, ColorKind, DecodeLimits};
 use std::path::PathBuf;
@@ -46,13 +47,14 @@ const CASES: [RealCase; 3] = [
 ];
 
 /// Warnings these streams are allowed to carry: the skipped
-/// reader-requirements box and the one-per-codestream TNsot advisory.
-/// Anything else is a regression.
+/// reader-requirements box and the one-per-codestream TNsot
+/// compatibility note. Anything else is a regression.
 fn warning_allowed(warning: &str) -> bool {
     warning == "reader-requirements (rreq) box skipped"
         || warning.ends_with(
-            "tile(s) ship more tile-parts than their declared TNsot; \
-             the count is advisory (T.800 A.4.2)",
+            "tile(s) ship more tile-parts than their declared TNsot \
+             (violates T.800 A.4.2); tolerated for compatibility with \
+             real-world encoders",
         )
 }
 

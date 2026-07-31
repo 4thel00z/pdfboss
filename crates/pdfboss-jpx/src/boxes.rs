@@ -278,6 +278,41 @@ fn read_box(data: &[u8], offset: usize) -> Result<RawBox<'_>> {
     })
 }
 
+/// The payload-to-EOF slice when the box at `offset` is a jp2c whose
+/// declared LBox/XLBox length overruns the remaining bytes — the
+/// signature of a truncated download. `None` for every other failure:
+/// non-jp2c boxes and unreadable headers keep hard-failing.
+fn jp2c_payload_to_eof(data: &[u8], offset: usize) -> Option<&[u8]> {
+    let rest = data.get(offset..)?;
+    if rest.len() < 8 || rest[4..8] != TYPE_JP2C {
+        return None;
+    }
+    let header_len = match be32(rest) {
+        // LBox = 0 runs to EOF and cannot overrun; reserved codes and a
+        // header truncated inside its own XLBox stay hard errors (I.4).
+        0 | 2..=7 => return None,
+        1 => {
+            if rest.len() < 16 {
+                return None;
+            }
+            let xlbox = u64::from_be_bytes([
+                rest[8], rest[9], rest[10], rest[11], rest[12], rest[13], rest[14], rest[15],
+            ]);
+            if xlbox < 16 || xlbox <= rest.len() as u64 {
+                return None;
+            }
+            16
+        }
+        length => {
+            if u64::from(length) <= rest.len() as u64 {
+                return None;
+            }
+            8
+        }
+    };
+    rest.get(header_len..)
+}
+
 /// Top-level walk of a JP2 file: signature (already verified by the
 /// sniff), then ftyp (I.5.2, immediately after the signature), then any
 /// mix of jp2h, jp2c and skippable boxes (I.8).
@@ -300,6 +335,20 @@ fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
         let next = match read_box(data, offset) {
             Ok(next) => next,
             Err(err) => {
+                // A final jp2c whose declared length overruns EOF is the
+                // shape of a truncated file: degrade to "runs to EOF" so
+                // the truncation lands in the codestream, where the
+                // marker layer already handles it leniently — exactly
+                // like the identical truncated RAW codestream.
+                if codestream.is_none() {
+                    if let Some(payload) = jp2c_payload_to_eof(data, offset) {
+                        warnings.push(
+                            "jp2c box length overruns the file; codestream truncated to EOF".into(),
+                        );
+                        codestream = Some(payload);
+                        break;
+                    }
+                }
                 // Everything needed to decode is in hand: a broken
                 // trailing box is a soft finding, not a hard error.
                 if header.is_some() && codestream.is_some() {
@@ -1185,18 +1234,36 @@ mod tests {
     // ---- hostile lengths -----------------------------------------------
 
     #[test]
-    fn every_truncated_prefix_of_a_fixture_errors_cleanly() {
-        // rgb-53-jp2.jp2 ends with an explicit-length jp2c, so every
-        // strict prefix must fail (missing or truncated box), and none
-        // may panic.
+    fn every_truncated_prefix_errors_cleanly_or_degrades_to_eof() {
+        // rgb-53-jp2.jp2 ends with an explicit-length jp2c whose payload
+        // starts at byte 85. Any prefix that ends before the payload has
+        // no usable codestream and must fail cleanly; from the payload's
+        // first byte on, the final jp2c's overrunning length degrades to
+        // "truncated to EOF" with a warning — the marker layer owns the
+        // codestream damage from there, exactly as it would for the
+        // identical truncated raw codestream. None may panic.
         let data = fixture("rgb-53-jp2.jp2");
+        assert_eq!(&data[81..85], b"jp2c");
+        let payload_start = 85;
         for len in 0..data.len() {
-            assert!(
-                scan(&data[..len]).is_err(),
-                "prefix of {len} bytes unexpectedly parsed",
-            );
+            let result = scan(&data[..len]);
+            if len < payload_start {
+                assert!(result.is_err(), "prefix of {len} bytes unexpectedly parsed");
+            } else {
+                let container =
+                    result.unwrap_or_else(|e| panic!("prefix of {len} bytes failed hard: {e}"));
+                assert!(
+                    container
+                        .warnings
+                        .iter()
+                        .any(|warning| warning.contains("truncated to EOF")),
+                    "prefix of {len} bytes lacks the truncation note: {:?}",
+                    container.warnings
+                );
+            }
         }
-        assert!(scan(&data).is_ok());
+        let container = scan(&data).unwrap();
+        assert!(container.warnings.is_empty(), "{:?}", container.warnings);
     }
 
     #[test]
