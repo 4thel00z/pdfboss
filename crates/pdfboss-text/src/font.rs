@@ -4,7 +4,7 @@
 
 use crate::cmap::ToUnicode;
 use crate::sfnt;
-use pdfboss_core::{AsyncObjectSource, Dict, Object};
+use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Object};
 use pdfboss_encoding as encodings;
 use std::collections::HashMap;
 
@@ -76,10 +76,13 @@ impl Font {
     }
 
     /// Reads and parses `/ToUnicode`, treating an empty CMap as absent so that
-    /// the lower-priority mappings still get their chance.
+    /// the lower-priority mappings still get their chance. Fetched through the
+    /// checked fetch, not raw `stream_data`: a CMap whose trailing `/Filter`
+    /// is an image codec holds a passthrough codestream, and token-scanning
+    /// one yields an empty — or in principle a bogus — mapping.
     async fn load_to_unicode<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<ToUnicode> {
         let obj = rv(src, dict, "ToUnicode").await?;
-        let data = src.stream_data(obj.as_stream()?).await.ok()?;
+        let data = decoded_stream_data_with(src, obj.as_stream()?).await.ok()?;
         let cmap = ToUnicode::parse(&data);
         (!cmap.is_empty()).then_some(cmap)
     }
@@ -344,13 +347,17 @@ impl Font {
     }
 
     /// Decoded bytes of `descriptor[key]` when it is a readable stream.
+    /// Fetched through the checked fetch, not raw `stream_data`: a font
+    /// program whose trailing `/Filter` is an image codec holds a
+    /// passthrough codestream, and reading one as an sfnt table directory
+    /// would let arbitrary JPEG bytes decide the WinAnsi guess.
     async fn sfnt_program<S: AsyncObjectSource>(
         src: &S,
         descriptor: &Dict,
         key: &str,
     ) -> Option<Vec<u8>> {
         let obj = rv(src, descriptor, key).await?;
-        src.stream_data(obj.as_stream()?).await.ok()
+        decoded_stream_data_with(src, obj.as_stream()?).await.ok()
     }
 
     /// Builds the 256-entry Unicode table from `/Encoding`: a base table
@@ -672,6 +679,87 @@ mod tests {
                 "code {byte:#04X} must keep its StandardEncoding character",
             );
         }
+    }
+
+    /// A `/FontFile2` whose trailing `/Filter` is an image codec is refused
+    /// by the checked fetch, so its bytes — a passthrough codestream, here
+    /// deliberately a valid sfnt to prove the refusal happens on the label —
+    /// contribute no WinAnsi evidence. Before the refusal, whatever the
+    /// codestream happened to contain decided how codes >= 128 read.
+    #[test]
+    fn an_image_codec_font_program_offers_no_winansi_evidence() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /OPPEKN+TimesNewRoman \
+             /FontDescriptor 7 0 R >>",
+        );
+        b.stream(6, "/Filter /DCTDecode", &sfnt_program(&[(3, 0)]));
+        b.object(7, "<< /Type /FontDescriptor /Flags 6 /FontFile2 6 0 R >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        let obj = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
+        let f = block_on(Font::load(&Immediate(&doc), obj.as_dict().unwrap()));
+        assert!(
+            !f.winansi_high_codes,
+            "a refused program is no evidence at all"
+        );
+        assert_eq!(f.decode(0x92), "\u{FFFD}");
+    }
+
+    /// Builds a document whose object 5 is a Type1 font carrying the given
+    /// `/ToUnicode` stream. The CMap maps code 65 to U+03A9, so the two
+    /// outcomes read apart: `Ω` when the mapping is honored, `A` (falling
+    /// through to StandardEncoding) when the stream is refused.
+    fn font_with_tounicode(stream_dict: &str, data: &[u8]) -> Font {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> >>",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 8 0 R >>",
+        );
+        b.stream(8, stream_dict, data);
+        let doc = Document::load(b.build(1)).unwrap();
+        let obj = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
+        block_on(Font::load(&Immediate(&doc), obj.as_dict().unwrap()))
+    }
+
+    const OMEGA_CMAP: &[u8] = b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+                                1 beginbfchar <41> <03A9> endbfchar";
+
+    /// A `/ToUnicode` whose trailing `/Filter` is an image codec is refused,
+    /// never token-scanned: the bytes here are deliberately a valid CMap to
+    /// prove the refusal happens on the label, not on the content.
+    #[test]
+    fn an_image_codec_tounicode_is_refused_not_parsed() {
+        let f = font_with_tounicode("/Filter /DCTDecode", OMEGA_CMAP);
+        assert_eq!(f.decode(65), "A", "the mapping must not apply");
+    }
+
+    /// The inverse of the refusal: a benign trailing filter the decoder can
+    /// run (here ASCIIHexDecode) must keep working — over-refusal would
+    /// silently strip the mappings from every compressed ToUnicode.
+    #[test]
+    fn a_hex_encoded_tounicode_still_reads() {
+        let hex: Vec<u8> = OMEGA_CMAP
+            .iter()
+            .flat_map(|b| format!("{b:02X}").into_bytes())
+            .chain([b'>'])
+            .collect();
+        let f = font_with_tounicode("/Filter /ASCIIHexDecode", &hex);
+        assert_eq!(f.decode(65), "\u{3A9}", "the mapping must apply");
     }
 
     #[test]
