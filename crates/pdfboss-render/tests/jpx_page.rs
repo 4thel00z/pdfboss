@@ -388,3 +388,32 @@ fn a_benign_decoder_note_keeps_the_report_clean() {
         report.warnings()
     );
 }
+
+/// An `/Indexed` colour space over JPX consumes the decoded samples as
+/// PALETTE INDICES (ISO 32000-1 7.4.9), but the decoder normalizes every
+/// channel to 8 bits: the uniform 4-bit codestream's index 8 arrives
+/// scaled to sample 136 (round(8 * 255 / 15)). The lookup must reverse
+/// that scaling and read palette entry 8 (green) — feeding the scaled
+/// value straight into the palette reads entry 136, which the hival = 15
+/// palette clamps to its red tail.
+#[test]
+fn indexed_over_jpx_recovers_4bit_palette_indices() {
+    // 16-entry palette: entry 8 green, every other entry red.
+    let palette: String = (0..16)
+        .map(|i| if i == 8 { "00FF00" } else { "FF0000" })
+        .collect();
+    let pdf = jpx_probe_pdf(
+        8,
+        8,
+        &format!("/ColorSpace [/Indexed /DeviceRGB 15 <{palette}>] /BitsPerComponent 8"),
+        &uniform_codestream(8, 4),
+    );
+    let (pix, report) = render_reported(&pdf);
+    assert!(
+        report.is_empty(),
+        "nothing to skip: {:?}",
+        report.warnings()
+    );
+    assert_eq!(probe_px(&pix, 4, 4), [0, 255, 0, 255], "palette entry 8");
+    assert_eq!(probe_px(&pix, 0, 7), [0, 255, 0, 255], "everywhere");
+}

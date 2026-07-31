@@ -617,7 +617,10 @@ fn jpx_stencil(
 ///
 /// - the dict's `/ColorSpace`, when present, overrides the codestream's
 ///   colour declaration, and its component count must match the colour
-///   channels the codestream carries;
+///   channels the codestream carries; an `/Indexed` space additionally has
+///   the decoder's 8-bit normalization reversed (via
+///   [`DecodedImage::component_depths`]) so its samples index the palette
+///   exactly;
 /// - without one, the codestream's declaration maps to the matching device
 ///   space, or — for a declaration the decoder does not interpret (an ICC
 ///   profile, an unconverted enumeration) — is approximated by channel
@@ -736,6 +739,33 @@ fn jpx_rgba(
         );
     }
 
+    // An `/Indexed` colour space consumes the samples as PALETTE INDICES
+    // (ISO 32000-1 7.4.9 allows it over JPX like any other space), but the
+    // decoder normalized every channel to 8 bits — T.800 knows nothing of
+    // PDF palettes — which rewrites an index: depths below 8 scale by
+    // 255/(2^d - 1), depths above 8 drop their low bits. The scaling is
+    // injective, so [`jpx_palette_index`] recovers the exact index; the
+    // dropped bits of a deeper channel are gone — legal indices fit 8 bits
+    // anyway (hival <= 255, ISO 32000-1 8.6.6.3) — so those samples pass
+    // through with a note owning up to the approximation.
+    if matches!(cs, ColorSpace::Indexed { .. }) {
+        // Indexed has one component, so the one colour channel's position
+        // is 0 unless the opacity channel sits there.
+        let channel = usize::from(alpha == Some(0));
+        let depth = img.component_depths.get(channel).copied().unwrap_or(8);
+        if depth < 8 {
+            for v in &mut color_data {
+                *v = jpx_palette_index(*v, depth);
+            }
+        } else if depth > 8 {
+            notes.push(format!(
+                "JPXDecode: palette indices carried in a {depth}-bit channel lost \
+                 their low bits in the 8-bit normalization; the palette lookup is \
+                 approximate"
+            ));
+        }
+    }
+
     // The same colour conversion every other image gets, at the decoder's
     // normalized 8 bits per component — but with no `/Decode` mapping:
     // ISO 32000-1 7.4.9 says "Decode shall be ignored, except in the case
@@ -757,6 +787,19 @@ fn jpx_rgba(
         },
         notes,
     ))
+}
+
+/// The palette index a decoded 8-bit sample was normalized FROM, for a
+/// source depth below 8. The decoder scales an index `i` to
+/// `round(i * 255 / (2^depth - 1))` (its documented contract for shallow
+/// channels), and the step between neighbouring indices — at least
+/// 255/127 for depth 7 — always exceeds 1, so the scaling is injective
+/// and rounding back with `round(v * (2^depth - 1) / 255)` recovers `i`
+/// exactly; `jpx_palette_index_reverses_the_normalization_exactly`
+/// proves it for every value of every depth.
+fn jpx_palette_index(v: u8, depth: u8) -> u8 {
+    let max = (1u32 << depth) - 1;
+    ((u32::from(v) * max + 127) / 255) as u8
 }
 
 /// Expands a decoded image to one owned RGBA quad per pixel. The general
@@ -1333,6 +1376,60 @@ mod tests {
         let (_, notes) = jpx_rgba(&meta, image).expect("decodes");
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0], "JPXDecode: tile 3 rendered as background");
+    }
+
+    #[test]
+    fn jpx_palette_index_reverses_the_normalization_exactly() {
+        // The decoder's forward normalization for depths below 8 is
+        // round(i * 255 / max), computed as (i*255 + max/2) / max (the
+        // pdfboss-jpx contract behind DecodedImage::component_depths).
+        // Prove the reversal recovers every index of every shallow depth.
+        for depth in 1u8..8 {
+            let max = (1u32 << depth) - 1;
+            for index in 0..=max {
+                let normalized = ((index * 255 + max / 2) / max) as u8;
+                assert_eq!(
+                    u32::from(jpx_palette_index(normalized, depth)),
+                    index,
+                    "depth {depth} index {index} normalized {normalized}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn jpx_indexed_4bit_samples_recover_their_palette_indices() {
+        // A 4-bit index of 8 arrives normalized to 136; the palette must
+        // be read at 8 (green), not at 136 (clamped into the red tail).
+        let palette: String = (0..16)
+            .map(|i| if i == 8 { "00FF00" } else { "FF0000" })
+            .collect();
+        let cs = format!("[/Indexed /DeviceRGB 15 <{palette}>]");
+        let doc = test_doc();
+        let mut image = jpx_image(1, 1, 1, vec![136], pdfboss_jpx::ColorKind::Gray, None);
+        image.component_depths = vec![4];
+        let meta = jpx_meta(&doc, b"<< >>", Some(cs.as_bytes()));
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert!(notes.is_empty(), "an exact reversal is silent: {notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn jpx_indexed_deep_channel_passes_through_with_a_note() {
+        // Depth > 8 right-shifted the indices; the low bits are gone, so
+        // the samples pass through unchanged and the report owns up.
+        let doc = test_doc();
+        let mut image = jpx_image(1, 1, 1, vec![2], pdfboss_jpx::ColorKind::Gray, None);
+        image.component_depths = vec![12];
+        let meta = jpx_meta(
+            &doc,
+            b"<< >>",
+            Some(b"[/Indexed /DeviceRGB 3 <FF0000 00FF00 0000FF 000000>]"),
+        );
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 0, 255, 255], "index 2 as stored");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("12-bit"), "{notes:?}");
     }
 
     #[test]
