@@ -233,11 +233,11 @@ pub fn is_image_codec(name: &str) -> bool {
 /// `trailing_filter_reads_the_chain_like_decode_stream` pins the
 /// agreement.
 pub async fn trailing_filter_with<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<Name> {
-    match read_trailing_filter(src, dict, false).await {
-        Ok(name) => name,
-        // Unreachable with `strict` false; spelled out rather than unwrapped.
-        Err(_) => None,
-    }
+    // An error is unreachable with `strict` false, and `None` would be its
+    // only lenient reading anyway.
+    read_trailing_filter(src, dict, false)
+        .await
+        .unwrap_or_default()
 }
 
 /// [`trailing_filter_with`] except that a `/Filter` value that cannot be
