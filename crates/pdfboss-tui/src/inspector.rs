@@ -24,8 +24,15 @@ pub enum InspectorMode {
 pub enum InspectorPayload {
     /// The parsed object (streams carry raw data in `Object::Stream`).
     Object { r: ObjRef, object: Object },
-    /// Decoded stream data for the Decoded/Ops views.
-    Decoded { r: ObjRef, data: Vec<u8> },
+    /// Decoded stream data for the Decoded/Ops views. `passthrough` names
+    /// the trailing image codec when `decode_stream` left the bytes encoded
+    /// for the image layer — the Ops view labels those instead of
+    /// disassembling a codestream into fabricated operators.
+    Decoded {
+        r: ObjRef,
+        data: Vec<u8>,
+        passthrough: Option<String>,
+    },
 }
 
 /// Inspector pane model.
@@ -33,6 +40,9 @@ pub struct InspectorState {
     pub title: String,
     pub object: Option<(ObjRef, Object)>,
     pub decoded: Option<Vec<u8>>,
+    /// The trailing image codec the decoded bytes are still encoded in,
+    /// when there is one; see [`InspectorPayload::Decoded`].
+    pub decoded_passthrough: Option<String>,
     pub mode: InspectorMode,
     pub scroll: u16,
     pub lines: Vec<String>,
@@ -48,6 +58,7 @@ impl InspectorState {
             title: String::new(),
             object: None,
             decoded: None,
+            decoded_passthrough: None,
             mode: InspectorMode::Pretty,
             scroll: 0,
             lines: Vec::new(),
@@ -90,7 +101,7 @@ impl InspectorState {
 
     /// Installs decoded stream data (ignored unless it matches the shown
     /// object) and refreshes decoded-backed views.
-    pub fn set_decoded(&mut self, r: ObjRef, data: Vec<u8>) {
+    pub fn set_decoded(&mut self, r: ObjRef, data: Vec<u8>, passthrough: Option<String>) {
         let matches_current = self
             .object
             .as_ref()
@@ -99,6 +110,7 @@ impl InspectorState {
             return;
         }
         self.decoded = Some(data);
+        self.decoded_passthrough = passthrough;
         if matches!(self.mode, InspectorMode::Decoded | InspectorMode::Ops) {
             self.rebuild();
         }
@@ -207,9 +219,20 @@ impl InspectorState {
                 self.ref_cursor = None;
             }
             InspectorMode::Ops => {
-                self.lines = match self.decoded.as_deref() {
-                    Some(data) => ops_lines(data),
-                    None => vec!["decoding\u{2026}".to_string()],
+                // A passthrough codestream is not operators: disassembling
+                // it fabricates ops out of encoded image bytes, misleading
+                // exactly the person debugging the mislabel.
+                self.lines = match (self.decoded.as_deref(), self.decoded_passthrough.as_deref()) {
+                    (Some(_), Some(codec)) => vec![
+                        format!(
+                            "passthrough /{codec} codestream: these bytes are \
+                             image data left encoded for the image layer, \
+                             not content operators"
+                        ),
+                        "(the decoded view shows the bytes)".to_string(),
+                    ],
+                    (Some(data), None) => ops_lines(data),
+                    (None, ..) => vec!["decoding\u{2026}".to_string()],
                 };
                 self.refs = Vec::new();
                 self.ref_cursor = None;
@@ -377,7 +400,7 @@ mod tests {
         assert!(inspector.cycle_mode(), "decoded view needs data");
         assert_eq!(inspector.mode, InspectorMode::Decoded);
         assert_eq!(inspector.lines, vec!["decoding\u{2026}"]);
-        inspector.set_decoded(ObjRef { num: 4, gen: 0 }, b"BT /F1 12 Tf ET".to_vec());
+        inspector.set_decoded(ObjRef { num: 4, gen: 0 }, b"BT /F1 12 Tf ET".to_vec(), None);
         assert_eq!(inspector.lines, vec!["BT /F1 12 Tf ET"]);
         assert!(!inspector.cycle_mode(), "ops reuses decoded data");
         assert_eq!(inspector.mode, InspectorMode::Ops);
@@ -395,11 +418,42 @@ mod tests {
         inspector.set_object(ObjRef { num: 4, gen: 0 }, content_stream());
         inspector.cycle_mode();
         inspector.cycle_mode();
-        inspector.set_decoded(ObjRef { num: 9, gen: 0 }, b"junk".to_vec());
+        inspector.set_decoded(ObjRef { num: 9, gen: 0 }, b"junk".to_vec(), None);
         assert_eq!(
             inspector.lines,
             vec!["decoding\u{2026}"],
             "wrong object dropped"
+        );
+    }
+
+    /// A passthrough codestream is not operators: the Ops view labels it
+    /// instead of disassembling encoded image bytes into fabricated ops —
+    /// which would mislead exactly the person debugging the mislabel. The
+    /// bytes here are deliberately valid operator syntax, so the label (not
+    /// the content) is proven to decide; the Decoded view still shows them.
+    #[test]
+    fn ops_view_labels_a_passthrough_codestream() {
+        let mut inspector = InspectorState::new();
+        inspector.set_object(ObjRef { num: 4, gen: 0 }, content_stream());
+        inspector.cycle_mode(); // Raw
+        inspector.cycle_mode(); // Decoded
+        inspector.set_decoded(
+            ObjRef { num: 4, gen: 0 },
+            b"BT /F1 12 Tf ET".to_vec(),
+            Some("DCTDecode".to_string()),
+        );
+        assert_eq!(
+            inspector.lines,
+            vec!["BT /F1 12 Tf ET"],
+            "the decoded view still shows the bytes"
+        );
+        assert!(!inspector.cycle_mode());
+        assert_eq!(inspector.mode, InspectorMode::Ops);
+        assert_eq!(inspector.lines.len(), 2);
+        assert!(
+            inspector.lines[0].starts_with("passthrough /DCTDecode codestream"),
+            "{:?}",
+            inspector.lines
         );
     }
 

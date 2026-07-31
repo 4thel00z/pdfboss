@@ -238,9 +238,11 @@ impl App {
                         InspectorPayload::Object { r, object } => {
                             self.inspector.set_object(r, object)
                         }
-                        InspectorPayload::Decoded { r, data } => {
-                            self.inspector.set_decoded(r, data)
-                        }
+                        InspectorPayload::Decoded {
+                            r,
+                            data,
+                            passthrough,
+                        } => self.inspector.set_decoded(r, data, passthrough),
                     }
                 }
                 Vec::new()
