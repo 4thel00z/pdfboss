@@ -21,7 +21,8 @@ pub mod xref;
 
 pub use crypt::Decryptor;
 pub use document::{
-    content_stream_data_with, map_pages, page_content_with, Document, DocumentSeed, Metadata, Page,
+    content_stream_data_with, decoded_stream_data_with, map_pages, page_content_with, Document,
+    DocumentSeed, Metadata, Page,
 };
 pub use elements::{Element, ElementOpts, Span, XrefKind};
 pub use error::{Error, Result};

@@ -213,7 +213,9 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
 /// `JPXDecode` (ISO 32000-1 7.4.9). Their decoded form exists only at the
 /// image layer; every other consumer of stream bytes must refuse them,
 /// because a raw JPEG or JPEG 2000 codestream is indistinguishable from
-/// decoded data to anything that is not an image decoder.
+/// decoded data to anything that is not an image decoder. Consumers do
+/// not check this themselves: they fetch through
+/// [`crate::document::decoded_stream_data_with`], which is that refusal.
 pub fn is_image_codec(name: &str) -> bool {
     matches!(name, "DCTDecode" | "DCT" | "JPXDecode")
 }

@@ -935,27 +935,47 @@ pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
     }
 }
 
-/// Fetches and decodes one CONTENT stream — page `/Contents`, a form
-/// XObject, a Type3 CharProc, a pattern cell: anything whose bytes feed a
-/// content parser rather than an image decoder.
+/// Fetches one stream's bytes GUARANTEED DECODED — refusing the streams
+/// whose bytes `decode_stream` leaves encoded for the image layer. This is
+/// the fetch for **every consumer that is not an image decoder**: content
+/// streams, font programs, `/ToUnicode` CMaps, `/CIDToGIDMap` tables —
+/// anything that parses what it fetches.
 ///
 /// This is [`AsyncObjectSource::stream_data`] with one refusal in front:
 /// a stream whose trailing `/Filter` entry is an image codec (`DCTDecode`,
 /// `JPXDecode`) fails with [`Error::UnsupportedFilter`] instead of handing
-/// back the passthrough. `decode_stream` leaves those bytes ENCODED for
-/// the image layer (ISO 32000-1 7.4.9); a content parser fed the raw
-/// codestream would chew binary garbage into operators — typically a blank
-/// page with a clean report — so the refusal here is what turns the
-/// mislabelled stream into the same reported skip as any other filter this
-/// library cannot run. Same calling convention as [`page_content_with`]
+/// back the passthrough (ISO 32000-1 7.4.9). A raw JPEG or JPEG 2000
+/// codestream is indistinguishable from decoded data to anything that is
+/// not an image decoder: a parser fed one chews binary garbage into
+/// operators, tables, or mappings with a clean result. The refusal turns
+/// the mislabelled stream into the same reportable error as any other
+/// filter this library cannot run.
+///
+/// Raw [`AsyncObjectSource::stream_data`] remains correct in exactly one
+/// place: the image layer, which reads the trailing filter itself and
+/// decodes the passthrough. A new call site that is not decoding images
+/// belongs here instead. Same calling convention as [`page_content_with`]
 /// (`src` by value; see that function's docs).
-pub async fn content_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
+pub async fn decoded_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
     if let Some(name) = filters::trailing_filter_with(&src, &s.dict).await {
         if filters::is_image_codec(&name.0) {
             return Err(Error::UnsupportedFilter(name.0));
         }
     }
     src.stream_data(s).await
+}
+
+/// Fetches and decodes one CONTENT stream — page `/Contents`, a form
+/// XObject, a Type3 CharProc, a pattern cell: anything whose bytes feed a
+/// content parser rather than an image decoder.
+///
+/// The content-flavored name for [`decoded_stream_data_with`], which is
+/// the same refusal for every non-image consumer; see it for why a
+/// passthrough image codec must never reach a parser. For a content
+/// stream the refusal is what turns the mislabelled stream into the same
+/// reported skip as any other filter this library cannot run.
+pub async fn content_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
+    decoded_stream_data_with(src, s).await
 }
 
 #[cfg(test)]
