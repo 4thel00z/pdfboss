@@ -3,7 +3,7 @@
 //! Comparison rules (design contract):
 //! - reversible 5-3 cases: EXACT match against `<name>.src.png`;
 //! - irreversible 9-7 cases: within +/-2 per sample AND PSNR >= 38 dB
-//!   against `<name>.pillow.png` (an independent decode of the same file).
+//!   against `<name>.indep.png` (an independent decode of the same file).
 //!
 //! The per-case tests ran `#[ignore]`d until the decoder pipeline was
 //! wired; the orchestration stage removed the ignores and nothing else.
@@ -689,7 +689,7 @@ fn run_case(name: &str) {
     if case.irreversible {
         // 9-7 path: match the independent decode within +/-2 per sample
         // and PSNR >= 38 dB.
-        let oracle = read_oracle(&fixture_dir().join(format!("{name}.pillow.png")));
+        let oracle = read_oracle(&fixture_dir().join(format!("{name}.indep.png")));
         assert_eq!((oracle.width, oracle.height), (case.width, case.height));
         assert_eq!(oracle.channels, image.components);
         let diff = max_abs_diff(&image.samples, &oracle.samples);
@@ -728,15 +728,15 @@ fn manifest_lists_all_committed_fixtures() {
             "{} missing",
             case.source
         );
-        let pillow = format!("{}.pillow.png", case.name);
-        assert!(fixture_dir().join(&pillow).is_file(), "{pillow} missing");
+        let indep = format!("{}.indep.png", case.name);
+        assert!(fixture_dir().join(&indep).is_file(), "{indep} missing");
     }
 }
 
 #[test]
 fn oracle_pngs_decode_with_manifest_dimensions() {
     for case in load_manifest() {
-        for oracle_file in [case.source.clone(), format!("{}.pillow.png", case.name)] {
+        for oracle_file in [case.source.clone(), format!("{}.indep.png", case.name)] {
             let oracle = read_oracle(&fixture_dir().join(&oracle_file));
             assert_eq!(
                 (oracle.width, oracle.height),
@@ -802,9 +802,9 @@ fn reversible_oracles_are_pixel_identical() {
     // filter/colour-type combination the zoo uses.
     for case in load_manifest().iter().filter(|case| !case.irreversible) {
         let src = read_oracle(&fixture_dir().join(&case.source));
-        let pillow = read_oracle(&fixture_dir().join(format!("{}.pillow.png", case.name)));
+        let indep = read_oracle(&fixture_dir().join(format!("{}.indep.png", case.name)));
         assert_eq!(
-            src.samples, pillow.samples,
+            src.samples, indep.samples,
             "{}: reversible oracles differ",
             case.name
         );
@@ -818,15 +818,15 @@ fn irreversible_oracles_stay_within_the_documented_tolerance() {
     // has real headroom. gray-97-jp2 measures ~62.1 dB.
     for case in load_manifest().iter().filter(|case| case.irreversible) {
         let src = read_oracle(&fixture_dir().join(&case.source));
-        let pillow = read_oracle(&fixture_dir().join(format!("{}.pillow.png", case.name)));
-        let diff = max_abs_diff(&src.samples, &pillow.samples);
+        let indep = read_oracle(&fixture_dir().join(format!("{}.indep.png", case.name)));
+        let diff = max_abs_diff(&src.samples, &indep.samples);
         assert!(diff <= 2, "{}: oracle diff {diff}", case.name);
-        let quality = psnr(&src.samples, &pillow.samples);
+        let quality = psnr(&src.samples, &indep.samples);
         assert!(quality >= 38.0, "{}: oracle PSNR {quality:.2}", case.name);
     }
     let gray = read_oracle(&fixture_dir().join("gray-97-jp2.src.png"));
-    let pillow = read_oracle(&fixture_dir().join("gray-97-jp2.pillow.png"));
-    let quality = psnr(&gray.samples, &pillow.samples);
+    let indep = read_oracle(&fixture_dir().join("gray-97-jp2.indep.png"));
+    let quality = psnr(&gray.samples, &indep.samples);
     assert!(
         (61.5..62.5).contains(&quality),
         "gray-97-jp2 oracle PSNR drifted: {quality:.2}"

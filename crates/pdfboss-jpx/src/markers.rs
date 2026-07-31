@@ -332,7 +332,8 @@ pub(crate) struct Sot {
     pub tile_part_index: u8,
     /// TNsot: declared tile-part count; 0 = not signalled here. ADVISORY
     /// ONLY (Table A.6): real-world streams ship more parts than declared,
-    /// so extra parts are decoded with a warning, never rejected.
+    /// so extra parts are decoded, never rejected; the decode stage warns
+    /// once per codestream.
     pub tile_part_count: u8,
 }
 
@@ -409,8 +410,7 @@ pub(crate) struct Codestream<'a> {
     /// Tile-parts in appearance order. Psot = 0 (final tile-part running
     /// to EOC) is resolved to a concrete body slice during the scan.
     pub tile_parts: Vec<TilePart<'a>>,
-    /// Soft findings: unknown markers skipped, TNsot advisories, a missing
-    /// EOC, etc.
+    /// Soft findings: unknown markers skipped, a missing EOC, etc.
     pub warnings: Vec<String>,
 }
 
@@ -1259,14 +1259,8 @@ pub(crate) fn parse_codestream<'a>(
     loop {
         // TNsot is ADVISORY (Table A.6): measured real-world streams
         // declare fewer tile-parts than they ship, so a surplus index
-        // warns and decodes, never rejects.
-        if sot.tile_part_count != 0 && sot.tile_part_index >= sot.tile_part_count {
-            warnings.push(format!(
-                "tile {}: tile-part {} at or beyond the declared TNsot = {}; \
-                 the count is advisory",
-                sot.tile_index, sot.tile_part_index, sot.tile_part_count
-            ));
-        }
+        // parses and decodes, never rejects. The decode stage summarizes
+        // the condition in one warning per codestream.
         let overrides = match scan_tile_part_header(&mut r, csiz, sot, &mut warnings) {
             Ok(overrides) => overrides,
             Err(e) => {
@@ -1948,8 +1942,9 @@ mod tests {
     #[test]
     fn tnsot_declared_count_is_advisory() {
         // The measured real-world shape: TNsot declares five tile-parts but
-        // six ship (TPsot 0..=5). Extra parts decode with a warning, never
-        // a rejection, and keep their appearance order.
+        // six ship (TPsot 0..=5). Extra parts parse silently, never a
+        // rejection, and keep their appearance order; the decode stage owns
+        // the one-per-codestream advisory summary.
         let mut s = tiny_main_header();
         for tpsot in 0..6u8 {
             s.extend(tile_part(0, 15, tpsot, 5, &[tpsot]));
@@ -1963,11 +1958,7 @@ mod tests {
             assert_eq!(part.sot.tile_part_count, 5);
             assert_eq!(part.body, [i as u8]);
         }
-        assert!(
-            cs.warnings.iter().any(|w| w.contains("TNsot")),
-            "{:?}",
-            cs.warnings
-        );
+        assert!(cs.warnings.is_empty(), "{:?}", cs.warnings);
     }
 
     #[test]
