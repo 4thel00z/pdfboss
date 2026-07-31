@@ -941,15 +941,26 @@ pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
 /// streams, font programs, `/ToUnicode` CMaps, `/CIDToGIDMap` tables —
 /// anything that parses what it fetches.
 ///
-/// This is [`AsyncObjectSource::stream_data`] with one refusal in front:
-/// a stream whose trailing `/Filter` entry is an image codec (`DCTDecode`,
+/// This is [`AsyncObjectSource::stream_data`] with two refusals in front.
+/// A stream whose trailing `/Filter` entry is an image codec (`DCTDecode`,
 /// `JPXDecode`) fails with [`Error::UnsupportedFilter`] instead of handing
-/// back the passthrough (ISO 32000-1 7.4.9). A raw JPEG or JPEG 2000
+/// back the passthrough (ISO 32000-1 7.4.9): a raw JPEG or JPEG 2000
 /// codestream is indistinguishable from decoded data to anything that is
-/// not an image decoder: a parser fed one chews binary garbage into
-/// operators, tables, or mappings with a clean result. The refusal turns
-/// the mislabelled stream into the same reportable error as any other
-/// filter this library cannot run.
+/// not an image decoder, and a parser fed one chews binary garbage into
+/// operators, tables, or mappings with a clean result. And a `/Filter`
+/// that cannot be READ at all — a reference cycle, or a chain deeper than
+/// [`crate::source::MAX_RESOLVE_DEPTH`] — is refused with the resolve
+/// error, because a value that cannot be read might name an image codec,
+/// and `decode_stream` would leniently return the bytes as stored. Either
+/// refusal is the same reportable error as any other filter this library
+/// cannot run.
+///
+/// One leniency is kept, deliberately: a `/Filter` that READS as `null`
+/// (a dangling reference included — ISO 32000-1 7.3.10 makes one
+/// equivalent to `null`) or as an unusable value says "no filter", which
+/// is exactly what `decode_stream` does with it; the stored bytes are the
+/// decoded bytes by that reading, and no codec name can hide in a value
+/// that is fully visible.
 ///
 /// Raw [`AsyncObjectSource::stream_data`] remains correct in exactly one
 /// place: the image layer, which reads the trailing filter itself and
@@ -957,7 +968,7 @@ pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
 /// belongs here instead. Same calling convention as [`page_content_with`]
 /// (`src` by value; see that function's docs).
 pub async fn decoded_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
-    if let Some(name) = filters::trailing_filter_with(&src, &s.dict).await {
+    if let Some(name) = filters::trailing_filter_checked_with(&src, &s.dict).await? {
         if filters::is_image_codec(&name.0) {
             return Err(Error::UnsupportedFilter(name.0));
         }
@@ -1037,6 +1048,32 @@ mod tests {
                 other => panic!("{codec} content must be refused, got {other:?}"),
             }
         }
+    }
+
+    /// A `/Contents` whose `/Filter` is a reference CYCLE is refused as
+    /// unreadable, never fetched: `decode_stream` cannot resolve the value
+    /// either and would leniently return the bytes AS STORED — and a value
+    /// nobody can read might name an image codec, so the stored bytes may
+    /// be a passthrough codestream. The bytes below are deliberately valid
+    /// operator syntax to prove the refusal is about the unreadable label.
+    #[test]
+    fn an_unreadable_filter_refuses_the_content_not_returns_it_raw() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        );
+        b.stream(4, "/Filter 6 0 R", b"1 0 0 rg 0 0 100 100 re f");
+        b.object(6, "7 0 R");
+        b.object(7, "6 0 R");
+        let doc = Document::load(b.build(1)).expect("load");
+        let page = doc.page(0).expect("page");
+        assert!(
+            page.content(&doc).is_err(),
+            "an unreadable /Filter must refuse, not pass stored bytes"
+        );
     }
 
     /// The composition every page-reading algorithm actually uses: the caller
