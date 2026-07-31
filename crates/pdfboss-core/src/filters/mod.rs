@@ -80,12 +80,19 @@ pub(crate) fn bool_parm(parms: Option<&Dict>, key: &str, default: bool) -> bool 
     }
 }
 
-/// Chases indirect references through `resolver` (bounded depth to break
-/// reference cycles); direct objects are cloned. Returns `None` when a
-/// reference cannot be resolved.
+/// Chases indirect references through `resolver`, depth-capped at
+/// [`crate::source::MAX_RESOLVE_DEPTH`] to break reference cycles; direct
+/// objects are cloned. Returns `None` when a reference cannot be resolved.
+///
+/// The cap is shared with the source-level chase deliberately: the
+/// image-codec gate reads `/Filter` through `src.resolve` and this decoder
+/// reads it here, and a chain one side follows further than the other is a
+/// stream the gate vouches for but the decoder leaves encoded (or the
+/// reverse). `deep_filter_ref_chains_decode_like_the_gate_reads_them` pins
+/// the agreement.
 fn resolve_value(obj: Option<&Object>, resolver: &dyn Resolve) -> Option<Object> {
     let mut cur = obj?.clone();
-    for _ in 0..8 {
+    for _ in 0..crate::source::MAX_RESOLVE_DEPTH {
         match cur {
             Object::Ref(r) => cur = resolver.resolve_ref(r)?,
             other => return Some(other),
@@ -364,6 +371,43 @@ mod tests {
                 "passthrough recognition of {filter:?}"
             );
         }
+    }
+
+    /// The gate (`trailing_filter_with`) and the decoder chase `/Filter`
+    /// reference chains to the same depth. Before they shared the cap, a
+    /// 9-hop chain sat exactly in the gap: deep enough that the decoder
+    /// gave up (leniently returning the bytes still encoded), shallow
+    /// enough that the gate resolved it and vouched for the stream —
+    /// handing still-compressed bytes to a content parser with a clean
+    /// result.
+    #[test]
+    fn deep_filter_ref_chains_decode_like_the_gate_reads_them() {
+        use crate::source::{block_on, Immediate};
+
+        let payload: &[u8] = b"BT (deep) Tj ET";
+        let compressed = zlib(payload);
+        // /Filter -> 1 0 R -> 2 0 R -> ... -> 9 0 R = /FlateDecode.
+        let mut map = HashMap::new();
+        for n in 1u32..9 {
+            map.insert((n, 0u16), Object::Ref(ObjRef { num: n + 1, gen: 0 }));
+        }
+        map.insert((9, 0), Object::Name(name("FlateDecode")));
+        let s = make_stream(
+            vec![("Filter", Object::Ref(ObjRef { num: 1, gen: 0 }))],
+            &compressed,
+        );
+        let src = Immediate(MapSource(map.clone()));
+        let gate_sees = block_on(trailing_filter_with(&src, &s.dict));
+        assert_eq!(
+            gate_sees.map(|n| n.0),
+            Some("FlateDecode".to_string()),
+            "the gate resolves the chain and passes the stream"
+        );
+        let decoded = decode_stream(&s, &MapResolve(map)).expect("decode");
+        assert_eq!(
+            decoded, payload,
+            "the decoder must chase /Filter as deep as the gate does"
+        );
     }
 
     #[test]
