@@ -722,20 +722,14 @@ fn owned_quads(img: Rgba<'_>) -> Vec<u8> {
 /// corrupt code-block, a tile or channel zeroed, a skipped component
 /// transform — as opposed to advisory notes about tolerated stream quirks
 /// (the TNsot tile-part count, a skipped rreq box), which would only be
-/// noise in a render report.
-fn material_jpx_warnings(warnings: &[String]) -> Vec<String> {
-    const MATERIAL: [&str; 6] = [
-        "corrupt code-block",
-        "treated as empty",
-        "zero-filled",
-        "tile skipped",
-        "out-of-range tile",
-        "transform skipped",
-    ];
+/// noise in a render report. The split is the decoder's own
+/// [`pdfboss_jpx::JpxWarning::data_loss`] contract; the message text is
+/// free-form and never consulted.
+fn material_jpx_warnings(warnings: &[pdfboss_jpx::JpxWarning]) -> Vec<String> {
     warnings
         .iter()
-        .filter(|w| MATERIAL.iter().any(|m| w.contains(m)))
-        .map(|w| format!("JPXDecode: {w}"))
+        .filter(|w| w.data_loss)
+        .map(|w| format!("JPXDecode: {}", w.message))
         .collect()
 }
 
@@ -1106,6 +1100,7 @@ mod tests {
             height,
             components,
             samples,
+            component_depths: vec![8; usize::from(components)],
             color,
             alpha_index,
             warnings: Vec::new(),
@@ -1252,23 +1247,32 @@ mod tests {
     }
 
     #[test]
-    fn jpx_material_warnings_surface_and_advisory_ones_do_not() {
+    fn jpx_data_loss_warnings_surface_and_benign_notes_do_not() {
+        // The split is the decoder's own `data_loss` flag, never the message
+        // text: the benign note below name-drops "corrupt code-block" and the
+        // loss reads like an advisory, and the classification must not care.
         let doc = test_doc();
         let mut image = jpx_image(1, 1, 1, vec![0], pdfboss_jpx::ColorKind::Gray, None);
         image.warnings = vec![
-            "2 tile(s) ship more tile-parts than their declared TNsot; \
-             the count is advisory (T.800 A.4.2)"
-                .to_string(),
-            "reader-requirements (rreq) box skipped".to_string(),
-            "tile 0 component 1: corrupt code-block [0, 32) x [0, 32) \
-             kept partially decoded"
-                .to_string(),
+            pdfboss_jpx::JpxWarning {
+                message: "2 tile(s) ship more tile-parts than their declared TNsot \
+                          (violates T.800 A.4.2); tolerated for compatibility"
+                    .to_string(),
+                data_loss: false,
+            },
+            pdfboss_jpx::JpxWarning {
+                message: "a benign note mentioning a corrupt code-block".to_string(),
+                data_loss: false,
+            },
+            pdfboss_jpx::JpxWarning {
+                message: "tile 3 rendered as background".to_string(),
+                data_loss: true,
+            },
         ];
         let meta = jpx_meta(&doc, b"<< >>", None);
         let (_, notes) = jpx_rgba(&meta, image).expect("decodes");
         assert_eq!(notes.len(), 1, "{notes:?}");
-        assert!(notes[0].contains("corrupt code-block"), "{notes:?}");
-        assert!(notes[0].starts_with("JPXDecode: "), "{notes:?}");
+        assert_eq!(notes[0], "JPXDecode: tile 3 rendered as background");
     }
 
     #[test]
