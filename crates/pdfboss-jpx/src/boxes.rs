@@ -962,18 +962,18 @@ mod tests {
 
     #[test]
     fn rgb_fixture_codestream_is_the_jp2c_payload() {
-        // Hand-parsed layout of rgb-53-jp2.jp2 (453 bytes total):
+        // Hand-parsed layout of rgb-53-jp2.jp2 (414 bytes total):
         //   offset  0: signature box, 12 bytes (I.5.1)
         //   offset 12: ftyp, LBox = 20
         //   offset 32: jp2h, LBox = 45 (0x2D)
-        //   offset 77: jp2c, LBox = 376 (0x178); 77 + 376 = 453 = EOF
-        // so the codestream payload is 376 - 8 = 368 bytes starting at
+        //   offset 77: jp2c, LBox = 337 (0x151); 77 + 337 = 414 = EOF
+        // so the codestream payload is 337 - 8 = 329 bytes starting at
         // offset 85.
         let data = fixture("rgb-53-jp2.jp2");
-        assert_eq!(data.len(), 453);
+        assert_eq!(data.len(), 414);
         let container = scan(&data).unwrap();
-        assert_eq!(container.codestream.len(), 368);
-        assert_eq!(container.codestream, &data[85..453]);
+        assert_eq!(container.codestream.len(), 329);
+        assert_eq!(container.codestream, &data[85..414]);
         assert!(container.warnings.is_empty());
     }
 
