@@ -161,9 +161,13 @@ fn execute_cmd(
         Cmd::DecodeStream { generation, r } => {
             tokio::spawn(async move {
                 let message = match decoded_stream_data(&doc, r).await {
-                    Ok(data) => Msg::InspectorLoaded {
+                    Ok((data, passthrough)) => Msg::InspectorLoaded {
                         generation,
-                        payload: InspectorPayload::Decoded { r, data },
+                        payload: InspectorPayload::Decoded {
+                            r,
+                            data,
+                            passthrough,
+                        },
                     },
                     Err(error) => Msg::InspectorFailed { generation, error },
                 };
@@ -310,15 +314,26 @@ async fn page_contents(doc: &AsyncDocument, r: ObjRef) -> Result<Vec<ObjRef>, St
     Ok(refs)
 }
 
-/// Decoded data of stream object `r`.
-async fn decoded_stream_data(doc: &AsyncDocument, r: ObjRef) -> Result<Vec<u8>, String> {
+/// Decoded data of stream object `r`, plus the trailing image codec's name
+/// when `decode_stream` leaves the bytes encoded for the image layer — the
+/// Ops view labels such a passthrough instead of disassembling it.
+async fn decoded_stream_data(
+    doc: &AsyncDocument,
+    r: ObjRef,
+) -> Result<(Vec<u8>, Option<String>), String> {
     let object = doc.get_object(r).await.map_err(|error| error.to_string())?;
     let Some(stream) = object.as_stream() else {
         return Err(format!("object {} {} is not a stream", r.num, r.gen));
     };
-    doc.decode_stream(stream)
+    let passthrough = pdfboss_core::filters::trailing_filter_with(doc, &stream.dict)
         .await
-        .map_err(|error| error.to_string())
+        .filter(|name| pdfboss_core::filters::is_image_codec(&name.0))
+        .map(|name| name.0);
+    let data = doc
+        .decode_stream(stream)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((data, passthrough))
 }
 
 /// Loads one hex window: a `read_span` window of a file span, or the whole
@@ -342,7 +357,7 @@ async fn load_hex(
         }
         HexSource::DecodedObjStm { container } => {
             match decoded_stream_data(&doc, container).await {
-                Ok(bytes) => Ok((0, bytes.len() as u64, bytes)),
+                Ok((bytes, _)) => Ok((0, bytes.len() as u64, bytes)),
                 Err(error) => Err(error),
             }
         }

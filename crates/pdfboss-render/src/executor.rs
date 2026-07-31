@@ -1597,7 +1597,21 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::XObject, SkipReason::Missing);
             return None;
         };
-        match stream.dict.get_name("Subtype").map(|n| n.0.as_str()) {
+        // `/Subtype` may be indirect like any dictionary value (ISO 32000-1
+        // 7.3.8.1): a direct name answers on the spot, a reference resolves.
+        let resolved;
+        let subtype = match stream.dict.get("Subtype") {
+            Some(Object::Name(n)) => Some(n.0.as_str()),
+            Some(indirect @ Object::Ref(_)) => {
+                resolved = self.src.resolve(indirect).await.ok();
+                resolved
+                    .as_ref()
+                    .and_then(|o| o.as_name())
+                    .map(|n| n.0.as_str())
+            }
+            _ => None,
+        };
+        match subtype {
             Some("Image") => {
                 self.draw_image_xobject(&stream, chain, gs).await;
                 None
@@ -2579,6 +2593,25 @@ mod tests {
             !dark_at(&pix, 55, 115),
             "the CharProc bytes must not be parsed as content"
         );
+    }
+
+    /// `/Subtype` may be indirect like any dictionary value (ISO 32000-1
+    /// 7.3.8.1). The XObject dispatch resolves it: a form declared through
+    /// a reference paints, rather than being skipped as an unsupported
+    /// XObject with its whole content subtree.
+    #[test]
+    fn a_form_whose_subtype_is_indirect_still_paints() {
+        let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype 6 0 R /BBox [0 0 100 100]",
+                b"1 0 0 rg 0 0 100 100 re f",
+            );
+            b.object(6, "/Form");
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_ne!(px(&pix, 50, 50), WHITE, "the form painted");
+        assert!(drops(&report).is_empty(), "nothing to report");
     }
 
     #[test]

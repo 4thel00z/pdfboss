@@ -80,12 +80,19 @@ pub(crate) fn bool_parm(parms: Option<&Dict>, key: &str, default: bool) -> bool 
     }
 }
 
-/// Chases indirect references through `resolver` (bounded depth to break
-/// reference cycles); direct objects are cloned. Returns `None` when a
-/// reference cannot be resolved.
+/// Chases indirect references through `resolver`, depth-capped at
+/// [`crate::source::MAX_RESOLVE_DEPTH`] to break reference cycles; direct
+/// objects are cloned. Returns `None` when a reference cannot be resolved.
+///
+/// The cap is shared with the source-level chase deliberately: the
+/// image-codec gate reads `/Filter` through `src.resolve` and this decoder
+/// reads it here, and a chain one side follows further than the other is a
+/// stream the gate vouches for but the decoder leaves encoded (or the
+/// reverse). `deep_filter_ref_chains_decode_like_the_gate_reads_them` pins
+/// the agreement.
 fn resolve_value(obj: Option<&Object>, resolver: &dyn Resolve) -> Option<Object> {
     let mut cur = obj?.clone();
-    for _ in 0..8 {
+    for _ in 0..crate::source::MAX_RESOLVE_DEPTH {
         match cur {
             Object::Ref(r) => cur = resolver.resolve_ref(r)?,
             other => return Some(other),
@@ -206,7 +213,9 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
 /// `JPXDecode` (ISO 32000-1 7.4.9). Their decoded form exists only at the
 /// image layer; every other consumer of stream bytes must refuse them,
 /// because a raw JPEG or JPEG 2000 codestream is indistinguishable from
-/// decoded data to anything that is not an image decoder.
+/// decoded data to anything that is not an image decoder. Consumers do
+/// not check this themselves: they fetch through
+/// [`crate::document::decoded_stream_data_with`], which is that refusal.
 pub fn is_image_codec(name: &str) -> bool {
     matches!(name, "DCTDecode" | "DCT" | "JPXDecode")
 }
@@ -224,18 +233,85 @@ pub fn is_image_codec(name: &str) -> bool {
 /// `trailing_filter_reads_the_chain_like_decode_stream` pins the
 /// agreement.
 pub async fn trailing_filter_with<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<Name> {
-    let filter = dict.get("Filter")?;
-    match src.resolve(filter).await.ok()? {
-        Object::Name(n) => Some(n),
+    // An error is unreachable with `strict` false, and `None` would be its
+    // only lenient reading anyway.
+    read_trailing_filter(src, dict, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// [`trailing_filter_with`] except that a `/Filter` value that cannot be
+/// READ — a reference cycle, or a chain deeper than
+/// [`crate::source::MAX_RESOLVE_DEPTH`] — is an error instead of "no
+/// trailing filter". A value that cannot be read might name an image
+/// codec, so the checked fetch
+/// ([`crate::document::decoded_stream_data_with`]) must refuse the stream
+/// rather than pass its possibly-still-encoded bytes to a parser.
+///
+/// A `/Filter` that resolves to `null` (a dangling reference included —
+/// ISO 32000-1 7.3.10 makes one equivalent to `null`) or to an unusable
+/// value is still `Ok(None)`: the value is readable and says "no filter",
+/// which is exactly how [`decode_stream`] treats it.
+pub async fn trailing_filter_checked_with<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+) -> Result<Option<Name>> {
+    read_trailing_filter(src, dict, true).await
+}
+
+/// The one reading of `/Filter` under both public faces above, so the
+/// strict and the lenient reader cannot drift apart on anything but their
+/// treatment of a resolve error.
+async fn read_trailing_filter<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+    strict: bool,
+) -> Result<Option<Name>> {
+    // The overwhelmingly common shapes — a bare name, or an array of bare
+    // names — are read straight off the dictionary. Each `resolve` is a
+    // boxed future plus an owned-Object clone, and this gate runs in front
+    // of every content fetch (up to once per form invocation), so the
+    // resolve is reserved for values that actually contain a reference.
+    let Some(filter) = dict.get("Filter") else {
+        return Ok(None);
+    };
+    let owned;
+    let filter = match filter {
+        Object::Ref(_) => match src.resolve(filter).await {
+            Ok(resolved) => {
+                owned = resolved;
+                &owned
+            }
+            Err(e) if strict => return Err(e),
+            Err(_) => return Ok(None),
+        },
+        direct => direct,
+    };
+    match filter {
+        Object::Name(n) => Ok(Some(n.clone())),
         Object::Array(items) => {
             for item in items.iter().rev() {
-                if let Ok(Object::Name(n)) = src.resolve(item).await {
-                    return Some(n);
+                match item {
+                    Object::Name(n) => return Ok(Some(n.clone())),
+                    Object::Ref(_) => match src.resolve(item).await {
+                        Ok(Object::Name(n)) => return Ok(Some(n)),
+                        // Readable but not a name (null included): skipped,
+                        // exactly as decode_stream skips it.
+                        Ok(_) => {}
+                        Err(e) if strict => return Err(e),
+                        // Lenient: an unreadable item is skipped like a
+                        // null one; decode_stream does the same, and the
+                        // two must agree on which filter is "last".
+                        Err(_) => {}
+                    },
+                    // Not a name and not a road to one: skipped, exactly
+                    // as decode_stream skips it.
+                    _ => {}
                 }
             }
-            None
+            Ok(None)
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -364,6 +440,187 @@ mod tests {
                 "passthrough recognition of {filter:?}"
             );
         }
+    }
+
+    /// A direct `/Filter` value costs the gate no `resolve` round-trip.
+    /// The overwhelmingly common shapes — a bare name, or an array of bare
+    /// names — are read straight off the dictionary; the boxed resolve
+    /// future (plus its owned-Object clone) is reserved for values that
+    /// actually contain a reference. Every content fetch pays this gate,
+    /// up to once per form invocation, which is what makes the fast path
+    /// worth pinning.
+    #[test]
+    fn direct_filter_values_cost_the_gate_no_resolve() {
+        use crate::source::{block_on, resolve_with, AsyncObjectSource, BoxFuture};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Counts `resolve` calls — each one is a boxed future plus an
+        /// owned-Object clone, which is the cost the fast path exists to
+        /// avoid, whether or not a fetch follows.
+        struct CountingSource {
+            map: HashMap<(u32, u16), Object>,
+            resolves: AtomicUsize,
+        }
+
+        impl AsyncObjectSource for CountingSource {
+            fn get(&self, r: ObjRef) -> BoxFuture<'_, Result<Object>> {
+                let got = self
+                    .map
+                    .get(&(r.num, r.gen))
+                    .cloned()
+                    .ok_or_else(|| Error::Decode("missing object".into()));
+                Box::pin(std::future::ready(got))
+            }
+
+            fn stream_data<'a>(&'a self, s: &'a Stream) -> BoxFuture<'a, Result<Vec<u8>>> {
+                Box::pin(std::future::ready(Ok(s.data.clone())))
+            }
+
+            fn resolve<'a>(&'a self, o: &'a Object) -> BoxFuture<'a, Result<Object>> {
+                self.resolves.fetch_add(1, Ordering::Relaxed);
+                Box::pin(resolve_with(self, o))
+            }
+        }
+
+        let map = HashMap::from([((7u32, 0u16), Object::Name(name("JPXDecode")))]);
+        let direct: Vec<(Object, Option<&str>)> = vec![
+            (Object::Name(name("DCTDecode")), Some("DCTDecode")),
+            (
+                Object::Array(vec![
+                    Object::Name(name("FlateDecode")),
+                    Object::Name(name("DCTDecode")),
+                ]),
+                Some("DCTDecode"),
+            ),
+            (Object::Array(vec![Object::Null]), None),
+            (Object::Int(3), None),
+        ];
+        for (filter, expected) in direct {
+            let src = CountingSource {
+                map: map.clone(),
+                resolves: AtomicUsize::new(0),
+            };
+            let dict = make_dict(vec![("Filter", filter.clone())]);
+            let got = block_on(trailing_filter_with(&src, &dict));
+            assert_eq!(got.map(|n| n.0), expected.map(str::to_string));
+            assert_eq!(
+                src.resolves.load(Ordering::Relaxed),
+                0,
+                "direct value {filter:?} must not resolve"
+            );
+        }
+        // The reference shapes still resolve — the fast path must not
+        // have cost them their answer.
+        for filter in [
+            Object::Ref(ObjRef { num: 7, gen: 0 }),
+            Object::Array(vec![Object::Ref(ObjRef { num: 7, gen: 0 })]),
+        ] {
+            let src = CountingSource {
+                map: map.clone(),
+                resolves: AtomicUsize::new(0),
+            };
+            let dict = make_dict(vec![("Filter", filter)]);
+            let got = block_on(trailing_filter_with(&src, &dict));
+            assert_eq!(got.map(|n| n.0), Some("JPXDecode".to_string()));
+            assert!(src.resolves.load(Ordering::Relaxed) > 0);
+        }
+    }
+
+    /// The gate (`trailing_filter_with`) and the decoder chase `/Filter`
+    /// reference chains to the same depth. Before they shared the cap, a
+    /// 9-hop chain sat exactly in the gap: deep enough that the decoder
+    /// gave up (leniently returning the bytes still encoded), shallow
+    /// enough that the gate resolved it and vouched for the stream —
+    /// handing still-compressed bytes to a content parser with a clean
+    /// result.
+    #[test]
+    fn deep_filter_ref_chains_decode_like_the_gate_reads_them() {
+        use crate::source::{block_on, Immediate};
+
+        let payload: &[u8] = b"BT (deep) Tj ET";
+        let compressed = zlib(payload);
+        // /Filter -> 1 0 R -> 2 0 R -> ... -> 9 0 R = /FlateDecode.
+        let mut map = HashMap::new();
+        for n in 1u32..9 {
+            map.insert((n, 0u16), Object::Ref(ObjRef { num: n + 1, gen: 0 }));
+        }
+        map.insert((9, 0), Object::Name(name("FlateDecode")));
+        let s = make_stream(
+            vec![("Filter", Object::Ref(ObjRef { num: 1, gen: 0 }))],
+            &compressed,
+        );
+        let src = Immediate(MapSource(map.clone()));
+        let gate_sees = block_on(trailing_filter_with(&src, &s.dict));
+        assert_eq!(
+            gate_sees.map(|n| n.0),
+            Some("FlateDecode".to_string()),
+            "the gate resolves the chain and passes the stream"
+        );
+        let decoded = decode_stream(&s, &MapResolve(map)).expect("decode");
+        assert_eq!(
+            decoded, payload,
+            "the decoder must chase /Filter as deep as the gate does"
+        );
+    }
+
+    /// A `/Filter` behind a reference cycle splits the readers on purpose.
+    /// The lenient reader and `decode_stream` agree — no usable filter,
+    /// data as stored — which is right for the image layer. The CHECKED
+    /// reader errors instead: a value that cannot be read might name an
+    /// image codec, so the checked fetch must refuse the stream rather
+    /// than let `decode_stream`'s stored bytes reach a parser.
+    #[test]
+    fn a_circular_filter_errors_the_checked_reader_only() {
+        use crate::source::{block_on, Immediate};
+
+        let map = HashMap::from([
+            ((7u32, 0u16), Object::Ref(ObjRef { num: 8, gen: 0 })),
+            ((8u32, 0u16), Object::Ref(ObjRef { num: 7, gen: 0 })),
+        ]);
+        for filter in [
+            Object::Ref(ObjRef { num: 7, gen: 0 }),
+            // The same cycle one level down, as an array element.
+            Object::Array(vec![Object::Ref(ObjRef { num: 7, gen: 0 })]),
+        ] {
+            let s = make_stream(vec![("Filter", filter.clone())], b"stored");
+            let src = Immediate(MapSource(map.clone()));
+            assert!(
+                block_on(trailing_filter_with(&src, &s.dict)).is_none(),
+                "lenient reader of {filter:?}"
+            );
+            assert!(
+                block_on(trailing_filter_checked_with(&src, &s.dict)).is_err(),
+                "checked reader of {filter:?}"
+            );
+            assert_eq!(
+                decode_stream(&s, &MapResolve(map.clone())).unwrap(),
+                b"stored",
+                "decode_stream leniency of {filter:?}"
+            );
+        }
+    }
+
+    /// The checked reader stays lenient where the value is READABLE and
+    /// says "no filter": a dangling reference is `null` (ISO 32000-1
+    /// 7.3.10), and null means unfiltered — exactly `decode_stream`'s
+    /// treatment. Only unreadability is an error.
+    #[test]
+    fn a_dangling_filter_reads_as_no_filter_for_both_readers() {
+        use crate::source::{block_on, Immediate};
+
+        // Object 9 does not exist anywhere.
+        let map: HashMap<(u32, u16), Object> = HashMap::new();
+        let s = make_stream(
+            vec![("Filter", Object::Ref(ObjRef { num: 9, gen: 0 }))],
+            b"stored",
+        );
+        let src = Immediate(MapSource(map.clone()));
+        assert!(block_on(trailing_filter_with(&src, &s.dict)).is_none());
+        assert_eq!(
+            block_on(trailing_filter_checked_with(&src, &s.dict)).expect("readable"),
+            None
+        );
+        assert_eq!(decode_stream(&s, &MapResolve(map)).unwrap(), b"stored");
     }
 
     #[test]

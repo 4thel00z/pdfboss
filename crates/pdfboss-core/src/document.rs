@@ -935,27 +935,58 @@ pub async fn page_content_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
     }
 }
 
-/// Fetches and decodes one CONTENT stream — page `/Contents`, a form
-/// XObject, a Type3 CharProc, a pattern cell: anything whose bytes feed a
-/// content parser rather than an image decoder.
+/// Fetches one stream's bytes GUARANTEED DECODED — refusing the streams
+/// whose bytes `decode_stream` leaves encoded for the image layer. This is
+/// the fetch for **every consumer that is not an image decoder**: content
+/// streams, font programs, `/ToUnicode` CMaps, `/CIDToGIDMap` tables —
+/// anything that parses what it fetches.
 ///
-/// This is [`AsyncObjectSource::stream_data`] with one refusal in front:
-/// a stream whose trailing `/Filter` entry is an image codec (`DCTDecode`,
+/// This is [`AsyncObjectSource::stream_data`] with two refusals in front.
+/// A stream whose trailing `/Filter` entry is an image codec (`DCTDecode`,
 /// `JPXDecode`) fails with [`Error::UnsupportedFilter`] instead of handing
-/// back the passthrough. `decode_stream` leaves those bytes ENCODED for
-/// the image layer (ISO 32000-1 7.4.9); a content parser fed the raw
-/// codestream would chew binary garbage into operators — typically a blank
-/// page with a clean report — so the refusal here is what turns the
-/// mislabelled stream into the same reported skip as any other filter this
-/// library cannot run. Same calling convention as [`page_content_with`]
+/// back the passthrough (ISO 32000-1 7.4.9): a raw JPEG or JPEG 2000
+/// codestream is indistinguishable from decoded data to anything that is
+/// not an image decoder, and a parser fed one chews binary garbage into
+/// operators, tables, or mappings with a clean result. And a `/Filter`
+/// that cannot be READ at all — a reference cycle, or a chain deeper than
+/// [`crate::source::MAX_RESOLVE_DEPTH`] — is refused with the resolve
+/// error, because a value that cannot be read might name an image codec,
+/// and `decode_stream` would leniently return the bytes as stored. Either
+/// refusal is the same reportable error as any other filter this library
+/// cannot run.
+///
+/// One leniency is kept, deliberately: a `/Filter` that READS as `null`
+/// (a dangling reference included — ISO 32000-1 7.3.10 makes one
+/// equivalent to `null`) or as an unusable value says "no filter", which
+/// is exactly what `decode_stream` does with it; the stored bytes are the
+/// decoded bytes by that reading, and no codec name can hide in a value
+/// that is fully visible.
+///
+/// Raw [`AsyncObjectSource::stream_data`] remains correct in exactly one
+/// place: the image layer, which reads the trailing filter itself and
+/// decodes the passthrough. A new call site that is not decoding images
+/// belongs here instead. Same calling convention as [`page_content_with`]
 /// (`src` by value; see that function's docs).
-pub async fn content_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
-    if let Some(name) = filters::trailing_filter_with(&src, &s.dict).await {
+pub async fn decoded_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
+    if let Some(name) = filters::trailing_filter_checked_with(&src, &s.dict).await? {
         if filters::is_image_codec(&name.0) {
             return Err(Error::UnsupportedFilter(name.0));
         }
     }
     src.stream_data(s).await
+}
+
+/// Fetches and decodes one CONTENT stream — page `/Contents`, a form
+/// XObject, a Type3 CharProc, a pattern cell: anything whose bytes feed a
+/// content parser rather than an image decoder.
+///
+/// The content-flavored name for [`decoded_stream_data_with`], which is
+/// the same refusal for every non-image consumer; see it for why a
+/// passthrough image codec must never reach a parser. For a content
+/// stream the refusal is what turns the mislabelled stream into the same
+/// reported skip as any other filter this library cannot run.
+pub async fn content_stream_data_with<S: AsyncObjectSource>(src: S, s: &Stream) -> Result<Vec<u8>> {
+    decoded_stream_data_with(src, s).await
 }
 
 #[cfg(test)]
@@ -1017,6 +1048,32 @@ mod tests {
                 other => panic!("{codec} content must be refused, got {other:?}"),
             }
         }
+    }
+
+    /// A `/Contents` whose `/Filter` is a reference CYCLE is refused as
+    /// unreadable, never fetched: `decode_stream` cannot resolve the value
+    /// either and would leniently return the bytes AS STORED — and a value
+    /// nobody can read might name an image codec, so the stored bytes may
+    /// be a passthrough codestream. The bytes below are deliberately valid
+    /// operator syntax to prove the refusal is about the unreadable label.
+    #[test]
+    fn an_unreadable_filter_refuses_the_content_not_returns_it_raw() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
+        );
+        b.stream(4, "/Filter 6 0 R", b"1 0 0 rg 0 0 100 100 re f");
+        b.object(6, "7 0 R");
+        b.object(7, "6 0 R");
+        let doc = Document::load(b.build(1)).expect("load");
+        let page = doc.page(0).expect("page");
+        assert!(
+            page.content(&doc).is_err(),
+            "an unreadable /Filter must refuse, not pass stored bytes"
+        );
     }
 
     /// The composition every page-reading algorithm actually uses: the caller
