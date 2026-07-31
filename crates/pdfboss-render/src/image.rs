@@ -246,41 +246,32 @@ async fn floats_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Opt
     Some(out)
 }
 
-/// The last entry of the image's `/Filter` chain, which names the codec the
-/// data is still in when the stream filters pass an image codec through
-/// untouched.
-async fn trailing_filter<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<String> {
-    let filter = dict.get("Filter")?;
-    let name = match src.resolve(filter).await {
-        Ok(Object::Name(n)) => n,
-        Ok(Object::Array(items)) => {
-            let last = items.last()?;
-            match src.resolve(last).await {
-                Ok(Object::Name(n)) => n,
-                _ => return None,
-            }
-        }
-        _ => return None,
-    };
-    Some(name.0)
-}
-
-/// Whether the last entry of the image's `/Filter` chain is `DCTDecode`
-/// (whose data the stream filters pass through as raw JPEG).
+/// Whether the trailing filter of the image's `/Filter` chain is
+/// `DCTDecode` (whose data the stream filters pass through as raw JPEG).
+/// "Trailing" is read by the shared core helper, which skips non-Name
+/// entries exactly as `decode_stream` does — `[/DCTDecode null]` is still
+/// a passthrough.
 async fn is_dct<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
     matches!(
-        trailing_filter(src, dict).await.as_deref(),
+        pdfboss_core::filters::trailing_filter_with(src, dict)
+            .await
+            .as_ref()
+            .map(|n| n.0.as_str()),
         Some("DCTDecode" | "DCT")
     )
 }
 
-/// Whether the last entry of the image's `/Filter` chain is `JPXDecode`
-/// (whose data the stream filters pass through as a JPEG 2000 file or raw
-/// codestream). There is no abbreviated form: ISO 32000-1 Table 94 defines
-/// none, JPXDecode not being an inline-image filter.
+/// Whether the trailing filter of the image's `/Filter` chain is
+/// `JPXDecode` (whose data the stream filters pass through as a JPEG 2000
+/// file or raw codestream), read like [`is_dct`]. There is no abbreviated
+/// form: ISO 32000-1 Table 94 defines none, JPXDecode not being an
+/// inline-image filter.
 async fn is_jpx<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
     matches!(
-        trailing_filter(src, dict).await.as_deref(),
+        pdfboss_core::filters::trailing_filter_with(src, dict)
+            .await
+            .as_ref()
+            .map(|n| n.0.as_str()),
         Some("JPXDecode")
     )
 }
@@ -1376,6 +1367,26 @@ mod tests {
         let (_, notes) = jpx_rgba(&meta, image).expect("decodes");
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0], "JPXDecode: tile 3 rendered as background");
+    }
+
+    #[test]
+    fn trailing_filter_skips_non_name_entries_like_decode_stream() {
+        // decode_stream reads /Filter by keeping only the Name entries, so
+        // `[/JPXDecode null]` passes the codestream through; the image
+        // layer's reading of "trailing" must agree, or the raw bytes get
+        // painted as samples.
+        let doc = test_doc();
+        let d = dict(b"<< /Width 1 /Height 1 /Filter [/JPXDecode null] >>");
+        let meta = ImageMeta::read(&doc, &d, None);
+        assert!(meta.jpx, "the trailing Name is JPXDecode");
+
+        let d = dict(b"<< /Width 1 /Height 1 /Filter [/FlateDecode /DCTDecode null] >>");
+        let meta = ImageMeta::read(&doc, &d, None);
+        assert!(meta.dct, "the trailing Name is DCTDecode");
+
+        let d = dict(b"<< /Width 1 /Height 1 /Filter [null] >>");
+        let meta = ImageMeta::read(&doc, &d, None);
+        assert!(!meta.jpx && !meta.dct, "no Name, no codec");
     }
 
     #[test]

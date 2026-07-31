@@ -28,6 +28,7 @@
 use crate::error::{Error, Result};
 use crate::object::{Dict, Name, Object, Stream};
 use crate::parser::Resolve;
+use crate::source::AsyncObjectSource;
 
 /// Upper bound on the decoded size of a stream, enforced inside every
 /// expanding decoder and after each chain stage. Without it a crafted
@@ -200,6 +201,44 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
     Ok(data)
 }
 
+/// Whether `name` (abbreviations included) is one of the two image codecs
+/// [`decode_stream`] passes through still encoded — `DCTDecode` and
+/// `JPXDecode` (ISO 32000-1 7.4.9). Their decoded form exists only at the
+/// image layer; every other consumer of stream bytes must refuse them,
+/// because a raw JPEG or JPEG 2000 codestream is indistinguishable from
+/// decoded data to anything that is not an image decoder.
+pub fn is_image_codec(name: &str) -> bool {
+    matches!(name, "DCTDecode" | "DCT" | "JPXDecode")
+}
+
+/// The last `Name` of a stream's `/Filter` value — the codec the data is
+/// still encoded in when [`decode_stream`] passes an image codec through
+/// untouched, or `None` when the chain ends in a filter that decodes here.
+///
+/// Reads `/Filter` exactly as [`decode_stream`] does: the value and every
+/// array element are resolved through the source, non-Name elements are
+/// skipped (`/Filter [/JPXDecode null]` still trails `JPXDecode`), and an
+/// unusable value has no trailing filter at all. The two must agree on
+/// which filter is "last", or a passthrough goes unrecognized and its
+/// codestream bytes get consumed as decoded data;
+/// `trailing_filter_reads_the_chain_like_decode_stream` pins the
+/// agreement.
+pub async fn trailing_filter_with<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<Name> {
+    let filter = dict.get("Filter")?;
+    match src.resolve(filter).await.ok()? {
+        Object::Name(n) => Some(n),
+        Object::Array(items) => {
+            for item in items.iter().rev() {
+                if let Ok(Object::Name(n)) = src.resolve(item).await {
+                    return Some(n);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +298,71 @@ mod tests {
     impl Resolve for MapResolve {
         fn resolve_ref(&self, r: ObjRef) -> Option<Object> {
             self.0.get(&(r.num, r.gen)).cloned()
+        }
+    }
+
+    /// The same map as an [`ObjectSource`], so [`Immediate`] can drive the
+    /// asynchronous `/Filter` reading over it.
+    struct MapSource(HashMap<(u32, u16), Object>);
+
+    impl crate::source::ObjectSource for MapSource {
+        fn get(&self, r: ObjRef) -> Result<Object> {
+            self.0
+                .get(&(r.num, r.gen))
+                .cloned()
+                .ok_or_else(|| Error::Decode("missing object".into()))
+        }
+
+        fn stream_data(&self, s: &Stream) -> Result<Vec<u8>> {
+            decode_stream(s, &NoResolve)
+        }
+    }
+
+    #[test]
+    fn trailing_filter_reads_the_chain_like_decode_stream() {
+        // The two readings of /Filter must agree on which filter is last,
+        // or a passthrough goes unrecognized and its codestream bytes get
+        // consumed as decoded data. Each case runs both sides: when
+        // decode_stream leaves a JPXDecode-trailing stream encoded (the
+        // data comes back byte-identical), trailing_filter_with must name
+        // JPXDecode — and only then.
+        use crate::source::{block_on, Immediate};
+
+        let raw: &[u8] = b"raw codestream bytes";
+        let cases: Vec<(Object, Option<&str>)> = vec![
+            (Object::Name(name("JPXDecode")), Some("JPXDecode")),
+            // The regression shape: a null AFTER the codec must not hide it.
+            (
+                Object::Array(vec![Object::Name(name("JPXDecode")), Object::Null]),
+                Some("JPXDecode"),
+            ),
+            // A reference to the codec name, at both levels.
+            (
+                Object::Array(vec![Object::Ref(ObjRef { num: 7, gen: 0 })]),
+                Some("JPXDecode"),
+            ),
+            (Object::Ref(ObjRef { num: 7, gen: 0 }), Some("JPXDecode")),
+            // No usable name at all: no filters run, no trailing filter.
+            (Object::Array(vec![Object::Null]), None),
+            (Object::Int(3), None),
+        ];
+        let map = HashMap::from([((7u32, 0u16), Object::Name(name("JPXDecode")))]);
+        for (filter, trailing) in cases {
+            let s = make_stream(vec![("Filter", filter.clone())], raw);
+            let decoded = decode_stream(&s, &MapResolve(map.clone())).expect("lenient");
+            assert_eq!(decoded, raw, "every case leaves the data as stored");
+            let src = Immediate(MapSource(map.clone()));
+            let got = block_on(trailing_filter_with(&src, &s.dict));
+            assert_eq!(
+                got.as_ref().map(|n| n.0.as_str()),
+                trailing,
+                "trailing filter of {filter:?}"
+            );
+            assert_eq!(
+                got.map(|n| is_image_codec(&n.0)).unwrap_or(false),
+                trailing.is_some(),
+                "passthrough recognition of {filter:?}"
+            );
         }
     }
 
