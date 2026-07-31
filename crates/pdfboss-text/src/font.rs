@@ -756,7 +756,7 @@ mod tests {
         let hex: Vec<u8> = OMEGA_CMAP
             .iter()
             .flat_map(|b| format!("{b:02X}").into_bytes())
-            .chain([b'>'])
+            .chain(*b">")
             .collect();
         let f = font_with_tounicode("/Filter /ASCIIHexDecode", &hex);
         assert_eq!(f.decode(65), "\u{3A9}", "the mapping must apply");

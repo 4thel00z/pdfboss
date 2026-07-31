@@ -254,7 +254,7 @@ mod tests {
     fn hex(data: &[u8]) -> Vec<u8> {
         data.iter()
             .flat_map(|b| format!("{b:02X}").into_bytes())
-            .chain([b'>'])
+            .chain(*b">")
             .collect()
     }
 
