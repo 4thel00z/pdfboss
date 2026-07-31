@@ -1237,6 +1237,10 @@ name = "pdfboss-encoding"
 version = "0.11.0"
 
 [[package]]
+name = "pdfboss-jpx"
+version = "0.11.0"
+
+[[package]]
 name = "pdfboss-py"
 version = "0.11.0"
 dependencies = [

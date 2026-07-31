@@ -1,0 +1,247 @@
+[
+ {
+  "name": "gray-53-jp2",
+  "file": "gray-53-jp2.jp2",
+  "source": "gray-53-jp2.src.png",
+  "mode": "L",
+  "size": [
+   97,
+   61
+  ],
+  "params": {
+   "irreversible": "False"
+  }
+ },
+ {
+  "name": "gray-97-jp2",
+  "file": "gray-97-jp2.jp2",
+  "source": "gray-97-jp2.src.png",
+  "mode": "L",
+  "size": [
+   97,
+   61
+  ],
+  "params": {
+   "irreversible": "True"
+  }
+ },
+ {
+  "name": "rgb-53-jp2",
+  "file": "rgb-53-jp2.jp2",
+  "source": "rgb-53-jp2.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False"
+  }
+ },
+ {
+  "name": "rgb-97-jp2",
+  "file": "rgb-97-jp2.jp2",
+  "source": "rgb-97-jp2.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "True"
+  }
+ },
+ {
+  "name": "gray-53-raw",
+  "file": "gray-53-raw.j2k",
+  "source": "gray-53-raw.src.png",
+  "mode": "L",
+  "size": [
+   97,
+   61
+  ],
+  "params": {
+   "irreversible": "False"
+  }
+ },
+ {
+  "name": "rgb-97-raw",
+  "file": "rgb-97-raw.j2k",
+  "source": "rgb-97-raw.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "True"
+  }
+ },
+ {
+  "name": "rgba-53-jp2",
+  "file": "rgba-53-jp2.jp2",
+  "source": "rgba-53-jp2.src.png",
+  "mode": "RGBA",
+  "size": [
+   64,
+   64
+  ],
+  "params": {
+   "irreversible": "False"
+  }
+ },
+ {
+  "name": "rgb-tiled",
+  "file": "rgb-tiled.jp2",
+  "source": "rgb-tiled.src.png",
+  "mode": "RGB",
+  "size": [
+   523,
+   311
+  ],
+  "params": {
+   "irreversible": "False",
+   "tile_size": "(128, 128)"
+  }
+ },
+ {
+  "name": "rgb-layers",
+  "file": "rgb-layers.jp2",
+  "source": "rgb-layers.src.png",
+  "mode": "RGB",
+  "size": [
+   523,
+   311
+  ],
+  "params": {
+   "irreversible": "True",
+   "quality_mode": "rates",
+   "quality_layers": "[50, 10, 2]"
+  }
+ },
+ {
+  "name": "rgb-res3",
+  "file": "rgb-res3.jp2",
+  "source": "rgb-res3.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "num_resolutions": "3"
+  }
+ },
+ {
+  "name": "rgb-cb16",
+  "file": "rgb-cb16.jp2",
+  "source": "rgb-cb16.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "codeblock_size": "(16, 16)"
+  }
+ },
+ {
+  "name": "rgb-precinct",
+  "file": "rgb-precinct.jp2",
+  "source": "rgb-precinct.src.png",
+  "mode": "RGB",
+  "size": [
+   523,
+   311
+  ],
+  "params": {
+   "irreversible": "False",
+   "precinct_size": "(128, 128)"
+  }
+ },
+ {
+  "name": "rgb-prog-lrcp",
+  "file": "rgb-prog-lrcp.jp2",
+  "source": "rgb-prog-lrcp.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "progression": "LRCP"
+  }
+ },
+ {
+  "name": "rgb-prog-rlcp",
+  "file": "rgb-prog-rlcp.jp2",
+  "source": "rgb-prog-rlcp.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "progression": "RLCP"
+  }
+ },
+ {
+  "name": "rgb-prog-rpcl",
+  "file": "rgb-prog-rpcl.jp2",
+  "source": "rgb-prog-rpcl.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "progression": "RPCL"
+  }
+ },
+ {
+  "name": "rgb-prog-pcrl",
+  "file": "rgb-prog-pcrl.jp2",
+  "source": "rgb-prog-pcrl.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "progression": "PCRL"
+  }
+ },
+ {
+  "name": "rgb-prog-cprl",
+  "file": "rgb-prog-cprl.jp2",
+  "source": "rgb-prog-cprl.src.png",
+  "mode": "RGB",
+  "size": [
+   130,
+   83
+  ],
+  "params": {
+   "irreversible": "False",
+   "progression": "CPRL"
+  }
+ },
+ {
+  "name": "gray16-53-jp2",
+  "file": "gray16-53-jp2.jp2",
+  "source": "gray16-53-jp2.src.png",
+  "mode": "I;16",
+  "size": [
+   80,
+   50
+  ],
+  "params": {
+   "irreversible": "False"
+  }
+ }
+]
