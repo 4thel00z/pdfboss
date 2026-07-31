@@ -15,12 +15,22 @@ pub(crate) struct ComponentContext {
     pub geometry: TileComponentGeometry,
     /// Resolved COD/COC + QCD/QCC + RGN parameters (markers stage output).
     pub coding: ComponentCoding,
+    /// Horizontal sub-sampling XRsiz (Table A.11): the B.12.1.3-5
+    /// positional walks fire precincts at reference-grid coordinates,
+    /// which scale by the component's sub-sampling.
+    pub xrsiz: u8,
+    /// Vertical sub-sampling YRsiz (Table A.11).
+    pub yrsiz: u8,
 }
 
 /// Everything Tier-2 needs to read one tile's packets.
 pub(crate) struct TileDecodeContext<'a> {
     /// Per-component geometry and coding, codestream component order.
     pub components: Vec<ComponentContext>,
+    /// The tile's REFERENCE-GRID rect (Equations (B-7)..(B-10)): the
+    /// B.12.1.3-5 positional walks range over its `(tx0..tx1, ty0..ty1)`
+    /// and fall back to its edges for unaligned first precincts.
+    pub tile_rect: Rect,
     /// Progression order in force before any POC applies (Table A.16).
     pub progression: ProgressionOrder,
     /// Layer count (SGcod).
@@ -184,7 +194,7 @@ fn decode_tile_packets(ctx: &TileDecodeContext<'_>, limits: &DecodeLimits) -> Re
         segment_count: 0,
     };
     let volumes = plan_volumes(&ctx.components, ctx.progression, ctx.layers, &ctx.poc);
-    let mut sequencer = PacketSequencer::new(&ctx.components, volumes, budget);
+    let mut sequencer = PacketSequencer::new(&ctx.components, ctx.tile_rect, volumes, budget);
     loop {
         let step = match sequencer.next_packet() {
             Ok(step) => step,
@@ -862,23 +872,26 @@ struct PositionKey {
 /// The reference-grid coordinate at which precinct `index` (row or column)
 /// of resolution level `r` fires its packets in the positional orders.
 ///
-/// B.12.1.3-B.12.1.5 walk (x, y) over the tile and admit a component at a
-/// coordinate divisible by `XRsiz * 2^(PPx + NL - r)` — the precinct
-/// partition line mapped through (B-20) — OR at the tile edge when the
-/// first precinct's line lies outside the tile (`trx0` not divisible by
-/// `2^PPx`). Equivalently: precinct `index` fires where its partition line
-/// lands, except that an unaligned first precinct fires at the tile edge.
+/// B.12.1.3-B.12.1.5 walk (x, y) over the tile's reference-grid rect and
+/// admit a component at a coordinate divisible by
+/// `XRsiz * 2^(PPx + NL - r)` — the precinct partition line mapped through
+/// (B-20) — OR at the tile edge `tx0` when the first precinct's line lies
+/// outside the tile (`trx0 * 2^(NL - r)` not divisible by
+/// `2^(PPx + NL - r)`, i.e. `trx0` not divisible by `2^PPx`). Equivalently:
+/// precinct `index` fires where its partition line lands on the reference
+/// grid, except that an unaligned first precinct fires at the tile edge.
 ///
-/// SEAM GAP: the Tier-2 seam carries no `XRsiz`/`YRsiz`, so positions are
-/// computed on each component's own grid (`XRsiz = YRsiz = 1`), `origin`
-/// being the tile-component rect corner (B-12). This is exact whenever all
-/// components share one subsampling factor (every practical JPX in PDF);
-/// components with DIFFERENT factors may interleave off-spec.
-fn axis_position(origin: u32, tr0: u32, pp: u8, up: u32, index: u32) -> u128 {
+/// Precinct `index` sits in partition row/column `(tr0 >> pp) + index` of
+/// the resolution-level grid (anchored at 0, B.6); its partition line maps
+/// back to the reference grid by `XRsiz * 2^(NL - r)` (B-12 with (B-14)),
+/// giving `((tr0 >> pp) + index) * sub << (pp + NL - r)`. Every component
+/// keys on one common reference-grid scale, so mixed sub-samplings
+/// interleave exactly.
+fn axis_position(tile_edge: u32, tr0: u32, pp: u8, sub: u8, up: u32, index: u32) -> u128 {
     if index == 0 && tr0 & ((1u32 << pp) - 1) != 0 {
-        return u128::from(origin);
+        return u128::from(tile_edge);
     }
-    (u128::from(tr0 >> pp) + u128::from(index)) << (u32::from(pp) + up)
+    ((u128::from(tr0 >> pp) + u128::from(index)) * u128::from(sub)) << (u32::from(pp) + up)
 }
 
 /// Number of precinct slots component `comp` owns at resolution `res`
@@ -918,6 +931,7 @@ fn push_resolution_slots(
 /// order-specific role of the resolution and component axes.
 fn positional_groups(
     components: &[ComponentContext],
+    tile_rect: Rect,
     volume: &Volume,
     budget: &mut u64,
 ) -> Result<Vec<Group>> {
@@ -938,18 +952,20 @@ fn positional_groups(
             let up = u32::from(geometry.levels) - res as u32;
             for row in 0..resolution.precincts_high {
                 let y = axis_position(
-                    geometry.rect.y0,
+                    tile_rect.y0,
                     resolution.rect.y0,
                     resolution.ppy,
+                    component.yrsiz,
                     up,
                     row,
                 );
                 for column in 0..resolution.precincts_wide {
                     charge(budget, 1)?;
                     let x = axis_position(
-                        geometry.rect.x0,
+                        tile_rect.x0,
                         resolution.rect.x0,
                         resolution.ppx,
+                        component.xrsiz,
                         up,
                         column,
                     );
@@ -1004,6 +1020,7 @@ fn positional_groups(
 /// Builds the layer-loop groups of one volume in its B.12.1 order.
 fn volume_groups(
     components: &[ComponentContext],
+    tile_rect: Rect,
     volume: &Volume,
     budget: &mut u64,
 ) -> Result<Vec<Group>> {
@@ -1037,7 +1054,7 @@ fn volume_groups(
             }
             Ok(groups)
         }
-        _ => positional_groups(components, volume, budget),
+        _ => positional_groups(components, tile_rect, volume, budget),
     }
 }
 
@@ -1046,6 +1063,8 @@ fn volume_groups(
 /// layer axis so a hostile layer count cannot force an allocation.
 struct PacketSequencer<'a> {
     components: &'a [ComponentContext],
+    /// Reference-grid tile rect for the B.12.1.3-5 spatial walks.
+    tile_rect: Rect,
     volumes: Vec<Volume>,
     volume_index: usize,
     groups_built: bool,
@@ -1069,7 +1088,12 @@ struct Group {
 }
 
 impl<'a> PacketSequencer<'a> {
-    fn new(components: &'a [ComponentContext], volumes: Vec<Volume>, budget: u64) -> Self {
+    fn new(
+        components: &'a [ComponentContext],
+        tile_rect: Rect,
+        volumes: Vec<Volume>,
+        budget: u64,
+    ) -> Self {
         let next_layer = components
             .iter()
             .map(|component| {
@@ -1087,6 +1111,7 @@ impl<'a> PacketSequencer<'a> {
             .collect();
         PacketSequencer {
             components,
+            tile_rect,
             volumes,
             volume_index: 0,
             groups_built: false,
@@ -1112,6 +1137,7 @@ impl<'a> PacketSequencer<'a> {
             if !self.groups_built {
                 self.groups = volume_groups(
                     self.components,
+                    self.tile_rect,
                     &self.volumes[self.volume_index],
                     &mut self.budget,
                 )?;
@@ -1159,15 +1185,6 @@ mod tests {
         Rect { x0, y0, x1, y1 }
     }
 
-    fn unit_component() -> SizComponent {
-        SizComponent {
-            depth: 8,
-            signed: false,
-            xrsiz: 1,
-            yrsiz: 1,
-        }
-    }
-
     fn coding_style(
         levels: u8,
         xcb: u8,
@@ -1203,8 +1220,27 @@ mod tests {
         quant: Quantization,
         roi_shift: Option<u8>,
     ) -> ComponentContext {
-        let geometry =
-            crate::geometry::tile_component_geometry(tile, &unit_component(), &style).unwrap();
+        subsampled_component_context(tile, 1, 1, style, quant, roi_shift)
+    }
+
+    /// A component sub-sampled by (Table A.11) `xrsiz`/`yrsiz` over the
+    /// reference-grid tile rect: geometry lands on the component grid
+    /// (B-12), positions on the reference grid.
+    fn subsampled_component_context(
+        tile: Rect,
+        xrsiz: u8,
+        yrsiz: u8,
+        style: CodingStyle,
+        quant: Quantization,
+        roi_shift: Option<u8>,
+    ) -> ComponentContext {
+        let component = SizComponent {
+            depth: 8,
+            signed: false,
+            xrsiz,
+            yrsiz,
+        };
+        let geometry = crate::geometry::tile_component_geometry(tile, &component, &style).unwrap();
         ComponentContext {
             geometry,
             coding: ComponentCoding {
@@ -1212,6 +1248,8 @@ mod tests {
                 quant,
                 roi_shift,
             },
+            xrsiz,
+            yrsiz,
         }
     }
 
@@ -1262,12 +1300,13 @@ mod tests {
 
     fn collect_sequence(
         components: &[ComponentContext],
+        tile_rect: Rect,
         order: ProgressionOrder,
         layers: u16,
         poc: Vec<PocSegment>,
     ) -> Vec<(u32, usize, usize, usize)> {
         let volumes = plan_volumes(components, order, layers, &poc);
-        let mut sequencer = PacketSequencer::new(components, volumes, 1 << 24);
+        let mut sequencer = PacketSequencer::new(components, tile_rect, volumes, 1 << 24);
         let mut sequence = Vec::new();
         while let Some((layer, slot)) = sequencer.next_packet().unwrap() {
             sequence.push((layer, slot.comp, slot.res, slot.precinct));
@@ -1390,6 +1429,7 @@ mod tests {
 
         let ctx = TileDecodeContext {
             components: vec![figure_b13_component()],
+            tile_rect: rect(0, 0, 48, 32),
             progression: ProgressionOrder::Lrcp,
             layers: 2,
             poc: Vec::new(),
@@ -1439,6 +1479,7 @@ mod tests {
         let bodies = [1u8, 2, 3, 4, 5, 6, 7, 8];
         let ctx = TileDecodeContext {
             components: vec![figure_b13_component()],
+            tile_rect: rect(0, 0, 48, 32),
             progression: ProgressionOrder::Lrcp,
             layers: 1,
             poc: Vec::new(),
@@ -1501,6 +1542,7 @@ mod tests {
         );
         let ctx = TileDecodeContext {
             components: vec![component],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 2,
             poc: Vec::new(),
@@ -1556,6 +1598,7 @@ mod tests {
         );
         let ctx = TileDecodeContext {
             components: vec![component],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 2,
             poc: Vec::new(),
@@ -1598,6 +1641,7 @@ mod tests {
         stream.extend_from_slice(&[7, 7]);
         let ctx = TileDecodeContext {
             components: vec![sop_eph_component()],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 1,
             poc: Vec::new(),
@@ -1624,6 +1668,7 @@ mod tests {
         stream.extend_from_slice(&[7, 7]);
         let ctx = TileDecodeContext {
             components: vec![sop_eph_component()],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 1,
             poc: Vec::new(),
@@ -1645,6 +1690,7 @@ mod tests {
     fn corruption_in_the_first_packet_is_a_hard_error() {
         let ctx = TileDecodeContext {
             components: vec![sop_eph_component()],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 1,
             poc: Vec::new(),
@@ -1670,6 +1716,7 @@ mod tests {
         stream.extend_from_slice(&[0u8; 5]);
         let ctx = TileDecodeContext {
             components: vec![sop_eph_component()],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 1,
             poc: Vec::new(),
@@ -1694,6 +1741,7 @@ mod tests {
         stream.push(241);
         let ctx = TileDecodeContext {
             components: vec![figure_b13_component()],
+            tile_rect: rect(0, 0, 48, 32),
             progression: ProgressionOrder::Lrcp,
             layers: 2,
             poc: Vec::new(),
@@ -1722,6 +1770,7 @@ mod tests {
         };
         let ctx = TileDecodeContext {
             components: vec![sop_eph_component()],
+            tile_rect: rect(0, 0, 16, 16),
             progression: ProgressionOrder::Lrcp,
             layers: 1,
             poc: Vec::new(),
@@ -1759,6 +1808,7 @@ mod tests {
         let component = component_context(rect(0, 0, 64, 64), style, quant, None);
         let ctx = TileDecodeContext {
             components: vec![component],
+            tile_rect: rect(0, 0, 64, 64),
             progression: ProgressionOrder::Lrcp,
             layers: 0,
             poc: Vec::new(),
@@ -1815,6 +1865,7 @@ mod tests {
         let component = component_context(rect(0, 0, 64, 64), style, quant, Some(4));
         let ctx = TileDecodeContext {
             components: vec![component],
+            tile_rect: rect(0, 0, 64, 64),
             progression: ProgressionOrder::Lrcp,
             layers: 0,
             poc: Vec::new(),
@@ -1837,9 +1888,8 @@ mod tests {
     /// Two components sharing one 32 x 32 tile:
     /// c0: NL = 1, precincts (PPx, PPy) = (3,3) then (4,4):
     ///     r0 rect [0,16)^2 -> 2 x 2 precincts, r1 [0,32)^2 -> 2 x 2.
-    /// c1: half-size component rect [0,16)^2 (the stand-in for a
-    ///     subsampled component — see `axis_position`), NL = 2, precincts
-    ///     (3,3), (3,3), (4,4): every level a single precinct.
+    /// c1: sub-sampled by 2 (component rect [0,16)^2 per B-12), NL = 2,
+    ///     precincts (3,3), (3,3), (4,4): every level a single precinct.
     fn progression_components() -> Vec<ComponentContext> {
         vec![
             component_context(
@@ -1848,8 +1898,10 @@ mod tests {
                 quant_none(2, vec![8]),
                 None,
             ),
-            component_context(
-                rect(0, 0, 16, 16),
+            subsampled_component_context(
+                rect(0, 0, 32, 32),
+                2,
+                2,
                 coding_style(2, 3, 3, &[(3, 3), (3, 3), (4, 4)], 0),
                 quant_none(2, vec![8]),
                 None,
@@ -1867,7 +1919,7 @@ mod tests {
 
         // B.12.1.1: for l { for r { for c { for k } } }; Nmax = 2 so r = 2
         // only carries c1 packets.
-        let lrcp = collect_sequence(&components, ProgressionOrder::Lrcp, 2, Vec::new());
+        let lrcp = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Lrcp, 2, Vec::new());
         let expected_layer0 = [
             (0, 0, 0, 0),
             (0, 0, 0, 1),
@@ -1889,7 +1941,7 @@ mod tests {
         assert_eq!(&lrcp[11..], &expected_layer1[..]);
 
         // B.12.1.2: for r { for l { for c { for k } } }.
-        let rlcp = collect_sequence(&components, ProgressionOrder::Rlcp, 2, Vec::new());
+        let rlcp = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Rlcp, 2, Vec::new());
         let expected = [
             (0, 0, 0, 0),
             (0, 0, 0, 1),
@@ -1919,14 +1971,15 @@ mod tests {
 
     #[test]
     fn positional_orders_follow_b_12_1_3_to_b_12_1_5() {
-        // Hand-derived positions (component grid, XRsiz = YRsiz = 1):
-        // every precinct fires where its partition line meets the tile
-        // (B.12.1.3 divisibility): c0 r0 rows/columns at 0 and
-        // 8 << 1 = 16; c0 r1 at 0 and 16; c1 fires only at (0, 0).
+        // Hand-derived reference-grid positions: every precinct fires
+        // where its partition line meets the tile (B.12.1.3
+        // divisibility): c0 r0 rows/columns at 0 and 8 << 1 = 16; c0 r1
+        // at 0 and 16; c1 (sub-sampled by 2, all levels aligned at 0)
+        // fires only at (0, 0).
         let components = progression_components();
 
         // B.12.1.3 RPCL: for r { for y { for x { for c } } }, layers last.
-        let rpcl = collect_sequence(&components, ProgressionOrder::Rpcl, 2, Vec::new());
+        let rpcl = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Rpcl, 2, Vec::new());
         let expected_rpcl = [
             // r = 0: (0,0) c0 k0 then c1 k0; (0,16) k1; (16,0) k2; (16,16) k3.
             (0, 0, 0, 0),
@@ -1957,7 +2010,7 @@ mod tests {
         assert_eq!(rpcl, expected_rpcl);
 
         // B.12.1.4 PCRL: for y { for x { for c { for r } } }.
-        let pcrl = collect_sequence(&components, ProgressionOrder::Pcrl, 2, Vec::new());
+        let pcrl = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Pcrl, 2, Vec::new());
         let expected_pcrl = [
             (0, 0, 0, 0),
             (1, 0, 0, 0),
@@ -1986,7 +2039,7 @@ mod tests {
 
         // B.12.1.5 CPRL: for c { for y { for x { for r } } } — all of c0's
         // spatial walk first, then c1's three resolutions at (0, 0).
-        let cprl = collect_sequence(&components, ProgressionOrder::Cprl, 2, Vec::new());
+        let cprl = collect_sequence(&components, rect(0, 0, 32, 32), ProgressionOrder::Cprl, 2, Vec::new());
         let expected_cprl = [
             (0, 0, 0, 0),
             (1, 0, 0, 0),
@@ -2017,11 +2070,15 @@ mod tests {
     #[test]
     fn unaligned_tile_origins_fire_their_first_precinct_at_the_tile_edge() {
         // B.12.1.4's second condition arm: at y = ty0, a precinct whose
-        // partition line lies above the tile still fires, because
-        // try0 = 5 is not divisible by 2^3 (and likewise for x).
-        // c0: tile [5,21)^2, NL = 0, (PPx, PPy) = (3,3) -> 3 x 3 precincts
-        //     firing at positions {5, 8, 16} on each axis.
-        // c1: tile [0,16)^2, NL = 0, (3,3) -> 2 x 2 precincts at {0, 8}.
+        // partition line lies above the tile still fires, because try0 is
+        // not divisible by 2^PPy (and likewise for x). Tile [5,21)^2:
+        // c0: XRsiz = 1, NL = 0, (PPx, PPy) = (3,3): component rect
+        //     [5,21)^2 -> 3 x 3 precincts firing at {5, 8, 16} per axis
+        //     (partition lines 0 -> tile edge 5, 8, 16).
+        // c1: sub-sampled by 2, component rect [3,11)^2 (B-12), NL = 0,
+        //     (3,3) -> 2 x 2 precincts; partition line 0 is unaligned
+        //     (trx0 = 3) and fires at the tile edge 5, line 8 maps to
+        //     reference-grid 8 * 2 = 16.
         let components = vec![
             component_context(
                 rect(5, 5, 21, 21),
@@ -2029,32 +2086,43 @@ mod tests {
                 quant_none(2, vec![8]),
                 None,
             ),
-            component_context(
-                rect(0, 0, 16, 16),
+            subsampled_component_context(
+                rect(5, 5, 21, 21),
+                2,
+                2,
                 coding_style(0, 2, 2, &[(3, 3)], 0),
                 quant_none(2, vec![8]),
                 None,
             ),
         ];
         assert_eq!(components[0].geometry.resolutions[0].precincts_wide, 3);
+        assert_eq!(components[1].geometry.rect, rect(3, 3, 11, 11));
         assert_eq!(components[1].geometry.resolutions[0].precincts_wide, 2);
-        // PCRL interleave by (y, x, c): rows fire at y = 0 (c1), 5 (c0),
-        // 8 (both), 16 (c0).
-        let pcrl = collect_sequence(&components, ProgressionOrder::Pcrl, 1, Vec::new());
+        // PCRL interleave by (y, x, c): rows fire at y = 5 (both), 8 (c0
+        // only) and 16 (both) — the sub-sampled component's second
+        // precinct row waits for reference-grid row 16, NOT its
+        // component-grid row 8 (the pre-seam approximation).
+        let pcrl = collect_sequence(
+            &components,
+            rect(5, 5, 21, 21),
+            ProgressionOrder::Pcrl,
+            1,
+            Vec::new(),
+        );
         let expected = [
-            (0, 1, 0, 0),
-            (0, 1, 0, 1),
             (0, 0, 0, 0),
+            (0, 1, 0, 0),
             (0, 0, 0, 1),
             (0, 0, 0, 2),
-            (0, 1, 0, 2),
+            (0, 1, 0, 1),
             (0, 0, 0, 3),
             (0, 0, 0, 4),
-            (0, 1, 0, 3),
             (0, 0, 0, 5),
             (0, 0, 0, 6),
+            (0, 1, 0, 2),
             (0, 0, 0, 7),
             (0, 0, 0, 8),
+            (0, 1, 0, 3),
         ];
         assert_eq!(pcrl, expected);
     }
@@ -2088,7 +2156,13 @@ mod tests {
                 order: ProgressionOrder::Rlcp,
             },
         ];
-        let sequence = collect_sequence(&[component], ProgressionOrder::Lrcp, 3, poc);
+        let sequence = collect_sequence(
+            &[component],
+            rect(0, 0, 16, 16),
+            ProgressionOrder::Lrcp,
+            3,
+            poc,
+        );
         let expected = [
             (0, 0, 0, 0),
             (1, 0, 0, 0),
@@ -2145,7 +2219,12 @@ mod tests {
                 let geometry =
                     crate::geometry::tile_component_geometry(tile_rect, component, &coding.style)
                         .unwrap();
-                components.push(ComponentContext { geometry, coding });
+                components.push(ComponentContext {
+                    geometry,
+                    coding,
+                    xrsiz: component.xrsiz,
+                    yrsiz: component.yrsiz,
+                });
             }
             let bitstream: Vec<u8> = parts
                 .iter()
@@ -2153,6 +2232,7 @@ mod tests {
                 .collect();
             let ctx = TileDecodeContext {
                 components,
+                tile_rect,
                 progression: tile_coding.progression,
                 layers: tile_coding.layers,
                 poc: tile_coding.poc.clone(),

@@ -191,7 +191,12 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
         for (index, component) in siz.components.iter().enumerate() {
             let coding = markers::resolve_component_coding(&cs.main, &overrides, index as u16)?;
             let geometry = geometry::tile_component_geometry(tile_rect, component, &coding.style)?;
-            components.push(packet::ComponentContext { geometry, coding });
+            components.push(packet::ComponentContext {
+                geometry,
+                coding,
+                xrsiz: component.xrsiz,
+                yrsiz: component.yrsiz,
+            });
         }
 
         // Packets flow across tile-part boundaries: concatenate bodies in
@@ -204,6 +209,7 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
 
         let ctx = packet::TileDecodeContext {
             components,
+            tile_rect,
             progression: tile_coding.progression,
             layers: tile_coding.layers,
             poc: tile_coding.poc.clone(),
