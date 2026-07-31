@@ -247,6 +247,82 @@ pub(crate) struct Quantization {
     pub style: QuantizationStyle,
 }
 
+/// One band's resolved quantization parameters: the single source of
+/// truth for the Equation (E-5) view of a QCD/QCC segment, shared by the
+/// Tier-2 plane budget (Mb, Equation (E-2)) and the dequantization step
+/// size (Delta_b, Equation (E-3)) so both stages resolve short lists
+/// identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BandQuant {
+    /// Exponent epsilon_b.
+    pub exponent: u32,
+    /// Mantissa mu_b (0 in the Table A.28 reversible style, where only
+    /// exponents are signalled).
+    pub mantissa: u16,
+}
+
+impl Quantization {
+    /// Resolves (epsilon_b, mu_b) for the band at decomposition level
+    /// `level`, flattened F.3.1 index `flat`, of a tile-component with
+    /// NL = `levels`. Scalar-derived values always follow Equation (E-5),
+    /// `epsilon_b = epsilon_0 - NL + n_b` with `mu_b = mu_0`; the listed
+    /// styles take entry `flat` and fall back to the same derivation from
+    /// their first entry when the list is short (the derivation clamps at
+    /// zero: exponents are unsigned, Table A.30). The parser rejects
+    /// empty lists, so a first entry always exists; the `unwrap_or`
+    /// defaults are unreachable belt-and-braces.
+    pub(crate) fn band_quant(&self, levels: u8, level: u8, flat: usize) -> BandQuant {
+        let derive =
+            |first: u8| (u32::from(first) + u32::from(level)).saturating_sub(u32::from(levels));
+        match &self.style {
+            QuantizationStyle::None { exponents } => match exponents.get(flat) {
+                Some(&exponent) => BandQuant {
+                    exponent: u32::from(exponent),
+                    mantissa: 0,
+                },
+                None => BandQuant {
+                    exponent: derive(exponents.first().copied().unwrap_or(0)),
+                    mantissa: 0,
+                },
+            },
+            QuantizationStyle::ScalarDerived { exponent, mantissa } => BandQuant {
+                exponent: derive(*exponent),
+                mantissa: *mantissa,
+            },
+            QuantizationStyle::ScalarExpounded { steps } => match steps.get(flat) {
+                Some(step) => BandQuant {
+                    exponent: u32::from(step.exponent),
+                    mantissa: step.mantissa,
+                },
+                None => {
+                    let first = steps.first().copied().unwrap_or(QuantStep {
+                        exponent: 0,
+                        mantissa: 0,
+                    });
+                    BandQuant {
+                        exponent: derive(first.exponent),
+                        mantissa: first.mantissa,
+                    }
+                }
+            },
+        }
+    }
+
+    /// True when a listed style signals fewer entries than the
+    /// `3 * NL + 1` sub-bands of the F.3.1 order — exactly the condition
+    /// under which [`Quantization::band_quant`] falls back to the (E-5)
+    /// derivation for some existing band. The decode stage turns this
+    /// into one benign note per codestream.
+    pub(crate) fn short_for(&self, levels: u8) -> bool {
+        let needed = 3 * usize::from(levels) + 1;
+        match &self.style {
+            QuantizationStyle::None { exponents } => exponents.len() < needed,
+            QuantizationStyle::ScalarDerived { .. } => false,
+            QuantizationStyle::ScalarExpounded { steps } => steps.len() < needed,
+        }
+    }
+}
+
 /// Quantization component override, QCC (A.6.5).
 // Constructed by the markers stage; the field list is the frozen seam.
 #[allow(dead_code)]
@@ -2580,5 +2656,78 @@ mod tests {
         let c1 = resolve_component_coding(&main, &empty, 1).unwrap();
         assert_eq!(c1.style.decomposition_levels, 4);
         assert_eq!(c1.quant.guard_bits, 3);
+    }
+
+    // ---- the shared (E-5) band-quantization resolution -------------------
+
+    fn quant(style: QuantizationStyle) -> Quantization {
+        Quantization {
+            guard_bits: 2,
+            style,
+        }
+    }
+
+    #[test]
+    fn band_quant_takes_listed_entries_and_derives_short_tails() {
+        // NL = 2 has seven sub-bands: LL(nb 2), r1 HL/LH/HH (nb 2),
+        // r2 HL/LH/HH (nb 1). A three-entry reversible list serves flat
+        // indices 0..3 directly; the tail derives from the first entry
+        // via (E-5): eps_b = eps_0 - NL + nb = 8 - 2 + nb.
+        let reversible = quant(QuantizationStyle::None {
+            exponents: vec![8, 9, 9],
+        });
+        for (flat, level, exponent) in [(0, 2, 8), (1, 2, 9), (2, 2, 9), (3, 2, 8), (4, 1, 7)] {
+            let resolved = reversible.band_quant(2, level, flat);
+            assert_eq!(
+                resolved,
+                BandQuant {
+                    exponent,
+                    mantissa: 0
+                },
+                "flat {flat}"
+            );
+        }
+        assert!(reversible.short_for(2));
+        assert!(!quant(QuantizationStyle::None {
+            exponents: vec![8; 7],
+        })
+        .short_for(2));
+
+        // Scalar derived always follows (E-5) with mu_0 and never counts
+        // as short; the derivation clamps at zero for hostile headers
+        // (eps_0 = 1, NL = 5, nb = 1 would go negative).
+        let derived = quant(QuantizationStyle::ScalarDerived {
+            exponent: 8,
+            mantissa: 100,
+        });
+        assert_eq!(
+            derived.band_quant(2, 1, 4),
+            BandQuant {
+                exponent: 7,
+                mantissa: 100
+            }
+        );
+        assert!(!derived.short_for(2));
+        let hostile = quant(QuantizationStyle::ScalarDerived {
+            exponent: 1,
+            mantissa: 0,
+        });
+        assert_eq!(hostile.band_quant(5, 1, 13).exponent, 0);
+
+        // An expounded short list derives (eps, mu) from its first entry.
+        let expounded = quant(QuantizationStyle::ScalarExpounded {
+            steps: vec![QuantStep {
+                exponent: 8,
+                mantissa: 50,
+            }],
+        });
+        assert_eq!(
+            expounded.band_quant(1, 1, 3),
+            BandQuant {
+                exponent: 8,
+                mantissa: 50
+            }
+        );
+        assert!(expounded.short_for(1));
     }
 }

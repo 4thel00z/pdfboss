@@ -891,6 +891,38 @@ fn single_byte_mutations_never_panic() {
 // syntax) that must fail fast on a limit instead of allocating.
 // ---------------------------------------------------------------------
 
+#[test]
+fn short_quantization_list_derives_instead_of_failing() {
+    // T.800 Equation (E-5) lets a truncated per-band step-size list
+    // derive its missing entries from the first one. gray-53-jp2.jp2
+    // signals 16 reversible exponents (NL = 5, Table A.29 order); splice
+    // the QCD down to ONE entry: the packet and dequantization stages
+    // must agree on the (E-5) fallback so the stream decodes with a
+    // benign note instead of dying at dequantization.
+    let case = case_by_name("gray-53-jp2");
+    let data = std::fs::read(fixture_dir().join(&case.file)).unwrap();
+    // The fixture's layout, asserted before splicing: the jp2c box header
+    // sits at offset 77 with LBox = 1113 (I.4), the QCD marker (0xFF5C)
+    // at 144 with Lqcd = 19 = 2 + Sqcd + 16 exponents (Table A.27).
+    assert_eq!(&data[81..85], b"jp2c");
+    assert_eq!(u32::from_be_bytes(data[77..81].try_into().unwrap()), 1113);
+    assert_eq!(&data[144..148], &[255, 92, 0, 19]);
+    let mut spliced = Vec::with_capacity(data.len() - 15);
+    spliced.extend_from_slice(&data[..77]);
+    spliced.extend((1113u32 - 15).to_be_bytes());
+    spliced.extend_from_slice(&data[81..146]);
+    spliced.extend(4u16.to_be_bytes()); // Lqcd: itself + Sqcd + 1 exponent
+    spliced.extend_from_slice(&data[148..150]); // Sqcd + the first exponent
+    spliced.extend_from_slice(&data[165..]); // drop the other 15 entries
+    let image = decode(&spliced, &DecodeLimits::default())
+        .unwrap_or_else(|e| panic!("short SPqcd must not hard-fail: {e}"));
+    assert!(
+        image.warnings.iter().any(|w| w.contains("(E-5)")),
+        "expected the E-5 derivation note: {:?}",
+        image.warnings
+    );
+}
+
 /// One marker segment: marker code, Lmar = payload + 2 (T.800 A.1.2).
 fn marker_segment(marker: u16, payload: &[u8]) -> Vec<u8> {
     let mut v = marker.to_be_bytes().to_vec();

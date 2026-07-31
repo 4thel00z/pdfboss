@@ -168,6 +168,9 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
     // The hard/soft leniency boundary is per image: once ANY tile decodes
     // a packet, later corruption softens (crate docs).
     let mut image_packets_decoded = false;
+    // Tile-components whose QCD/QCC lists fewer sub-band entries than the
+    // decomposition describes; summarized as one (E-5) note per image.
+    let mut short_quant_components = 0u64;
     for (tile_index, parts) in tiles.iter().enumerate() {
         if parts.is_empty() {
             // A tile without tile-parts renders as background (leniency).
@@ -212,6 +215,9 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
                 component,
                 &coding.style,
             )?);
+            if coding.quant.short_for(coding.style.decomposition_levels) {
+                short_quant_components += 1;
+            }
             codings.push(coding);
         }
         if metadata_cost > limits.max_decoded_bytes {
@@ -300,6 +306,13 @@ pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
             canvases.push(canvas);
         }
         assembler.push_tile(tile_rect, tile_coding.mct, canvases)?;
+    }
+    if short_quant_components > 0 {
+        warnings.push(format!(
+            "{short_quant_components} tile-component(s) signal fewer QCD/QCC sub-band \
+             entries than their decomposition describes; missing step sizes derived \
+             from the first entry via Equation (E-5)"
+        ));
     }
     assembler.finish(warnings)
 }

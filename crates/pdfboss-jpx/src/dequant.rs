@@ -149,10 +149,12 @@ fn step_size(rb: i32, eps: i32, mantissa: u16) -> f64 {
     f64::from(rb - eps).exp2() * (1.0 + f64::from(mantissa) / 2048.0)
 }
 
-/// Resolves one band's (Mb, Delta_b) from the quantization marker data:
-/// expounded steps are listed per band, derived steps follow Equation (E-5)
-/// `(eps_b, mu_b) = (eps_0 - NL + nb, mu_0)`, and the no-quantization style
-/// lists one reversible-ranging exponent per band with step size 1 (E.1.2.1).
+/// Resolves one band's (Mb, Delta_b) from the quantization marker data
+/// through the shared [`crate::markers::Quantization::band_quant`]
+/// resolution — expounded steps listed per band, derived steps and SHORT
+/// lists via Equation (E-5) `(eps_b, mu_b) = (eps_0 - NL + nb, mu_0)` —
+/// so this stage can never reject a list the packet stage accepted. The
+/// no-quantization style keeps step size 1 (E.1.2.1).
 fn band_parameters(
     coding: &ComponentCoding,
     component: &SizComponent,
@@ -163,36 +165,21 @@ fn band_parameters(
     // (E-4): Rb = RI + log2(gain_b); RI is the Table A.11 sample precision
     // (sign bit included for signed components).
     let rb = i32::from(component.depth) + gain_log2(band.kind);
-    match &coding.quant.style {
-        QuantizationStyle::None { exponents } => {
-            let index = subband_index(band.kind, band.level, levels)?;
-            let eps = exponents.get(index).copied().ok_or_else(|| {
-                JpxError::Malformed("QCD/QCC: too few reversible sub-band exponents".into())
-            })?;
-            Ok(BandParams {
-                mb: guard + i32::from(eps) - 1,
-                delta: 1.0,
-            })
+    let index = subband_index(band.kind, band.level, levels)?;
+    let quant = coding.quant.band_quant(levels, band.level, index);
+    // Exponents are 5-bit (Table A.30) and the (E-5) derivation clamps at
+    // zero, so the u32 -> i32 cast cannot wrap.
+    let eps = quant.exponent.min(u32::from(u8::MAX)) as i32;
+    let delta = match &coding.quant.style {
+        QuantizationStyle::None { .. } => 1.0,
+        QuantizationStyle::ScalarDerived { .. } | QuantizationStyle::ScalarExpounded { .. } => {
+            step_size(rb, eps, quant.mantissa)
         }
-        QuantizationStyle::ScalarDerived { exponent, mantissa } => {
-            let eps = i32::from(*exponent) - i32::from(levels) + i32::from(band.level);
-            Ok(BandParams {
-                mb: guard + eps - 1,
-                delta: step_size(rb, eps, *mantissa),
-            })
-        }
-        QuantizationStyle::ScalarExpounded { steps } => {
-            let index = subband_index(band.kind, band.level, levels)?;
-            let step = steps.get(index).ok_or_else(|| {
-                JpxError::Malformed("QCD/QCC: too few expounded sub-band step sizes".into())
-            })?;
-            let eps = i32::from(step.exponent);
-            Ok(BandParams {
-                mb: guard + eps - 1,
-                delta: step_size(rb, eps, step.mantissa),
-            })
-        }
-    }
+    };
+    Ok(BandParams {
+        mb: guard + eps - 1,
+        delta,
+    })
 }
 
 /// Undoes the Maxshift scaling of one sample per H.1. The encoder up-shifted
@@ -1125,9 +1112,12 @@ mod tests {
     }
 
     #[test]
-    fn missing_expounded_step_is_malformed() {
+    fn missing_expounded_step_derives_from_the_first_entry() {
         // NL = 1 has four sub-bands in the codestream order; a one-entry
-        // expounded list cannot serve band 1HH (index 3).
+        // expounded list cannot serve band 1HH (index 3) directly, so it
+        // derives via Equation (E-5) from the first entry — the same
+        // fallback the packet stage applies — instead of hard-failing
+        // (truncated lists appear in real streams).
         let tile = Rect {
             x0: 0,
             y0: 0,
@@ -1148,17 +1138,24 @@ mod tests {
             None,
         );
         let rect = band_rect_of(&geometry, BandKind::Hh, 1);
-        let bands = vec![one_band(BandKind::Hh, 1, rect, zero_block(rect))];
-        assert!(matches!(
-            dequantize_tile_component(
-                &geometry,
-                &coding,
-                &component(8),
-                &bands,
-                &DecodeLimits::default()
-            ),
-            Err(JpxError::Malformed(_))
-        ));
+        // Derived: eps = eps_0 - NL + nb = 8 - 1 + 1 = 8, mu = mu_0 = 0,
+        // so Mb = 2 + 8 - 1 = 9 (E-2) and Delta = 2^(Rb - eps) with
+        // Rb = 8 + gain(HH) = 10 (E-3/E-4), i.e. 4.0. A fully decoded
+        // magnitude of 1 (Nb = Mb) reconstructs to exactly 1 * 4.0.
+        let mut block = zero_block(rect);
+        set_sample(&mut block, 0, 0, 1, false, 9);
+        let bands = vec![one_band(BandKind::Hh, 1, rect, block)];
+        let canvas = dequantize_tile_component(
+            &geometry,
+            &coding,
+            &component(8),
+            &bands,
+            &DecodeLimits::default(),
+        )
+        .unwrap();
+        let values = floats(&canvas);
+        assert_eq!(values.iter().filter(|v| **v != 0.0).count(), 1);
+        assert!(values.contains(&4.0), "derived Delta drifted: {values:?}");
     }
 
     #[test]

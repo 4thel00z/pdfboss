@@ -4,7 +4,7 @@
 
 use crate::error::{JpxError, Result};
 use crate::geometry::{BandKind, Rect, TileComponentGeometry};
-use crate::markers::{ComponentCoding, PocSegment, ProgressionOrder, QuantizationStyle};
+use crate::markers::{ComponentCoding, PocSegment, ProgressionOrder};
 use crate::tagtree::{BitReader, TagTree};
 use crate::DecodeLimits;
 
@@ -277,39 +277,21 @@ fn flat_band_index(res: usize, band: usize) -> usize {
     }
 }
 
-/// Band exponent epsilon_b: signalled per band (Tables A.28-A.30) or
-/// derived from the NL-LL pair via Equation (E-5),
-/// `eps_b = eps_0 - NL + nb`. Truncated per-band lists fall back to the
-/// derivation from their first entry.
-fn band_exponent(coding: &ComponentCoding, levels: u8, level: u8, flat: usize) -> u32 {
-    let derive =
-        |first: u8| (u32::from(first) + u32::from(level)).saturating_sub(u32::from(levels));
-    match &coding.quant.style {
-        QuantizationStyle::None { exponents } => exponents
-            .get(flat)
-            .copied()
-            .map(u32::from)
-            .or_else(|| exponents.first().map(|&first| derive(first))),
-        QuantizationStyle::ScalarDerived { exponent, .. } => Some(derive(*exponent)),
-        QuantizationStyle::ScalarExpounded { steps } => steps
-            .get(flat)
-            .map(|step| u32::from(step.exponent))
-            .or_else(|| steps.first().map(|step| derive(step.exponent))),
-    }
-    .unwrap_or(0)
-}
-
 /// Mb = G + eps_b - 1 (Equation (E-2)), raised by the RGN maxshift when
 /// one is in force (A.6.3, H.2) to M'b = Mb + s (H-3); clamped to the
-/// seam's u8. `pub(crate)` so the dequantization stage can pin the H.1
-/// composition (coded weights here, unshifted Mb there) in a test.
+/// seam's u8. The band exponent comes from the shared
+/// [`crate::markers::Quantization::band_quant`] resolution — signalled
+/// per band (Tables A.28-A.30) or derived via Equation (E-5) — so this
+/// budget and the dequantization step size can never disagree.
+/// `pub(crate)` so the dequantization stage can pin the H.1 composition
+/// (coded weights here, unshifted Mb there) in a test.
 pub(crate) fn band_magnitude_bits(
     coding: &ComponentCoding,
     levels: u8,
     level: u8,
     flat: usize,
 ) -> u8 {
-    let exponent = band_exponent(coding, levels, level, flat);
+    let exponent = coding.quant.band_quant(levels, level, flat).exponent;
     let mb = (u32::from(coding.quant.guard_bits) + exponent).saturating_sub(1)
         + u32::from(coding.roi_shift.unwrap_or(0));
     mb.min(255) as u8
@@ -1204,7 +1186,8 @@ impl<'a> PacketSequencer<'a> {
 mod tests {
     use super::*;
     use crate::markers::{
-        CodingStyle, PrecinctExponents, QuantStep, Quantization, SizComponent, WaveletKind,
+        CodingStyle, PrecinctExponents, QuantStep, Quantization, QuantizationStyle, SizComponent,
+        WaveletKind,
     };
 
     // ---- builders ------------------------------------------------------
