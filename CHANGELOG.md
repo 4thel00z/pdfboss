@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/4thel00z/pdfboss/compare/v0.12.0...v0.12.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* close every leak the chokepoint review found ([#20](https://github.com/4thel00z/pdfboss/issues/20)) ([2dce5eb](https://github.com/4thel00z/pdfboss/commit/2dce5ebc4b06da0306c531d5db92bebf3ce62d1d))
+
 ## [0.12.0](https://github.com/4thel00z/pdfboss/compare/v0.11.0...v0.12.0) (2026-07-31)
 
 
