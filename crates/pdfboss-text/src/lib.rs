@@ -19,10 +19,20 @@ pub struct TextSpan {
     pub x: f32,
     /// Device-space y coordinate of the span baseline.
     pub y: f32,
+    /// Device-space x after the last glyph's advance.
+    pub end_x: f32,
     /// Effective font size.
     pub size: f32,
     /// Font resource name.
     pub font: String,
+    /// Whether the font that produced this span is bold: FontDescriptor
+    /// `/FontWeight` >= 600 or `/Flags` ForceBold, else a `Bold` substring
+    /// in `/BaseFont` (ISO 32000-1 Table 123).
+    pub bold: bool,
+    /// Whether the font that produced this span is italic: FontDescriptor
+    /// `/Flags` Italic or a nonzero `/ItalicAngle`, else an `Italic` or
+    /// `Oblique` substring in `/BaseFont` (ISO 32000-1 Table 123).
+    pub italic: bool,
 }
 
 /// Extracts the page's text with positional layout applied: spans grouped
@@ -87,16 +97,25 @@ pub async fn extract_spans_with<S: AsyncObjectSource>(
     page: &Page,
 ) -> Result<Vec<TextSpan>> {
     let (spans, _) = extract::page_spans_with(src, page).await;
-    Ok(spans
-        .into_iter()
-        .map(|s| TextSpan {
-            text: s.text,
-            x: s.x,
-            y: s.y,
-            size: s.size,
-            font: s.font,
-        })
-        .collect())
+    Ok(spans)
+}
+
+/// [`extract_spans`] with the report of what could not be read.
+pub fn extract_spans_reporting(
+    doc: &Document,
+    page: &Page,
+) -> Result<(Vec<TextSpan>, ExtractReport)> {
+    block_on(extract_spans_reporting_with(Immediate(doc), page))
+}
+
+/// [`extract_spans_reporting`] against any object source. Signed like
+/// [`extract_text_with`], for the same reasons.
+pub async fn extract_spans_reporting_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+) -> Result<(Vec<TextSpan>, ExtractReport)> {
+    let (spans, report) = extract::page_spans_with(src, page).await;
+    Ok((spans, report))
 }
 
 #[cfg(test)]
@@ -539,6 +558,111 @@ mod tests {
         assert_eq!(spans[0].text, "top");
         assert_eq!(spans[1].text, "bottom");
         assert!(spans.iter().all(|s| s.size > 0.0 && s.x >= 0.0));
+    }
+
+    /// FontDescriptor evidence: /Flags italic bit and /FontWeight.
+    /// Verify the exact bit position against ISO 32000-1 Table 123 while
+    /// implementing — bit 7 (mask 64) is Italic, bit 19 (mask 0x40000) is
+    /// ForceBold — and cite the table in the implementation comment.
+    #[test]
+    fn descriptor_flags_set_span_style() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (x) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Custom \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Custom /Flags 64 /FontWeight 700 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page).unwrap();
+        assert!(spans[0].italic, "Flags bit 7 (mask 64) is Italic");
+        assert!(spans[0].bold, "FontWeight 700 >= 600 is bold");
+    }
+
+    /// BaseFont-name fallback when no descriptor exists, and ItalicAngle.
+    #[test]
+    fn basefont_name_and_italic_angle_fallbacks() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (a) Tj /F2 12 Tf (b) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman \
+             /Encoding /WinAnsiEncoding /FontDescriptor 7 0 R >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /Times-Roman /ItalicAngle -12 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page).unwrap();
+        assert!(
+            spans[0].bold && spans[0].italic,
+            "BaseFont substrings Bold+Oblique"
+        );
+        assert!(!spans[1].bold && spans[1].italic, "ItalicAngle != 0 alone");
+    }
+
+    /// Type0: the descriptor hangs off the descendant font.
+    #[test]
+    fn type0_descendant_descriptor_sets_style() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td <0001> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 \
+             /FontDescriptor 7 0 R >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 64 /FontWeight 600 >>",
+        );
+        b.stream(
+            8,
+            "",
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+              1 beginbfchar <0001> <0041> endbfchar",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page).unwrap();
+        assert!(spans[0].bold && spans[0].italic);
     }
 
     /// An asynchronous source that answers everything with `null`.

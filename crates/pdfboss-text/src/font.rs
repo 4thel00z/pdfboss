@@ -30,6 +30,11 @@ pub struct Font {
     /// as WinAnsiEncoding. See [`Font::decode_into`] for why that evidence is
     /// required rather than assumed.
     winansi_high_codes: bool,
+    /// Style evidence for extraction: the FontDescriptor's Flags/FontWeight/
+    /// ItalicAngle when present (ISO 32000-1 §9.8.1, Table 123), with
+    /// BaseFont-name substrings as fallback.
+    pub bold: bool,
+    pub italic: bool,
 }
 
 /// One `/Encoding` table cell. Base-table entries and most `/Differences`
@@ -76,6 +81,8 @@ impl Font {
             default_width: 500.0,
             space_code: Some(32),
             winansi_high_codes: false,
+            bold: false,
+            italic: false,
         }
     }
 
@@ -275,6 +282,48 @@ impl Font {
         PICTURE_FAMILIES.contains(&family.as_str())
     }
 
+    /// Bold/italic evidence for `dict` (whose `/BaseFont` is read directly):
+    /// BaseFont name substrings first, then `descriptor_holder`'s own
+    /// `/FontDescriptor` — the font's own dict for simple fonts, the
+    /// already-resolved descendant dict for Type0 — refining the guess with
+    /// `/Flags`, `/FontWeight`, and `/ItalicAngle` (ISO 32000-1 §9.8.1,
+    /// Table 123).
+    async fn style<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+        descriptor_holder: &Dict,
+    ) -> (bool, bool) {
+        let name = rv(src, dict, "BaseFont")
+            .await
+            .and_then(|o| o.as_name().map(|n| n.0.clone()))
+            .unwrap_or_default();
+        let mut bold = name.contains("Bold");
+        let mut italic = name.contains("Italic") || name.contains("Oblique");
+        let Some(descriptor) = rv(src, descriptor_holder, "FontDescriptor")
+            .await
+            .and_then(|o| o.as_dict().cloned())
+        else {
+            return (bold, italic);
+        };
+        if let Some(flags) = rv(src, &descriptor, "Flags").await.and_then(|o| o.as_int()) {
+            italic = italic || flags & (1 << 6) != 0; // Table 123 bit 7: Italic
+            bold = bold || flags & (1 << 18) != 0; // Table 123 bit 19: ForceBold
+        }
+        if let Some(weight) = rv(src, &descriptor, "FontWeight")
+            .await
+            .and_then(|o| o.as_f64())
+        {
+            bold = bold || weight >= 600.0;
+        }
+        if let Some(angle) = rv(src, &descriptor, "ItalicAngle")
+            .await
+            .and_then(|o| o.as_f64())
+        {
+            italic = italic || angle != 0.0;
+        }
+        (bold, italic)
+    }
+
     /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
     /// plus `/Differences`, widths from `/FirstChar` + `/Widths`.
     async fn load_simple<S: AsyncObjectSource>(
@@ -314,6 +363,7 @@ impl Font {
         // Only a font that states no `/Encoding` has anything to gain here, and
         // only then is the embedded program worth inflating.
         let winansi_high_codes = encoding.is_none() && Font::built_for_windows(src, dict).await;
+        let (bold, italic) = Font::style(src, dict, dict).await;
 
         Font {
             simple: true,
@@ -323,6 +373,8 @@ impl Font {
             default_width,
             space_code: Some(32),
             winansi_high_codes,
+            bold,
+            italic,
         }
     }
 
@@ -453,6 +505,11 @@ impl Font {
                 Font::parse_cid_widths(src, &w, &mut widths).await;
             }
         }
+        // The descendant already holds the /FontDescriptor for a Type0 font
+        // (ISO 32000-1 §9.7.4); reuse the dict just resolved above rather
+        // than resolving /DescendantFonts a second time.
+        let descriptor_holder = descendant.as_ref().unwrap_or(dict);
+        let (bold, italic) = Font::style(src, dict, descriptor_holder).await;
 
         Font {
             simple: false,
@@ -463,6 +520,8 @@ impl Font {
             space_code: None,
             // Two-byte codes never reach the single-byte fallbacks.
             winansi_high_codes: false,
+            bold,
+            italic,
         }
     }
 

@@ -3,6 +3,7 @@
 //! pass.
 
 use crate::font::Font;
+use crate::TextSpan;
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page,
@@ -18,18 +19,6 @@ const MAX_FORM_DEPTH: usize = 16;
 /// does not bound work: a chain of forms in which each level invokes the
 /// next N times fans out to N^depth executions from a tiny file.
 const MAX_FORM_INVOCATIONS: usize = 4096;
-
-/// A positioned text run before layout: origin, advance end, device-space
-/// size, and the font resource name that produced it.
-pub struct RawSpan {
-    pub text: String,
-    pub x: f32,
-    pub y: f32,
-    /// Device-space x after the last glyph's advance.
-    pub end_x: f32,
-    pub size: f32,
-    pub font: String,
-}
 
 /// What extraction could not read. Extraction is lenient the way rendering
 /// is — content that will not fetch, decode, or parse yields no text rather
@@ -124,7 +113,7 @@ fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
 }
 
 /// Runs the page's content stream (and any form XObjects) and collects
-/// every shown string as a [`RawSpan`], in emission order, along with the
+/// every shown string as a [`TextSpan`], in emission order, along with the
 /// report of what could not be read.
 ///
 /// Lenient like rendering: a `/Contents` that will not fetch, decode, or
@@ -138,7 +127,7 @@ fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
 pub async fn page_spans_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
-) -> (Vec<RawSpan>, ExtractReport) {
+) -> (Vec<TextSpan>, ExtractReport) {
     let mut report = ExtractReport::default();
     let content = match page_content_with(&src, page).await {
         Ok(content) => content,
@@ -258,7 +247,7 @@ impl Frame {
 
 struct Executor<'a, S> {
     src: &'a S,
-    spans: Vec<RawSpan>,
+    spans: Vec<TextSpan>,
     fallback: Arc<Font>,
     /// Form-XObject invocations so far, checked against
     /// `MAX_FORM_INVOCATIONS`.
@@ -450,7 +439,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// the handle is an `Arc` now, so cloning it there costs two atomic updates
     /// per shown string; borrowing `self.fallback` is only possible while nothing
     /// holds `&mut self.spans`.
-    fn show(&self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) -> Option<RawSpan> {
+    fn show(&self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) -> Option<TextSpan> {
         let font: &Font = gs.font.as_deref().unwrap_or(&self.fallback);
         let start = tm.concat(gs.ctm);
         let origin = start.apply(Point { x: 0.0, y: gs.rise });
@@ -472,13 +461,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         let end = tm.concat(gs.ctm).apply(Point { x: 0.0, y: gs.rise });
-        (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| RawSpan {
+        (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| TextSpan {
             text,
             x: origin.x,
             y: origin.y,
             end_x: end.x,
             size: if size.is_finite() { size } else { 0.0 },
             font: gs.font_name.clone(),
+            bold: font.bold,
+            italic: font.italic,
         })
     }
 
@@ -635,7 +626,7 @@ const GUTTER_BINS: usize = 128;
 /// A page with a clear two-column gutter reads column-major: full-width
 /// separators split it into bands, and within each band the left column
 /// flows before the right (see [`segments`]).
-pub fn layout(spans: &[RawSpan]) -> String {
+pub fn layout(spans: &[TextSpan]) -> String {
     let mut out = String::new();
     for segment in segments(spans) {
         if segment.is_empty() {
@@ -650,11 +641,11 @@ pub fn layout(spans: &[RawSpan]) -> String {
 }
 
 /// Lays one reading-order segment out into lines, appending to `out`.
-fn flow(spans: &[&RawSpan], out: &mut String) {
+fn flow(spans: &[&TextSpan], out: &mut String) {
     struct Line<'s> {
         y: f32,
         size: f32,
-        spans: Vec<&'s RawSpan>,
+        spans: Vec<&'s TextSpan>,
     }
     let mut lines: Vec<Line> = Vec::new();
     for &span in spans {
@@ -704,8 +695,8 @@ fn flow(spans: &[&RawSpan], out: &mut String) {
 /// real columns (enough spans, enough distinct baselines, enough shared
 /// height) — anything less reads top-to-bottom as one segment, which is
 /// exactly the old behavior.
-fn segments(spans: &[RawSpan]) -> Vec<Vec<&RawSpan>> {
-    let whole = || vec![spans.iter().collect::<Vec<&RawSpan>>()];
+fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
+    let whole = || vec![spans.iter().collect::<Vec<&TextSpan>>()];
     let mut x_min = f32::INFINITY;
     let mut x_max = f32::NEG_INFINITY;
     for span in spans {
@@ -716,7 +707,7 @@ fn segments(spans: &[RawSpan]) -> Vec<Vec<&RawSpan>> {
     if !width.is_finite() || width <= 0.0 {
         return whole();
     }
-    let (separators, body): (Vec<&RawSpan>, Vec<&RawSpan>) = spans
+    let (separators, body): (Vec<&TextSpan>, Vec<&TextSpan>) = spans
         .iter()
         .partition(|s| (s.end_x - s.x).abs() > SEPARATOR_FRACTION * width);
     if body.len() < COLUMN_MIN_SPANS {
@@ -751,7 +742,7 @@ fn segments(spans: &[RawSpan]) -> Vec<Vec<&RawSpan>> {
     }
     let cut = x_min + (gutter.start + gutter.end) as f32 / 2.0 / scale;
 
-    let (left, right): (Vec<&RawSpan>, Vec<&RawSpan>) =
+    let (left, right): (Vec<&TextSpan>, Vec<&TextSpan>) =
         body.iter().partition(|s| s.x.max(s.end_x) <= cut);
     if !column_shaped(&left) || !column_shaped(&right) {
         return whole();
@@ -776,7 +767,7 @@ fn segments(spans: &[RawSpan]) -> Vec<Vec<&RawSpan>> {
     let mut cuts: Vec<f32> = separators.iter().map(|s| s.y).collect();
     cuts.sort_by(|a, b| b.total_cmp(a));
     cuts.dedup();
-    let mut out: Vec<Vec<&RawSpan>> = Vec::new();
+    let mut out: Vec<Vec<&TextSpan>> = Vec::new();
     let mut top = f32::INFINITY;
     for &sep_y in &cuts {
         push_band(&left, &right, top, sep_y, &mut out);
@@ -796,11 +787,11 @@ fn segments(spans: &[RawSpan]) -> Vec<Vec<&RawSpan>> {
 /// Pushes one band's columns — the spans with baseline in `(bottom, top]` —
 /// left side first.
 fn push_band<'s>(
-    left: &[&'s RawSpan],
-    right: &[&'s RawSpan],
+    left: &[&'s TextSpan],
+    right: &[&'s TextSpan],
     top: f32,
     bottom: f32,
-    out: &mut Vec<Vec<&'s RawSpan>>,
+    out: &mut Vec<Vec<&'s TextSpan>>,
 ) {
     for side in [left, right] {
         out.push(
@@ -838,7 +829,7 @@ fn wide_gaps(occupied: &[bool; GUTTER_BINS], scale: f32) -> Vec<std::ops::Range<
 
 /// True when a gutter side has enough spans on enough distinct baselines
 /// to be a text column rather than a stray cluster.
-fn column_shaped(spans: &[&RawSpan]) -> bool {
+fn column_shaped(spans: &[&TextSpan]) -> bool {
     if spans.len() < COLUMN_MIN_SIDE_SPANS {
         return false;
     }
@@ -849,7 +840,7 @@ fn column_shaped(spans: &[&RawSpan]) -> bool {
 }
 
 /// Lowest and highest baseline of a span set.
-fn y_extent(spans: &[&RawSpan]) -> (f32, f32) {
+fn y_extent(spans: &[&TextSpan]) -> (f32, f32) {
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
     for span in spans {
@@ -860,7 +851,7 @@ fn y_extent(spans: &[&RawSpan]) -> (f32, f32) {
 }
 
 /// Horizontal extent of a span set.
-fn x_span(spans: &[&RawSpan]) -> f32 {
+fn x_span(spans: &[&TextSpan]) -> f32 {
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
     for span in spans {
@@ -881,7 +872,7 @@ mod tests {
     /// the same `block_on` over `Immediate`, so every test below still asserts on
     /// exactly what a synchronous caller receives. The report is asserted
     /// complete: no test here expects to lose content.
-    fn page_spans(doc: &Document, page: &Page) -> Vec<RawSpan> {
+    fn page_spans(doc: &Document, page: &Page) -> Vec<TextSpan> {
         let (spans, report) = block_on(page_spans_with(Immediate(doc), page));
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         spans
@@ -896,7 +887,7 @@ mod tests {
     }
 
     /// Raw spans of the same setup.
-    fn spans_of(content: &str) -> Vec<RawSpan> {
+    fn spans_of(content: &str) -> Vec<TextSpan> {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
         page_spans(&doc, &page)
