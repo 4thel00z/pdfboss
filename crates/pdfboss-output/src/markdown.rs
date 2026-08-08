@@ -23,7 +23,7 @@ impl Output for Markdown {
 /// furniture, or a block whose lines are all blank.
 fn render_block(block: &Block) -> Option<String> {
     let rendered = match block {
-        Block::Heading { level, lines, .. } => heading(*level, lines),
+        Block::Heading { level, lines, .. } => heading(*level, lines)?,
         Block::Paragraph { lines, role, .. } => {
             if !matches!(role, Role::Body) {
                 return None;
@@ -36,16 +36,22 @@ fn render_block(block: &Block) -> Option<String> {
     (!rendered.trim().is_empty()).then_some(rendered)
 }
 
-/// `#` per level and the heading's lines as one line. Emphasis is dropped:
-/// a heading is already the strongest thing on the page, and ground truth
-/// never carries `**` inside one.
-fn heading(level: u8, lines: &[Line]) -> String {
+/// `#` per level and the heading's lines as one line, or nothing when those
+/// lines carry no text — the markers must be weighed after the text, never
+/// before, or a blank line at heading size renders as a bare `#`. Emphasis is
+/// dropped: a heading is already the strongest thing on the page, and ground
+/// truth never carries `**` inside one.
+fn heading(level: u8, lines: &[Line]) -> Option<String> {
     let text = lines
         .iter()
         .map(line_text)
         .collect::<Vec<String>>()
         .join(" ");
-    format!("{} {}", "#".repeat(level as usize), text.trim())
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{} {}", "#".repeat(level as usize), trimmed))
 }
 
 /// One output line per source line: hard line breaks are what the extracted

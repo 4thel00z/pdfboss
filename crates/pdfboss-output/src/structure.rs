@@ -95,9 +95,11 @@ fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
 }
 
 /// Character-weighted histogram of span sizes rounded to half a point. Body
-/// size is the mode; the ladder holds the distinct buckets at least
+/// size is the mode; the ladder holds every distinct bucket at least
 /// [`HEADING_MIN_DELTA`] above it, largest first, so a bucket's position is
-/// its heading level.
+/// its heading level. The ladder is not cut at six: the buckets nearest body
+/// size are the document's real section headings, so ranks past the sixth
+/// clamp to level six rather than dropping back to body text.
 struct SizeStats {
     body: f32,
     ladder: Vec<f32>,
@@ -111,18 +113,24 @@ impl SizeStats {
             .ladder
             .iter()
             .position(|bucket| half_points(*bucket) == half_points(size))?;
-        Some((rank as u8 + 1).min(HEADING_MAX_LEVEL))
+        Some(clamped_level(rank + 1))
     }
 
     /// The level a bold body-size title joins at: one below the ladder's
     /// deepest rank, since it is the smallest heading the page has.
     fn bold_level(&self) -> u8 {
-        ((self.ladder.len() + 1) as u8).min(HEADING_MAX_LEVEL)
+        clamped_level(self.ladder.len() + 1)
     }
 
     fn is_body(&self, size: f32) -> bool {
         half_points(size) == half_points(self.body)
     }
+}
+
+/// A one-based rank as a heading level. Ranks are counted in `usize` because
+/// a document may show more distinct sizes than a `u8` can rank.
+fn clamped_level(rank: usize) -> u8 {
+    rank.min(HEADING_MAX_LEVEL as usize) as u8
 }
 
 /// A size as its half-point bucket. Halves are exact in binary, so bucket
@@ -150,13 +158,12 @@ fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
             ladder: Vec::new(),
         };
     };
-    let mut ladder: Vec<f32> = weights
+    let ladder: Vec<f32> = weights
         .keys()
         .rev()
         .map(|bucket| *bucket as f32 / 2.0)
         .filter(|size| *size >= body + HEADING_MIN_DELTA)
         .collect();
-    ladder.truncate(HEADING_MAX_LEVEL as usize);
     SizeStats { body, ladder }
 }
 
@@ -631,7 +638,9 @@ pub(crate) mod tests {
 
     /// The content streams the crate's Text-adapter parity test replays:
     /// plain lines, both sides of the word-gap threshold, band separators,
-    /// and the shapes that must and must not split into columns.
+    /// the shapes that must and must not split into columns, and a page whose
+    /// sizes and spacing put headings and a paragraph break into the
+    /// partition — Text output must survive all of it unchanged.
     pub(crate) fn fixture_contents() -> Vec<String> {
         let mut contents: Vec<String> = [
             "BT ET",
@@ -641,6 +650,11 @@ pub(crate) mod tests {
             "BT /F1 12 Tf 0.993 0 0 1 72 720 Tm [(We) -251 (would)] TJ ET",
             "BT /F1 12 Tf 14 TL 72 720 Td (a) Tj T* (b) Tj (c) ' ET",
             "BT /F1 12 Tf 200 720 Td (world) Tj ET BT /F1 12 Tf 72 720 Td (hello) Tj ET",
+            "BT /F1 24 Tf 72 740 Td (Chapter title) Tj \
+             /F1 12 Tf 0 -40 Td (Body line one is long enough to look like body.) Tj \
+             0 -14 Td (Body line two keeps twelve the dominant size.) Tj \
+             0 -14 Td (And a third line for good measure.) Tj \
+             0 -60 Td (A far-below line starts a second paragraph.) Tj ET",
         ]
         .iter()
         .map(|s| s.to_string())

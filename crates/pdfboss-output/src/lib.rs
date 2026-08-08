@@ -129,18 +129,36 @@ mod tests {
     /// [`structure::layout_reference`] is that builder, kept as the oracle.
     #[test]
     fn text_adapter_matches_layout_on_fixtures() {
+        let mut headings = 0usize;
+        let mut splits = 0usize;
         for content in structure::tests::fixture_contents() {
             let doc = Document::load(doc_with_graphics(&content)).unwrap();
             let page = doc.page(0).unwrap();
             let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
             assert!(report.is_complete(), "unexpected skips: {report:?}");
-            let via_ir = Text.render(&[page_layout(&spans)]);
+            let layout = page_layout(&spans);
+            headings += layout
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Heading { .. }))
+                .count();
+            let paragraphs = layout
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Paragraph { .. }))
+                .count();
+            splits += usize::from(paragraphs > 1);
+            let via_ir = Text.render(&[layout]);
             assert_eq!(
                 via_ir,
                 structure::layout_reference(&spans),
                 "content: {content}"
             );
         }
+        // A fixture set that classifies nothing would pass this test without
+        // ever reaching the code it guards.
+        assert!(headings > 0, "no fixture produced a heading block");
+        assert!(splits > 0, "no fixture split into several paragraphs");
     }
 
     /// Markdown of a one-page document with `content` as its raw content
@@ -195,6 +213,48 @@ mod tests {
         assert!(md.contains("# Title\n"), "md: {md}");
         assert!(md.contains("## Section\n"), "md: {md}");
         assert!(!md.contains("# Body"), "md: {md}");
+    }
+
+    /// Sizes past the sixth ladder rank clamp to `######` instead of falling
+    /// out of the ladder: the buckets nearest body size are the real section
+    /// headings, and one stray oversized logo must not evict them.
+    #[test]
+    fn ranks_past_six_clamp_to_level_six() {
+        let heads = [36, 28, 24, 20, 18, 16, 14, 12, 11]
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let y = 750 - 50 * index;
+                format!("BT /F1 {size} Tf 72 {y} Td (Head {size}) Tj ET ")
+            })
+            .collect::<String>();
+        let body = (0..3)
+            .map(|index| {
+                let y = 260 - 14 * index;
+                format!(
+                    "BT /F1 10 Tf 72 {y} Td (Body line {index} is long enough to be body.) Tj ET "
+                )
+            })
+            .collect::<String>();
+        let md = markdown_of(&format!("{heads}{body}"));
+        assert!(md.starts_with("# Head 36"), "md: {md}");
+        assert!(md.contains("###### Head 16"), "md: {md}");
+        assert!(md.contains("###### Head 14"), "md: {md}");
+        assert!(md.contains("###### Head 12"), "md: {md}");
+        assert!(md.contains("###### Head 11"), "md: {md}");
+    }
+
+    /// A whitespace-only line at heading size is still classified as a
+    /// heading; Markdown must not emit a bare `#` for it.
+    #[test]
+    fn blank_heading_line_emits_nothing() {
+        let md = markdown_of(
+            "BT /F1 24 Tf 72 740 Td (   ) Tj \
+             /F1 12 Tf 0 -40 Td (Body line one is long enough to be body.) Tj \
+             0 -14 Td (Body line two keeps twelve the dominant size.) Tj \
+             0 -14 Td (And a third body line seals it.) Tj ET",
+        );
+        assert!(!md.contains('#'), "md: {md:?}");
     }
 
     /// Emphasis wraps maximal same-style runs, with the spaces left outside
