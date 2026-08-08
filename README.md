@@ -117,9 +117,26 @@ Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, 
   <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 3,185 pages/s versus PyMuPDF's 458 (≈7×), and 32–170× the pure-Python readers. On open + parse it reaches 361,000 pages/s versus PyMuPDF's 98,000 (≈4×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front, so opening is close to free and the ratio says more about what the others do eagerly than about pdfboss. Rendering is not compared on this corpus — a few faces still go unpainted (see Limitations), so timing it against full renderers would flatter pdfboss for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair precisely because a scan has no glyphs in it.
+**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 9,000 pages/s versus PyMuPDF's 449 (≈20×), and 95–500× the pure-Python readers; since 0.9.0 `doc.extract_text()` fans pages out across cores, so the gap over the sequential libraries widened from the ≈7× measured before that landed. On open + parse it reaches 357,000 pages/s versus PyMuPDF's 99,000 (≈3.6×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front, so opening is close to free and the ratio says more about what the others do eagerly than about pdfboss. Rendering is not compared on this corpus — a few faces still go unpainted (see Limitations), so timing it against full renderers would flatter pdfboss for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair precisely because a scan has no glyphs in it.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
+
+### Extraction quality
+
+Speed without fidelity is worthless, so extraction quality is measured too — on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 real-world PDFs), the corpus PDF-to-Markdown engines publish their comparisons on. pdfboss emits plain text, not Markdown, so the comparable metric is **NID** — reading-order similarity against the ground truth, 0–1, higher is better. The table/heading metrics score Markdown structure that plain text cannot express, and pdfboss does not compete on them.
+
+| Engine | Reading order (NID) | Output | Time (200 docs) |
+|---|--:|---|--:|
+| pdf-inspector 0.2.6 | 0.915 | Markdown | 0.44s |
+| liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
+| opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
+| pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
+| **pdfboss** | **0.868** | plain text | **0.16s** |
+| markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
+
+pdfboss reads the whole corpus in 0.16 seconds — 2.7× faster than the fastest Markdown engine measured on the same machine — and holds a reading-order score in the middle of that field: per document it beats pdf-inspector's NID on 105 of the 200 files and loses on 72, with the difference concentrated in table regions, where a Markdown engine's structured output matches the ground truth more closely than flowed text can. Two-column layouts are read column-major, justified text keeps its word spacing, and ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
+
+Quality rows come from the benchmark's own evaluator over all 200 documents; pdf-inspector and pdfboss timings were measured together on an Apple M3 Pro under the benchmark's protocol (median of five single-process runs after a warm-up), the other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro — read them as order-of-magnitude context, not a same-machine race.
 
 ### Scanned documents
 
@@ -127,10 +144,10 @@ Scans are the other half of the world's PDFs, and they are a different workload:
 
 | Library | pages/sec | Ink on page 1 |
 |---|--:|--:|
-| pdfboss | 88.5 | 4.83% |
-| pdfplumber (via pdfium) | 59.5 | 4.87% |
-| pypdfium2 | 55.6 | 4.85% |
-| PyMuPDF | 55.3 | 4.82% |
+| pdfboss | 88.1 | 4.83% |
+| pdfplumber (via pdfium) | 57.8 | 4.87% |
+| PyMuPDF | 54.5 | 4.82% |
+| pypdfium2 | 52.6 | 4.85% |
 
 **pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers** — and the only one of them with no C in it. Compare the four rows against each other rather than against another machine's: all four are timed in one pass, and that ratio has landed within a few percent of 1.5× on every run (1.49× to 1.56×), across absolute numbers that varied by half as the machine warmed and cooled.
 
@@ -139,6 +156,10 @@ What is left is the codec itself. Four fifths of the time goes to the JBIG2 arit
 The ink column is what makes the timings mean anything: a library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel — each downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
 
 Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
+
+### In the browser
+
+[pdfarena](https://pdfarena.tahrioui.de) races pdfboss against hayro, pdf.js and PDFium on any PDF you drop in, with pdfboss and hayro compiled to WebAssembly. Each engine renders in its own web worker, the stopwatch wraps only the render call, and every challenger is pixel-diffed against pdf.js as the reference. Nothing gets uploaded; the whole benchmark runs in your browser.
 
 ## Limitations
 
