@@ -18,7 +18,7 @@ pub struct Font {
     to_unicode: Option<ToUnicode>,
     /// Per-code Unicode from the `/Encoding` base table plus
     /// `/Differences` (simple fonts only).
-    encoding: Option<Box<[Option<char>; 256]>>,
+    encoding: Option<Box<[Option<Decoded>; 256]>>,
     /// Explicit widths per code, in glyph-space units (1/1000 em).
     widths: HashMap<u32, f32>,
     /// Width used for codes without an explicit entry.
@@ -30,6 +30,26 @@ pub struct Font {
     /// as WinAnsiEncoding. See [`Font::decode_into`] for why that evidence is
     /// required rather than assumed.
     winansi_high_codes: bool,
+}
+
+/// One `/Encoding` table cell. Base-table entries and most `/Differences`
+/// names decode to one scalar; AGL underscore ligatures (`f_i`, `T_h`) and
+/// multi-group `uniXXXX` names decode to several.
+#[derive(Clone)]
+enum Decoded {
+    Char(char),
+    Text(Box<str>),
+}
+
+impl Decoded {
+    /// Keeps the common single-scalar case on the allocation-free path.
+    fn from_text(text: String) -> Decoded {
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Decoded::Char(c),
+            _ => Decoded::Text(text.into_boxed_str()),
+        }
+    }
 }
 
 /// Resolves `dict[key]`, treating resolution failures and `null` as absent.
@@ -171,9 +191,16 @@ impl Font {
         }
         if self.simple {
             if let Ok(byte) = u8::try_from(code) {
-                if let Some(Some(c)) = self.encoding.as_ref().map(|t| t[byte as usize]) {
-                    out.push(c);
-                    return;
+                match self.encoding.as_ref().map(|t| &t[byte as usize]) {
+                    Some(Some(Decoded::Char(c))) => {
+                        out.push(*c);
+                        return;
+                    }
+                    Some(Some(Decoded::Text(s))) => {
+                        out.push_str(s);
+                        return;
+                    }
+                    _ => {}
                 }
                 let fallback = encodings::standard(byte).or_else(|| {
                     self.winansi_high_codes
@@ -366,7 +393,7 @@ impl Font {
     async fn load_encoding<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
-    ) -> Option<Box<[Option<char>; 256]>> {
+    ) -> Option<Box<[Option<Decoded>; 256]>> {
         let enc = rv(src, dict, "Encoding").await?;
         let base_name = match &enc {
             Object::Name(n) => Some(n.0.clone()),
@@ -380,9 +407,9 @@ impl Font {
             Some("MacRomanEncoding") => encodings::mac_roman,
             _ => encodings::standard,
         };
-        let mut table = Box::new([None; 256]);
+        let mut table: Box<[Option<Decoded>; 256]> = Box::new(std::array::from_fn(|_| None));
         for (code, slot) in table.iter_mut().enumerate() {
-            *slot = base(code as u8);
+            *slot = base(code as u8).map(Decoded::Char);
         }
         if let Object::Dict(d) = &enc {
             if let Some(Object::Array(diffs)) = rv(src, d, "Differences").await {
@@ -393,7 +420,8 @@ impl Font {
                         Some(Object::Real(n)) => code = n.max(0.0) as u32,
                         Some(Object::Name(name)) => {
                             if code < 256 {
-                                table[code as usize] = encodings::glyph_to_unicode(&name.0);
+                                table[code as usize] =
+                                    encodings::glyph_to_text(&name.0).map(Decoded::from_text);
                             }
                             code = code.saturating_add(1);
                         }
@@ -581,6 +609,43 @@ mod tests {
         assert_eq!(f.decode(0x92), "\u{2019}", "right single quote");
         assert_eq!(f.decode(0x96), "\u{2013}", "en dash");
         assert_eq!(f.decode(0x97), "\u{2014}", "em dash");
+    }
+
+    /// `/Differences` names using the AGL conventions — underscore-joined
+    /// ligature components and period-suffixed variants — decode to the text
+    /// they represent. Modeled on a real Garamond Premier Pro subset whose
+    /// low codes carry `/f_i`, `/T_h`, and `/eight.oldstyle` and used to
+    /// extract as U+FFFD.
+    #[test]
+    fn differences_agl_ligatures_and_variants_decode() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /MCDWFT+GaramondPremrPro \
+             /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding \
+             /Differences [ 1 /f_i /T_h /eight.oldstyle /x.sc ] >> >>",
+            &[],
+            &[],
+        );
+        assert_eq!(f.decode(1), "fi");
+        assert_eq!(f.decode(2), "Th");
+        assert_eq!(f.decode(3), "8");
+        assert_eq!(f.decode(4), "x");
+        assert_eq!(f.decode(65), "A"); // the base table is untouched
+    }
+
+    /// A `/ToUnicode` entry of `<FFFD>` outranks nothing: the `/Differences`
+    /// name for the same code is real evidence and must win. Modeled on a
+    /// Brill journal header whose page number `314` extracted as `3\u{FFFD}4`
+    /// because the producer wrote `<13> <FFFD>` for `/one.SP`.
+    #[test]
+    fn a_differences_name_outranks_a_replacement_tounicode_entry() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /GKDCHH+Brill-Roman \
+             /ToUnicode 6 0 R \
+             /Encoding << /Type /Encoding /Differences [ 19 /one.SP ] >> >>",
+            &[(6, b"1 beginbfchar <13> <FFFD> endbfchar")],
+            &[],
+        );
+        assert_eq!(f.decode(0x13), "1");
     }
 
     /// The guess requires evidence. A font with no program at all offers none,

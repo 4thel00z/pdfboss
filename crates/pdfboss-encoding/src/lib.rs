@@ -359,6 +359,43 @@ pub fn glyph_to_unicode(name: &str) -> Option<char> {
         .map(|&(_, u)| u)
 }
 
+/// Resolves a glyph name to the text it represents, per the Adobe Glyph
+/// List algorithm: everything from the first period on is dropped
+/// (`eight.oldstyle` → `8`), underscore-joined components each resolve and
+/// concatenate (`f_i` → `fi`, `T_h` → `Th`), and a `uni` prefix may carry
+/// several 4-digit hex groups. `None` unless every component resolves —
+/// a partially-resolved ligature would silently drop letters, where the
+/// caller's U+FFFD at least stays visible.
+pub fn glyph_to_text(name: &str) -> Option<String> {
+    let base = name.split('.').next().unwrap_or_default();
+    if base.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for component in base.split('_') {
+        push_component(component, &mut out)?;
+    }
+    Some(out)
+}
+
+/// Appends one underscore-separated component of a glyph name; `None` when
+/// the component resolves to nothing.
+fn push_component(component: &str, out: &mut String) -> Option<()> {
+    let hex = component.strip_prefix("uni").unwrap_or_default();
+    if hex.len() >= 8 && hex.len().is_multiple_of(4) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        // Multi-group form: `uni20AC0308` is two scalars. The single-group
+        // form stays on the `glyph_to_unicode` path below.
+        for group in hex.as_bytes().chunks(4) {
+            let group = std::str::from_utf8(group).ok()?;
+            let scalar = u32::from_str_radix(group, 16).ok()?;
+            out.push(char::from_u32(scalar)?);
+        }
+        return Some(());
+    }
+    out.push(glyph_to_unicode(component)?);
+    Some(())
+}
+
 /// All bundled glyph-name tables, searched in order.
 const GLYPH_TABLES: [&[(&str, char)]; 5] = [
     GLYPHS_ASCII,
@@ -740,5 +777,39 @@ mod tests {
         assert_eq!(glyph_to_unicode("seven"), Some('7'));
         assert_eq!(glyph_to_unicode("union"), Some('\u{222A}'));
         assert_eq!(glyph_to_unicode("nosuchglyphname"), None);
+    }
+
+    #[test]
+    fn glyph_text_ligatures_and_variants() {
+        assert_eq!(glyph_to_text("f_i").as_deref(), Some("fi"));
+        assert_eq!(glyph_to_text("f_l").as_deref(), Some("fl"));
+        assert_eq!(glyph_to_text("T_h").as_deref(), Some("Th"));
+        assert_eq!(glyph_to_text("f_f_i").as_deref(), Some("ffi"));
+        assert_eq!(glyph_to_text("eight.oldstyle").as_deref(), Some("8"));
+        assert_eq!(glyph_to_text("x.sc").as_deref(), Some("x"));
+        assert_eq!(glyph_to_text("C.a").as_deref(), Some("C"));
+        // Suffix stripping happens before underscore splitting.
+        assert_eq!(glyph_to_text("f_i.alt").as_deref(), Some("fi"));
+        assert_eq!(glyph_to_text("uni00A0").as_deref(), Some("\u{A0}"));
+        assert_eq!(glyph_to_text("eacute").as_deref(), Some("\u{E9}"));
+    }
+
+    #[test]
+    fn glyph_text_multi_group_uni() {
+        assert_eq!(
+            glyph_to_text("uni20AC0308").as_deref(),
+            Some("\u{20AC}\u{0308}")
+        );
+        assert_eq!(glyph_to_text("uniD800DC00"), None); // surrogates never decode
+    }
+
+    #[test]
+    fn glyph_text_rejects_unknowns() {
+        assert_eq!(glyph_to_text(".notdef"), None);
+        assert_eq!(glyph_to_text(""), None);
+        assert_eq!(glyph_to_text("glorp"), None);
+        // Every component must resolve, or the whole name is unknown.
+        assert_eq!(glyph_to_text("f_glorp"), None);
+        assert_eq!(glyph_to_text("f__i"), None);
     }
 }
