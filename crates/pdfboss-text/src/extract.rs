@@ -598,9 +598,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 }
 
+/// Fraction of the device font size a horizontal gap must exceed to read
+/// as a word break. The ceiling is justified LaTeX's shrunk inter-word
+/// glue — 0.17 em for Times-family fonts, and a hair less under a
+/// compressed text matrix — and the floor is italic corrections and
+/// kerns, which stay under 0.1 em; 0.25 em sat exactly on the nominal
+/// Times space width and swallowed every shrunk line's spaces.
+const WORD_GAP: f32 = 0.15;
+
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
 /// top to bottom and spans left to right, inserts a space at horizontal
-/// gaps wider than `0.25 · size`, and joins lines with `\n`.
+/// gaps wider than [`WORD_GAP`]` · size`, and joins lines with `\n`.
 pub fn layout(spans: &[RawSpan]) -> String {
     struct Line<'s> {
         y: f32,
@@ -636,7 +644,7 @@ pub fn layout(spans: &[RawSpan]) -> String {
         for span in &line.spans {
             if let Some(end) = prev_end {
                 let gap = span.x - end;
-                if gap > 0.25 * prev_size.max(span.size) {
+                if gap > WORD_GAP * prev_size.max(span.size) {
                     out.push(' ');
                 }
             }
@@ -688,13 +696,23 @@ mod tests {
 
     #[test]
     fn tj_offset_space_thresholds() {
-        // -300/1000 * 12 = 3.6 > 0.25 * 12 -> space.
+        // -300/1000 * 12 = 3.6 > 0.15 * 12 -> space.
         assert_eq!(
             text_of("BT /F1 12 Tf 72 720 Td [(A) -300 (B)] TJ ET"),
             "A B"
         );
         // -50/1000 * 12 = 0.6 -> no space.
         assert_eq!(text_of("BT /F1 12 Tf 72 720 Td [(A) -50 (B)] TJ ET"), "AB");
+    }
+
+    /// Justified LaTeX shrinks inter-word glue below the font's nominal
+    /// space width: a Times word gap of 251/1000 em under a slightly
+    /// compressed text matrix lands just under 0.25 em in device space,
+    /// and a 0.25·size gap threshold reads the whole line as one word.
+    #[test]
+    fn shrunk_justified_word_gaps_still_become_spaces() {
+        let text = text_of("BT /F1 12 Tf 0.993 0 0 1 72 720 Tm [(We) -251 (would)] TJ ET");
+        assert_eq!(text, "We would");
     }
 
     #[test]
