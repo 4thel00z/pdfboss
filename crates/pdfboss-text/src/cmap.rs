@@ -39,6 +39,13 @@ fn utf16_units(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
+/// True for a destination that maps to exactly U+FFFD — how producers spell
+/// "no mapping known" (seen in Brill and OUP pipelines). Recording it would
+/// outrank real evidence like a `/Differences` name, so it parses as absent.
+fn is_replacement(units: &[u16]) -> bool {
+    units == [0xFFFD]
+}
+
 impl ToUnicode {
     /// Parses a decoded ToUnicode CMap stream. Never fails; anything the
     /// parser does not understand is skipped.
@@ -133,7 +140,7 @@ impl ToUnicode {
             match next_or_skip(lx, len) {
                 Some(Token::HexString(dst)) => {
                     let units = utf16_units(&dst);
-                    if !units.is_empty() {
+                    if !units.is_empty() && !is_replacement(&units) {
                         self.singles
                             .insert(code_value(&src), String::from_utf16_lossy(&units));
                     }
@@ -159,7 +166,7 @@ impl ToUnicode {
             match next_or_skip(lx, len) {
                 Some(Token::HexString(dst)) => {
                     let units = utf16_units(&dst);
-                    if !units.is_empty() && lo <= hi {
+                    if !units.is_empty() && !is_replacement(&units) && lo <= hi {
                         self.ranges.push((lo, hi, units));
                     }
                 }
@@ -169,7 +176,7 @@ impl ToUnicode {
                         match next_or_skip(lx, len) {
                             Some(Token::HexString(dst)) => {
                                 let units = utf16_units(&dst);
-                                if !units.is_empty() && code <= hi {
+                                if !units.is_empty() && !is_replacement(&units) && code <= hi {
                                     self.singles.insert(code, String::from_utf16_lossy(&units));
                                 }
                                 code = code.saturating_add(1);
@@ -275,6 +282,24 @@ mod tests {
         assert_eq!(cmap.code_len(&[0x80, 0x01]), Some(2));
         assert_eq!(cmap.code_len(&[0xFF]), None);
         assert!(cmap.is_empty());
+    }
+
+    /// Real producers write `<13> <FFFD>` for codes they could not map (seen
+    /// in Brill and OUP journal pipelines). An explicit replacement character
+    /// says "unknown", and recording it would outrank a `/Differences` name
+    /// that does know — so it must parse as no mapping at all.
+    #[test]
+    fn explicit_replacement_destinations_are_not_mappings() {
+        let cmap = ToUnicode::parse(
+            b"2 beginbfchar <13> <FFFD> <14> <0041> endbfchar\n\
+              1 beginbfrange <20> <21> <FFFD> endbfrange\n\
+              1 beginbfrange <30> <31> [<FFFD> <0042>] endbfrange",
+        );
+        assert_eq!(cmap.lookup(0x13), None);
+        assert_eq!(cmap.lookup(0x14).as_deref(), Some("A"));
+        assert_eq!(cmap.lookup(0x20), None);
+        assert_eq!(cmap.lookup(0x30), None);
+        assert_eq!(cmap.lookup(0x31).as_deref(), Some("B"));
     }
 
     #[test]
