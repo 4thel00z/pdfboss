@@ -1,6 +1,6 @@
 [package]
-name = "pdfboss-text"
-description = "Font loading, encodings, ToUnicode CMaps and text extraction for pdfboss"
+name = "pdfboss-output"
+description = "Layout analysis and output rendering (plain text, markdown) for pdfboss"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,12 @@ keywords.workspace = true
 
 [dependencies]
 pdfboss-core = { workspace = true }
-pdfboss-encoding = { workspace = true }
+pdfboss-text = { workspace = true }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
+criterion = { workspace = true }
+
+[[bench]]
+name = "extract"
+harness = false

@@ -384,7 +384,7 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
             let (text, report) =
-                pdfboss_text::extract_text_reporting(&doc, &page).map_err(|e| e.to_string())?;
+                pdfboss_output::extract_text_reporting(&doc, &page).map_err(|e| e.to_string())?;
             warn_skips(n, &report);
             text
         }
@@ -394,7 +394,7 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
             // flattened tree, not the declared `/Count`, which on a damaged
             // file may not match what the tree yields) and returns them in
             // page order.
-            let parts = pdfboss_core::map_pages(&doc, pdfboss_text::extract_text_reporting)
+            let parts = pdfboss_core::map_pages(&doc, pdfboss_output::extract_text_reporting)
                 .into_iter()
                 .enumerate()
                 .map(|(index, outcome)| {
@@ -413,7 +413,7 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
 /// One stderr line per skipped stream, 1-based page numbers matching
 /// `--page`. Warnings, not errors: the text on stdout is still everything
 /// that could be read.
-fn warn_skips(page_no: usize, report: &pdfboss_text::ExtractReport) {
+fn warn_skips(page_no: usize, report: &pdfboss_output::ExtractReport) {
     for skip in &report.skipped {
         eprintln!(
             "warning: page {page_no}: skipped {} ({})",

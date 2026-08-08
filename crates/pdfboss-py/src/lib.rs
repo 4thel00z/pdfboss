@@ -353,7 +353,7 @@ impl Document {
             // `map_pages` visits exactly the materializable pages — the
             // flattened tree, not the declared `/Count`, which on a damaged
             // file can exceed (or fall short of) what the tree yields.
-            let texts = pdfboss_core::map_pages(&doc, pdfboss_text::extract_text);
+            let texts = pdfboss_core::map_pages(&doc, pdfboss_output::extract_text);
             let mut out = String::new();
             for (i, text) in texts.into_iter().enumerate() {
                 if i > 0 {
@@ -518,7 +518,7 @@ impl Page {
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            pdfboss_text::extract_text(&doc, &self.page).map_err(pdf_err)
+            pdfboss_output::extract_text(&doc, &self.page).map_err(pdf_err)
         })
     }
 
@@ -879,7 +879,7 @@ impl AsyncDocument {
                     out.push('\u{c}');
                 }
                 let page = inner.page(i).map_err(aio_err)?;
-                let text = pdfboss_text::extract_text_with(inner.clone(), &page)
+                let text = pdfboss_output::extract_text_with(inner.clone(), &page)
                     .await
                     .map_err(pdf_err)?;
                 out.push_str(&text);
@@ -1065,7 +1065,7 @@ impl AsyncPage {
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            pdfboss_text::extract_text_with(doc, &page)
+            pdfboss_output::extract_text_with(doc, &page)
                 .await
                 .map_err(pdf_err)
         })
