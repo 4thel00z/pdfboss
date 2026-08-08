@@ -1,8 +1,8 @@
-//! Spans to the layout IR: line assembly, word gaps, and the two-column
-//! gutter split.
+//! Spans to the layout IR: line assembly, word gaps, the two-column gutter
+//! split, and the size statistics that rank headings.
 
 use crate::ir::{BBox, Block, Inline, Line, PageLayout, Role};
-use crate::output::{Output, Text};
+use crate::output::{line_text, Output, Text};
 use pdfboss_text::TextSpan;
 
 /// Fraction of the device font size a horizontal gap must exceed to read
@@ -36,37 +36,251 @@ const SEPARATOR_FRACTION: f32 = 0.5;
 /// Occupancy-histogram resolution for gutter detection.
 const GUTTER_BINS: usize = 128;
 
+/// How far above body size a size bucket must sit before it reads as a
+/// heading rather than as emphasis or a stray measurement.
+const HEADING_MIN_DELTA: f32 = 1.0;
+/// ATX headings stop at six `#`.
+const HEADING_MAX_LEVEL: u8 = 6;
+/// A wholly bold body-size line this short reads as a title; anything
+/// longer is a sentence that happens to be bold.
+const BOLD_HEADING_MAX_CHARS: usize = 60;
+/// A baseline step beyond this multiple of a run's median step is white
+/// space between paragraphs rather than leading inside one.
+const PARAGRAPH_GAP: f32 = 1.8;
+/// Consecutive heading lines of one size stay one heading while their
+/// baseline step is within this multiple of the line size.
+const HEADING_MERGE_STEP: f32 = 1.8;
+
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
 /// top to bottom and spans left to right, inserts a space at horizontal
-/// gaps wider than [`WORD_GAP`] times the size, and joins lines with `\n`.
+/// gaps wider than `WORD_GAP` times the size, and joins lines with `\n`.
 /// A page with a clear two-column gutter reads column-major: full-width
 /// separators split it into bands, and within each band the left column
-/// flows before the right (see [`segments`]).
+/// flows before the right.
 pub fn layout(spans: &[TextSpan]) -> String {
     Text.render(&[page_layout(spans)])
 }
 
-/// The page's spans as structure: one [`Block::Paragraph`] per reading-order
-/// segment (see [`segments`]), each holding the segment's assembled lines.
+/// The page's spans as structure, ranking heading sizes against this page
+/// alone. Prefer [`document_layout`] whenever the whole document is at
+/// hand: a page of nothing but large type has no body size of its own.
 pub fn page_layout(spans: &[TextSpan]) -> PageLayout {
+    page_layout_with_stats(spans, &size_stats(&[spans]))
+}
+
+/// Every page's spans as structure, ranking heading sizes against the whole
+/// document, so one oversized page cannot redefine what body text is.
+pub fn document_layout(pages: &[Vec<TextSpan>]) -> Vec<PageLayout> {
+    let borrowed: Vec<&[TextSpan]> = pages.iter().map(Vec::as_slice).collect();
+    let stats = size_stats(&borrowed);
+    pages
+        .iter()
+        .map(|spans| page_layout_with_stats(spans, &stats))
+        .collect()
+}
+
+/// The page's blocks: each reading-order segment's lines classified into
+/// headings and paragraph runs, in order. The classification is a partition
+/// — no line is reordered, merged away, or dropped — which is what keeps
+/// the [`Text`] adapter byte-equal to positional extraction.
+fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
     let mut blocks = Vec::new();
     for segment in segments(spans) {
         if segment.is_empty() {
             continue;
         }
-        let lines = assemble_lines(&segment);
-        let bbox = bbox(&lines);
-        blocks.push(Block::Paragraph {
-            lines,
-            bbox,
-            role: Role::Body,
-        });
+        push_blocks(&assemble_lines(&segment), stats, &mut blocks);
     }
     PageLayout { blocks }
 }
 
+/// Character-weighted histogram of span sizes rounded to half a point. Body
+/// size is the mode; the ladder holds the distinct buckets at least
+/// [`HEADING_MIN_DELTA`] above it, largest first, so a bucket's position is
+/// its heading level.
+struct SizeStats {
+    body: f32,
+    ladder: Vec<f32>,
+}
+
+impl SizeStats {
+    /// The heading level of a line whose smallest text measures `size`, or
+    /// `None` when that size reads as body text.
+    fn level(&self, size: f32) -> Option<u8> {
+        let rank = self
+            .ladder
+            .iter()
+            .position(|bucket| half_points(*bucket) == half_points(size))?;
+        Some((rank as u8 + 1).min(HEADING_MAX_LEVEL))
+    }
+
+    /// The level a bold body-size title joins at: one below the ladder's
+    /// deepest rank, since it is the smallest heading the page has.
+    fn bold_level(&self) -> u8 {
+        ((self.ladder.len() + 1) as u8).min(HEADING_MAX_LEVEL)
+    }
+
+    fn is_body(&self, size: f32) -> bool {
+        half_points(size) == half_points(self.body)
+    }
+}
+
+/// A size as its half-point bucket. Halves are exact in binary, so bucket
+/// equality is exact too.
+fn half_points(size: f32) -> i32 {
+    (size * 2.0).round() as i32
+}
+
+/// The document's size statistics, weighted by characters shown: a title
+/// carries a handful, body text carries thousands.
+fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
+    let mut weights: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    for span in pages.iter().flat_map(|page| page.iter()) {
+        *weights.entry(half_points(span.size)).or_default() += span.text.chars().count();
+    }
+    // Ties go to the smaller size: body text is what a document has most of
+    // and, at equal weight, the likelier of the two to be it.
+    let body = weights
+        .iter()
+        .min_by_key(|(bucket, weight)| (std::cmp::Reverse(**weight), **bucket))
+        .map(|(bucket, _)| *bucket as f32 / 2.0);
+    let Some(body) = body else {
+        return SizeStats {
+            body: 0.0,
+            ladder: Vec::new(),
+        };
+    };
+    let mut ladder: Vec<f32> = weights
+        .keys()
+        .rev()
+        .map(|bucket| *bucket as f32 / 2.0)
+        .filter(|size| *size >= body + HEADING_MIN_DELTA)
+        .collect();
+    ladder.truncate(HEADING_MAX_LEVEL as usize);
+    SizeStats { body, ladder }
+}
+
+/// One assembled line and the smallest size that put a glyph on it. Heading
+/// classification measures a line by its smallest text, so a drop cap or an
+/// inline formula cannot promote a body line.
+struct Assembled {
+    line: Line,
+    min_size: f32,
+}
+
+/// Emits one segment's lines as blocks, walking them once: a heading line
+/// closes the paragraph run before it and takes any tightly-spaced
+/// continuation lines of the same size with it.
+fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
+    let mut run: Vec<Line> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(level) = heading_level(&lines[index], stats) else {
+            run.push(lines[index].line.clone());
+            index += 1;
+            continue;
+        };
+        push_paragraphs(&mut run, out);
+        let mut end = index + 1;
+        while end < lines.len() && continues_heading(&lines[end - 1], &lines[end], stats, level) {
+            end += 1;
+        }
+        let heading: Vec<Line> = lines[index..end].iter().map(|a| a.line.clone()).collect();
+        let bbox = bbox(&heading);
+        out.push(Block::Heading {
+            level,
+            lines: heading,
+            bbox,
+        });
+        index = end;
+    }
+    push_paragraphs(&mut run, out);
+}
+
+/// The heading level of a line: its size's ladder rank, or — for a line at
+/// body size — the bold-title rank.
+fn heading_level(line: &Assembled, stats: &SizeStats) -> Option<u8> {
+    if let Some(level) = stats.level(line.min_size) {
+        return Some(level);
+    }
+    if !stats.is_body(line.min_size) {
+        return None;
+    }
+    if !is_bold_title(&line.line) {
+        return None;
+    }
+    Some(stats.bold_level())
+}
+
+/// True when `next` is a wrapped continuation of the heading line `prev`:
+/// same size bucket, same level, and no more than a line of space between.
+fn continues_heading(prev: &Assembled, next: &Assembled, stats: &SizeStats, level: u8) -> bool {
+    if heading_level(next, stats) != Some(level) {
+        return false;
+    }
+    if half_points(prev.min_size) != half_points(next.min_size) {
+        return false;
+    }
+    prev.line.y - next.line.y <= HEADING_MERGE_STEP * next.line.size
+}
+
+/// True for a short, wholly bold line that does not end like a sentence —
+/// the run-in heading of a document that sets its headings in body size.
+fn is_bold_title(line: &Line) -> bool {
+    if line.inlines.is_empty() || !line.inlines.iter().all(|inline| inline.bold) {
+        return false;
+    }
+    let text = line_text(line);
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > BOLD_HEADING_MAX_CHARS {
+        return false;
+    }
+    !trimmed.ends_with(['.', ',', ';'])
+}
+
+/// Drains a paragraph run into blocks, cutting it where a baseline step
+/// exceeds [`PARAGRAPH_GAP`] times the run's median step.
+fn push_paragraphs(run: &mut Vec<Line>, out: &mut Vec<Block>) {
+    let lines = std::mem::take(run);
+    if lines.is_empty() {
+        return;
+    }
+    let limit = PARAGRAPH_GAP * median_step(&lines);
+    let mut start = 0;
+    for index in 1..lines.len() {
+        if limit <= 0.0 || lines[index - 1].y - lines[index].y <= limit {
+            continue;
+        }
+        push_paragraph(&lines[start..index], out);
+        start = index;
+    }
+    push_paragraph(&lines[start..], out);
+}
+
+fn push_paragraph(lines: &[Line], out: &mut Vec<Block>) {
+    if lines.is_empty() {
+        return;
+    }
+    out.push(Block::Paragraph {
+        lines: lines.to_vec(),
+        bbox: bbox(lines),
+        role: Role::Body,
+    });
+}
+
+/// Median baseline step of consecutive lines, or zero when there is no step
+/// to measure — a run of one line never splits.
+fn median_step(lines: &[Line]) -> f32 {
+    let mut steps: Vec<f32> = lines.windows(2).map(|pair| pair[0].y - pair[1].y).collect();
+    if steps.is_empty() {
+        return 0.0;
+    }
+    steps.sort_by(f32::total_cmp);
+    steps[steps.len() / 2]
+}
+
 /// One reading-order segment's spans as lines, top of page first.
-fn assemble_lines(spans: &[&TextSpan]) -> Vec<Line> {
+fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
     struct Group<'s> {
         y: f32,
         size: f32,
@@ -102,22 +316,27 @@ fn assemble_lines(spans: &[&TextSpan]) -> Vec<Line> {
 /// One line from its spans in left-to-right order: a gap wider than
 /// [`WORD_GAP`] times the size becomes a space, and a change of
 /// `(bold, italic)` opens a new [`Inline`].
-fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Line {
+fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
     let mut inlines: Vec<Inline> = Vec::new();
     let mut prev_end: Option<f32> = None;
     let mut prev_size = 0.0f32;
+    let mut min_size = f32::INFINITY;
     for span in spans {
         let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
         push_span(&mut inlines, span, spaced);
         prev_end = Some(span.end_x);
         prev_size = span.size;
+        min_size = min_size.min(span.size);
     }
-    Line {
-        inlines,
-        y,
-        x: spans.first().map_or(0.0, |span| span.x),
-        end_x: spans.last().map_or(0.0, |span| span.end_x),
-        size,
+    Assembled {
+        line: Line {
+            inlines,
+            y,
+            x: spans.first().map_or(0.0, |span| span.x),
+            end_x: spans.last().map_or(0.0, |span| span.end_x),
+            size,
+        },
+        min_size: if min_size.is_finite() { min_size } else { size },
     }
 }
 

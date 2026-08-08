@@ -56,6 +56,13 @@ fn open_line(out: &mut String, written: &mut usize) {
     *written += 1;
 }
 
+/// A line as unmarked text: what every adapter starts from.
+pub(crate) fn line_text(line: &Line) -> String {
+    let mut out = String::new();
+    push_line(&mut out, line);
+    out
+}
+
 /// A line's inline runs concatenated; the runs already carry the spaces the
 /// word-gap rule inserted.
 fn push_line(out: &mut String, line: &Line) {

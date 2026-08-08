@@ -2,15 +2,17 @@
 //! spans into a structured layout IR, and the IR into a document.
 
 mod ir;
+mod markdown;
 mod output;
 mod structure;
 
 use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Result};
 
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
+pub use markdown::Markdown;
 pub use output::{Output, Text};
 pub use pdfboss_text::{ExtractReport, SkipCause, SkippedText, SkippedTextKind, TextSpan};
-pub use structure::{layout, page_layout};
+pub use structure::{document_layout, layout, page_layout};
 
 /// Extracts the page's text with positional layout applied: spans grouped
 /// into lines, lines ordered top to bottom and joined with `\n`, spaces
@@ -60,6 +62,56 @@ pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     Ok((Text.render(&[page_layout(&spans)]), report))
 }
 
+/// Extracts the whole document as Markdown: ATX headings, paragraphs, and
+/// emphasis over the same positional layout [`extract_text`] renders flat.
+///
+/// Heading sizes are ranked against every page at once, so a title page or
+/// a chapter opener — all of it larger than body text — is read as headings
+/// rather than as its own idea of body size.
+///
+/// Lenient like [`extract_text`]: unreadable content costs its own text and
+/// nothing else. Use [`extract_markdown_reporting`] to see what was left
+/// out.
+pub fn extract_markdown(doc: &Document) -> Result<String> {
+    let (markdown, _) = extract_markdown_reporting(doc)?;
+    Ok(markdown)
+}
+
+/// [`extract_markdown`] with one [`ExtractReport`] per page, in page order.
+pub fn extract_markdown_reporting(doc: &Document) -> Result<(String, Vec<ExtractReport>)> {
+    let per_page = pdfboss_core::map_pages(doc, pdfboss_text::extract_spans_reporting);
+    let mut pages = Vec::with_capacity(per_page.len());
+    let mut reports = Vec::with_capacity(per_page.len());
+    for outcome in per_page {
+        let (spans, report) = outcome?;
+        pages.push(spans);
+        reports.push(report);
+    }
+    Ok((Markdown.render(&document_layout(&pages)), reports))
+}
+
+/// One page as Markdown, ranking heading sizes against that page alone.
+/// [`extract_markdown`] is the better answer whenever the document is at
+/// hand — a page whose text is all one size has no heading to find.
+pub fn extract_page_markdown(doc: &Document, page: &Page) -> Result<String> {
+    block_on(extract_page_markdown_with(Immediate(doc), page))
+}
+
+/// [`extract_page_markdown`] against any object source. Signed like
+/// [`extract_text_with`], for the same reasons.
+///
+/// There is no document-level `_with`: an asynchronous caller collects each
+/// page's spans with `pdfboss_text::extract_spans_reporting_with` and then
+/// calls the pure [`document_layout`] and [`Markdown`], which is the same
+/// document-wide ranking without a second I/O path to keep in step.
+pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+) -> Result<String> {
+    let (spans, _) = pdfboss_text::extract_spans_reporting_with(src, page).await?;
+    Ok(Markdown.render(&[page_layout(&spans)]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +141,122 @@ mod tests {
                 "content: {content}"
             );
         }
+    }
+
+    /// Markdown of a one-page document with `content` as its raw content
+    /// stream, through document-level size statistics.
+    fn markdown_of(content: &str) -> String {
+        let doc = Document::load(doc_with_graphics(content)).unwrap();
+        let page = doc.page(0).unwrap();
+        let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        Markdown.render(&document_layout(&[spans]))
+    }
+
+    /// [`markdown_of`] on a page whose resources carry `/F1` Helvetica and
+    /// `/F2` Helvetica-Bold, so a span's boldness comes from a real font.
+    fn markdown_of_two_fonts(content: &str) -> String {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content.as_bytes());
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        Markdown.render(&document_layout(&[spans]))
+    }
+
+    /// Sizes rank into levels; body text stays a paragraph. 24pt > 16pt > 12pt
+    /// body: `#` for 24, `##` for 16.
+    #[test]
+    fn heading_levels_by_size_rank() {
+        let content = "BT /F1 24 Tf 72 740 Td (Title) Tj \
+                       /F1 16 Tf 0 -40 Td (Section) Tj \
+                       /F1 12 Tf 0 -30 Td (Body text long enough to look like body.) Tj \
+                       0 -14 Td (More body keeps twelve the dominant size.) Tj \
+                       0 -14 Td (And a third line for good measure.) Tj ET";
+        let md = markdown_of(content);
+        assert!(md.contains("# Title\n"), "md: {md}");
+        assert!(md.contains("## Section\n"), "md: {md}");
+        assert!(!md.contains("# Body"), "md: {md}");
+    }
+
+    /// Emphasis wraps maximal same-style runs, with the spaces left outside
+    /// the markers.
+    #[test]
+    fn bold_run_renders_as_strong() {
+        let md = markdown_of_two_fonts(
+            "BT /F1 12 Tf 72 720 Td (plain ) Tj /F2 12 Tf (loud) Tj /F1 12 Tf ( tail) Tj \
+             0 -14 Td (body body body body) Tj 0 -14 Td (body body body body) Tj ET",
+        );
+        assert!(md.contains("plain **loud** tail"), "md: {md}");
+    }
+
+    /// A lone page of huge text must not become all headings under per-page
+    /// stats when the document knows better.
+    #[test]
+    fn document_stats_beat_page_stats() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>",
+        );
+        b.object(
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+        );
+        b.stream(
+            5,
+            "",
+            b"BT /F1 12 Tf 72 720 Td (Body line one is long enough.) Tj \
+              0 -14 Td (Body line two keeps twelve dominant.) Tj \
+              0 -14 Td (Body line three seals it.) Tj ET",
+        );
+        b.stream(6, "", b"BT /F1 24 Tf 72 720 Td (Chapter Two) Tj ET");
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let pages: Vec<Vec<TextSpan>> = (0..2)
+            .map(|i| {
+                let page = doc.page(i).unwrap();
+                pdfboss_text::extract_spans_reporting(&doc, &page)
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let md = Markdown.render(&document_layout(&pages));
+        assert!(
+            md.contains("# Chapter Two"),
+            "doc stats make it a heading: {md}"
+        );
+        let alone = Markdown.render(&[page_layout(&pages[1])]);
+        assert!(
+            !alone.contains("# "),
+            "page stats alone see 24pt as body: {alone}"
+        );
     }
 
     #[test]
