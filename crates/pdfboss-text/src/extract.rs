@@ -631,7 +631,7 @@ const GUTTER_BINS: usize = 128;
 
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
 /// top to bottom and spans left to right, inserts a space at horizontal
-/// gaps wider than [`WORD_GAP`]` · size`, and joins lines with `\n`.
+/// gaps wider than [`WORD_GAP`] times the size, and joins lines with `\n`.
 /// A page with a clear two-column gutter reads column-major: full-width
 /// separators split it into bands, and within each band the left column
 /// flows before the right (see [`segments`]).
