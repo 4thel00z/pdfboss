@@ -382,7 +382,7 @@ pub fn glyph_to_text(name: &str) -> Option<String> {
 /// the component resolves to nothing.
 fn push_component(component: &str, out: &mut String) -> Option<()> {
     let hex = component.strip_prefix("uni").unwrap_or_default();
-    if hex.len() >= 8 && hex.len() % 4 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if hex.len() >= 8 && hex.len().is_multiple_of(4) && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         // Multi-group form: `uni20AC0308` is two scalars. The single-group
         // form stays on the `glyph_to_unicode` path below.
         for group in hex.as_bytes().chunks(4) {
