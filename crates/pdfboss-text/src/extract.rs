@@ -818,8 +818,9 @@ fn push_band<'s>(
 fn wide_gaps(occupied: &[bool; GUTTER_BINS], scale: f32) -> Vec<std::ops::Range<usize>> {
     let mut gaps = Vec::new();
     let mut run_start: Option<usize> = None;
-    for i in 0..=GUTTER_BINS {
-        let filled = i == GUTTER_BINS || occupied[i];
+    // One trailing filled sentinel closes a run that touches the end.
+    let bins = occupied.iter().copied().chain(std::iter::once(true));
+    for (i, filled) in bins.enumerate() {
         match (filled, run_start.take()) {
             (false, None) => run_start = Some(i),
             (false, Some(start)) => run_start = Some(start),
