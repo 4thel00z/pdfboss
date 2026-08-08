@@ -1,12 +1,16 @@
 //! Layout analysis and output rendering for pdfboss: turns `pdfboss-text`
-//! spans into reading-order text.
+//! spans into a structured layout IR, and the IR into a document.
 
+mod ir;
+mod output;
 mod structure;
 
 use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Result};
 
+pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
+pub use output::{Output, Text};
 pub use pdfboss_text::{ExtractReport, SkipCause, SkippedText, SkippedTextKind, TextSpan};
-pub use structure::layout;
+pub use structure::{layout, page_layout};
 
 /// Extracts the page's text with positional layout applied: spans grouped
 /// into lines, lines ordered top to bottom and joined with `\n`, spaces
@@ -53,19 +57,38 @@ pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     page: &Page,
 ) -> Result<(String, ExtractReport)> {
     let (spans, report) = pdfboss_text::extract_spans_reporting_with(src, page).await?;
-    Ok((structure::layout(&spans), report))
+    Ok((Text.render(&[page_layout(&spans)]), report))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pdfboss_core::{resolve_with, BoxFuture, ObjRef, Object, Stream};
-    use pdfboss_testkit::{multi_page_doc, simple_doc, PdfBuilder};
+    use pdfboss_testkit::{doc_with_graphics, multi_page_doc, simple_doc, PdfBuilder};
     use std::future::Future;
 
     fn page_text(doc: &Document, index: usize) -> String {
         let page = doc.page(index).unwrap();
         extract_text(doc, &page).unwrap()
+    }
+
+    /// The Text adapter over the IR must reproduce the pre-IR string builder
+    /// exactly — the local form of the corpus parity gate.
+    /// [`structure::layout_reference`] is that builder, kept as the oracle.
+    #[test]
+    fn text_adapter_matches_layout_on_fixtures() {
+        for content in structure::tests::fixture_contents() {
+            let doc = Document::load(doc_with_graphics(&content)).unwrap();
+            let page = doc.page(0).unwrap();
+            let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+            assert!(report.is_complete(), "unexpected skips: {report:?}");
+            let via_ir = Text.render(&[page_layout(&spans)]);
+            assert_eq!(
+                via_ir,
+                structure::layout_reference(&spans),
+                "content: {content}"
+            );
+        }
     }
 
     #[test]

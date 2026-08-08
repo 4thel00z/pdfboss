@@ -1,6 +1,8 @@
-//! Spans to reading-order text: line assembly, word gaps, and the
-//! two-column gutter split.
+//! Spans to the layout IR: line assembly, word gaps, and the two-column
+//! gutter split.
 
+use crate::ir::{BBox, Block, Inline, Line, PageLayout, Role};
+use crate::output::{Output, Text};
 use pdfboss_text::TextSpan;
 
 /// Fraction of the device font size a horizontal gap must exceed to read
@@ -41,62 +43,124 @@ const GUTTER_BINS: usize = 128;
 /// separators split it into bands, and within each band the left column
 /// flows before the right (see [`segments`]).
 pub fn layout(spans: &[TextSpan]) -> String {
-    let mut out = String::new();
+    Text.render(&[page_layout(spans)])
+}
+
+/// The page's spans as structure: one [`Block::Paragraph`] per reading-order
+/// segment (see [`segments`]), each holding the segment's assembled lines.
+pub fn page_layout(spans: &[TextSpan]) -> PageLayout {
+    let mut blocks = Vec::new();
     for segment in segments(spans) {
         if segment.is_empty() {
             continue;
         }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        flow(&segment, &mut out);
+        let lines = assemble_lines(&segment);
+        let bbox = bbox(&lines);
+        blocks.push(Block::Paragraph {
+            lines,
+            bbox,
+            role: Role::Body,
+        });
     }
-    out
+    PageLayout { blocks }
 }
 
-/// Lays one reading-order segment out into lines, appending to `out`.
-fn flow(spans: &[&TextSpan], out: &mut String) {
-    struct Line<'s> {
+/// One reading-order segment's spans as lines, top of page first.
+fn assemble_lines(spans: &[&TextSpan]) -> Vec<Line> {
+    struct Group<'s> {
         y: f32,
         size: f32,
         spans: Vec<&'s TextSpan>,
     }
-    let mut lines: Vec<Line> = Vec::new();
+    let mut groups: Vec<Group> = Vec::new();
     for &span in spans {
-        let found = lines
+        let found = groups
             .iter_mut()
-            .find(|line| (line.y - span.y).abs() <= 0.5 * line.size.max(span.size));
+            .find(|group| (group.y - span.y).abs() <= 0.5 * group.size.max(span.size));
         match found {
-            Some(line) => {
-                line.size = line.size.max(span.size);
-                line.spans.push(span);
+            Some(group) => {
+                group.size = group.size.max(span.size);
+                group.spans.push(span);
             }
-            None => lines.push(Line {
+            None => groups.push(Group {
                 y: span.y,
                 size: span.size,
                 spans: vec![span],
             }),
         }
     }
-    lines.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
-    for (i, line) in lines.iter_mut().enumerate() {
-        if i > 0 {
-            out.push('\n');
+    groups.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
+    groups
+        .iter_mut()
+        .map(|group| {
+            group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+            assemble_line(group.y, group.size, &group.spans)
+        })
+        .collect()
+}
+
+/// One line from its spans in left-to-right order: a gap wider than
+/// [`WORD_GAP`] times the size becomes a space, and a change of
+/// `(bold, italic)` opens a new [`Inline`].
+fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Line {
+    let mut inlines: Vec<Inline> = Vec::new();
+    let mut prev_end: Option<f32> = None;
+    let mut prev_size = 0.0f32;
+    for span in spans {
+        let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
+        push_span(&mut inlines, span, spaced);
+        prev_end = Some(span.end_x);
+        prev_size = span.size;
+    }
+    Line {
+        inlines,
+        y,
+        x: spans.first().map_or(0.0, |span| span.x),
+        end_x: spans.last().map_or(0.0, |span| span.end_x),
+        size,
+    }
+}
+
+/// Extends the run the span continues, or opens one when its style differs.
+/// A `spaced` span puts its word-gap space at the end of the run before it,
+/// so the space is never lost at a style boundary.
+fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
+    if let Some(last) = inlines.last_mut() {
+        if spaced {
+            last.text.push(' ');
         }
-        line.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
-        let mut prev_end: Option<f32> = None;
-        let mut prev_size = 0.0f32;
-        for span in &line.spans {
-            if let Some(end) = prev_end {
-                let gap = span.x - end;
-                if gap > WORD_GAP * prev_size.max(span.size) {
-                    out.push(' ');
-                }
-            }
-            out.push_str(&span.text);
-            prev_end = Some(span.end_x);
-            prev_size = span.size;
+        if last.bold == span.bold && last.italic == span.italic {
+            last.text.push_str(&span.text);
+            return;
         }
+    }
+    inlines.push(Inline {
+        text: span.text.clone(),
+        bold: span.bold,
+        italic: span.italic,
+    });
+}
+
+/// The lines' device-space box. Spans carry no glyph extents, so the top is
+/// the highest baseline plus the largest size — an ascender approximation.
+fn bbox(lines: &[Line]) -> BBox {
+    let mut x0 = f32::INFINITY;
+    let mut y0 = f32::INFINITY;
+    let mut x1 = f32::NEG_INFINITY;
+    let mut y1 = f32::NEG_INFINITY;
+    let mut size = 0.0f32;
+    for line in lines {
+        x0 = x0.min(line.x);
+        x1 = x1.max(line.end_x);
+        y0 = y0.min(line.y);
+        y1 = y1.max(line.y);
+        size = size.max(line.size);
+    }
+    BBox {
+        x0,
+        y0,
+        x1,
+        y1: y1 + size,
     }
 }
 
@@ -275,11 +339,101 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
     hi - lo
 }
 
+/// The pre-IR string builder, kept as the oracle [`layout`] is measured
+/// against: it walks segments straight into a `String` with no structure in
+/// between. Any divergence is a parity bug in the IR or the [`Text`] adapter.
 #[cfg(test)]
-mod tests {
+pub(crate) fn layout_reference(spans: &[TextSpan]) -> String {
+    let mut out = String::new();
+    for segment in segments(spans) {
+        if segment.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        flow(&segment, &mut out);
+    }
+    out
+}
+
+/// Lays one reading-order segment out into lines, appending to `out`.
+#[cfg(test)]
+fn flow(spans: &[&TextSpan], out: &mut String) {
+    struct Group<'s> {
+        y: f32,
+        size: f32,
+        spans: Vec<&'s TextSpan>,
+    }
+    let mut lines: Vec<Group> = Vec::new();
+    for &span in spans {
+        let found = lines
+            .iter_mut()
+            .find(|line| (line.y - span.y).abs() <= 0.5 * line.size.max(span.size));
+        match found {
+            Some(line) => {
+                line.size = line.size.max(span.size);
+                line.spans.push(span);
+            }
+            None => lines.push(Group {
+                y: span.y,
+                size: span.size,
+                spans: vec![span],
+            }),
+        }
+    }
+    lines.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
+    for (i, line) in lines.iter_mut().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        line.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let mut prev_end: Option<f32> = None;
+        let mut prev_size = 0.0f32;
+        for span in &line.spans {
+            if let Some(end) = prev_end {
+                let gap = span.x - end;
+                if gap > WORD_GAP * prev_size.max(span.size) {
+                    out.push(' ');
+                }
+            }
+            out.push_str(&span.text);
+            prev_end = Some(span.end_x);
+            prev_size = span.size;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use pdfboss_core::Document;
     use pdfboss_testkit::doc_with_graphics;
+
+    /// The content streams the crate's Text-adapter parity test replays:
+    /// plain lines, both sides of the word-gap threshold, band separators,
+    /// and the shapes that must and must not split into columns.
+    pub(crate) fn fixture_contents() -> Vec<String> {
+        let mut contents: Vec<String> = [
+            "BT ET",
+            "BT /F1 12 Tf 72 720 Td (Line one) Tj 0 -20 Td (Line two) Tj ET",
+            "BT /F1 12 Tf 72 720 Td [(A) -300 (B)] TJ ET",
+            "BT /F1 12 Tf 72 720 Td [(A) -50 (B)] TJ ET",
+            "BT /F1 12 Tf 0.993 0 0 1 72 720 Tm [(We) -251 (would)] TJ ET",
+            "BT /F1 12 Tf 14 TL 72 720 Td (a) Tj T* (b) Tj (c) ' ET",
+            "BT /F1 12 Tf 200 720 Td (world) Tj ET BT /F1 12 Tf 72 720 Td (hello) Tj ET",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        contents.push(two_column_content(25));
+        contents.push(two_column_content(3));
+        contents.push(format!(
+            "BT /F1 12 Tf 72 760 Td (A quite wide heading spanning both text columns here) Tj ET {}",
+            two_column_content(25)
+        ));
+        contents
+    }
 
     /// The page's spans, asserting the extraction report is complete: no
     /// test here expects to lose content.
