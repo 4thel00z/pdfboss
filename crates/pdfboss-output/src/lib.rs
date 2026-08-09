@@ -437,6 +437,61 @@ mod tests {
         );
     }
 
+    /// A running title repeated at the top of every page and a page number at
+    /// the bottom disappear from markdown but stay in text.
+    #[test]
+    fn running_headers_and_page_numbers_are_tagged() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>");
+        for (page_obj, contents_obj) in [(3u32, 6u32), (4, 7), (5, 8)] {
+            b.object(
+                page_obj,
+                &format!(
+                    "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                     /Resources << /Font << /F1 9 0 R >> >> /Contents {contents_obj} 0 R >>"
+                ),
+            );
+        }
+        for (contents_obj, n) in [(6u32, 1u32), (7, 2), (8, 3)] {
+            b.stream(
+                contents_obj,
+                "",
+                format!(
+                    "BT /F1 10 Tf 72 770 Td (ACME REPORT) Tj \
+                     /F1 12 Tf 0 -50 Td (Page {n} body text differs everywhere.) Tj \
+                     0 -14 Td (A second body line pads the page.) Tj \
+                     /F1 10 Tf 200 -666 Td ({n}) Tj ET"
+                )
+                .as_bytes(),
+            );
+        }
+        b.object(
+            9,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let pages: Vec<Vec<TextSpan>> = (0..3)
+            .map(|i| {
+                let page = doc.page(i).unwrap();
+                pdfboss_text::extract_spans_reporting(&doc, &page)
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        let layouts = document_layout(&pages);
+        let md = Markdown.render(&layouts);
+        assert!(!md.contains("ACME REPORT"), "md: {md}");
+        assert!(!md.contains("\n1\n"), "page number dropped: {md}");
+        assert!(md.contains("body text differs"), "body survives: {md}");
+        let text = Text.render(&layouts);
+        assert!(
+            text.contains("ACME REPORT"),
+            "text keeps everything: {text}"
+        );
+    }
+
     #[test]
     fn simple_doc_exact_text() {
         let doc = Document::load(simple_doc("Hello, world!")).unwrap();

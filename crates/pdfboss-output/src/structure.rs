@@ -76,6 +76,14 @@ const TABLE_MIN_ROW_CELLS: usize = 2;
 /// space between blocks rather than the next row.
 const TABLE_ROW_GAP: f32 = 2.0;
 
+/// Minimum pages before a repeated edge line reads as furniture rather than
+/// coincidence: two documents opening with the same word is unremarkable,
+/// three or more sharing a whole line is not.
+const HEADER_FOOTER_MIN_PAGES: usize = 3;
+/// How close two occurrences' baselines must sit to read as the same running
+/// line rather than two different ones that happen to match text.
+const HEADER_FOOTER_Y_TOLERANCE: f32 = 2.0;
+
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
 /// top to bottom and spans left to right, inserts a space at horizontal
 /// gaps wider than `WORD_GAP` times the size, and joins lines with `\n`.
@@ -98,10 +106,197 @@ pub fn page_layout(spans: &[TextSpan]) -> PageLayout {
 pub fn document_layout(pages: &[Vec<TextSpan>]) -> Vec<PageLayout> {
     let borrowed: Vec<&[TextSpan]> = pages.iter().map(Vec::as_slice).collect();
     let stats = size_stats(&borrowed);
-    pages
+    let mut layouts: Vec<PageLayout> = pages
         .iter()
         .map(|spans| page_layout_with_stats(spans, &stats))
-        .collect()
+        .collect();
+    tag_page_roles(&mut layouts);
+    layouts
+}
+
+/// Tags page furniture: a page's first or last line, repeated near-verbatim
+/// at the same baseline across enough pages, is split out of whatever
+/// paragraph it was assembled into and marked `PageHeader`/`PageFooter`; a
+/// line that is nothing but a page number is tagged on its own, with no
+/// repetition required. Needs at least [`HEADER_FOOTER_MIN_PAGES`] pages —
+/// below that, a repeat is coincidence as often as furniture.
+fn tag_page_roles(layouts: &mut [PageLayout]) {
+    if layouts.len() < HEADER_FOOTER_MIN_PAGES {
+        return;
+    }
+    let top: Vec<Option<(String, f32)>> = layouts
+        .iter()
+        .map(|layout| edge_line(layout, true))
+        .collect();
+    let bottom: Vec<Option<(String, f32)>> = layouts
+        .iter()
+        .map(|layout| edge_line(layout, false))
+        .collect();
+    let headers = furniture_pages(&top);
+    let footers = furniture_pages(&bottom);
+    for (index, layout) in layouts.iter_mut().enumerate() {
+        // Footer first: on a one-block page that qualifies as both, the
+        // block can only be split once, and the first split wins.
+        if footers[index] {
+            split_edge(layout, false, Role::PageFooter);
+        }
+        if headers[index] {
+            split_edge(layout, true, Role::PageHeader);
+        }
+    }
+}
+
+/// The page's first (`top`) or last line, normalized, and its baseline —
+/// the shape a running header or a page number takes — when the block it
+/// sits in is an untagged `Paragraph`.
+fn edge_line(layout: &PageLayout, top: bool) -> Option<(String, f32)> {
+    let block = if top {
+        layout.blocks.first()
+    } else {
+        layout.blocks.last()
+    }?;
+    let Block::Paragraph { lines, role, .. } = block else {
+        return None;
+    };
+    if !matches!(role, Role::Body) {
+        return None;
+    }
+    let line = if top { lines.first() } else { lines.last() }?;
+    let normalized = normalize_candidate(&line_text(line));
+    (!normalized.is_empty()).then_some((normalized, line.y))
+}
+
+/// Which pages' edge-line candidates should be tagged furniture: repetition
+/// of the same normalized text at a close enough baseline on at least
+/// `max(HEADER_FOOTER_MIN_PAGES, pages / 2)` pages, or — with no repetition
+/// required — a line that is nothing but a page number.
+fn furniture_pages(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
+    let mut tagged = repeated_lines(candidates);
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some((text, _)) = candidate else { continue };
+        tagged[index] |= looks_like_page_number(text);
+    }
+    tagged
+}
+
+/// Pages whose edge line's normalized text repeats, at a close enough
+/// baseline, on enough other pages.
+fn repeated_lines(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
+    let threshold = (candidates.len() / 2).max(HEADER_FOOTER_MIN_PAGES);
+    let mut groups: std::collections::BTreeMap<&str, Vec<(usize, f32)>> =
+        std::collections::BTreeMap::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let Some((text, y)) = candidate else { continue };
+        groups.entry(text.as_str()).or_default().push((index, *y));
+    }
+    let mut tagged = vec![false; candidates.len()];
+    for occurrences in groups.values() {
+        if occurrences.len() < threshold {
+            continue;
+        }
+        let (min_y, max_y) = occurrences
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &(_, y)| {
+                (lo.min(y), hi.max(y))
+            });
+        if max_y - min_y > HEADER_FOOTER_Y_TOLERANCE {
+            continue;
+        }
+        for &(index, _) in occurrences {
+            tagged[index] = true;
+        }
+    }
+    tagged
+}
+
+/// Case- and digit-blind text for repetition matching: a running header and
+/// a page number repeat their shape on every page, not always their exact
+/// characters.
+fn normalize_candidate(text: &str) -> String {
+    let digits_marked: String = text
+        .chars()
+        .map(|ch| if ch.is_ascii_digit() { '#' } else { ch })
+        .collect();
+    digits_marked
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// A normalized line that is nothing but a page number: `#`, `page #`,
+/// `# of #`, `page # of #`, or `- # -`. A page number's text changes on
+/// every page, so it is tagged on its own rather than by repetition.
+fn looks_like_page_number(normalized: &str) -> bool {
+    let body = normalized.strip_prefix("page ").unwrap_or(normalized);
+    if is_hash_run(body) {
+        return true;
+    }
+    if let Some((left, right)) = body.split_once(" of ") {
+        return is_hash_run(left) && is_hash_run(right);
+    }
+    let Some(inner) = normalized
+        .strip_prefix('-')
+        .and_then(|s| s.strip_suffix('-'))
+    else {
+        return false;
+    };
+    is_hash_run(inner.trim())
+}
+
+/// Non-empty and made of nothing but `#`.
+fn is_hash_run(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|ch| ch == '#')
+}
+
+/// Splits the page's first (`top`) or last block's edge line into its own
+/// single-line `Paragraph` tagged `role`, leaving the rest of that block as
+/// `Body`. A no-op when the block at that end is not an untagged
+/// `Paragraph` — including when the opposite end's split already claimed it.
+fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
+    if layout.blocks.is_empty() {
+        return;
+    }
+    let index = if top { 0 } else { layout.blocks.len() - 1 };
+    let Block::Paragraph {
+        lines,
+        role: current,
+        ..
+    } = &layout.blocks[index]
+    else {
+        return;
+    };
+    if !matches!(current, Role::Body) {
+        return;
+    }
+    let mut lines = lines.clone();
+    let edge_line = if top {
+        lines.remove(0)
+    } else {
+        let Some(line) = lines.pop() else { return };
+        line
+    };
+    let edge_block = Block::Paragraph {
+        bbox: bbox(std::slice::from_ref(&edge_line)),
+        lines: vec![edge_line],
+        role,
+    };
+    if lines.is_empty() {
+        layout.blocks[index] = edge_block;
+        return;
+    }
+    let rest_block = Block::Paragraph {
+        bbox: bbox(&lines),
+        lines,
+        role: Role::Body,
+    };
+    if top {
+        layout.blocks[index] = rest_block;
+        layout.blocks.insert(index, edge_block);
+    } else {
+        layout.blocks[index] = rest_block;
+        layout.blocks.push(edge_block);
+    }
 }
 
 /// The page's blocks: each reading-order segment's lines classified into
