@@ -18,6 +18,7 @@ pub enum Action {
     PageDown,
     CycleView,
     TogglePreview,
+    ToggleMarkdown,
     OpenSearch,
     SearchChar(char),
     SearchBackspace,
@@ -62,6 +63,7 @@ pub fn action_for(key: KeyEvent, search_input: bool) -> Action {
         KeyCode::PageDown => Action::PageDown,
         KeyCode::Char('d') => Action::CycleView,
         KeyCode::Char('p') => Action::TogglePreview,
+        KeyCode::Char('m') => Action::ToggleMarkdown,
         _ => Action::Noop,
     }
 }
@@ -114,6 +116,10 @@ mod tests {
         assert_eq!(
             action_for(press(KeyCode::Char('p')), false),
             Action::TogglePreview
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('m')), false),
+            Action::ToggleMarkdown
         );
         assert_eq!(
             action_for(press(KeyCode::Char('n')), false),

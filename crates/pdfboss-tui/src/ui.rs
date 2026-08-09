@@ -9,6 +9,7 @@ use ratatui::Frame;
 use crate::app::{App, Pane};
 use crate::hexview::{hex_line, highlight_cols, BYTES_PER_LINE};
 use crate::inspector::InspectorMode;
+use crate::markdown::style_markdown;
 use crate::preview::{cell_colors, SPINNER};
 
 /// The four screen regions.
@@ -41,7 +42,9 @@ pub fn panes(area: Rect) -> Panes {
 pub fn draw(app: &App, frame: &mut Frame) {
     let split = panes(frame.area());
     draw_tree(app, frame, split.tree);
-    if app.preview.active {
+    if app.markdown.active {
+        draw_markdown(app, frame, split.right_top);
+    } else if app.preview.active {
         draw_preview(app, frame, split.right_top);
     } else {
         draw_inspector(app, frame, split.right_top);
@@ -206,6 +209,39 @@ fn draw_preview(app: &App, frame: &mut Frame, area: Rect) {
         lines.push(Line::raw("no preview yet"));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+/// The extracted Markdown as scrollable styled text. Repeated page headers
+/// and footers (page numbers among them) are not part of the extraction, so
+/// the pane shows the page's body only.
+fn draw_markdown(app: &App, frame: &mut Frame, area: Rect) {
+    let title = match app.markdown.page {
+        Some(page) => format!("Markdown \u{b7} page {} (body only)", page + 1),
+        None => "Markdown".to_string(),
+    };
+    let block = pane_block(title, app.focus == Pane::Inspector);
+    let lines: Vec<Line> = if app.markdown.loading {
+        vec![Line::raw(format!(
+            "{} extracting\u{2026}",
+            SPINNER[app.markdown.spinner_frame]
+        ))]
+    } else if let Some(error) = &app.markdown.error {
+        vec![Line::raw(format!("error: {error}"))]
+    } else {
+        match app.markdown.source.as_deref() {
+            Some(source) if !source.trim().is_empty() => style_markdown(source),
+            // An image-only page really does extract to nothing; say so
+            // rather than leaving the pane silently blank.
+            Some(..) => vec![Line::raw("no text on this page")],
+            None => vec![Line::raw("no markdown yet")],
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .scroll((app.markdown.scroll, 0))
+            .block(block),
+        area,
+    );
 }
 
 fn draw_status(app: &App, frame: &mut Frame, area: Rect) {

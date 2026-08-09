@@ -2,8 +2,8 @@
 //! ISO 32000 on top of `pdfboss-aio`'s async document model.
 //!
 //! State machine (`app`), pane models (`tree`, `inspector`, `hexview`,
-//! `preview`, `search`), key mapping (`input`) and rendering (`ui`) are
-//! pure and unit-testable; only [`run`] touches the real terminal. The
+//! `preview`, `markdown`, `search`), key mapping (`input`) and rendering
+//! (`ui`) are pure and unit-testable; only [`run`] touches the terminal. The
 //! event loop `tokio::select!`s over the crossterm event stream, a
 //! background-task message channel and a 100 ms tick, so long operations
 //! (element streaming, hex fetches, search, preview rasterization) never
@@ -13,6 +13,7 @@ pub mod app;
 pub mod hexview;
 pub mod input;
 pub mod inspector;
+pub mod markdown;
 pub mod preview;
 pub mod search;
 pub mod tree;
@@ -199,6 +200,9 @@ fn execute_cmd(
             tokio::spawn(render_preview(
                 doc, tx, generation, page, max_w, max_h, file_bytes,
             ));
+        }
+        Cmd::ExtractMarkdown { generation, page } => {
+            tokio::spawn(extract_markdown(doc, tx, generation, page));
         }
     }
 }
@@ -466,6 +470,25 @@ async fn render_preview(
     tx.send(Msg::PreviewReady { generation, result }).ok();
 }
 
+/// Extracts one page as Markdown. Unlike the preview this needs no
+/// whole-file fetch and no `spawn_blocking`: `extract_page_markdown_with`
+/// runs directly over the `AsyncDocument`, which is `Send` and fetches
+/// only the objects the page's text touches.
+async fn extract_markdown(
+    doc: AsyncDocument,
+    tx: UnboundedSender<Msg>,
+    generation: u64,
+    page: usize,
+) {
+    let result = match doc.page(page) {
+        Ok(page_object) => pdfboss_output::extract_page_markdown_with(doc, &page_object)
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    tx.send(Msg::MarkdownReady { generation, result }).ok();
+}
+
 /// Fetches the entire file via one `read_span` over
 /// `0..doc.file_len()` (the aio crate reports the length synchronously).
 async fn fetch_whole_file(doc: &AsyncDocument) -> Result<Vec<u8>, String> {
@@ -495,6 +518,45 @@ mod tests {
             "partial salvage: any real element wins over errors"
         );
         assert!(!pass_failed(3, 0), "clean pass with elements");
+    }
+
+    /// The markdown task end to end over the real async path: no
+    /// whole-file fetch, no `spawn_blocking`, and the page's text comes
+    /// back on the channel as a `MarkdownReady`.
+    #[tokio::test]
+    async fn extract_markdown_sends_the_page_text() {
+        let doc = AsyncDocument::from_bytes(pdfboss_testkit::simple_doc("Hello"))
+            .await
+            .expect("fixture opens");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        extract_markdown(doc, tx, 7, 0).await;
+        match rx.try_recv().expect("one message") {
+            Msg::MarkdownReady { generation, result } => {
+                assert_eq!(generation, 7, "the request's generation rides along");
+                assert!(
+                    result.expect("extraction succeeds").contains("Hello"),
+                    "the page's text must reach the pane"
+                );
+            }
+            other => panic!("expected MarkdownReady, got {:?}", other),
+        }
+    }
+
+    /// A page index the document does not have fails the task, not the
+    /// event loop: the error travels as the message's `Err`.
+    #[tokio::test]
+    async fn extract_markdown_reports_a_missing_page_as_an_error() {
+        let doc = AsyncDocument::from_bytes(pdfboss_testkit::simple_doc("Hello"))
+            .await
+            .expect("fixture opens");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        extract_markdown(doc, tx, 1, 99).await;
+        match rx.try_recv().expect("one message") {
+            Msg::MarkdownReady { result, .. } => {
+                assert!(result.is_err(), "page 99 does not exist");
+            }
+            other => panic!("expected MarkdownReady, got {:?}", other),
+        }
     }
 
     #[tokio::test]

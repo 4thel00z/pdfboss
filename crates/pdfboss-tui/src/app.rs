@@ -12,6 +12,7 @@ use pdfboss_core::ObjRef;
 use crate::hexview::{HexSource, HexState};
 use crate::input::{action_for, Action};
 use crate::inspector::{InspectorPayload, InspectorState};
+use crate::markdown::MarkdownState;
 use crate::preview::{PreviewFrame, PreviewState, RESIZE_DEBOUNCE_TICKS};
 use crate::search::{SearchHit, SearchState};
 use crate::tree::{LoadState, NodeId, NodeKind, TreeReq, TreeState};
@@ -81,6 +82,11 @@ pub enum Msg {
         generation: u64,
         result: Result<PreviewFrame, String>,
     },
+    /// A page's Markdown extraction finished (or failed).
+    MarkdownReady {
+        generation: u64,
+        result: Result<String, String>,
+    },
 }
 
 /// Side effects `update` requests; the event loop executes them by
@@ -116,6 +122,8 @@ pub enum Cmd {
         /// Cached whole-file bytes from an earlier render, if any.
         file_bytes: Option<Arc<Vec<u8>>>,
     },
+    /// Extract page `page` as Markdown.
+    ExtractMarkdown { generation: u64, page: usize },
 }
 
 /// The whole TUI state.
@@ -125,6 +133,7 @@ pub struct App {
     pub inspector: InspectorState,
     pub hex: HexState,
     pub preview: PreviewState,
+    pub markdown: MarkdownState,
     pub search: SearchState,
     pub focus: Pane,
     pub history: Vec<NodeId>,
@@ -146,6 +155,7 @@ impl App {
             inspector: InspectorState::new(),
             hex: HexState::new(),
             preview: PreviewState::new(),
+            markdown: MarkdownState::new(),
             search: SearchState::new(),
             focus: Pane::Tree,
             history: Vec::new(),
@@ -178,7 +188,7 @@ impl App {
             return message.clone();
         }
         format!(
-            "{} \u{b7} {} \u{b7} [/] search  [p] preview  [q] quit",
+            "{} \u{b7} {} \u{b7} [/] search  [p] preview  [m] markdown  [q] quit",
             self.title,
             self.tree.breadcrumb()
         )
@@ -295,6 +305,14 @@ impl App {
                 }
                 Vec::new()
             }
+            Msg::MarkdownReady { generation, result } => {
+                if self.markdown.apply_ready(generation, result) {
+                    if let Some(error) = self.markdown.error.clone() {
+                        self.toast(format!("markdown: {error}"));
+                    }
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -305,6 +323,7 @@ impl App {
                 self.toast = None;
             }
         }
+        self.markdown.tick();
         if self.preview.tick() {
             return self.request_preview();
         }
@@ -366,8 +385,20 @@ impl App {
                     self.preview.active = false;
                     Vec::new()
                 } else {
+                    // Both render into the right-top pane.
+                    self.markdown.active = false;
                     self.preview.active = true;
                     self.request_preview()
+                }
+            }
+            Action::ToggleMarkdown => {
+                if self.markdown.active {
+                    self.markdown.active = false;
+                    Vec::new()
+                } else {
+                    self.preview.active = false;
+                    self.markdown.active = true;
+                    self.request_markdown()
                 }
             }
             Action::CycleView => {
@@ -418,6 +449,10 @@ impl App {
                     self.tree.select_top();
                     self.on_select(false)
                 }
+                Pane::Inspector if self.markdown.active => {
+                    self.markdown.scroll_to(0);
+                    Vec::new()
+                }
                 Pane::Inspector => {
                     self.inspector.scroll = 0;
                     self.inspector.ref_cursor = None;
@@ -432,6 +467,10 @@ impl App {
                 Pane::Tree => {
                     self.tree.select_bottom();
                     self.on_select(false)
+                }
+                Pane::Inspector if self.markdown.active => {
+                    self.markdown.scroll_to(u64::MAX);
+                    Vec::new()
                 }
                 Pane::Inspector => {
                     self.inspector.scroll = self.inspector.lines.len().saturating_sub(1) as u16;
@@ -455,6 +494,10 @@ impl App {
                     self.tree.select_next();
                 }
                 self.on_select(false)
+            }
+            Pane::Inspector if self.markdown.active => {
+                self.markdown.scroll_by(delta);
+                Vec::new()
             }
             Pane::Inspector => {
                 self.inspector.move_cursor(delta);
@@ -480,6 +523,10 @@ impl App {
                     }
                 }
                 self.on_select(false)
+            }
+            Pane::Inspector if self.markdown.active => {
+                self.markdown.scroll_by(direction * PAGE_JUMP as i32);
+                Vec::new()
             }
             Pane::Inspector => {
                 self.inspector.move_cursor(direction * PAGE_JUMP as i32);
@@ -753,6 +800,20 @@ impl App {
             max_h,
             file_bytes: self.preview.file_bytes.clone(),
         }]
+    }
+
+    /// Extracts the selected page as Markdown. Per page, not document-wide:
+    /// the document can be HTTP-range-backed, and the pane shows one page
+    /// at a time anyway.
+    fn request_markdown(&mut self) -> Vec<Cmd> {
+        if self.tree.page_count == 0 {
+            self.toast("document has no pages to extract");
+            self.markdown.active = false;
+            return Vec::new();
+        }
+        let page = self.tree.page_of(self.tree.selected).unwrap_or(0);
+        let generation = self.markdown.start_extract(page);
+        vec![Cmd::ExtractMarkdown { generation, page }]
     }
 
     /// The pixel budget `fit_scale` fits a page into: a `C`-column,
@@ -1116,6 +1177,100 @@ mod tests {
         ));
     }
 
+    /// Controller item: `m` and `p` paint the same pane, so activating one
+    /// must deactivate the other in both directions — otherwise the
+    /// three-way draw branch would show markdown while the user believes
+    /// they turned the raster preview on.
+    #[test]
+    fn markdown_and_preview_are_mutually_exclusive() {
+        let mut app = loaded_app();
+        let cmds = app.update(key(KeyCode::Char('m')));
+        assert!(app.markdown.active);
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::ExtractMarkdown { page: 0, .. }]
+        ));
+        let cmds = app.update(key(KeyCode::Char('p')));
+        assert!(app.preview.active);
+        assert!(!app.markdown.active, "preview replaces markdown");
+        assert!(matches!(
+            cmds.as_slice(),
+            [Cmd::RenderPreview { page: 0, .. }]
+        ));
+        app.update(key(KeyCode::Char('m')));
+        assert!(app.markdown.active);
+        assert!(!app.preview.active, "markdown replaces preview");
+        app.update(key(KeyCode::Char('m')));
+        assert!(!app.markdown.active, "m toggles back off");
+    }
+
+    /// Controller item: a superseded extraction finishing late must not
+    /// install its text over the newer request's.
+    #[test]
+    fn stale_markdown_extraction_is_dropped() {
+        let mut app = loaded_app();
+        let cmds = app.update(key(KeyCode::Char('m')));
+        let stale = match cmds.as_slice() {
+            [Cmd::ExtractMarkdown { generation, .. }] => *generation,
+            other => panic!("expected ExtractMarkdown, got {:?}", other),
+        };
+        app.update(key(KeyCode::Char('m'))); // off
+        let cmds = app.update(key(KeyCode::Char('m'))); // on again
+        let current = match cmds.as_slice() {
+            [Cmd::ExtractMarkdown { generation, .. }] => *generation,
+            other => panic!("expected ExtractMarkdown, got {:?}", other),
+        };
+        assert!(current > stale);
+        app.update(Msg::MarkdownReady {
+            generation: stale,
+            result: Ok("# stale".to_string()),
+        });
+        assert!(app.markdown.source.is_none(), "stale text is not installed");
+        assert!(
+            app.markdown.loading,
+            "the newer extraction is still awaited"
+        );
+        app.update(Msg::MarkdownReady {
+            generation: current,
+            result: Ok("# fresh".to_string()),
+        });
+        assert_eq!(app.markdown.source.as_deref(), Some("# fresh"));
+    }
+
+    /// Controller item: the markdown pane shares `Pane::Inspector` focus,
+    /// so while it is active the movement keys must scroll *it*, not move
+    /// the inspector's hidden ref cursor.
+    #[test]
+    fn movement_scrolls_the_markdown_pane_while_it_is_active() {
+        let mut app = loaded_app();
+        let cmds = app.update(key(KeyCode::Char('m')));
+        let generation = match cmds.as_slice() {
+            [Cmd::ExtractMarkdown { generation, .. }] => *generation,
+            other => panic!("expected ExtractMarkdown, got {:?}", other),
+        };
+        app.update(Msg::MarkdownReady {
+            generation,
+            result: Ok((0..40)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<String>>()
+                .join("\n")),
+        });
+        app.update(key(KeyCode::Tab));
+        assert_eq!(app.focus, Pane::Inspector);
+        app.update(key(KeyCode::Char('j')));
+        assert_eq!(app.markdown.scroll, 1);
+        app.update(key(KeyCode::PageDown));
+        assert_eq!(app.markdown.scroll, 11);
+        app.update(key(KeyCode::Char('G')));
+        assert_eq!(app.markdown.scroll, 39, "last of the 40 lines");
+        app.update(key(KeyCode::Char('g')));
+        assert_eq!(app.markdown.scroll, 0);
+        assert!(
+            app.inspector.ref_cursor.is_none(),
+            "the hidden inspector must not have moved"
+        );
+    }
+
     #[test]
     fn toast_expires_after_ticks() {
         let mut app = loaded_app();
@@ -1133,7 +1288,7 @@ mod tests {
         let mut app = loaded_app();
         assert_eq!(
             app.status_line(),
-            "t.pdf \u{b7} /Document \u{b7} [/] search  [p] preview  [q] quit"
+            "t.pdf \u{b7} /Document \u{b7} [/] search  [p] preview  [m] markdown  [q] quit"
         );
         app.update(key(KeyCode::Char('/')));
         app.update(key(KeyCode::Char('a')));

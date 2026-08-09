@@ -1,6 +1,6 @@
 [package]
 name = "pdfboss-tui"
-description = "Terminal explorer for PDF internals: element tree, object inspector, hex view and page preview"
+description = "Terminal explorer for PDF internals: element tree, object inspector, hex view, page preview and Markdown preview"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +11,7 @@ keywords.workspace = true
 [dependencies]
 pdfboss-aio = { workspace = true }
 pdfboss-core = { workspace = true }
+pdfboss-output = { workspace = true }
 pdfboss-render = { workspace = true }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

@@ -8,6 +8,7 @@ use pdfboss_tui::app::{App, Msg};
 use pdfboss_tui::tree::TreeReq;
 use pdfboss_tui::ui;
 use ratatui::backend::TestBackend;
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 
 fn key(code: KeyCode) -> Msg {
@@ -98,7 +99,7 @@ fn document_overview_frame() {
             "│                          ││                                                  │",
             "│                          ││                                                  │",
             "└──────────────────────────┘└──────────────────────────────────────────────────┘",
-            "fixture.pdf · /Document · [/] search  [p] preview  [q] quit",
+            "fixture.pdf · /Document · [/] search  [p] preview  [m] markdown  [q] quit",
         ],
     );
 }
@@ -175,7 +176,85 @@ fn object_inspection_frame() {
             "│                          ││00000037 │ 3e 0a 65 6e 64 6f 62 6a │ >·endobj     │",
             "│                          ││0000003f │ 0a                      │ ·            │",
             "└──────────────────────────┘└──────────────────────────────────────────────────┘",
-            "fixture.pdf · /Document/Objects/obj 1 0 · [/] search  [p] preview  [q] quit",
+            // A deep breadcrumb pushes the hints past 80 columns; the status
+            // bar clips like every other pane.
+            "fixture.pdf · /Document/Objects/obj 1 0 · [/] search  [p] preview  [m] markdown",
         ],
+    );
+}
+
+/// Frame D: the markdown pane toggled on with `m` — headings, list items
+/// and a table row in place of the inspector, page-numbered title. The
+/// extraction result is injected, so this frame exercises the pane and its
+/// styling pass without running text extraction.
+#[test]
+fn markdown_pane_frame() {
+    let data = pdfboss_testkit::simple_doc("Hello");
+    let doc = Document::load(data).expect("fixture loads");
+    let elements: Vec<Element> = doc
+        .elements(ElementOpts {
+            physical: true,
+            logical: false,
+            pages: None,
+            content_ops: false,
+        })
+        .filter_map(Result::ok)
+        .collect();
+    let mut app = App::new(
+        "fixture.pdf".to_string(),
+        doc.version(),
+        doc.page_count(),
+        (80, 24),
+    );
+    app.update(Msg::TreeBatch {
+        req: TreeReq::Physical,
+        elements,
+        errors: 0,
+        done: true,
+    });
+    app.update(key(KeyCode::Char('m')));
+    app.update(Msg::MarkdownReady {
+        generation: app.markdown.generation,
+        result: Ok("# Title\n\nBody with **bold**\n\n- one\n- two\n\n| a | b |".to_string()),
+    });
+    let terminal = draw(&app);
+    assert_frame(
+        &terminal,
+        &[
+            "┌Tree──────────────────────┐┌Markdown · page 1 (body only)─────────────────────┐",
+            "│▾ Document · PDF 1.7      ││# Title                                           │",
+            "│  ▸ Pages (1)             ││                                                  │",
+            "│  ▸ Objects (5)           ││Body with bold                                    │",
+            "│  ▸ Xref (1 secs)         ││                                                  │",
+            "│    Trailer               ││  - one                                           │",
+            "│                          ││  - two                                           │",
+            "│                          ││                                                  │",
+            "│                          ││| a | b |                                         │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          │└──────────────────────────────────────────────────┘",
+            "│                          │┌Hex───────────────────────────────────────────────┐",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "│                          ││                                                  │",
+            "└──────────────────────────┘└──────────────────────────────────────────────────┘",
+            "fixture.pdf · /Document · [/] search  [p] preview  [m] markdown  [q] quit",
+        ],
+    );
+    // The symbols alone cannot show the styling pass ran: the heading is
+    // bold and the emphasis run inside the paragraph is too, while the
+    // prose around it is not.
+    let buffer = terminal.backend().buffer();
+    assert!(buffer[(29, 1)].modifier.contains(Modifier::BOLD), "heading");
+    assert!(!buffer[(29, 3)].modifier.contains(Modifier::BOLD), "prose");
+    assert!(
+        buffer[(39, 3)].modifier.contains(Modifier::BOLD),
+        "the **bold** run keeps its emphasis once the markers are consumed"
     );
 }
