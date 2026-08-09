@@ -8,22 +8,66 @@ use crate::input::{use_color, Input};
 use crate::q::value::{build_tree, TreeFlags};
 
 /// `pdfboss json <file-or-url> [--raw|--decode] [--pages ..] [--no-logical]
-/// [--content-ops]`: dumps the full value tree for piping to external tools.
-pub fn cmd_json(input_spec: &str, flags: &TreeFlags) -> Result<(), String> {
+/// [--content-ops] [--layout]`: dumps the full value tree for piping to
+/// external tools.
+pub fn cmd_json(input_spec: &str, flags: &TreeFlags, layout: bool) -> Result<(), String> {
     let input = Input::open(input_spec)?;
     let opts = flags.element_opts()?;
     let elements = input.collect_elements(opts);
     let mut decode = |s: &Stream| input.decode_stream(s);
-    let tree = build_tree(
+    let mut tree = build_tree(
         &elements,
         flags.stream_data(),
         flags.content_ops,
         &mut decode,
     );
+    if layout {
+        let value = layout_value(&input, &flags.pages)?;
+        if let Value::Object(map) = &mut tree {
+            map.insert("layout".to_string(), value);
+        }
+    }
     let mut text = String::new();
     write_json_pretty(&mut text, &tree, 0, use_color());
     println!("{text}");
     Ok(())
+}
+
+/// Builds the `"layout"` array `--layout` adds to the tree: one
+/// `pdfboss_output::PageLayout` per page. A `--pages` filter (1-based,
+/// deduplicated and sorted the way the elements path already surfaces its
+/// `pages[]` array) ranks each requested page's headings against itself,
+/// via `page_layout`, matching `md --page`; out-of-range numbers are
+/// skipped, matching the elements path's own permissiveness. A
+/// full-document run ranks every page's headings against the whole
+/// document via `document_layout`.
+fn layout_value(input: &Input, pages: &Option<Vec<usize>>) -> Result<Value, String> {
+    let count = input.page_count();
+    let layouts = match pages {
+        Some(numbers) => {
+            let mut numbers: Vec<usize> = numbers
+                .iter()
+                .copied()
+                .filter(|&n| n >= 1 && n <= count)
+                .collect();
+            numbers.sort_unstable();
+            numbers.dedup();
+            let mut layouts = Vec::with_capacity(numbers.len());
+            for n in numbers {
+                let spans = input.page_spans(n - 1)?;
+                layouts.push(pdfboss_output::page_layout(&spans));
+            }
+            layouts
+        }
+        None => {
+            let mut spans = Vec::with_capacity(count);
+            for index in 0..count {
+                spans.push(input.page_spans(index)?);
+            }
+            pdfboss_output::document_layout(&spans)
+        }
+    };
+    serde_json::to_value(&layouts).map_err(|e| e.to_string())
 }
 
 /// Two-space-indented JSON with optional ANSI coloring: keys cyan, strings

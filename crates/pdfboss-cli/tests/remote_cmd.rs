@@ -180,6 +180,30 @@ fn json_over_url_matches_local() {
 }
 
 #[test]
+fn json_layout_over_url_matches_local() {
+    let server = MockServer::start(hello_bytes());
+    let url = server.url("hello.pdf");
+
+    let remote = pdfboss(&["json", &url, "--layout"]);
+    assert!(
+        remote.status.success(),
+        "json --layout over url failed: {remote:?}"
+    );
+
+    let file = fixture("hello.pdf");
+    let local = pdfboss(&["json", file.to_str().unwrap(), "--layout"]);
+    assert!(
+        local.status.success(),
+        "json --layout over local file failed: {local:?}"
+    );
+
+    assert_eq!(
+        remote.stdout, local.stdout,
+        "json --layout output over url must match local byte-for-byte"
+    );
+}
+
+#[test]
 fn hex_over_url_range_guard_fires() {
     let data = hello_bytes();
     let len = data.len() as u64;

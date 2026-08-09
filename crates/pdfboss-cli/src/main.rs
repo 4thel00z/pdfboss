@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use pdfboss_core::{Document, Error, Metadata, ObjRef, Object};
+use pdfboss_output::Output as _;
 
 use crate::input::is_url;
 
@@ -71,6 +72,15 @@ enum Command {
         /// Path to the PDF file.
         file: PathBuf,
         /// 1-based page number.
+        #[arg(long)]
+        page: Option<usize>,
+    },
+    /// Extract markdown (headings, lists, tables inferred from layout).
+    Md {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// 1-based page number (heading sizes are then judged per page,
+        /// not across the document).
         #[arg(long)]
         page: Option<usize>,
     },
@@ -133,6 +143,9 @@ enum Command {
         /// Include per-page content-stream operators (high volume).
         #[arg(long)]
         content_ops: bool,
+        /// Include per-page layout blocks (headings, paragraphs, lists, tables).
+        #[arg(long)]
+        layout: bool,
     },
     /// Hexdump the file or a selected element (hexyl-style).
     Hex {
@@ -211,6 +224,7 @@ fn main() {
     let result: Result<(), Failure> = match cli.command {
         Command::Info { file } => cmd_info(&file).map_err(Failure::from),
         Command::Text { file, page } => cmd_text(&file, page).map_err(Failure::from),
+        Command::Md { file, page } => cmd_md(&file, page).map_err(Failure::from),
         Command::Render {
             file,
             page,
@@ -230,6 +244,7 @@ fn main() {
             pages,
             no_logical,
             content_ops,
+            layout,
         } => {
             let flags = q::value::TreeFlags {
                 raw,
@@ -238,7 +253,7 @@ fn main() {
                 no_logical,
                 content_ops,
             };
-            json::cmd_json(&input, &flags).map_err(Failure::from)
+            json::cmd_json(&input, &flags, layout).map_err(Failure::from)
         }
         Command::Hex {
             input,
@@ -404,6 +419,34 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
                 })
                 .collect::<Result<Vec<String>, String>>()?;
             parts.join("\u{c}")
+        }
+    };
+    println!("{text}");
+    Ok(())
+}
+
+/// `pdfboss md`: one page (1-based `--page`) or the whole document as
+/// Markdown -- headings, lists and pipe/HTML tables inferred from layout.
+/// Heading sizes rank against the whole document unless `--page` narrows to
+/// one page, whose sizes are then judged only against themselves.
+fn cmd_md(file: &Path, page: Option<usize>) -> Result<(), String> {
+    let doc = Document::open(file).map_err(|e| e.to_string())?;
+    let text = match page {
+        Some(n) => {
+            let index = page_index(n, doc.page_count())?;
+            let page = doc.page(index).map_err(|e| e.to_string())?;
+            let (spans, report) =
+                pdfboss_text::extract_spans_reporting(&doc, &page).map_err(|e| e.to_string())?;
+            warn_skips(n, &report);
+            pdfboss_output::Markdown.render(&[pdfboss_output::page_layout(&spans)])
+        }
+        None => {
+            let (md, reports) =
+                pdfboss_output::extract_markdown_reporting(&doc).map_err(|e| e.to_string())?;
+            for (index, report) in reports.iter().enumerate() {
+                warn_skips(index + 1, report);
+            }
+            md
         }
     };
     println!("{text}");
@@ -783,6 +826,7 @@ mod tests {
             "1,3",
             "--no-logical",
             "--content-ops",
+            "--layout",
         ]);
         let Command::Json {
             input,
@@ -791,13 +835,42 @@ mod tests {
             pages,
             no_logical,
             content_ops,
+            layout,
         } = cli.command
         else {
             panic!("expected json command");
         };
         assert_eq!(input, "in.pdf");
-        assert!(raw && !decode && no_logical && content_ops);
+        assert!(raw && !decode && no_logical && content_ops && layout);
         assert_eq!(pages, Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn json_layout_flag_defaults_to_false() {
+        let cli = Cli::parse_from(["pdfboss", "json", "in.pdf"]);
+        let Command::Json { layout, .. } = cli.command else {
+            panic!("expected json command");
+        };
+        assert!(!layout);
+    }
+
+    #[test]
+    fn md_subcommand_parses_page_flag() {
+        let cli = Cli::parse_from(["pdfboss", "md", "in.pdf", "--page", "2"]);
+        let Command::Md { file, page } = cli.command else {
+            panic!("expected md command");
+        };
+        assert_eq!(file, PathBuf::from("in.pdf"));
+        assert_eq!(page, Some(2));
+    }
+
+    #[test]
+    fn md_subcommand_page_defaults_to_none() {
+        let cli = Cli::parse_from(["pdfboss", "md", "in.pdf"]);
+        let Command::Md { page, .. } = cli.command else {
+            panic!("expected md command");
+        };
+        assert_eq!(page, None);
     }
 
     #[test]

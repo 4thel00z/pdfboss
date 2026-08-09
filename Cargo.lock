@@ -1216,6 +1216,7 @@ dependencies = [
  "pdfboss-output",
  "pdfboss-render",
  "pdfboss-testkit",
+ "pdfboss-text",
  "pdfboss-tui",
  "serde_json",
  "tokio",

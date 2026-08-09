@@ -8,6 +8,7 @@ use futures_core::Stream as _;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::{Element, ElementOpts, Span};
 use pdfboss_core::{Document, Stream};
+use pdfboss_text::TextSpan;
 
 /// Whether stdout should carry ANSI colors: only on a tty, and never when
 /// `NO_COLOR` is set (any value, per the NO_COLOR convention).
@@ -87,6 +88,37 @@ impl Input {
                 }
                 out
             }),
+        }
+    }
+
+    /// Number of pages in the document.
+    pub fn page_count(&self) -> usize {
+        match self {
+            Input::Local { doc } => doc.page_count(),
+            Input::Remote { doc, .. } => doc.page_count(),
+        }
+    }
+
+    /// Extracts one page's text spans -- the input `pdfboss-output`'s
+    /// layout pass builds a `PageLayout` from.
+    pub fn page_spans(&self, index: usize) -> Result<Vec<TextSpan>, String> {
+        match self {
+            Input::Local { doc } => {
+                let page = doc.page(index).map_err(|e| e.to_string())?;
+                let (spans, _) =
+                    pdfboss_text::extract_spans_reporting(doc, &page).map_err(|e| e.to_string())?;
+                Ok(spans)
+            }
+            Input::Remote { rt, doc } => {
+                let page = doc.page(index).map_err(|e| e.to_string())?;
+                let (spans, _) = rt
+                    .block_on(pdfboss_text::extract_spans_reporting_with(
+                        doc.clone(),
+                        &page,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                Ok(spans)
+            }
         }
     }
 
