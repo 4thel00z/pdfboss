@@ -1,6 +1,6 @@
 //! The Markdown adapter: the layout IR as CommonMark.
 
-use crate::ir::{Block, Cell, Inline, Line, ListItem, PageLayout, Role};
+use crate::ir::{Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output};
 
 /// Markdown: ATX headings ranked by font size, one output line per source
@@ -64,15 +64,57 @@ fn paragraph(lines: &[Line]) -> String {
         .join("\n")
 }
 
-/// Task 6 gives lists their markers; until then a list reads as its raw
-/// lines, exactly as plain text does.
+/// Canonical bullets and numbers: `- ` regardless of the source glyph, and
+/// `{n}. ` preserving the detected number. The first line loses its matched
+/// marker prefix; continuation lines render on their own line, unprefixed —
+/// the soft wrap the source layout already shows.
 fn list(items: &[ListItem]) -> String {
     items
         .iter()
-        .flat_map(|item| item.lines.iter())
-        .map(emphasized)
+        .map(list_item)
         .collect::<Vec<String>>()
         .join("\n")
+}
+
+fn list_item(item: &ListItem) -> String {
+    let prefix = match &item.marker {
+        Marker::Bullet => "- ".to_string(),
+        Marker::Number(n) => format!("{n}. "),
+    };
+    let Some((first, rest)) = item.lines.split_first() else {
+        return String::new();
+    };
+    let head = Line {
+        inlines: strip_marker(first, item.marker_len),
+        ..first.clone()
+    };
+    let mut out = format!("{prefix}{}", emphasized(&head));
+    for line in rest {
+        out.push('\n');
+        out.push_str(&emphasized(line));
+    }
+    out
+}
+
+/// `line`'s inlines with `chars` characters removed from the front — the
+/// matched marker glyph and its trailing whitespace.
+fn strip_marker(line: &Line, chars: usize) -> Vec<Inline> {
+    let mut remaining = chars;
+    let mut out = Vec::new();
+    for inline in &line.inlines {
+        let count = inline.text.chars().count();
+        if remaining >= count {
+            remaining -= count;
+            continue;
+        }
+        out.push(Inline {
+            text: inline.text.chars().skip(remaining).collect(),
+            bold: inline.bold,
+            italic: inline.italic,
+        });
+        remaining = 0;
+    }
+    out
 }
 
 /// Task 7 gives tables pipes; until then a row reads as one line, exactly

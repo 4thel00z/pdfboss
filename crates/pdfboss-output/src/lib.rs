@@ -268,6 +268,42 @@ mod tests {
         assert!(md.contains("plain **loud** tail"), "md: {md}");
     }
 
+    #[test]
+    fn bullet_lines_become_list_items() {
+        let content = "BT /F1 12 Tf 72 720 Td (\\225 first item) Tj \
+                       0 -14 Td (\\225 second item) Tj \
+                       0 -14 Td (Body sentence after the list ends here.) Tj ET";
+        // \225 is bullet in WinAnsi. Fixture font must be WinAnsi-encoded.
+        let md = markdown_of(content);
+        assert!(md.contains("- first item\n- second item"), "md: {md}");
+        assert!(!md.contains('\u{2022}'), "marker replaced, not kept: {md}");
+    }
+
+    #[test]
+    fn numbered_items_keep_their_numbers() {
+        let content = "BT /F1 12 Tf 72 720 Td (1. alpha) Tj 0 -14 Td (2. beta) Tj \
+                       0 -14 Td (12) Tj ET";
+        let md = markdown_of(content);
+        assert!(md.contains("1. alpha\n2. beta"), "md: {md}");
+        assert!(
+            md.contains("12"),
+            "a bare number line is not a list item: {md}"
+        );
+    }
+
+    #[test]
+    fn hanging_indent_continues_an_item() {
+        // Continuation line starts right of the marker column.
+        let content = "BT /F1 12 Tf 72 720 Td (\\225 a long item that) Tj \
+                       10 -14 Td (wraps to a second line) Tj ET";
+        let md = markdown_of(content);
+        assert!(
+            md.contains("- a long item that\nwraps to a second line")
+                || md.contains("- a long item that wraps to a second line"),
+            "md: {md}"
+        );
+    }
+
     /// A lone page of huge text must not become all headings under per-page
     /// stats when the document knows better.
     #[test]

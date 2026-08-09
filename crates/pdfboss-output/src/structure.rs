@@ -1,7 +1,7 @@
 //! Spans to the layout IR: line assembly, word gaps, the two-column gutter
 //! split, and the size statistics that rank headings.
 
-use crate::ir::{BBox, Block, Inline, Line, PageLayout, Role};
+use crate::ir::{BBox, Block, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::TextSpan;
 
@@ -50,6 +50,19 @@ const PARAGRAPH_GAP: f32 = 1.8;
 /// Consecutive heading lines of one size stay one heading while their
 /// baseline step is within this multiple of the line size.
 const HEADING_MERGE_STEP: f32 = 1.8;
+
+/// The glyphs PDFs draw list bullets with: filled dot, hollow dot, square,
+/// en dash, hyphen, asterisk.
+const BULLETS: &[char] = &['\u{2022}', '\u{25E6}', '\u{25AA}', '\u{2013}', '-', '*'];
+/// A candidate list must total at least this many lines — an item plus a
+/// second item, or an item plus one folded continuation — to become a
+/// [`Block::List`]. Below it, the lone marker line is a stray dash or
+/// bullet-shaped glyph sitting in running prose.
+const LIST_MIN_LINES: usize = 2;
+/// How far right of its item's marker line a following non-marker line
+/// must start, in multiples of the item's size, to read as that item's
+/// wrapped continuation rather than the next block.
+const LIST_CONTINUATION_INDENT: f32 = 0.5;
 
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
 /// top to bottom and spans left to right, inserts a space at horizontal
@@ -187,7 +200,7 @@ fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
             index += 1;
             continue;
         };
-        push_paragraphs(&mut run, out);
+        push_run(&mut run, out);
         let mut end = index + 1;
         while end < lines.len() && continues_heading(&lines[end - 1], &lines[end], stats, level) {
             end += 1;
@@ -201,7 +214,7 @@ fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
         });
         index = end;
     }
-    push_paragraphs(&mut run, out);
+    push_run(&mut run, out);
 }
 
 /// The heading level of a line: its size's ladder rank, or — for a line at
@@ -243,6 +256,116 @@ fn is_bold_title(line: &Line) -> bool {
         return false;
     }
     !trimmed.ends_with(['.', ',', ';'])
+}
+
+/// Splits a heading-free run into blocks: a stretch of marker lines — with
+/// hanging continuations folded into their item — becomes one
+/// [`Block::List`] once it reaches [`LIST_MIN_LINES`] lines; everything
+/// around and between list stretches still goes through [`push_paragraphs`]'
+/// gap-based splitting. Detection runs before that split, over the run's
+/// lines as assembled, so a list item is never cut into two paragraphs by
+/// its own leading.
+fn push_run(run: &mut Vec<Line>, out: &mut Vec<Block>) {
+    let lines = std::mem::take(run);
+    let mut prose: Vec<Line> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let Some(items) = list_run(&lines[index..]) else {
+            prose.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        push_paragraphs(&mut prose, out);
+        index += items.iter().map(|item| item.lines.len()).sum::<usize>();
+        out.push(Block::List {
+            bbox: list_bbox(&items),
+            items,
+        });
+    }
+    push_paragraphs(&mut prose, out);
+}
+
+/// The list opening at `lines[0]`, or `None` when that line does not open
+/// one or the candidate falls short of [`LIST_MIN_LINES`] — in which case
+/// the line is left for [`push_run`] to fold back into prose.
+fn list_run(lines: &[Line]) -> Option<Vec<ListItem>> {
+    let mut items = Vec::new();
+    let mut consumed = 0usize;
+    let mut index = 0;
+    while index < lines.len() {
+        let Some((marker, marker_len)) = list_marker(&line_text(&lines[index])) else {
+            break;
+        };
+        let item_x = lines[index].x;
+        let item_size = lines[index].size;
+        let mut item_lines = vec![lines[index].clone()];
+        index += 1;
+        while index < lines.len()
+            && list_marker(&line_text(&lines[index])).is_none()
+            && lines[index].x > item_x + LIST_CONTINUATION_INDENT * item_size
+        {
+            item_lines.push(lines[index].clone());
+            index += 1;
+        }
+        consumed += item_lines.len();
+        items.push(ListItem {
+            marker,
+            marker_len,
+            lines: item_lines,
+        });
+    }
+    (consumed >= LIST_MIN_LINES).then_some(items)
+}
+
+/// Some(marker, marker_len) when `text` opens a list item: a bullet from
+/// [`BULLETS`] followed by whitespace, or 1-3 digits then `.`/`)` then
+/// whitespace. `marker_len` is the matched prefix's length in characters.
+/// A bare number with nothing after it is not an item.
+fn list_marker(text: &str) -> Option<(Marker, usize)> {
+    let trimmed = text.trim_start();
+    let indent = text.chars().count() - trimmed.chars().count();
+    let first = trimmed.chars().next()?;
+    if BULLETS.contains(&first) {
+        let rest = &trimmed[first.len_utf8()..];
+        let whitespace = rest.chars().take_while(|c| c.is_whitespace()).count();
+        if whitespace == 0 {
+            return None;
+        }
+        return Some((Marker::Bullet, indent + 1 + whitespace));
+    }
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    let digit_count = trimmed
+        .chars()
+        .take(3)
+        .take_while(char::is_ascii_digit)
+        .count();
+    let rest = &trimmed[digit_count..];
+    let mut rest_chars = rest.chars();
+    let separator = rest_chars.next()?;
+    if separator != '.' && separator != ')' {
+        return None;
+    }
+    let whitespace = rest_chars
+        .as_str()
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    if whitespace == 0 {
+        return None;
+    }
+    let number: u32 = trimmed[..digit_count].parse().ok()?;
+    Some((
+        Marker::Number(number),
+        indent + digit_count + 1 + whitespace,
+    ))
+}
+
+/// The list's device-space box: every item's lines combined.
+fn list_bbox(items: &[ListItem]) -> BBox {
+    let lines: Vec<Line> = items.iter().flat_map(|item| item.lines.clone()).collect();
+    bbox(&lines)
 }
 
 /// Drains a paragraph run into blocks, cutting it where a baseline step
