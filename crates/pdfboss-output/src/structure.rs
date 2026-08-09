@@ -346,9 +346,11 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
 }
 
 /// The page's blocks: each reading-order segment's lines classified into
-/// headings and paragraph runs, in order. The classification is a partition
-/// — no line is reordered, merged away, or dropped — which is what keeps
-/// the [`Text`] adapter byte-equal to positional extraction.
+/// headings and paragraph runs, in order. On a ruling-free layout the
+/// classification is a partition — no line is reordered, merged away, or
+/// dropped — which is what keeps the [`Text`] adapter byte-equal to
+/// positional extraction. A drawn grid's bands merge into logical rows,
+/// which preserves every token but reads cell-major.
 fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeStats) -> PageLayout {
     let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
@@ -356,27 +358,69 @@ fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeSt
         if segment.is_empty() {
             continue;
         }
-        if let Some((band, bbox)) = ruled_band(&segment, &grids) {
-            push_blocks(&band.above, stats, &mut blocks);
-            blocks.push(Block::Table {
-                bbox,
-                rows: band.rows,
-            });
-            push_blocks(&band.below, stats, &mut blocks);
-            continue;
-        }
-        if let Some(band) = table_band(&segment) {
-            push_blocks(&band.above, stats, &mut blocks);
-            blocks.push(Block::Table {
-                bbox: table_bbox(&band.rows),
-                rows: band.rows,
-            });
-            push_blocks(&band.below, stats, &mut blocks);
-            continue;
-        }
-        push_blocks(&assemble_lines(&segment), stats, &mut blocks);
+        push_segment_blocks(&segment, &grids, stats, &mut blocks);
     }
     PageLayout { blocks }
+}
+
+/// One segment's blocks. A segment no grid claims — every segment, when the
+/// page has no rulings — takes the single lane attempt it always has.
+/// Otherwise the segment is walked top-down: each claimed stretch becomes a
+/// table and every uncovered remainder stretch gets that same lane attempt,
+/// so a drawn grid and a whitespace-laned table can share a segment.
+fn push_segment_blocks(
+    segment: &[&TextSpan],
+    grids: &[RuledGrid],
+    stats: &SizeStats,
+    out: &mut Vec<Block>,
+) {
+    if grids.is_empty() {
+        push_lane_blocks(segment, stats, out);
+        return;
+    }
+    let groups = line_groups(segment);
+    let claims = grid_claims(&groups, grids);
+    if claims.is_empty() {
+        push_lane_blocks(segment, stats, out);
+        return;
+    }
+    let mut next = 0usize;
+    for claim in claims {
+        push_stretch(&groups[next..claim.range.start], stats, out);
+        out.push(Block::Table {
+            bbox: claim.bbox,
+            rows: claim.rows,
+        });
+        next = claim.range.end;
+    }
+    push_stretch(&groups[next..], stats, out);
+}
+
+/// The lane path: one [`table_band`] attempt over the spans, else prose.
+fn push_lane_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
+    let Some(band) = table_band(spans) else {
+        push_blocks(&assemble_lines(spans), stats, out);
+        return;
+    };
+    push_blocks(&band.above, stats, out);
+    out.push(Block::Table {
+        bbox: table_bbox(&band.rows),
+        rows: band.rows,
+    });
+    push_blocks(&band.below, stats, out);
+}
+
+/// A remainder stretch between grid claims, back as spans, through the same
+/// lane attempt a whole segment gets.
+fn push_stretch(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+    if groups.is_empty() {
+        return;
+    }
+    let spans: Vec<&TextSpan> = groups
+        .iter()
+        .flat_map(|group| group.spans.iter().copied())
+        .collect();
+    push_lane_blocks(&spans, stats, out);
 }
 
 /// Character-weighted histogram of span sizes rounded to half a point. Body
@@ -971,28 +1015,49 @@ fn covers(lines: &[&GridLine], position: f32, lo: f32, hi: f32) -> bool {
     reached >= hi - RULING_SNAP_TOLERANCE
 }
 
-/// The segment's lines read against the page's drawn grids: the first grid,
-/// topmost first, that holds the segment's interior lines as rows, as a
-/// [`TableBand`] plus the grid's drawn border box. Lane-occupancy gates do
-/// not apply — a drawn single-column box is a table no lane could show — but
-/// every row still passes [`table_row`]'s word-gap cell gate, so a `None`
-/// falls through to the lane path with the flat flow intact.
-fn ruled_band(segment: &[&TextSpan], grids: &[RuledGrid]) -> Option<(TableBand, BBox)> {
-    if grids.is_empty() {
-        return None;
+/// One drawn grid's claim on a segment: the contiguous stretch of line
+/// groups whose baselines fall inside the grid, the logical rows they merge
+/// into, and the grid's drawn border box.
+struct GridClaim {
+    range: std::ops::Range<usize>,
+    rows: Vec<Vec<Cell>>,
+    bbox: BBox,
+}
+
+/// Every grid's claim on the segment's lines, disjoint and top-down. Grids
+/// are tried topmost first, so of two lattices claiming the same lines the
+/// higher wins; a grid that fails its gates claims nothing and its lines
+/// stay available to the lane attempt. Lane-occupancy gates do not apply to
+/// a claim — a drawn single-column box is a table no lane could show — but
+/// every line still passes [`table_row`]'s word-gap cell gate.
+fn grid_claims(groups: &[Group], grids: &[RuledGrid]) -> Vec<GridClaim> {
+    let mut claims: Vec<GridClaim> = Vec::new();
+    for grid in grids {
+        let Some(claim) = grid_claim(groups, grid) else {
+            continue;
+        };
+        let taken = claims
+            .iter()
+            .any(|held| held.range.start < claim.range.end && claim.range.start < held.range.end);
+        if taken {
+            continue;
+        }
+        claims.push(claim);
     }
-    let groups = line_groups(segment);
-    grids.iter().find_map(|grid| grid_band(&groups, grid))
+    claims.sort_by_key(|claim| claim.range.start);
+    claims
 }
 
 /// `groups` against one grid: the contiguous stretch of lines whose
-/// baselines fall inside the grid becomes its rows; the lines above and
-/// below stay prose. `None` when a line will not sit in the grid's columns,
-/// when a column boundary lands inside a sub-word gap — the row would split
-/// a word the flat flow wrote whole — or when the populated bands between
-/// horizontal rulings number under [`TABLE_MIN_ROWS`], or under
-/// [`RULED_BOXED_MIN_ROWS`] for a grid with all four borders drawn.
-fn grid_band(groups: &[Group], grid: &RuledGrid) -> Option<(TableBand, BBox)> {
+/// baselines fall inside the grid becomes the claim, one logical row per
+/// populated band — the y-range between consecutive horizontal rulings.
+/// `None` when a line will not sit in the grid's columns, when a column
+/// boundary lands inside a sub-word gap — the row would split a word the
+/// flat flow wrote whole — or when the populated bands number under
+/// [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid with
+/// all four borders drawn. Every line passes [`table_row`] before any
+/// band's lines merge.
+fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
     let lo = groups.iter().position(|group| grid.holds(group.y))?;
     let inside = groups[lo..]
         .iter()
@@ -1000,18 +1065,116 @@ fn grid_band(groups: &[Group], grid: &RuledGrid) -> Option<(TableBand, BBox)> {
         .count();
     let hi = lo + inside;
     let columns = grid.columns();
-    let mut rows = Vec::with_capacity(inside);
-    let mut bands = std::collections::BTreeSet::new();
-    for group in &groups[lo..hi] {
-        rows.push(table_row(group, &columns)?);
-        bands.insert(grid.band_of(group.y));
+    let mut rows = Vec::new();
+    for band in groups[lo..hi].chunk_by(|a, b| grid.band_of(a.y) == grid.band_of(b.y)) {
+        let mut lines = Vec::with_capacity(band.len());
+        for group in band {
+            lines.push(table_row(group, &columns)?);
+        }
+        rows.push(logical_row(lines, columns.len()));
     }
-    if bands.len() < TABLE_MIN_ROWS && !(grid.boxed && bands.len() >= RULED_BOXED_MIN_ROWS) {
+    if rows.len() < TABLE_MIN_ROWS && !(grid.boxed && rows.len() >= RULED_BOXED_MIN_ROWS) {
         return None;
     }
-    let above = groups[..lo].iter().map(assembled).collect();
-    let below = groups[hi..].iter().map(assembled).collect();
-    Some((TableBand { above, rows, below }, grid.bbox()))
+    Some(GridClaim {
+        range: lo..hi,
+        rows,
+        bbox: grid.bbox(),
+    })
+}
+
+/// One band's visual lines as its logical row. Cells whose column intervals
+/// overlap across the band's lines are fragments of one drawn cell — ink
+/// crossing a vertical inside the band means the drawn cell is merged
+/// there — so their lines merge, in reading order, into one cell over the
+/// union of the columns. With no cell crossing a vertical that is plain
+/// per-column merging, and a band of one line rebuilds into the same cells.
+fn logical_row(lines: Vec<Vec<Cell>>, columns: usize) -> Vec<Cell> {
+    let mut fragments: Vec<(std::ops::Range<usize>, Line)> = Vec::new();
+    for cells in lines {
+        let mut column = 0usize;
+        for cell in cells {
+            let width = cell.colspan as usize;
+            if let Some(line) = cell.line {
+                fragments.push((column..column + width, line));
+            }
+            column += width;
+        }
+    }
+    let mut intervals: Vec<std::ops::Range<usize>> = fragments
+        .iter()
+        .map(|(interval, _)| interval.clone())
+        .collect();
+    intervals.sort_by_key(|interval| interval.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for interval in intervals {
+        match merged.last_mut() {
+            Some(last) if interval.start < last.end => last.end = last.end.max(interval.end),
+            _ => merged.push(interval),
+        }
+    }
+    let mut row = Vec::with_capacity(columns);
+    let mut next = 0usize;
+    for interval in merged {
+        for _ in next..interval.start {
+            row.push(empty_cell());
+        }
+        let cell_lines: Vec<&Line> = fragments
+            .iter()
+            .filter(|(held, _)| interval.start <= held.start && held.end <= interval.end)
+            .map(|(_, line)| line)
+            .collect();
+        row.push(Cell {
+            line: Some(merged_line(&cell_lines)),
+            colspan: (interval.end - interval.start) as u8,
+            rowspan: 1,
+        });
+        next = interval.end;
+    }
+    for _ in next..columns {
+        row.push(empty_cell());
+    }
+    row
+}
+
+/// One cell's fragment lines — reading order — as the single line ground
+/// truth wants for a wrapped cell: inlines concatenated with one plain
+/// space at each fragment boundary. The space lands at the end of the run
+/// before the boundary, the way [`push_span`] carries a word gap, and only
+/// then does a same-styled boundary extend that run — the space keeps the
+/// two fragments' tokens from fusing. Geometry is the fragments' union;
+/// `y` stays the first fragment's.
+fn merged_line(fragments: &[&Line]) -> Line {
+    let mut inlines: Vec<Inline> = Vec::new();
+    let mut x = f32::INFINITY;
+    let mut end_x = f32::NEG_INFINITY;
+    let mut size = 0.0f32;
+    for (index, fragment) in fragments.iter().enumerate() {
+        x = x.min(fragment.x);
+        end_x = end_x.max(fragment.end_x);
+        size = size.max(fragment.size);
+        for (position, inline) in fragment.inlines.iter().enumerate() {
+            let Some(last) = inlines.last_mut() else {
+                inlines.push(inline.clone());
+                continue;
+            };
+            if index > 0 && position == 0 {
+                last.text.push(' ');
+            }
+            if last.bold == inline.bold && last.italic == inline.italic {
+                last.text.push_str(&inline.text);
+                continue;
+            }
+            inlines.push(inline.clone());
+        }
+    }
+    Line {
+        inlines,
+        y: fragments.first().map_or(0.0, |line| line.y),
+        x,
+        end_x,
+        size,
+    }
 }
 
 /// The longest stretch of the segment's lines that reads as a grid, or `None`
@@ -1680,6 +1843,8 @@ pub(crate) mod tests {
         contents.push(ruled_grid_content());
         contents.push(ruled_boxed_list_content());
         contents.push(ruled_sub_word_gap_content());
+        contents.push(ruled_wrapped_band_content());
+        contents.push(ruled_grid_above_lane_grid_content());
         contents
     }
 
@@ -1717,6 +1882,38 @@ pub(crate) mod tests {
              BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
              1 0 0 1 229.4 675 Tm (worl) Tj 1 0 0 1 250.5 675 Tm (d) Tj ET",
         )
+    }
+
+    /// A boxed three-column grid whose bottom band wraps its first cell over
+    /// three visual lines — the shape that shattered into fragmentary rows
+    /// when every visual line was its own row. Ground truth wants one
+    /// logical row per band, the wrapped text joined inside the cell.
+    pub(crate) fn ruled_wrapped_band_content() -> String {
+        String::from(
+            "70 600 390 100 re S 200 600 m 200 700 l S 330 600 m 330 700 l S \
+             70 660 m 460 660 l S 70 680 m 460 680 l S \
+             BT /F1 10 Tf 1 0 0 1 80 685 Tm (h1) Tj 1 0 0 1 210 685 Tm (h2) Tj \
+             1 0 0 1 340 685 Tm (h3) Tj \
+             1 0 0 1 80 665 Tm (m1) Tj 1 0 0 1 210 665 Tm (m2) Tj \
+             1 0 0 1 340 665 Tm (m3) Tj \
+             1 0 0 1 80 645 Tm (wrap one) Tj 1 0 0 1 210 645 Tm (solo) Tj \
+             1 0 0 1 340 645 Tm (tail) Tj \
+             1 0 0 1 80 625 Tm (wrap two) Tj 1 0 0 1 80 605 Tm (wrap three) Tj ET",
+        )
+    }
+
+    /// The doc-81 shape: a small fully boxed grid above a whitespace-laned
+    /// grid in one segment. The drawn grid claims only its own stretch; the
+    /// laned rows below it must still become a table of their own.
+    pub(crate) fn ruled_grid_above_lane_grid_content() -> String {
+        let mut content = format!("{} BT /F1 10 Tf ", ruled_grid_content());
+        for (row, y) in [(0, 560.0), (1, 540.0), (2, 520.0), (3, 500.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
     }
 
     /// Four rows of three cells on three lanes: the shape that reads as a
