@@ -82,7 +82,10 @@ const TABLE_ROW_GAP: f32 = 2.0;
 
 /// How close two rulings must sit to read as one drawn line: collinear
 /// segments cluster within it, and a lattice crossing may miss by it.
-const RULING_SNAP_TOLERANCE: f32 = 2.0;
+/// Six points, because tables are often drawn one row box at a time with
+/// the side borders stopping five and a half points short of the next
+/// row's rule — the corners must still weld into one lattice.
+const RULING_SNAP_TOLERANCE: f32 = 6.0;
 /// The narrowest lattice that reads as a ruled grid: two verticals and three
 /// horizontals are one boxed column of two cells. Lane-occupancy gates do not
 /// apply here — the structure is drawn, not implied by white space.
