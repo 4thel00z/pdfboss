@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pdfboss-core",
     "crates/pdfboss-text",
+    "crates/pdfboss-output",
     "crates/pdfboss-encoding",
     "crates/pdfboss-jpx",
     "crates/pdfboss-render",
@@ -29,6 +30,7 @@ pdfboss-core = { path = "crates/pdfboss-core", version = "0.12.1" } # x-release-
 pdfboss-encoding = { path = "crates/pdfboss-encoding", version = "0.12.1" } # x-release-please-version
 pdfboss-jpx = { path = "crates/pdfboss-jpx", version = "0.12.1" } # x-release-please-version
 pdfboss-text = { path = "crates/pdfboss-text", version = "0.12.1" } # x-release-please-version
+pdfboss-output = { path = "crates/pdfboss-output", version = "0.12.1" } # x-release-please-version
 pdfboss-render = { path = "crates/pdfboss-render", version = "0.12.1" } # x-release-please-version
 pdfboss-aio = { path = "crates/pdfboss-aio", version = "0.12.1" } # x-release-please-version
 pdfboss-tui = { path = "crates/pdfboss-tui", version = "0.12.1" } # x-release-please-version

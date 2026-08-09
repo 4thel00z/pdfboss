@@ -64,6 +64,46 @@ fn json_content_ops_lists_operator_spans() {
 }
 
 #[test]
+fn json_layout_adds_a_layout_array() {
+    let file = fixture("hello.pdf");
+    let output = pdfboss(&["json", file.to_str().unwrap(), "--layout"]);
+    assert!(output.status.success(), "json --layout failed: {output:?}");
+    let text = strip_ansi(&stdout_str(&output));
+    let tree: serde_json::Value = serde_json::from_str(&text).expect("valid json output");
+    let layout = tree["layout"].as_array().expect("layout is an array");
+    assert_eq!(layout.len(), 1, "one page: {text}");
+    assert!(text.contains("Hello, world!"), "no page text in: {text}");
+}
+
+#[test]
+fn json_without_layout_omits_the_key() {
+    let file = fixture("hello.pdf");
+    let output = pdfboss(&["json", file.to_str().unwrap()]);
+    assert!(output.status.success(), "json failed: {output:?}");
+    let text = strip_ansi(&stdout_str(&output));
+    let tree: serde_json::Value = serde_json::from_str(&text).expect("valid json output");
+    assert!(tree.get("layout").is_none(), "unexpected layout: {text}");
+}
+
+#[test]
+fn json_layout_with_pages_filter_ranks_only_the_requested_page() {
+    let bytes = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
+    let path = std::env::temp_dir().join(format!(
+        "pdfboss-json-layout-pages-{}.pdf",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).expect("write temp fixture");
+    let output = pdfboss(&["json", path.to_str().unwrap(), "--pages", "2", "--layout"]);
+    let _ = std::fs::remove_file(&path);
+    assert!(output.status.success(), "json failed: {output:?}");
+    let text = strip_ansi(&stdout_str(&output));
+    let tree: serde_json::Value = serde_json::from_str(&text).expect("valid json output");
+    let layout = tree["layout"].as_array().expect("layout is an array");
+    assert_eq!(layout.len(), 1, "one requested page: {text}");
+    assert!(text.contains("two"), "missing requested page text: {text}");
+}
+
+#[test]
 fn json_pages_filter_keeps_only_selected_pages() {
     let bytes = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
     let path = std::env::temp_dir().join(format!("pdfboss-json-pages-{}.pdf", std::process::id()));

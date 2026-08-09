@@ -1193,9 +1193,9 @@ dependencies = [
  "futures-core",
  "futures-util",
  "pdfboss-core",
+ "pdfboss-output",
  "pdfboss-render",
  "pdfboss-testkit",
- "pdfboss-text",
  "reqwest",
  "thiserror",
  "tokio",
@@ -1213,6 +1213,7 @@ dependencies = [
  "jaq-std",
  "pdfboss-aio",
  "pdfboss-core",
+ "pdfboss-output",
  "pdfboss-render",
  "pdfboss-testkit",
  "pdfboss-text",
@@ -1241,12 +1242,24 @@ name = "pdfboss-jpx"
 version = "0.12.1"
 
 [[package]]
+name = "pdfboss-output"
+version = "0.12.1"
+dependencies = [
+ "criterion",
+ "pdfboss-core",
+ "pdfboss-testkit",
+ "pdfboss-text",
+ "serde",
+]
+
+[[package]]
 name = "pdfboss-py"
 version = "0.12.1"
 dependencies = [
  "futures-util",
  "pdfboss-aio",
  "pdfboss-core",
+ "pdfboss-output",
  "pdfboss-render",
  "pdfboss-text",
  "pyo3",
@@ -1275,7 +1288,6 @@ version = "0.12.1"
 name = "pdfboss-text"
 version = "0.12.1"
 dependencies = [
- "criterion",
  "pdfboss-core",
  "pdfboss-encoding",
  "pdfboss-testkit",

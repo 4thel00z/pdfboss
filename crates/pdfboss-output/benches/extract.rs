@@ -1,11 +1,11 @@
-//! Benchmarks for positional text extraction.
+//! Benchmarks for positional text extraction and layout.
 //!
-//! Run with `cargo bench -p pdfboss-text`.
+//! Run with `cargo bench -p pdfboss-output`.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use pdfboss_core::Document;
+use pdfboss_output::extract_text;
 use pdfboss_testkit::doc_with_graphics;
-use pdfboss_text::extract_text;
 
 /// A single page whose content stream shows `lines` lines of text.
 fn text_doc(lines: usize) -> Vec<u8> {

@@ -25,7 +25,7 @@ http = ["dep:reqwest"]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
 # Test-only: the end-to-end parity tests drive the shared text-extraction and
 # rendering implementations over an AsyncDocument and compare with sync.
-pdfboss-text = { path = "../pdfboss-text" }
+pdfboss-output = { path = "../pdfboss-output" }
 pdfboss-render = { path = "../pdfboss-render" }
 tokio = { workspace = true, features = ["macros", "net", "time"] }
 # Test-only: compresses fixture payloads for the indirect-/DecodeParms

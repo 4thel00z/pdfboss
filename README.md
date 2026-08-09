@@ -33,8 +33,8 @@ Prebuilt abi3 wheels (CPython ≥ 3.12) for Linux and macOS; no toolchain requir
 ### Rust
 
 ```bash
-cargo add pdfboss-core pdfboss-text pdfboss-render pdfboss-aio pdfboss-tui   # library crates
-cargo install pdfboss-cli                                                    # the `pdfboss` binary
+cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-aio pdfboss-tui   # library crates
+cargo install pdfboss-cli                                                                   # the `pdfboss` binary
 ```
 
 ## Usage
@@ -44,6 +44,7 @@ cargo install pdfboss-cli                                                    # t
 ```bash
 pdfboss info    report.pdf                 # version, page count, sizes, metadata
 pdfboss text    report.pdf --page 2        # extract text (omit --page for all)
+pdfboss md      report.pdf                 # markdown: headings, lists, tables from layout
 pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
 pdfboss obj     report.pdf 5               # pretty-print object 5
 ```
@@ -52,6 +53,7 @@ Explorer subcommands, each accepting a local path or an `http(s)://` URL (range-
 
 ```bash
 pdfboss json    report.pdf                    # dump the document as a JSON value tree
+pdfboss json    report.pdf --layout           # ...plus per-page layout blocks
 pdfboss hex     report.pdf obj:5              # hexdump the file or a selected element
 pdfboss q       report.pdf '.header.version'  # jq-style queries over the JSON tree
 pdfboss tui     report.pdf                    # interactive terminal explorer
@@ -68,6 +70,7 @@ print(doc.page_count, doc.version, doc.metadata)
 page = doc[0]
 print(page.width, page.height, page.rotation)
 text = page.extract_text()                 # or doc.extract_text() for all pages
+md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
 png  = page.render(scale=2.0)              # PNG bytes
 
 for element in doc.elements():             # lazy: physical + logical, byte spans included
@@ -87,7 +90,8 @@ use pdfboss_core::Document;
 let doc = Document::open("report.pdf")?;
 let page = doc.page(0)?;
 
-let text = pdfboss_text::extract_text(&doc, &page)?;
+let text = pdfboss_output::extract_text(&doc, &page)?;
+let markdown = pdfboss_output::extract_markdown(&doc)?;
 let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;
 pixmap.save_png("page.png")?;
 ```
@@ -97,7 +101,8 @@ pixmap.save_png("page.png")?;
 | Crate | Responsibility |
 |---|---|
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
-| `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text extraction |
+| `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text spans |
+| `pdfboss-output` | Layout analysis over those spans — lines, columns, headings, lists, tables, repeated page headers — rendered as plain text or Markdown |
 | `pdfboss-jpx` | JPEG 2000 decoder for `JPXDecode` image streams, implemented from ITU-T T.800 |
 | `pdfboss-render` | Anti-aliased vector rasterizer — paths, fills, strokes, clipping, color, images, glyph outlines — to RGBA/PNG |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
@@ -105,7 +110,7 @@ pixmap.save_png("page.png")?;
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
-**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images — JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans — Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans — generic regions, symbol dictionaries and text regions, arithmetic- or Huffman-coded, MMR-coded generic regions and collective bitmaps, immediate generic refinement regions, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
+**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images — JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans — Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans — generic regions, symbol dictionaries and text regions, arithmetic- or Huffman-coded, MMR-coded generic regions and collective bitmaps, immediate generic refinement regions, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · Markdown output with headings, lists, emphasis and pipe/HTML tables inferred from the page layout · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
 
 ## Benchmarks
 
@@ -123,7 +128,7 @@ Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks
 
 ### Extraction quality
 
-Speed without fidelity is worthless, so extraction quality is measured too — on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 real-world PDFs), the corpus PDF-to-Markdown engines publish their comparisons on. pdfboss emits plain text, not Markdown, so the comparable metric is **NID** — reading-order similarity against the ground truth, 0–1, higher is better. The table/heading metrics score Markdown structure that plain text cannot express, and pdfboss does not compete on them.
+Speed without fidelity is worthless, so extraction quality is measured too — on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 real-world PDFs), the corpus PDF-to-Markdown engines publish their comparisons on. The row below scores pdfboss's default plain-text output, so the comparable metric is **NID** — reading-order similarity against the ground truth, 0–1, higher is better. The table/heading metrics score Markdown structure that plain text cannot express; the Markdown adapter behind `pdfboss md` is new and is not scored in this table.
 
 | Engine | Reading order (NID) | Output | Time (200 docs) |
 |---|--:|---|--:|
@@ -175,7 +180,7 @@ Not yet supported (they error or degrade gracefully, and are on the roadmap): pa
 
 Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render — `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary, the TUI preview raises a status-bar notice, and the libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
 
-The sync and async APIs are not at parity on encryption: `Document`/`Page` (and the CLI's `info`/`text`/`render`/`obj`) decrypt empty-user-password RC4/AES files transparently, as above. `AsyncDocument` (`pdfboss tui`, any `http(s)://` target, and the Python `AsyncDocument`) currently rejects every encrypted document outright, real password or not — async decryption parity is a tracked follow-up.
+The sync and async APIs are not at parity on encryption: `Document`/`Page` (and the CLI's `info`/`text`/`md`/`render`/`obj`) decrypt empty-user-password RC4/AES files transparently, as above. `AsyncDocument` (`pdfboss tui`, any `http(s)://` target, and the Python `AsyncDocument`) currently rejects every encrypted document outright, real password or not — async decryption parity is a tracked follow-up.
 
 ## Development
 

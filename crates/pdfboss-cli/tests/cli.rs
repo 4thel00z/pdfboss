@@ -116,6 +116,45 @@ fn text_all_pages_joined_by_form_feed() {
 }
 
 #[test]
+fn md_hello_prints_a_plain_paragraph() {
+    // hello.pdf's single 12pt line has no heading ladder: plain paragraph.
+    let file = fixture("hello.pdf");
+    let output = pdfboss(&["md", file.to_str().unwrap()]);
+    assert!(output.status.success(), "md failed: {output:?}");
+    assert_eq!(stdout(&output).trim_end(), "Hello, world!");
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn md_page_two_of_three() {
+    let file = fixture("three-pages.pdf");
+    let output = pdfboss(&["md", file.to_str().unwrap(), "--page", "2"]);
+    assert!(output.status.success(), "md failed: {output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("Page two"), "missing text in: {text}");
+}
+
+#[test]
+fn md_missing_file_exits_one() {
+    let output = pdfboss(&["md", "definitely-not-here.pdf"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!output.stderr.is_empty(), "expected an error message");
+}
+
+#[test]
+fn md_out_of_range_page_exits_one() {
+    let file = fixture("hello.pdf");
+    let output = pdfboss(&["md", file.to_str().unwrap(), "--page", "9"]);
+    assert_eq!(output.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(err.contains("out of range"), "unexpected stderr: {err}");
+}
+
+#[test]
 fn render_smoke_writes_png() {
     let file = fixture("hello.pdf");
     let out = std::env::temp_dir().join(format!("pdfboss-cli-render-{}.png", std::process::id()));
