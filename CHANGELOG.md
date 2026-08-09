@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.0](https://github.com/4thel00z/pdfboss/compare/v0.12.1...v0.13.0) (2026-08-09)
+
+
+### Features
+
+* **output:** pdfboss-output crate with Text and Markdown adapters ([#24](https://github.com/4thel00z/pdfboss/issues/24)) ([2e9edba](https://github.com/4thel00z/pdfboss/commit/2e9edba5a9753df3f51cb630ace55752ba5fe454))
+* **text:** column-major reading order, shrunk-glue word gaps, AGL glyph names ([#22](https://github.com/4thel00z/pdfboss/issues/22)) ([cf6ed0f](https://github.com/4thel00z/pdfboss/commit/cf6ed0f04d8052f08d6d8bee08d725dbd5b0699a))
+
 ## [0.12.1](https://github.com/4thel00z/pdfboss/compare/v0.12.0...v0.12.1) (2026-07-31)
 
 
