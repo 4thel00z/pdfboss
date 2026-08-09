@@ -3,7 +3,7 @@
 
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
-use pdfboss_text::TextSpan;
+use pdfboss_text::{Ruling, TextSpan};
 
 /// Fraction of the device font size a horizontal gap must exceed to read
 /// as a word break. The ceiling is justified LaTeX's shrunk inter-word
@@ -80,6 +80,22 @@ const TABLE_MIN_ROW_CELLS: usize = 2;
 /// space between blocks rather than the next row.
 const TABLE_ROW_GAP: f32 = 2.0;
 
+/// How close two rulings must sit to read as one drawn line: collinear
+/// segments cluster within it, and a lattice crossing may miss by it.
+/// Six points, because tables are often drawn one row box at a time with
+/// the side borders stopping five and a half points short of the next
+/// row's rule — the corners must still weld into one lattice.
+const RULING_SNAP_TOLERANCE: f32 = 6.0;
+/// The narrowest lattice that reads as a ruled grid: two verticals and three
+/// horizontals are one boxed column of two cells. Lane-occupancy gates do not
+/// apply here — the structure is drawn, not implied by white space.
+const RULED_GRID_MIN_VERTICALS: usize = 2;
+const RULED_GRID_MIN_HORIZONTALS: usize = 3;
+/// Populated bands a fully boxed grid needs; an unboxed lattice needs
+/// [`TABLE_MIN_ROWS`], since stray separators reach three lines more easily
+/// than a drawn border box does.
+const RULED_BOXED_MIN_ROWS: usize = 2;
+
 /// Minimum pages before a repeated edge line reads as a running line rather than
 /// coincidence: two documents opening with the same word is unremarkable,
 /// three or more sharing a whole line is not.
@@ -102,17 +118,43 @@ pub fn layout(spans: &[TextSpan]) -> String {
 /// alone. Prefer [`document_layout`] whenever the whole document is at
 /// hand: a page of nothing but large type has no body size of its own.
 pub fn page_layout(spans: &[TextSpan]) -> PageLayout {
-    page_layout_with_stats(spans, &size_stats(&[spans]))
+    page_layout_with_rulings(spans, &[])
+}
+
+/// [`page_layout`] with the page's rulings: a lattice of drawn borders is
+/// read as a table ahead of lane occupancy. With no rulings the two are the
+/// same function.
+pub fn page_layout_with_rulings(spans: &[TextSpan], rulings: &[Ruling]) -> PageLayout {
+    page_layout_with_stats(spans, rulings, &size_stats(&[spans]))
 }
 
 /// Every page's spans as structure, ranking heading sizes against the whole
 /// document, so one oversized page cannot redefine what body text is.
 pub fn document_layout(pages: &[Vec<TextSpan>]) -> Vec<PageLayout> {
-    let borrowed: Vec<&[TextSpan]> = pages.iter().map(Vec::as_slice).collect();
+    let paired: Vec<(&[TextSpan], &[Ruling])> = pages
+        .iter()
+        .map(|spans| (spans.as_slice(), &[][..]))
+        .collect();
+    layouts_of(&paired)
+}
+
+/// [`document_layout`] with each page's rulings, so drawn grids become
+/// tables document-wide. With no rulings the two are the same function.
+pub fn document_layout_with_rulings(pages: &[(Vec<TextSpan>, Vec<Ruling>)]) -> Vec<PageLayout> {
+    let paired: Vec<(&[TextSpan], &[Ruling])> = pages
+        .iter()
+        .map(|(spans, rulings)| (spans.as_slice(), rulings.as_slice()))
+        .collect();
+    layouts_of(&paired)
+}
+
+/// Every page's layout over shared document-wide size statistics.
+fn layouts_of(pages: &[(&[TextSpan], &[Ruling])]) -> Vec<PageLayout> {
+    let borrowed: Vec<&[TextSpan]> = pages.iter().map(|(spans, _)| *spans).collect();
     let stats = size_stats(&borrowed);
     let mut layouts: Vec<PageLayout> = pages
         .iter()
-        .map(|spans| page_layout_with_stats(spans, &stats))
+        .map(|(spans, rulings)| page_layout_with_stats(spans, rulings, &stats))
         .collect();
     tag_page_roles(&mut layouts);
     layouts
@@ -304,27 +346,81 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
 }
 
 /// The page's blocks: each reading-order segment's lines classified into
-/// headings and paragraph runs, in order. The classification is a partition
-/// — no line is reordered, merged away, or dropped — which is what keeps
-/// the [`Text`] adapter byte-equal to positional extraction.
-fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
+/// headings and paragraph runs, in order. On a ruling-free layout the
+/// classification is a partition — no line is reordered, merged away, or
+/// dropped — which is what keeps the [`Text`] adapter byte-equal to
+/// positional extraction. A drawn grid's bands merge into logical rows,
+/// which preserves every token but reads cell-major.
+fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeStats) -> PageLayout {
+    let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
     for segment in segments(spans) {
         if segment.is_empty() {
             continue;
         }
-        if let Some(band) = table_band(&segment) {
-            push_blocks(&band.above, stats, &mut blocks);
-            blocks.push(Block::Table {
-                bbox: table_bbox(&band.rows),
-                rows: band.rows,
-            });
-            push_blocks(&band.below, stats, &mut blocks);
-            continue;
-        }
-        push_blocks(&assemble_lines(&segment), stats, &mut blocks);
+        push_segment_blocks(&segment, &grids, stats, &mut blocks);
     }
     PageLayout { blocks }
+}
+
+/// One segment's blocks. A segment no grid claims — every segment, when the
+/// page has no rulings — takes the single lane attempt it always has.
+/// Otherwise the segment is walked top-down: each claimed stretch becomes a
+/// table and every uncovered remainder stretch gets that same lane attempt,
+/// so a drawn grid and a whitespace-laned table can share a segment.
+fn push_segment_blocks(
+    segment: &[&TextSpan],
+    grids: &[RuledGrid],
+    stats: &SizeStats,
+    out: &mut Vec<Block>,
+) {
+    if grids.is_empty() {
+        push_lane_blocks(segment, stats, out);
+        return;
+    }
+    let groups = line_groups(segment);
+    let claims = grid_claims(&groups, grids);
+    if claims.is_empty() {
+        push_lane_blocks(segment, stats, out);
+        return;
+    }
+    let mut next = 0usize;
+    for claim in claims {
+        push_stretch(&groups[next..claim.range.start], stats, out);
+        out.push(Block::Table {
+            bbox: claim.bbox,
+            rows: claim.rows,
+        });
+        next = claim.range.end;
+    }
+    push_stretch(&groups[next..], stats, out);
+}
+
+/// The lane path: one [`table_band`] attempt over the spans, else prose.
+fn push_lane_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
+    let Some(band) = table_band(spans) else {
+        push_blocks(&assemble_lines(spans), stats, out);
+        return;
+    };
+    push_blocks(&band.above, stats, out);
+    out.push(Block::Table {
+        bbox: table_bbox(&band.rows),
+        rows: band.rows,
+    });
+    push_blocks(&band.below, stats, out);
+}
+
+/// A remainder stretch between grid claims, back as spans, through the same
+/// lane attempt a whole segment gets.
+fn push_stretch(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+    if groups.is_empty() {
+        return;
+    }
+    let spans: Vec<&TextSpan> = groups
+        .iter()
+        .flat_map(|group| group.spans.iter().copied())
+        .collect();
+    push_lane_blocks(&spans, stats, out);
 }
 
 /// Character-weighted histogram of span sizes rounded to half a point. Body
@@ -699,6 +795,386 @@ struct TableBand {
     above: Vec<Assembled>,
     rows: Vec<Vec<Cell>>,
     below: Vec<Assembled>,
+}
+
+/// A lattice of drawn rulings: the x positions of its vertical lines and the
+/// y positions of its horizontal lines, ascending, joined by their crossings
+/// into one connected region. Built by [`ruled_grids`].
+struct RuledGrid {
+    xs: Vec<f32>,
+    ys: Vec<f32>,
+    /// Whether all four outer borders are drawn end to end.
+    boxed: bool,
+}
+
+impl RuledGrid {
+    /// The x ranges between consecutive vertical lines: the grid's cell
+    /// columns, in the shape [`table_row`] takes.
+    fn columns(&self) -> Vec<std::ops::Range<f32>> {
+        self.xs.windows(2).map(|pair| pair[0]..pair[1]).collect()
+    }
+
+    /// True when a baseline at `y` sits inside the grid: on or above the
+    /// bottom border, strictly below the top one — a baseline exactly on a
+    /// ruling has its glyphs in the band above it.
+    fn holds(&self, y: f32) -> bool {
+        self.ys[0] <= y && y < self.ys[self.ys.len() - 1]
+    }
+
+    /// The index of the band between consecutive horizontal rulings a
+    /// baseline at `y` falls in; callers check [`RuledGrid::holds`] first.
+    fn band_of(&self, y: f32) -> usize {
+        self.ys.partition_point(|ruling_y| *ruling_y <= y) - 1
+    }
+
+    /// The grid's drawn border box.
+    fn bbox(&self) -> BBox {
+        BBox {
+            x0: self.xs[0],
+            y0: self.ys[0],
+            x1: self.xs[self.xs.len() - 1],
+            y1: self.ys[self.ys.len() - 1],
+        }
+    }
+}
+
+/// Collinear rulings merged into one drawn line: the position on the
+/// constant axis and the extent covered along the other.
+struct GridLine {
+    position: f32,
+    extent: std::ops::Range<f32>,
+}
+
+/// The page's ruled grids: vertical and horizontal rulings clustered into
+/// drawn lines, lines joined where they cross, and every connected lattice
+/// of at least [`RULED_GRID_MIN_VERTICALS`] verticals and
+/// [`RULED_GRID_MIN_HORIZONTALS`] horizontals kept, topmost first. A ruling
+/// is vertical when it runs farther in y than in x; extraction already
+/// snapped it exactly axis-aligned.
+fn ruled_grids(rulings: &[Ruling]) -> Vec<RuledGrid> {
+    if rulings.is_empty() {
+        return Vec::new();
+    }
+    let vertical = |r: &&Ruling| r.end.y - r.start.y > r.end.x - r.start.x;
+    let verticals = grid_lines(
+        rulings
+            .iter()
+            .filter(vertical)
+            .map(|r| (r.start.x, r.start.y..r.end.y)),
+    );
+    let horizontals = grid_lines(
+        rulings
+            .iter()
+            .filter(|r| !vertical(r))
+            .map(|r| (r.start.y, r.start.x..r.end.x)),
+    );
+    let mut parent: Vec<usize> = (0..verticals.len() + horizontals.len()).collect();
+    for (v, vertical) in verticals.iter().enumerate() {
+        for (h, horizontal) in horizontals.iter().enumerate() {
+            if crosses(vertical, horizontal) {
+                union(&mut parent, v, verticals.len() + h);
+            }
+        }
+    }
+    let mut components: std::collections::BTreeMap<usize, (Vec<usize>, Vec<usize>)> =
+        std::collections::BTreeMap::new();
+    for v in 0..verticals.len() {
+        let root = find(&mut parent, v);
+        components.entry(root).or_default().0.push(v);
+    }
+    for h in 0..horizontals.len() {
+        let root = find(&mut parent, verticals.len() + h);
+        components.entry(root).or_default().1.push(h);
+    }
+    let mut grids: Vec<RuledGrid> = components
+        .values()
+        .filter_map(|(v_indices, h_indices)| {
+            let component_verticals: Vec<&GridLine> =
+                v_indices.iter().map(|&i| &verticals[i]).collect();
+            let component_horizontals: Vec<&GridLine> =
+                h_indices.iter().map(|&i| &horizontals[i]).collect();
+            lattice(&component_verticals, &component_horizontals)
+        })
+        .collect();
+    grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
+    grids
+}
+
+/// Rulings on one axis as drawn lines: grouped by their constant coordinate
+/// within [`RULING_SNAP_TOLERANCE`], each group's near-touching extents
+/// merged. Extents farther apart stay separate lines at the same position —
+/// the x two stacked tables' borders share must not weld them into one
+/// lattice.
+fn grid_lines(rulings: impl Iterator<Item = (f32, std::ops::Range<f32>)>) -> Vec<GridLine> {
+    let mut all: Vec<(f32, std::ops::Range<f32>)> = rulings.collect();
+    all.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut lines: Vec<GridLine> = Vec::new();
+    let mut cluster: Vec<(f32, std::ops::Range<f32>)> = Vec::new();
+    for line in all {
+        if let Some(last) = cluster.last() {
+            if line.0 - last.0 > RULING_SNAP_TOLERANCE {
+                lines.append(&mut merged_cluster(std::mem::take(&mut cluster)));
+            }
+        }
+        cluster.push(line);
+    }
+    lines.append(&mut merged_cluster(cluster));
+    lines
+}
+
+/// One position cluster's segments as [`GridLine`]s at the cluster's mean
+/// position: extents that overlap or come within [`RULING_SNAP_TOLERANCE`]
+/// merge, the rest stay separate lines.
+fn merged_cluster(mut cluster: Vec<(f32, std::ops::Range<f32>)>) -> Vec<GridLine> {
+    if cluster.is_empty() {
+        return Vec::new();
+    }
+    let position = cluster.iter().map(|(p, _)| *p).sum::<f32>() / cluster.len() as f32;
+    cluster.sort_by(|a, b| a.1.start.total_cmp(&b.1.start));
+    let mut lines: Vec<GridLine> = Vec::new();
+    for (_, extent) in cluster {
+        match lines.last_mut() {
+            Some(last) if extent.start <= last.extent.end + RULING_SNAP_TOLERANCE => {
+                last.extent.end = last.extent.end.max(extent.end);
+            }
+            _ => lines.push(GridLine { position, extent }),
+        }
+    }
+    lines
+}
+
+/// True when a vertical and a horizontal line cross within
+/// [`RULING_SNAP_TOLERANCE`]: an L corner, a T junction, or a + crossing.
+fn crosses(vertical: &GridLine, horizontal: &GridLine) -> bool {
+    vertical.position >= horizontal.extent.start - RULING_SNAP_TOLERANCE
+        && vertical.position <= horizontal.extent.end + RULING_SNAP_TOLERANCE
+        && horizontal.position >= vertical.extent.start - RULING_SNAP_TOLERANCE
+        && horizontal.position <= vertical.extent.end + RULING_SNAP_TOLERANCE
+}
+
+/// The set representative, with path halving.
+fn find(parent: &mut [usize], mut node: usize) -> usize {
+    while parent[node] != node {
+        parent[node] = parent[parent[node]];
+        node = parent[node];
+    }
+    node
+}
+
+/// Joins the two nodes' sets.
+fn union(parent: &mut [usize], a: usize, b: usize) {
+    let root_a = find(parent, a);
+    let root_b = find(parent, b);
+    parent[root_a] = root_b;
+}
+
+/// One connected component as a grid, or `None` when it is too sparse to be
+/// one: a lone separator, an underline, a pair of column rules with nothing
+/// across them.
+fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGrid> {
+    let xs = distinct_positions(verticals);
+    let ys = distinct_positions(horizontals);
+    if xs.len() < RULED_GRID_MIN_VERTICALS || ys.len() < RULED_GRID_MIN_HORIZONTALS {
+        return None;
+    }
+    let (x_lo, x_hi) = (xs[0], xs[xs.len() - 1]);
+    let (y_lo, y_hi) = (ys[0], ys[ys.len() - 1]);
+    let boxed = covers(verticals, x_lo, y_lo, y_hi)
+        && covers(verticals, x_hi, y_lo, y_hi)
+        && covers(horizontals, y_lo, x_lo, x_hi)
+        && covers(horizontals, y_hi, x_lo, x_hi);
+    Some(RuledGrid { xs, ys, boxed })
+}
+
+/// The lines' positions, ascending, neighbours within
+/// [`RULING_SNAP_TOLERANCE`] collapsed to the first.
+fn distinct_positions(lines: &[&GridLine]) -> Vec<f32> {
+    let mut positions: Vec<f32> = lines.iter().map(|line| line.position).collect();
+    positions.sort_by(f32::total_cmp);
+    positions.dedup_by(|next, kept| *next - *kept <= RULING_SNAP_TOLERANCE);
+    positions
+}
+
+/// True when the lines at `position` cover `lo..hi` end to end, gaps and
+/// shortfalls no wider than [`RULING_SNAP_TOLERANCE`]: whether a border is
+/// drawn along the whole of one edge.
+fn covers(lines: &[&GridLine], position: f32, lo: f32, hi: f32) -> bool {
+    let mut extents: Vec<&std::ops::Range<f32>> = lines
+        .iter()
+        .filter(|line| (line.position - position).abs() <= RULING_SNAP_TOLERANCE)
+        .map(|line| &line.extent)
+        .collect();
+    extents.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let mut reached = lo;
+    for extent in extents {
+        if extent.start > reached + RULING_SNAP_TOLERANCE {
+            return false;
+        }
+        reached = reached.max(extent.end);
+    }
+    reached >= hi - RULING_SNAP_TOLERANCE
+}
+
+/// One drawn grid's claim on a segment: the contiguous stretch of line
+/// groups whose baselines fall inside the grid, the logical rows they merge
+/// into, and the grid's drawn border box.
+struct GridClaim {
+    range: std::ops::Range<usize>,
+    rows: Vec<Vec<Cell>>,
+    bbox: BBox,
+}
+
+/// Every grid's claim on the segment's lines, disjoint and top-down. Grids
+/// are tried topmost first, so of two lattices claiming the same lines the
+/// higher wins; a grid that fails its gates claims nothing and its lines
+/// stay available to the lane attempt. Lane-occupancy gates do not apply to
+/// a claim — a drawn single-column box is a table no lane could show — but
+/// every line still passes [`table_row`]'s word-gap cell gate.
+fn grid_claims(groups: &[Group], grids: &[RuledGrid]) -> Vec<GridClaim> {
+    let mut claims: Vec<GridClaim> = Vec::new();
+    for grid in grids {
+        let Some(claim) = grid_claim(groups, grid) else {
+            continue;
+        };
+        let taken = claims
+            .iter()
+            .any(|held| held.range.start < claim.range.end && claim.range.start < held.range.end);
+        if taken {
+            continue;
+        }
+        claims.push(claim);
+    }
+    claims.sort_by_key(|claim| claim.range.start);
+    claims
+}
+
+/// `groups` against one grid: the contiguous stretch of lines whose
+/// baselines fall inside the grid becomes the claim, one logical row per
+/// populated band — the y-range between consecutive horizontal rulings.
+/// `None` when a line will not sit in the grid's columns, when a column
+/// boundary lands inside a sub-word gap — the row would split a word the
+/// flat flow wrote whole — or when the populated bands number under
+/// [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid with
+/// all four borders drawn. Every line passes [`table_row`] before any
+/// band's lines merge.
+fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
+    let lo = groups.iter().position(|group| grid.holds(group.y))?;
+    let inside = groups[lo..]
+        .iter()
+        .take_while(|group| grid.holds(group.y))
+        .count();
+    let hi = lo + inside;
+    let columns = grid.columns();
+    let mut rows = Vec::new();
+    for band in groups[lo..hi].chunk_by(|a, b| grid.band_of(a.y) == grid.band_of(b.y)) {
+        let mut lines = Vec::with_capacity(band.len());
+        for group in band {
+            lines.push(table_row(group, &columns)?);
+        }
+        rows.push(logical_row(lines, columns.len()));
+    }
+    if rows.len() < TABLE_MIN_ROWS && !(grid.boxed && rows.len() >= RULED_BOXED_MIN_ROWS) {
+        return None;
+    }
+    Some(GridClaim {
+        range: lo..hi,
+        rows,
+        bbox: grid.bbox(),
+    })
+}
+
+/// One band's visual lines as its logical row. Cells whose column intervals
+/// overlap across the band's lines are fragments of one drawn cell — ink
+/// crossing a vertical inside the band means the drawn cell is merged
+/// there — so their lines merge, in reading order, into one cell over the
+/// union of the columns. With no cell crossing a vertical that is plain
+/// per-column merging, and a band of one line rebuilds into the same cells.
+fn logical_row(lines: Vec<Vec<Cell>>, columns: usize) -> Vec<Cell> {
+    let mut fragments: Vec<(std::ops::Range<usize>, Line)> = Vec::new();
+    for cells in lines {
+        let mut column = 0usize;
+        for cell in cells {
+            let width = cell.colspan as usize;
+            if let Some(line) = cell.line {
+                fragments.push((column..column + width, line));
+            }
+            column += width;
+        }
+    }
+    let mut intervals: Vec<std::ops::Range<usize>> = fragments
+        .iter()
+        .map(|(interval, _)| interval.clone())
+        .collect();
+    intervals.sort_by_key(|interval| interval.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for interval in intervals {
+        match merged.last_mut() {
+            Some(last) if interval.start < last.end => last.end = last.end.max(interval.end),
+            _ => merged.push(interval),
+        }
+    }
+    let mut row = Vec::with_capacity(columns);
+    let mut next = 0usize;
+    for interval in merged {
+        for _ in next..interval.start {
+            row.push(empty_cell());
+        }
+        let cell_lines: Vec<&Line> = fragments
+            .iter()
+            .filter(|(held, _)| interval.start <= held.start && held.end <= interval.end)
+            .map(|(_, line)| line)
+            .collect();
+        row.push(Cell {
+            line: Some(merged_line(&cell_lines)),
+            colspan: (interval.end - interval.start) as u8,
+            rowspan: 1,
+        });
+        next = interval.end;
+    }
+    for _ in next..columns {
+        row.push(empty_cell());
+    }
+    row
+}
+
+/// One cell's fragment lines — reading order — as the single line ground
+/// truth wants for a wrapped cell: inlines concatenated with one plain
+/// space at each fragment boundary. The space lands at the end of the run
+/// before the boundary, the way [`push_span`] carries a word gap, and only
+/// then does a same-styled boundary extend that run — the space keeps the
+/// two fragments' tokens from fusing. Geometry is the fragments' union;
+/// `y` stays the first fragment's.
+fn merged_line(fragments: &[&Line]) -> Line {
+    let mut inlines: Vec<Inline> = Vec::new();
+    let mut x = f32::INFINITY;
+    let mut end_x = f32::NEG_INFINITY;
+    let mut size = 0.0f32;
+    for (index, fragment) in fragments.iter().enumerate() {
+        x = x.min(fragment.x);
+        end_x = end_x.max(fragment.end_x);
+        size = size.max(fragment.size);
+        for (position, inline) in fragment.inlines.iter().enumerate() {
+            let Some(last) = inlines.last_mut() else {
+                inlines.push(inline.clone());
+                continue;
+            };
+            if index > 0 && position == 0 {
+                last.text.push(' ');
+            }
+            if last.bold == inline.bold && last.italic == inline.italic {
+                last.text.push_str(&inline.text);
+                continue;
+            }
+            inlines.push(inline.clone());
+        }
+    }
+    Line {
+        inlines,
+        y: fragments.first().map_or(0.0, |line| line.y),
+        x,
+        end_x,
+        size,
+    }
 }
 
 /// The longest stretch of the segment's lines that reads as a grid, or `None`
@@ -1364,7 +1840,80 @@ pub(crate) mod tests {
         contents.push(lane_grid_content());
         contents.push(grid_with_edge_lines_content());
         contents.push(margin_number_grid_content());
+        contents.push(ruled_grid_content());
+        contents.push(ruled_boxed_list_content());
+        contents.push(ruled_sub_word_gap_content());
+        contents.push(ruled_wrapped_band_content());
+        contents.push(ruled_grid_above_lane_grid_content());
         contents
+    }
+
+    /// A drawn 2x2 grid — boxed border, one interior vertical, one interior
+    /// horizontal — with a word in each cell. Two cell columns leave a single
+    /// lane, so only the ruled path can read it as a table.
+    pub(crate) fn ruled_grid_content() -> String {
+        String::from(
+            "70 670 360 40 re S 250 670 m 250 710 l S 70 690 m 430 690 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 80 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj ET",
+        )
+    }
+
+    /// The corpus shape the ruled path exists for: a single-column boxed
+    /// list — two verticals, five horizontals, one item per band. No lane
+    /// structure at all: the lane path needs two lanes and this has none.
+    pub(crate) fn ruled_boxed_list_content() -> String {
+        String::from(
+            "70 630 360 80 re S 70 690 m 430 690 l S 70 670 m 430 670 l S 70 650 m 430 650 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (first item) Tj \
+             1 0 0 1 80 675 Tm (second item) Tj \
+             1 0 0 1 80 655 Tm (third item) Tj \
+             1 0 0 1 80 635 Tm (fourth item) Tj ET",
+        )
+    }
+
+    /// [`ruled_grid_content`]'s lattice with one row's word split across the
+    /// interior vertical at x=250 by a sub-word gap: "worl" ends at 249.4,
+    /// "d" starts at 250.5. Reading the rulings as columns would cut "world"
+    /// in two, so the grid must be rejected and the page must stay prose.
+    pub(crate) fn ruled_sub_word_gap_content() -> String {
+        String::from(
+            "70 670 360 40 re S 250 670 m 250 710 l S 70 690 m 430 690 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 229.4 675 Tm (worl) Tj 1 0 0 1 250.5 675 Tm (d) Tj ET",
+        )
+    }
+
+    /// A boxed three-column grid whose bottom band wraps its first cell over
+    /// three visual lines — the shape that shattered into fragmentary rows
+    /// when every visual line was its own row. Ground truth wants one
+    /// logical row per band, the wrapped text joined inside the cell.
+    pub(crate) fn ruled_wrapped_band_content() -> String {
+        String::from(
+            "70 600 390 100 re S 200 600 m 200 700 l S 330 600 m 330 700 l S \
+             70 660 m 460 660 l S 70 680 m 460 680 l S \
+             BT /F1 10 Tf 1 0 0 1 80 685 Tm (h1) Tj 1 0 0 1 210 685 Tm (h2) Tj \
+             1 0 0 1 340 685 Tm (h3) Tj \
+             1 0 0 1 80 665 Tm (m1) Tj 1 0 0 1 210 665 Tm (m2) Tj \
+             1 0 0 1 340 665 Tm (m3) Tj \
+             1 0 0 1 80 645 Tm (wrap one) Tj 1 0 0 1 210 645 Tm (solo) Tj \
+             1 0 0 1 340 645 Tm (tail) Tj \
+             1 0 0 1 80 625 Tm (wrap two) Tj 1 0 0 1 80 605 Tm (wrap three) Tj ET",
+        )
+    }
+
+    /// The doc-81 shape: a small fully boxed grid above a whitespace-laned
+    /// grid in one segment. The drawn grid claims only its own stretch; the
+    /// laned rows below it must still become a table of their own.
+    pub(crate) fn ruled_grid_above_lane_grid_content() -> String {
+        let mut content = format!("{} BT /F1 10 Tf ", ruled_grid_content());
+        for (row, y) in [(0, 560.0), (1, 540.0), (2, 520.0), (3, 500.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
     }
 
     /// Four rows of three cells on three lanes: the shape that reads as a
@@ -1592,6 +2141,85 @@ pub(crate) mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 30);
         assert_eq!(lines[0], "Rowname0 12345 678 90");
+    }
+
+    /// An already-normalized ruling, the shape extraction emits.
+    fn ruling(x0: f32, y0: f32, x1: f32, y1: f32) -> Ruling {
+        Ruling {
+            start: pdfboss_text::Point { x: x0, y: y0 },
+            end: pdfboss_text::Point { x: x1, y: y1 },
+            width: 1.0,
+        }
+    }
+
+    /// The four borders of a box plus one interior horizontal through its
+    /// middle: the smallest lattice that qualifies as a grid.
+    fn boxed_grid_rulings(x0: f32, y0: f32, x1: f32, y1: f32) -> Vec<Ruling> {
+        let mid = (y0 + y1) / 2.0;
+        vec![
+            ruling(x0, y0, x0, y1),
+            ruling(x1, y0, x1, y1),
+            ruling(x0, y0, x1, y0),
+            ruling(x0, y1, x1, y1),
+            ruling(x0, mid, x1, mid),
+        ]
+    }
+
+    #[test]
+    fn a_boxed_lattice_clusters_into_one_grid() {
+        let grids = ruled_grids(&boxed_grid_rulings(70.0, 630.0, 430.0, 710.0));
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].xs, vec![70.0, 430.0]);
+        assert_eq!(grids[0].ys, vec![630.0, 670.0, 710.0]);
+        assert!(grids[0].boxed);
+    }
+
+    /// Two boxes stacked on the page share their border x positions; the gap
+    /// between their extents must keep them two lattices, topmost first.
+    #[test]
+    fn stacked_boxes_sharing_their_x_stay_two_grids() {
+        let mut rulings = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
+        rulings.extend(boxed_grid_rulings(70.0, 300.0, 430.0, 380.0));
+        let grids = ruled_grids(&rulings);
+        assert_eq!(grids.len(), 2);
+        assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0], "topmost first");
+        assert_eq!(grids[1].ys, vec![300.0, 340.0, 380.0]);
+    }
+
+    /// A plain box has only its two border horizontals — a frame, not a
+    /// grid — and a lone separator line is nothing at all.
+    #[test]
+    fn a_plain_box_is_not_a_grid() {
+        let rulings = vec![
+            ruling(70.0, 630.0, 70.0, 710.0),
+            ruling(430.0, 630.0, 430.0, 710.0),
+            ruling(70.0, 630.0, 430.0, 630.0),
+            ruling(70.0, 710.0, 430.0, 710.0),
+        ];
+        assert!(ruled_grids(&rulings).is_empty());
+        assert!(ruled_grids(&[ruling(70.0, 400.0, 430.0, 400.0)]).is_empty());
+    }
+
+    /// A ruling that crosses nothing in the lattice — an underline elsewhere
+    /// on the page — must not join it or open a phantom column.
+    #[test]
+    fn an_unconnected_ruling_stays_out_of_the_lattice() {
+        let mut rulings = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
+        rulings.push(ruling(70.0, 100.0, 200.0, 100.0));
+        let grids = ruled_grids(&rulings);
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0]);
+    }
+
+    /// The spans-only layout ignores drawn borders — the flat flow of the
+    /// ruled fixtures is what the Text adapter must keep rendering.
+    #[test]
+    fn ruled_fixtures_keep_the_flat_flow() {
+        assert_eq!(
+            text_of(&ruled_boxed_list_content()),
+            "first item\nsecond item\nthird item\nfourth item"
+        );
+        assert_eq!(text_of(&ruled_sub_word_gap_content()), "a1 b1\nworld");
     }
 
     /// A table's narrow number column beside a wide text column is not a

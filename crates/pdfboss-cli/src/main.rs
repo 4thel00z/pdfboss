@@ -435,10 +435,12 @@ fn cmd_md(file: &Path, page: Option<usize>) -> Result<(), String> {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
-            let (spans, report) =
-                pdfboss_text::extract_spans_reporting(&doc, &page).map_err(|e| e.to_string())?;
+            let (spans, rulings, report) =
+                pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page)
+                    .map_err(|e| e.to_string())?;
             warn_skips(n, &report);
-            pdfboss_output::Markdown.render(&[pdfboss_output::page_layout(&spans)])
+            pdfboss_output::Markdown
+                .render(&[pdfboss_output::page_layout_with_rulings(&spans, &rulings)])
         }
         None => {
             let (md, reports) =

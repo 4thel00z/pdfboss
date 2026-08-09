@@ -9,6 +9,7 @@ mod sfnt;
 use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Result};
 
 pub use extract::{ExtractReport, SkipCause, SkippedText, SkippedTextKind};
+pub use pdfboss_core::Point;
 
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,22 @@ pub struct TextSpan {
     /// `/Flags` Italic or a nonzero `/ItalicAngle`, else an `Italic` or
     /// `Oblique` substring in `/BaseFont` (ISO 32000-1 Table 123).
     pub italic: bool,
+}
+
+/// An axis-aligned line segment a page draws, in the same y-up user space as
+/// `TextSpan`: a table border, a separator, an underline.
+///
+/// Endpoints are normalized (`start.x <= end.x`, `start.y <= end.y`) and
+/// exactly axis-aligned: the near-constant coordinate is snapped to its
+/// midpoint over the segment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ruling {
+    pub start: Point,
+    pub end: Point,
+    /// Stroke width in device space. Zero does not say how the ruling was
+    /// drawn: a hairline stroke (`0 w`) and a thin filled rectangle's
+    /// centerline both carry 0.0.
+    pub width: f32,
 }
 
 /// Extracts the page's raw text spans (position, size and font per span).
@@ -61,7 +78,7 @@ pub async fn extract_spans_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<Vec<TextSpan>> {
-    let (spans, _) = extract::page_spans_with(src, page).await;
+    let (spans, _, _) = extract::page_spans_and_rulings_with(src, page).await;
     Ok(spans)
 }
 
@@ -83,8 +100,32 @@ pub async fn extract_spans_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    let (spans, report) = extract::page_spans_with(src, page).await;
+    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page).await;
     Ok((spans, report))
+}
+
+/// [`extract_spans_reporting`] plus the page's rulings: every axis-aligned
+/// segment the content strokes, and the centerline of every thin filled
+/// rectangle, in the same y-up user space as the spans. See [`Ruling`] for
+/// the normalization the returned segments carry.
+pub fn extract_spans_and_rulings_reporting(
+    doc: &Document,
+    page: &Page,
+) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
+    block_on(extract_spans_and_rulings_reporting_with(
+        Immediate(doc),
+        page,
+    ))
+}
+
+/// [`extract_spans_and_rulings_reporting`] against any object source. Signed
+/// like [`extract_spans_with`], for the same reasons.
+pub async fn extract_spans_and_rulings_reporting_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
+    let (spans, rulings, report) = extract::page_spans_and_rulings_with(src, page).await;
+    Ok((spans, rulings, report))
 }
 
 #[cfg(test)]
@@ -141,6 +182,23 @@ mod tests {
         assert!((s.y - 720.0).abs() < 1e-3);
         assert!((s.size - 12.0).abs() < 1e-3);
         assert_eq!(s.font, "F1");
+    }
+
+    /// The combined entry point carries the spans, the drawn rulings, and
+    /// the completeness report through in one call.
+    #[test]
+    fn extract_spans_and_rulings_reports_both() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hi) Tj ET 72 700 m 272 700 l S",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let (spans, rulings, report) = extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "Hi");
+        assert_eq!(rulings.len(), 1);
+        assert!((rulings[0].start.y - 700.0).abs() < 1e-3);
+        assert!(report.is_complete());
     }
 
     #[test]
