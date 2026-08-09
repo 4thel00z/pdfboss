@@ -388,4 +388,11 @@ async fn encrypted_documents_decrypt_identically() {
         sync_text, async_text,
         "extraction agrees on encrypted files"
     );
+
+    // Markdown extraction over the same encrypted content agrees too.
+    let sync_md = pdfboss_output::extract_page_markdown(&sync_doc, &sync_page).expect("sync md");
+    let async_md = pdfboss_output::extract_page_markdown_with(async_doc.clone(), &async_page)
+        .await
+        .expect("async md");
+    assert_eq!(sync_md, async_md, "markdown agrees on encrypted files");
 }

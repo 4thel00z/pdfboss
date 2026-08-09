@@ -99,6 +99,10 @@ class Document:
     def extract_text(self) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``)."""
 
+    def extract_markdown(self) -> str:
+        """Whole-document markdown: headings, lists and tables inferred from
+        layout; heading sizes judged across the document."""
+
     def elements(
         self,
         *,
@@ -138,6 +142,11 @@ class Page:
 
     def extract_text(self) -> str:
         """Extracts the page's text."""
+
+    def extract_markdown(self) -> str:
+        """Page markdown, ranking heading sizes against that page alone.
+        ``Document.extract_markdown`` is the better answer whenever the
+        whole document is at hand."""
 
     def render(
         self,
@@ -201,6 +210,7 @@ class AsyncDocument:
     def __getitem__(self, index: int) -> "AsyncPage": ...
     def page(self, index: int) -> "AsyncPage": ...
     async def extract_text(self) -> str: ...
+    async def extract_markdown(self) -> str: ...
     async def render_pages(
         self,
         pages: list[int] | None = None,
@@ -245,6 +255,7 @@ class AsyncPage:
     @property
     def rotation(self) -> int: ...
     async def extract_text(self) -> str: ...
+    async def extract_markdown(self) -> str: ...
     async def render(
         self,
         scale: float = 1.0,

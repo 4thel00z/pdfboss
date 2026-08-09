@@ -24,6 +24,7 @@ use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
 use pdfboss_core::{Dict, DocumentSeed, ObjRef, Object};
+use pdfboss_output::Output;
 
 create_exception!(
     pdfboss,
@@ -365,6 +366,17 @@ impl Document {
         })
     }
 
+    /// Extracts the whole document as markdown: headings, lists and tables
+    /// inferred from layout, with font sizes judged across the document.
+    /// Same fan-out and per-page leniency as `extract_text`.
+    fn extract_markdown(&self, py: Python<'_>) -> PyResult<String> {
+        let inner = &self.inner;
+        py.allow_threads(move || {
+            let doc = CoreDocument::from_seed(inner.lock().seed());
+            pdfboss_output::extract_markdown(&doc).map_err(pdf_err)
+        })
+    }
+
     /// Renders every page (or the 0-based `pages` given, in the order given)
     /// to PNG bytes, fanned out across the machine's cores — same arguments
     /// and leniency as `Page.render`, one PNG per page. For a multi-page
@@ -519,6 +531,16 @@ impl Page {
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
             pdfboss_output::extract_text(&doc, &self.page).map_err(pdf_err)
+        })
+    }
+
+    /// Extracts the page's markdown, ranking heading sizes against that page
+    /// alone. `Document.extract_markdown` is the better answer whenever the
+    /// whole document is at hand.
+    fn extract_markdown(&self, py: Python<'_>) -> PyResult<String> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            pdfboss_output::extract_page_markdown(&doc, &self.page).map_err(pdf_err)
         })
     }
 
@@ -888,6 +910,25 @@ impl AsyncDocument {
         })
     }
 
+    /// Extracts the whole document as markdown, like the sync
+    /// `Document.extract_markdown` — headings, lists and tables inferred
+    /// from layout, font sizes judged across the document. Coroutine; runs
+    /// on the tokio runtime, so the asyncio loop is never blocked.
+    fn extract_markdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut pages = Vec::new();
+            for i in 0..inner.page_count() {
+                let page = inner.page(i).map_err(aio_err)?;
+                let (spans, _) = pdfboss_text::extract_spans_reporting_with(inner.clone(), &page)
+                    .await
+                    .map_err(pdf_err)?;
+                pages.push(spans);
+            }
+            Ok(pdfboss_output::Markdown.render(&pdfboss_output::document_layout(&pages)))
+        })
+    }
+
     /// Renders every page (or the 0-based `pages` given, in the order given)
     /// to PNG bytes — the async twin of `Document.render_pages`, same
     /// arguments, same leniency, one PNG per page. Coroutine resolving to a
@@ -1066,6 +1107,18 @@ impl AsyncPage {
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             pdfboss_output::extract_text_with(doc, &page)
+                .await
+                .map_err(pdf_err)
+        })
+    }
+
+    /// Extracts the page's markdown, like the sync `Page.extract_markdown`,
+    /// ranking heading sizes against that page alone. Coroutine.
+    fn extract_markdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            pdfboss_output::extract_page_markdown_with(doc, &page)
                 .await
                 .map_err(pdf_err)
         })
