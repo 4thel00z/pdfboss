@@ -323,16 +323,32 @@ mod tests {
         assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
     }
 
-    /// A title above the grid is a line of the table, not a row: evenness is
-    /// measured over the rows alone, so the white space under the title does
-    /// not read as a hole in the grid.
+    /// Page furniture sharing the band with a grid leaves as prose: the
+    /// running header does not take the header row's place — which, being
+    /// wide enough to cross every lane, would also flip the block to the HTML
+    /// dialect as a merged cell — and the page number is not a last row. A
+    /// single-cell line between two rows is a wrapped cell and stays a row.
     #[test]
-    fn a_title_above_the_grid_keeps_the_table() {
-        let md = markdown_of(&structure::tests::titled_grid_content());
-        assert!(md.contains("| Table 1 |  |  |"), "md: {md}");
-        assert!(md.contains("| --- | --- | --- |"), "md: {md}");
-        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+    fn page_furniture_around_the_grid_stays_prose() {
+        let md = markdown_of(&structure::tests::furnished_grid_content());
+        let header = structure::tests::RUNNING_HEADER;
+        assert!(
+            !md.contains("<table>"),
+            "furniture flipped the dialect: {md}"
+        );
+        assert!(
+            md.contains(&format!(
+                "{header}\n\n| r0c0 | r0c1 | r0c2 |\n| --- | --- | --- |"
+            )),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("| r1c0 | r1c1 | r1c2 |\n| wrapped cell |  |  |\n| r2c0 |"),
+            "wrapped cell is a row: {md}"
+        );
         assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+        assert!(!md.contains("| 24 |"), "page number is not a row: {md}");
+        assert!(md.ends_with("\n\n24"), "md: {md}");
     }
 
     /// A cell crossing the lane gap forces the HTML dialect with colspan.

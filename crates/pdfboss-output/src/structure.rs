@@ -114,11 +114,13 @@ fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
         if segment.spans.is_empty() {
             continue;
         }
-        if let Some(rows) = table_rows(&segment) {
+        if let Some(band) = table_band(&segment) {
+            push_blocks(&band.above, stats, &mut blocks);
             blocks.push(Block::Table {
-                bbox: table_bbox(&rows),
-                rows,
+                bbox: table_bbox(&band.rows),
+                rows: band.rows,
             });
+            push_blocks(&band.below, stats, &mut blocks);
             continue;
         }
         push_blocks(&assemble_lines(&segment.spans), stats, &mut blocks);
@@ -470,41 +472,69 @@ fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
 
 /// One reading-order segment's spans as lines, top of page first.
 fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
-    line_groups(spans)
-        .iter()
-        .map(|group| assemble_line(group.y, group.size, &group.spans))
-        .collect()
+    line_groups(spans).iter().map(assembled).collect()
 }
 
-/// The segment's lines as table rows, or `None` when it fails a gate and
-/// must flow as prose exactly as a segment with no lanes does.
+/// A grid and the page furniture around it: the lines above the first
+/// populated row and below the last are a caption, a running header or a page
+/// number, not rows.
+struct TableBand {
+    above: Vec<Assembled>,
+    rows: Vec<Vec<Cell>>,
+    below: Vec<Assembled>,
+}
+
+/// The segment as a table band, or `None` when it fails a gate and must flow
+/// as prose exactly as a segment with no lanes does.
 ///
 /// The gates are all required: three cell columns, three rows populating two
 /// cells each, every span sitting in a column, evenly spaced row baselines,
 /// and neighbouring cells more than a word gap apart — the last so a row
 /// reads as the one line the flat flow wrote, cell texts and all.
 ///
-/// Every line group is returned, rows and single-cell lines alike, so the
-/// block still holds every line the flat flow would have written.
-fn table_rows(segment: &Segment) -> Option<Vec<Vec<Cell>>> {
+/// The grid runs from the first populated row to the last, so its first row
+/// is a real one. Lines outside that stretch populate a single cell and leave
+/// as prose — where the roles and the heading and list passes can still read
+/// them; the single-cell lines inside it stay rows, being the wrapped cells
+/// and continuation lines of the grid itself.
+fn table_band(segment: &Segment) -> Option<TableBand> {
     if segment.lanes.len() < TABLE_MIN_LANES {
         return None;
     }
     let columns = cell_columns(&segment.spans, &segment.lanes);
-    let mut rows = Vec::new();
-    let mut baselines = Vec::new();
-    for group in &line_groups(&segment.spans) {
+    let groups = line_groups(&segment.spans);
+    let mut rows = Vec::with_capacity(groups.len());
+    let mut populated = Vec::with_capacity(groups.len());
+    for group in &groups {
         let row = table_row(group, &columns)?;
         let cells = row.iter().filter(|cell| cell.line.is_some()).count();
-        if cells >= TABLE_MIN_ROW_CELLS {
-            baselines.push(group.y);
-        }
+        populated.push(cells >= TABLE_MIN_ROW_CELLS);
         rows.push(row);
     }
+    let first = populated.iter().position(|filled| *filled)?;
+    let last = populated.iter().rposition(|filled| *filled)?;
+    let baselines: Vec<f32> = groups[first..=last]
+        .iter()
+        .zip(&populated[first..=last])
+        .filter(|(_, filled)| **filled)
+        .map(|(group, _)| group.y)
+        .collect();
     if baselines.len() < TABLE_MIN_ROWS {
         return None;
     }
-    even_rows(&baselines).then_some(rows)
+    if !even_rows(&baselines) {
+        return None;
+    }
+    let above = groups[..first].iter().map(assembled).collect();
+    let below = groups[last + 1..].iter().map(assembled).collect();
+    rows.truncate(last + 1);
+    rows.drain(..first);
+    Some(TableBand { above, rows, below })
+}
+
+/// One line group as an assembled line, for the passes that read prose.
+fn assembled(group: &Group) -> Assembled {
+    assemble_line(group.y, group.size, &group.spans)
 }
 
 /// The x ranges the lanes leave between them, left to right: the band's cell
@@ -523,9 +553,9 @@ fn cell_columns(spans: &[&TextSpan], lanes: &[std::ops::Range<f32>]) -> Vec<std:
 
 /// True when no step between neighbouring row baselines, top of page first,
 /// exceeds [`TABLE_ROW_GAP`] times the median — what separates one grid from
-/// two blocks that happen to share columns. Only the rows are measured: a
-/// title above the grid or a page number below it populates no cells, and
-/// the white space around it is not a hole in the table.
+/// two blocks that happen to share columns. Only populated rows are measured,
+/// so a wrapped cell standing alone in a hole cannot halve it into two steps
+/// small enough to pass.
 fn even_rows(baselines: &[f32]) -> bool {
     let steps: Vec<f32> = baselines.windows(2).map(|pair| pair[0] - pair[1]).collect();
     if steps.is_empty() {
@@ -1003,7 +1033,7 @@ pub(crate) mod tests {
             two_column_content(25)
         ));
         contents.push(lane_grid_content());
-        contents.push(titled_grid_content());
+        contents.push(furnished_grid_content());
         contents
     }
 
@@ -1021,13 +1051,21 @@ pub(crate) mod tests {
         content
     }
 
-    /// [`lane_grid_content`] under a title sitting well above the grid, in
-    /// the first cell column. The title populates one cell, so it is a line
-    /// of the block but not a row, and the white space between it and the
-    /// grid is not a step between rows.
-    pub(crate) fn titled_grid_content() -> String {
+    /// Wide enough to cross every lane, so reading it as a row would make it
+    /// the grid's header — and a merged cell, which flips the whole block to
+    /// the HTML dialect.
+    pub(crate) const RUNNING_HEADER: &str =
+        "ANFREL Pre-Election Assessment Mission Report to the Union Election Commission";
+
+    /// [`lane_grid_content`] with the furniture a real page puts around a
+    /// grid: a running header above, a page number below, and one wrapped
+    /// cell between two rows. All three populate a single cell; only the
+    /// wrapped one is inside the grid.
+    pub(crate) fn furnished_grid_content() -> String {
         format!(
-            "BT /F1 10 Tf 1 0 0 1 72 760 Tm (Table 1) Tj ET {}",
+            "BT /F1 10 Tf 1 0 0 1 72 760 Tm ({RUNNING_HEADER}) Tj ET {} \
+             BT /F1 10 Tf 1 0 0 1 72 670 Tm (wrapped cell) Tj ET \
+             BT /F1 10 Tf 1 0 0 1 72 600 Tm (24) Tj ET",
             lane_grid_content()
         )
     }
