@@ -131,6 +131,7 @@ mod tests {
     fn text_adapter_matches_layout_on_fixtures() {
         let mut headings = 0usize;
         let mut splits = 0usize;
+        let mut tables = 0usize;
         for content in structure::tests::fixture_contents() {
             let doc = Document::load(doc_with_graphics(&content)).unwrap();
             let page = doc.page(0).unwrap();
@@ -148,6 +149,11 @@ mod tests {
                 .filter(|block| matches!(block, Block::Paragraph { .. }))
                 .count();
             splits += usize::from(paragraphs > 1);
+            tables += layout
+                .blocks
+                .iter()
+                .filter(|block| matches!(block, Block::Table { .. }))
+                .count();
             let via_ir = Text.render(&[layout]);
             assert_eq!(
                 via_ir,
@@ -159,6 +165,7 @@ mod tests {
         // ever reaching the code it guards.
         assert!(headings > 0, "no fixture produced a heading block");
         assert!(splits > 0, "no fixture split into several paragraphs");
+        assert!(tables > 0, "no fixture produced a table block");
     }
 
     /// Markdown of a one-page document with `content` as its raw content
@@ -302,6 +309,40 @@ mod tests {
                 || md.contains("- a long item that wraps to a second line"),
             "md: {md}"
         );
+    }
+
+    /// Three lanes, four aligned rows -> one pipe table.
+    #[test]
+    fn lane_grid_becomes_pipe_table() {
+        let md = markdown_of(&structure::tests::lane_grid_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(
+            md.contains("| --- | --- | --- |"),
+            "separator after header: {md}"
+        );
+        assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+    }
+
+    /// A cell crossing the lane gap forces the HTML dialect with colspan.
+    #[test]
+    fn spanning_cell_switches_to_html_table() {
+        // Same 4x3 grid as lane_grid_becomes_pipe_table, except row 0's first
+        // cell is one long string whose advance (testkit default width 500 →
+        // 5pt/char at 10pt) runs from x=72 past lane 1's start at x=250.
+        let mut content = String::from(
+            "BT /F1 10 Tf 1 0 0 1 72 700 Tm (a merged header cell spanning two lanes xx) Tj \
+             1 0 0 1 430 700 Tm (r0c2) Tj ",
+        );
+        for (row, y) in [(1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        let md = markdown_of(&content);
+        assert!(md.contains("<table>"), "md: {md}");
+        assert!(md.contains("colspan=\"2\""), "md: {md}");
+        assert!(!md.contains("| r1c0 |"), "one table, one dialect: {md}");
     }
 
     /// A lone page of huge text must not become all headings under per-page

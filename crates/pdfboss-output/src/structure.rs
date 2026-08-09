@@ -1,7 +1,7 @@
 //! Spans to the layout IR: line assembly, word gaps, the two-column gutter
 //! split, and the size statistics that rank headings.
 
-use crate::ir::{BBox, Block, Inline, Line, ListItem, Marker, PageLayout, Role};
+use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::TextSpan;
 
@@ -64,6 +64,18 @@ const LIST_MIN_LINES: usize = 2;
 /// wrapped continuation rather than the next block.
 const LIST_CONTINUATION_INDENT: f32 = 0.5;
 
+/// A grid needs a lane between every pair of cell columns, so two lanes —
+/// three cell columns — is the narrowest band that reads as a table. One
+/// lane is a gutter, a label beside its value, or a hanging indent.
+const TABLE_MIN_LANES: usize = 2;
+/// How many rows must populate [`TABLE_MIN_ROW_CELLS`] cells before the band
+/// is a table rather than two lines that happen to share a lane.
+const TABLE_MIN_ROWS: usize = 3;
+const TABLE_MIN_ROW_CELLS: usize = 2;
+/// A baseline step beyond this multiple of the band's median step is white
+/// space between blocks rather than the next row.
+const TABLE_ROW_GAP: f32 = 2.0;
+
 /// Groups spans into lines (baselines within `0.5 · size`), orders lines
 /// top to bottom and spans left to right, inserts a space at horizontal
 /// gaps wider than `WORD_GAP` times the size, and joins lines with `\n`.
@@ -99,10 +111,17 @@ pub fn document_layout(pages: &[Vec<TextSpan>]) -> Vec<PageLayout> {
 fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
     let mut blocks = Vec::new();
     for segment in segments(spans) {
-        if segment.is_empty() {
+        if segment.spans.is_empty() {
             continue;
         }
-        push_blocks(&assemble_lines(&segment), stats, &mut blocks);
+        if let Some(rows) = table_rows(&segment) {
+            blocks.push(Block::Table {
+                bbox: table_bbox(&rows),
+                rows,
+            });
+            continue;
+        }
+        push_blocks(&assemble_lines(&segment.spans), stats, &mut blocks);
     }
     PageLayout { blocks }
 }
@@ -401,21 +420,30 @@ fn push_paragraph(lines: &[Line], out: &mut Vec<Block>) {
 /// Median baseline step of consecutive lines, or zero when there is no step
 /// to measure — a run of one line never splits.
 fn median_step(lines: &[Line]) -> f32 {
-    let mut steps: Vec<f32> = lines.windows(2).map(|pair| pair[0].y - pair[1].y).collect();
-    if steps.is_empty() {
-        return 0.0;
-    }
-    steps.sort_by(f32::total_cmp);
-    steps[steps.len() / 2]
+    median(lines.windows(2).map(|pair| pair[0].y - pair[1].y).collect())
 }
 
-/// One reading-order segment's spans as lines, top of page first.
-fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
-    struct Group<'s> {
-        y: f32,
-        size: f32,
-        spans: Vec<&'s TextSpan>,
+/// The middle value, or zero when there is none.
+fn median(mut values: Vec<f32>) -> f32 {
+    if values.is_empty() {
+        return 0.0;
     }
+    values.sort_by(f32::total_cmp);
+    values[values.len() / 2]
+}
+
+/// The spans that share one visual line, and the line's baseline and largest
+/// size. Table rows are these groups too, which is what makes a table's rows
+/// the very lines the flat flow would have written.
+struct Group<'s> {
+    y: f32,
+    size: f32,
+    spans: Vec<&'s TextSpan>,
+}
+
+/// One reading-order segment's spans grouped into lines — baselines within
+/// `0.5 · size` — top of page first, spans left to right inside each.
+fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
     let mut groups: Vec<Group> = Vec::new();
     for &span in spans {
         let found = groups
@@ -434,13 +462,148 @@ fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
         }
     }
     groups.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
+    for group in &mut groups {
+        group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+    }
     groups
-        .iter_mut()
-        .map(|group| {
-            group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
-            assemble_line(group.y, group.size, &group.spans)
-        })
+}
+
+/// One reading-order segment's spans as lines, top of page first.
+fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
+    line_groups(spans)
+        .iter()
+        .map(|group| assemble_line(group.y, group.size, &group.spans))
         .collect()
+}
+
+/// The segment's lines as table rows, or `None` when it fails a gate and
+/// must flow as prose exactly as a segment with no lanes does.
+///
+/// The gates are all required: three cell columns, three rows populating two
+/// cells each, every span sitting in a column, evenly spaced baselines, and
+/// neighbouring cells more than a word gap apart — the last so a row reads
+/// as the one line the flat flow wrote, cell texts and all.
+fn table_rows(segment: &Segment) -> Option<Vec<Vec<Cell>>> {
+    if segment.lanes.len() < TABLE_MIN_LANES {
+        return None;
+    }
+    let columns = cell_columns(&segment.spans, &segment.lanes);
+    let groups = line_groups(&segment.spans);
+    if !even_rows(&groups) {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(groups.len());
+    let mut populated = 0usize;
+    for group in &groups {
+        let row = table_row(group, &columns)?;
+        let cells = row.iter().filter(|cell| cell.line.is_some()).count();
+        populated += usize::from(cells >= TABLE_MIN_ROW_CELLS);
+        rows.push(row);
+    }
+    (populated >= TABLE_MIN_ROWS).then_some(rows)
+}
+
+/// The x ranges the lanes leave between them, left to right: the band's cell
+/// columns. The outer two run to the band's own horizontal extent.
+fn cell_columns(spans: &[&TextSpan], lanes: &[std::ops::Range<f32>]) -> Vec<std::ops::Range<f32>> {
+    let (lo, hi) = x_bounds(spans);
+    let mut columns = Vec::with_capacity(lanes.len() + 1);
+    let mut start = lo;
+    for lane in lanes {
+        columns.push(start..lane.start);
+        start = lane.end;
+    }
+    columns.push(start..hi);
+    columns
+}
+
+/// True when no baseline step exceeds [`TABLE_ROW_GAP`] times the median —
+/// what separates one grid from two blocks that happen to share columns.
+fn even_rows(groups: &[Group]) -> bool {
+    let steps: Vec<f32> = groups
+        .windows(2)
+        .map(|pair| pair[0].y - pair[1].y)
+        .collect();
+    if steps.is_empty() {
+        return true;
+    }
+    let limit = TABLE_ROW_GAP * median(steps.clone());
+    if limit <= 0.0 {
+        return false;
+    }
+    steps.iter().all(|step| *step <= limit)
+}
+
+/// One row's cells, left to right, with a lineless cell for every column
+/// nothing was drawn in. `None` when a span will not sit in a column: one
+/// starting inside a lane, or two cells claiming the same column.
+fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell>> {
+    let mut claimed: Vec<(usize, usize, Vec<&TextSpan>)> = Vec::new();
+    for &span in &group.spans {
+        let lo = span.x.min(span.end_x);
+        let hi = span.x.max(span.end_x);
+        let start = columns.iter().rposition(|column| column.start <= lo)?;
+        if lo >= columns[start].end {
+            return None;
+        }
+        let end = columns.iter().rposition(|column| column.start <= hi)?;
+        match claimed.last_mut() {
+            Some(last) if last.0 == start => {
+                last.1 = last.1.max(end);
+                last.2.push(span);
+            }
+            Some(last) if start <= last.1 => return None,
+            _ => claimed.push((start, end, vec![span])),
+        }
+    }
+    // `next` counts columns, `row` counts cells: a colspan cell is one cell
+    // over several columns, so the two only agree on a grid with no merges.
+    let mut row = Vec::with_capacity(columns.len());
+    let mut next = 0usize;
+    for (start, end, spans) in &claimed {
+        for _ in next..*start {
+            row.push(empty_cell());
+        }
+        row.push(Cell {
+            line: Some(assemble_line(group.y, group.size, spans).line),
+            colspan: (end - start + 1) as u8,
+            rowspan: 1,
+        });
+        next = end + 1;
+    }
+    for _ in next..columns.len() {
+        row.push(empty_cell());
+    }
+    spaced_cells(&row, group.size).then_some(row)
+}
+
+fn empty_cell() -> Cell {
+    Cell {
+        line: None,
+        colspan: 1,
+        rowspan: 1,
+    }
+}
+
+/// True when neighbouring cells stand more than a word gap apart at the
+/// row's largest size — the gap the flat flow turned into the single space
+/// the [`Text`] adapter puts between cells. Below it the flow ran two cells
+/// into one word, and reading them as cells would change what the page says.
+fn spaced_cells(row: &[Cell], size: f32) -> bool {
+    let lines: Vec<&Line> = row.iter().filter_map(|cell| cell.line.as_ref()).collect();
+    lines
+        .windows(2)
+        .all(|pair| pair[1].x - pair[0].end_x > WORD_GAP * size)
+}
+
+/// The table's device-space box: every populated cell's line.
+fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
+    let lines: Vec<Line> = rows
+        .iter()
+        .flatten()
+        .filter_map(|cell| cell.line.clone())
+        .collect();
+    bbox(&lines)
 }
 
 /// One line from its spans in left-to-right order: a gap wider than
@@ -513,6 +676,22 @@ fn bbox(lines: &[Line]) -> BBox {
     }
 }
 
+/// One reading-order run of spans and the interior vertical lanes its
+/// non-separator spans leave empty. Lanes are what a table's cell columns
+/// stand either side of; a segment with none reads as prose.
+struct Segment<'s> {
+    spans: Vec<&'s TextSpan>,
+    lanes: Vec<std::ops::Range<f32>>,
+}
+
+/// A segment that reads top to bottom, whatever lanes the page has.
+fn prose(spans: Vec<&TextSpan>) -> Segment<'_> {
+    Segment {
+        spans,
+        lanes: Vec::new(),
+    }
+}
+
 /// The page's spans in reading order, cut into segments.
 ///
 /// Detects a two-column layout by x-occupancy: full-width spans are set
@@ -522,8 +701,11 @@ fn bbox(lines: &[Line]) -> BBox {
 /// real columns (enough spans, enough distinct baselines, enough shared
 /// height) — anything less reads top-to-bottom as one segment, which is
 /// exactly the old behavior.
-fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
-    let whole = || vec![spans.iter().collect::<Vec<&TextSpan>>()];
+///
+/// The same histogram answers the table question: an unsplit page carries
+/// its lanes on out, and several of them are the cell columns the split
+/// refuses to read column-major.
+fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
     let mut x_min = f32::INFINITY;
     let mut x_max = f32::NEG_INFINITY;
     for span in spans {
@@ -532,21 +714,11 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     }
     let width = x_max - x_min;
     if !width.is_finite() || width <= 0.0 {
-        return whole();
+        return vec![prose(spans.iter().collect())];
     }
     let (separators, body): (Vec<&TextSpan>, Vec<&TextSpan>) = spans
         .iter()
         .partition(|s| (s.end_x - s.x).abs() > SEPARATOR_FRACTION * width);
-    if body.len() < COLUMN_MIN_SPANS {
-        return whole();
-    }
-    // Two-column flow lives on portrait-shaped text blocks. A block wider
-    // than it is tall is a slide or a table sheet, where a lone lane is a
-    // cell boundary, not a gutter.
-    let (body_lo, body_hi) = y_extent(&body);
-    if body_hi - body_lo <= width {
-        return whole();
-    }
 
     let mut occupied = [false; GUTTER_BINS];
     let scale = GUTTER_BINS as f32 / width;
@@ -557,9 +729,26 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
             *bin = true;
         }
     }
+    let gaps = wide_gaps(&occupied, scale);
+    let whole = || {
+        vec![Segment {
+            spans: spans.iter().collect(),
+            lanes: lane_ranges(&gaps, x_min, scale),
+        }]
+    };
+
+    if body.len() < COLUMN_MIN_SPANS {
+        return whole();
+    }
+    // Two-column flow lives on portrait-shaped text blocks. A block wider
+    // than it is tall is a slide or a table sheet, where a lone lane is a
+    // cell boundary, not a gutter.
+    let (body_lo, body_hi) = y_extent(&body);
+    if body_hi - body_lo <= width {
+        return whole();
+    }
     // Exactly one wide interior lane is a gutter; several are the cell
     // columns of a data table, whose rows must keep reading left to right.
-    let gaps = wide_gaps(&occupied, scale);
     let [gutter] = gaps.as_slice() else {
         return whole();
     };
@@ -594,17 +783,17 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     let mut cuts: Vec<f32> = separators.iter().map(|s| s.y).collect();
     cuts.sort_by(|a, b| b.total_cmp(a));
     cuts.dedup();
-    let mut out: Vec<Vec<&TextSpan>> = Vec::new();
+    let mut out: Vec<Segment> = Vec::new();
     let mut top = f32::INFINITY;
     for &sep_y in &cuts {
         push_band(&left, &right, top, sep_y, &mut out);
-        out.push(
+        out.push(prose(
             separators
                 .iter()
                 .filter(|s| s.y == sep_y)
                 .copied()
                 .collect(),
-        );
+        ));
         top = sep_y;
     }
     push_band(&left, &right, top, f32::NEG_INFINITY, &mut out);
@@ -612,21 +801,22 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
 }
 
 /// Pushes one band's columns — the spans with baseline in `(bottom, top]` —
-/// left side first.
+/// left side first. A column half is prose: its one gutter lane belongs to
+/// the page, not to anything inside the column.
 fn push_band<'s>(
     left: &[&'s TextSpan],
     right: &[&'s TextSpan],
     top: f32,
     bottom: f32,
-    out: &mut Vec<Vec<&'s TextSpan>>,
+    out: &mut Vec<Segment<'s>>,
 ) {
     for side in [left, right] {
-        out.push(
+        out.push(prose(
             side.iter()
                 .filter(|s| s.y <= top && s.y > bottom)
                 .copied()
                 .collect(),
-        );
+        ));
     }
 }
 
@@ -654,6 +844,19 @@ fn wide_gaps(occupied: &[bool; GUTTER_BINS], scale: f32) -> Vec<std::ops::Range<
     gaps
 }
 
+/// The bin ranges back in device space. Bins, not device coordinates, stay
+/// the currency of the gutter split: rounding a lane and cutting the page at
+/// the rounded center could move a span from one column to the other.
+fn lane_ranges(
+    gaps: &[std::ops::Range<usize>],
+    x_min: f32,
+    scale: f32,
+) -> Vec<std::ops::Range<f32>> {
+    gaps.iter()
+        .map(|gap| (x_min + gap.start as f32 / scale)..(x_min + gap.end as f32 / scale))
+        .collect()
+}
+
 /// True when a gutter side has enough spans on enough distinct baselines
 /// to be a text column rather than a stray cluster.
 fn column_shaped(spans: &[&TextSpan]) -> bool {
@@ -677,31 +880,38 @@ fn y_extent(spans: &[&TextSpan]) -> (f32, f32) {
     (lo, hi)
 }
 
-/// Horizontal extent of a span set.
-fn x_span(spans: &[&TextSpan]) -> f32 {
+/// Leftmost and rightmost x of a span set.
+fn x_bounds(spans: &[&TextSpan]) -> (f32, f32) {
     let mut lo = f32::INFINITY;
     let mut hi = f32::NEG_INFINITY;
     for span in spans {
         lo = lo.min(span.x.min(span.end_x));
         hi = hi.max(span.x.max(span.end_x));
     }
+    (lo, hi)
+}
+
+/// Horizontal extent of a span set.
+fn x_span(spans: &[&TextSpan]) -> f32 {
+    let (lo, hi) = x_bounds(spans);
     hi - lo
 }
 
 /// The pre-IR string builder, kept as the oracle [`layout`] is measured
 /// against: it walks segments straight into a `String` with no structure in
-/// between. Any divergence is a parity bug in the IR or the [`Text`] adapter.
+/// between — lanes and tables included, which it knows nothing about. Any
+/// divergence is a parity bug in the IR or the [`Text`] adapter.
 #[cfg(test)]
 pub(crate) fn layout_reference(spans: &[TextSpan]) -> String {
     let mut out = String::new();
     for segment in segments(spans) {
-        if segment.is_empty() {
+        if segment.spans.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push('\n');
         }
-        flow(&segment, &mut out);
+        flow(&segment.spans, &mut out);
     }
     out
 }
@@ -788,7 +998,22 @@ pub(crate) mod tests {
             "BT /F1 12 Tf 72 760 Td (A quite wide heading spanning both text columns here) Tj ET {}",
             two_column_content(25)
         ));
+        contents.push(lane_grid_content());
         contents
+    }
+
+    /// Four rows of three cells on three lanes: the shape that reads as a
+    /// table. The Markdown tests and the Text-parity oracle replay the same
+    /// geometry, so the table path is measured against the plain flow.
+    pub(crate) fn lane_grid_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
     }
 
     /// The page's spans, asserting the extraction report is complete: no
