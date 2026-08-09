@@ -2,7 +2,7 @@
 //! `beginbfrange` forms; destination hex is UTF-16BE and may be multi-char.
 
 use pdfboss_core::lexer::{Lexer, Token};
-use std::collections::HashMap;
+use pdfboss_core::FastMap;
 
 /// A parsed ToUnicode CMap mapping character codes to Unicode strings.
 ///
@@ -13,7 +13,7 @@ pub struct ToUnicode {
     /// `(byte_len, low, high)` from `begincodespacerange`.
     codespaces: Vec<(usize, u32, u32)>,
     /// Single-code mappings (`bfchar` and array-form `bfrange`).
-    singles: HashMap<u32, String>,
+    singles: FastMap<u32, String>,
     /// Increment-form `bfrange` entries: `(low, high, base UTF-16 units)`;
     /// the last unit increments with the code.
     ranges: Vec<(u32, u32, Vec<u16>)>,
@@ -300,6 +300,19 @@ mod tests {
         assert_eq!(cmap.lookup(0x20), None);
         assert_eq!(cmap.lookup(0x30), None);
         assert_eq!(cmap.lookup(0x31).as_deref(), Some("B"));
+    }
+
+    /// Duplicate source codes follow map insert semantics: the last mapping
+    /// wins, within a section and across sections.
+    #[test]
+    fn duplicate_code_keeps_last_mapping() {
+        let cmap = ToUnicode::parse(b"2 beginbfchar <41> <0058> <41> <0059> endbfchar");
+        assert_eq!(cmap.lookup(0x41).as_deref(), Some("Y"));
+        let across = ToUnicode::parse(
+            b"1 beginbfchar <41> <0058> endbfchar\n\
+              1 beginbfrange <41> <41> [<005A>] endbfrange",
+        );
+        assert_eq!(across.lookup(0x41).as_deref(), Some("Z"));
     }
 
     #[test]
