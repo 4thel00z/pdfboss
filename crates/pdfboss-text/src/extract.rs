@@ -2,7 +2,7 @@
 //! Ts), glyph advances, and form XObject recursion.
 
 use crate::font::Font;
-use crate::TextSpan;
+use crate::{Ruling, TextSpan};
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page,
@@ -18,6 +18,18 @@ const MAX_FORM_DEPTH: usize = 16;
 /// does not bound work: a chain of forms in which each level invokes the
 /// next N times fans out to N^depth executions from a tiny file.
 const MAX_FORM_INVOCATIONS: usize = 4096;
+
+/// Maximum device-space cross-axis deviation over a path segment for it to
+/// count as axis-aligned after the CTM.
+const RULING_AXIS_EPSILON: f32 = 0.5;
+
+/// Minimum device-space length of a ruling. Shorter marks (tick marks,
+/// dashes of glyph decoration) are not table structure.
+const RULING_MIN_LENGTH: f32 = 8.0;
+
+/// Maximum thin dimension of a filled rectangle that reads as a drawn line;
+/// anything fatter is a shaded box, not a ruling.
+const RULING_MAX_FILL_THICKNESS: f32 = 3.0;
 
 /// What extraction could not read. Extraction is lenient the way rendering
 /// is — content that will not fetch, decode, or parse yields no text rather
@@ -112,8 +124,9 @@ fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
 }
 
 /// Runs the page's content stream (and any form XObjects) and collects
-/// every shown string as a [`TextSpan`], in emission order, along with the
-/// report of what could not be read.
+/// every shown string as a [`TextSpan`] and every axis-aligned drawn line
+/// as a [`Ruling`], each in emission order, along with the report of what
+/// could not be read.
 ///
 /// Lenient like rendering: a `/Contents` that will not fetch, decode, or
 /// parse contributes no spans and one report entry, never an error — the
@@ -123,10 +136,10 @@ fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
 /// `page` is borrowed, which does not stand in the way, because a caller that
 /// owns its page creates the borrow inside its own `async move` block. See
 /// `pdfboss_core::source`'s "Signing a shared algorithm".
-pub async fn page_spans_with<S: AsyncObjectSource>(
+pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
-) -> (Vec<TextSpan>, ExtractReport) {
+) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
     let mut report = ExtractReport::default();
     let content = match page_content_with(&src, page).await {
         Ok(content) => content,
@@ -145,6 +158,7 @@ pub async fn page_spans_with<S: AsyncObjectSource>(
     let mut exec = Executor {
         src: &src,
         spans: Vec::new(),
+        rulings: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
         report,
@@ -156,7 +170,7 @@ pub async fn page_spans_with<S: AsyncObjectSource>(
         0,
     );
     exec.run(root).await;
-    (exec.spans, exec.report)
+    (exec.spans, exec.rulings, exec.report)
 }
 
 /// The graphics-state parameters text extraction cares about. Saved and
@@ -173,6 +187,8 @@ struct GState {
     font: Option<Arc<Font>>,
     font_name: String,
     size: f32,
+    /// `w` and ExtGState `/LW`; scales rulings' stroke width.
+    line_width: f32,
 }
 
 impl GState {
@@ -187,6 +203,7 @@ impl GState {
             font: None,
             font_name: String::new(),
             size: 0.0,
+            line_width: 1.0,
         }
     }
 }
@@ -194,6 +211,111 @@ impl GState {
 /// True when every matrix component is finite.
 fn finite(m: &Matrix) -> bool {
     [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite())
+}
+
+/// Isotropic scale factor of `m`: `sqrt(|det|)`, 1.0 when degenerate — the
+/// same rule rendering uses to carry a line width into device space.
+fn ctm_scale(m: &Matrix) -> f32 {
+    let det = (m.a * m.d - m.b * m.c).abs();
+    if det.is_finite() && det > 0.0 {
+        return det.sqrt();
+    }
+    1.0
+}
+
+/// Classifies one device-space segment: `Some` when it is axis-aligned
+/// within [`RULING_AXIS_EPSILON`] and at least [`RULING_MIN_LENGTH`] long.
+fn ruling_from_segment(a: Point, b: Point, width: f32) -> Option<Ruling> {
+    if [a.x, a.y, b.x, b.y, width].iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let dx = (b.x - a.x).abs();
+    let dy = (b.y - a.y).abs();
+    if dy <= RULING_AXIS_EPSILON && dx >= RULING_MIN_LENGTH {
+        let y = (a.y + b.y) / 2.0;
+        return Some(Ruling {
+            start: Point::new(a.x.min(b.x), y),
+            end: Point::new(a.x.max(b.x), y),
+            width,
+        });
+    }
+    if dx <= RULING_AXIS_EPSILON && dy >= RULING_MIN_LENGTH {
+        let x = (a.x + b.x) / 2.0;
+        return Some(Ruling {
+            start: Point::new(x, a.y.min(b.y)),
+            end: Point::new(x, a.y.max(b.y)),
+            width,
+        });
+    }
+    None
+}
+
+/// The centerline of a thin filled rectangle: a closed 4-vertex subpath in
+/// device space whose edges are all axis-aligned, with a thin dimension at
+/// most [`RULING_MAX_FILL_THICKNESS`] and a long dimension at least
+/// [`RULING_MIN_LENGTH`]. Width is 0.0 — a fill has no stroke width.
+fn filled_rect_ruling(device: &[Point]) -> Option<Ruling> {
+    let corners = match device {
+        [a, b, c, d] => [*a, *b, *c, *d],
+        [a, b, c, d, e]
+            if (e.x - a.x).abs() <= RULING_AXIS_EPSILON
+                && (e.y - a.y).abs() <= RULING_AXIS_EPSILON =>
+        {
+            [*a, *b, *c, *d]
+        }
+        _ => return None,
+    };
+    if corners.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return None;
+    }
+    let axis_aligned = |a: Point, b: Point| {
+        (b.x - a.x).abs() <= RULING_AXIS_EPSILON || (b.y - a.y).abs() <= RULING_AXIS_EPSILON
+    };
+    for i in 0..4 {
+        if !axis_aligned(corners[i], corners[(i + 1) % 4]) {
+            return None;
+        }
+    }
+    let x0 = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let x1 = corners
+        .iter()
+        .map(|p| p.x)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let y0 = corners.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let y1 = corners
+        .iter()
+        .map(|p| p.y)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w.min(h) > RULING_MAX_FILL_THICKNESS || w.max(h) < RULING_MIN_LENGTH {
+        return None;
+    }
+    if h <= w {
+        let y = (y0 + y1) / 2.0;
+        return Some(Ruling {
+            start: Point::new(x0, y),
+            end: Point::new(x1, y),
+            width: 0.0,
+        });
+    }
+    let x = (x0 + x1) / 2.0;
+    Some(Ruling {
+        start: Point::new(x, y0),
+        end: Point::new(x, y1),
+        width: 0.0,
+    })
+}
+
+/// One subpath under construction, in the frame's untransformed user space.
+///
+/// A curve operator poisons it — glyph outlines and diagrams are not
+/// rulings — but still advances the endpoint, so a following `l` extends
+/// the poisoned subpath instead of corrupting the next one.
+struct Subpath {
+    points: Vec<Point>,
+    closed: bool,
+    poisoned: bool,
 }
 
 /// One suspended operator stream: what to execute, how far it has got, and
@@ -223,6 +345,10 @@ struct Frame {
     saved: Vec<GState>,
     tm: Matrix,
     tlm: Matrix,
+    /// Path accumulation for rulings, per operator stream like `tm`/`tlm`:
+    /// the last element is the active subpath. Not part of [`GState`] —
+    /// `q`/`Q` do not save or restore the path.
+    subpaths: Vec<Subpath>,
     /// Loaded fonts, per operator stream: every form invocation starts with an
     /// empty cache, as it did when each invocation was its own `run` call.
     fonts: HashMap<String, Arc<Font>>,
@@ -239,14 +365,71 @@ impl Frame {
             saved: Vec::new(),
             tm: Matrix::identity(),
             tlm: Matrix::identity(),
+            subpaths: Vec::new(),
             fonts: HashMap::new(),
         }
+    }
+
+    fn move_to(&mut self, x: f32, y: f32) {
+        self.subpaths.push(Subpath {
+            points: vec![Point::new(x, y)],
+            closed: false,
+            poisoned: false,
+        });
+    }
+
+    /// Extends the active subpath by one segment. Appending to a closed
+    /// subpath begins a new one at the closed subpath's starting point
+    /// (ISO 32000-1 §8.5.2.1); with no current point at all the operator
+    /// is ignored.
+    fn segment_to(&mut self, x: f32, y: f32, poisons: bool) {
+        let Some(active) = self.subpaths.last_mut() else {
+            return;
+        };
+        if active.closed {
+            let start = active.points[0];
+            self.subpaths.push(Subpath {
+                points: vec![start, Point::new(x, y)],
+                closed: false,
+                poisoned: poisons,
+            });
+            return;
+        }
+        active.points.push(Point::new(x, y));
+        if poisons {
+            active.poisoned = true;
+        }
+    }
+
+    fn close_subpath(&mut self) {
+        if let Some(active) = self.subpaths.last_mut() {
+            active.closed = true;
+        }
+    }
+
+    /// Appends `re` as the closed subpath rendering's path builder makes of
+    /// it: the `(x, y)` corner, then the three others in `re`'s own order.
+    /// Raw corners even for negative `w`/`h` — the current point a
+    /// follow-on segment continues from is `(x, y)` — normalization happens
+    /// when the committed rectangle's bounding box is measured.
+    fn rect_subpath(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        self.subpaths.push(Subpath {
+            points: vec![
+                Point::new(x, y),
+                Point::new(x + w, y),
+                Point::new(x + w, y + h),
+                Point::new(x, y + h),
+            ],
+            closed: true,
+            poisoned: false,
+        });
     }
 }
 
 struct Executor<'a, S> {
     src: &'a S,
     spans: Vec<TextSpan>,
+    rulings: Vec<Ruling>,
     fallback: Arc<Font>,
     /// Form-XObject invocations so far, checked against
     /// `MAX_FORM_INVOCATIONS`.
@@ -331,6 +514,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         frame.gs.font_name = name.0.clone();
                         frame.gs.size = *size;
                     }
+                    Op::SetExtGState(name) => {
+                        if let Some(lw) = self.ext_gstate_line_width(&frame.chain, &name.0).await {
+                            frame.gs.line_width = lw;
+                        }
+                    }
                     Op::XObject(name) => {
                         let entered = self
                             .form_frame(&name.0, &frame.chain, &frame.gs, frame.depth)
@@ -351,9 +539,22 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
-    /// Applies one operator that needs no I/O — everything except `Tf` and `Do`.
-    /// `q`/`Q` and `cm` maintain the CTM; text operators maintain Tm/Tlm; shown
-    /// strings become spans.
+    /// The `/LW` entry of the named `/ExtGState` resource (ISO 32000-1
+    /// Table 58) — the one ExtGState parameter ruling extraction reads.
+    /// Negative values are ignored, matching the renderer; non-finite ones
+    /// too, because an infinite line width would otherwise silently drop
+    /// every later stroked ruling at the segment gate.
+    async fn ext_gstate_line_width(&self, chain: &[Arc<Dict>], name: &str) -> Option<f32> {
+        let resolved = self.find_res(chain, "ExtGState", name).await?;
+        let dict = resolved.as_dict()?;
+        let lw = self.src.resolve(dict.get("LW")?).await.ok()?.as_f64()? as f32;
+        (lw.is_finite() && lw >= 0.0).then_some(lw)
+    }
+
+    /// Applies one operator that needs no I/O — everything except `Tf`,
+    /// `gs`, and `Do`. `q`/`Q` and `cm` maintain the CTM; text operators
+    /// maintain Tm/Tlm; shown strings become spans; path operators feed the
+    /// frame's subpaths and paint operators commit them as rulings.
     fn step(&mut self, frame: &mut Frame, op: &Op) {
         match op {
             Op::Save => frame.saved.push(frame.gs.clone()),
@@ -415,9 +616,66 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 frame.tm = frame.tlm;
                 self.emit(frame, s);
             }
+            Op::SetLineWidth(w) => {
+                if w.is_finite() && *w >= 0.0 {
+                    frame.gs.line_width = *w;
+                }
+            }
+            Op::MoveTo(x, y) => frame.move_to(*x, *y),
+            Op::LineTo(x, y) => frame.segment_to(*x, *y, false),
+            Op::CurveTo(_, _, _, _, x, y) | Op::CurveToV(_, _, x, y) | Op::CurveToY(_, _, x, y) => {
+                frame.segment_to(*x, *y, true)
+            }
+            Op::ClosePath => frame.close_subpath(),
+            Op::Rect(x, y, w, h) => frame.rect_subpath(*x, *y, *w, *h),
+            Op::Stroke => self.commit_rulings(frame, true, false),
+            Op::CloseStroke => {
+                frame.close_subpath();
+                self.commit_rulings(frame, true, false);
+            }
+            Op::Fill | Op::FillEvenOdd => self.commit_rulings(frame, false, true),
+            Op::FillStroke | Op::FillStrokeEvenOdd => self.commit_rulings(frame, true, true),
+            Op::CloseFillStroke | Op::CloseFillStrokeEvenOdd => {
+                frame.close_subpath();
+                self.commit_rulings(frame, true, true);
+            }
+            // `W`/`W*` never commit by themselves: the paint operator that
+            // must follow them does, and after a clip that operator is `n`.
+            Op::EndPath => frame.subpaths.clear(),
             // Text render mode 3 (invisible) is still extracted, so `Tr` and
             // everything else is a no-op here.
             _ => {}
+        }
+    }
+
+    /// Commits the accumulated path on a painting operator and clears it.
+    /// Stroked subpaths yield one ruling per axis-aligned segment at the
+    /// device-space line width; filled subpaths yield the centerline of a
+    /// thin axis-aligned rectangle. Poisoned subpaths yield nothing.
+    fn commit_rulings(&mut self, frame: &mut Frame, stroke: bool, fill: bool) {
+        let ctm = frame.gs.ctm;
+        let width = frame.gs.line_width * ctm_scale(&ctm);
+        for sub in frame.subpaths.drain(..) {
+            if sub.poisoned {
+                continue;
+            }
+            let device: Vec<Point> = sub.points.iter().map(|p| ctm.apply(*p)).collect();
+            if stroke {
+                let segments = device.windows(2).map(|pair| (pair[0], pair[1]));
+                // A closed 2-point subpath draws one doubled edge, not two.
+                let closing =
+                    (sub.closed && device.len() > 2).then(|| (device[device.len() - 1], device[0]));
+                for (a, b) in segments.chain(closing) {
+                    if let Some(ruling) = ruling_from_segment(a, b, width) {
+                        self.rulings.push(ruling);
+                    }
+                }
+            }
+            if fill {
+                if let Some(ruling) = filled_rect_ruling(&device) {
+                    self.rulings.push(ruling);
+                }
+            }
         }
     }
 
@@ -595,14 +853,21 @@ mod tests {
     use pdfboss_testkit::doc_with_graphics;
 
     /// The synchronous spans accessor. Production has no use for one — the public
-    /// entry points in `lib.rs` wrap [`page_spans_with`] themselves — but it is
-    /// the same `block_on` over `Immediate`, so every test below still asserts on
-    /// exactly what a synchronous caller receives. The report is asserted
-    /// complete: no test here expects to lose content.
+    /// entry points in `lib.rs` wrap [`page_spans_and_rulings_with`] themselves —
+    /// but it is the same `block_on` over `Immediate`, so every test below still
+    /// asserts on exactly what a synchronous caller receives. The report is
+    /// asserted complete: no test here expects to lose content.
     fn page_spans(doc: &Document, page: &Page) -> Vec<TextSpan> {
-        let (spans, report) = block_on(page_spans_with(Immediate(doc), page));
+        let (spans, _, report) = block_on(page_spans_and_rulings_with(Immediate(doc), page));
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         spans
+    }
+
+    /// The synchronous rulings accessor, the twin of [`page_spans`].
+    fn page_rulings(doc: &Document, page: &Page) -> Vec<Ruling> {
+        let (_, rulings, report) = block_on(page_spans_and_rulings_with(Immediate(doc), page));
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        rulings
     }
 
     /// Raw spans of a one-page document with `content` as its raw content
@@ -611,6 +876,23 @@ mod tests {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
         page_spans(&doc, &page)
+    }
+
+    /// Raw rulings of a one-page document with `content` as its raw content
+    /// stream.
+    fn rulings_of(content: &str) -> Vec<Ruling> {
+        let doc = Document::load(doc_with_graphics(content)).unwrap();
+        let page = doc.page(0).unwrap();
+        page_rulings(&doc, &page)
+    }
+
+    #[track_caller]
+    fn assert_ruling(r: &Ruling, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let close = (r.start.x - x0).abs() < 1e-3
+            && (r.start.y - y0).abs() < 1e-3
+            && (r.end.x - x1).abs() < 1e-3
+            && (r.end.y - y1).abs() < 1e-3;
+        assert!(close, "{r:?} is not ({x0},{y0})-({x1},{y1})");
     }
 
     #[test]
@@ -712,7 +994,7 @@ mod tests {
         let page = doc.page(0).unwrap();
         // Raw call: exhausting the budget is this test's point, so the
         // report is legitimately incomplete here.
-        let (spans, report) = block_on(page_spans_with(Immediate(&doc), &page));
+        let (spans, _, report) = block_on(page_spans_and_rulings_with(Immediate(&doc), &page));
         assert!(!spans.is_empty()); // nested forms still extract text
         assert!(
             spans.len() <= MAX_FORM_INVOCATIONS,
@@ -798,5 +1080,133 @@ mod tests {
         assert_send_sync::<Font>();
         assert_send_sync::<Arc<Font>>();
         assert_send_sync::<GState>();
+    }
+
+    /// A stroked 2x2 grid: the `re` contributes its four border edges in
+    /// construction order (bottom, right, top, left — the order rendering's
+    /// path builder decomposes `re` into), then the two inner dividers in
+    /// stream order, all at the default 1.0 line width.
+    #[test]
+    fn stroked_grid_yields_rulings_with_correct_endpoints() {
+        let rulings = rulings_of("72 600 200 100 re S 172 600 m 172 700 l S 72 650 m 272 650 l S");
+        assert_eq!(rulings.len(), 6, "{rulings:?}");
+        assert_ruling(&rulings[0], 72.0, 600.0, 272.0, 600.0);
+        assert_ruling(&rulings[1], 272.0, 600.0, 272.0, 700.0);
+        assert_ruling(&rulings[2], 72.0, 700.0, 272.0, 700.0);
+        assert_ruling(&rulings[3], 72.0, 600.0, 72.0, 700.0);
+        assert_ruling(&rulings[4], 172.0, 600.0, 172.0, 700.0);
+        assert_ruling(&rulings[5], 72.0, 650.0, 272.0, 650.0);
+        assert!(rulings.iter().all(|r| (r.width - 1.0).abs() < 1e-3));
+    }
+
+    #[test]
+    fn w_sets_the_stroke_width() {
+        let rulings = rulings_of("0.5 w 72 700 m 272 700 l S");
+        assert_eq!(rulings.len(), 1);
+        assert!((rulings[0].width - 0.5).abs() < 1e-3);
+    }
+
+    /// A negative or non-finite `w` operand leaves the line width alone, the
+    /// way the renderer treats it. The 39-digit literal lexes as a real and
+    /// overflows `f32` to infinity; unguarded, that width would fail the
+    /// segment gate and silently drop the stroke.
+    #[test]
+    fn negative_or_nonfinite_w_is_ignored() {
+        let rulings = rulings_of("-5 w 72 700 m 272 700 l S");
+        assert_eq!(rulings.len(), 1, "{rulings:?}");
+        assert!((rulings[0].width - 1.0).abs() < 1e-3);
+        let rulings = rulings_of("400000000000000000000000000000000000000 w 72 700 m 272 700 l S");
+        assert_eq!(rulings.len(), 1, "{rulings:?}");
+        assert!((rulings[0].width - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ext_gstate_lw_sets_the_stroke_width() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /ExtGState << /G1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/G1 gs 72 700 m 272 700 l S");
+        b.object(5, "<< /Type /ExtGState /LW 2.5 >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let rulings = page_rulings(&doc, &page);
+        assert_eq!(rulings.len(), 1);
+        assert!((rulings[0].width - 2.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn thin_filled_rect_yields_its_centerline() {
+        let rulings = rulings_of("72 700 200 0.8 re f");
+        assert_eq!(rulings.len(), 1, "{rulings:?}");
+        assert_ruling(&rulings[0], 72.0, 700.4, 272.0, 700.4);
+        assert_eq!(rulings[0].width, 0.0, "a fill has no stroke width");
+    }
+
+    #[test]
+    fn fat_filled_rect_yields_no_rulings() {
+        assert!(rulings_of("72 600 200 40 re f").is_empty());
+    }
+
+    /// Axis alignment is judged after the CTM: a 90° rotation turns a
+    /// horizontal segment into a vertical ruling, while a 30° rotation
+    /// leaves it diagonal and drops it.
+    #[test]
+    fn cm_rotation_keeps_axis_aligned_segments_only() {
+        let rotated90 = rulings_of("q 0 1 -1 0 300 100 cm 0 0 m 100 0 l S Q");
+        assert_eq!(rotated90.len(), 1, "{rotated90:?}");
+        assert_ruling(&rotated90[0], 300.0, 100.0, 300.0, 200.0);
+        let rotated30 = rulings_of("q 0.866 0.5 -0.5 0.866 0 0 cm 72 700 m 172 700 l S Q");
+        assert!(rotated30.is_empty(), "{rotated30:?}");
+    }
+
+    /// The curve poisons its own subpath — including the straight `l` that
+    /// continues it — but not the sibling subpath committed by the same `S`.
+    #[test]
+    fn curves_poison_only_their_own_subpath() {
+        let rulings =
+            rulings_of("72 500 m 100 550 150 550 172 500 c 200 500 l 72 700 m 272 700 l S");
+        assert_eq!(rulings.len(), 1, "{rulings:?}");
+        assert_ruling(&rulings[0], 72.0, 700.0, 272.0, 700.0);
+    }
+
+    /// `n` discards the path whether it stands alone or finishes a `W`
+    /// clip: clipping never commits rulings.
+    #[test]
+    fn end_path_discards_the_accumulated_path() {
+        assert!(rulings_of("72 700 m 272 700 l n").is_empty());
+        assert!(rulings_of("72 600 200 100 re W n").is_empty());
+    }
+
+    /// A form's `/Matrix` concatenates into the CTM its content runs under,
+    /// so its rulings land in page space like its spans do.
+    #[test]
+    fn form_matrix_lands_rulings_in_page_space() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /XObject << /Fx 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/Fx Do");
+        b.stream(
+            5,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+             /Matrix [1 0 0 1 0 -20]",
+            b"72 720 m 272 720 l S",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let rulings = page_rulings(&doc, &page);
+        assert_eq!(rulings.len(), 1, "{rulings:?}");
+        assert_ruling(&rulings[0], 72.0, 700.0, 272.0, 700.0);
     }
 }
