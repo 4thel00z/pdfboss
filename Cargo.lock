@@ -1301,6 +1301,7 @@ dependencies = [
  "futures-util",
  "pdfboss-aio",
  "pdfboss-core",
+ "pdfboss-output",
  "pdfboss-render",
  "pdfboss-testkit",
  "ratatui",
