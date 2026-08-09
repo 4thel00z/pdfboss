@@ -134,9 +134,25 @@ mod tests {
         extract_text(doc, &page).unwrap()
     }
 
-    /// The Text adapter over the IR must reproduce the pre-IR string builder
-    /// exactly — the local form of the corpus parity gate.
+    /// Non-whitespace token runs, counted — the content-preservation
+    /// currency of the ruled oracle branch.
+    fn token_counts(text: &str) -> std::collections::BTreeMap<&str, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for token in text.split_whitespace() {
+            *counts.entry(token).or_default() += 1;
+        }
+        counts
+    }
+
+    /// The Text adapter over a ruling-free layout must reproduce the pre-IR
+    /// string builder exactly — the local form of the corpus parity gate.
     /// [`structure::layout_reference`] is that builder, kept as the oracle.
+    ///
+    /// A ruling-fed layout genuinely reorders text — a merged logical row
+    /// reads cell-major where the flat flow reads line-major — so the ruled
+    /// branch asserts content preservation instead: the multiset of
+    /// non-whitespace token runs equals the flat flow's, counted exactly.
+    /// Loss, duplication, and fused tokens all break the count.
     #[test]
     fn text_adapter_matches_layout_on_fixtures() {
         let mut headings = 0usize;
@@ -171,11 +187,16 @@ mod tests {
                 ruled_tables += fixture_tables;
             }
             let via_ir = Text.render(&[layout]);
-            assert_eq!(
-                via_ir,
-                structure::layout_reference(&spans),
-                "content: {content}"
-            );
+            let flat = structure::layout_reference(&spans);
+            if rulings.is_empty() {
+                assert_eq!(via_ir, flat, "content: {content}");
+            } else {
+                assert_eq!(
+                    token_counts(&via_ir),
+                    token_counts(&flat),
+                    "content: {content}\nvia IR: {via_ir}\nflat flow: {flat}"
+                );
+            }
         }
         // A fixture set that classifies nothing would pass this test without
         // ever reaching the code it guards.
@@ -431,6 +452,59 @@ mod tests {
                 "| first item |\n| --- |\n| second item |\n| third item |\n| fourth item |"
             ),
             "md: {md}"
+        );
+    }
+
+    /// One ruled band holding three visual lines is one logical row: the
+    /// wrapped cell's fragments join with single spaces and the other cells
+    /// stay intact.
+    #[test]
+    fn a_wrapped_band_merges_into_one_logical_row() {
+        let md = markdown_of_drawn(&structure::tests::ruled_wrapped_band_content());
+        assert!(
+            md.contains("| h1 | h2 | h3 |\n| --- | --- | --- |\n| m1 | m2 | m3 |"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("| wrap one wrap two wrap three | solo | tail |"),
+            "the band's lines merge into one row: {md}"
+        );
+        assert!(
+            !md.contains("| wrap two |"),
+            "no fragmentary row survives: {md}"
+        );
+    }
+
+    /// A drawn grid no longer claims its whole segment: the whitespace-laned
+    /// rows below it still become a table of their own — exactly the table
+    /// the lane path alone emits — and blocks stay in reading order.
+    #[test]
+    fn a_ruled_grid_and_a_lane_grid_share_a_segment() {
+        let content = structure::tests::ruled_grid_above_lane_grid_content();
+        let md = markdown_of_drawn(&content);
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "the drawn grid stays a table: {md}"
+        );
+        let lane_table = [
+            "| r0c0 | r0c1 | r0c2 |",
+            "| --- | --- | --- |",
+            "| r1c0 | r1c1 | r1c2 |",
+            "| r2c0 | r2c1 | r2c2 |",
+            "| r3c0 | r3c1 | r3c2 |",
+        ]
+        .join("\n");
+        assert!(
+            md.contains(&lane_table),
+            "the laned rows stay a table: {md}"
+        );
+        assert!(
+            md.find("| a1 |").unwrap() < md.find("| r0c0 |").unwrap(),
+            "reading order: {md}"
+        );
+        assert!(
+            markdown_of(&content).contains(&lane_table),
+            "the lane path alone emits the same table"
         );
     }
 
