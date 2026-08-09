@@ -44,6 +44,10 @@ const HEADING_MAX_LEVEL: u8 = 6;
 /// A wholly bold body-size line this short reads as a title; anything
 /// longer is a sentence that happens to be bold.
 const BOLD_HEADING_MAX_CHARS: usize = 60;
+/// A heading names a section, so it is short. Past this many characters the
+/// large type is a pull quote, a caption, or — on a page whose body size the
+/// character histogram read off a dense table — ordinary prose one bucket up.
+const HEADING_MAX_CHARS: usize = 120;
 /// A baseline step beyond this multiple of a run's median step is white
 /// space between paragraphs rather than leading inside one.
 const PARAGRAPH_GAP: f32 = 1.8;
@@ -306,7 +310,7 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
 fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
     let mut blocks = Vec::new();
     for segment in segments(spans) {
-        if segment.spans.is_empty() {
+        if segment.is_empty() {
             continue;
         }
         if let Some(band) = table_band(&segment) {
@@ -318,7 +322,7 @@ fn page_layout_with_stats(spans: &[TextSpan], stats: &SizeStats) -> PageLayout {
             push_blocks(&band.below, stats, &mut blocks);
             continue;
         }
-        push_blocks(&assemble_lines(&segment.spans), stats, &mut blocks);
+        push_blocks(&assemble_lines(&segment), stats, &mut blocks);
     }
     PageLayout { blocks }
 }
@@ -416,12 +420,17 @@ fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
             index += 1;
             continue;
         };
-        push_run(&mut run, out);
         let mut end = index + 1;
         while end < lines.len() && continues_heading(&lines[end - 1], &lines[end], stats, level) {
             end += 1;
         }
         let heading: Vec<Line> = lines[index..end].iter().map(|a| a.line.clone()).collect();
+        if heading_chars(&heading) > HEADING_MAX_CHARS {
+            run.extend(heading);
+            index = end;
+            continue;
+        }
+        push_run(&mut run, out);
         let bbox = bbox(&heading);
         out.push(Block::Heading {
             level,
@@ -431,6 +440,19 @@ fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
         index = end;
     }
     push_run(&mut run, out);
+}
+
+/// A candidate heading's text length, counted as the Markdown adapter joins
+/// its lines: one space between them, ends trimmed.
+fn heading_chars(lines: &[Line]) -> usize {
+    lines
+        .iter()
+        .map(|line| line_text(line))
+        .collect::<Vec<String>>()
+        .join(" ")
+        .trim()
+        .chars()
+        .count()
 }
 
 /// The heading level of a line: its size's ladder rank, or — for a line at
@@ -679,8 +701,64 @@ struct TableBand {
     below: Vec<Assembled>,
 }
 
-/// The segment as a table band, or `None` when it fails a gate and must flow
-/// as prose exactly as a segment with no lanes does.
+/// The longest stretch of the segment's lines that reads as a grid, or `None`
+/// when no stretch does and the whole segment must flow as prose.
+///
+/// Lanes are measured over the candidate stretch alone, never over the whole
+/// segment: a page title and a paragraph of prose put ink across the width the
+/// grid keeps clear, so a segment holding anything besides its table leaves no
+/// lanes at all. Adding a line can only fill bins, so lanes shrink as a stretch
+/// grows and never come back — a stretch is grown until they fall below
+/// [`TABLE_MIN_LANES`], and that is its end. A wrapped cell standing alone in
+/// one column survives inside the stretch for free: it occupies bins that
+/// column already held.
+fn table_band(segment: &[&TextSpan]) -> Option<TableBand> {
+    let groups = line_groups(segment);
+    let (x_min, x_max) = x_bounds(segment);
+    let width = x_max - x_min;
+    if !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    let scale = GUTTER_BINS as f32 / width;
+    for start in 0..groups.len() {
+        let (end, lanes) = lane_run(&groups, start, x_min, scale);
+        if end - start < TABLE_MIN_ROWS {
+            continue;
+        }
+        if let Some(band) = grid(&groups, start, end, &lanes) {
+            return Some(band);
+        }
+    }
+    None
+}
+
+/// The stretch starting at `start` that keeps at least [`TABLE_MIN_LANES`]
+/// lanes, as an exclusive end and the lanes the whole stretch leaves. The
+/// occupancy histogram is kept in the segment's frame so each line's bins can
+/// simply be added to it; a stretch narrower than the segment leaves its
+/// margins empty, and [`wide_gaps`] already reads edge runs as margins.
+fn lane_run(
+    groups: &[Group],
+    start: usize,
+    x_min: f32,
+    scale: f32,
+) -> (usize, Vec<std::ops::Range<f32>>) {
+    let mut occupied = [false; GUTTER_BINS];
+    let mut lanes = Vec::new();
+    for (offset, group) in groups[start..].iter().enumerate() {
+        let mut next = occupied;
+        fill_bins(&mut next, &group.spans, x_min, scale);
+        let gaps = wide_gaps(&next, scale);
+        if gaps.len() < TABLE_MIN_LANES {
+            return (start + offset, lanes);
+        }
+        occupied = next;
+        lanes = lane_ranges(&gaps, x_min, scale);
+    }
+    (groups.len(), lanes)
+}
+
+/// `groups[start..end]` as a table band, or `None` when it fails a gate.
 ///
 /// The gates are all required: three cell columns, three rows populating two
 /// cells each, every span sitting in a column, evenly spaced row baselines,
@@ -694,23 +772,32 @@ struct TableBand {
 /// and continuation lines of the grid itself. The column gate is then asked
 /// again of what is left, because hoisting those edge lines can take the only
 /// text a column ever held.
-fn table_band(segment: &Segment) -> Option<TableBand> {
-    if segment.lanes.len() < TABLE_MIN_LANES {
-        return None;
-    }
-    let columns = cell_columns(&segment.spans, &segment.lanes);
-    let groups = line_groups(&segment.spans);
-    let mut rows = Vec::with_capacity(groups.len());
-    let mut populated = Vec::with_capacity(groups.len());
-    for group in &groups {
-        let row = table_row(group, &columns)?;
+fn grid(
+    groups: &[Group],
+    start: usize,
+    end: usize,
+    lanes: &[std::ops::Range<f32>],
+) -> Option<TableBand> {
+    let spans: Vec<&TextSpan> = groups[start..end]
+        .iter()
+        .flat_map(|group| group.spans.iter().copied())
+        .collect();
+    let columns = cell_columns(&spans, lanes);
+    let (lo, hi) = merged_edges(groups, start, end, &columns);
+    let inside = &groups[lo..hi];
+    let mut rows = Vec::with_capacity(inside.len());
+    let mut populated = Vec::with_capacity(inside.len());
+    for group in inside {
+        let Some(row) = table_row(group, &columns) else {
+            break;
+        };
         let cells = row.iter().filter(|cell| cell.line.is_some()).count();
         populated.push(cells >= TABLE_MIN_ROW_CELLS);
         rows.push(row);
     }
     let first = populated.iter().position(|filled| *filled)?;
     let last = populated.iter().rposition(|filled| *filled)?;
-    let baselines: Vec<f32> = groups[first..=last]
+    let baselines: Vec<f32> = inside[first..=last]
         .iter()
         .zip(&populated[first..=last])
         .filter(|(_, filled)| **filled)
@@ -725,11 +812,46 @@ fn table_band(segment: &Segment) -> Option<TableBand> {
     if populated_columns(&rows[first..=last], columns.len()) < TABLE_MIN_LANES + 1 {
         return None;
     }
-    let above = groups[..first].iter().map(assembled).collect();
-    let below = groups[last + 1..].iter().map(assembled).collect();
+    let above = groups[..lo + first].iter().map(assembled).collect();
+    let below = groups[lo + last + 1..].iter().map(assembled).collect();
     rows.truncate(last + 1);
     rows.drain(..first);
     Some(TableBand { above, rows, below })
+}
+
+/// The stretch `start..end` grown over the neighbouring lines that still sit
+/// in `columns`, as a half-open range. A header or total row whose cell covers
+/// two columns puts ink in the lane between them and so ends the lane run
+/// short of itself, but it is a row of this grid all the same — `table_row`
+/// reads it as the merged cell it is. Growth stops at a line the columns
+/// cannot hold, and at one standing further off than [`TABLE_ROW_GAP`] times
+/// the run's own row pitch, which is a separate block that happens to fit.
+fn merged_edges(
+    groups: &[Group],
+    start: usize,
+    end: usize,
+    columns: &[std::ops::Range<f32>],
+) -> (usize, usize) {
+    let pitch = median(
+        groups[start..end]
+            .windows(2)
+            .map(|pair| pair[0].y - pair[1].y)
+            .collect(),
+    );
+    let limit = TABLE_ROW_GAP * pitch;
+    let holds = |index: usize, neighbour: usize| {
+        (groups[neighbour].y - groups[index].y).abs() <= limit
+            && table_row(&groups[index], columns).is_some()
+    };
+    let mut lo = start;
+    while lo > 0 && holds(lo - 1, lo) {
+        lo -= 1;
+    }
+    let mut hi = end;
+    while hi < groups.len() && holds(hi, hi - 1) {
+        hi += 1;
+    }
+    (lo, hi)
 }
 
 /// How many cell columns the rows themselves draw in, a colspan cell
@@ -932,22 +1054,6 @@ fn bbox(lines: &[Line]) -> BBox {
     }
 }
 
-/// One reading-order run of spans and the interior vertical lanes its
-/// non-separator spans leave empty. Lanes are what a table's cell columns
-/// stand either side of; a segment with none reads as prose.
-struct Segment<'s> {
-    spans: Vec<&'s TextSpan>,
-    lanes: Vec<std::ops::Range<f32>>,
-}
-
-/// A segment that reads top to bottom, whatever lanes the page has.
-fn prose(spans: Vec<&TextSpan>) -> Segment<'_> {
-    Segment {
-        spans,
-        lanes: Vec::new(),
-    }
-}
-
 /// The page's spans in reading order, cut into segments.
 ///
 /// Detects a two-column layout by x-occupancy: full-width spans are set
@@ -958,10 +1064,10 @@ fn prose(spans: Vec<&TextSpan>) -> Segment<'_> {
 /// height) — anything less reads top-to-bottom as one segment, which is
 /// exactly the old behavior.
 ///
-/// The same histogram answers the table question: an unsplit page carries
-/// its lanes on out, and several of them are the cell columns the split
-/// refuses to read column-major.
-fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
+/// Lanes are not carried out: a table is looked for inside a segment, over
+/// its own rows, because a page's lanes are whatever every line on it leaves
+/// clear together, which is nothing as soon as one line runs the full width.
+fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     let mut x_min = f32::INFINITY;
     let mut x_max = f32::NEG_INFINITY;
     for span in spans {
@@ -970,7 +1076,7 @@ fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
     }
     let width = x_max - x_min;
     if !width.is_finite() || width <= 0.0 {
-        return vec![prose(spans.iter().collect())];
+        return vec![spans.iter().collect()];
     }
     let (separators, body): (Vec<&TextSpan>, Vec<&TextSpan>) = spans
         .iter()
@@ -978,20 +1084,9 @@ fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
 
     let mut occupied = [false; GUTTER_BINS];
     let scale = GUTTER_BINS as f32 / width;
-    for span in &body {
-        let lo = ((span.x.min(span.end_x) - x_min) * scale).floor().max(0.0) as usize;
-        let hi = ((span.x.max(span.end_x) - x_min) * scale).ceil() as usize;
-        for bin in occupied.iter_mut().take(hi.min(GUTTER_BINS)).skip(lo) {
-            *bin = true;
-        }
-    }
+    fill_bins(&mut occupied, &body, x_min, scale);
     let gaps = wide_gaps(&occupied, scale);
-    let whole = || {
-        vec![Segment {
-            spans: spans.iter().collect(),
-            lanes: lane_ranges(&gaps, x_min, scale),
-        }]
-    };
+    let whole = || vec![spans.iter().collect::<Vec<&TextSpan>>()];
 
     if body.len() < COLUMN_MIN_SPANS {
         return whole();
@@ -1039,17 +1134,17 @@ fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
     let mut cuts: Vec<f32> = separators.iter().map(|s| s.y).collect();
     cuts.sort_by(|a, b| b.total_cmp(a));
     cuts.dedup();
-    let mut out: Vec<Segment> = Vec::new();
+    let mut out: Vec<Vec<&TextSpan>> = Vec::new();
     let mut top = f32::INFINITY;
     for &sep_y in &cuts {
         push_band(&left, &right, top, sep_y, &mut out);
-        out.push(prose(
+        out.push(
             separators
                 .iter()
                 .filter(|s| s.y == sep_y)
                 .copied()
                 .collect(),
-        ));
+        );
         top = sep_y;
     }
     push_band(&left, &right, top, f32::NEG_INFINITY, &mut out);
@@ -1064,15 +1159,27 @@ fn push_band<'s>(
     right: &[&'s TextSpan],
     top: f32,
     bottom: f32,
-    out: &mut Vec<Segment<'s>>,
+    out: &mut Vec<Vec<&'s TextSpan>>,
 ) {
     for side in [left, right] {
-        out.push(prose(
+        out.push(
             side.iter()
                 .filter(|s| s.y <= top && s.y > bottom)
                 .copied()
                 .collect(),
-        ));
+        );
+    }
+}
+
+/// Marks every bin `spans` put ink in, rounding each span outwards so a lane
+/// is never wider than the white space that drew it.
+fn fill_bins(occupied: &mut [bool; GUTTER_BINS], spans: &[&TextSpan], x_min: f32, scale: f32) {
+    for span in spans {
+        let lo = ((span.x.min(span.end_x) - x_min) * scale).floor().max(0.0) as usize;
+        let hi = ((span.x.max(span.end_x) - x_min) * scale).ceil() as usize;
+        for bin in occupied.iter_mut().take(hi.min(GUTTER_BINS)).skip(lo) {
+            *bin = true;
+        }
     }
 }
 
@@ -1161,13 +1268,13 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
 pub(crate) fn layout_reference(spans: &[TextSpan]) -> String {
     let mut out = String::new();
     for segment in segments(spans) {
-        if segment.spans.is_empty() {
+        if segment.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push('\n');
         }
-        flow(&segment.spans, &mut out);
+        flow(&segment, &mut out);
     }
     out
 }
