@@ -480,27 +480,31 @@ fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
 /// must flow as prose exactly as a segment with no lanes does.
 ///
 /// The gates are all required: three cell columns, three rows populating two
-/// cells each, every span sitting in a column, evenly spaced baselines, and
-/// neighbouring cells more than a word gap apart — the last so a row reads
-/// as the one line the flat flow wrote, cell texts and all.
+/// cells each, every span sitting in a column, evenly spaced row baselines,
+/// and neighbouring cells more than a word gap apart — the last so a row
+/// reads as the one line the flat flow wrote, cell texts and all.
+///
+/// Every line group is returned, rows and single-cell lines alike, so the
+/// block still holds every line the flat flow would have written.
 fn table_rows(segment: &Segment) -> Option<Vec<Vec<Cell>>> {
     if segment.lanes.len() < TABLE_MIN_LANES {
         return None;
     }
     let columns = cell_columns(&segment.spans, &segment.lanes);
-    let groups = line_groups(&segment.spans);
-    if !even_rows(&groups) {
-        return None;
-    }
-    let mut rows = Vec::with_capacity(groups.len());
-    let mut populated = 0usize;
-    for group in &groups {
+    let mut rows = Vec::new();
+    let mut baselines = Vec::new();
+    for group in &line_groups(&segment.spans) {
         let row = table_row(group, &columns)?;
         let cells = row.iter().filter(|cell| cell.line.is_some()).count();
-        populated += usize::from(cells >= TABLE_MIN_ROW_CELLS);
+        if cells >= TABLE_MIN_ROW_CELLS {
+            baselines.push(group.y);
+        }
         rows.push(row);
     }
-    (populated >= TABLE_MIN_ROWS).then_some(rows)
+    if baselines.len() < TABLE_MIN_ROWS {
+        return None;
+    }
+    even_rows(&baselines).then_some(rows)
 }
 
 /// The x ranges the lanes leave between them, left to right: the band's cell
@@ -517,13 +521,13 @@ fn cell_columns(spans: &[&TextSpan], lanes: &[std::ops::Range<f32>]) -> Vec<std:
     columns
 }
 
-/// True when no baseline step exceeds [`TABLE_ROW_GAP`] times the median —
-/// what separates one grid from two blocks that happen to share columns.
-fn even_rows(groups: &[Group]) -> bool {
-    let steps: Vec<f32> = groups
-        .windows(2)
-        .map(|pair| pair[0].y - pair[1].y)
-        .collect();
+/// True when no step between neighbouring row baselines, top of page first,
+/// exceeds [`TABLE_ROW_GAP`] times the median — what separates one grid from
+/// two blocks that happen to share columns. Only the rows are measured: a
+/// title above the grid or a page number below it populates no cells, and
+/// the white space around it is not a hole in the table.
+fn even_rows(baselines: &[f32]) -> bool {
+    let steps: Vec<f32> = baselines.windows(2).map(|pair| pair[0] - pair[1]).collect();
     if steps.is_empty() {
         return true;
     }
@@ -999,6 +1003,7 @@ pub(crate) mod tests {
             two_column_content(25)
         ));
         contents.push(lane_grid_content());
+        contents.push(titled_grid_content());
         contents
     }
 
@@ -1014,6 +1019,17 @@ pub(crate) mod tests {
         }
         content += "ET";
         content
+    }
+
+    /// [`lane_grid_content`] under a title sitting well above the grid, in
+    /// the first cell column. The title populates one cell, so it is a line
+    /// of the block but not a row, and the white space between it and the
+    /// grid is not a step between rows.
+    pub(crate) fn titled_grid_content() -> String {
+        format!(
+            "BT /F1 10 Tf 1 0 0 1 72 760 Tm (Table 1) Tj ET {}",
+            lane_grid_content()
+        )
     }
 
     /// The page's spans, asserting the extraction report is complete: no

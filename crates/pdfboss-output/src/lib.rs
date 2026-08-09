@@ -323,6 +323,18 @@ mod tests {
         assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
     }
 
+    /// A title above the grid is a line of the table, not a row: evenness is
+    /// measured over the rows alone, so the white space under the title does
+    /// not read as a hole in the grid.
+    #[test]
+    fn a_title_above_the_grid_keeps_the_table() {
+        let md = markdown_of(&structure::tests::titled_grid_content());
+        assert!(md.contains("| Table 1 |  |  |"), "md: {md}");
+        assert!(md.contains("| --- | --- | --- |"), "md: {md}");
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+    }
+
     /// A cell crossing the lane gap forces the HTML dialect with colspan.
     #[test]
     fn spanning_cell_switches_to_html_table() {
