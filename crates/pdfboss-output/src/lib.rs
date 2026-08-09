@@ -11,8 +11,10 @@ use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Resul
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 pub use markdown::Markdown;
 pub use output::{Output, Text};
-pub use pdfboss_text::{ExtractReport, SkipCause, SkippedText, SkippedTextKind, TextSpan};
-pub use structure::{document_layout, layout, page_layout};
+pub use pdfboss_text::{ExtractReport, Ruling, SkipCause, SkippedText, SkippedTextKind, TextSpan};
+pub use structure::{
+    document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
+};
 
 /// Extracts the page's text with positional layout applied: spans grouped
 /// into lines, lines ordered top to bottom and joined with `\n`, spaces
@@ -78,16 +80,22 @@ pub fn extract_markdown(doc: &Document) -> Result<String> {
 }
 
 /// [`extract_markdown`] with one [`ExtractReport`] per page, in page order.
+///
+/// Each page's rulings ride along with its spans: a table whose structure is
+/// drawn as borders is read from them ahead of lane occupancy.
 pub fn extract_markdown_reporting(doc: &Document) -> Result<(String, Vec<ExtractReport>)> {
-    let per_page = pdfboss_core::map_pages(doc, pdfboss_text::extract_spans_reporting);
+    let per_page = pdfboss_core::map_pages(doc, pdfboss_text::extract_spans_and_rulings_reporting);
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
     for outcome in per_page {
-        let (spans, report) = outcome?;
-        pages.push(spans);
+        let (spans, rulings, report) = outcome?;
+        pages.push((spans, rulings));
         reports.push(report);
     }
-    Ok((Markdown.render(&document_layout(&pages)), reports))
+    Ok((
+        Markdown.render(&document_layout_with_rulings(&pages)),
+        reports,
+    ))
 }
 
 /// One page as Markdown, ranking heading sizes against that page alone.
@@ -101,15 +109,17 @@ pub fn extract_page_markdown(doc: &Document, page: &Page) -> Result<String> {
 /// [`extract_text_with`], for the same reasons.
 ///
 /// There is no document-level `_with`: an asynchronous caller collects each
-/// page's spans with `pdfboss_text::extract_spans_reporting_with` and then
-/// calls the pure [`document_layout`] and [`Markdown`], which is the same
-/// document-wide ranking without a second I/O path to keep in step.
+/// page's spans and rulings with
+/// `pdfboss_text::extract_spans_and_rulings_reporting_with` and then calls
+/// the pure [`document_layout_with_rulings`] and [`Markdown`], which is the
+/// same document-wide ranking without a second I/O path to keep in step.
 pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<String> {
-    let (spans, _) = pdfboss_text::extract_spans_reporting_with(src, page).await?;
-    Ok(Markdown.render(&[page_layout(&spans)]))
+    let (spans, rulings, _) =
+        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page).await?;
+    Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings)]))
 }
 
 #[cfg(test)]
@@ -132,12 +142,14 @@ mod tests {
         let mut headings = 0usize;
         let mut splits = 0usize;
         let mut tables = 0usize;
+        let mut ruled_tables = 0usize;
         for content in structure::tests::fixture_contents() {
             let doc = Document::load(doc_with_graphics(&content)).unwrap();
             let page = doc.page(0).unwrap();
-            let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+            let (spans, rulings, report) =
+                pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page).unwrap();
             assert!(report.is_complete(), "unexpected skips: {report:?}");
-            let layout = page_layout(&spans);
+            let layout = page_layout_with_rulings(&spans, &rulings);
             headings += layout
                 .blocks
                 .iter()
@@ -149,11 +161,15 @@ mod tests {
                 .filter(|block| matches!(block, Block::Paragraph { .. }))
                 .count();
             splits += usize::from(paragraphs > 1);
-            tables += layout
+            let fixture_tables = layout
                 .blocks
                 .iter()
                 .filter(|block| matches!(block, Block::Table { .. }))
                 .count();
+            tables += fixture_tables;
+            if !rulings.is_empty() {
+                ruled_tables += fixture_tables;
+            }
             let via_ir = Text.render(&[layout]);
             assert_eq!(
                 via_ir,
@@ -166,6 +182,7 @@ mod tests {
         assert!(headings > 0, "no fixture produced a heading block");
         assert!(splits > 0, "no fixture split into several paragraphs");
         assert!(tables > 0, "no fixture produced a table block");
+        assert!(ruled_tables > 0, "no fixture produced a ruled table block");
     }
 
     /// Markdown of a one-page document with `content` as its raw content
@@ -384,6 +401,68 @@ mod tests {
         assert!(md.contains("<table>"), "md: {md}");
         assert!(md.contains("colspan=\"2\""), "md: {md}");
         assert!(!md.contains("| r1c0 |"), "one table, one dialect: {md}");
+    }
+
+    /// Markdown of a one-page document whose content stream draws rulings,
+    /// through the real document entry point, which threads them.
+    fn markdown_of_drawn(content: &str) -> String {
+        let doc = Document::load(doc_with_graphics(content)).unwrap();
+        extract_markdown(&doc).unwrap()
+    }
+
+    /// A drawn 2x2 grid leaves one lane, which the lane gates can never
+    /// admit; the rulings alone make it a table.
+    #[test]
+    fn a_ruled_grid_becomes_a_pipe_table() {
+        let md = markdown_of_drawn(&structure::tests::ruled_grid_content());
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "md: {md}"
+        );
+    }
+
+    /// The corpus failure the ruled path fixes: a single-column boxed list
+    /// is a one-column table, which no lane-occupancy gate could ever admit.
+    #[test]
+    fn a_single_column_boxed_list_becomes_a_table() {
+        let md = markdown_of_drawn(&structure::tests::ruled_boxed_list_content());
+        assert!(
+            md.contains(
+                "| first item |\n| --- |\n| second item |\n| third item |\n| fourth item |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// A grid boundary inside a sub-word gap would split a word the flat
+    /// flow writes whole: the grid is rejected and the segment stays prose.
+    #[test]
+    fn a_ruling_inside_a_sub_word_gap_rejects_the_grid() {
+        let md = markdown_of_drawn(&structure::tests::ruled_sub_word_gap_content());
+        assert!(!md.contains('|'), "no table: {md}");
+        assert!(!md.contains("<table>"), "no table: {md}");
+        assert!(md.contains("world"), "the word survives whole: {md}");
+    }
+
+    /// The spans-only entry points delegate with no rulings: a page whose
+    /// only table is drawn stays prose through them, exactly as before.
+    #[test]
+    fn spans_only_layout_ignores_drawn_grids() {
+        let doc = Document::load(doc_with_graphics(
+            &structure::tests::ruled_boxed_list_content(),
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        let layout = page_layout(&spans);
+        assert!(
+            layout
+                .blocks
+                .iter()
+                .all(|block| !matches!(block, Block::Table { .. })),
+            "no rulings, no table: {layout:?}"
+        );
     }
 
     /// A lone page of huge text must not become all headings under per-page

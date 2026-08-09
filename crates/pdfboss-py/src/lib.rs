@@ -920,12 +920,14 @@ impl AsyncDocument {
             let mut pages = Vec::new();
             for i in 0..inner.page_count() {
                 let page = inner.page(i).map_err(aio_err)?;
-                let (spans, _) = pdfboss_text::extract_spans_reporting_with(inner.clone(), &page)
-                    .await
-                    .map_err(pdf_err)?;
-                pages.push(spans);
+                let (spans, rulings, _) =
+                    pdfboss_text::extract_spans_and_rulings_reporting_with(inner.clone(), &page)
+                        .await
+                        .map_err(pdf_err)?;
+                pages.push((spans, rulings));
             }
-            Ok(pdfboss_output::Markdown.render(&pdfboss_output::document_layout(&pages)))
+            Ok(pdfboss_output::Markdown
+                .render(&pdfboss_output::document_layout_with_rulings(&pages)))
         })
     }
 

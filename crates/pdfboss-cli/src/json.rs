@@ -54,17 +54,17 @@ fn layout_value(input: &Input, pages: &Option<Vec<usize>>) -> Result<Value, Stri
             numbers.dedup();
             let mut layouts = Vec::with_capacity(numbers.len());
             for n in numbers {
-                let spans = input.page_spans(n - 1)?;
-                layouts.push(pdfboss_output::page_layout(&spans));
+                let (spans, rulings) = input.page_spans_and_rulings(n - 1)?;
+                layouts.push(pdfboss_output::page_layout_with_rulings(&spans, &rulings));
             }
             layouts
         }
         None => {
-            let mut spans = Vec::with_capacity(count);
+            let mut pages = Vec::with_capacity(count);
             for index in 0..count {
-                spans.push(input.page_spans(index)?);
+                pages.push(input.page_spans_and_rulings(index)?);
             }
-            pdfboss_output::document_layout(&spans)
+            pdfboss_output::document_layout_with_rulings(&pages)
         }
     };
     serde_json::to_value(&layouts).map_err(|e| e.to_string())
