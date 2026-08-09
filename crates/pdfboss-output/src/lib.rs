@@ -351,6 +351,19 @@ mod tests {
         assert!(md.ends_with("\n\n24"), "md: {md}");
     }
 
+    /// A lane held open by a page number out in the margin is not a cell
+    /// column: hoisting the number empties it, and two columns of rows are a
+    /// layout. Modeled on a bench page whose two-column pitch read as a
+    /// three-column table with an empty third cell in every row.
+    #[test]
+    fn a_margin_page_number_does_not_manufacture_a_column() {
+        let md = markdown_of(&structure::tests::margin_number_grid_content());
+        assert!(!md.contains('|'), "two columns are not a table: {md}");
+        assert!(!md.contains("<table>"), "two columns are not a table: {md}");
+        assert!(md.contains("r0c0 r0c1"), "rows still read as prose: {md}");
+        assert!(md.ends_with("\n\n3"), "the page number survives: {md}");
+    }
+
     /// A cell crossing the lane gap forces the HTML dialect with colspan.
     #[test]
     fn spanning_cell_switches_to_html_table() {

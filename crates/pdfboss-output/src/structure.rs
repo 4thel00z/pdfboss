@@ -496,7 +496,9 @@ struct TableBand {
 /// is a real one. Lines outside that stretch populate a single cell and leave
 /// as prose — where the roles and the heading and list passes can still read
 /// them; the single-cell lines inside it stay rows, being the wrapped cells
-/// and continuation lines of the grid itself.
+/// and continuation lines of the grid itself. The column gate is then asked
+/// again of what is left, because hoisting the furniture can take the only
+/// text a column ever held.
 fn table_band(segment: &Segment) -> Option<TableBand> {
     if segment.lanes.len() < TABLE_MIN_LANES {
         return None;
@@ -525,11 +527,36 @@ fn table_band(segment: &Segment) -> Option<TableBand> {
     if !even_rows(&baselines) {
         return None;
     }
+    if populated_columns(&rows[first..=last], columns.len()) < TABLE_MIN_LANES + 1 {
+        return None;
+    }
     let above = groups[..first].iter().map(assembled).collect();
     let below = groups[last + 1..].iter().map(assembled).collect();
     rows.truncate(last + 1);
     rows.drain(..first);
     Some(TableBand { above, rows, below })
+}
+
+/// How many cell columns the rows themselves draw in, a colspan cell
+/// counting for every column it covers. A page number, folio or marginal
+/// note sitting alone out in the margin manufactures a lane, and once it is
+/// hoisted out of the band nothing is left to fill the column it opened —
+/// a two-column layout with an empty third column, not a grid.
+fn populated_columns(rows: &[Vec<Cell>], columns: usize) -> usize {
+    let mut filled = vec![false; columns];
+    for row in rows {
+        let mut column = 0usize;
+        for cell in row {
+            let width = cell.colspan as usize;
+            if cell.line.is_some() {
+                for slot in filled.iter_mut().skip(column).take(width) {
+                    *slot = true;
+                }
+            }
+            column += width;
+        }
+    }
+    filled.iter().filter(|slot| **slot).count()
 }
 
 /// One line group as an assembled line, for the passes that read prose.
@@ -1034,6 +1061,7 @@ pub(crate) mod tests {
         ));
         contents.push(lane_grid_content());
         contents.push(furnished_grid_content());
+        contents.push(margin_number_grid_content());
         contents
     }
 
@@ -1056,6 +1084,21 @@ pub(crate) mod tests {
     /// the HTML dialect.
     pub(crate) const RUNNING_HEADER: &str =
         "ANFREL Pre-Election Assessment Mission Report to the Union Election Commission";
+
+    /// Two cell columns of aligned rows and a page number alone at the right
+    /// margin, below them. The number's lane opens a third cell column that
+    /// no row draws in — and hoisting the number leaves the column empty, so
+    /// the band is a two-column layout rather than a grid.
+    pub(crate) fn margin_number_grid_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "1 0 0 1 500 600 Tm (3) Tj ET";
+        content
+    }
 
     /// [`lane_grid_content`] with the furniture a real page puts around a
     /// grid: a running header above, a page number below, and one wrapped
