@@ -447,7 +447,7 @@ fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
 fn heading_chars(lines: &[Line]) -> usize {
     lines
         .iter()
-        .map(|line| line_text(line))
+        .map(line_text)
         .collect::<Vec<String>>()
         .join(" ")
         .trim()
