@@ -61,7 +61,7 @@ pub struct Cell {
     pub rowspan: u8,
 }
 
-/// What a paragraph is to the page: its body, or furniture repeated on
+/// What a paragraph is to the page: its body, or a page header or footer repeated on
 /// every page.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Role {

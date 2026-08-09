@@ -76,7 +76,7 @@ const TABLE_MIN_ROW_CELLS: usize = 2;
 /// space between blocks rather than the next row.
 const TABLE_ROW_GAP: f32 = 2.0;
 
-/// Minimum pages before a repeated edge line reads as furniture rather than
+/// Minimum pages before a repeated edge line reads as a running line rather than
 /// coincidence: two documents opening with the same word is unremarkable,
 /// three or more sharing a whole line is not.
 const HEADER_FOOTER_MIN_PAGES: usize = 3;
@@ -114,12 +114,12 @@ pub fn document_layout(pages: &[Vec<TextSpan>]) -> Vec<PageLayout> {
     layouts
 }
 
-/// Tags page furniture: a page's first or last line, repeated near-verbatim
+/// Tags page headers and footers: a page's first or last line, repeated near-verbatim
 /// at the same baseline across enough pages, is split out of whatever
 /// paragraph it was assembled into and marked `PageHeader`/`PageFooter`; a
 /// line that is nothing but a page number is tagged on its own, with no
 /// repetition required. Needs at least [`HEADER_FOOTER_MIN_PAGES`] pages —
-/// below that, a repeat is coincidence as often as furniture.
+/// below that, a repeat is coincidence as often as a real running line.
 fn tag_page_roles(layouts: &mut [PageLayout]) {
     if layouts.len() < HEADER_FOOTER_MIN_PAGES {
         return;
@@ -132,8 +132,8 @@ fn tag_page_roles(layouts: &mut [PageLayout]) {
         .iter()
         .map(|layout| edge_line(layout, false))
         .collect();
-    let headers = furniture_pages(&top);
-    let footers = furniture_pages(&bottom);
+    let headers = header_footer_pages(&top);
+    let footers = header_footer_pages(&bottom);
     for (index, layout) in layouts.iter_mut().enumerate() {
         // Footer first: on a one-block page that qualifies as both, the
         // block can only be split once, and the first split wins.
@@ -166,11 +166,11 @@ fn edge_line(layout: &PageLayout, top: bool) -> Option<(String, f32)> {
     (!normalized.is_empty()).then_some((normalized, line.y))
 }
 
-/// Which pages' edge-line candidates should be tagged furniture: repetition
+/// Which pages' edge-line candidates should be tagged header/footer: repetition
 /// of the same normalized text at a close enough baseline on at least
 /// `max(HEADER_FOOTER_MIN_PAGES, pages / 2)` pages, or — with no repetition
 /// required — a line that is nothing but a page number.
-fn furniture_pages(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
+fn header_footer_pages(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
     let mut tagged = repeated_lines(candidates);
     for (index, candidate) in candidates.iter().enumerate() {
         let Some((text, _)) = candidate else { continue };
@@ -670,7 +670,7 @@ fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
     line_groups(spans).iter().map(assembled).collect()
 }
 
-/// A grid and the page furniture around it: the lines above the first
+/// A grid and the page-edge lines around it: the lines above the first
 /// populated row and below the last are a caption, a running header or a page
 /// number, not rows.
 struct TableBand {
@@ -692,7 +692,7 @@ struct TableBand {
 /// as prose — where the roles and the heading and list passes can still read
 /// them; the single-cell lines inside it stay rows, being the wrapped cells
 /// and continuation lines of the grid itself. The column gate is then asked
-/// again of what is left, because hoisting the furniture can take the only
+/// again of what is left, because hoisting those edge lines can take the only
 /// text a column ever held.
 fn table_band(segment: &Segment) -> Option<TableBand> {
     if segment.lanes.len() < TABLE_MIN_LANES {
@@ -1255,7 +1255,7 @@ pub(crate) mod tests {
             two_column_content(25)
         ));
         contents.push(lane_grid_content());
-        contents.push(furnished_grid_content());
+        contents.push(grid_with_edge_lines_content());
         contents.push(margin_number_grid_content());
         contents
     }
@@ -1295,11 +1295,11 @@ pub(crate) mod tests {
         content
     }
 
-    /// [`lane_grid_content`] with the furniture a real page puts around a
+    /// [`lane_grid_content`] with the lines a real page puts around a
     /// grid: a running header above, a page number below, and one wrapped
     /// cell between two rows. All three populate a single cell; only the
     /// wrapped one is inside the grid.
-    pub(crate) fn furnished_grid_content() -> String {
+    pub(crate) fn grid_with_edge_lines_content() -> String {
         format!(
             "BT /F1 10 Tf 1 0 0 1 72 760 Tm ({RUNNING_HEADER}) Tj ET {} \
              BT /F1 10 Tf 1 0 0 1 72 670 Tm (wrapped cell) Tj ET \

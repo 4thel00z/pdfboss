@@ -323,18 +323,18 @@ mod tests {
         assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
     }
 
-    /// Page furniture sharing the band with a grid leaves as prose: the
+    /// Page-edge lines sharing the band with a grid leave as prose: the
     /// running header does not take the header row's place — which, being
     /// wide enough to cross every lane, would also flip the block to the HTML
     /// dialect as a merged cell — and the page number is not a last row. A
     /// single-cell line between two rows is a wrapped cell and stays a row.
     #[test]
-    fn page_furniture_around_the_grid_stays_prose() {
-        let md = markdown_of(&structure::tests::furnished_grid_content());
+    fn page_edge_lines_around_the_grid_stay_prose() {
+        let md = markdown_of(&structure::tests::grid_with_edge_lines_content());
         let header = structure::tests::RUNNING_HEADER;
         assert!(
             !md.contains("<table>"),
-            "furniture flipped the dialect: {md}"
+            "an edge line flipped the dialect: {md}"
         );
         assert!(
             md.contains(&format!(

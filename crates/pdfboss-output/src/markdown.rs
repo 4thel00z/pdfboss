@@ -19,8 +19,8 @@ impl Output for Markdown {
     }
 }
 
-/// One block's Markdown, or nothing when it contributes no text — page
-/// furniture, or a block whose lines are all blank.
+/// One block's Markdown, or nothing when it contributes no text — a page
+/// header or footer, or a block whose lines are all blank.
 fn render_block(block: &Block) -> Option<String> {
     let rendered = match block {
         Block::Heading { level, lines, .. } => heading(*level, lines)?,
