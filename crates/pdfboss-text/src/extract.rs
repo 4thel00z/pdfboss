@@ -5,11 +5,11 @@ use crate::font::Font;
 use crate::{Ruling, TextSpan};
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
-    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Object, Page,
-    Point,
+    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, ObjRef, Object,
+    Page, Point,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Maximum form-XObject recursion depth.
 const MAX_FORM_DEPTH: usize = 16;
@@ -114,6 +114,37 @@ impl std::fmt::Display for SkipCause {
     }
 }
 
+/// Loaded fonts shared across page extractions of one document, keyed by the
+/// font dictionary's object reference.
+///
+/// The name→font binding is resource-scoped — `/F1` in one form and `/F1` in
+/// the page resources may be different fonts — so names are never keys here.
+/// The reference is: within a document (and its forks, which share the same
+/// bytes) an object reference resolves to the same dictionary every time, and
+/// loading that dictionary yields the same font. A font held as a direct
+/// dictionary has no reference and is never cached here.
+///
+/// `Send + Sync`, so one cache may serve every worker of a parallel
+/// page walk; the executor consults it at most once per page per distinct
+/// font reference.
+#[derive(Default)]
+pub struct FontCache {
+    fonts: Mutex<HashMap<ObjRef, Arc<Font>>>,
+}
+
+impl FontCache {
+    fn get(&self, r: ObjRef) -> Option<Arc<Font>> {
+        self.fonts.lock().unwrap().get(&r).cloned()
+    }
+
+    /// Stores `font` under `r`, keeping (and returning) an already-present
+    /// entry: concurrent workers may load the same font twice, and the copies
+    /// are interchangeable, so the first one in wins.
+    fn insert(&self, r: ObjRef, font: Arc<Font>) -> Arc<Font> {
+        self.fonts.lock().unwrap().entry(r).or_insert(font).clone()
+    }
+}
+
 /// Maps a fetch/decode error onto its cause, keeping the filter name — the
 /// one detail a caller can act on (the same split rendering reports).
 fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
@@ -139,6 +170,7 @@ fn cause_for(error: &pdfboss_core::Error) -> SkipCause {
 pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
+    fonts: Option<&FontCache>,
 ) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
     let mut report = ExtractReport::default();
     let content = match page_content_with(&src, page).await {
@@ -162,6 +194,8 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         fallback: Arc::new(Font::fallback()),
         forms: 0,
         report,
+        loaded: HashMap::new(),
+        shared: fonts,
     };
     let root = Frame::new(
         ops.into(),
@@ -436,6 +470,14 @@ struct Executor<'a, S> {
     forms: usize,
     /// What could not be read; carried out alongside the spans.
     report: ExtractReport,
+    /// Fonts loaded during this page walk, keyed by their dictionary's
+    /// object reference — shared across every frame the walk pushes, so a
+    /// form invoked many times loads its fonts once. Never keyed by name:
+    /// that binding is per resource scope and stays in [`Frame::fonts`].
+    loaded: HashMap<ObjRef, Arc<Font>>,
+    /// Fonts carried across page walks, when the caller extracts a whole
+    /// document and passes one [`FontCache`] to every page.
+    shared: Option<&'a FontCache>,
 }
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
@@ -467,7 +509,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Loads (with per-stream caching) the font resource `name` from the
     /// active resource chain, falling back to a default font.
     async fn font(
-        &self,
+        &mut self,
         chain: &[Arc<Dict>],
         name: &str,
         cache: &mut HashMap<String, Arc<Font>>,
@@ -475,15 +517,79 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
-        let resolved = self.find_res(chain, "Font", name).await;
-        let loaded = match resolved.as_ref().and_then(|o| o.as_dict()) {
-            Some(dict) => Arc::new(Font::load(self.src, dict).await),
-            // No such resource, or one that is not a dictionary: the fallback
-            // font keeps the text extractable rather than failing the page.
-            None => self.fallback.clone(),
-        };
+        let loaded = self.load_font(chain, name).await;
         cache.insert(name.to_string(), loaded.clone());
         loaded
+    }
+
+    /// Resolves `name` through the chain with [`Self::find_res`]'s exact
+    /// semantics — innermost scope first, a name whose value will not resolve
+    /// falls through to the outer scopes, the first value that resolves wins
+    /// whatever it turns out to be — and loads the font it lands on.
+    ///
+    /// A value held as an indirect reference is answered from the caches
+    /// before it is even resolved: within one document a reference resolves
+    /// to the same dictionary every time, so an already-loaded font is the
+    /// same font. Anything else — a direct dictionary, a value that is no
+    /// dictionary at all (the fallback), an exhausted chain (also the
+    /// fallback) — is loaded per use, cached only under its name in the
+    /// calling frame.
+    async fn load_font(&mut self, chain: &[Arc<Dict>], name: &str) -> Arc<Font> {
+        for res in chain {
+            let Some(cat) = res.get("Font") else {
+                continue;
+            };
+            let Ok(Object::Dict(dict)) = self.src.resolve(cat).await else {
+                continue;
+            };
+            let Some(value) = dict.get(name) else {
+                continue;
+            };
+            let key = match value {
+                Object::Ref(r) => Some(*r),
+                _ => None,
+            };
+            if let Some(f) = key.and_then(|r| self.hit(r)) {
+                return f;
+            }
+            let Ok(obj) = self.src.resolve(value).await else {
+                continue;
+            };
+            let Some(font_dict) = obj.as_dict() else {
+                // The name resolved to something that is not a dictionary:
+                // the fallback font keeps the text extractable rather than
+                // failing the page.
+                return self.fallback.clone();
+            };
+            let loaded = Arc::new(Font::load(self.src, font_dict).await);
+            return match key {
+                Some(r) => self.remember(r, loaded),
+                None => loaded,
+            };
+        }
+        self.fallback.clone()
+    }
+
+    /// An already-loaded font for the dictionary `r` refers to, if any walk
+    /// of this document has loaded it.
+    fn hit(&mut self, r: ObjRef) -> Option<Arc<Font>> {
+        if let Some(f) = self.loaded.get(&r) {
+            return Some(f.clone());
+        }
+        let f = self.shared?.get(r)?;
+        self.loaded.insert(r, f.clone());
+        Some(f)
+    }
+
+    /// Records a freshly loaded font under its dictionary's reference, in
+    /// this walk's cache and in the document-wide one when present.
+    fn remember(&mut self, r: ObjRef, font: Arc<Font>) -> Arc<Font> {
+        let font = match self.shared {
+            Some(shared) => shared.insert(r, font),
+            None => font,
+        };
+        self.loaded.insert(r, font.clone());
+        font
     }
 
     /// Executes an operator stream and every form XObject it invokes.
@@ -858,14 +964,15 @@ mod tests {
     /// asserts on exactly what a synchronous caller receives. The report is
     /// asserted complete: no test here expects to lose content.
     fn page_spans(doc: &Document, page: &Page) -> Vec<TextSpan> {
-        let (spans, _, report) = block_on(page_spans_and_rulings_with(Immediate(doc), page));
+        let (spans, _, report) = block_on(page_spans_and_rulings_with(Immediate(doc), page, None));
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         spans
     }
 
     /// The synchronous rulings accessor, the twin of [`page_spans`].
     fn page_rulings(doc: &Document, page: &Page) -> Vec<Ruling> {
-        let (_, rulings, report) = block_on(page_spans_and_rulings_with(Immediate(doc), page));
+        let (_, rulings, report) =
+            block_on(page_spans_and_rulings_with(Immediate(doc), page, None));
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         rulings
     }
@@ -994,7 +1101,8 @@ mod tests {
         let page = doc.page(0).unwrap();
         // Raw call: exhausting the budget is this test's point, so the
         // report is legitimately incomplete here.
-        let (spans, _, report) = block_on(page_spans_and_rulings_with(Immediate(&doc), &page));
+        let (spans, _, report) =
+            block_on(page_spans_and_rulings_with(Immediate(&doc), &page, None));
         assert!(!spans.is_empty()); // nested forms still extract text
         assert!(
             spans.len() <= MAX_FORM_INVOCATIONS,
@@ -1073,13 +1181,66 @@ mod tests {
     /// Nothing in this crate has interior mutability, so this holds as soon as
     /// the handle is an `Arc`. The assertion exists to stop a later `Rc` or
     /// `RefCell` taking it away silently — which is exactly how the renderer's
-    /// glyph cache came to block a spawnable future.
+    /// glyph cache came to block a spawnable future. [`FontCache`] is on the
+    /// list because one instance serves every worker of a parallel page walk.
     #[test]
     fn loaded_fonts_are_shareable_across_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Font>();
         assert_send_sync::<Arc<Font>>();
         assert_send_sync::<GState>();
+        assert_send_sync::<FontCache>();
+    }
+
+    /// `/F1` in a form's own resources and `/F1` in the page resources are
+    /// different fonts: the name→font binding is resource-scoped (ISO 32000
+    /// §7.8.3). The loaded-font cache is keyed by the font dictionary's
+    /// object reference, never by name — a cache keyed by name would hand
+    /// the form the page's font and fail this test.
+    #[test]
+    fn same_name_binds_a_different_font_per_resource_scope() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> /XObject << /Fx 6 0 R >> >> \
+             /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (aa) Tj ET /Fx Do");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding /FirstChar 97 /LastChar 97 /Widths [500] >>",
+        );
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+             /Resources << /Font << /F1 7 0 R >> >>",
+            b"BT /F1 12 Tf 72 700 Td (aa) Tj ET",
+        );
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding /FirstChar 97 /LastChar 97 /Widths [1000] >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = page_spans(&doc, &page);
+        assert_eq!(spans.len(), 2);
+        let advance = |s: &TextSpan| s.end_x - s.x;
+        assert!(
+            (advance(&spans[0]) - 12.0).abs() < 1e-3,
+            "page scope must use the 500-width font: {}",
+            advance(&spans[0])
+        );
+        assert!(
+            (advance(&spans[1]) - 24.0).abs() < 1e-3,
+            "form scope must use the 1000-width font: {}",
+            advance(&spans[1])
+        );
     }
 
     /// A stroked 2x2 grid: the `re` contributes its four border edges in

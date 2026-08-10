@@ -11,7 +11,9 @@ use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Resul
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 pub use markdown::Markdown;
 pub use output::{Output, Text};
-pub use pdfboss_text::{ExtractReport, Ruling, SkipCause, SkippedText, SkippedTextKind, TextSpan};
+pub use pdfboss_text::{
+    ExtractReport, FontCache, Ruling, SkipCause, SkippedText, SkippedTextKind, TextSpan,
+};
 pub use structure::{
     document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
 };
@@ -64,6 +66,23 @@ pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     Ok((Text.render(&[page_layout(&spans)]), report))
 }
 
+/// [`extract_text_reporting`] with fonts cached across pages: a caller
+/// walking a whole document — `pdfboss_core::map_pages` included — passes one
+/// [`FontCache`] to every page and each font loads once for the document.
+/// The text is identical to the uncached call's, page for page.
+///
+/// There is no `_with` twin: an asynchronous caller composes
+/// `pdfboss_text::extract_spans_reporting_cached_with` with the pure
+/// [`page_layout`] and [`Text`], exactly as this function does.
+pub fn extract_text_reporting_cached(
+    doc: &Document,
+    page: &Page,
+    fonts: &FontCache,
+) -> Result<(String, ExtractReport)> {
+    let (spans, report) = pdfboss_text::extract_spans_reporting_cached(doc, page, fonts)?;
+    Ok((Text.render(&[page_layout(&spans)]), report))
+}
+
 /// Extracts the whole document as Markdown: ATX headings, paragraphs, and
 /// emphasis over the same positional layout [`extract_text`] renders flat.
 ///
@@ -84,7 +103,10 @@ pub fn extract_markdown(doc: &Document) -> Result<String> {
 /// Each page's rulings ride along with its spans: a table whose structure is
 /// drawn as borders is read from them ahead of lane occupancy.
 pub fn extract_markdown_reporting(doc: &Document) -> Result<(String, Vec<ExtractReport>)> {
-    let per_page = pdfboss_core::map_pages(doc, pdfboss_text::extract_spans_and_rulings_reporting);
+    let fonts = FontCache::default();
+    let per_page = pdfboss_core::map_pages(doc, |doc: &Document, page: &Page| {
+        pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts)
+    });
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
     for outcome in per_page {

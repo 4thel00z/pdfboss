@@ -408,16 +408,20 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
             // `map_pages` visits exactly the materializable pages (the
             // flattened tree, not the declared `/Count`, which on a damaged
             // file may not match what the tree yields) and returns them in
-            // page order.
-            let parts = pdfboss_core::map_pages(&doc, pdfboss_output::extract_text_reporting)
-                .into_iter()
-                .enumerate()
-                .map(|(index, outcome)| {
-                    let (text, report) = outcome.map_err(|e| e.to_string())?;
-                    warn_skips(index + 1, &report);
-                    Ok(text)
-                })
-                .collect::<Result<Vec<String>, String>>()?;
+            // page order. One font cache serves every worker, so a font
+            // loads once per document rather than once per page.
+            let fonts = pdfboss_output::FontCache::default();
+            let parts = pdfboss_core::map_pages(&doc, |doc, page| {
+                pdfboss_output::extract_text_reporting_cached(doc, page, &fonts)
+            })
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                let (text, report) = outcome.map_err(|e| e.to_string())?;
+                warn_skips(index + 1, &report);
+                Ok(text)
+            })
+            .collect::<Result<Vec<String>, String>>()?;
             parts.join("\u{c}")
         }
     };
