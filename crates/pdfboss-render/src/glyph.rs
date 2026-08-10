@@ -63,6 +63,14 @@ enum Outlines {
     /// (`Full`-tier substitution), standing in for the original font, which
     /// has no glyph program of its own.
     Substitute(TrueType),
+    /// No program at all: a font no tier paints, loaded for its advance
+    /// metrics alone (the PDF's own `/Widths` or `/W`+`/DW`, or the AFM-14
+    /// table for a recognized standard-14 `/BaseFont`) so the text position
+    /// still moves under every show operator and the runs that follow stay
+    /// where the page put them. Nothing is painted and nothing is reported
+    /// for such a font — unpainted tiers are configured behavior, not a
+    /// drop.
+    Metrics,
 }
 
 /// How character codes map to glyph indices for a loaded font.
@@ -188,7 +196,15 @@ impl GlyphFont {
         // a substitute's 1-byte table would mis-split them), and `Type3`
         // (the executor's `/CharProcs` path) falls into the `_` catch-all,
         // which also never substitutes.
-        match font.get_name("Subtype").map(|n| n.0.as_str()) {
+        //
+        // When every paintable loader for a recognized outline-font subtype
+        // has declined, the font still loads metrics-only (`metrics_only`)
+        // so its text advances. `Type3` and unknown subtypes keep returning
+        // `None` outright: the executor's Type3 fallback fires only while
+        // `ts.font` is `None`, and a metrics-only stand-in there would stop
+        // Type3 pages painting.
+        let subtype = font.get_name("Subtype").map(|n| n.0.to_owned());
+        let loaded = match subtype.as_deref() {
             Some("Type0") => load_type0(src, font, painting).await,
             Some("TrueType") => match load_simple(src, font).await {
                 Some(f) => Some(f),
@@ -200,7 +216,14 @@ impl GlyphFont {
                     None => substitute_at_full(src, font, painting, provider).await,
                 }
             }
-            _ => None,
+            // Type1/MMType1 at a tier below AllEmbedded: painted by nothing,
+            // but the metrics fallback below still applies.
+            Some("Type1") | Some("MMType1") => None,
+            _ => return None,
+        };
+        match loaded {
+            Some(f) => Some(f),
+            None => metrics_only(src, font, subtype.as_deref()).await,
         }
     }
 
@@ -232,6 +255,7 @@ impl GlyphFont {
             Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.glyph_path(gid),
             Outlines::Cff(cff) => cff.glyph_path(gid),
             Outlines::Type1(t1) => t1.glyph_path(gid),
+            Outlines::Metrics => Vec::new(),
         }
         .into();
         lock_cache(&self.outline_cache).insert(gid, Arc::clone(&segs));
@@ -296,7 +320,7 @@ impl GlyphFont {
             Outlines::TrueType(tt) | Outlines::Substitute(tt) => {
                 f32::from(tt.advance(self.gid(code)))
             }
-            Outlines::Cff(_) | Outlines::Type1(_) => 0.0,
+            Outlines::Cff(_) | Outlines::Type1(_) | Outlines::Metrics => 0.0,
         }
     }
 
@@ -306,7 +330,17 @@ impl GlyphFont {
             Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.units_per_em() as f32,
             Outlines::Cff(cff) => cff.units_per_em(),
             Outlines::Type1(t1) => t1.units_per_em(),
+            // Metrics-only advances come from `/Widths`-space values, which
+            // are already thousandths of an em.
+            Outlines::Metrics => 1000.0,
         }
+    }
+
+    /// Whether this font paints glyphs at all. A metrics-only font advances
+    /// the text position but draws nothing, and its unpainted codes are
+    /// configured tier behavior rather than reportable drops.
+    pub(crate) fn paints(&self) -> bool {
+        !matches!(self.outlines, Outlines::Metrics)
     }
 }
 
@@ -774,33 +808,92 @@ async fn load_substitute<S: AsyncObjectSource>(
     }
 
     let widths = simple_widths(src, font).await;
-
-    // AFM-14 advances: only for a recognized standard-14 /BaseFont. Codes
-    // with no resolvable glyph name (WinAnsi/MacRoman, which have no
-    // code -> name table here) are simply not inserted, so `advance` falls
-    // through to the substitute's own hmtx for them.
-    let mut afm_widths = FastMap::default();
-    if pdfboss_encoding::is_standard_14(base_font) {
-        let standard_ok = is_standard_encoding(src, font).await;
-        for code in 0u32..256 {
-            let name = diffs.get(&(code as u8)).map(String::as_str).or_else(|| {
-                standard_ok
-                    .then(|| pdfboss_encoding::standard_encoding_name(code as u8))
-                    .flatten()
-            });
-            if let Some(name) = name {
-                if let Some(w) = pdfboss_encoding::standard_14_width(base_font, name) {
-                    afm_widths.insert(code, w);
-                }
-            }
-        }
-    }
+    let afm_widths = afm_14_widths(src, font, base_font, &diffs).await;
 
     Some(GlyphFont {
         outline_cache: Mutex::new(FastMap::default()),
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Substitute(tt),
         kind: GlyphKind::Simple(table),
+        widths,
+        afm_widths,
+    })
+}
+
+/// The Adobe Core-14 AFM advance table for a recognized standard-14
+/// `/BaseFont`, keyed by character code. A code's glyph name is its
+/// `/Differences` entry, else -- only when the base encoding is
+/// `StandardEncoding` or absent -- the `StandardEncoding` name for that
+/// code. Codes with no resolvable name (WinAnsi/MacRoman, which have no
+/// code -> name table here) are simply not inserted, and every other
+/// `/BaseFont` gets an empty map, so `GlyphFont::advance` falls through to
+/// its next tier.
+async fn afm_14_widths<S: AsyncObjectSource>(
+    src: &S,
+    font: &Dict,
+    base_font: &str,
+    diffs: &FastMap<u8, String>,
+) -> FastMap<u32, f32> {
+    let mut afm_widths = FastMap::default();
+    if !pdfboss_encoding::is_standard_14(base_font) {
+        return afm_widths;
+    }
+    let standard_ok = is_standard_encoding(src, font).await;
+    for code in 0u32..256 {
+        let name = diffs.get(&(code as u8)).map(String::as_str).or_else(|| {
+            standard_ok
+                .then(|| pdfboss_encoding::standard_encoding_name(code as u8))
+                .flatten()
+        });
+        if let Some(name) = name {
+            if let Some(w) = pdfboss_encoding::standard_14_width(base_font, name) {
+                afm_widths.insert(code, w);
+            }
+        }
+    }
+    afm_widths
+}
+
+/// Loads a font no tier paints for its advance metrics alone -- see
+/// [`Outlines::Metrics`]. Simple fonts read `/Widths` (+ `/MissingWidth`)
+/// and, for a recognized standard-14 `/BaseFont`, the AFM-14 table; a
+/// `/Type0` reads its descendant's `/W` + `/DW`. Returns `None` when the
+/// dictionary declares no metric at all, leaving such a font exactly as
+/// unloaded as it always was.
+async fn metrics_only<S: AsyncObjectSource>(
+    src: &S,
+    font: &Dict,
+    subtype: Option<&str>,
+) -> Option<GlyphFont> {
+    let (kind, widths, afm_widths) = if subtype == Some("Type0") {
+        let descendants = src.resolve(font.get("DescendantFonts")?).await.ok()?;
+        let first = descendants.as_array()?.first()?;
+        let cid = resolve_dict(src, first).await?;
+        (
+            GlyphKind::Cid(None),
+            cid_widths(src, &cid).await,
+            FastMap::default(),
+        )
+    } else {
+        let base_font = font
+            .get_name("BaseFont")
+            .map(|n| n.0.as_str())
+            .unwrap_or("");
+        let diffs = differences(src, font).await;
+        (
+            GlyphKind::Simple(Box::new([0u16; 256])),
+            simple_widths(src, font).await,
+            afm_14_widths(src, font, base_font, &diffs).await,
+        )
+    };
+    if !widths.declared && afm_widths.is_empty() {
+        return None;
+    }
+    Some(GlyphFont {
+        outline_cache: Mutex::new(FastMap::default()),
+        flat_cache: Mutex::new(FastMap::default()),
+        outlines: Outlines::Metrics,
+        kind,
         widths,
         afm_widths,
     })
@@ -1400,6 +1493,158 @@ mod tests {
             dark_pixel_at(&pix, 135, 115),
             "second glyph must paint at the /W-implied origin (135,115), not \
              stacked on the first glyph as the program's 0 advance would give"
+        );
+    }
+
+    /// Builds a one-page PDF with two fonts: `/F0` the embedded synthetic
+    /// TrueType (`build_font`, paints at every tier) and `/F1` given verbatim
+    /// as `font_dict` — the fixture for text that paints at no tier but must
+    /// still advance the text position for what follows it.
+    fn two_font_doc(font_dict: &str, content: &[u8]) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R /F1 8 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /X \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 7 0 R >>",
+        );
+        b.stream(7, "", &build_font());
+        b.object(8, font_dict);
+        b.build(1)
+    }
+
+    #[test]
+    fn unpainted_font_widths_still_advance_the_following_run() {
+        // /F1 is a non-embedded font no tier paints, declaring an
+        // 800/1000-em advance for code 65. The embedded /F0 run after it
+        // must start 80pt further right — the advance happens even though
+        // nothing painted — landing its box glyph over (135,115).
+        let bytes = two_font_doc(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /NoSuchFace \
+             /Encoding /WinAnsiEncoding /FirstChar 65 /Widths [800] >>",
+            b"BT /F1 100 Tf 20 50 Td <41> Tj /F0 100 Tf <41> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "the unpainted /F1 run must not paint at (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "the embedded run must start after /F1's /Widths advance, \
+             not on top of where /F1's text began"
+        );
+    }
+
+    #[test]
+    fn standard_14_font_advances_by_afm_width_without_widths() {
+        // A bare non-embedded /Helvetica with no /Widths at all: code 'M'
+        // must advance by its Core-14 AFM width (833/1000 em = 83.3pt at
+        // 100pt), carrying the embedded run to its box over (135,115).
+        let bytes = two_font_doc(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"BT /F1 100 Tf 20 50 Td (M) Tj /F0 100 Tf <41> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "the unpainted /Helvetica run must not paint at (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "the embedded run must start after the AFM advance of 'M'"
+        );
+    }
+
+    #[test]
+    fn metrics_only_text_reports_nothing() {
+        // Unpainted tiers are configured behavior: a metrics-only font's
+        // codes advance without painting, and the report must stay empty
+        // rather than describing them as drops.
+        let bytes = two_font_doc(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"BT /F1 100 Tf 20 50 Td (Mensch) Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let (pix, report) =
+            crate::render_page_reporting(&doc, &page, 1.0, &RenderOptions::default())
+                .expect("render");
+        assert!(
+            report.is_empty(),
+            "metrics-only text must not be reported: {:?}",
+            report.warnings()
+        );
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "nothing may paint for the metrics-only run"
+        );
+    }
+
+    #[test]
+    fn non_embedded_type0_advances_by_w_array() {
+        // A /Type0 whose CIDFontType2 descendant has no FontFile2: nothing
+        // paints at any tier, but /W declares CID 1's advance as 800/1000 em,
+        // and the embedded /F0 run after it must land over (135,115).
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R /F1 8 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 100 Tf 20 50 Td <0001> Tj /F0 100 Tf <41> Tj ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /X \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 7 0 R >>",
+        );
+        b.stream(7, "", &build_font());
+        b.object(
+            8,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /Y /Encoding /Identity-H \
+             /DescendantFonts [9 0 R] >>",
+        );
+        b.object(
+            9,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Y /DW 1000 /W [1 [800]] >>",
+        );
+        let bytes = b.build(1);
+
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "the unpainted Type0 run must not paint at (55,115)"
+        );
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "the embedded run must start after the /W advance of CID 1"
         );
     }
 

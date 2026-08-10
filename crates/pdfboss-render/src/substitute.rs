@@ -29,13 +29,11 @@
 //! from_font_dict` returns `None` for `/Symbol` and `/ZapfDingbats`, which
 //! have no license-clean substitute in the bundled set, so that text stays
 //! unpainted at every tier rather than borrowing an unrelated face's
-//! glyphs; a "bold" *sans* request is not visually distinct from the
-//! regular weight, because Arimo ships only as a `[wght]` variable font
-//! and is rendered at its default (Regular) instance -- only italic varies,
-//! via a separate static face; and advancing *unpainted* non-embedded text
-//! at `AllEmbedded` (giving that tier the AFM-14 benefit even though it
-//! paints nothing) is deferred -- the AFM tables exist and feed the
-//! `Full`-tier substitute advance now, not any earlier tier.
+//! glyphs (it still advances, via `glyph.rs`'s metrics-only loader); and a
+//! "bold" *sans* request is not visually distinct from the regular weight,
+//! because Arimo ships only as a `[wght]` variable font and is rendered at
+//! its default (Regular) instance -- only italic varies, via a separate
+//! static face.
 
 use pdfboss_core::{AsyncObjectSource, Dict};
 

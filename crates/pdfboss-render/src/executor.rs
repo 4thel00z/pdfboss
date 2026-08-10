@@ -1059,7 +1059,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 .concat(params)
                 .concat(ts.tm)
                 .concat(gs.ctm);
-            if gid != 0 && finite_matrix(&to_device) {
+            if !font.paints() {
+                // A metrics-only font: the advance below is the whole point,
+                // and its unpainted codes are configured tier behavior, so
+                // neither the paint attempt nor the no-glyph report applies.
+            } else if gid != 0 && finite_matrix(&to_device) {
                 // Flatten under the linear part only (memoized per glyph +
                 // linear map); the per-glyph translation is applied when the
                 // cached outline is blitted, keeping the flatten reusable

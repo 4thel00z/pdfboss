@@ -249,12 +249,13 @@ pub enum SkippedKind {
     BlendMode,
     /// An annotation appearance stream: annotations are not painted.
     Annotation,
-    /// A character code a *loaded* font has no glyph for: the code advanced
-    /// the text position but painted nothing. A single-byte code 0x20 is
-    /// exempt — a space paints nothing whether or not the font maps it —
-    /// while a two-byte 0x20 is a real CID and is reported. Text whose font
-    /// never loaded at all (the [`GlyphPainting`] tier, or a load failure)
-    /// is configured behavior and stays unreported.
+    /// A character code a *painting* font has no glyph for: the code
+    /// advanced the text position but painted nothing. A single-byte code
+    /// 0x20 is exempt — a space paints nothing whether or not the font maps
+    /// it — while a two-byte 0x20 is a real CID and is reported. Text whose
+    /// font paints at no tier (the [`GlyphPainting`] tier, or a load
+    /// failure) is configured behavior and stays unreported; such a font
+    /// still loads its metrics so the text advances.
     Glyph,
 }
 
@@ -369,9 +370,10 @@ pub struct SkippedContent {
 ///
 /// Two things are deliberately *not* reported, because they are configured
 /// behavior rather than a failure: text left unpainted by the requested
-/// [`GlyphPainting`] tier — its font never loaded — and content clipped or
-/// transformed off the page. A code a *loaded* font has no glyph for is a
-/// real loss and IS reported, as [`SkippedKind::Glyph`].
+/// [`GlyphPainting`] tier — its font loads metrics only, so the text still
+/// advances but draws nothing — and content clipped or transformed off the
+/// page. A code a *painting* font has no glyph for is a real loss and IS
+/// reported, as [`SkippedKind::Glyph`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RenderReport {
