@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.15.0](https://github.com/4thel00z/pdfboss/compare/v0.14.0...v0.15.0) (2026-08-10)
+
+
+### Performance Improvements
+
+* faster text and markdown extraction with byte-identical output ([#29](https://github.com/4thel00z/pdfboss/issues/29)) ([9f80ee8](https://github.com/4thel00z/pdfboss/commit/9f80ee83338c2c483ed56b4bc2810d6833ace50b))
+
+
+### Documentation
+
+* score the Markdown adapter and restate the README plainly ([#30](https://github.com/4thel00z/pdfboss/issues/30)) ([ccf12a4](https://github.com/4thel00z/pdfboss/commit/ccf12a4b0de0be2f5b28a3b294ee31b80a27c2c7))
+
+
+### Miscellaneous Chores
+
+* bump the next release to 0.15.0 ([76af0f1](https://github.com/4thel00z/pdfboss/commit/76af0f148886f3722ffca26787146f8f233c633b))
+
 ## [0.14.0](https://github.com/4thel00z/pdfboss/compare/v0.13.0...v0.14.0) (2026-08-09)
 
 
