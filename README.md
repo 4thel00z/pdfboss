@@ -1,7 +1,7 @@
 <h1 align="center">pdfboss</h1>
 
 <p align="center">
-  <strong>A PDF engine written from scratch in Rust — parse, extract text, rasterize to PNG. One core, a CLI, and pythonic bindings.</strong>
+  <strong>A PDF engine written from scratch in Rust: parse, extract text, rasterize to PNG. One core, a CLI, and pythonic bindings.</strong>
 </p>
 
 <p align="center">
@@ -16,9 +16,9 @@
 
 ## Motivation
 
-Reading a PDF shouldn't mean linking a C library. pdfboss is a clean-room reader built straight from the ISO 32000 specification: no C dependencies, no bindings to anyone else's engine — just safe Rust with a small, obvious API. The same core powers a CLI and a native Python extension, so a script and a service share one implementation.
+Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification. It has no C dependencies and no bindings to another engine. It is safe Rust with a small, obvious API. The same core powers the CLI and the native Python extension, so a script and a service share one implementation.
 
-It is a **lenient reader**: real-world files are damaged, and pdfboss recovers rather than refuses — reconstructing broken cross-reference tables, tolerating wrong stream lengths, and skipping garbage operators instead of erroring out.
+pdfboss is a **lenient reader**. Real-world files are damaged, so it recovers instead of refusing. It reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators.
 
 ## Install
 
@@ -28,7 +28,7 @@ It is a **lenient reader**: real-world files are damaged, and pdfboss recovers r
 pip install pdfboss
 ```
 
-Prebuilt abi3 wheels (CPython ≥ 3.12) for Linux and macOS; no toolchain required.
+Prebuilt abi3 wheels (CPython 3.12+) for Linux and macOS. No toolchain required.
 
 ### Rust
 
@@ -49,7 +49,7 @@ pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
 pdfboss obj     report.pdf 5               # pretty-print object 5
 ```
 
-Explorer subcommands, each accepting a local path or an `http(s)://` URL (range-fetched, never downloaded whole):
+Explorer subcommands. Each accepts a local path or an `http(s)://` URL, fetched in ranges and never downloaded whole:
 
 ```bash
 pdfboss json    report.pdf                    # dump the document as a JSON value tree
@@ -102,15 +102,15 @@ pixmap.save_png("page.png")?;
 |---|---|
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
 | `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text spans |
-| `pdfboss-output` | Layout analysis over those spans — lines, columns, headings, lists, tables, repeated page headers — rendered as plain text or Markdown |
+| `pdfboss-output` | Layout analysis over those spans (lines, columns, headings, lists, tables, repeated page headers), rendered as plain text or Markdown |
 | `pdfboss-jpx` | JPEG 2000 decoder for `JPXDecode` image streams, implemented from ITU-T T.800 |
-| `pdfboss-render` | Anti-aliased vector rasterizer — paths, fills, strokes, clipping, color, images, glyph outlines — to RGBA/PNG |
+| `pdfboss-render` | Anti-aliased vector rasterizer (paths, fills, strokes, clipping, color, images, glyph outlines) to RGBA/PNG |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
-**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images — JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans — Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans — generic regions, symbol dictionaries and text regions, arithmetic- or Huffman-coded, MMR-coded generic regions and collective bitmaps, immediate generic refinement regions, with or without `/JBIG2Globals` · Standard-handler decryption — RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · Markdown output with headings, lists, emphasis and pipe/HTML tables inferred from the page layout · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
+**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images: JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans: Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans: generic regions, symbol dictionaries and text regions, arithmetic- or Huffman-coded, MMR-coded generic regions and collective bitmaps, immediate generic refinement regions, with or without `/JBIG2Globals` · Standard-handler decryption: RC4 and AES-128/256 (empty user password) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · Markdown output with headings, lists, emphasis and pipe/HTML tables inferred from the page layout and from drawn table borders · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, image/form XObjects, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
 
 ## Benchmarks
 
@@ -122,13 +122,13 @@ Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, 
   <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations — including against the C-backed PyMuPDF.** On text extraction it reaches 9,000 pages/s versus PyMuPDF's 449 (≈20×), and 95–500× the pure-Python readers; since 0.9.0 `doc.extract_text()` fans pages out across cores, so the gap over the sequential libraries widened from the ≈7× measured before that landed. On open + parse it reaches 357,000 pages/s versus PyMuPDF's 99,000 (≈3.6×): lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front, so opening is close to free and the ratio says more about what the others do eagerly than about pdfboss. Rendering is not compared on this corpus — a few faces still go unpainted (see Limitations), so timing it against full renderers would flatter pdfboss for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair precisely because a scan has no glyphs in it.
+**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF.** On text extraction it reaches 9,000 pages/s. PyMuPDF reaches 449 (about 20×), and the pure-Python readers are 95× to 500× slower. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed. On open + parse it reaches 357,000 pages/s against PyMuPDF's 99,000 (about 3.6×). Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is not compared on this corpus. A few faces still go unpainted (see Limitations), and timing pdfboss against full renderers would credit it for work it skipped. The scanned-document benchmark below is the render comparison, and it is fair because a scan has no glyphs in it.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
 ### Extraction quality
 
-Speed without fidelity is worthless, so extraction quality is measured too — on [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 real-world PDFs), the corpus PDF-to-Markdown engines publish their comparisons on. The row below scores pdfboss's default plain-text output, so the comparable metric is **NID** — reading-order similarity against the ground truth, 0–1, higher is better. The table/heading metrics score Markdown structure that plain text cannot express; the Markdown adapter behind `pdfboss md` is new and is not scored in this table.
+Speed without fidelity is worthless, so extraction quality is measured too. The corpus is [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 real-world PDFs), which PDF-to-Markdown engines use for their published comparisons. pdfboss appears twice: the default plain-text output and the Markdown adapter behind `pdfboss md`. The metric that is comparable across all rows is **NID**, the reading-order similarity against the ground truth (0 to 1, higher is better).
 
 | Engine | Reading order (NID) | Output | Time (200 docs) |
 |---|--:|---|--:|
@@ -136,16 +136,17 @@ Speed without fidelity is worthless, so extraction quality is measured too — o
 | liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
 | opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
 | pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
-| **pdfboss** | **0.868** | plain text | **0.16s** |
+| **pdfboss** (`md`) | **0.877** | Markdown | **0.14s** |
+| **pdfboss** | **0.868** | plain text | **0.13s** |
 | markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
 
-pdfboss reads the whole corpus in 0.16 seconds — 2.7× faster than the fastest Markdown engine measured on the same machine — and holds a reading-order score in the middle of that field: per document it beats pdf-inspector's NID on 105 of the 200 files, ties on 23 and loses on 72, with the difference concentrated in table regions, where a Markdown engine's structured output matches the ground truth more closely than flowed text can. Two-column layouts are read column-major, justified text keeps its word spacing, and ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
+pdfboss reads the whole corpus in about a seventh of a second in either mode. That is over 3× faster than the fastest competing Markdown engine measured on the same machine. Its reading-order score sits in the middle of the field: per document, the plain-text output beats pdf-inspector's NID on 105 of the 200 files, ties on 23 and loses on 72. The losses concentrate in table regions, where structured output matches the ground truth more closely than flowed text can. On the benchmark's combined metric the Markdown adapter scores 0.801 (reading order 0.877, headings and lists 0.667, table structure 0.532). It detects tables from column gaps and from drawn borders, so bordered grids and boxed lists without column gaps are found too. Two-column layouts are read column-major. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
 
-Quality rows come from the benchmark's own evaluator over all 200 documents; pdf-inspector and pdfboss timings were measured together on an Apple M3 Pro under the benchmark's protocol (median of five single-process runs after a warm-up), the other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro — read them as order-of-magnitude context, not a same-machine race.
+Quality rows come from the benchmark's own evaluator over all 200 documents. The two pdfboss timings were measured together in one session on an Apple M3 Pro under the benchmark's protocol: median of five single-process runs after a warm-up, wheel built from main. pdf-inspector was measured the same way on the same machine in an earlier session. The other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro. Read them as order-of-magnitude context, not a same-machine race.
 
 ### Scanned documents
 
-Scans are the other half of the world's PDFs, and they are a different workload: one full-page bilevel image per page, JBIG2- or CCITT-coded, with no text operators at all. Rendering **is** comparable there — with no glyphs to paint, every library draws the same picture — so it gets its own benchmark, over a 544-page JBIG2 book (1994 × 2832 samples per page) rasterized to PNG at 1:1.
+Scans are the other half of the world's PDFs, and they are a different workload: one full-page bilevel image per page, JBIG2- or CCITT-coded, with no text operators at all. Rendering **is** comparable there, because with no glyphs to paint every library draws the same picture. So scans get their own benchmark: a 544-page JBIG2 book (1994 × 2832 samples per page) rasterized to PNG at 1:1.
 
 | Library | pages/sec | Ink on page 1 |
 |---|--:|--:|
@@ -154,11 +155,11 @@ Scans are the other half of the world's PDFs, and they are a different workload:
 | PyMuPDF | 54.5 | 4.82% |
 | pypdfium2 | 52.6 | 4.85% |
 
-**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers** — and the only one of them with no C in it. Compare the four rows against each other rather than against another machine's: all four are timed in one pass, and that ratio has landed within a few percent of 1.5× on every run (1.49× to 1.56×), across absolute numbers that varied by half as the machine warmed and cooled.
+**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers**, and the only one of them with no C in it. Compare the four rows against each other, not against another machine's numbers. All four are timed in one pass, and the ratio has landed within a few percent of 1.5× on every run (1.49× to 1.56×), while the absolute numbers varied by half as the machine warmed and cooled.
 
-What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation feeding it, and that part is a serial dependency chain — every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded — so it neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
+What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation that feeds it. That part is a serial dependency chain: every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded. It neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
 
-The ink column is what makes the timings mean anything: a library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel — each downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
+The ink column is what makes the timings mean anything. A library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel, because each library downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
 
 Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
@@ -168,19 +169,19 @@ Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
 ## Limitations
 
-Glyph painting is staged in tiers, selected with `--fonts`. The default, `all-embedded`, paints every embedded font program — TrueType, CFF, Type1 and Type3. `embedded-only` restricts that to TrueType, and `full` additionally substitutes a replacement face for a **non-embedded** simple font, from either a directory you supply or the compiled-in OFL Croscore set (behind the `substitute-fonts` feature). Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
+Glyph painting is staged in tiers, selected with `--fonts`. The default, `all-embedded`, paints every embedded font program (TrueType, CFF, Type1 and Type3). `embedded-only` restricts that to TrueType. `full` additionally substitutes a replacement face for a **non-embedded** simple font, from either a directory you supply or the compiled-in OFL Croscore set (behind the `substitute-fonts` feature). Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
 
-What still does not paint: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank at every tier rather than borrowing an unrelated face's glyphs. A bold *sans* substitute is not visually distinct from regular weight. And non-embedded text left unpainted at `all-embedded` is not yet advanced through the AFM tables, so its positioning drifts.
+What still does not paint: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank at every tier rather than borrowing an unrelated face's glyphs. A bold *sans* substitute is not visually distinct from regular weight. Non-embedded text left unpainted at `all-embedded` is not yet advanced through the AFM tables, so its positioning drifts.
 
-`JBIG2Decode` covers generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant, immediate generic refinement regions (both templates, with TPGRON), and custom code table segments. That is what scanners actually emit, but it is not the whole standard, and the rest is refused rather than approximated — a stream using refinement inside a symbol dictionary or a text region, an intermediate region of any kind, pattern dictionaries or halftone regions fails with a message naming the feature, so a scan that will not decode says why on the first try.
+`JBIG2Decode` covers generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant, immediate generic refinement regions (both templates, with TPGRON), and custom code table segments. That is what scanners actually emit, but it is not the whole standard, and the rest is refused rather than approximated. A stream that uses refinement inside a symbol dictionary or a text region, an intermediate region of any kind, or pattern dictionaries and halftone regions fails with a message that names the feature. A scan that will not decode says why on the first try.
 
-`JPXDecode` implements ITU-T T.800 (JPEG 2000 Part 1) with known approximations, each reported as a render warning rather than passed off silently: embedded ICC profiles are not interpreted — colour is approximated from the channel count — and sYCC conversion is approximate; Part 2 (ISO/IEC 15444-2) extensions are tolerated in the container but not decoded; and every output sample is normalized to 8 bits per channel, so sources deeper than 8 bits (the spec allows up to 38) decode with their extra precision dropped.
+`JPXDecode` implements ITU-T T.800 (JPEG 2000 Part 1) with known approximations, each reported as a render warning rather than passed off silently. Embedded ICC profiles are not interpreted; colour is approximated from the channel count, and sYCC conversion is approximate. Part 2 (ISO/IEC 15444-2) extensions are tolerated in the container but not decoded. Every output sample is normalized to 8 bits per channel, so sources deeper than 8 bits (the spec allows up to 38) lose their extra precision.
 
 Not yet supported (they error or degrade gracefully, and are on the roadmap): password-protected documents (the empty user password is handled for both RC4 and AES) · shadings and tiling patterns · the JBIG2 features listed above · the unpainted faces listed above · soft masks and blend modes · annotation appearance streams.
 
-Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render — `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary, the TUI preview raises a status-bar notice, and the libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
+Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render. `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary. The TUI preview raises a status-bar notice. The libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
 
-The sync and async APIs are not at parity on encryption: `Document`/`Page` (and the CLI's `info`/`text`/`md`/`render`/`obj`) decrypt empty-user-password RC4/AES files transparently, as above. `AsyncDocument` (`pdfboss tui`, any `http(s)://` target, and the Python `AsyncDocument`) currently rejects every encrypted document outright, real password or not — async decryption parity is a tracked follow-up.
+The sync and async APIs are not at parity on encryption. `Document`/`Page` (and the CLI's `info`/`text`/`md`/`render`/`obj`) decrypt empty-user-password RC4/AES files transparently, as above. `AsyncDocument` (`pdfboss tui`, any `http(s)://` target, and the Python `AsyncDocument`) currently rejects every encrypted document outright, real password or not. Async decryption parity is a tracked follow-up.
 
 ## Development
 
