@@ -61,6 +61,13 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Cap on the bytes pre-reserved for a hex string from its distance to the
+/// next `>`. On corrupt input a stray `<` can put that `>` (or end of input)
+/// megabytes away with few hex digits in between, so an uncapped reservation
+/// amplifies memory; genuine hex strings virtually never exceed this, and
+/// longer ones just grow from here.
+const HEX_STRING_PREALLOC_CAP: usize = 16 * 1024;
+
 /// Largest mantissa the exact real fast path accepts: 10^15, i.e. at most
 /// 15 significant digits, comfortably inside f64's 2^53 exact-integer range.
 const MAX_EXACT_MANTISSA: u64 = 1_000_000_000_000_000;
@@ -120,6 +127,22 @@ fn parse_number_fast(run: &[u8]) -> Option<Token> {
     Some(Token::Real(if negative { -magnitude } else { magnitude }))
 }
 
+/// A lexed token whose keyword bytes borrow the input.
+///
+/// This is the content parser's working form: an operator stream is mostly
+/// keywords, and copying each one into a [`Token::Keyword`] allocation just
+/// to match on it and drop it dominated content-parse allocation.
+/// [`Lexer::next_token`] wraps this, copying keyword bytes into the public
+/// [`Token`], so the two forms cannot lex differently.
+pub(crate) enum RawToken<'a> {
+    /// Any non-keyword token, carried as the public type. Never
+    /// [`Token::Keyword`]: keywords always come out borrowed.
+    Owned(Token),
+    /// A bare regular-character run — or a lenient stray delimiter —
+    /// borrowed from the input.
+    Keyword(&'a [u8]),
+}
+
 /// Tokenizer over a byte slice.
 pub struct Lexer<'a> {
     data: &'a [u8],
@@ -149,53 +172,63 @@ impl<'a> Lexer<'a> {
 
     /// Consumes and returns the next token.
     pub fn next_token(&mut self) -> Result<Token> {
+        Ok(match self.next_raw_token()? {
+            RawToken::Owned(token) => token,
+            RawToken::Keyword(kw) => Token::Keyword(kw.to_vec()),
+        })
+    }
+
+    /// [`Lexer::next_token`] with keyword bytes borrowed instead of copied.
+    /// This is the one lexing implementation; `next_token` merely copies the
+    /// borrow out.
+    pub(crate) fn next_raw_token(&mut self) -> Result<RawToken<'a>> {
         self.skip_whitespace_and_comments();
         let Some(&b) = self.data.get(self.pos) else {
-            return Ok(Token::Eof);
+            return Ok(RawToken::Owned(Token::Eof));
         };
         match b {
             b'[' => {
                 self.pos += 1;
-                Ok(Token::ArrayOpen)
+                Ok(RawToken::Owned(Token::ArrayOpen))
             }
             b']' => {
                 self.pos += 1;
-                Ok(Token::ArrayClose)
+                Ok(RawToken::Owned(Token::ArrayClose))
             }
             b'<' => {
                 if self.data.get(self.pos + 1) == Some(&b'<') {
                     self.pos += 2;
-                    Ok(Token::DictOpen)
+                    Ok(RawToken::Owned(Token::DictOpen))
                 } else {
                     self.pos += 1;
-                    Ok(self.lex_hex_string())
+                    Ok(RawToken::Owned(self.lex_hex_string()))
                 }
             }
             b'>' => {
                 if self.data.get(self.pos + 1) == Some(&b'>') {
                     self.pos += 2;
-                    Ok(Token::DictClose)
+                    Ok(RawToken::Owned(Token::DictClose))
                 } else {
                     // Stray `>`: surfaced leniently as a one-byte keyword.
                     self.pos += 1;
-                    Ok(Token::Keyword(vec![b'>']))
+                    Ok(RawToken::Keyword(&self.data[self.pos - 1..self.pos]))
                 }
             }
             b'(' => {
                 self.pos += 1;
-                Ok(self.lex_literal_string())
+                Ok(RawToken::Owned(self.lex_literal_string()))
             }
             b'/' => {
                 self.pos += 1;
-                Ok(self.lex_name())
+                Ok(RawToken::Owned(self.lex_name()))
             }
             // Stray delimiters with no token of their own: kept lenient.
             b')' | b'{' | b'}' => {
                 self.pos += 1;
-                Ok(Token::Keyword(vec![b]))
+                Ok(RawToken::Keyword(&self.data[self.pos - 1..self.pos]))
             }
             b'0'..=b'9' | b'+' | b'-' | b'.' => Ok(self.lex_number_or_keyword()),
-            _ => Ok(self.lex_keyword()),
+            _ => Ok(RawToken::Keyword(self.take_regular_run())),
         }
     }
 
@@ -243,20 +276,27 @@ impl<'a> Lexer<'a> {
 
     /// Lexes a run starting with a digit, sign, or period: a number when the
     /// run contains only numeric characters, otherwise a keyword (lenient).
-    fn lex_number_or_keyword(&mut self) -> Token {
+    fn lex_number_or_keyword(&mut self) -> RawToken<'a> {
         let run = self.take_regular_run();
         if !run
             .iter()
             .all(|&b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.'))
         {
-            return Token::Keyword(run.to_vec());
+            return RawToken::Keyword(run);
         }
-        // Manual fast path first (the overwhelming majority of runs); its
-        // guards guarantee bit-identical results, and anything it declines
-        // goes through the standard parses below unchanged.
-        if let Some(token) = parse_number_fast(run) {
-            return token;
-        }
+        RawToken::Owned(number_token(run))
+    }
+}
+
+/// Lexes a run of only numeric characters into its token: the manual fast
+/// path first (the overwhelming majority of runs) — its guards guarantee
+/// bit-identical results — and anything it declines goes through the
+/// standard parses, then the lenient cleaner, unchanged.
+fn number_token(run: &[u8]) -> Token {
+    if let Some(token) = parse_number_fast(run) {
+        return token;
+    }
+    {
         // Standard parse for well-formed numbers past the fast path's bounds:
         // integers with no `.` go to `i64`; anything else (including
         // overflow) to `f64`. Malformed runs (multiple signs/dots, bare sign)
@@ -316,12 +356,9 @@ impl<'a> Lexer<'a> {
             Token::Real(if negative { -value } else { value })
         }
     }
+}
 
-    /// Lexes a keyword: any other run of regular characters.
-    fn lex_keyword(&mut self) -> Token {
-        Token::Keyword(self.take_regular_run().to_vec())
-    }
-
+impl<'a> Lexer<'a> {
     /// Lexes a name after the leading `/`, decoding `#xx` escapes. A `#`
     /// not followed by two hex digits is kept literally.
     fn lex_name(&mut self) -> Token {
@@ -363,6 +400,17 @@ impl<'a> Lexer<'a> {
     /// line continuation, and raw EOL normalized to `\n`. An unterminated
     /// string yields whatever was accumulated (lenient).
     fn lex_literal_string(&mut self) -> Token {
+        // Fast path: nothing before the closing `)` escapes (`\`), nests
+        // (`(`), or needs EOL normalization (`\r`), so the string's bytes
+        // are exactly the input's — one bounds-checked copy, no per-byte
+        // scan. Anything else falls through to the general loop unchanged.
+        let rest = &self.data[self.pos..];
+        if let Some(close) = memchr::memchr(b')', rest) {
+            if memchr::memchr3(b'\\', b'(', b'\r', &rest[..close]).is_none() {
+                self.pos += close + 1;
+                return Token::LitString(rest[..close].to_vec());
+            }
+        }
         let mut out = Vec::new();
         let mut depth = 1usize;
         while let Some(&b) = self.data.get(self.pos) {
@@ -433,7 +481,9 @@ impl<'a> Lexer<'a> {
     /// trailing odd digit is padded with `0`, non-hex bytes are skipped
     /// (lenient), and a missing `>` terminates at end of input.
     fn lex_hex_string(&mut self) -> Token {
-        let mut out = Vec::new();
+        let rest = &self.data[self.pos..];
+        let digits = memchr::memchr(b'>', rest).unwrap_or(rest.len());
+        let mut out = Vec::with_capacity(digits.div_ceil(2).min(HEX_STRING_PREALLOC_CAP));
         let mut pending: Option<u8> = None;
         while let Some(&b) = self.data.get(self.pos) {
             self.pos += 1;
@@ -794,6 +844,26 @@ mod tests {
         assert_eq!(one(b"(abc\\"), Token::LitString(b"abc".to_vec()));
     }
 
+    /// The copy fast path may only fire when nothing before the closing
+    /// paren escapes, nests, or normalizes: each byte in its gate set
+    /// (`\`, `(`, `\r`) placed before the first `)` must still produce the
+    /// general loop's exact output, and a raw `\n` (not in the gate set)
+    /// must pass through the fast path verbatim.
+    #[test]
+    fn literal_string_fast_path_gate() {
+        assert_eq!(one(b"(a\\)b)"), Token::LitString(b"a)b".to_vec()));
+        assert_eq!(one(b"(a(b)c)"), Token::LitString(b"a(b)c".to_vec()));
+        assert_eq!(one(b"(a\rb)"), Token::LitString(b"a\nb".to_vec()));
+        assert_eq!(one(b"(a\nb)"), Token::LitString(b"a\nb".to_vec()));
+        assert_eq!(
+            toks(b"(plain) (esc\\)aped)"),
+            vec![
+                Token::LitString(b"plain".to_vec()),
+                Token::LitString(b"esc)aped".to_vec()),
+            ]
+        );
+    }
+
     #[test]
     fn hex_strings() {
         assert_eq!(one(b"<>"), Token::HexString(Vec::new()));
@@ -812,6 +882,24 @@ mod tests {
         );
         // Missing `>` terminates at end of input (lenient).
         assert_eq!(one(b"<41"), Token::HexString(vec![0x41]));
+    }
+
+    /// The pre-reservation cap must not change what decodes: a hex string
+    /// past [`HEX_STRING_PREALLOC_CAP`] bytes grows to its full content, and
+    /// a stray `<` whose `>` lies far away (mostly non-hex bytes) still
+    /// decodes only the actual digits.
+    #[test]
+    fn hex_string_prealloc_cap_is_invisible() {
+        let long = "4F".repeat(HEX_STRING_PREALLOC_CAP + 17);
+        let src = format!("<{long}>");
+        assert_eq!(
+            one(src.as_bytes()),
+            Token::HexString(vec![0x4F; HEX_STRING_PREALLOC_CAP + 17])
+        );
+        let mut corrupt = b"<41".to_vec();
+        corrupt.resize(corrupt.len() + 100_000, b'(');
+        corrupt.extend_from_slice(b"42>");
+        assert_eq!(one(&corrupt), Token::HexString(vec![0x41, 0x42]));
     }
 
     #[test]
