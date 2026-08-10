@@ -346,7 +346,6 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
             Vec::new()
         }
     };
-    record_annotations(&src, page, &mut report).await;
     let ctm = base_ctm(page.crop_box.normalize(), page.rotate, scale);
     let provider: Option<Box<dyn SubstituteProvider>> = match &opts.substitutes {
         SubstituteSource::Dir(dir) => Some(Box::new(DirProvider { dir: dir.clone() })),
@@ -378,39 +377,14 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         FrameKind::PageOrForm,
     );
     exec.run(root).await;
+    exec.paint_annotations(page, ctm).await;
     Ok((exec.pix, exec.report))
 }
 
-/// Records every annotation this renderer leaves unpainted. Annotation
-/// appearance streams (ISO 32000-1 §12.5.5) are not drawn at all, so a page
-/// whose visible content is a stamp or a filled form field rasterizes blank
-/// and would otherwise have nothing to say for itself. Annotations with no
-/// `/AP` have no appearance to paint, and ones flagged Hidden (bit 2) or
-/// NoView (bit 6) are invisible on screen anyway (§12.5.3), so neither
-/// counts as a drop.
-async fn record_annotations<S: AsyncObjectSource>(src: &S, page: &Page, report: &mut RenderReport) {
-    /// `/F` bits whose annotations are not displayed even by a renderer
-    /// that paints appearance streams.
-    const INVISIBLE: i64 = (1 << 1) | (1 << 5);
-    let Some(annots) = page.dict().get("Annots") else {
-        return;
-    };
-    let Ok(Object::Array(items)) = src.resolve(annots).await else {
-        return;
-    };
-    for item in &items {
-        let Ok(resolved) = src.resolve(item).await else {
-            continue;
-        };
-        let Some(dict) = resolved.as_dict() else {
-            continue;
-        };
-        if dict.get("AP").is_none() || dict.get_int("F").unwrap_or(0) & INVISIBLE != 0 {
-            continue;
-        }
-        report.record(SkippedKind::Annotation, SkipReason::Unsupported);
-    }
-}
+/// The `/F` flag bits whose annotations are not displayed even by a renderer
+/// that paints appearance streams: Hidden (bit 2) and NoView (bit 6),
+/// ISO 32000-1 §12.5.3.
+const INVISIBLE_ANNOTS: i64 = (1 << 1) | (1 << 5);
 
 /// Upper bound on distinct parsed CharProcs kept per page render. A real
 /// Type3 font has at most 256 mapped codes, so this is never approached
@@ -1626,6 +1600,210 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
+    /// Paints every visible annotation's normal appearance over the page
+    /// content (ISO 32000-1 §12.5.5). Each appearance is a form XObject
+    /// whose `/BBox`, transformed by its `/Matrix`, is fitted onto the
+    /// annotation's `/Rect` and then run like any other form, in default
+    /// user space. Annotations flagged Hidden or NoView (§12.5.3), `/Popup`
+    /// annotations (a viewer-UI artifact), and annotations with no usable
+    /// normal appearance paint nothing and report nothing; an appearance
+    /// that exists but cannot be read or placed reports as a dropped
+    /// annotation, so a page whose visible content is a stamp or a filled
+    /// form field never rasterizes blank without saying why.
+    async fn paint_annotations(&mut self, page: &Page, base: Matrix) {
+        let Some(annots) = page.dict().get("Annots") else {
+            return;
+        };
+        let Ok(Object::Array(items)) = self.src.resolve(annots).await else {
+            return;
+        };
+        let chain: Vec<Arc<Dict>> = vec![Arc::new(page.resources.clone())];
+        for item in &items {
+            let Ok(resolved) = self.src.resolve(item).await else {
+                continue;
+            };
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get_int("F").unwrap_or(0) & INVISIBLE_ANNOTS != 0 {
+                continue;
+            }
+            if dict.get_name("Subtype").is_some_and(|n| n.0 == "Popup") {
+                continue;
+            }
+            let Some(stream) = self.normal_appearance(dict).await else {
+                continue;
+            };
+            if let Some(frame) = self.appearance_frame(&stream, dict, &chain, base).await {
+                self.run(frame).await;
+            }
+        }
+    }
+
+    /// The annotation's normal appearance stream, or `None` when it has
+    /// nothing to paint. `/AP` `/N` is the appearance; when `/N` is a
+    /// dictionary of states, `/AS` selects one, and a single-state
+    /// dictionary needs no `/AS` to be unambiguous. A declared appearance
+    /// that cannot be resolved — `/N` that is neither stream nor dictionary,
+    /// an `/AS` naming no state, an ambiguous stateless dictionary — is a
+    /// real drop and is reported; an absent `/AP` or `/N` declares nothing
+    /// and stays silent.
+    async fn normal_appearance(&mut self, annot: &Dict) -> Option<Stream> {
+        let ap = match annot.get("AP") {
+            Some(o) => match self.src.resolve(o).await {
+                Ok(Object::Dict(d)) => d,
+                _ => return None,
+            },
+            None => return None,
+        };
+        let n = ap.get("N")?;
+        let states = match self.src.resolve(n).await {
+            Ok(Object::Stream(s)) => return Some(s),
+            Ok(Object::Dict(states)) => states,
+            _ => {
+                self.skip(SkippedKind::Annotation, SkipReason::Missing);
+                return None;
+            }
+        };
+        let selected = match annot.get_name("AS") {
+            Some(name) => states.get(&name.0),
+            None if states.len() == 1 => states.iter().map(|(_, v)| v).next(),
+            None => None,
+        };
+        let Some(entry) = selected else {
+            self.skip(SkippedKind::Annotation, SkipReason::Missing);
+            return None;
+        };
+        match self.src.resolve(entry).await {
+            Ok(Object::Stream(s)) => Some(s),
+            _ => {
+                self.skip(SkippedKind::Annotation, SkipReason::Missing);
+                None
+            }
+        }
+    }
+
+    /// Builds the frame that paints one appearance stream: the form's
+    /// `/BBox` corners are transformed by its `/Matrix`, their bounding box
+    /// is fitted onto the annotation's normalized `/Rect` (§12.5.5's
+    /// appearance algorithm), and the form runs under `Matrix ∘ fit ∘ base`
+    /// with the untransformed `/BBox` as its clip. `None` reports the
+    /// annotation as dropped — every bail-out here loses a declared
+    /// appearance.
+    async fn appearance_frame(
+        &mut self,
+        stream: &Stream,
+        annot: &Dict,
+        chain: &[Arc<Dict>],
+        base: Matrix,
+    ) -> Option<Frame> {
+        let Some(rect) = floats_from(self.src, annot.get("Rect"), 4).await else {
+            self.skip(SkippedKind::Annotation, SkipReason::Missing);
+            return None;
+        };
+        let data = match content_stream_data_with(self.src, stream).await {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip(SkippedKind::Annotation, skip_reason_for(&e));
+                return None;
+            }
+        };
+        let ops = match parse_content(&data) {
+            Ok(ops) => ops,
+            Err(e) => {
+                self.skip(SkippedKind::Annotation, skip_reason_for(&e));
+                return None;
+            }
+        };
+        let Some(bbox) = floats_from(self.src, stream.dict.get("BBox"), 4).await else {
+            self.skip(SkippedKind::Annotation, SkipReason::Missing);
+            return None;
+        };
+        let matrix = floats_from(self.src, stream.dict.get("Matrix"), 6)
+            .await
+            .map(|m| Matrix {
+                a: m[0],
+                b: m[1],
+                c: m[2],
+                d: m[3],
+                e: m[4],
+                f: m[5],
+            })
+            .unwrap_or_else(Matrix::identity);
+
+        let (bx0, bx1) = (bbox[0].min(bbox[2]), bbox[0].max(bbox[2]));
+        let (by0, by1) = (bbox[1].min(bbox[3]), bbox[1].max(bbox[3]));
+        let corners = [
+            matrix.apply(Point { x: bx0, y: by0 }),
+            matrix.apply(Point { x: bx1, y: by0 }),
+            matrix.apply(Point { x: bx0, y: by1 }),
+            matrix.apply(Point { x: bx1, y: by1 }),
+        ];
+        let tx0 = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let tx1 = corners
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let ty0 = corners.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let ty1 = corners
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let (rx0, rx1) = (rect[0].min(rect[2]), rect[0].max(rect[2]));
+        let (ry0, ry1) = (rect[1].min(rect[3]), rect[1].max(rect[3]));
+        // A degenerate transformed box cannot be fitted by scaling; §12.5.5
+        // defines the fit through a division by its extent, so paint the
+        // appearance unscaled on that axis rather than inventing geometry.
+        let sx = if tx1 - tx0 > 0.0 {
+            (rx1 - rx0) / (tx1 - tx0)
+        } else {
+            1.0
+        };
+        let sy = if ty1 - ty0 > 0.0 {
+            (ry1 - ry0) / (ty1 - ty0)
+        } else {
+            1.0
+        };
+        let fit = Matrix {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            e: rx0 - tx0 * sx,
+            f: ry0 - ty0 * sy,
+        };
+        let ctm = matrix.concat(fit).concat(base);
+        if !finite_matrix(&ctm) {
+            self.skip(SkippedKind::Annotation, SkipReason::Undecodable);
+            return None;
+        }
+
+        let mut gs = GState::new(ctm);
+        let mut pb = PathBuilder::new(ctm);
+        pb.rect(bx0, by0, bx1 - bx0, by1 - by0);
+        gs.clip = Some(self.rasterize_clip(&pb.finish(), FillRule::NonZero));
+
+        let own_res = match stream.dict.get("Resources") {
+            Some(o) => match self.src.resolve(o).await {
+                Ok(Object::Dict(d)) => Some(d),
+                _ => None,
+            },
+            None => None,
+        };
+        let mut inner_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
+        if let Some(d) = own_res {
+            inner_chain.push(Arc::new(d));
+        }
+        inner_chain.extend_from_slice(chain);
+        Some(Frame::new(
+            ops.into(),
+            inner_chain,
+            gs,
+            0,
+            FrameKind::PageOrForm,
+        ))
+    }
+
     /// Builds the frame for a form XObject: `/Matrix` concatenated before
     /// the CTM, `/BBox` intersected into the clip, own `/Resources` prepended
     /// to the chain, depth-bounded. `None` where the recursive version bailed
@@ -2787,32 +2965,162 @@ mod tests {
     }
 
     #[test]
-    fn unpainted_annotation_appearance_is_reported() {
-        // One annotation with an appearance stream (never painted), one
-        // hidden (invisible either way) and one with no `/AP` at all.
+    fn annotation_normal_appearance_paints_onto_rect() {
+        // A stamp whose /AP /N fills its whole /BBox red must paint the
+        // whole /Rect red: BBox [0 0 10 10] scales 4x onto Rect [20 20 60
+        // 60], user y 20..60 = device y 40..80 on a 100pt page. The report
+        // stays empty — a painted annotation is not a drop.
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
         b.object(
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
-             /Annots [5 0 R 6 0 R 7 0 R] >>",
+             /Annots [5 0 R] >>",
         );
         b.stream(4, "", b"");
         b.object(
             5,
-            "<< /Type /Annot /Subtype /Stamp /Rect [0 0 10 10] /AP << /N 8 0 R >> >>",
+            "<< /Type /Annot /Subtype /Stamp /Rect [20 20 60 60] /AP << /N 8 0 R >> >>",
         );
+        b.stream(
+            8,
+            "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+            b"1 0 0 rg 0 0 10 10 re f",
+        );
+        let (pix, report) = render_reporting(b.build(1));
+        assert_eq!(px(&pix, 40, 60), RED, "the appearance must fill the rect");
+        assert_eq!(px(&pix, 10, 50), WHITE, "outside the rect stays clear");
+        assert!(
+            report.is_empty(),
+            "a painted annotation is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    /// One page, 100pt square, whose `/Annots` array holds `annots` (raw
+    /// object bodies added from object number 10 up) — the appearance
+    /// streams they reference are given as `(num, dict_extra, content)`.
+    fn annots_doc(annots: &[&str], streams: &[(u32, &str, &[u8])]) -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let refs: Vec<String> = (0..annots.len())
+            .map(|i| format!("{} 0 R", 10 + i))
+            .collect();
         b.object(
-            6,
-            "<< /Type /Annot /Subtype /Stamp /Rect [0 0 10 10] /F 2 /AP << /N 8 0 R >> >>",
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
+                 /Annots [{}] >>",
+                refs.join(" ")
+            ),
         );
-        b.object(7, "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>");
-        b.stream(8, "/Type /XObject /Subtype /Form /BBox [0 0 10 10]", b"");
-        let (_, report) = render_reporting(b.build(1));
+        b.stream(4, "", b"");
+        for (i, body) in annots.iter().enumerate() {
+            b.object(10 + i as u32, body);
+        }
+        for (num, dict, content) in streams {
+            b.stream(*num, dict, content);
+        }
+        b.build(1)
+    }
+
+    #[test]
+    fn invisible_and_apless_annotations_stay_silent() {
+        // A hidden stamp, a Link with no /AP, and a Popup: none paints,
+        // none is a drop.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Stamp /Rect [20 20 60 60] /F 2 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>",
+                "<< /Type /Annot /Subtype /Popup /Rect [20 20 60 60] /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+                b"1 0 0 rg 0 0 10 10 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 40, 60), WHITE, "nothing may paint");
+        assert!(report.is_empty(), "none of these is a drop");
+    }
+
+    #[test]
+    fn appearance_state_dictionary_selects_by_as() {
+        // /N is a dictionary of states: /AS picks /On (red). The /Off
+        // stream would paint green — a wrong selection is visible.
+        let on = "<< /Type /Annot /Subtype /Widget /Rect [20 20 60 60] /AS /On \
+                  /AP << /N << /On 20 0 R /Off 21 0 R >> >> >>";
+        let streams: &[(u32, &str, &[u8])] = &[
+            (
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+                b"1 0 0 rg 0 0 10 10 re f",
+            ),
+            (
+                21,
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+                b"0 1 0 rg 0 0 10 10 re f",
+            ),
+        ];
+        let (pix, report) = render_reporting(annots_doc(&[on], streams));
+        assert_eq!(px(&pix, 40, 60), RED, "/AS /On must select the red state");
+        assert!(report.is_empty());
+
+        // /AS naming a state that does not exist is a declared appearance
+        // lost, and must be reported.
+        let missing = "<< /Type /Annot /Subtype /Widget /Rect [20 20 60 60] /AS /Nope \
+                       /AP << /N << /On 20 0 R /Off 21 0 R >> >> >>";
+        let (pix, report) = render_reporting(annots_doc(&[missing], streams));
+        assert_eq!(px(&pix, 40, 60), WHITE);
         assert_eq!(
             drops(&report),
-            vec![(SkippedKind::Annotation, SkipReason::Unsupported, 1)],
+            vec![(SkippedKind::Annotation, SkipReason::Missing, 1)],
+        );
+    }
+
+    #[test]
+    fn appearance_matrix_is_normalized_by_the_rect_fit() {
+        // §12.5.5: the form /Matrix participates in the bbox-to-rect fit,
+        // so a pure translation cancels out — the appearance lands exactly
+        // where the untranslated one does. An implementation that applied
+        // /Matrix as a plain CTM would shift the content out of the rect.
+        let bytes = annots_doc(
+            &["<< /Type /Annot /Subtype /Stamp /Rect [20 20 60 60] /AP << /N 20 0 R >> >>"],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Matrix [1 0 0 1 500 0]",
+                b"1 0 0 rg 0 0 10 10 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 40, 60), RED, "translation must cancel in the fit");
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn unreadable_appearance_stream_is_reported() {
+        // The declared appearance names a filter nobody decodes: the
+        // annotation is genuinely lost and the report must say so.
+        let bytes = annots_doc(
+            &["<< /Type /Annot /Subtype /Stamp /Rect [20 20 60 60] /AP << /N 20 0 R >> >>"],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10] /Filter /NoSuchFilter",
+                b"1 0 0 rg 0 0 10 10 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 40, 60), WHITE);
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Annotation,
+                SkipReason::UnsupportedFilter("NoSuchFilter".into()),
+                1
+            )],
         );
     }
 
