@@ -59,7 +59,9 @@ fn inflate_tolerant(data: &[u8]) -> Result<Vec<u8>> {
 /// larger than `MAX_DECODED_LEN` (a decompression bomb) is an error.
 fn inflate(data: &[u8], zlib_header: bool) -> Result<(Vec<u8>, bool)> {
     let mut inflater = Decompress::new(zlib_header);
-    let mut out: Vec<u8> = Vec::with_capacity(data.len().saturating_mul(2).clamp(1024, 1 << 22));
+    // Typical PDF streams decompress 3-5x; starting at 4x (same 4 MiB cap)
+    // usually lands the whole stream without a realloc-and-copy cycle.
+    let mut out: Vec<u8> = Vec::with_capacity(data.len().saturating_mul(4).clamp(1024, 1 << 22));
     loop {
         let consumed = (inflater.total_in() as usize).min(data.len());
         let in_before = inflater.total_in();

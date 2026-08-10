@@ -61,6 +61,88 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// Cap on the bytes pre-reserved for a hex string from its distance to the
+/// next `>`. On corrupt input a stray `<` can put that `>` (or end of input)
+/// megabytes away with few hex digits in between, so an uncapped reservation
+/// amplifies memory; genuine hex strings virtually never exceed this, and
+/// longer ones just grow from here.
+const HEX_STRING_PREALLOC_CAP: usize = 16 * 1024;
+
+/// Largest mantissa the exact real fast path accepts: 10^15, i.e. at most
+/// 15 significant digits, comfortably inside f64's 2^53 exact-integer range.
+const MAX_EXACT_MANTISSA: u64 = 1_000_000_000_000_000;
+
+/// Powers of ten that are exactly representable in `f64` (10^0 ..= 10^22).
+const EXACT_POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// Manual parse of a well-formed numeric run (`sign? digits '.'? digits`
+/// with at least one digit): integers accumulate in `u64`; reals divide an
+/// exact mantissa (under [`MAX_EXACT_MANTISSA`]) by an exact power of ten,
+/// and IEEE 754 division of exact operands rounds to the same bits the
+/// standard library parser produces. Any other shape, a `u64` overflow, or
+/// a bound violation returns `None`, and the caller falls back to the
+/// standard parse.
+fn parse_number_fast(run: &[u8]) -> Option<Token> {
+    let (negative, digits) = match run.split_first() {
+        Some((&b'-', rest)) => (true, rest),
+        Some((&b'+', rest)) => (false, rest),
+        _ => (false, run),
+    };
+    let mut mantissa = 0u64;
+    let mut digit_count = 0usize;
+    let mut frac_len: Option<usize> = None;
+    for &b in digits {
+        match b {
+            b'0'..=b'9' => {
+                mantissa = mantissa.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
+                digit_count += 1;
+                if let Some(count) = frac_len.as_mut() {
+                    *count += 1;
+                }
+            }
+            b'.' if frac_len.is_none() => frac_len = Some(0),
+            _ => return None,
+        }
+    }
+    if digit_count == 0 {
+        return None;
+    }
+    let Some(frac) = frac_len else {
+        if !negative {
+            return i64::try_from(mantissa).ok().map(Token::Int);
+        }
+        if mantissa == 1u64 << 63 {
+            return Some(Token::Int(i64::MIN));
+        }
+        let magnitude = i64::try_from(mantissa).ok()?;
+        return Some(Token::Int(-magnitude));
+    };
+    if mantissa >= MAX_EXACT_MANTISSA || frac >= EXACT_POW10.len() {
+        return None;
+    }
+    let magnitude = mantissa as f64 / EXACT_POW10[frac];
+    Some(Token::Real(if negative { -magnitude } else { magnitude }))
+}
+
+/// A lexed token whose keyword bytes borrow the input.
+///
+/// This is the content parser's working form: an operator stream is mostly
+/// keywords, and copying each one into a [`Token::Keyword`] allocation just
+/// to match on it and drop it dominated content-parse allocation.
+/// [`Lexer::next_token`] wraps this, copying keyword bytes into the public
+/// [`Token`], so the two forms cannot lex differently.
+pub(crate) enum RawToken<'a> {
+    /// Any non-keyword token, carried as the public type. Never
+    /// [`Token::Keyword`]: keywords always come out borrowed.
+    Owned(Token),
+    /// A bare regular-character run — or a lenient stray delimiter —
+    /// borrowed from the input.
+    Keyword(&'a [u8]),
+}
+
 /// Tokenizer over a byte slice.
 pub struct Lexer<'a> {
     data: &'a [u8],
@@ -90,53 +172,63 @@ impl<'a> Lexer<'a> {
 
     /// Consumes and returns the next token.
     pub fn next_token(&mut self) -> Result<Token> {
+        Ok(match self.next_raw_token()? {
+            RawToken::Owned(token) => token,
+            RawToken::Keyword(kw) => Token::Keyword(kw.to_vec()),
+        })
+    }
+
+    /// [`Lexer::next_token`] with keyword bytes borrowed instead of copied.
+    /// This is the one lexing implementation; `next_token` merely copies the
+    /// borrow out.
+    pub(crate) fn next_raw_token(&mut self) -> Result<RawToken<'a>> {
         self.skip_whitespace_and_comments();
         let Some(&b) = self.data.get(self.pos) else {
-            return Ok(Token::Eof);
+            return Ok(RawToken::Owned(Token::Eof));
         };
         match b {
             b'[' => {
                 self.pos += 1;
-                Ok(Token::ArrayOpen)
+                Ok(RawToken::Owned(Token::ArrayOpen))
             }
             b']' => {
                 self.pos += 1;
-                Ok(Token::ArrayClose)
+                Ok(RawToken::Owned(Token::ArrayClose))
             }
             b'<' => {
                 if self.data.get(self.pos + 1) == Some(&b'<') {
                     self.pos += 2;
-                    Ok(Token::DictOpen)
+                    Ok(RawToken::Owned(Token::DictOpen))
                 } else {
                     self.pos += 1;
-                    Ok(self.lex_hex_string())
+                    Ok(RawToken::Owned(self.lex_hex_string()))
                 }
             }
             b'>' => {
                 if self.data.get(self.pos + 1) == Some(&b'>') {
                     self.pos += 2;
-                    Ok(Token::DictClose)
+                    Ok(RawToken::Owned(Token::DictClose))
                 } else {
                     // Stray `>`: surfaced leniently as a one-byte keyword.
                     self.pos += 1;
-                    Ok(Token::Keyword(vec![b'>']))
+                    Ok(RawToken::Keyword(&self.data[self.pos - 1..self.pos]))
                 }
             }
             b'(' => {
                 self.pos += 1;
-                Ok(self.lex_literal_string())
+                Ok(RawToken::Owned(self.lex_literal_string()))
             }
             b'/' => {
                 self.pos += 1;
-                Ok(self.lex_name())
+                Ok(RawToken::Owned(self.lex_name()))
             }
             // Stray delimiters with no token of their own: kept lenient.
             b')' | b'{' | b'}' => {
                 self.pos += 1;
-                Ok(Token::Keyword(vec![b]))
+                Ok(RawToken::Keyword(&self.data[self.pos - 1..self.pos]))
             }
             b'0'..=b'9' | b'+' | b'-' | b'.' => Ok(self.lex_number_or_keyword()),
-            _ => Ok(self.lex_keyword()),
+            _ => Ok(RawToken::Keyword(self.take_regular_run())),
         }
     }
 
@@ -184,19 +276,32 @@ impl<'a> Lexer<'a> {
 
     /// Lexes a run starting with a digit, sign, or period: a number when the
     /// run contains only numeric characters, otherwise a keyword (lenient).
-    fn lex_number_or_keyword(&mut self) -> Token {
+    fn lex_number_or_keyword(&mut self) -> RawToken<'a> {
         let run = self.take_regular_run();
         if !run
             .iter()
             .all(|&b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.'))
         {
-            return Token::Keyword(run.to_vec());
+            return RawToken::Keyword(run);
         }
-        // Fast path for well-formed numbers (the overwhelming majority):
-        // parse directly off the borrowed slice with no intermediate String.
-        // Integers with no `.` go to `i64`; anything else (including overflow)
-        // to `f64`. Malformed runs (multiple signs/dots, bare sign) fall
-        // through to the lenient cleaner below, preserving its exact result.
+        RawToken::Owned(number_token(run))
+    }
+}
+
+/// Lexes a run of only numeric characters into its token: the manual fast
+/// path first (the overwhelming majority of runs) — its guards guarantee
+/// bit-identical results — and anything it declines goes through the
+/// standard parses, then the lenient cleaner, unchanged.
+fn number_token(run: &[u8]) -> Token {
+    if let Some(token) = parse_number_fast(run) {
+        return token;
+    }
+    {
+        // Standard parse for well-formed numbers past the fast path's bounds:
+        // integers with no `.` go to `i64`; anything else (including
+        // overflow) to `f64`. Malformed runs (multiple signs/dots, bare sign)
+        // fall through to the lenient cleaner below, preserving its exact
+        // result.
         if let Ok(s) = std::str::from_utf8(run) {
             if !run.contains(&b'.') {
                 if let Ok(value) = s.parse::<i64>() {
@@ -251,12 +356,9 @@ impl<'a> Lexer<'a> {
             Token::Real(if negative { -value } else { value })
         }
     }
+}
 
-    /// Lexes a keyword: any other run of regular characters.
-    fn lex_keyword(&mut self) -> Token {
-        Token::Keyword(self.take_regular_run().to_vec())
-    }
-
+impl<'a> Lexer<'a> {
     /// Lexes a name after the leading `/`, decoding `#xx` escapes. A `#`
     /// not followed by two hex digits is kept literally.
     fn lex_name(&mut self) -> Token {
@@ -298,6 +400,17 @@ impl<'a> Lexer<'a> {
     /// line continuation, and raw EOL normalized to `\n`. An unterminated
     /// string yields whatever was accumulated (lenient).
     fn lex_literal_string(&mut self) -> Token {
+        // Fast path: nothing before the closing `)` escapes (`\`), nests
+        // (`(`), or needs EOL normalization (`\r`), so the string's bytes
+        // are exactly the input's — one bounds-checked copy, no per-byte
+        // scan. Anything else falls through to the general loop unchanged.
+        let rest = &self.data[self.pos..];
+        if let Some(close) = memchr::memchr(b')', rest) {
+            if memchr::memchr3(b'\\', b'(', b'\r', &rest[..close]).is_none() {
+                self.pos += close + 1;
+                return Token::LitString(rest[..close].to_vec());
+            }
+        }
         let mut out = Vec::new();
         let mut depth = 1usize;
         while let Some(&b) = self.data.get(self.pos) {
@@ -368,7 +481,9 @@ impl<'a> Lexer<'a> {
     /// trailing odd digit is padded with `0`, non-hex bytes are skipped
     /// (lenient), and a missing `>` terminates at end of input.
     fn lex_hex_string(&mut self) -> Token {
-        let mut out = Vec::new();
+        let rest = &self.data[self.pos..];
+        let digits = memchr::memchr(b'>', rest).unwrap_or(rest.len());
+        let mut out = Vec::with_capacity(digits.div_ceil(2).min(HEX_STRING_PREALLOC_CAP));
         let mut pending: Option<u8> = None;
         while let Some(&b) = self.data.get(self.pos) {
             self.pos += 1;
@@ -430,6 +545,174 @@ mod tests {
         assert_eq!(one(b"0"), Token::Int(0));
         assert_eq!(one(b"123"), Token::Int(123));
         assert_eq!(one(b"0.0"), Token::Real(0.0));
+    }
+
+    /// Verbatim copy of the number lexing as it stood before
+    /// [`parse_number_fast`], kept as the differential oracle: the fast
+    /// path must never change what any numeric run produces.
+    fn reference_number_token(run: &[u8]) -> Token {
+        if !run
+            .iter()
+            .all(|&b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.'))
+        {
+            return Token::Keyword(run.to_vec());
+        }
+        if let Ok(s) = std::str::from_utf8(run) {
+            if !run.contains(&b'.') {
+                if let Ok(value) = s.parse::<i64>() {
+                    return Token::Int(value);
+                }
+            }
+            if let Ok(value) = s.parse::<f64>() {
+                return Token::Real(value);
+            }
+        }
+        let mut bytes = run.iter().copied();
+        let negative = match run.first() {
+            Some(b'-') => {
+                bytes.next();
+                true
+            }
+            Some(b'+') => {
+                bytes.next();
+                false
+            }
+            _ => false,
+        };
+        let mut digits = String::new();
+        let mut seen_dot = false;
+        for b in bytes {
+            match b {
+                b'0'..=b'9' => digits.push(char::from(b)),
+                b'.' if !seen_dot => {
+                    seen_dot = true;
+                    digits.push('.');
+                }
+                _ => {}
+            }
+        }
+        if seen_dot {
+            let value = if digits == "." {
+                0.0
+            } else {
+                digits.parse::<f64>().unwrap_or(0.0)
+            };
+            Token::Real(if negative { -value } else { value })
+        } else if digits.is_empty() {
+            Token::Int(0)
+        } else if let Ok(value) = digits.parse::<i64>() {
+            Token::Int(if negative { -value } else { value })
+        } else {
+            let value = digits.parse::<f64>().unwrap_or(0.0);
+            Token::Real(if negative { -value } else { value })
+        }
+    }
+
+    /// Lexes `src` as one token and asserts it equals the reference —
+    /// reals bit-for-bit at `f64` and again after casting to `f32`, where
+    /// double rounding would hide.
+    fn assert_number_matches_reference(src: &str) {
+        let actual = one(src.as_bytes());
+        let expected = reference_number_token(src.as_bytes());
+        match (&actual, &expected) {
+            (Token::Real(a), Token::Real(b)) => {
+                assert_eq!(a.to_bits(), b.to_bits(), "f64 bits for {src:?}");
+                assert_eq!(
+                    (*a as f32).to_bits(),
+                    (*b as f32).to_bits(),
+                    "f32 bits for {src:?}"
+                );
+            }
+            _ => assert_eq!(actual, expected, "token for {src:?}"),
+        }
+    }
+
+    /// Differential fuzz over the numeric grammar: a digit-count grid across
+    /// the fast path's bounds (15/16/17 significant digits, fraction lengths
+    /// at and past the exact-power-of-ten table) crossed with signs and
+    /// leading zeros, plus literal corner cases (bare signs and dots,
+    /// multi-sign and multi-dot runs, `i64`/`u64` boundaries, and huge
+    /// literals whose `f32` cast overflows to infinity).
+    #[test]
+    fn numeric_fast_path_matches_reference() {
+        let corner_cases = [
+            "0",
+            "-0",
+            "+0",
+            "0.0",
+            "-0.0",
+            "+0.0",
+            ".5",
+            "5.",
+            "-.5",
+            "+.5",
+            "-5.",
+            "+5.",
+            ".",
+            "-.",
+            "+.",
+            "+",
+            "-",
+            "..",
+            "-..",
+            "1.2.3",
+            "1-2",
+            "--5",
+            "+-3",
+            "1..5",
+            "1+",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "18446744073709551615",
+            "18446744073709551616",
+            "184467440737095516150",
+            "999999999999999999999999999999999999999",
+            "400000000000000000000000000000000000000",
+            "340282366920938463463374607431768211455",
+            "-400000000000000000000000000000000000000",
+            "0.0000000000000000000001",
+            "0.00000000000000000000001",
+            "5.0000000000000000000001",
+            "1.00000000000000",
+            "1.000000000000000",
+            "1.0000000000000000000000000000",
+            "123.4500000000000000000000",
+            "12345678901234567890.12345",
+            "0.1",
+            "0.30000000000000004",
+        ];
+        let mut cases: Vec<String> = corner_cases.iter().map(|s| s.to_string()).collect();
+        let digit_cycle = |n: usize| -> String {
+            (0..n)
+                .map(|i| char::from(b'1' + (i % 9) as u8))
+                .collect::<String>()
+        };
+        let sig_counts = [1usize, 2, 7, 14, 15, 16, 17, 18, 19, 20, 21, 39];
+        let frac_counts = [0usize, 1, 2, 7, 14, 15, 16, 21, 22, 23, 28, 38];
+        for &sig in &sig_counts {
+            let body = digit_cycle(sig);
+            for &frac in &frac_counts {
+                if frac > sig {
+                    continue;
+                }
+                let mut with_dot = body.clone();
+                with_dot.insert(sig - frac, '.');
+                for sign in ["", "+", "-"] {
+                    for lead in ["", "0", "0000000000000000"] {
+                        cases.push(format!("{sign}{lead}{with_dot}"));
+                        if frac == 0 {
+                            cases.push(format!("{sign}{lead}{body}"));
+                        }
+                    }
+                }
+            }
+        }
+        for case in &cases {
+            assert_number_matches_reference(case);
+        }
+        eprintln!("differential cases: {}", cases.len());
     }
 
     #[test]
@@ -561,6 +844,26 @@ mod tests {
         assert_eq!(one(b"(abc\\"), Token::LitString(b"abc".to_vec()));
     }
 
+    /// The copy fast path may only fire when nothing before the closing
+    /// paren escapes, nests, or normalizes: each byte in its gate set
+    /// (`\`, `(`, `\r`) placed before the first `)` must still produce the
+    /// general loop's exact output, and a raw `\n` (not in the gate set)
+    /// must pass through the fast path verbatim.
+    #[test]
+    fn literal_string_fast_path_gate() {
+        assert_eq!(one(b"(a\\)b)"), Token::LitString(b"a)b".to_vec()));
+        assert_eq!(one(b"(a(b)c)"), Token::LitString(b"a(b)c".to_vec()));
+        assert_eq!(one(b"(a\rb)"), Token::LitString(b"a\nb".to_vec()));
+        assert_eq!(one(b"(a\nb)"), Token::LitString(b"a\nb".to_vec()));
+        assert_eq!(
+            toks(b"(plain) (esc\\)aped)"),
+            vec![
+                Token::LitString(b"plain".to_vec()),
+                Token::LitString(b"esc)aped".to_vec()),
+            ]
+        );
+    }
+
     #[test]
     fn hex_strings() {
         assert_eq!(one(b"<>"), Token::HexString(Vec::new()));
@@ -579,6 +882,24 @@ mod tests {
         );
         // Missing `>` terminates at end of input (lenient).
         assert_eq!(one(b"<41"), Token::HexString(vec![0x41]));
+    }
+
+    /// The pre-reservation cap must not change what decodes: a hex string
+    /// past [`HEX_STRING_PREALLOC_CAP`] bytes grows to its full content, and
+    /// a stray `<` whose `>` lies far away (mostly non-hex bytes) still
+    /// decodes only the actual digits.
+    #[test]
+    fn hex_string_prealloc_cap_is_invisible() {
+        let long = "4F".repeat(HEX_STRING_PREALLOC_CAP + 17);
+        let src = format!("<{long}>");
+        assert_eq!(
+            one(src.as_bytes()),
+            Token::HexString(vec![0x4F; HEX_STRING_PREALLOC_CAP + 17])
+        );
+        let mut corrupt = b"<41".to_vec();
+        corrupt.resize(corrupt.len() + 100_000, b'(');
+        corrupt.extend_from_slice(b"42>");
+        assert_eq!(one(&corrupt), Token::HexString(vec![0x41, 0x42]));
     }
 
     #[test]

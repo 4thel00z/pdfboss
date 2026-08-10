@@ -5,7 +5,7 @@
 use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::geom::Matrix;
-use crate::lexer::{is_whitespace, Lexer, Token};
+use crate::lexer::{is_whitespace, Lexer, RawToken, Token};
 use crate::object::{Dict, Name, Object};
 
 /// Maximum operand container (array/dictionary) nesting depth. Composing
@@ -206,18 +206,34 @@ pub enum Op {
 /// token boundary (or the declared `/L`ength when present, which is
 /// trusted).
 pub fn parse_content(data: &[u8]) -> Result<Vec<Op>> {
-    Ok(parse_content_spanned(data)?
-        .into_iter()
-        .map(|pair| pair.0)
-        .collect())
+    let mut ops = Vec::with_capacity(ops_estimate(data.len()));
+    parse_content_ops(data, |op, _| ops.push(op))?;
+    Ok(ops)
 }
 
 /// Like [`parse_content`], but also reports each operator's byte range —
 /// from the first token of its operand run through the operator keyword —
 /// within `data`.
 pub fn parse_content_spanned(data: &[u8]) -> Result<Vec<(Op, Span)>> {
+    let mut ops = Vec::with_capacity(ops_estimate(data.len()));
+    parse_content_ops(data, |op, span| ops.push((op, span)))?;
+    Ok(ops)
+}
+
+/// Initial operator-vector capacity for a content stream of `len` bytes.
+/// An operator run (operands, keyword, separators) averages well above 16
+/// bytes, so `len / 16` reserves slightly high instead of growing; the cap
+/// keeps a huge stream — usually mostly inline-image data — from
+/// pre-claiming space for operators it may never produce.
+fn ops_estimate(len: usize) -> usize {
+    (len / 16).min(1 << 17)
+}
+
+/// The parse loop behind both public entry points: one pass over the
+/// tokens, each finished operator handed to `emit` — so the span-less
+/// caller never materializes spans it will throw away.
+fn parse_content_ops(data: &[u8], mut emit: impl FnMut(Op, Span)) -> Result<()> {
     let mut lexer = Lexer::new(data);
-    let mut ops = Vec::new();
     let mut stack: Vec<Object> = Vec::new();
     // Start of the current operand run; cleared whenever the run dies
     // (an operator was emitted, an unknown operator dropped it, or a
@@ -226,51 +242,64 @@ pub fn parse_content_spanned(data: &[u8]) -> Result<Vec<(Op, Span)>> {
     loop {
         lexer.skip_whitespace_and_comments();
         let token_start = lexer.pos();
-        let token = lexer.next_token()?;
-        if !matches!(token, Token::Eof) && run_start.is_none() {
-            run_start = Some(token_start);
-        }
-        match token {
-            Token::Eof => break,
-            Token::Int(i) => stack.push(Object::Int(i)),
-            Token::Real(r) => stack.push(Object::Real(r)),
-            Token::Name(n) => stack.push(Object::Name(n)),
-            Token::LitString(s) | Token::HexString(s) => stack.push(Object::String(s)),
-            Token::ArrayOpen => {
-                let a = parse_array(&mut lexer, 0)?;
-                stack.push(a);
+        let kw = match lexer.next_raw_token()? {
+            RawToken::Keyword(kw) => {
+                if run_start.is_none() {
+                    run_start = Some(token_start);
+                }
+                kw
             }
-            Token::DictOpen => {
-                let d = parse_dict(&mut lexer, 0)?;
-                stack.push(Object::Dict(d));
+            RawToken::Owned(token) => {
+                if !matches!(token, Token::Eof) && run_start.is_none() {
+                    run_start = Some(token_start);
+                }
+                match token {
+                    Token::Eof => break,
+                    Token::Int(i) => stack.push(Object::Int(i)),
+                    Token::Real(r) => stack.push(Object::Real(r)),
+                    Token::Name(n) => stack.push(Object::Name(n)),
+                    Token::LitString(s) | Token::HexString(s) => stack.push(Object::String(s)),
+                    Token::ArrayOpen => {
+                        let a = parse_array(&mut lexer, 0)?;
+                        stack.push(a);
+                    }
+                    Token::DictOpen => {
+                        let d = parse_dict(&mut lexer, 0)?;
+                        stack.push(Object::Dict(d));
+                    }
+                    // Stray closers: malformed input, drop pending operands.
+                    Token::ArrayClose | Token::DictClose => {
+                        stack.clear();
+                        run_start = None;
+                    }
+                    Token::Keyword(_) => {
+                        unreachable!("next_raw_token yields keywords borrowed")
+                    }
+                }
+                continue;
             }
-            // Stray closers: malformed input, drop pending operands.
-            Token::ArrayClose | Token::DictClose => {
+        };
+        match kw {
+            b"true" => stack.push(Object::Bool(true)),
+            b"false" => stack.push(Object::Bool(false)),
+            b"null" => stack.push(Object::Null),
+            b"BI" => {
+                let start = run_start.take().unwrap_or(token_start);
+                if let Some(op) = parse_inline_image(&mut lexer) {
+                    emit(op, Span::new(start as u64, lexer.pos() as u64));
+                }
                 stack.clear();
-                run_start = None;
             }
-            Token::Keyword(kw) => match kw.as_slice() {
-                b"true" => stack.push(Object::Bool(true)),
-                b"false" => stack.push(Object::Bool(false)),
-                b"null" => stack.push(Object::Null),
-                b"BI" => {
-                    let start = run_start.take().unwrap_or(token_start);
-                    if let Some(op) = parse_inline_image(&mut lexer) {
-                        ops.push((op, Span::new(start as u64, lexer.pos() as u64)));
-                    }
-                    stack.clear();
+            _ => {
+                let start = run_start.take().unwrap_or(token_start);
+                if let Some(op) = dispatch(kw, &mut stack) {
+                    emit(op, Span::new(start as u64, lexer.pos() as u64));
                 }
-                _ => {
-                    let start = run_start.take().unwrap_or(token_start);
-                    if let Some(op) = dispatch(&kw, &stack) {
-                        ops.push((op, Span::new(start as u64, lexer.pos() as u64)));
-                    }
-                    stack.clear();
-                }
-            },
+                stack.clear();
+            }
         }
     }
-    Ok(ops)
+    Ok(())
 }
 
 /// Composes an array value; the opening `[` has already been consumed.
@@ -325,18 +354,19 @@ fn int1(stack: &[Object]) -> Option<i32> {
     }
 }
 
-/// The last operand as a name.
-fn name1(stack: &[Object]) -> Option<Name> {
-    match stack.last()? {
-        Object::Name(n) => Some(n.clone()),
+/// The last operand as a name, taken off the stack: the caller clears the
+/// stack after every dispatch, so operands are moved out, never cloned.
+fn name1(stack: &mut [Object]) -> Option<Name> {
+    match stack.last_mut()? {
+        Object::Name(n) => Some(Name(std::mem::take(&mut n.0))),
         _ => None,
     }
 }
 
-/// The last operand as a string's bytes.
-fn str1(stack: &[Object]) -> Option<Vec<u8>> {
-    match stack.last()? {
-        Object::String(s) => Some(s.clone()),
+/// The last operand as a string's bytes, taken off the stack like [`name1`].
+fn str1(stack: &mut [Object]) -> Option<Vec<u8>> {
+    match stack.last_mut()? {
+        Object::String(s) => Some(std::mem::take(s)),
         _ => None,
     }
 }
@@ -382,7 +412,12 @@ fn parse_dict(lexer: &mut Lexer, depth: usize) -> Result<Dict> {
 /// Maps an operator keyword plus its operand stack to a typed [`Op`].
 /// Returns `None` (operator skipped) for unknown keywords or operand
 /// arity/type mismatches.
-fn dispatch(kw: &[u8], stack: &[Object]) -> Option<Op> {
+///
+/// The stack is dispatch's to consume — the caller clears it after every
+/// keyword — so heap operands (strings, names) are moved into the `Op`
+/// rather than cloned, and a mismatch may leave the stack partially
+/// emptied.
+fn dispatch(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
     Some(match kw {
         // Graphics state.
         b"q" => Op::Save,
@@ -452,7 +487,7 @@ fn dispatch(kw: &[u8], stack: &[Object]) -> Option<Op> {
 }
 
 /// Continuation of [`dispatch`]: color and text operators.
-fn dispatch_color_text(kw: &[u8], stack: &[Object]) -> Option<Op> {
+fn dispatch_color_text(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
     Some(match kw {
         // Color.
         b"CS" => Op::SetStrokeColorSpace(name1(stack)?),
@@ -498,10 +533,11 @@ fn dispatch_color_text(kw: &[u8], stack: &[Object]) -> Option<Op> {
                 return None;
             }
             let size = num(&stack[stack.len() - 1])?;
-            let Object::Name(font) = &stack[stack.len() - 2] else {
+            let at = stack.len() - 2;
+            let Object::Name(font) = &mut stack[at] else {
                 return None;
             };
-            Op::SetFont(font.clone(), size)
+            Op::SetFont(Name(std::mem::take(&mut font.0)), size)
         }
         b"d0" => {
             let [wx, wy] = nums::<2>(stack)?;
@@ -525,13 +561,13 @@ fn dispatch_color_text(kw: &[u8], stack: &[Object]) -> Option<Op> {
         b"T*" => Op::TextNextLine,
         b"Tj" => Op::ShowText(str1(stack)?),
         b"TJ" => {
-            let Object::Array(items) = stack.last()? else {
+            let Object::Array(items) = stack.last_mut()? else {
                 return None;
             };
             let adjusted = items
-                .iter()
+                .iter_mut()
                 .filter_map(|o| match o {
-                    Object::String(s) => Some(TextItem::Str(s.clone())),
+                    Object::String(s) => Some(TextItem::Str(std::mem::take(s))),
                     other => num(other).map(TextItem::Offset),
                 })
                 .collect();
@@ -553,7 +589,7 @@ fn dispatch_color_text(kw: &[u8], stack: &[Object]) -> Option<Op> {
 
 /// Continuation of [`dispatch`]: XObject, shading, marked-content, and
 /// compatibility operators.
-fn dispatch_misc(kw: &[u8], stack: &[Object]) -> Option<Op> {
+fn dispatch_misc(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
     Some(match kw {
         b"Do" => Op::XObject(name1(stack)?),
         b"sh" => Op::Shading(name1(stack)?),
@@ -586,31 +622,33 @@ fn nums_at<const N: usize>(stack: &[Object], start: usize) -> Option<[f32; N]> {
 }
 
 /// Operands of `SCN`/`scn`: numeric components optionally followed by a
-/// pattern name.
-fn color_n(stack: &[Object]) -> Option<(Vec<f32>, Option<Name>)> {
-    match stack.last() {
+/// pattern name (taken off the stack like [`name1`]).
+fn color_n(stack: &mut [Object]) -> Option<(Vec<f32>, Option<Name>)> {
+    match stack.last_mut() {
         Some(Object::Name(n)) => {
+            let pattern = Name(std::mem::take(&mut n.0));
             let comps = all_nums(&stack[..stack.len() - 1])?;
-            Some((comps, Some(n.clone())))
+            Some((comps, Some(pattern)))
         }
         _ => Some((all_nums(stack)?, None)),
     }
 }
 
 /// Operands of `DP`/`BDC`: a tag name and a properties value (an inline
-/// dictionary or a resource name).
-fn tag_props(stack: &[Object]) -> Option<(Name, Object)> {
+/// dictionary or a resource name), both taken off the stack like [`name1`].
+fn tag_props(stack: &mut [Object]) -> Option<(Name, Object)> {
     if stack.len() < 2 {
         return None;
     }
-    let props = match &stack[stack.len() - 1] {
-        o @ (Object::Dict(_) | Object::Name(_)) => o.clone(),
+    let last = stack.len() - 1;
+    let props = match &stack[last] {
+        Object::Dict(_) | Object::Name(_) => std::mem::replace(&mut stack[last], Object::Null),
         _ => return None,
     };
-    let Object::Name(tag) = &stack[stack.len() - 2] else {
+    let Object::Name(tag) = &mut stack[last - 1] else {
         return None;
     };
-    Some((tag.clone(), props))
+    Some((Name(std::mem::take(&mut tag.0)), props))
 }
 
 /// Parses an inline image; the `BI` keyword has already been consumed.

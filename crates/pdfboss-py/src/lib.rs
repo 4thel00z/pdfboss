@@ -353,8 +353,14 @@ impl Document {
             let doc = CoreDocument::from_seed(inner.lock().seed());
             // `map_pages` visits exactly the materializable pages — the
             // flattened tree, not the declared `/Count`, which on a damaged
-            // file can exceed (or fall short of) what the tree yields.
-            let texts = pdfboss_core::map_pages(&doc, pdfboss_output::extract_text);
+            // file can exceed (or fall short of) what the tree yields. One
+            // font cache serves every worker, so a font loads once per
+            // document rather than once per page.
+            let fonts = pdfboss_output::FontCache::default();
+            let texts = pdfboss_core::map_pages(&doc, |doc, page| {
+                let (text, _) = pdfboss_output::extract_text_reporting_cached(doc, page, &fonts)?;
+                Ok(text)
+            });
             let mut out = String::new();
             for (i, text) in texts.into_iter().enumerate() {
                 if i > 0 {

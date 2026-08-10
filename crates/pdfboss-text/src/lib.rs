@@ -8,7 +8,7 @@ mod sfnt;
 
 use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Result};
 
-pub use extract::{ExtractReport, SkipCause, SkippedText, SkippedTextKind};
+pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
 pub use pdfboss_core::Point;
 
 /// A positioned run of extracted text.
@@ -78,7 +78,7 @@ pub async fn extract_spans_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<Vec<TextSpan>> {
-    let (spans, _, _) = extract::page_spans_and_rulings_with(src, page).await;
+    let (spans, _, _) = extract::page_spans_and_rulings_with(src, page, None).await;
     Ok(spans)
 }
 
@@ -100,7 +100,40 @@ pub async fn extract_spans_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page).await;
+    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, None).await;
+    Ok((spans, report))
+}
+
+/// [`extract_spans_reporting`] with fonts cached across calls: a caller
+/// walking a whole document passes one [`FontCache`] to every page, and each
+/// font dictionary — descriptor, widths, encoding, ToUnicode and font-program
+/// parsing included — loads once for the document instead of once per page.
+/// The cache is `Send + Sync`, so a parallel page walk may share it.
+///
+/// The result is identical to calling [`extract_spans_reporting`] per page:
+/// the cache is keyed by each font dictionary's object reference, never by
+/// its resource name, and a reference resolves to the same dictionary on
+/// every page of a document.
+pub fn extract_spans_reporting_cached(
+    doc: &Document,
+    page: &Page,
+    fonts: &FontCache,
+) -> Result<(Vec<TextSpan>, ExtractReport)> {
+    block_on(extract_spans_reporting_cached_with(
+        Immediate(doc),
+        page,
+        fonts,
+    ))
+}
+
+/// [`extract_spans_reporting_cached`] against any object source. Signed like
+/// [`extract_spans_with`], for the same reasons.
+pub async fn extract_spans_reporting_cached_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: &FontCache,
+) -> Result<(Vec<TextSpan>, ExtractReport)> {
+    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, Some(fonts)).await;
     Ok((spans, report))
 }
 
@@ -124,7 +157,37 @@ pub async fn extract_spans_and_rulings_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
-    let (spans, rulings, report) = extract::page_spans_and_rulings_with(src, page).await;
+    let (spans, rulings, report) = extract::page_spans_and_rulings_with(src, page, None).await;
+    Ok((spans, rulings, report))
+}
+
+/// [`extract_spans_and_rulings_reporting`] with fonts cached across calls —
+/// the rulings twin of [`extract_spans_reporting_cached`], for a caller
+/// walking a whole document page by page. Spans, rulings, and report are
+/// identical to the uncached call's, for the same reason: the cache is keyed
+/// by each font dictionary's object reference, never by its resource name,
+/// and rulings never touch fonts at all.
+pub fn extract_spans_and_rulings_reporting_cached(
+    doc: &Document,
+    page: &Page,
+    fonts: &FontCache,
+) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
+    block_on(extract_spans_and_rulings_reporting_cached_with(
+        Immediate(doc),
+        page,
+        fonts,
+    ))
+}
+
+/// [`extract_spans_and_rulings_reporting_cached`] against any object source.
+/// Signed like [`extract_spans_with`], for the same reasons.
+pub async fn extract_spans_and_rulings_reporting_cached_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: &FontCache,
+) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
+    let (spans, rulings, report) =
+        extract::page_spans_and_rulings_with(src, page, Some(fonts)).await;
     Ok((spans, rulings, report))
 }
 
@@ -319,6 +382,185 @@ mod tests {
         let page = doc.page(0).unwrap();
         let spans = extract_spans(&doc, &page).unwrap();
         assert!(spans[0].bold && spans[0].italic);
+    }
+
+    /// An asynchronous source that counts each reference resolution by
+    /// object number and delegates to the document. Loading a font resolves
+    /// its dictionary's reference exactly once, so the count makes cache
+    /// hits observable without any instrumentation in the production code.
+    struct Counting<'a> {
+        inner: Immediate<&'a Document>,
+        resolutions: std::cell::RefCell<std::collections::HashMap<u32, usize>>,
+    }
+
+    impl<'a> Counting<'a> {
+        fn new(doc: &'a Document) -> Counting<'a> {
+            Counting {
+                inner: Immediate(doc),
+                resolutions: std::cell::RefCell::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn resolutions(&self, num: u32) -> usize {
+            self.resolutions.borrow().get(&num).copied().unwrap_or(0)
+        }
+    }
+
+    impl AsyncObjectSource for Counting<'_> {
+        fn get(&self, r: ObjRef) -> BoxFuture<'_, Result<Object>> {
+            self.inner.get(r)
+        }
+
+        fn stream_data<'b>(&'b self, s: &'b Stream) -> BoxFuture<'b, Result<Vec<u8>>> {
+            self.inner.stream_data(s)
+        }
+
+        fn resolve<'b>(&'b self, o: &'b Object) -> BoxFuture<'b, Result<Object>> {
+            if let Object::Ref(r) = o {
+                *self.resolutions.borrow_mut().entry(r.num).or_insert(0) += 1;
+            }
+            self.inner.resolve(o)
+        }
+    }
+
+    /// Two invocations of the same form used to load the form's font twice:
+    /// every invocation started with an empty font map. The walk-level cache
+    /// (no [`FontCache`] involved) must fetch the font dictionary once.
+    #[test]
+    fn a_font_reached_from_repeated_forms_loads_once_per_page() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /XObject << /Fx 6 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"/Fx Do /Fx Do");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >>",
+            b"BT /F1 12 Tf 72 700 Td (x) Tj ET",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let counting = Counting::new(&doc);
+        let (spans, report) = block_on(extract_spans_reporting_with(&counting, &page)).unwrap();
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        assert_eq!(spans.len(), 2, "both form invocations must show text");
+        assert_eq!(
+            counting.resolutions(5),
+            1,
+            "one font dictionary resolution per page walk"
+        );
+    }
+
+    /// A two-page document whose pages bind the same font dictionary: with
+    /// one [`FontCache`] passed to both extractions the dictionary is
+    /// fetched once, and the spans are exactly the uncached call's.
+    #[test]
+    fn a_font_shared_across_pages_loads_once_per_document() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (one) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+        );
+        b.stream(6, "", b"BT /F1 12 Tf 72 720 Td (two) Tj ET");
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let fonts = FontCache::default();
+        let counting = Counting::new(&doc);
+        let mut cached = Vec::new();
+        for index in 0..2 {
+            let page = doc.page(index).unwrap();
+            let (spans, report) = block_on(extract_spans_reporting_cached_with(
+                &counting, &page, &fonts,
+            ))
+            .unwrap();
+            assert!(report.is_complete(), "unexpected skips: {report:?}");
+            cached.push(spans);
+        }
+        assert_eq!(
+            counting.resolutions(7),
+            1,
+            "one font dictionary resolution per document"
+        );
+        for (index, spans) in cached.iter().enumerate() {
+            let page = doc.page(index).unwrap();
+            let plain = extract_spans_reporting(&doc, &page).unwrap().0;
+            assert_eq!(spans, &plain, "page {index} must extract identically");
+        }
+    }
+
+    /// `/F1` on one page and `/F1` on the next may be different fonts: the
+    /// shared cache is keyed by the font dictionary's object reference, so
+    /// each page keeps its own binding. A cache keyed by resource name would
+    /// hand page two the font of page one and fail here.
+    #[test]
+    fn a_shared_cache_keeps_the_name_binding_per_page() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (aa) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 8 0 R >> >> /Contents 6 0 R >>",
+        );
+        b.stream(6, "", b"BT /F1 12 Tf 72 720 Td (aa) Tj ET");
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding /FirstChar 97 /LastChar 97 /Widths [500] >>",
+        );
+        b.object(
+            8,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding /FirstChar 97 /LastChar 97 /Widths [1000] >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let fonts = FontCache::default();
+        let mut advances = Vec::new();
+        for index in 0..2 {
+            let page = doc.page(index).unwrap();
+            let (spans, _) = extract_spans_reporting_cached(&doc, &page, &fonts).unwrap();
+            assert_eq!(spans.len(), 1);
+            advances.push(spans[0].end_x - spans[0].x);
+        }
+        assert!(
+            (advances[0] - 12.0).abs() < 1e-3,
+            "page one: {}",
+            advances[0]
+        );
+        assert!(
+            (advances[1] - 24.0).abs() < 1e-3,
+            "page two: {}",
+            advances[1]
+        );
     }
 
     /// An asynchronous source that answers everything with `null`.
