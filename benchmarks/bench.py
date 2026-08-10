@@ -109,6 +109,8 @@ LIBS = {
 
 
 def sample_files(corpus, n):
+    if n <= 0:
+        raise SystemExit("--sample must be a positive number of files")
     files = sorted(glob.glob(os.path.join(corpus, "*.pdf")))
     if not files:
         raise SystemExit(f"no PDFs found in {corpus}")

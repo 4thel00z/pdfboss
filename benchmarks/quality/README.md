@@ -36,14 +36,14 @@ cp /path/to/pdfboss/benchmarks/quality/pdf_parser_pdfboss*.py src/
 ```
 
 Then register them in `src/engine_registry.py`: add both engines to
-`ENGINES` (the value is the version, `python -c "import pdfboss;
+`ENGINES` (the value is your installed version, `python -c "import pdfboss;
 print(pdfboss.__version__)"`), and their modules to `_ENGINE_MODULES`:
 
 ```python
 ENGINES: Dict[str, str] = {
     ...
-    "pdfboss": "0.15.0",
-    "pdfboss-text": "0.15.0",
+    "pdfboss": "X.Y.Z",
+    "pdfboss-text": "X.Y.Z",
 }
 
 _ENGINE_MODULES: Dict[str, str] = {

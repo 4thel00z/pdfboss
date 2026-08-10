@@ -115,6 +115,8 @@ INK_SLACK = 0.15
 
 
 def sample_files(corpus, n):
+    if n <= 0:
+        raise SystemExit("--sample must be a positive number of files")
     files = sorted(glob.glob(os.path.join(corpus, "*.pdf")))
     if not files:
         raise SystemExit(f"no PDFs found in {corpus}")
@@ -148,7 +150,7 @@ def certify(path, scale, fonts):
             # that do exist were all checked, so certify those.
             break
         try:
-            png, warnings = page.render_reporting(scale=scale, fonts=fonts)
+            warnings = page.render_reporting(scale=scale, fonts=fonts)[1]
         except Exception as exc:  # noqa: BLE001 - the message is the result
             return None, f"render failed: {type(exc).__name__}: {exc}"
         if warnings:
