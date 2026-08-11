@@ -190,30 +190,58 @@ type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>)>;
 /// hitting it reports the paint as dropped rather than tiling partially.
 const MAX_PATTERN_TILES: i64 = 65536;
 
-/// What a resolved `/Pattern` color paints as.
+/// What a resolved `/Pattern` color paints as. The matrix maps pattern
+/// space to device pixels: `/Matrix` ∘ the invoking stream's pattern base
+/// (§8.7.3.1 — patterns do not move with `cm`). It rides alongside the
+/// loaded pattern rather than inside it because the base differs per
+/// invoking stream while the pattern itself does not, which is what lets
+/// [`Executor::pattern_cache`] share one load across paints.
 enum PatternPaint {
-    /// A shading pattern (`/PatternType 2`) and the matrix it paints under.
-    Shading(Box<Shading>, Matrix),
+    /// A shading pattern (`/PatternType 2`).
+    Shading(Arc<Shading>, Matrix),
     /// A tiling pattern (`/PatternType 1`), ready to plan cell frames from.
-    Tiling(TilingPattern),
+    Tiling(Arc<TilingPattern>, Matrix),
 }
 
-/// A loaded tiling-pattern cell (ISO 32000-1 §8.7.3).
+/// A loaded tiling-pattern cell (ISO 32000-1 §8.7.3), everything about the
+/// pattern object itself and nothing about any particular paint.
 struct TilingPattern {
     /// The cell's content stream, shared into every tile's frame.
     ops: Arc<[Op]>,
     /// The cell's own `/Resources`, prepended to the invoking chain.
-    resources: Option<Dict>,
+    resources: Option<Arc<Dict>>,
     /// Normalized cell bounds in pattern space; also each tile's clip.
     bbox: [f32; 4],
     xstep: f32,
     ystep: f32,
-    /// Pattern space to device pixels: `/Matrix` ∘ the stream's pattern
-    /// base (§8.7.3.1 — patterns do not move with `cm`).
-    to_device: Matrix,
     /// `/PaintType 2`: the cell paints in the `scn` color, its own color
     /// operators ignored under the executor's color lock.
     uncolored: bool,
+}
+
+/// Bound on `Executor::pattern_cache`'s size, capping memory like
+/// [`MAX_CLIP_CACHE`] against a hostile file minting endless distinct
+/// pattern objects. Real pages use a handful of patterns each.
+const MAX_PATTERN_CACHE: usize = 256;
+
+/// A pattern that loaded successfully earlier in this page render, keyed by
+/// its indirect reference in [`Executor::pattern_cache`]. Holds the raw
+/// `/Matrix` and the loaded payload — never a composed device matrix, which
+/// depends on the invoking stream's pattern base and so belongs to each
+/// paint. Failures are never cached: a failing paint must re-resolve and
+/// re-report, so the report's multiplicity stays one entry per paint.
+#[derive(Clone)]
+enum CachedPattern {
+    Shading(Matrix, Arc<Shading>),
+    Tiling(Matrix, Arc<TilingPattern>),
+}
+
+/// What [`Executor::find_pattern`] found for a name: an already-loaded
+/// pattern, or the resolved object still to load (with the indirect
+/// reference it resolved through, if any, for caching the result).
+enum FoundPattern {
+    Cached(CachedPattern),
+    Resolved(Option<pdfboss_core::ObjRef>, Object),
 }
 
 /// Text-showing state within a `BT`/`ET` block. Held per content stream (not
@@ -447,6 +475,7 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         glyph_blit: Vec::new(),
         clip_cache: FastMap::default(),
         charproc_cache: FastMap::default(),
+        pattern_cache: FastMap::default(),
         report,
     };
     let root = Frame::new(
@@ -506,6 +535,13 @@ struct Executor<'a, S> {
     /// every occurrence of its code; parsing is context-free, so one parse
     /// serves them all. See [`MAX_CHARPROC_CACHE`].
     charproc_cache: FastMap<pdfboss_core::ObjRef, Arc<[Op]>>,
+    /// Patterns loaded earlier in this page render, keyed by the pattern
+    /// object's indirect reference and shared across paints (a pattern fill
+    /// used to re-fetch, re-decompress, and re-parse its cell on every
+    /// fill/stroke). Successes only, and only patterns the resource chain
+    /// names through a reference — see [`CachedPattern`] and
+    /// [`MAX_PATTERN_CACHE`].
+    pattern_cache: FastMap<pdfboss_core::ObjRef, CachedPattern>,
     /// Content this render dropped rather than painted, accumulated across
     /// the page (forms and Type3 CharProcs included, since they run through
     /// the same [`Executor`]).
@@ -1029,9 +1065,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 Some(PatternPaint::Shading(shading, to_device)) => {
                     self.paint_shading_through(&polys, rule, shading, *to_device, gs.clone())
                 }
-                Some(PatternPaint::Tiling(tiling)) => {
-                    let planned =
-                        self.plan_tiles(&polys, rule, tiling, &gs, &frame.chain, frame.depth);
+                Some(PatternPaint::Tiling(tiling, to_device)) => {
+                    let planned = self.plan_tiles(
+                        &polys,
+                        rule,
+                        tiling,
+                        *to_device,
+                        &gs,
+                        &frame.chain,
+                        frame.depth,
+                    );
                     frame.pending_tiles.extend(planned);
                 }
                 None => fill_path(
@@ -1057,11 +1100,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     *to_device,
                     gs.clone(),
                 ),
-                Some(PatternPaint::Tiling(tiling)) => {
+                Some(PatternPaint::Tiling(tiling, to_device)) => {
                     let planned = self.plan_tiles(
                         &quads,
                         FillRule::NonZero,
                         tiling,
+                        *to_device,
                         &gs,
                         &frame.chain,
                         frame.depth,
@@ -1106,13 +1150,24 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Pattern, SkipReason::Missing);
             return None;
         };
-        let Some(obj) = self.find_res(chain, "Pattern", name).await else {
+        let Some(found) = self.find_pattern(chain, name).await else {
             self.skip(SkippedKind::Pattern, SkipReason::Missing);
             return None;
         };
-        let (dict, stream) = match self.src.resolve(&obj).await {
-            Ok(Object::Dict(d)) => (d, None),
-            Ok(Object::Stream(s)) => (s.dict.clone(), Some(s)),
+        let (pref, obj) = match found {
+            FoundPattern::Cached(CachedPattern::Shading(matrix, s)) => {
+                let to_device = self.pattern_to_device(matrix, pattern_base)?;
+                return Some(PatternPaint::Shading(s, to_device));
+            }
+            FoundPattern::Cached(CachedPattern::Tiling(matrix, cell)) => {
+                let to_device = self.pattern_to_device(matrix, pattern_base)?;
+                return Some(PatternPaint::Tiling(cell, to_device));
+            }
+            FoundPattern::Resolved(pref, obj) => (pref, obj),
+        };
+        let (dict, stream) = match obj {
+            Object::Dict(d) => (d, None),
+            Object::Stream(s) => (s.dict.clone(), Some(s)),
             _ => {
                 self.skip(SkippedKind::Pattern, SkipReason::Missing);
                 return None;
@@ -1129,11 +1184,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 f: m[5],
             })
             .unwrap_or_else(Matrix::identity);
-        let to_device = matrix.concat(pattern_base);
-        if !finite_matrix(&to_device) || to_device.invert().is_none() {
-            self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
-            return None;
-        }
+        let to_device = self.pattern_to_device(matrix, pattern_base)?;
         match dict.get_int("PatternType") {
             Some(2) => {
                 let Some(shading_obj) = dict.get("Shading") else {
@@ -1141,7 +1192,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     return None;
                 };
                 match Shading::load_with(self.src, shading_obj).await {
-                    Ok(Some(s)) => Some(PatternPaint::Shading(Box::new(s), to_device)),
+                    Ok(Some(s)) => {
+                        let s = Arc::new(s);
+                        self.cache_pattern(pref, CachedPattern::Shading(matrix, Arc::clone(&s)));
+                        Some(PatternPaint::Shading(s, to_device))
+                    }
                     Ok(None) => {
                         self.skip(SkippedKind::Shading, SkipReason::Unsupported);
                         None
@@ -1157,7 +1212,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     self.skip(SkippedKind::Pattern, SkipReason::Missing);
                     return None;
                 };
-                self.load_tiling(&stream, &dict, to_device).await
+                let cell = self.load_tiling(&stream, &dict).await?;
+                self.cache_pattern(pref, CachedPattern::Tiling(matrix, Arc::clone(&cell)));
+                Some(PatternPaint::Tiling(cell, to_device))
             }
             _ => {
                 self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
@@ -1166,16 +1223,80 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
+    /// Looks the named pattern up in the chain (innermost dict first, like
+    /// [`Executor::find_res`]): a cache entry when the name reaches an
+    /// indirect reference already loaded this page — probed before
+    /// resolving, which is the point of the cache — otherwise the resolved
+    /// object plus the reference to cache it under (`None` for a pattern
+    /// written directly into the resource dictionary).
+    async fn find_pattern(&self, chain: &[Arc<Dict>], name: &str) -> Option<FoundPattern> {
+        for res in chain {
+            let Some(cat) = res.get("Pattern") else {
+                continue;
+            };
+            let resolved_cat;
+            let cat = match cat {
+                Object::Dict(d) => d,
+                other => match self.src.resolve(other).await {
+                    Ok(Object::Dict(d)) => {
+                        resolved_cat = d;
+                        &resolved_cat
+                    }
+                    _ => continue,
+                },
+            };
+            let Some(value) = cat.get(name) else {
+                continue;
+            };
+            let pref = match value {
+                Object::Ref(r) => {
+                    if let Some(entry) = self.pattern_cache.get(r) {
+                        return Some(FoundPattern::Cached(entry.clone()));
+                    }
+                    Some(*r)
+                }
+                _ => None,
+            };
+            if let Ok(obj) = self.src.resolve(value).await {
+                if !obj.is_null() {
+                    return Some(FoundPattern::Resolved(pref, obj));
+                }
+            }
+        }
+        None
+    }
+
+    /// Composes a pattern's `/Matrix` with the invoking stream's base into
+    /// the pattern-space-to-device matrix, reporting a degenerate result.
+    /// Per paint even for a cached pattern: the base differs per stream, so
+    /// the same pattern can be paintable in one paint and degenerate in the
+    /// next, each reporting for itself.
+    fn pattern_to_device(&mut self, matrix: Matrix, pattern_base: Matrix) -> Option<Matrix> {
+        let to_device = matrix.concat(pattern_base);
+        if !finite_matrix(&to_device) || to_device.invert().is_none() {
+            self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
+            return None;
+        }
+        Some(to_device)
+    }
+
+    /// Remembers a successfully loaded pattern for the rest of the page,
+    /// when it came through an indirect reference and the cache has room.
+    fn cache_pattern(&mut self, pref: Option<pdfboss_core::ObjRef>, entry: CachedPattern) {
+        let Some(r) = pref else {
+            return;
+        };
+        if self.pattern_cache.len() >= MAX_PATTERN_CACHE {
+            return;
+        }
+        self.pattern_cache.insert(r, entry);
+    }
+
     /// Loads a tiling pattern's cell: content ops, own resources, `/BBox`
     /// and steps (defaulting a missing or degenerate step to the cell's
     /// extent, so a broken step tiles edge-to-edge instead of dividing by
     /// zero). Failures report as a dropped pattern.
-    async fn load_tiling(
-        &mut self,
-        stream: &Stream,
-        dict: &Dict,
-        to_device: Matrix,
-    ) -> Option<PatternPaint> {
+    async fn load_tiling(&mut self, stream: &Stream, dict: &Dict) -> Option<Arc<TilingPattern>> {
         let data = match content_stream_data_with(self.src, stream).await {
             Ok(data) => data,
             Err(e) => {
@@ -1213,18 +1334,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         let ystep = step(dict_f32(self.src, dict, "YStep").await, h);
         let resources = match dict.get("Resources") {
             Some(o) => match self.src.resolve(o).await {
-                Ok(Object::Dict(d)) => Some(d),
+                Ok(Object::Dict(d)) => Some(Arc::new(d)),
                 _ => None,
             },
             None => None,
         };
-        Some(PatternPaint::Tiling(TilingPattern {
+        Some(Arc::new(TilingPattern {
             ops: ops.into(),
             resources,
             bbox,
             xstep,
             ystep,
-            to_device,
             uncolored: dict.get_int("PaintType") == Some(2),
         }))
     }
@@ -1238,11 +1358,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// lock, restored by their `CharProc` frame kind. Past
     /// [`MAX_PATTERN_TILES`] the whole paint reports as dropped instead of
     /// running unbounded work.
+    #[allow(clippy::too_many_arguments)]
     fn plan_tiles(
         &mut self,
         polys: &[Subpath],
         rule: FillRule,
         tiling: &TilingPattern,
+        to_device: Matrix,
         gs: &GState,
         chain: &[Arc<Dict>],
         depth: u32,
@@ -1263,7 +1385,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if region.bbox_w == 0 || region.bbox_h == 0 {
             return tiles;
         }
-        let Some(inv) = tiling.to_device.invert() else {
+        let Some(inv) = to_device.invert() else {
             self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
             return tiles;
         };
@@ -1308,7 +1430,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         for j in j_min..=j_max {
             for i in i_min..=i_max {
                 let origin = Matrix::translate(i as f32 * tiling.xstep, j as f32 * tiling.ystep);
-                let tile_ctm = origin.concat(tiling.to_device);
+                let tile_ctm = origin.concat(to_device);
                 let mut pb = PathBuilder::new(tile_ctm);
                 pb.rect(bx0, by0, bx1 - bx0, by1 - by0);
                 let cell = Mask::from_path(self.pix.width, self.pix.height, &pb.finish(), rule);
@@ -1332,7 +1454,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 };
                 let mut tile_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
                 if let Some(res) = &tiling.resources {
-                    tile_chain.push(Arc::new(res.clone()));
+                    tile_chain.push(Arc::clone(res));
                 }
                 tile_chain.extend_from_slice(chain);
                 tiles.push_back(Frame::new(
@@ -3857,6 +3979,95 @@ mod tests {
             "still green: cell color locked"
         );
         assert_eq!(px(&pix, 7, 97), WHITE, "unpainted cell corner");
+    }
+
+    #[test]
+    fn repeated_pattern_paints_under_each_use_site_matrix() {
+        // The same indirect pattern fills twice: once from the page content
+        // and once from inside a form invoked under a translated CTM. The
+        // pattern anchors to each stream's own base (§8.7.3.1), so the
+        // form's tiles sit 53pt right of the page's — red quarters at page
+        // x [0,5), [10,15)... and at x [53,58), [63,68)... If a reused
+        // pattern kept the first paint's matrix, the form's quarters would
+        // land at [50,55), [60,65) instead.
+        let resources = "/Pattern << /P0 5 0 R >> /XObject << /Fm0 6 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 0 40 40 re f q 1 0 0 1 53 0 cm /Fm0 Do Q";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"1 0 0 rg 0 0 5 5 re f",
+            );
+            b.stream(
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 40 40] \
+                 /Resources << /Pattern << /P0 5 0 R >> >>",
+                b"/Pattern cs /P0 scn 0 0 40 40 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 2, 97), RED, "page fill, first tile's quarter");
+        assert_eq!(px(&pix, 7, 97), WHITE, "page fill, outside the quarter");
+        assert_eq!(px(&pix, 56, 97), RED, "form fill, tiles anchor at x=53");
+        assert_eq!(px(&pix, 61, 97), WHITE, "form fill, between its quarters");
+        assert_eq!(px(&pix, 50, 97), WHITE, "left of the form's fill path");
+    }
+
+    #[test]
+    fn repeated_shading_pattern_paints_under_each_use_site_matrix() {
+        // The tiling test's shading twin: the same indirect axial pattern
+        // (red at x=0 to blue at x=100 in pattern space) fills from the
+        // page and from a form invoked 40pt right. The form's gradient
+        // anchors to the form's own base, so device x=60 is pattern x=20
+        // (t=0.20); a reused pattern keeping the first paint's matrix
+        // would put t=0.60 there.
+        let resources = "/Pattern << /P0 5 0 R >> /XObject << /Fm0 6 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 20 30 30 re f q 1 0 0 1 40 0 cm /Fm0 Do Q";
+        let bytes = small_doc(resources, content, |b| {
+            b.object(
+                5,
+                "<< /PatternType 2 /Shading << /ShadingType 2 \
+                 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                 /Extend [true true] /Function << /FunctionType 2 \
+                 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>",
+            );
+            b.stream(
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 40 40] \
+                 /Resources << /Pattern << /P0 5 0 R >> >>",
+                b"/Pattern cs /P0 scn 0 0 40 40 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 65), [191, 0, 64, 255], 4, "page fill t=0.25");
+        assert_near(px(&pix, 60, 80), [204, 0, 51, 255], 4, "form fill t=0.20");
+        assert_eq!(px(&pix, 35, 65), WHITE, "between the two fills");
+    }
+
+    #[test]
+    fn failing_pattern_reports_every_paint() {
+        // An indirect pattern with no /BBox fails to load; two fills through
+        // it must produce two reports — a reused failure would collapse the
+        // multiplicity the report contract promises.
+        let resources = "/Pattern << /P0 5 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 0 40 40 re f 60 60 30 30 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"1 0 0 rg 0 0 5 5 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 20, 80), [128, 128, 128, 255], "stand-in gray");
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Pattern, SkipReason::Missing, 2)],
+        );
     }
 
     #[test]
