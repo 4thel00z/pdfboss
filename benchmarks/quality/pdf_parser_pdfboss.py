@@ -11,6 +11,7 @@ import pdfboss
 
 def to_markdown(doc_paths, input_path, output_dir):
     output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     for doc_path in doc_paths:
         markdown = pdfboss.Document(str(doc_path)).extract_markdown()
         output_file = output_dir / f"{Path(doc_path).stem}.md"
