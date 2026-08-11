@@ -120,6 +120,8 @@ def sample_files(corpus, n):
     files = sorted(glob.glob(os.path.join(corpus, "*.pdf")))
     if not files:
         raise SystemExit(f"no PDFs found in {corpus}")
+    if n <= 0:
+        raise SystemExit("--sample must be >= 1")
     if n >= len(files):
         return files
     # Evenly spaced across the sorted corpus for a representative spread.
