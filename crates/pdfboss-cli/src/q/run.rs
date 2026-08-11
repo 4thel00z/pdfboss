@@ -152,10 +152,11 @@ pub fn cmd_q(
     flags: &TreeFlags,
     hex: bool,
     raw_strings: bool,
+    password: &str,
 ) -> Result<(), Failure> {
     // Compile first: a bad program should fail fast, before any I/O.
     let program = compile_program(program).map_err(Failure::program)?;
-    let input = Input::open(input_spec).map_err(Failure::new)?;
+    let input = Input::open_with_password(input_spec, password).map_err(Failure::new)?;
     let opts = flags.element_opts().map_err(Failure::new)?;
     let elements = input.collect_elements(opts);
     let mut decode = |s: &Stream| input.decode_stream(s);
@@ -354,8 +355,15 @@ mod tests {
     fn hex_rejects_a_fabricated_out_of_range_span() {
         let path = fixture("hello.pdf");
         let len = std::fs::metadata(&path).expect("fixture exists").len();
-        let failure = cmd_q(&path, r#"{"_span": [0, 999999]}"#, &no_flags(), true, false)
-            .expect_err("fabricated span exceeds the file length");
+        let failure = cmd_q(
+            &path,
+            r#"{"_span": [0, 999999]}"#,
+            &no_flags(),
+            true,
+            false,
+            "",
+        )
+        .expect_err("fabricated span exceeds the file length");
         assert_eq!(failure.code, 1);
         assert!(
             failure.message.contains("_span result"),

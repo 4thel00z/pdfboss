@@ -147,6 +147,17 @@ impl Document {
     /// first page access, so opening a document (or reading `page_count`) does
     /// not parse every page dictionary.
     pub fn load(data: Vec<u8>) -> Result<Document> {
+        Document::load_with_password(data, "")
+    }
+
+    /// [`Document::load`] with the password that opens the file, accepted as
+    /// either the user or the owner password. The empty string is the
+    /// transparent empty-user-password case [`Document::load`] always
+    /// handles; a password the file does not accept yields
+    /// [`Error::Encrypted`]. Non-ASCII passwords are tried UTF-8 encoded
+    /// and, for the legacy RC4/AES-128 revisions, Latin-1 encoded as well,
+    /// covering both encodings real files use.
+    pub fn load_with_password(data: Vec<u8>, password: &str) -> Result<Document> {
         let version = parse_version(&data);
         let xref = load_xref(&data)?;
         let mut doc = Document {
@@ -165,18 +176,25 @@ impl Document {
             .get("Encrypt")
             .is_some_and(|o| !o.is_null())
         {
-            doc.setup_decryption()?;
+            doc.setup_decryption(password)?;
         }
         Ok(doc)
     }
 
+    /// Reads the file at `path` and loads it via
+    /// [`Document::load_with_password`].
+    pub fn open_with_password(path: impl AsRef<Path>, password: &str) -> Result<Document> {
+        Document::load_with_password(std::fs::read(path)?, password)
+    }
+
     /// Configures decryption for an encrypted file. Supports the Standard
     /// security handler with RC4 (`/V` 1–2), AESV2 (`/V` 4) and AESV3 (`/V` 5)
-    /// under the empty user password; a required password is reported as
-    /// [`Error::Encrypted`]. Must run before any content object is fetched, and
-    /// reads `/Encrypt` and `/ID` while decryption is still off (those values
-    /// are stored unencrypted).
-    fn setup_decryption(&mut self) -> Result<()> {
+    /// with `password` as the user or owner password (the empty string is
+    /// the transparent empty-user-password case); a password the file does
+    /// not accept is reported as [`Error::Encrypted`]. Must run before any
+    /// content object is fetched, and reads `/Encrypt` and `/ID` while
+    /// decryption is still off (those values are stored unencrypted).
+    fn setup_decryption(&mut self, password: &str) -> Result<()> {
         let enc_obj = self
             .xref
             .trailer
@@ -194,7 +212,7 @@ impl Document {
             .and_then(Object::as_str_bytes)
             .unwrap_or(&[])
             .to_vec();
-        match Decryptor::from_standard(enc_dict, &id0) {
+        match Decryptor::from_standard_with_password_str(enc_dict, &id0, password) {
             Some(dec) => {
                 self.decryptor = Some(dec);
                 // Objects fetched while resolving /Encrypt were cached without

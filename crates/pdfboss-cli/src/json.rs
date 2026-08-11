@@ -10,8 +10,13 @@ use crate::q::value::{build_tree, TreeFlags};
 /// `pdfboss json <file-or-url> [--raw|--decode] [--pages ..] [--no-logical]
 /// [--content-ops] [--layout]`: dumps the full value tree for piping to
 /// external tools.
-pub fn cmd_json(input_spec: &str, flags: &TreeFlags, layout: bool) -> Result<(), String> {
-    let input = Input::open(input_spec)?;
+pub fn cmd_json(
+    input_spec: &str,
+    flags: &TreeFlags,
+    layout: bool,
+    password: &str,
+) -> Result<(), String> {
+    let input = Input::open_with_password(input_spec, password)?;
     let opts = flags.element_opts()?;
     let elements = input.collect_elements(opts);
     let mut decode = |s: &Stream| input.decode_stream(s);

@@ -272,11 +272,11 @@ struct Document {
 #[pymethods]
 impl Document {
     #[new]
-    #[pyo3(signature = (path=None, *, data=None))]
-    fn new(path: Option<PathBuf>, data: Option<Vec<u8>>) -> PyResult<Self> {
+    #[pyo3(signature = (path=None, *, data=None, password=""))]
+    fn new(path: Option<PathBuf>, data: Option<Vec<u8>>, password: &str) -> PyResult<Self> {
         let core = match (path, data) {
-            (Some(p), None) => CoreDocument::open(p).map_err(pdf_err)?,
-            (None, Some(d)) => CoreDocument::load(d).map_err(pdf_err)?,
+            (Some(p), None) => CoreDocument::open_with_password(p, password).map_err(pdf_err)?,
+            (None, Some(d)) => CoreDocument::load_with_password(d, password).map_err(pdf_err)?,
             _ => {
                 return Err(PyValueError::new_err(
                     "Document() takes exactly one of `path` or `data`",
@@ -810,21 +810,29 @@ struct AsyncDocument {
 #[pymethods]
 impl AsyncDocument {
     /// Opens a PDF file for async access. Coroutine resolving to an
-    /// AsyncDocument. The whole file is never read eagerly.
+    /// AsyncDocument. The whole file is never read eagerly. `password`
+    /// opens an encrypted file, as the user or the owner password.
     #[staticmethod]
-    fn open(py: Python<'_>, path: PathBuf) -> PyResult<Bound<'_, PyAny>> {
+    #[pyo3(signature = (path, *, password=String::new()))]
+    fn open(py: Python<'_>, path: PathBuf, password: String) -> PyResult<Bound<'_, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let inner = AioDocument::open(path).await.map_err(aio_err)?;
+            let inner = AioDocument::open_with_password(path, &password)
+                .await
+                .map_err(aio_err)?;
             Ok(AsyncDocument { inner })
         })
     }
 
     /// Loads a PDF from bytes already in memory. Coroutine resolving to
-    /// an AsyncDocument.
+    /// an AsyncDocument. `password` opens an encrypted file, as the user
+    /// or the owner password.
     #[staticmethod]
-    fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Bound<'_, PyAny>> {
+    #[pyo3(signature = (data, *, password=String::new()))]
+    fn from_bytes(py: Python<'_>, data: Vec<u8>, password: String) -> PyResult<Bound<'_, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let inner = AioDocument::from_bytes(data).await.map_err(aio_err)?;
+            let inner = AioDocument::from_bytes_with_password(data, &password)
+                .await
+                .map_err(aio_err)?;
             Ok(AsyncDocument { inner })
         })
     }
@@ -832,11 +840,15 @@ impl AsyncDocument {
     /// Opens a PDF over HTTP using range requests; the whole file is
     /// never downloaded. The server must honor `Range` (a server that
     /// ignores it raises PdfError with an "http:" message). Coroutine
-    /// resolving to an AsyncDocument.
+    /// resolving to an AsyncDocument. `password` opens an encrypted file,
+    /// as the user or the owner password.
     #[staticmethod]
-    fn open_url(py: Python<'_>, url: String) -> PyResult<Bound<'_, PyAny>> {
+    #[pyo3(signature = (url, *, password=String::new()))]
+    fn open_url(py: Python<'_>, url: String, password: String) -> PyResult<Bound<'_, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let inner = AioDocument::open_url(url).await.map_err(aio_err)?;
+            let inner = AioDocument::open_url_with_password(url, &password)
+                .await
+                .map_err(aio_err)?;
             Ok(AsyncDocument { inner })
         })
     }
