@@ -369,6 +369,93 @@ fn inside(wind: i32, rule: FillRule) -> bool {
     }
 }
 
+/// The separable blend modes this rasterizer paints (ISO 32000-1
+/// §11.3.5.2), plus `Normal`. The non-separable four (Hue, Saturation,
+/// Color, Luminosity) are recognized by the executor and reported instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+}
+
+impl BlendMode {
+    /// The blended source color `B(Cb, Cs)` for one pixel, in RGBA8 terms.
+    /// The page backdrop is always opaque here, so compositing stays
+    /// `(1 − αs)·Cb + αs·B(Cb, Cs)` — the caller feeds this through the
+    /// ordinary source-over composite in place of the raw source.
+    pub(crate) fn blend(self, cb: [u8; 3], cs: [u8; 3]) -> [u8; 3] {
+        if self == BlendMode::Normal {
+            return cs;
+        }
+        let mut out = [0u8; 3];
+        for i in 0..3 {
+            let b = cb[i] as f32 / 255.0;
+            let s = cs[i] as f32 / 255.0;
+            let v = match self {
+                BlendMode::Normal => s,
+                BlendMode::Multiply => b * s,
+                BlendMode::Screen => b + s - b * s,
+                BlendMode::Overlay => hard_light(s, b),
+                BlendMode::Darken => b.min(s),
+                BlendMode::Lighten => b.max(s),
+                BlendMode::ColorDodge => {
+                    if s >= 1.0 {
+                        1.0
+                    } else {
+                        (b / (1.0 - s)).min(1.0)
+                    }
+                }
+                BlendMode::ColorBurn => {
+                    if s <= 0.0 {
+                        0.0
+                    } else {
+                        1.0 - ((1.0 - b) / s).min(1.0)
+                    }
+                }
+                BlendMode::HardLight => hard_light(b, s),
+                BlendMode::SoftLight => {
+                    let d = if b <= 0.25 {
+                        ((16.0 * b - 12.0) * b + 4.0) * b
+                    } else {
+                        b.sqrt()
+                    };
+                    if s <= 0.5 {
+                        b - (1.0 - 2.0 * s) * b * (1.0 - b)
+                    } else {
+                        b + (2.0 * s - 1.0) * (d - b)
+                    }
+                }
+                BlendMode::Difference => (b - s).abs(),
+                BlendMode::Exclusion => b + s - 2.0 * b * s,
+            };
+            out[i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        }
+        out
+    }
+}
+
+/// `HardLight(Cb, Cs)` per §11.3.5.2; `Overlay` is the same with the
+/// operands swapped.
+fn hard_light(b: f32, s: f32) -> f32 {
+    if s <= 0.5 {
+        b * (2.0 * s)
+    } else {
+        let s2 = 2.0 * s - 1.0;
+        b + s2 - b * s2
+    }
+}
+
 /// Composites `rgb` at alpha `a` (0..=1) over one straight-alpha RGBA8
 /// pixel using the source-over rule.
 fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
@@ -398,6 +485,7 @@ pub(crate) fn fill_path(
     rgba: [u8; 4],
     alpha: f32,
     clip: Option<&Mask>,
+    blend: BlendMode,
 ) {
     let alpha = if alpha.is_finite() {
         alpha.clamp(0.0, 1.0)
@@ -423,12 +511,22 @@ pub(crate) fn fill_path(
                 continue;
             }
             let off = (base + x) * 4;
-            if a >= 1.0 {
+            let dst = &mut pix.data[off..off + 4];
+            // A non-Normal blend derives the effective source color from
+            // the backdrop pixel, so neither branch below may shortcut it.
+            let rgb = if blend == BlendMode::Normal {
+                rgb
+            } else {
+                blend.blend([dst[0], dst[1], dst[2]], rgb)
+            };
+            if a >= 1.0 && blend == BlendMode::Normal {
                 // Fully covered by an opaque source: the source-over result
                 // is exactly the source color, so skip the per-pixel divide.
-                pix.data[off..off + 4].copy_from_slice(&opaque);
+                dst.copy_from_slice(&opaque);
+            } else if a >= 1.0 {
+                dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
             } else {
-                composite_over(&mut pix.data[off..off + 4], rgb, a);
+                composite_over(dst, rgb, a);
             }
         }
     });
@@ -466,7 +564,15 @@ mod tests {
     fn axis_aligned_rect_exact_interior() {
         let mut pix = Pixmap::new(10, 10);
         let polys = [rect_poly(2.0, 2.0, 8.0, 8.0)];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         for y in 0..10 {
             for x in 0..10 {
                 let inside = (2..8).contains(&x) && (2..8).contains(&y);
@@ -483,7 +589,15 @@ mod tests {
     fn half_pixel_horizontal_edge_antialiases() {
         let mut pix = Pixmap::new(10, 10);
         let polys = [rect_poly(2.5, 2.0, 8.0, 8.0)];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         let a = alpha_at(&pix, 2, 4);
         assert!((127..=129).contains(&a), "edge alpha {a}");
         assert_eq!(alpha_at(&pix, 3, 4), 255);
@@ -494,7 +608,15 @@ mod tests {
     fn half_pixel_vertical_edge_antialiases() {
         let mut pix = Pixmap::new(10, 10);
         let polys = [rect_poly(2.0, 2.5, 8.0, 8.0)];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         let a = alpha_at(&pix, 4, 2);
         assert!((115..=140).contains(&a), "edge alpha {a}");
         assert_eq!(alpha_at(&pix, 4, 3), 255);
@@ -512,7 +634,15 @@ mod tests {
             ],
             closed: true,
         };
-        fill_path(&mut pix, &[tri], FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &[tri],
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         assert_eq!(alpha_at(&pix, 5, 4), 255, "interior");
         assert_eq!(alpha_at(&pix, 4, 2), 255, "interior near top");
         assert_eq!(alpha_at(&pix, 0, 5), 0, "left of triangle");
@@ -527,7 +657,15 @@ mod tests {
             rect_poly(1.0, 1.0, 11.0, 11.0),
             rect_poly(4.0, 4.0, 8.0, 8.0),
         ];
-        fill_path(&mut pix, &polys, FillRule::EvenOdd, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::EvenOdd,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         assert_eq!(alpha_at(&pix, 6, 6), 0, "hole must be empty");
         assert_eq!(alpha_at(&pix, 2, 6), 255, "ring left");
         assert_eq!(alpha_at(&pix, 9, 6), 255, "ring right");
@@ -543,7 +681,15 @@ mod tests {
             rect_poly(1.0, 1.0, 11.0, 11.0),
             rect_poly(4.0, 4.0, 8.0, 8.0),
         ];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         assert_eq!(alpha_at(&pix, 6, 6), 255, "center filled under nonzero");
         assert_eq!(alpha_at(&pix, 2, 6), 255, "ring");
         assert_eq!(alpha_at(&pix, 0, 6), 0, "outside");
@@ -562,7 +708,15 @@ mod tests {
             closed: true,
         };
         let polys = [rect_poly(1.0, 1.0, 11.0, 11.0), inner];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         assert_eq!(alpha_at(&pix, 6, 6), 0, "reversed inner rect punches hole");
         assert_eq!(alpha_at(&pix, 2, 6), 255, "ring");
     }
@@ -572,7 +726,15 @@ mod tests {
         let mut pix = Pixmap::new(10, 10);
         let clip = Mask::from_path(10, 10, &[rect_poly(0.0, 0.0, 5.0, 10.0)], FillRule::NonZero);
         let polys = [rect_poly(0.0, 0.0, 10.0, 10.0)];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 1.0, Some(&clip));
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            1.0,
+            Some(&clip),
+            BlendMode::Normal,
+        );
         for y in 0..10 {
             for x in 0..10 {
                 if x < 5 {
@@ -680,7 +842,15 @@ mod tests {
         let mut pix = Pixmap::new(4, 4);
         pix.fill([255, 255, 255, 255]);
         let polys = [rect_poly(0.0, 0.0, 4.0, 4.0)];
-        fill_path(&mut pix, &polys, FillRule::NonZero, RED, 0.5, None);
+        fill_path(
+            &mut pix,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            0.5,
+            None,
+            BlendMode::Normal,
+        );
         let px = rgba_at(&pix, 2, 2);
         assert_eq!(px[0], 255);
         assert!((127..=129).contains(&px[1]), "green {}", px[1]);
@@ -699,7 +869,15 @@ mod tests {
             ],
             closed: false,
         };
-        fill_path(&mut pix, &[tri], FillRule::NonZero, RED, 1.0, None);
+        fill_path(
+            &mut pix,
+            &[tri],
+            FillRule::NonZero,
+            RED,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
         assert_eq!(alpha_at(&pix, 5, 4), 255);
     }
 }
