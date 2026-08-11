@@ -41,19 +41,20 @@ impl Input {
     /// `Display` prefixed by layer ("parse:", "io:", "http:"), so the sync
     /// local path prefixes its own `std::io::Error` and
     /// `pdfboss_core::Error` the same way, for the equivalent failure.
-    pub fn open(spec: &str) -> Result<Input, String> {
+    pub fn open_with_password(spec: &str, password: &str) -> Result<Input, String> {
         if is_url(spec) {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?;
             let doc = rt
-                .block_on(AsyncDocument::open_url(spec))
+                .block_on(AsyncDocument::open_url_with_password(spec, password))
                 .map_err(|e| e.to_string())?;
             Ok(Input::Remote { rt, doc })
         } else {
             let bytes = std::fs::read(spec).map_err(|e| format!("{spec}: io: {e}"))?;
-            let doc = Document::load(bytes).map_err(|e| format!("parse: {e}"))?;
+            let doc =
+                Document::load_with_password(bytes, password).map_err(|e| format!("parse: {e}"))?;
             Ok(Input::Local { doc })
         }
     }
@@ -205,7 +206,7 @@ mod tests {
 
     #[test]
     fn local_open_collects_header_first() {
-        let input = Input::open(&fixture("hello.pdf")).expect("fixture opens");
+        let input = Input::open_with_password(&fixture("hello.pdf"), "").expect("fixture opens");
         let elements = input.collect_elements(physical_opts());
         assert!(!elements.is_empty(), "no elements from hello.pdf");
         assert!(
@@ -216,7 +217,7 @@ mod tests {
 
     #[test]
     fn local_read_span_and_file_len() {
-        let input = Input::open(&fixture("hello.pdf")).expect("fixture opens");
+        let input = Input::open_with_password(&fixture("hello.pdf"), "").expect("fixture opens");
         let len = input.file_len();
         assert!(len > 0);
         let head = input
@@ -238,7 +239,7 @@ mod tests {
         // implement `Debug`, which it cannot (it embeds a
         // `tokio::runtime::Runtime` and an `AsyncDocument` wrapping a `dyn
         // Backend`, neither `Debug`). Match directly instead.
-        let err = match Input::open("definitely-not-here.pdf") {
+        let err = match Input::open_with_password("definitely-not-here.pdf", "") {
             Ok(_) => panic!("expected missing file to error"),
             Err(e) => e,
         };

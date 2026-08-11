@@ -66,11 +66,17 @@ enum Command {
     Info {
         /// Path to the PDF file.
         file: PathBuf,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
     },
     /// Extract text (all pages separated by form feed unless --page is given).
     Text {
         /// Path to the PDF file.
         file: PathBuf,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         /// 1-based page number.
         #[arg(long)]
         page: Option<usize>,
@@ -79,6 +85,9 @@ enum Command {
     Md {
         /// Path to the PDF file.
         file: PathBuf,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         /// 1-based page number (heading sizes are then judged per page,
         /// not across the document).
         #[arg(long)]
@@ -88,6 +97,9 @@ enum Command {
     Render {
         /// Path to the PDF file.
         file: PathBuf,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         /// 1-based page number.
         #[arg(long)]
         page: usize,
@@ -110,24 +122,29 @@ enum Command {
     Obj {
         /// Path to the PDF file.
         file: PathBuf,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         /// Object number.
         num: u32,
         /// Generation number (default 0).
         gen: Option<u16>,
     },
     /// Explore a PDF interactively in the terminal.
-    ///
-    /// Encrypted PDFs are not yet supported over this path (they are
-    /// rejected at open, even under the empty user password that
-    /// `info`/`text`/`render`/`obj` accept).
     Tui {
         /// Path or http(s) URL of the PDF.
         target: String,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
     },
     /// Dump the document as a JSON value tree (for piping to external tools).
     Json {
         /// Path or http(s) URL of the PDF.
         input: String,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         /// Embed raw (still encoded) stream data as base64.
         #[arg(long, conflicts_with = "decode")]
         raw: bool,
@@ -151,6 +168,9 @@ enum Command {
     Hex {
         /// Path or http(s) URL of the PDF.
         input: String,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         // Not a real intra-doc link: `[,G]` is the CLI's own bracket
         // notation for an optional generation number, not markdown link
         // syntax, but rustdoc parses it as one.
@@ -170,6 +190,9 @@ enum Command {
     Q {
         /// Path or http(s) URL of the PDF.
         input: String,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
         /// jq program, e.g. '.objects["12 0"]'.
         program: String,
         /// Embed raw (still encoded) stream data as base64.
@@ -222,9 +245,17 @@ impl FontsArg {
 fn main() {
     let cli = Cli::parse();
     let result: Result<(), Failure> = match cli.command {
-        Command::Info { file } => cmd_info(&file).map_err(Failure::from),
-        Command::Text { file, page } => cmd_text(&file, page).map_err(Failure::from),
-        Command::Md { file, page } => cmd_md(&file, page).map_err(Failure::from),
+        Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
+        Command::Text {
+            file,
+            page,
+            password,
+        } => cmd_text(&file, page, &password).map_err(Failure::from),
+        Command::Md {
+            file,
+            page,
+            password,
+        } => cmd_md(&file, page, &password).map_err(Failure::from),
         Command::Render {
             file,
             page,
@@ -232,11 +263,15 @@ fn main() {
             scale,
             fonts,
             font_dir,
-        } => cmd_render(&file, page, out, scale, fonts, font_dir).map_err(Failure::from),
-        Command::Obj { file, num, gen } => {
-            cmd_obj(&file, num, gen.unwrap_or(0)).map_err(Failure::from)
-        }
-        Command::Tui { target } => cmd_tui(&target).map_err(Failure::from),
+            password,
+        } => cmd_render(&file, page, out, scale, fonts, font_dir, &password).map_err(Failure::from),
+        Command::Obj {
+            file,
+            num,
+            gen,
+            password,
+        } => cmd_obj(&file, num, gen.unwrap_or(0), &password).map_err(Failure::from),
+        Command::Tui { target, password } => cmd_tui(&target, &password).map_err(Failure::from),
         Command::Json {
             input,
             raw,
@@ -245,6 +280,7 @@ fn main() {
             no_logical,
             content_ops,
             layout,
+            password,
         } => {
             let flags = q::value::TreeFlags {
                 raw,
@@ -253,14 +289,16 @@ fn main() {
                 no_logical,
                 content_ops,
             };
-            json::cmd_json(&input, &flags, layout).map_err(Failure::from)
+            json::cmd_json(&input, &flags, layout, &password).map_err(Failure::from)
         }
         Command::Hex {
             input,
             selector,
             annotate,
             width,
-        } => hexdump::cmd_hex(&input, selector.as_deref(), annotate, width).map_err(Failure::from),
+            password,
+        } => hexdump::cmd_hex(&input, selector.as_deref(), annotate, width, &password)
+            .map_err(Failure::from),
         Command::Q {
             input,
             program,
@@ -271,6 +309,7 @@ fn main() {
             pages,
             no_logical,
             content_ops,
+            password,
         } => {
             let flags = q::value::TreeFlags {
                 raw,
@@ -279,7 +318,7 @@ fn main() {
                 no_logical,
                 content_ops,
             };
-            q::run::cmd_q(&input, &program, &flags, hex, raw_strings)
+            q::run::cmd_q(&input, &program, &flags, hex, raw_strings, &password)
         }
     };
     if let Err(failure) = result {
@@ -292,8 +331,8 @@ fn main() {
 /// sizes and the metadata table. Encrypted documents still report
 /// successfully (with `encrypted: true`) since that is the very thing the
 /// user is asking about.
-fn cmd_info(file: &Path) -> Result<(), String> {
-    match Document::open(file) {
+fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
+    match Document::open_with_password(file, password) {
         Ok(doc) => {
             let sizes: Vec<Option<(f32, f32)>> = (0..doc.page_count())
                 .map(|i| doc.page(i).ok().map(|p| p.size()))
@@ -392,8 +431,8 @@ fn scan_version(data: &[u8]) -> Option<(u8, u8)> {
 /// form feed. Extraction is lenient — content that will not read yields
 /// no text rather than an error — so anything skipped is surfaced as a
 /// stderr warning instead of vanishing.
-fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
-    let doc = Document::open(file).map_err(|e| e.to_string())?;
+fn cmd_text(file: &Path, page: Option<usize>, password: &str) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
@@ -433,8 +472,8 @@ fn cmd_text(file: &Path, page: Option<usize>) -> Result<(), String> {
 /// Markdown -- headings, lists and pipe/HTML tables inferred from layout.
 /// Heading sizes rank against the whole document unless `--page` narrows to
 /// one page, whose sizes are then judged only against themselves.
-fn cmd_md(file: &Path, page: Option<usize>) -> Result<(), String> {
-    let doc = Document::open(file).map_err(|e| e.to_string())?;
+fn cmd_md(file: &Path, page: Option<usize>, password: &str) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
@@ -508,12 +547,13 @@ fn cmd_render(
     scale: f32,
     fonts: FontsArg,
     font_dir: Option<PathBuf>,
+    password: &str,
 ) -> Result<(), String> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
     }
     let substitutes = substitute_source(fonts, font_dir)?;
-    let doc = Document::open(file).map_err(|e| e.to_string())?;
+    let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let index = page_index(page, doc.page_count())?;
     let p = doc.page(index).map_err(|e| e.to_string())?;
     let opts = pdfboss_render::RenderOptions {
@@ -550,8 +590,8 @@ fn cmd_render(
 
 /// `pdfboss obj`: pretty-prints one indirect object. Stream objects print
 /// their dictionary plus a decoded-length note instead of raw bytes.
-fn cmd_obj(file: &Path, num: u32, gen: u16) -> Result<(), String> {
-    let doc = Document::open(file).map_err(|e| e.to_string())?;
+fn cmd_obj(file: &Path, num: u32, gen: u16, password: &str) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let obj = doc.get(ObjRef { num, gen }).map_err(|e| e.to_string())?;
     match &obj {
         Object::Stream(s) => {
@@ -569,13 +609,13 @@ fn cmd_obj(file: &Path, num: u32, gen: u16) -> Result<(), String> {
 /// `pdfboss tui`: interactive explorer over a local file or an http(s)
 /// URL, on a current-thread tokio runtime (rasterization uses the
 /// runtime's blocking pool; the loop itself is single-threaded).
-fn cmd_tui(target: &str) -> Result<(), String> {
+fn cmd_tui(target: &str, password: &str) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async {
-        let doc = open_async_document(target).await?;
+        let doc = open_async_document(target, password).await?;
         pdfboss_tui::run(doc, display_title(target))
             .await
             .map_err(|e| e.to_string())
@@ -592,13 +632,16 @@ fn cmd_tui(target: &str) -> Result<(), String> {
 /// `std::io::Error` failures: without it, a missing file or bad URL surfaces
 /// only the layer-prefixed message ("io: No such file or directory") with
 /// no indication of which target failed to open.
-async fn open_async_document(target: &str) -> Result<pdfboss_aio::AsyncDocument, String> {
+async fn open_async_document(
+    target: &str,
+    password: &str,
+) -> Result<pdfboss_aio::AsyncDocument, String> {
     if is_url(target) {
-        return pdfboss_aio::AsyncDocument::open_url(target)
+        return pdfboss_aio::AsyncDocument::open_url_with_password(target, password)
             .await
             .map_err(|e| format!("{target}: {e}"));
     }
-    pdfboss_aio::AsyncDocument::open(target)
+    pdfboss_aio::AsyncDocument::open_with_password(target, password)
         .await
         .map_err(|e| format!("{target}: {e}"))
 }
@@ -842,6 +885,7 @@ mod tests {
             no_logical,
             content_ops,
             layout,
+            password: _,
         } = cli.command
         else {
             panic!("expected json command");
@@ -863,7 +907,7 @@ mod tests {
     #[test]
     fn md_subcommand_parses_page_flag() {
         let cli = Cli::parse_from(["pdfboss", "md", "in.pdf", "--page", "2"]);
-        let Command::Md { file, page } = cli.command else {
+        let Command::Md { file, page, .. } = cli.command else {
             panic!("expected md command");
         };
         assert_eq!(file, PathBuf::from("in.pdf"));
@@ -895,6 +939,7 @@ mod tests {
             selector,
             annotate,
             width,
+            password: _,
         } = cli.command
         else {
             panic!("expected hex command");
@@ -929,7 +974,7 @@ mod tests {
     #[test]
     fn tui_subcommand_parses() {
         let cli = Cli::parse_from(["pdfboss", "tui", "in.pdf"]);
-        let Command::Tui { target } = cli.command else {
+        let Command::Tui { target, .. } = cli.command else {
             panic!("expected tui command");
         };
         assert_eq!(target, "in.pdf");

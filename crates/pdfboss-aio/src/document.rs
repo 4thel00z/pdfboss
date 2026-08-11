@@ -627,8 +627,18 @@ impl AsyncDocument {
     /// synchronous document decrypts them; a file that requires a real
     /// password is rejected with [`pdfboss_core::Error::Encrypted`].
     pub async fn open(path: impl AsRef<Path>) -> Result<AsyncDocument> {
+        AsyncDocument::open_with_password(path, "").await
+    }
+
+    /// [`AsyncDocument::open`] with the password that opens the file,
+    /// accepted as either the user or the owner password — the async twin
+    /// of [`pdfboss_core::Document::open_with_password`].
+    pub async fn open_with_password(
+        path: impl AsRef<Path>,
+        password: &str,
+    ) -> Result<AsyncDocument> {
         let backend = FileBackend::open(path).await.map_err(Error::from)?;
-        AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend))).await
+        AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend)), password).await
     }
 
     /// Opens an in-memory document through an uncached [`MemBackend`].
@@ -637,7 +647,16 @@ impl AsyncDocument {
     /// [`AsyncDocument::open`]; a required password is rejected with
     /// [`pdfboss_core::Error::Encrypted`].
     pub async fn from_bytes(bytes: impl Into<Bytes>) -> Result<AsyncDocument> {
-        AsyncDocument::from_arc(Arc::new(MemBackend::from(bytes.into()))).await
+        AsyncDocument::from_bytes_with_password(bytes, "").await
+    }
+
+    /// [`AsyncDocument::from_bytes`] with the password that opens the file,
+    /// accepted as either the user or the owner password.
+    pub async fn from_bytes_with_password(
+        bytes: impl Into<Bytes>,
+        password: &str,
+    ) -> Result<AsyncDocument> {
+        AsyncDocument::from_arc(Arc::new(MemBackend::from(bytes.into())), password).await
     }
 
     /// Opens a document over any backend, as-is (no cache is added).
@@ -646,7 +665,7 @@ impl AsyncDocument {
     /// [`AsyncDocument::open`]; a required password is rejected with
     /// [`pdfboss_core::Error::Encrypted`].
     pub async fn with_backend(backend: impl Backend) -> Result<AsyncDocument> {
-        AsyncDocument::from_arc(Arc::new(backend)).await
+        AsyncDocument::from_arc(Arc::new(backend), "").await
     }
 
     /// Opens a remote document over HTTP range requests, wrapped in a
@@ -657,12 +676,22 @@ impl AsyncDocument {
     /// [`pdfboss_core::Error::Encrypted`].
     #[cfg(feature = "http")]
     pub async fn open_url(url: impl reqwest::IntoUrl) -> Result<AsyncDocument> {
+        AsyncDocument::open_url_with_password(url, "").await
+    }
+
+    /// [`AsyncDocument::open_url`] with the password that opens the file,
+    /// accepted as either the user or the owner password.
+    #[cfg(feature = "http")]
+    pub async fn open_url_with_password(
+        url: impl reqwest::IntoUrl,
+        password: &str,
+    ) -> Result<AsyncDocument> {
         let backend = crate::backend::HttpBackend::new(url).await?;
-        AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend))).await
+        AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend)), password).await
     }
 
     /// The open flow: header window → tail scan → xref chain → indexes.
-    async fn from_arc(backend: Arc<dyn Backend>) -> Result<AsyncDocument> {
+    async fn from_arc(backend: Arc<dyn Backend>, password: &str) -> Result<AsyncDocument> {
         let file_len = backend.len().await.map_err(Error::from)?;
         let fetcher = Fetcher {
             backend: Arc::clone(&backend),
@@ -692,7 +721,7 @@ impl AsyncDocument {
             inner: Arc::new(inner),
         };
         if encrypted {
-            doc.setup_decryption().await?;
+            doc.setup_decryption(password).await?;
         }
         let pages = doc.flatten_pages().await;
         doc.inner
@@ -704,12 +733,13 @@ impl AsyncDocument {
 
     /// Configures decryption for an encrypted file, mirroring the
     /// synchronous document: the Standard handler with RC4 (`/V` 1-2),
-    /// AESV2 (`/V` 4) and AESV3 (`/V` 5) under the empty user password; a
-    /// required password is reported as
-    /// [`pdfboss_core::Error::Encrypted`]. Runs before any content object
-    /// is fetched, and reads `/Encrypt` and `/ID` while decryption is still
-    /// off — both are stored unencrypted.
-    async fn setup_decryption(&self) -> Result<()> {
+    /// AESV2 (`/V` 4) and AESV3 (`/V` 5), with `password` accepted as the
+    /// user or the owner password (the empty string is the transparent
+    /// empty-user-password case); a password the file does not accept is
+    /// reported as [`pdfboss_core::Error::Encrypted`]. Runs before any
+    /// content object is fetched, and reads `/Encrypt` and `/ID` while
+    /// decryption is still off — both are stored unencrypted.
+    async fn setup_decryption(&self, password: &str) -> Result<()> {
         let enc_obj = self
             .inner
             .xref
@@ -731,7 +761,7 @@ impl AsyncDocument {
             .and_then(Object::as_str_bytes)
             .unwrap_or(&[])
             .to_vec();
-        match pdfboss_core::Decryptor::from_standard(enc_dict, &id0) {
+        match pdfboss_core::Decryptor::from_standard_with_password_str(enc_dict, &id0, password) {
             Some(dec) => {
                 self.inner
                     .decryptor

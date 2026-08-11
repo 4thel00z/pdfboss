@@ -1,9 +1,10 @@
-//! Decryption for the Standard security handler (ISO 32000 §7.6) opened with
-//! the empty user password.
+//! Decryption for the Standard security handler (ISO 32000 §7.6), opened
+//! with the user or the owner password (the empty user password opens
+//! transparently).
 //!
 //! Handles RC4 (`/V` 1–2, `/R` 2–3, 40–128-bit), AESV2 (`/V` 4, 128-bit
-//! AES-CBC) and AESV3 (`/V` 5, `/R` 5–6, 256-bit AES-CBC). Documents that need
-//! a real password are reported as encrypted-and-unsupported by the caller. The
+//! AES-CBC) and AESV3 (`/V` 5, `/R` 5–6, 256-bit AES-CBC). Documents whose
+//! password the caller does not supply are reported as encrypted. The
 //! primitives — MD5, RC4, AES and the SHA-2 family — are implemented here from
 //! their published specifications so the crate needs no cryptographic
 //! dependency.
@@ -32,8 +33,7 @@ enum Cipher {
     Aesv3,
 }
 
-/// A configured Standard-handler decryptor for a document opened with the empty
-/// user password.
+/// A configured Standard-handler decryptor for an opened document.
 #[derive(Clone)]
 pub struct Decryptor {
     /// The file key (`n` bytes for RC4/AESV2, 32 for AESV3).
@@ -58,6 +58,36 @@ impl Decryptor {
     /// assert!(Decryptor::from_standard(&Dict::default(), &[]).is_none());
     /// ```
     pub fn from_standard(enc: &Dict, id0: &[u8]) -> Option<Decryptor> {
+        Decryptor::from_standard_with_password(enc, id0, b"")
+    }
+
+    /// [`Decryptor::from_standard_with_password`] for a text password: the
+    /// UTF-8 bytes are tried first and, when they differ and every char
+    /// fits, the Latin-1 bytes as well — the legacy revisions hash raw
+    /// bytes without naming an encoding, and real files use both.
+    pub fn from_standard_with_password_str(
+        enc: &Dict,
+        id0: &[u8],
+        password: &str,
+    ) -> Option<Decryptor> {
+        let dec = Decryptor::from_standard_with_password(enc, id0, password.as_bytes());
+        if dec.is_some() || password.is_ascii() || password.chars().any(|c| (c as u32) > 255) {
+            return dec;
+        }
+        let latin1: Vec<u8> = password.chars().map(|c| c as u8).collect();
+        Decryptor::from_standard_with_password(enc, id0, &latin1)
+    }
+
+    /// [`Decryptor::from_standard`] with a caller-supplied password, tried
+    /// first as the user password and then as the owner password (which
+    /// recovers the user-level key, ISO 32000 §7.6.3.4 Algorithm 7 for the
+    /// RC4/AES-128 revisions, §7.6.4.3.3 for AES-256). `None` when the
+    /// password opens nothing.
+    pub fn from_standard_with_password(
+        enc: &Dict,
+        id0: &[u8],
+        password: &[u8],
+    ) -> Option<Decryptor> {
         if enc.get_name("Filter").map(|n| n.0.as_str()) != Some("Standard") {
             return None;
         }
@@ -71,20 +101,15 @@ impl Decryptor {
                 } else {
                     (enc.get_int("Length").unwrap_or(40) / 8).clamp(5, 16) as usize
                 };
-                let key = md5_file_key(enc, id0, r, n)?;
-                let u = enc.get("U").and_then(Object::as_str_bytes)?;
-                verify_user_password(&key, r, id0, u).then_some(Decryptor {
+                let key = rc4_family_key(enc, id0, r, n, password)?;
+                Some(Decryptor {
                     key,
                     cipher: Cipher::Rc4,
                 })
             }
             // V4: 128-bit key, cipher chosen by the standard crypt filter.
             (4, 4) => {
-                let key = md5_file_key(enc, id0, r, 16)?;
-                let u = enc.get("U").and_then(Object::as_str_bytes)?;
-                if !verify_user_password(&key, r, id0, u) {
-                    return None;
-                }
+                let key = rc4_family_key(enc, id0, r, 16, password)?;
                 let cipher = match crypt_filter_method(enc)?.as_str() {
                     "AESV2" => Cipher::Aesv2,
                     "V2" => Cipher::Rc4,
@@ -93,7 +118,7 @@ impl Decryptor {
                 Some(Decryptor { key, cipher })
             }
             // V5: AES-256 with SHA-2-based key derivation.
-            (5, 5 | 6) => aesv3_key(enc, r).map(|key| Decryptor {
+            (5, 5 | 6) => aesv3_key(enc, r, password).map(|key| Decryptor {
                 key,
                 cipher: Cipher::Aesv3,
             }),
@@ -183,15 +208,66 @@ fn crypt_filter_method(enc: &Dict) -> Option<String> {
     Some(filter.get_name("CFM")?.0.clone())
 }
 
-/// Algorithm 2: derive the RC4/AESV2 file key from the empty user password.
-fn md5_file_key(enc: &Dict, id0: &[u8], r: i64, n: usize) -> Option<Vec<u8>> {
+/// Pads or truncates a password to the 32 bytes every legacy algorithm
+/// hashes (ISO 32000 §7.6.3.3, Algorithm 2 step (a)). The empty password
+/// pads to [`PAD`] itself.
+fn pad_password(password: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = password.len().min(32);
+    out[..n].copy_from_slice(&password[..n]);
+    out[n..].copy_from_slice(&PAD[..32 - n]);
+    out
+}
+
+/// The RC4/AESV2 file key `password` actually opens: tried as the user
+/// password (Algorithm 2 + the `/U` check), then as the owner password
+/// (Algorithm 7: the owner key decrypts `/O` back into the padded user
+/// password, which must then verify like any user password).
+fn rc4_family_key(enc: &Dict, id0: &[u8], r: i64, n: usize, password: &[u8]) -> Option<Vec<u8>> {
+    let u = enc.get("U").and_then(Object::as_str_bytes)?;
+    if let Some(key) = md5_file_key(enc, id0, r, n, &pad_password(password)) {
+        if verify_user_password(&key, r, id0, u) {
+            return Some(key);
+        }
+    }
+    // Owner attempt. The owner key comes from the owner password alone
+    // (Algorithm 3 steps (a)-(d)); what it decrypts out of `/O` is the
+    // padded user password, ready for Algorithm 2 verbatim.
+    let o = enc.get("O").and_then(Object::as_str_bytes)?;
+    if o.len() < 32 {
+        return None;
+    }
+    let mut d = md5(&pad_password(password));
+    if r >= 3 {
+        for _ in 0..50 {
+            d = md5(&d[..n]);
+        }
+    }
+    let okey = &d[..n];
+    let recovered = if r == 2 {
+        rc4(okey, &o[..32])
+    } else {
+        let mut x = o[..32].to_vec();
+        for i in (1u8..=19).rev() {
+            let keyed: Vec<u8> = okey.iter().map(|b| b ^ i).collect();
+            x = rc4(&keyed, &x);
+        }
+        rc4(okey, &x)
+    };
+    let padded: [u8; 32] = recovered.get(..32)?.try_into().ok()?;
+    let key = md5_file_key(enc, id0, r, n, &padded)?;
+    verify_user_password(&key, r, id0, u).then_some(key)
+}
+
+/// Algorithm 2: derive the RC4/AESV2 file key from a padded user password.
+fn md5_file_key(enc: &Dict, id0: &[u8], r: i64, n: usize, padded: &[u8; 32]) -> Option<Vec<u8>> {
     let o = enc.get("O").and_then(Object::as_str_bytes)?;
     if o.len() < 32 {
         return None;
     }
     let p = enc.get_int("P")?;
     let mut input = Vec::with_capacity(32 + 32 + 4 + id0.len() + 4);
-    input.extend_from_slice(&PAD); // padded empty password == the pad itself
+    input.extend_from_slice(padded);
     input.extend_from_slice(&o[..32]);
     input.extend_from_slice(&(p as i32 as u32).to_le_bytes()); // /P low 32 bits, LE
     input.extend_from_slice(id0);
@@ -673,22 +749,36 @@ fn sha384(input: &[u8]) -> Vec<u8> {
     h.iter().take(6).flat_map(|w| w.to_be_bytes()).collect()
 }
 
-/// Recovers the AES-256 file key for the empty user password (ISO 32000-2
-/// §7.6.4.3.3, Algorithm 2.A) for revisions 5 and 6.
-fn aesv3_key(enc: &Dict, r: i64) -> Option<Vec<u8>> {
+/// Recovers the AES-256 file key `password` opens (ISO 32000-2 §7.6.4.3.3,
+/// Algorithm 2.A) for revisions 5 and 6: as the user password against
+/// `/U`+`/UE`, then as the owner password against `/O`+`/OE` (whose hashes
+/// additionally salt in the first 48 bytes of `/U`). Passwords longer than
+/// the 127 UTF-8 bytes the algorithm defines are truncated.
+fn aesv3_key(enc: &Dict, r: i64, password: &[u8]) -> Option<Vec<u8>> {
+    let pw = &password[..password.len().min(127)];
     let u = enc.get("U").and_then(Object::as_str_bytes)?;
-    let ue = enc.get("UE").and_then(Object::as_str_bytes)?;
-    if u.len() < 48 || ue.len() < 32 {
+    if u.len() < 48 {
         return None;
     }
-    let validation_salt = &u[32..40];
-    let key_salt = &u[40..48];
-    let pw: &[u8] = b""; // empty user password
-    if hash_2b(r, pw, validation_salt, &[])[..32] != u[..32] {
-        return None; // empty password does not open the file
+    if let Some(ue) = enc.get("UE").and_then(Object::as_str_bytes) {
+        if ue.len() >= 32 && hash_2b(r, pw, &u[32..40], &[])[..32] == u[..32] {
+            let intermediate = hash_2b(r, pw, &u[40..48], &[]);
+            let file_key = aes_cbc_decrypt_blocks(&intermediate, &[0u8; 16], &ue[..32]);
+            if file_key.len() == 32 {
+                return Some(file_key);
+            }
+        }
     }
-    let intermediate = hash_2b(r, pw, key_salt, &[]);
-    let file_key = aes_cbc_decrypt_blocks(&intermediate, &[0u8; 16], &ue[..32]);
+    let o = enc.get("O").and_then(Object::as_str_bytes)?;
+    let oe = enc.get("OE").and_then(Object::as_str_bytes)?;
+    if o.len() < 48 || oe.len() < 32 {
+        return None;
+    }
+    if hash_2b(r, pw, &o[32..40], &u[..48])[..32] != o[..32] {
+        return None;
+    }
+    let intermediate = hash_2b(r, pw, &o[40..48], &u[..48]);
+    let file_key = aes_cbc_decrypt_blocks(&intermediate, &[0u8; 16], &oe[..32]);
     (file_key.len() == 32).then_some(file_key)
 }
 
@@ -836,20 +926,22 @@ mod tests {
     }
 
     // --- End-to-end fixture: build a V2/R3 (128-bit RC4) file encrypted under
-    // the empty password, then confirm the loader transparently decrypts it. ---
+    // caller-chosen user and owner passwords, then confirm the loader
+    // decrypts it — transparently for the empty user password, and through
+    // the password APIs for real ones. ---
 
     const N: usize = 16; // 128-bit key
     const P: i32 = -44;
     const ID0: &[u8] = b"0123456789abcdef";
 
-    /// `/O` for empty owner and user passwords (Algorithm 3, R3).
-    fn owner_entry() -> Vec<u8> {
-        let mut d = md5(&PAD);
+    /// `/O` for the given owner and user passwords (Algorithm 3, R3).
+    fn owner_entry(owner_pw: &[u8], user_pw: &[u8]) -> Vec<u8> {
+        let mut d = md5(&pad_password(owner_pw));
         for _ in 0..50 {
             d = md5(&d[..N]);
         }
         let rc4key = d[..N].to_vec();
-        let mut o = rc4(&rc4key, &PAD);
+        let mut o = rc4(&rc4key, &pad_password(user_pw));
         for i in 1u8..=19 {
             let k: Vec<u8> = rc4key.iter().map(|b| b ^ i).collect();
             o = rc4(&k, &o);
@@ -857,10 +949,10 @@ mod tests {
         o
     }
 
-    /// File key from `/O` for the empty user password (Algorithm 2, R3).
-    fn file_key(o: &[u8]) -> Vec<u8> {
+    /// File key from `/O` for the given user password (Algorithm 2, R3).
+    fn file_key(o: &[u8], user_pw: &[u8]) -> Vec<u8> {
         let mut input = Vec::new();
-        input.extend_from_slice(&PAD);
+        input.extend_from_slice(&pad_password(user_pw));
         input.extend_from_slice(o);
         input.extend_from_slice(&(P as u32).to_le_bytes());
         input.extend_from_slice(ID0);
@@ -871,7 +963,7 @@ mod tests {
         d[..N].to_vec()
     }
 
-    /// `/U` for the empty user password (Algorithm 5, R3).
+    /// `/U` for the given file key (Algorithm 5, R3).
     fn user_entry(key: &[u8]) -> Vec<u8> {
         let mut input = Vec::new();
         input.extend_from_slice(&PAD);
@@ -903,9 +995,17 @@ mod tests {
     }
 
     fn encrypted_fixture(u_override: Option<Vec<u8>>) -> Vec<u8> {
+        encrypted_fixture_with(b"", b"", u_override)
+    }
+
+    fn encrypted_fixture_with(
+        user_pw: &[u8],
+        owner_pw: &[u8],
+        u_override: Option<Vec<u8>>,
+    ) -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
-        let o = owner_entry();
-        let key = file_key(&o);
+        let o = owner_entry(owner_pw, user_pw);
+        let key = file_key(&o, user_pw);
         let u = u_override.unwrap_or_else(|| user_entry(&key));
 
         let msg = rc4(&obj_key(&key, 3, 0), b"Top secret message");
@@ -960,6 +1060,85 @@ mod tests {
         let bad_u = vec![0u8; 32];
         let err = Document::load(encrypted_fixture(Some(bad_u)));
         assert!(matches!(err, Err(Error::Encrypted)));
+    }
+
+    #[test]
+    fn real_user_password_opens_an_rc4_file() {
+        use crate::error::Error;
+        use crate::object::ObjRef;
+        use crate::Document;
+
+        let bytes = encrypted_fixture_with(b"hunter2", b"owner-secret", None);
+        assert!(
+            matches!(Document::load(bytes.clone()), Err(Error::Encrypted)),
+            "without the password the file stays closed"
+        );
+        let doc = Document::load_with_password(bytes, "hunter2").expect("user password opens");
+        let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+        let msg = obj3.as_dict().unwrap().get("Msg").unwrap();
+        assert_eq!(msg.as_str_bytes().unwrap(), b"Top secret message");
+    }
+
+    #[test]
+    fn owner_password_opens_an_rc4_file() {
+        use crate::object::ObjRef;
+        use crate::Document;
+
+        let bytes = encrypted_fixture_with(b"hunter2", b"owner-secret", None);
+        let doc =
+            Document::load_with_password(bytes, "owner-secret").expect("owner password opens");
+        let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+        let msg = obj3.as_dict().unwrap().get("Msg").unwrap();
+        assert_eq!(msg.as_str_bytes().unwrap(), b"Top secret message");
+    }
+
+    #[test]
+    fn wrong_password_stays_encrypted() {
+        use crate::error::Error;
+        use crate::Document;
+
+        let bytes = encrypted_fixture_with(b"hunter2", b"owner-secret", None);
+        let err = Document::load_with_password(bytes, "letmein");
+        assert!(matches!(err, Err(Error::Encrypted)));
+    }
+
+    #[test]
+    fn real_passwords_open_an_aes256_r6_file() {
+        use crate::error::Error;
+        use crate::object::ObjRef;
+        use crate::Document;
+
+        let bytes = encrypted_fixture_aesv3_with(6, "pässword".as_bytes(), b"owner-secret");
+        assert!(
+            matches!(Document::load(bytes.clone()), Err(Error::Encrypted)),
+            "without the password the file stays closed"
+        );
+        for pw in ["pässword", "owner-secret"] {
+            let doc = Document::load_with_password(bytes.clone(), pw)
+                .unwrap_or_else(|_| panic!("{pw:?} opens the file"));
+            let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+            let msg = obj3.as_dict().unwrap().get("Msg").unwrap();
+            assert_eq!(msg.as_str_bytes().unwrap(), b"AES-256 secret");
+        }
+        assert!(matches!(
+            Document::load_with_password(bytes, "letmein"),
+            Err(Error::Encrypted)
+        ));
+    }
+
+    #[test]
+    fn empty_password_files_still_open_through_the_password_api() {
+        use crate::object::ObjRef;
+        use crate::Document;
+
+        // Passing a password to an empty-password file must not break it:
+        // the empty user password still verifies... only if the caller's
+        // password IS empty; a random one is simply wrong for this file.
+        let doc = Document::load_with_password(encrypted_fixture(None), "")
+            .expect("the empty password opens through the password API too");
+        let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+        let msg = obj3.as_dict().unwrap().get("Msg").unwrap();
+        assert_eq!(msg.as_str_bytes().unwrap(), b"Top secret message");
     }
 
     #[test]
@@ -1056,8 +1235,8 @@ mod tests {
 
     fn encrypted_fixture_aesv2() -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
-        let o = owner_entry();
-        let key = file_key(&o); // R4 derivation matches R3 (EncryptMetadata true)
+        let o = owner_entry(b"", b"");
+        let key = file_key(&o, b""); // R4 derivation matches R3 (EncryptMetadata true)
         let u = user_entry(&key);
         let iv = [0x11u8; 16];
         let msg = aes_encrypt_pdf(&obj_key_aes(&key, 3, 0), b"Top secret message", &iv);
@@ -1105,15 +1284,27 @@ mod tests {
     // --- AESV3 (V5/R5 and R6) end-to-end fixture ---
 
     fn encrypted_fixture_aesv3(r: i64) -> Vec<u8> {
+        encrypted_fixture_aesv3_with(r, b"", b"")
+    }
+
+    fn encrypted_fixture_aesv3_with(r: i64, user_pw: &[u8], owner_pw: &[u8]) -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
         let key: Vec<u8> = (0u8..32).map(|i| i ^ 0x5a).collect(); // arbitrary 256-bit file key
         let vsalt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
         let ksalt: [u8; 8] = [9, 10, 11, 12, 13, 14, 15, 16];
-        let mut u = hash_2b(r, b"", &vsalt, &[]); // 32-byte validation hash
+        let mut u = hash_2b(r, user_pw, &vsalt, &[]); // 32-byte validation hash
         u.extend_from_slice(&vsalt);
         u.extend_from_slice(&ksalt);
-        let intermediate = hash_2b(r, b"", &ksalt, &[]);
+        let intermediate = hash_2b(r, user_pw, &ksalt, &[]);
         let ue = aes_cbc_encrypt_blocks(&intermediate, &[0u8; 16], &key);
+        // The owner hashes additionally salt in the first 48 bytes of /U.
+        let ovsalt: [u8; 8] = [21, 22, 23, 24, 25, 26, 27, 28];
+        let oksalt: [u8; 8] = [31, 32, 33, 34, 35, 36, 37, 38];
+        let mut o = hash_2b(r, owner_pw, &ovsalt, &u[..48]);
+        o.extend_from_slice(&ovsalt);
+        o.extend_from_slice(&oksalt);
+        let ointermediate = hash_2b(r, owner_pw, &oksalt, &u[..48]);
+        let oe = aes_cbc_encrypt_blocks(&ointermediate, &[0u8; 16], &key);
         let iv = [0x22u8; 16];
         let msg = aes_encrypt_pdf(&key, b"AES-256 secret", &iv);
         let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &iv);
@@ -1131,8 +1322,8 @@ mod tests {
                  /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>",
                 hexstr(&u),
                 hexstr(&ue),
-                hexstr(&[0u8; 48]),
-                hexstr(&[0u8; 32])
+                hexstr(&o),
+                hexstr(&oe)
             ),
         );
         let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));

@@ -50,7 +50,9 @@ class Document:
     """A loaded PDF document.
 
     Construct from exactly one of ``path`` or ``data``; passing neither or
-    both raises ``ValueError``.
+    both raises ``ValueError``. ``password`` opens an encrypted file, as
+    either the user or the owner password (the empty user password opens
+    transparently without one).
 
     Thread-safety: a ``Document`` (and any ``Page`` it hands out) may be
     used from any thread. Access to the underlying parsed document is
@@ -64,6 +66,7 @@ class Document:
         path: str | os.PathLike[str] | None = None,
         *,
         data: bytes | None = None,
+        password: str = "",
     ) -> None: ...
     @property
     def page_count(self) -> int:
@@ -197,11 +200,11 @@ class AsyncDocument:
     """
 
     @staticmethod
-    async def open(path: str | os.PathLike) -> "AsyncDocument": ...
+    async def open(path: str | os.PathLike, *, password: str = "") -> "AsyncDocument": ...
     @staticmethod
-    async def open_url(url: str) -> "AsyncDocument": ...
+    async def open_url(url: str, *, password: str = "") -> "AsyncDocument": ...
     @staticmethod
-    async def from_bytes(data: bytes) -> "AsyncDocument": ...
+    async def from_bytes(data: bytes, *, password: str = "") -> "AsyncDocument": ...
     @property
     def page_count(self) -> int: ...
     @property

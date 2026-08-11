@@ -342,6 +342,7 @@ pub fn cmd_hex(
     selector: Option<&str>,
     annotate: bool,
     width: usize,
+    password: &str,
 ) -> Result<(), String> {
     if width == 0 {
         return Err("--width must be at least 1".to_string());
@@ -350,7 +351,7 @@ pub fn cmd_hex(
         Some(s) => parse_selector(s)?,
         None => Selector::WholeFile,
     };
-    let input = Input::open(input_spec)?;
+    let input = Input::open_with_password(input_spec, password)?;
     let opts = ElementOpts {
         physical: true,
         logical: false,
@@ -593,8 +594,8 @@ mod tests {
         let path = fixture("hello.pdf");
         let len = std::fs::metadata(&path).expect("fixture exists").len();
         let selector = format!("range:0-{}", len + 1000);
-        let err =
-            cmd_hex(&path, Some(&selector), false, 16).expect_err("out-of-range range must fail");
+        let err = cmd_hex(&path, Some(&selector), false, 16, "")
+            .expect_err("out-of-range range must fail");
         assert!(
             err.contains(&len.to_string()),
             "error does not mention file length {len}: {err}"
