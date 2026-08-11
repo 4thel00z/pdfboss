@@ -35,6 +35,8 @@ pub(crate) struct DrawParams<'a> {
     /// Active blend mode; anything but `Normal` blends each sample with
     /// the backdrop pixel before compositing.
     pub blend: BlendMode,
+    /// Per-sample alpha from the image's `/SMask` or `/Mask`, if any.
+    pub smask: Option<&'a SampleMask>,
 }
 
 /// A decoded RGBA image, row 0 at the image's top edge (the `v = 1` side
@@ -301,6 +303,93 @@ fn sample_bits(data: &[u8], bit: usize, bpc: usize) -> u32 {
 /// already rounded up to whole bytes by both callers.
 fn short_of_samples(data: &[u8], row_bits: usize, height: usize) -> bool {
     data.len() < (row_bits / 8).saturating_mul(height)
+}
+
+/// Per-sample alpha applied to a base image at draw time: an `/SMask`'s
+/// gray samples, a `/Mask` stencil's paintable bits, or the inverse of a
+/// color-key `/Mask`'s matches — sampled nearest-neighbor in the image's
+/// unit square, so a mask whose dimensions differ from the base's still
+/// lands on the right pixels (§8.9.6.3).
+pub(crate) struct SampleMask {
+    width: usize,
+    height: usize,
+    /// Row-major alpha, row 0 at the image's top edge.
+    data: Vec<u8>,
+}
+
+impl SampleMask {
+    /// The mask's alpha at unit-square coordinates (`u` right, `v` up).
+    fn sample(&self, u: f32, v: f32) -> u8 {
+        let i = ((u * self.width as f32) as usize).min(self.width - 1);
+        let j = (((1.0 - v) * self.height as f32) as usize).min(self.height - 1);
+        self.data[j * self.width + i]
+    }
+}
+
+/// Decodes a mask image into per-sample alpha: an `/SMask`'s luminance
+/// (its gray sample IS the alpha, `/Decode` applied), or a `/Mask`
+/// stencil's paintable bits (sample 1 hides the base sample, §8.9.6.4 —
+/// which is exactly the stencil decode's transparent side).
+pub(crate) fn decode_alpha(meta: &ImageMeta, data: &[u8]) -> Option<SampleMask> {
+    let img = decode_rgba(meta, data, [255, 255, 255])?;
+    let (width, height) = (img.width, img.height);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let mut out = vec![0u8; width.checked_mul(height)?];
+    for j in 0..height {
+        for i in 0..width {
+            let px = img.at(i, j);
+            out[j * width + i] = if meta.stencil { px[3] } else { px[0] };
+        }
+    }
+    Some(SampleMask {
+        width,
+        height,
+        data: out,
+    })
+}
+
+/// Builds the alpha a color-key `/Mask` array describes: a sample whose
+/// every raw component lies inside its `[min, max]` range is transparent
+/// (§8.9.6.4). `None` when the base's samples cannot be walked here (a
+/// passed-through JPEG or JPEG 2000 codestream, or a stencil).
+pub(crate) fn color_key_mask(meta: &ImageMeta, data: &[u8], key: &[i64]) -> Option<SampleMask> {
+    if meta.dct || meta.jpx || meta.stencil {
+        return None;
+    }
+    let width = meta.width? as usize;
+    let height = meta.height? as usize;
+    if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM {
+        return None;
+    }
+    width.checked_mul(height).filter(|&n| n <= MAX_PIXELS)?;
+    let cs = meta.cs.as_ref().unwrap_or(&ColorSpace::DeviceGray);
+    let ncomp = cs.components().clamp(1, 8);
+    if key.len() < 2 * ncomp {
+        return None;
+    }
+    let bpc = match meta.bpc.map(|v| v as i64) {
+        Some(v @ (1 | 2 | 4 | 8 | 16)) => v as usize,
+        _ => 8,
+    };
+    let stride_bits = (ncomp * bpc * width).div_ceil(8) * 8;
+    let mut out = vec![0u8; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let base = y * stride_bits + x * ncomp * bpc;
+            let inside = (0..ncomp).all(|c| {
+                let v = i64::from(sample_bits(data, base + c * bpc, bpc));
+                v >= key[2 * c] && v <= key[2 * c + 1]
+            });
+            out[y * width + x] = if inside { 0 } else { 255 };
+        }
+    }
+    Some(SampleMask {
+        width,
+        height,
+        data: out,
+    })
 }
 
 /// Decodes an image's `data` to RGBA under its resolved metadata. Pure —
@@ -888,6 +977,9 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
             let j = (((1.0 - u.y) * img.height as f32) as usize).min(img.height - 1);
             let s = img.at(i, j);
             let mut a = f32::from(s[3]) / 255.0 * alpha;
+            if let Some(m) = p.smask {
+                a *= f32::from(m.sample(u.x, u.y)) / 255.0;
+            }
             if let Some(mask) = p.clip {
                 a *= f32::from(mask.coverage(px, py)) / 255.0;
             }
@@ -1548,6 +1640,7 @@ mod tests {
             fill_rgb: [0; 3],
             clip: None,
             blend: BlendMode::Normal,
+            smask: None,
         };
         draw_rgba(&mut pix, &quad_image(), &p);
         assert_eq!(pix_at(&pix, 1, 1), [0, 0, 255, 255], "row 1 left on top");
@@ -1574,6 +1667,7 @@ mod tests {
             fill_rgb: [0; 3],
             clip: Some(&clip),
             blend: BlendMode::Normal,
+            smask: None,
         };
         draw_rgba(&mut pix, &quad_image(), &p);
         assert_eq!(pix_at(&pix, 1, 1), [255, 255, 255, 255], "outside image");
@@ -1617,6 +1711,7 @@ mod tests {
             fill_rgb: [0; 3],
             clip: None,
             blend: BlendMode::Normal,
+            smask: None,
         };
         draw_rgba(&mut pix, &quad_image(), &p);
         assert!(pix.data.iter().all(|&b| b == 0), "pixmap untouched");
