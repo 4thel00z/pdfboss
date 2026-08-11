@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.16.0](https://github.com/4thel00z/pdfboss/compare/v0.15.0...v0.16.0) (2026-08-11)
+
+
+### Features
+
+* open password-protected documents ([#39](https://github.com/4thel00z/pdfboss/issues/39)) ([08eeb78](https://github.com/4thel00z/pdfboss/commit/08eeb78911b79c9728364522d0b6579e9463dd0a))
+* **render:** advance text through metrics-only fonts at every tier ([#35](https://github.com/4thel00z/pdfboss/issues/35)) ([378417d](https://github.com/4thel00z/pdfboss/commit/378417dff0adfac8b01e8e3bd92004be134559e0))
+* **render:** apply image and group soft masks ([#44](https://github.com/4thel00z/pdfboss/issues/44)) ([11313d3](https://github.com/4thel00z/pdfboss/commit/11313d3b596f00a2d61e198bfcf2589c2b27c677))
+* **render:** paint annotation normal appearances ([#36](https://github.com/4thel00z/pdfboss/issues/36)) ([41d7784](https://github.com/4thel00z/pdfboss/commit/41d7784910791fd243bb2b1e90881aa05111e28f))
+* **render:** paint axial and radial shadings ([#37](https://github.com/4thel00z/pdfboss/issues/37)) ([f01dd87](https://github.com/4thel00z/pdfboss/commit/f01dd87378b3c142f5e83b137ad322319b6936c9))
+* **render:** paint the separable blend modes ([#40](https://github.com/4thel00z/pdfboss/issues/40)) ([fc9afe7](https://github.com/4thel00z/pdfboss/commit/fc9afe7324a55d318f56ecda51c1cdad882a2686))
+
+
+### Documentation
+
+* close the README's benchmark and staleness gaps ([#34](https://github.com/4thel00z/pdfboss/issues/34)) ([79c15fc](https://github.com/4thel00z/pdfboss/commit/79c15fcfca5bd2537dba19adacbc37b95b0e5535))
+
 ## [0.15.0](https://github.com/4thel00z/pdfboss/compare/v0.14.0...v0.15.0) (2026-08-10)
 
 
