@@ -25,6 +25,7 @@ use crate::glyph::GlyphFont;
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
 use crate::raster::{fill_path, BlendMode, FillRule, Mask};
+use crate::shading::Shading;
 use crate::stroke::stroke_path;
 #[cfg(feature = "substitute-fonts")]
 use crate::substitute::BuiltinProvider;
@@ -90,9 +91,14 @@ struct GState {
     /// Fill color already converted to RGB in 0..=1.
     fill_rgb: [f32; 3],
     stroke_rgb: [f32; 3],
-    /// A `/Pattern` fill space is active: paint mid-gray instead.
+    /// A `/Pattern` fill space is active. Shading patterns (`/PatternType
+    /// 2`) paint their gradient; everything else paints the mid-gray
+    /// stand-in and reports.
     fill_pattern: bool,
     stroke_pattern: bool,
+    /// The pattern resource `scn`/`SCN` named, resolved at paint time.
+    fill_pattern_name: Option<String>,
+    stroke_pattern_name: Option<String>,
     /// Line width in user space.
     line_width: f32,
     /// Stored but unused: stroking approximates round caps (v0.1).
@@ -131,6 +137,8 @@ impl GState {
             stroke_rgb: [0.0; 3],
             fill_pattern: false,
             stroke_pattern: false,
+            fill_pattern_name: None,
+            stroke_pattern_name: None,
             line_width: 1.0,
             line_cap: 0,
             line_join: 0,
@@ -479,6 +487,11 @@ struct Frame {
     pending_t3: Option<Arc<Type3Font>>,
     /// What this frame owes on the way out.
     kind: FrameKind,
+    /// The CTM this content stream started with. Pattern space anchors here
+    /// (§8.7.3.1): a pattern's `/Matrix` maps pattern space to the stream's
+    /// default space, so fills through `cm` changes do not drag the pattern
+    /// with them.
+    pattern_base: Matrix,
 }
 
 /// What kind of content stream a [`Frame`] is running, and therefore what
@@ -505,6 +518,7 @@ impl Frame {
         depth: u32,
         kind: FrameKind,
     ) -> Frame {
+        let pattern_base = gs.ctm;
         Frame {
             ops,
             chain,
@@ -519,6 +533,7 @@ impl Frame {
             pending_glyphs: std::collections::VecDeque::new(),
             pending_t3: None,
             kind,
+            pattern_base,
         }
     }
 }
@@ -593,6 +608,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         }
                     }
                     Op::SetExtGState(name) => self.apply_ext_gstate_op(name, frame).await,
+                    Op::Shading(name) => {
+                        let name = name.0.clone();
+                        self.sh_operator(&name, frame).await;
+                    }
                     Op::SetRenderingIntent(_) | Op::SetFlatness(_) => {}
 
                     // Path construction (user space; the builder applies the
@@ -636,33 +655,42 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
 
                     // Path painting: fill first, then stroke; a pending W/W*
                     // clip takes effect after any of these (including n).
-                    Op::Stroke => self.paint_frame(frame, PAINT_STROKE),
-                    Op::CloseStroke => self.paint_frame(
-                        frame,
-                        Paint {
-                            close: true,
-                            ..PAINT_STROKE
-                        },
-                    ),
-                    Op::Fill => self.paint_frame(frame, PAINT_FILL),
-                    Op::FillEvenOdd => self.paint_frame(frame, PAINT_FILL_EO),
-                    Op::FillStroke => self.paint_frame(frame, PAINT_BOTH),
-                    Op::FillStrokeEvenOdd => self.paint_frame(frame, PAINT_BOTH_EO),
-                    Op::CloseFillStroke => self.paint_frame(
-                        frame,
-                        Paint {
-                            close: true,
-                            ..PAINT_BOTH
-                        },
-                    ),
-                    Op::CloseFillStrokeEvenOdd => self.paint_frame(
-                        frame,
-                        Paint {
-                            close: true,
-                            ..PAINT_BOTH_EO
-                        },
-                    ),
-                    Op::EndPath => self.paint_frame(frame, PAINT_NONE),
+                    Op::Stroke => self.paint_frame(frame, PAINT_STROKE).await,
+                    Op::CloseStroke => {
+                        self.paint_frame(
+                            frame,
+                            Paint {
+                                close: true,
+                                ..PAINT_STROKE
+                            },
+                        )
+                        .await
+                    }
+                    Op::Fill => self.paint_frame(frame, PAINT_FILL).await,
+                    Op::FillEvenOdd => self.paint_frame(frame, PAINT_FILL_EO).await,
+                    Op::FillStroke => self.paint_frame(frame, PAINT_BOTH).await,
+                    Op::FillStrokeEvenOdd => self.paint_frame(frame, PAINT_BOTH_EO).await,
+                    Op::CloseFillStroke => {
+                        self.paint_frame(
+                            frame,
+                            Paint {
+                                close: true,
+                                ..PAINT_BOTH
+                            },
+                        )
+                        .await
+                    }
+                    Op::CloseFillStrokeEvenOdd => {
+                        self.paint_frame(
+                            frame,
+                            Paint {
+                                close: true,
+                                ..PAINT_BOTH_EO
+                            },
+                        )
+                        .await
+                    }
+                    Op::EndPath => self.paint_frame(frame, PAINT_NONE).await,
                     Op::ClipNonZero => frame.pending_clip = Some(FillRule::NonZero),
                     Op::ClipEvenOdd => frame.pending_clip = Some(FillRule::EvenOdd),
 
@@ -819,26 +847,12 @@ const PAINT_BOTH_EO: Paint = Paint {
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
     /// [`Executor::paint`] on a frame's own path, pending clip and state.
-    fn paint_frame(&mut self, frame: &mut Frame, how: Paint) {
-        let Frame {
-            gs,
-            path,
-            pending_clip,
-            ..
-        } = frame;
-        self.paint(gs, path, pending_clip, how);
-    }
-
     /// Fills and/or strokes the current path, applies any pending clip
-    /// from `W`/`W*`, and resets the path.
-    fn paint(
-        &mut self,
-        gs: &mut GState,
-        path: &mut Option<PathBuilder>,
-        pending: &mut Option<FillRule>,
-        how: Paint,
-    ) {
-        let polys = match path.take() {
+    /// from `W`/`W*`, and resets the path. A shading-pattern color paints
+    /// its gradient through the path; any other pattern paints the mid-gray
+    /// stand-in with a report (see [`Executor::pattern_shading`]).
+    async fn paint_frame(&mut self, frame: &mut Frame, how: Paint) {
+        let polys = match frame.path.take() {
             Some(mut pb) => {
                 if how.close {
                     pb.close();
@@ -847,46 +861,191 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             None => Vec::new(),
         };
-        // A pattern paints its stand-in gray (see `GState::fill_rgba8`), so
-        // every such paint is an approximation the caller should hear about
-        // -- but only once the path actually covers something.
-        if !polys.is_empty()
-            && ((how.fill.is_some() && gs.fill_pattern) || (how.stroke && gs.stroke_pattern))
-        {
-            self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
-        }
+        let fill_shading = if how.fill.is_some() && frame.gs.fill_pattern && !polys.is_empty() {
+            let name = frame.gs.fill_pattern_name.clone();
+            self.pattern_shading(&frame.chain, name.as_deref(), frame.pattern_base)
+                .await
+        } else {
+            None
+        };
+        let stroke_shading = if how.stroke && frame.gs.stroke_pattern && !polys.is_empty() {
+            let name = frame.gs.stroke_pattern_name.clone();
+            self.pattern_shading(&frame.chain, name.as_deref(), frame.pattern_base)
+                .await
+        } else {
+            None
+        };
+        let gs = &frame.gs;
         if let Some(rule) = how.fill {
-            fill_path(
-                &mut self.pix,
-                &polys,
-                rule,
-                gs.fill_rgba8(),
-                gs.fill_alpha,
-                gs.clip.as_deref(),
-                gs.blend_mode,
-            );
+            match &fill_shading {
+                Some((shading, to_device)) => {
+                    self.paint_shading_through(&polys, rule, shading, *to_device, gs.clone())
+                }
+                None => fill_path(
+                    &mut self.pix,
+                    &polys,
+                    rule,
+                    gs.fill_rgba8(),
+                    gs.fill_alpha,
+                    gs.clip.as_deref(),
+                    gs.blend_mode,
+                ),
+            }
         }
         if how.stroke {
             let s = ctm_scale(gs.ctm);
             let dash: Vec<f32> = gs.dash.iter().map(|d| d * s).collect();
             let quads = stroke_path(&polys, gs.line_width * s, &dash, gs.dash_phase * s);
-            fill_path(
-                &mut self.pix,
-                &quads,
-                FillRule::NonZero,
-                gs.stroke_rgba8(),
-                gs.stroke_alpha,
-                gs.clip.as_deref(),
-                gs.blend_mode,
-            );
+            match &stroke_shading {
+                Some((shading, to_device)) => self.paint_shading_through(
+                    &quads,
+                    FillRule::NonZero,
+                    shading,
+                    *to_device,
+                    gs.clone(),
+                ),
+                None => fill_path(
+                    &mut self.pix,
+                    &quads,
+                    FillRule::NonZero,
+                    gs.stroke_rgba8(),
+                    gs.stroke_alpha,
+                    gs.clip.as_deref(),
+                    gs.blend_mode,
+                ),
+            }
         }
-        if let Some(rule) = pending.take() {
+        if let Some(rule) = frame.pending_clip.take() {
             let rasterized = self.rasterize_clip(&polys, rule);
+            let gs = &mut frame.gs;
             gs.clip = Some(match &gs.clip {
                 Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
                 None => rasterized,
             });
         }
+    }
+
+    /// Resolves the named pattern to a paintable shading and the matrix it
+    /// paints under (`/Matrix` ∘ the stream's pattern base). `None` means
+    /// the caller paints the stand-in gray instead — every such case has
+    /// already been reported here with its real reason: an unresolvable
+    /// name, a tiling pattern (not painted yet), an unsupported shading
+    /// kind, or a structural failure.
+    async fn pattern_shading(
+        &mut self,
+        chain: &[Arc<Dict>],
+        name: Option<&str>,
+        pattern_base: Matrix,
+    ) -> Option<(Shading, Matrix)> {
+        let Some(name) = name else {
+            self.skip(SkippedKind::Pattern, SkipReason::Missing);
+            return None;
+        };
+        let Some(obj) = self.find_res(chain, "Pattern", name).await else {
+            self.skip(SkippedKind::Pattern, SkipReason::Missing);
+            return None;
+        };
+        let dict = match self.src.resolve(&obj).await {
+            Ok(Object::Dict(d)) => d,
+            Ok(Object::Stream(s)) => s.dict.clone(),
+            _ => {
+                self.skip(SkippedKind::Pattern, SkipReason::Missing);
+                return None;
+            }
+        };
+        match dict.get_int("PatternType") {
+            Some(2) => {}
+            Some(1) => {
+                // Tiling patterns still paint the stand-in.
+                self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
+                return None;
+            }
+            _ => {
+                self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
+                return None;
+            }
+        }
+        let Some(shading_obj) = dict.get("Shading") else {
+            self.skip(SkippedKind::Pattern, SkipReason::Missing);
+            return None;
+        };
+        let shading = match Shading::load_with(self.src, shading_obj).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.skip(SkippedKind::Shading, SkipReason::Unsupported);
+                return None;
+            }
+            Err(e) => {
+                self.skip(SkippedKind::Shading, skip_reason_for(&e));
+                return None;
+            }
+        };
+        let matrix = floats_from(self.src, dict.get("Matrix"), 6)
+            .await
+            .map(|m| Matrix {
+                a: m[0],
+                b: m[1],
+                c: m[2],
+                d: m[3],
+                e: m[4],
+                f: m[5],
+            })
+            .unwrap_or_else(Matrix::identity);
+        let to_device = matrix.concat(pattern_base);
+        if !finite_matrix(&to_device) || to_device.invert().is_none() {
+            self.skip(SkippedKind::Shading, SkipReason::Undecodable);
+            return None;
+        }
+        Some((shading, to_device))
+    }
+
+    /// Paints `shading` through `polys` (the fill or stroke geometry,
+    /// rasterized under `rule` and intersected with the active clip and the
+    /// shading's own `/BBox`), first laying down `/Background` where the
+    /// shading declares one (§8.7.4.3 — pattern fills only, which is the
+    /// single caller).
+    fn paint_shading_through(
+        &mut self,
+        polys: &[Subpath],
+        rule: FillRule,
+        shading: &Shading,
+        to_device: Matrix,
+        gs: GState,
+    ) {
+        if polys.is_empty() {
+            return;
+        }
+        let path_mask = self.rasterize_clip(polys, rule);
+        let region = match &gs.clip {
+            Some(clip) => Arc::new(Mask::intersected(&path_mask, clip)),
+            None => path_mask,
+        };
+        let region = match shading.bbox {
+            Some(b) => {
+                let mut pb = PathBuilder::new(to_device);
+                pb.rect(
+                    b[0].min(b[2]),
+                    b[1].min(b[3]),
+                    (b[2] - b[0]).abs(),
+                    (b[3] - b[1]).abs(),
+                );
+                let bbox_mask = self.rasterize_clip(&pb.finish(), FillRule::NonZero);
+                Arc::new(Mask::intersected(&bbox_mask, &region))
+            }
+            None => region,
+        };
+        if let Some(bg) = shading.background {
+            fill_path(
+                &mut self.pix,
+                polys,
+                rule,
+                rgba8(bg),
+                gs.fill_alpha,
+                gs.clip.as_deref(),
+                gs.blend_mode,
+            );
+        }
+        shading.paint(&mut self.pix, Some(&region), gs.fill_alpha, to_device);
     }
 
     /// Rasterizes `polys` under `rule` into a clip [`Mask`], reusing a
@@ -1198,6 +1357,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 gs.fill_rgb = initial_color(&cs);
                 gs.fill_space = cs;
                 gs.fill_pattern = pattern;
+                gs.fill_pattern_name = None;
             }
             Op::SetStrokeColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
@@ -1205,21 +1365,24 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 gs.stroke_rgb = initial_color(&cs);
                 gs.stroke_space = cs;
                 gs.stroke_pattern = pattern;
+                gs.stroke_pattern_name = None;
             }
             Op::SetFillColor(c) => frame.gs.fill_rgb = frame.gs.fill_space.to_rgb(c),
             Op::SetStrokeColor(c) => frame.gs.stroke_rgb = frame.gs.stroke_space.to_rgb(c),
             Op::SetFillColorN(c, pattern_name) => {
                 let gs = &mut frame.gs;
-                if pattern_name.is_some() {
+                if let Some(name) = pattern_name {
                     gs.fill_pattern = true;
+                    gs.fill_pattern_name = Some(name.0.clone());
                 } else if !gs.fill_pattern {
                     gs.fill_rgb = gs.fill_space.to_rgb(c);
                 }
             }
             Op::SetStrokeColorN(c, pattern_name) => {
                 let gs = &mut frame.gs;
-                if pattern_name.is_some() {
+                if let Some(name) = pattern_name {
                     gs.stroke_pattern = true;
+                    gs.stroke_pattern_name = Some(name.0.clone());
                 } else if !gs.stroke_pattern {
                     gs.stroke_rgb = gs.stroke_space.to_rgb(c);
                 }
@@ -1228,36 +1391,42 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 let gs = &mut frame.gs;
                 gs.fill_space = ColorSpace::DeviceGray;
                 gs.fill_pattern = false;
+                gs.fill_pattern_name = None;
                 gs.fill_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
             }
             Op::SetStrokeGray(g) => {
                 let gs = &mut frame.gs;
                 gs.stroke_space = ColorSpace::DeviceGray;
                 gs.stroke_pattern = false;
+                gs.stroke_pattern_name = None;
                 gs.stroke_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
             }
             Op::SetFillRGB(r, g, b) => {
                 let gs = &mut frame.gs;
                 gs.fill_space = ColorSpace::DeviceRGB;
                 gs.fill_pattern = false;
+                gs.fill_pattern_name = None;
                 gs.fill_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
             }
             Op::SetStrokeRGB(r, g, b) => {
                 let gs = &mut frame.gs;
                 gs.stroke_space = ColorSpace::DeviceRGB;
                 gs.stroke_pattern = false;
+                gs.stroke_pattern_name = None;
                 gs.stroke_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
             }
             Op::SetFillCMYK(c, m, y, k) => {
                 let gs = &mut frame.gs;
                 gs.fill_space = ColorSpace::DeviceCMYK;
                 gs.fill_pattern = false;
+                gs.fill_pattern_name = None;
                 gs.fill_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
             }
             Op::SetStrokeCMYK(c, m, y, k) => {
                 let gs = &mut frame.gs;
                 gs.stroke_space = ColorSpace::DeviceCMYK;
                 gs.stroke_pattern = false;
+                gs.stroke_pattern_name = None;
                 gs.stroke_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
             }
             Op::XObject(name) => {
@@ -1268,9 +1437,6 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             Op::InlineImage(img) => {
                 self.draw_inline_image(img, &frame.chain, &frame.gs).await;
             }
-            // Shadings are out of scope for v0.1: `sh` paints nothing, so a
-            // page whose visible content is a gradient comes out blank.
-            Op::Shading(_) => self.skip(SkippedKind::Shading, SkipReason::Unsupported),
             // Text and marked content: state-only in v0.1, nothing painted.
             _ => {}
         }
@@ -1836,6 +2002,69 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             0,
             FrameKind::PageOrForm,
         ))
+    }
+
+    /// Paints the `sh` operator (§8.7.4.2): the named shading fills the
+    /// current clip region, further clipped by the shading's own `/BBox`
+    /// when it has one, in the current user space at the fill alpha.
+    /// Unsupported shading kinds and every structural failure report as a
+    /// dropped shading — the page loses a gradient either way.
+    async fn sh_operator(&mut self, name: &str, frame: &mut Frame) {
+        let Some(obj) = self.find_res(&frame.chain, "Shading", name).await else {
+            self.skip(SkippedKind::Shading, SkipReason::Missing);
+            return;
+        };
+        let loaded = match Shading::load_with(self.src, &obj).await {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                self.skip(SkippedKind::Shading, SkipReason::Unsupported);
+                return;
+            }
+            Err(e) => {
+                self.skip(SkippedKind::Shading, skip_reason_for(&e));
+                return;
+            }
+        };
+        if !finite_matrix(&frame.gs.ctm) || frame.gs.ctm.invert().is_none() {
+            self.skip(SkippedKind::Shading, SkipReason::Undecodable);
+            return;
+        }
+        let region = self.shading_region(&loaded, &frame.gs, frame.gs.ctm);
+        loaded.paint(
+            &mut self.pix,
+            region.as_deref(),
+            frame.gs.fill_alpha,
+            frame.gs.ctm,
+        );
+    }
+
+    /// The coverage region a shading paints under: the active clip,
+    /// intersected with the shading's `/BBox` (rasterized under the same
+    /// matrix the shading paints with) when it declares one.
+    fn shading_region(
+        &mut self,
+        shading: &Shading,
+        gs: &GState,
+        to_device: Matrix,
+    ) -> Option<Arc<Mask>> {
+        match (&shading.bbox, &gs.clip) {
+            (Some(b), clip) => {
+                let mut pb = PathBuilder::new(to_device);
+                pb.rect(
+                    b[0].min(b[2]),
+                    b[1].min(b[3]),
+                    (b[2] - b[0]).abs(),
+                    (b[3] - b[1]).abs(),
+                );
+                let bbox_mask = self.rasterize_clip(&pb.finish(), FillRule::NonZero);
+                Some(match clip {
+                    Some(clip) => Arc::new(Mask::intersected(&bbox_mask, clip)),
+                    None => bbox_mask,
+                })
+            }
+            (None, Some(clip)) => Some(Arc::clone(clip)),
+            (None, None) => None,
+        }
     }
 
     /// Builds the frame for a form XObject: `/Matrix` concatenated before
@@ -2929,10 +3158,134 @@ mod tests {
         );
     }
 
+    /// Asserts each channel of `got` is within `tol` of `want` — shading
+    /// probes hit interpolated colors, where float-to-u8 rounding wobbles.
+    fn assert_near(got: [u8; 4], want: [u8; 4], tol: u8, what: &str) {
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(
+                g.abs_diff(*w) <= tol,
+                "{what}: got {got:?}, want {want:?} ± {tol}"
+            );
+        }
+    }
+
     #[test]
-    fn shading_operator_is_reported() {
-        let (pix, report) = render_reporting(small_doc("", b"q /Sh0 sh Q", |_| {}));
-        assert_eq!(px(&pix, 50, 50), WHITE, "shadings paint nothing");
+    fn sh_paints_an_axial_gradient() {
+        // Red at x=0 to blue at x=100, linear (/N 1), extended both ways.
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
+            b.object(
+                5,
+                "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                     /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] \
+                     /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 5, 50), [241, 0, 14, 255], 4, "left is red");
+        assert_near(px(&pix, 50, 50), [126, 0, 129, 255], 4, "middle mixes");
+        assert_near(px(&pix, 95, 50), [11, 0, 244, 255], 4, "right is blue");
+    }
+
+    #[test]
+    fn sh_respects_the_active_clip() {
+        let bytes = small_doc(
+            "/Shading << /Sh0 5 0 R >>",
+            b"q 20 20 60 60 re W n /Sh0 sh Q",
+            |b| {
+                b.object(
+                    5,
+                    "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                     /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] \
+                     /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>",
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty());
+        assert_near(px(&pix, 50, 50), [126, 0, 129, 255], 4, "inside the clip");
+        assert_eq!(px(&pix, 10, 50), WHITE, "outside the clip stays clear");
+    }
+
+    #[test]
+    fn radial_shading_paints_concentric_gradient() {
+        // Red at the center of (50,50), green at radius 40, nothing beyond
+        // (no /Extend), on the y-flipped 100pt page: device (50,50) is the
+        // center, device (50,15) sits at r=35 (t=0.875), corners lie outside.
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
+            b.object(
+                5,
+                "<< /ShadingType 3 /ColorSpace /DeviceRGB \
+                     /Coords [50 50 0 50 50 40] /Function << /FunctionType 2 \
+                     /Domain [0 1] /C0 [1 0 0] /C1 [0 1 0] /N 1 >> >>",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // The probe pixel's center sits √0.5 user units off the circle
+        // center, so t is 0.0177, not exactly 0.
+        assert_near(px(&pix, 50, 50), [250, 5, 0, 255], 4, "center is red");
+        assert_near(px(&pix, 50, 15), [32, 223, 0, 255], 5, "ring blends");
+        assert_eq!(px(&pix, 3, 3), WHITE, "beyond r1 unpainted without extend");
+    }
+
+    #[test]
+    fn stitching_function_selects_and_remaps_subfunctions() {
+        // Red→green over the first half of the axis, green→blue over the
+        // second: x=25 is halfway through the first subfunction.
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
+            b.object(
+                5,
+                "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                     /Extend [true true] /Function << /FunctionType 3 /Domain [0 1] \
+                     /Bounds [0.5] /Encode [0 1 0 1] /Functions [ \
+                     << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 1 0] /N 1 >> \
+                     << /FunctionType 2 /Domain [0 1] /C0 [0 1 0] /C1 [0 0 1] /N 1 >> ] >> >>",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 50), [126, 129, 0, 255], 4, "first half");
+        assert_near(px(&pix, 75, 50), [0, 126, 129, 255], 4, "second half");
+    }
+
+    #[test]
+    fn sampled_function_interpolates_its_samples() {
+        // Three RGB8 samples — red, green, blue — across the axis: x=25
+        // lands halfway between samples 0 and 1.
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
+            b.stream(
+                5,
+                "/ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                     /Extend [true true] /Function 6 0 R",
+                b"",
+            );
+            b.stream(
+                6,
+                "/FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] \
+                     /Size [3] /BitsPerSample 8",
+                &[0xff, 0, 0, 0, 0xff, 0, 0, 0, 0xff],
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 50), [126, 129, 0, 255], 4, "between samples");
+        assert_near(px(&pix, 95, 50), [0, 23, 232, 255], 5, "near the last");
+    }
+
+    #[test]
+    fn mesh_shadings_still_report_unsupported() {
+        // ShadingType 4 (free-form triangle mesh) stays a reported drop.
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
+            b.stream(
+                5,
+                "/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+                     /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 1 0 1 0 1 0 1 0 1]",
+                &[0; 16],
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "mesh shadings paint nothing");
         assert_eq!(
             drops(&report),
             vec![(SkippedKind::Shading, SkipReason::Unsupported, 1)],
@@ -2940,14 +3293,55 @@ mod tests {
     }
 
     #[test]
-    fn pattern_fill_is_reported_as_an_approximation() {
+    fn missing_shading_resource_reports_missing() {
+        let (pix, report) = render_reporting(small_doc("", b"q /Sh0 sh Q", |_| {}));
+        assert_eq!(px(&pix, 50, 50), WHITE, "nothing to paint");
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Shading, SkipReason::Missing, 1)],
+        );
+    }
+
+    #[test]
+    fn missing_pattern_fill_paints_gray_and_reports() {
+        // /P0 resolves to nothing: the stand-in gray with a report.
         let content = b"/Pattern cs /P0 scn 0 0 100 100 re f";
         let (pix, report) = render_reporting(small_doc("", content, |_| {}));
         assert_eq!(px(&pix, 50, 50), [128, 128, 128, 255], "stand-in gray");
         assert_eq!(
             drops(&report),
-            vec![(SkippedKind::Pattern, SkipReason::Unsupported, 1)],
+            vec![(SkippedKind::Pattern, SkipReason::Missing, 1)],
         );
+    }
+
+    /// Resources declaring `/P0` as a PatternType 2 axial shading pattern,
+    /// red at x=0 to blue at x=100 in pattern (= page) space.
+    const AXIAL_PATTERN: &str = "/Pattern << /P0 << /PatternType 2 /Shading \
+         << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+         /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] \
+         /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> >>";
+
+    #[test]
+    fn shading_pattern_fill_paints_through_the_path() {
+        let content = b"/Pattern cs /P0 scn 20 20 60 60 re f";
+        let (pix, report) = render_reporting(small_doc(AXIAL_PATTERN, content, |_| {}));
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 50), [191, 0, 64, 255], 4, "left of the rect");
+        assert_near(px(&pix, 75, 50), [64, 0, 191, 255], 4, "right of the rect");
+        assert_eq!(px(&pix, 10, 50), WHITE, "outside the path stays clear");
+    }
+
+    #[test]
+    fn pattern_space_is_anchored_to_the_page_not_the_cm() {
+        // The same pattern under a translated CTM: the path moves with the
+        // cm, the gradient must NOT — pattern space maps to the page
+        // (§8.7.3.1). At device x=60 the color is t=0.6 regardless of the
+        // 30pt translation; a gs.ctm-anchored gradient would paint t=0.3.
+        let content = b"q 1 0 0 1 30 0 cm /Pattern cs /P0 scn 20 20 40 40 re f Q";
+        let (pix, report) = render_reporting(small_doc(AXIAL_PATTERN, content, |_| {}));
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 60, 50), [102, 0, 153, 255], 4, "page-anchored t");
+        assert_eq!(px(&pix, 40, 50), WHITE, "the path itself did move");
     }
 
     #[test]

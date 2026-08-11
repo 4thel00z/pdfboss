@@ -458,7 +458,7 @@ fn hard_light(b: f32, s: f32) -> f32 {
 
 /// Composites `rgb` at alpha `a` (0..=1) over one straight-alpha RGBA8
 /// pixel using the source-over rule.
-fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
+pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
     let da = dst[3] as f32 / 255.0;
     let oa = a + da * (1.0 - a);
     if oa <= 0.0 {
