@@ -56,6 +56,13 @@ pub(crate) struct Mask {
     pub bbox_h: u32,
     /// Row-major coverage values over the bbox, `bbox_w * bbox_h` bytes.
     pub data: Vec<u8>,
+    /// Every stored byte is 255 (proven at construction, conservatively
+    /// false otherwise). Lets a fill skip the per-pixel coverage multiply —
+    /// scaling by `255/255.0 == 1.0` is exactly the identity — and treat the
+    /// clip as pure bbox narrowing. Rectangular clips on integer device
+    /// coordinates (the page-bounds reset clip most generators emit) are the
+    /// common case.
+    pub opaque: bool,
 }
 
 impl Mask {
@@ -69,6 +76,7 @@ impl Mask {
             bbox_w: width,
             bbox_h: height,
             data: vec![0; width as usize * height as usize],
+            opaque: false,
         }
     }
 
@@ -82,6 +90,7 @@ impl Mask {
             bbox_w: 0,
             bbox_h: 0,
             data: Vec::new(),
+            opaque: false,
         }
     }
 
@@ -125,6 +134,7 @@ impl Mask {
             bbox_w,
             bbox_h,
             data: vec![0u8; bbox_w as usize * bbox_h as usize],
+            opaque: false,
         };
         let bw = bbox_w as usize;
         sweep_rows(scratch, width, height, rule, |y, row, lo, hi| {
@@ -139,6 +149,7 @@ impl Mask {
                 *out = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         });
+        mask.opaque = mask.data.iter().all(|&b| b == 255);
         mask
     }
 
@@ -199,6 +210,8 @@ impl Mask {
             bbox_w,
             bbox_h,
             data,
+            // Two everywhere-255 operands stay 255 across the overlap.
+            opaque: a.opaque && b.opaque,
         }
     }
 }
@@ -571,8 +584,15 @@ pub(crate) fn fill_path(
                 if hi <= lo {
                     return;
                 }
-                let base = (y - m.y0) as usize * m.bbox_w as usize;
-                Some(&m.data[base + lo - mx0..base + hi - mx0])
+                if m.opaque {
+                    // Every byte in range is 255 and scaling by 255/255.0
+                    // == 1.0 is exactly the identity, so the clip reduces
+                    // to the bbox narrowing above.
+                    None
+                } else {
+                    let base = (y - m.y0) as usize * m.bbox_w as usize;
+                    Some(&m.data[base + lo - mx0..base + hi - mx0])
+                }
             }
         };
         let base = (y as usize * w + lo) * 4;
