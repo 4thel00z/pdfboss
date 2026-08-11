@@ -546,6 +546,7 @@ pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// `rgba`, further scaled by the constant `alpha` (0..=1) and, when
 /// present, the `clip` coverage mask. Anti-aliased coverage is composited
 /// source-over.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_path(
     pix: &mut Pixmap,
     scratch: &mut RasterScratch,
@@ -568,41 +569,47 @@ pub(crate) fn fill_path(
     let rgb = [rgba[0], rgba[1], rgba[2]];
     let w = pix.width as usize;
     prepare_edges(&mut scratch.edges, polys);
-    sweep_rows(scratch, pix.width, pix.height, rule, |y, row, mut lo, mut hi| {
-        let mask_row = match clip {
-            None => None,
-            Some(m) => {
-                // Pixels outside the mask's stored bbox read coverage 0, so
-                // the fill cannot touch them; narrow the span to the overlap
-                // and hand the pixel loop the mask bytes for what remains.
-                if y < m.y0 || y - m.y0 >= m.bbox_h {
-                    return;
+    sweep_rows(
+        scratch,
+        pix.width,
+        pix.height,
+        rule,
+        |y, row, mut lo, mut hi| {
+            let mask_row = match clip {
+                None => None,
+                Some(m) => {
+                    // Pixels outside the mask's stored bbox read coverage 0, so
+                    // the fill cannot touch them; narrow the span to the overlap
+                    // and hand the pixel loop the mask bytes for what remains.
+                    if y < m.y0 || y - m.y0 >= m.bbox_h {
+                        return;
+                    }
+                    let mx0 = m.x0 as usize;
+                    lo = lo.max(mx0);
+                    hi = hi.min(mx0 + m.bbox_w as usize);
+                    if hi <= lo {
+                        return;
+                    }
+                    if m.opaque {
+                        // Every byte in range is 255 and scaling by 255/255.0
+                        // == 1.0 is exactly the identity, so the clip reduces
+                        // to the bbox narrowing above.
+                        None
+                    } else {
+                        let base = (y - m.y0) as usize * m.bbox_w as usize;
+                        Some(&m.data[base + lo - mx0..base + hi - mx0])
+                    }
                 }
-                let mx0 = m.x0 as usize;
-                lo = lo.max(mx0);
-                hi = hi.min(mx0 + m.bbox_w as usize);
-                if hi <= lo {
-                    return;
-                }
-                if m.opaque {
-                    // Every byte in range is 255 and scaling by 255/255.0
-                    // == 1.0 is exactly the identity, so the clip reduces
-                    // to the bbox narrowing above.
-                    None
-                } else {
-                    let base = (y - m.y0) as usize * m.bbox_w as usize;
-                    Some(&m.data[base + lo - mx0..base + hi - mx0])
-                }
+            };
+            let base = (y as usize * w + lo) * 4;
+            let dst_row = &mut pix.data[base..base + (hi - lo) * 4];
+            if blend == BlendMode::Normal {
+                blend_row::<true>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
+            } else {
+                blend_row::<false>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
             }
-        };
-        let base = (y as usize * w + lo) * 4;
-        let dst_row = &mut pix.data[base..base + (hi - lo) * 4];
-        if blend == BlendMode::Normal {
-            blend_row::<true>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
-        } else {
-            blend_row::<false>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
-        }
-    });
+        },
+    );
 }
 
 /// Paints one emitted coverage row into `dst_row` (4 bytes per pixel).
