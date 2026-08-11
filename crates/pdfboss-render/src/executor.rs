@@ -24,7 +24,7 @@ use crate::color::{self, ColorSpace};
 use crate::glyph::GlyphFont;
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
-use crate::raster::{fill_path, FillRule, Mask};
+use crate::raster::{fill_path, BlendMode, FillRule, Mask};
 use crate::stroke::stroke_path;
 #[cfg(feature = "substitute-fonts")]
 use crate::substitute::BuiltinProvider;
@@ -107,6 +107,9 @@ struct GState {
     /// Dash pattern lengths in user space (empty = solid).
     dash: Vec<f32>,
     dash_phase: f32,
+    /// Active blend mode (`/BM`); the separable modes paint, see
+    /// [`BlendMode`].
+    blend_mode: BlendMode,
     /// Constant fill alpha (`ca`).
     fill_alpha: f32,
     /// Constant stroke alpha (`CA`).
@@ -134,6 +137,7 @@ impl GState {
             miter_limit: 10.0,
             dash: Vec::new(),
             dash_phase: 0.0,
+            blend_mode: BlendMode::default(),
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             clip: None,
@@ -859,6 +863,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 gs.fill_rgba8(),
                 gs.fill_alpha,
                 gs.clip.as_deref(),
+                gs.blend_mode,
             );
         }
         if how.stroke {
@@ -872,6 +877,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 gs.stroke_rgba8(),
                 gs.stroke_alpha,
                 gs.clip.as_deref(),
+                gs.blend_mode,
             );
         }
         if let Some(rule) = pending.take() {
@@ -980,6 +986,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             fill,
             gs.fill_alpha,
             gs.clip.as_deref(),
+            gs.blend_mode,
         );
     }
 
@@ -1421,8 +1428,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if ignores_mask(self.src, &dict).await {
             self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
         }
-        if ignores_blend_mode(self.src, &dict).await {
-            self.skip(SkippedKind::BlendMode, SkipReason::Unsupported);
+        match blend_mode_entry(self.src, &dict).await {
+            Some(Ok(mode)) => frame.gs.blend_mode = mode,
+            Some(Err(())) => self.skip(SkippedKind::BlendMode, SkipReason::Unsupported),
+            None => {}
         }
         let gs = &mut frame.gs;
         if let Some(ca) = dict_f32(self.src, &dict, "ca").await {
@@ -1536,25 +1545,43 @@ async fn ignores_mask<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
 /// apply (ISO 32000-1 11.3.5). Everything composites source-over, so
 /// anything but `Normal` (and its deprecated alias `Compatible`) paints
 /// differently than the page asks for.
-async fn ignores_blend_mode<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
-    let Some(bm) = dict.get("BM") else {
-        return false;
-    };
+/// The `/BM` entry classified for painting: `None` when the dictionary
+/// sets no mode, `Some(Ok(mode))` for a mode the rasterizer paints, and
+/// `Some(Err(()))` for the recognized-but-unpainted non-separable four
+/// (Hue, Saturation, Color, Luminosity), which the caller reports. An
+/// unrecognized name reads as Normal, exactly as ISO 32000-1 §11.3.5
+/// tells a conforming reader to treat it — that is compliance, not an
+/// approximation, so it is not reported.
+async fn blend_mode_entry<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+) -> Option<std::result::Result<BlendMode, ()>> {
+    let bm = dict.get("BM")?;
     // An array-valued `/BM` names the first mode the reader supports.
     let selected = match src.resolve(bm).await {
         Ok(Object::Name(n)) => n.0,
-        Ok(Object::Array(items)) => {
-            let Some(first) = items.first() else {
-                return false;
-            };
-            match src.resolve(first).await {
-                Ok(Object::Name(n)) => n.0,
-                _ => return false,
-            }
-        }
-        _ => return false,
+        Ok(Object::Array(items)) => match src.resolve(items.first()?).await {
+            Ok(Object::Name(n)) => n.0,
+            _ => return None,
+        },
+        _ => return None,
     };
-    !matches!(selected.as_str(), "Normal" | "Compatible")
+    Some(match selected.as_str() {
+        "Normal" | "Compatible" => Ok(BlendMode::Normal),
+        "Multiply" => Ok(BlendMode::Multiply),
+        "Screen" => Ok(BlendMode::Screen),
+        "Overlay" => Ok(BlendMode::Overlay),
+        "Darken" => Ok(BlendMode::Darken),
+        "Lighten" => Ok(BlendMode::Lighten),
+        "ColorDodge" => Ok(BlendMode::ColorDodge),
+        "ColorBurn" => Ok(BlendMode::ColorBurn),
+        "HardLight" => Ok(BlendMode::HardLight),
+        "SoftLight" => Ok(BlendMode::SoftLight),
+        "Difference" => Ok(BlendMode::Difference),
+        "Exclusion" => Ok(BlendMode::Exclusion),
+        "Hue" | "Saturation" | "Color" | "Luminosity" => Err(()),
+        _ => Ok(BlendMode::Normal),
+    })
 }
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
@@ -1968,6 +1995,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 alpha: gs.fill_alpha,
                 fill_rgb: [fill[0], fill[1], fill[2]],
                 clip: gs.clip.as_deref(),
+                blend: gs.blend_mode,
             },
         );
         match outcome {
@@ -2923,9 +2951,12 @@ mod tests {
     }
 
     #[test]
-    fn ignored_soft_mask_and_blend_mode_are_reported() {
+    fn ignored_soft_mask_and_nonseparable_blend_are_reported() {
+        // A group soft mask is still ignored and reported; so is a
+        // NON-separable blend mode (/Hue). The separable ones paint (see
+        // the blend tests below) and are no longer drops.
         let resources = "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> \
-                         /BM /Multiply >> >>";
+                         /BM /Hue >> >>";
         let bytes = small_doc(resources, b"/GS0 gs 0 0 100 100 re f", |b| {
             b.stream(5, "/Type /XObject /Subtype /Form /BBox [0 0 8 8]", b"");
         });
@@ -2937,6 +2968,48 @@ mod tests {
                 (SkippedKind::BlendMode, SkipReason::Unsupported, 1),
             ],
         );
+    }
+
+    #[test]
+    fn multiply_blend_darkens_the_overlap() {
+        // A red square, then a blue square multiplied over it: the overlap
+        // multiplies to black, the blue-only region lands on white where
+        // Multiply degenerates to Normal, and the red-only region is
+        // untouched. Painting the overlap plain blue is the pre-blend bug.
+        let resources = "/ExtGState << /GS0 << /BM /Multiply >> >>";
+        let content = b"1 0 0 rg 0 0 60 60 re f /GS0 gs 0 0 1 rg 30 30 60 60 re f";
+        let (pix, report) = render_reporting(small_doc(resources, content, |_| {}));
+        assert!(report.is_empty(), "separable blends are not drops");
+        assert_eq!(
+            px(&pix, 45, 55),
+            [0, 0, 0, 255],
+            "overlap multiplies to black"
+        );
+        assert_eq!(
+            px(&pix, 75, 15),
+            [0, 0, 255, 255],
+            "blue over white stays blue"
+        );
+        assert_eq!(px(&pix, 10, 89), RED, "red-only region untouched");
+    }
+
+    #[test]
+    fn blend_mode_array_takes_the_first_recognized_name() {
+        let resources = "/ExtGState << /GS0 << /BM [/Multiply /Normal] >> >>";
+        let content = b"1 0 0 rg 0 0 60 60 re f /GS0 gs 0 0 1 rg 30 30 60 60 re f";
+        let (pix, report) = render_reporting(small_doc(resources, content, |_| {}));
+        assert!(report.is_empty());
+        assert_eq!(px(&pix, 45, 55), [0, 0, 0, 255], "array form blends too");
+    }
+
+    #[test]
+    fn screen_blend_lightens_the_overlap() {
+        // Screen of red and blue is magenta: 1-(1-r)(1-b) per channel.
+        let resources = "/ExtGState << /GS0 << /BM /Screen >> >>";
+        let content = b"1 0 0 rg 0 0 60 60 re f /GS0 gs 0 0 1 rg 30 30 60 60 re f";
+        let (pix, report) = render_reporting(small_doc(resources, content, |_| {}));
+        assert!(report.is_empty());
+        assert_eq!(px(&pix, 45, 55), [255, 0, 255, 255], "screen makes magenta");
     }
 
     #[test]

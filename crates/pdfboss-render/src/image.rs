@@ -14,7 +14,7 @@ use pdfboss_core::{block_on, Document, Immediate};
 use pdfboss_core::{AsyncObjectSource, Dict, Object};
 
 use crate::color::ColorSpace;
-use crate::raster::Mask;
+use crate::raster::{BlendMode, Mask};
 use crate::Pixmap;
 
 /// Upper bound on decoded pixels, guarding malformed dimensions.
@@ -32,6 +32,9 @@ pub(crate) struct DrawParams<'a> {
     pub fill_rgb: [u8; 3],
     /// Active clip mask, if any.
     pub clip: Option<&'a Mask>,
+    /// Active blend mode; anything but `Normal` blends each sample with
+    /// the backdrop pixel before compositing.
+    pub blend: BlendMode,
 }
 
 /// A decoded RGBA image, row 0 at the image's top edge (the `v = 1` side
@@ -893,11 +896,19 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
             }
             let off = ((py * pix.width + px) * 4) as usize;
             let dst = &mut pix.data[off..off + 4];
-            if a >= 1.0 {
+            let s = if p.blend == BlendMode::Normal {
+                s
+            } else {
+                let b = p.blend.blend([dst[0], dst[1], dst[2]], [s[0], s[1], s[2]]);
+                [b[0], b[1], b[2], s[3]]
+            };
+            if a >= 1.0 && p.blend == BlendMode::Normal {
                 // An opaque source covers whatever is under it: source-over
                 // reduces to a copy. Taking it through the general formula
                 // would spend three divides to arrive at these same four
                 // bytes, and a scanned page is opaque over its whole extent.
+                dst.copy_from_slice(&[s[0], s[1], s[2], 255]);
+            } else if a >= 1.0 {
                 dst.copy_from_slice(&[s[0], s[1], s[2], 255]);
             } else {
                 composite_over(dst, [s[0], s[1], s[2]], a);
@@ -1536,6 +1547,7 @@ mod tests {
             alpha: 1.0,
             fill_rgb: [0; 3],
             clip: None,
+            blend: BlendMode::Normal,
         };
         draw_rgba(&mut pix, &quad_image(), &p);
         assert_eq!(pix_at(&pix, 1, 1), [0, 0, 255, 255], "row 1 left on top");
@@ -1561,6 +1573,7 @@ mod tests {
             alpha: 0.5,
             fill_rgb: [0; 3],
             clip: Some(&clip),
+            blend: BlendMode::Normal,
         };
         draw_rgba(&mut pix, &quad_image(), &p);
         assert_eq!(pix_at(&pix, 1, 1), [255, 255, 255, 255], "outside image");
@@ -1603,6 +1616,7 @@ mod tests {
             alpha: 1.0,
             fill_rgb: [0; 3],
             clip: None,
+            blend: BlendMode::Normal,
         };
         draw_rgba(&mut pix, &quad_image(), &p);
         assert!(pix.data.iter().all(|&b| b == 0), "pixmap untouched");
