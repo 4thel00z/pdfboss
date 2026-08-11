@@ -987,6 +987,42 @@ mod tests {
     }
 
     #[test]
+    fn opaque_clip_shortcut_matches_full_mask_math() {
+        let polys = [rect_poly(1.5, 1.5, 9.5, 9.5)];
+        let clip = mask_from_path(12, 12, &[rect_poly(2.0, 0.0, 8.0, 12.0)], FillRule::NonZero);
+        assert!(clip.opaque, "integer-coordinate rect clip is fully opaque");
+        let mut dull = clip.clone();
+        dull.opaque = false;
+        let mut a = Pixmap::new(12, 12);
+        let mut b = Pixmap::new(12, 12);
+        fill_path(
+            &mut a,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            0.7,
+            Some(&clip),
+            BlendMode::Normal,
+        );
+        fill_path(
+            &mut b,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            0.7,
+            Some(&dull),
+            BlendMode::Normal,
+        );
+        assert_eq!(a.data, b.data, "opaque shortcut must not change pixels");
+    }
+
+    #[test]
+    fn fractional_clip_is_not_marked_opaque() {
+        let m = mask_from_path(12, 12, &[rect_poly(2.5, 2.0, 8.0, 10.0)], FillRule::NonZero);
+        assert!(!m.opaque, "partial edge coverage forbids the opaque flag");
+    }
+
+    #[test]
     fn mask_new_is_full_page_and_directly_indexable() {
         // `Mask::new` stays a full-page buffer (unlike `from_path`): a few
         // tests (and image.rs's) build a synthetic mask by hand via direct
