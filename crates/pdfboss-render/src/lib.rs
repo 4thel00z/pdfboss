@@ -36,6 +36,7 @@ mod image;
 mod path;
 #[allow(dead_code)]
 mod raster;
+mod shading;
 #[allow(dead_code)]
 mod stroke;
 #[allow(dead_code)]
