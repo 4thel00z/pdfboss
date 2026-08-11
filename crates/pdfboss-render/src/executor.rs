@@ -4016,6 +4016,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_shading_pattern_paints_under_each_use_site_matrix() {
+        // The tiling test's shading twin: the same indirect axial pattern
+        // (red at x=0 to blue at x=100 in pattern space) fills from the
+        // page and from a form invoked 40pt right. The form's gradient
+        // anchors to the form's own base, so device x=60 is pattern x=20
+        // (t=0.20); a reused pattern keeping the first paint's matrix
+        // would put t=0.60 there.
+        let resources = "/Pattern << /P0 5 0 R >> /XObject << /Fm0 6 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 20 30 30 re f q 1 0 0 1 40 0 cm /Fm0 Do Q";
+        let bytes = small_doc(resources, content, |b| {
+            b.object(
+                5,
+                "<< /PatternType 2 /Shading << /ShadingType 2 \
+                 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+                 /Extend [true true] /Function << /FunctionType 2 \
+                 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>",
+            );
+            b.stream(
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 40 40] \
+                 /Resources << /Pattern << /P0 5 0 R >> >>",
+                b"/Pattern cs /P0 scn 0 0 40 40 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 65), [191, 0, 64, 255], 4, "page fill t=0.25");
+        assert_near(px(&pix, 60, 80), [204, 0, 51, 255], 4, "form fill t=0.20");
+        assert_eq!(px(&pix, 35, 65), WHITE, "between the two fills");
+    }
+
+    #[test]
     fn failing_pattern_reports_every_paint() {
         // An indirect pattern with no /BBox fails to load; two fills through
         // it must produce two reports — a reused failure would collapse the
