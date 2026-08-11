@@ -625,19 +625,58 @@ fn blend_row<const NORMAL: bool>(
     blend: BlendMode,
 ) {
     let opaque = [rgb[0], rgb[1], rgb[2], 255];
+    // `base_a` is clamped to [0, 1], so `>= 1.0` means exactly 1.0: a fully
+    // covered pixel then writes exactly the source color, and a run of them
+    // becomes a plain pattern fill instead of per-pixel arithmetic.
+    let solid_src = NORMAL && base_a >= 1.0;
+    let n = covs.len();
+    let dst_row = &mut dst_row[..n * 4];
     match mask_row {
         None => {
-            for (dst, &cov) in dst_row.chunks_exact_mut(4).zip(covs) {
+            let mut x = 0;
+            while x < n {
+                let cov = covs[x];
+                if solid_src && cov >= 1.0 {
+                    let start = x;
+                    x += 1;
+                    while x < n && covs[x] >= 1.0 {
+                        x += 1;
+                    }
+                    fill_run(&mut dst_row[start * 4..x * 4], opaque);
+                    continue;
+                }
                 let a = cov.clamp(0.0, 1.0) * base_a;
-                paint_pixel::<NORMAL>(dst, a, rgb, opaque, blend);
+                paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
+                x += 1;
             }
         }
         Some(mrow) => {
-            for ((dst, &cov), &mb) in dst_row.chunks_exact_mut(4).zip(covs).zip(mrow) {
-                let a = (cov.clamp(0.0, 1.0) * base_a) * UNIT[mb as usize];
-                paint_pixel::<NORMAL>(dst, a, rgb, opaque, blend);
+            let mrow = &mrow[..n];
+            let mut x = 0;
+            while x < n {
+                let cov = covs[x];
+                if solid_src && cov >= 1.0 && mrow[x] == 255 {
+                    let start = x;
+                    x += 1;
+                    while x < n && covs[x] >= 1.0 && mrow[x] == 255 {
+                        x += 1;
+                    }
+                    fill_run(&mut dst_row[start * 4..x * 4], opaque);
+                    continue;
+                }
+                let a = (cov.clamp(0.0, 1.0) * base_a) * UNIT[mrow[x] as usize];
+                paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
+                x += 1;
             }
         }
+    }
+}
+
+/// Fills a run of pixels with one RGBA value (plain repeated 4-byte
+/// pattern; the loop lowers to wide stores).
+fn fill_run(dst: &mut [u8], px: [u8; 4]) {
+    for chunk in dst.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&px);
     }
 }
 
