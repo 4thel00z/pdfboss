@@ -1,0 +1,36 @@
+{
+  "corpus": "pdfs",
+  "files_sampled": 40,
+  "files_certified": 33,
+  "files_compared": 33,
+  "excluded": {
+    "annotation skipped": 3,
+    "glyph skipped": 3,
+    "pattern skipped": 1
+  },
+  "scale": 1.0,
+  "fonts": "full",
+  "repeat": 3,
+  "libraries": {
+    "pdfboss": {
+      "time": 6.72020858500764,
+      "pages": 660,
+      "ok": 33
+    },
+    "PyMuPDF": {
+      "time": 7.372506789979525,
+      "pages": 660,
+      "ok": 33
+    },
+    "pypdfium2": {
+      "time": 5.42418058799376,
+      "pages": 660,
+      "ok": 33
+    },
+    "pdfplumber": {
+      "time": 6.388550789000874,
+      "pages": 660,
+      "ok": 33
+    }
+  }
+}
