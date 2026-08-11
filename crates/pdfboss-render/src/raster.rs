@@ -17,6 +17,21 @@ pub(crate) enum FillRule {
     EvenOdd,
 }
 
+/// Reusable rasterizer buffers, owned by the caller so a page of fills does
+/// not re-allocate (and re-zero) them on every call. `row` is all-zero
+/// between calls; the sweep clears exactly the slots it dirtied.
+#[derive(Debug, Default)]
+pub(crate) struct RasterScratch {
+    /// Per-row coverage accumulator, at least page-width long.
+    row: Vec<f32>,
+    /// Edge list of the path being rasterized.
+    edges: Vec<Edge>,
+    /// Active-edge indices for the current scanline.
+    active: Vec<usize>,
+    /// Scanline crossings as `(x, winding direction)`.
+    crossings: Vec<(f32, i32)>,
+}
+
 /// A per-pixel coverage mask (0 = fully clipped out, 255 = fully visible)
 /// over a page of `width * height` device pixels.
 ///
@@ -72,16 +87,22 @@ impl Mask {
 
     /// Rasterizes `polys` under `rule` into a fresh mask sized to `polys`'
     /// own bounding box (clamped to the page), not the full page.
-    pub(crate) fn from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
-        let edges = build_edges(polys);
-        if edges.is_empty() || width == 0 || height == 0 {
+    pub(crate) fn from_path(
+        width: u32,
+        height: u32,
+        scratch: &mut RasterScratch,
+        polys: &[Subpath],
+        rule: FillRule,
+    ) -> Mask {
+        prepare_edges(&mut scratch.edges, polys);
+        if scratch.edges.is_empty() || width == 0 || height == 0 {
             return Mask::empty(width, height);
         }
         let mut xmin = f32::MAX;
         let mut xmax = f32::MIN;
         let mut ymin = f32::MAX;
         let mut ymax = f32::MIN;
-        for e in &edges {
+        for e in &scratch.edges {
             xmin = xmin.min(e.x0).min(e.x1);
             xmax = xmax.max(e.x0).max(e.x1);
             ymin = ymin.min(e.y0);
@@ -106,7 +127,7 @@ impl Mask {
             data: vec![0u8; bbox_w as usize * bbox_h as usize],
         };
         let bw = bbox_w as usize;
-        coverage_rows(width, height, polys, rule, |y, row, lo, hi| {
+        sweep_rows(scratch, width, height, rule, |y, row, lo, hi| {
             // `lo`/`hi` are columns touched on this row, which `coverage_rows`
             // only ever derives from crossings between edges already bounded
             // by `[xmin, xmax]` — so they always fall within `[bx0, bx1)`.
@@ -184,6 +205,7 @@ impl Mask {
 
 /// A non-horizontal polygon edge, stored top-to-bottom with its winding
 /// direction.
+#[derive(Debug)]
 struct Edge {
     /// Top endpoint (smaller y).
     x0: f32,
@@ -203,11 +225,18 @@ impl Edge {
     }
 }
 
-/// Collects the non-horizontal edges of `polys`, implicitly closing every
-/// subpath (fills always treat subpaths as closed). Edges with non-finite
-/// vertices are skipped.
-fn build_edges(polys: &[Subpath]) -> Vec<Edge> {
-    let mut edges = Vec::new();
+/// Collects the non-horizontal edges of `polys` into `edges` (cleared
+/// first), implicitly closing every subpath (fills always treat subpaths as
+/// closed), then sorts them by top `y` so the active-edge sweep can bring
+/// them in with a single forward-moving pointer as the scanline descends.
+/// Edges with non-finite vertices are skipped.
+///
+/// The sort must stay STABLE: equal-`y0` ties keep build order, which fixes
+/// the order crossings enter the scanline sort, which in turn fixes how
+/// coincident crossings split spans — and span splits change the f32
+/// accumulation order, i.e. the output bytes.
+fn prepare_edges(edges: &mut Vec<Edge>, polys: &[Subpath]) {
+    edges.clear();
     for sub in polys {
         let pts = &sub.points;
         if pts.len() < 2 {
@@ -232,7 +261,7 @@ fn build_edges(polys: &[Subpath]) -> Vec<Edge> {
             });
         }
     }
-    edges
+    edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 }
 
 /// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
@@ -265,51 +294,62 @@ fn add_span(
     }
 }
 
-/// Computes per-row anti-aliased coverage of `polys` under `rule` and
-/// invokes `emit(y, row, x_lo, x_hi)` for every pixel row the path touches,
-/// where `[x_lo, x_hi)` bounds the columns that received coverage. Rows the
-/// path does not reach are never emitted (their coverage is zero), and
-/// columns outside `[x_lo, x_hi)` in an emitted row are guaranteed zero.
-fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
+/// Computes per-row anti-aliased coverage of the prepared `scratch.edges`
+/// under `rule` and invokes `emit(y, row, x_lo, x_hi)` for every pixel row
+/// the path touches, where `[x_lo, x_hi)` bounds the columns that received
+/// coverage. Rows the path does not reach are never emitted (their coverage
+/// is zero), and columns outside `[x_lo, x_hi)` in an emitted row are
+/// guaranteed zero. The caller runs [`prepare_edges`] first; on return,
+/// `scratch.row` is all-zero again.
+fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
+    scratch: &mut RasterScratch,
     width: u32,
     height: u32,
-    polys: &[Subpath],
     rule: FillRule,
     mut emit: F,
 ) {
     if width == 0 || height == 0 {
         return;
     }
-    let mut edges = build_edges(polys);
+    let RasterScratch {
+        row,
+        edges,
+        active,
+        crossings,
+    } = scratch;
     if edges.is_empty() {
         return;
     }
     let mut ymin = f32::MAX;
     let mut ymax = f32::MIN;
-    for e in &edges {
+    for e in edges.iter() {
         ymin = ymin.min(e.y0);
         ymax = ymax.max(e.y1);
     }
-    // Sort edges by their top `y` so the active-edge sweep below can bring
-    // them in with a single forward-moving pointer as the scanline descends.
-    edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 
     let row_start = ymin.floor().max(0.0) as u32;
     let row_end = (ymax.ceil().max(0.0) as u32).min(height);
-    let mut row = vec![0.0f32; width as usize];
-    let mut crossings: Vec<(f32, i32)> = Vec::new();
+    let full = width as usize;
+    if row.len() < full {
+        row.resize(full, 0.0);
+    }
+    // `add_span` clamps against the slice length, so hand it exactly the
+    // page width even when the reused buffer is longer.
+    let row = &mut row[..full];
     // Active-edge table: indices into `edges` for the edges that straddle the
     // current scanline. `ys` increases monotonically across the whole sweep
     // (rows outer, subsamples inner), so `next` only ever advances and expired
     // edges are dropped once and never revisited — turning the per-scanline
-    // cost from O(all edges) into O(edges crossing this row).
-    let mut active: Vec<usize> = Vec::new();
+    // cost from O(all edges) into O(edges crossing this row). Activation in
+    // index order plus order-preserving `retain` fixes the order crossings
+    // are generated in, which the byte-identity of coincident-crossing span
+    // splits depends on (see `prepare_edges`).
+    active.clear();
     let mut next = 0usize;
     let weight = 1.0 / SUBSAMPLES as f32;
     // `[dirty_lo, dirty_hi)` is the range of `row` written for the row being
     // built; it is used both to bound `emit` and to clear only the touched
     // slice before the next row instead of re-zeroing the full width.
-    let full = width as usize;
     let mut dirty_lo = full;
     let mut dirty_hi = 0usize;
     for y in row_start..row_end {
@@ -326,7 +366,7 @@ fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
             }
             active.retain(|&i| edges[i].y1 > ys);
             crossings.clear();
-            for &i in &active {
+            for &i in active.iter() {
                 // By construction `y0 <= ys` (activation) and `ys < y1`
                 // (retain), so this edge genuinely crosses the scanline.
                 crossings.push((edges[i].x_at(ys), edges[i].dir));
@@ -337,27 +377,24 @@ fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
             crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
             let mut wind = 0i32;
             let mut span_start = 0.0f32;
-            for &(x, dir) in &crossings {
+            for &(x, dir) in crossings.iter() {
                 let was_inside = inside(wind, rule);
                 wind += dir;
                 let is_inside = inside(wind, rule);
                 if !was_inside && is_inside {
                     span_start = x;
                 } else if was_inside && !is_inside {
-                    add_span(
-                        &mut row,
-                        span_start,
-                        x,
-                        weight,
-                        &mut dirty_lo,
-                        &mut dirty_hi,
-                    );
+                    add_span(row, span_start, x, weight, &mut dirty_lo, &mut dirty_hi);
                 }
             }
         }
         if dirty_lo < dirty_hi {
-            emit(y, &row, dirty_lo, dirty_hi);
+            emit(y, row, dirty_lo, dirty_hi);
         }
+    }
+    // Restore the all-zero invariant for the next caller.
+    if dirty_lo < dirty_hi {
+        row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
     }
 }
 
@@ -494,6 +531,7 @@ pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// source-over.
 pub(crate) fn fill_path(
     pix: &mut Pixmap,
+    scratch: &mut RasterScratch,
     polys: &[Subpath],
     rule: FillRule,
     rgba: [u8; 4],
@@ -512,7 +550,8 @@ pub(crate) fn fill_path(
     }
     let rgb = [rgba[0], rgba[1], rgba[2]];
     let w = pix.width as usize;
-    coverage_rows(pix.width, pix.height, polys, rule, |y, row, mut lo, mut hi| {
+    prepare_edges(&mut scratch.edges, polys);
+    sweep_rows(scratch, pix.width, pix.height, rule, |y, row, mut lo, mut hi| {
         let mask_row = match clip {
             None => None,
             Some(m) => {
@@ -607,6 +646,33 @@ fn paint_pixel<const NORMAL: bool>(
 mod tests {
     use super::*;
     use pdfboss_core::geom::Point;
+
+    /// Shadows the crate fn with a fresh-scratch wrapper so the tests stay
+    /// focused on rasterization behavior, not buffer plumbing.
+    fn fill_path(
+        pix: &mut Pixmap,
+        polys: &[Subpath],
+        rule: FillRule,
+        rgba: [u8; 4],
+        alpha: f32,
+        clip: Option<&Mask>,
+        blend: BlendMode,
+    ) {
+        super::fill_path(
+            pix,
+            &mut RasterScratch::default(),
+            polys,
+            rule,
+            rgba,
+            alpha,
+            clip,
+            blend,
+        );
+    }
+
+    fn mask_from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
+        Mask::from_path(width, height, &mut RasterScratch::default(), polys, rule)
+    }
 
     fn rect_poly(x0: f32, y0: f32, x1: f32, y1: f32) -> Subpath {
         Subpath {
@@ -795,7 +861,7 @@ mod tests {
     #[test]
     fn clip_mask_restricts_fill() {
         let mut pix = Pixmap::new(10, 10);
-        let clip = Mask::from_path(10, 10, &[rect_poly(0.0, 0.0, 5.0, 10.0)], FillRule::NonZero);
+        let clip = mask_from_path(10, 10, &[rect_poly(0.0, 0.0, 5.0, 10.0)], FillRule::NonZero);
         let polys = [rect_poly(0.0, 0.0, 10.0, 10.0)];
         fill_path(
             &mut pix,
@@ -819,8 +885,8 @@ mod tests {
 
     #[test]
     fn mask_intersect_takes_minimum() {
-        let mut a = Mask::from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
-        let b = Mask::from_path(8, 8, &[rect_poly(4.0, 0.0, 8.0, 8.0)], FillRule::NonZero);
+        let mut a = mask_from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
+        let b = mask_from_path(8, 8, &[rect_poly(4.0, 0.0, 8.0, 8.0)], FillRule::NonZero);
         a.intersect(&b);
         assert_eq!(a.coverage(2, 4), 0, "only in a");
         assert_eq!(a.coverage(7, 4), 0, "only in b");
@@ -832,7 +898,7 @@ mod tests {
         // A small clip rect on a large page should only allocate its own
         // bounding box, not the whole page — this is the whole point of the
         // fix (O(clip area), not O(page area), per clip operation).
-        let mask = Mask::from_path(
+        let mask = mask_from_path(
             1000,
             1000,
             &[rect_poly(10.0, 20.0, 30.0, 50.0)],
@@ -850,13 +916,13 @@ mod tests {
 
     #[test]
     fn mask_intersect_disjoint_bboxes_is_empty() {
-        let mut a = Mask::from_path(
+        let mut a = mask_from_path(
             100,
             100,
             &[rect_poly(0.0, 0.0, 10.0, 10.0)],
             FillRule::NonZero,
         );
-        let b = Mask::from_path(
+        let b = mask_from_path(
             100,
             100,
             &[rect_poly(50.0, 50.0, 60.0, 60.0)],
@@ -874,13 +940,13 @@ mod tests {
 
     #[test]
     fn mask_intersect_shrinks_bbox_to_overlap() {
-        let mut a = Mask::from_path(
+        let mut a = mask_from_path(
             100,
             100,
             &[rect_poly(0.0, 0.0, 20.0, 20.0)],
             FillRule::NonZero,
         );
-        let b = Mask::from_path(
+        let b = mask_from_path(
             100,
             100,
             &[rect_poly(10.0, 10.0, 30.0, 30.0)],

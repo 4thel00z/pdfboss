@@ -169,7 +169,7 @@ pub(crate) fn stroke_path(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raster::{fill_path, BlendMode, FillRule};
+    use crate::raster::{fill_path, BlendMode, FillRule, RasterScratch};
     use crate::Pixmap;
 
     fn line(points: &[(f32, f32)]) -> Subpath {
@@ -188,6 +188,7 @@ mod tests {
     fn paint(pix: &mut Pixmap, polys: &[Subpath]) {
         fill_path(
             pix,
+            &mut RasterScratch::default(),
             polys,
             FillRule::NonZero,
             BLACK,
