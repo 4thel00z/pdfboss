@@ -285,13 +285,17 @@ fn add_span(
     let last = (x1.ceil() as usize).min(row.len());
     *dirty_lo = (*dirty_lo).min(first);
     *dirty_hi = (*dirty_hi).max(last);
-    for (px, slot) in row.iter_mut().enumerate().take(last).skip(first) {
-        let l = x0.max(px as f32);
-        let r = x1.min(px as f32 + 1.0);
-        if r > l {
-            *slot += (r - l) * weight;
-        }
+    if last == first + 1 {
+        row[first] += (x1.min(first as f32 + 1.0) - x0) * weight;
+        return;
     }
+    row[first] += (first as f32 + 1.0 - x0) * weight;
+    // Interior pixels are fully covered: the old per-pixel min/max produced
+    // exactly `(r - l) == 1.0` there, so this adds the identical value.
+    for slot in &mut row[first + 1..last - 1] {
+        *slot += weight;
+    }
+    row[last - 1] += (x1 - (last - 1) as f32) * weight;
 }
 
 /// Computes per-row anti-aliased coverage of the prepared `scratch.edges`
