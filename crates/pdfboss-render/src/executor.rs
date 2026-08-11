@@ -4092,6 +4092,91 @@ mod tests {
     }
 
     #[test]
+    fn tile_cell_gstate_stays_inside_its_tile() {
+        // A cell that pushes `q`, scales the CTM and never pops: every tile
+        // must paint the identical scaled quarter, and content after the
+        // pattern fill must land where the page's own CTM puts it. A tile
+        // frame that bled its graphics state into a sibling or its parent
+        // fails one of these probes.
+        let resources = "/Pattern << /P0 5 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 0 100 100 re f \
+                        /DeviceRGB cs 0 0 1 scn 90 90 8 8 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"q 0.5 0 0 0.5 0 0 cm 1 0 0 rg 0 0 10 10 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 2, 97), RED, "first tile's scaled quarter");
+        assert_eq!(px(&pix, 12, 87), RED, "diagonal neighbor, identical cell");
+        assert_eq!(px(&pix, 7, 97), WHITE, "outside the scaled quarter");
+        assert_eq!(
+            px(&pix, 94, 5),
+            [0, 0, 255, 255],
+            "content after the pattern paints at page scale"
+        );
+    }
+
+    #[test]
+    fn tile_cell_clip_stays_inside_its_tile() {
+        // A cell that clips itself down to 3x3 before filling: the clip
+        // must not survive into the next tile or into the content painted
+        // after the pattern.
+        let resources = "/Pattern << /P0 5 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 0 100 100 re f \
+                        /DeviceRGB cs 0 0 1 scn 60 60 10 10 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"0 0 3 3 re W n 1 0 0 rg 0 0 10 10 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 1, 98), RED, "first tile's clipped fill");
+        assert_eq!(px(&pix, 11, 88), RED, "next tile clips independently");
+        assert_eq!(px(&pix, 6, 95), WHITE, "the cell outside its own clip");
+        assert_eq!(
+            px(&pix, 64, 34),
+            [0, 0, 255, 255],
+            "content after the pattern is not clipped"
+        );
+    }
+
+    #[test]
+    fn uncolored_pattern_color_lock_ends_with_the_fill() {
+        // /PaintType 2 tiles run under the color lock. Once the pattern
+        // fill is done the page's own color operators must work again — a
+        // leaked lock would ignore the scn and repaint in the pattern.
+        let resources = "/Pattern << /P0 5 0 R >> \
+                         /ColorSpace << /CS0 [/Pattern /DeviceRGB] >>";
+        let content = b"/CS0 cs 0 1 0 /P0 scn 0 0 40 40 re f \
+                        /DeviceRGB cs 1 0 0 scn 60 60 10 10 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"0 0 5 5 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 2, 97), [0, 255, 0, 255], "uncolored tile in scn");
+        assert_eq!(
+            px(&pix, 64, 34),
+            RED,
+            "color operators work again after the pattern"
+        );
+    }
+
+    #[test]
     fn mesh_shadings_still_report_unsupported() {
         // ShadingType 4 (free-form triangle mesh) stays a reported drop.
         let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
