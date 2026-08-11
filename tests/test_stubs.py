@@ -19,9 +19,9 @@ def test_stub_declares_the_element_and_async_surface() -> None:
     stub = STUB.read_text()
     assert "def elements(" in stub
     assert "def value(self) -> object" in stub
-    assert "async def open(path: str | os.PathLike)" in stub
-    assert "async def open_url(url: str)" in stub
-    assert "async def from_bytes(data: bytes)" in stub
+    assert 'async def open(path: str | os.PathLike, *, password: str = "")' in stub
+    assert 'async def open_url(url: str, *, password: str = "")' in stub
+    assert 'async def from_bytes(data: bytes, *, password: str = "")' in stub
     assert "async def metadata(self) -> dict[str, str]" in stub
     assert "async def get_object(self, num: int, gen: int = 0)" in stub
     assert "Iterator[Element]" in stub
