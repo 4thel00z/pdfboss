@@ -1959,6 +1959,98 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         self.blit_image(&img.dict, &data, cs_obj, gs).await;
     }
 
+    /// The per-sample alpha an image's `/SMask` or `/Mask` entry asks for
+    /// (`/SMask` wins when both are present, §8.9.6.4). A mask that exists
+    /// but cannot be honored reports as an ignored soft mask and the image
+    /// draws unmasked — exactly the pre-mask behavior, now the exception
+    /// instead of the rule.
+    async fn image_alpha_mask(
+        &mut self,
+        dict: &Dict,
+        base: &image::ImageMeta,
+        base_data: &[u8],
+    ) -> Option<image::SampleMask> {
+        if let Some(obj) = dict.get("SMask") {
+            match self.src.resolve(obj).await {
+                Ok(Object::Stream(s)) => {
+                    if s.dict.get("Matte").is_some() {
+                        // Pre-blended matte colors are not un-blended here;
+                        // the alpha still applies, the colors approximate.
+                        self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+                    }
+                    let data = match self.src.stream_data(&s).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            self.skip(SkippedKind::SoftMask, skip_reason_for(&e));
+                            return None;
+                        }
+                    };
+                    let cs_obj = s.dict.get("ColorSpace").cloned();
+                    let meta =
+                        image::ImageMeta::read_with(self.src, &s.dict, cs_obj.as_ref()).await;
+                    let mask = image::decode_alpha(&meta, &data);
+                    if mask.is_none() {
+                        self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
+                    }
+                    return mask;
+                }
+                Ok(Object::Name(n)) if n.0 == "None" => {}
+                Ok(Object::Null) => {}
+                _ => {
+                    self.skip(SkippedKind::SoftMask, SkipReason::Missing);
+                    return None;
+                }
+            }
+        }
+        match dict.get("Mask") {
+            None => None,
+            Some(obj) => match self.src.resolve(obj).await {
+                Ok(Object::Stream(s)) => {
+                    let data = match self.src.stream_data(&s).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            self.skip(SkippedKind::SoftMask, skip_reason_for(&e));
+                            return None;
+                        }
+                    };
+                    let meta = image::ImageMeta::read_with(self.src, &s.dict, None).await;
+                    if !meta.stencil {
+                        // A stream-valued /Mask must be a stencil (§8.9.6.4).
+                        self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
+                        return None;
+                    }
+                    let mask = image::decode_alpha(&meta, &data);
+                    if mask.is_none() {
+                        self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
+                    }
+                    mask
+                }
+                Ok(Object::Array(items)) => {
+                    let mut key = Vec::with_capacity(items.len());
+                    for item in &items {
+                        match self.src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
+                            Some(v) => key.push(v as i64),
+                            None => {
+                                self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
+                                return None;
+                            }
+                        }
+                    }
+                    let mask = image::color_key_mask(base, base_data, &key);
+                    if mask.is_none() {
+                        self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+                    }
+                    mask
+                }
+                Ok(Object::Null) => None,
+                _ => {
+                    self.skip(SkippedKind::SoftMask, SkipReason::Missing);
+                    None
+                }
+            },
+        }
+    }
+
     async fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
         // `data` is decoded samples, a raw JPEG, or a JPEG 2000 file: the
         // filter chain passes only `DCTDecode` and `JPXDecode` through
@@ -1976,10 +2068,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(e) = palette_err {
             self.skip(SkippedKind::Image, skip_reason_for(&e));
         }
-        if ignores_mask(self.src, dict).await {
-            self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
-        }
         let meta = image::ImageMeta::read_with(self.src, dict, cs_obj.as_ref()).await;
+        let smask = self.image_alpha_mask(dict, &meta, data).await;
         if gs.fill_pattern && meta.stencil {
             // The stencil paints the pattern's stand-in gray, not the
             // pattern (see `GState::fill_rgba8`).
@@ -1996,6 +2086,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 fill_rgb: [fill[0], fill[1], fill[2]],
                 clip: gs.clip.as_deref(),
                 blend: gs.blend_mode,
+                smask: smask.as_ref(),
             },
         );
         match outcome {
@@ -2971,6 +3062,62 @@ mod tests {
     }
 
     #[test]
+    fn stencil_mask_stream_hides_where_it_is_one() {
+        // A /Mask stencil whose top half is all ones: those samples of the
+        // black base image are not painted (§8.9.6.4).
+        let mut mask = [0u8; 8]; // 8 rows x 8 one-BIT samples = 1 byte/row
+        mask[..4].fill(0xFF); // stencil rows are top-first
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace /DeviceGray /Mask 6 0 R",
+                    &[0x00; 64],
+                );
+                b.stream(
+                    6,
+                    "/Type /XObject /Subtype /Image /ImageMask true \
+                     /Width 8 /Height 8 /BitsPerComponent 1",
+                    &mask,
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 25), WHITE, "mask=1 rows stay unpainted");
+        assert_eq!(px(&pix, 50, 75), [0, 0, 0, 255], "mask=0 rows paint");
+        assert!(report.is_empty(), "an applied stencil mask is not a drop");
+    }
+
+    #[test]
+    fn color_key_mask_hides_matching_samples() {
+        // /Mask [0 32]: the dark half of a two-tone gray image becomes
+        // transparent, the light half paints.
+        let mut samples = [0u8; 64];
+        for row in samples.chunks_mut(8) {
+            row[4..].fill(0xC0);
+        }
+        let bytes = small_doc(
+            "/XObject << /Im0 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im0 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
+                     /BitsPerComponent 8 /ColorSpace /DeviceGray /Mask [0 32]",
+                    &samples,
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 50), WHITE, "keyed-out samples are transparent");
+        assert_eq!(px(&pix, 75, 50), [192, 192, 192, 255], "others paint");
+        assert!(report.is_empty(), "an applied color key is not a drop");
+    }
+
+    #[test]
     fn multiply_blend_darkens_the_overlap() {
         // A red square, then a blue square multiplied over it: the overlap
         // multiplies to black, the blue-only region lands on white where
@@ -3013,7 +3160,14 @@ mod tests {
     }
 
     #[test]
-    fn image_soft_mask_is_reported() {
+    fn image_soft_mask_applies_per_sample_alpha() {
+        // A solid black image whose /SMask is transparent on its left half
+        // and opaque on its right: the left half shows the page, the right
+        // half paints, and nothing is a drop anymore.
+        let mut smask = [0u8; 64];
+        for row in smask.chunks_mut(8) {
+            row[4..].fill(0xFF);
+        }
         let bytes = small_doc(
             "/XObject << /Im0 5 0 R >>",
             b"q 100 0 0 100 0 0 cm /Im0 Do Q",
@@ -3022,26 +3176,20 @@ mod tests {
                     5,
                     "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
                      /BitsPerComponent 8 /ColorSpace /DeviceGray /SMask 6 0 R",
-                    &[0xFF; 64],
+                    &[0x00; 64],
                 );
                 b.stream(
                     6,
                     "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
                      /BitsPerComponent 8 /ColorSpace /DeviceGray",
-                    &[0; 64],
+                    &smask,
                 );
             },
         );
         let (pix, report) = render_reporting(bytes);
-        assert_eq!(
-            px(&pix, 50, 50),
-            WHITE,
-            "fully masked content painted anyway"
-        );
-        assert_eq!(
-            drops(&report),
-            vec![(SkippedKind::SoftMask, SkipReason::Unsupported, 1)],
-        );
+        assert_eq!(px(&pix, 25, 50), WHITE, "masked-out half shows the page");
+        assert_eq!(px(&pix, 75, 50), [0, 0, 0, 255], "kept half paints");
+        assert!(report.is_empty(), "an applied mask is not a drop");
     }
 
     #[test]
