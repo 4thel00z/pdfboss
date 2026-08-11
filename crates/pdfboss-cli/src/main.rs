@@ -117,6 +117,9 @@ enum Command {
         /// `pdfboss-fonts` package). Overrides the compiled-in OFL set.
         #[arg(long)]
         font_dir: Option<PathBuf>,
+        /// PNG compression: encode time against file size, same pixels.
+        #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
+        png_compression: PngCompressionArg,
     },
     /// Pretty-print a single object.
     Obj {
@@ -242,6 +245,33 @@ impl FontsArg {
     }
 }
 
+/// `--png-compression` choices for `render`, mapping to
+/// `pdfboss_render::PngCompression`.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum PngCompressionArg {
+    /// Uncompressed: fastest, largest files.
+    None,
+    /// Very fast with a decent ratio.
+    Fast,
+    /// Balances encode speed and file size (default).
+    #[default]
+    Default,
+    /// Smallest files, much slower.
+    Best,
+}
+
+impl PngCompressionArg {
+    fn to_compression(self) -> pdfboss_render::PngCompression {
+        use pdfboss_render::PngCompression;
+        match self {
+            PngCompressionArg::None => PngCompression::None,
+            PngCompressionArg::Fast => PngCompression::Fast,
+            PngCompressionArg::Default => PngCompression::Balanced,
+            PngCompressionArg::Best => PngCompression::Best,
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let result: Result<(), Failure> = match cli.command {
@@ -264,7 +294,18 @@ fn main() {
             fonts,
             font_dir,
             password,
-        } => cmd_render(&file, page, out, scale, fonts, font_dir, &password).map_err(Failure::from),
+            png_compression,
+        } => cmd_render(
+            &file,
+            page,
+            out,
+            scale,
+            fonts,
+            font_dir,
+            &password,
+            png_compression,
+        )
+        .map_err(Failure::from),
         Command::Obj {
             file,
             num,
@@ -540,6 +581,7 @@ fn substitute_source(
 }
 
 /// `pdfboss render`: rasterizes one page to a PNG file.
+#[allow(clippy::too_many_arguments)]
 fn cmd_render(
     file: &Path,
     page: usize,
@@ -548,6 +590,7 @@ fn cmd_render(
     fonts: FontsArg,
     font_dir: Option<PathBuf>,
     password: &str,
+    png_compression: PngCompressionArg,
 ) -> Result<(), String> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
@@ -563,7 +606,10 @@ fn cmd_render(
     let (pixmap, report) =
         pdfboss_render::render_page_reporting(&doc, &p, scale, &opts).map_err(|e| e.to_string())?;
     let out = out.unwrap_or_else(|| default_out(page));
-    pixmap.save_png(&out).map_err(|e| e.to_string())?;
+    let png = pixmap
+        .encode_png_with(png_compression.to_compression())
+        .map_err(|e| e.to_string())?;
+    std::fs::write(&out, png).map_err(|e| e.to_string())?;
     // Rendering is lenient, so a page whose content pdfboss could not read
     // still writes a PNG and still exits 0. Say what was lost, on stderr and
     // in the summary line, rather than reporting a clean render.
@@ -728,6 +774,59 @@ mod tests {
 
         let source = substitute_source(fonts, font_dir).expect("--font-dir given, always Ok");
         assert!(matches!(source, pdfboss_render::SubstituteSource::Dir(p) if p == Path::new("X")));
+    }
+
+    #[test]
+    fn png_compression_flag_defaults_to_default_level() {
+        let cli = Cli::parse_from(["pdfboss", "render", "in.pdf", "--page", "1"]);
+        let Command::Render {
+            png_compression, ..
+        } = cli.command
+        else {
+            panic!("expected render command");
+        };
+        assert!(matches!(png_compression, PngCompressionArg::Default));
+    }
+
+    #[test]
+    fn png_compression_flag_parses_every_level() {
+        for (value, expected) in [
+            ("none", pdfboss_render::PngCompression::None),
+            ("fast", pdfboss_render::PngCompression::Fast),
+            ("default", pdfboss_render::PngCompression::Balanced),
+            ("best", pdfboss_render::PngCompression::Best),
+        ] {
+            let cli = Cli::parse_from([
+                "pdfboss",
+                "render",
+                "in.pdf",
+                "--page",
+                "1",
+                "--png-compression",
+                value,
+            ]);
+            let Command::Render {
+                png_compression, ..
+            } = cli.command
+            else {
+                panic!("expected render command");
+            };
+            assert_eq!(png_compression.to_compression(), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn png_compression_flag_rejects_unknown_levels() {
+        let outcome = Cli::try_parse_from([
+            "pdfboss",
+            "render",
+            "in.pdf",
+            "--page",
+            "1",
+            "--png-compression",
+            "bogus",
+        ]);
+        assert!(outcome.is_err());
     }
 
     #[test]

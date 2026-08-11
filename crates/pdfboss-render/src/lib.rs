@@ -59,6 +59,33 @@ pub struct Pixmap {
     pub data: Vec<u8>,
 }
 
+/// How much CPU the PNG encoder spends shrinking the file. Every level
+/// round-trips the exact same pixels; only encode time and file size move.
+/// `Balanced` is what [`Pixmap::encode_png`] has always used.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PngCompression {
+    /// Uncompressed: fastest, largest files.
+    None,
+    /// Very fast with a decent ratio.
+    Fast,
+    /// Balances encode speed and file size.
+    #[default]
+    Balanced,
+    /// Smallest files, much slower.
+    Best,
+}
+
+impl PngCompression {
+    fn to_encoding(self) -> png::Compression {
+        match self {
+            PngCompression::None => png::Compression::NoCompression,
+            PngCompression::Fast => png::Compression::Fast,
+            PngCompression::Balanced => png::Compression::Balanced,
+            PngCompression::Best => png::Compression::High,
+        }
+    }
+}
+
 impl Pixmap {
     /// Creates a fully transparent pixmap.
     pub fn new(w: u32, h: u32) -> Pixmap {
@@ -76,8 +103,13 @@ impl Pixmap {
         }
     }
 
-    /// Encodes the pixmap as a PNG image.
+    /// Encodes the pixmap as a PNG image, at the default compression level.
     pub fn encode_png(&self) -> Result<Vec<u8>> {
+        self.encode_png_with(PngCompression::default())
+    }
+
+    /// Encodes the pixmap as a PNG image at the given compression level.
+    pub fn encode_png_with(&self, compression: PngCompression) -> Result<Vec<u8>> {
         fn err(e: png::EncodingError) -> Error {
             Error::Other(format!("png encode: {e}"))
         }
@@ -85,6 +117,7 @@ impl Pixmap {
         let mut enc = png::Encoder::new(&mut out, self.width, self.height);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
+        enc.set_compression(compression.to_encoding());
         let mut writer = enc.write_header().map_err(err)?;
         writer.write_image_data(&self.data).map_err(err)?;
         writer.finish().map_err(err)?;
@@ -486,6 +519,32 @@ mod tests {
         let mut pix = Pixmap::new(2, 2);
         pix.fill([1, 2, 3, 4]);
         assert_eq!(pix.data, [1, 2, 3, 4].repeat(4));
+    }
+
+    #[test]
+    fn compression_levels_map_to_their_encoder_settings() {
+        // png::Compression derives no PartialEq, hence matches!.
+        assert!(matches!(
+            PngCompression::None.to_encoding(),
+            png::Compression::NoCompression
+        ));
+        assert!(matches!(
+            PngCompression::Fast.to_encoding(),
+            png::Compression::Fast
+        ));
+        assert!(matches!(
+            PngCompression::Balanced.to_encoding(),
+            png::Compression::Balanced
+        ));
+        assert!(matches!(
+            PngCompression::Best.to_encoding(),
+            png::Compression::High
+        ));
+    }
+
+    #[test]
+    fn balanced_is_the_default_compression() {
+        assert_eq!(PngCompression::default(), PngCompression::Balanced);
     }
 
     #[test]

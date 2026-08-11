@@ -8,6 +8,7 @@ import gc
 import sys
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -17,6 +18,57 @@ import pdfboss
 from pdfboss import Document, Page, PdfError
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def decode_png(png: bytes) -> tuple[int, int, bytes]:
+    """Stdlib-only RGBA8 PNG decode: chunk walk, zlib, row unfilter.
+
+    Deliberately not an imaging dependency, so the pixel-identity tests
+    below always run. The ``none`` compression level writes unfiltered
+    rows, so comparing it against the filtered levels also cross-checks
+    this unfilter implementation.
+    """
+    if png[:8] != PNG_MAGIC:
+        raise ValueError("not a PNG")
+    pos, idat, width, height = 8, b"", 0, 0
+    while pos < len(png):
+        length = int.from_bytes(png[pos : pos + 4], "big")
+        kind = png[pos + 4 : pos + 8]
+        data = png[pos + 8 : pos + 8 + length]
+        if kind == b"IHDR":
+            width = int.from_bytes(data[0:4], "big")
+            height = int.from_bytes(data[4:8], "big")
+            if (data[8], data[9], data[12]) != (8, 6, 0):
+                raise ValueError("expected non-interlaced RGBA8")
+        elif kind == b"IDAT":
+            idat += data
+        pos += 12 + length
+    raw = zlib.decompress(idat)
+    stride = width * 4
+    out = bytearray()
+    prev = bytearray(stride)
+    for y in range(height):
+        start = y * (stride + 1)
+        filter_type = raw[start]
+        row = bytearray(raw[start + 1 : start + 1 + stride])
+        for i in range(stride):
+            a = row[i - 4] if i >= 4 else 0
+            b = prev[i]
+            c = prev[i - 4] if i >= 4 else 0
+            if filter_type == 1:
+                row[i] = (row[i] + a) & 0xFF
+            elif filter_type == 2:
+                row[i] = (row[i] + b) & 0xFF
+            elif filter_type == 3:
+                row[i] = (row[i] + (a + b) // 2) & 0xFF
+            elif filter_type == 4:
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                nearest = a if pa <= pb and pa <= pc else b if pb <= pc else c
+                row[i] = (row[i] + nearest) & 0xFF
+        out += row
+        prev = row
+    return width, height, bytes(out)
 
 
 class TestOpen:
@@ -225,6 +277,47 @@ class TestRender:
         # all-embedded / embedded-only must not attempt discovery -> no raise.
         assert page.render(fonts="all-embedded")[:8] == PNG_MAGIC
         assert page.render(fonts="embedded-only")[:8] == PNG_MAGIC
+
+
+class TestRenderCompression:
+    def test_every_level_round_trips_the_same_pixels(self, hello_pdf: Path) -> None:
+        page = Document(str(hello_pdf))[0]
+        reference = decode_png(page.render())
+        for level in ("none", "fast", "default", "best"):
+            assert decode_png(page.render(compression=level)) == reference, level
+
+    def test_no_compression_is_larger_than_best(self, hello_pdf: Path) -> None:
+        page = Document(str(hello_pdf))[0]
+        none = page.render(compression="none")
+        best = page.render(compression="best")
+        assert len(none) > len(best)
+
+    def test_omitted_compression_is_byte_identical_to_the_default_level(
+        self, hello_pdf: Path
+    ) -> None:
+        doc = Document(str(hello_pdf))
+        page = doc[0]
+        assert page.render() == page.render(compression="default")
+        assert (
+            page.render_reporting()[0] == page.render_reporting(compression="default")[0]
+        )
+        assert doc.render_pages() == doc.render_pages(compression="default")
+
+    def test_render_pages_honors_the_level(self, three_pages_pdf: Path) -> None:
+        doc = Document(str(three_pages_pdf))
+        none = doc.render_pages(compression="none")
+        best = doc.render_pages(compression="best")
+        assert all(png.startswith(PNG_MAGIC) for png in none + best)
+        assert all(len(n) > len(b) for n, b in zip(none, best))
+
+    def test_unknown_compression_raises_value_error_naming_the_choices(
+        self, hello_pdf: Path
+    ) -> None:
+        doc = Document(str(hello_pdf))
+        page = doc[0]
+        for call in (page.render, page.render_reporting, doc.render_pages):
+            with pytest.raises(ValueError, match="'none', 'fast', 'default' or 'best'"):
+                call(compression="bogus")
 
 
 def pdf_with_undecodable_image() -> bytes:

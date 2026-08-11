@@ -95,6 +95,7 @@ class Document:
         scale: float = 1.0,
         fonts: str = "all-embedded",
         font_dir: str | None = None,
+        compression: str = "default",
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
         given) to PNG bytes, fanned out across the machine's cores."""
@@ -156,6 +157,7 @@ class Page:
         scale: float = 1.0,
         fonts: str = "all-embedded",
         font_dir: str | None = None,
+        compression: str = "default",
     ) -> bytes:
         """Renders the page at ``scale`` and returns PNG bytes.
 
@@ -170,6 +172,10 @@ class Page:
         raises ``ValueError`` (install with ``pip install pdfboss[full]``,
         or pass ``font_dir=...``).
 
+        ``compression`` trades PNG encode time against file size:
+        ``"none"``, ``"fast"``, ``"default"`` or ``"best"``. Every level
+        produces the same pixels.
+
         Content pdfboss cannot read is skipped rather than raising, so a
         page can come out blank; ``render_reporting`` says what was lost.
         """
@@ -179,6 +185,7 @@ class Page:
         scale: float = 1.0,
         fonts: str = "all-embedded",
         font_dir: str | None = None,
+        compression: str = "default",
     ) -> tuple[bytes, list[str]]:
         """Renders the page like ``render``, returning ``(png, warnings)``.
 
@@ -220,6 +227,7 @@ class AsyncDocument:
         scale: float = 1.0,
         fonts: str = "all-embedded",
         font_dir: str | None = None,
+        compression: str = "default",
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
         given) to PNG bytes — the async twin of ``Document.render_pages``,
@@ -264,10 +272,12 @@ class AsyncPage:
         scale: float = 1.0,
         fonts: str = "all-embedded",
         font_dir: str | None = None,
+        compression: str = "default",
     ) -> bytes: ...
     async def render_reporting(
         self,
         scale: float = 1.0,
         fonts: str = "all-embedded",
         font_dir: str | None = None,
+        compression: str = "default",
     ) -> tuple[bytes, list[str]]: ...

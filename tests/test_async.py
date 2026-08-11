@@ -428,3 +428,35 @@ class TestAsyncPageParity:
         sync_doc = Document(str(pdf_path))
         doc = await AsyncDocument.open_url(url)
         assert await doc.render_pages() == sync_doc.render_pages()
+
+
+class TestAsyncRenderCompression:
+    @pytest.mark.asyncio
+    async def test_every_level_matches_the_sync_bytes(self, hello_pdf: Path) -> None:
+        sync_page = Document(str(hello_pdf))[0]
+        doc = await AsyncDocument.open(str(hello_pdf))
+        for level in ("none", "fast", "default", "best"):
+            png = await doc[0].render(compression=level)
+            assert png == sync_page.render(compression=level), level
+
+    @pytest.mark.asyncio
+    async def test_omitted_compression_is_byte_identical_to_the_default_level(
+        self, hello_pdf: Path
+    ) -> None:
+        doc = await AsyncDocument.open(str(hello_pdf))
+        page = doc[0]
+        assert await page.render() == await page.render(compression="default")
+        reporting = await page.render_reporting()
+        explicit = await page.render_reporting(compression="default")
+        assert reporting[0] == explicit[0]
+        assert await doc.render_pages() == await doc.render_pages(compression="default")
+
+    @pytest.mark.asyncio
+    async def test_unknown_compression_raises_value_error_naming_the_choices(
+        self, hello_pdf: Path
+    ) -> None:
+        doc = await AsyncDocument.open(str(hello_pdf))
+        page = doc[0]
+        for call in (page.render, page.render_reporting, doc.render_pages):
+            with pytest.raises(ValueError, match="'none', 'fast', 'default' or 'best'"):
+                await call(compression="bogus")
