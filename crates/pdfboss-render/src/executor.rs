@@ -120,6 +120,11 @@ struct GState {
     fill_alpha: f32,
     /// Constant stroke alpha (`CA`).
     stroke_alpha: f32,
+    /// Active group soft mask (`/SMask` in `/ExtGState`), a device-space
+    /// coverage mask multiplied into every paint alongside the clip. Its
+    /// own field, never folded into `clip`: `/SMask /None` must reset it
+    /// and `q`/`Q` must restore it independently.
+    soft_mask: Option<Arc<Mask>>,
     /// Active clip as a device-space coverage mask. Shared behind an `Arc` so
     /// that saving state (`q`) and entering a form clone the graphics state
     /// without copying the full-page mask buffer; a new clip always builds a
@@ -146,6 +151,7 @@ impl GState {
             dash: Vec::new(),
             dash_phase: 0.0,
             blend_mode: BlendMode::default(),
+            soft_mask: None,
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             clip: None,
@@ -244,6 +250,36 @@ impl Default for TextState {
             leading: 0.0,
             rise: 0.0,
         }
+    }
+}
+
+/// Reduces a rendered soft-mask group to a page-sized coverage mask: the
+/// Rec. 601 luma of each pixel (times its alpha) for luminosity masks, the
+/// alpha channel alone for alpha masks. Pixels the group never painted
+/// keep its backdrop and read as that backdrop's coverage.
+fn mask_from_group(pix: &Pixmap, luminosity: bool) -> Mask {
+    let mut mask = Mask::new(pix.width, pix.height);
+    for (px, out) in pix.data.chunks_exact(4).zip(mask.data.iter_mut()) {
+        *out = if luminosity {
+            let luma =
+                (77 * u32::from(px[0]) + 150 * u32::from(px[1]) + 29 * u32::from(px[2])) >> 8;
+            ((luma * u32::from(px[3])) / 255) as u8
+        } else {
+            px[3]
+        };
+    }
+    mask
+}
+
+/// The coverage a paint composites through: the clip intersected with the
+/// active group soft mask. Cheap when either is absent; the per-paint
+/// intersection only ever runs on the rare content under a group mask.
+fn effective_mask(gs: &GState) -> Option<Arc<Mask>> {
+    match (&gs.clip, &gs.soft_mask) {
+        (Some(clip), Some(soft)) => Some(Arc::new(Mask::intersected(clip, soft))),
+        (Some(clip), None) => Some(Arc::clone(clip)),
+        (None, Some(soft)) => Some(Arc::clone(soft)),
+        (None, None) => None,
     }
 }
 
@@ -520,6 +556,10 @@ struct Frame {
     /// work-stack shape of what a recursive executor would express as a
     /// nested call per tile.
     pending_tiles: std::collections::VecDeque<Frame>,
+    /// A soft-mask group frame a `gs` operator planned, run offscreen
+    /// before the next operator so the mask is in force exactly as if it
+    /// had been computed inline (boxed: a `Frame` cannot contain itself).
+    pending_smask: Option<Box<Frame>>,
     /// The font the pending glyphs paint from.
     pending_t3: Option<Arc<Type3Font>>,
     /// What this frame owes on the way out.
@@ -545,6 +585,20 @@ enum FrameKind {
     /// own color operators are ignored; a `d0` glyph nested inside a `d1`
     /// one regains color control for its own subtree).
     CharProc { saved_lock: bool },
+    /// A soft-mask group (`/SMask` `/G` form, §11.6.5.2). Its pixels render
+    /// offscreen: the drain swaps the page out into `saved` and paints the
+    /// group onto `backdrop`; the pop swaps the page back, reduces the
+    /// group render to a coverage mask (its luminosity or its alpha) and
+    /// hands that to the invoking frame's graphics state.
+    SoftMaskGroup {
+        /// The real page while the group paints; `None` until the drain.
+        saved: Option<Pixmap>,
+        /// Luminosity masks read Rec. 601 luma; alpha masks read alpha.
+        luminosity: bool,
+        /// What the offscreen page starts as: opaque black (or `/BC`) for
+        /// luminosity, transparent for alpha.
+        backdrop: [u8; 4],
+    },
 }
 
 impl Frame {
@@ -569,6 +623,7 @@ impl Frame {
             fonts: FastMap::default(),
             pending_glyphs: std::collections::VecDeque::new(),
             pending_tiles: std::collections::VecDeque::new(),
+            pending_smask: None,
             pending_t3: None,
             kind,
             pattern_base,
@@ -587,6 +642,25 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     async fn run(&mut self, root: Frame) {
         let mut frames = vec![root];
         'frames: while let Some(mut frame) = frames.pop() {
+            // A planned soft-mask group renders offscreen before the next
+            // operator: swap the page out, let the group paint onto its
+            // backdrop, and let the group frame's pop swap it back and
+            // harvest the mask.
+            if let Some(group) = frame.pending_smask.take() {
+                let mut group = *group;
+                if let FrameKind::SoftMaskGroup {
+                    saved, backdrop, ..
+                } = &mut group.kind
+                {
+                    let mut offscreen = Pixmap::new(self.pix.width, self.pix.height);
+                    offscreen.fill(*backdrop);
+                    std::mem::swap(&mut self.pix, &mut offscreen);
+                    *saved = Some(offscreen);
+                }
+                frames.push(frame);
+                frames.push(group);
+                continue 'frames;
+            }
             // Planned tiling-pattern cells paint before the next operator,
             // one frame per pass. An uncolored cell (kind `CharProc`) locks
             // color for its run — its own color operators are ignored, the
@@ -832,12 +906,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     }
                 }
                 // A `Do`/CharProc pushed a child, or a show operator planned
-                // Type3 glyphs, or a paint operator planned pattern tiles:
-                // either way this frame suspends here and the child (or the
-                // queue) runs before its next operator.
+                // Type3 glyphs, or a paint operator planned pattern tiles,
+                // or a `gs` planned a soft-mask group: either way this frame
+                // suspends here and the child (or the queue) runs before its
+                // next operator.
                 if spawned.is_some()
                     || !frame.pending_glyphs.is_empty()
                     || !frame.pending_tiles.is_empty()
+                    || frame.pending_smask.is_some()
                 {
                     break;
                 }
@@ -847,14 +923,31 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 frames.push(child);
                 continue 'frames;
             }
-            if !frame.pending_glyphs.is_empty() || !frame.pending_tiles.is_empty() {
+            if !frame.pending_glyphs.is_empty()
+                || !frame.pending_tiles.is_empty()
+                || frame.pending_smask.is_some()
+            {
                 frames.push(frame);
                 continue 'frames;
             }
-            // The frame is done; a CharProc restores the color lock its
-            // glyph saved.
-            if let FrameKind::CharProc { saved_lock } = frame.kind {
-                self.color_locked = saved_lock;
+            // The frame is done: a CharProc restores the color lock its
+            // glyph saved; a soft-mask group swaps the real page back and
+            // hands the invoking frame its coverage mask.
+            match frame.kind {
+                FrameKind::CharProc { saved_lock } => self.color_locked = saved_lock,
+                FrameKind::SoftMaskGroup {
+                    saved: Some(mut saved),
+                    luminosity,
+                    ..
+                } => {
+                    std::mem::swap(&mut self.pix, &mut saved);
+                    // `saved` now holds the group's own render.
+                    let mask = mask_from_group(&saved, luminosity);
+                    if let Some(parent) = frames.last_mut() {
+                        parent.gs.soft_mask = Some(Arc::new(mask));
+                    }
+                }
+                FrameKind::SoftMaskGroup { saved: None, .. } | FrameKind::PageOrForm => {}
             }
         }
     }
@@ -930,6 +1023,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             None
         };
         let gs = frame.gs.clone();
+        let coverage = effective_mask(&gs);
         if let Some(rule) = how.fill {
             match &fill_pattern {
                 Some(PatternPaint::Shading(shading, to_device)) => {
@@ -946,7 +1040,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     rule,
                     gs.fill_rgba8(),
                     gs.fill_alpha,
-                    gs.clip.as_deref(),
+                    coverage.as_deref(),
                     gs.blend_mode,
                 ),
             }
@@ -980,7 +1074,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     FillRule::NonZero,
                     gs.stroke_rgba8(),
                     gs.stroke_alpha,
-                    gs.clip.as_deref(),
+                    coverage.as_deref(),
                     gs.blend_mode,
                 ),
             }
@@ -1398,7 +1492,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             FillRule::NonZero,
             fill,
             gs.fill_alpha,
-            gs.clip.as_deref(),
+            effective_mask(gs).as_deref(),
             gs.blend_mode,
         );
     }
@@ -1854,13 +1948,86 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// that change what the page looks like -- a `/SMask` mask group and a
     /// non-`Normal` `/BM` blend mode -- are reported so the caller knows the
     /// render is an approximation.
+    /// Builds the offscreen frame for an `/SMask` group dictionary
+    /// (§11.6.5.2): its `/G` form runs with a fresh graphics state at the
+    /// current CTM, and its pop reduces the render to a luminosity or
+    /// alpha coverage mask. Failures report a dropped soft mask and paint
+    /// proceeds unmasked, the old behavior as the fallback. A `/TR`
+    /// transfer function other than `/Identity` is approximated as
+    /// identity and reported.
+    async fn soft_mask_group(&mut self, sm: &Dict, frame: &Frame) -> Option<Frame> {
+        let luminosity = match sm.get_name("S").map(|n| n.0.as_str()) {
+            Some("Luminosity") => true,
+            Some("Alpha") => false,
+            _ => {
+                self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
+                return None;
+            }
+        };
+        match sm.get("TR") {
+            None => {}
+            Some(Object::Name(n)) if n.0 == "Identity" => {}
+            Some(_) => self.skip(SkippedKind::SoftMask, SkipReason::Unsupported),
+        }
+        let backdrop = if luminosity {
+            // `/BC` is given in the group's own color space; reading it
+            // through the group's parsed space is deferred — black is the
+            // spec default and by far the common case.
+            let bc = match sm.get("BC") {
+                Some(obj) => floats_from(self.src, Some(obj), 1)
+                    .await
+                    .map(|v| (v[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            [bc, bc, bc, 255]
+        } else {
+            [0, 0, 0, 0]
+        };
+        let group = match sm.get("G") {
+            Some(obj) => match self.src.resolve(obj).await {
+                Ok(Object::Stream(s)) => s,
+                _ => {
+                    self.skip(SkippedKind::SoftMask, SkipReason::Missing);
+                    return None;
+                }
+            },
+            None => {
+                self.skip(SkippedKind::SoftMask, SkipReason::Missing);
+                return None;
+            }
+        };
+        // The group renders like any form, but from a fresh graphics state
+        // at the current CTM: it is its own little page, not a continuation
+        // of the content around it.
+        let gs = GState::new(frame.gs.ctm);
+        let mut built = self
+            .form_frame(&group, &frame.chain, &gs, frame.depth)
+            .await?;
+        built.kind = FrameKind::SoftMaskGroup {
+            saved: None,
+            luminosity,
+            backdrop,
+        };
+        Some(built)
+    }
+
     async fn apply_ext_gstate_op(&mut self, name: &Name, frame: &mut Frame) {
         let Some(Object::Dict(dict)) = self.find_res(&frame.chain, "ExtGState", &name.0).await
         else {
             return;
         };
-        if ignores_mask(self.src, &dict).await {
-            self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+        match dict.get("SMask") {
+            None => {}
+            Some(obj) => match self.src.resolve(obj).await {
+                Ok(Object::Name(n)) if n.0 == "None" => frame.gs.soft_mask = None,
+                Ok(Object::Dict(sm)) => {
+                    if let Some(group) = self.soft_mask_group(&sm, frame).await {
+                        frame.pending_smask = Some(Box::new(group));
+                    }
+                }
+                _ => self.skip(SkippedKind::SoftMask, SkipReason::Missing),
+            },
         }
         match blend_mode_entry(self.src, &dict).await {
             Some(Ok(mode)) => frame.gs.blend_mode = mode,
@@ -1951,28 +2118,6 @@ fn skip_reason_for(e: &Error) -> SkipReason {
         Error::UnsupportedFilter(name) => SkipReason::UnsupportedFilter(name.clone()),
         other => SkipReason::DecodeFailed(other.to_string()),
     }
-}
-
-/// Whether an image dictionary carries masking this renderer ignores: a
-/// `/SMask` alpha channel, or a `/Mask` stencil or color-key array (ISO
-/// 32000-1 8.9.6). What the author masked out paints solid instead, so the
-/// caller reports it rather than passing the result off as the real image.
-async fn ignores_mask<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
-    for key in ["SMask", "Mask"] {
-        let Some(obj) = dict.get(key) else {
-            continue;
-        };
-        let ignored = match src.resolve(obj).await {
-            Ok(Object::Null) => false,
-            // `/SMask /None` in particular is the explicit "no mask" value.
-            Ok(Object::Name(n)) => n.0 != "None",
-            _ => true,
-        };
-        if ignored {
-            return true;
-        }
-    }
-    false
 }
 
 /// Whether an `/ExtGState` selects a blend mode this renderer does not
@@ -2573,6 +2718,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
         }
         let fill = gs.fill_rgba8();
+        let coverage = effective_mask(gs);
         let outcome = image::draw(
             &mut self.pix,
             &meta,
@@ -2581,7 +2727,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 ctm: gs.ctm,
                 alpha: gs.fill_alpha,
                 fill_rgb: [fill[0], fill[1], fill[2]],
-                clip: gs.clip.as_deref(),
+                clip: coverage.as_deref(),
                 blend: gs.blend_mode,
                 smask: smask.as_ref(),
             },
@@ -3806,23 +3952,89 @@ mod tests {
     }
 
     #[test]
-    fn ignored_soft_mask_and_nonseparable_blend_are_reported() {
-        // A group soft mask is still ignored and reported; so is a
-        // NON-separable blend mode (/Hue). The separable ones paint (see
-        // the blend tests below) and are no longer drops.
-        let resources = "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> \
-                         /BM /Hue >> >>";
-        let bytes = small_doc(resources, b"/GS0 gs 0 0 100 100 re f", |b| {
-            b.stream(5, "/Type /XObject /Subtype /Form /BBox [0 0 8 8]", b"");
-        });
+    fn nonseparable_blend_is_reported() {
+        // A NON-separable blend mode (/Hue) is still a reported
+        // approximation; the separable ones paint (see the blend tests).
+        let resources = "/ExtGState << /GS0 << /BM /Hue >> >>";
+        let bytes = small_doc(resources, b"/GS0 gs 0 0 100 100 re f", |_| {});
         let (_, report) = render_reporting(bytes);
         assert_eq!(
             drops(&report),
-            vec![
-                (SkippedKind::SoftMask, SkipReason::Unsupported, 1),
-                (SkippedKind::BlendMode, SkipReason::Unsupported, 1),
-            ],
+            vec![(SkippedKind::BlendMode, SkipReason::Unsupported, 1)],
         );
+    }
+
+    /// Resources declaring `/GS0` with a Luminosity soft-mask group whose
+    /// form paints `group_content` inside `bbox`.
+    fn smask_resources() -> &'static str {
+        "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> >>"
+    }
+
+    #[test]
+    fn luminosity_soft_mask_gates_painting() {
+        // The group paints white over the left half of the page: luminosity
+        // 1 there, the black backdrop elsewhere. A black fill through that
+        // mask covers only the left half, and nothing is a drop.
+        let bytes = small_doc(smask_resources(), b"/GS0 gs 0 0 100 100 re f", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "an applied group mask is not a drop");
+        assert_eq!(px(&pix, 25, 50), [0, 0, 0, 255], "unmasked half paints");
+        assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
+    }
+
+    #[test]
+    fn alpha_soft_mask_uses_the_group_alpha() {
+        // /S /Alpha: coverage comes from the group's alpha channel — the
+        // left half is painted (opaque), the right is untouched
+        // (transparent backdrop).
+        let resources = "/ExtGState << /GS0 << /SMask << /S /Alpha /G 5 0 R >> >> >>";
+        let bytes = small_doc(resources, b"/GS0 gs 0 0 100 100 re f", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"0 0 1 rg 0 0 50 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 25, 50), [0, 0, 0, 255], "opaque half paints");
+        assert_eq!(px(&pix, 75, 50), WHITE, "transparent half is masked");
+    }
+
+    #[test]
+    fn smask_none_resets_the_mask() {
+        let resources = "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> \
+                         /GS1 << /SMask /None >> >>";
+        let bytes = small_doc(resources, b"/GS0 gs /GS1 gs 0 0 100 100 re f", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty());
+        assert_eq!(px(&pix, 75, 50), [0, 0, 0, 255], "/SMask /None unmasks");
+    }
+
+    #[test]
+    fn soft_mask_restores_with_grestore() {
+        let bytes = small_doc(smask_resources(), b"q /GS0 gs Q 0 0 100 100 re f", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty());
+        assert_eq!(px(&pix, 75, 50), [0, 0, 0, 255], "Q drops the mask");
     }
 
     #[test]
