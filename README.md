@@ -146,16 +146,16 @@ Quality rows come from the benchmark's own evaluator over all 200 documents. The
 
 ### Rendering
 
-A renderer that skips work looks fast, and pdfboss does not paint everything yet. So the render benchmark certifies every file before the stopwatch starts: pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees, which catches work skipped without a report: a blank page renders instantly and means nothing. Of the 40-file sample above, 33 files (660 pages) certify. The exclusions were three files with annotation appearances, one with tiling patterns — both Limitations items, counted on a real corpus — and three whose fonts lack a glyph for a code the page draws.
+A renderer that skips work looks fast, and pdfboss does not paint everything yet. So the render benchmark certifies every file before the stopwatch starts: pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees, which catches work skipped without a report: a blank page renders instantly and means nothing. Of the 40-file sample above, 37 files (864 pages) certify. The three annotation-appearance files and the tiling-pattern file the earlier sample excluded now certify, leaving only three files whose fonts lack a glyph for a code the page draws.
 
 | Library | pages/sec |
 |---|--:|
-| pypdfium2 | 121.7 |
-| pdfplumber (via pdfium) | 103.3 |
-| pdfboss | 98.2 |
-| PyMuPDF | 89.5 |
+| pypdfium2 | 123.8 |
+| pdfplumber (via pdfium) | 103.1 |
+| pdfboss | 95.5 |
+| PyMuPDF | 91.9 |
 
-pdfboss rasterizes the mixed corpus inside the C-backed field: about 24% behind pdfium, 10% ahead of PyMuPDF, with no C in it. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 1.3% and the ordering never moved.
+pdfboss rasterizes the mixed corpus inside the C-backed field: about 23% behind pdfium, 4% ahead of PyMuPDF, with no C in it — while painting the annotation and pattern pages the earlier sample had to exclude. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 3.1% as ambient load shifted, the pdfboss-to-pdfium ratio held within 0.3%, and the ordering never moved.
 
 Reproduce with [`benchmarks/bench_render.py`](benchmarks/README.md).
 
