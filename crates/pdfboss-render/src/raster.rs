@@ -456,6 +456,20 @@ fn hard_light(b: f32, s: f32) -> f32 {
     }
 }
 
+/// `UNIT[b]` is exactly `b as f32 / 255.0`, precomputed so per-pixel
+/// coverage scaling replaces a hardware divide with a table load. Const
+/// evaluation uses the same IEEE rounding as the runtime expression, so the
+/// values are bit-identical to computing the division per pixel.
+static UNIT: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    t
+};
+
 /// Composites `rgb` at alpha `a` (0..=1) over one straight-alpha RGBA8
 /// pixel using the source-over rule.
 pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
@@ -497,39 +511,96 @@ pub(crate) fn fill_path(
         return;
     }
     let rgb = [rgba[0], rgba[1], rgba[2]];
-    let opaque = [rgba[0], rgba[1], rgba[2], 255];
     let w = pix.width as usize;
-    coverage_rows(pix.width, pix.height, polys, rule, |y, row, lo, hi| {
-        let base = y as usize * w;
-        for (dx, &cov) in row[lo..hi].iter().enumerate() {
-            let x = lo + dx;
-            let mut a = cov.clamp(0.0, 1.0) * base_a;
-            if let Some(mask) = clip {
-                a *= mask.coverage(x as u32, y) as f32 / 255.0;
+    coverage_rows(pix.width, pix.height, polys, rule, |y, row, mut lo, mut hi| {
+        let mask_row = match clip {
+            None => None,
+            Some(m) => {
+                // Pixels outside the mask's stored bbox read coverage 0, so
+                // the fill cannot touch them; narrow the span to the overlap
+                // and hand the pixel loop the mask bytes for what remains.
+                if y < m.y0 || y - m.y0 >= m.bbox_h {
+                    return;
+                }
+                let mx0 = m.x0 as usize;
+                lo = lo.max(mx0);
+                hi = hi.min(mx0 + m.bbox_w as usize);
+                if hi <= lo {
+                    return;
+                }
+                let base = (y - m.y0) as usize * m.bbox_w as usize;
+                Some(&m.data[base + lo - mx0..base + hi - mx0])
             }
-            if a <= 0.0 {
-                continue;
-            }
-            let off = (base + x) * 4;
-            let dst = &mut pix.data[off..off + 4];
-            // A non-Normal blend derives the effective source color from
-            // the backdrop pixel, so neither branch below may shortcut it.
-            let rgb = if blend == BlendMode::Normal {
-                rgb
-            } else {
-                blend.blend([dst[0], dst[1], dst[2]], rgb)
-            };
-            if a >= 1.0 && blend == BlendMode::Normal {
-                // Fully covered by an opaque source: the source-over result
-                // is exactly the source color, so skip the per-pixel divide.
-                dst.copy_from_slice(&opaque);
-            } else if a >= 1.0 {
-                dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-            } else {
-                composite_over(dst, rgb, a);
-            }
+        };
+        let base = (y as usize * w + lo) * 4;
+        let dst_row = &mut pix.data[base..base + (hi - lo) * 4];
+        if blend == BlendMode::Normal {
+            blend_row::<true>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
+        } else {
+            blend_row::<false>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
         }
     });
+}
+
+/// Paints one emitted coverage row into `dst_row` (4 bytes per pixel).
+/// `NORMAL` mirrors `blend == BlendMode::Normal` so the mode test stays out
+/// of the pixel loop.
+#[inline(always)]
+fn blend_row<const NORMAL: bool>(
+    dst_row: &mut [u8],
+    covs: &[f32],
+    mask_row: Option<&[u8]>,
+    base_a: f32,
+    rgb: [u8; 3],
+    blend: BlendMode,
+) {
+    let opaque = [rgb[0], rgb[1], rgb[2], 255];
+    match mask_row {
+        None => {
+            for (dst, &cov) in dst_row.chunks_exact_mut(4).zip(covs) {
+                let a = cov.clamp(0.0, 1.0) * base_a;
+                paint_pixel::<NORMAL>(dst, a, rgb, opaque, blend);
+            }
+        }
+        Some(mrow) => {
+            for ((dst, &cov), &mb) in dst_row.chunks_exact_mut(4).zip(covs).zip(mrow) {
+                let a = (cov.clamp(0.0, 1.0) * base_a) * UNIT[mb as usize];
+                paint_pixel::<NORMAL>(dst, a, rgb, opaque, blend);
+            }
+        }
+    }
+}
+
+/// Source-over paints one pixel at alpha `a`, honoring the blend mode.
+#[inline(always)]
+fn paint_pixel<const NORMAL: bool>(
+    dst: &mut [u8],
+    a: f32,
+    rgb: [u8; 3],
+    opaque: [u8; 4],
+    blend: BlendMode,
+) {
+    if a <= 0.0 {
+        return;
+    }
+    if NORMAL {
+        if a >= 1.0 {
+            // Fully covered by an opaque source: the source-over result
+            // is exactly the source color, so skip the per-pixel divide.
+            dst.copy_from_slice(&opaque);
+        } else {
+            composite_over(dst, rgb, a);
+        }
+        return;
+    }
+    // A non-Normal blend derives the effective source color from the
+    // backdrop pixel, so neither branch below may shortcut it.
+    let rgb = blend.blend([dst[0], dst[1], dst[2]], rgb);
+    if a >= 1.0 {
+        dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    } else {
+        composite_over(dst, rgb, a);
+    }
 }
 
 #[cfg(test)]
