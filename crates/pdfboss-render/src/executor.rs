@@ -174,6 +174,38 @@ impl GState {
 /// (the [`crate::GlyphPainting`] tier, or a load failure).
 type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>)>;
 
+/// Upper bound on tiles one pattern paint may plan. Real hatchings use
+/// hundreds to a few thousand cells; the cap only stops a hostile step
+/// (`/XStep 0.001` over a full page) from demanding unbounded work, and
+/// hitting it reports the paint as dropped rather than tiling partially.
+const MAX_PATTERN_TILES: i64 = 65536;
+
+/// What a resolved `/Pattern` color paints as.
+enum PatternPaint {
+    /// A shading pattern (`/PatternType 2`) and the matrix it paints under.
+    Shading(Box<Shading>, Matrix),
+    /// A tiling pattern (`/PatternType 1`), ready to plan cell frames from.
+    Tiling(TilingPattern),
+}
+
+/// A loaded tiling-pattern cell (ISO 32000-1 §8.7.3).
+struct TilingPattern {
+    /// The cell's content stream, shared into every tile's frame.
+    ops: Arc<[Op]>,
+    /// The cell's own `/Resources`, prepended to the invoking chain.
+    resources: Option<Dict>,
+    /// Normalized cell bounds in pattern space; also each tile's clip.
+    bbox: [f32; 4],
+    xstep: f32,
+    ystep: f32,
+    /// Pattern space to device pixels: `/Matrix` ∘ the stream's pattern
+    /// base (§8.7.3.1 — patterns do not move with `cm`).
+    to_device: Matrix,
+    /// `/PaintType 2`: the cell paints in the `scn` color, its own color
+    /// operators ignored under the executor's color lock.
+    uncolored: bool,
+}
+
 /// Text-showing state within a `BT`/`ET` block. Held per content stream (not
 /// saved by `q`/`Q`), matching how the extractor tracks text.
 struct TextState {
@@ -479,6 +511,11 @@ struct Frame {
     /// Type3 glyphs planned by a show operator and not yet painted. Drained
     /// one CharProc frame at a time before the next operator runs.
     pending_glyphs: std::collections::VecDeque<Type3Glyph>,
+    /// Tiling-pattern cells planned by a paint operator and not yet run,
+    /// drained one frame at a time exactly like `pending_glyphs` — the
+    /// work-stack shape of what a recursive executor would express as a
+    /// nested call per tile.
+    pending_tiles: std::collections::VecDeque<Frame>,
     /// The font the pending glyphs paint from.
     pending_t3: Option<Arc<Type3Font>>,
     /// What this frame owes on the way out.
@@ -527,6 +564,7 @@ impl Frame {
             ts: TextState::default(),
             fonts: FastMap::default(),
             pending_glyphs: std::collections::VecDeque::new(),
+            pending_tiles: std::collections::VecDeque::new(),
             pending_t3: None,
             kind,
             pattern_base,
@@ -545,6 +583,18 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     async fn run(&mut self, root: Frame) {
         let mut frames = vec![root];
         'frames: while let Some(mut frame) = frames.pop() {
+            // Planned tiling-pattern cells paint before the next operator,
+            // one frame per pass. An uncolored cell (kind `CharProc`) locks
+            // color for its run — its own color operators are ignored, the
+            // `scn` color rules — and its pop restores the lock.
+            if let Some(tile) = frame.pending_tiles.pop_front() {
+                if matches!(tile.kind, FrameKind::CharProc { .. }) {
+                    self.color_locked = true;
+                }
+                frames.push(frame);
+                frames.push(tile);
+                continue 'frames;
+            }
             // Planned Type3 glyphs paint before the next operator, one
             // CharProc frame per pass; a glyph whose stream will not resolve
             // or parse is the same silent skip it always was.
@@ -778,9 +828,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     }
                 }
                 // A `Do`/CharProc pushed a child, or a show operator planned
-                // Type3 glyphs: either way this frame suspends here and the
-                // child (or the glyph queue) runs before its next operator.
-                if spawned.is_some() || !frame.pending_glyphs.is_empty() {
+                // Type3 glyphs, or a paint operator planned pattern tiles:
+                // either way this frame suspends here and the child (or the
+                // queue) runs before its next operator.
+                if spawned.is_some()
+                    || !frame.pending_glyphs.is_empty()
+                    || !frame.pending_tiles.is_empty()
+                {
                     break;
                 }
             }
@@ -789,7 +843,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 frames.push(child);
                 continue 'frames;
             }
-            if !frame.pending_glyphs.is_empty() {
+            if !frame.pending_glyphs.is_empty() || !frame.pending_tiles.is_empty() {
                 frames.push(frame);
                 continue 'frames;
             }
@@ -857,25 +911,30 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             None => Vec::new(),
         };
-        let fill_shading = if how.fill.is_some() && frame.gs.fill_pattern && !polys.is_empty() {
+        let fill_pattern = if how.fill.is_some() && frame.gs.fill_pattern && !polys.is_empty() {
             let name = frame.gs.fill_pattern_name.clone();
-            self.pattern_shading(&frame.chain, name.as_deref(), frame.pattern_base)
+            self.resolve_pattern(&frame.chain, name.as_deref(), frame.pattern_base)
                 .await
         } else {
             None
         };
-        let stroke_shading = if how.stroke && frame.gs.stroke_pattern && !polys.is_empty() {
+        let stroke_pattern = if how.stroke && frame.gs.stroke_pattern && !polys.is_empty() {
             let name = frame.gs.stroke_pattern_name.clone();
-            self.pattern_shading(&frame.chain, name.as_deref(), frame.pattern_base)
+            self.resolve_pattern(&frame.chain, name.as_deref(), frame.pattern_base)
                 .await
         } else {
             None
         };
-        let gs = &frame.gs;
+        let gs = frame.gs.clone();
         if let Some(rule) = how.fill {
-            match &fill_shading {
-                Some((shading, to_device)) => {
+            match &fill_pattern {
+                Some(PatternPaint::Shading(shading, to_device)) => {
                     self.paint_shading_through(&polys, rule, shading, *to_device, gs.clone())
+                }
+                Some(PatternPaint::Tiling(tiling)) => {
+                    let planned =
+                        self.plan_tiles(&polys, rule, tiling, &gs, &frame.chain, frame.depth);
+                    frame.pending_tiles.extend(planned);
                 }
                 None => fill_path(
                     &mut self.pix,
@@ -891,14 +950,25 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             let s = ctm_scale(gs.ctm);
             let dash: Vec<f32> = gs.dash.iter().map(|d| d * s).collect();
             let quads = stroke_path(&polys, gs.line_width * s, &dash, gs.dash_phase * s);
-            match &stroke_shading {
-                Some((shading, to_device)) => self.paint_shading_through(
+            match &stroke_pattern {
+                Some(PatternPaint::Shading(shading, to_device)) => self.paint_shading_through(
                     &quads,
                     FillRule::NonZero,
                     shading,
                     *to_device,
                     gs.clone(),
                 ),
+                Some(PatternPaint::Tiling(tiling)) => {
+                    let planned = self.plan_tiles(
+                        &quads,
+                        FillRule::NonZero,
+                        tiling,
+                        &gs,
+                        &frame.chain,
+                        frame.depth,
+                    );
+                    frame.pending_tiles.extend(planned);
+                }
                 None => fill_path(
                     &mut self.pix,
                     &quads,
@@ -919,18 +989,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
-    /// Resolves the named pattern to a paintable shading and the matrix it
-    /// paints under (`/Matrix` ∘ the stream's pattern base). `None` means
-    /// the caller paints the stand-in gray instead — every such case has
-    /// already been reported here with its real reason: an unresolvable
-    /// name, a tiling pattern (not painted yet), an unsupported shading
-    /// kind, or a structural failure.
-    async fn pattern_shading(
+    /// Resolves the named pattern to something paintable: a shading with
+    /// the matrix it paints under, or a tiling cell ready to plan tiles
+    /// from (`/Matrix` ∘ the stream's pattern base in both cases). `None`
+    /// means the caller paints the stand-in gray instead — every such case
+    /// has already been reported here with its real reason: an
+    /// unresolvable name, an unsupported shading kind, an unreadable cell,
+    /// or a structural failure.
+    async fn resolve_pattern(
         &mut self,
         chain: &[Arc<Dict>],
         name: Option<&str>,
         pattern_base: Matrix,
-    ) -> Option<(Shading, Matrix)> {
+    ) -> Option<PatternPaint> {
         let Some(name) = name else {
             self.skip(SkippedKind::Pattern, SkipReason::Missing);
             return None;
@@ -939,38 +1010,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Pattern, SkipReason::Missing);
             return None;
         };
-        let dict = match self.src.resolve(&obj).await {
-            Ok(Object::Dict(d)) => d,
-            Ok(Object::Stream(s)) => s.dict.clone(),
+        let (dict, stream) = match self.src.resolve(&obj).await {
+            Ok(Object::Dict(d)) => (d, None),
+            Ok(Object::Stream(s)) => (s.dict.clone(), Some(s)),
             _ => {
                 self.skip(SkippedKind::Pattern, SkipReason::Missing);
-                return None;
-            }
-        };
-        match dict.get_int("PatternType") {
-            Some(2) => {}
-            Some(1) => {
-                // Tiling patterns still paint the stand-in.
-                self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
-                return None;
-            }
-            _ => {
-                self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
-                return None;
-            }
-        }
-        let Some(shading_obj) = dict.get("Shading") else {
-            self.skip(SkippedKind::Pattern, SkipReason::Missing);
-            return None;
-        };
-        let shading = match Shading::load_with(self.src, shading_obj).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                self.skip(SkippedKind::Shading, SkipReason::Unsupported);
-                return None;
-            }
-            Err(e) => {
-                self.skip(SkippedKind::Shading, skip_reason_for(&e));
                 return None;
             }
         };
@@ -987,10 +1031,220 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .unwrap_or_else(Matrix::identity);
         let to_device = matrix.concat(pattern_base);
         if !finite_matrix(&to_device) || to_device.invert().is_none() {
-            self.skip(SkippedKind::Shading, SkipReason::Undecodable);
+            self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
             return None;
         }
-        Some((shading, to_device))
+        match dict.get_int("PatternType") {
+            Some(2) => {
+                let Some(shading_obj) = dict.get("Shading") else {
+                    self.skip(SkippedKind::Pattern, SkipReason::Missing);
+                    return None;
+                };
+                match Shading::load_with(self.src, shading_obj).await {
+                    Ok(Some(s)) => Some(PatternPaint::Shading(Box::new(s), to_device)),
+                    Ok(None) => {
+                        self.skip(SkippedKind::Shading, SkipReason::Unsupported);
+                        None
+                    }
+                    Err(e) => {
+                        self.skip(SkippedKind::Shading, skip_reason_for(&e));
+                        None
+                    }
+                }
+            }
+            Some(1) => {
+                let Some(stream) = stream else {
+                    self.skip(SkippedKind::Pattern, SkipReason::Missing);
+                    return None;
+                };
+                self.load_tiling(&stream, &dict, to_device).await
+            }
+            _ => {
+                self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
+                None
+            }
+        }
+    }
+
+    /// Loads a tiling pattern's cell: content ops, own resources, `/BBox`
+    /// and steps (defaulting a missing or degenerate step to the cell's
+    /// extent, so a broken step tiles edge-to-edge instead of dividing by
+    /// zero). Failures report as a dropped pattern.
+    async fn load_tiling(
+        &mut self,
+        stream: &Stream,
+        dict: &Dict,
+        to_device: Matrix,
+    ) -> Option<PatternPaint> {
+        let data = match content_stream_data_with(self.src, stream).await {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip(SkippedKind::Pattern, skip_reason_for(&e));
+                return None;
+            }
+        };
+        let ops = match parse_content(&data) {
+            Ok(ops) => ops,
+            Err(e) => {
+                self.skip(SkippedKind::Pattern, skip_reason_for(&e));
+                return None;
+            }
+        };
+        let Some(b) = floats_from(self.src, dict.get("BBox"), 4).await else {
+            self.skip(SkippedKind::Pattern, SkipReason::Missing);
+            return None;
+        };
+        let bbox = [
+            b[0].min(b[2]),
+            b[1].min(b[3]),
+            b[0].max(b[2]),
+            b[1].max(b[3]),
+        ];
+        let (w, h) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+        if w <= 0.0 || h <= 0.0 {
+            self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
+            return None;
+        }
+        let step = |v: Option<f32>, fallback: f32| match v {
+            Some(s) if s.is_finite() && s.abs() > 0.0 => s.abs(),
+            _ => fallback,
+        };
+        let xstep = step(dict_f32(self.src, dict, "XStep").await, w);
+        let ystep = step(dict_f32(self.src, dict, "YStep").await, h);
+        let resources = match dict.get("Resources") {
+            Some(o) => match self.src.resolve(o).await {
+                Ok(Object::Dict(d)) => Some(d),
+                _ => None,
+            },
+            None => None,
+        };
+        Some(PatternPaint::Tiling(TilingPattern {
+            ops: ops.into(),
+            resources,
+            bbox,
+            xstep,
+            ystep,
+            to_device,
+            uncolored: dict.get_int("PaintType") == Some(2),
+        }))
+    }
+
+    /// Plans one frame per visible tile of `tiling` across the fill or
+    /// stroke geometry: the region is the rasterized `polys` ∩ the active
+    /// clip; its device bounds map back through the pattern matrix to a
+    /// tile index range (never a scan of the page), and each tile's frame
+    /// clips to its own cell `/BBox` ∩ the region. Uncolored cells
+    /// (`/PaintType 2`) paint in the `scn` color under the executor's color
+    /// lock, restored by their `CharProc` frame kind. Past
+    /// [`MAX_PATTERN_TILES`] the whole paint reports as dropped instead of
+    /// running unbounded work.
+    fn plan_tiles(
+        &mut self,
+        polys: &[Subpath],
+        rule: FillRule,
+        tiling: &TilingPattern,
+        gs: &GState,
+        chain: &[Arc<Dict>],
+        depth: u32,
+    ) -> std::collections::VecDeque<Frame> {
+        let mut tiles = std::collections::VecDeque::new();
+        if polys.is_empty() {
+            return tiles;
+        }
+        if depth >= MAX_FORM_DEPTH {
+            self.skip(SkippedKind::Pattern, SkipReason::LimitExceeded);
+            return tiles;
+        }
+        let path_mask = self.rasterize_clip(polys, rule);
+        let region = match &gs.clip {
+            Some(clip) => Arc::new(Mask::intersected(&path_mask, clip)),
+            None => path_mask,
+        };
+        if region.bbox_w == 0 || region.bbox_h == 0 {
+            return tiles;
+        }
+        let Some(inv) = tiling.to_device.invert() else {
+            self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
+            return tiles;
+        };
+        // The region's device corners in pattern space bound the tiles that
+        // can possibly show.
+        let (dx0, dy0) = (region.x0 as f32, region.y0 as f32);
+        let (dx1, dy1) = (
+            (region.x0 + region.bbox_w) as f32,
+            (region.y0 + region.bbox_h) as f32,
+        );
+        let corners = [
+            inv.apply(Point { x: dx0, y: dy0 }),
+            inv.apply(Point { x: dx1, y: dy0 }),
+            inv.apply(Point { x: dx0, y: dy1 }),
+            inv.apply(Point { x: dx1, y: dy1 }),
+        ];
+        let px0 = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+        let px1 = corners
+            .iter()
+            .map(|p| p.x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let py0 = corners.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+        let py1 = corners
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if ![px0, px1, py0, py1].iter().all(|v| v.is_finite()) {
+            self.skip(SkippedKind::Pattern, SkipReason::Undecodable);
+            return tiles;
+        }
+        let [bx0, by0, bx1, by1] = tiling.bbox;
+        let i_min = ((px0 - bx1) / tiling.xstep).ceil() as i64;
+        let i_max = ((px1 - bx0) / tiling.xstep).floor() as i64;
+        let j_min = ((py0 - by1) / tiling.ystep).ceil() as i64;
+        let j_max = ((py1 - by0) / tiling.ystep).floor() as i64;
+        let count = (i_max - i_min + 1).max(0) * (j_max - j_min + 1).max(0);
+        if count > MAX_PATTERN_TILES {
+            self.skip(SkippedKind::Pattern, SkipReason::LimitExceeded);
+            return tiles;
+        }
+        let saved_lock = self.color_locked;
+        for j in j_min..=j_max {
+            for i in i_min..=i_max {
+                let origin = Matrix::translate(i as f32 * tiling.xstep, j as f32 * tiling.ystep);
+                let tile_ctm = origin.concat(tiling.to_device);
+                let mut pb = PathBuilder::new(tile_ctm);
+                pb.rect(bx0, by0, bx1 - bx0, by1 - by0);
+                let cell = Mask::from_path(self.pix.width, self.pix.height, &pb.finish(), rule);
+                if cell.bbox_w == 0 || cell.bbox_h == 0 {
+                    continue;
+                }
+                let clip = Arc::new(Mask::intersected(&cell, &region));
+                if clip.bbox_w == 0 || clip.bbox_h == 0 {
+                    continue;
+                }
+                let mut tgs = GState::new(tile_ctm);
+                tgs.clip = Some(clip);
+                tgs.fill_alpha = gs.fill_alpha;
+                tgs.stroke_alpha = gs.stroke_alpha;
+                let kind = if tiling.uncolored {
+                    tgs.fill_rgb = gs.fill_rgb;
+                    tgs.stroke_rgb = gs.stroke_rgb;
+                    FrameKind::CharProc { saved_lock }
+                } else {
+                    FrameKind::PageOrForm
+                };
+                let mut tile_chain: Vec<Arc<Dict>> = Vec::with_capacity(chain.len() + 1);
+                if let Some(res) = &tiling.resources {
+                    tile_chain.push(Arc::new(res.clone()));
+                }
+                tile_chain.extend_from_slice(chain);
+                tiles.push_back(Frame::new(
+                    Arc::clone(&tiling.ops),
+                    tile_chain,
+                    tgs,
+                    depth + 1,
+                    kind,
+                ));
+            }
+        }
+        tiles
     }
 
     /// Paints `shading` through `polys` (the fill or stroke geometry,
@@ -1366,6 +1620,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 if let Some(name) = pattern_name {
                     gs.fill_pattern = true;
                     gs.fill_pattern_name = Some(name.0.clone());
+                    // An uncolored pattern's components are its paint color,
+                    // given in the pattern space's underlying base.
+                    if !c.is_empty() {
+                        gs.fill_rgb = gs.fill_space.to_rgb(c);
+                    }
                 } else if !gs.fill_pattern {
                     gs.fill_rgb = gs.fill_space.to_rgb(c);
                 }
@@ -1375,6 +1634,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 if let Some(name) = pattern_name {
                     gs.stroke_pattern = true;
                     gs.stroke_pattern_name = Some(name.0.clone());
+                    if !c.is_empty() {
+                        gs.stroke_rgb = gs.stroke_space.to_rgb(c);
+                    }
                 } else if !gs.stroke_pattern {
                     gs.stroke_rgb = gs.stroke_space.to_rgb(c);
                 }
@@ -1559,11 +1821,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
         match self.find_res(chain, "ColorSpace", &name.0).await {
             Some(obj) => {
-                // `[/Pattern base]` resource entries are pattern spaces too.
+                // `[/Pattern base]` resource entries are pattern spaces too;
+                // the base is the space an uncolored pattern's `scn`
+                // components are given in, so it is kept, not discarded.
                 if let Object::Array(items) = &obj {
                     if let Some(Object::Name(n)) = items.first() {
                         if n.0 == "Pattern" {
-                            return (ColorSpace::DeviceGray, true);
+                            let base = match items.get(1) {
+                                Some(base) => ColorSpace::parse_with(self.src, base).await,
+                                None => ColorSpace::DeviceGray,
+                            };
+                            return (base, true);
                         }
                     }
                 }
@@ -3242,6 +3510,108 @@ mod tests {
         assert!(report.is_empty(), "painted: {:?}", report.warnings());
         assert_near(px(&pix, 25, 50), [126, 129, 0, 255], 4, "between samples");
         assert_near(px(&pix, 95, 50), [0, 23, 232, 255], 5, "near the last");
+    }
+
+    #[test]
+    fn tiling_pattern_fill_repeats_its_cell() {
+        // A 10x10 cell whose lower-left 5x5 quarter is red, tiled over the
+        // whole page: user (2.5,2.5) and (12.5,12.5) land in painted
+        // quarters, user (7.5,2.5) in an unpainted one. The report stays
+        // empty — a painted pattern is not a drop.
+        let resources = "/Pattern << /P0 5 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"1 0 0 rg 0 0 5 5 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 2, 97), RED, "first tile's quarter");
+        assert_eq!(px(&pix, 12, 87), RED, "the diagonal neighbor's quarter");
+        assert_eq!(
+            px(&pix, 7, 97),
+            WHITE,
+            "outside the quarter, inside the cell"
+        );
+        assert_eq!(px(&pix, 2, 82), WHITE, "the tile above's empty upper half");
+    }
+
+    #[test]
+    fn tiling_pattern_is_clipped_to_the_fill_path() {
+        // The same pattern through a small rect: tiles outside the path
+        // must not paint.
+        let resources = "/Pattern << /P0 5 0 R >>";
+        let content = b"/Pattern cs /P0 scn 40 40 20 20 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"1 0 0 rg 0 0 10 10 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), RED, "inside the fill rect");
+        assert_eq!(px(&pix, 30, 50), WHITE, "outside the fill rect");
+        assert_eq!(px(&pix, 50, 25), WHITE, "outside the fill rect below");
+    }
+
+    #[test]
+    fn uncolored_tiling_pattern_paints_in_the_scn_color() {
+        // /PaintType 2: the cell has no color of its own — the fill paints
+        // in the color scn supplied through the pattern space's underlying
+        // /DeviceRGB, and the cell's own color operators are ignored (the
+        // second cell op tries to turn red and must not win).
+        let resources = "/Pattern << /P0 5 0 R >> \
+                         /ColorSpace << /CS0 [/Pattern /DeviceRGB] >>";
+        let content = b"/CS0 cs 0 1 0 /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 2 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"0 0 5 5 re f 1 0 0 rg 5 5 5 5 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(
+            px(&pix, 2, 97),
+            [0, 255, 0, 255],
+            "scn green, lower quarter"
+        );
+        assert_eq!(
+            px(&pix, 7, 92),
+            [0, 255, 0, 255],
+            "still green: cell color locked"
+        );
+        assert_eq!(px(&pix, 7, 97), WHITE, "unpainted cell corner");
+    }
+
+    #[test]
+    fn hostile_tile_step_hits_the_cap_and_reports() {
+        // An XStep small enough to demand millions of tiles must stop at
+        // the cap with a report instead of running forever.
+        let resources = "/Pattern << /P0 5 0 R >>";
+        let content = b"/Pattern cs /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 0.001 /YStep 0.001 /Resources << >>",
+                b"1 0 0 rg 0 0 10 10 re f",
+            );
+        });
+        let (_, report) = render_reporting(bytes);
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Pattern, SkipReason::LimitExceeded, 1)],
+        );
     }
 
     #[test]
