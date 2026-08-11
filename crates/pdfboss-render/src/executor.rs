@@ -1644,15 +1644,18 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// nothing to paint. `/AP` `/N` is the appearance; when `/N` is a
     /// dictionary of states, `/AS` selects one, and a single-state
     /// dictionary needs no `/AS` to be unambiguous. A declared appearance
-    /// that cannot be resolved — `/N` that is neither stream nor dictionary,
-    /// an `/AS` naming no state, an ambiguous stateless dictionary — is a
-    /// real drop and is reported; an absent `/AP` or `/N` declares nothing
-    /// and stays silent.
+    /// that cannot be resolved — an `/AP` that is not a dictionary, `/N`
+    /// that is neither stream nor dictionary, an `/AS` naming no state, an
+    /// ambiguous stateless dictionary — is a real drop and is reported; an
+    /// absent `/AP` or `/N` declares nothing and stays silent.
     async fn normal_appearance(&mut self, annot: &Dict) -> Option<Stream> {
         let ap = match annot.get("AP") {
             Some(o) => match self.src.resolve(o).await {
                 Ok(Object::Dict(d)) => d,
-                _ => return None,
+                _ => {
+                    self.skip(SkippedKind::Annotation, SkipReason::Missing);
+                    return None;
+                }
             },
             None => return None,
         };
@@ -3121,6 +3124,23 @@ mod tests {
                 SkipReason::UnsupportedFilter("NoSuchFilter".into()),
                 1
             )],
+        );
+    }
+
+    #[test]
+    fn non_dictionary_ap_is_reported() {
+        // /AP is declared but is not a dictionary: the annotation declared
+        // an appearance and lost it, which must be reported — only an
+        // absent /AP declares nothing and stays silent.
+        let bytes = annots_doc(
+            &["<< /Type /Annot /Subtype /Stamp /Rect [20 20 60 60] /AP [1 2 3] >>"],
+            &[],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 40, 60), WHITE);
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Annotation, SkipReason::Missing, 1)],
         );
     }
 
