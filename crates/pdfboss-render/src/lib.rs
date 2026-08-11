@@ -247,7 +247,10 @@ pub enum SkippedKind {
     SoftMask,
     /// A blend mode other than `Normal`, painted as `Normal`.
     BlendMode,
-    /// An annotation appearance stream: annotations are not painted.
+    /// An annotation appearance stream that was declared but could not be
+    /// painted: unreadable, unparsable, or with no selectable state.
+    /// Annotations that declare no appearance, and ones flagged Hidden or
+    /// NoView, paint nothing by design and are not reported.
     Annotation,
     /// A character code a *painting* font has no glyph for: the code
     /// advanced the text position but painted nothing. A single-byte code
