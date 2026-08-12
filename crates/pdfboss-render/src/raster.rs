@@ -17,6 +17,21 @@ pub(crate) enum FillRule {
     EvenOdd,
 }
 
+/// Reusable rasterizer buffers, owned by the caller so a page of fills does
+/// not re-allocate (and re-zero) them on every call. `row` is all-zero
+/// between calls; the sweep clears exactly the slots it dirtied.
+#[derive(Debug, Default)]
+pub(crate) struct RasterScratch {
+    /// Per-row coverage accumulator, at least page-width long.
+    row: Vec<f32>,
+    /// Edge list of the path being rasterized.
+    edges: Vec<Edge>,
+    /// Active-edge indices for the current scanline.
+    active: Vec<usize>,
+    /// Scanline crossings as `(x, winding direction)`.
+    crossings: Vec<(f32, i32)>,
+}
+
 /// A per-pixel coverage mask (0 = fully clipped out, 255 = fully visible)
 /// over a page of `width * height` device pixels.
 ///
@@ -41,6 +56,13 @@ pub(crate) struct Mask {
     pub bbox_h: u32,
     /// Row-major coverage values over the bbox, `bbox_w * bbox_h` bytes.
     pub data: Vec<u8>,
+    /// Every stored byte is 255 (proven at construction, conservatively
+    /// false otherwise). Lets a fill skip the per-pixel coverage multiply —
+    /// scaling by `255/255.0 == 1.0` is exactly the identity — and treat the
+    /// clip as pure bbox narrowing. Rectangular clips on integer device
+    /// coordinates (the page-bounds reset clip most generators emit) are the
+    /// common case.
+    pub opaque: bool,
 }
 
 impl Mask {
@@ -54,6 +76,7 @@ impl Mask {
             bbox_w: width,
             bbox_h: height,
             data: vec![0; width as usize * height as usize],
+            opaque: false,
         }
     }
 
@@ -67,21 +90,28 @@ impl Mask {
             bbox_w: 0,
             bbox_h: 0,
             data: Vec::new(),
+            opaque: false,
         }
     }
 
     /// Rasterizes `polys` under `rule` into a fresh mask sized to `polys`'
     /// own bounding box (clamped to the page), not the full page.
-    pub(crate) fn from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
-        let edges = build_edges(polys);
-        if edges.is_empty() || width == 0 || height == 0 {
+    pub(crate) fn from_path(
+        width: u32,
+        height: u32,
+        scratch: &mut RasterScratch,
+        polys: &[Subpath],
+        rule: FillRule,
+    ) -> Mask {
+        prepare_edges(&mut scratch.edges, polys);
+        if scratch.edges.is_empty() || width == 0 || height == 0 {
             return Mask::empty(width, height);
         }
         let mut xmin = f32::MAX;
         let mut xmax = f32::MIN;
         let mut ymin = f32::MAX;
         let mut ymax = f32::MIN;
-        for e in &edges {
+        for e in &scratch.edges {
             xmin = xmin.min(e.x0).min(e.x1);
             xmax = xmax.max(e.x0).max(e.x1);
             ymin = ymin.min(e.y0);
@@ -104,9 +134,10 @@ impl Mask {
             bbox_w,
             bbox_h,
             data: vec![0u8; bbox_w as usize * bbox_h as usize],
+            opaque: false,
         };
         let bw = bbox_w as usize;
-        coverage_rows(width, height, polys, rule, |y, row, lo, hi| {
+        sweep_rows(scratch, width, height, rule, |y, row, lo, hi| {
             // `lo`/`hi` are columns touched on this row, which `coverage_rows`
             // only ever derives from crossings between edges already bounded
             // by `[xmin, xmax]` — so they always fall within `[bx0, bx1)`.
@@ -118,6 +149,7 @@ impl Mask {
                 *out = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         });
+        mask.opaque = mask.data.iter().all(|&b| b == 255);
         mask
     }
 
@@ -178,12 +210,15 @@ impl Mask {
             bbox_w,
             bbox_h,
             data,
+            // Two everywhere-255 operands stay 255 across the overlap.
+            opaque: a.opaque && b.opaque,
         }
     }
 }
 
 /// A non-horizontal polygon edge, stored top-to-bottom with its winding
 /// direction.
+#[derive(Debug)]
 struct Edge {
     /// Top endpoint (smaller y).
     x0: f32,
@@ -203,11 +238,18 @@ impl Edge {
     }
 }
 
-/// Collects the non-horizontal edges of `polys`, implicitly closing every
-/// subpath (fills always treat subpaths as closed). Edges with non-finite
-/// vertices are skipped.
-fn build_edges(polys: &[Subpath]) -> Vec<Edge> {
-    let mut edges = Vec::new();
+/// Collects the non-horizontal edges of `polys` into `edges` (cleared
+/// first), implicitly closing every subpath (fills always treat subpaths as
+/// closed), then sorts them by top `y` so the active-edge sweep can bring
+/// them in with a single forward-moving pointer as the scanline descends.
+/// Edges with non-finite vertices are skipped.
+///
+/// The sort must stay STABLE: equal-`y0` ties keep build order, which fixes
+/// the order crossings enter the scanline sort, which in turn fixes how
+/// coincident crossings split spans — and span splits change the f32
+/// accumulation order, i.e. the output bytes.
+fn prepare_edges(edges: &mut Vec<Edge>, polys: &[Subpath]) {
+    edges.clear();
     for sub in polys {
         let pts = &sub.points;
         if pts.len() < 2 {
@@ -232,7 +274,7 @@ fn build_edges(polys: &[Subpath]) -> Vec<Edge> {
             });
         }
     }
-    edges
+    edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 }
 
 /// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
@@ -256,60 +298,75 @@ fn add_span(
     let last = (x1.ceil() as usize).min(row.len());
     *dirty_lo = (*dirty_lo).min(first);
     *dirty_hi = (*dirty_hi).max(last);
-    for (px, slot) in row.iter_mut().enumerate().take(last).skip(first) {
-        let l = x0.max(px as f32);
-        let r = x1.min(px as f32 + 1.0);
-        if r > l {
-            *slot += (r - l) * weight;
-        }
+    if last == first + 1 {
+        row[first] += (x1.min(first as f32 + 1.0) - x0) * weight;
+        return;
     }
+    row[first] += (first as f32 + 1.0 - x0) * weight;
+    // Interior pixels are fully covered: the old per-pixel min/max produced
+    // exactly `(r - l) == 1.0` there, so this adds the identical value.
+    for slot in &mut row[first + 1..last - 1] {
+        *slot += weight;
+    }
+    row[last - 1] += (x1 - (last - 1) as f32) * weight;
 }
 
-/// Computes per-row anti-aliased coverage of `polys` under `rule` and
-/// invokes `emit(y, row, x_lo, x_hi)` for every pixel row the path touches,
-/// where `[x_lo, x_hi)` bounds the columns that received coverage. Rows the
-/// path does not reach are never emitted (their coverage is zero), and
-/// columns outside `[x_lo, x_hi)` in an emitted row are guaranteed zero.
-fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
+/// Computes per-row anti-aliased coverage of the prepared `scratch.edges`
+/// under `rule` and invokes `emit(y, row, x_lo, x_hi)` for every pixel row
+/// the path touches, where `[x_lo, x_hi)` bounds the columns that received
+/// coverage. Rows the path does not reach are never emitted (their coverage
+/// is zero), and columns outside `[x_lo, x_hi)` in an emitted row are
+/// guaranteed zero. The caller runs [`prepare_edges`] first; on return,
+/// `scratch.row` is all-zero again.
+fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
+    scratch: &mut RasterScratch,
     width: u32,
     height: u32,
-    polys: &[Subpath],
     rule: FillRule,
     mut emit: F,
 ) {
     if width == 0 || height == 0 {
         return;
     }
-    let mut edges = build_edges(polys);
+    let RasterScratch {
+        row,
+        edges,
+        active,
+        crossings,
+    } = scratch;
     if edges.is_empty() {
         return;
     }
     let mut ymin = f32::MAX;
     let mut ymax = f32::MIN;
-    for e in &edges {
+    for e in edges.iter() {
         ymin = ymin.min(e.y0);
         ymax = ymax.max(e.y1);
     }
-    // Sort edges by their top `y` so the active-edge sweep below can bring
-    // them in with a single forward-moving pointer as the scanline descends.
-    edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 
     let row_start = ymin.floor().max(0.0) as u32;
     let row_end = (ymax.ceil().max(0.0) as u32).min(height);
-    let mut row = vec![0.0f32; width as usize];
-    let mut crossings: Vec<(f32, i32)> = Vec::new();
+    let full = width as usize;
+    if row.len() < full {
+        row.resize(full, 0.0);
+    }
+    // `add_span` clamps against the slice length, so hand it exactly the
+    // page width even when the reused buffer is longer.
+    let row = &mut row[..full];
     // Active-edge table: indices into `edges` for the edges that straddle the
     // current scanline. `ys` increases monotonically across the whole sweep
     // (rows outer, subsamples inner), so `next` only ever advances and expired
     // edges are dropped once and never revisited — turning the per-scanline
-    // cost from O(all edges) into O(edges crossing this row).
-    let mut active: Vec<usize> = Vec::new();
+    // cost from O(all edges) into O(edges crossing this row). Activation in
+    // index order plus order-preserving `retain` fixes the order crossings
+    // are generated in, which the byte-identity of coincident-crossing span
+    // splits depends on (see `prepare_edges`).
+    active.clear();
     let mut next = 0usize;
     let weight = 1.0 / SUBSAMPLES as f32;
     // `[dirty_lo, dirty_hi)` is the range of `row` written for the row being
     // built; it is used both to bound `emit` and to clear only the touched
     // slice before the next row instead of re-zeroing the full width.
-    let full = width as usize;
     let mut dirty_lo = full;
     let mut dirty_hi = 0usize;
     for y in row_start..row_end {
@@ -326,7 +383,7 @@ fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
             }
             active.retain(|&i| edges[i].y1 > ys);
             crossings.clear();
-            for &i in &active {
+            for &i in active.iter() {
                 // By construction `y0 <= ys` (activation) and `ys < y1`
                 // (retain), so this edge genuinely crosses the scanline.
                 crossings.push((edges[i].x_at(ys), edges[i].dir));
@@ -337,27 +394,24 @@ fn coverage_rows<F: FnMut(u32, &[f32], usize, usize)>(
             crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
             let mut wind = 0i32;
             let mut span_start = 0.0f32;
-            for &(x, dir) in &crossings {
+            for &(x, dir) in crossings.iter() {
                 let was_inside = inside(wind, rule);
                 wind += dir;
                 let is_inside = inside(wind, rule);
                 if !was_inside && is_inside {
                     span_start = x;
                 } else if was_inside && !is_inside {
-                    add_span(
-                        &mut row,
-                        span_start,
-                        x,
-                        weight,
-                        &mut dirty_lo,
-                        &mut dirty_hi,
-                    );
+                    add_span(row, span_start, x, weight, &mut dirty_lo, &mut dirty_hi);
                 }
             }
         }
         if dirty_lo < dirty_hi {
-            emit(y, &row, dirty_lo, dirty_hi);
+            emit(y, row, dirty_lo, dirty_hi);
         }
+    }
+    // Restore the all-zero invariant for the next caller.
+    if dirty_lo < dirty_hi {
+        row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
     }
 }
 
@@ -456,6 +510,20 @@ fn hard_light(b: f32, s: f32) -> f32 {
     }
 }
 
+/// `UNIT[b]` is exactly `b as f32 / 255.0`, precomputed so per-pixel
+/// coverage scaling replaces a hardware divide with a table load. Const
+/// evaluation uses the same IEEE rounding as the runtime expression, so the
+/// values are bit-identical to computing the division per pixel.
+static UNIT: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = i as f32 / 255.0;
+        i += 1;
+    }
+    t
+};
+
 /// Composites `rgb` at alpha `a` (0..=1) over one straight-alpha RGBA8
 /// pixel using the source-over rule.
 pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
@@ -478,8 +546,10 @@ pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// `rgba`, further scaled by the constant `alpha` (0..=1) and, when
 /// present, the `clip` coverage mask. Anti-aliased coverage is composited
 /// source-over.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_path(
     pix: &mut Pixmap,
+    scratch: &mut RasterScratch,
     polys: &[Subpath],
     rule: FillRule,
     rgba: [u8; 4],
@@ -497,45 +567,182 @@ pub(crate) fn fill_path(
         return;
     }
     let rgb = [rgba[0], rgba[1], rgba[2]];
-    let opaque = [rgba[0], rgba[1], rgba[2], 255];
     let w = pix.width as usize;
-    coverage_rows(pix.width, pix.height, polys, rule, |y, row, lo, hi| {
-        let base = y as usize * w;
-        for (dx, &cov) in row[lo..hi].iter().enumerate() {
-            let x = lo + dx;
-            let mut a = cov.clamp(0.0, 1.0) * base_a;
-            if let Some(mask) = clip {
-                a *= mask.coverage(x as u32, y) as f32 / 255.0;
-            }
-            if a <= 0.0 {
-                continue;
-            }
-            let off = (base + x) * 4;
-            let dst = &mut pix.data[off..off + 4];
-            // A non-Normal blend derives the effective source color from
-            // the backdrop pixel, so neither branch below may shortcut it.
-            let rgb = if blend == BlendMode::Normal {
-                rgb
-            } else {
-                blend.blend([dst[0], dst[1], dst[2]], rgb)
+    prepare_edges(&mut scratch.edges, polys);
+    sweep_rows(
+        scratch,
+        pix.width,
+        pix.height,
+        rule,
+        |y, row, mut lo, mut hi| {
+            let mask_row = match clip {
+                None => None,
+                Some(m) => {
+                    // Pixels outside the mask's stored bbox read coverage 0, so
+                    // the fill cannot touch them; narrow the span to the overlap
+                    // and hand the pixel loop the mask bytes for what remains.
+                    if y < m.y0 || y - m.y0 >= m.bbox_h {
+                        return;
+                    }
+                    let mx0 = m.x0 as usize;
+                    lo = lo.max(mx0);
+                    hi = hi.min(mx0 + m.bbox_w as usize);
+                    if hi <= lo {
+                        return;
+                    }
+                    if m.opaque {
+                        // Every byte in range is 255 and scaling by 255/255.0
+                        // == 1.0 is exactly the identity, so the clip reduces
+                        // to the bbox narrowing above.
+                        None
+                    } else {
+                        let base = (y - m.y0) as usize * m.bbox_w as usize;
+                        Some(&m.data[base + lo - mx0..base + hi - mx0])
+                    }
+                }
             };
-            if a >= 1.0 && blend == BlendMode::Normal {
-                // Fully covered by an opaque source: the source-over result
-                // is exactly the source color, so skip the per-pixel divide.
-                dst.copy_from_slice(&opaque);
-            } else if a >= 1.0 {
-                dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            let base = (y as usize * w + lo) * 4;
+            let dst_row = &mut pix.data[base..base + (hi - lo) * 4];
+            if blend == BlendMode::Normal {
+                blend_row::<true>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
             } else {
-                composite_over(dst, rgb, a);
+                blend_row::<false>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
+            }
+        },
+    );
+}
+
+/// Paints one emitted coverage row into `dst_row` (4 bytes per pixel).
+/// `NORMAL` mirrors `blend == BlendMode::Normal` so the mode test stays out
+/// of the pixel loop.
+#[inline(always)]
+fn blend_row<const NORMAL: bool>(
+    dst_row: &mut [u8],
+    covs: &[f32],
+    mask_row: Option<&[u8]>,
+    base_a: f32,
+    rgb: [u8; 3],
+    blend: BlendMode,
+) {
+    let opaque = [rgb[0], rgb[1], rgb[2], 255];
+    // `base_a` is clamped to [0, 1], so `>= 1.0` means exactly 1.0: a fully
+    // covered pixel then writes exactly the source color, and a run of them
+    // becomes a plain pattern fill instead of per-pixel arithmetic.
+    let solid_src = NORMAL && base_a >= 1.0;
+    let n = covs.len();
+    let dst_row = &mut dst_row[..n * 4];
+    match mask_row {
+        None => {
+            let mut x = 0;
+            while x < n {
+                let cov = covs[x];
+                if solid_src && cov >= 1.0 {
+                    let start = x;
+                    x += 1;
+                    while x < n && covs[x] >= 1.0 {
+                        x += 1;
+                    }
+                    fill_run(&mut dst_row[start * 4..x * 4], opaque);
+                    continue;
+                }
+                let a = cov.clamp(0.0, 1.0) * base_a;
+                paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
+                x += 1;
             }
         }
-    });
+        Some(mrow) => {
+            let mrow = &mrow[..n];
+            let mut x = 0;
+            while x < n {
+                let cov = covs[x];
+                if solid_src && cov >= 1.0 && mrow[x] == 255 {
+                    let start = x;
+                    x += 1;
+                    while x < n && covs[x] >= 1.0 && mrow[x] == 255 {
+                        x += 1;
+                    }
+                    fill_run(&mut dst_row[start * 4..x * 4], opaque);
+                    continue;
+                }
+                let a = (cov.clamp(0.0, 1.0) * base_a) * UNIT[mrow[x] as usize];
+                paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
+                x += 1;
+            }
+        }
+    }
+}
+
+/// Fills a run of pixels with one RGBA value (plain repeated 4-byte
+/// pattern; the loop lowers to wide stores).
+fn fill_run(dst: &mut [u8], px: [u8; 4]) {
+    for chunk in dst.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&px);
+    }
+}
+
+/// Source-over paints one pixel at alpha `a`, honoring the blend mode.
+#[inline(always)]
+fn paint_pixel<const NORMAL: bool>(
+    dst: &mut [u8],
+    a: f32,
+    rgb: [u8; 3],
+    opaque: [u8; 4],
+    blend: BlendMode,
+) {
+    if a <= 0.0 {
+        return;
+    }
+    if NORMAL {
+        if a >= 1.0 {
+            // Fully covered by an opaque source: the source-over result
+            // is exactly the source color, so skip the per-pixel divide.
+            dst.copy_from_slice(&opaque);
+        } else {
+            composite_over(dst, rgb, a);
+        }
+        return;
+    }
+    // A non-Normal blend derives the effective source color from the
+    // backdrop pixel, so neither branch below may shortcut it.
+    let rgb = blend.blend([dst[0], dst[1], dst[2]], rgb);
+    if a >= 1.0 {
+        dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+    } else {
+        composite_over(dst, rgb, a);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pdfboss_core::geom::Point;
+
+    /// Shadows the crate fn with a fresh-scratch wrapper so the tests stay
+    /// focused on rasterization behavior, not buffer plumbing.
+    fn fill_path(
+        pix: &mut Pixmap,
+        polys: &[Subpath],
+        rule: FillRule,
+        rgba: [u8; 4],
+        alpha: f32,
+        clip: Option<&Mask>,
+        blend: BlendMode,
+    ) {
+        super::fill_path(
+            pix,
+            &mut RasterScratch::default(),
+            polys,
+            rule,
+            rgba,
+            alpha,
+            clip,
+            blend,
+        );
+    }
+
+    fn mask_from_path(width: u32, height: u32, polys: &[Subpath], rule: FillRule) -> Mask {
+        Mask::from_path(width, height, &mut RasterScratch::default(), polys, rule)
+    }
 
     fn rect_poly(x0: f32, y0: f32, x1: f32, y1: f32) -> Subpath {
         Subpath {
@@ -724,7 +931,7 @@ mod tests {
     #[test]
     fn clip_mask_restricts_fill() {
         let mut pix = Pixmap::new(10, 10);
-        let clip = Mask::from_path(10, 10, &[rect_poly(0.0, 0.0, 5.0, 10.0)], FillRule::NonZero);
+        let clip = mask_from_path(10, 10, &[rect_poly(0.0, 0.0, 5.0, 10.0)], FillRule::NonZero);
         let polys = [rect_poly(0.0, 0.0, 10.0, 10.0)];
         fill_path(
             &mut pix,
@@ -748,8 +955,8 @@ mod tests {
 
     #[test]
     fn mask_intersect_takes_minimum() {
-        let mut a = Mask::from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
-        let b = Mask::from_path(8, 8, &[rect_poly(4.0, 0.0, 8.0, 8.0)], FillRule::NonZero);
+        let mut a = mask_from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
+        let b = mask_from_path(8, 8, &[rect_poly(4.0, 0.0, 8.0, 8.0)], FillRule::NonZero);
         a.intersect(&b);
         assert_eq!(a.coverage(2, 4), 0, "only in a");
         assert_eq!(a.coverage(7, 4), 0, "only in b");
@@ -761,7 +968,7 @@ mod tests {
         // A small clip rect on a large page should only allocate its own
         // bounding box, not the whole page — this is the whole point of the
         // fix (O(clip area), not O(page area), per clip operation).
-        let mask = Mask::from_path(
+        let mask = mask_from_path(
             1000,
             1000,
             &[rect_poly(10.0, 20.0, 30.0, 50.0)],
@@ -779,13 +986,13 @@ mod tests {
 
     #[test]
     fn mask_intersect_disjoint_bboxes_is_empty() {
-        let mut a = Mask::from_path(
+        let mut a = mask_from_path(
             100,
             100,
             &[rect_poly(0.0, 0.0, 10.0, 10.0)],
             FillRule::NonZero,
         );
-        let b = Mask::from_path(
+        let b = mask_from_path(
             100,
             100,
             &[rect_poly(50.0, 50.0, 60.0, 60.0)],
@@ -803,13 +1010,13 @@ mod tests {
 
     #[test]
     fn mask_intersect_shrinks_bbox_to_overlap() {
-        let mut a = Mask::from_path(
+        let mut a = mask_from_path(
             100,
             100,
             &[rect_poly(0.0, 0.0, 20.0, 20.0)],
             FillRule::NonZero,
         );
-        let b = Mask::from_path(
+        let b = mask_from_path(
             100,
             100,
             &[rect_poly(10.0, 10.0, 30.0, 30.0)],
@@ -823,6 +1030,42 @@ mod tests {
         assert_eq!(a.coverage(15, 15), 255, "in overlap");
         assert_eq!(a.coverage(5, 5), 0, "only in a");
         assert_eq!(a.coverage(25, 25), 0, "only in b");
+    }
+
+    #[test]
+    fn opaque_clip_shortcut_matches_full_mask_math() {
+        let polys = [rect_poly(1.5, 1.5, 9.5, 9.5)];
+        let clip = mask_from_path(12, 12, &[rect_poly(2.0, 0.0, 8.0, 12.0)], FillRule::NonZero);
+        assert!(clip.opaque, "integer-coordinate rect clip is fully opaque");
+        let mut dull = clip.clone();
+        dull.opaque = false;
+        let mut a = Pixmap::new(12, 12);
+        let mut b = Pixmap::new(12, 12);
+        fill_path(
+            &mut a,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            0.7,
+            Some(&clip),
+            BlendMode::Normal,
+        );
+        fill_path(
+            &mut b,
+            &polys,
+            FillRule::NonZero,
+            RED,
+            0.7,
+            Some(&dull),
+            BlendMode::Normal,
+        );
+        assert_eq!(a.data, b.data, "opaque shortcut must not change pixels");
+    }
+
+    #[test]
+    fn fractional_clip_is_not_marked_opaque() {
+        let m = mask_from_path(12, 12, &[rect_poly(2.5, 2.0, 8.0, 10.0)], FillRule::NonZero);
+        assert!(!m.opaque, "partial edge coverage forbids the opaque flag");
     }
 
     #[test]

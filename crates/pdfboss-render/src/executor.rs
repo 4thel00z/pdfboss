@@ -24,7 +24,7 @@ use crate::color::{self, ColorSpace};
 use crate::glyph::GlyphFont;
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
-use crate::raster::{fill_path, BlendMode, FillRule, Mask};
+use crate::raster::{fill_path, BlendMode, FillRule, Mask, RasterScratch};
 use crate::shading::Shading;
 use crate::stroke::stroke_path;
 #[cfg(feature = "substitute-fonts")]
@@ -473,6 +473,7 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         color_locked: false,
         provider,
         glyph_blit: Vec::new(),
+        raster: RasterScratch::default(),
         clip_cache: FastMap::default(),
         charproc_cache: FastMap::default(),
         pattern_cache: FastMap::default(),
@@ -524,6 +525,10 @@ struct Executor<'a, S> {
     /// here translated to the glyph's device origin, so a whole page of text
     /// paints its glyphs without allocating a fresh polygon set per glyph.
     glyph_blit: Vec<Subpath>,
+    /// Reused rasterizer buffers (coverage row, edge/active/crossing lists),
+    /// shared by every fill and clip rasterization on the page so thousands
+    /// of small fills stop re-allocating and re-zeroing them per call.
+    raster: RasterScratch,
     /// Rasterized clip masks by exact path geometry, shared across the whole
     /// page render (including nested forms — a repeated clip means the same
     /// device-space geometry regardless of which resource scope drew it).
@@ -1079,6 +1084,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 }
                 None => fill_path(
                     &mut self.pix,
+                    &mut self.raster,
                     &polys,
                     rule,
                     gs.fill_rgba8(),
@@ -1114,6 +1120,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 }
                 None => fill_path(
                     &mut self.pix,
+                    &mut self.raster,
                     &quads,
                     FillRule::NonZero,
                     gs.stroke_rgba8(),
@@ -1433,7 +1440,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 let tile_ctm = origin.concat(to_device);
                 let mut pb = PathBuilder::new(tile_ctm);
                 pb.rect(bx0, by0, bx1 - bx0, by1 - by0);
-                let cell = Mask::from_path(self.pix.width, self.pix.height, &pb.finish(), rule);
+                let cell = Mask::from_path(
+                    self.pix.width,
+                    self.pix.height,
+                    &mut self.raster,
+                    &pb.finish(),
+                    rule,
+                );
                 if cell.bbox_w == 0 || cell.bbox_h == 0 {
                     continue;
                 }
@@ -1507,6 +1520,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(bg) = shading.background {
             fill_path(
                 &mut self.pix,
+                &mut self.raster,
                 polys,
                 rule,
                 rgba8(bg),
@@ -1533,6 +1547,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         let mask = Arc::new(Mask::from_path(
             self.pix.width,
             self.pix.height,
+            &mut self.raster,
             polys,
             rule,
         ));
@@ -1610,6 +1625,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
         fill_path(
             &mut self.pix,
+            &mut self.raster,
             &self.glyph_blit[..cached.len()],
             FillRule::NonZero,
             fill,
