@@ -150,12 +150,12 @@ A renderer that skips work looks fast, and pdfboss does not paint everything yet
 
 | Library | pages/sec |
 |---|--:|
-| pypdfium2 | 123.8 |
-| pdfplumber (via pdfium) | 103.1 |
-| pdfboss | 95.5 |
-| PyMuPDF | 91.9 |
+| pypdfium2 | 125.9 |
+| pdfboss | 112.0 |
+| pdfplumber (via pdfium) | 104.5 |
+| PyMuPDF | 94.8 |
 
-pdfboss rasterizes the mixed corpus inside the C-backed field: about 23% behind pdfium, 4% ahead of PyMuPDF, with no C in it — while painting the annotation and pattern pages the earlier sample had to exclude. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 3.1% as ambient load shifted, the pdfboss-to-pdfium ratio held within 0.3%, and the ordering never moved.
+pdfboss rasterizes the mixed corpus second only to pdfium itself: about 11% behind it, ahead of pdfplumber's pdfium stack and PyMuPDF, with no C in it. Caching loaded shadings and patterns across paints and reworking the rasterizer's hot paths moved it up a place since the last table, with every output byte identical. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 1.6%, the pdfboss-to-pdfium ratio held within 0.5%, and the ordering never moved.
 
 Reproduce with [`benchmarks/bench_render.py`](benchmarks/README.md).
 
