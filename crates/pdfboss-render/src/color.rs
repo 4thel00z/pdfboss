@@ -3,10 +3,18 @@
 
 use pdfboss_core::{block_on, AsyncObjectSource, Document, Error, Immediate, Object};
 
+use crate::shading::{load_functions, Functions, MAX_COMPS};
+
 /// Nesting guard for color-space definitions that defer to another one
 /// (Indexed bases, ICCBased `/Alternate` chains): levels `0..=MAX_DEPTH`
 /// are read, anything deeper reads as `DeviceGray`.
 const MAX_DEPTH: u32 = 8;
+
+/// Tint-transform samples a [`ColorSpace::Separation`] keeps. The transform
+/// is evaluated once per step at parse time and interpolated per pixel, so
+/// the pixel loops stay free of function evaluation; 256 steps hold a
+/// smooth ramp to within a 255th of the alternate space's own resolution.
+const TINT_STEPS: usize = 256;
 
 /// A color space reduced to what the rasterizer can paint.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,10 +31,14 @@ pub(crate) enum ColorSpace {
         base: Box<ColorSpace>,
         lookup: Vec<u8>,
     },
+    /// A one-component `Separation` whose tint transform was evaluated
+    /// through its alternate space at parse time (§8.6.6.4): `ramp[i]` is
+    /// the RGB for tint `i / (TINT_STEPS - 1)`.
+    Separation { ramp: Vec<[f32; 3]> },
     /// Any other family, kept only for its component count. `to_rgb`
     /// approximates it as an ink tint: gray = 1 - max component (used for
-    /// Separation/DeviceN, whose tint transforms are not evaluated, and
-    /// Lab).
+    /// `DeviceN`, whose multi-input transforms this does not evaluate, for a
+    /// `Separation` whose transform is a type 4, and for Lab).
     Other(usize),
 }
 
@@ -49,6 +61,7 @@ impl ColorSpace {
             ColorSpace::DeviceRGB => 3,
             ColorSpace::DeviceCMYK => 4,
             ColorSpace::Indexed { .. } => 1,
+            ColorSpace::Separation { .. } => 1,
             ColorSpace::Other(n) => *n,
         }
     }
@@ -89,6 +102,26 @@ impl ColorSpace {
                 }
                 base.to_rgb(&base_comps[..n])
             }
+            ColorSpace::Separation { ramp } => {
+                // The transform is already evaluated; interpolate between the
+                // two nearest steps so a gradient over the tint stays smooth.
+                let t = comp(comps, 0) * (ramp.len().saturating_sub(1)) as f32;
+                let lo = t.floor().max(0.0) as usize;
+                let hi = (lo + 1).min(ramp.len().saturating_sub(1));
+                match (ramp.get(lo), ramp.get(hi)) {
+                    (Some(a), Some(b)) => {
+                        let f = t - lo as f32;
+                        [
+                            a[0] + (b[0] - a[0]) * f,
+                            a[1] + (b[1] - a[1]) * f,
+                            a[2] + (b[2] - a[2]) * f,
+                        ]
+                    }
+                    // An empty ramp cannot happen (the parser only builds a
+                    // full one) but white is the harmless reading.
+                    _ => [1.0, 1.0, 1.0],
+                }
+            }
             ColorSpace::Other(n) => {
                 // Tint approximation: treat the strongest component as ink
                 // coverage v and paint gray 1 - v.
@@ -124,6 +157,11 @@ impl ColorSpace {
     /// palettes, innermost last.
     pub(crate) async fn parse_with<S: AsyncObjectSource>(src: &S, obj: &Object) -> ColorSpace {
         let mut palettes: Vec<Vec<u8>> = Vec::new();
+        // Tint transforms met on the way down, innermost last — the same
+        // deferral `palettes` uses, for the same reason: the transform's
+        // output is read in the alternate space, which this loop has not
+        // resolved yet.
+        let mut tints: Vec<Functions> = Vec::new();
         let mut current: Object = obj.clone();
         // If the loop runs out of levels while still descending, this is the
         // answer — the same one the recursion's depth guard gave.
@@ -185,8 +223,27 @@ impl ColorSpace {
                             }
                         }
                         "Separation" => {
-                            result = ColorSpace::Other(1);
-                            break;
+                            // [/Separation name alternate transform]: keep the
+                            // transform and carry on into the alternate space,
+                            // whose components the transform's output *is*.
+                            let transform = match items.get(3) {
+                                Some(o) => load_functions(src, o).await.ok().flatten(),
+                                None => None,
+                            };
+                            match (transform, items.get(2)) {
+                                (Some(funcs), Some(alternate)) => {
+                                    tints.push(funcs);
+                                    current = alternate.clone();
+                                    continue;
+                                }
+                                // A type 4 transform, a malformed one, or no
+                                // alternate at all: the ink approximation is
+                                // still better than painting nothing.
+                                _ => {
+                                    result = ColorSpace::Other(1);
+                                    break;
+                                }
+                            }
                         }
                         "DeviceN" => {
                             let n = match items.get(1) {
@@ -207,6 +264,19 @@ impl ColorSpace {
                 }
                 _ => break, // stays DeviceGray
             }
+        }
+        for funcs in tints.into_iter().rev() {
+            let alternate = result;
+            let mut out = [0f32; MAX_COMPS];
+            result = ColorSpace::Separation {
+                ramp: (0..TINT_STEPS)
+                    .map(|i| {
+                        let tint = i as f32 / (TINT_STEPS - 1) as f32;
+                        let written = funcs.eval(tint, &mut out);
+                        alternate.to_rgb(&out[..written])
+                    })
+                    .collect(),
+            };
         }
         for lookup in palettes.into_iter().rev() {
             result = ColorSpace::Indexed {
