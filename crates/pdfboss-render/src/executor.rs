@@ -3167,6 +3167,35 @@ mod tests {
     }
 
     #[test]
+    fn separation_image_samples_go_through_the_tint_transform() {
+        // An image in a Separation space reaches the transform through the
+        // reader's per-value table — one entry per distinct sample, not one
+        // evaluation per pixel — so this also pins that path.
+        let bytes = small_doc(
+            "/XObject << /Im1 5 0 R >> /ColorSpace << /T 7 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im1 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                     /ColorSpace 7 0 R /BitsPerComponent 8",
+                    // Tint 0 (no ink) then tint 1 (full ink).
+                    &[0x00, 0xFF],
+                );
+                b.object(
+                    6,
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] \
+                     /C1 [0 0 0 1] /N 1 >>",
+                );
+                b.object(7, "[/Separation /Spot /DeviceCMYK 6 0 R]");
+            },
+        );
+        let pix = render(bytes, 1.0);
+        assert_eq!(px(&pix, 25, 50), WHITE, "tint 0 is no ink");
+        assert_eq!(px(&pix, 75, 50), BLACK, "tint 1 is full ink");
+    }
+
+    #[test]
     fn separation_without_an_evaluable_transform_keeps_the_ink_approximation() {
         // Type 4 (PostScript calculator) transforms are not evaluated here;
         // full tint has to stay dark rather than falling back to white.

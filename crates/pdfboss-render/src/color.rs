@@ -1,6 +1,8 @@
 //! Color spaces: DeviceGray/RGB/CMYK, Indexed, and approximations for the
 //! CIE-based and tint-transform families, converted to RGB.
 
+use std::sync::Arc;
+
 use pdfboss_core::{block_on, AsyncObjectSource, Document, Error, Immediate, Object};
 
 use crate::shading::{load_functions, Functions, MAX_COMPS};
@@ -9,12 +11,6 @@ use crate::shading::{load_functions, Functions, MAX_COMPS};
 /// (Indexed bases, ICCBased `/Alternate` chains): levels `0..=MAX_DEPTH`
 /// are read, anything deeper reads as `DeviceGray`.
 const MAX_DEPTH: u32 = 8;
-
-/// Tint-transform samples a [`ColorSpace::Separation`] keeps. The transform
-/// is evaluated once per step at parse time and interpolated per pixel, so
-/// the pixel loops stay free of function evaluation; 256 steps hold a
-/// smooth ramp to within a 255th of the alternate space's own resolution.
-const TINT_STEPS: usize = 256;
 
 /// A color space reduced to what the rasterizer can paint.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,10 +27,18 @@ pub(crate) enum ColorSpace {
         base: Box<ColorSpace>,
         lookup: Vec<u8>,
     },
-    /// A one-component `Separation` whose tint transform was evaluated
-    /// through its alternate space at parse time (§8.6.6.4): `ramp[i]` is
-    /// the RGB for tint `i / (TINT_STEPS - 1)`.
-    Separation { ramp: Vec<[f32; 3]> },
+    /// A one-component `Separation`: its tint transform and the alternate
+    /// space the transform's output is read in (§8.6.6.4).
+    ///
+    /// The transform is evaluated per colour, not per parse: a fill or stroke
+    /// costs one evaluation, and an image's samples reach it through the
+    /// reader's own per-value table (one entry per distinct sample, 256 at
+    /// eight bits) rather than once per pixel. `Arc` so cloning a space
+    /// shares one arena instead of copying a sampled function's data.
+    Separation {
+        tint: Arc<Functions>,
+        alternate: Box<ColorSpace>,
+    },
     /// Any other family, kept only for its component count. `to_rgb`
     /// approximates it as an ink tint: gray = 1 - max component (used for
     /// `DeviceN`, whose multi-input transforms this does not evaluate, for a
@@ -102,25 +106,10 @@ impl ColorSpace {
                 }
                 base.to_rgb(&base_comps[..n])
             }
-            ColorSpace::Separation { ramp } => {
-                // The transform is already evaluated; interpolate between the
-                // two nearest steps so a gradient over the tint stays smooth.
-                let t = comp(comps, 0) * (ramp.len().saturating_sub(1)) as f32;
-                let lo = t.floor().max(0.0) as usize;
-                let hi = (lo + 1).min(ramp.len().saturating_sub(1));
-                match (ramp.get(lo), ramp.get(hi)) {
-                    (Some(a), Some(b)) => {
-                        let f = t - lo as f32;
-                        [
-                            a[0] + (b[0] - a[0]) * f,
-                            a[1] + (b[1] - a[1]) * f,
-                            a[2] + (b[2] - a[2]) * f,
-                        ]
-                    }
-                    // An empty ramp cannot happen (the parser only builds a
-                    // full one) but white is the harmless reading.
-                    _ => [1.0, 1.0, 1.0],
-                }
+            ColorSpace::Separation { tint, alternate } => {
+                let mut components = [0f32; MAX_COMPS];
+                let written = tint.eval(comp(comps, 0), &mut components);
+                alternate.to_rgb(&components[..written])
             }
             ColorSpace::Other(n) => {
                 // Tint approximation: treat the strongest component as ink
@@ -266,16 +255,9 @@ impl ColorSpace {
             }
         }
         for funcs in tints.into_iter().rev() {
-            let alternate = result;
-            let mut out = [0f32; MAX_COMPS];
             result = ColorSpace::Separation {
-                ramp: (0..TINT_STEPS)
-                    .map(|i| {
-                        let tint = i as f32 / (TINT_STEPS - 1) as f32;
-                        let written = funcs.eval(tint, &mut out);
-                        alternate.to_rgb(&out[..written])
-                    })
-                    .collect(),
+                tint: Arc::new(funcs),
+                alternate: Box::new(result),
             };
         }
         for lookup in palettes.into_iter().rev() {
