@@ -14,7 +14,7 @@ use crate::Pixmap;
 
 /// Most components any color space here carries (CMYK is 4; `Other` caps at
 /// what `ColorSpace::to_rgb` reads).
-const MAX_COMPS: usize = 8;
+pub(crate) const MAX_COMPS: usize = 8;
 
 /// Upper bound on parsed function nodes per shading. A real gradient uses a
 /// handful (one stitching function over a few exponentials); the cap only
@@ -24,6 +24,7 @@ const MAX_FUNCTIONS: usize = 256;
 /// One parsed function. Stitching children are arena indices, so loading
 /// needs no recursion (a queue fills the arena) and evaluation recurses
 /// over indices with the depth bounded by [`MAX_FUNCTIONS`].
+#[derive(Debug, Clone, PartialEq)]
 enum Node {
     /// Type 2: `C0 + x^N (C1 - C0)` over `domain`.
     Exponential {
@@ -55,7 +56,8 @@ enum Node {
 
 /// The functions a shading evaluates: one n-output function, or an array of
 /// single-output functions whose results concatenate (§8.7.4.5.2).
-struct Functions {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Functions {
     nodes: Vec<Node>,
     roots: Vec<usize>,
 }
@@ -63,7 +65,7 @@ struct Functions {
 impl Functions {
     /// Evaluates every root at `x` into `out`, returning how many
     /// components were written.
-    fn eval(&self, x: f32, out: &mut [f32; MAX_COMPS]) -> usize {
+    pub(crate) fn eval(&self, x: f32, out: &mut [f32; MAX_COMPS]) -> usize {
         let mut written = 0;
         for &root in &self.roots {
             if written >= MAX_COMPS {
@@ -305,7 +307,7 @@ async fn function_dict<S: AsyncObjectSource>(
 /// Loads `/Function` — one function or an array of them — into an arena.
 /// `Ok(None)` means a function *type* nobody evaluates here (the PostScript
 /// calculator); `Err` is a structural failure worth reporting verbatim.
-async fn load_functions<S: AsyncObjectSource>(
+pub(crate) async fn load_functions<S: AsyncObjectSource>(
     src: &S,
     obj: &Object,
 ) -> Result<Option<Functions>, Error> {
