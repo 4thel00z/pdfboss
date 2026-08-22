@@ -419,18 +419,18 @@ fn check_ftyp(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<()> {
     if be32(&payload[4..]) != 0 {
         warnings.push(JpxWarning::note("ftyp minor version is not zero"));
     }
-    let mut chunks = payload[8..].chunks_exact(4);
+    let (entries, remainder) = payload[8..].as_chunks::<4>();
     let mut compatible = false;
     let mut jpx_compatible = false;
-    for entry in &mut chunks {
-        let code = [entry[0], entry[1], entry[2], entry[3]];
+    for entry in entries {
+        let code = *entry;
         compatible = compatible || code == BRAND_JP2;
         jpx_compatible = jpx_compatible || code == BRAND_JPX || code == BRAND_JPXB;
     }
-    if !chunks.remainder().is_empty() {
+    if !remainder.is_empty() {
         warnings.push(JpxWarning::note(format!(
             "ftyp compatibility list has {} trailing bytes",
-            chunks.remainder().len()
+            remainder.len()
         )));
     }
     if brand == BRAND_JP2 {
@@ -775,7 +775,7 @@ fn parse_cmap(
         )));
     }
     let mut entries = Vec::with_capacity(payload.len() / 4);
-    for chunk in payload.chunks_exact(4) {
+    for chunk in payload.as_chunks::<4>().0 {
         let component = be16(chunk);
         let mapping_type = chunk[2];
         let palette_column = chunk[3];
@@ -821,7 +821,9 @@ fn parse_cdef(payload: &[u8]) -> Result<Vec<ChannelDefinition>> {
         )));
     }
     Ok(payload[2..]
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .map(|chunk| ChannelDefinition {
             channel: be16(chunk),
             kind: be16(&chunk[2..]),

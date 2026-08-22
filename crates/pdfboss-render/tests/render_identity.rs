@@ -69,7 +69,9 @@ fn digest(pix: &Pixmap) -> String {
 fn ink(pix: &Pixmap) -> String {
     let inked = pix
         .data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] != 255 || p[1] != 255 || p[2] != 255)
         .count();
     let total = (pix.width * pix.height) as usize;
@@ -437,7 +439,9 @@ fn every_case_paints_something_distinct() {
         let pix = render(&case);
         let inked = pix
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[0] != 255 || p[1] != 255 || p[2] != 255)
             .count();
         assert!(
@@ -458,7 +462,9 @@ fn every_case_paints_something_distinct() {
 /// counts are exact rather than approximate.
 fn count_rgb(pix: &Pixmap, rgb: [u8; 3]) -> usize {
     pix.data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|p| p[0] == rgb[0] && p[1] == rgb[1] && p[2] == rgb[2])
         .count()
 }

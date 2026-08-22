@@ -508,7 +508,7 @@ fn aes_cbc_decrypt_blocks(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     let mut prev = [0u8; 16];
     prev.copy_from_slice(&iv[..16]);
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(16) {
+    for chunk in data.as_chunks::<16>().0 {
         let mut block = [0u8; 16];
         block.copy_from_slice(chunk);
         let cipher = block;
@@ -529,7 +529,7 @@ fn aes_cbc_encrypt_blocks(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     let mut prev = [0u8; 16];
     prev.copy_from_slice(&iv[..16]);
     let mut out = Vec::with_capacity(data.len());
-    for chunk in data.chunks_exact(16) {
+    for chunk in data.as_chunks::<16>().0 {
         let mut block = [0u8; 16];
         for ((b, c), p) in block.iter_mut().zip(chunk).zip(&prev) {
             *b = c ^ p;
@@ -595,10 +595,10 @@ fn sha256(input: &[u8]) -> [u8; 32] {
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(4)) {
-            *word = u32::from_be_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in w.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_be_bytes(*bytes);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -674,10 +674,10 @@ fn sha512_core(input: &[u8], mut h: [u64; 8]) -> [u64; 8] {
     }
     msg.extend_from_slice(&bitlen.to_be_bytes());
 
-    for chunk in msg.chunks_exact(128) {
+    for chunk in msg.as_chunks::<128>().0 {
         let mut w = [0u64; 80];
-        for (word, bytes) in w.iter_mut().zip(chunk.chunks_exact(8)) {
-            *word = u64::from_be_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in w.iter_mut().zip(chunk.as_chunks::<8>().0) {
+            *word = u64::from_be_bytes(*bytes);
         }
         for i in 16..80 {
             let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
@@ -857,10 +857,10 @@ fn md5(input: &[u8]) -> [u8; 16] {
     }
     msg.extend_from_slice(&bitlen.to_le_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in m.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
         for i in 0..64 {

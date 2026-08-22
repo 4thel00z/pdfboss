@@ -61,10 +61,10 @@ fn md5(input: &[u8]) -> [u8; 16] {
         msg.push(0);
     }
     msg.extend_from_slice(&bitlen.to_le_bytes());
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut m = [0u32; 16];
-        for (word, bytes) in m.iter_mut().zip(chunk.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap());
+        for (word, bytes) in m.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
         }
         let (mut a, mut b, mut c, mut d) = (a0, b0, c0, d0);
         for i in 0..64 {

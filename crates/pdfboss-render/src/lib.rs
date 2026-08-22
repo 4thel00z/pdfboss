@@ -98,8 +98,8 @@ impl Pixmap {
 
     /// Fills every pixel with `rgba`.
     pub fn fill(&mut self, rgba: [u8; 4]) {
-        for px in self.data.chunks_exact_mut(4) {
-            px.copy_from_slice(&rgba);
+        for px in self.data.as_chunks_mut::<4>().0 {
+            *px = rgba;
         }
     }
 

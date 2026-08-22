@@ -938,7 +938,9 @@ async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Optio
         Some(Object::Stream(s)) => match decoded_stream_data_with(src, &s).await {
             Ok(bytes) => Some(
                 bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|c| u16::from_be_bytes([c[0], c[1]]))
                     .collect(),
             ),
@@ -2226,7 +2228,9 @@ mod tests {
     #[cfg(feature = "substitute-fonts")]
     fn has_dark_ink(pix: &Pixmap) -> bool {
         pix.data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .any(|p| p[0] < 200 && p[1] < 200 && p[2] < 200)
     }
 

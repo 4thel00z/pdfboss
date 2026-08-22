@@ -675,8 +675,8 @@ fn blend_row<const NORMAL: bool>(
 /// Fills a run of pixels with one RGBA value (plain repeated 4-byte
 /// pattern; the loop lowers to wide stores).
 fn fill_run(dst: &mut [u8], px: [u8; 4]) {
-    for chunk in dst.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&px);
+    for chunk in dst.as_chunks_mut::<4>().0 {
+        *chunk = px;
     }
 }
 

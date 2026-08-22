@@ -45,7 +45,9 @@ fn render_clean(bytes: &[u8]) -> Pixmap {
 /// below 245 — the 9-7 wavelet is lossy, so near-white is still white).
 fn nonwhite(pix: &Pixmap) -> usize {
     pix.data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] < 245 || px[1] < 245 || px[2] < 245)
         .count()
 }
@@ -53,7 +55,9 @@ fn nonwhite(pix: &Pixmap) -> usize {
 /// How many pixels are visibly chromatic rather than a shade of gray.
 fn colored(pix: &Pixmap) -> usize {
     pix.data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| {
             let hi = px[0].max(px[1]).max(px[2]);
             let lo = px[0].min(px[1]).min(px[2]);

@@ -571,18 +571,18 @@ fn decode_jpeg<'a>(data: &[u8]) -> Option<Rgba<'a>> {
             }
         }
         jpeg_decoder::PixelFormat::L16 => {
-            for (i, pair) in pixels.chunks_exact(2).enumerate().take(w * h) {
+            for (i, pair) in pixels.as_chunks::<2>().0.iter().enumerate().take(w * h) {
                 let g = pair[0]; // big-endian: high byte carries the tone
                 out[i * 4..i * 4 + 3].copy_from_slice(&[g, g, g]);
             }
         }
         jpeg_decoder::PixelFormat::RGB24 => {
-            for (i, rgb) in pixels.chunks_exact(3).enumerate().take(w * h) {
+            for (i, rgb) in pixels.as_chunks::<3>().0.iter().enumerate().take(w * h) {
                 out[i * 4..i * 4 + 3].copy_from_slice(rgb);
             }
         }
         jpeg_decoder::PixelFormat::CMYK32 => {
-            for (i, cmyk) in pixels.chunks_exact(4).enumerate().take(w * h) {
+            for (i, cmyk) in pixels.as_chunks::<4>().0.iter().enumerate().take(w * h) {
                 let rgb = inverted_cmyk_to_rgb([cmyk[0], cmyk[1], cmyk[2], cmyk[3]]);
                 out[i * 4..i * 4 + 3].copy_from_slice(&rgb);
             }
@@ -857,7 +857,7 @@ fn jpx_rgba(
     let converted = decode_samples(width, height, &color_data, cs, 8, None);
     let mut quads = owned_quads(converted);
     if masking {
-        for (px, &a) in quads.chunks_exact_mut(4).zip(&alpha_data) {
+        for (px, &a) in quads.as_chunks_mut::<4>().0.iter_mut().zip(&alpha_data) {
             px[3] = a;
         }
     }
