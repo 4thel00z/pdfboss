@@ -2004,13 +2004,14 @@ fn type3_glyph_plan(
 
 /// The initial color after selecting a color space: black for the device
 /// and Indexed spaces (CMYK black is `K = 1`). Separation/DeviceN start at
-/// full tint 1.0 (ISO 32000-1 8.6.6.4/8.6.6.5), which the tint
-/// approximation paints as gray 0; feeding 1.0 everywhere also gives the
-/// right dark initial color for Lab (`L = 0`), the other `Other` space.
+/// full tint 1.0 (ISO 32000-1 8.6.6.4/8.6.6.5) — a `Separation` runs that
+/// through its tint transform, while the `Other` approximation paints it as
+/// gray 0; feeding 1.0 everywhere also gives the right dark initial color
+/// for Lab (`L = 0`), the other `Other` space.
 fn initial_color(cs: &ColorSpace) -> [f32; 3] {
     match cs {
         ColorSpace::DeviceCMYK => cs.to_rgb(&[0.0, 0.0, 0.0, 1.0]),
-        ColorSpace::Other(_) => cs.to_rgb(&[1.0; 8]),
+        ColorSpace::Separation { .. } | ColorSpace::Other(_) => cs.to_rgb(&[1.0; 8]),
         _ => cs.to_rgb(&[0.0, 0.0, 0.0, 0.0]),
     }
 }
@@ -3091,6 +3092,13 @@ mod tests {
         // ISO 32000-1 8.6.6.4/8.6.6.5: selecting a Separation or DeviceN
         // space with `cs` sets every component to 1.0, so painting before
         // any `scn` must give a full-tint (dark) mark, not white.
+        //
+        // The tint transform below is what makes "full tint" mean dark:
+        // `/C0 [1] /C1 [0]` maps tint 0 to white and tint 1 to black, the
+        // usual ink direction. It has to say so explicitly — a transform
+        // that defaults to `C0 [0] C1 [1]` legally means the opposite, and
+        // this test would then be pinning the transform's direction rather
+        // than the initial component value it exists to check.
         for (entry, content) in [
             // Fill: broken initial color paints white-on-white.
             (
@@ -3108,7 +3116,10 @@ mod tests {
             ),
         ] {
             let bytes = small_doc("/ColorSpace << /T 6 0 R >>", content.as_bytes(), |b| {
-                b.object(5, "<< /FunctionType 2 /Domain [0 1] /N 1 >>");
+                b.object(
+                    5,
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>",
+                );
                 b.object(6, entry);
             });
             let pix = render(bytes, 1.0);
@@ -3119,11 +3130,88 @@ mod tests {
             "/ColorSpace << /T 6 0 R >>",
             b"/T cs 0 scn 10 10 80 80 re f",
             |b| {
-                b.object(5, "<< /FunctionType 2 /Domain [0 1] /N 1 >>");
+                b.object(
+                    5,
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>",
+                );
                 b.object(6, "[/Separation /Spot /DeviceGray 5 0 R]");
             },
         );
         assert_eq!(px(&render(bytes, 1.0), 50, 50), WHITE, "0 scn wins");
+    }
+
+    #[test]
+    fn separation_tint_transform_decides_the_color() {
+        // A spot colour is whatever its tint transform says, which is not
+        // always dark: print-origin files fill page backgrounds with a
+        // separation whose transform maps full tint to a pale ink. Painting
+        // such a fill as gray `1 - tint` turns the page black.
+        let bytes = small_doc(
+            "/ColorSpace << /T 6 0 R >>",
+            b"/T cs 1 scn 0 0 100 100 re f",
+            |b| {
+                // tint 1 -> CMYK 0.02 0.012 0.129 0, a pale cream.
+                b.object(
+                    5,
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0]                      /C1 [0.02 0.012 0.129 0] /N 1 >>",
+                );
+                b.object(6, "[/Separation /PaleSpot /DeviceCMYK 5 0 R]");
+            },
+        );
+        let [r, g, b_, _] = px(&render(bytes, 1.0), 50, 50);
+        assert!(
+            r > 240 && g > 240 && b_ > 210 && b_ < 240,
+            "expected the transform's pale cream, got {:?}",
+            [r, g, b_],
+        );
+    }
+
+    #[test]
+    fn separation_image_samples_go_through_the_tint_transform() {
+        // An image in a Separation space reaches the transform through the
+        // reader's per-value table — one entry per distinct sample, not one
+        // evaluation per pixel — so this also pins that path.
+        let bytes = small_doc(
+            "/XObject << /Im1 5 0 R >> /ColorSpace << /T 7 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im1 Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                     /ColorSpace 7 0 R /BitsPerComponent 8",
+                    // Tint 0 (no ink) then tint 1 (full ink).
+                    &[0x00, 0xFF],
+                );
+                b.object(
+                    6,
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [0 0 0 0] \
+                     /C1 [0 0 0 1] /N 1 >>",
+                );
+                b.object(7, "[/Separation /Spot /DeviceCMYK 6 0 R]");
+            },
+        );
+        let pix = render(bytes, 1.0);
+        assert_eq!(px(&pix, 25, 50), WHITE, "tint 0 is no ink");
+        assert_eq!(px(&pix, 75, 50), BLACK, "tint 1 is full ink");
+    }
+
+    #[test]
+    fn separation_without_an_evaluable_transform_keeps_the_ink_approximation() {
+        // Type 4 (PostScript calculator) transforms are not evaluated here;
+        // full tint has to stay dark rather than falling back to white.
+        let bytes = small_doc(
+            "/ColorSpace << /T 6 0 R >>",
+            b"/T cs 1 scn 0 0 100 100 re f",
+            |b| {
+                b.stream(
+                    5,
+                    "<< /FunctionType 4 /Domain [0 1] /Range [0 1] >>",
+                    b"{ }",
+                );
+                b.object(6, "[/Separation /Spot /DeviceGray 5 0 R]");
+            },
+        );
+        assert_eq!(px(&render(bytes, 1.0), 50, 50), BLACK);
     }
 
     #[test]
