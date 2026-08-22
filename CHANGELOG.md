@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.17.0](https://github.com/4thel00z/pdfboss/compare/v0.16.0...v0.17.0) (2026-08-22)
+
+
+### Features
+
+* **render:** configurable PNG encode compression ([#48](https://github.com/4thel00z/pdfboss/issues/48)) ([20fd226](https://github.com/4thel00z/pdfboss/commit/20fd2266572681601c48ab280925fdaee58b51f4))
+
+
+### Bug Fixes
+
+* **render:** evaluate Separation tint transforms instead of approximating ink ([#53](https://github.com/4thel00z/pdfboss/issues/53)) ([ce6d7c2](https://github.com/4thel00z/pdfboss/commit/ce6d7c227046c67d802b5075c65c3756e686dd95))
+* replace constant-size chunks_exact with as_chunks ([#54](https://github.com/4thel00z/pdfboss/issues/54)) ([591d9df](https://github.com/4thel00z/pdfboss/commit/591d9df86209795f740f15b7c11d32dd2694b11f))
+
+
+### Performance Improvements
+
+* **render:** cache loaded patterns across paints on a page ([#49](https://github.com/4thel00z/pdfboss/issues/49)) ([578f62c](https://github.com/4thel00z/pdfboss/commit/578f62c978dcd9a2129f1122e52c41b8b8d40362))
+* **render:** rework the rasterizer's hot paths for byte-identical output ([#50](https://github.com/4thel00z/pdfboss/issues/50)) ([5451237](https://github.com/4thel00z/pdfboss/commit/5451237f853365722940b0e3c0fc60589725211e))
+
+
+### Documentation
+
+* refresh the render benchmark after the paint gaps closed ([#45](https://github.com/4thel00z/pdfboss/issues/45)) ([d1cc516](https://github.com/4thel00z/pdfboss/commit/d1cc51680b50bb5e0ce9a9ef74ba31051a378797))
+* refresh the render benchmark after the rasterizer rework ([#51](https://github.com/4thel00z/pdfboss/issues/51)) ([1ea1d56](https://github.com/4thel00z/pdfboss/commit/1ea1d565ad4cff165f6d05ff42e4ba5ed95af86e))
+
 ## [0.16.0](https://github.com/4thel00z/pdfboss/compare/v0.15.0...v0.16.0) (2026-08-11)
 
 
