@@ -629,7 +629,7 @@ impl<'a> Type2Interpreter<'a> {
             }
             T2_RLINETO => {
                 let args = std::mem::take(&mut self.stack);
-                for pair in args.chunks_exact(2) {
+                for pair in args.as_chunks::<2>().0 {
                     self.lineto(pair[0] as f32, pair[1] as f32);
                 }
                 OpResult::Continue
@@ -649,7 +649,7 @@ impl<'a> Type2Interpreter<'a> {
             }
             T2_RRCURVETO => {
                 let args = std::mem::take(&mut self.stack);
-                for c in args.chunks_exact(6) {
+                for c in args.as_chunks::<6>().0 {
                     self.curveto(
                         c[0] as f32,
                         c[1] as f32,
@@ -681,7 +681,7 @@ impl<'a> Type2Interpreter<'a> {
                 let args = std::mem::take(&mut self.stack);
                 if args.len() >= 2 {
                     let (curves, line) = args.split_at(args.len() - 2);
-                    for c in curves.chunks_exact(6) {
+                    for c in curves.as_chunks::<6>().0 {
                         self.curveto(
                             c[0] as f32,
                             c[1] as f32,
@@ -699,7 +699,7 @@ impl<'a> Type2Interpreter<'a> {
                 let args = std::mem::take(&mut self.stack);
                 if args.len() >= 6 {
                     let (lines, curve) = args.split_at(args.len() - 6);
-                    for pair in lines.chunks_exact(2) {
+                    for pair in lines.as_chunks::<2>().0 {
                         self.lineto(pair[0] as f32, pair[1] as f32);
                     }
                     self.curveto(

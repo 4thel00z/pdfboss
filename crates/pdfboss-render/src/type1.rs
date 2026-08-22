@@ -107,7 +107,9 @@ fn hex_decode_lenient(region: &[u8]) -> Vec<u8> {
         }
     }
     nibbles
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| (pair[0] << 4) | pair[1])
         .collect()
 }

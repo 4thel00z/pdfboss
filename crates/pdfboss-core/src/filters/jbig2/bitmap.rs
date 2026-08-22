@@ -315,8 +315,8 @@ impl Bitmap {
             // groups of eight and each group folded into a byte. Doing it a
             // pixel at a time costs a bounds check and a variable shift per
             // pixel, and a full page of a scan has millions of them.
-            let mut groups = row.chunks_exact(8);
-            for (byte, group) in dst.iter_mut().zip(&mut groups) {
+            let (groups, rest) = row.as_chunks::<8>();
+            for (byte, group) in dst.iter_mut().zip(groups) {
                 *byte = group
                     .iter()
                     .fold(0u8, |acc, &pixel| (acc << 1) | u8::from(pixel != 0));
@@ -324,7 +324,6 @@ impl Bitmap {
             // A row whose width is not a multiple of eight ends in a partial
             // byte, whose remaining low bits stay 0 — the padding this
             // function's contract leaves clear.
-            let rest = groups.remainder();
             if !rest.is_empty() {
                 if let Some(byte) = dst.get_mut(row.len() / 8) {
                     *byte = rest

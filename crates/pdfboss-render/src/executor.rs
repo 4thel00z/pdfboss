@@ -287,7 +287,7 @@ impl Default for TextState {
 /// keep its backdrop and read as that backdrop's coverage.
 fn mask_from_group(pix: &Pixmap, luminosity: bool) -> Mask {
     let mut mask = Mask::new(pix.width, pix.height);
-    for (px, out) in pix.data.chunks_exact(4).zip(mask.data.iter_mut()) {
+    for (px, out) in pix.data.as_chunks::<4>().0.iter().zip(mask.data.iter_mut()) {
         *out = if luminosity {
             let luma =
                 (77 * u32::from(px[0]) + 150 * u32::from(px[1]) + 29 * u32::from(px[2])) >> 8;
@@ -4790,7 +4790,11 @@ mod tests {
             render_page_with_options(&doc, &page, 1.0, &RenderOptions::default()).expect("render");
         assert_eq!((pix.width, pix.height), (612, 792));
         assert!(
-            pix.data.chunks_exact(4).any(|p| p[0] != 255 || p[1] != 255),
+            pix.data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[0] != 255 || p[1] != 255),
             "page must contain non-white pixels"
         );
         // 1 0 0 rg 72 600 100 80 re -> device rows [112,192].
