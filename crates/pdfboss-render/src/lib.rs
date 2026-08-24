@@ -294,6 +294,11 @@ pub enum SkippedKind {
     /// failure) is configured behavior and stays unreported; such a font
     /// still loads its metrics so the text advances.
     Glyph,
+    /// Text shown in a clipping rendering mode (`Tr` 4-7, ISO 32000-1
+    /// §9.3.6). The painting half of the mode is honored, but the glyph
+    /// outlines never join the clipping path, so content the author
+    /// clipped to the text paints unclipped.
+    TextClip,
 }
 
 impl SkippedKind {
@@ -322,6 +327,8 @@ impl SkippedKind {
             SkippedKind::Annotation => "annotations",
             SkippedKind::Glyph if one => "glyph",
             SkippedKind::Glyph => "glyphs",
+            SkippedKind::TextClip if one => "text clip",
+            SkippedKind::TextClip => "text clips",
         }
     }
 }

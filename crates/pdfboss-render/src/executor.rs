@@ -120,6 +120,13 @@ struct GState {
     fill_alpha: f32,
     /// Constant stroke alpha (`CA`).
     stroke_alpha: f32,
+    /// Text rendering mode (`Tr`, ISO 32000-1 §9.3.6) — graphics state
+    /// (Table 104), so `Q` restores it; producers bracket their hidden OCR
+    /// layer with `q 3 Tr … Q` and never issue `0 Tr`. Modes 3 and 7 paint
+    /// nothing — painting a hidden OCR layer double-prints every searchable
+    /// scan. The other modes all paint as fills here: stroking and clipping
+    /// text are approximated by the shape they share.
+    text_render: i32,
     /// Active group soft mask (`/SMask` in `/ExtGState`), a device-space
     /// coverage mask multiplied into every paint alongside the clip. Its
     /// own field, never folded into `clip`: `/SMask /None` must reset it
@@ -145,6 +152,7 @@ impl GState {
             fill_pattern_name: None,
             stroke_pattern_name: None,
             line_width: 1.0,
+            text_render: 0,
             line_cap: 0,
             line_join: 0,
             miter_limit: 10.0,
@@ -315,18 +323,6 @@ fn effective_mask(gs: &GState) -> Option<Arc<Mask>> {
 fn rgba8(rgb: [f32; 3]) -> [u8; 4] {
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     [q(rgb[0]), q(rgb[1]), q(rgb[2]), 255]
-}
-
-/// Approximate device scale of `m`: the square root of the absolute
-/// determinant (exact for uniform scaling), used to size stroke widths and
-/// dash lengths in device space.
-fn ctm_scale(m: Matrix) -> f32 {
-    let det = (m.a * m.d - m.b * m.c).abs();
-    if det.is_finite() && det > 0.0 {
-        det.sqrt()
-    } else {
-        1.0
-    }
 }
 
 /// True when every value is finite (NaN/Inf operands skip the op).
@@ -870,6 +866,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     Op::SetHorizScaling(v) if v.is_finite() => frame.ts.horiz = v / 100.0,
                     Op::SetLeading(v) if v.is_finite() => frame.ts.leading = *v,
                     Op::SetTextRise(v) if v.is_finite() => frame.ts.rise = *v,
+                    Op::SetTextRender(mode) => frame.gs.text_render = *mode,
                     Op::SetFont(name, size) => {
                         frame.ts.size = if size.is_finite() { *size } else { 0.0 };
                         frame.ts.font = self
@@ -1095,9 +1092,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         if how.stroke {
-            let s = ctm_scale(gs.ctm);
-            let dash: Vec<f32> = gs.dash.iter().map(|d| d * s).collect();
-            let quads = stroke_path(&polys, gs.line_width * s, &dash, gs.dash_phase * s);
+            let quads = stroke_path(&polys, gs.line_width, gs.ctm, &gs.dash, gs.dash_phase);
             match &stroke_pattern {
                 Some(PatternPaint::Shading(shading, to_device)) => self.paint_shading_through(
                     &quads,
@@ -1643,11 +1638,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// CharProc frames are pushed by the driver, one at a time, before the
     /// frame's next operator.
     fn show_text(&mut self, frame: &mut Frame, bytes: &[u8]) {
+        // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6); the advances
+        // below still happen, so a visible run that follows stays placed.
+        let visible = !matches!(frame.gs.text_render, 3 | 7);
+        // Modes 4-7 also ask the glyph outlines to join the clipping path,
+        // which this renderer does not do: whatever the author clipped to
+        // the text paints unclipped, and that approximation is reported.
+        if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() {
+            self.skip(SkippedKind::TextClip, SkipReason::Unsupported);
+        }
         if let Some(t3) = frame.ts.type3.clone() {
             // The depth guard bounds a self-referential glyph: each CharProc
             // frame is pushed at `depth + 1`, so painting stops at
             // `MAX_FORM_DEPTH` while the advances still happen.
-            let paint = frame.depth < MAX_FORM_DEPTH;
+            let paint = visible && frame.depth < MAX_FORM_DEPTH;
             let planned = type3_glyph_plan(&mut frame.ts, &t3, bytes, frame.gs.ctm, paint);
             frame.pending_glyphs.extend(planned);
             frame.pending_t3 = Some(t3);
@@ -1685,10 +1689,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 .concat(params)
                 .concat(ts.tm)
                 .concat(gs.ctm);
-            if !font.paints() {
-                // A metrics-only font: the advance below is the whole point,
-                // and its unpainted codes are configured tier behavior, so
-                // neither the paint attempt nor the no-glyph report applies.
+            if !font.paints() || !visible {
+                // A metrics-only font or an invisible rendering mode: the
+                // advance below is the whole point, and nothing was going to
+                // paint, so neither the paint attempt nor the no-glyph
+                // report applies.
             } else if gid != 0 && finite_matrix(&to_device) {
                 // Flatten under the linear part only (memoized per glyph +
                 // linear map); the per-glyph translation is applied when the
@@ -2980,6 +2985,95 @@ mod tests {
         b.stream(4, "", content);
         extra(&mut b);
         b.build(1)
+    }
+
+    /// `3 Tr` is how a searchable scan hides its OCR text layer
+    /// (ISO 32000-1 §9.3.6): the glyphs position but never paint. Painting
+    /// them double-prints every such page — the scan and the recognized
+    /// text over it. The advance must survive, though, so a later visible
+    /// run lands where the invisible one left off.
+    #[test]
+    fn invisible_text_mode_advances_without_painting() {
+        let bytes = small_doc(
+            "/Font << /T3 5 0 R >>",
+            b"BT /T3 100 Tf 3 Tr 0 20 Td <41> Tj 0 Tr <41> Tj ET",
+            |b| {
+                b.object(
+                    5,
+                    "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                     /FontMatrix [0.001 0 0 0.001 0 0] \
+                     /Encoding << /Differences [65 /box] >> \
+                     /CharProcs << /box 6 0 R >> /FirstChar 65 /Widths [500] >>",
+                );
+                b.stream(6, "", b"500 0 d0 0 0 500 500 re f");
+            },
+        );
+        let pix = render(bytes, 1.0);
+        // Each glyph is a 50x50 box on the baseline at y 20; the invisible
+        // first one spans device x 0..50, the visible second x 50..100.
+        assert_eq!(px(&pix, 25, 50), WHITE, "invisible glyph painted");
+        assert_eq!(px(&pix, 75, 50), BLACK, "visible glyph after the advance");
+    }
+
+    /// The clipping half of modes 4-7 is not implemented — the glyph
+    /// outlines never join the clipping path, so content the author clipped
+    /// to text paints unclipped — and an approximation is never silent:
+    /// showing text in those modes must land in the report. Mode 0 must not.
+    #[test]
+    fn text_clip_modes_are_reported() {
+        let font = |b: &mut PdfBuilder| {
+            b.object(
+                5,
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] \
+                 /Encoding << /Differences [65 /box] >> \
+                 /CharProcs << /box 6 0 R >> /FirstChar 65 /Widths [500] >>",
+            );
+            b.stream(6, "", b"500 0 d0 0 0 500 500 re f");
+        };
+        let clipping = small_doc(
+            "/Font << /T3 5 0 R >>",
+            b"BT /T3 100 Tf 7 Tr 0 20 Td <41> Tj ET",
+            font,
+        );
+        let (pix, report) = render_reporting(clipping);
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::TextClip, SkipReason::Unsupported, 1)],
+        );
+        assert_eq!(px(&pix, 25, 50), WHITE, "mode 7 shows nothing");
+        let plain = small_doc(
+            "/Font << /T3 5 0 R >>",
+            b"BT /T3 100 Tf 0 20 Td <41> Tj ET",
+            font,
+        );
+        let (_, report) = render_reporting(plain);
+        assert_eq!(drops(&report), vec![], "mode 0 reports nothing");
+    }
+
+    /// The rendering mode is graphics state (ISO 32000-1 §9.3.1, Table 104),
+    /// so `Q` must restore it: producers write `q … 3 Tr … Q` and rely on
+    /// the restore instead of issuing `0 Tr`. A mode that leaked past `Q`
+    /// would blank every glyph after the OCR block — worse than the
+    /// double-print it was hiding.
+    #[test]
+    fn text_render_mode_is_restored_by_q() {
+        let bytes = small_doc(
+            "/Font << /T3 5 0 R >>",
+            b"q BT /T3 100 Tf 3 Tr ET Q BT /T3 100 Tf 0 20 Td <41> Tj ET",
+            |b| {
+                b.object(
+                    5,
+                    "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                     /FontMatrix [0.001 0 0 0.001 0 0] \
+                     /Encoding << /Differences [65 /box] >> \
+                     /CharProcs << /box 6 0 R >> /FirstChar 65 /Widths [500] >>",
+                );
+                b.stream(6, "", b"500 0 d0 0 0 500 500 re f");
+            },
+        );
+        let pix = render(bytes, 1.0);
+        assert_eq!(px(&pix, 25, 50), BLACK, "text after Q must paint");
     }
 
     #[test]

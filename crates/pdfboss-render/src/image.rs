@@ -107,7 +107,213 @@ impl Rgba<'_> {
             }
         }
     }
+
+    /// A copy shrunk by integer factors: each output pixel averages an
+    /// `rx` by `ry` block of this image (smaller blocks at the right and
+    /// bottom edges). One sequential pass over the source; drawing then
+    /// samples the copy the way it samples any image, so the per-device-
+    /// pixel cost of a minified draw stays what point sampling costs.
+    fn reduced(&self, rx: usize, ry: usize) -> Rgba<'static> {
+        if let Pixels::Packed {
+            data,
+            bpc: 1,
+            row_bytes,
+            lut,
+        } = &self.pixels
+        {
+            if let [zero, one] = lut[..] {
+                return self.reduced_bilevel(rx, ry, data, *row_bytes, zero, one);
+            }
+        }
+        let rw = self.width.div_ceil(rx);
+        let rh = self.height.div_ceil(ry);
+        let mut quads = vec![0u8; rw * rh * 4];
+        let mut sums = vec![[0u32; 4]; rw];
+        for jr in 0..rh {
+            sums.fill([0; 4]);
+            let j1 = ((jr + 1) * ry).min(self.height);
+            for j in jr * ry..j1 {
+                for i in 0..self.width {
+                    let s = self.at(i, j);
+                    for (acc, v) in sums[i / rx].iter_mut().zip(s) {
+                        *acc += u32::from(v);
+                    }
+                }
+            }
+            let rows = (j1 - jr * ry) as u32;
+            let out = quads[jr * rw * 4..(jr + 1) * rw * 4].as_chunks_mut::<4>().0;
+            for (ir, (texel, sum)) in out.iter_mut().zip(&sums).enumerate() {
+                let n = rows * rx.min(self.width - ir * rx) as u32;
+                for (t, acc) in texel.iter_mut().zip(sum) {
+                    *t = ((acc + n / 2) / n) as u8;
+                }
+            }
+        }
+        Rgba {
+            width: rw,
+            height: rh,
+            pixels: Pixels::Quads(quads),
+            truncated: self.truncated,
+        }
+    }
+
+    /// [`Rgba::reduced`] for packed 1-bit samples — every CCITT and JBIG2
+    /// scan — counting set bits per block instead of converting pixel by
+    /// pixel.
+    fn reduced_bilevel(
+        &self,
+        rx: usize,
+        ry: usize,
+        data: &[u8],
+        row_bytes: usize,
+        zero: [u8; 4],
+        one: [u8; 4],
+    ) -> Rgba<'static> {
+        let rw = self.width.div_ceil(rx);
+        let rh = self.height.div_ceil(ry);
+        let mut quads = vec![0u8; rw * rh * 4];
+        let mut ones = vec![0u32; rw];
+        for jr in 0..rh {
+            ones.fill(0);
+            let j1 = ((jr + 1) * ry).min(self.height);
+            for j in jr * ry..j1 {
+                let row = data.get(j * row_bytes..).unwrap_or(&[]);
+                let row = &row[..row.len().min(row_bytes)];
+                // One walk over the row's bytes: a byte whose bits all land
+                // in one block adds its popcount; one that straddles blocks
+                // (and the padded last byte) splits bit by bit.
+                for (b, &byte) in row.iter().enumerate() {
+                    if byte == 0 {
+                        continue;
+                    }
+                    let bit0 = b * 8;
+                    if bit0 + 8 <= self.width && bit0 / rx == (bit0 + 7) / rx {
+                        ones[bit0 / rx] += byte.count_ones();
+                        continue;
+                    }
+                    for k in 0..8.min(self.width - bit0) {
+                        ones[(bit0 + k) / rx] += u32::from((byte >> (7 - k)) & 1);
+                    }
+                }
+            }
+            let rows = (j1 - jr * ry) as u32;
+            let out = quads[jr * rw * 4..(jr + 1) * rw * 4].as_chunks_mut::<4>().0;
+            for (ir, (texel, k)) in out.iter_mut().zip(&ones).enumerate() {
+                let n = rows * rx.min(self.width - ir * rx) as u32;
+                for c in 0..4 {
+                    texel[c] =
+                        ((k * u32::from(one[c]) + (n - k) * u32::from(zero[c]) + n / 2) / n) as u8;
+                }
+            }
+        }
+        Rgba {
+            width: rw,
+            height: rh,
+            pixels: Pixels::Quads(quads),
+            truncated: self.truncated,
+        }
+    }
+
+    /// The average pixel over the box of half-extents `hx`, `hy` around
+    /// (`ic`, `jc`), all in image pixels — the source footprint of one
+    /// device pixel when the image is drawn smaller than itself. Every
+    /// channel is averaged, alpha included, which is what turns a halftone
+    /// pattern back into its gray and a stencil's dropped-or-kept pixels
+    /// into fractional coverage.
+    ///
+    /// A footprint wider than [`FOOTPRINT_SAMPLES`] pixels on an axis is
+    /// read at a stride instead of in full, which bounds the cost of a
+    /// device pixel to a constant however extreme the shrink.
+    fn averaged(&self, ic: f32, jc: f32, hx: f32, hy: f32) -> [u8; 4] {
+        // Rounded box edges rather than floor/ceil ones: adjacent device
+        // pixels then split the boundary source pixel instead of both
+        // reading it, which keeps the total work one read per source pixel.
+        // The caller clamps the center into the image, so each range below
+        // holds at least one pixel.
+        let i0 = ((ic - hx).round().max(0.0) as usize).min(self.width - 1);
+        let i1 = (((ic + hx).round()).max(0.0) as usize).clamp(i0 + 1, self.width);
+        // `jc` reaches exactly `height` when `v = 0` maps onto a pixel
+        // center, and rounding `height - 0.5` would step past the last row.
+        let j0 = ((jc - hy).round().max(0.0) as usize).min(self.height - 1);
+        let j1 = (((jc + hy).round()).max(0.0) as usize).clamp(j0 + 1, self.height);
+        let jstep = (j1 - j0).div_ceil(FOOTPRINT_SAMPLES).max(1);
+        // Packed 1-bit samples — every CCITT and JBIG2 scan — average by
+        // counting set bits per row instead of converting pixel by pixel.
+        // The count walks the row in full, so past FOOTPRINT_SAMPLES bytes
+        // of width the strided read below keeps the per-device-pixel bound
+        // instead.
+        if let Pixels::Packed {
+            data,
+            bpc: 1,
+            row_bytes,
+            lut,
+        } = &self.pixels
+        {
+            if let [zero, one] = lut[..] {
+                if i1 - i0 <= FOOTPRINT_SAMPLES * 8 {
+                    let mut ones = 0u32;
+                    let mut n = 0u32;
+                    for j in (j0..j1).step_by(jstep) {
+                        ones += ones_in_row(data, j * row_bytes, i0, i1);
+                        n += (i1 - i0) as u32;
+                    }
+                    let zeros = n - ones;
+                    let mix = |c: usize| {
+                        ((ones * u32::from(one[c]) + zeros * u32::from(zero[c]) + n / 2) / n) as u8
+                    };
+                    return [mix(0), mix(1), mix(2), mix(3)];
+                }
+            }
+        }
+        let istep = (i1 - i0).div_ceil(FOOTPRINT_SAMPLES).max(1);
+        let mut sum = [0u32; 4];
+        let mut n = 0u32;
+        for j in (j0..j1).step_by(jstep) {
+            for i in (i0..i1).step_by(istep) {
+                let s = self.at(i, j);
+                for (acc, v) in sum.iter_mut().zip(s) {
+                    *acc += u32::from(v);
+                }
+                n += 1;
+            }
+        }
+        [
+            ((sum[0] + n / 2) / n) as u8,
+            ((sum[1] + n / 2) / n) as u8,
+            ((sum[2] + n / 2) / n) as u8,
+            ((sum[3] + n / 2) / n) as u8,
+        ]
+    }
 }
+
+/// Set bits of the row starting at byte `row`, sample columns `i0..i1`
+/// (1-bit samples, MSB first). Bytes past the end of the data count as
+/// zero, matching [`Rgba::at`]'s leniency toward short data.
+fn ones_in_row(data: &[u8], row: usize, i0: usize, i1: usize) -> u32 {
+    let first = i0 / 8;
+    let last = (i1 - 1) / 8;
+    let mut ones = 0u32;
+    for b in first..=last {
+        let mut byte = data.get(row + b).copied().unwrap_or(0);
+        if b == first {
+            byte &= 0xFF >> (i0 % 8);
+        }
+        if b == last {
+            byte &= 0xFF << (7 - (i1 - 1) % 8);
+        }
+        ones += byte.count_ones();
+    }
+    ones
+}
+
+/// Point sampling holds until a device pixel spans more than this many
+/// source pixels on either image axis; past it the footprint is averaged.
+/// Slightly above one so that 1:1 placements with rounding jitter keep the
+/// exact-copy path.
+const MINIFICATION_THRESHOLD: f32 = 1.25;
+
+/// Cap on averaged samples per image axis of one device pixel's footprint.
+const FOOTPRINT_SAMPLES: usize = 64;
 
 /// How much of an image [`draw`] managed to paint.
 pub(crate) enum Drawn {
@@ -950,6 +1156,13 @@ fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// unit square through `p.ctm`, sampling nearest-neighbor (image row 0 at
 /// the `v = 1` edge), and compositing source-over with the constant alpha
 /// and clip mask.
+///
+/// Nearest is right at 1:1 and under magnification, where it keeps bilevel
+/// edges crisp. Under minification a device pixel spans several source
+/// pixels and point sampling keeps one of them, which reads a halftoned
+/// scan as moiré stripes and drops the thin strokes of scanned text; there
+/// the sample is the average of the device pixel's source footprint
+/// instead ([`Rgba::averaged`]).
 fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
     let Some(inv) = p.ctm.invert() else {
         return;
@@ -967,15 +1180,50 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
     let y0 = bbox.y0.floor().max(0.0) as u32;
     let x1 = (bbox.x1.ceil().max(0.0) as u32).min(pix.width);
     let y1 = (bbox.y1.ceil().max(0.0) as u32).min(pix.height);
+    // Source pixels one device-pixel step spans, per image axis: the sum of
+    // the two inverse-mapped device steps, so rotations and shears count
+    // their full reach.
+    let fx = (inv.a.abs() + inv.c.abs()) * img.width as f32;
+    let fy = (inv.b.abs() + inv.d.abs()) * img.height as f32;
+    let minified = fx.is_finite()
+        && fy.is_finite()
+        && (fx > MINIFICATION_THRESHOLD || fy > MINIFICATION_THRESHOLD);
+    // Shrink whole axes of the image first — one sequential pass — and keep
+    // per-pixel footprint averaging only for what a pass cannot serve: the
+    // sub-2x fraction the integer factors leave, and a draw whose visible
+    // part is so small that reducing the whole image would out-cost it
+    // (the box cost there is bounded by the same factors being under 2).
+    let mut rx = 1;
+    let mut ry = 1;
+    if minified {
+        rx = (fx as usize).max(1);
+        ry = (fy as usize).max(1);
+        let visible = u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0));
+        let texels = (img.width.div_ceil(rx) as u64) * (img.height.div_ceil(ry) as u64);
+        if visible * 4 < texels {
+            rx = 1;
+            ry = 1;
+        }
+    }
+    let reduced = (rx > 1 || ry > 1).then(|| img.reduced(rx, ry));
+    let img = reduced.as_ref().unwrap_or(img);
+    let (fx, fy) = (fx / rx as f32, fy / ry as f32);
+    let footprint = (minified && (fx > MINIFICATION_THRESHOLD || fy > MINIFICATION_THRESHOLD))
+        .then_some((fx.max(1.0) / 2.0, fy.max(1.0) / 2.0));
     for py in y0..y1 {
         for px in x0..x1 {
             let u = inv.apply(Point::new(px as f32 + 0.5, py as f32 + 0.5));
             if !(0.0..1.0).contains(&u.x) || !(0.0..1.0).contains(&u.y) {
                 continue;
             }
-            let i = ((u.x * img.width as f32) as usize).min(img.width - 1);
-            let j = (((1.0 - u.y) * img.height as f32) as usize).min(img.height - 1);
-            let s = img.at(i, j);
+            let ic = u.x * img.width as f32;
+            let jc = (1.0 - u.y) * img.height as f32;
+            let i = (ic as usize).min(img.width - 1);
+            let j = (jc as usize).min(img.height - 1);
+            let s = match footprint {
+                None => img.at(i, j),
+                Some((hx, hy)) => img.averaged(ic, jc, hx, hy),
+            };
             let mut a = f32::from(s[3]) / 255.0 * alpha;
             if let Some(m) = p.smask {
                 a *= f32::from(m.sample(u.x, u.y)) / 255.0;
@@ -1700,6 +1948,178 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An 8x8 one-pixel checkerboard squeezed into 2x2 device pixels. Point
+    /// sampling lands on one source pixel per device pixel — solid black or
+    /// solid white, and which one is an accident of rounding; that is the
+    /// moiré that turns a halftoned scan into stripes. Averaging the device
+    /// pixel's source footprint reads all sixteen and lands on the gray the
+    /// halftone encodes.
+    #[test]
+    fn minified_halftone_averages_to_its_gray() {
+        let mut quads = Vec::with_capacity(8 * 8 * 4);
+        for j in 0..8u8 {
+            for i in 0..8u8 {
+                let v = if (i + j) % 2 == 0 { 0 } else { 255 };
+                quads.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let img = Rgba {
+            width: 8,
+            height: 8,
+            pixels: Pixels::Quads(quads),
+            truncated: false,
+        };
+        let mut pix = Pixmap::new(2, 2);
+        let p = DrawParams {
+            ctm: Matrix::scale(2.0, 2.0),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: None,
+        };
+        draw_rgba(&mut pix, &img, &p);
+        for y in 0..2 {
+            for x in 0..2 {
+                let [r, _, _, a] = pix_at(&pix, x, y);
+                assert!((112..=144).contains(&r), "({x},{y}) gray {r}, want ~128");
+                assert_eq!(a, 255, "({x},{y}) opaque");
+            }
+        }
+    }
+
+    fn checkerboard(side: u8) -> Rgba<'static> {
+        let mut quads = Vec::with_capacity(usize::from(side) * usize::from(side) * 4);
+        for j in 0..side {
+            for i in 0..side {
+                let v = if (i + j) % 2 == 0 { 0 } else { 255 };
+                quads.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        Rgba {
+            width: usize::from(side),
+            height: usize::from(side),
+            pixels: Pixels::Quads(quads),
+            truncated: false,
+        }
+    }
+
+    /// A shrink factor between the integer reductions (11 source pixels per
+    /// 2.75 device steps: reduce by 2, then a 1.375 residual) exercises the
+    /// per-pixel footprint average over the reduced copy.
+    #[test]
+    fn fractional_minification_still_averages() {
+        let mut pix = Pixmap::new(4, 4);
+        let p = DrawParams {
+            ctm: Matrix::scale(4.0, 4.0),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: None,
+        };
+        draw_rgba(&mut pix, &checkerboard(11), &p);
+        // Interior pixels only: at the image's edges the residual box can
+        // degenerate to a single one-source-pixel block, which is not gray.
+        for y in 1..3 {
+            for x in 1..3 {
+                let [r, _, _, _] = pix_at(&pix, x, y);
+                assert!((100..=156).contains(&r), "({x},{y}) gray {r}, want ~128");
+            }
+        }
+    }
+
+    /// A draw whose visible part is a sliver of the image skips the
+    /// whole-image reduction pass and still averages per device pixel.
+    #[test]
+    fn minified_sliver_averages_without_a_reduction_pass() {
+        let mut pix = Pixmap::new(2, 2);
+        let p = DrawParams {
+            ctm: Matrix::scale(8.0, 8.0),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: None,
+        };
+        draw_rgba(&mut pix, &checkerboard(32), &p);
+        for y in 0..2 {
+            for x in 0..2 {
+                let [r, _, _, _] = pix_at(&pix, x, y);
+                assert!((112..=144).contains(&r), "({x},{y}) gray {r}, want ~128");
+            }
+        }
+    }
+
+    /// The packed 1-bit layout every CCITT and JBIG2 scan decodes into has
+    /// its own counting path through [`Rgba::averaged`]; it must land on
+    /// the same gray the generic path finds.
+    #[test]
+    fn minified_packed_bilevel_averages_to_its_gray() {
+        // 8x8 one-pixel checkerboard, one byte per row, MSB first.
+        let data: &[u8] = &[0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA];
+        let img = Rgba {
+            width: 8,
+            height: 8,
+            pixels: Pixels::Packed {
+                data,
+                bpc: 1,
+                row_bytes: 1,
+                lut: vec![[0, 0, 0, 255], [255, 255, 255, 255]],
+            },
+            truncated: false,
+        };
+        let mut pix = Pixmap::new(2, 2);
+        let p = DrawParams {
+            ctm: Matrix::scale(2.0, 2.0),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: None,
+        };
+        draw_rgba(&mut pix, &img, &p);
+        for y in 0..2 {
+            for x in 0..2 {
+                let [r, _, _, _] = pix_at(&pix, x, y);
+                assert!((112..=144).contains(&r), "({x},{y}) gray {r}, want ~128");
+            }
+        }
+    }
+
+    /// The stencil analogue: a mask whose alpha alternates opaque/clear per
+    /// pixel paints half-coverage when minified, not the all-or-nothing a
+    /// point sample gives. Black at 50% over white must land mid-gray.
+    #[test]
+    fn minified_stencil_paints_fractional_coverage() {
+        let mut quads = Vec::with_capacity(8 * 8 * 4);
+        for j in 0..8u8 {
+            for i in 0..8u8 {
+                let a = if (i + j) % 2 == 0 { 255 } else { 0 };
+                quads.extend_from_slice(&[0, 0, 0, a]);
+            }
+        }
+        let img = Rgba {
+            width: 8,
+            height: 8,
+            pixels: Pixels::Quads(quads),
+            truncated: false,
+        };
+        let mut pix = Pixmap::new(2, 2);
+        pix.fill([255, 255, 255, 255]);
+        let p = DrawParams {
+            ctm: Matrix::scale(2.0, 2.0),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: None,
+        };
+        draw_rgba(&mut pix, &img, &p);
+        let [r, _, _, _] = pix_at(&pix, 1, 1);
+        assert!((112..=144).contains(&r), "coverage gray {r}, want ~128");
     }
 
     #[test]
