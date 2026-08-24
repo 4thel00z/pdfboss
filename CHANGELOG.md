@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.1](https://github.com/4thel00z/pdfboss/compare/v0.17.0...v0.17.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* **render:** stroke pen geometry, bilevel minification, and Tr modes ([#55](https://github.com/4thel00z/pdfboss/issues/55)) ([1b20769](https://github.com/4thel00z/pdfboss/commit/1b20769a2756f5261f62f2b39e751d0e167eb903))
+
 ## [0.17.0](https://github.com/4thel00z/pdfboss/compare/v0.16.0...v0.17.0) (2026-08-22)
 
 
