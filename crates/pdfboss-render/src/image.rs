@@ -239,6 +239,9 @@ impl Rgba<'_> {
         let jstep = (j1 - j0).div_ceil(FOOTPRINT_SAMPLES).max(1);
         // Packed 1-bit samples — every CCITT and JBIG2 scan — average by
         // counting set bits per row instead of converting pixel by pixel.
+        // The count walks the row in full, so past FOOTPRINT_SAMPLES bytes
+        // of width the strided read below keeps the per-device-pixel bound
+        // instead.
         if let Pixels::Packed {
             data,
             bpc: 1,
@@ -247,17 +250,19 @@ impl Rgba<'_> {
         } = &self.pixels
         {
             if let [zero, one] = lut[..] {
-                let mut ones = 0u32;
-                let mut n = 0u32;
-                for j in (j0..j1).step_by(jstep) {
-                    ones += ones_in_row(data, j * row_bytes, i0, i1);
-                    n += (i1 - i0) as u32;
+                if i1 - i0 <= FOOTPRINT_SAMPLES * 8 {
+                    let mut ones = 0u32;
+                    let mut n = 0u32;
+                    for j in (j0..j1).step_by(jstep) {
+                        ones += ones_in_row(data, j * row_bytes, i0, i1);
+                        n += (i1 - i0) as u32;
+                    }
+                    let zeros = n - ones;
+                    let mix = |c: usize| {
+                        ((ones * u32::from(one[c]) + zeros * u32::from(zero[c]) + n / 2) / n) as u8
+                    };
+                    return [mix(0), mix(1), mix(2), mix(3)];
                 }
-                let zeros = n - ones;
-                let mix = |c: usize| {
-                    ((ones * u32::from(one[c]) + zeros * u32::from(zero[c]) + n / 2) / n) as u8
-                };
-                return [mix(0), mix(1), mix(2), mix(3)];
             }
         }
         let istep = (i1 - i0).div_ceil(FOOTPRINT_SAMPLES).max(1);
@@ -1193,8 +1198,9 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
     if minified {
         rx = (fx as usize).max(1);
         ry = (fy as usize).max(1);
-        let visible = (x1.saturating_sub(x0) as usize) * (y1.saturating_sub(y0) as usize);
-        if visible * 4 < img.width.div_ceil(rx) * img.height.div_ceil(ry) {
+        let visible = u64::from(x1.saturating_sub(x0)) * u64::from(y1.saturating_sub(y0));
+        let texels = (img.width.div_ceil(rx) as u64) * (img.height.div_ceil(ry) as u64);
+        if visible * 4 < texels {
             rx = 1;
             ry = 1;
         }

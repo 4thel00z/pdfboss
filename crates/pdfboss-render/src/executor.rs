@@ -1641,6 +1641,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6); the advances
         // below still happen, so a visible run that follows stays placed.
         let visible = !matches!(frame.gs.text_render, 3 | 7);
+        // Modes 4-7 also ask the glyph outlines to join the clipping path,
+        // which this renderer does not do: whatever the author clipped to
+        // the text paints unclipped, and that approximation is reported.
+        if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() {
+            self.skip(SkippedKind::TextClip, SkipReason::Unsupported);
+        }
         if let Some(t3) = frame.ts.type3.clone() {
             // The depth guard bounds a self-referential glyph: each CharProc
             // frame is pushed at `depth + 1`, so painting stops at
@@ -3007,6 +3013,42 @@ mod tests {
         // first one spans device x 0..50, the visible second x 50..100.
         assert_eq!(px(&pix, 25, 50), WHITE, "invisible glyph painted");
         assert_eq!(px(&pix, 75, 50), BLACK, "visible glyph after the advance");
+    }
+
+    /// The clipping half of modes 4-7 is not implemented — the glyph
+    /// outlines never join the clipping path, so content the author clipped
+    /// to text paints unclipped — and an approximation is never silent:
+    /// showing text in those modes must land in the report. Mode 0 must not.
+    #[test]
+    fn text_clip_modes_are_reported() {
+        let font = |b: &mut PdfBuilder| {
+            b.object(
+                5,
+                "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                 /FontMatrix [0.001 0 0 0.001 0 0] \
+                 /Encoding << /Differences [65 /box] >> \
+                 /CharProcs << /box 6 0 R >> /FirstChar 65 /Widths [500] >>",
+            );
+            b.stream(6, "", b"500 0 d0 0 0 500 500 re f");
+        };
+        let clipping = small_doc(
+            "/Font << /T3 5 0 R >>",
+            b"BT /T3 100 Tf 7 Tr 0 20 Td <41> Tj ET",
+            font,
+        );
+        let (pix, report) = render_reporting(clipping);
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::TextClip, SkipReason::Unsupported, 1)],
+        );
+        assert_eq!(px(&pix, 25, 50), WHITE, "mode 7 shows nothing");
+        let plain = small_doc(
+            "/Font << /T3 5 0 R >>",
+            b"BT /T3 100 Tf 0 20 Td <41> Tj ET",
+            font,
+        );
+        let (_, report) = render_reporting(plain);
+        assert_eq!(drops(&report), vec![], "mode 0 reports nothing");
     }
 
     /// The rendering mode is graphics state (ISO 32000-1 §9.3.1, Table 104),
