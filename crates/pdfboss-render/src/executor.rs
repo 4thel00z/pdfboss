@@ -317,18 +317,6 @@ fn rgba8(rgb: [f32; 3]) -> [u8; 4] {
     [q(rgb[0]), q(rgb[1]), q(rgb[2]), 255]
 }
 
-/// Approximate device scale of `m`: the square root of the absolute
-/// determinant (exact for uniform scaling), used to size stroke widths and
-/// dash lengths in device space.
-fn ctm_scale(m: Matrix) -> f32 {
-    let det = (m.a * m.d - m.b * m.c).abs();
-    if det.is_finite() && det > 0.0 {
-        det.sqrt()
-    } else {
-        1.0
-    }
-}
-
 /// True when every value is finite (NaN/Inf operands skip the op).
 fn all_finite(vals: &[f32]) -> bool {
     vals.iter().all(|v| v.is_finite())
@@ -1095,9 +1083,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         if how.stroke {
-            let s = ctm_scale(gs.ctm);
-            let dash: Vec<f32> = gs.dash.iter().map(|d| d * s).collect();
-            let quads = stroke_path(&polys, gs.line_width * s, &dash, gs.dash_phase * s);
+            let quads = stroke_path(&polys, gs.line_width, gs.ctm, &gs.dash, gs.dash_phase);
             match &stroke_pattern {
                 Some(PatternPaint::Shading(shading, to_device)) => self.paint_shading_through(
                     &quads,
