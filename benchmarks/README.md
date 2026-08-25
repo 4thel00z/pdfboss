@@ -1,7 +1,9 @@
 # Benchmarks
 
-Five scripts, because opening, rendering, scanned PDFs, malformed PDFs and
-memory are different workloads.
+Six scripts, because opening, rendering, scanned PDFs, rendering *quality*,
+malformed PDFs and memory are different workloads — plus two
+extraction-quality suites (`olmocr/`, `parsebench/`), because speed means
+nothing if the output is wrong.
 
 `bench.py` compares pdfboss against other Python PDF libraries on the two
 operations they all produce comparable output for:
@@ -21,6 +23,12 @@ scanned page is a single full-page bilevel image — JBIG2 or CCITT G3/G4 — wi
 no text operators, so there are no glyphs to paint and every library
 rasterizes the same picture.
 
+`bench_fidelity.py` scores rendering *quality* instead of speed. The render
+benchmark's ink gate proves a page is not blank, not that it is right; this
+bench quantifies closeness to a reference rasterizer (pypdfium2) with windowed
+SSIM, and scores the other engines against the same reference so pdfboss lands
+in a field rather than being judged alone.
+
 `bench_robustness.py` turns the filtering around: instead of keeping only the
 files every engine handles, it feeds them fuzzer-minimized malformed PDFs and
 measures survival — page count, clean exception, crash, or hang. Every other
@@ -36,15 +44,15 @@ address space.
 
 ## Libraries
 
-| Library | Open | Text | Render | Scan | Robustness | Memory | Notes |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|---|
-| pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
-| PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
-| pypdf | ✓ | ✓ | | | | | pure Python; no rasterizer |
-| pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
-| pypdfium2 | | | ✓ | ✓ | ✓ | ✓ | pdfium bindings; text API used by bench_memory.py |
-| pdfminer.six | | ✓ | | | | | pure Python |
-| pikepdf | ✓ | | | | | | qpdf bindings; no text API |
+| Library | Open | Text | Render | Scan | Fidelity | Robustness | Memory | Notes |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|
+| pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
+| PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
+| pypdf | ✓ | ✓ | | | | | | pure Python; no rasterizer |
+| pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
+| pypdfium2 | | | ✓ | ✓ | ref | ✓ | ✓ | pdfium bindings; text API used by bench_memory.py |
+| pdfminer.six | | ✓ | | | | | | pure Python |
+| pikepdf | ✓ | | | | | | | qpdf bindings; no text API |
 
 ## Method
 
@@ -92,6 +100,48 @@ address space.
   instantly and means nothing, and disagreeing coverage is what catches it.
   The renders are not pixel-identical: each library downsamples the scan onto
   the page with its own resampling.
+
+## Method — fidelity
+
+- The same deterministic, evenly-spaced sample as the other benches; the
+  **first page** of each file, rendered by every library at `--scale 2.0` and
+  pdfboss's `full` fonts tier.
+- **Certification** — pdfboss renders the first page through
+  `render_reporting`; a file reporting dropped or approximated content is
+  excluded with its reason counted, because comparing a knowingly incomplete
+  render against a reference would measure the known gap, not fidelity. A file
+  where any library raises is excluded too, so every row scores the exact same
+  pages.
+- **Reference** — pypdfium2, the fastest C engine in the render benchmark.
+  pdfplumber also rasterizes through pdfium, so its row approximates a
+  same-engine control; PyMuPDF is the independent cross-engine baseline. Read
+  pdfboss's score against those two rows, not against 1.0 — even the
+  pdfium-family pair does not score 1.0, because each pipeline resamples and
+  anti-aliases on its own.
+- **Alignment** — each render is decoded to 8-bit grayscale (alpha composited
+  onto white), center-cropped to the common minimum dimensions (absorbing the
+  one-pixel size drift of engines that size pages via DPI), then
+  Lanczos-downsampled to half resolution, which suppresses engine-specific
+  anti-aliasing phase differences.
+- **Metrics** — windowed SSIM with a uniform 8×8 window (integral-image box
+  filter, K1=0.01, K2=0.03, L=255, mean over fully-inside windows) and mean
+  absolute pixel difference on the 0–255 range. The JSON records each engine's
+  median and p10 SSIM, median MAD, and the full sorted score distributions —
+  never file names.
+- SSIM is a quality metric, not a timing one, so the scores are insensitive to
+  machine load and published as measured. On a local corpus of real-world
+  PDFs (39 of 40 sampled files scored; 1 excluded for a glyph its substituted
+  face lacks), two runs produce byte-identical results:
+
+  | Engine | SSIM median | SSIM p10 | MAD median |
+  |---|---|---|---|
+  | PyMuPDF | 0.9909 | 0.9816 | 1.78 |
+  | pdfplumber | 0.9876 | 0.9613 | 2.33 |
+  | pdfboss | 0.9830 | 0.9590 | 2.60 |
+
+  pdfboss's distance from the reference sits inside the band spanned by the
+  other engines' rows: it disagrees with pdfium about as much as pdfium-based
+  and independent C pipelines disagree among themselves.
 
 ## Method — robustness
 
@@ -150,12 +200,13 @@ address space.
 ## Running
 
 ```bash
-pip install pypdf pdfminer.six pdfplumber pikepdf pymupdf pypdfium2 pillow matplotlib
-pip install pdfboss-fonts               # substitute faces for bench_render.py's full tier
+pip install pypdf pdfminer.six pdfplumber pikepdf pymupdf pypdfium2 pillow numpy matplotlib
+pip install pdfboss-fonts               # substitute faces for the full fonts tier
 maturin develop --release           # build pdfboss into the venv
-python benchmarks/bench.py        /path/to/pdfs --sample 40 --repeat 3
-python benchmarks/bench_render.py /path/to/pdfs --sample 40 --repeat 3
-python benchmarks/bench_scans.py  /path/to/scan.pdf --pages 100 --repeat 3
+python benchmarks/bench.py          /path/to/pdfs --sample 40 --repeat 3
+python benchmarks/bench_render.py   /path/to/pdfs --sample 40 --repeat 3
+python benchmarks/bench_scans.py    /path/to/scan.pdf --pages 100 --repeat 3
+python benchmarks/bench_fidelity.py /path/to/pdfs --sample 40
 
 benchmarks/fetch_stress_corpus.sh /outside/repo/stress-corpus   # ~460 MB once
 python benchmarks/bench_robustness.py /outside/repo/stress-corpus --sample 2000
@@ -165,8 +216,37 @@ python benchmarks/bench_memory.py     /path/to/pdfs --sample 40 --pages 10 --sca
 `bench.py` writes `results.json` (raw numbers) and `results.png` (the chart
 shown in the top-level README); `bench_render.py` writes
 `results-render.json`; `bench_scans.py` writes `results-scans.json`;
-`bench_robustness.py` writes `results-robustness.json`; `bench_memory.py`
-writes `results-memory.json`. The real-world corpora are local and not
-committed — those results record page counts, sizes and directory basenames,
-never file names. The stress corpus is public (OSS-Fuzz) and its results name
-it, but it stays outside the repo too.
+`bench_fidelity.py` writes `results-fidelity.json`; `bench_robustness.py`
+writes `results-robustness.json`; `bench_memory.py` writes
+`results-memory.json`. The real-world corpora are local and not committed —
+those results record corpus shape, page counts, sizes and score
+distributions, never file names. The stress corpus is public (OSS-Fuzz) and
+its results name it, but it stays outside the repo too.
+
+## olmOCR-bench
+
+[olmocr/](olmocr/) wires pdfboss into
+[olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench), a
+public suite of 7,010 machine-checkable tests (text presence, reading order,
+table structure, math rendering) over 1,403 single-page PDFs.
+`olmocr/generate_candidates.py` writes the markdown candidate tree the
+suite's scorer reads; results land in `results-olmocr.json`. pdfboss is a
+non-OCR engine, so the honest headline is the born-digital buckets — the
+scan and LaTeX-math buckets score near zero by construction. The recipe and
+the full interpretation notes are in [olmocr/README.md](olmocr/README.md).
+
+## Method — ParseBench (quality)
+
+`parsebench/` wires pdfboss into
+[run-llama/ParseBench](https://github.com/run-llama/ParseBench): 2,078
+human-verified pages, five quality dimensions, ~169k deterministic rules,
+no LLM judge. `parsebench/pdfboss_provider.py` is a drop-in provider for
+their tree (per-page markdown, pipe tables converted to HTML for the table
+metrics the same way their pdf_inspector provider does it); the wiring
+steps, full method and score interpretation live in
+[`parsebench/README.md`](parsebench/README.md). Scores are rule-based and
+deterministic, so unlike the timing benchmarks they are load-insensitive
+and published as measured: **28.00 overall** for pdfboss 0.17.1 (Content
+Faithfulness 61.50, Semantic Formatting 33.78, Tables 28.89, Visual
+Grounding 10.77, Charts 5.04), from a full 2,078-example run at ParseBench
+commit 34b7345. Raw aggregates land in `results-parsebench.json`.
