@@ -1,14 +1,13 @@
 //! Content-op execution against a graphics state stack: transforms, colors,
 //! clipping, ExtGState, form XObject recursion, and paint dispatch.
 //!
-//! Limitations (v0.1): only embedded-TrueType glyph outlines are painted
-//! (other fonts are positioned but not drawn); `sh` shadings are skipped;
-//! pattern fills paint mid-gray; masks and blend modes are ignored;
-//! annotation appearance streams are not drawn. Everything on that list
-//! except the glyph tiers -- which the caller chooses -- is recorded in the
-//! [`RenderReport`] this module returns, along with every content stream and
-//! image leniency drops, so no caller is handed a blank page it cannot
-//! account for.
+//! What cannot be reproduced is reported, never silently dropped: every
+//! skipped or approximated element -- a mesh shading, a non-separable blend
+//! mode, text shown in a clipping mode, undecodable content -- lands in the
+//! [`RenderReport`] this module returns, along with every content stream
+//! and image leniency drop, so no caller is handed a blank page it cannot
+//! account for. The one exception is the glyph tiers, which the caller
+//! chooses.
 
 use pdfboss_core::FastMap;
 use std::sync::Arc;
@@ -1491,6 +1490,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 tgs.clip = Some(clip);
                 tgs.fill_alpha = gs.fill_alpha;
                 tgs.stroke_alpha = gs.stroke_alpha;
+                tgs.blend_mode = gs.blend_mode;
+                tgs.soft_mask = gs.soft_mask.clone();
                 let kind = if tiling.uncolored {
                     tgs.fill_rgb = gs.fill_rgb;
                     tgs.stroke_rgb = gs.stroke_rgb;
@@ -1516,10 +1517,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// Paints `shading` through `polys` (the fill or stroke geometry,
-    /// rasterized under `rule` and intersected with the active clip and the
-    /// shading's own `/BBox`), first laying down `/Background` where the
-    /// shading declares one (§8.7.4.3 — pattern fills only, which is the
-    /// single caller).
+    /// rasterized under `rule` and intersected with the active clip, the
+    /// group soft mask and the shading's own `/BBox`), first laying down
+    /// `/Background` over that same region where the shading declares one
+    /// (§8.7.4.3 — pattern fills only, which is the single caller).
     fn paint_shading_through(
         &mut self,
         polys: &[Subpath],
@@ -1532,8 +1533,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             return;
         }
         let path_mask = self.rasterize_clip(polys, rule);
-        let region = match &gs.clip {
-            Some(clip) => Arc::new(Mask::intersected(&path_mask, clip)),
+        let region = match effective_mask(&gs) {
+            Some(cov) => Arc::new(Mask::intersected(&path_mask, &cov)),
             None => path_mask,
         };
         let region = match shading.bbox {
@@ -1550,19 +1551,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             None => region,
         };
-        if let Some(bg) = shading.background {
-            fill_path(
-                &mut self.pix,
-                &mut self.raster,
-                polys,
-                rule,
-                rgba8(bg),
-                gs.fill_alpha,
-                gs.clip.as_deref(),
-                gs.blend_mode,
-            );
-        }
-        shading.paint(&mut self.pix, Some(&region), gs.fill_alpha, to_device);
+        shading.paint_background(&mut self.pix, &region, gs.fill_alpha, gs.blend_mode);
+        shading.paint(
+            &mut self.pix,
+            Some(&region),
+            gs.fill_alpha,
+            to_device,
+            gs.blend_mode,
+        );
     }
 
     /// Rasterizes `polys` under `rule` into a clip [`Mask`], reusing a
@@ -2766,20 +2762,22 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             region.as_deref(),
             frame.gs.fill_alpha,
             frame.gs.ctm,
+            frame.gs.blend_mode,
         );
     }
 
-    /// The coverage region a shading paints under: the active clip,
-    /// intersected with the shading's `/BBox` (rasterized under the same
-    /// matrix the shading paints with) when it declares one.
+    /// The coverage region a shading paints under: the active clip and
+    /// group soft mask, intersected with the shading's `/BBox` (rasterized
+    /// under the same matrix the shading paints with) when it declares one.
     fn shading_region(
         &mut self,
         shading: &Shading,
         gs: &GState,
         to_device: Matrix,
     ) -> Option<Arc<Mask>> {
-        match (&shading.bbox, &gs.clip) {
-            (Some(b), clip) => {
+        let coverage = effective_mask(gs);
+        match (&shading.bbox, coverage) {
+            (Some(b), coverage) => {
                 let mut pb = PathBuilder::new(to_device);
                 pb.rect(
                     b[0].min(b[2]),
@@ -2788,13 +2786,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     (b[3] - b[1]).abs(),
                 );
                 let bbox_mask = self.rasterize_clip(&pb.finish(), FillRule::NonZero);
-                Some(match clip {
-                    Some(clip) => Arc::new(Mask::intersected(&bbox_mask, clip)),
+                Some(match coverage {
+                    Some(cov) => Arc::new(Mask::intersected(&bbox_mask, &cov)),
                     None => bbox_mask,
                 })
             }
-            (None, Some(clip)) => Some(Arc::clone(clip)),
-            (None, None) => None,
+            (None, coverage) => coverage,
         }
     }
 
@@ -4959,6 +4956,154 @@ mod tests {
         assert!(report.is_empty(), "painted: {:?}", report.warnings());
         assert_near(px(&pix, 60, 50), [102, 0, 153, 255], 4, "page-anchored t");
         assert_eq!(px(&pix, 40, 50), WHITE, "the path itself did move");
+    }
+
+    /// A constant-green shading (C0 = C1, extended both ways) so blend and
+    /// mask probes read one exact color everywhere the shading paints.
+    const GREEN_SHADING: &str = "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 100 0] \
+         /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] \
+         /C0 [0 1 0] /C1 [0 1 0] /N 1 >> >>";
+
+    #[test]
+    fn sh_honors_the_blend_mode() {
+        // Multiply over a mid-gray backdrop keeps half of each source
+        // channel (§11.3.5.2): 0.5 × green = (0, 128, 0) exactly.
+        let resources = "/Shading << /Sh0 5 0 R >> /ExtGState << /GS0 << /BM /Multiply >> >>";
+        let content = b"0.5 0.5 0.5 rg 0 0 100 100 re f /GS0 gs /Sh0 sh";
+        let bytes = small_doc(resources, content, |b| {
+            b.object(5, GREEN_SHADING);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), [0, 128, 0, 255], "multiply with backdrop");
+    }
+
+    #[test]
+    fn sh_composites_through_the_group_soft_mask() {
+        // The group paints white over the left half: the shading may only
+        // reach those pixels, exactly like any other paint under the mask.
+        let resources = "/Shading << /Sh0 6 0 R >> \
+             /ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> >>";
+        let bytes = small_doc(resources, b"/GS0 gs /Sh0 sh", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+            b.object(6, GREEN_SHADING);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 25, 50), [0, 255, 0, 255], "unmasked half paints");
+        assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
+    }
+
+    #[test]
+    fn shading_pattern_fill_honors_the_blend_mode() {
+        let resources = "/Pattern << /P0 << /PatternType 2 /Shading 5 0 R >> >> \
+             /ExtGState << /GS0 << /BM /Multiply >> >>";
+        let content = b"0.5 0.5 0.5 rg 0 0 100 100 re f \
+                        /GS0 gs /Pattern cs /P0 scn 20 20 60 60 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.object(5, GREEN_SHADING);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), [0, 128, 0, 255], "multiply inside path");
+        assert_eq!(px(&pix, 10, 50), [128, 128, 128, 255], "outside untouched");
+    }
+
+    #[test]
+    fn shading_pattern_fill_composites_through_the_group_soft_mask() {
+        let resources = "/Pattern << /P0 << /PatternType 2 /Shading 6 0 R >> >> \
+             /ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> >>";
+        let content = b"/GS0 gs /Pattern cs /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+            b.object(6, GREEN_SHADING);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 25, 50), [0, 255, 0, 255], "unmasked half paints");
+        assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
+    }
+
+    #[test]
+    fn pattern_background_respects_the_shading_bbox() {
+        // /Background obeys /BBox exactly as the gradient does — both are
+        // painting the shading (ISO 32000-1 Table 78, temporary clipping
+        // boundary). The axis spans x 30..50 with no extension, so inside
+        // the BBox the strips beside the gradient show the background and
+        // everything outside the BBox stays untouched even though the
+        // filled path covers the whole page.
+        let resources = "/Pattern << /P0 << /PatternType 2 /Shading 5 0 R >> >>";
+        let content = b"/Pattern cs /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.object(
+                5,
+                "<< /ShadingType 2 /ColorSpace /DeviceRGB /Coords [30 0 50 0] \
+                 /BBox [20 20 60 60] /Background [0 1 0] \
+                 /Function << /FunctionType 2 /Domain [0 1] \
+                 /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >>",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 10, 50), WHITE, "left of the BBox");
+        assert_eq!(px(&pix, 25, 50), [0, 255, 0, 255], "background strip");
+        assert_near(px(&pix, 40, 50), [121, 0, 134, 255], 2, "gradient");
+        assert_eq!(px(&pix, 55, 50), [0, 255, 0, 255], "background strip");
+        assert_eq!(px(&pix, 70, 50), WHITE, "right of the BBox");
+        assert_eq!(px(&pix, 40, 10), WHITE, "above the BBox");
+    }
+
+    #[test]
+    fn tiles_inherit_the_blend_mode() {
+        // The Multiply set before the pattern fill must reach the tile
+        // frames: green cells over the mid-gray backdrop keep half the
+        // green channel instead of reverting to Normal inside each tile.
+        let resources = "/Pattern << /P0 5 0 R >> /ExtGState << /GS0 << /BM /Multiply >> >>";
+        let content = b"0.5 0.5 0.5 rg 0 0 100 100 re f \
+                        /GS0 gs /Pattern cs /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"0 1 0 rg 0 0 10 10 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), [0, 128, 0, 255], "tile multiplies");
+    }
+
+    #[test]
+    fn tiles_inherit_the_group_soft_mask() {
+        let resources = "/Pattern << /P0 6 0 R >> \
+             /ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> >>";
+        let content = b"/GS0 gs /Pattern cs /P0 scn 0 0 100 100 re f";
+        let bytes = small_doc(resources, content, |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+            b.stream(
+                6,
+                "/PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 10 10] \
+                 /XStep 10 /YStep 10 /Resources << >>",
+                b"1 0 0 rg 0 0 10 10 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 25, 50), RED, "unmasked half tiles");
+        assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Error, Object};
 
 use crate::color::ColorSpace;
-use crate::raster::{composite_over, Mask};
+use crate::raster::{paint_pixel, BlendMode, Mask};
 use crate::Pixmap;
 
 /// Most components any color space here carries (CMYK is 4; `Other` caps at
@@ -1131,36 +1131,25 @@ impl Shading {
     }
 
     /// Paints the shading over every pixel `region` covers (the whole page
-    /// when `None`), compositing at `alpha` × coverage. `to_device` maps the
-    /// shading's target space to device pixels; a singular matrix paints
-    /// nothing (the caller reports it).
+    /// when `None`), compositing at `alpha` × coverage under `blend`.
+    /// `to_device` maps the shading's target space to device pixels; a
+    /// singular matrix paints nothing (the caller reports it).
     pub(crate) fn paint(
         &self,
         pix: &mut Pixmap,
         region: Option<&Mask>,
         alpha: f32,
         to_device: Matrix,
+        blend: BlendMode,
     ) {
         let Some(inv) = to_device.invert() else {
             return;
         };
-        let alpha = if alpha.is_finite() {
-            alpha.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        if alpha <= 0.0 {
+        let Some(alpha) = clamped_alpha(alpha) else {
             return;
-        }
-        let (x_lo, x_hi, y_lo, y_hi) = match region {
-            Some(m) => (
-                m.x0,
-                (m.x0 + m.bbox_w).min(pix.width),
-                m.y0,
-                (m.y0 + m.bbox_h).min(pix.height),
-            ),
-            None => (0, pix.width, 0, pix.height),
         };
+        let (x_lo, x_hi, y_lo, y_hi) = region_bounds(pix, region);
+        let normal = blend == BlendMode::Normal;
         let mut comps = [0f32; MAX_COMPS];
         for y in y_lo..y_hi {
             for x in x_lo..x_hi {
@@ -1177,19 +1166,95 @@ impl Shading {
                 };
                 let t = self.domain[0] + (self.domain[1] - self.domain[0]) * s;
                 let n = self.functions.eval(&[t], &mut comps);
-                let rgb = self.cs.to_rgb(&comps[..n]);
-                let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                let rgb8 = [q(rgb[0]), q(rgb[1]), q(rgb[2])];
+                let rgb8 = quantize_rgb(self.cs.to_rgb(&comps[..n]));
                 let a = alpha * cov as f32 / 255.0;
-                let off = ((y * pix.width + x) * 4) as usize;
-                if a >= 1.0 {
-                    let opaque = [rgb8[0], rgb8[1], rgb8[2], 255];
-                    pix.data[off..off + 4].copy_from_slice(&opaque);
-                } else {
-                    composite_over(&mut pix.data[off..off + 4], rgb8, a);
-                }
+                shade_pixel(pix, x, y, a, rgb8, normal, blend);
             }
         }
+    }
+
+    /// Composites `/Background` over every pixel `region` covers, at
+    /// `alpha` × coverage under `blend` — the first half of the spec's
+    /// paint-twice model (Table 78: background first, then the shading
+    /// over it), sharing the shading's own clipping including `/BBox`.
+    pub(crate) fn paint_background(
+        &self,
+        pix: &mut Pixmap,
+        region: &Mask,
+        alpha: f32,
+        blend: BlendMode,
+    ) {
+        let Some(bg) = self.background else {
+            return;
+        };
+        let Some(alpha) = clamped_alpha(alpha) else {
+            return;
+        };
+        let (x_lo, x_hi, y_lo, y_hi) = region_bounds(pix, Some(region));
+        let normal = blend == BlendMode::Normal;
+        let rgb8 = quantize_rgb(bg);
+        for y in y_lo..y_hi {
+            for x in x_lo..x_hi {
+                let cov = region.coverage(x, y);
+                if cov == 0 {
+                    continue;
+                }
+                let a = alpha * cov as f32 / 255.0;
+                shade_pixel(pix, x, y, a, rgb8, normal, blend);
+            }
+        }
+    }
+}
+
+/// A constant alpha normalized for painting: clamped to 0..=1 (non-finite
+/// reads as opaque), `None` when nothing would paint.
+fn clamped_alpha(alpha: f32) -> Option<f32> {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (alpha > 0.0).then_some(alpha)
+}
+
+/// The device-pixel rectangle a paint loop walks: the region's bbox clamped
+/// to the page, or the whole page without a region.
+fn region_bounds(pix: &Pixmap, region: Option<&Mask>) -> (u32, u32, u32, u32) {
+    match region {
+        Some(m) => (
+            m.x0,
+            (m.x0 + m.bbox_w).min(pix.width),
+            m.y0,
+            (m.y0 + m.bbox_h).min(pix.height),
+        ),
+        None => (0, pix.width, 0, pix.height),
+    }
+}
+
+/// Unit-range RGB to RGB8.
+fn quantize_rgb(rgb: [f32; 3]) -> [u8; 3] {
+    let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    [q(rgb[0]), q(rgb[1]), q(rgb[2])]
+}
+
+/// Composites one shading pixel through the raster blend seam.
+#[inline]
+fn shade_pixel(
+    pix: &mut Pixmap,
+    x: u32,
+    y: u32,
+    a: f32,
+    rgb8: [u8; 3],
+    normal: bool,
+    blend: BlendMode,
+) {
+    let opaque = [rgb8[0], rgb8[1], rgb8[2], 255];
+    let off = ((y * pix.width + x) * 4) as usize;
+    let dst = &mut pix.data[off..off + 4];
+    if normal {
+        paint_pixel::<true>(dst, a, rgb8, opaque, blend);
+    } else {
+        paint_pixel::<false>(dst, a, rgb8, opaque, blend);
     }
 }
 

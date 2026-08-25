@@ -682,7 +682,7 @@ fn fill_run(dst: &mut [u8], px: [u8; 4]) {
 
 /// Source-over paints one pixel at alpha `a`, honoring the blend mode.
 #[inline(always)]
-fn paint_pixel<const NORMAL: bool>(
+pub(crate) fn paint_pixel<const NORMAL: bool>(
     dst: &mut [u8],
     a: f32,
     rgb: [u8; 3],
