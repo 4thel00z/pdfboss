@@ -1602,14 +1602,32 @@ mod tests {
     /// Two instances are refined so that the second's codeword is decoded with
     /// the GR statistics the first left behind: E.3.7 resets statistics per
     /// segment, so a decoder that started each codeword from fresh contexts
-    /// would read the second refinement as noise. The trailing plain instance
-    /// pins the cursor: it is read correctly only if the refinement consumed
+    /// would read the second refinement as noise. Both refinements walk the
+    /// same large reference for the reason the shrinking test's fixture is
+    /// large: the statistics only tell adapted from fresh once dozens of
+    /// decisions have revisited the same contexts. The trailing plain instance
+    /// pins the cursor: it is read correctly only if each refinement consumed
     /// exactly BMSIZE bytes, no more and no fewer.
     #[test]
     fn a_huffman_region_decodes_refined_instances() {
-        let syms = two_symbols();
-        let first = glyph(&["101101", "110011"]);
-        let second = glyph(&["11111", "10101", "10001", "11111"]);
+        let big = glyph(&[
+            "1111111111",
+            "1000110001",
+            "1011001101",
+            "1010110101",
+            "1001100011",
+            "1111111111",
+        ]);
+        let syms = [glyph(&["101", "010", "101", "010"]), big];
+        let first = glyph(&["10110011011", "11001100110", "10101010101", "11110000111"]);
+        let second = glyph(&[
+            "1111111111",
+            "1001100101",
+            "1010011001",
+            "1011010101",
+            "1000101011",
+            "1111111111",
+        ]);
         let strip = [
             RefinedPlacement {
                 ds: 2,
@@ -1647,7 +1665,7 @@ mod tests {
             },
         ];
         let data = huffman_refined_text_segment(
-            (26, 8),
+            (30, 8),
             Shape::default(),
             3,
             &syms,
@@ -1657,11 +1675,11 @@ mod tests {
         );
         let refs: Vec<&Bitmap> = syms.iter().collect();
         let (_, region) = decode(&data, &refs).expect("text region");
-        // STRIPT = −1 + 2; FIRSTS = 2; the refined widths 6 and 5 leave CURS
-        // at 7 and 13, so the gaps of 2 and 3 land the instances at 9 and 16.
+        // STRIPT = −1 + 2; FIRSTS = 2; the refined widths 11 and 10 leave CURS
+        // at 12 and 23, so the gaps of 2 and 3 land the instances at 14 and 26.
         expect_at(&region, &first, 2, 1);
-        expect_at(&region, &second, 9, 1);
-        expect_at(&region, &syms[0], 16, 1);
+        expect_at(&region, &second, 14, 1);
+        expect_at(&region, &syms[0], 26, 1);
     }
 
     /// A user-supplied table reaches the refinement selector that named it, in
