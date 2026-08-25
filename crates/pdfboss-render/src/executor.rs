@@ -951,14 +951,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         }
                     }
                     Op::ShowTextAdjusted(items) => {
+                        // In vertical writing the TJ offset moves ty, with
+                        // Th not applied (ISO 32000-1 §9.4.4).
+                        let vertical = frame.ts.font.as_ref().is_some_and(|(f, ..)| f.vertical());
                         for item in items {
                             match item {
                                 TextItem::Str(s) => self.show_text(frame, s),
                                 TextItem::Offset(n) => {
-                                    let tx = -n / 1000.0 * frame.ts.size * frame.ts.horiz;
-                                    if tx.is_finite() {
-                                        frame.ts.tm =
-                                            Matrix::translate(tx, 0.0).concat(frame.ts.tm);
+                                    let (tx, ty) = if vertical {
+                                        (0.0, -n / 1000.0 * frame.ts.size)
+                                    } else {
+                                        (-n / 1000.0 * frame.ts.size * frame.ts.horiz, 0.0)
+                                    };
+                                    if tx.is_finite() && ty.is_finite() {
+                                        frame.ts.tm = Matrix::translate(tx, ty).concat(frame.ts.tm);
                                     }
                                 }
                             }
@@ -1787,18 +1793,26 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             return;
         };
         let upm = font.units_per_em();
-        let two_byte = font.two_byte();
+        let vertical = font.vertical();
         let fill = gs.fill_rgba8();
         let mut i = 0;
         while i < bytes.len() {
-            let (code, n) = if two_byte && i + 1 < bytes.len() {
-                (u32::from(u16::from_be_bytes([bytes[i], bytes[i + 1]])), 2)
-            } else {
-                (u32::from(bytes[i]), 1)
-            };
-            i += n;
-            let gid = font.gid(code);
+            let (code, n) = font.code_at(bytes, i);
+            i += usize::from(n);
+            let cid = font.cid(code, n);
+            let gid = font.gid(cid);
 
+            // In vertical writing the glyph origin is displaced by the
+            // position vector v (ISO 32000-1 §9.4.4): /W2's (vx, vy), or
+            // the default (w0/2, /DW2's vy). vx shares the glyph's own
+            // horizontal Tz scaling so the glyph stays centered; vy does
+            // not — Tz applies to horizontal quantities only.
+            let (ve, vf) = if vertical {
+                let [_, vx, vy] = font.vmetrics(cid);
+                (-vx / 1000.0 * ts.size * ts.horiz, -vy / 1000.0 * ts.size)
+            } else {
+                (0.0, 0.0)
+            };
             // glyph units -> text space (÷ em, then the text-scaling params),
             // -> user space (Tm) -> device (CTM).
             let params = Matrix {
@@ -1806,8 +1820,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 b: 0.0,
                 c: 0.0,
                 d: ts.size,
-                e: 0.0,
-                f: ts.rise,
+                e: ve,
+                f: ts.rise + vf,
             };
             let to_device = Matrix::scale(1.0 / upm, 1.0 / upm)
                 .concat(params)
@@ -1856,16 +1870,23 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 }
             }
 
-            // Advance: (w0·Tfs + Tc + Tw[single-byte space]) · Th.
-            let w0 = font.advance(code) / upm;
+            // Advance: (w0·Tfs + Tc + Tw[single-byte space]) · Th, or in
+            // vertical writing w1·Tfs + Tc + Tw on ty with Th not applied
+            // (ISO 32000-1 §9.4.4).
             let word = if n == 1 && code == 32 {
                 ts.word_spacing
             } else {
                 0.0
             };
-            let tx = (w0 * ts.size + ts.char_spacing + word) * ts.horiz;
-            if tx.is_finite() {
-                ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
+            let (tx, ty) = if vertical {
+                let w1 = font.vmetrics(cid)[0] / 1000.0;
+                (0.0, w1 * ts.size + ts.char_spacing + word)
+            } else {
+                let w0 = font.advance(cid) / upm;
+                ((w0 * ts.size + ts.char_spacing + word) * ts.horiz, 0.0)
+            };
+            if tx.is_finite() && ty.is_finite() {
+                ts.tm = Matrix::translate(tx, ty).concat(ts.tm);
             }
         }
     }

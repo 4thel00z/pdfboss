@@ -14,14 +14,15 @@
 //! drawn code falls back per glyph to the same provider-supplied face
 //! ([`GlyphFallback`]), keeping its own program for every code it does
 //! cover. Substitution is scoped to simple font subtypes only:
-//! a `/Type0` composite font's codes are two bytes wide and a substitute's
-//! 1-byte table would mis-split them, so a non-embedded `/Type0` never
-//! substitutes, at any tier. `/Type3` (whose glyphs paint via
+//! a `/Type0` composite font's codes are CMap-split multi-byte CIDs and a
+//! substitute's 1-byte table would mis-split them, so a non-embedded
+//! `/Type0` never substitutes, at any tier. `/Type3` (whose glyphs paint via
 //! `/CharProcs`, handled by the executor re-entering itself, not this
 //! module) and any font that still yields no result (Symbol/ZapfDingbats,
 //! or `Full` with no substitute provider) leave that text unpainted rather
 //! than guessing.
 
+use pdfboss_core::cmap::{type0_encoding, CidCmap};
 use pdfboss_core::FastMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
@@ -112,10 +113,38 @@ impl WidthMap {
     }
 }
 
+/// The composite-font (`/Type0`) state: the `/Encoding` CMap that splits
+/// codes and maps them to CIDs, the writing mode, and the vertical metrics
+/// `/W2` + `/DW2`. The default — simple fonts, and Identity encodings — is
+/// horizontal with no CMap.
+struct Composite {
+    cmap: Option<Arc<CidCmap>>,
+    vertical: bool,
+    /// `/W2` per CID: `[w1, vx, vy]` in the 1000-unit glyph space (w1 is
+    /// the vertical displacement, negative downward; (vx, vy) the position
+    /// vector).
+    vmetrics: FastMap<u32, [f32; 3]>,
+    /// `/DW2` as `(vy, w1)`, default `[880 -1000]` (ISO 32000-1 §9.7.4.3);
+    /// the default vx is half the glyph's horizontal advance.
+    dw2: (f32, f32),
+}
+
+impl Default for Composite {
+    fn default() -> Composite {
+        Composite {
+            cmap: None,
+            vertical: false,
+            vmetrics: FastMap::default(),
+            dw2: (880.0, -1000.0),
+        }
+    }
+}
+
 /// A font whose glyph outlines can be drawn.
 pub(crate) struct GlyphFont {
     outlines: Outlines,
     kind: GlyphKind,
+    composite: Composite,
     widths: WidthMap,
     /// A second, per-code-optional advance tier consulted between `widths`
     /// and each program's own advance metric: Adobe Core-14 AFM widths,
@@ -231,17 +260,60 @@ impl GlyphFont {
         }
     }
 
-    /// Whether codes are two bytes wide (composite fonts).
-    pub(crate) fn two_byte(&self) -> bool {
-        matches!(self.kind, GlyphKind::Cid(_))
+    /// Splits the next character code from `bytes` at `pos` (which must be
+    /// in bounds), returning `(value, byte length)`: one byte for simple
+    /// fonts, the `/Encoding` CMap's codespaces for a composite font with
+    /// one, two bytes otherwise (a trailing odd byte on its own).
+    pub(crate) fn code_at(&self, bytes: &[u8], pos: usize) -> (u32, u8) {
+        if matches!(self.kind, GlyphKind::Simple(_)) {
+            return (u32::from(bytes[pos]), 1);
+        }
+        if let Some(cmap) = &self.composite.cmap {
+            return cmap.code_at(bytes, pos);
+        }
+        if pos + 1 < bytes.len() {
+            (
+                u32::from(u16::from_be_bytes([bytes[pos], bytes[pos + 1]])),
+                2,
+            )
+        } else {
+            (u32::from(bytes[pos]), 1)
+        }
     }
 
-    /// The glyph index for a character code.
-    pub(crate) fn gid(&self, code: u32) -> u16 {
+    /// The CID a code of `len` bytes selects: through the `/Encoding` CMap
+    /// when there is one (unmapped codes are CID 0, the notdef), the code
+    /// itself otherwise (simple fonts and Identity).
+    pub(crate) fn cid(&self, code: u32, len: u8) -> u32 {
+        match &self.composite.cmap {
+            Some(cmap) => cmap.cid(code, len).unwrap_or(0),
+            None => code,
+        }
+    }
+
+    /// Writing mode 1 (top-to-bottom).
+    pub(crate) fn vertical(&self) -> bool {
+        self.composite.vertical
+    }
+
+    /// Vertical metrics `[w1, vx, vy]` for a CID, in the 1000-unit glyph
+    /// space: `/W2`'s entry, else `/DW2` with vx defaulting to half the
+    /// horizontal advance (ISO 32000-1 §9.7.4.3).
+    pub(crate) fn vmetrics(&self, cid: u32) -> [f32; 3] {
+        if let Some(&m) = self.composite.vmetrics.get(&cid) {
+            return m;
+        }
+        let (vy, w1) = self.composite.dw2;
+        let w0 = self.advance(cid) / self.units_per_em() * 1000.0;
+        [w1, w0 / 2.0, vy]
+    }
+
+    /// The glyph index for a CID (composite fonts) or code (simple fonts).
+    pub(crate) fn gid(&self, cid: u32) -> u16 {
         match &self.kind {
-            GlyphKind::Simple(table) => table[(code & 0xff) as usize],
-            GlyphKind::Cid(None) => code as u16,
-            GlyphKind::Cid(Some(map)) => map.get(code as usize).copied().unwrap_or(0),
+            GlyphKind::Simple(table) => table[(cid & 0xff) as usize],
+            GlyphKind::Cid(None) => cid as u16,
+            GlyphKind::Cid(Some(map)) => map.get(cid as usize).copied().unwrap_or(0),
         }
     }
 
@@ -450,6 +522,7 @@ async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<Glyph
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Simple(table),
+        composite: Composite::default(),
         widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
@@ -563,6 +636,7 @@ async fn load_cff_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<G
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Simple(table),
+        composite: Composite::default(),
         widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
@@ -656,6 +730,7 @@ async fn load_type1_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Type1(t1),
         kind: GlyphKind::Simple(table),
+        composite: Composite::default(),
         widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
@@ -893,6 +968,7 @@ impl SubstituteInputs {
             flat_cache: Mutex::new(FastMap::default()),
             outlines: Outlines::Substitute(tt),
             kind: GlyphKind::Simple(table),
+            composite: Composite::default(),
             widths: self.widths.clone(),
             afm_widths: self.afm_widths.clone(),
         })
@@ -967,12 +1043,13 @@ async fn metrics_only<S: AsyncObjectSource>(
     font: &Dict,
     subtype: Option<&str>,
 ) -> Option<GlyphFont> {
-    let (kind, widths, afm_widths) = if subtype == Some("Type0") {
+    let (kind, composite, widths, afm_widths) = if subtype == Some("Type0") {
         let descendants = src.resolve(font.get("DescendantFonts")?).await.ok()?;
         let first = descendants.as_array()?.first()?;
         let cid = resolve_dict(src, first).await?;
         (
             GlyphKind::Cid(None),
+            composite(src, font, &cid).await,
             cid_widths(src, &cid).await,
             FastMap::default(),
         )
@@ -984,6 +1061,7 @@ async fn metrics_only<S: AsyncObjectSource>(
         let diffs = differences(src, font).await;
         (
             GlyphKind::Simple(Box::new([0u16; 256])),
+            Composite::default(),
             simple_widths(src, font).await,
             afm_14_widths(src, font, base_font, &diffs).await,
         )
@@ -996,6 +1074,7 @@ async fn metrics_only<S: AsyncObjectSource>(
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Metrics,
         kind,
+        composite,
         widths,
         afm_widths,
     })
@@ -1004,6 +1083,9 @@ async fn metrics_only<S: AsyncObjectSource>(
 /// Loads a `/Type0` composite font by dispatching on its descendant's
 /// `/Subtype`: `CIDFontType2` (embedded TrueType) paints at every tier;
 /// `CIDFontType0` (embedded CFF) joins once `painting` reaches `AllEmbedded`.
+/// Either way the top-level `/Encoding` decides code splitting and the
+/// code-to-CID mapping ([`composite`]); the CID feeds `/CIDToGIDMap` or the
+/// CFF charset, and the CID-keyed width tables.
 async fn load_type0<S: AsyncObjectSource>(
     src: &S,
     font: &Dict,
@@ -1012,16 +1094,44 @@ async fn load_type0<S: AsyncObjectSource>(
     let descendants = src.resolve(font.get("DescendantFonts")?).await.ok()?;
     let first = descendants.as_array()?.first()?;
     let cid = resolve_dict(src, first).await?;
-    match cid.get_name("Subtype").map(|n| n.0.as_str()) {
+    let mut loaded = match cid.get_name("Subtype").map(|n| n.0.as_str()) {
         Some("CIDFontType2") => load_type0_truetype(src, &cid).await,
         Some("CIDFontType0") if painting.paints_all_embedded() => load_cff_cid(src, &cid).await,
         _ => None,
+    }?;
+    loaded.composite = composite(src, font, &cid).await;
+    Some(loaded)
+}
+
+/// Reads a Type0 font's composite state: the `/Encoding` CMap and writing
+/// mode via `pdfboss_core::cmap` (an unresolvable name degrades to the
+/// Identity assumption, whose unmapped codes then report as NoGlyph skips),
+/// and the descendant's `/W2` + `/DW2` vertical metrics.
+async fn composite<S: AsyncObjectSource>(src: &S, font: &Dict, cid: &Dict) -> Composite {
+    let encoding = type0_encoding(src, font).await;
+    let mut dw2 = (880.0, -1000.0);
+    if let Some(Object::Array(a)) = rv(src, cid, "DW2").await {
+        let vy = a.first().and_then(|o| o.as_f64());
+        let w1 = a.get(1).and_then(|o| o.as_f64());
+        if let (Some(vy), Some(w1)) = (vy, w1) {
+            dw2 = (vy as f32, w1 as f32);
+        }
+    }
+    let mut vmetrics = FastMap::default();
+    if let Some(Object::Array(w2)) = rv(src, cid, "W2").await {
+        parse_cid_vmetrics(src, &w2, &mut vmetrics).await;
+    }
+    Composite {
+        cmap: encoding.cmap,
+        vertical: encoding.vertical,
+        vmetrics,
+        dw2,
     }
 }
 
 /// Loads a `CIDFontType2` descendant (embedded TrueType), reading its
-/// `/CIDToGIDMap`. Codes are assumed two bytes (`Identity-H`/`Identity-V`
-/// encoding, the embedded-subset norm).
+/// `/CIDToGIDMap`. The caller ([`load_type0`]) attaches the code-to-CID
+/// mapping.
 async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
@@ -1055,6 +1165,7 @@ async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Optio
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::TrueType(tt),
         kind: GlyphKind::Cid(map),
+        composite: Composite::default(),
         widths: cid_widths(src, cid).await,
         afm_widths: FastMap::default(),
     })
@@ -1153,9 +1264,76 @@ async fn parse_cid_width_array<S: AsyncObjectSource>(
     }
 }
 
-/// Loads a `CIDFontType0` descendant (embedded CFF). Codes are assumed two
-/// bytes (`Identity-H`/`Identity-V`, the embedded-subset norm) and are CIDs;
-/// the CID-to-GID mapping comes from the CFF's own charset (`cid_to_gid`).
+/// Parses a CID `/W2` array (ISO 32000-1 §9.7.4.3): `c [w1 vx vy …]` gives
+/// per-CID triples from CID `c`; `c1 c2 w1 vx vy` gives every CID in
+/// `c1..=c2` the same metrics. The same aggregate entry cap as `/W`
+/// (`MAX_CID_WIDTH_ENTRIES`) bounds a hostile array.
+async fn parse_cid_vmetrics<S: AsyncObjectSource>(
+    src: &S,
+    items: &[Object],
+    map: &mut FastMap<u32, [f32; 3]>,
+) {
+    let mut resolved: Vec<Object> = Vec::with_capacity(items.len());
+    for item in items {
+        resolved.push(src.resolve(item).await.unwrap_or(Object::Null));
+    }
+    let mut i = 0;
+    while i < resolved.len() {
+        if map.len() >= MAX_CID_WIDTH_ENTRIES {
+            break;
+        }
+        let Some(first) = resolved[i].as_int() else {
+            i += 1;
+            continue;
+        };
+        let first = first.max(0) as u32;
+        match resolved.get(i + 1) {
+            Some(Object::Array(list)) => {
+                for (j, triple) in list.chunks(3).enumerate() {
+                    if map.len() >= MAX_CID_WIDTH_ENTRIES {
+                        break;
+                    }
+                    let Some(cid) = first.checked_add(j as u32) else {
+                        break; // start CID so large the CIDs overflow u32
+                    };
+                    let mut m = [0.0f32; 3];
+                    let mut complete = triple.len() == 3;
+                    for (slot, item) in m.iter_mut().zip(triple) {
+                        match src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
+                            Some(v) => *slot = v as f32,
+                            None => complete = false,
+                        }
+                    }
+                    if complete {
+                        map.insert(cid, m);
+                    }
+                }
+                i += 2;
+            }
+            Some(other) if other.as_f64().is_some() => {
+                let last = other.as_int().unwrap_or(first as i64).max(0) as u32;
+                let w1 = resolved.get(i + 2).and_then(|o| o.as_f64());
+                let vx = resolved.get(i + 3).and_then(|o| o.as_f64());
+                let vy = resolved.get(i + 4).and_then(|o| o.as_f64());
+                if let (Some(w1), Some(vx), Some(vy)) = (w1, vx, vy) {
+                    let end = last.min(first.saturating_add(65535));
+                    for c in first..=end.max(first) {
+                        if map.len() >= MAX_CID_WIDTH_ENTRIES {
+                            break;
+                        }
+                        map.insert(c, [w1 as f32, vx as f32, vy as f32]);
+                    }
+                }
+                i += 5;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// Loads a `CIDFontType0` descendant (embedded CFF). The caller
+/// ([`load_type0`]) attaches the code-to-CID mapping; the CID-to-GID
+/// mapping composes after it, from the CFF's own charset (`cid_to_gid`).
 /// `/CIDToGIDMap` is a `CIDFontType2`-only key (it maps into a `glyf`
 /// program); a `CIDFontType0` descendant is not expected to carry one, so it
 /// is not consulted here.
@@ -1170,6 +1348,7 @@ async fn load_cff_cid<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<Glyph
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
         kind: GlyphKind::Cid(Some(cid_to_gid)),
+        composite: Composite::default(),
         widths,
         afm_widths: FastMap::default(),
     })
@@ -1497,6 +1676,99 @@ mod tests {
         assert!(
             !dark_pixel_at(&pix, 55, 115),
             "embedded CIDFontType0 (CFF) must not paint at EmbeddedTrueTypeOnly (tier gate)"
+        );
+    }
+
+    /// An embedded CMap stream as `/Encoding`: the show string's single
+    /// BYTE 0x41 splits per the CMap's 1-byte codespace and maps to CID 5,
+    /// which the CFF charset then turns into the box glyph — variable-width
+    /// splitting and code-to-CID proven in paint. Under the old fixed
+    /// 2-byte identity reading this byte was half a code and nothing drew.
+    #[test]
+    fn an_embedded_cmap_stream_maps_one_byte_codes_to_glyphs() {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 9 0 R \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /X \
+             /FontDescriptor 7 0 R >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile3 8 0 R >>",
+        );
+        b.stream(8, "", &build_box_glyph_fixture_cid(5));
+        b.stream(
+            9,
+            "/Type /CMap /CMapName /OneByte /CIDSystemInfo \
+             << /Registry (Test) /Ordering (Box) /Supplement 0 >>",
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+              1 begincidrange <41> <41> 5 endcidrange",
+        );
+        let pix = render_at_tier(&b.build(1), GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "the 1-byte code must reach CID 5's box glyph"
+        );
+    }
+
+    /// `Identity-V`: writing mode 1 shows glyphs top-to-bottom. The glyph
+    /// origin is displaced by the default position vector (vx = w0/2 = 0
+    /// here — the CFF fixture has no declared widths — and vy = 880), and
+    /// each show advances ty by the `/DW2` default w1 = -1000.
+    #[test]
+    fn identity_v_advances_downward_with_the_default_position_vector() {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 260 Td <00050005> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-V \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /X \
+             /FontDescriptor 7 0 R >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile3 8 0 R >>",
+        );
+        b.stream(8, "", &build_box_glyph_fixture_cid(5));
+        let pix = render_at_tier(&b.build(1), GlyphPainting::AllEmbedded);
+        // The box's dark point sits at origin + (35, 35) in page space
+        // (see the horizontal tests' (55, 115)); vertical writing lowers
+        // the glyph by vy = 88 and the second glyph a further 100.
+        assert!(
+            dark_pixel_at(&pix, 55, 93),
+            "first vertical glyph at page y 260-88+35"
+        );
+        assert!(
+            dark_pixel_at(&pix, 55, 193),
+            "second vertical glyph one em (100) below the first"
+        );
+        assert!(
+            !dark_pixel_at(&pix, 155, 93),
+            "nothing advances horizontally in writing mode 1"
         );
     }
 
