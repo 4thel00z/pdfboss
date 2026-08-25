@@ -1300,21 +1300,15 @@ fn merged_line(fragments: &[&Line]) -> Line {
 /// Lanes are measured over the candidate stretch alone, never over the whole
 /// segment: a page title and a paragraph of prose put ink across the width the
 /// grid keeps clear, so a segment holding anything besides its table leaves no
-/// lanes at all. Adding a line can only fill bins, so lanes shrink as a stretch
+/// lanes at all. Adding a line can only add ink, so lanes shrink as a stretch
 /// grows and never come back — a stretch is grown until they fall below
 /// [`TABLE_MIN_LANES`], and that is its end. A wrapped cell standing alone in
-/// one column survives inside the stretch for free: it occupies bins that
-/// column already held.
+/// one column survives inside the stretch for free: it puts ink where that
+/// column already held some.
 fn table_band(segment: &[&TextSpan]) -> Option<TableBand> {
     let groups = line_groups(segment);
-    let (x_min, x_max) = x_bounds(segment);
-    let width = x_max - x_min;
-    if !width.is_finite() || width <= 0.0 {
-        return None;
-    }
-    let scale = GUTTER_BINS as f32 / width;
     for start in 0..groups.len() {
-        let (end, lanes) = lane_run(&groups, start, x_min, scale);
+        let (end, lanes) = lane_run(&groups, start);
         if end - start < TABLE_MIN_ROWS {
             continue;
         }
@@ -1326,29 +1320,49 @@ fn table_band(segment: &[&TextSpan]) -> Option<TableBand> {
 }
 
 /// The stretch starting at `start` that keeps at least [`TABLE_MIN_LANES`]
-/// lanes, as an exclusive end and the lanes the whole stretch leaves. The
-/// occupancy histogram is kept in the segment's frame so each line's bins can
-/// simply be added to it; a stretch narrower than the segment leaves its
-/// margins empty, and [`wide_gaps`] already reads edge runs as margins.
-fn lane_run(
-    groups: &[Group],
-    start: usize,
-    x_min: f32,
-    scale: f32,
-) -> (usize, Vec<std::ops::Range<f32>>) {
-    let mut occupied = [false; GUTTER_BINS];
+/// lanes, as an exclusive end and the lanes the whole stretch leaves. Ink is
+/// tracked as exact intervals, not histogram bins: a column gap of a few
+/// points is real table structure that bin rounding swallows.
+fn lane_run(groups: &[Group], start: usize) -> (usize, Vec<std::ops::Range<f32>>) {
+    let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     let mut lanes = Vec::new();
     for (offset, group) in groups[start..].iter().enumerate() {
-        let mut next = occupied;
-        fill_bins(&mut next, &group.spans, x_min, scale);
-        let gaps = wide_gaps(&next, scale);
+        let mut next = occupied.clone();
+        for span in &group.spans {
+            add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
+        }
+        let gaps = ink_gaps(&next);
         if gaps.len() < TABLE_MIN_LANES {
             return (start + offset, lanes);
         }
         occupied = next;
-        lanes = lane_ranges(&gaps, x_min, scale);
+        lanes = gaps;
     }
     (groups.len(), lanes)
+}
+
+/// Adds one span's extent to a sorted, disjoint interval set, merging every
+/// interval it touches.
+fn add_ink(occupied: &mut Vec<std::ops::Range<f32>>, ink: std::ops::Range<f32>) {
+    let at = occupied.partition_point(|held| held.end < ink.start);
+    let mut merged = ink;
+    while at < occupied.len() && occupied[at].start <= merged.end {
+        let held = occupied.remove(at);
+        merged.start = merged.start.min(held.start);
+        merged.end = merged.end.max(held.end);
+    }
+    occupied.insert(at, merged);
+}
+
+/// The gaps between consecutive ink intervals at least [`GUTTER_MIN_WIDTH`]
+/// wide — interior by construction: whatever lies beyond the outermost ink
+/// is margin, not lane.
+fn ink_gaps(occupied: &[std::ops::Range<f32>]) -> Vec<std::ops::Range<f32>> {
+    occupied
+        .windows(2)
+        .filter(|pair| pair[1].start - pair[0].end >= GUTTER_MIN_WIDTH)
+        .map(|pair| pair[0].end..pair[1].start)
+        .collect()
 }
 
 /// `groups[start..end]` as a table band, or `None` when it fails a gate.
@@ -1805,19 +1819,6 @@ fn wide_gaps(occupied: &[bool; GUTTER_BINS], scale: f32) -> Vec<std::ops::Range<
         }
     }
     gaps
-}
-
-/// The bin ranges back in device space. Bins, not device coordinates, stay
-/// the currency of the gutter split: rounding a lane and cutting the page at
-/// the rounded center could move a span from one column to the other.
-fn lane_ranges(
-    gaps: &[std::ops::Range<usize>],
-    x_min: f32,
-    scale: f32,
-) -> Vec<std::ops::Range<f32>> {
-    gaps.iter()
-        .map(|gap| (x_min + gap.start as f32 / scale)..(x_min + gap.end as f32 / scale))
-        .collect()
 }
 
 /// True when a span set stands taller than it runs wide — the shape of one
