@@ -1,0 +1,129 @@
+{
+  "corpus": "OSS-Fuzz public corpora (mupdf_pdf_fuzzer + poppler_pdf_fuzzer)",
+  "files_total": 36294,
+  "files_sampled": 2000,
+  "sampled_from": {
+    "mupdf": 1088,
+    "poppler": 912
+  },
+  "timeout_seconds": 20.0,
+  "stages": {
+    "parse": "open + page count",
+    "render": "first page to pixels"
+  },
+  "engines": {
+    "pdfboss": {
+      "survival_percent": 99.85,
+      "parse": {
+        "ok": 1526,
+        "error": 474,
+        "crash": 0,
+        "timeout": 0,
+        "not_reached": 0
+      },
+      "render": {
+        "ok": 767,
+        "error": 756,
+        "crash": 0,
+        "timeout": 3,
+        "not_reached": 474
+      },
+      "failure_detail": {
+        "parse": {
+          "PdfError": 474
+        },
+        "render": {
+          "no pages": 596,
+          "PdfError": 160,
+          "SIGKILL after 20s": 3
+        }
+      }
+    },
+    "PyMuPDF": {
+      "survival_percent": 99.95,
+      "parse": {
+        "ok": 1404,
+        "error": 596,
+        "crash": 0,
+        "timeout": 0,
+        "not_reached": 0
+      },
+      "render": {
+        "ok": 1051,
+        "error": 352,
+        "crash": 1,
+        "timeout": 0,
+        "not_reached": 596
+      },
+      "failure_detail": {
+        "parse": {
+          "FileDataError": 596
+        },
+        "render": {
+          "FzErrorLibrary": 37,
+          "FzErrorFormat": 23,
+          "FzErrorLimit": 10,
+          "no pages": 266,
+          "FzErrorSyntax": 1,
+          "ValueError": 15,
+          "SIGABRT": 1
+        }
+      }
+    },
+    "pypdfium2": {
+      "survival_percent": 100.0,
+      "parse": {
+        "ok": 478,
+        "error": 1522,
+        "crash": 0,
+        "timeout": 0,
+        "not_reached": 0
+      },
+      "render": {
+        "ok": 455,
+        "error": 23,
+        "crash": 0,
+        "timeout": 0,
+        "not_reached": 1522
+      },
+      "failure_detail": {
+        "parse": {
+          "PdfiumError": 1522
+        },
+        "render": {
+          "PdfiumError": 23
+        }
+      }
+    },
+    "pdfplumber": {
+      "survival_percent": 100.0,
+      "parse": {
+        "ok": 317,
+        "error": 1683,
+        "crash": 0,
+        "timeout": 0,
+        "not_reached": 0
+      },
+      "render": {
+        "ok": 263,
+        "error": 54,
+        "crash": 0,
+        "timeout": 0,
+        "not_reached": 1683
+      },
+      "failure_detail": {
+        "parse": {
+          "PdfminerException": 1674,
+          "TypeError": 5,
+          "MalformedPDFException": 4
+        },
+        "render": {
+          "MalformedPDFException": 21,
+          "no pages": 31,
+          "PdfiumError": 1,
+          "ZeroDivisionError": 1
+        }
+      }
+    }
+  }
+}
