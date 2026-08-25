@@ -672,15 +672,10 @@ fn decode_samples<'a>(
 ) -> Rgba<'a> {
     let ncomp = cs.components().clamp(1, 8);
     let max = ((1u32 << bpc) - 1) as f32;
-    let default_hi = if matches!(cs, ColorSpace::Indexed { .. }) {
-        max
-    } else {
-        1.0
-    };
     let ranges: Vec<(f32, f32)> = (0..ncomp)
         .map(|c| match decode {
             Some(d) if d.len() >= 2 * (c + 1) => (d[2 * c], d[2 * c + 1]),
-            _ => (0.0, default_hi),
+            _ => cs.default_decode(c, max),
         })
         .collect();
     let stride_bits = (ncomp * bpc * width).div_ceil(8) * 8;

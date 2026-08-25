@@ -11,6 +11,7 @@ keywords.workspace = true
 [dependencies]
 pdfboss-core = { workspace = true }
 pdfboss-encoding = { workspace = true }
+pdfboss-icc = { workspace = true }
 pdfboss-jpx = { workspace = true }
 png = "0.18"
 jpeg-decoder = "0.3"

@@ -1,0 +1,11 @@
+[package]
+name = "pdfboss-icc"
+description = "Cleanroom ICC profile parser and colour transform for pdfboss (ICC.1:2010)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+
+[dependencies]

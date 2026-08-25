@@ -6,6 +6,7 @@ members = [
     "crates/pdfboss-output",
     "crates/pdfboss-encoding",
     "crates/pdfboss-jpx",
+    "crates/pdfboss-icc",
     "crates/pdfboss-render",
     "crates/pdfboss-aio",
     "crates/pdfboss-cli",
@@ -29,6 +30,7 @@ keywords = ["pdf", "iso-32000"]
 pdfboss-core = { path = "crates/pdfboss-core", version = "0.17.1" } # x-release-please-version
 pdfboss-encoding = { path = "crates/pdfboss-encoding", version = "0.17.1" } # x-release-please-version
 pdfboss-jpx = { path = "crates/pdfboss-jpx", version = "0.17.1" } # x-release-please-version
+pdfboss-icc = { path = "crates/pdfboss-icc", version = "0.17.1" } # x-release-please-version
 pdfboss-text = { path = "crates/pdfboss-text", version = "0.17.1" } # x-release-please-version
 pdfboss-output = { path = "crates/pdfboss-output", version = "0.17.1" } # x-release-please-version
 pdfboss-render = { path = "crates/pdfboss-render", version = "0.17.1" } # x-release-please-version
