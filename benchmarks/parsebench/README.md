@@ -56,8 +56,8 @@ uv run parse-bench serve output/pdfboss_markdown            # per-rule drill-dow
 ```
 
 No API keys: local engines run offline, LLM normalization is off by
-default, and every metric is rule-based and deterministic — the scores are
-reproducible and load-insensitive, so they are published as measured.
+default, and every metric is rule-based and deterministic, so the scores
+reproduce exactly on any machine.
 
 ## Results — pdfboss 0.17.1, full run (2,078 examples)
 
@@ -89,7 +89,7 @@ leaderboard's "Open Source - Local" bracket (numbers from the repo's
 ## Reading the numbers
 
 - **Charts is effectively ML-only** — the pages are chart images, and
-  text-layer engines land at 0–7 across the board.
+  text-layer engines land at 0–7.
 - **Visual Grounding** scores only the 64 reading-order examples; the other
   436 need a per-page layout payload (`ParseLayoutPageIR` items with
   normalized bboxes) that this provider does not emit, plus the 42 image

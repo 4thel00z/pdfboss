@@ -8,7 +8,7 @@ render to the same symbols. The scorer is the `olmocr` package's bench
 module; this directory holds the candidate generator and the recipe that
 produced pdfboss's scores in `../results-olmocr.json`.
 
-## Reading the numbers honestly
+## Reading the numbers
 
 pdfboss extracts the text a PDF carries; it does not OCR pixels. The
 benchmark mixes both worlds, and the per-bucket table only means something
@@ -16,8 +16,8 @@ with the text-layer census next to it (the generator prints it — `empty` is
 the count of PDFs whose extraction produced zero characters):
 
 - **Born-digital buckets** — `table_tests`, `multi_column`,
-  `headers_footers`, and the auto-added per-PDF `baseline` — are the honest
-  headline for a non-OCR engine. Nearly every PDF there has a text layer.
+  `headers_footers`, and the auto-added per-PDF `baseline` — are where a
+  non-OCR engine competes. Nearly every PDF there has a text layer.
 - **Scan buckets** — `old_scans` is 98/98 image-only, `old_scans_math` 21/36,
   `long_tiny_text` 23/62. Scores there measure the OCR pdfboss does not do
   (plus, for the two partial buckets, whatever embedded text the scans carry).
@@ -27,16 +27,16 @@ the count of PDFs whose extraction produced zero characters):
   glyphs, not LaTeX source — no text extractor scores here.
 - **`headers_footers` is all absence tests** — the engine is rewarded for
   *stripping* page headers, footers and page numbers. An empty output would
-  pass them all, so the number only means something next to `baseline`
-  (which requires real content per PDF). pdfboss keeps page headers and
+  pass them all, so read the number next to `baseline` (which requires
+  real content per PDF). pdfboss keeps page headers and
   footers in its markdown today, and the low score reflects that choice.
 - **Markdown tables cap the table score**: tests that hinge on rowspan or
   colspan structure only pass with HTML `<table>` output (stated in the
   benchmark's README). pdfboss emits pipe tables.
 - The overall score is a macro-average of the 8 buckets, each weighted
-  equally — the scan and math buckets pull a non-OCR engine's overall down
-  by construction. The leaderboard's engines OCR a rasterized page, which is
-  a different (strictly harder) task on the scan buckets.
+  equally, so the scan and math buckets pull a non-OCR engine's overall down
+  no matter how well it extracts. The leaderboard's engines OCR a rasterized
+  page — a different and harder task on the scan buckets.
 
 ## Setup
 
