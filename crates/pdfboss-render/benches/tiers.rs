@@ -140,6 +140,7 @@ fn bench_group(
         let opts = RenderOptions {
             glyph_painting: *painting,
             substitutes: substitutes.clone(),
+            ..Default::default()
         };
         group.bench_function(*label, |b| {
             b.iter(|| black_box(render_page_with_options(doc, page, 1.0, &opts).unwrap()));

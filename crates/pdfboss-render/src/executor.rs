@@ -397,11 +397,15 @@ pub(crate) fn render_page_reporting(
     scale: f32,
     opts: &RenderOptions,
 ) -> Result<(Pixmap, RenderReport)> {
+    let mut opts = opts.clone();
+    if opts.oc.is_none() {
+        opts.oc = doc.oc_state().map(Arc::new);
+    }
     block_on(render_page_reporting_with(
         Immediate(doc),
         page,
         scale,
-        opts,
+        &opts,
     ))
 }
 
@@ -468,6 +472,7 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         painting: opts.glyph_painting,
         color_locked: false,
         provider,
+        oc: opts.oc.clone(),
         glyph_blit: Vec::new(),
         raster: RasterScratch::default(),
         clip_cache: FastMap::default(),
@@ -516,6 +521,9 @@ struct Executor<'a, S> {
     /// `/Type0` and `/Type3` fonts never consult it (see `glyph.rs`'s module
     /// doc).
     provider: Option<Box<dyn SubstituteProvider>>,
+    /// The document's optional-content visibility from
+    /// [`RenderOptions::oc`]; `None` renders every layer.
+    oc: Option<Arc<pdfboss_core::OcState>>,
     /// Reused scratch for painting a cached glyph outline: the flattened
     /// (origin-relative) subpaths from [`GlyphFont::flattened`] are copied
     /// here translated to the glyph's device origin, so a whole page of text
@@ -606,6 +614,12 @@ struct Frame {
     /// default space, so fills through `cm` changes do not drag the pattern
     /// with them.
     pattern_base: Matrix,
+    /// The marked-content stack: one entry per open `BMC`/`BDC`, `true` for
+    /// a `BDC /OC` span the optional-content configuration hides. Per frame
+    /// and not part of [`GState`] — `BMC`/`EMC` nesting is not `q`/`Q`
+    /// scoped, and it never crosses a content-stream boundary. A stray
+    /// `EMC` pops nothing.
+    marks: Vec<bool>,
 }
 
 /// What kind of content stream a [`Frame`] is running, and therefore what
@@ -664,7 +678,15 @@ impl Frame {
             pending_t3: None,
             kind,
             pattern_base,
+            marks: Vec::new(),
         }
+    }
+
+    /// Whether the frame is inside a marked-content span the
+    /// optional-content configuration hides: state still executes, marks
+    /// are suppressed.
+    fn suppressed(&self) -> bool {
+        self.marks.iter().any(|hidden| *hidden)
     }
 }
 
@@ -1046,6 +1068,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             None => Vec::new(),
         };
+        // A hidden optional-content span suppresses the marks but not the
+        // state: nothing fills or strokes (and no pattern loads or tiles),
+        // while a pending `W`/`W*` still narrows the clip below — clipping
+        // is graphics state, carried past `EMC`, not a mark on the page.
+        if frame.suppressed() {
+            self.clip_frame(frame, &polys);
+            return;
+        }
         let fill_pattern = if how.fill.is_some() && frame.gs.fill_pattern && !polys.is_empty() {
             let name = frame.gs.fill_pattern_name.clone();
             self.resolve_pattern(&frame.chain, name.as_deref(), frame.pattern_base)
@@ -1125,14 +1155,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 ),
             }
         }
-        if let Some(rule) = frame.pending_clip.take() {
-            let rasterized = self.rasterize_clip(&polys, rule);
-            let gs = &mut frame.gs;
-            gs.clip = Some(match &gs.clip {
-                Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
-                None => rasterized,
-            });
-        }
+        self.clip_frame(frame, &polys);
+    }
+
+    /// Applies a pending `W`/`W*` clip from the painted path, if any.
+    fn clip_frame(&mut self, frame: &mut Frame, polys: &[Subpath]) {
+        let Some(rule) = frame.pending_clip.take() else {
+            return;
+        };
+        let rasterized = self.rasterize_clip(polys, rule);
+        let gs = &mut frame.gs;
+        gs.clip = Some(match &gs.clip {
+            Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
+            None => rasterized,
+        });
     }
 
     /// Resolves the named pattern to something paintable: a shading with
@@ -1638,13 +1674,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// CharProc frames are pushed by the driver, one at a time, before the
     /// frame's next operator.
     fn show_text(&mut self, frame: &mut Frame, bytes: &[u8]) {
-        // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6); the advances
+        // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6), and a hidden
+        // optional-content span shows nothing either (§8.11); the advances
         // below still happen, so a visible run that follows stays placed.
-        let visible = !matches!(frame.gs.text_render, 3 | 7);
+        let suppressed = frame.suppressed();
+        let visible = !matches!(frame.gs.text_render, 3 | 7) && !suppressed;
         // Modes 4-7 also ask the glyph outlines to join the clipping path,
         // which this renderer does not do: whatever the author clipped to
         // the text paints unclipped, and that approximation is reported.
-        if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() {
+        // Not from a hidden span: its text was configured away, so nothing
+        // the report owes the caller was lost.
+        if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() && !suppressed {
             self.skip(SkippedKind::TextClip, SkipReason::Unsupported);
         }
         if let Some(t3) = frame.ts.type3.clone() {
@@ -1929,17 +1969,51 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 gs.stroke_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
             }
             Op::XObject(name) => {
+                // Inside a hidden span the whole invocation is part of the
+                // span: nothing is resolved, drawn, scheduled, or reported.
+                if frame.suppressed() {
+                    return None;
+                }
                 return self
                     .do_xobject(name, &frame.chain, &frame.gs, frame.depth)
                     .await;
             }
             Op::InlineImage(img) => {
+                if frame.suppressed() {
+                    return None;
+                }
                 self.draw_inline_image(img, &frame.chain, &frame.gs).await;
             }
-            // Text and marked content: state-only in v0.1, nothing painted.
+            // Marked content: only a `BDC /OC` span changes what paints —
+            // every open is pushed (hidden or not) so `EMC` stays balanced.
+            Op::BeginMarkedContent(_) => frame.marks.push(false),
+            Op::BeginMarkedContentProps(tag, props) => {
+                let hidden = self.marked_hidden(tag, props, &frame.chain).await;
+                if hidden {
+                    self.report.hidden += 1;
+                }
+                frame.marks.push(hidden);
+            }
+            Op::EndMarkedContent => {
+                frame.marks.pop();
+            }
+            // Text state and points: nothing painted.
             _ => {}
         }
         None
+    }
+
+    /// Whether a `BDC` opens a span the optional-content configuration
+    /// hides: only `/OC` tags gate anything, and with no configuration (or
+    /// anything unresolvable) every span is visible.
+    async fn marked_hidden(&self, tag: &Name, props: &Object, chain: &[Arc<Dict>]) -> bool {
+        let Some(oc) = &self.oc else {
+            return false;
+        };
+        if tag.0 != "OC" {
+            return false;
+        }
+        !oc.props_visible_with(self.src, chain, props).await
     }
 }
 
@@ -2161,17 +2235,23 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         else {
             return;
         };
-        match dict.get("SMask") {
-            None => {}
-            Some(obj) => match self.src.resolve(obj).await {
-                Ok(Object::Name(n)) if n.0 == "None" => frame.gs.soft_mask = None,
-                Ok(Object::Dict(sm)) => {
-                    if let Some(group) = self.soft_mask_group(&sm, frame).await {
-                        frame.pending_smask = Some(Box::new(group));
+        // A hidden span leaves the soft-mask machinery alone: the group
+        // frame it would schedule is a paint-bearing child, and the
+        // matching `/None` reset stays skipped so the pair is symmetric.
+        // Every scalar entry below is plain graphics state and applies.
+        if !frame.suppressed() {
+            match dict.get("SMask") {
+                None => {}
+                Some(obj) => match self.src.resolve(obj).await {
+                    Ok(Object::Name(n)) if n.0 == "None" => frame.gs.soft_mask = None,
+                    Ok(Object::Dict(sm)) => {
+                        if let Some(group) = self.soft_mask_group(&sm, frame).await {
+                            frame.pending_smask = Some(Box::new(group));
+                        }
                     }
-                }
-                _ => self.skip(SkippedKind::SoftMask, SkipReason::Missing),
-            },
+                    _ => self.skip(SkippedKind::SoftMask, SkipReason::Missing),
+                },
+            }
         }
         match blend_mode_entry(self.src, &dict).await {
             Some(Ok(mode)) => frame.gs.blend_mode = mode,
@@ -2325,6 +2405,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::XObject, SkipReason::Missing);
             return None;
         };
+        // An `/OC` entry gates the whole XObject — image and form alike
+        // (§8.11.3.5). Hidden is configured behavior: counted, not skipped.
+        if let (Some(oc), Some(gate)) = (self.oc.clone(), stream.dict.get("OC")) {
+            if !oc.visible_with(self.src, gate).await {
+                self.report.hidden += 1;
+                return None;
+            }
+        }
         // `/Subtype` may be indirect like any dictionary value (ISO 32000-1
         // 7.3.8.1): a direct name answers on the spot, a reference resolves.
         let resolved;
@@ -2381,6 +2469,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             };
             if dict.get_int("F").unwrap_or(0) & INVISIBLE_ANNOTS != 0 {
                 continue;
+            }
+            // An `/OC` entry hides the annotation exactly like the Hidden
+            // flag (§8.11.3.5), silently but counted.
+            if let (Some(oc), Some(gate)) = (self.oc.clone(), dict.get("OC")) {
+                if !oc.visible_with(self.src, gate).await {
+                    self.report.hidden += 1;
+                    continue;
+                }
             }
             if dict.get_name("Subtype").is_some_and(|n| n.0 == "Popup") {
                 continue;
@@ -2567,6 +2663,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Unsupported shading kinds and every structural failure report as a
     /// dropped shading — the page loses a gradient either way.
     async fn sh_operator(&mut self, name: &str, frame: &mut Frame) {
+        if frame.suppressed() {
+            return;
+        }
         let Some(obj) = self.find_res(&frame.chain, "Shading", name).await else {
             self.skip(SkippedKind::Shading, SkipReason::Missing);
             return;
@@ -3074,6 +3173,310 @@ mod tests {
         );
         let pix = render(bytes, 1.0);
         assert_eq!(px(&pix, 25, 50), BLACK, "text after Q must paint");
+    }
+
+    /// A one-page 100x100 document like [`small_doc`], with two optional
+    /// content groups: object 8 stays on and object 9 is off in the default
+    /// configuration, reachable from content as `/Properties` entries `/V`
+    /// (visible) and `/H` (hidden).
+    fn oc_doc(resources: &str, content: &[u8], extra: impl FnOnce(&mut PdfBuilder)) -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties \
+             << /OCGs [8 0 R 9 0 R] /D << /OFF [9 0 R] >> >> >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Resources << /Properties << /V 8 0 R /H 9 0 R >> {resources} >> \
+                 /Contents 4 0 R >>"
+            ),
+        );
+        b.stream(4, "", content);
+        b.object(8, "<< /Type /OCG /Name (shown) >>");
+        b.object(9, "<< /Type /OCG /Name (hidden) >>");
+        extra(&mut b);
+        b.build(1)
+    }
+
+    /// A `BDC /OC` span whose group the default configuration turns off
+    /// paints nothing; a span whose group stays on paints normally. Hidden
+    /// content is configured behavior: one count on the dedicated counter,
+    /// nothing in the drop list, and the report still reads empty.
+    #[test]
+    fn hidden_span_suppresses_marks_and_counts() {
+        let bytes = oc_doc(
+            "",
+            b"1 0 0 rg /OC /H BDC 10 10 30 30 re f EMC /OC /V BDC 60 60 30 30 re f EMC",
+            |_| {},
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), WHITE, "the hidden span must not paint");
+        assert_eq!(px(&pix, 75, 25), RED, "the visible span paints");
+        assert_eq!(report.hidden, 1);
+        assert_eq!(drops(&report), vec![], "hidden is not a drop");
+        assert!(report.is_empty(), "hidden does not dirty the report");
+    }
+
+    /// Suppression nests as a stack: a visible span inside a hidden one
+    /// stays suppressed, and a hidden span inside a visible one suppresses
+    /// only itself. State set inside a hidden span (here the fill color)
+    /// still executes and survives the span.
+    #[test]
+    fn suppression_nests_and_state_survives() {
+        let bytes = oc_doc(
+            "",
+            b"/OC /H BDC 1 0 0 rg /OC /V BDC 10 10 30 30 re f EMC EMC 60 60 30 30 re f",
+            |_| {},
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), WHITE, "visible-in-hidden is suppressed");
+        assert_eq!(px(&pix, 75, 25), RED, "after EMC the red state persists");
+        assert_eq!(report.hidden, 1);
+
+        let bytes = oc_doc(
+            "",
+            b"1 0 0 rg /OC /V BDC 10 10 30 30 re f /OC /H BDC 60 60 30 30 re f EMC EMC",
+            |_| {},
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), RED, "the visible outer span paints");
+        assert_eq!(px(&pix, 75, 25), WHITE, "hidden-in-visible is suppressed");
+        assert_eq!(report.hidden, 1);
+    }
+
+    /// A stray `EMC` pops nothing, and a hidden span left open at the end
+    /// of the stream suppresses to the end without leaking anywhere else.
+    #[test]
+    fn stray_emc_clamps_and_open_spans_end_with_the_stream() {
+        let bytes = oc_doc(
+            "",
+            b"EMC 1 0 0 rg 10 10 30 30 re f /OC /H BDC 60 60 30 30 re f",
+            |_| {},
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), RED, "a stray EMC must not suppress");
+        assert_eq!(px(&pix, 75, 25), WHITE, "the open hidden span suppresses");
+        assert_eq!(report.hidden, 1);
+    }
+
+    /// The properties name may resolve to a membership dictionary; its
+    /// `/OCGs` groups keep their reference identity through the raw
+    /// `/Properties` lookup, so the off group hides the span. With no
+    /// `/OCProperties` at all the same span paints — nothing to be off.
+    #[test]
+    fn membership_properties_and_absent_configuration() {
+        let bytes = oc_doc(
+            "/Properties << /M 30 0 R >>",
+            b"1 0 0 rg /OC /M BDC 10 10 30 30 re f EMC",
+            |b| {
+                b.object(30, "<< /Type /OCMD /OCGs [9 0 R] >>");
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), WHITE, "the membership hides the span");
+        assert_eq!(report.hidden, 1);
+
+        let bytes = small_doc(
+            "/Properties << /H 8 0 R >>",
+            b"1 0 0 rg /OC /H BDC 10 10 30 30 re f EMC",
+            |b| {
+                b.object(8, "<< /Type /OCG /Name (loose) >>");
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), RED, "no configuration, every layer on");
+        assert_eq!(report.hidden, 0);
+    }
+
+    /// Text in a hidden span paints nothing but still advances — a visible
+    /// run after `EMC` lands where the hidden one left off (the same
+    /// contract as `3 Tr`), with no no-glyph noise from the hidden run.
+    #[test]
+    fn hidden_span_text_advances_without_painting() {
+        let bytes = oc_doc(
+            "/Font << /T3 5 0 R >>",
+            b"BT /T3 100 Tf 0 20 Td /OC /H BDC <41> Tj EMC <41> Tj ET",
+            |b| {
+                b.object(
+                    5,
+                    "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] \
+                     /FontMatrix [0.001 0 0 0.001 0 0] \
+                     /Encoding << /Differences [65 /box] >> \
+                     /CharProcs << /box 6 0 R >> /FirstChar 65 /Widths [500] >>",
+                );
+                b.stream(6, "", b"500 0 d0 0 0 500 500 re f");
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 50), WHITE, "hidden glyph painted");
+        assert_eq!(px(&pix, 75, 50), BLACK, "visible glyph after the advance");
+        assert_eq!(report.hidden, 1);
+        assert!(report.is_empty(), "no reports from the hidden run");
+    }
+
+    /// `W n` inside a hidden span still narrows the clip: clipping is
+    /// graphics state carried past `EMC`, not a mark on the page.
+    #[test]
+    fn clip_from_hidden_span_still_applies() {
+        let bytes = oc_doc(
+            "",
+            b"/OC /H BDC 20 20 40 40 re W n EMC 0 0 100 100 re f",
+            |_| {},
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 40, 60), BLACK, "inside the hidden span's clip");
+        assert_eq!(px(&pix, 10, 10), WHITE, "outside it");
+        assert_eq!(report.hidden, 1);
+    }
+
+    /// No paint-bearing child runs out of a hidden span: a form `Do` is not
+    /// scheduled (and reports nothing, not even a missing resource), and a
+    /// pattern fill neither loads nor reports its pattern.
+    #[test]
+    fn hidden_span_schedules_no_children_and_reports_nothing() {
+        let bytes = oc_doc(
+            "/XObject << /Fx 5 0 R >>",
+            b"/OC /H BDC /Fx Do /Nope Do /Pattern cs /P1 scn 10 10 30 30 re f EMC",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                    b"1 0 0 rg 0 0 100 100 re f",
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "the form must not run");
+        assert_eq!(drops(&report), vec![], "a hidden span reports nothing");
+        assert_eq!(report.hidden, 1);
+    }
+
+    /// A `gs` inside a hidden span leaves the soft-mask machinery alone: no
+    /// offscreen group runs, and the paint after `EMC` composites unmasked.
+    #[test]
+    fn hidden_span_skips_soft_mask_groups() {
+        let bytes = oc_doc(
+            "/ExtGState << /GS1 << /SMask << /S /Luminosity /G 5 0 R >> >> >>",
+            b"/OC /H BDC /GS1 gs EMC 1 0 0 rg 10 10 30 30 re f",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Group << /S /Transparency >>",
+                    b"",
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 75), RED, "no mask was harvested");
+        assert_eq!(drops(&report), vec![]);
+        assert_eq!(report.hidden, 1);
+    }
+
+    /// An `/OC` entry on the XObject itself gates both arms: a hidden form
+    /// and a hidden image draw nothing and count once each; the same form
+    /// under the on group draws.
+    #[test]
+    fn xobject_oc_entry_gates_forms_and_images() {
+        let form = |oc: &str| {
+            oc_doc("/XObject << /Fx 5 0 R >>", b"/Fx Do", |b| {
+                b.stream(
+                    5,
+                    &format!("/Type /XObject /Subtype /Form /BBox [0 0 100 100] /OC {oc}"),
+                    b"1 0 0 rg 0 0 100 100 re f",
+                );
+            })
+        };
+        let (pix, report) = render_reporting(form("9 0 R"));
+        assert_eq!(px(&pix, 50, 50), WHITE, "the off form must not draw");
+        assert_eq!(report.hidden, 1);
+        assert_eq!(drops(&report), vec![]);
+        let (pix, report) = render_reporting(form("8 0 R"));
+        assert_eq!(px(&pix, 50, 50), RED, "the on form draws");
+        assert_eq!(report.hidden, 0);
+
+        let bytes = oc_doc(
+            "/XObject << /Im 5 0 R >>",
+            b"q 100 0 0 100 0 0 cm /Im Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceGray /BitsPerComponent 8 /OC 9 0 R",
+                    &[0x00],
+                );
+            },
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "the off image must not draw");
+        assert_eq!(report.hidden, 1);
+        assert_eq!(drops(&report), vec![]);
+    }
+
+    /// An annotation's `/OC` entry hides it like the Hidden flag — silent
+    /// in the drop list, counted on the dedicated counter — and an on-group
+    /// annotation paints exactly as without the entry.
+    #[test]
+    fn annotation_oc_entry_gates_the_appearance() {
+        let stamp = |oc: &str, extra: &mut PdfBuilder| {
+            extra.object(
+                10,
+                &format!(
+                    "<< /Type /Annot /Subtype /Stamp /Rect [20 20 60 60] \
+                     /OC {oc} /AP << /N 20 0 R >> >>"
+                ),
+            );
+            extra.stream(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 10 10]",
+                b"1 0 0 rg 0 0 10 10 re f",
+            );
+        };
+        let with = |oc: &'static str| {
+            let mut b = PdfBuilder::new();
+            b.object(
+                1,
+                "<< /Type /Catalog /Pages 2 0 R /OCProperties \
+                 << /OCGs [8 0 R 9 0 R] /D << /OFF [9 0 R] >> >> >>",
+            );
+            b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            b.object(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+                 /Contents 4 0 R /Annots [10 0 R] >>",
+            );
+            b.stream(4, "", b"");
+            b.object(8, "<< /Type /OCG /Name (shown) >>");
+            b.object(9, "<< /Type /OCG /Name (hidden) >>");
+            stamp(oc, &mut b);
+            render_reporting(b.build(1))
+        };
+        let (pix, report) = with("9 0 R");
+        assert_eq!(px(&pix, 40, 60), WHITE, "the off annotation must not paint");
+        assert_eq!(report.hidden, 1);
+        assert_eq!(drops(&report), vec![]);
+        let (pix, report) = with("8 0 R");
+        assert_eq!(px(&pix, 40, 60), RED, "the on annotation paints");
+        assert_eq!(report.hidden, 0);
+    }
+
+    /// An inline image inside a hidden span is a mark like any other.
+    #[test]
+    fn hidden_span_suppresses_inline_images() {
+        let bytes = oc_doc(
+            "",
+            b"/OC /H BDC q 100 0 0 100 0 0 cm \
+              BI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI Q EMC",
+            |_| {},
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "the inline image must not draw");
+        assert_eq!(report.hidden, 1);
+        assert_eq!(drops(&report), vec![]);
     }
 
     #[test]
@@ -5294,6 +5697,7 @@ mod tests {
         let opts = RenderOptions {
             glyph_painting: GlyphPainting::Full,
             substitutes: SubstituteSource::Dir(dir.clone()),
+            ..Default::default()
         };
         let pix = render_page_with_options(&doc, &page, 1.0, &opts).expect("render");
         assert!(
@@ -5345,6 +5749,7 @@ mod tests {
         let opts = RenderOptions {
             glyph_painting: GlyphPainting::Full,
             substitutes: SubstituteSource::Dir(dir.clone()),
+            ..Default::default()
         };
         let pix = render_page_with_options(&doc, &page, 1.0, &opts).expect("render");
         assert!(
