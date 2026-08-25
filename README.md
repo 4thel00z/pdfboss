@@ -194,7 +194,7 @@ What still does not paint: `/Symbol` and `/ZapfDingbats` have no license-clean s
 
 Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the document's default configuration: rendering and text extraction skip layers it turns off, counting them on the reports' `hidden` counters.
 
-Not yet supported (they error or degrade gracefully, and are on the roadmap): mesh shadings (types 4–7 and the function-based type 1) and PostScript-calculator functions · the JBIG2 features listed above · the unpainted faces listed above · the non-separable blend modes (Hue, Saturation, Color, Luminosity) and `/SMask` transfer functions.
+Not yet supported (they error or degrade gracefully, and are on the roadmap): mesh shadings (types 4–7 and the function-based type 1) · the JBIG2 features listed above · the unpainted faces listed above · the non-separable blend modes (Hue, Saturation, Color, Luminosity) and `/SMask` transfer functions.
 
 Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render. `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary. The TUI preview raises a status-bar notice. The libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
 
