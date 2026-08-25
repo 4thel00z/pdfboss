@@ -2,8 +2,8 @@
 //! clipping, ExtGState, form XObject recursion, and paint dispatch.
 //!
 //! What cannot be reproduced is reported, never silently dropped: every
-//! skipped or approximated element -- a mesh shading, a non-separable blend
-//! mode, text shown in a clipping mode, undecodable content -- lands in the
+//! skipped or approximated element -- a non-separable blend mode, text
+//! shown in a clipping mode, undecodable content -- lands in the
 //! [`RenderReport`] this module returns, along with every content stream
 //! and image leniency drop, so no caller is handed a blank page it cannot
 //! account for. The one exception is the glyph tiers, which the caller
@@ -1231,14 +1231,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     return None;
                 };
                 match Shading::load_with(self.src, shading_obj).await {
-                    Ok(Some(s)) => {
+                    Ok(s) => {
                         let s = Arc::new(s);
                         self.cache_pattern(pref, CachedPattern::Shading(matrix, Arc::clone(&s)));
                         Some(PatternPaint::Shading(s, to_device))
-                    }
-                    Ok(None) => {
-                        self.skip(SkippedKind::Shading, SkipReason::Unsupported);
-                        None
                     }
                     Err(e) => {
                         self.skip(SkippedKind::Shading, skip_reason_for(&e));
@@ -2731,8 +2727,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Paints the `sh` operator (§8.7.4.2): the named shading fills the
     /// current clip region, further clipped by the shading's own `/BBox`
     /// when it has one, in the current user space at the fill alpha.
-    /// Unsupported shading kinds and every structural failure report as a
-    /// dropped shading — the page loses a gradient either way.
+    /// Every structural failure reports as a dropped shading — the page
+    /// loses a gradient either way.
     async fn sh_operator(&mut self, name: &str, frame: &mut Frame) {
         if frame.suppressed() {
             return;
@@ -2742,11 +2738,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             return;
         };
         let loaded = match Shading::load_with(self.src, &obj).await {
-            Ok(Some(s)) => s,
-            Ok(None) => {
-                self.skip(SkippedKind::Shading, SkipReason::Unsupported);
-                return;
-            }
+            Ok(s) => s,
             Err(e) => {
                 self.skip(SkippedKind::Shading, skip_reason_for(&e));
                 return;
@@ -4887,23 +4879,374 @@ mod tests {
         );
     }
 
+    /// A type 4 mesh over DeviceRGB with 8-bit fields whose /Decode maps
+    /// raw values straight to user-space coordinates and unit components.
+    const MESH4_DICT: &str = "/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+         /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 255 0 255 0 1 0 1 0 1]";
+
+    /// The type 5 twin: no flags, two vertices per row.
+    const MESH5_DICT: &str = "/ShadingType 5 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+         /BitsPerComponent 8 /VerticesPerRow 2 /Decode [0 255 0 255 0 1 0 1 0 1]";
+
+    /// Coons patches over DeviceRGB with the same raw-value /Decode.
+    const MESH6_DICT: &str = "/ShadingType 6 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+         /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 255 0 255 0 1 0 1 0 1]";
+
+    /// One patch record: the edge flag, then (x, y) pairs, then RGB corner
+    /// colors — 12 points and 4 colors for flag 0, 8 and 2 otherwise.
+    fn patch(flag: u8, pts: &[(u8, u8)], colors: &[[u8; 3]]) -> Vec<u8> {
+        let mut d = vec![flag];
+        for &(x, y) in pts {
+            d.push(x);
+            d.push(y);
+        }
+        for c in colors {
+            d.extend_from_slice(c);
+        }
+        d
+    }
+
     #[test]
-    fn mesh_shadings_still_report_unsupported() {
-        // ShadingType 4 (free-form triangle mesh) stays a reported drop.
-        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"q /Sh0 sh Q", |b| {
-            b.stream(
+    fn type4_mesh_interpolates_vertex_colors() {
+        // Triangle (0,0)R (99,0)G (0,99)B, then flag 1 adds (99,99)W on the
+        // shared v_b v_c edge (§8.7.4.5.5). The flags of a new triangle's
+        // second and third vertices are read and ignored, so they carry
+        // junk. Expected pixels are hand-computed barycentric blends: the
+        // device pixel (x, y) samples user space at (x+0.5, 99.5-y).
+        let data: [u8; 24] = [
+            0, 0, 0, 255, 0, 0, //
+            1, 99, 0, 0, 255, 0, //
+            2, 0, 99, 0, 0, 255, //
+            1, 99, 99, 255, 255, 255,
+        ];
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH4_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // user (25.5, 39.5): weights R 0.3434, G 0.2576, B 0.3990.
+        assert_near(px(&pix, 25, 60), [88, 66, 102, 255], 1, "first triangle");
+        // user (75.5, 69.5): weights G 0.2980, B 0.2374, W 0.4646.
+        assert_near(px(&pix, 75, 30), [118, 194, 179, 255], 1, "strip triangle");
+        assert_eq!(px(&pix, 99, 50), WHITE, "outside both triangles");
+    }
+
+    #[test]
+    fn type4_mesh_flag2_shares_the_va_vc_edge() {
+        // After (0,0)R (0,99)G (99,0)B, flag 2 forms (v_a, v_c, v_d) with
+        // (99,99)W — the new triangle hangs off the (0,0)-(99,0) edge.
+        let data: [u8; 24] = [
+            0, 0, 0, 255, 0, 0, //
+            3, 0, 99, 0, 255, 0, //
+            1, 99, 0, 0, 0, 255, //
+            2, 99, 99, 255, 255, 255,
+        ];
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH4_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // user (25.5, 39.5): weights R 0.3434, G 0.3990, B 0.2576.
+        assert_near(px(&pix, 25, 60), [88, 102, 66, 255], 1, "first triangle");
+        // user (80.5, 29.5): weights R 0.1869, B 0.5152, W 0.2980.
+        assert_near(px(&pix, 80, 70), [124, 76, 207, 255], 1, "fan triangle");
+    }
+
+    #[test]
+    fn type5_lattice_triangulates_row_pairs() {
+        // A 2x2 lattice: rows (0,0)R (99,0)G and (0,99)B (99,99)W split
+        // into (V00,V01,V10) and (V01,V10,V11) per §8.7.4.5.6 — the same
+        // two triangles as the type 4 strip test, so the same pixels.
+        let data: [u8; 20] = [
+            0, 0, 255, 0, 0, //
+            99, 0, 0, 255, 0, //
+            0, 99, 0, 0, 255, //
+            99, 99, 255, 255, 255,
+        ];
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH5_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 60), [88, 66, 102, 255], 1, "upper-left half");
+        assert_near(
+            px(&pix, 75, 30),
+            [118, 194, 179, 255],
+            1,
+            "lower-right half",
+        );
+    }
+
+    #[test]
+    fn type6_straight_coons_patch_degenerates_to_bilinear() {
+        // A square patch with every control point at exact thirds of its
+        // straight edges: S(u,v) = (99u, 99v), so the corner colors blend
+        // bilinearly in user space — hand-computable at any pixel.
+        let pts = [
+            (0, 0),
+            (0, 33),
+            (0, 66),
+            (0, 99),
+            (33, 99),
+            (66, 99),
+            (99, 99),
+            (99, 66),
+            (99, 33),
+            (99, 0),
+            (66, 0),
+            (33, 0),
+        ];
+        let colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]];
+        let data = patch(0, &pts, &colors);
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH6_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // user (25.5, 74.5): u 0.2576, v 0.7525.
+        assert_near(px(&pix, 25, 25), [63, 159, 66, 255], 3, "upper left");
+        // user (75.5, 24.5): u 0.7626, v 0.2475.
+        assert_near(px(&pix, 75, 75), [192, 162, 195, 255], 3, "lower right");
+    }
+
+    #[test]
+    fn type7_tensor_patch_paints_like_the_matching_coons() {
+        // The same square with the four interior points given explicitly at
+        // their bilinear positions: identical surface, identical pixels.
+        let pts = [
+            (0, 0),
+            (0, 33),
+            (0, 66),
+            (0, 99),
+            (33, 99),
+            (66, 99),
+            (99, 99),
+            (99, 66),
+            (99, 33),
+            (99, 0),
+            (66, 0),
+            (33, 0),
+            (33, 33),
+            (33, 66),
+            (66, 66),
+            (66, 33),
+        ];
+        let colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]];
+        let data = patch(0, &pts, &colors);
+        let dict = "/ShadingType 7 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+             /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 255 0 255 0 1 0 1 0 1]";
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, dict, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 25), [63, 159, 66, 255], 3, "upper left");
+        assert_near(px(&pix, 75, 75), [192, 162, 195, 255], 3, "lower right");
+    }
+
+    #[test]
+    fn type6_flag2_reuses_the_previous_patch_edge() {
+        // Patch one covers x 0..48; a flag-2 patch shares its p7..p10 edge
+        // (x = 48) and covers x 48..96, inheriting c1 = previous c3 (blue)
+        // and c2 = previous c4 (white) — Table 85.
+        let first = patch(
+            0,
+            &[
+                (0, 0),
+                (0, 33),
+                (0, 66),
+                (0, 99),
+                (16, 99),
+                (32, 99),
+                (48, 99),
+                (48, 66),
+                (48, 33),
+                (48, 0),
+                (32, 0),
+                (16, 0),
+            ],
+            &[[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]],
+        );
+        let second = patch(
+            2,
+            &[
+                (64, 0),
+                (80, 0),
+                (96, 0),
+                (96, 33),
+                (96, 66),
+                (96, 99),
+                (80, 99),
+                (64, 99),
+            ],
+            &[[255, 0, 0], [0, 255, 0]],
+        );
+        let data = [first, second].concat();
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH6_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // First patch, user (24.5, 49.5): u 0.5104 along x/48, v 0.5.
+        assert_near(px(&pix, 24, 50), [128, 128, 130, 255], 3, "first patch");
+        // Second patch, user (72.5, 49.5): shared blue/white edge at x=48.
+        assert_near(px(&pix, 72, 50), [128, 128, 125, 255], 3, "second patch");
+    }
+
+    #[test]
+    fn type6_flag3_reuses_the_previous_patch_edge() {
+        // Patch one covers y 51..99; a flag-3 patch shares its p10..p1 edge
+        // (y = 51) and covers y 3..51, inheriting c1 = previous c4 (white)
+        // and c2 = previous c1 (red) — Table 85.
+        let first = patch(
+            0,
+            &[
+                (0, 51),
+                (0, 67),
+                (0, 83),
+                (0, 99),
+                (16, 99),
+                (32, 99),
+                (48, 99),
+                (48, 83),
+                (48, 67),
+                (48, 51),
+                (32, 51),
+                (16, 51),
+            ],
+            &[[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]],
+        );
+        let second = patch(
+            3,
+            &[
+                (0, 35),
+                (0, 19),
+                (0, 3),
+                (16, 3),
+                (32, 3),
+                (48, 3),
+                (48, 19),
+                (48, 35),
+            ],
+            &[[0, 255, 0], [0, 0, 255]],
+        );
+        let data = [first, second].concat();
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH6_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // First patch, user (24.5, 74.5): u 0.5104, v 0.4896.
+        assert_near(px(&pix, 24, 25), [130, 128, 130, 255], 3, "first patch");
+        // Second patch, user (24.5, 27.5): u 0.4896, v 0.4896 in its frame.
+        assert_near(px(&pix, 24, 72), [130, 128, 130, 255], 3, "second patch");
+    }
+
+    #[test]
+    fn truncated_mesh_paints_what_decoded() {
+        // The stream ends one byte into the fourth vertex: the complete
+        // first triangle paints, the partial record is dropped, and nothing
+        // is reported — the same leniency truncated images get.
+        let data: [u8; 22] = [
+            0, 0, 0, 255, 0, 0, //
+            0, 99, 0, 0, 255, 0, //
+            0, 0, 99, 0, 0, 255, //
+            1, 99, 99, 255,
+        ];
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, MESH4_DICT, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 25, 60), [88, 66, 102, 255], 1, "decoded triangle");
+        assert_eq!(px(&pix, 75, 30), WHITE, "truncated triangle absent");
+    }
+
+    #[test]
+    fn mesh_vertex_budget_reports_limit() {
+        // 70k one-byte vertices exceed the mesh budget: the shading drops
+        // with a report instead of decoding unbounded geometry.
+        let dict = "/ShadingType 5 /ColorSpace /DeviceGray /BitsPerCoordinate 1 \
+             /BitsPerComponent 1 /VerticesPerRow 2 /Decode [0 99 0 99 0 1]";
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, dict, &vec![0u8; 70_000]);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
+        let d = drops(&report);
+        assert_eq!(d.len(), 1, "one drop: {d:?}");
+        assert_eq!(d[0].0, SkippedKind::Shading);
+        assert!(
+            matches!(&d[0].1, SkipReason::DecodeFailed(m) if m.contains("mesh")),
+            "reason names the mesh budget: {:?}",
+            d[0].1
+        );
+    }
+
+    #[test]
+    fn type4_mesh_function_maps_vertex_t() {
+        // With /Function, each vertex carries one t instead of components:
+        // t=0 paints C0 red, t=1 paints C1 blue, blended across the face.
+        let dict = "/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
+             /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 255 0 255 0 1] \
+             /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>";
+        let data: [u8; 12] = [
+            0, 0, 0, 0, //
+            0, 99, 0, 255, //
+            0, 0, 99, 0,
+        ];
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.stream(5, dict, &data);
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        // user (25.5, 39.5): weight of the blue vertex is x/99 = 0.2576.
+        assert_near(px(&pix, 25, 60), [189, 0, 66, 255], 1, "blend of C0/C1");
+    }
+
+    #[test]
+    fn function_based_shading_paints_per_pixel() {
+        // Type 1: a 2-in calculator turns the x coordinate into a gray
+        // ramp over the whole /Domain square (§8.7.4.5.2).
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.object(
                 5,
-                "/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 \
-                     /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 1 0 1 0 1 0 1 0 1]",
-                &[0; 16],
+                "<< /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 100 0 100] \
+                 /Function 6 0 R >>",
+            );
+            b.stream(
+                6,
+                "/FunctionType 4 /Domain [0 100 0 100] /Range [0 1 0 1 0 1]",
+                b"{ pop 0.01 mul dup dup }",
             );
         });
         let (pix, report) = render_reporting(bytes);
-        assert_eq!(px(&pix, 50, 50), WHITE, "mesh shadings paint nothing");
-        assert_eq!(
-            drops(&report),
-            vec![(SkippedKind::Shading, SkipReason::Unsupported, 1)],
-        );
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_near(px(&pix, 30, 50), [78, 78, 78, 255], 1, "x = 30.5 gray");
+        assert_near(px(&pix, 80, 20), [205, 205, 205, 255], 1, "x = 80.5 gray");
+    }
+
+    #[test]
+    fn function_based_shading_clips_to_domain_and_matrix() {
+        // /Matrix maps the unit /Domain square onto x 0..50, y 0..100;
+        // points outside the transformed rectangle stay unpainted.
+        let bytes = small_doc("/Shading << /Sh0 5 0 R >>", b"/Sh0 sh", |b| {
+            b.object(
+                5,
+                "<< /ShadingType 1 /ColorSpace /DeviceRGB \
+                 /Matrix [50 0 0 100 0 0] /Function 6 0 R >>",
+            );
+            b.stream(
+                6,
+                "/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]",
+                b"{ pop pop 1 0 0 }",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "painted: {:?}", report.warnings());
+        assert_eq!(px(&pix, 25, 50), RED, "inside the mapped domain");
+        assert_eq!(px(&pix, 60, 50), WHITE, "outside the mapped domain");
+        assert_eq!(px(&pix, 75, 50), WHITE, "far outside");
     }
 
     #[test]
