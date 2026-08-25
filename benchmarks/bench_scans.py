@@ -313,8 +313,10 @@ def run_suite(
                 "libraries": libraries,
                 "refused": refused,
             }
-            with open(out, "w") as f:
+            tmp = f"{out}.tmp"
+            with open(tmp, "w") as f:
                 json.dump(results, f, indent=2)
+            os.replace(tmp, out)
             timed = ", ".join(
                 f"{name} {len(indices) / r['time']:.1f} p/s"
                 for name, r in sorted(libraries.items(), key=lambda kv: kv[1]["time"])
