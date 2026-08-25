@@ -1238,6 +1238,10 @@ name = "pdfboss-encoding"
 version = "0.17.1"
 
 [[package]]
+name = "pdfboss-icc"
+version = "0.17.1"
+
+[[package]]
 name = "pdfboss-jpx"
 version = "0.17.1"
 
