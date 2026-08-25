@@ -391,6 +391,16 @@ mod tests {
         assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
     }
 
+    /// An eight-point column gap on a page-wide stretch is real table
+    /// structure: exact interval lanes must keep resolving it where a
+    /// binned occupancy histogram rounded it away.
+    #[test]
+    fn a_narrow_column_gap_still_opens_a_lane() {
+        let md = markdown_of(&structure::tests::narrow_gap_lane_grid_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+    }
+
     /// Page-edge lines sharing the band with a grid leave as prose: the
     /// running header does not take the header row's place — which, being
     /// wide enough to cross every lane, would also flip the block to the HTML

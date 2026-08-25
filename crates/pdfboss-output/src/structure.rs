@@ -1971,6 +1971,7 @@ pub(crate) mod tests {
             two_column_content(25)
         ));
         contents.push(lane_grid_content());
+        contents.push(narrow_gap_lane_grid_content());
         contents.push(grid_with_edge_lines_content());
         contents.push(margin_number_grid_content());
         contents.push(ruled_grid_content());
@@ -2119,6 +2120,21 @@ pub(crate) mod tests {
         let mut content = String::from("BT /F1 10 Tf ");
         for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
             for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
+    }
+
+    /// [`lane_grid_content`]'s shape with the second lane squeezed to eight
+    /// points on a page-wide stretch: real structure, but under the ~two-bin
+    /// floor a 128-bin occupancy histogram could resolve at this width. Only
+    /// exact interval gaps keep it a lane.
+    pub(crate) fn narrow_gap_lane_grid_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 500.0), (2, 528.0)] {
                 content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
             }
         }
