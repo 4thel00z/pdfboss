@@ -1,0 +1,85 @@
+{
+  "corpus": "pdfs",
+  "ru_maxrss_normalization": "getrusage(RUSAGE_SELF).ru_maxrss read by the child itself; bytes on macOS, kilobytes elsewhere, normalized to bytes",
+  "caveat": "measured on a shared machine under concurrent load; peak RSS is mostly load-insensitive, but co-resident processes can shift numbers a few percent through allocator and page-cache pressure",
+  "workloads": {
+    "import": {
+      "libraries": {
+        "pdfboss": {
+          "peak_rss_bytes": 18235392,
+          "peak_rss_mib": 17.4
+        },
+        "PyMuPDF": {
+          "peak_rss_bytes": 52150272,
+          "peak_rss_mib": 49.7
+        },
+        "pypdfium2": {
+          "peak_rss_bytes": 30670848,
+          "peak_rss_mib": 29.2
+        },
+        "pdfplumber": {
+          "peak_rss_bytes": 36454400,
+          "peak_rss_mib": 34.8
+        }
+      }
+    },
+    "render": {
+      "file_bytes": 9678045,
+      "document_pages": 31,
+      "pages_rendered": 10,
+      "scale": 2.0,
+      "fonts": "full",
+      "libraries": {
+        "pdfboss": {
+          "peak_rss_bytes": 119914496,
+          "peak_rss_mib": 114.4,
+          "pages_failed": 0
+        },
+        "PyMuPDF": {
+          "peak_rss_bytes": 84803584,
+          "peak_rss_mib": 80.9,
+          "pages_failed": 0
+        },
+        "pypdfium2": {
+          "peak_rss_bytes": 96714752,
+          "peak_rss_mib": 92.2,
+          "pages_failed": 0
+        },
+        "pdfplumber": {
+          "peak_rss_bytes": 109936640,
+          "peak_rss_mib": 104.8,
+          "pages_failed": 0
+        }
+      }
+    },
+    "text": {
+      "files": 40,
+      "libraries": {
+        "pdfboss": {
+          "peak_rss_bytes": 51281920,
+          "peak_rss_mib": 48.9,
+          "text_chars": 2481771,
+          "files_failed": 0
+        },
+        "PyMuPDF": {
+          "peak_rss_bytes": 65306624,
+          "peak_rss_mib": 62.3,
+          "text_chars": 2473568,
+          "files_failed": 0
+        },
+        "pypdfium2": {
+          "peak_rss_bytes": 106708992,
+          "peak_rss_mib": 101.8,
+          "text_chars": 2334280,
+          "files_failed": 0
+        },
+        "pdfplumber": {
+          "peak_rss_bytes": 851378176,
+          "peak_rss_mib": 811.9,
+          "text_chars": 2259292,
+          "files_failed": 0
+        }
+      }
+    }
+  }
+}

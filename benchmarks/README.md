@@ -1,9 +1,9 @@
 # Benchmarks
 
-Four scripts, because opening, rendering, scanned PDFs and rendering
-*quality* are different workloads — plus two extraction-quality suites
-(`olmocr/`, `parsebench/`), because speed means nothing if the output is
-wrong.
+Six scripts, because opening, rendering, scanned PDFs, rendering *quality*,
+malformed PDFs and memory are different workloads — plus two
+extraction-quality suites (`olmocr/`, `parsebench/`), because speed means
+nothing if the output is wrong.
 
 `bench.py` compares pdfboss against other Python PDF libraries on the two
 operations they all produce comparable output for:
@@ -29,17 +29,30 @@ bench quantifies closeness to a reference rasterizer (pypdfium2) with windowed
 SSIM, and scores the other engines against the same reference so pdfboss lands
 in a field rather than being judged alone.
 
+`bench_robustness.py` turns the filtering around: instead of keeping only the
+files every engine handles, it feeds them fuzzer-minimized malformed PDFs and
+measures survival — page count, clean exception, crash, or hang. Every other
+benchmark here calls the engines in-process, where a segfault in a C engine
+kills the whole run; this one and `bench_memory.py` share a subprocess
+harness (`isolation.py`) that runs each measurement in a fresh interpreter
+precisely so a crash is a data point instead of a disaster.
+
+`bench_memory.py` measures peak RSS per engine on the same harness — one
+fresh process per (engine, workload), each reporting its own high-water mark,
+because a peak is meaningless once four engines have allocated in the same
+address space.
+
 ## Libraries
 
-| Library | Open | Text | Render | Scan | Fidelity | Notes |
-|---|:-:|:-:|:-:|:-:|:-:|---|
-| pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
-| PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
-| pypdf | ✓ | ✓ | | | | pure Python; no rasterizer |
-| pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
-| pypdfium2 | | | ✓ | ✓ | ref | pdfium bindings; no text API used here |
-| pdfminer.six | | ✓ | | | | pure Python |
-| pikepdf | ✓ | | | | | qpdf bindings; no text API |
+| Library | Open | Text | Render | Scan | Fidelity | Robustness | Memory | Notes |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|
+| pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
+| PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
+| pypdf | ✓ | ✓ | | | | | | pure Python; no rasterizer |
+| pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
+| pypdfium2 | | | ✓ | ✓ | ref | ✓ | ✓ | pdfium bindings; text API used by bench_memory.py |
+| pdfminer.six | | ✓ | | | | | | pure Python |
+| pikepdf | ✓ | | | | | | | qpdf bindings; no text API |
 
 ## Method
 
@@ -130,6 +143,60 @@ in a field rather than being judged alone.
   other engines' rows: it disagrees with pdfium about as much as pdfium-based
   and independent C pipelines disagree among themselves.
 
+## Method — robustness
+
+- The corpus is malformed by construction: the OSS-Fuzz **public corpora** for
+  `mupdf_pdf_fuzzer` and `poppler_pdf_fuzzer` (~230 MB, tens of thousands of
+  hash-named seeds each), downloaded by `fetch_stress_corpus.sh` into a
+  directory **outside the repo** — fuzzer-minimized inputs are fine to fetch
+  and use locally, and are never committed or redistributed from here.
+- Provenance, for fairness: the seeds were minimized against two specific C
+  engines (MuPDF and Poppler), and one tested library binds one of them. That
+  does not materially bias the comparison — a malformed file is malformed for
+  every parser, and the metric is process survival, not output fidelity — but
+  it is the corpus's origin and belongs in the open.
+- **Isolation** — every (file, engine) pair runs in a fresh interpreter (the
+  script re-runs itself in worker mode via `isolation.py`), because two of the
+  engines are in-process C libraries whose segfaults cannot be caught. Each
+  worker runs two stages, **parse** (open + page count) then **render** (first
+  page to pixels), printing a flushed stage marker before each so a dead
+  process is attributed to the stage that was running.
+- **Classification** — per stage: `ok`, `error` (a clean Python exception),
+  `crash` (signal, nonzero exit, or exit without a result — which is what a
+  swallowed `SystemExit` looks like from outside), `timeout` (wall-clock
+  `--timeout`, default 20 s, then SIGKILL). The headline is the **survival
+  rate**: the share of files an engine processed with no crash and no timeout.
+- A deterministic, evenly-spaced sample of the sorted corpus (`--sample`,
+  default 2000). Counts and rates are load-insensitive except right at the
+  timeout threshold, and 20 s is orders of magnitude above a typical parse of
+  these mostly tiny seeds.
+- Read the survival rate next to the per-stage `ok` counts: an engine that
+  cleanly refuses most malformed files exercises far less of its own code than
+  one that parses and renders them, so a high survival rate on few accepted
+  files is a weaker statement than the same rate on many.
+
+## Method — memory
+
+- Peak RSS per engine, one **fresh subprocess per (engine, workload)** on the
+  same `isolation.py` harness, so no engine's allocations sit inside another's
+  peak. The child measures itself with
+  `resource.getrusage(RUSAGE_SELF).ru_maxrss` just before exiting — macOS
+  reports that in **bytes**, Linux in **kilobytes**, and the worker normalizes
+  to bytes so results compare across platforms.
+- Three workloads: **import** (import the engine and stop — the floor under
+  the other two numbers, since every peak includes the interpreter and the
+  engine's own libraries), **render** (the corpus's largest file, `--pages`
+  evenly spaced pages to PNG bytes at `--scale`, default 10 pages at 2.0), and
+  **text** (every page of the `--sample` evenly spaced corpus files, default
+  40, accumulating string lengths only so no side carries a giant joined
+  string).
+- pdfboss renders at `fonts=full`, so its substitute-face loading — work the
+  other engines also do, with their own faces — is inside its measured
+  footprint.
+- Peak RSS is mostly load-insensitive, but the published numbers were measured
+  on a shared machine under concurrent load; co-resident processes can shift
+  them a few percent through allocator and page-cache pressure.
+
 ## Running
 
 ```bash
@@ -140,15 +207,21 @@ python benchmarks/bench.py          /path/to/pdfs --sample 40 --repeat 3
 python benchmarks/bench_render.py   /path/to/pdfs --sample 40 --repeat 3
 python benchmarks/bench_scans.py    /path/to/scan.pdf --pages 100 --repeat 3
 python benchmarks/bench_fidelity.py /path/to/pdfs --sample 40
+
+benchmarks/fetch_stress_corpus.sh /outside/repo/stress-corpus   # ~460 MB once
+python benchmarks/bench_robustness.py /outside/repo/stress-corpus --sample 2000
+python benchmarks/bench_memory.py     /path/to/pdfs --sample 40 --pages 10 --scale 2.0
 ```
 
 `bench.py` writes `results.json` (raw numbers) and `results.png` (the chart
 shown in the top-level README); `bench_render.py` writes
 `results-render.json`; `bench_scans.py` writes `results-scans.json`;
-`bench_fidelity.py` writes `results-fidelity.json`.
-The datasets are local corpora of real-world PDFs and are not committed —
-the results record corpus shape and score distributions, never file names
-(`bench_scans.py` records the document's page count and geometry).
+`bench_fidelity.py` writes `results-fidelity.json`; `bench_robustness.py`
+writes `results-robustness.json`; `bench_memory.py` writes
+`results-memory.json`. The real-world corpora are local and not committed —
+those results record corpus shape, page counts, sizes and score
+distributions, never file names. The stress corpus is public (OSS-Fuzz) and
+its results name it, but it stays outside the repo too.
 
 ## olmOCR-bench
 
