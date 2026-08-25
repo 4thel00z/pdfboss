@@ -44,7 +44,10 @@ def rss_bytes() -> int:
 
 
 def spread(count: int, limit: int) -> list[int]:
-    """Evenly spaced indices across `count`, at most `limit` of them."""
+    """Evenly spaced indices across `count`, at most `limit` of them.
+
+    If *limit* is <= 0 or >= *count* all indices are returned (no limit).
+    """
     if limit <= 0 or limit >= count:
         return list(range(count))
     step = count / limit
@@ -259,6 +262,30 @@ def largest_file(corpus: str) -> str:
     return max(files, key=os.path.getsize)
 
 
+def page_count_of(path: str, engine: str) -> int:
+    """Return the page count of *path* using *engine* (must be importable)."""
+    module, _, _ = ENGINES[engine]
+    lib = importlib.import_module(module)
+    if engine == "pdfboss":
+        return lib.Document(path).page_count
+    if engine == "PyMuPDF":
+        doc = lib.open(path)
+        try:
+            return doc.page_count
+        finally:
+            doc.close()
+    if engine == "pypdfium2":
+        doc = lib.PdfDocument(path)
+        try:
+            return len(doc)
+        finally:
+            doc.close()
+    if engine == "pdfplumber":
+        with lib.open(path) as doc:
+            return len(doc.pages)
+    raise ValueError(f"unknown engine: {engine}")
+
+
 def run(
     corpus: str,
     sample_n: int,
@@ -271,9 +298,7 @@ def run(
     if not engines:
         raise SystemExit("no engine is importable; nothing to measure")
     big = largest_file(corpus)
-    import pdfboss
-
-    big_pages = pdfboss.Document(big).page_count
+    big_pages = page_count_of(big, engines[0])
     big_bytes = os.path.getsize(big)
     rendered = len(spread(big_pages, pages))
     files = sample_files(corpus, sample_n)
