@@ -72,8 +72,28 @@ pub(crate) trait SubstituteProvider: Send + Sync {
 /// `/FontDescriptor /Flags` bits consulted here (ISO 32000-1 Table 121).
 const FLAG_FIXED_PITCH: i64 = 0x1;
 const FLAG_SERIF: i64 = 0x2;
+const FLAG_NONSYMBOLIC: i64 = 0x20;
 const FLAG_ITALIC: i64 = 0x40;
 const FLAG_FORCE_BOLD: i64 = 0x40000;
+
+/// Whether `font`'s descriptor declares the Nonsymbolic flag (ISO 32000-1
+/// Table 121): the font uses the Adobe standard Latin character set. An
+/// absent descriptor or absent `/Flags` reads as `false` -- unknown is
+/// never nonsymbolic.
+pub(crate) async fn nonsymbolic<S: AsyncObjectSource>(src: &S, font: &Dict) -> bool {
+    let Some(obj) = font.get("FontDescriptor") else {
+        return false;
+    };
+    let Some(descriptor) = src
+        .resolve(obj)
+        .await
+        .ok()
+        .and_then(|o| o.as_dict().cloned())
+    else {
+        return false;
+    };
+    descriptor.get_int("Flags").unwrap_or(0) & FLAG_NONSYMBOLIC != 0
+}
 
 /// Strips a subset prefix (`ABCDEF+Name` -> `Name`, ISO 32000-1 9.6.4): six
 /// uppercase ASCII letters followed by `+`. Names that don't match this exact

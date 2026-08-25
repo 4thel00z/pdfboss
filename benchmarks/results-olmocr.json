@@ -1,0 +1,30 @@
+{
+  "dataset": "allenai/olmOCR-bench",
+  "scorer": "olmocr.bench.benchmark (github.com/allenai/olmocr@f7cfe4c, 2026-08-25)",
+  "pdfboss": "0.17.1",
+  "protocol": "full 8-bucket run, markdown extraction, one repeat (deterministic)",
+  "pdfs": 1403,
+  "overall_macro": 0.258,
+  "overall_ci95": 0.009,
+  "born_digital_macro": 0.428,
+  "born_digital_buckets": ["baseline", "table_tests", "multi_column", "headers_footers"],
+  "buckets": {
+    "baseline": {"passed": 1217, "total": 1394, "rate": 0.873},
+    "table_tests": {"passed": 307, "total": 1022, "rate": 0.300},
+    "headers_footers": {"passed": 266, "total": 760, "rate": 0.350},
+    "multi_column": {"passed": 167, "total": 884, "rate": 0.189},
+    "long_tiny_text": {"passed": 98, "total": 442, "rate": 0.222},
+    "old_scans": {"passed": 70, "total": 526, "rate": 0.133},
+    "old_scans_math": {"passed": 0, "total": 458, "rate": 0.0},
+    "arxiv_math": {"passed": 0, "total": 2927, "rate": 0.0}
+  },
+  "text_layer_census_empty_of_total": {
+    "arxiv_math": [0, 522],
+    "headers_footers": [13, 266],
+    "long_tiny_text": [23, 62],
+    "multi_column": [11, 231],
+    "old_scans": [98, 98],
+    "old_scans_math": [21, 36],
+    "tables": [12, 188]
+  }
+}
