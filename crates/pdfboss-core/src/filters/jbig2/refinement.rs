@@ -9,16 +9,17 @@
 //! Two templates exist (6.3.5.3): template 0 gathers thirteen pixels and has
 //! two adaptive pixels, template 1 gathers ten and has none.
 //!
-//! The refinement region segment of 7.4.7 reaches this, and so does the text
-//! region symbol refinement of 6.4.11. The remaining caller the standard
-//! defines — the refinement/aggregate symbol coding of 6.5.8.2 — still refuses
-//! its streams, and is wired up in turn.
+//! The refinement region segment of 7.4.7 reaches this, and so do the text
+//! region symbol refinement of 6.4.11 and the refinement/aggregate symbol
+//! coding of a symbol dictionary (6.5.8.2) — every caller the standard
+//! defines.
 
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 #[cfg(test)]
 use super::mq::{encoder::MqEncoder, MqContext};
 use super::mq::{MqContexts, MqDecoder};
+use super::reader::Reader;
 use super::Jbig2Error;
 
 /// Contexts the refinement templates address, one per value of the widest
@@ -166,6 +167,37 @@ impl RefinementParams {
             tpgron: false,
         }
     }
+}
+
+/// Reads a refinement AT pixel field — SBRATX1 to SBRATY2 of T.88 7.4.3.1.3,
+/// or SDRATX1 to SDRATY2 of 7.4.2.1.3, one signed byte each — and folds it,
+/// with the template bit, into this procedure's parameters.
+///
+/// Template 1 has no adaptive pixels, so both clauses omit the field for it
+/// and the nominal offsets stand in for values nothing will read. TPGRON is 0
+/// for every embedded refinement — Tables 12 and 18 both fix it — which is why
+/// it is not a parameter here; the refinement region segment of 7.4.7 carries
+/// its own flag and parses its own field.
+pub(crate) fn parse_refinement_at(
+    r: &mut Reader<'_>,
+    template_1: bool,
+) -> Result<RefinementParams, Jbig2Error> {
+    if template_1 {
+        return Ok(RefinementParams {
+            template: 1,
+            at: NOMINAL_AT,
+            tpgron: false,
+        });
+    }
+    let mut at = NOMINAL_AT;
+    for pixel in &mut at {
+        *pixel = (r.u8()? as i8, r.u8()? as i8);
+    }
+    Ok(RefinementParams {
+        template: 0,
+        at,
+        tpgron: false,
+    })
 }
 
 /// Decodes a refinement region against `reference` (T.88 6.3.5.6).

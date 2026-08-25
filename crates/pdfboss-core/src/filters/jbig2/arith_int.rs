@@ -360,8 +360,7 @@ pub(crate) struct IntCtxSet {
     pub(crate) iadw: IntCtx,
     /// `IAEX`: length of an export or non-export run.
     pub(crate) iaex: IntCtx,
-    /// `IAAI`: number of symbol instances in an aggregate.
-    #[allow(dead_code)] // Read once aggregate symbol coding is decoded (6.5.8.2).
+    /// `IAAI`: number of symbol instances in an aggregate (6.5.8.2.1).
     pub(crate) iaai: IntCtx,
     /// `IADT`: strip coordinate delta of a text region.
     pub(crate) iadt: IntCtx,

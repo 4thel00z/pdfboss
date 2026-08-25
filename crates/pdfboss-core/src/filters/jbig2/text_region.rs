@@ -38,6 +38,12 @@
 //! region's one codeword; the Huffman variant carries each refinement as a
 //! byte-counted arithmetic codeword of its own, byte-aligned within the
 //! segment's bit stream.
+//!
+//! The walk serves one caller besides the text region segment: a
+//! refinement/aggregate symbol dictionary decodes a many-instance symbol as a
+//! text region nested in its own stream (6.5.8.2, Table 17), entering through
+//! [`decode_aggregate_region`] with the dictionary's decoder and contexts
+//! borrowed rather than fresh.
 
 use super::arith_int::{decode_iaid, decode_int, IaidCtx, IntCtxSet};
 use super::bitmap::{Bitmap, CombOp};
@@ -46,7 +52,7 @@ use super::huffman::{from_code_lengths, read_bits, standard, take_custom, Table,
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
 use super::refinement::{
-    decode_refinement_region, Reference, RefinementParams, GR_CONTEXT_LEN, NOMINAL_AT,
+    decode_refinement_region, parse_refinement_at, Reference, RefinementParams, GR_CONTEXT_LEN,
 };
 use super::segment::{parse_region_info, RegionInfo};
 use super::Jbig2Error;
@@ -190,31 +196,37 @@ pub(crate) fn decode_text_region(
         .map_err(|_| Jbig2Error::Malformed("symbol count exceeds the limit"))?;
 
     budget.charge_region(info.width, info.height)?;
-    let mut region = Bitmap::filled(info.width, info.height, params.def_pixel)?;
+    let mut region = Bitmap::filled(info.width, info.height, params.walk.def_pixel)?;
 
     // The GR statistics adapt across every refinement of the region and are
     // allocated only when the region can code one; the placeholder entry a
     // refinement-free region carries instead is what `MqContexts` makes of a
     // zero length.
-    let gr_len = if params.refinement.is_some() {
+    let gr_len = if params.walk.refinement.is_some() {
         GR_CONTEXT_LEN
     } else {
         0
     };
     match &params.coding {
-        Coding::Arithmetic => Walk {
-            values: Arithmetic {
-                dec: MqDecoder::new(r.rest()),
-                ints: IntCtxSet::new(),
-                iaid: IaidCtx::new(sym_code_len(num_syms)),
-                gr: MqContexts::new(gr_len),
-            },
-            region: &mut region,
-            symbols,
-            params: &params,
-            budget,
+        Coding::Arithmetic => {
+            let mut dec = MqDecoder::new(r.rest());
+            let mut ints = IntCtxSet::new();
+            let mut iaid = IaidCtx::new(sym_code_len(num_syms));
+            let mut gr = MqContexts::new(gr_len);
+            Walk {
+                values: Arithmetic {
+                    dec: &mut dec,
+                    ints: &mut ints,
+                    iaid: &mut iaid,
+                    gr: &mut gr,
+                },
+                region: &mut region,
+                symbols: Symbols::concat(symbols, &[]),
+                params: &params.walk,
+                budget,
+            }
+            .run()?
         }
-        .run()?,
         Coding::Huffman(tables) => {
             // 7.4.3.1.5: the last field of the segment's data header, and the
             // only one whose size depends on something outside the segment —
@@ -223,17 +235,18 @@ pub(crate) fn decode_text_region(
             // it, which is what step 6's byte alignment exists to settle.
             let mut bits = BitReader::new(r.rest());
             let codes = decode_symbol_id_codes(&mut bits, num_syms, budget)?;
+            let mut gr = MqContexts::new(gr_len);
             Walk {
                 values: Huffman {
-                    bits,
+                    bits: &mut bits,
                     tables,
-                    codes,
+                    codes: SymbolCodes::Assigned(Box::new(codes)),
                     log_strips: params.log_strips,
-                    gr: MqContexts::new(gr_len),
+                    gr: &mut gr,
                 },
                 region: &mut region,
-                symbols,
-                params: &params,
+                symbols: Symbols::concat(symbols, &[]),
+                params: &params.walk,
                 budget,
             }
             .run()?;
@@ -242,16 +255,144 @@ pub(crate) fn decode_text_region(
     Ok((info, region))
 }
 
+/// The decoding state a symbol dictionary shares with the nested text region
+/// of T.88 6.5.8.2 step 2.
+///
+/// The nested region has no coded data of its own: its values continue in the
+/// dictionary's stream, read with the statistics already adapted there —
+/// 7.4.2.2 resets the integer contexts once per segment, E.3.7 the bitmap ones
+/// — so everything here is borrowed from the enclosing decode rather than
+/// created for the nested one. A fresh context set would decode the first
+/// aggregate and desynchronise every value after it.
+pub(crate) enum AggregateSource<'a, 'd> {
+    /// SDHUFF = 0: the dictionary's one arithmetic decoder and its contexts.
+    /// `iaid` is sized by 6.5.8.2.3's SBSYMCODELEN, which the dictionary fixed
+    /// from its total symbol count so that it never changes mid-decode.
+    Arithmetic {
+        dec: &'a mut MqDecoder<'d>,
+        ints: &'a mut IntCtxSet,
+        iaid: &'a mut IaidCtx,
+        gr: &'a mut MqContexts,
+    },
+    /// SDHUFF = 1: the dictionary's bit cursor, the shared GR statistics its
+    /// refinement codewords adapt, and the equal-length symbol ID code width
+    /// of 6.5.8.2.3.
+    Huffman {
+        bits: &'a mut BitReader<'d>,
+        gr: &'a mut MqContexts,
+        code_len: u32,
+    },
+}
+
+/// Decodes one refinement/aggregate symbol bitmap as the nested text region of
+/// T.88 6.5.8.2 step 2, with the parameters Table 17 fixes.
+///
+/// `symbols` is SBSYMS per 6.5.8.2.4 — the dictionary's input symbols followed
+/// by the new ones decoded so far — and `instances` is REFAGGNINST, which step
+/// 2 has already found to be greater than one. The bitmap is charged from its
+/// declared dimensions before it is allocated, exactly as a stand-alone region
+/// is; each placement then pays [`INSTANCE_COST`] and its own pixels as the
+/// walk reaches it, so a large instance count buys nothing the budget does not
+/// see.
+pub(crate) fn decode_aggregate_region(
+    source: AggregateSource<'_, '_>,
+    symbols: Symbols<'_>,
+    width: u32,
+    height: u32,
+    instances: u32,
+    refinement: RefinementParams,
+    budget: &mut Budget,
+) -> Result<Bitmap, Jbig2Error> {
+    if symbols.is_empty() {
+        return Err(Jbig2Error::Malformed("text region with no symbols"));
+    }
+    if instances > MAX_INSTANCES {
+        return Err(Jbig2Error::Malformed("instance count exceeds the limit"));
+    }
+    let params = WalkParams::aggregate(instances, refinement);
+    budget.charge_region(width, height)?;
+    let mut region = Bitmap::filled(width, height, params.def_pixel)?;
+    match source {
+        AggregateSource::Arithmetic {
+            dec,
+            ints,
+            iaid,
+            gr,
+        } => Walk {
+            values: Arithmetic {
+                dec,
+                ints,
+                iaid,
+                gr,
+            },
+            region: &mut region,
+            symbols,
+            params: &params,
+            budget,
+        }
+        .run()?,
+        AggregateSource::Huffman { bits, gr, code_len } => {
+            let tables = aggregate_tables()?;
+            Walk {
+                values: Huffman {
+                    bits,
+                    tables: &tables,
+                    codes: SymbolCodes::EqualLength(code_len),
+                    log_strips: 0,
+                    gr,
+                },
+                region: &mut region,
+                symbols,
+                params: &params,
+                budget,
+            }
+            .run()?
+        }
+    }
+    Ok(region)
+}
+
+/// The Huffman tables Table 17 fixes for a nested text region: B.6, B.8 and
+/// B.11 for the walk, B.15 for all four refinement deltas and B.1 for a
+/// refinement codeword's byte count. Nothing selects here — a nested region
+/// has no header to select with.
+fn aggregate_tables() -> Result<TextTables, Jbig2Error> {
+    Ok(TextTables {
+        fs: standard(6)?,
+        ds: standard(8)?,
+        dt: standard(11)?,
+        refine: Some(RefineTables {
+            rdw: standard(15)?,
+            rdh: standard(15)?,
+            rdx: standard(15)?,
+            rdy: standard(15)?,
+            rsize: standard(1)?,
+        }),
+    })
+}
+
 /// The fields of a text region segment that precede its coded data
 /// (T.88 7.4.3.1).
 struct TextParams {
     /// SBHUFF, and with it whatever the chosen coding needs in order to read
     /// the values that follow.
     coding: Coding,
-    /// LOGSBSTRIPS. Kept alongside [`TextParams::strips`], which is `1` shifted
+    /// LOGSBSTRIPS. Kept alongside [`WalkParams::strips`], which is `1` shifted
     /// by it, because a Huffman region reads the T coordinate within a strip as
     /// exactly this many raw bits (6.4.9).
     log_strips: u8,
+    /// The parameters the strip walk of 6.4.5 reads.
+    walk: WalkParams,
+}
+
+/// The parameters of the text region decoding procedure itself (T.88 6.4.2),
+/// as the strip walk reads them.
+///
+/// Split from [`TextParams`] because the procedure has two callers with two
+/// sources for these values: a text region segment reads them from its own
+/// header (7.4.3.1), and the nested region of a refinement/aggregate symbol
+/// dictionary is handed the fixed set of Table 17 with no header at all.
+struct WalkParams {
     /// SBSTRIPS, the number of rows one strip spans: `1 << LOGSBSTRIPS`, so 1,
     /// 2, 4 or 8.
     strips: i32,
@@ -271,6 +412,62 @@ struct TextParams {
     /// parameters 6.4.11 hands to the refinement procedure. `None` when the
     /// region codes no refinement flag at all — Table 12 fixes TPGRON at 0.
     refinement: Option<RefinementParams>,
+}
+
+impl WalkParams {
+    /// The values Table 17 fixes for the nested text region of 6.5.8.2 step 2:
+    /// one-row strips, TOPLEFT corners, no transposition, OR compositing, a 0
+    /// default pixel and no gap offset — and SBREFINE is 1, with the
+    /// dictionary's own refinement template and AT pixels.
+    fn aggregate(instances: u32, refinement: RefinementParams) -> WalkParams {
+        WalkParams {
+            strips: 1,
+            corner: RefCorner::TopLeft,
+            transposed: false,
+            comb_op: CombOp::Or,
+            def_pixel: 0,
+            ds_offset: 0,
+            instances,
+            refinement: Some(refinement),
+        }
+    }
+}
+
+/// The symbols a text region's coded ids index — SBSYMS of T.88 6.4.2.
+///
+/// A stand-alone region gets them as one list, the concatenated exports of its
+/// referred-to dictionaries. The nested region of 6.5.8.2 indexes the symbols
+/// its dictionary knows *so far* — the input symbols and the new ones already
+/// decoded (6.5.8.2.4) — and those cannot be one slice, because the second
+/// list is still being built while the first is borrowed. Two slices behind
+/// one lookup keep that concatenation a view rather than a copy made afresh
+/// for every aggregate symbol.
+#[derive(Clone, Copy)]
+pub(crate) struct Symbols<'a> {
+    /// The referred-to exports, or SDINSYMS for a nested region.
+    inputs: &'a [&'a Bitmap],
+    /// The enclosing dictionary's SDNEWSYMS decoded so far; empty for a
+    /// stand-alone region.
+    new: &'a [Bitmap],
+}
+
+impl<'a> Symbols<'a> {
+    /// The two lists as one, ids running over `inputs` first.
+    pub(crate) fn concat(inputs: &'a [&'a Bitmap], new: &'a [Bitmap]) -> Symbols<'a> {
+        Symbols { inputs, new }
+    }
+
+    /// The symbol a coded id names, or `None` for an id past both lists.
+    pub(crate) fn get(&self, id: usize) -> Option<&'a Bitmap> {
+        if id < self.inputs.len() {
+            return Some(self.inputs[id]);
+        }
+        self.new.get(id - self.inputs.len())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inputs.is_empty() && self.new.is_empty()
+    }
 }
 
 /// How a text region's values are coded (T.88 7.4.3.1.1, bit 0).
@@ -373,8 +570,10 @@ fn parse_params(
     // 15, which belongs to SBRTEMPLATE.
     let raw = i32::from((flags >> 10) & 0x1F);
     let ds_offset = if raw > 15 { raw - 32 } else { raw };
+    // 7.4.3.1.3: the refinement AT pixels, present only when SBREFINE is 1 and
+    // SBRTEMPLATE — bit 15 — is 0.
     let refinement = if refine {
-        Some(parse_refinement_params(r, flags & 0x8000 != 0)?)
+        Some(parse_refinement_at(r, flags & 0x8000 != 0)?)
     } else {
         None
     };
@@ -386,42 +585,16 @@ fn parse_params(
     Ok(TextParams {
         coding,
         log_strips,
-        strips,
-        corner,
-        transposed,
-        comb_op,
-        def_pixel,
-        ds_offset,
-        instances,
-        refinement,
-    })
-}
-
-/// Reads the refinement AT pixels of T.88 7.4.3.1.3 — SBRATX1, SBRATY1,
-/// SBRATX2, SBRATY2, one signed byte each — and folds them, with the template
-/// bit, into the parameters of 6.4.11's Table 12.
-///
-/// Template 1 has no adaptive pixels, so the field is absent for it and the
-/// nominal offsets stand in for values nothing will read.
-fn parse_refinement_params(
-    r: &mut Reader<'_>,
-    template_1: bool,
-) -> Result<RefinementParams, Jbig2Error> {
-    if template_1 {
-        return Ok(RefinementParams {
-            template: 1,
-            at: NOMINAL_AT,
-            tpgron: false,
-        });
-    }
-    let mut at = NOMINAL_AT;
-    for pixel in &mut at {
-        *pixel = (r.u8()? as i8, r.u8()? as i8);
-    }
-    Ok(RefinementParams {
-        template: 0,
-        at,
-        tpgron: false,
+        walk: WalkParams {
+            strips,
+            corner,
+            transposed,
+            comb_op,
+            def_pixel,
+            ds_offset,
+            instances,
+            refinement,
+        },
     })
 }
 
@@ -723,56 +896,61 @@ trait Values {
 
 /// The arithmetic value source: the integer procedures of Annex A, all drawing
 /// on one decoder and each adapting its own contexts across the whole region.
-struct Arithmetic<'d> {
+///
+/// Everything here is borrowed rather than owned because the region is not
+/// always the whole segment: a stand-alone text region makes these for itself,
+/// but the nested region of 6.5.8.2 reads the enclosing symbol dictionary's
+/// decoder and contexts, mid-stream and mid-adaptation.
+struct Arithmetic<'a, 'd> {
     /// The one arithmetic decoder every coded value of the region comes from.
-    dec: MqDecoder<'d>,
-    /// The integer procedures of Annex A, adapting across the whole region.
-    ints: IntCtxSet,
+    dec: &'a mut MqDecoder<'d>,
+    /// The integer procedures of Annex A, adapting across the whole segment.
+    ints: &'a mut IntCtxSet,
     /// The symbol ID procedure of A.3, sized by SBSYMCODELEN.
-    iaid: IaidCtx,
-    /// The GR statistics every refinement of the region adapts.
-    gr: MqContexts,
+    iaid: &'a mut IaidCtx,
+    /// The GR statistics every refinement of the segment adapts.
+    gr: &'a mut MqContexts,
 }
 
-impl Values for Arithmetic<'_> {
+impl Values for Arithmetic<'_, '_> {
     fn delta_t(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iadt))
+        Ok(decode_int(self.dec, &mut self.ints.iadt))
     }
 
     fn first_s(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iafs))
+        Ok(decode_int(self.dec, &mut self.ints.iafs))
     }
 
     fn delta_s(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iads))
+        Ok(decode_int(self.dec, &mut self.ints.iads))
     }
 
     fn curt(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iait))
+        Ok(decode_int(self.dec, &mut self.ints.iait))
     }
 
     fn symbol_id(&mut self) -> Result<u32, Jbig2Error> {
-        Ok(decode_iaid(&mut self.dec, &mut self.iaid))
+        Ok(decode_iaid(self.dec, self.iaid))
     }
 
     fn refine_flag(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iari))
+        Ok(decode_int(self.dec, &mut self.ints.iari))
     }
 
     fn rdw(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iardw))
+        Ok(decode_int(self.dec, &mut self.ints.iardw))
     }
 
     fn rdh(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iardh))
+        Ok(decode_int(self.dec, &mut self.ints.iardh))
     }
 
     fn rdx(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iardx))
+        Ok(decode_int(self.dec, &mut self.ints.iardx))
     }
 
     fn rdy(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        Ok(decode_int(&mut self.dec, &mut self.ints.iardy))
+        Ok(decode_int(self.dec, &mut self.ints.iardy))
     }
 
     fn refine(
@@ -785,94 +963,111 @@ impl Values for Arithmetic<'_> {
     ) -> Result<Bitmap, Jbig2Error> {
         // 6.4.11 step 6: the pixel decisions follow the deltas in the
         // region's one codeword — nothing marks where they begin or end.
-        decode_refinement_region(
-            &mut self.dec,
-            &mut self.gr,
-            budget,
-            width,
-            height,
-            reference,
-            params,
-        )
+        decode_refinement_region(self.dec, self.gr, budget, width, height, reference, params)
     }
 }
 
-/// The Huffman value source: three selected tables, the symbol ID table the
-/// segment carried, and one bit cursor they all share.
+/// How a Huffman text region's symbol ids are coded (T.88 6.4.10).
+enum SymbolCodes {
+    /// SBSYMCODES as a stand-alone segment carries it (7.4.3.1.7): a table
+    /// whose lines decode to the index of the symbol they name. Boxed for the
+    /// reason the segment's other tables are — a table is most of a kilobyte,
+    /// which the nested variant below would otherwise carry as its size.
+    Assigned(Box<Table>),
+    /// SBSYMCODES as 6.5.8.2.3 fixes it for a nested region: every symbol's
+    /// code is its own index in this many bits, so reading them *is* the
+    /// decode and no table need be built over a list that grows with every
+    /// symbol the dictionary finishes.
+    EqualLength(u32),
+}
+
+/// The Huffman value source: three selected tables, the symbol ID coding, and
+/// one bit cursor they all share.
 ///
 /// Running out of bits is [`Jbig2Error::Truncated`] here, where the arithmetic
 /// source above synthesises bits forever and settles into returning OOB (T.88
 /// E.3.4). The walk is written for the latter — its strip loop treats an OOB as
 /// the end of a strip — so the difference matters: a truncated Huffman region
 /// fails instead of decoding to a plausible short one.
+///
+/// The cursor and the GR statistics are borrowed for the reason the arithmetic
+/// source's are: a nested region continues in its dictionary's bit stream and
+/// adapts the refinement statistics the dictionary's other symbols share.
 struct Huffman<'a, 'd> {
     /// The cursor over the region's coded data, positioned by 7.4.3.1.7 step 6
     /// at the byte boundary the walk begins on.
-    bits: BitReader<'d>,
+    bits: &'a mut BitReader<'d>,
     /// SBHUFFFS, SBHUFFDS and SBHUFFDT, as 7.4.3.1.6 bound them.
     tables: &'a TextTables,
-    /// SBSYMCODES, the symbol ID table of 7.4.3.1.7, whose lines decode to the
-    /// index of the symbol they name.
-    codes: Table,
+    /// SBSYMCODES, however this region came by it.
+    codes: SymbolCodes,
     /// LOGSBSTRIPS: how many bits an instance's T coordinate occupies (6.4.9).
     log_strips: u8,
-    /// The GR statistics every refinement of the region adapts — shared
+    /// The GR statistics every refinement of the segment adapts — shared
     /// across the refinements' separate codewords, since E.3.7 resets
     /// statistics per segment.
-    gr: MqContexts,
+    gr: &'a mut MqContexts,
 }
 
 impl Values for Huffman<'_, '_> {
     fn delta_t(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.tables.dt.decode(&mut self.bits)
+        self.tables.dt.decode(self.bits)
     }
 
     fn first_s(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.tables.fs.decode(&mut self.bits)
+        self.tables.fs.decode(self.bits)
     }
 
     fn delta_s(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.tables.ds.decode(&mut self.bits)
+        self.tables.ds.decode(self.bits)
     }
 
     fn curt(&mut self) -> Result<Option<i32>, Jbig2Error> {
         // 6.4.9: read directly from the bitstream, through no table at all.
         // LOGSBSTRIPS is at most 3, so the value is at most 7.
-        let value = read_bits(&mut self.bits, self.log_strips)?;
+        let value = read_bits(self.bits, self.log_strips)?;
         Ok(Some(value as i32))
     }
 
     fn symbol_id(&mut self) -> Result<u32, Jbig2Error> {
-        // 6.4.10: bits are read until they spell one of the entries of
-        // SBSYMCODES, and the value is that entry's index. `codes` carries the
-        // index as the line's value, so the matcher of B.4 answers directly.
-        let id = self
-            .codes
-            .decode(&mut self.bits)?
-            .ok_or(Jbig2Error::Malformed("unexpected OOB decoding a symbol id"))?;
-        u32::try_from(id).map_err(|_| Jbig2Error::Malformed("symbol id out of range"))
+        match &self.codes {
+            // 6.4.10: bits are read until they spell one of the entries of
+            // SBSYMCODES, and the value is that entry's index. The table
+            // carries the index as the line's value, so the matcher of B.4
+            // answers directly.
+            SymbolCodes::Assigned(codes) => {
+                let id = codes
+                    .decode(self.bits)?
+                    .ok_or(Jbig2Error::Malformed("unexpected OOB decoding a symbol id"))?;
+                u32::try_from(id).map_err(|_| Jbig2Error::Malformed("symbol id out of range"))
+            }
+            // 6.5.8.2.3: SBSYMCODES[I] is I, so the bits are the id. An id
+            // the code can express but the symbol list cannot answer is the
+            // walk's to refuse, exactly as it is for the arithmetic coding.
+            SymbolCodes::EqualLength(len) => read_bits(self.bits, *len as u8),
+        }
     }
 
     fn refine_flag(&mut self) -> Result<Option<i32>, Jbig2Error> {
         // 6.4.11: one bit read directly from the bitstream, through no table.
-        let bit = read_bits(&mut self.bits, 1)?;
+        let bit = read_bits(self.bits, 1)?;
         Ok(Some(bit as i32))
     }
 
     fn rdw(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.refine_tables()?.rdw.decode(&mut self.bits)
+        self.refine_tables()?.rdw.decode(self.bits)
     }
 
     fn rdh(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.refine_tables()?.rdh.decode(&mut self.bits)
+        self.refine_tables()?.rdh.decode(self.bits)
     }
 
     fn rdx(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.refine_tables()?.rdx.decode(&mut self.bits)
+        self.refine_tables()?.rdx.decode(self.bits)
     }
 
     fn rdy(&mut self) -> Result<Option<i32>, Jbig2Error> {
-        self.refine_tables()?.rdy.decode(&mut self.bits)
+        self.refine_tables()?.rdy.decode(self.bits)
     }
 
     fn refine(
@@ -884,13 +1079,13 @@ impl Values for Huffman<'_, '_> {
         budget: &mut Budget,
     ) -> Result<Bitmap, Jbig2Error> {
         // 6.4.11 step 5 a): BMSIZE, the refinement's coded size in bytes.
-        let size =
-            self.refine_tables()?
-                .rsize
-                .decode(&mut self.bits)?
-                .ok_or(Jbig2Error::Malformed(
-                    "unexpected OOB decoding a refinement data size",
-                ))?;
+        let size = self
+            .refine_tables()?
+            .rsize
+            .decode(self.bits)?
+            .ok_or(Jbig2Error::Malformed(
+                "unexpected OOB decoding a refinement data size",
+            ))?;
         let size = usize::try_from(size)
             .map_err(|_| Jbig2Error::Malformed("negative refinement data size"))?;
         // Step 5 b): the refinement's codeword begins on a byte boundary.
@@ -904,15 +1099,7 @@ impl Values for Huffman<'_, '_> {
         // ends — taking the chunk has already positioned the cursor after it,
         // which is also the byte boundary step 7 asks for.
         let mut dec = MqDecoder::new(data);
-        decode_refinement_region(
-            &mut dec,
-            &mut self.gr,
-            budget,
-            width,
-            height,
-            reference,
-            params,
-        )
+        decode_refinement_region(&mut dec, self.gr, budget, width, height, reference, params)
     }
 }
 
@@ -944,9 +1131,10 @@ struct Walk<'a, V> {
     /// SBREGBITMAP, the region being painted.
     region: &'a mut Bitmap,
     /// SBSYMS, the symbols the coded ids index.
-    symbols: &'a [&'a Bitmap],
-    /// The parameters the segment header fixed.
-    params: &'a TextParams,
+    symbols: Symbols<'a>,
+    /// The parameters the caller fixed — from a segment header, or from
+    /// Table 17 for a nested region.
+    params: &'a WalkParams,
     /// The embedded stream's remaining allowance of decoding work.
     budget: &'a mut Budget,
 }
@@ -1032,7 +1220,7 @@ impl<V: Values> Walk<'_, V> {
         // The code length is the bit width of the largest id, so a symbol count
         // that is not a power of two leaves ids the code can express and the
         // list cannot answer. Refusing those keeps the lookup in bounds.
-        let symbol = *self
+        let symbol = self
             .symbols
             .get(id as usize)
             .ok_or(Jbig2Error::Malformed("symbol id out of range"))?;

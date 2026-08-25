@@ -30,16 +30,29 @@
 //! widths already read (6.5.9, figure 22). That is the construct the whole
 //! Huffman variant needed the facsimile decoder for.
 //!
-//! Refinement/aggregate coding (SDREFAGG) is refused by name rather than
-//! approximated.
+//! Refinement/aggregate coding (SDREFAGG, 6.5.8.2) changes what a symbol's
+//! bitmap *is*. Instead of a generic region, each symbol is coded against the
+//! symbols already known — the dictionary's inputs and its own earlier
+//! symbols — which is how an encoder says "like that one, but". One instance
+//! in the aggregation is the common case and is a single refinement (6.3) of
+//! the symbol an id names, at an offset the stream gives outright (Table 18).
+//! Several instances are a whole text region decode nested mid-stream
+//! (Table 17), reading the dictionary's own decoder, cursor and contexts
+//! through [`decode_aggregate_region`] — the statistics of Annexes A and E
+//! reset per *segment*, so the nested region continuing the dictionary's
+//! adaptation is what the standard's coded bytes assume.
 
-use super::arith_int::{decode_int, IntCtxSet};
+use super::arith_int::{decode_iaid, decode_int, IaidCtx, IntCtxSet};
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 use super::generic::{decode_generic_region, decode_mmr_region, GenericParams, GB_CONTEXT_LEN};
-use super::huffman::{standard, take_custom, Table};
+use super::huffman::{read_bits, standard, take_custom, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
+use super::refinement::{
+    decode_refinement_region, parse_refinement_at, Reference, RefinementParams, GR_CONTEXT_LEN,
+};
+use super::text_region::{decode_aggregate_region, sym_code_len, AggregateSource, Symbols};
 use super::Jbig2Error;
 use crate::filters::ccitt::bits::BitReader;
 
@@ -133,11 +146,18 @@ pub(crate) fn decode_symbol_dict(
             let mut dec = MqDecoder::new(r.rest());
             let mut gb = MqContexts::new(GB_CONTEXT_LEN);
             let mut ints = IntCtxSet::new();
+            let mut coding = match &header.refinement {
+                None => SymbolCoding::Direct(params),
+                Some(refparams) => {
+                    SymbolCoding::RefAgg(RefAgg::new(refparams, num_input + header.num_new))
+                }
+            };
             let new_symbols = decode_height_classes(
                 &mut dec,
                 &mut gb,
                 &mut ints,
-                params,
+                &mut coding,
+                input_symbols,
                 header.num_new,
                 budget,
             )?;
@@ -148,8 +168,23 @@ pub(crate) fn decode_symbol_dict(
         Coding::Huffman(tables) => {
             let coded = r.rest();
             let mut bits = BitReader::new(coded);
-            let new_symbols =
-                decode_huffman_height_classes(coded, &mut bits, tables, header.num_new, budget)?;
+            let new_symbols = match &header.refinement {
+                None => {
+                    decode_huffman_height_classes(coded, &mut bits, tables, header.num_new, budget)?
+                }
+                Some(refparams) => {
+                    let mut refagg =
+                        HuffmanRefAgg::new(tables, refparams, num_input + header.num_new)?;
+                    decode_huffman_refagg_classes(
+                        &mut bits,
+                        tables,
+                        &mut refagg,
+                        input_symbols,
+                        header.num_new,
+                        budget,
+                    )?
+                }
+            };
             let total = input_symbols.len() + new_symbols.len();
             // 6.5.10 step 2: the export runs are read with Table B.1 whenever
             // SDHUFF is 1, whatever tables the dictionary selected for its own
@@ -200,6 +235,10 @@ struct DictHeader {
     /// SDHUFF, and with it whatever the chosen coding needs in order to read
     /// the data that follows.
     coding: Coding,
+    /// SDREFAGG, and with it SDRTEMPLATE and the SDRAT pixels, folded into the
+    /// parameters 6.5.8.2 hands to the refinement procedure. `None` when every
+    /// symbol is coded outright — Table 18 fixes TPGRON at 0.
+    refinement: Option<RefinementParams>,
     /// SDNUMEXSYMS, the number of symbols the dictionary exports.
     num_ex: u32,
     /// SDNUMNEWSYMS, the number of symbols coded in this segment.
@@ -224,10 +263,6 @@ enum Coding {
 }
 
 /// The Huffman tables a dictionary decodes its integers with (T.88 7.4.2.1.6).
-///
-/// SDHUFFAGGINST is absent because nothing can select it: 7.4.2.1.1 requires
-/// its field to be 0 while SDREFAGG is 0, and SDREFAGG = 1 is refused before
-/// the tables are bound at all.
 struct HuffmanTables {
     /// SDHUFFDH, the delta on the running height class height (6.5.6).
     dh: Table,
@@ -237,45 +272,46 @@ struct HuffmanTables {
     /// SDHUFFBMSIZE, the size in bytes of a height class collective bitmap
     /// (6.5.9).
     bmsize: Table,
+    /// SDHUFFAGGINST, an aggregate's instance count (6.5.8.2.1). Present
+    /// exactly when SDREFAGG is 1: 7.4.2.1.1 requires its selector to be 0
+    /// otherwise, since a dictionary coding every symbol outright has no
+    /// instance count to read.
+    agginst: Option<Table>,
 }
 
 /// Parses the symbol dictionary flags and the fields that follow them
 /// (T.88 7.4.2.1.1 to 7.4.2.1.6).
 ///
-/// The one coding mode this build does not implement is refused before a single
-/// further byte is read, because the layout of everything after the flags
-/// depends on it.
-///
-/// SDHUFF decides that layout too, which is why the two branches part company
-/// here rather than later. **A Huffman dictionary carries no AT flags** —
-/// 7.4.2.1.2 makes that field present only when SDHUFF is 0 — so reading them
-/// anyway would leave the cursor eight bytes into SDNUMEXSYMS and turn a
-/// perfectly good stream into a plausible-looking wrong answer.
+/// SDHUFF decides the header's layout, which is why the two branches part
+/// company here rather than later. **A Huffman dictionary carries no AT
+/// flags** — 7.4.2.1.2 makes that field present only when SDHUFF is 0 — so
+/// reading them anyway would leave the cursor eight bytes into SDNUMEXSYMS and
+/// turn a perfectly good stream into a plausible-looking wrong answer. The
+/// refinement AT flags of 7.4.2.1.3 come after, present exactly when SDREFAGG
+/// is 1 and SDRTEMPLATE — bit 12 — is 0.
 ///
 /// Bits 8 and 9 — "bitmap coding context used" and "retained" — ask for the
-/// arithmetic context array to be carried in from, or handed on to, another
-/// dictionary segment. With SDHUFF clear both are accepted and ignored: they
-/// change nothing for a dictionary that codes its symbols within one segment,
-/// which is every dictionary that does not deliberately split itself, and
-/// honouring them would mean keeping a context array alive across the segment
-/// walk for a case no encoder in practice emits. With SDHUFF set there is no
-/// such array to carry, and 7.4.2.1.1 requires both bits to be 0 along with
-/// SDTEMPLATE; a stream that sets one is far more likely to be a header being
-/// read at the wrong offset than a dictionary meaning something by it, so the
-/// Huffman branch refuses rather than ignores. Bits 13 to 15 are reserved; they
-/// select no field, so a stream that sets one still describes a dictionary that
-/// can be read.
+/// arithmetic context arrays to be carried in from, or handed on to, another
+/// dictionary segment. Wherever such arrays exist — SDHUFF clear, or SDREFAGG
+/// set, whose refinement statistics are arithmetic under either coding — both
+/// bits are accepted and ignored: they change nothing for a dictionary that
+/// codes its symbols within one segment, which is every dictionary that does
+/// not deliberately split itself, and honouring them would mean keeping a
+/// context array alive across the segment walk for a case no encoder in
+/// practice emits. When SDHUFF is 1 and SDREFAGG is 0 there is no array to
+/// carry, and 7.4.2.1.1 requires both bits to be 0 along with SDTEMPLATE; a
+/// stream that sets one is far more likely to be a header being read at the
+/// wrong offset than a dictionary meaning something by it, so that case
+/// refuses rather than ignores. Bits 13 to 15 are reserved; they select no
+/// field, so a stream that sets one still describes a dictionary that can be
+/// read.
 fn parse_header(
     r: &mut Reader<'_>,
     tables: &[&Table],
     budget: &mut Budget,
 ) -> Result<DictHeader, Jbig2Error> {
     let flags = r.u16()?;
-    if flags & 0x0002 != 0 {
-        return Err(Jbig2Error::Unimplemented(
-            "refinement/aggregate symbol coding",
-        ));
-    }
+    let refagg = flags & 0x0002 != 0;
     let coding = if flags & 0x0001 == 0 {
         // 7.4.2.1.6: the number of selectors reading "user-supplied table" must
         // equal the number of table segments referred to, and with SDHUFF clear
@@ -287,8 +323,10 @@ fn parse_header(
         }
         let template = ((flags >> 10) & 0x3) as u8;
 
-        // 7.4.2.1.2: eight AT bytes for template 0, two for the rest. The slots
-        // a template does not use keep their nominal offsets, so the parameters
+        // 7.4.2.1.2: eight AT bytes for template 0, two for the rest, present
+        // whatever SDREFAGG says — a refinement/aggregate dictionary reads no
+        // generic region, but its header still carries the field. The slots a
+        // template does not use keep their nominal offsets, so the parameters
         // always describe a complete neighbourhood.
         let mut params = GenericParams::nominal(template);
         let at_pairs = if template == 0 { 4 } else { 1 };
@@ -299,13 +337,22 @@ fn parse_header(
         }
         Coding::Arithmetic(params)
     } else {
-        // Bits 8 to 11, all of which 7.4.2.1.1 pins to 0 here.
-        if flags & 0x0F00 != 0 {
+        // The bits 7.4.2.1.1 pins to 0 here: SDTEMPLATE always, and the two
+        // context bits only while SDREFAGG is 0.
+        let pinned = if refagg { 0x0C00 } else { 0x0F00 };
+        if flags & pinned != 0 {
             return Err(Jbig2Error::Malformed(
                 "Huffman dictionary sets an arithmetic-only flag",
             ));
         }
-        Coding::Huffman(Box::new(bind_tables(flags, tables, budget)?))
+        Coding::Huffman(Box::new(bind_tables(flags, refagg, tables, budget)?))
+    };
+    // 7.4.2.1.3, present only when a symbol can be refinement-coded at all and
+    // the template — bit 12, SDRTEMPLATE — has adaptive pixels to place.
+    let refinement = if refagg {
+        Some(parse_refinement_at(r, flags & 0x1000 != 0)?)
+    } else {
+        None
     };
 
     let num_ex = r.u32()?;
@@ -315,6 +362,7 @@ fn parse_header(
     }
     Ok(DictHeader {
         coding,
+        refinement,
         num_ex,
         num_new,
     })
@@ -335,6 +383,7 @@ fn parse_header(
 /// table without one would run a class until the segment ran out.
 fn bind_tables(
     flags: u16,
+    refagg: bool,
     tables: &[&Table],
     budget: &mut Budget,
 ) -> Result<HuffmanTables, Jbig2Error> {
@@ -353,38 +402,165 @@ fn bind_tables(
         3 => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
         _ => return Err(Jbig2Error::Malformed("reserved SDHUFFDW selection")),
     };
-    // Bit 6: SDHUFFBMSIZE.
+    // Bit 6: SDHUFFBMSIZE. Bound even when SDREFAGG leaves no collective
+    // bitmap to read it for, because the binding of 7.4.2.1.6 is positional:
+    // a selector reading "user-supplied" consumes a referred-to table whether
+    // or not a value ever comes through it.
     let bmsize = if flags & 0x0040 == 0 {
         standard(1)?
     } else {
         take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?
     };
-    // Bit 7: SDHUFFAGGINST, which 7.4.2.1.1 requires to be 0 while SDREFAGG is
-    // 0. Since SDREFAGG = 1 is refused, no table is ever bound to it, and a
-    // stream that selects one has named a table segment this dictionary would
-    // never read.
-    if flags & 0x0080 != 0 {
-        return Err(Jbig2Error::Malformed(
-            "SDHUFFAGGINST selected without aggregate coding",
-        ));
-    }
+    // Bit 7: SDHUFFAGGINST, which 7.4.2.1.1 requires to be 0 while SDREFAGG
+    // is 0 — there is no aggregate instance count to read then, so a stream
+    // that selects one has named a table segment this dictionary would never
+    // read. With SDREFAGG set the selector is live and binds last.
+    let agginst = if !refagg {
+        if flags & 0x0080 != 0 {
+            return Err(Jbig2Error::Malformed(
+                "SDHUFFAGGINST selected without aggregate coding",
+            ));
+        }
+        None
+    } else if flags & 0x0080 == 0 {
+        Some(standard(1)?)
+    } else {
+        Some(take_custom(
+            tables,
+            &mut used,
+            TABLE_COUNT_DISAGREES,
+            budget,
+        )?)
+    };
     if used != tables.len() {
         return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
     }
     if !dw.has_oob() {
         return Err(Jbig2Error::Malformed("SDHUFFDW cannot code OOB"));
     }
-    if dh.has_oob() || bmsize.has_oob() {
-        return Err(Jbig2Error::Malformed("SDHUFFDH or SDHUFFBMSIZE codes OOB"));
+    if dh.has_oob() || bmsize.has_oob() || agginst.as_ref().is_some_and(Table::has_oob) {
+        return Err(Jbig2Error::Malformed(
+            "SDHUFFDH, SDHUFFBMSIZE or SDHUFFAGGINST codes OOB",
+        ));
     }
-    Ok(HuffmanTables { dh, dw, bmsize })
+    Ok(HuffmanTables {
+        dh,
+        dw,
+        bmsize,
+        agginst,
+    })
+}
+
+/// How the symbols of an arithmetic dictionary's height classes are coded
+/// (T.88 6.5.8): SDREFAGG decides which of the field's two forms every symbol
+/// takes, so the walk carries one or the other, never a mix.
+enum SymbolCoding<'a> {
+    /// SDREFAGG = 0: each bitmap is a generic region (6.5.8.1, Table 16).
+    Direct(&'a GenericParams),
+    /// SDREFAGG = 1: each bitmap refines or aggregates the symbols known so
+    /// far (6.5.8.2).
+    RefAgg(RefAgg<'a>),
+}
+
+/// The state a refinement/aggregate dictionary shares across every symbol it
+/// decodes (T.88 6.5.8.2).
+struct RefAgg<'a> {
+    /// SDRTEMPLATE and the SDRAT pixels, as the header fixed them.
+    params: &'a RefinementParams,
+    /// The symbol ID procedure of A.3, sized once from the dictionary's total
+    /// symbol count (6.5.8.2.3) so the width of an id never changes while the
+    /// known-symbol list grows underneath it.
+    iaid: IaidCtx,
+    /// The GR statistics every refinement of the segment adapts (E.3.7).
+    gr: MqContexts,
+}
+
+impl<'a> RefAgg<'a> {
+    /// Fresh statistics for one dictionary of `total` symbols, inputs and new
+    /// ones together.
+    fn new(params: &'a RefinementParams, total: u32) -> RefAgg<'a> {
+        RefAgg {
+            params,
+            iaid: IaidCtx::new(sym_code_len(total)),
+            gr: MqContexts::new(GR_CONTEXT_LEN),
+        }
+    }
+
+    /// Decodes one refinement/aggregate-coded symbol bitmap (T.88 6.5.8.2).
+    ///
+    /// `symbols` is the known set the coded ids index — SBSYMS per 6.5.8.2.4,
+    /// the dictionary's inputs and the new symbols decoded before this one.
+    fn decode_symbol(
+        &mut self,
+        dec: &mut MqDecoder<'_>,
+        ints: &mut IntCtxSet,
+        symbols: Symbols<'_>,
+        width: u32,
+        height: u32,
+        budget: &mut Budget,
+    ) -> Result<Bitmap, Jbig2Error> {
+        // 6.5.8.2.1: REFAGGNINST, through IAAI.
+        let instances = decode_int(dec, &mut ints.iaai).ok_or(Jbig2Error::Malformed(
+            "unexpected OOB decoding an aggregate instance count",
+        ))?;
+        if instances < 1 {
+            return Err(Jbig2Error::Malformed("aggregate instance count below one"));
+        }
+        if instances > 1 {
+            // 6.5.8.2 step 2: a text region decode with the parameters of
+            // Table 17, continuing in this dictionary's decoder and contexts.
+            return decode_aggregate_region(
+                AggregateSource::Arithmetic {
+                    dec,
+                    ints,
+                    iaid: &mut self.iaid,
+                    gr: &mut self.gr,
+                },
+                symbols,
+                width,
+                height,
+                instances as u32,
+                *self.params,
+                budget,
+            );
+        }
+        // 6.5.8.2.2: one instance is a single refinement of a named symbol —
+        // the region walk's values are all known, so none of them is coded.
+        let id = decode_iaid(dec, &mut self.iaid);
+        let reference = symbols
+            .get(id as usize)
+            .ok_or(Jbig2Error::Malformed("symbol id out of range"))?;
+        const DELTA_OOB: &str = "unexpected OOB decoding a refinement delta";
+        let rdx = decode_int(dec, &mut ints.iardx).ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        let rdy = decode_int(dec, &mut ints.iardy).ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        // Table 18: GRREFERENCEDX is RDXI itself — no ⌊RDW/2⌋ term as in
+        // 6.4.11's Table 12, because the refined bitmap's size is the height
+        // class's rather than a delta on the reference's.
+        decode_refinement_region(
+            dec,
+            &mut self.gr,
+            budget,
+            width,
+            height,
+            Reference {
+                bitmap: reference,
+                dx: rdx,
+                dy: rdy,
+            },
+            self.params,
+        )
+    }
 }
 
 /// Decodes the new symbols of a dictionary, height class by height class
 /// (T.88 6.5.5).
 ///
-/// `dec`, `gb` and `ints` are shared across every symbol by design; see the
-/// module documentation for why the context array in particular must be.
+/// `dec`, `gb`, `ints` and the statistics inside `coding` are shared across
+/// every symbol by design; see the module documentation for why the context
+/// array in particular must be. `input_symbols` take part when SDREFAGG is 1:
+/// a symbol may be coded against them, or against a symbol decoded earlier in
+/// this very walk (6.5.8.2.4), which is why the known set is re-formed for
+/// each symbol rather than fixed up front.
 ///
 /// Both loops end on something the input cannot extend indefinitely. The inner
 /// one either takes a symbol — and there are at most SDNUMNEWSYMS of those
@@ -397,16 +573,19 @@ fn decode_height_classes(
     dec: &mut MqDecoder<'_>,
     gb: &mut MqContexts,
     ints: &mut IntCtxSet,
-    params: &GenericParams,
+    coding: &mut SymbolCoding<'_>,
+    input_symbols: &[&Bitmap],
     num_new: u32,
     budget: &mut Budget,
 ) -> Result<Vec<Bitmap>, Jbig2Error> {
     let mut new_symbols: Vec<Bitmap> = Vec::new();
     // The running height, and the running width inside each class below, both
     // accumulate signed deltas and are therefore free to go negative on a
-    // malformed stream. Each is held wider than the dimension it becomes so
-    // that the check is a comparison rather than a cast that has already lost
-    // the sign.
+    // malformed stream — with SDREFAGG set, a *negative delta* is even
+    // expected, since a symbol may refine a taller one from an earlier class
+    // (6.5.5 NOTE 1). Each is held wider than the dimension it becomes so that
+    // the check is a comparison rather than a cast that has already lost the
+    // sign.
     let mut height: i64 = 0;
     let max_classes = max_height_classes(num_new);
     let mut classes = 0usize;
@@ -432,22 +611,33 @@ fn decode_height_classes(
             if (new_symbols.len() as u32) >= num_new {
                 return Err(Jbig2Error::Malformed("more symbols coded than declared"));
             }
-            // The generic region decoder charges for the symbol's pixels, which
+            // The bitmap decoders below charge for the symbol's pixels, which
             // is nothing at all when the height class has no rows — and a
             // rowless symbol still costs the width decode that produced it and
             // a bitmap the caller may keep for the rest of the stream. Hence
             // the fixed price here, before the region charge and before any of
             // its pixels are read.
             budget.charge(SYMBOL_COST)?;
-            new_symbols.push(decode_generic_region(
-                dec,
-                gb,
-                budget,
-                symbol_width,
-                class_height,
-                params,
-                None,
-            )?);
+            let symbol = match coding {
+                SymbolCoding::Direct(params) => decode_generic_region(
+                    dec,
+                    gb,
+                    budget,
+                    symbol_width,
+                    class_height,
+                    params,
+                    None,
+                )?,
+                SymbolCoding::RefAgg(refagg) => refagg.decode_symbol(
+                    dec,
+                    ints,
+                    Symbols::concat(input_symbols, &new_symbols),
+                    symbol_width,
+                    class_height,
+                    budget,
+                )?,
+            };
+            new_symbols.push(symbol);
         }
     }
     Ok(new_symbols)
@@ -536,6 +726,191 @@ fn decode_huffman_height_classes(
         for symbol_width in widths {
             new_symbols.push(collective.columns(left, symbol_width)?);
             left += symbol_width;
+        }
+    }
+    Ok(new_symbols)
+}
+
+/// The state a Huffman refinement/aggregate dictionary shares across every
+/// symbol it decodes (T.88 6.5.8.2 with SDHUFF = 1).
+struct HuffmanRefAgg<'a> {
+    /// SDRTEMPLATE and the SDRAT pixels, as the header fixed them.
+    params: &'a RefinementParams,
+    /// SDHUFFAGGINST, an aggregate's instance count (6.5.8.2.1).
+    agginst: &'a Table,
+    /// Table B.15, which 6.5.8.2.2 steps 3 and 4 fix for both refinement
+    /// offsets.
+    deltas: Table,
+    /// Table B.1, which step 5 fixes for a refinement codeword's byte count.
+    sizes: Table,
+    /// The equal-length symbol ID code width of 6.5.8.2.3, at least one bit.
+    code_len: u32,
+    /// The GR statistics every refinement of the segment adapts — shared
+    /// across the refinements' separate codewords, since E.3.7 resets
+    /// statistics per segment.
+    gr: MqContexts,
+}
+
+impl<'a> HuffmanRefAgg<'a> {
+    /// Fresh statistics for one dictionary of `total` symbols, inputs and new
+    /// ones together.
+    ///
+    /// The missing-table refusal cannot fire on a parsed header — 7.4.2.1.1
+    /// binds SDHUFFAGGINST exactly when SDREFAGG is 1, the same flag that
+    /// routes decoding here — so refusing keeps that an assumption about this
+    /// file rather than an unwrap.
+    fn new(
+        tables: &'a HuffmanTables,
+        params: &'a RefinementParams,
+        total: u32,
+    ) -> Result<HuffmanRefAgg<'a>, Jbig2Error> {
+        let agginst = tables.agginst.as_ref().ok_or(Jbig2Error::Malformed(
+            "aggregate coding without an instance count table",
+        ))?;
+        Ok(HuffmanRefAgg {
+            params,
+            agginst,
+            deltas: standard(15)?,
+            sizes: standard(1)?,
+            code_len: sym_code_len(total).max(1),
+            gr: MqContexts::new(GR_CONTEXT_LEN),
+        })
+    }
+
+    /// Decodes one refinement/aggregate-coded symbol bitmap (T.88 6.5.8.2 with
+    /// SDHUFF = 1).
+    fn decode_symbol(
+        &mut self,
+        bits: &mut BitReader<'_>,
+        symbols: Symbols<'_>,
+        width: u32,
+        height: u32,
+        budget: &mut Budget,
+    ) -> Result<Bitmap, Jbig2Error> {
+        // 6.5.8.2.1: REFAGGNINST, through SDHUFFAGGINST.
+        let instances = self.agginst.decode(bits)?.ok_or(Jbig2Error::Malformed(
+            "unexpected OOB decoding an aggregate instance count",
+        ))?;
+        if instances < 1 {
+            return Err(Jbig2Error::Malformed("aggregate instance count below one"));
+        }
+        if instances > 1 {
+            // 6.5.8.2 step 2: a text region decode with the parameters of
+            // Table 17, continuing in this dictionary's bit stream.
+            return decode_aggregate_region(
+                AggregateSource::Huffman {
+                    bits,
+                    gr: &mut self.gr,
+                    code_len: self.code_len,
+                },
+                symbols,
+                width,
+                height,
+                instances as u32,
+                *self.params,
+                budget,
+            );
+        }
+        // 6.5.8.2.2 step 2: the equal-length code of 6.5.8.2.3 gives symbol I
+        // the code I, so the bits are the id.
+        let id = read_bits(bits, self.code_len as u8)?;
+        let reference = symbols
+            .get(id as usize)
+            .ok_or(Jbig2Error::Malformed("symbol id out of range"))?;
+        // Steps 3 and 4: both offsets through Table B.15.
+        const DELTA_OOB: &str = "unexpected OOB decoding a refinement delta";
+        let rdx = self
+            .deltas
+            .decode(bits)?
+            .ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        let rdy = self
+            .deltas
+            .decode(bits)?
+            .ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        // Step 5: the codeword's byte count through Table B.1, then a byte
+        // boundary.
+        let size = self.sizes.decode(bits)?.ok_or(Jbig2Error::Malformed(
+            "unexpected OOB decoding a refinement data size",
+        ))?;
+        let size = usize::try_from(size)
+            .map_err(|_| Jbig2Error::Malformed("negative refinement data size"))?;
+        bits.align_to_byte();
+        let data = bits.take_aligned_bytes(size).ok_or(Jbig2Error::Truncated)?;
+        // Steps 6 and 7: the refinement of Table 18 as its own arithmetic
+        // codeword over exactly those bytes; taking the chunk has already
+        // positioned the cursor on the byte boundary step 7 asks for.
+        let mut dec = MqDecoder::new(data);
+        decode_refinement_region(
+            &mut dec,
+            &mut self.gr,
+            budget,
+            width,
+            height,
+            Reference {
+                bitmap: reference,
+                dx: rdx,
+                dy: rdy,
+            },
+            self.params,
+        )
+    }
+}
+
+/// Decodes the new symbols of a Huffman refinement/aggregate dictionary,
+/// height class by height class (T.88 6.5.5, figure 23).
+///
+/// With SDREFAGG set a Huffman dictionary loses the collective bitmap: the
+/// height class interleaves widths with bitmaps exactly as the arithmetic walk
+/// does, so this is that walk with the values read through tables — and with
+/// its harder failure mode, since running out of bits here is
+/// [`Jbig2Error::Truncated`] from a table rather than a synthesized OOB.
+///
+/// The loop bounds are the other walks', for the same reasons.
+fn decode_huffman_refagg_classes(
+    bits: &mut BitReader<'_>,
+    tables: &HuffmanTables,
+    refagg: &mut HuffmanRefAgg<'_>,
+    input_symbols: &[&Bitmap],
+    num_new: u32,
+    budget: &mut Budget,
+) -> Result<Vec<Bitmap>, Jbig2Error> {
+    let mut new_symbols: Vec<Bitmap> = Vec::new();
+    let mut height: i64 = 0;
+    let max_classes = max_height_classes(num_new);
+    let mut classes = 0usize;
+
+    while (new_symbols.len() as u32) < num_new {
+        classes += 1;
+        if classes > max_classes {
+            return Err(Jbig2Error::Malformed("too many symbol height classes"));
+        }
+        // 6.5.6.
+        let delta = tables.dh.decode(bits)?.ok_or(Jbig2Error::Malformed(
+            "unexpected OOB decoding a height class",
+        ))?;
+        height += i64::from(delta);
+        let class_height = checked_class_height(height)?;
+
+        // 6.5.7, with the bitmap following each width (figure 23).
+        let mut width: i64 = 0;
+        while let Some(delta) = tables.dw.decode(bits)? {
+            width += i64::from(delta);
+            let symbol_width = checked_symbol_width(width)?;
+            if (new_symbols.len() as u32) >= num_new {
+                return Err(Jbig2Error::Malformed("more symbols coded than declared"));
+            }
+            // Charged where the other walks charge it — as the symbol is
+            // brought into existence, before anything is decoded or allocated
+            // for it.
+            budget.charge(SYMBOL_COST)?;
+            let symbol = refagg.decode_symbol(
+                bits,
+                Symbols::concat(input_symbols, &new_symbols),
+                symbol_width,
+                class_height,
+                budget,
+            )?;
+            new_symbols.push(symbol);
         }
     }
     Ok(new_symbols)
@@ -725,17 +1100,19 @@ fn decode_export_flags(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filters::jbig2::arith_int::encoder::encode_int;
+    use crate::filters::jbig2::arith_int::encoder::{encode_iaid, encode_int};
     use crate::filters::jbig2::budget::ROW_COST;
     use crate::filters::jbig2::generic::context_at;
     use crate::filters::jbig2::huffman::encoder::{push_value, BitWriter};
     use crate::filters::jbig2::huffman::parse_table_segment;
     use crate::filters::jbig2::mq::encoder::MqEncoder;
     use crate::filters::jbig2::mq::MqContext;
+    use crate::filters::jbig2::refinement::{encode_refinement_into, NOMINAL_AT};
     use crate::filters::jbig2::testing::{
         code_table_segment, dictionary_segment, glyph, huffman_dictionary_segment,
         nominal_at_bytes, reexport_segment, rowless_dictionary_segment, sample_symbols, Collective,
     };
+    use crate::filters::jbig2::text_region::{INSTANCE_COST, MAX_INSTANCES};
 
     /// What one 4 x 4 symbol costs: the fixed per-symbol price and its rows.
     const FOUR_BY_FOUR: u64 = SYMBOL_COST + (4 + ROW_COST) * 4;
@@ -884,16 +1261,548 @@ mod tests {
         );
     }
 
+    /// The refusal SDREFAGG used to earn, flipped: the header parses through —
+    /// AT bytes, refinement AT bytes, both counts — and a dictionary of no
+    /// symbols decodes to no exports.
     #[test]
-    fn refagg_reports_itself() {
+    fn an_empty_refagg_dictionary_decodes() {
         let mut segment = 0x0002u16.to_be_bytes().to_vec();
-        segment.extend_from_slice(&[0u8; 16]);
+        segment.extend_from_slice(&[0u8; 20]);
+        assert_eq!(decode(&segment, &[]), Ok(Vec::new()));
+    }
+
+    /// The header of an arithmetic refinement/aggregate dictionary
+    /// (7.4.2.1): flags with SDREFAGG set, the AT bytes a refagg dictionary
+    /// carries but never reads, the SDRAT bytes — absent for template 1 — and
+    /// the two counts.
+    fn refagg_segment(num_ex: u32, num_new: u32, template_1: bool, coded: &[u8]) -> Vec<u8> {
+        let flags = 0x0002u16 | if template_1 { 0x1000 } else { 0 };
+        let mut out = flags.to_be_bytes().to_vec();
+        out.extend_from_slice(&nominal_at_bytes());
+        if !template_1 {
+            for (dx, dy) in NOMINAL_AT {
+                out.push(dx as u8);
+                out.push(dy as u8);
+            }
+        }
+        out.extend_from_slice(&num_ex.to_be_bytes());
+        out.extend_from_slice(&num_new.to_be_bytes());
+        out.extend_from_slice(coded);
+        out
+    }
+
+    /// One symbol refined from one input symbol (6.5.8.2.2), at offsets that
+    /// are deliberately not zero. Returns the input, the symbol the
+    /// dictionary should decode, and the segment.
+    fn refined_fixture() -> (Bitmap, Bitmap, Vec<u8>) {
+        let input = glyph(&["1111", "1001", "1001", "1111"]);
+        let want = glyph(&["0110", "1001", "1010", "0110"]);
+        let params = RefinementParams::nominal(0);
+
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        // 6.5.8.2.3: one bit per id, from ⌈log2(1 input + 1 new)⌉.
+        let mut iaid = IaidCtx::new(1);
+        let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+        encode_int(&mut enc, &mut ints.iadh, Some(4));
+        encode_int(&mut enc, &mut ints.iadw, Some(4));
+        encode_int(&mut enc, &mut ints.iaai, Some(1)); // REFAGGNINST
+        encode_iaid(&mut enc, &mut iaid, 0); // refine the input symbol
+        encode_int(&mut enc, &mut ints.iardx, Some(1));
+        encode_int(&mut enc, &mut ints.iardy, Some(-1));
+        encode_refinement_into(&mut enc, &mut gr, &want, &input, &params, 1, -1);
+        encode_int(&mut enc, &mut ints.iadw, None);
+        encode_int(&mut enc, &mut ints.iaex, Some(1)); // the input stays behind
+        encode_int(&mut enc, &mut ints.iaex, Some(1));
+
+        let segment = refagg_segment(1, 1, false, &enc.finish());
+        (input, want, segment)
+    }
+
+    /// The one-instance aggregation of 6.5.8.2.2: the symbol is a single
+    /// refinement of the symbol its id names, at the offset RDX and RDY give
+    /// *directly* (Table 18). The offsets are nonzero because the direct
+    /// reading is the point: a decoder that reused Table 12's ⌊RDW/2⌋ + RDX
+    /// here would place the reference elsewhere and decode noise.
+    #[test]
+    fn decodes_a_symbol_refined_from_an_input_symbol() {
+        let (input, want, segment) = refined_fixture();
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+    }
+
+    /// The known set an aggregate's id indexes grows as the dictionary
+    /// decodes: the inputs first, then each new symbol as it lands
+    /// (6.5.8.2.4). The second symbol here refines the first — a bitmap that
+    /// did not exist when the segment began — while the id width stays the
+    /// one fixed from the dictionary's total count, and the GR statistics
+    /// adapt across both refinements.
+    #[test]
+    fn a_symbol_can_refine_one_decoded_earlier() {
+        let input = glyph(&["111", "101", "111"]);
+        let first = glyph(&["110", "101", "011"]);
+        let second = glyph(&["010", "111", "010"]);
+        let params = RefinementParams::nominal(0);
+
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        // ⌈log2(1 input + 2 new)⌉ = 2 bits per id.
+        let mut iaid = IaidCtx::new(2);
+        let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+        encode_int(&mut enc, &mut ints.iadh, Some(3));
+        encode_int(&mut enc, &mut ints.iadw, Some(3));
+        encode_int(&mut enc, &mut ints.iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, 0); // the input
+        encode_int(&mut enc, &mut ints.iardx, Some(0));
+        encode_int(&mut enc, &mut ints.iardy, Some(0));
+        encode_refinement_into(&mut enc, &mut gr, &first, &input, &params, 0, 0);
+        encode_int(&mut enc, &mut ints.iadw, Some(0));
+        encode_int(&mut enc, &mut ints.iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, 1); // the symbol just decoded
+        encode_int(&mut enc, &mut ints.iardx, Some(0));
+        encode_int(&mut enc, &mut ints.iardy, Some(0));
+        encode_refinement_into(&mut enc, &mut gr, &second, &first, &params, 0, 0);
+        encode_int(&mut enc, &mut ints.iadw, None);
+        encode_int(&mut enc, &mut ints.iaex, Some(1));
+        encode_int(&mut enc, &mut ints.iaex, Some(2));
+
+        let segment = refagg_segment(2, 2, false, &enc.finish());
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_eq!(got.len(), 2);
+        assert_same(&got[0], &first, 0);
+        assert_same(&got[1], &second, 1);
+    }
+
+    /// SDRTEMPLATE 1 has no adaptive pixels, so the header carries no SDRAT
+    /// field (7.4.2.1.3) — reading one anyway would take four bytes of
+    /// SDNUMEXSYMS as pixel offsets.
+    #[test]
+    fn a_template_1_dictionary_carries_no_refinement_at_flags() {
+        let input = glyph(&["11", "11"]);
+        let want = glyph(&["10", "01"]);
+        let params = RefinementParams::nominal(1);
+
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        let mut iaid = IaidCtx::new(1);
+        let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+        encode_int(&mut enc, &mut ints.iadh, Some(2));
+        encode_int(&mut enc, &mut ints.iadw, Some(2));
+        encode_int(&mut enc, &mut ints.iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, 0);
+        encode_int(&mut enc, &mut ints.iardx, Some(0));
+        encode_int(&mut enc, &mut ints.iardy, Some(0));
+        encode_refinement_into(&mut enc, &mut gr, &want, &input, &params, 0, 0);
+        encode_int(&mut enc, &mut ints.iadw, None);
+        encode_int(&mut enc, &mut ints.iaex, Some(1));
+        encode_int(&mut enc, &mut ints.iaex, Some(1));
+
+        let segment = refagg_segment(1, 1, true, &enc.finish());
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+    }
+
+    /// One symbol aggregated from two placements of the input (Table 17): the
+    /// input itself at the left edge, and a refinement of it one gap along.
+    /// Returns the input, the symbol the dictionary should decode, and the
+    /// segment.
+    ///
+    /// The coordinates are walked by hand from 6.4.5 with Table 17's values:
+    /// STRIPT starts and stays at 0, the first instance lands with its
+    /// TOPLEFT pixel at (0, 0) and leaves CURS on its far edge at 1, and the
+    /// gap of 1 puts the second at (2, 0).
+    fn aggregate_fixture() -> (Bitmap, Bitmap, Vec<u8>) {
+        let a = glyph(&["10", "11"]);
+        let b = glyph(&["01", "11"]);
+        let want = glyph(&["1001", "1111"]);
+        let params = RefinementParams::nominal(0);
+
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        let mut iaid = IaidCtx::new(1);
+        let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+        encode_int(&mut enc, &mut ints.iadh, Some(2));
+        encode_int(&mut enc, &mut ints.iadw, Some(4));
+        encode_int(&mut enc, &mut ints.iaai, Some(2)); // REFAGGNINST
+        encode_int(&mut enc, &mut ints.iadt, Some(0)); // 6.4.5 step 2
+        encode_int(&mut enc, &mut ints.iadt, Some(0)); // the one strip
+        encode_int(&mut enc, &mut ints.iafs, Some(0));
+        encode_iaid(&mut enc, &mut iaid, 0);
+        encode_int(&mut enc, &mut ints.iari, Some(0)); // the input as it stands
+        encode_int(&mut enc, &mut ints.iads, Some(1)); // the gap
+        encode_iaid(&mut enc, &mut iaid, 0);
+        encode_int(&mut enc, &mut ints.iari, Some(1)); // refined this time
+        encode_int(&mut enc, &mut ints.iardw, Some(0));
+        encode_int(&mut enc, &mut ints.iardh, Some(0));
+        encode_int(&mut enc, &mut ints.iardx, Some(0));
+        encode_int(&mut enc, &mut ints.iardy, Some(0));
+        encode_refinement_into(&mut enc, &mut gr, &b, &a, &params, 0, 0);
+        encode_int(&mut enc, &mut ints.iads, None); // close the strip
+        encode_int(&mut enc, &mut ints.iadw, None); // close the height class
+        encode_int(&mut enc, &mut ints.iaex, Some(1));
+        encode_int(&mut enc, &mut ints.iaex, Some(1));
+
+        let segment = refagg_segment(1, 1, false, &enc.finish());
+        (a, want, segment)
+    }
+
+    /// The many-instance aggregation of 6.5.8.2 step 2: the symbol's bitmap is
+    /// a text region decoded mid-stream, its values braided into the
+    /// dictionary's one codeword and one instance refined against the same GR
+    /// statistics the dictionary's other refinements adapt.
+    #[test]
+    fn an_aggregate_composes_a_symbol_from_placements() {
+        let (input, want, segment) = aggregate_fixture();
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+    }
+
+    /// A refined symbol costs what a directly-coded one of the same size
+    /// does: the fixed per-symbol price and its pixels, charged from the
+    /// declared dimensions before the refinement is decoded.
+    #[test]
+    fn a_refined_symbol_is_charged_like_a_direct_one() {
+        let (input, _, segment) = refined_fixture();
+        let refs = [&input];
+
+        let mut budget = Budget::with_limit(FOUR_BY_FOUR);
+        assert!(decode_symbol_dict(&segment, &refs, &[], &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(FOUR_BY_FOUR - 1);
         assert_eq!(
-            decode(&segment, &[]),
-            Err(Jbig2Error::Unimplemented(
-                "refinement/aggregate symbol coding"
+            decode_symbol_dict(&segment, &refs, &[], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// The nested text region charges once for the symbol's 4 x 2 bitmap and
+    /// then per placement — the fixed instance price and each instance's
+    /// pixels, with the refined instance also paying for its refinement
+    /// decode. The enclosing walk adds only the per-symbol price, so nothing
+    /// is paid twice.
+    #[test]
+    fn an_aggregate_symbol_is_charged_once() {
+        let (input, _, segment) = aggregate_fixture();
+        let refs = [&input];
+        let total = SYMBOL_COST + (4 + ROW_COST) * 2 + 2 * INSTANCE_COST + 3 * (2 + ROW_COST) * 2;
+
+        let mut budget = Budget::with_limit(total);
+        assert!(decode_symbol_dict(&segment, &refs, &[], &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(total - 1);
+        assert_eq!(
+            decode_symbol_dict(&segment, &refs, &[], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// The export runs treat an aggregate like any other new symbol: inputs
+    /// first, new ones after (6.5.10), and an exported input is charged for
+    /// the copy exactly as in a direct dictionary.
+    #[test]
+    fn exports_cover_inputs_and_refined_symbols_alike() {
+        let input = glyph(&["1111", "1001", "1001", "1111"]);
+        let want = glyph(&["0110", "1001", "1010", "0110"]);
+        let params = RefinementParams::nominal(0);
+
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        let mut iaid = IaidCtx::new(1);
+        let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+        encode_int(&mut enc, &mut ints.iadh, Some(4));
+        encode_int(&mut enc, &mut ints.iadw, Some(4));
+        encode_int(&mut enc, &mut ints.iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, 0);
+        encode_int(&mut enc, &mut ints.iardx, Some(0));
+        encode_int(&mut enc, &mut ints.iardy, Some(0));
+        encode_refinement_into(&mut enc, &mut gr, &want, &input, &params, 0, 0);
+        encode_int(&mut enc, &mut ints.iadw, None);
+        // A zero-length "not exported" run, then both symbols in one run.
+        encode_int(&mut enc, &mut ints.iaex, Some(0));
+        encode_int(&mut enc, &mut ints.iaex, Some(2));
+
+        let segment = refagg_segment(2, 1, false, &enc.finish());
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_eq!(got.len(), 2);
+        assert_same(&got[0], &input, 0);
+        assert_same(&got[1], &want, 1);
+    }
+
+    /// REFAGGNINST below one aggregates nothing and is refused (6.5.8.2.1),
+    /// and a count above the instance cap is refused before the nested walk
+    /// begins — both from a handful of bytes.
+    #[test]
+    fn an_aggregate_instance_count_out_of_range_is_refused() {
+        let input = glyph(&["11", "11"]);
+        for (instances, want) in [
+            (0, "aggregate instance count below one"),
+            (-2, "aggregate instance count below one"),
+            (MAX_INSTANCES as i32 + 1, "instance count exceeds the limit"),
+        ] {
+            let mut enc = MqEncoder::new();
+            let mut ints = IntCtxSet::new();
+            encode_int(&mut enc, &mut ints.iadh, Some(2));
+            encode_int(&mut enc, &mut ints.iadw, Some(2));
+            encode_int(&mut enc, &mut ints.iaai, Some(instances));
+            let segment = refagg_segment(1, 1, false, &enc.finish());
+            assert_eq!(
+                decode(&segment, &[&input]),
+                Err(Jbig2Error::Malformed(want)),
+                "REFAGGNINST {instances}",
+            );
+        }
+    }
+
+    /// An id must name a symbol that exists *by the time it is read*: with
+    /// one input and no new symbol decoded yet, id 1 is expressible in the
+    /// fixed code width but answerable by nothing (6.5.8.2.4).
+    #[test]
+    fn an_aggregate_id_past_the_known_symbols_is_refused() {
+        let input = glyph(&["1"]);
+        let mut enc = MqEncoder::new();
+        let mut ints = IntCtxSet::new();
+        let mut iaid = IaidCtx::new(1);
+        encode_int(&mut enc, &mut ints.iadh, Some(1));
+        encode_int(&mut enc, &mut ints.iadw, Some(1));
+        encode_int(&mut enc, &mut ints.iaai, Some(1));
+        encode_iaid(&mut enc, &mut iaid, 1);
+        let segment = refagg_segment(1, 1, false, &enc.finish());
+        assert_eq!(
+            decode(&segment, &[&input]),
+            Err(Jbig2Error::Malformed("symbol id out of range")),
+        );
+    }
+
+    /// The header of a Huffman refinement/aggregate dictionary: SDHUFF and
+    /// SDREFAGG in `flags`, no AT bytes (7.4.2.1.2), the nominal SDRAT bytes,
+    /// and the two counts.
+    fn huffman_refagg_segment(flags: u16, num_ex: u32, num_new: u32, coded: &[u8]) -> Vec<u8> {
+        let mut out = flags.to_be_bytes().to_vec();
+        for (dx, dy) in NOMINAL_AT {
+            out.push(dx as u8);
+            out.push(dy as u8);
+        }
+        out.extend_from_slice(&num_ex.to_be_bytes());
+        out.extend_from_slice(&num_new.to_be_bytes());
+        out.extend_from_slice(coded);
+        out
+    }
+
+    /// The coded data of a Huffman dictionary whose one symbol refines its
+    /// one input (6.5.8.2.2 with SBHUFF = 1): REFAGGNINST through the given
+    /// table, the id as one raw bit, the offsets through Table B.15, and the
+    /// refinement as a byte-counted arithmetic codeword of its own.
+    fn huffman_refined_body(input: &Bitmap, want: &Bitmap, dh: &Table, agginst: &Table) -> Vec<u8> {
+        let dw = standard(2).expect("Table B.2");
+        let b1 = standard(1).expect("Table B.1");
+        let b15 = standard(15).expect("Table B.15");
+        let params = RefinementParams::nominal(0);
+
+        let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+        let mut chunk = MqEncoder::new();
+        encode_refinement_into(&mut chunk, &mut gr, want, input, &params, 1, -1);
+        let coded = chunk.finish();
+
+        let mut w = BitWriter::default();
+        push_value(&mut w, dh, Some(4));
+        push_value(&mut w, &dw, Some(4));
+        push_value(&mut w, agginst, Some(1)); // REFAGGNINST
+        w.push(0, 1); // the id, in ⌈log2(2)⌉ raw bits (6.5.8.2.3)
+        push_value(&mut w, &b15, Some(1)); // RDX
+        push_value(&mut w, &b15, Some(-1)); // RDY
+        push_value(&mut w, &b1, Some(coded.len() as i32));
+        w.align();
+        w.push_bytes(&coded);
+        push_value(&mut w, &dw, None);
+        push_value(&mut w, &b1, Some(1)); // the input stays behind
+        push_value(&mut w, &b1, Some(1));
+        w.finish()
+    }
+
+    /// The Huffman variant of 6.5.8.2.2, with every table left standard.
+    #[test]
+    fn decodes_a_huffman_refined_symbol() {
+        let input = glyph(&["1111", "1001", "1001", "1111"]);
+        let want = glyph(&["0110", "1001", "1010", "0110"]);
+        let dh = standard(4).expect("Table B.4");
+        let b1 = standard(1).expect("Table B.1");
+        let body = huffman_refined_body(&input, &want, &dh, &b1);
+
+        let segment = huffman_refagg_segment(0x0003, 1, 1, &body);
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+    }
+
+    /// With SDREFAGG set there *are* refinement statistics a dictionary could
+    /// carry across segments, so the two context bits are accepted and
+    /// ignored as the arithmetic branch accepts them — while SDTEMPLATE stays
+    /// pinned to 0 (7.4.2.1.1).
+    #[test]
+    fn a_huffman_refagg_dictionary_accepts_the_context_bits() {
+        let input = glyph(&["1111", "1001", "1001", "1111"]);
+        let want = glyph(&["0110", "1001", "1010", "0110"]);
+        let dh = standard(4).expect("Table B.4");
+        let b1 = standard(1).expect("Table B.1");
+        let body = huffman_refined_body(&input, &want, &dh, &b1);
+
+        let segment = huffman_refagg_segment(0x0303, 1, 1, &body);
+        let got = decode(&segment, &[&input]).expect("dictionary");
+        assert_same(&got[0], &want, 0);
+
+        let segment = huffman_refagg_segment(0x0403, 1, 1, &body);
+        assert_eq!(
+            decode(&segment, &[&input]),
+            Err(Jbig2Error::Malformed(
+                "Huffman dictionary sets an arithmetic-only flag"
             )),
         );
+    }
+
+    /// SDHUFFAGGINST binds *fourth* (7.4.2.1.6): with SDHUFFDH also
+    /// user-supplied, the first referred-to table must reach the height
+    /// deltas and the second the instance counts. The two tables differ only
+    /// in the range they start at, so binding them the wrong way round does
+    /// not fail loudly — it decodes a wrong height and wrong pixels, which is
+    /// what the exact assert is for.
+    #[test]
+    fn a_custom_agginst_table_binds_after_the_other_selectors() {
+        let dh_table =
+            parse_table_segment(&code_table_segment(2), &mut Budget::new()).expect("code table");
+        let agg_table =
+            parse_table_segment(&code_table_segment(1), &mut Budget::new()).expect("code table");
+        let input = glyph(&["1111", "1001", "1001", "1111"]);
+        let want = glyph(&["0110", "1001", "1010", "0110"]);
+        let body = huffman_refined_body(&input, &want, &dh_table, &agg_table);
+
+        // SDHUFF, SDREFAGG, SDHUFFDH = 3 and SDHUFFAGGINST = 1.
+        let flags = 0x0003 | (3 << 2) | (1 << 7);
+        let segment = huffman_refagg_segment(flags, 1, 1, &body);
+        let refs = [&dh_table, &agg_table];
+        let got =
+            decode_symbol_dict(&segment, &[&input], &refs, &mut Budget::new()).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+    }
+
+    /// A refinement/aggregate dictionary has no collective bitmap, but a
+    /// user-supplied SDHUFFBMSIZE still consumes its referred-to table — the
+    /// binding of 7.4.2.1.6 is positional — so with bit 6 also set the
+    /// instance counts must come from the *third* table, and the count check
+    /// must expect all three.
+    #[test]
+    fn a_dead_bmsize_selector_still_consumes_its_table() {
+        let dh_table =
+            parse_table_segment(&code_table_segment(2), &mut Budget::new()).expect("code table");
+        let bm_table =
+            parse_table_segment(&code_table_segment(0), &mut Budget::new()).expect("code table");
+        let agg_table =
+            parse_table_segment(&code_table_segment(1), &mut Budget::new()).expect("code table");
+        let input = glyph(&["1111", "1001", "1001", "1111"]);
+        let want = glyph(&["0110", "1001", "1010", "0110"]);
+        let body = huffman_refined_body(&input, &want, &dh_table, &agg_table);
+
+        // SDHUFFDH = 3, SDHUFFBMSIZE = 1 and SDHUFFAGGINST = 1.
+        let flags = 0x0003 | (3 << 2) | (1 << 6) | (1 << 7);
+        let segment = huffman_refagg_segment(flags, 1, 1, &body);
+        let refs = [&dh_table, &bm_table, &agg_table];
+        let got =
+            decode_symbol_dict(&segment, &[&input], &refs, &mut Budget::new()).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+
+        // Without the table the dead selector would have bound, the header
+        // disagrees with its own referred-to list.
+        let refs = [&dh_table, &agg_table];
+        assert_eq!(
+            decode_symbol_dict(&segment, &[&input], &refs, &mut Budget::new()),
+            Err(Jbig2Error::Malformed(
+                "Huffman table count disagrees with the dictionary flags"
+            )),
+        );
+    }
+
+    /// The Huffman many-instance aggregation: the nested text region reads
+    /// the tables Table 17 fixes — B.11 for strip offsets, B.6 and B.8 along
+    /// the strip — and raw equal-length ids, all mid-bit in the dictionary's
+    /// own stream.
+    ///
+    /// Table B.11 codes no value below 1, so the fixture reaches STRIPT 0 the
+    /// way an encoder does: an initial offset of 1 puts it at −1 and the one
+    /// strip's delta of 1 brings it home.
+    #[test]
+    fn a_huffman_aggregate_composes_a_symbol_from_placements() {
+        let a = glyph(&["10", "11"]);
+        let want = glyph(&["1010", "1111"]);
+        let dh = standard(4).expect("Table B.4");
+        let dw = standard(2).expect("Table B.2");
+        let b1 = standard(1).expect("Table B.1");
+        let fs = standard(6).expect("Table B.6");
+        let ds = standard(8).expect("Table B.8");
+        let dt = standard(11).expect("Table B.11");
+
+        let mut w = BitWriter::default();
+        push_value(&mut w, &dh, Some(2));
+        push_value(&mut w, &dw, Some(4));
+        push_value(&mut w, &b1, Some(2)); // REFAGGNINST
+        push_value(&mut w, &dt, Some(1)); // STRIPT to -1 (6.4.5 step 2)
+        push_value(&mut w, &dt, Some(1)); // and back to 0
+        push_value(&mut w, &fs, Some(0));
+        w.push(0, 1); // the id
+        w.push(0, 1); // RI: the input as it stands
+        push_value(&mut w, &ds, Some(1)); // the gap
+        w.push(0, 1);
+        w.push(0, 1);
+        push_value(&mut w, &ds, None); // close the strip
+        push_value(&mut w, &dw, None); // close the height class
+        push_value(&mut w, &b1, Some(1));
+        push_value(&mut w, &b1, Some(1));
+
+        let segment = huffman_refagg_segment(0x0003, 1, 1, &w.finish());
+        let got = decode(&segment, &[&a]).expect("dictionary");
+        assert_eq!(got.len(), 1);
+        assert_same(&got[0], &want, 0);
+    }
+
+    /// Both refagg paths must survive arbitrary bytes exactly as the direct
+    /// ones do. The flags word is forced to each variant so the sweep reaches
+    /// the aggregate walks rather than being turned away at the first bit.
+    #[test]
+    fn arbitrary_refagg_bytes_error_rather_than_panicking() {
+        let input = glyph(&["11", "11"]);
+        let mut state: u32 = 0x4D2A_11C7;
+        for flags in [0x0002u16, 0x0003] {
+            for _ in 0..1_000 {
+                let len = (state % 193) as usize;
+                let mut data: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (state >> 24) as u8
+                    })
+                    .collect();
+                if data.len() >= 2 {
+                    data[..2].copy_from_slice(&flags.to_be_bytes());
+                }
+                let _ = decode_symbol_dict(&data, &[&input], &[], &mut Budget::with_limit(1 << 16));
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_of_a_refagg_segment_errors_cleanly() {
+        let (input, _, segment) = refined_fixture();
+        let refs = [&input];
+        for cut in 0..segment.len() {
+            let _ = decode_symbol_dict(
+                &segment[..cut],
+                &refs,
+                &[],
+                &mut Budget::with_limit(1 << 16),
+            );
+        }
     }
 
     /// The Huffman variant of the same dictionary, across two height classes,
