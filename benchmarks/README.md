@@ -54,9 +54,8 @@ reported per engine.
 `bench_diversity.py` measures quality — never timing — on corpora the other
 benchmarks do not cover: CJK, Arabic and academic PDFs fetched by the scripts
 under `corpora/`. Per corpus and engine it records open rate, text-extraction
-non-crash rate, the per-document U+FFFD replacement-character rate (the
-honest proxy for encoding gaps), markdown non-crash rate and a first-page
-ink check.
+non-crash rate, the per-document U+FFFD replacement-character rate, markdown
+non-crash rate and a first-page ink check.
 
 ## Libraries
 
@@ -146,8 +145,7 @@ document to a set and from one scale to a sweep:
   049104, 049107, 049109), 2 JPX files (049124, 049359) and 2 JBIG2 files
   (049373, 049396). CCITT-bearing does not always mean scan-shaped — 049004
   is a vector map with a fax inset, and cells like it gate out engines whose
-  ink diverges on the vector content. That is the gate doing its job; the
-  cell records the exclusion.
+  ink diverges on the vector content. The cell records the exclusion.
 
 Suite results table: **pending a quiet-machine pass.** Suite mode is
 smoke-tested (2 files × 2 scales, per-cell gates and per-scale totals
@@ -224,7 +222,7 @@ Per-engine parallel routes, documented because they are the comparison:
   it has no thread knob, so `--threads` does not apply to it.
 - **PyMuPDF** — `ThreadPoolExecutor` over per-page calls, one document handle
   per worker thread (its objects are not thread-safe across a shared handle).
-  Whatever its internal serialization then allows is its parallel story.
+  Whatever its internal locks then allow is what the row measures.
 - **pypdfium2, pdfplumber rendering** — pdfium's contract requires callers to
   serialize every pdfium call across threads, and it means it: threaded
   rendering with one document per worker intermittently corrupts pdfium's
@@ -232,7 +230,8 @@ Per-engine parallel routes, documented because they are the comparison:
   (a fresh pdfium document open/close inside every call) crashes the process
   outright — both reproduced while building this bench. The harness therefore
   serializes all pdfium calls under one lock and threads only the PNG
-  encoding; the resulting near-1x IS the pdfium threading story. Parallel
+  encoding; the resulting near-1× is the measurement, not a harness
+  artifact. Parallel
   pdfium in Python means one process per worker, a different workload shape
   than this in-process comparison.
 - **pdfplumber text** — threads with one document per worker; extraction is
@@ -245,7 +244,6 @@ Results table: **pending a quiet-machine pass.** The script is smoke-tested
 built it was under heavy parallel load, so no wall-clock numbers are
 published yet.
 
-
 ## Method — robustness
 
 - The corpus is malformed by construction: the OSS-Fuzz **public corpora** for
@@ -253,11 +251,10 @@ published yet.
   hash-named seeds each), downloaded by `fetch_stress_corpus.sh` into a
   directory **outside the repo** — fuzzer-minimized inputs are fine to fetch
   and use locally, and are never committed or redistributed from here.
-- Provenance, for fairness: the seeds were minimized against two specific C
-  engines (MuPDF and Poppler), and one tested library binds one of them. That
-  does not materially bias the comparison — a malformed file is malformed for
-  every parser, and the metric is process survival, not output fidelity — but
-  it is the corpus's origin and belongs in the open.
+- Provenance: the seeds were minimized against two C engines (MuPDF and
+  Poppler), and one tested library binds one of them. A malformed file is
+  malformed for every parser, and the metric is survival rather than output
+  fidelity, so the bias is small — but the origin is worth stating.
 - **Isolation** — every (file, engine) pair runs in a fresh interpreter (the
   script re-runs itself in worker mode via `isolation.py`), because two of the
   engines are in-process C libraries whose segfaults cannot be caught. Each
@@ -313,8 +310,8 @@ published yet.
 - Text and markdown run over the first `--max-pages` pages (default 20),
   capped identically across engines, so a 400-page book weighs the same as
   an article and the per-character U+FFFD proxy is unchanged.
-- The U+FFFD rate is the honest proxy for encoding gaps: replacement
-  characters per extracted character. A doc that extracts *zero* characters
+- The U+FFFD rate — replacement characters per extracted character — is the
+  proxy for an encoding gap. A doc that extracts *zero* characters
   is worse than one full of U+FFFD, so zero-text docs are tallied separately
   (`docs_with_zero_text`) and never score a flattering 0.0.
 - **pdfboss currently lacks predefined-CMap support**, so Japanese documents
@@ -322,10 +319,9 @@ published yet.
   targets — are expected to score poorly on the text metrics. This bench
   exists to measure that gap and to catch the improvement when CMap support
   lands.
-- All metrics are quality, not timing, so they are load-insensitive and the
-  results are published as measured. The JSON records counts and rates only,
+- All metrics are quality, not timing, so machine load cannot move them.
+  The JSON records counts and rates only,
   never file names; per-file character and U+FFFD counts print to stdout.
-
 
 ## Corpora fetch scripts
 
@@ -353,13 +349,12 @@ measured slice 6 of 15 files carry RKSJ CMaps.
 
 Measured on the fetched slices (17 CJK, 10 RTL/Arabic, 15 academic files;
 see `results-diversity.json`): every engine opens, extracts and renders
-non-blank on 100% of all three corpora, and the gap shows exactly where the
-proxy was designed to find it — pdfboss's mean per-doc U+FFFD rate is 35.9%
+non-blank on 100% of all three corpora, and the U+FFFD rate lands on the
+encoding gap: pdfboss's mean per-doc rate is 35.9%
 on the CJK slice (9 of 17 docs affected, worst doc 96.1%) versus 0 for the
 other engines, 0 on the Arabic books, and 0.29% on the academic slice
 (9 of 15 docs, worst 1.24%). The CJK numbers are the baseline the
 predefined-CMap feature work will be measured against.
-
 
 ## Running
 
@@ -414,7 +409,7 @@ non-OCR engine, so the honest headline is the born-digital buckets — the
 scan and LaTeX-math buckets score near zero by construction. The recipe and
 the full interpretation notes are in [olmocr/README.md](olmocr/README.md).
 
-## Method — ParseBench (quality)
+## ParseBench
 
 `parsebench/` wires pdfboss into
 [run-llama/ParseBench](https://github.com/run-llama/ParseBench): 2,078
@@ -424,8 +419,8 @@ their tree (per-page markdown, pipe tables converted to HTML for the table
 metrics the same way their pdf_inspector provider does it); the wiring
 steps, full method and score interpretation live in
 [`parsebench/README.md`](parsebench/README.md). Scores are rule-based and
-deterministic, so unlike the timing benchmarks they are load-insensitive
-and published as measured: **28.00 overall** for pdfboss 0.17.1 (Content
+deterministic, so they hold regardless of machine load: **28.00 overall**
+for pdfboss 0.17.1 (Content
 Faithfulness 61.50, Semantic Formatting 33.78, Tables 28.89, Visual
 Grounding 10.77, Charts 5.04), from a full 2,078-example run at ParseBench
 commit 34b7345. Raw aggregates land in `results-parsebench.json`.
