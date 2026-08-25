@@ -391,6 +391,16 @@ mod tests {
         assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
     }
 
+    /// An eight-point column gap on a page-wide stretch is real table
+    /// structure: exact interval lanes must keep resolving it where a
+    /// binned occupancy histogram rounded it away.
+    #[test]
+    fn a_narrow_column_gap_still_opens_a_lane() {
+        let md = markdown_of(&structure::tests::narrow_gap_lane_grid_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+    }
+
     /// Page-edge lines sharing the band with a grid leave as prose: the
     /// running header does not take the header row's place — which, being
     /// wide enough to cross every lane, would also flip the block to the HTML
@@ -502,6 +512,53 @@ mod tests {
         assert!(
             !md.contains("| wrap two |"),
             "no fragmentary row survives: {md}"
+        );
+    }
+
+    /// A grid ruled only on its interior boundaries: the header band above
+    /// the top horizontal is claimed via the verticals' reach, the text
+    /// overflowing the outer verticals opens a column on each side, and the
+    /// rule-less data band's lines become one row per anchor line.
+    #[test]
+    fn an_open_edged_grid_becomes_a_full_table() {
+        let md = markdown_of_drawn(&structure::tests::ruled_open_grid_content());
+        assert!(
+            md.contains(
+                "| name | count | note |\n| --- | --- | --- |\n\
+                 | alpha | one | xx |\n| beta | two | yy |\n\
+                 | gamma | three | zz |\n| delta | four | ww |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// Records wrapping inside a rule-less band fold behind their anchor
+    /// lines: the continuation populates no anchor cell, so it is the same
+    /// row still being written, not a row of its own.
+    #[test]
+    fn wrapped_records_fold_behind_their_anchors() {
+        let md = markdown_of_drawn(&structure::tests::ruled_wrapped_records_content());
+        assert!(
+            md.contains(
+                "| name | org | count |\n| --- | --- | --- |\n\
+                 | one | recordaa wrapa | c1 |\n| two | recordbb wrapb | c2 |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// A rule-less band whose first line populates a single cell holds one
+    /// vertically centered record: it merges whole instead of shattering at
+    /// its anchor column.
+    #[test]
+    fn a_centered_record_band_merges_whole() {
+        let md = markdown_of_drawn(&structure::tests::ruled_centered_record_content());
+        assert!(
+            md.contains(
+                "| name | org | count |\n| --- | --- | --- |\n\
+                 | actlinea actlineb actlinec actlined | union | c9 |"
+            ),
+            "md: {md}"
         );
     }
 

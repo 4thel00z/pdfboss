@@ -27,7 +27,8 @@ pub struct TextSpan {
     /// Font resource name.
     pub font: String,
     /// Whether the font that produced this span is bold: FontDescriptor
-    /// `/FontWeight` >= 600 or `/Flags` ForceBold, else a `Bold` substring
+    /// `/FontWeight` >= 600, `/Flags` ForceBold, or a `/StemV` in bold
+    /// stem-width territory, else a `Bold` substring
     /// in `/BaseFont` (ISO 32000-1 Table 123).
     pub bold: bool,
     /// Whether the font that produced this span is italic: FontDescriptor
@@ -345,6 +346,45 @@ mod tests {
         let spans = extract_spans(&doc, &page).unwrap();
         assert!(spans[0].italic, "Flags bit 7 (mask 64) is Italic");
         assert!(spans[0].bold, "FontWeight 700 >= 600 is bold");
+    }
+
+    /// Table 122 `/StemV`: a thick dominant vertical stem marks a bold face
+    /// whose descriptor carries neither a weight nor a telling name — the
+    /// URW `-Medi` faces LaTeX embeds. A regular-width stem stays regular.
+    #[test]
+    fn thick_stemv_reads_as_bold() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (a) Tj /F2 12 Tf (b) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /NimbusRomNo9L-Medi \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /NimbusRomNo9L-Medi /Flags 4 /StemV 140 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /NimbusRomNo9L-Regu \
+             /Encoding /WinAnsiEncoding /FontDescriptor 8 0 R >>",
+        );
+        b.object(
+            8,
+            "<< /Type /FontDescriptor /FontName /NimbusRomNo9L-Regu /Flags 4 /StemV 85 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page).unwrap();
+        assert!(spans[0].bold, "StemV 140 is a bold stem");
+        assert!(!spans[1].bold, "StemV 85 is a regular stem");
     }
 
     /// BaseFont-name fallback when no descriptor exists, and ItalicAngle.

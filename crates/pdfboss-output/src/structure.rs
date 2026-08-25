@@ -26,6 +26,11 @@ const COLUMN_MIN_HEIGHT: f32 = 0.4;
 /// a table's number or label column is far narrower than any genuine text
 /// column, and splitting a table reads its rows column-major.
 const COLUMN_MIN_SIDE_WIDTH: f32 = 0.25;
+/// A landscape text block splits only as a 2-up sheet — two portrait pages
+/// scanned side by side — and its gutter must span at least this fraction
+/// of the block's width: facing pages never touch, where a slide's or a
+/// table sheet's interior lane is a cell boundary.
+const TWO_UP_MIN_GUTTER: f32 = 0.05;
 /// Minimum device-space gutter width, and the central band of the text
 /// width the gutter's center must fall in.
 const GUTTER_MIN_WIDTH: f32 = 6.0;
@@ -91,6 +96,12 @@ const RULING_SNAP_TOLERANCE: f32 = 6.0;
 /// apply here — the structure is drawn, not implied by white space.
 const RULED_GRID_MIN_VERTICALS: usize = 2;
 const RULED_GRID_MIN_HORIZONTALS: usize = 3;
+/// How many lines a band must hold before rows are inferred inside it — the
+/// dominant band of a table drawn with column rules but no row rules, which
+/// otherwise folds its whole body into one line of cells. Below it, and in
+/// any band holding a minority of the claim's lines, a multi-line band is a
+/// wrapped row whose lines merge as ever.
+const BAND_INFER_MIN_LINES: usize = 4;
 /// Populated bands a fully boxed grid needs; an unboxed lattice needs
 /// [`TABLE_MIN_ROWS`], since stray separators reach three lines more easily
 /// than a drawn border box does.
@@ -971,10 +982,15 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 /// One connected component as a grid, or `None` when it is too sparse to be
 /// one: a lone separator, an underline, a pair of column rules with nothing
 /// across them.
+///
+/// The column rules often run past the outermost horizontal — a header row
+/// bounded above by nothing but its verticals, drawn one row box at a time.
+/// Where they reach beyond it, a synthetic boundary at their far end adds
+/// that band, so the rows it holds stay rows of this grid.
 fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGrid> {
     let xs = distinct_positions(verticals);
-    let ys = distinct_positions(horizontals);
-    if xs.len() < RULED_GRID_MIN_VERTICALS || ys.len() < RULED_GRID_MIN_HORIZONTALS {
+    let mut ys = distinct_positions(horizontals);
+    if xs.len() < RULED_GRID_MIN_VERTICALS || ys.is_empty() {
         return None;
     }
     let (x_lo, x_hi) = (xs[0], xs[xs.len() - 1]);
@@ -983,6 +999,23 @@ fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGr
         && covers(verticals, x_hi, y_lo, y_hi)
         && covers(horizontals, y_lo, x_lo, x_hi)
         && covers(horizontals, y_hi, x_lo, x_hi);
+    let reach_lo = verticals
+        .iter()
+        .map(|line| line.extent.start)
+        .fold(f32::INFINITY, f32::min);
+    let reach_hi = verticals
+        .iter()
+        .map(|line| line.extent.end)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if reach_lo < y_lo - RULING_SNAP_TOLERANCE {
+        ys.insert(0, reach_lo);
+    }
+    if reach_hi > y_hi + RULING_SNAP_TOLERANCE {
+        ys.push(reach_hi);
+    }
+    if ys.len() < RULED_GRID_MIN_HORIZONTALS {
+        return None;
+    }
     Some(RuledGrid { xs, ys, boxed })
 }
 
@@ -1050,12 +1083,14 @@ fn grid_claims(groups: &[Group], grids: &[RuledGrid]) -> Vec<GridClaim> {
 
 /// `groups` against one grid: the contiguous stretch of lines whose
 /// baselines fall inside the grid becomes the claim, one logical row per
-/// populated band — the y-range between consecutive horizontal rulings.
-/// `None` when a line will not sit in the grid's columns, when a column
-/// boundary lands inside a sub-word gap — the row would split a word the
-/// flat flow wrote whole — or when the populated bands number under
-/// [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid with
-/// all four borders drawn. Every line passes [`table_row`] before any
+/// populated band — the y-range between consecutive horizontal rulings —
+/// except a dominant rule-less band, whose rows [`anchored_rows`] infers.
+/// The columns are the grid's, opened outward where the stretch's ink
+/// overflows the outer verticals. `None` when a line will not sit in the
+/// columns, when a column boundary lands inside a sub-word gap — the row
+/// would split a word the flat flow wrote whole — or when the rows number
+/// under [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid
+/// with all four borders drawn. Every line passes [`table_row`] before any
 /// band's lines merge.
 fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
     let lo = groups.iter().position(|group| grid.holds(group.y))?;
@@ -1064,12 +1099,16 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         .take_while(|group| grid.holds(group.y))
         .count();
     let hi = lo + inside;
-    let columns = grid.columns();
+    let columns = open_columns(&groups[lo..hi], grid);
     let mut rows = Vec::new();
     for band in groups[lo..hi].chunk_by(|a, b| grid.band_of(a.y) == grid.band_of(b.y)) {
         let mut lines = Vec::with_capacity(band.len());
         for group in band {
             lines.push(table_row(group, &columns)?);
+        }
+        if lines.len() >= BAND_INFER_MIN_LINES && 2 * lines.len() > hi - lo {
+            rows.append(&mut anchored_rows(lines, columns.len()));
+            continue;
         }
         rows.push(logical_row(lines, columns.len()));
     }
@@ -1081,6 +1120,84 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         rows,
         bbox: grid.bbox(),
     })
+}
+
+/// The grid's columns, with an open outer column on each side the claimed
+/// lines' ink overflows: many tables rule only the interior boundaries and
+/// leave the first and last columns unboxed. The overflow may reach at most
+/// the widest drawn column's width — ink farther out is a neighbouring
+/// block, and without the extra column such a row fails [`table_row`]
+/// exactly as it always did.
+fn open_columns(groups: &[Group], grid: &RuledGrid) -> Vec<std::ops::Range<f32>> {
+    let spans: Vec<&TextSpan> = groups
+        .iter()
+        .flat_map(|group| group.spans.iter().copied())
+        .collect();
+    let (x_lo, x_hi) = x_bounds(&spans);
+    let mut columns = grid.columns();
+    let widest = columns
+        .iter()
+        .map(|column| column.end - column.start)
+        .fold(0.0f32, f32::max);
+    let first = grid.xs[0];
+    let last = grid.xs[grid.xs.len() - 1];
+    if x_lo < first - RULING_SNAP_TOLERANCE && first - x_lo <= widest {
+        columns.insert(0, x_lo..first);
+    }
+    if x_hi > last + RULING_SNAP_TOLERANCE && x_hi - last <= widest {
+        columns.push(last..x_hi);
+    }
+    columns
+}
+
+/// A rule-less band's lines as logical rows: a new row opens at every line
+/// that populates the band's leftmost populated column — the anchor a
+/// record's first line draws in a top-aligned table — and also stands like
+/// a record, populating [`TABLE_MIN_ROW_CELLS`] cells. The lines between
+/// openers are wrapped continuations, merged in behind their opener.
+///
+/// A band whose first line is no opener is not top-aligned: its records
+/// center their cells vertically, or it is one wrapped record whose long
+/// first column touches every line. There the anchor says nothing, and the
+/// band merges whole, exactly as a wrapped row always has.
+fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize) -> Vec<Vec<Cell>> {
+    let Some(anchor) =
+        (0..columns).find(|column| lines.iter().any(|line| populates(line, *column)))
+    else {
+        return vec![logical_row(lines, columns)];
+    };
+    let opens = |line: &Vec<Cell>| {
+        populates(line, anchor)
+            && line.iter().filter(|cell| cell.line.is_some()).count() >= TABLE_MIN_ROW_CELLS
+    };
+    if !lines.first().is_some_and(opens) {
+        return vec![logical_row(lines, columns)];
+    }
+    let mut rows = Vec::new();
+    let mut group: Vec<Vec<Cell>> = Vec::new();
+    for line in lines {
+        if opens(&line) && !group.is_empty() {
+            rows.push(logical_row(std::mem::take(&mut group), columns));
+        }
+        group.push(line);
+    }
+    if !group.is_empty() {
+        rows.push(logical_row(group, columns));
+    }
+    rows
+}
+
+/// True when the row's cell covering `column` carries a line.
+fn populates(row: &[Cell], column: usize) -> bool {
+    let mut at = 0usize;
+    for cell in row {
+        let width = cell.colspan as usize;
+        if at <= column && column < at + width {
+            return cell.line.is_some();
+        }
+        at += width;
+    }
+    false
 }
 
 /// One band's visual lines as its logical row. Cells whose column intervals
@@ -1183,21 +1300,15 @@ fn merged_line(fragments: &[&Line]) -> Line {
 /// Lanes are measured over the candidate stretch alone, never over the whole
 /// segment: a page title and a paragraph of prose put ink across the width the
 /// grid keeps clear, so a segment holding anything besides its table leaves no
-/// lanes at all. Adding a line can only fill bins, so lanes shrink as a stretch
+/// lanes at all. Adding a line can only add ink, so lanes shrink as a stretch
 /// grows and never come back — a stretch is grown until they fall below
 /// [`TABLE_MIN_LANES`], and that is its end. A wrapped cell standing alone in
-/// one column survives inside the stretch for free: it occupies bins that
-/// column already held.
+/// one column survives inside the stretch for free: it puts ink where that
+/// column already held some.
 fn table_band(segment: &[&TextSpan]) -> Option<TableBand> {
     let groups = line_groups(segment);
-    let (x_min, x_max) = x_bounds(segment);
-    let width = x_max - x_min;
-    if !width.is_finite() || width <= 0.0 {
-        return None;
-    }
-    let scale = GUTTER_BINS as f32 / width;
     for start in 0..groups.len() {
-        let (end, lanes) = lane_run(&groups, start, x_min, scale);
+        let (end, lanes) = lane_run(&groups, start);
         if end - start < TABLE_MIN_ROWS {
             continue;
         }
@@ -1209,29 +1320,49 @@ fn table_band(segment: &[&TextSpan]) -> Option<TableBand> {
 }
 
 /// The stretch starting at `start` that keeps at least [`TABLE_MIN_LANES`]
-/// lanes, as an exclusive end and the lanes the whole stretch leaves. The
-/// occupancy histogram is kept in the segment's frame so each line's bins can
-/// simply be added to it; a stretch narrower than the segment leaves its
-/// margins empty, and [`wide_gaps`] already reads edge runs as margins.
-fn lane_run(
-    groups: &[Group],
-    start: usize,
-    x_min: f32,
-    scale: f32,
-) -> (usize, Vec<std::ops::Range<f32>>) {
-    let mut occupied = [false; GUTTER_BINS];
+/// lanes, as an exclusive end and the lanes the whole stretch leaves. Ink is
+/// tracked as exact intervals, not histogram bins: a column gap of a few
+/// points is real table structure that bin rounding swallows.
+fn lane_run(groups: &[Group], start: usize) -> (usize, Vec<std::ops::Range<f32>>) {
+    let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     let mut lanes = Vec::new();
     for (offset, group) in groups[start..].iter().enumerate() {
-        let mut next = occupied;
-        fill_bins(&mut next, &group.spans, x_min, scale);
-        let gaps = wide_gaps(&next, scale);
+        let mut next = occupied.clone();
+        for span in &group.spans {
+            add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
+        }
+        let gaps = ink_gaps(&next);
         if gaps.len() < TABLE_MIN_LANES {
             return (start + offset, lanes);
         }
         occupied = next;
-        lanes = lane_ranges(&gaps, x_min, scale);
+        lanes = gaps;
     }
     (groups.len(), lanes)
+}
+
+/// Adds one span's extent to a sorted, disjoint interval set, merging every
+/// interval it touches.
+fn add_ink(occupied: &mut Vec<std::ops::Range<f32>>, ink: std::ops::Range<f32>) {
+    let at = occupied.partition_point(|held| held.end < ink.start);
+    let mut merged = ink;
+    while at < occupied.len() && occupied[at].start <= merged.end {
+        let held = occupied.remove(at);
+        merged.start = merged.start.min(held.start);
+        merged.end = merged.end.max(held.end);
+    }
+    occupied.insert(at, merged);
+}
+
+/// The gaps between consecutive ink intervals at least [`GUTTER_MIN_WIDTH`]
+/// wide — interior by construction: whatever lies beyond the outermost ink
+/// is margin, not lane.
+fn ink_gaps(occupied: &[std::ops::Range<f32>]) -> Vec<std::ops::Range<f32>> {
+    occupied
+        .windows(2)
+        .filter(|pair| pair[1].start - pair[0].end >= GUTTER_MIN_WIDTH)
+        .map(|pair| pair[0].end..pair[1].start)
+        .collect()
 }
 
 /// `groups[start..end]` as a table band, or `None` when it fails a gate.
@@ -1389,8 +1520,11 @@ fn even_rows(baselines: &[f32]) -> bool {
 }
 
 /// One row's cells, left to right, with a lineless cell for every column
-/// nothing was drawn in. `None` when a span will not sit in a column: one
-/// starting inside a lane, or two cells claiming the same column.
+/// nothing was drawn in. `None` when a span will not sit in a column — one
+/// starting inside a lane. A span starting in any column the last cell
+/// already covers extends that cell: ink crossing a boundary means the cell
+/// is merged there, and everything under its covered columns reads as its
+/// contents.
 fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell>> {
     let mut claimed: Vec<(usize, usize, Vec<&TextSpan>)> = Vec::new();
     for &span in &group.spans {
@@ -1402,11 +1536,10 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         }
         let end = columns.iter().rposition(|column| column.start <= hi)?;
         match claimed.last_mut() {
-            Some(last) if last.0 == start => {
+            Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
                 last.2.push(span);
             }
-            Some(last) if start <= last.1 => return None,
             _ => claimed.push((start, end, vec![span])),
         }
     }
@@ -1567,13 +1700,6 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     if body.len() < COLUMN_MIN_SPANS {
         return whole();
     }
-    // Two-column flow lives on portrait-shaped text blocks. A block wider
-    // than it is tall is a slide or a table sheet, where a lone lane is a
-    // cell boundary, not a gutter.
-    let (body_lo, body_hi) = y_extent(&body);
-    if body_hi - body_lo <= width {
-        return whole();
-    }
     // Exactly one wide interior lane is a gutter; several are the cell
     // columns of a data table, whose rows must keep reading left to right.
     let [gutter] = gaps.as_slice() else {
@@ -1587,6 +1713,18 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
 
     let (left, right): (Vec<&TextSpan>, Vec<&TextSpan>) =
         body.iter().partition(|s| s.x.max(s.end_x) <= cut);
+    // Two-column flow lives on portrait-shaped text blocks. A block wider
+    // than it is tall is a slide or a table sheet, where a lone lane is a
+    // cell boundary, not a gutter — unless it is a 2-up sheet: a gutter no
+    // narrower than [`TWO_UP_MIN_GUTTER`] of the width with a portrait page
+    // shape on each side of it.
+    let (body_lo, body_hi) = y_extent(&body);
+    if body_hi - body_lo <= width {
+        let gutter_width = (gutter.end - gutter.start) as f32 / scale;
+        if gutter_width < TWO_UP_MIN_GUTTER * width || !portrait(&left) || !portrait(&right) {
+            return whole();
+        }
+    }
     if !column_shaped(&left) || !column_shaped(&right) {
         return whole();
     }
@@ -1683,17 +1821,11 @@ fn wide_gaps(occupied: &[bool; GUTTER_BINS], scale: f32) -> Vec<std::ops::Range<
     gaps
 }
 
-/// The bin ranges back in device space. Bins, not device coordinates, stay
-/// the currency of the gutter split: rounding a lane and cutting the page at
-/// the rounded center could move a span from one column to the other.
-fn lane_ranges(
-    gaps: &[std::ops::Range<usize>],
-    x_min: f32,
-    scale: f32,
-) -> Vec<std::ops::Range<f32>> {
-    gaps.iter()
-        .map(|gap| (x_min + gap.start as f32 / scale)..(x_min + gap.end as f32 / scale))
-        .collect()
+/// True when a span set stands taller than it runs wide — the shape of one
+/// page of a 2-up sheet.
+fn portrait(spans: &[&TextSpan]) -> bool {
+    let (lo, hi) = y_extent(spans);
+    hi - lo > x_span(spans)
 }
 
 /// True when a gutter side has enough spans on enough distinct baselines
@@ -1833,11 +1965,13 @@ pub(crate) mod tests {
         .collect();
         contents.push(two_column_content(25));
         contents.push(two_column_content(3));
+        contents.push(two_up_content(25));
         contents.push(format!(
             "BT /F1 12 Tf 72 760 Td (A quite wide heading spanning both text columns here) Tj ET {}",
             two_column_content(25)
         ));
         contents.push(lane_grid_content());
+        contents.push(narrow_gap_lane_grid_content());
         contents.push(grid_with_edge_lines_content());
         contents.push(margin_number_grid_content());
         contents.push(ruled_grid_content());
@@ -1845,6 +1979,9 @@ pub(crate) mod tests {
         contents.push(ruled_sub_word_gap_content());
         contents.push(ruled_wrapped_band_content());
         contents.push(ruled_grid_above_lane_grid_content());
+        contents.push(ruled_open_grid_content());
+        contents.push(ruled_wrapped_records_content());
+        contents.push(ruled_centered_record_content());
         contents
     }
 
@@ -1902,6 +2039,66 @@ pub(crate) mod tests {
         )
     }
 
+    /// A registration-results shape: two interior verticals running past the
+    /// top horizontal, no rule between the data rows, and text overflowing
+    /// both unruled outer edges. The claim must extend to the verticals'
+    /// reach, open a column on each side, and infer the rule-less band's
+    /// rows at its anchor column.
+    pub(crate) fn ruled_open_grid_content() -> String {
+        String::from(
+            "150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 600 m 330 600 l S 70 700 m 330 700 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (name) Tj 1 0 0 1 160 703 Tm (count) Tj \
+             1 0 0 1 260 703 Tm (note) Tj \
+             1 0 0 1 80 685 Tm (alpha) Tj 1 0 0 1 160 685 Tm (one) Tj \
+             1 0 0 1 260 685 Tm (xx) Tj \
+             1 0 0 1 80 665 Tm (beta) Tj 1 0 0 1 160 665 Tm (two) Tj \
+             1 0 0 1 260 665 Tm (yy) Tj \
+             1 0 0 1 80 645 Tm (gamma) Tj 1 0 0 1 160 645 Tm (three) Tj \
+             1 0 0 1 260 645 Tm (zz) Tj \
+             1 0 0 1 80 625 Tm (delta) Tj 1 0 0 1 160 625 Tm (four) Tj \
+             1 0 0 1 260 625 Tm (ww) Tj ET",
+        )
+    }
+
+    /// [`ruled_open_grid_content`]'s lattice with records wrapping inside
+    /// the rule-less band: the second line of each record populates only the
+    /// middle column, so it must fold into the anchor line before it rather
+    /// than stand as a row of its own.
+    pub(crate) fn ruled_wrapped_records_content() -> String {
+        String::from(
+            "150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 600 m 330 600 l S 70 700 m 330 700 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (name) Tj 1 0 0 1 160 703 Tm (org) Tj \
+             1 0 0 1 260 703 Tm (count) Tj \
+             1 0 0 1 80 685 Tm (one) Tj 1 0 0 1 160 685 Tm (recordaa) Tj \
+             1 0 0 1 260 685 Tm (c1) Tj \
+             1 0 0 1 160 670 Tm (wrapa) Tj \
+             1 0 0 1 80 650 Tm (two) Tj 1 0 0 1 160 650 Tm (recordbb) Tj \
+             1 0 0 1 260 650 Tm (c2) Tj \
+             1 0 0 1 160 635 Tm (wrapb) Tj ET",
+        )
+    }
+
+    /// One record wrapping over the whole rule-less band, its long first
+    /// column inked on every line and its other cells centered on the second
+    /// line. The first line populates one cell only, so no line is an
+    /// opener: the band must merge whole, one record, not shatter at its
+    /// anchor column.
+    pub(crate) fn ruled_centered_record_content() -> String {
+        String::from(
+            "150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 600 m 330 600 l S 70 700 m 330 700 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (name) Tj 1 0 0 1 160 703 Tm (org) Tj \
+             1 0 0 1 260 703 Tm (count) Tj \
+             1 0 0 1 80 685 Tm (actlinea) Tj \
+             1 0 0 1 80 665 Tm (actlineb) Tj 1 0 0 1 160 665 Tm (union) Tj \
+             1 0 0 1 260 665 Tm (c9) Tj \
+             1 0 0 1 80 645 Tm (actlinec) Tj \
+             1 0 0 1 80 625 Tm (actlined) Tj ET",
+        )
+    }
+
     /// The doc-81 shape: a small fully boxed grid above a whitespace-laned
     /// grid in one segment. The drawn grid claims only its own stretch; the
     /// laned rows below it must still become a table of their own.
@@ -1923,6 +2120,21 @@ pub(crate) mod tests {
         let mut content = String::from("BT /F1 10 Tf ");
         for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
             for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
+    }
+
+    /// [`lane_grid_content`]'s shape with the second lane squeezed to eight
+    /// points on a page-wide stretch: real structure, but under the ~two-bin
+    /// floor a 128-bin occupancy histogram could resolve at this width. Only
+    /// exact interval gaps keep it a lane.
+    pub(crate) fn narrow_gap_lane_grid_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 500.0), (2, 528.0)] {
                 content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
             }
         }
@@ -2057,6 +2269,34 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// Two portrait book pages scanned side by side onto one landscape
+    /// sheet, a wide empty gutter between them. Each side's lines run wide
+    /// enough to be a real page column, yet stand taller than they run.
+    pub(crate) fn two_up_content(lines: u32) -> String {
+        (0..lines)
+            .flat_map(|i| {
+                let y = 720 - i * 14;
+                [
+                    column_line(72, y, &format!("Left{i}")),
+                    column_line(500, y, &format!("Right{i}")),
+                ]
+            })
+            .collect()
+    }
+
+    /// A 2-up sheet is landscape, but its huge gutter and the portrait
+    /// shape of each side still split it: each page reads whole.
+    #[test]
+    fn two_up_sheet_reads_page_by_page() {
+        let text = text_of(&two_up_content(25));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines[0], "Left0a Left0b Left0c Left0d");
+        assert_eq!(lines[24], "Left24a Left24b Left24c Left24d");
+        assert_eq!(lines[25], "Right0a Right0b Right0c Right0d");
+        assert_eq!(lines[49], "Right24a Right24b Right24c Right24d");
+    }
+
     /// A page with a clear central gutter reads column-major: the whole left
     /// column, then the whole right column — not line-by-line across both.
     #[test]
@@ -2184,6 +2424,22 @@ pub(crate) mod tests {
         assert_eq!(grids.len(), 2);
         assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0], "topmost first");
         assert_eq!(grids[1].ys, vec![300.0, 340.0, 380.0]);
+    }
+
+    /// Column rules running past the outermost horizontals bound bands of
+    /// their own: the lattice gains a synthetic boundary at each far end.
+    #[test]
+    fn vertical_reach_beyond_the_horizontals_adds_bands() {
+        let rulings = vec![
+            ruling(150.0, 590.0, 150.0, 712.0),
+            ruling(250.0, 590.0, 250.0, 712.0),
+            ruling(70.0, 600.0, 330.0, 600.0),
+            ruling(70.0, 640.0, 330.0, 640.0),
+            ruling(70.0, 700.0, 330.0, 700.0),
+        ];
+        let grids = ruled_grids(&rulings);
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].ys, vec![590.0, 600.0, 640.0, 700.0, 712.0]);
     }
 
     /// A plain box has only its two border horizontals — a frame, not a

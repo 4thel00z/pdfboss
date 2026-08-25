@@ -21,6 +21,11 @@ pub struct CharCode {
     pub len: u8,
 }
 
+/// The descriptor `/StemV` (glyph-space units) at which a face reads as
+/// bold. Regular text faces report dominant vertical stems up to ~110 and
+/// bold faces from ~140, so the cut sits in the gap between the clusters.
+const BOLD_STEM_WIDTH: f64 = 120.0;
+
 /// A loaded font: everything needed to decode show-string bytes to
 /// Unicode and to advance the text position.
 pub struct Font {
@@ -421,6 +426,13 @@ impl Font {
             .and_then(|o| o.as_f64())
         {
             bold = bold || weight >= 600.0;
+        }
+        // Table 122: StemV is the thickness of the dominant vertical stems.
+        // Text faces stay under ~110 glyph-space units and bold faces start
+        // around 140, so a thick stem marks bold fonts whose descriptors
+        // carry neither a weight nor a telling name (URW's -Medi faces).
+        if let Some(stem) = rv(src, &descriptor, "StemV").await.and_then(|o| o.as_f64()) {
+            bold = bold || stem >= BOLD_STEM_WIDTH;
         }
         if let Some(angle) = rv(src, &descriptor, "ItalicAngle")
             .await
