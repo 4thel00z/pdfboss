@@ -118,6 +118,26 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// The next `n` whole bytes as a slice, advancing past them.
+    ///
+    /// `None` when the position is not on a byte boundary or fewer than `n`
+    /// bytes remain. The byte-boundary requirement is the caller's to meet —
+    /// JBIG2 embeds byte-counted fields only after an explicit alignment
+    /// (T.88 6.4.11 step 5), so an unaligned call is a field read out of the
+    /// wrong place, not a slice to invent.
+    pub(crate) fn take_aligned_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.pos % 8 != 0 {
+            return None;
+        }
+        let start = self.pos / 8;
+        let end = start.checked_add(n)?;
+        if end > self.data.len() {
+            return None;
+        }
+        self.pos = end.saturating_mul(8);
+        Some(&self.data[start..end])
+    }
+
     /// Whether every bit of the data has been consumed.
     pub(crate) fn is_exhausted(&self) -> bool {
         self.pos >= self.end()
@@ -248,6 +268,21 @@ mod tests {
         assert_eq!(r.remaining(), 11);
         r.skip(u32::MAX);
         assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn take_aligned_bytes_requires_alignment_and_enough_data() {
+        let mut r = BitReader::new(&[0xAB, 0xCD, 0xEF]);
+        r.skip(3);
+        assert_eq!(r.take_aligned_bytes(1), None, "unaligned");
+        r.align_to_byte();
+        assert_eq!(r.take_aligned_bytes(3), None, "only two bytes remain");
+        assert_eq!(r.take_aligned_bytes(1), Some(&[0xCD][..]));
+        assert_eq!(r.bit_pos(), 16, "the cursor moved past the byte");
+        assert_eq!(r.take_aligned_bytes(0), Some(&[][..]));
+        assert_eq!(r.take_aligned_bytes(1), Some(&[0xEF][..]));
+        assert!(r.is_exhausted());
+        assert_eq!(r.take_aligned_bytes(1), None);
     }
 
     #[test]

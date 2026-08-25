@@ -23,6 +23,9 @@ use super::huffman::{from_code_lengths, standard, Table, Unused};
 use super::mq::encoder::MqEncoder;
 use super::mq::MqContext;
 use super::reader::Reader;
+use super::refinement::{
+    encode_refinement_into, RefinementParams, GR_CONTEXT_LEN, NOMINAL_AT as REFINEMENT_NOMINAL_AT,
+};
 use super::segment::parse_header;
 use super::text_region::sym_code_len;
 use crate::filters::ccitt::testing::encode_g4;
@@ -335,6 +338,30 @@ pub(crate) fn code_table_segment(low: i32) -> Vec<u8> {
     out
 }
 
+/// [`code_table_segment`] with HTOOB set: one ordinary line covering `low`
+/// and the fifteen values above it, an upper range line, and the out-of-band
+/// line of B.2 step 10 holding the one-bit code.
+///
+/// This is the shape a table bound to SBHUFFDS wants and every other selector
+/// refuses (7.4.3.1.6), so it is the fixture for testing that refusal.
+pub(crate) fn oob_code_table_segment(low: i32) -> Vec<u8> {
+    let htps = 3u8;
+    let htrs = 5u8;
+    // B.2.1: HTOOB in bit 0.
+    let mut out = vec![1 | ((htps - 1) << 1) | ((htrs - 1) << 4)];
+    out.extend_from_slice(&(low as u32).to_be_bytes());
+    out.extend_from_slice(&((low + 16) as u32).to_be_bytes());
+
+    let mut w = BitWriter::default();
+    w.push(2, htps); // B.2 step 5a: PREFLEN of the one ordinary line
+    w.push(4, htrs); // B.2 step 5b: RANGELEN, so the line covers 16 values
+    w.push(0, htps); // B.2 step 6: the lower range line, unused
+    w.push(2, htps); // B.2 step 8: the upper range line
+    w.push(1, htps); // B.2 step 10: the out-of-band line
+    out.extend_from_slice(&w.finish());
+    out
+}
+
 /// Encodes `bitmaps` one after another through a single arithmetic coder and
 /// a single GB context array.
 ///
@@ -480,6 +507,9 @@ pub(crate) struct Shape {
     pub(crate) defpixel: bool,
     /// SBDSOFFSET, added to every gap after the first instance of a strip.
     pub(crate) dsoffset: i32,
+    /// SBRTEMPLATE, the refinement template. Read only by the refined
+    /// builders, which set SBREFINE themselves.
+    pub(crate) rtemplate: u8,
 }
 
 impl Default for Shape {
@@ -491,12 +521,13 @@ impl Default for Shape {
             combop: 0, // OR
             defpixel: false,
             dsoffset: 0,
+            rtemplate: 0,
         }
     }
 }
 
 /// Packs a [`Shape`] into the two-byte text region segment flags field
-/// (T.88 7.4.3.1.1), with SBHUFF, REFINE and SBRTEMPLATE all clear.
+/// (T.88 7.4.3.1.1), with SBHUFF and REFINE clear.
 ///
 /// SBDSOFFSET occupies bits 10 to 14 as a five-bit two's complement number, so
 /// a negative offset is masked to five bits rather than sign-extended into the
@@ -508,6 +539,7 @@ fn flags_of(shape: Shape) -> u16 {
         | u16::from(shape.combop) << 7
         | u16::from(shape.defpixel) << 9
         | ((shape.dsoffset as u16) & 0x1F) << 10
+        | u16::from(shape.rtemplate & 1) << 15
 }
 
 /// One instruction in a text region fixture, in the order T.88 6.4.5 decodes
@@ -630,6 +662,231 @@ pub(crate) fn text_segment_with_curt(
     out.extend_from_slice(&flags_of(shape).to_be_bytes());
     out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
     out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// One symbol instance of a refined text region fixture: the delta on S, the
+/// T offset within the strip, the symbol id, and — when RI is 1 — the
+/// refinement 6.4.11 codes for it.
+pub(crate) struct RefinedPlacement<'a> {
+    /// The delta on S: `IAFS` for a strip's first instance, `IADS` after.
+    pub(crate) ds: i32,
+    /// The T offset within the strip, coded only when SBSTRIPS is above 1.
+    pub(crate) curt: i32,
+    /// The symbol id.
+    pub(crate) id: u32,
+    /// `None` codes RI as 0; the instance is its symbol as it stands.
+    pub(crate) refine: Option<Refine<'a>>,
+}
+
+/// The refinement of one placement: the bitmap the instance decodes to, the
+/// four deltas of 6.4.11.1 to 6.4.11.4, and the reference offset the encoder
+/// codes with.
+///
+/// `dx` and `dy` are stated by the caller rather than derived from the deltas
+/// so that a test pins Table 12's `⌊RDW/2⌋ + RDX` by hand: the encoder codes
+/// the target's pixels against the reference at the literal offset, the
+/// decoder derives its own offset from the coded RDW and RDX, and the decoded
+/// pixels match the target only when the derivation is the table's.
+pub(crate) struct Refine<'a> {
+    /// The bitmap the refined instance decodes to, of size
+    /// `(symbol width + rdw, symbol height + rdh)`.
+    pub(crate) target: &'a Bitmap,
+    /// RDW, the signed refinement delta width.
+    pub(crate) rdw: i32,
+    /// RDH, the signed refinement delta height.
+    pub(crate) rdh: i32,
+    /// RDX, the refinement X offset.
+    pub(crate) rdx: i32,
+    /// RDY, the refinement Y offset.
+    pub(crate) rdy: i32,
+    /// GRREFERENCEDX, hand-derived from Table 12 by the test.
+    pub(crate) dx: i32,
+    /// GRREFERENCEDY, likewise.
+    pub(crate) dy: i32,
+}
+
+/// One strip of a refined text region fixture: the delta on STRIPT, counted in
+/// strips, and the placements the strip holds.
+pub(crate) type RefinedStrip<'a> = (i32, &'a [RefinedPlacement<'a>]);
+
+/// The two refinement AT pixel pairs at their nominal offsets, as the four
+/// signed bytes the text region refinement AT flags field carries them in
+/// (T.88 7.4.3.1.3).
+fn refinement_at_bytes() -> Vec<u8> {
+    let mut out = Vec::new();
+    for (dx, dy) in REFINEMENT_NOMINAL_AT {
+        out.push(dx as u8);
+        out.push(dy as u8);
+    }
+    out
+}
+
+/// Builds the data of an arithmetic text region segment with SBREFINE set
+/// (T.88 7.4.3, 6.4.11), placing the instances of `strips`.
+///
+/// Every value — the walk's integers, each instance's RI, a refined
+/// instance's four deltas and its pixel decisions — is coded into the one
+/// arithmetic codeword the region has, and the GR statistics adapt across the
+/// refinements exactly as the walk's integer contexts do across its values.
+/// The template is `shape.rtemplate`; with template 0 the header carries the
+/// nominal SBRAT pixels, with template 1 no such field at all (7.4.3.1.3).
+pub(crate) fn refined_text_segment(
+    region: (u32, u32),
+    shape: Shape,
+    instances: u32,
+    symbols: &[Bitmap],
+    initial_dt: i32,
+    strips: &[RefinedStrip<'_>],
+) -> Vec<u8> {
+    let mut enc = MqEncoder::new();
+    let mut ints = IntCtxSet::new();
+    let mut iaid = IaidCtx::new(sym_code_len(symbols.len() as u32));
+    let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+    let params = RefinementParams {
+        template: shape.rtemplate,
+        at: REFINEMENT_NOMINAL_AT,
+        tpgron: false,
+    };
+
+    encode_int(&mut enc, &mut ints.iadt, Some(initial_dt));
+    for (dt, placements) in strips {
+        encode_int(&mut enc, &mut ints.iadt, Some(*dt));
+        for (index, p) in placements.iter().enumerate() {
+            if index == 0 {
+                encode_int(&mut enc, &mut ints.iafs, Some(p.ds));
+            } else {
+                encode_int(&mut enc, &mut ints.iads, Some(p.ds));
+            }
+            if shape.log_strips > 0 {
+                encode_int(&mut enc, &mut ints.iait, Some(p.curt));
+            }
+            encode_iaid(&mut enc, &mut iaid, p.id);
+            let ri = i32::from(p.refine.is_some());
+            encode_int(&mut enc, &mut ints.iari, Some(ri));
+            let Some(r) = &p.refine else {
+                continue;
+            };
+            encode_int(&mut enc, &mut ints.iardw, Some(r.rdw));
+            encode_int(&mut enc, &mut ints.iardh, Some(r.rdh));
+            encode_int(&mut enc, &mut ints.iardx, Some(r.rdx));
+            encode_int(&mut enc, &mut ints.iardy, Some(r.rdy));
+            encode_refinement_into(
+                &mut enc,
+                &mut gr,
+                r.target,
+                &symbols[p.id as usize],
+                &params,
+                r.dx,
+                r.dy,
+            );
+        }
+        encode_int(&mut enc, &mut ints.iads, None);
+    }
+
+    let mut out = region_info_bytes(region.0, region.1);
+    out.extend_from_slice(&(flags_of(shape) | 0x0002).to_be_bytes());
+    if shape.rtemplate == 0 {
+        out.extend_from_slice(&refinement_at_bytes());
+    }
+    out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
+    out.extend_from_slice(&enc.finish());
+    out
+}
+
+/// Builds the data of a Huffman text region segment with SBREFINE set
+/// (T.88 7.4.3, 6.4.11), placing the instances of `strips`.
+///
+/// The selectors this builder writes exercise both refinement defaults: RDW,
+/// RDX and RDY read standard Table B.14 and RDH reads B.15, with BMSIZE
+/// through Table B.1. `rdw` overrides SBHUFFRDW with a user-supplied table,
+/// which sets that selector to 3 and makes the segment's referred-to list
+/// responsible for carrying the code table segment it came from (7.4.3.1.6).
+///
+/// Each instance spends one raw bit on RI, and each refinement is its own
+/// arithmetic codeword: its byte count through SBHUFFRSIZE, a byte boundary,
+/// then exactly that many bytes — while the GR statistics carry over from one
+/// refinement to the next, since E.3.7 resets them per segment.
+pub(crate) fn huffman_refined_text_segment(
+    region: (u32, u32),
+    shape: Shape,
+    instances: u32,
+    symbols: &[Bitmap],
+    initial_dt: i32,
+    strips: &[RefinedStrip<'_>],
+    rdw: Option<&Table>,
+) -> Vec<u8> {
+    let standard_rdw = standard(14).expect("Table B.14");
+    let rdw_table = rdw.unwrap_or(&standard_rdw);
+    let rdh = standard(15).expect("Table B.15");
+    let rd = standard(14).expect("Table B.14");
+    let fs = standard(6).expect("Table B.6");
+    let ds = standard(8).expect("Table B.8");
+    let dt = standard(11).expect("Table B.11");
+    let rsize = standard(1).expect("Table B.1");
+    let lengths = symbol_code_lengths(symbols.len() as u32);
+    let codes = from_code_lengths(&lengths, Unused::Refused).expect("symbol ID codes");
+    let mut gr = vec![MqContext::default(); GR_CONTEXT_LEN];
+    let params = RefinementParams {
+        template: shape.rtemplate,
+        at: REFINEMENT_NOMINAL_AT,
+        tpgron: false,
+    };
+
+    let mut w = BitWriter::default();
+    push_symbol_id_table(&mut w, &lengths);
+
+    push_value(&mut w, &dt, Some(initial_dt));
+    for (delta, placements) in strips {
+        push_value(&mut w, &dt, Some(*delta));
+        for (index, p) in placements.iter().enumerate() {
+            if index == 0 {
+                push_value(&mut w, &fs, Some(p.ds));
+            } else {
+                push_value(&mut w, &ds, Some(p.ds));
+            }
+            if shape.log_strips > 0 {
+                w.push(p.curt as u32, shape.log_strips);
+            }
+            push_value(&mut w, &codes, Some(p.id as i32));
+            // 6.4.11: RI is one bit read directly from the bitstream.
+            w.push(u32::from(p.refine.is_some()), 1);
+            let Some(r) = &p.refine else {
+                continue;
+            };
+            push_value(&mut w, rdw_table, Some(r.rdw));
+            push_value(&mut w, &rdh, Some(r.rdh));
+            push_value(&mut w, &rd, Some(r.rdx));
+            push_value(&mut w, &rd, Some(r.rdy));
+            let mut chunk = MqEncoder::new();
+            encode_refinement_into(
+                &mut chunk,
+                &mut gr,
+                r.target,
+                &symbols[p.id as usize],
+                &params,
+                r.dx,
+                r.dy,
+            );
+            let coded = chunk.finish();
+            push_value(&mut w, &rsize, Some(coded.len() as i32));
+            w.align();
+            w.push_bytes(&coded);
+        }
+        push_value(&mut w, &ds, None);
+    }
+
+    let mut out = region_info_bytes(region.0, region.1);
+    out.extend_from_slice(&(flags_of(shape) | 0x0003).to_be_bytes());
+    // 7.4.3.1.2: all-standard walk tables, RDH selecting B.15 and RDW
+    // whichever the caller chose.
+    let huffman_flags: u16 = (1 << 8) | if rdw.is_some() { 3 << 6 } else { 0 };
+    out.extend_from_slice(&huffman_flags.to_be_bytes());
+    if shape.rtemplate == 0 {
+        out.extend_from_slice(&refinement_at_bytes());
+    }
+    out.extend_from_slice(&instances.to_be_bytes()); // SBNUMINSTANCES
+    out.extend_from_slice(&w.finish());
     out
 }
 

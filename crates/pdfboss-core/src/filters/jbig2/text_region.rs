@@ -30,14 +30,24 @@
 //! by a pixel reads as a font problem rather than as a coding bug, and two
 //! copies of it would each have to be got right.
 //!
-//! Instance refinement (REFINE) is refused by name rather than approximated.
+//! Instance refinement (6.4.11) rides on that walk without changing it: after
+//! the symbol ID, one more coded bit says whether the instance is the
+//! dictionary symbol as it stands or that symbol refined into a bitmap of its
+//! own, sized by four signed deltas and decoded against the symbol through the
+//! procedure of 6.3. The arithmetic variant braids those decisions into the
+//! region's one codeword; the Huffman variant carries each refinement as a
+//! byte-counted arithmetic codeword of its own, byte-aligned within the
+//! segment's bit stream.
 
 use super::arith_int::{decode_iaid, decode_int, IaidCtx, IntCtxSet};
 use super::bitmap::{Bitmap, CombOp};
 use super::budget::Budget;
 use super::huffman::{from_code_lengths, read_bits, standard, take_custom, Table, Unused};
-use super::mq::MqDecoder;
+use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
+use super::refinement::{
+    decode_refinement_region, Reference, RefinementParams, GR_CONTEXT_LEN, NOMINAL_AT,
+};
 use super::segment::{parse_region_info, RegionInfo};
 use super::Jbig2Error;
 use crate::filters::ccitt::bits::BitReader;
@@ -182,12 +192,22 @@ pub(crate) fn decode_text_region(
     budget.charge_region(info.width, info.height)?;
     let mut region = Bitmap::filled(info.width, info.height, params.def_pixel)?;
 
+    // The GR statistics adapt across every refinement of the region and are
+    // allocated only when the region can code one; the placeholder entry a
+    // refinement-free region carries instead is what `MqContexts` makes of a
+    // zero length.
+    let gr_len = if params.refinement.is_some() {
+        GR_CONTEXT_LEN
+    } else {
+        0
+    };
     match &params.coding {
         Coding::Arithmetic => Walk {
             values: Arithmetic {
                 dec: MqDecoder::new(r.rest()),
                 ints: IntCtxSet::new(),
                 iaid: IaidCtx::new(sym_code_len(num_syms)),
+                gr: MqContexts::new(gr_len),
             },
             region: &mut region,
             symbols,
@@ -209,6 +229,7 @@ pub(crate) fn decode_text_region(
                     tables,
                     codes,
                     log_strips: params.log_strips,
+                    gr: MqContexts::new(gr_len),
                 },
                 region: &mut region,
                 symbols,
@@ -246,6 +267,10 @@ struct TextParams {
     ds_offset: i32,
     /// SBNUMINSTANCES, the number of placements the region carries.
     instances: u32,
+    /// SBREFINE, and with it SBRTEMPLATE and the SBRAT pixels, folded into the
+    /// parameters 6.4.11 hands to the refinement procedure. `None` when the
+    /// region codes no refinement flag at all — Table 12 fixes TPGRON at 0.
+    refinement: Option<RefinementParams>,
 }
 
 /// How a text region's values are coded (T.88 7.4.3.1.1, bit 0).
@@ -268,11 +293,12 @@ enum Coding {
 /// The Huffman tables a text region decodes its coordinates with
 /// (T.88 7.4.3.1.6).
 ///
-/// The five refinement selectors are absent because nothing can select them:
-/// 7.4.3.1.2 requires each of their fields to be 0 while SBREFINE is 0, and
-/// SBREFINE = 1 is refused before the tables are bound at all. The symbol ID
-/// table is not here either — it is not selected but carried, in the field
-/// 7.4.3.1.5 puts after SBNUMINSTANCES.
+/// The five refinement tables live behind an `Option` because 7.4.3.1.2
+/// requires each of their selectors to be 0 while SBREFINE is 0: a
+/// refinement-free region cannot select them, and holding them this way keeps
+/// that impossibility in the type rather than in five unread fields. The
+/// symbol ID table is not here either — it is not selected but carried, in
+/// the field 7.4.3.1.5 puts after SBNUMINSTANCES.
 struct TextTables {
     /// SBHUFFFS, the S coordinate of a strip's first instance (6.4.7).
     fs: Table,
@@ -281,6 +307,23 @@ struct TextTables {
     ds: Table,
     /// SBHUFFDT, the strip offset, in strips rather than rows (6.4.6).
     dt: Table,
+    /// The tables of 6.4.11, present exactly when SBREFINE is 1.
+    refine: Option<RefineTables>,
+}
+
+/// The Huffman tables a refined instance is decoded with (T.88 6.4.11,
+/// selectors in 7.4.3.1.2 bits 6 to 14).
+struct RefineTables {
+    /// SBHUFFRDW, the refinement delta width (6.4.11.1).
+    rdw: Table,
+    /// SBHUFFRDH, the refinement delta height (6.4.11.2).
+    rdh: Table,
+    /// SBHUFFRDX, the refinement X offset (6.4.11.3).
+    rdx: Table,
+    /// SBHUFFRDY, the refinement Y offset (6.4.11.4).
+    rdy: Table,
+    /// SBHUFFRSIZE, the byte count of a refinement's coded data (6.4.11.5).
+    rsize: Table,
 }
 
 /// Parses the text region segment's data header down to the instance count
@@ -290,25 +333,20 @@ struct TextTables {
 /// Huffman flags between the ordinary flags and SBNUMINSTANCES, and makes them
 /// present only when SBHUFF is 1, so a parser that reaches for the instance
 /// count straight after the flags word reads two bytes of table selectors as
-/// the top half of it.
+/// the top half of it. The refinement AT pixels sit between the two
+/// (7.4.3.1.3), present only when SBREFINE is 1 *and* SBRTEMPLATE is 0 —
+/// template 1 has no adaptive pixels, so a refining region that selects it
+/// carries no such field.
 ///
-/// The one coding mode this build does not implement is refused before any
-/// further byte is read, for the same reason: a refining region carries the
-/// SBRAT pixels here (7.4.3.1.3), so reading past them would leave the cursor
-/// in the wrong field and turn an unsupported stream into a plausible wrong
-/// answer.
-///
-/// Bit 15, SBRTEMPLATE, selects the template refinement uses; with REFINE
-/// refused above it selects nothing, so it is not examined.
+/// Bit 15, SBRTEMPLATE, selects the template refinement uses; with SBREFINE
+/// clear it selects nothing, so it is not examined then.
 fn parse_params(
     r: &mut Reader<'_>,
     tables: &[&Table],
     budget: &mut Budget,
 ) -> Result<TextParams, Jbig2Error> {
     let flags = r.u16()?;
-    if flags & 0x0002 != 0 {
-        return Err(Jbig2Error::Unimplemented("text region symbol refinement"));
-    }
+    let refine = flags & 0x0002 != 0;
     let coding = if flags & 0x0001 == 0 {
         // 7.4.3.1.6: the number of selectors reading "user-supplied table" must
         // equal the number of table segments referred to, and an arithmetic
@@ -320,7 +358,7 @@ fn parse_params(
         }
         Coding::Arithmetic
     } else {
-        Coding::Huffman(Box::new(bind_tables(r.u16()?, tables, budget)?))
+        Coding::Huffman(Box::new(bind_tables(r.u16()?, refine, tables, budget)?))
     };
     let log_strips = ((flags >> 2) & 0x3) as u8;
     let strips = 1i32 << log_strips;
@@ -335,6 +373,11 @@ fn parse_params(
     // 15, which belongs to SBRTEMPLATE.
     let raw = i32::from((flags >> 10) & 0x1F);
     let ds_offset = if raw > 15 { raw - 32 } else { raw };
+    let refinement = if refine {
+        Some(parse_refinement_params(r, flags & 0x8000 != 0)?)
+    } else {
+        None
+    };
 
     let instances = r.u32()?;
     if instances > MAX_INSTANCES {
@@ -350,6 +393,35 @@ fn parse_params(
         def_pixel,
         ds_offset,
         instances,
+        refinement,
+    })
+}
+
+/// Reads the refinement AT pixels of T.88 7.4.3.1.3 — SBRATX1, SBRATY1,
+/// SBRATX2, SBRATY2, one signed byte each — and folds them, with the template
+/// bit, into the parameters of 6.4.11's Table 12.
+///
+/// Template 1 has no adaptive pixels, so the field is absent for it and the
+/// nominal offsets stand in for values nothing will read.
+fn parse_refinement_params(
+    r: &mut Reader<'_>,
+    template_1: bool,
+) -> Result<RefinementParams, Jbig2Error> {
+    if template_1 {
+        return Ok(RefinementParams {
+            template: 1,
+            at: NOMINAL_AT,
+            tpgron: false,
+        });
+    }
+    let mut at = NOMINAL_AT;
+    for pixel in &mut at {
+        *pixel = (r.u8()? as i8, r.u8()? as i8);
+    }
+    Ok(RefinementParams {
+        template: 0,
+        at,
+        tpgron: false,
     })
 }
 
@@ -359,22 +431,25 @@ fn parse_params(
 /// The selectors are not uniform, and the one place a reader is likely to
 /// assume they are is exactly where the specification says otherwise: SBHUFFDS
 /// and SBHUFFDT each admit the value 2, naming Tables B.10 and B.13, where
-/// SBHUFFFS and the four refinement selectors call 2 "not permitted".
+/// SBHUFFFS and the four refinement delta selectors call 2 "not permitted".
 ///
-/// Everything from bit 6 up must read 0 here. 7.4.3.1.2 requires each of the
-/// five refinement selectors to be 0 while SBREFINE is 0, and SBREFINE = 1 is
-/// refused, so a stream that sets one has named a table segment nothing in this
-/// region would ever read. Saying so beats binding a table to a slot no value
-/// comes out of, because the binding order is positional: a table consumed by a
-/// dead selector is a table the live ones no longer receive.
+/// With SBREFINE clear, everything from bit 6 up must read 0 here — 7.4.3.1.2
+/// requires each of the five refinement selectors to be 0 then, so a stream
+/// that sets one has named a table segment nothing in this region would ever
+/// read. Saying so beats binding a table to a slot no value comes out of,
+/// because the binding order is positional: a table consumed by a dead
+/// selector is a table the live ones no longer receive. With SBREFINE set the
+/// five bind after SBHUFFDT, in the order 7.4.3.1.6 fixes.
 ///
 /// The OOB requirement of 7.4.3.1.6 is checked for every table rather than only
 /// for the custom ones, which costs nothing because the standard tables satisfy
 /// it by construction. It is what catches two custom tables bound the wrong way
 /// round: SBHUFFDS's OOB is the only thing that closes a strip, so a table
-/// without one would run a strip until the segment ran out.
+/// without one would run a strip until the segment ran out — and none of the
+/// other seven may code OOB at all.
 fn bind_tables(
     flags: u16,
+    refine: bool,
     tables: &[&Table],
     budget: &mut Budget,
 ) -> Result<TextTables, Jbig2Error> {
@@ -385,7 +460,7 @@ fn bind_tables(
         ));
     }
     // Bits 6 to 14: SBHUFFRDW, RDH, RDX, RDY and RSIZE.
-    if flags & 0x7FC0 != 0 {
+    if !refine && flags & 0x7FC0 != 0 {
         return Err(Jbig2Error::Malformed(
             "refinement Huffman table selected without refinement",
         ));
@@ -413,6 +488,11 @@ fn bind_tables(
         2 => standard(13)?,
         _ => take_custom(tables, &mut used, TABLE_COUNT_DISAGREES, budget)?,
     };
+    let refine_tables = if refine {
+        Some(bind_refine_tables(flags, tables, &mut used, budget)?)
+    } else {
+        None
+    };
     if used != tables.len() {
         return Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES));
     }
@@ -422,7 +502,63 @@ fn bind_tables(
     if fs.has_oob() || dt.has_oob() {
         return Err(Jbig2Error::Malformed("SBHUFFFS or SBHUFFDT codes OOB"));
     }
-    Ok(TextTables { fs, ds, dt })
+    Ok(TextTables {
+        fs,
+        ds,
+        dt,
+        refine: refine_tables,
+    })
+}
+
+/// Resolves the five refinement selectors of T.88 7.4.3.1.2, bits 6 to 14
+/// (SBHUFFRDW, RDH, RDX, RDY, RSIZE).
+///
+/// The four delta selectors share one shape — 0 names Table B.14, 1 names
+/// B.15, 2 is not permitted — and RSIZE is a single bit choosing between
+/// Table B.1 and a user-supplied table. 7.4.3.1.6 forbids all five to code
+/// OOB: nothing in 6.4.11 could read one, and the checks are the mirror of
+/// SBHUFFDS's, whose OOB is required.
+fn bind_refine_tables(
+    flags: u16,
+    tables: &[&Table],
+    used: &mut usize,
+    budget: &mut Budget,
+) -> Result<RefineTables, Jbig2Error> {
+    let mut delta = |selector: u16| -> Result<Table, Jbig2Error> {
+        match selector {
+            0 => standard(14),
+            1 => standard(15),
+            3 => take_custom(tables, used, TABLE_COUNT_DISAGREES, budget),
+            _ => Err(Jbig2Error::Malformed(
+                "reserved refinement Huffman table selection",
+            )),
+        }
+    };
+    // Bits 6 to 13: SBHUFFRDW, RDH, RDX, RDY, two bits each.
+    let rdw = delta((flags >> 6) & 0x3)?;
+    let rdh = delta((flags >> 8) & 0x3)?;
+    let rdx = delta((flags >> 10) & 0x3)?;
+    let rdy = delta((flags >> 12) & 0x3)?;
+    // Bit 14: SBHUFFRSIZE.
+    let rsize = if flags & 0x4000 == 0 {
+        standard(1)?
+    } else {
+        take_custom(tables, used, TABLE_COUNT_DISAGREES, budget)?
+    };
+    for table in [&rdw, &rdh, &rdx, &rdy, &rsize] {
+        if table.has_oob() {
+            return Err(Jbig2Error::Malformed(
+                "a refinement Huffman table codes OOB",
+            ));
+        }
+    }
+    Ok(RefineTables {
+        rdw,
+        rdh,
+        rdx,
+        rdy,
+        rsize,
+    })
 }
 
 /// Decodes the symbol ID Huffman decoding table of T.88 7.4.3.1.5, whose
@@ -552,6 +688,37 @@ trait Values {
     fn curt(&mut self) -> Result<Option<i32>, Jbig2Error>;
     /// 6.4.10: an instance's symbol ID.
     fn symbol_id(&mut self) -> Result<u32, Jbig2Error>;
+    /// 6.4.11: RI, whether the instance refines its symbol. Read for every
+    /// instance when SBREFINE is 1 and never otherwise — a raw bit with SBHUFF
+    /// set, a value through `IARI` without.
+    fn refine_flag(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.11.1: RDW, the refinement delta width. Signed — a refined instance
+    /// may shrink.
+    fn rdw(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.11.2: RDH, the refinement delta height.
+    fn rdh(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.11.3: RDX, the refinement X offset.
+    fn rdx(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.11.4: RDY, the refinement Y offset.
+    fn rdy(&mut self) -> Result<Option<i32>, Jbig2Error>;
+    /// 6.4.11 steps 5 to 7: the refined bitmap itself, decoded through 6.3
+    /// against the instance's dictionary symbol.
+    ///
+    /// This is a whole procedure rather than a value because the two codings
+    /// disagree about where the coded pixels live: the arithmetic variant
+    /// braids them into the decoder every other value comes from, while the
+    /// Huffman variant carries a byte count through SBHUFFRSIZE, aligns to a
+    /// byte boundary, and gives the refinement a codeword of its own. Both
+    /// adapt one set of GR statistics across the region's refinements — E.3.7
+    /// resets statistics per segment, not per bitmap.
+    fn refine(
+        &mut self,
+        width: u32,
+        height: u32,
+        reference: Reference<'_>,
+        params: &RefinementParams,
+        budget: &mut Budget,
+    ) -> Result<Bitmap, Jbig2Error>;
 }
 
 /// The arithmetic value source: the integer procedures of Annex A, all drawing
@@ -563,6 +730,8 @@ struct Arithmetic<'d> {
     ints: IntCtxSet,
     /// The symbol ID procedure of A.3, sized by SBSYMCODELEN.
     iaid: IaidCtx,
+    /// The GR statistics every refinement of the region adapts.
+    gr: MqContexts,
 }
 
 impl Values for Arithmetic<'_> {
@@ -585,6 +754,47 @@ impl Values for Arithmetic<'_> {
     fn symbol_id(&mut self) -> Result<u32, Jbig2Error> {
         Ok(decode_iaid(&mut self.dec, &mut self.iaid))
     }
+
+    fn refine_flag(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iari))
+    }
+
+    fn rdw(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iardw))
+    }
+
+    fn rdh(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iardh))
+    }
+
+    fn rdx(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iardx))
+    }
+
+    fn rdy(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        Ok(decode_int(&mut self.dec, &mut self.ints.iardy))
+    }
+
+    fn refine(
+        &mut self,
+        width: u32,
+        height: u32,
+        reference: Reference<'_>,
+        params: &RefinementParams,
+        budget: &mut Budget,
+    ) -> Result<Bitmap, Jbig2Error> {
+        // 6.4.11 step 6: the pixel decisions follow the deltas in the
+        // region's one codeword — nothing marks where they begin or end.
+        decode_refinement_region(
+            &mut self.dec,
+            &mut self.gr,
+            budget,
+            width,
+            height,
+            reference,
+            params,
+        )
+    }
 }
 
 /// The Huffman value source: three selected tables, the symbol ID table the
@@ -606,6 +816,10 @@ struct Huffman<'a, 'd> {
     codes: Table,
     /// LOGSBSTRIPS: how many bits an instance's T coordinate occupies (6.4.9).
     log_strips: u8,
+    /// The GR statistics every refinement of the region adapts — shared
+    /// across the refinements' separate codewords, since E.3.7 resets
+    /// statistics per segment.
+    gr: MqContexts,
 }
 
 impl Values for Huffman<'_, '_> {
@@ -637,6 +851,83 @@ impl Values for Huffman<'_, '_> {
             .decode(&mut self.bits)?
             .ok_or(Jbig2Error::Malformed("unexpected OOB decoding a symbol id"))?;
         u32::try_from(id).map_err(|_| Jbig2Error::Malformed("symbol id out of range"))
+    }
+
+    fn refine_flag(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        // 6.4.11: one bit read directly from the bitstream, through no table.
+        let bit = read_bits(&mut self.bits, 1)?;
+        Ok(Some(bit as i32))
+    }
+
+    fn rdw(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        self.refine_tables()?.rdw.decode(&mut self.bits)
+    }
+
+    fn rdh(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        self.refine_tables()?.rdh.decode(&mut self.bits)
+    }
+
+    fn rdx(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        self.refine_tables()?.rdx.decode(&mut self.bits)
+    }
+
+    fn rdy(&mut self) -> Result<Option<i32>, Jbig2Error> {
+        self.refine_tables()?.rdy.decode(&mut self.bits)
+    }
+
+    fn refine(
+        &mut self,
+        width: u32,
+        height: u32,
+        reference: Reference<'_>,
+        params: &RefinementParams,
+        budget: &mut Budget,
+    ) -> Result<Bitmap, Jbig2Error> {
+        // 6.4.11 step 5 a): BMSIZE, the refinement's coded size in bytes.
+        let size =
+            self.refine_tables()?
+                .rsize
+                .decode(&mut self.bits)?
+                .ok_or(Jbig2Error::Malformed(
+                    "unexpected OOB decoding a refinement data size",
+                ))?;
+        let size = usize::try_from(size)
+            .map_err(|_| Jbig2Error::Malformed("negative refinement data size"))?;
+        // Step 5 b): the refinement's codeword begins on a byte boundary.
+        self.bits.align_to_byte();
+        let data = self
+            .bits
+            .take_aligned_bytes(size)
+            .ok_or(Jbig2Error::Truncated)?;
+        // Steps 6 and 7: a decoder of its own over exactly those bytes. The
+        // size field, not the arithmetic decoder, says where the codeword
+        // ends — taking the chunk has already positioned the cursor after it,
+        // which is also the byte boundary step 7 asks for.
+        let mut dec = MqDecoder::new(data);
+        decode_refinement_region(
+            &mut dec,
+            &mut self.gr,
+            budget,
+            width,
+            height,
+            reference,
+            params,
+        )
+    }
+}
+
+impl<'a> Huffman<'a, '_> {
+    /// The refinement tables of 7.4.3.1.6, which a call implies were bound:
+    /// every caller decodes a value 6.4.11 asked for, and 6.4.11 is reached
+    /// only when SBREFINE is 1, the same flag that binds the tables. Refusing
+    /// rather than unwrapping keeps that an assumption about this file.
+    ///
+    /// The result borrows the segment's tables rather than `self`, so a
+    /// caller can hold it across reads of the bit cursor beside it.
+    fn refine_tables(&self) -> Result<&'a RefineTables, Jbig2Error> {
+        self.tables.refine.as_ref().ok_or(Jbig2Error::Malformed(
+            "refinement value without refinement tables",
+        ))
     }
 }
 
@@ -747,15 +1038,22 @@ impl<V: Values> Walk<'_, V> {
             .ok_or(Jbig2Error::Malformed("symbol id out of range"))?;
 
         self.budget.charge(INSTANCE_COST)?;
-        self.budget.charge_region(symbol.width(), symbol.height())?;
+        // 6.4.5 step 3(c)(v): the instance's bitmap IBI — the symbol itself,
+        // or that symbol refined into a bitmap of its own. Everything below
+        // measures and draws IBI, never the symbol: a refined instance
+        // advances CURS by its own extent, not its reference's.
+        let refined = self.refine_instance(symbol)?;
+        let instance = refined.as_ref().unwrap_or(symbol);
+        self.budget
+            .charge_region(instance.width(), instance.height())?;
 
         // 6.4.5 steps 3(c)(vi) and (x): CURS always finishes on the symbol's
         // far edge along the strip. Which end of the symbol that is depends on
         // the corner, so the advance happens either before the draw or after it
         // — never both, never neither. The two conditions are complements,
         // which is why one boolean drives them.
-        let w = i64::from(symbol.width());
-        let h = i64::from(symbol.height());
+        let w = i64::from(instance.width());
+        let h = i64::from(instance.height());
         let extent = if self.params.transposed { h } else { w } - 1;
         let advance_first = if self.params.transposed {
             matches!(
@@ -776,7 +1074,7 @@ impl<V: Values> Walk<'_, V> {
         };
         let (x, y) = top_left(si, ti, w, h, self.params.transposed, self.params.corner);
         self.region.combine(
-            symbol,
+            instance,
             clamp_offset(x),
             clamp_offset(y),
             self.params.comb_op,
@@ -786,6 +1084,45 @@ impl<V: Values> Walk<'_, V> {
         } else {
             si.saturating_add(extent)
         })
+    }
+
+    /// Decodes 6.4.11's refinement of one instance, or `None` when the
+    /// instance is its dictionary symbol as it stands — because the region
+    /// codes no refinements at all, or because this instance's RI bit says so.
+    fn refine_instance(&mut self, symbol: &Bitmap) -> Result<Option<Bitmap>, Jbig2Error> {
+        let Some(params) = &self.params.refinement else {
+            return Ok(None);
+        };
+        let ri = self.values.refine_flag()?.ok_or(Jbig2Error::Malformed(
+            "unexpected OOB decoding a refinement flag",
+        ))?;
+        if ri == 0 {
+            return Ok(None);
+        }
+        const DELTA_OOB: &str = "unexpected OOB decoding a refinement delta";
+        let rdw = self.values.rdw()?.ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        let rdh = self.values.rdh()?.ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        let rdx = self.values.rdx()?.ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+        let rdy = self.values.rdy()?.ok_or(Jbig2Error::Malformed(DELTA_OOB))?;
+
+        // Table 12: the refined size is the symbol's plus the signed deltas —
+        // 6.4.11.1 says in as many words that a refinement may shrink, so only
+        // a size below zero is a contradiction rather than a small bitmap.
+        let width = u32::try_from(i64::from(symbol.width()) + i64::from(rdw))
+            .map_err(|_| Jbig2Error::Malformed("refined instance size out of range"))?;
+        let height = u32::try_from(i64::from(symbol.height()) + i64::from(rdh))
+            .map_err(|_| Jbig2Error::Malformed("refined instance size out of range"))?;
+        // Table 12: GRREFERENCEDX is ⌊RDW/2⌋ + RDX, and the floor matters —
+        // an odd negative delta rounds away from zero, where `/` would round
+        // toward it.
+        let reference = Reference {
+            bitmap: symbol,
+            dx: rdw.div_euclid(2).saturating_add(rdx),
+            dy: rdh.div_euclid(2).saturating_add(rdy),
+        };
+        self.values
+            .refine(width, height, reference, params, self.budget)
+            .map(Some)
     }
 }
 
@@ -836,8 +1173,9 @@ mod tests {
     use crate::filters::jbig2::huffman::encoder::{push_value, BitWriter};
     use crate::filters::jbig2::huffman::parse_table_segment;
     use crate::filters::jbig2::testing::{
-        code_table_segment, expect_at, glyph, huffman_text_segment, text_segment,
-        text_segment_with_curt, two_symbols, Op, Placement, Shape,
+        code_table_segment, expect_at, glyph, huffman_refined_text_segment, huffman_text_segment,
+        oob_code_table_segment, refined_text_segment, text_segment, text_segment_with_curt,
+        two_symbols, Op, Placement, Refine, RefinedPlacement, Shape,
     };
     use crate::filters::jbig2::Jbig2Error;
 
@@ -1115,22 +1453,420 @@ mod tests {
         assert_eq!(sym_code_len(0), 0);
     }
 
-    /// Refinement is the one coding mode a text region can still name that this
-    /// build does not decode. SBHUFF used to be refused beside it, and is now
-    /// the path the Huffman tests below take, so what remains to pin is that
-    /// the two flags are told apart: a Huffman region whose SBREFINE bit is
-    /// also set is refused, and a Huffman region on its own is not.
+    /// One refined instance between two plain ones, against pixels and
+    /// coordinates walked by hand from 6.4.5 and 6.4.11.
+    ///
+    /// The refined instance's deltas are RDW = 2, RDH = −1, RDX = 0, RDY = 1,
+    /// so by Table 12 its size is 5 + 2 by 4 − 1 and the reference offsets are
+    /// GRREFERENCEDX = ⌊2/2⌋ + 0 = 1 and GRREFERENCEDY = ⌊−1/2⌋ + 1 = 0 — the
+    /// fixture encodes the target's pixels at exactly those literals, so the
+    /// decoder reproduces the target only by deriving the same two numbers
+    /// from the coded deltas.
+    ///
+    /// The third instance is the load-bearing one for step 3 c) x): its gap of
+    /// 3 is measured from the *refined* bitmap's far edge, column 11, so it
+    /// lands at 14. A decoder that advanced CURS by the dictionary symbol's
+    /// width instead would put it at 12 — two columns of drift from a single
+    /// refinement.
     #[test]
-    fn refinement_reports_itself_and_huffman_no_longer_does() {
-        for flags in [0x0002u16, 0x0003] {
+    fn a_refined_instance_decodes_and_advances_by_its_own_width() {
+        let syms = two_symbols();
+        let target = glyph(&["1111111", "1000001", "1111111"]);
+        let strip = [
+            RefinedPlacement {
+                ds: 1,
+                curt: 0,
+                id: 0,
+                refine: None,
+            },
+            RefinedPlacement {
+                ds: 2,
+                curt: 0,
+                id: 1,
+                refine: Some(Refine {
+                    target: &target,
+                    rdw: 2,
+                    rdh: -1,
+                    rdx: 0,
+                    rdy: 1,
+                    dx: 1, // Table 12: ⌊2/2⌋ + 0
+                    dy: 0, // Table 12: ⌊−1/2⌋ + 1
+                }),
+            },
+            RefinedPlacement {
+                ds: 3,
+                curt: 0,
+                id: 0,
+                refine: None,
+            },
+        ];
+        let data = refined_text_segment((20, 10), Shape::default(), 3, &syms, 0, &[(2, &strip)]);
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        let (info, region) = decode(&data, &refs).expect("text region");
+        assert_eq!((info.width, info.height), (20, 10));
+        expect_at(&region, &syms[0], 1, 2);
+        expect_at(&region, &target, 5, 2);
+        expect_at(&region, &syms[0], 14, 2);
+        assert_eq!(region.get(19, 9), 0);
+    }
+
+    /// A shrinking refinement: RDW and RDH are −1, so the instance is smaller
+    /// than its reference, and both offsets exercise the floor of Table 12
+    /// where it differs from truncation.
+    ///
+    /// GRREFERENCEDX = ⌊−1/2⌋ + 1 = 0 and GRREFERENCEDY = ⌊−1/2⌋ + 0 = −1.
+    /// A decoder that divided toward zero would derive 1 and 0 instead,
+    /// reading the reference one pixel askew on each axis.
+    ///
+    /// The bitmaps are deliberately not small. Every arithmetic context starts
+    /// from the same state, so over a handful of pixels a decoder reading the
+    /// reference askew still mirrors the encoder bit for bit — the wrong
+    /// offset only shows once the statistics have adapted apart, which takes
+    /// dozens of decisions. A fixture the size of a symbol would pass with
+    /// truncation and pin nothing.
+    #[test]
+    fn a_shrinking_refinement_floors_its_reference_offsets() {
+        let reference = glyph(&[
+            "1111111111",
+            "1000110001",
+            "1011001101",
+            "1010110101",
+            "1001100011",
+            "1111111111",
+        ]);
+        let syms = [reference];
+        let target = glyph(&[
+            "111111111",
+            "100101001",
+            "101100110",
+            "101011010",
+            "111111111",
+        ]);
+        let strip = [RefinedPlacement {
+            ds: 2,
+            curt: 0,
+            id: 0,
+            refine: Some(Refine {
+                target: &target,
+                rdw: -1,
+                rdh: -1,
+                rdx: 1,
+                rdy: 0,
+                dx: 0,  // Table 12: ⌊−1/2⌋ + 1
+                dy: -1, // Table 12: ⌊−1/2⌋ + 0
+            }),
+        }];
+        let data = refined_text_segment((16, 8), Shape::default(), 1, &syms, 0, &[(1, &strip)]);
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        let (_, region) = decode(&data, &refs).expect("text region");
+        expect_at(&region, &target, 2, 1);
+    }
+
+    /// SBRTEMPLATE = 1 selects the ten-pixel refinement template, and with it
+    /// 7.4.3.1.3 removes the AT field from the header entirely. A decoder that
+    /// read four AT bytes anyway would take the instance count out of the
+    /// wrong field, so this decoding at all pins the field's absence.
+    #[test]
+    fn a_template_1_refinement_carries_no_at_field() {
+        let syms = two_symbols();
+        let target = glyph(&["11111", "10011", "11001", "11111"]);
+        let shape = Shape {
+            rtemplate: 1,
+            ..Shape::default()
+        };
+        let strip = [RefinedPlacement {
+            ds: 1,
+            curt: 0,
+            id: 1,
+            refine: Some(Refine {
+                target: &target,
+                rdw: 0,
+                rdh: 0,
+                rdx: 0,
+                rdy: 0,
+                dx: 0,
+                dy: 0,
+            }),
+        }];
+        let data = refined_text_segment((10, 8), shape, 1, &syms, 0, &[(1, &strip)]);
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        let (_, region) = decode(&data, &refs).expect("text region");
+        expect_at(&region, &target, 1, 1);
+    }
+
+    /// The Huffman variant of 6.4.11: RI is a raw bit per instance, the deltas
+    /// come through the selected tables — B.14 for RDW, RDX and RDY here, B.15
+    /// for RDH — and each refinement is a byte-counted arithmetic codeword of
+    /// its own behind a BMSIZE from Table B.1.
+    ///
+    /// Two instances are refined so that the second's codeword is decoded with
+    /// the GR statistics the first left behind: E.3.7 resets statistics per
+    /// segment, so a decoder that started each codeword from fresh contexts
+    /// would read the second refinement as noise. The trailing plain instance
+    /// pins the cursor: it is read correctly only if the refinement consumed
+    /// exactly BMSIZE bytes, no more and no fewer.
+    #[test]
+    fn a_huffman_region_decodes_refined_instances() {
+        let syms = two_symbols();
+        let first = glyph(&["101101", "110011"]);
+        let second = glyph(&["11111", "10101", "10001", "11111"]);
+        let strip = [
+            RefinedPlacement {
+                ds: 2,
+                curt: 0,
+                id: 1,
+                refine: Some(Refine {
+                    target: &first,
+                    rdw: 1,
+                    rdh: -2,
+                    rdx: -1,
+                    rdy: 0,
+                    dx: -1, // Table 12: ⌊1/2⌋ − 1
+                    dy: -1, // Table 12: ⌊−2/2⌋ + 0
+                }),
+            },
+            RefinedPlacement {
+                ds: 2,
+                curt: 0,
+                id: 1,
+                refine: Some(Refine {
+                    target: &second,
+                    rdw: 0,
+                    rdh: 0,
+                    rdx: 0,
+                    rdy: 0,
+                    dx: 0,
+                    dy: 0,
+                }),
+            },
+            RefinedPlacement {
+                ds: 3,
+                curt: 0,
+                id: 0,
+                refine: None,
+            },
+        ];
+        let data = huffman_refined_text_segment(
+            (26, 8),
+            Shape::default(),
+            3,
+            &syms,
+            1,
+            &[(2, &strip)],
+            None,
+        );
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        let (_, region) = decode(&data, &refs).expect("text region");
+        // STRIPT = −1 + 2; FIRSTS = 2; the refined widths 6 and 5 leave CURS
+        // at 7 and 13, so the gaps of 2 and 3 land the instances at 9 and 16.
+        expect_at(&region, &first, 2, 1);
+        expect_at(&region, &second, 9, 1);
+        expect_at(&region, &syms[0], 16, 1);
+    }
+
+    /// A user-supplied table reaches the refinement selector that named it, in
+    /// the binding order of 7.4.3.1.6 — after SBHUFFFS, SBHUFFDS and SBHUFFDT.
+    ///
+    /// The custom table spends a `0` bit and four more on the values 0 to 15,
+    /// where standard Table B.14 spends three bits on 2; a region bound to it
+    /// and read with B.14 instead desynchronises inside the refinement fields.
+    #[test]
+    fn a_custom_table_binds_to_a_refinement_selector() {
+        let table = parse_table_segment(&code_table_segment(0), &mut Budget::new())
+            .expect("code table segment");
+        let syms = two_symbols();
+        let target = glyph(&["1111111", "1000001", "1000001", "1111111"]);
+        let strip = [RefinedPlacement {
+            ds: 1,
+            curt: 0,
+            id: 1,
+            refine: Some(Refine {
+                target: &target,
+                rdw: 2,
+                rdh: 0,
+                rdx: 0,
+                rdy: 0,
+                dx: 1, // Table 12: ⌊2/2⌋ + 0
+                dy: 0,
+            }),
+        }];
+        let data = huffman_refined_text_segment(
+            (16, 8),
+            Shape::default(),
+            1,
+            &syms,
+            1,
+            &[(2, &strip)],
+            Some(&table),
+        );
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        let (_, region) = decode_with(&data, &refs, &[&table]).expect("text region");
+        expect_at(&region, &target, 1, 1);
+    }
+
+    /// Every refinement selector combination the Huffman flags may not name
+    /// once SBREFINE is set: the reserved delta selection, a user-supplied
+    /// RSIZE with no table segment to bind, and a bound table that codes OOB —
+    /// which 7.4.3.1.6 forbids for all five refinement tables.
+    #[test]
+    fn the_refinement_huffman_flags_are_validated() {
+        let symbol = glyph(&["1"]);
+        let syms = [&symbol];
+        // Region information, text flags with SBHUFF and SBREFINE, and the
+        // Huffman flags under test; parsing fails inside the table binding,
+        // before any later field is read.
+        let header = |huffman_flags: u16| {
             let mut data = vec![0u8; 17];
-            data.extend_from_slice(&flags.to_be_bytes());
-            data.extend_from_slice(&0u32.to_be_bytes());
-            assert_eq!(
-                decode(&data, &[]),
-                Err(Jbig2Error::Unimplemented("text region symbol refinement")),
-                "flags {flags:#06x}",
-            );
+            data[3] = 8; // width 8
+            data[7] = 8; // height 8
+            data.extend_from_slice(&0x0003u16.to_be_bytes());
+            data.extend_from_slice(&huffman_flags.to_be_bytes());
+            data
+        };
+        // Bits 6-7: SBHUFFRDW = 2 is not permitted (7.4.3.1.2).
+        assert_eq!(
+            decode(&header(2 << 6), &syms),
+            Err(Jbig2Error::Malformed(
+                "reserved refinement Huffman table selection"
+            )),
+        );
+        // Bit 14: SBHUFFRSIZE reading "user-supplied" with nothing to bind.
+        assert_eq!(
+            decode(&header(1 << 14), &syms),
+            Err(Jbig2Error::Malformed(TABLE_COUNT_DISAGREES)),
+        );
+        // A custom table that codes OOB, bound to SBHUFFRDW.
+        let oob = parse_table_segment(&oob_code_table_segment(0), &mut Budget::new())
+            .expect("code table segment");
+        assert_eq!(
+            decode_with(&header(3 << 6), &syms, &[&oob]),
+            Err(Jbig2Error::Malformed(
+                "a refinement Huffman table codes OOB"
+            )),
+        );
+    }
+
+    /// A refined instance decodes a fresh bitmap, and both that decode and its
+    /// composite draw on the stream's one allowance — pinned at the exact
+    /// boundary, like the plain-instance charge above.
+    #[test]
+    fn a_refined_instance_draws_on_the_stream_budget() {
+        let symbol = glyph(&["1"]);
+        let syms = [symbol.clone()];
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        let target = glyph(&["11", "10"]);
+        let strip = [RefinedPlacement {
+            ds: 0,
+            curt: 0,
+            id: 0,
+            refine: Some(Refine {
+                target: &target,
+                rdw: 1,
+                rdh: 1,
+                rdx: 0,
+                rdy: 0,
+                dx: 0, // Table 12: ⌊1/2⌋ + 0
+                dy: 0,
+            }),
+        }];
+        let data = refined_text_segment((8, 8), Shape::default(), 1, &syms, 0, &[(0, &strip)]);
+        // The 8 by 8 region, the fixed price of the placement, then the 2 by 2
+        // refined bitmap twice over: once decoded, once composited.
+        let total = 8 * (8 + ROW_COST) + INSTANCE_COST + 2 * (2 * (2 + ROW_COST));
+
+        let mut budget = Budget::with_limit(total);
+        assert!(decode_text_region(&data, &refs, &[], &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(total - 1);
+        assert_eq!(
+            decode_text_region(&data, &refs, &[], &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// A refinement whose declared deltas grow the instance far past the
+    /// stream's allowance is refused from those deltas, before a pixel of it
+    /// is decoded — the segment carries no bits to back the size up.
+    #[test]
+    fn an_enormous_refinement_is_refused_by_the_budget() {
+        let syms = two_symbols();
+        let target = glyph(&["11"]);
+        let strip = [RefinedPlacement {
+            ds: 0,
+            curt: 0,
+            id: 1,
+            refine: Some(Refine {
+                target: &target,
+                rdw: 1 << 20,
+                rdh: 1 << 20,
+                rdx: 0,
+                rdy: 0,
+                dx: 0,
+                dy: 0,
+            }),
+        }];
+        let data = refined_text_segment((8, 8), Shape::default(), 1, &syms, 0, &[(0, &strip)]);
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        assert_eq!(
+            decode_text_region(&data, &refs, &[], &mut Budget::with_limit(1 << 16)),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// A refinement may shrink an instance but not below nothing: deltas that
+    /// leave a negative size contradict Table 12 rather than describe a small
+    /// bitmap.
+    #[test]
+    fn a_refinement_below_zero_size_is_refused() {
+        let syms = two_symbols();
+        let target = glyph(&["1"]);
+        let strip = [RefinedPlacement {
+            ds: 0,
+            curt: 0,
+            id: 1,
+            refine: Some(Refine {
+                target: &target,
+                rdw: -6, // the symbol is 5 wide
+                rdh: 0,
+                rdx: 0,
+                rdy: 0,
+                dx: 0,
+                dy: 0,
+            }),
+        }];
+        let data = refined_text_segment((8, 8), Shape::default(), 1, &syms, 0, &[(0, &strip)]);
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        assert_eq!(
+            decode(&data, &refs),
+            Err(Jbig2Error::Malformed("refined instance size out of range")),
+        );
+    }
+
+    /// No truncation of a refined segment may panic, hang or read out of
+    /// bounds — the refinement path adds header fields (the SBRAT pixels) and
+    /// coded fields the plain sweep below never reaches.
+    #[test]
+    fn every_truncation_of_a_refined_segment_errors_cleanly() {
+        let syms = two_symbols();
+        let target = glyph(&["1111111", "1000001", "1111111"]);
+        let strip = [RefinedPlacement {
+            ds: 1,
+            curt: 0,
+            id: 1,
+            refine: Some(Refine {
+                target: &target,
+                rdw: 2,
+                rdh: -1,
+                rdx: 0,
+                rdy: 1,
+                dx: 1,
+                dy: 0,
+            }),
+        }];
+        let segment = refined_text_segment((20, 10), Shape::default(), 1, &syms, 0, &[(2, &strip)]);
+        let refs: Vec<&Bitmap> = syms.iter().collect();
+        for cut in 0..segment.len() {
+            let _ = decode_text_region(&segment[..cut], &refs, &[], &mut Budget::new());
         }
     }
 

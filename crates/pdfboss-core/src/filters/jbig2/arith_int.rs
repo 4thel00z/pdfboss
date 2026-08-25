@@ -371,26 +371,15 @@ pub(crate) struct IntCtxSet {
     pub(crate) iads: IntCtx,
     /// `IAIT`: T coordinate of a symbol instance within its strip.
     pub(crate) iait: IntCtx,
-    // The five refinement procedures below are the ones no decoder in this
-    // build reaches: a text region rejects REFINE and a symbol dictionary
-    // rejects SDREFAGG, so nothing decodes the flag or the four offsets of
-    // 6.4.11. They are allocated all the same, because the thirteen arrays are
-    // constructed as one set per segment and a set missing five of them would
-    // have to be assembled differently once refinement lands.
-    /// `IARI`: whether a symbol instance carries a refinement.
-    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
+    /// `IARI`: whether a symbol instance carries a refinement (6.4.11).
     pub(crate) iari: IntCtx,
-    /// `IARDW`: width delta of a refined symbol instance.
-    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
+    /// `IARDW`: width delta of a refined symbol instance (6.4.11.1).
     pub(crate) iardw: IntCtx,
-    /// `IARDH`: height delta of a refined symbol instance.
-    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
+    /// `IARDH`: height delta of a refined symbol instance (6.4.11.2).
     pub(crate) iardh: IntCtx,
-    /// `IARDX`: horizontal offset of a refined symbol instance.
-    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
+    /// `IARDX`: horizontal offset of a refined symbol instance (6.4.11.3).
     pub(crate) iardx: IntCtx,
-    /// `IARDY`: vertical offset of a refined symbol instance.
-    #[allow(dead_code)] // Read once refinement coding is decoded (6.4.11).
+    /// `IARDY`: vertical offset of a refined symbol instance (6.4.11.4).
     pub(crate) iardy: IntCtx,
 }
 
