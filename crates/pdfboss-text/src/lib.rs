@@ -58,16 +58,30 @@ pub struct Ruling {
 /// parse yields no spans rather than an error, so one unreadable stream
 /// never costs a caller the rest of the document. Use
 /// [`extract_spans_reporting`] to see what (if anything) was left out.
+///
+/// Content in optional-content layers the document's default configuration
+/// turns off (ISO 32000-1 §8.11) is excluded, counted in
+/// [`ExtractReport::hidden`]. The document-level entry points here read
+/// that configuration themselves; the source-generic `_with` twins have no
+/// document to read it from and extract every layer.
 pub fn extract_spans(doc: &Document, page: &Page) -> Result<Vec<TextSpan>> {
-    block_on(extract_spans_with(Immediate(doc), page))
+    let oc = doc.oc_state();
+    let (spans, _, _) = block_on(extract::page_spans_and_rulings_with(
+        Immediate(doc),
+        page,
+        None,
+        oc.as_ref(),
+    ));
+    Ok(spans)
 }
 
 /// [`extract_spans`] against any object source, awaiting whatever I/O the
 /// source needs to read the page.
 ///
-/// This is the implementation; [`extract_spans`] is this function over
-/// [`Immediate`], driven to completion on the calling thread. The two cannot
-/// disagree about what a document says, because there is only one of them.
+/// This is the shared implementation [`extract_spans`] drives over
+/// [`Immediate`] on the calling thread; the one thing the document-level
+/// entry adds is the document's optional-content configuration, which a
+/// bare source cannot supply — this function extracts every layer.
 ///
 /// The source is taken by value and the page by reference. That combination is
 /// what a consumer needs to spawn the result: the future is `Send` over a source
@@ -78,7 +92,7 @@ pub async fn extract_spans_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<Vec<TextSpan>> {
-    let (spans, _, _) = extract::page_spans_and_rulings_with(src, page, None).await;
+    let (spans, _, _) = extract::page_spans_and_rulings_with(src, page, None, None).await;
     Ok(spans)
 }
 
@@ -91,16 +105,24 @@ pub fn extract_spans_reporting(
     doc: &Document,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    block_on(extract_spans_reporting_with(Immediate(doc), page))
+    let oc = doc.oc_state();
+    let (spans, _, report) = block_on(extract::page_spans_and_rulings_with(
+        Immediate(doc),
+        page,
+        None,
+        oc.as_ref(),
+    ));
+    Ok((spans, report))
 }
 
 /// [`extract_spans_reporting`] against any object source. Signed like
-/// [`extract_spans_with`], for the same reasons.
+/// [`extract_spans_with`], for the same reasons — including extracting
+/// every optional-content layer, which a bare source cannot gate.
 pub async fn extract_spans_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, None).await;
+    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, None, None).await;
     Ok((spans, report))
 }
 
@@ -119,21 +141,26 @@ pub fn extract_spans_reporting_cached(
     page: &Page,
     fonts: &FontCache,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    block_on(extract_spans_reporting_cached_with(
+    let oc = doc.oc_state();
+    let (spans, _, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
-        fonts,
-    ))
+        Some(fonts),
+        oc.as_ref(),
+    ));
+    Ok((spans, report))
 }
 
 /// [`extract_spans_reporting_cached`] against any object source. Signed like
-/// [`extract_spans_with`], for the same reasons.
+/// [`extract_spans_with`], for the same reasons — including extracting
+/// every optional-content layer, which a bare source cannot gate.
 pub async fn extract_spans_reporting_cached_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     fonts: &FontCache,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, Some(fonts)).await;
+    let (spans, _, report) =
+        extract::page_spans_and_rulings_with(src, page, Some(fonts), None).await;
     Ok((spans, report))
 }
 
@@ -145,19 +172,25 @@ pub fn extract_spans_and_rulings_reporting(
     doc: &Document,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
-    block_on(extract_spans_and_rulings_reporting_with(
+    let oc = doc.oc_state();
+    let (spans, rulings, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
-    ))
+        None,
+        oc.as_ref(),
+    ));
+    Ok((spans, rulings, report))
 }
 
 /// [`extract_spans_and_rulings_reporting`] against any object source. Signed
-/// like [`extract_spans_with`], for the same reasons.
+/// like [`extract_spans_with`], for the same reasons — including extracting
+/// every optional-content layer, which a bare source cannot gate.
 pub async fn extract_spans_and_rulings_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
-    let (spans, rulings, report) = extract::page_spans_and_rulings_with(src, page, None).await;
+    let (spans, rulings, report) =
+        extract::page_spans_and_rulings_with(src, page, None, None).await;
     Ok((spans, rulings, report))
 }
 
@@ -172,22 +205,26 @@ pub fn extract_spans_and_rulings_reporting_cached(
     page: &Page,
     fonts: &FontCache,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
-    block_on(extract_spans_and_rulings_reporting_cached_with(
+    let oc = doc.oc_state();
+    let (spans, rulings, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
-        fonts,
-    ))
+        Some(fonts),
+        oc.as_ref(),
+    ));
+    Ok((spans, rulings, report))
 }
 
 /// [`extract_spans_and_rulings_reporting_cached`] against any object source.
-/// Signed like [`extract_spans_with`], for the same reasons.
+/// Signed like [`extract_spans_with`], for the same reasons — including
+/// extracting every optional-content layer, which a bare source cannot gate.
 pub async fn extract_spans_and_rulings_reporting_cached_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     fonts: &FontCache,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
     let (spans, rulings, report) =
-        extract::page_spans_and_rulings_with(src, page, Some(fonts)).await;
+        extract::page_spans_and_rulings_with(src, page, Some(fonts), None).await;
     Ok((spans, rulings, report))
 }
 

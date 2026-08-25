@@ -6,7 +6,7 @@ mod markdown;
 mod output;
 mod structure;
 
-use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, Page, Result};
+use pdfboss_core::{AsyncObjectSource, Document, Page, Result};
 
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 pub use markdown::Markdown;
@@ -26,16 +26,20 @@ pub use structure::{
 /// parse yields no text rather than an error, so one unreadable stream
 /// never costs a caller the rest of the document. Use
 /// [`extract_text_reporting`] to see what (if anything) was left out.
+///
+/// Optional-content layers the document's default configuration turns off
+/// are excluded, exactly as `pdfboss_text`'s document-level entries exclude
+/// them; the source-generic `_with` twins have no document to read that
+/// configuration from and extract every layer.
 pub fn extract_text(doc: &Document, page: &Page) -> Result<String> {
-    block_on(extract_text_with(Immediate(doc), page))
+    let (text, _) = extract_text_reporting(doc, page)?;
+    Ok(text)
 }
 
 /// [`extract_text`] against any object source, awaiting whatever I/O the
-/// source needs to read the page.
-///
-/// This is the implementation; [`extract_text`] is this function over
-/// [`Immediate`], driven to completion on the calling thread. The two cannot
-/// disagree about what a document says, because there is only one of them.
+/// source needs to read the page — the same span extraction and layout,
+/// minus the document's optional-content configuration, which a bare
+/// source cannot supply: every layer extracts here.
 ///
 /// The source is taken by value and the page by reference. That combination is
 /// what a consumer needs to spawn the result: the future is `Send` over a source
@@ -53,11 +57,13 @@ pub async fn extract_text_with<S: AsyncObjectSource>(src: S, page: &Page) -> Res
 /// bytes, unparseable content, missing resources, exhausted form limits.
 /// An empty text with an empty report really is an empty page.
 pub fn extract_text_reporting(doc: &Document, page: &Page) -> Result<(String, ExtractReport)> {
-    block_on(extract_text_reporting_with(Immediate(doc), page))
+    let (spans, report) = pdfboss_text::extract_spans_reporting(doc, page)?;
+    Ok((Text.render(&[page_layout(&spans)]), report))
 }
 
 /// [`extract_text_reporting`] against any object source. Signed like
-/// [`extract_text_with`], for the same reasons.
+/// [`extract_text_with`], for the same reasons — every optional-content
+/// layer included.
 pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
@@ -124,11 +130,13 @@ pub fn extract_markdown_reporting(doc: &Document) -> Result<(String, Vec<Extract
 /// [`extract_markdown`] is the better answer whenever the document is at
 /// hand — a page whose text is all one size has no heading to find.
 pub fn extract_page_markdown(doc: &Document, page: &Page) -> Result<String> {
-    block_on(extract_page_markdown_with(Immediate(doc), page))
+    let (spans, rulings, _) = pdfboss_text::extract_spans_and_rulings_reporting(doc, page)?;
+    Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings)]))
 }
 
 /// [`extract_page_markdown`] against any object source. Signed like
-/// [`extract_text_with`], for the same reasons.
+/// [`extract_text_with`], for the same reasons — every optional-content
+/// layer included.
 ///
 /// There is no document-level `_with`: an asynchronous caller collects each
 /// page's spans and rulings with
@@ -147,7 +155,7 @@ pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pdfboss_core::{resolve_with, BoxFuture, ObjRef, Object, Stream};
+    use pdfboss_core::{block_on, resolve_with, BoxFuture, ObjRef, Object, Stream};
     use pdfboss_testkit::{doc_with_graphics, multi_page_doc, simple_doc, PdfBuilder};
     use std::future::Future;
 
