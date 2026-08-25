@@ -108,7 +108,7 @@ impl ColorSpace {
             }
             ColorSpace::Separation { tint, alternate } => {
                 let mut components = [0f32; MAX_COMPS];
-                let written = tint.eval(comp(comps, 0), &mut components);
+                let written = tint.eval(&[comp(comps, 0)], &mut components);
                 alternate.to_rgb(&components[..written])
             }
             ColorSpace::Other(n) => {

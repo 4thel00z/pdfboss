@@ -21,6 +21,11 @@ pub(crate) const MAX_COMPS: usize = 8;
 /// stops a hostile file minting nodes without limit.
 const MAX_FUNCTIONS: usize = 256;
 
+/// Upper bound on a sampled function's grid (the product of its `/Size`
+/// entries). A real tint or gradient table holds at most a few thousand
+/// samples; the cap stops a hostile `/Size` from driving giant index math.
+const MAX_SAMPLES: u64 = 1 << 24;
+
 /// One parsed function. Stitching children are arena indices, so loading
 /// needs no recursion (a queue fills the arena) and evaluation recurses
 /// over indices with the depth bounded by [`MAX_FUNCTIONS`].
@@ -42,12 +47,15 @@ enum Node {
         encode: Vec<f32>,
     },
     /// Type 0: `outputs` values per sample, `bps` bits each, big-endian,
-    /// linearly interpolated between the two nearest of `size` samples.
+    /// over a grid of `size[i]` samples per input dimension with the first
+    /// dimension varying fastest, interpolated multilinearly between the
+    /// 2^m nearest samples (§7.10.2). `domain` and `encode` hold two
+    /// entries per dimension.
     Sampled {
-        domain: [f32; 2],
-        encode: [f32; 2],
+        domain: Vec<f32>,
+        encode: Vec<f32>,
         decode: Vec<f32>,
-        size: usize,
+        size: Vec<usize>,
         bps: u32,
         outputs: usize,
         data: Vec<u8>,
@@ -63,23 +71,24 @@ pub(crate) struct Functions {
 }
 
 impl Functions {
-    /// Evaluates every root at `x` into `out`, returning how many
-    /// components were written.
-    pub(crate) fn eval(&self, x: f32, out: &mut [f32; MAX_COMPS]) -> usize {
+    /// Evaluates every root at `inputs` into `out`, returning how many
+    /// components were written. Missing inputs read as 0; every root sees
+    /// the same inputs and their outputs concatenate.
+    pub(crate) fn eval(&self, inputs: &[f32], out: &mut [f32; MAX_COMPS]) -> usize {
         let mut written = 0;
         for &root in &self.roots {
             if written >= MAX_COMPS {
                 break;
             }
-            written += self.eval_node(root, x, &mut out[written..]);
+            written += self.eval_node(root, inputs, &mut out[written..]);
         }
         written
     }
 
-    fn eval_node(&self, idx: usize, x: f32, out: &mut [f32]) -> usize {
+    fn eval_node(&self, idx: usize, inputs: &[f32], out: &mut [f32]) -> usize {
         match &self.nodes[idx] {
             Node::Exponential { domain, c0, c1, n } => {
-                let x = x.clamp(domain[0], domain[1]);
+                let x = first_input(inputs).clamp(domain[0], domain[1]);
                 // x^1 is the overwhelmingly common gradient; skip the powf.
                 let xn = if *n == 1.0 { x } else { x.powf(*n) };
                 let count = c0.len().min(out.len());
@@ -94,7 +103,7 @@ impl Functions {
                 bounds,
                 encode,
             } => {
-                let x = x.clamp(domain[0], domain[1]);
+                let x = first_input(inputs).clamp(domain[0], domain[1]);
                 // Subinterval k: bounds partition [domain0, domain1).
                 let k = bounds.iter().take_while(|&&b| x >= b).count();
                 let Some(&child) = children.get(k) else {
@@ -104,7 +113,7 @@ impl Functions {
                 let hi = bounds.get(k).copied().unwrap_or(domain[1]);
                 let (e0, e1) = (encode[2 * k], encode[2 * k + 1]);
                 let t = if hi > lo { (x - lo) / (hi - lo) } else { 0.0 };
-                self.eval_node(child, e0 + t * (e1 - e0), out)
+                self.eval_node(child, &[e0 + t * (e1 - e0)], out)
             }
             Node::Sampled {
                 domain,
@@ -115,29 +124,66 @@ impl Functions {
                 outputs,
                 data,
             } => {
-                let x = x.clamp(domain[0], domain[1]);
-                let span = domain[1] - domain[0];
-                let t = if span > 0.0 {
-                    (x - domain[0]) / span
-                } else {
-                    0.0
-                };
-                let e = (encode[0] + t * (encode[1] - encode[0])).clamp(0.0, (*size - 1) as f32);
-                let i0 = e.floor() as usize;
-                let i1 = (i0 + 1).min(*size - 1);
-                let frac = e - i0 as f32;
+                let m = size.len();
+                // Grid neighborhood per dimension: the sample below the
+                // encoded input, the one above, and the blend between them.
+                let mut lo = [0usize; MAX_COMPS];
+                let mut hi = [0usize; MAX_COMPS];
+                let mut frac = [0f32; MAX_COMPS];
+                for i in 0..m {
+                    let x = inputs
+                        .get(i)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(domain[2 * i], domain[2 * i + 1]);
+                    let span = domain[2 * i + 1] - domain[2 * i];
+                    let t = if span > 0.0 {
+                        (x - domain[2 * i]) / span
+                    } else {
+                        0.0
+                    };
+                    let e = (encode[2 * i] + t * (encode[2 * i + 1] - encode[2 * i]))
+                        .clamp(0.0, (size[i] - 1) as f32);
+                    lo[i] = e.floor() as usize;
+                    hi[i] = (lo[i] + 1).min(size[i] - 1);
+                    frac[i] = e - lo[i] as f32;
+                }
                 let count = (*outputs).min(out.len()).min(decode.len() / 2);
                 let max = ((1u64 << *bps) - 1) as f32;
                 for (j, slot) in out.iter_mut().enumerate().take(count) {
-                    let s0 = sample_at(data, (i0 * outputs + j) as u64, *bps) as f32 / max;
-                    let s1 = sample_at(data, (i1 * outputs + j) as u64, *bps) as f32 / max;
-                    let s = s0 + (s1 - s0) * frac;
+                    // Multilinear blend over the 2^m corners of the
+                    // neighborhood; bit i of the corner picks lo/hi in
+                    // dimension i, and the first dimension varies fastest
+                    // in the sample stream.
+                    let mut acc = 0.0f32;
+                    for corner in 0..1usize << m {
+                        let mut weight = 1.0f32;
+                        let mut index = 0u64;
+                        let mut stride = 1u64;
+                        for i in 0..m {
+                            let up = corner & (1 << i) != 0;
+                            weight *= if up { frac[i] } else { 1.0 - frac[i] };
+                            index += if up { hi[i] as u64 } else { lo[i] as u64 } * stride;
+                            stride *= size[i] as u64;
+                        }
+                        if weight <= 0.0 {
+                            continue;
+                        }
+                        acc += weight
+                            * sample_at(data, index * *outputs as u64 + j as u64, *bps) as f32;
+                    }
+                    let s = acc / max;
                     *slot = decode[2 * j] + s * (decode[2 * j + 1] - decode[2 * j]);
                 }
                 count
             }
         }
     }
+}
+
+/// The single input the 1-input function types read, 0 when absent.
+fn first_input(inputs: &[f32]) -> f32 {
+    inputs.first().copied().unwrap_or(0.0)
 }
 
 /// Reads big-endian sample `index` of `bps` bits from a packed bit stream,
@@ -392,12 +438,26 @@ pub(crate) async fn load_functions<S: AsyncObjectSource>(
             0 => {
                 let data =
                     data.ok_or_else(|| Error::Other("sampled function carries no stream".into()))?;
-                let size = match float_array(src, dict.get("Size")).await {
-                    // Shading functions take one input; a multi-input
-                    // sampled function has no meaning here.
-                    Some(s) if s.len() == 1 && s[0] >= 1.0 => s[0] as usize,
+                let size: Vec<usize> = match float_array(src, dict.get("Size")).await {
+                    Some(s)
+                        if (1..=MAX_COMPS).contains(&s.len())
+                            && s.iter().all(|&v| (1.0..=MAX_SAMPLES as f32).contains(&v)) =>
+                    {
+                        s.iter().map(|&v| v as usize).collect()
+                    }
                     _ => return Err(Error::Other("sampled function /Size unusable".into())),
                 };
+                let samples = size
+                    .iter()
+                    .try_fold(1u64, |p, &s| p.checked_mul(s as u64))
+                    .filter(|&p| p <= MAX_SAMPLES);
+                if samples.is_none() {
+                    return Err(Error::Other("sampled function grid too large".into()));
+                }
+                let m = size.len();
+                let domain = floats(src, dict.get("Domain"), 2 * m)
+                    .await
+                    .unwrap_or_else(|| (0..m).flat_map(|_| [0.0, 1.0]).collect());
                 let bps = match dict.get_int("BitsPerSample") {
                     Some(b @ (1 | 2 | 4 | 8 | 12 | 16 | 24 | 32)) => b as u32,
                     _ => return Err(Error::Other("sampled function bits unusable".into())),
@@ -407,10 +467,9 @@ pub(crate) async fn load_functions<S: AsyncObjectSource>(
                     .filter(|r| r.len() >= 2 && r.len() % 2 == 0)
                     .ok_or_else(|| Error::Other("sampled function has no /Range".into()))?;
                 let outputs = range.len() / 2;
-                let encode = match floats(src, dict.get("Encode"), 2).await {
-                    Some(e) => [e[0], e[1]],
-                    None => [0.0, (size - 1) as f32],
-                };
+                let encode = floats(src, dict.get("Encode"), 2 * m)
+                    .await
+                    .unwrap_or_else(|| size.iter().flat_map(|&s| [0.0, (s - 1) as f32]).collect());
                 let decode = float_array(src, dict.get("Decode"))
                     .await
                     .filter(|d| d.len() == range.len())
@@ -574,7 +633,7 @@ impl Shading {
                     continue;
                 };
                 let t = self.domain[0] + (self.domain[1] - self.domain[0]) * s;
-                let n = self.functions.eval(t, &mut comps);
+                let n = self.functions.eval(&[t], &mut comps);
                 let rgb = self.cs.to_rgb(&comps[..n]);
                 let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 let rgb8 = [q(rgb[0]), q(rgb[1]), q(rgb[2])];
@@ -588,5 +647,124 @@ impl Shading {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pdfboss_core::parser::{NoResolve, Parser};
+    use pdfboss_core::{block_on, Document, Immediate};
+    use pdfboss_testkit::PdfBuilder;
+
+    fn obj(src: &[u8]) -> Object {
+        Parser::new(src).parse_object(&NoResolve).unwrap()
+    }
+
+    fn load(dict: &str, data: &[u8]) -> Result<Option<Functions>, Error> {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.stream(5, dict, data);
+        let doc = Document::load(b.build(1)).unwrap();
+        block_on(load_functions(&Immediate(&doc), &obj(b"5 0 R")))
+    }
+
+    fn eval(f: &Functions, inputs: &[f32]) -> Vec<f32> {
+        let mut out = [0f32; MAX_COMPS];
+        let n = f.eval(inputs, &mut out);
+        out[..n].to_vec()
+    }
+
+    fn close(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-4, "{got:?} vs {want:?}");
+        }
+    }
+
+    /// A 2x2 sample grid interpolated per ISO 32000-2 7.10.2: the first
+    /// dimension varies fastest, so the four bytes are f(0,0), f(1,0),
+    /// f(0,1), f(1,1).
+    #[test]
+    fn a_two_input_sampled_grid_interpolates_multilinearly() {
+        let f = load(
+            "/FunctionType 0 /Domain [0 1 0 1] /Range [0 1] /Size [2 2] /BitsPerSample 8",
+            &[0, 100, 200, 255],
+        )
+        .unwrap()
+        .unwrap();
+        close(&eval(&f, &[0.0, 0.0]), &[0.0]);
+        close(&eval(&f, &[1.0, 0.0]), &[100.0 / 255.0]);
+        close(&eval(&f, &[0.0, 1.0]), &[200.0 / 255.0]);
+        close(&eval(&f, &[1.0, 1.0]), &[1.0]);
+        // Center: the plain average of all four corners.
+        close(&eval(&f, &[0.5, 0.5]), &[138.75 / 255.0]);
+        // Hand-computed bilinear blend at (0.25, 0.75):
+        // 0.1875*0 + 0.0625*100 + 0.5625*200 + 0.1875*255 = 166.5625.
+        close(&eval(&f, &[0.25, 0.75]), &[166.5625 / 255.0]);
+        // Out-of-domain inputs clamp per dimension.
+        close(&eval(&f, &[-2.0, 7.0]), &[200.0 / 255.0]);
+    }
+
+    #[test]
+    fn a_one_input_sampled_function_still_interpolates_linearly() {
+        let f = load(
+            "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [4] /BitsPerSample 8",
+            &[0, 85, 170, 255],
+        )
+        .unwrap()
+        .unwrap();
+        close(&eval(&f, &[0.0]), &[0.0]);
+        close(&eval(&f, &[0.5]), &[127.5 / 255.0]);
+        close(&eval(&f, &[1.0]), &[1.0]);
+    }
+
+    /// A missing multi-input /Encode defaults to [0 size_i-1] per dimension,
+    /// and /Decode maps samples into each output's range.
+    #[test]
+    fn multi_input_encode_and_decode_defaults_apply_per_dimension() {
+        let f = load(
+            "/FunctionType 0 /Domain [0 1 0 1] /Range [0 1] /Size [3 2] \
+             /BitsPerSample 8 /Decode [1 0]",
+            &[0, 51, 102, 153, 204, 255],
+        )
+        .unwrap()
+        .unwrap();
+        // (1, 0) encodes to grid point (2, 0): sample 102, decoded 1 - s.
+        close(&eval(&f, &[1.0, 0.0]), &[1.0 - 102.0 / 255.0]);
+        // (0.5, 1) encodes to (1, 1): sample index 1 + 2*3 = 204.
+        close(&eval(&f, &[0.5, 1.0]), &[1.0 - 204.0 / 255.0]);
+    }
+
+    #[test]
+    fn exponential_and_stitching_read_only_the_first_input() {
+        let f = load(
+            "/FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1",
+            b"unused",
+        );
+        // Type 2 is a dictionary in real files; the stream dict works too.
+        let f = f.unwrap().unwrap();
+        close(&eval(&f, &[0.25, 9.0]), &[0.25]);
+        close(&eval(&f, &[]), &[0.0]);
+    }
+
+    #[test]
+    fn oversized_sample_grids_are_refused() {
+        // Nine input dimensions overflow every consumer (MAX_COMPS is 8).
+        let nine = load(
+            "/FunctionType 0 /Domain [0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1] /Range [0 1] \
+             /Size [2 2 2 2 2 2 2 2 2] /BitsPerSample 8",
+            &[0; 512],
+        );
+        assert!(nine.is_err());
+        // A sample count beyond the cap is hostile, not a gradient.
+        let huge = load(
+            "/FunctionType 0 /Domain [0 1 0 1] /Range [0 1] /Size [100000 100000] \
+             /BitsPerSample 8",
+            &[0; 4],
+        );
+        assert!(huge.is_err());
     }
 }
