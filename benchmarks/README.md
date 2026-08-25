@@ -1,7 +1,8 @@
 # Benchmarks
 
 Three scripts, because opening, rendering and scanned PDFs are different
-workloads.
+workloads — plus a quality benchmark under `parsebench/`, because speed
+means nothing if the output is wrong.
 
 `bench.py` compares pdfboss against other Python PDF libraries on the two
 operations they all produce comparable output for:
@@ -109,3 +110,19 @@ suite's scorer reads; results land in `results-olmocr.json`. pdfboss is a
 non-OCR engine, so the honest headline is the born-digital buckets — the
 scan and LaTeX-math buckets score near zero by construction. The recipe and
 the full interpretation notes are in [olmocr/README.md](olmocr/README.md).
+
+## Method — ParseBench (quality)
+
+`parsebench/` wires pdfboss into
+[run-llama/ParseBench](https://github.com/run-llama/ParseBench): 2,078
+human-verified pages, five quality dimensions, ~169k deterministic rules,
+no LLM judge. `parsebench/pdfboss_provider.py` is a drop-in provider for
+their tree (per-page markdown, pipe tables converted to HTML for the table
+metrics the same way their pdf_inspector provider does it); the wiring
+steps, full method and score interpretation live in
+[`parsebench/README.md`](parsebench/README.md). Scores are rule-based and
+deterministic, so unlike the timing benchmarks they are load-insensitive
+and published as measured: **28.00 overall** for pdfboss 0.17.1 (Content
+Faithfulness 61.50, Semantic Formatting 33.78, Tables 28.89, Visual
+Grounding 10.77, Charts 5.04), from a full 2,078-example run at ParseBench
+commit 34b7345. Raw aggregates land in `results-parsebench.json`.

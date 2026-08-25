@@ -1,0 +1,81 @@
+{
+  "benchmark": "run-llama/ParseBench",
+  "harness_commit": "34b7345",
+  "dataset": "llamaindex/ParseBench (Hugging Face)",
+  "pipeline": "pdfboss_markdown",
+  "pdfboss": "0.17.1",
+  "scoring": {
+    "llm_normalization": "off (harness default)",
+    "fast_teds": "on (harness default, identical scores)",
+    "overall": "mean of the five dimension headline scores, the public leaderboard's formula"
+  },
+  "inference": {
+    "examples": 2078,
+    "parsed": 2036,
+    "rejected_non_pdf": 42
+  },
+  "overall": 28.0,
+  "dimensions": {
+    "table": {
+      "examples": 503,
+      "headline_metric": "grits_trm_composite",
+      "score": 28.89,
+      "grits_con": 36.42,
+      "table_record_match": 20.07,
+      "table_record_match_perfect": 14.32,
+      "tables_expected_avg": 1.779,
+      "tables_emitted_avg": 1.1913
+    },
+    "chart": {
+      "examples": 568,
+      "headline_metric": "rule_chart_data_point_pass_rate",
+      "score": 5.04
+    },
+    "text_content": {
+      "examples": 506,
+      "headline_metric": "content_faithfulness",
+      "score": 61.5,
+      "text_correctness": 68.39,
+      "reading_order": 46.76,
+      "page_header_rule_pass_rate": 0.0,
+      "page_footer_rule_pass_rate": 0.0
+    },
+    "text_formatting": {
+      "examples": 476,
+      "headline_metric": "semantic_formatting",
+      "score": 33.78,
+      "title_accuracy": 35.47,
+      "title_hierarchy": 31.95,
+      "bold": 37.55,
+      "italic": 41.25,
+      "text_styling": 32.3
+    },
+    "layout": {
+      "examples": 500,
+      "scored": 64,
+      "headline_metric": "rule_pass_rate",
+      "score": 10.77,
+      "note": "436 examples score zero: 394 need a layout payload the provider does not emit, 42 are jpg/png inputs a PDF-only provider rejects. Identical accounting to the pypdf/PyMuPDF baselines (verified: pypdf_baseline fails the same examples in this harness)."
+    }
+  },
+  "peers_open_source_local": {
+    "source": "leaderboard.csv in run-llama/ParseBench at 34b7345 (public numbers, not rerun locally)",
+    "overall": {
+      "pypdf": 14.87,
+      "PyMuPDF (Text)": 16.02,
+      "PyMuPDF (HTML)": 16.62,
+      "MarkItDown": 18.63,
+      "pdf-inspector": 26.59,
+      "pdfboss (this run)": 28.0,
+      "OpenDataLoader": 29.4,
+      "LiteParse (no OCR)": 32.8,
+      "Warp Ingest": 40.18
+    }
+  },
+  "notes": [
+    "Deterministic rule-based scoring; quality scores are load-insensitive and published as measured.",
+    "pdfboss markdown drops page headers/footers by design, so the is_header/is_footer rules in Content Faithfulness score zero.",
+    "Markdown pipe tables are converted to HTML tables in the provider's normalize(), the same step the pdf_inspector provider applies, because the Tables similarity metrics consume HTML tables only.",
+    "No Visual Grounding layout payload yet: the pdfboss Python bindings do not expose block geometry; emitting it from the layout IR is follow-up work in pdfboss."
+  ]
+}
