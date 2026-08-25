@@ -1,7 +1,8 @@
 # Benchmarks
 
-Six scripts, because opening, rendering, scanned PDFs, rendering *quality*,
-malformed PDFs and memory are different workloads — plus two
+Seven scripts, because opening, rendering, scanned PDFs, rendering
+*quality*, parallel throughput, malformed PDFs and memory are different
+workloads — plus two
 extraction-quality suites (`olmocr/`, `parsebench/`), because speed means
 nothing if the output is wrong.
 
@@ -42,17 +43,25 @@ fresh process per (engine, workload), each reporting its own high-water mark,
 because a peak is meaningless once four engines have allocated in the same
 address space.
 
+`bench_parallel.py` measures what the sequential scripts deliberately do not:
+they time per-page loops, which understates every engine that can use more
+than one core. pdfboss's `Document.render_pages` and `Document.extract_text`
+fan pages out across the machine's cores in one call, and the competing
+engines can thread too — so each engine is timed twice on the same workload,
+sequential baseline and its best available parallel route, and the speedup is
+reported per engine.
+
 ## Libraries
 
-| Library | Open | Text | Render | Scan | Fidelity | Robustness | Memory | Notes |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|
-| pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
-| PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
-| pypdf | ✓ | ✓ | | | | | | pure Python; no rasterizer |
-| pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
-| pypdfium2 | | | ✓ | ✓ | ref | ✓ | ✓ | pdfium bindings; text API used by bench_memory.py |
-| pdfminer.six | | ✓ | | | | | | pure Python |
-| pikepdf | ✓ | | | | | | | qpdf bindings; no text API |
+| Library | Open | Text | Render | Scan | Fidelity | Parallel | Robustness | Memory | Notes |
+|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|
+| pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
+| PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
+| pypdf | ✓ | ✓ | | | | | | | pure Python; no rasterizer |
+| pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
+| pypdfium2 | | | ✓ | ✓ | ref | ✓ | ✓ | ✓ | pdfium bindings; text API used by bench_memory.py |
+| pdfminer.six | | ✓ | | | | | | | pure Python |
+| pikepdf | ✓ | | | | | | | | qpdf bindings; no text API |
 
 ## Method
 
@@ -143,6 +152,56 @@ address space.
   other engines' rows: it disagrees with pdfium about as much as pdfium-based
   and independent C pipelines disagree among themselves.
 
+## Method — parallel
+
+Two workloads, one results file (`results-parallel.json`, sections merge):
+
+- **scan** — render `--pages` evenly spaced pages (default 60) of one scanned
+  document to PNG bytes at `--scale`, the `bench_scans.py` workload where
+  every engine rasterizes the same bilevel picture and no glyph-painting gate
+  is needed. The `bench_scans.py` ink check runs first: each engine's render
+  of the first sampled page is measured for dark-pixel coverage, printed and
+  recorded — the renders must agree.
+- **text** — extract the text of every page of a corpus sample (`--sample`,
+  default 40), the `bench.py` workload. Extracted character counts are
+  recorded per engine, so an engine extracting nothing is visible.
+
+Each engine is timed in both modes, best-of-`--repeat` after one warm-up pass
+per mode; the text aggregate keeps only files every engine handled in both
+modes, so the totals compare the exact same workload. `--threads` (default:
+the machine's cores) sizes the competitors' pools.
+
+Per-engine parallel routes, documented because they are the comparison:
+
+- **pdfboss** — one call: `render_pages` / `extract_text`, with the same
+  explicit `scale`/`fonts` arguments as its sequential per-page loop. The
+  call is internally parallel (one worker per core, each holding its own fork
+  of the document — shared bytes and cross-reference table, private caches);
+  it has no thread knob, so `--threads` does not apply to it.
+- **PyMuPDF** — `ThreadPoolExecutor` over per-page calls, one document handle
+  per worker thread (its objects are not thread-safe across a shared handle).
+  Whatever its internal serialization then allows is its parallel story.
+- **pypdfium2, pdfplumber rendering** — pdfium's contract requires callers to
+  serialize every pdfium call across threads, and it means it: threaded
+  rendering with one document per worker intermittently corrupts pdfium's
+  document loader for the rest of the process, and pdfplumber's `to_image`
+  (a fresh pdfium document open/close inside every call) crashes the process
+  outright — both reproduced while building this bench. The harness therefore
+  serializes all pdfium calls under one lock and threads only the PNG
+  encoding; the resulting near-1x IS the pdfium threading story. Parallel
+  pdfium in Python means one process per worker, a different workload shape
+  than this in-process comparison.
+- **pdfplumber text** — threads with one document per worker; extraction is
+  pure Python, so it stays GIL-bound. pypdfium2's text goes through its
+  textpage API here (the Libraries table's "no text API used here" describes
+  `bench.py`).
+
+Results table: **pending a quiet-machine pass.** The script is smoke-tested
+(both workloads, every engine timed in both modes), but the machine that
+built it was under heavy parallel load, so no wall-clock numbers are
+published yet.
+
+
 ## Method — robustness
 
 - The corpus is malformed by construction: the OSS-Fuzz **public corpora** for
@@ -207,6 +266,8 @@ python benchmarks/bench.py          /path/to/pdfs --sample 40 --repeat 3
 python benchmarks/bench_render.py   /path/to/pdfs --sample 40 --repeat 3
 python benchmarks/bench_scans.py    /path/to/scan.pdf --pages 100 --repeat 3
 python benchmarks/bench_fidelity.py /path/to/pdfs --sample 40
+python benchmarks/bench_parallel.py scan /path/to/scan.pdf --pages 60 --repeat 3
+python benchmarks/bench_parallel.py text /path/to/pdfs --sample 40 --repeat 3
 
 benchmarks/fetch_stress_corpus.sh /outside/repo/stress-corpus   # ~460 MB once
 python benchmarks/bench_robustness.py /outside/repo/stress-corpus --sample 2000
@@ -216,7 +277,9 @@ python benchmarks/bench_memory.py     /path/to/pdfs --sample 40 --pages 10 --sca
 `bench.py` writes `results.json` (raw numbers) and `results.png` (the chart
 shown in the top-level README); `bench_render.py` writes
 `results-render.json`; `bench_scans.py` writes `results-scans.json`;
-`bench_fidelity.py` writes `results-fidelity.json`; `bench_robustness.py`
+`bench_fidelity.py` writes `results-fidelity.json`; `bench_parallel.py`
+writes `results-parallel.json` (the two workloads merge into one file, saved
+incrementally so a crashed engine keeps what finished); `bench_robustness.py`
 writes `results-robustness.json`; `bench_memory.py` writes
 `results-memory.json`. The real-world corpora are local and not committed —
 those results record corpus shape, page counts, sizes and score
