@@ -2261,6 +2261,7 @@ mod tests {
         let opts = || RenderOptions {
             glyph_painting: GlyphPainting::Full,
             substitutes: SubstituteSource::Dir(dir.clone()),
+            ..Default::default()
         };
 
         // Serif (0x2) + Nonsymbolic (0x20): the descriptor states the font
