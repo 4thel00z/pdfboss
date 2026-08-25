@@ -455,8 +455,16 @@ impl BlendMode {
         if self == BlendMode::Normal {
             return cs;
         }
-        let b3 = [UNIT[cb[0] as usize], UNIT[cb[1] as usize], UNIT[cb[2] as usize]];
-        let s3 = [UNIT[cs[0] as usize], UNIT[cs[1] as usize], UNIT[cs[2] as usize]];
+        let b3 = [
+            UNIT[cb[0] as usize],
+            UNIT[cb[1] as usize],
+            UNIT[cb[2] as usize],
+        ];
+        let s3 = [
+            UNIT[cs[0] as usize],
+            UNIT[cs[1] as usize],
+            UNIT[cs[2] as usize],
+        ];
         let v3 = match self {
             BlendMode::Hue => set_lum(set_sat(s3, sat(b3)), lum(b3)),
             BlendMode::Saturation => set_lum(set_sat(b3, sat(s3)), lum(b3)),

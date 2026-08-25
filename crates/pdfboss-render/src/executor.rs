@@ -21,7 +21,7 @@ use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
 use crate::raster::{fill_path, BlendMode, FillRule, Mask, RasterScratch};
-use crate::shading::Shading;
+use crate::shading::{load_functions, Functions, Shading, MAX_COMPS};
 use crate::stroke::stroke_path;
 #[cfg(feature = "substitute-fonts")]
 use crate::substitute::BuiltinProvider;
@@ -288,20 +288,42 @@ impl Default for TextState {
 
 /// Reduces a rendered soft-mask group to a page-sized coverage mask: the
 /// Rec. 601 luma of each pixel (times its alpha) for luminosity masks, the
-/// alpha channel alone for alpha masks. Pixels the group never painted
-/// keep its backdrop and read as that backdrop's coverage.
-fn mask_from_group(pix: &Pixmap, luminosity: bool) -> Mask {
+/// alpha channel alone for alpha masks, each byte then remapped through the
+/// group's `/TR` transfer LUT when it has one (§11.6.5.2). Pixels the group
+/// never painted keep its backdrop and read as that backdrop's coverage.
+fn mask_from_group(pix: &Pixmap, luminosity: bool, transfer: Option<&[u8; 256]>) -> Mask {
     let mut mask = Mask::new(pix.width, pix.height);
     for (px, out) in pix.data.as_chunks::<4>().0.iter().zip(mask.data.iter_mut()) {
-        *out = if luminosity {
+        let v = if luminosity {
             let luma =
                 (77 * u32::from(px[0]) + 150 * u32::from(px[1]) + 29 * u32::from(px[2])) >> 8;
             ((luma * u32::from(px[3])) / 255) as u8
         } else {
             px[3]
         };
+        *out = match transfer {
+            Some(lut) => lut[usize::from(v)],
+            None => v,
+        };
     }
     mask
+}
+
+/// Bakes a loaded `/TR` transfer function into a 256-entry LUT: each mask
+/// byte `i` evaluates at `i/255` and the first output clamps back into a
+/// byte. A function writing no outputs reads as identity.
+fn transfer_lut(f: &Functions) -> Box<[u8; 256]> {
+    let mut lut = Box::new([0u8; 256]);
+    let mut out = [0f32; MAX_COMPS];
+    for (i, slot) in lut.iter_mut().enumerate() {
+        let written = f.eval(&[i as f32 / 255.0], &mut out);
+        *slot = if written == 0 {
+            i as u8
+        } else {
+            (out[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+        };
+    }
+    lut
 }
 
 /// The coverage a paint composites through: the clip intersected with the
@@ -646,6 +668,9 @@ enum FrameKind {
         /// What the offscreen page starts as: opaque black (or `/BC`) for
         /// luminosity, transparent for alpha.
         backdrop: [u8; 4],
+        /// The `/TR` transfer function baked to a byte LUT the harvest
+        /// remaps every mask byte through; `None` is identity.
+        transfer: Option<Box<[u8; 256]>>,
     },
 }
 
@@ -995,11 +1020,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 FrameKind::SoftMaskGroup {
                     saved: Some(mut saved),
                     luminosity,
+                    transfer,
                     ..
                 } => {
                     std::mem::swap(&mut self.pix, &mut saved);
                     // `saved` now holds the group's own render.
-                    let mask = mask_from_group(&saved, luminosity);
+                    let mask = mask_from_group(&saved, luminosity, transfer.as_deref());
                     if let Some(parent) = frames.last_mut() {
                         parent.gs.soft_mask = Some(Arc::new(mask));
                     }
@@ -2229,8 +2255,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// current CTM, and its pop reduces the render to a luminosity or
     /// alpha coverage mask. Failures report a dropped soft mask and paint
     /// proceeds unmasked, the old behavior as the fallback. A `/TR`
-    /// transfer function other than `/Identity` is approximated as
-    /// identity and reported.
+    /// transfer function bakes into a byte LUT the harvested mask maps
+    /// through; one that will not load is approximated as identity and
+    /// reported.
     async fn soft_mask_group(&mut self, sm: &Dict, frame: &Frame) -> Option<Frame> {
         let luminosity = match sm.get_name("S").map(|n| n.0.as_str()) {
             Some("Luminosity") => true,
@@ -2240,11 +2267,25 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 return None;
             }
         };
-        match sm.get("TR") {
-            None => {}
-            Some(Object::Name(n)) if n.0 == "Identity" => {}
-            Some(_) => self.skip(SkippedKind::SoftMask, SkipReason::Unsupported),
-        }
+        let transfer = match sm.get("TR") {
+            None => None,
+            Some(obj) => match self.src.resolve(obj).await {
+                // `/Default` names the identity here: nothing upstream in
+                // the mask pipeline has a non-default transfer to restore.
+                Ok(Object::Name(n)) if n.0 == "Identity" || n.0 == "Default" => None,
+                Ok(function) => match load_functions(self.src, &function).await {
+                    Ok(f) => Some(transfer_lut(&f)),
+                    Err(_) => {
+                        self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+                        None
+                    }
+                },
+                Err(_) => {
+                    self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
+                    None
+                }
+            },
+        };
         let backdrop = if luminosity {
             // `/BC` is given in the group's own color space; reading it
             // through the group's parsed space is deferred — black is the
@@ -2284,6 +2325,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             saved: None,
             luminosity,
             backdrop,
+            transfer,
         };
         Some(built)
     }
@@ -5444,7 +5486,11 @@ mod tests {
         let content = b"1 0 0 rg 0 0 60 60 re f /GS0 gs 0 0 1 rg 30 30 60 60 re f";
         let (pix, report) = render_reporting(small_doc(resources, content, |_| {}));
         assert!(report.is_empty(), "non-separable blends are not drops");
-        assert_eq!(px(&pix, 45, 55), [54, 54, 255, 255], "overlap takes the hue");
+        assert_eq!(
+            px(&pix, 45, 55),
+            [54, 54, 255, 255],
+            "overlap takes the hue"
+        );
         assert_eq!(px(&pix, 75, 15), WHITE, "blue over white stays white");
         assert_eq!(px(&pix, 10, 89), RED, "red-only region untouched");
     }
@@ -5533,6 +5579,77 @@ mod tests {
         let (pix, report) = render_reporting(bytes);
         assert!(report.is_empty());
         assert_eq!(px(&pix, 75, 50), [0, 0, 0, 255], "Q drops the mask");
+    }
+
+    /// A Luminosity group painting white over the left half of the page
+    /// (black backdrop right), with the given `/TR` entry ("" for none).
+    fn smask_transfer_doc(tr: &str, extra: impl FnOnce(&mut PdfBuilder)) -> Vec<u8> {
+        let resources =
+            format!("/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R {tr} >> >> >>");
+        small_doc(&resources, b"/GS0 gs 0 0 100 100 re f", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100]",
+                b"1 1 1 rg 0 0 50 100 re f",
+            );
+            extra(b);
+        })
+    }
+
+    #[test]
+    fn inverting_exponential_transfer_flips_the_mask() {
+        // /TR is 1 − x (type 2): the white half's mask byte 255 maps to 0
+        // (shows the page), the black backdrop's 0 maps to 255 (paints).
+        // Exactly the un-transferred test with the halves swapped.
+        let tr = "/TR << /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [0] /N 1 >>";
+        let (pix, report) = render_reporting(smask_transfer_doc(tr, |_| {}));
+        assert!(report.is_empty(), "an applied transfer is not a drop");
+        assert_eq!(px(&pix, 25, 50), WHITE, "inverted mask hides the fill");
+        assert_eq!(px(&pix, 75, 50), BLACK, "inverted backdrop paints");
+    }
+
+    #[test]
+    fn inverting_calculator_transfer_flips_the_mask() {
+        // The same inversion as a type-4 program.
+        let bytes = smask_transfer_doc("/TR 6 0 R", |b| {
+            b.stream(
+                6,
+                "/FunctionType 4 /Domain [0 1] /Range [0 1]",
+                b"{ 1 exch sub }",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "an applied transfer is not a drop");
+        assert_eq!(px(&pix, 25, 50), WHITE, "inverted mask hides the fill");
+        assert_eq!(px(&pix, 75, 50), BLACK, "inverted backdrop paints");
+    }
+
+    #[test]
+    fn identity_and_default_transfers_match_an_absent_one() {
+        // /TR /Identity and /TR /Default are byte-for-byte the no-/TR
+        // render, and none of the three is a drop.
+        let (base, report) = render_reporting(smask_transfer_doc("", |_| {}));
+        assert!(report.is_empty());
+        assert_eq!(px(&base, 25, 50), BLACK, "unmasked half paints");
+        assert_eq!(px(&base, 75, 50), WHITE, "masked half shows the page");
+        for tr in ["/TR /Identity", "/TR /Default"] {
+            let (pix, report) = render_reporting(smask_transfer_doc(tr, |_| {}));
+            assert!(report.is_empty(), "{tr} is not a drop");
+            assert_eq!(pix, base, "{tr} must render byte-for-byte as absent");
+        }
+    }
+
+    #[test]
+    fn unloadable_transfer_stays_reported_as_identity() {
+        // A /TR that is no function still reports a dropped soft-mask
+        // feature and the mask applies un-transferred.
+        let (pix, report) = render_reporting(smask_transfer_doc("/TR /Bogus", |_| {}));
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::SoftMask, SkipReason::Unsupported, 1)],
+        );
+        assert_eq!(px(&pix, 25, 50), BLACK, "mask still applies as identity");
+        assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
     #[test]
