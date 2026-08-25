@@ -478,6 +478,17 @@ impl Document {
         meta
     }
 
+    /// The document's optional-content visibility under its default
+    /// configuration (ISO 32000-1 §8.11.4.3), or `None` when the catalog
+    /// declares no `/OCProperties` — no optional content, everything
+    /// visible. Computed per call from a handful of object reads.
+    pub fn oc_state(&self) -> Option<crate::oc::OcState> {
+        block_on(crate::oc::OcState::load_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     fn meta_string(&self, dict: &Dict, key: &str) -> Option<String> {
         let value = self.resolve(dict.get(key)?).ok()?;
