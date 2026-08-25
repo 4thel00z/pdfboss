@@ -44,6 +44,7 @@ use super::budget::Budget;
 use super::generic::{
     decode_generic_region, decode_mmr_region, parse_generic_flags, GB_CONTEXT_LEN,
 };
+use super::halftone::{decode_halftone_region, decode_pattern_dict};
 use super::huffman::{parse_table_segment, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
@@ -153,6 +154,10 @@ fn decode_embedded_within(
     // set to "user-supplied", in the order its referred-to list names them
     // (7.4.2.1.6).
     let mut tables: HashMap<u32, Table> = HashMap::new();
+    // Pattern dictionaries' exports, keyed the same way once more: a halftone
+    // region names the dictionary supplying its patterns by segment number
+    // (7.4.5.2 step 2).
+    let mut patterns: HashMap<u32, Vec<Bitmap>> = HashMap::new();
     let mut page: Option<Bitmap> = None;
     for segment in global_segments.iter().chain(page_segments.iter()) {
         match segment.header.kind {
@@ -175,15 +180,25 @@ fn decode_embedded_within(
                 // The borrow of `symbols` ends with this block, because the
                 // insert that follows needs the map mutably.
                 let exported = {
-                    let inputs =
-                        gather_referred_to(&symbols, &tables, &segment.header.referred_to, budget)?;
+                    let inputs = gather_referred_to(
+                        &symbols,
+                        &tables,
+                        &patterns,
+                        &segment.header.referred_to,
+                        budget,
+                    )?;
                     decode_symbol_dict(segment.data, &inputs.symbols, &inputs.tables, budget)?
                 };
                 symbols.insert(segment.header.number, exported);
             }
             SegmentKind::ImmediateTextRegion | SegmentKind::ImmediateLosslessTextRegion => {
-                let inputs =
-                    gather_referred_to(&symbols, &tables, &segment.header.referred_to, budget)?;
+                let inputs = gather_referred_to(
+                    &symbols,
+                    &tables,
+                    &patterns,
+                    &segment.header.referred_to,
+                    budget,
+                )?;
                 let (info, region) =
                     decode_text_region(segment.data, &inputs.symbols, &inputs.tables, budget)?;
                 let mut target = match page.take() {
@@ -209,14 +224,34 @@ fn decode_embedded_within(
                 return Err(Jbig2Error::Unimplemented("intermediate region"))
             }
             SegmentKind::PatternDictionary => {
-                return Err(Jbig2Error::Unimplemented("pattern dictionary"))
+                let exported = decode_pattern_dict(segment.data, budget)?;
+                patterns.insert(segment.header.number, exported);
             }
-            SegmentKind::IntermediateHalftoneRegion
-            | SegmentKind::ImmediateHalftoneRegion
-            | SegmentKind::ImmediateLosslessHalftoneRegion => {
-                return Err(Jbig2Error::Unimplemented("halftone region"))
+            SegmentKind::ImmediateHalftoneRegion | SegmentKind::ImmediateLosslessHalftoneRegion => {
+                let inputs = gather_referred_to(
+                    &symbols,
+                    &tables,
+                    &patterns,
+                    &segment.header.referred_to,
+                    budget,
+                )?;
+                // 7.4.5.2 step 2 speaks of *the* referred-to pattern
+                // dictionary: exactly one supplies HPATS, and a region naming
+                // none or several has no single dictionary to mean.
+                let [dictionary] = inputs.patterns.as_slice() else {
+                    return Err(Jbig2Error::Malformed(
+                        "halftone region must name exactly one pattern dictionary",
+                    ));
+                };
+                let (info, region) = decode_halftone_region(segment.data, dictionary, budget)?;
+                let mut target = match page.take() {
+                    Some(existing) => existing,
+                    None => Bitmap::new(width, height)?,
+                };
+                target.combine(&region, offset(info.x), offset(info.y), info.op);
+                page = Some(target);
             }
-            SegmentKind::IntermediateGenericRegion => {
+            SegmentKind::IntermediateHalftoneRegion | SegmentKind::IntermediateGenericRegion => {
                 return Err(Jbig2Error::Unimplemented("intermediate region"))
             }
             // An intermediate refinement region, like any other intermediate
@@ -270,10 +305,14 @@ struct Referred<'a> {
     /// segments, which is the order the selectors of 7.4.2.1.6 and 7.4.3.1.6
     /// consume them in.
     tables: Vec<&'a Table>,
+    /// The pattern dictionaries' exports, one entry per dictionary named. A
+    /// halftone region requires exactly one (7.4.5.2 step 2), and that is its
+    /// caller's check to make: this list only reports what the stream said.
+    patterns: Vec<&'a [Bitmap]>,
 }
 
-/// Splits a segment's referred-to list into the symbols and the tables it
-/// supplies (T.88 7.4.2.2, 7.4.3.2, 7.4.2.1.6).
+/// Splits a segment's referred-to list into the symbols, tables and patterns
+/// it supplies (T.88 7.4.2.2, 7.4.3.2, 7.4.2.1.6, 7.4.5.2).
 ///
 /// Order is the whole point, and the two orders are independent: a symbol ID
 /// indexes the concatenated symbols, so naming two dictionaries the other way
@@ -304,16 +343,19 @@ struct Referred<'a> {
 /// as long as SBNUMSYMS however short the segment is, and every later segment
 /// that names the same dictionary builds it over again. A unit per symbol is
 /// far above what appending a borrow costs and far below anything a document
-/// would notice.
+/// would notice. Pattern dictionaries go uncharged for the tables' reason: an
+/// entry contributes one borrow of the whole export, never a per-pattern copy.
 fn gather_referred_to<'a>(
     symbols: &'a HashMap<u32, Vec<Bitmap>>,
     tables: &'a HashMap<u32, Table>,
+    patterns: &'a HashMap<u32, Vec<Bitmap>>,
     referred_to: &[u32],
     budget: &mut Budget,
 ) -> Result<Referred<'a>, Jbig2Error> {
     let mut out = Referred {
         symbols: Vec::new(),
         tables: Vec::new(),
+        patterns: Vec::new(),
     };
     for number in referred_to {
         if let Some(exported) = symbols.get(number) {
@@ -324,9 +366,11 @@ fn gather_referred_to<'a>(
             out.symbols.extend(exported.iter());
         } else if let Some(table) = tables.get(number) {
             out.tables.push(table);
+        } else if let Some(exported) = patterns.get(number) {
+            out.patterns.push(exported);
         } else {
             return Err(Jbig2Error::Malformed(
-                "referred-to segment supplies neither symbols nor a table",
+                "referred-to segment supplies neither symbols, patterns, nor a table",
             ));
         }
     }
@@ -482,10 +526,10 @@ mod tests {
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
     use crate::filters::jbig2::symbol_dict::SYMBOL_COST;
     use crate::filters::jbig2::testing::{
-        code_table_segment, dictionary_segment, expect_at, glyph, header,
-        huffman_dictionary_segment, huffman_text_segment, reexport_segment,
-        rowless_dictionary_segment, split_after_segment, text_segment_for_page, Collective, Op,
-        Placement, Shape,
+        code_table_segment, dictionary_segment, encode_generic_sequence, expect_at, glyph,
+        halftone_segment, header, huffman_dictionary_segment, huffman_text_segment,
+        pattern_dict_segment, reexport_segment, rowless_dictionary_segment, split_after_segment,
+        text_segment_for_page, Collective, Op, Placement, Shape,
     };
 
     /// Handing a segment the symbols its header names is work the segment buys
@@ -497,11 +541,12 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(1u32, vec![glyph(&["1"]); 64]);
         let tables = HashMap::new();
+        let patterns = HashMap::new();
 
         let mut budget = Budget::with_limit(64);
-        assert!(gather_referred_to(&symbols, &tables, &[1], &mut budget).is_ok());
+        assert!(gather_referred_to(&symbols, &tables, &patterns, &[1], &mut budget).is_ok());
         assert!(matches!(
-            gather_referred_to(&symbols, &tables, &[1], &mut budget),
+            gather_referred_to(&symbols, &tables, &patterns, &[1], &mut budget),
             Err(Jbig2Error::WorkLimit),
         ));
     }
@@ -706,21 +751,18 @@ mod tests {
         }
     }
 
-    /// Segment types later plans own must fail loudly, naming themselves, so
-    /// the render report can say what is missing rather than showing a blank.
+    /// Segment types this build does not decode must fail loudly, naming
+    /// themselves, so the render report can say what is missing rather than
+    /// showing a blank. Every remaining one is an intermediate region: a
+    /// region retained for a later segment, which needs an auxiliary buffer
+    /// this walk does not keep.
     #[test]
     fn unimplemented_segment_types_are_named_errors() {
-        for (kind, want) in [
-            (4u8, "intermediate region"),
-            (16, "pattern dictionary"),
-            (22, "halftone region"),
-            (36, "intermediate region"),
-            (40, "intermediate region"),
-        ] {
+        for kind in [4u8, 20, 36, 40] {
             let stream = header(0, kind, &[], 1, 0);
             assert_eq!(
                 decode_embedded(&[], &stream, 8, 8),
-                Err(Jbig2Error::Unimplemented(want)),
+                Err(Jbig2Error::Unimplemented("intermediate region")),
                 "segment type {kind}",
             );
         }
@@ -840,6 +882,105 @@ mod tests {
         let page = decode_embedded(&[], &stream, 8, 8).expect("page");
         assert_eq!((page.width(), page.height()), (8, 8));
         assert_eq!(page.get(0, 0), 0);
+    }
+
+    /// A pattern dictionary and the halftone region drawing from it, end to
+    /// end through the page walk: the dictionary is decoded and kept by
+    /// segment number, the region finds it through its referred-to list, and
+    /// the finished region composites onto the page like any other.
+    ///
+    /// The two combination operators in play are deliberately different. The
+    /// region's flags say HDEFPIXEL 1 with HCOMBOP XNOR, which writes each
+    /// pattern verbatim over the ones background — OR there would have left
+    /// solid ink. The region information field then says REPLACE, which puts
+    /// the region onto the page as-is at (2, 1).
+    #[test]
+    fn decodes_a_halftone_page_end_to_end() {
+        let dot = glyph(&["000", "010", "000"]);
+        let ring = glyph(&["111", "101", "111"]);
+        let dict = pattern_dict_segment(&[dot.clone(), ring.clone()], false);
+
+        // Two patterns take one gray-scale plane, and GI = (0 1): the grid is
+        // axis-aligned with a step of three pixels (HRX = 768), so the dot
+        // lands at region (0, 0) and the ring at (3, 0).
+        let plane = glyph(&["01"]);
+        let coded = encode_generic_sequence(&[&plane], &GenericParams::nominal(0), None);
+        let region = halftone_segment((6, 3), (2, 1), 4, 0xB0, (2, 1, 0, 0, 768, 0), &coded);
+
+        let mut stream = page_info_segment(0, (10, 6));
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 22, &[1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 10, 6).expect("page");
+        expect_at(&page, &dot, 2, 1);
+        expect_at(&page, &ring, 5, 1);
+        assert_eq!(page.get(0, 0), 0, "outside the region");
+        assert_eq!(page.get(9, 5), 0);
+    }
+
+    /// A lossless halftone region (type 23) composites exactly like an
+    /// immediate one; only the encoder's promise about fidelity differs.
+    #[test]
+    fn a_lossless_halftone_region_paints_too() {
+        let ring = glyph(&["111", "101", "111"]);
+        let dict = pattern_dict_segment(&[glyph(&["000", "000", "000"]), ring.clone()], false);
+        let plane = glyph(&["1"]);
+        let coded = encode_generic_sequence(&[&plane], &GenericParams::nominal(0), None);
+        let region = halftone_segment((3, 3), (1, 2), 0, 0, (1, 1, 0, 0, 768, 0), &coded);
+
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 23, &[1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 8, 8).expect("page");
+        expect_at(&page, &ring, 1, 2);
+    }
+
+    /// A pattern dictionary carries no pixels of its own, so a stream holding
+    /// one and nothing else decodes to a blank page rather than to a refusal:
+    /// the patterns are kept for whichever halftone region names them.
+    #[test]
+    fn a_pattern_dictionary_segment_is_kept_rather_than_refused() {
+        let dict = pattern_dict_segment(&[glyph(&["11", "11"])], false);
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        let page = decode_embedded(&[], &stream, 8, 8).expect("page");
+        assert_eq!(page.get(0, 0), 0);
+    }
+
+    /// 7.4.5.2 step 2 speaks of *the* referred-to pattern dictionary, so a
+    /// halftone region naming none — or two — has no single dictionary to
+    /// mean, and painting from a guess would be wrong either way.
+    #[test]
+    fn a_halftone_region_must_name_exactly_one_pattern_dictionary() {
+        let want = Err(Jbig2Error::Malformed(
+            "halftone region must name exactly one pattern dictionary",
+        ));
+
+        let region = halftone_segment((4, 4), (0, 0), 0, 0, (1, 1, 0, 0, 256, 0), &[]);
+        let mut stream = header(0, 22, &[], 1, region.len() as u32);
+        stream.extend_from_slice(&region);
+        assert_eq!(decode_embedded(&[], &stream, 8, 8), want, "no dictionary");
+
+        let dict = pattern_dict_segment(&[glyph(&["1"])], false);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        let region = halftone_segment((4, 4), (0, 0), 0, 0, (1, 1, 0, 0, 256, 0), &[]);
+        stream.extend_from_slice(&header(3, 22, &[1, 2], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            want,
+            "two dictionaries"
+        );
     }
 
     /// A table segment whose bytes are not a table is a malformed stream, not a
@@ -1407,7 +1548,7 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed(
-                "referred-to segment supplies neither symbols nor a table",
+                "referred-to segment supplies neither symbols, patterns, nor a table",
             )),
         );
     }
@@ -1423,7 +1564,7 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed(
-                "referred-to segment supplies neither symbols nor a table",
+                "referred-to segment supplies neither symbols, patterns, nor a table",
             )),
         );
     }
@@ -1457,15 +1598,27 @@ mod tests {
 
         let within = vec![1u32; 8_192];
         assert_eq!(
-            gather_referred_to(&store, &tables, &within, &mut Budget::new())
-                .map(|r| r.symbols.len()),
+            gather_referred_to(
+                &store,
+                &tables,
+                &HashMap::new(),
+                &within,
+                &mut Budget::new()
+            )
+            .map(|r| r.symbols.len()),
             Ok(65_536),
         );
 
         let beyond = vec![1u32; 8_193];
         assert_eq!(
-            gather_referred_to(&store, &tables, &beyond, &mut Budget::new())
-                .map(|r| r.symbols.len()),
+            gather_referred_to(
+                &store,
+                &tables,
+                &HashMap::new(),
+                &beyond,
+                &mut Budget::new()
+            )
+            .map(|r| r.symbols.len()),
             Err(Jbig2Error::Malformed("symbol count exceeds the limit")),
         );
     }

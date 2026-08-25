@@ -17,17 +17,20 @@
 //! Huffman variant of the format uses wherever the arithmetic variant reaches
 //! for [`arith_int`]; [`symbol_dict`] and [`text_region`] are the pair a
 //! scanned page of text is actually made of, and each decodes both variants;
-//! and [`page`] walks a segment sequence, compositing each region onto the
-//! page.
+//! [`halftone`] is the corresponding pair for tone — a pattern dictionary and
+//! the halftone region that draws its patterns over a grid (6.6, 6.7, with
+//! the gray-scale image coding of Annex C between them); and [`page`] walks a
+//! segment sequence, compositing each region onto the page.
 //!
-//! What that leaves undecoded is two things, both refused by name. A symbol
-//! instance or a dictionary symbol may be coded as a *refinement* of another
-//! bitmap rather than outright (6.3, SDREFAGG and SBREFINE), and a region of
-//! greyscale-like tone may be coded as a halftone over a pattern dictionary
-//! (6.6, 6.7). Everything else a scanner emits — generic regions in all four
-//! templates, symbol dictionaries, text regions, custom code tables, and the
-//! MMR coding any of them may use in place of the arithmetic decoder — decodes
-//! here.
+//! What that leaves undecoded is refused by name rather than approximated: a
+//! symbol instance or a dictionary symbol may be coded as a *refinement* of
+//! another bitmap rather than outright (6.3, SDREFAGG and SBREFINE), and the
+//! intermediate region segments — regions retained in an auxiliary buffer for
+//! a later segment to refine — are refused with it. Everything else a scanner
+//! emits — generic regions in all four templates, symbol dictionaries, text
+//! regions, pattern dictionaries and halftone regions, custom code tables,
+//! and the MMR coding any of them may use in place of the arithmetic decoder
+//! — decodes here.
 //!
 //! One region coding is not decoded here at all. A generic region may say that
 //! its pixels are coded with the two-dimensional facsimile scheme of ITU-T T.6
@@ -47,6 +50,7 @@ pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod budget;
 pub(crate) mod generic;
+pub(crate) mod halftone;
 pub(crate) mod huffman;
 pub(crate) mod mq;
 pub(crate) mod page;

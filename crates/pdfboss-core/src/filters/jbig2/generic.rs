@@ -45,7 +45,7 @@ pub(crate) const GB_CONTEXT_LEN: usize = 1 << 16;
 /// Templates 1 to 3 define only A1; their remaining slots repeat template 0's
 /// so that every [`GenericParams`] holds four well-defined offsets, and
 /// [`context_at`] never reads a slot the template does not use anyway.
-pub(crate) const NOMINAL_AT: [[(i8, i8); 4]; 4] = [
+pub(crate) const NOMINAL_AT: [[(i16, i16); 4]; 4] = [
     [(3, -1), (-3, -1), (2, -2), (-2, -2)],
     [(3, -1), (-3, -1), (2, -2), (-2, -2)],
     [(2, -1), (-3, -1), (2, -2), (-2, -2)],
@@ -72,7 +72,11 @@ pub(crate) struct GenericParams {
     pub(crate) template: u8,
     /// The AT pixel offsets A1 to A4, as `(dx, dy)` relative to the pixel
     /// being decoded. Templates 1 to 3 use only A1.
-    pub(crate) at: [(i8, i8); 4],
+    ///
+    /// Wider than the signed byte a segment header carries, because the offsets
+    /// do not all come from headers: the pattern dictionary procedure sets A1
+    /// to `-HDPW` (T.88 Table 27), and HDPW runs to 255.
+    pub(crate) at: [(i16, i16); 4],
     /// TPGDON: whether each row is preceded by a typical-prediction decision.
     pub(crate) tpgdon: bool,
 }
@@ -524,6 +528,36 @@ pub(crate) fn decode_mmr_region(
     Ok(facsimile::decode(data, &layout)?)
 }
 
+/// [`decode_mmr_region`] for a region followed by more MMR data in the same
+/// slice, reporting how many bytes it consumed alongside the bitmap.
+///
+/// The gray-scale image procedure is the caller (T.88 Annex C): its bitplanes
+/// are consecutive MMR streams, each closed by an end-of-facsimile block
+/// because the byte count of a plane is not known in advance (6.2.6), and each
+/// invocation consumes a whole number of bytes — so the next plane starts at
+/// the byte boundary the returned count names. Every check and charge of
+/// [`decode_mmr_region`] applies unchanged.
+pub(crate) fn decode_mmr_region_consumed(
+    data: &[u8],
+    budget: &mut Budget,
+    width: u32,
+    height: u32,
+) -> Result<(Bitmap, usize), Jbig2Error> {
+    facsimile::check_dimensions(width, height)?;
+    budget.charge_region(width, height)?;
+    if height == 0 {
+        return Err(Jbig2Error::Malformed("MMR region of no rows"));
+    }
+    let layout = facsimile::Params {
+        columns: width,
+        rows: height,
+        k: -1,
+        end_of_line: false,
+        byte_align: false,
+    };
+    Ok(facsimile::decode_consumed(data, &layout)?)
+}
+
 /// Decodes the typical-prediction decision that precedes a row when TPGDON is
 /// set, and reports whether the row is a copy of the one above
 /// (T.88 6.2.5.7).
@@ -580,7 +614,7 @@ pub(crate) fn parse_generic_flags(r: &mut Reader<'_>) -> Result<(bool, GenericPa
     for slot in params.at.iter_mut().take(at_pairs) {
         let dx = r.i8()?;
         let dy = r.i8()?;
-        *slot = (dx, dy);
+        *slot = (i16::from(dx), i16::from(dy));
     }
     Ok((mmr, params))
 }

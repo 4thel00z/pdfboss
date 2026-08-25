@@ -295,7 +295,7 @@ fn parse_header(
         for slot in params.at.iter_mut().take(at_pairs) {
             let dx = r.i8()?;
             let dy = r.i8()?;
-            *slot = (dx, dy);
+            *slot = (i16::from(dx), i16::from(dy));
         }
         Coding::Arithmetic(params)
     } else {
@@ -534,7 +534,7 @@ fn decode_huffman_height_classes(
         )?;
         let mut left = 0u32;
         for symbol_width in widths {
-            new_symbols.push(columns_of(&collective, left, symbol_width)?);
+            new_symbols.push(collective.columns(left, symbol_width)?);
             left += symbol_width;
         }
     }
@@ -572,22 +572,6 @@ fn checked_symbol_width(width: i64) -> Result<u32, Jbig2Error> {
         return Err(Jbig2Error::Malformed("negative symbol width"));
     }
     u32::try_from(width).map_err(|_| Jbig2Error::Malformed("symbol too wide"))
-}
-
-/// The `width` columns of `collective` starting at column `left`, as a bitmap
-/// of their own (T.88 6.5.5 step 4 d)).
-fn columns_of(collective: &Bitmap, left: u32, width: u32) -> Result<Bitmap, Jbig2Error> {
-    let mut symbol = Bitmap::new(width, collective.height())?;
-    for y in 0..collective.height() {
-        for x in 0..width {
-            symbol.set(
-                x,
-                y,
-                collective.get(i64::from(left) + i64::from(x), i64::from(y)),
-            );
-        }
-    }
-    Ok(symbol)
 }
 
 /// Decodes one height class collective bitmap (T.88 6.5.9).

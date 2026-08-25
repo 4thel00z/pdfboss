@@ -16,7 +16,7 @@
 
 use super::arith_int::encoder::{encode_iaid, encode_int};
 use super::arith_int::{IaidCtx, IntCtxSet};
-use super::bitmap::Bitmap;
+use super::bitmap::{Bitmap, CombOp};
 use super::generic::{context_at, GenericParams, GB_CONTEXT_LEN, NOMINAL_AT};
 use super::huffman::encoder::{push_value, BitWriter};
 use super::huffman::{from_code_lengths, standard, Table, Unused};
@@ -332,6 +332,101 @@ pub(crate) fn code_table_segment(low: i32) -> Vec<u8> {
     w.push(0, htps); // B.2 step 6: the lower range line, unused
     w.push(1, htps); // B.2 step 8: the upper range line
     out.extend_from_slice(&w.finish());
+    out
+}
+
+/// Encodes `bitmaps` one after another through a single arithmetic coder and
+/// a single GB context array.
+///
+/// That is the shape of every multi-bitmap coding within one segment: E.3.7
+/// resets the statistics per segment, not per bitmap, so the bitplanes of a
+/// gray-scale image (T.88 Annex C) share coder and contexts exactly as a
+/// symbol dictionary's symbols do. `skip` marks pixels no decision is coded
+/// for (6.2.5.7 USESKIP); a skipped pixel must hold 0 in its bitmap, because
+/// 0 is what the decoder stores there and forms the following contexts from.
+pub(crate) fn encode_generic_sequence(
+    bitmaps: &[&Bitmap],
+    params: &GenericParams,
+    skip: Option<&Bitmap>,
+) -> Vec<u8> {
+    let mut enc = MqEncoder::new();
+    let mut cx = vec![MqContext::default(); GB_CONTEXT_LEN];
+    for bm in bitmaps {
+        for y in 0..bm.height() {
+            for x in 0..bm.width() {
+                if skip.is_some_and(|s| s.get(i64::from(x), i64::from(y)) == 1) {
+                    assert_eq!(
+                        bm.get(i64::from(x), i64::from(y)),
+                        0,
+                        "a skipped pixel must be 0 in the fixture bitmap",
+                    );
+                    continue;
+                }
+                let ctx = usize::from(context_at(bm, x, y, params));
+                enc.encode(&mut cx[ctx], bm.get(i64::from(x), i64::from(y)));
+            }
+        }
+    }
+    enc.finish()
+}
+
+/// A pattern dictionary segment's data (T.88 7.4.4): the header, then
+/// `patterns` concatenated left to right into the collective bitmap and coded
+/// as one region — MMR or arithmetic with the Table 27 parameters, whose A1
+/// sits at (−HDPW, 0) rather than anywhere a segment header could put it.
+pub(crate) fn pattern_dict_segment(patterns: &[Bitmap], mmr: bool) -> Vec<u8> {
+    let hdpw = patterns[0].width();
+    let hdph = patterns[0].height();
+    let mut collective =
+        Bitmap::new(hdpw * patterns.len() as u32, hdph).expect("fixture collectives are small");
+    for (index, pattern) in patterns.iter().enumerate() {
+        assert_eq!((pattern.width(), pattern.height()), (hdpw, hdph));
+        collective.combine(pattern, (index as u32 * hdpw) as i32, 0, CombOp::Replace);
+    }
+
+    let mut out = vec![u8::from(mmr)]; // flags: HDTEMPLATE 0
+    out.push(hdpw as u8);
+    out.push(hdph as u8);
+    out.extend_from_slice(&(patterns.len() as u32 - 1).to_be_bytes());
+    if mmr {
+        out.extend_from_slice(&encode_g4(&collective));
+        return out;
+    }
+    let params = GenericParams {
+        template: 0,
+        at: [(-(hdpw as i16), 0), (-3, -1), (2, -2), (-2, -2)],
+        tpgdon: false,
+    };
+    out.extend_from_slice(&encode_generic_sequence(&[&collective], &params, None));
+    out
+}
+
+/// A halftone region segment's data (T.88 7.4.5): the region segment
+/// information field — `size` at `at`, composited with `op` — then the
+/// halftone flags byte exactly as Figure 42 lays it out, the grid as
+/// (HGW, HGH, HGX, HGY, HRX, HRY), and the coded gray-plane bytes.
+pub(crate) fn halftone_segment(
+    size: (u32, u32),
+    at: (u32, u32),
+    op: u8,
+    flags: u8,
+    grid: (u32, u32, i32, i32, u16, u16),
+    coded: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&size.0.to_be_bytes());
+    out.extend_from_slice(&size.1.to_be_bytes());
+    out.extend_from_slice(&at.0.to_be_bytes());
+    out.extend_from_slice(&at.1.to_be_bytes());
+    out.push(op);
+    out.push(flags);
+    out.extend_from_slice(&grid.0.to_be_bytes());
+    out.extend_from_slice(&grid.1.to_be_bytes());
+    out.extend_from_slice(&grid.2.to_be_bytes());
+    out.extend_from_slice(&grid.3.to_be_bytes());
+    out.extend_from_slice(&grid.4.to_be_bytes());
+    out.extend_from_slice(&grid.5.to_be_bytes());
+    out.extend_from_slice(coded);
     out
 }
 
