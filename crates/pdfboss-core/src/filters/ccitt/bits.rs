@@ -126,7 +126,7 @@ impl<'a> BitReader<'a> {
     /// (T.88 6.4.11 step 5), so an unaligned call is a field read out of the
     /// wrong place, not a slice to invent.
     pub(crate) fn take_aligned_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
-        if self.pos % 8 != 0 {
+        if !self.pos.is_multiple_of(8) {
             return None;
         }
         let start = self.pos / 8;
