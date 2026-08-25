@@ -15,6 +15,14 @@ thiserror = "2"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 memchr = "2"
 
+[features]
+# Compiles in Adobe's predefined CJK CMap set (ISO 32000-1 Table 118;
+# BSD-licensed data, see assets/cmaps/NOTICE), ~830 KB of zlib archives
+# decompressed lazily per character collection. Without it, predefined
+# names other than Identity-H/-V resolve to nothing and Type0 consumers
+# keep their Identity fallback.
+predefined-cmaps = []
+
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
 criterion = { workspace = true }

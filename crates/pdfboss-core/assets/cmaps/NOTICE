@@ -1,0 +1,24 @@
+This directory bundles Adobe's predefined CJK CMap data files — the set
+ISO 32000-1 Table 118 names — from adobe-type-tools/cmap-resources
+(commit f5cf3bca7fdfeaceb77aa82847e974f2306c20b4), repacked verbatim into
+one zlib-compressed archive per character collection:
+
+  - adobe-japan1.bin  (Adobe-Japan1: 83pv-RKSJ-H, 90ms-RKSJ-H/V,
+    90msp-RKSJ-H/V, 90pv-RKSJ-H, Add-RKSJ-H/V, EUC-H/V, Ext-RKSJ-H/V,
+    H, V, UniJIS-UCS2-H/V, UniJIS-UCS2-HW-H/V, UniJIS-UTF16-H/V)
+  - adobe-gb1.bin     (Adobe-GB1: GB-EUC-H/V, GBpc-EUC-H/V, GBK-EUC-H/V,
+    GBKp-EUC-H/V, GBK2K-H/V, UniGB-UCS2-H/V, UniGB-UTF16-H/V)
+  - adobe-cns1.bin    (Adobe-CNS1: B5pc-H/V, HKscs-B5-H/V, ETen-B5-H/V,
+    ETenms-B5-H/V, CNS-EUC-H/V, UniCNS-UCS2-H/V, UniCNS-UTF16-H/V)
+  - adobe-korea1.bin  (Adobe-Korea1: KSC-EUC-H/V, KSCms-UHC-H/V,
+    KSCms-UHC-HW-H/V, KSCpc-EUC-H, UniKS-UCS2-H/V, UniKS-UTF16-H/V)
+  - adobe-kr.bin      (Adobe-KR: UniAKR-UTF16-H, ISO 32000-2)
+
+Copyright 1990-2023 Adobe. All rights reserved. The data is licensed
+under Adobe's BSD-3-Clause terms; the full license text is in LICENSE.md
+in this directory. Each packed file also retains its own %%Copyright
+header unmodified.
+
+Archive layout (after zlib decompression): a little-endian u32 count,
+then per entry a u16 name length, the name bytes, and a u32 data length;
+the file payloads follow concatenated in entry order.

@@ -5,8 +5,15 @@
 //! mode. The value domain is codes to CID integers — distinct from the
 //! ToUnicode CMaps parsed in `pdfboss-text`, whose destinations are text.
 
+mod predefined;
+
+pub use predefined::{cid_to_unicode, predefined, CidToUnicode};
+
+use crate::document::decoded_stream_data_with;
 use crate::hash::FastMap;
 use crate::lexer::{Lexer, Token};
+use crate::object::{Dict, Object, Stream};
+use crate::source::AsyncObjectSource;
 use std::sync::Arc;
 
 /// One `begincodespacerange` entry: byte-wise lower and upper bounds for
@@ -251,6 +258,39 @@ impl CidCmap {
             .or_else(|| self.parent.as_ref()?.notdef(code, len))
     }
 
+    /// Feeds every real mapping in the chain to `push` as
+    /// `(len, lo, hi, first_cid)`, shallowest layer first and ascending by
+    /// code within a layer — the iteration order that lets an inversion
+    /// keep the lowest code for each CID.
+    fn mappings(&self, push: &mut impl FnMut(u8, u32, u32, u32)) {
+        let mut singles: Vec<(u8, u32, u32)> = self
+            .singles
+            .iter()
+            .map(|(&(len, code), &cid)| (len, code, cid))
+            .collect();
+        singles.sort_unstable();
+        let mut singles = singles.into_iter().peekable();
+        let mut ranges = self.ranges.iter().peekable();
+        loop {
+            let single_first = match (singles.peek(), ranges.peek()) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(&(len, code, _)), Some(r)) => (len, code) <= (r.len, r.lo),
+            };
+            if single_first {
+                let (len, code, cid) = singles.next().unwrap();
+                push(len, code, code, cid);
+            } else {
+                let r = ranges.next().unwrap();
+                push(r.len, r.lo, r.hi, r.cid);
+            }
+        }
+        if let Some(parent) = &self.parent {
+            parent.mappings(push);
+        }
+    }
+
     /// Reads `<lo> <hi>` pairs until `endcodespacerange`.
     fn parse_codespaces(&mut self, lx: &mut Lexer<'_>, len: usize) {
         loop {
@@ -336,6 +376,101 @@ impl CidCmap {
             }
         }
     }
+}
+
+/// How a Type0 font's `/Encoding` maps show-string bytes to CIDs.
+pub struct Type0Encoding {
+    /// The CMap when one resolved; `None` means the Identity assumption
+    /// (2-byte codes, CID == code) — either stated (`/Identity-H`/`-V`) or
+    /// the fallback for anything unresolvable.
+    pub cmap: Option<Arc<CidCmap>>,
+    /// Writing mode 1 (top-to-bottom).
+    pub vertical: bool,
+    /// False when `/Encoding` named a CMap that could not be resolved (or
+    /// was absent), so the Identity fallback is a guess rather than what
+    /// the file states.
+    pub known: bool,
+}
+
+/// Resolves `dict[key]`, treating resolution failures and `null` as absent.
+async fn rv<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Object> {
+    let obj = dict.get(key)?;
+    let resolved = src.resolve(obj).await.ok()?;
+    (!resolved.is_null()).then_some(resolved)
+}
+
+/// Reads a Type0 font dictionary's `/Encoding` (ISO 32000-1 §9.7.5): the
+/// two Identity names map straight through; any other name resolves via
+/// [`predefined`]; a stream is parsed as an embedded CMap, its dictionary's
+/// `/UseCMap` chain (streams or predefined names, bounded depth) layered
+/// underneath and its `/WMode` overriding the content's. Whatever fails
+/// resolves to the Identity assumption with `known` false.
+pub async fn type0_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> Type0Encoding {
+    let identity = |vertical: bool, known: bool| Type0Encoding {
+        cmap: None,
+        vertical,
+        known,
+    };
+    let Some(enc) = rv(src, font, "Encoding").await else {
+        return identity(false, false);
+    };
+    match enc {
+        Object::Name(n) if n.0 == "Identity-H" => identity(false, true),
+        Object::Name(n) if n.0 == "Identity-V" => identity(true, true),
+        Object::Name(n) => match predefined(&n.0) {
+            Some(cmap) => Type0Encoding {
+                vertical: cmap.vertical(),
+                cmap: Some(cmap),
+                known: true,
+            },
+            None => identity(n.0.ends_with("-V"), false),
+        },
+        Object::Stream(stream) => match embedded_cmap(src, &stream).await {
+            Some(cmap) => Type0Encoding {
+                vertical: cmap.vertical(),
+                cmap: Some(cmap),
+                known: true,
+            },
+            None => identity(false, false),
+        },
+        _ => identity(false, false),
+    }
+}
+
+/// Parses an embedded CMap stream with its `/UseCMap` ancestry. `None` when
+/// the stream will not read or parses to nothing.
+async fn embedded_cmap<S: AsyncObjectSource>(src: &S, stream: &Stream) -> Option<Arc<CidCmap>> {
+    // Walk the /UseCMap chain outward first (bounded), then parse from the
+    // deepest layer up so each child wraps its parent.
+    let mut layers: Vec<(Vec<u8>, Option<i64>)> = Vec::new();
+    let mut parent: Option<Arc<CidCmap>> = None;
+    let mut current = stream.clone();
+    for _ in 0..4 {
+        // Through the checked fetch: a CMap labelled with an image codec is
+        // a passthrough codestream, refused rather than token-scanned.
+        let data = decoded_stream_data_with(src, &current).await.ok()?;
+        let wmode = rv(src, &current.dict, "WMode")
+            .await
+            .and_then(|o| o.as_int());
+        layers.push((data, wmode));
+        match rv(src, &current.dict, "UseCMap").await {
+            Some(Object::Name(n)) => {
+                parent = predefined(&n.0);
+                break;
+            }
+            Some(Object::Stream(s)) => current = s,
+            _ => break,
+        }
+    }
+    for (data, wmode) in layers.into_iter().rev() {
+        let mut resolve = |n: &str| predefined(n);
+        let mut cmap = CidCmap::parse_with(&data, parent.take(), &mut resolve);
+        if let Some(w) = wmode {
+            cmap.wmode = u8::from(w == 1);
+        }
+        parent = Some(Arc::new(cmap));
+    }
+    parent.filter(|c| !c.is_empty())
 }
 
 /// Fetches the next token, force-advancing past unlexable bytes; `None` at
