@@ -284,7 +284,9 @@ pub enum SkippedKind {
     /// A `Do` whose XObject resource is missing, is not a stream, or has no
     /// subtype this renderer knows how to draw.
     XObject,
-    /// A shading (`sh`), which this renderer does not paint.
+    /// A shading (`sh` or a shading pattern) this renderer could not
+    /// paint: an unsupported kind, a missing resource, or a structural
+    /// failure. Axial and radial gradients paint.
     Shading,
     /// A pattern fill or stroke, painted as flat mid-gray instead of the
     /// pattern's own content.
@@ -292,7 +294,8 @@ pub enum SkippedKind {
     /// A mask that was ignored, so content the author masked out painted
     /// solid: an image `/SMask` or `/Mask`, or an `/ExtGState` `/SMask`.
     SoftMask,
-    /// A blend mode other than `Normal`, painted as `Normal`.
+    /// A non-separable blend mode (Hue, Saturation, Color, Luminosity),
+    /// painted as `Normal`; the separable modes paint.
     BlendMode,
     /// An annotation appearance stream that was declared but could not be
     /// painted: unreadable, unparsable, or with no selectable state.
