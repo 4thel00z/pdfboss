@@ -26,15 +26,16 @@
 //! Annex C between them); and [`page`] walks a segment sequence, compositing
 //! each region onto the page.
 //!
-//! What that leaves undecoded is refused by name rather than approximated,
-//! and it is one construct: the intermediate region segments — regions
-//! retained in an auxiliary buffer for a later segment to refine rather than
-//! composited onto the page. Everything else a scanner emits — generic
-//! regions in all four templates, symbol dictionaries with and without
-//! refinement/aggregate coding, text regions and their instance refinements,
-//! immediate refinement regions over the page, pattern dictionaries and
-//! halftone regions, custom code tables, and the MMR coding any of them may
-//! use in place of the arithmetic decoder — decodes here.
+//! Nothing in the segment type table (7.3) is left undecoded. The last gap to
+//! close was the intermediate region segments: [`page`] retains each one's
+//! bitmap — the auxiliary buffer of 8.2 — instead of compositing it, hands it
+//! to the refinement region that names it as that segment's reference
+//! (7.4.7.4), and composites the refined result. So generic regions in all
+//! four templates, symbol dictionaries with and without refinement/aggregate
+//! coding, text regions and their instance refinements, refinement regions
+//! over the page or over a retained region, pattern dictionaries and halftone
+//! regions, custom code tables, and the MMR coding any of them may use in
+//! place of the arithmetic decoder all decode here.
 //!
 //! One region coding is not decoded here at all. A generic region may say that
 //! its pixels are coded with the two-dimensional facsimile scheme of ITU-T T.6
