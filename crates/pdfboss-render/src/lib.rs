@@ -294,8 +294,9 @@ pub enum SkippedKind {
     /// A mask that was ignored, so content the author masked out painted
     /// solid: an image `/SMask` or `/Mask`, or an `/ExtGState` `/SMask`.
     SoftMask,
-    /// A non-separable blend mode (Hue, Saturation, Color, Luminosity),
-    /// painted as `Normal`; the separable modes paint.
+    /// A `/BM` blend mode painted as `Normal`. No longer produced — every
+    /// ISO 32000 blend mode paints — but retained so report consumers
+    /// keep compiling against the same set of kinds.
     BlendMode,
     /// An annotation appearance stream that was declared but could not be
     /// painted: unreadable, unparsable, or with no selectable state.

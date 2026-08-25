@@ -1,13 +1,10 @@
 //! Content-op execution against a graphics state stack: transforms, colors,
 //! clipping, ExtGState, form XObject recursion, and paint dispatch.
 //!
-//! What cannot be reproduced is reported, never silently dropped: every
-//! skipped or approximated element -- a non-separable blend mode, text
-//! shown in a clipping mode, undecodable content -- lands in the
-//! [`RenderReport`] this module returns, along with every content stream
-//! and image leniency drop, so no caller is handed a blank page it cannot
-//! account for. The one exception is the glyph tiers, which the caller
-//! chooses.
+//! Everything the render approximates or drops -- except the glyph tiers,
+//! which the caller chooses -- is recorded in the [`RenderReport`] this
+//! module returns, along with every content stream and image leniency
+//! drop, so no caller is handed a blank page it cannot account for.
 
 use pdfboss_core::FastMap;
 use std::sync::Arc;
@@ -112,8 +109,7 @@ struct GState {
     /// Dash pattern lengths in user space (empty = solid).
     dash: Vec<f32>,
     dash_phase: f32,
-    /// Active blend mode (`/BM`); the separable modes paint, see
-    /// [`BlendMode`].
+    /// Active blend mode (`/BM`); every mode paints, see [`BlendMode`].
     blend_mode: BlendMode,
     /// Constant fill alpha (`ca`).
     fill_alpha: f32,
@@ -2228,11 +2224,6 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
-    /// Applies the `/ca /CA /LW /LC /LJ /D` entries of the named
-    /// `/ExtGState` resource. Other entries are ignored in v0.1; the two
-    /// that change what the page looks like -- a `/SMask` mask group and a
-    /// non-`Normal` `/BM` blend mode -- are reported so the caller knows the
-    /// render is an approximation.
     /// Builds the offscreen frame for an `/SMask` group dictionary
     /// (§11.6.5.2): its `/G` form runs with a fresh graphics state at the
     /// current CTM, and its pop reduces the render to a luminosity or
@@ -2297,6 +2288,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         Some(built)
     }
 
+    /// Applies the named `/ExtGState` resource: `/SMask` (a mask group or
+    /// `/None`), `/BM`, `/ca /CA /LW /LC /LJ /D`. Other entries are
+    /// ignored.
     async fn apply_ext_gstate_op(&mut self, name: &Name, frame: &mut Frame) {
         let Some(Object::Dict(dict)) = self.find_res(&frame.chain, "ExtGState", &name.0).await
         else {
@@ -2320,10 +2314,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 },
             }
         }
-        match blend_mode_entry(self.src, &dict).await {
-            Some(Ok(mode)) => frame.gs.blend_mode = mode,
-            Some(Err(())) => self.skip(SkippedKind::BlendMode, SkipReason::Unsupported),
-            None => {}
+        if let Some(mode) = blend_mode_entry(self.src, &dict).await {
+            frame.gs.blend_mode = mode;
         }
         let gs = &mut frame.gs;
         if let Some(ca) = dict_f32(self.src, &dict, "ca").await {
@@ -2411,21 +2403,12 @@ fn skip_reason_for(e: &Error) -> SkipReason {
     }
 }
 
-/// Whether an `/ExtGState` selects a blend mode this renderer does not
-/// apply (ISO 32000-1 11.3.5). Everything composites source-over, so
-/// anything but `Normal` (and its deprecated alias `Compatible`) paints
-/// differently than the page asks for.
 /// The `/BM` entry classified for painting: `None` when the dictionary
-/// sets no mode, `Some(Ok(mode))` for a mode the rasterizer paints, and
-/// `Some(Err(()))` for the recognized-but-unpainted non-separable four
-/// (Hue, Saturation, Color, Luminosity), which the caller reports. An
-/// unrecognized name reads as Normal, exactly as ISO 32000-1 §11.3.5
-/// tells a conforming reader to treat it — that is compliance, not an
+/// sets no mode, `Some(mode)` otherwise (ISO 32000-1 §11.3.5). An
+/// unrecognized name reads as Normal, exactly as the spec tells a
+/// conforming reader to treat it — that is compliance, not an
 /// approximation, so it is not reported.
-async fn blend_mode_entry<S: AsyncObjectSource>(
-    src: &S,
-    dict: &Dict,
-) -> Option<std::result::Result<BlendMode, ()>> {
+async fn blend_mode_entry<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<BlendMode> {
     let bm = dict.get("BM")?;
     // An array-valued `/BM` names the first mode the reader supports.
     let selected = match src.resolve(bm).await {
@@ -2437,20 +2420,22 @@ async fn blend_mode_entry<S: AsyncObjectSource>(
         _ => return None,
     };
     Some(match selected.as_str() {
-        "Normal" | "Compatible" => Ok(BlendMode::Normal),
-        "Multiply" => Ok(BlendMode::Multiply),
-        "Screen" => Ok(BlendMode::Screen),
-        "Overlay" => Ok(BlendMode::Overlay),
-        "Darken" => Ok(BlendMode::Darken),
-        "Lighten" => Ok(BlendMode::Lighten),
-        "ColorDodge" => Ok(BlendMode::ColorDodge),
-        "ColorBurn" => Ok(BlendMode::ColorBurn),
-        "HardLight" => Ok(BlendMode::HardLight),
-        "SoftLight" => Ok(BlendMode::SoftLight),
-        "Difference" => Ok(BlendMode::Difference),
-        "Exclusion" => Ok(BlendMode::Exclusion),
-        "Hue" | "Saturation" | "Color" | "Luminosity" => Err(()),
-        _ => Ok(BlendMode::Normal),
+        "Multiply" => BlendMode::Multiply,
+        "Screen" => BlendMode::Screen,
+        "Overlay" => BlendMode::Overlay,
+        "Darken" => BlendMode::Darken,
+        "Lighten" => BlendMode::Lighten,
+        "ColorDodge" => BlendMode::ColorDodge,
+        "ColorBurn" => BlendMode::ColorBurn,
+        "HardLight" => BlendMode::HardLight,
+        "SoftLight" => BlendMode::SoftLight,
+        "Difference" => BlendMode::Difference,
+        "Exclusion" => BlendMode::Exclusion,
+        "Hue" => BlendMode::Hue,
+        "Saturation" => BlendMode::Saturation,
+        "Color" => BlendMode::Color,
+        "Luminosity" => BlendMode::Luminosity,
+        _ => BlendMode::Normal,
     })
 }
 
@@ -5450,16 +5435,31 @@ mod tests {
     }
 
     #[test]
-    fn nonseparable_blend_is_reported() {
-        // A NON-separable blend mode (/Hue) is still a reported
-        // approximation; the separable ones paint (see the blend tests).
+    fn hue_blend_paints_the_overlap() {
+        // Blue huemixed over red: SetLum(blue, Lum(red) = 0.3) clips to
+        // [0.213483, 0.213483, 1.0] → [54, 54, 255] (§11.3.5.3, see the
+        // raster vectors). Blue over white keeps the white: Sat(white) = 0
+        // zeroes the source and SetLum lifts it back to Lum(white) = 1.
         let resources = "/ExtGState << /GS0 << /BM /Hue >> >>";
-        let bytes = small_doc(resources, b"/GS0 gs 0 0 100 100 re f", |_| {});
-        let (_, report) = render_reporting(bytes);
-        assert_eq!(
-            drops(&report),
-            vec![(SkippedKind::BlendMode, SkipReason::Unsupported, 1)],
-        );
+        let content = b"1 0 0 rg 0 0 60 60 re f /GS0 gs 0 0 1 rg 30 30 60 60 re f";
+        let (pix, report) = render_reporting(small_doc(resources, content, |_| {}));
+        assert!(report.is_empty(), "non-separable blends are not drops");
+        assert_eq!(px(&pix, 45, 55), [54, 54, 255, 255], "overlap takes the hue");
+        assert_eq!(px(&pix, 75, 15), WHITE, "blue over white stays white");
+        assert_eq!(px(&pix, 10, 89), RED, "red-only region untouched");
+    }
+
+    #[test]
+    fn luminosity_blend_paints_the_overlap() {
+        // Mid-gray (128) luminosity onto red: SetLum(red, 128/255) clips to
+        // [1.0, 0.288515, 0.288515] → [255, 74, 74] (see the raster
+        // vectors).
+        let resources = "/ExtGState << /GS0 << /BM /Luminosity >> >>";
+        let content = b"1 0 0 rg 0 0 60 60 re f /GS0 gs 0.5 0.5 0.5 rg 30 30 60 60 re f";
+        let (pix, report) = render_reporting(small_doc(resources, content, |_| {}));
+        assert!(report.is_empty(), "non-separable blends are not drops");
+        assert_eq!(px(&pix, 45, 55), [255, 74, 74, 255], "overlap relit red");
+        assert_eq!(px(&pix, 10, 89), RED, "red-only region untouched");
     }
 
     /// Resources declaring `/GS0` with a Luminosity soft-mask group whose

@@ -423,9 +423,8 @@ fn inside(wind: i32, rule: FillRule) -> bool {
     }
 }
 
-/// The separable blend modes this rasterizer paints (ISO 32000-1
-/// §11.3.5.2), plus `Normal`. The non-separable four (Hue, Saturation,
-/// Color, Luminosity) are recognized by the executor and reported instead.
+/// The blend modes this rasterizer paints: `Normal`, the separable modes
+/// (ISO 32000-1 §11.3.5.2) and the non-separable four (§11.3.5.3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum BlendMode {
     #[default]
@@ -441,6 +440,10 @@ pub(crate) enum BlendMode {
     SoftLight,
     Difference,
     Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 impl BlendMode {
@@ -452,51 +455,116 @@ impl BlendMode {
         if self == BlendMode::Normal {
             return cs;
         }
-        let mut out = [0u8; 3];
-        for i in 0..3 {
-            let b = cb[i] as f32 / 255.0;
-            let s = cs[i] as f32 / 255.0;
-            let v = match self {
-                BlendMode::Normal => s,
-                BlendMode::Multiply => b * s,
-                BlendMode::Screen => b + s - b * s,
-                BlendMode::Overlay => hard_light(s, b),
-                BlendMode::Darken => b.min(s),
-                BlendMode::Lighten => b.max(s),
-                BlendMode::ColorDodge => {
-                    if s >= 1.0 {
-                        1.0
-                    } else {
-                        (b / (1.0 - s)).min(1.0)
-                    }
+        let b3 = [UNIT[cb[0] as usize], UNIT[cb[1] as usize], UNIT[cb[2] as usize]];
+        let s3 = [UNIT[cs[0] as usize], UNIT[cs[1] as usize], UNIT[cs[2] as usize]];
+        let v3 = match self {
+            BlendMode::Hue => set_lum(set_sat(s3, sat(b3)), lum(b3)),
+            BlendMode::Saturation => set_lum(set_sat(b3, sat(s3)), lum(b3)),
+            BlendMode::Color => set_lum(s3, lum(b3)),
+            BlendMode::Luminosity => set_lum(b3, lum(s3)),
+            separable => {
+                let mut v3 = [0f32; 3];
+                for i in 0..3 {
+                    v3[i] = blend_channel(separable, b3[i], s3[i]);
                 }
-                BlendMode::ColorBurn => {
-                    if s <= 0.0 {
-                        0.0
-                    } else {
-                        1.0 - ((1.0 - b) / s).min(1.0)
-                    }
-                }
-                BlendMode::HardLight => hard_light(b, s),
-                BlendMode::SoftLight => {
-                    let d = if b <= 0.25 {
-                        ((16.0 * b - 12.0) * b + 4.0) * b
-                    } else {
-                        b.sqrt()
-                    };
-                    if s <= 0.5 {
-                        b - (1.0 - 2.0 * s) * b * (1.0 - b)
-                    } else {
-                        b + (2.0 * s - 1.0) * (d - b)
-                    }
-                }
-                BlendMode::Difference => (b - s).abs(),
-                BlendMode::Exclusion => b + s - 2.0 * b * s,
-            };
-            out[i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-        }
-        out
+                v3
+            }
+        };
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        [q(v3[0]), q(v3[1]), q(v3[2])]
     }
+}
+
+/// One channel of a separable blend function (§11.3.5.2).
+fn blend_channel(mode: BlendMode, b: f32, s: f32) -> f32 {
+    match mode {
+        BlendMode::Multiply => b * s,
+        BlendMode::Screen => b + s - b * s,
+        BlendMode::Overlay => hard_light(s, b),
+        BlendMode::Darken => b.min(s),
+        BlendMode::Lighten => b.max(s),
+        BlendMode::ColorDodge => {
+            if s >= 1.0 {
+                1.0
+            } else {
+                (b / (1.0 - s)).min(1.0)
+            }
+        }
+        BlendMode::ColorBurn => {
+            if s <= 0.0 {
+                0.0
+            } else {
+                1.0 - ((1.0 - b) / s).min(1.0)
+            }
+        }
+        BlendMode::HardLight => hard_light(b, s),
+        BlendMode::SoftLight => {
+            let d = if b <= 0.25 {
+                ((16.0 * b - 12.0) * b + 4.0) * b
+            } else {
+                b.sqrt()
+            };
+            if s <= 0.5 {
+                b - (1.0 - 2.0 * s) * b * (1.0 - b)
+            } else {
+                b + (2.0 * s - 1.0) * (d - b)
+            }
+        }
+        BlendMode::Difference => (b - s).abs(),
+        BlendMode::Exclusion => b + s - 2.0 * b * s,
+        // Normal returns early and the non-separable four never come here.
+        _ => s,
+    }
+}
+
+/// `Lum(C)` per §11.3.5.3.
+fn lum(c: [f32; 3]) -> f32 {
+    0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
+}
+
+/// `ClipColor(C)` per §11.3.5.3: pulls out-of-range components back toward
+/// the color's luminosity. `n` and `x` are taken once, before either fixup,
+/// exactly as the spec's pseudocode reads them.
+fn clip_color(mut c: [f32; 3]) -> [f32; 3] {
+    let l = lum(c);
+    let n = c[0].min(c[1]).min(c[2]);
+    let x = c[0].max(c[1]).max(c[2]);
+    if n < 0.0 {
+        for v in &mut c {
+            *v = l + ((*v - l) * l) / (l - n);
+        }
+    }
+    if x > 1.0 {
+        for v in &mut c {
+            *v = l + ((*v - l) * (1.0 - l)) / (x - l);
+        }
+    }
+    c
+}
+
+/// `SetLum(C, l)` per §11.3.5.3.
+fn set_lum(c: [f32; 3], l: f32) -> [f32; 3] {
+    let d = l - lum(c);
+    clip_color([c[0] + d, c[1] + d, c[2] + d])
+}
+
+/// `Sat(C)` per §11.3.5.3.
+fn sat(c: [f32; 3]) -> f32 {
+    c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
+}
+
+/// `SetSat(C, s)` per §11.3.5.3, on the components sorted into min/mid/max
+/// slots. Ties order arbitrarily — tied slots compute the same value.
+fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
+    let mut order = [0usize, 1, 2];
+    order.sort_by(|&a, &b| c[a].total_cmp(&c[b]));
+    let [imin, imid, imax] = order;
+    let mut out = [0f32; 3];
+    if c[imax] > c[imin] {
+        out[imid] = ((c[imid] - c[imin]) * s) / (c[imax] - c[imin]);
+        out[imax] = s;
+    }
+    out
 }
 
 /// `HardLight(Cb, Cs)` per §11.3.5.2; `Overlay` is the same with the
@@ -1099,6 +1167,60 @@ mod tests {
         assert!((127..=129).contains(&px[1]), "green {}", px[1]);
         assert!((127..=129).contains(&px[2]), "blue {}", px[2]);
         assert_eq!(px[3], 255);
+    }
+
+    // Non-separable blend vectors, hand-computed from the ISO 32000-1
+    // §11.3.5.3 formulas (Lum weights 0.3/0.59/0.11).
+
+    #[test]
+    fn hue_takes_source_hue_at_backdrop_luminosity() {
+        // B(red, blue) = SetLum(SetSat(blue, Sat(red)=1) = blue, Lum(red)=0.3):
+        // d = 0.3 − 0.11 → [0.19, 0.19, 1.19]; ClipColor's x>1 branch maps
+        // to [0.213483, 0.213483, 1.0] → bytes [54, 54, 255].
+        let got = BlendMode::Hue.blend([255, 0, 0], [0, 0, 255]);
+        assert_eq!(got, [54, 54, 255]);
+    }
+
+    #[test]
+    fn hue_with_a_gray_source_paints_backdrop_luminosity_gray() {
+        // SetSat's min == max branch: a gray source zeroes out, then
+        // SetLum lifts it to Lum(yellow) = 0.89 → bytes [227, 227, 227].
+        let got = BlendMode::Hue.blend([255, 255, 0], [128, 128, 128]);
+        assert_eq!(got, [227, 227, 227]);
+    }
+
+    #[test]
+    fn saturation_of_a_gray_source_desaturates_the_backdrop() {
+        // Sat(gray) = 0, so SetSat(yellow, 0) = [0, 0, 0]; SetLum lifts it
+        // to Lum(yellow) = 0.89 → bytes [227, 227, 227].
+        let got = BlendMode::Saturation.blend([255, 255, 0], [128, 128, 128]);
+        assert_eq!(got, [227, 227, 227]);
+    }
+
+    #[test]
+    fn color_takes_source_color_at_backdrop_luminosity() {
+        // SetLum(red, Lum(mid-gray) = 128/255): d = 0.201961 →
+        // [1.201961, 0.201961, 0.201961]; ClipColor's x>1 branch maps to
+        // [1.0, 0.288515, 0.288515] → bytes [255, 74, 74].
+        let got = BlendMode::Color.blend([128, 128, 128], [255, 0, 0]);
+        assert_eq!(got, [255, 74, 74]);
+    }
+
+    #[test]
+    fn luminosity_takes_source_luminosity_at_backdrop_color() {
+        // SetLum(red, Lum(mid-gray)) — the Color vector with the operands
+        // swapped lands on the same clipped result [255, 74, 74].
+        let got = BlendMode::Luminosity.blend([255, 0, 0], [128, 128, 128]);
+        assert_eq!(got, [255, 74, 74]);
+    }
+
+    #[test]
+    fn luminosity_darkening_exercises_the_negative_clip() {
+        // SetLum(red, Lum(dark gray) = 64/255): d = −0.049020 →
+        // [0.950980, −0.049020, −0.049020]; ClipColor's n<0 branch maps to
+        // [0.836601, 0, 0] → bytes [213, 0, 0].
+        let got = BlendMode::Luminosity.blend([255, 0, 0], [64, 64, 64]);
+        assert_eq!(got, [213, 0, 0]);
     }
 
     #[test]
