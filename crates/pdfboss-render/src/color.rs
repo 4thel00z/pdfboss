@@ -216,7 +216,7 @@ impl ColorSpace {
                             // transform and carry on into the alternate space,
                             // whose components the transform's output *is*.
                             let transform = match items.get(3) {
-                                Some(o) => load_functions(src, o).await.ok().flatten(),
+                                Some(o) => load_functions(src, o).await.ok(),
                                 None => None,
                             };
                             match (transform, items.get(2)) {
@@ -225,9 +225,9 @@ impl ColorSpace {
                                     current = alternate.clone();
                                     continue;
                                 }
-                                // A type 4 transform, a malformed one, or no
-                                // alternate at all: the ink approximation is
-                                // still better than painting nothing.
+                                // A malformed transform or no alternate at
+                                // all: the ink approximation is still better
+                                // than painting nothing.
                                 _ => {
                                     result = ColorSpace::Other(1);
                                     break;
@@ -492,6 +492,27 @@ mod tests {
         let doc = Document::load(b.build(1)).unwrap();
         let cs = ColorSpace::parse(&doc, &obj(b"7 0 R"));
         assert_eq!(cs, ColorSpace::DeviceGray);
+    }
+
+    /// A `/Separation` whose tint transform is a type 4 calculator: the
+    /// program maps tint `t` to `(1-t, 0, 0)` in the DeviceRGB alternate.
+    #[test]
+    fn separation_with_a_calculator_tint_evaluates() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.stream(
+            5,
+            "/FunctionType 4 /Domain [0 1] /Range [0 1 0 1 0 1]",
+            b"{ 1 exch sub 0 0 }",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let cs = ColorSpace::parse(&doc, &obj(b"[/Separation /Spot /DeviceRGB 5 0 R]"));
+        assert!(matches!(cs, ColorSpace::Separation { .. }), "{cs:?}");
+        let [r, g, bl] = cs.to_rgb(&[0.5]);
+        assert!((r - 0.5).abs() < 1e-5, "{r}");
+        assert_eq!((g, bl), (0.0, 0.0));
     }
 
     #[test]

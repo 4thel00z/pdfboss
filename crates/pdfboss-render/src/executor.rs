@@ -3769,8 +3769,8 @@ mod tests {
 
     #[test]
     fn separation_without_an_evaluable_transform_keeps_the_ink_approximation() {
-        // Type 4 (PostScript calculator) transforms are not evaluated here;
-        // full tint has to stay dark rather than falling back to white.
+        // A transform that fails to load (unbalanced braces); full tint has
+        // to stay dark rather than falling back to white.
         let bytes = small_doc(
             "/ColorSpace << /T 6 0 R >>",
             b"/T cs 1 scn 0 0 100 100 re f",
@@ -3778,12 +3778,32 @@ mod tests {
                 b.stream(
                     5,
                     "<< /FunctionType 4 /Domain [0 1] /Range [0 1] >>",
-                    b"{ }",
+                    b"{ 1 exch sub",
                 );
                 b.object(6, "[/Separation /Spot /DeviceGray 5 0 R]");
             },
         );
         assert_eq!(px(&render(bytes, 1.0), 50, 50), BLACK);
+    }
+
+    #[test]
+    fn separation_with_a_calculator_transform_evaluates_it() {
+        // Tint t paints gray 1-t through the calculator, so full tint is
+        // black and the transform, not the ink approximation, decides.
+        let bytes = small_doc(
+            "/ColorSpace << /T 6 0 R >>",
+            b"/T cs 0.25 scn 0 0 100 100 re f",
+            |b| {
+                b.stream(
+                    5,
+                    "<< /FunctionType 4 /Domain [0 1] /Range [0 1] >>",
+                    b"{ 1 exch sub }",
+                );
+                b.object(6, "[/Separation /Spot /DeviceGray 5 0 R]");
+            },
+        );
+        let gray = px(&render(bytes, 1.0), 50, 50);
+        assert_eq!(gray, [191, 191, 191, 255]);
     }
 
     #[test]

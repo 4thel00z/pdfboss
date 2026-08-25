@@ -1,9 +1,9 @@
 //! Shading dictionaries (ISO 32000-1 §8.7.4.5): axial (type 2) and radial
 //! (type 3) shadings evaluated through function types 0 (sampled), 2
-//! (exponential) and 3 (stitching), painted per device pixel under a
-//! coverage mask. Function-based (type 1) and mesh (types 4-7) shadings and
-//! PostScript calculator functions (type 4) load as `None` so the caller
-//! reports them as unsupported instead of guessing.
+//! (exponential), 3 (stitching) and 4 (PostScript calculator), painted per
+//! device pixel under a coverage mask. Function-based (type 1) and mesh
+//! (types 4-7) shadings load as `None` so the caller reports them as
+//! unsupported instead of guessing.
 
 use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Error, Object};
@@ -25,6 +25,22 @@ const MAX_FUNCTIONS: usize = 256;
 /// entries). A real tint or gradient table holds at most a few thousand
 /// samples; the cap stops a hostile `/Size` from driving giant index math.
 const MAX_SAMPLES: u64 = 1 << 24;
+
+/// Operand-stack depth limit for calculator programs (§7.10.5.1 limits the
+/// stack to 100 entries).
+const CALC_STACK: usize = 100;
+
+/// Instructions one calculator evaluation may execute before the program is
+/// declared runaway and its outputs clamp to the bottom of `/Range`.
+const CALC_STEPS: usize = 10_000;
+
+/// Compiled calculator length cap: a longer program fails to load. Larger
+/// than [`CALC_STEPS`] because branches skip instructions.
+const MAX_CALC_OPS: usize = 65_536;
+
+/// Brace-nesting cap for calculator programs; compilation recurses over
+/// blocks, so the depth must stay bounded.
+const MAX_CALC_DEPTH: usize = 32;
 
 /// One parsed function. Stitching children are arena indices, so loading
 /// needs no recursion (a queue fills the arena) and evaluation recurses
@@ -60,6 +76,86 @@ enum Node {
         outputs: usize,
         data: Vec<u8>,
     },
+    /// Type 4: a compiled PostScript calculator program (§7.10.5).
+    /// `domain` and `range` hold two entries per input/output; a runtime
+    /// failure (stack underflow, type mismatch, runaway program) clamps
+    /// every output to the bottom of its range instead of dropping the
+    /// element being painted.
+    Calculator {
+        domain: Vec<f32>,
+        range: Vec<f32>,
+        program: Vec<Calc>,
+    },
+}
+
+/// One value on a calculator's operand stack. The boolean/number split is
+/// load-bearing: `and`, `or`, `xor` and `not` are logical on booleans and
+/// bitwise on integers, and `if`/`ifelse` demand a boolean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Value {
+    Num(f32),
+    Bool(bool),
+}
+
+/// One flat calculator instruction. `if`/`ifelse` compile to explicit
+/// forward jumps, so evaluation is a plain loop — the language has no
+/// backward edges.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Calc {
+    Push(Value),
+    /// Unconditional jump past an else branch.
+    Jump(usize),
+    /// Pops a boolean and jumps when it is false.
+    JumpIfFalse(usize),
+    Abs,
+    Add,
+    Atan,
+    Ceiling,
+    Cos,
+    Cvi,
+    Cvr,
+    Div,
+    Exp,
+    Floor,
+    Idiv,
+    Ln,
+    Log,
+    Mod,
+    Mul,
+    Neg,
+    Round,
+    Sin,
+    Sqrt,
+    Sub,
+    Truncate,
+    And,
+    Bitshift,
+    Eq,
+    Ge,
+    Gt,
+    Le,
+    Lt,
+    Ne,
+    Not,
+    Or,
+    Xor,
+    Copy,
+    Dup,
+    Exch,
+    Index,
+    Pop,
+    Roll,
+}
+
+/// One parsed calculator token before jump resolution: a literal, a
+/// resolved operator, a brace-delimited procedure, or the conditional that
+/// consumes procedures.
+#[derive(Debug, Clone, PartialEq)]
+enum CalcItem {
+    Op(Calc),
+    If,
+    IfElse,
+    Block(Vec<CalcItem>),
 }
 
 /// The functions a shading evaluates: one n-output function, or an array of
@@ -177,6 +273,46 @@ impl Functions {
                 }
                 count
             }
+            Node::Calculator {
+                domain,
+                range,
+                program,
+            } => {
+                let m = domain.len() / 2;
+                let outputs = range.len() / 2;
+                let count = outputs.min(out.len());
+                let mut clamped = [0f32; MAX_COMPS];
+                for (i, slot) in clamped.iter_mut().enumerate().take(m) {
+                    *slot = inputs
+                        .get(i)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(domain[2 * i], domain[2 * i + 1]);
+                }
+                // The program's results are the top `outputs` stack values,
+                // bottom-most first; a missing, boolean, or non-finite
+                // result fails the whole evaluation.
+                let results = run_calculator(program, &clamped[..m])
+                    .filter(|stack| stack.len() >= outputs)
+                    .and_then(|stack| {
+                        let start = stack.len() - outputs;
+                        let mut values = [0f32; MAX_COMPS];
+                        for (j, slot) in values.iter_mut().enumerate().take(count) {
+                            match stack[start + j] {
+                                Value::Num(v) if v.is_finite() => *slot = v,
+                                _ => return None,
+                            }
+                        }
+                        Some(values)
+                    })
+                    .unwrap_or([0f32; MAX_COMPS]);
+                for (j, slot) in out.iter_mut().enumerate().take(count) {
+                    // max/min instead of clamp: a reversed range must not
+                    // panic, just pin to its own bounds.
+                    *slot = results[j].max(range[2 * j]).min(range[2 * j + 1]);
+                }
+                count
+            }
         }
     }
 }
@@ -199,6 +335,398 @@ fn sample_at(data: &[u8], index: u64, bps: u32) -> u64 {
         value = (value << 1) | u64::from((b >> within) & 1);
     }
     value
+}
+
+/// The item a calculator token names, or `None` for anything that has to
+/// be a number.
+fn calc_item(token: &str) -> Option<CalcItem> {
+    let op = match token {
+        "abs" => Calc::Abs,
+        "add" => Calc::Add,
+        "atan" => Calc::Atan,
+        "ceiling" => Calc::Ceiling,
+        "cos" => Calc::Cos,
+        "cvi" => Calc::Cvi,
+        "cvr" => Calc::Cvr,
+        "div" => Calc::Div,
+        "exp" => Calc::Exp,
+        "floor" => Calc::Floor,
+        "idiv" => Calc::Idiv,
+        "ln" => Calc::Ln,
+        "log" => Calc::Log,
+        "mod" => Calc::Mod,
+        "mul" => Calc::Mul,
+        "neg" => Calc::Neg,
+        "round" => Calc::Round,
+        "sin" => Calc::Sin,
+        "sqrt" => Calc::Sqrt,
+        "sub" => Calc::Sub,
+        "truncate" => Calc::Truncate,
+        "and" => Calc::And,
+        "bitshift" => Calc::Bitshift,
+        "eq" => Calc::Eq,
+        "ge" => Calc::Ge,
+        "gt" => Calc::Gt,
+        "le" => Calc::Le,
+        "lt" => Calc::Lt,
+        "ne" => Calc::Ne,
+        "not" => Calc::Not,
+        "or" => Calc::Or,
+        "xor" => Calc::Xor,
+        "copy" => Calc::Copy,
+        "dup" => Calc::Dup,
+        "exch" => Calc::Exch,
+        "index" => Calc::Index,
+        "pop" => Calc::Pop,
+        "roll" => Calc::Roll,
+        "true" => Calc::Push(Value::Bool(true)),
+        "false" => Calc::Push(Value::Bool(false)),
+        "if" => return Some(CalcItem::If),
+        "ifelse" => return Some(CalcItem::IfElse),
+        _ => return None,
+    };
+    Some(CalcItem::Op(op))
+}
+
+/// Parses the decoded bytes of a type 4 program: one brace-delimited block,
+/// optionally surrounded by whitespace or `%` comments. Anything else —
+/// unbalanced braces, an unknown operator, trailing tokens — is a load
+/// error, so the caller's report machinery fires.
+fn parse_calculator(data: &[u8]) -> Result<Vec<CalcItem>, Error> {
+    let malformed = |what: &str| Error::Other(format!("calculator program {what}"));
+    let mut blocks: Vec<Vec<CalcItem>> = Vec::new();
+    let mut done: Option<Vec<CalcItem>> = None;
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            b'\0' | b'\t' | b'\n' | b'\x0c' | b'\r' | b' ' => i += 1,
+            b'%' => {
+                while i < data.len() && !matches!(data[i], b'\n' | b'\r') {
+                    i += 1;
+                }
+            }
+            b'{' => {
+                if done.is_some() {
+                    return Err(malformed("continues after its closing brace"));
+                }
+                if blocks.len() >= MAX_CALC_DEPTH {
+                    return Err(malformed("nests too deeply"));
+                }
+                blocks.push(Vec::new());
+                i += 1;
+            }
+            b'}' => {
+                let block = blocks
+                    .pop()
+                    .ok_or_else(|| malformed("has unbalanced braces"))?;
+                match blocks.last_mut() {
+                    Some(parent) => parent.push(CalcItem::Block(block)),
+                    None => done = Some(block),
+                }
+                i += 1;
+            }
+            _ => {
+                if done.is_some() {
+                    return Err(malformed("continues after its closing brace"));
+                }
+                let start = i;
+                while i < data.len()
+                    && !data[i].is_ascii_whitespace()
+                    && !matches!(data[i], b'\0' | b'{' | b'}' | b'%')
+                {
+                    i += 1;
+                }
+                let token = std::str::from_utf8(&data[start..i])
+                    .map_err(|_| malformed("holds a non-ASCII token"))?;
+                let dest = blocks
+                    .last_mut()
+                    .ok_or_else(|| malformed("has tokens outside the braces"))?;
+                match calc_item(token) {
+                    Some(item) => dest.push(item),
+                    None => {
+                        if !matches!(token.as_bytes()[0], b'0'..=b'9' | b'+' | b'-' | b'.') {
+                            return Err(Error::Other(format!(
+                                "calculator operator {token} unknown"
+                            )));
+                        }
+                        let number: f32 = token.parse().map_err(|_| {
+                            Error::Other(format!("calculator number {token} unusable"))
+                        })?;
+                        dest.push(CalcItem::Op(Calc::Push(Value::Num(number))));
+                    }
+                }
+            }
+        }
+    }
+    done.ok_or_else(|| malformed("has unbalanced braces"))
+}
+
+/// Flattens parsed items into instructions. A procedure block is legal only
+/// as the operand of `if`/`ifelse` (§7.10.5.4), where it becomes a forward
+/// jump over the branch body.
+fn compile_calculator(items: &[CalcItem], out: &mut Vec<Calc>) -> Result<(), Error> {
+    let mut i = 0;
+    while i < items.len() {
+        if out.len() > MAX_CALC_OPS {
+            return Err(Error::Other("calculator program too long".into()));
+        }
+        match &items[i] {
+            CalcItem::Op(op) => out.push(*op),
+            CalcItem::If | CalcItem::IfElse => {
+                return Err(Error::Other(
+                    "calculator conditional lacks its procedure".into(),
+                ))
+            }
+            CalcItem::Block(body) => match (items.get(i + 1), items.get(i + 2)) {
+                (Some(CalcItem::If), _) => {
+                    let skip = out.len();
+                    out.push(Calc::JumpIfFalse(0));
+                    compile_calculator(body, out)?;
+                    out[skip] = Calc::JumpIfFalse(out.len());
+                    i += 2;
+                    continue;
+                }
+                (Some(CalcItem::Block(other)), Some(CalcItem::IfElse)) => {
+                    let skip = out.len();
+                    out.push(Calc::JumpIfFalse(0));
+                    compile_calculator(body, out)?;
+                    let done = out.len();
+                    out.push(Calc::Jump(0));
+                    out[skip] = Calc::JumpIfFalse(out.len());
+                    compile_calculator(other, out)?;
+                    out[done] = Calc::Jump(out.len());
+                    i += 3;
+                    continue;
+                }
+                _ => {
+                    return Err(Error::Other(
+                        "calculator procedure without if or ifelse".into(),
+                    ))
+                }
+            },
+        }
+        i += 1;
+    }
+    if out.len() > MAX_CALC_OPS {
+        return Err(Error::Other("calculator program too long".into()));
+    }
+    Ok(())
+}
+
+/// The integer a calculator number stands for; integer-only operators
+/// truncate toward zero and refuse non-finite operands.
+fn calc_int(v: f32) -> Option<i32> {
+    if !v.is_finite() {
+        return None;
+    }
+    Some(v.trunc() as i32)
+}
+
+/// Pushes with the §7.10.5.1 depth cap.
+fn calc_push(stack: &mut Vec<Value>, v: Value) -> Option<()> {
+    if stack.len() >= CALC_STACK {
+        return None;
+    }
+    stack.push(v);
+    Some(())
+}
+
+/// Pops a number; a boolean operand is a type error.
+fn calc_num(stack: &mut Vec<Value>) -> Option<f32> {
+    match stack.pop()? {
+        Value::Num(v) => Some(v),
+        Value::Bool(_) => None,
+    }
+}
+
+/// Replaces the top two numbers with `f` of them; `None` from `f` is a
+/// domain error (division by zero, log of a non-positive number).
+fn calc_binary(stack: &mut Vec<Value>, f: impl Fn(f32, f32) -> Option<f32>) -> Option<()> {
+    let b = calc_num(stack)?;
+    let a = calc_num(stack)?;
+    stack.push(Value::Num(f(a, b)?));
+    Some(())
+}
+
+/// Replaces the top number with `f` of it.
+fn calc_unary(stack: &mut Vec<Value>, f: impl Fn(f32) -> Option<f32>) -> Option<()> {
+    let a = calc_num(stack)?;
+    stack.push(Value::Num(f(a)?));
+    Some(())
+}
+
+/// Replaces the top two numbers with their comparison.
+fn calc_compare(stack: &mut Vec<Value>, f: impl Fn(f32, f32) -> bool) -> Option<()> {
+    let b = calc_num(stack)?;
+    let a = calc_num(stack)?;
+    stack.push(Value::Bool(f(a, b)));
+    Some(())
+}
+
+/// `and`/`or`/`xor`: bitwise over two integers, logical over two booleans,
+/// a type error over a mix.
+fn calc_logic(
+    stack: &mut Vec<Value>,
+    ints: impl Fn(i32, i32) -> i32,
+    bools: impl Fn(bool, bool) -> bool,
+) -> Option<()> {
+    let b = stack.pop()?;
+    let a = stack.pop()?;
+    let v = match (a, b) {
+        (Value::Num(a), Value::Num(b)) => Value::Num(ints(calc_int(a)?, calc_int(b)?) as f32),
+        (Value::Bool(a), Value::Bool(b)) => Value::Bool(bools(a, b)),
+        _ => return None,
+    };
+    stack.push(v);
+    Some(())
+}
+
+/// Whether two calculator values are equal; values of different types
+/// compare unequal rather than erroring.
+fn calc_equal(stack: &mut Vec<Value>) -> Option<bool> {
+    let b = stack.pop()?;
+    let a = stack.pop()?;
+    let equal = match (a, b) {
+        (Value::Num(a), Value::Num(b)) => a == b,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        _ => false,
+    };
+    Some(equal)
+}
+
+/// Runs a compiled calculator over `inputs`. `None` is any runtime failure
+/// — stack underflow or overflow, a type mismatch, a domain error, or a
+/// runaway program — which the caller paints as range-clamped zeros.
+fn run_calculator(program: &[Calc], inputs: &[f32]) -> Option<Vec<Value>> {
+    if inputs.len() > CALC_STACK {
+        return None;
+    }
+    let mut stack: Vec<Value> = inputs.iter().map(|&v| Value::Num(v)).collect();
+    let mut pc = 0;
+    let mut steps = 0;
+    while let Some(op) = program.get(pc) {
+        steps += 1;
+        if steps > CALC_STEPS {
+            return None;
+        }
+        pc += 1;
+        match *op {
+            Calc::Push(v) => calc_push(&mut stack, v)?,
+            Calc::Jump(target) => pc = target,
+            Calc::JumpIfFalse(target) => match stack.pop()? {
+                Value::Bool(true) => {}
+                Value::Bool(false) => pc = target,
+                Value::Num(_) => return None,
+            },
+            Calc::Abs => calc_unary(&mut stack, |a| Some(a.abs()))?,
+            Calc::Add => calc_binary(&mut stack, |a, b| Some(a + b))?,
+            Calc::Atan => calc_binary(&mut stack, |num, den| {
+                let deg = num.atan2(den).to_degrees();
+                Some(if deg < 0.0 { deg + 360.0 } else { deg })
+            })?,
+            Calc::Ceiling => calc_unary(&mut stack, |a| Some(a.ceil()))?,
+            Calc::Cos => calc_unary(&mut stack, |a| Some(a.to_radians().cos()))?,
+            Calc::Cvi => calc_unary(&mut stack, |a| calc_int(a).map(|i| i as f32))?,
+            Calc::Cvr => calc_unary(&mut stack, Some)?,
+            Calc::Div => calc_binary(&mut stack, |a, b| (b != 0.0).then(|| a / b))?,
+            Calc::Exp => calc_binary(&mut stack, |a, b| Some(a.powf(b)))?,
+            Calc::Floor => calc_unary(&mut stack, |a| Some(a.floor()))?,
+            Calc::Idiv => calc_binary(&mut stack, |a, b| {
+                let (a, b) = (calc_int(a)?, calc_int(b)?);
+                (b != 0).then(|| a.wrapping_div(b) as f32)
+            })?,
+            Calc::Ln => calc_unary(&mut stack, |a| (a > 0.0).then(|| a.ln()))?,
+            Calc::Log => calc_unary(&mut stack, |a| (a > 0.0).then(|| a.log10()))?,
+            Calc::Mod => calc_binary(&mut stack, |a, b| {
+                let (a, b) = (calc_int(a)?, calc_int(b)?);
+                (b != 0).then(|| a.wrapping_rem(b) as f32)
+            })?,
+            Calc::Mul => calc_binary(&mut stack, |a, b| Some(a * b))?,
+            Calc::Neg => calc_unary(&mut stack, |a| Some(-a))?,
+            // Ties go to the greater integer, so this is not f32::round.
+            Calc::Round => calc_unary(&mut stack, |a| Some((a + 0.5).floor()))?,
+            Calc::Sin => calc_unary(&mut stack, |a| Some(a.to_radians().sin()))?,
+            Calc::Sqrt => calc_unary(&mut stack, |a| (a >= 0.0).then(|| a.sqrt()))?,
+            Calc::Sub => calc_binary(&mut stack, |a, b| Some(a - b))?,
+            Calc::Truncate => calc_unary(&mut stack, |a| Some(a.trunc()))?,
+            Calc::And => calc_logic(&mut stack, |a, b| a & b, |a, b| a && b)?,
+            Calc::Bitshift => calc_binary(&mut stack, |a, shift| {
+                let (a, shift) = (calc_int(a)?, calc_int(shift)?);
+                let shifted = match shift {
+                    32.. => 0,
+                    0..=31 => ((a as u32) << shift) as i32,
+                    -31..=-1 => ((a as u32) >> -shift) as i32,
+                    _ => 0,
+                };
+                Some(shifted as f32)
+            })?,
+            Calc::Eq => {
+                let equal = calc_equal(&mut stack)?;
+                stack.push(Value::Bool(equal));
+            }
+            Calc::Ne => {
+                let equal = calc_equal(&mut stack)?;
+                stack.push(Value::Bool(!equal));
+            }
+            Calc::Ge => calc_compare(&mut stack, |a, b| a >= b)?,
+            Calc::Gt => calc_compare(&mut stack, |a, b| a > b)?,
+            Calc::Le => calc_compare(&mut stack, |a, b| a <= b)?,
+            Calc::Lt => calc_compare(&mut stack, |a, b| a < b)?,
+            Calc::Not => {
+                let v = match stack.pop()? {
+                    Value::Bool(b) => Value::Bool(!b),
+                    Value::Num(v) => Value::Num(!calc_int(v)? as f32),
+                };
+                stack.push(v);
+            }
+            Calc::Or => calc_logic(&mut stack, |a, b| a | b, |a, b| a || b)?,
+            Calc::Xor => calc_logic(&mut stack, |a, b| a ^ b, |a, b| a ^ b)?,
+            Calc::Copy => {
+                let n = calc_int(calc_num(&mut stack)?)?;
+                if n < 0 || n as usize > stack.len() || stack.len() + n as usize > CALC_STACK {
+                    return None;
+                }
+                let start = stack.len() - n as usize;
+                for i in start..start + n as usize {
+                    let v = stack[i];
+                    stack.push(v);
+                }
+            }
+            Calc::Dup => {
+                let v = *stack.last()?;
+                calc_push(&mut stack, v)?;
+            }
+            Calc::Exch => {
+                let b = stack.pop()?;
+                let a = stack.pop()?;
+                stack.push(b);
+                stack.push(a);
+            }
+            Calc::Index => {
+                let n = calc_int(calc_num(&mut stack)?)?;
+                if n < 0 || n as usize >= stack.len() {
+                    return None;
+                }
+                let v = stack[stack.len() - 1 - n as usize];
+                calc_push(&mut stack, v)?;
+            }
+            Calc::Pop => {
+                stack.pop()?;
+            }
+            Calc::Roll => {
+                let j = calc_int(calc_num(&mut stack)?)?;
+                let n = calc_int(calc_num(&mut stack)?)?;
+                if n < 0 || n as usize > stack.len() {
+                    return None;
+                }
+                if n > 0 {
+                    let start = stack.len() - n as usize;
+                    stack[start..].rotate_right(j.rem_euclid(n) as usize);
+                }
+            }
+        }
+    }
+    Some(stack)
 }
 
 /// The geometry of a supported shading.
@@ -351,12 +879,11 @@ async fn function_dict<S: AsyncObjectSource>(
 }
 
 /// Loads `/Function` — one function or an array of them — into an arena.
-/// `Ok(None)` means a function *type* nobody evaluates here (the PostScript
-/// calculator); `Err` is a structural failure worth reporting verbatim.
+/// `Err` is a structural failure worth reporting verbatim.
 pub(crate) async fn load_functions<S: AsyncObjectSource>(
     src: &S,
     obj: &Object,
-) -> Result<Option<Functions>, Error> {
+) -> Result<Functions, Error> {
     let mut queue: Vec<Object> = Vec::new();
     match src.resolve(obj).await {
         Ok(Object::Array(items)) => queue.extend(items.iter().cloned()),
@@ -484,7 +1011,26 @@ pub(crate) async fn load_functions<S: AsyncObjectSource>(
                     data,
                 }
             }
-            4 => return Ok(None),
+            4 => {
+                let data = data
+                    .ok_or_else(|| Error::Other("calculator function carries no stream".into()))?;
+                let domain = float_array(src, dict.get("Domain"))
+                    .await
+                    .filter(|d| d.len() >= 2 && d.len() % 2 == 0 && d.len() / 2 <= MAX_COMPS)
+                    .ok_or_else(|| Error::Other("calculator function /Domain unusable".into()))?;
+                let range = float_array(src, dict.get("Range"))
+                    .await
+                    .filter(|r| r.len() >= 2 && r.len() % 2 == 0)
+                    .ok_or_else(|| Error::Other("calculator function has no /Range".into()))?;
+                let items = parse_calculator(&data)?;
+                let mut program = Vec::new();
+                compile_calculator(&items, &mut program)?;
+                Node::Calculator {
+                    domain,
+                    range,
+                    program,
+                }
+            }
             _ => return Err(Error::Other("unknown function type".into())),
         };
         let index = functions.nodes.len();
@@ -500,14 +1046,14 @@ pub(crate) async fn load_functions<S: AsyncObjectSource>(
     }
     // A stitching child that never loaded leaves usize::MAX behind; the cap
     // above is the only way to get here, and it already errored.
-    Ok(Some(functions))
+    Ok(functions)
 }
 
 impl Shading {
     /// Loads a shading dictionary (or stream — mesh shadings are streams,
-    /// and they answer `Ok(None)`). `Ok(None)` = a shading or function type
-    /// this renderer does not paint, for the caller to report as
-    /// unsupported; `Err` = a structural failure, reported verbatim.
+    /// and they answer `Ok(None)`). `Ok(None)` = a shading type this
+    /// renderer does not paint, for the caller to report as unsupported;
+    /// `Err` = a structural failure, reported verbatim.
     pub(crate) async fn load_with<S: AsyncObjectSource>(
         src: &S,
         obj: &Object,
@@ -550,10 +1096,7 @@ impl Shading {
             .ok_or_else(|| Error::Other("shading has no /ColorSpace".into()))?;
         let cs = ColorSpace::parse_with(src, cs_obj).await;
         let functions = match dict.get("Function") {
-            Some(f) => match load_functions(src, f).await? {
-                Some(functions) => functions,
-                None => return Ok(None),
-            },
+            Some(f) => load_functions(src, f).await?,
             None => return Err(Error::Other("shading has no /Function".into())),
         };
         let domain = match floats(src, dict.get("Domain"), 2).await {
@@ -661,7 +1204,7 @@ mod tests {
         Parser::new(src).parse_object(&NoResolve).unwrap()
     }
 
-    fn load(dict: &str, data: &[u8]) -> Result<Option<Functions>, Error> {
+    fn load(dict: &str, data: &[u8]) -> Result<Functions, Error> {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -693,7 +1236,6 @@ mod tests {
             "/FunctionType 0 /Domain [0 1 0 1] /Range [0 1] /Size [2 2] /BitsPerSample 8",
             &[0, 100, 200, 255],
         )
-        .unwrap()
         .unwrap();
         close(&eval(&f, &[0.0, 0.0]), &[0.0]);
         close(&eval(&f, &[1.0, 0.0]), &[100.0 / 255.0]);
@@ -714,7 +1256,6 @@ mod tests {
             "/FunctionType 0 /Domain [0 1] /Range [0 1] /Size [4] /BitsPerSample 8",
             &[0, 85, 170, 255],
         )
-        .unwrap()
         .unwrap();
         close(&eval(&f, &[0.0]), &[0.0]);
         close(&eval(&f, &[0.5]), &[127.5 / 255.0]);
@@ -730,7 +1271,6 @@ mod tests {
              /BitsPerSample 8 /Decode [1 0]",
             &[0, 51, 102, 153, 204, 255],
         )
-        .unwrap()
         .unwrap();
         // (1, 0) encodes to grid point (2, 0): sample 102, decoded 1 - s.
         close(&eval(&f, &[1.0, 0.0]), &[1.0 - 102.0 / 255.0]);
@@ -745,9 +1285,200 @@ mod tests {
             b"unused",
         );
         // Type 2 is a dictionary in real files; the stream dict works too.
-        let f = f.unwrap().unwrap();
+        let f = f.unwrap();
         close(&eval(&f, &[0.25, 9.0]), &[0.25]);
         close(&eval(&f, &[]), &[0.0]);
+    }
+
+    fn calc(domain: &str, range: &str, program: &str) -> Functions {
+        load(
+            &format!("/FunctionType 4 /Domain [{domain}] /Range [{range}]"),
+            program.as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn calculator_arithmetic_operators_compute() {
+        let f = calc(
+            "0 1",
+            "0 2000 0 2000 0 2000 0 2000 0 2000 0 2000",
+            "{ 3 4 add 2 mul 2 10 exp 100 log 9 sqrt 7 2 div 1 ln }",
+        );
+        close(&eval(&f, &[0.0]), &[14.0, 1024.0, 2.0, 3.0, 3.5, 0.0]);
+    }
+
+    #[test]
+    fn calculator_atan_returns_degrees_in_every_quadrant() {
+        let f = calc(
+            "0 1",
+            "0 360 0 360 0 360 0 360 0 360",
+            "{ 1 1 atan 1 -1 atan -1 -1 atan -1 1 atan 1 0 atan }",
+        );
+        close(&eval(&f, &[0.0]), &[45.0, 135.0, 225.0, 315.0, 90.0]);
+    }
+
+    #[test]
+    fn calculator_integer_division_and_modulo_keep_the_dividend_sign() {
+        let f = calc(
+            "0 1",
+            "-10 10 -10 10 -10 10 -10 10",
+            "{ -7 2 idiv -7 3 mod 7 -3 mod 6 2 idiv }",
+        );
+        close(&eval(&f, &[0.0]), &[-3.0, -1.0, 1.0, 3.0]);
+    }
+
+    #[test]
+    fn calculator_roll_rotates_both_directions() {
+        let up = calc("0 1", "0 5 0 5 0 5", "{ 1 2 3 3 1 roll }");
+        close(&eval(&up, &[0.0]), &[3.0, 1.0, 2.0]);
+        let down = calc("0 1", "0 5 0 5 0 5", "{ 1 2 3 3 -1 roll }");
+        close(&eval(&down, &[0.0]), &[2.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn calculator_stack_operators_manage_the_stack() {
+        let index = calc("0 1", "0 5 0 5 0 5 0 5", "{ 1 2 3 2 index }");
+        close(&eval(&index, &[0.0]), &[1.0, 2.0, 3.0, 1.0]);
+        let copy = calc("0 1", "0 5 0 5 0 5 0 5", "{ 1 2 2 copy }");
+        close(&eval(&copy, &[0.0]), &[1.0, 2.0, 1.0, 2.0]);
+        let mix = calc("0 1", "0 1", "{ dup 1 exch sub exch pop }");
+        close(&eval(&mix, &[0.3]), &[0.7]);
+    }
+
+    #[test]
+    fn calculator_nested_conditionals_branch() {
+        let f = calc(
+            "0 1",
+            "0 1",
+            "{ dup 0.25 lt { pop 0 } { 0.75 lt { 0.5 } { 1 } ifelse } ifelse }",
+        );
+        close(&eval(&f, &[0.1]), &[0.0]);
+        close(&eval(&f, &[0.5]), &[0.5]);
+        close(&eval(&f, &[0.9]), &[1.0]);
+    }
+
+    #[test]
+    fn calculator_logic_operators_split_on_operand_type() {
+        let ints = calc(
+            "0 1",
+            "-20 20 -20 20 -20 20 -20 20",
+            "{ 12 10 and 12 10 or 12 10 xor 7 not }",
+        );
+        close(&eval(&ints, &[0.0]), &[8.0, 14.0, 6.0, -8.0]);
+        let bools = calc(
+            "0 1",
+            "0 1 0 1",
+            "{ true false or { 1 } { 0 } ifelse true not { 1 } { 0 } ifelse }",
+        );
+        close(&eval(&bools, &[0.0]), &[1.0, 0.0]);
+    }
+
+    #[test]
+    fn calculator_bitshift_shifts_both_directions() {
+        let f = calc("0 1", "0 10 0 10", "{ 1 3 bitshift 8 -2 bitshift }");
+        close(&eval(&f, &[0.0]), &[8.0, 2.0]);
+    }
+
+    #[test]
+    fn calculator_comparisons_and_mixed_type_equality() {
+        let f = calc(
+            "0 1",
+            "0 1 0 1 0 1 0 1",
+            "{ 3 4 lt { 1 } { 0 } ifelse 3 3 ge { 1 } { 0 } ifelse \
+              1 true eq { 1 } { 0 } ifelse 1 true ne { 1 } { 0 } ifelse }",
+        );
+        close(&eval(&f, &[0.0]), &[1.0, 1.0, 0.0, 1.0]);
+    }
+
+    /// `round` resolves ties toward the greater integer, unlike a
+    /// round-half-away-from-zero.
+    #[test]
+    fn calculator_rounding_family() {
+        let f = calc(
+            "0 1",
+            "-10 10 -10 10 -10 10 -10 10 -10 10 -10 10",
+            "{ 2.5 round -2.5 round -3.7 truncate -3.7 floor 3.2 ceiling -3.7 cvi }",
+        );
+        close(&eval(&f, &[0.0]), &[3.0, -2.0, -3.0, -4.0, 4.0, -3.0]);
+    }
+
+    #[test]
+    fn calculator_inputs_arrive_in_order_and_clamp_to_domain() {
+        let f = calc("0 1 0 1", "-1 1", "{ sub }");
+        close(&eval(&f, &[0.7, 0.2]), &[0.5]);
+        close(&eval(&f, &[2.0, -1.0]), &[1.0]);
+    }
+
+    #[test]
+    fn calculator_runtime_failures_clamp_to_the_range_floor() {
+        // Stack underflow: `add` finds one operand, not two.
+        let underflow = calc("0 1", "5 10", "{ add }");
+        close(&eval(&underflow, &[0.5]), &[5.0]);
+        let zero_div = calc("0 1", "0 1", "{ pop 1 0 div }");
+        close(&eval(&zero_div, &[0.5]), &[0.0]);
+        // Bitwise `and` over a boolean and a number is a type error.
+        let mixed = calc("0 1", "0 1", "{ pop true 1 and }");
+        close(&eval(&mixed, &[0.5]), &[0.0]);
+        // A boolean is not a number, so it cannot be an output.
+        let boolean_out = calc("0 1", "0 1", "{ pop true }");
+        close(&eval(&boolean_out, &[0.5]), &[0.0]);
+    }
+
+    #[test]
+    fn calculator_success_outputs_clamp_to_range() {
+        let f = calc("0 1", "0 1 0 1", "{ pop 2 -1 }");
+        close(&eval(&f, &[0.5]), &[1.0, 0.0]);
+    }
+
+    #[test]
+    fn a_runaway_calculator_program_clamps_instead_of_hanging() {
+        let mut runaway = String::from("{ 0 ");
+        for _ in 0..8000 {
+            runaway.push_str("1 add ");
+        }
+        runaway.push('}');
+        let f = calc("0 1", "0 20000", &runaway);
+        close(&eval(&f, &[0.0]), &[0.0]);
+        // The same shape under the step budget still computes.
+        let mut fine = String::from("{ 0 ");
+        for _ in 0..100 {
+            fine.push_str("1 add ");
+        }
+        fine.push('}');
+        let f = calc("0 1", "0 20000", &fine);
+        close(&eval(&f, &[0.0]), &[100.0]);
+    }
+
+    #[test]
+    fn calculator_comments_and_whitespace_are_skipped() {
+        let f = calc("0 1", "0 10", "{ % a comment\n 3 4 add pop 5 }");
+        close(&eval(&f, &[0.0]), &[5.0]);
+    }
+
+    #[test]
+    fn malformed_calculator_programs_fail_at_load() {
+        let check = |program: &str| {
+            let loaded = load(
+                "/FunctionType 4 /Domain [0 1] /Range [0 1]",
+                program.as_bytes(),
+            );
+            assert!(loaded.is_err(), "{program:?} should not load");
+        };
+        check("{ 1 2 add");
+        check("1 2 add }");
+        check("{ 1 2 frobnicate }");
+        check("{ { 1 } }");
+        check("{ 1 if }");
+        check("{ { 1 } { 2 } if }");
+        check("{ 1 2 } }");
+        check("{ 1 } 2");
+        check("");
+    }
+
+    #[test]
+    fn a_calculator_function_without_range_fails_at_load() {
+        assert!(load("/FunctionType 4 /Domain [0 1]", b"{ 1 }").is_err());
     }
 
     #[test]
