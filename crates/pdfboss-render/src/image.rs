@@ -8,13 +8,17 @@
 //! JPEG 2000 codestream carries *inside* itself (`/SMaskInData`, ISO 32000-1
 //! 7.4.9) IS applied, since it arrives with the samples.
 
+use std::sync::Arc;
+
 use pdfboss_core::geom::{Matrix, Point, Rect};
 #[cfg(test)]
 use pdfboss_core::{block_on, Document, Immediate};
 use pdfboss_core::{AsyncObjectSource, Dict, Object};
+use pdfboss_icc::DeviceSpace;
 
 use crate::color::ColorSpace;
 use crate::raster::{BlendMode, Mask};
+use crate::shading::MAX_COMPS;
 use crate::Pixmap;
 
 /// Upper bound on decoded pixels, guarding malformed dimensions.
@@ -906,9 +910,12 @@ fn jpx_stencil(
 ///   [`DecodedImage::component_depths`]) so its samples index the palette
 ///   exactly;
 /// - without one, the codestream's declaration maps to the matching device
-///   space, or — for a declaration the decoder does not interpret (an ICC
-///   profile, an unconverted enumeration) — is approximated by channel
-///   count, with a note saying so;
+///   space; an embedded restricted ICC profile (T.800 I.5.3.3 METH 2) is
+///   interpreted through the shared ICC engine (a device-equivalent
+///   profile keeps the exact device path), and only a declaration nothing
+///   interprets — no profile, one that will not parse, an unconverted
+///   enumeration — is approximated by channel count, with a note saying
+///   so;
 /// - a channel the codestream marks as opacity is never a colour channel;
 ///   `/SMaskInData` 1 or 2 additionally turns it into per-pixel alpha, and
 ///   2 un-premultiplies the colour samples by it first;
@@ -953,25 +960,9 @@ fn jpx_rgba(
                 pdfboss_jpx::ColorKind::Gray => ColorSpace::DeviceGray,
                 pdfboss_jpx::ColorKind::Rgb => ColorSpace::DeviceRGB,
                 pdfboss_jpx::ColorKind::Cmyk => ColorSpace::DeviceCMYK,
-                // An ICC profile or an enumeration the decoder does not
-                // convert (T.800 I.5.3.3): approximate by channel count,
-                // and own up to the guess.
-                _ => {
-                    notes.push(format!(
-                        "JPXDecode: colour approximated from {color_count} channel(s); \
-                         the codestream's colour declaration is not interpreted"
-                    ));
-                    match color_count {
-                        1 => ColorSpace::DeviceGray,
-                        3 => ColorSpace::DeviceRGB,
-                        4 => ColorSpace::DeviceCMYK,
-                        n => {
-                            return Err(format!(
-                                "JPXDecode: no colour space for {n} colour channel(s)"
-                            ))
-                        }
-                    }
-                }
+                // An embedded ICC profile, or an enumeration the decoder
+                // does not convert (T.800 I.5.3.3).
+                _ => jpx_declared_color(&img, color_count, &mut notes)?,
             };
             if mapped.components() != color_count {
                 return Err(format!(
@@ -1027,11 +1018,12 @@ fn jpx_rgba(
     // (ISO 32000-1 7.4.9 allows it over JPX like any other space), but the
     // decoder normalized every channel to 8 bits — T.800 knows nothing of
     // PDF palettes — which rewrites an index: depths below 8 scale by
-    // 255/(2^d - 1), depths above 8 drop their low bits. The scaling is
-    // injective, so [`jpx_palette_index`] recovers the exact index; the
-    // dropped bits of a deeper channel are gone — legal indices fit 8 bits
-    // anyway (hival <= 255, ISO 32000-1 8.6.6.3) — so those samples pass
-    // through with a note owning up to the approximation.
+    // 255/(2^d - 1), depths above 8 shrink through the rounded shift. The
+    // scaling is injective, so [`jpx_palette_index`] recovers the exact
+    // index; a deeper channel's shift is not (every index a legal palette
+    // uses — hival <= 255, ISO 32000-1 8.6.6.3 — collapses toward 0), so
+    // those samples pass through with a note owning up to the
+    // approximation.
     if matches!(cs, ColorSpace::Indexed { .. }) {
         // Indexed has one component, so the one colour channel's position
         // is 0 unless the opacity channel sits there.
@@ -1043,8 +1035,8 @@ fn jpx_rgba(
             }
         } else if depth > 8 {
             notes.push(format!(
-                "JPXDecode: palette indices carried in a {depth}-bit channel lost \
-                 their low bits in the 8-bit normalization; the palette lookup is \
+                "JPXDecode: palette indices carried in a {depth}-bit channel were \
+                 rounded away by the 8-bit normalization; the palette lookup is \
                  approximate"
             ));
         }
@@ -1071,6 +1063,63 @@ fn jpx_rgba(
         },
         notes,
     ))
+}
+
+/// The colour space for a codestream declaration the decoder itself does
+/// not convert, absent a dictionary `/ColorSpace`. An embedded restricted
+/// ICC profile (T.800 I.5.3.3 METH 2) is interpreted through the shared
+/// ICC engine: a device-equivalent profile keeps the exact device path —
+/// byte-identical to the old channel-count guess — and any other parsed
+/// profile transforms per sample (one-component images still flow through
+/// the per-value lookup table, so the cost profile is unchanged).
+/// Anything else — no profile, one that will not parse, or one whose
+/// arity disagrees with the colour channels — falls back to the
+/// channel-count approximation with a note owning up to it.
+fn jpx_declared_color(
+    img: &pdfboss_jpx::DecodedImage,
+    color_count: usize,
+    notes: &mut Vec<String>,
+) -> Result<ColorSpace, String> {
+    match &img.icc_profile {
+        // The MAX_COMPS bound mirrors the ICCBased path: ColorSpace::Icc
+        // feeds its transform from a MAX_COMPS-sized buffer, so a wider
+        // profile (jpx_limits admits up to 9 channels, and xCLR profiles
+        // parse) must never be built.
+        Some(data) if color_count <= MAX_COMPS => match pdfboss_icc::parse(data) {
+            Ok(profile) if profile.channels() == color_count => {
+                return Ok(match profile.device_equivalent() {
+                    Some(DeviceSpace::Rgb) => ColorSpace::DeviceRGB,
+                    Some(DeviceSpace::Gray) => ColorSpace::DeviceGray,
+                    None => ColorSpace::Icc {
+                        profile: Arc::new(profile),
+                        n: color_count,
+                    },
+                });
+            }
+            Ok(profile) => notes.push(format!(
+                "JPXDecode: the embedded ICC profile expects {} component(s) but the \
+                 codestream carries {color_count} colour channel(s); colour \
+                 approximated from the channel count",
+                profile.channels()
+            )),
+            Err(err) => notes.push(format!(
+                "JPXDecode: the embedded ICC profile did not parse ({err}); colour \
+                 approximated from {color_count} channel(s)"
+            )),
+        },
+        _ => notes.push(format!(
+            "JPXDecode: colour approximated from {color_count} channel(s); \
+             the codestream's colour declaration is not interpreted"
+        )),
+    }
+    match color_count {
+        1 => Ok(ColorSpace::DeviceGray),
+        3 => Ok(ColorSpace::DeviceRGB),
+        4 => Ok(ColorSpace::DeviceCMYK),
+        n => Err(format!(
+            "JPXDecode: no colour space for {n} colour channel(s)"
+        )),
+    }
 }
 
 /// The palette index a decoded 8-bit sample was normalized FROM, for a
@@ -1618,6 +1667,216 @@ mod tests {
         assert!(notes[0].contains("colour approximated"), "{notes:?}");
     }
 
+    fn icc_fx(v: f64) -> [u8; 4] {
+        (((v * 65536.0).round()) as i32).to_be_bytes()
+    }
+
+    fn icc_srgb_trc() -> Vec<u8> {
+        let mut out = b"para\0\0\0\0\0\x03\0\0".to_vec();
+        for v in [2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045] {
+            out.extend_from_slice(&icc_fx(v));
+        }
+        out
+    }
+
+    fn icc_gamma_trc(g: f64) -> Vec<u8> {
+        let mut out = b"curv\0\0\0\0\0\0\0\x01".to_vec();
+        out.extend_from_slice(&((g * 256.0).round() as u16).to_be_bytes());
+        out
+    }
+
+    /// A byte-built ICC profile: the header for `space`, then `tags`.
+    fn icc_build(space: &[u8; 4], tags: &[([u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let mut header = vec![0u8; 128];
+        header[8] = 4;
+        header[16..20].copy_from_slice(space);
+        header[20..24].copy_from_slice(b"XYZ ");
+        header[36..40].copy_from_slice(b"acsp");
+        let mut table = (tags.len() as u32).to_be_bytes().to_vec();
+        let mut body = Vec::new();
+        let mut at = 132 + 12 * tags.len();
+        for (sig, data) in tags {
+            table.extend_from_slice(sig);
+            table.extend_from_slice(&(at as u32).to_be_bytes());
+            table.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            body.extend_from_slice(data);
+            at += data.len();
+        }
+        let mut out = header;
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&body);
+        let size = (out.len() as u32).to_be_bytes();
+        out[0..4].copy_from_slice(&size);
+        out
+    }
+
+    /// A matrix/TRC RGB profile with the sRGB colorant columns (Bradford-
+    /// adapted into the D50 PCS) and the given shared TRC.
+    fn icc_rgb_profile(trc: &[u8]) -> Vec<u8> {
+        let columns: [[f64; 3]; 3] = [
+            [0.4360, 0.2225, 0.0139],
+            [0.3851, 0.7169, 0.0971],
+            [0.1431, 0.0606, 0.7139],
+        ];
+        let mut tags: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        for (sig, col) in [*b"rXYZ", *b"gXYZ", *b"bXYZ"].iter().zip(columns) {
+            let mut data = b"XYZ \0\0\0\0".to_vec();
+            for v in col {
+                data.extend_from_slice(&icc_fx(v));
+            }
+            tags.push((*sig, data));
+        }
+        for sig in [*b"rTRC", *b"gTRC", *b"bTRC"] {
+            tags.push((sig, trc.to_vec()));
+        }
+        icc_build(b"RGB ", &tags)
+    }
+
+    #[test]
+    fn jpx_embedded_device_equivalent_profiles_keep_the_device_path() {
+        // A profile that probes as sRGB (or as the gray identity) maps to
+        // the plain device space: pixels byte-identical to the old
+        // channel-count guess, and no approximation note.
+        let doc = test_doc();
+        let meta = jpx_meta(&doc, b"<< >>", None);
+
+        let mut image = jpx_image(
+            1,
+            1,
+            3,
+            vec![10, 200, 30],
+            pdfboss_jpx::ColorKind::IccGuess { components: 3 },
+            None,
+        );
+        image.icc_profile = Some(icc_rgb_profile(&icc_srgb_trc()));
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert!(
+            notes.is_empty(),
+            "an interpreted profile is silent: {notes:?}"
+        );
+        assert_eq!(rgba_at(&img, 0, 0), [10, 200, 30, 255]);
+
+        let mut image = jpx_image(
+            1,
+            1,
+            1,
+            vec![77],
+            pdfboss_jpx::ColorKind::IccGuess { components: 1 },
+            None,
+        );
+        image.icc_profile = Some(icc_build(b"GRAY", &[(*b"kTRC", icc_srgb_trc())]));
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0), [77, 77, 77, 255]);
+    }
+
+    #[test]
+    fn jpx_embedded_profile_transforms_the_samples() {
+        // Gamma 1,8 with sRGB primaries: mid-gray brightens to the sRGB
+        // encoding of (128/255)^1,8, quantized exactly like the sample
+        // paths quantize.
+        let doc = test_doc();
+        let meta = jpx_meta(&doc, b"<< >>", None);
+        let want = (pdfboss_icc::srgb_encode((128.0f32 / 255.0).powf(1.8)) * 255.0 + 0.5) as u8;
+
+        // Three channels take the per-pixel path...
+        let mut image = jpx_image(
+            1,
+            1,
+            3,
+            vec![128, 128, 128],
+            pdfboss_jpx::ColorKind::IccGuess { components: 3 },
+            None,
+        );
+        image.icc_profile = Some(icc_rgb_profile(&icc_gamma_trc(1.8)));
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert!(notes.is_empty(), "{notes:?}");
+        let px = rgba_at(&img, 0, 0);
+        for c in &px[..3] {
+            assert!(c.abs_diff(want) <= 1, "{px:?} want {want}");
+        }
+        assert!(px[0] > 140, "gamma 1,8 must brighten mid-gray: {px:?}");
+
+        // ...one channel flows through the sample LUT and must agree.
+        let mut image = jpx_image(
+            1,
+            1,
+            1,
+            vec![128],
+            pdfboss_jpx::ColorKind::IccGuess { components: 1 },
+            None,
+        );
+        image.icc_profile = Some(icc_build(b"GRAY", &[(*b"kTRC", icc_gamma_trc(1.8))]));
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(rgba_at(&img, 0, 0)[0], want);
+    }
+
+    #[test]
+    fn jpx_unusable_embedded_profiles_fall_back_with_a_note() {
+        let doc = test_doc();
+        let meta = jpx_meta(&doc, b"<< >>", None);
+
+        // Bytes that are no ICC profile: the channel-count approximation
+        // paints exactly as before, and the note names the parse failure.
+        let mut image = jpx_image(
+            1,
+            1,
+            3,
+            vec![0, 255, 0],
+            pdfboss_jpx::ColorKind::IccGuess { components: 3 },
+            None,
+        );
+        image.icc_profile = Some(vec![1, 2, 3]);
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert_eq!(rgba_at(&img, 0, 0), [0, 255, 0, 255]);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("did not parse"), "{notes:?}");
+
+        // A profile whose arity disagrees with the colour channels is
+        // distrusted the same way.
+        let mut image = jpx_image(
+            1,
+            1,
+            4,
+            vec![0, 0, 0, 0],
+            pdfboss_jpx::ColorKind::IccGuess { components: 4 },
+            None,
+        );
+        image.icc_profile = Some(icc_rgb_profile(&icc_srgb_trc()));
+        let (img, notes) = jpx_rgba(&meta, image).expect("decodes");
+        assert_eq!(rgba_at(&img, 0, 0), [255, 255, 255, 255], "zero ink");
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].contains("expects 3 component(s)") && notes[0].contains("4 colour"),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn jpx_profile_over_more_channels_than_the_rasterizer_reads_never_builds() {
+        // jpx_limits admits up to 9 channels and xCLR profiles parse, but
+        // ColorSpace::Icc feeds its transform from a MAX_COMPS-sized
+        // buffer: the profile must be skipped, landing on the named
+        // channel-count failure instead of a panic.
+        let doc = test_doc();
+        let meta = jpx_meta(&doc, b"<< >>", None);
+        let mut image = jpx_image(
+            1,
+            1,
+            9,
+            vec![0; 9],
+            pdfboss_jpx::ColorKind::IccGuess { components: 9 },
+            None,
+        );
+        image.icc_profile = Some(icc_rgb_profile(&icc_srgb_trc()));
+        let reason = match jpx_rgba(&meta, image) {
+            Err(reason) => reason,
+            Ok(..) => panic!("9 colour channels fit no colour space"),
+        };
+        assert!(reason.contains("no colour space for 9"), "{reason}");
+    }
+
     #[test]
     fn jpx_alpha_channel_masks_only_when_smask_in_data_asks() {
         let doc = test_doc();
@@ -1774,8 +2033,9 @@ mod tests {
 
     #[test]
     fn jpx_indexed_deep_channel_passes_through_with_a_note() {
-        // Depth > 8 right-shifted the indices; the low bits are gone, so
-        // the samples pass through unchanged and the report owns up.
+        // Depth > 8 rounded the indices through the normalizing shift;
+        // the original values are unrecoverable, so the samples pass
+        // through unchanged and the report owns up.
         let doc = test_doc();
         let mut image = jpx_image(1, 1, 1, vec![2], pdfboss_jpx::ColorKind::Gray, None);
         image.component_depths = vec![12];
