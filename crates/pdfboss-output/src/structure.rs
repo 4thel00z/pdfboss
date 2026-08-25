@@ -26,6 +26,11 @@ const COLUMN_MIN_HEIGHT: f32 = 0.4;
 /// a table's number or label column is far narrower than any genuine text
 /// column, and splitting a table reads its rows column-major.
 const COLUMN_MIN_SIDE_WIDTH: f32 = 0.25;
+/// A landscape text block splits only as a 2-up sheet — two portrait pages
+/// scanned side by side — and its gutter must span at least this fraction
+/// of the block's width: facing pages never touch, where a slide's or a
+/// table sheet's interior lane is a cell boundary.
+const TWO_UP_MIN_GUTTER: f32 = 0.05;
 /// Minimum device-space gutter width, and the central band of the text
 /// width the gutter's center must fall in.
 const GUTTER_MIN_WIDTH: f32 = 6.0;
@@ -1681,13 +1686,6 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     if body.len() < COLUMN_MIN_SPANS {
         return whole();
     }
-    // Two-column flow lives on portrait-shaped text blocks. A block wider
-    // than it is tall is a slide or a table sheet, where a lone lane is a
-    // cell boundary, not a gutter.
-    let (body_lo, body_hi) = y_extent(&body);
-    if body_hi - body_lo <= width {
-        return whole();
-    }
     // Exactly one wide interior lane is a gutter; several are the cell
     // columns of a data table, whose rows must keep reading left to right.
     let [gutter] = gaps.as_slice() else {
@@ -1701,6 +1699,18 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
 
     let (left, right): (Vec<&TextSpan>, Vec<&TextSpan>) =
         body.iter().partition(|s| s.x.max(s.end_x) <= cut);
+    // Two-column flow lives on portrait-shaped text blocks. A block wider
+    // than it is tall is a slide or a table sheet, where a lone lane is a
+    // cell boundary, not a gutter — unless it is a 2-up sheet: a gutter no
+    // narrower than [`TWO_UP_MIN_GUTTER`] of the width with a portrait page
+    // shape on each side of it.
+    let (body_lo, body_hi) = y_extent(&body);
+    if body_hi - body_lo <= width {
+        let gutter_width = (gutter.end - gutter.start) as f32 / scale;
+        if gutter_width < TWO_UP_MIN_GUTTER * width || !portrait(&left) || !portrait(&right) {
+            return whole();
+        }
+    }
     if !column_shaped(&left) || !column_shaped(&right) {
         return whole();
     }
@@ -1808,6 +1818,13 @@ fn lane_ranges(
     gaps.iter()
         .map(|gap| (x_min + gap.start as f32 / scale)..(x_min + gap.end as f32 / scale))
         .collect()
+}
+
+/// True when a span set stands taller than it runs wide — the shape of one
+/// page of a 2-up sheet.
+fn portrait(spans: &[&TextSpan]) -> bool {
+    let (lo, hi) = y_extent(spans);
+    hi - lo > x_span(spans)
 }
 
 /// True when a gutter side has enough spans on enough distinct baselines
@@ -1947,6 +1964,7 @@ pub(crate) mod tests {
         .collect();
         contents.push(two_column_content(25));
         contents.push(two_column_content(3));
+        contents.push(two_up_content(25));
         contents.push(format!(
             "BT /F1 12 Tf 72 760 Td (A quite wide heading spanning both text columns here) Tj ET {}",
             two_column_content(25)
@@ -2232,6 +2250,34 @@ pub(crate) mod tests {
                 ]
             })
             .collect()
+    }
+
+    /// Two portrait book pages scanned side by side onto one landscape
+    /// sheet, a wide empty gutter between them. Each side's lines run wide
+    /// enough to be a real page column, yet stand taller than they run.
+    pub(crate) fn two_up_content(lines: u32) -> String {
+        (0..lines)
+            .flat_map(|i| {
+                let y = 720 - i * 14;
+                [
+                    column_line(72, y, &format!("Left{i}")),
+                    column_line(500, y, &format!("Right{i}")),
+                ]
+            })
+            .collect()
+    }
+
+    /// A 2-up sheet is landscape, but its huge gutter and the portrait
+    /// shape of each side still split it: each page reads whole.
+    #[test]
+    fn two_up_sheet_reads_page_by_page() {
+        let text = text_of(&two_up_content(25));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 50);
+        assert_eq!(lines[0], "Left0a Left0b Left0c Left0d");
+        assert_eq!(lines[24], "Left24a Left24b Left24c Left24d");
+        assert_eq!(lines[25], "Right0a Right0b Right0c Right0d");
+        assert_eq!(lines[49], "Right24a Right24b Right24c Right24d");
     }
 
     /// A page with a clear central gutter reads column-major: the whole left
