@@ -80,16 +80,25 @@ once and fast after.
 
 ## Results
 
-pdfboss 0.17.1, one repeat (extraction is deterministic), full 8-bucket run:
+pdfboss 0.17.1, one repeat (extraction is deterministic), full 8-bucket run.
+Pass rates are load-insensitive and reported as measured; raw numbers in
+[`../results-olmocr.json`](../results-olmocr.json).
 
 | Bucket | Pass rate | Tests |
 |---|--:|--:|
-| baseline | PENDING | 1403 |
-| table_tests | PENDING | 1020 |
-| multi_column | PENDING | 884 |
-| headers_footers | PENDING | 753 |
-| long_tiny_text | PENDING | 442 |
-| old_scans | PENDING | 526 |
-| old_scans_math | PENDING | 458 |
-| arxiv_math | PENDING | 2927 |
-| **overall (macro)** | **PENDING** | 8413 |
+| baseline | 87.3% | 1394 |
+| headers_footers | 35.0% | 760 |
+| table_tests | 30.0% | 1022 |
+| long_tiny_text | 22.2% | 442 |
+| multi_column | 18.9% | 884 |
+| old_scans | 13.3% | 526 |
+| old_scans_math | 0.0% | 458 |
+| arxiv_math | 0.0% | 2927 |
+| **overall (macro over 8 buckets)** | **25.8% ± 0.9%** | 8413 |
+| **born-digital subset (baseline, tables, multi_column, headers_footers)** | **42.8%** | 4060 |
+
+(A few jsonls carry baseline-type tests of their own, which is why the test
+counts differ slightly from the bucket sizes; the born-digital subset number
+is the macro over those four rows of this same run, not a separate run.
+old_scans' 13.3% is exactly its 70 absence tests, passing trivially on
+empty output — the fully image-only bucket contributes nothing real.)
