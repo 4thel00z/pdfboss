@@ -81,37 +81,43 @@ impl CidToUnicode {
 /// The CID-to-Unicode mapping for a `/CIDSystemInfo` `/Ordering`, built on
 /// first use. `None` for unknown orderings (Identity included: its CIDs are
 /// font-private and mean nothing outside the font).
+///
+/// Japan1 also folds in UniJIS-UCS2-HW-H: the halfwidth-form CIDs it remaps
+/// Latin and digits onto (231-325) have no preimage in UniJIS-UTF16-H, and
+/// they are what every Shift-JIS ASCII run selects.
 pub fn cid_to_unicode(ordering: &str) -> Option<Arc<CidToUnicode>> {
-    let (slot, name) = match ordering {
-        "Japan1" => (0, "UniJIS-UTF16-H"),
-        "GB1" => (1, "UniGB-UTF16-H"),
-        "CNS1" => (2, "UniCNS-UTF16-H"),
-        "Korea1" => (3, "UniKS-UTF16-H"),
-        "KR" => (4, "UniAKR-UTF16-H"),
+    let (slot, names): (usize, &[&str]) = match ordering {
+        "Japan1" => (0, &["UniJIS-UTF16-H", "UniJIS-UCS2-HW-H"]),
+        "GB1" => (1, &["UniGB-UTF16-H"]),
+        "CNS1" => (2, &["UniCNS-UTF16-H"]),
+        "Korea1" => (3, &["UniKS-UTF16-H"]),
+        "KR" => (4, &["UniAKR-UTF16-H"]),
         _ => return None,
     };
     static INVERSES: [OnceLock<Option<Arc<CidToUnicode>>>; 5] = [const { OnceLock::new() }; 5];
     INVERSES[slot]
         .get_or_init(|| {
-            let cmap = predefined(name)?;
-            Some(Arc::new(invert(cmap.as_ref())))
+            let cmaps: Vec<_> = names.iter().filter_map(|n| predefined(n)).collect();
+            (!cmaps.is_empty()).then(|| Arc::new(invert(&cmaps)))
         })
         .clone()
 }
 
-/// Runs a code-to-CID CMap backward. Codes arrive lowest first within each
-/// layer (see `CidCmap::mappings`), so the first insert for a CID is the
-/// lowest code point that reaches it.
-fn invert(cmap: &CidCmap) -> CidToUnicode {
+/// Runs code-to-CID CMaps backward, earlier sources winning. Codes arrive
+/// lowest first within each layer (see `CidCmap::mappings`), so the first
+/// insert for a CID is the lowest code point that reaches it.
+fn invert(cmaps: &[Arc<CidCmap>]) -> CidToUnicode {
     let mut map = crate::hash::FastMap::default();
-    cmap.mappings(&mut |len, lo, hi, cid| {
-        for offset in 0..=hi.saturating_sub(lo) {
-            let Some(c) = unicode_of(lo + offset, len) else {
-                continue;
-            };
-            map.entry(cid.saturating_add(offset)).or_insert(c);
-        }
-    });
+    for cmap in cmaps {
+        cmap.mappings(&mut |len, lo, hi, cid| {
+            for offset in 0..=hi.saturating_sub(lo) {
+                let Some(c) = unicode_of(lo + offset, len) else {
+                    continue;
+                };
+                map.entry(cid.saturating_add(offset)).or_insert(c);
+            }
+        });
+    }
     CidToUnicode { map }
 }
 
@@ -312,6 +318,9 @@ mod tests {
         assert_eq!(inv.lookup(843), Some('あ'));
         // CID 1 is the space in every Adobe collection.
         assert_eq!(inv.lookup(1), Some(' '));
+        // The halfwidth-form digit 1 (CID 248, what Shift-JIS ASCII runs
+        // select): reachable only through UniJIS-UCS2-HW-H.
+        assert_eq!(inv.lookup(248), Some('1'));
         assert!(cid_to_unicode("Identity").is_none());
         assert!(cid_to_unicode("Unknown").is_none());
     }
