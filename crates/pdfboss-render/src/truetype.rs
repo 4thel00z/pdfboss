@@ -720,9 +720,9 @@ pub(crate) mod tests {
         g
     }
 
-    fn table_head() -> Vec<u8> {
+    fn table_head(upm: u16) -> Vec<u8> {
         let mut t = vec![0u8; 54];
-        t[18..20].copy_from_slice(&be(1000)); // unitsPerEm
+        t[18..20].copy_from_slice(&be(upm)); // unitsPerEm
         t[50..52].copy_from_slice(&be(0)); // indexToLocFormat = short
         t
     }
@@ -733,8 +733,8 @@ pub(crate) mod tests {
         t
     }
 
-    /// Format-4 cmap mapping `'A'` (0x41) to glyph 1.
-    fn table_cmap() -> Vec<u8> {
+    /// Format-4 cmap mapping the single character `ch` to glyph 1.
+    fn table_cmap(ch: u16) -> Vec<u8> {
         let mut sub = Vec::new();
         sub.extend_from_slice(&be(4)); // format
         sub.extend_from_slice(&be(0)); // length placeholder
@@ -743,12 +743,12 @@ pub(crate) mod tests {
         sub.extend_from_slice(&be(0)); // searchRange
         sub.extend_from_slice(&be(0)); // entrySelector
         sub.extend_from_slice(&be(0)); // rangeShift
-        sub.extend_from_slice(&be(0x0041)); // endCode[0]
+        sub.extend_from_slice(&be(ch)); // endCode[0]
         sub.extend_from_slice(&be(0xFFFF)); // endCode[1]
         sub.extend_from_slice(&be(0)); // reservedPad
-        sub.extend_from_slice(&be(0x0041)); // startCode[0]
+        sub.extend_from_slice(&be(ch)); // startCode[0]
         sub.extend_from_slice(&be(0xFFFF)); // startCode[1]
-        sub.extend_from_slice(&be((1i32 - 0x41) as u16)); // idDelta[0] → gid 1
+        sub.extend_from_slice(&be((1i32 - i32::from(ch)) as u16)); // idDelta[0] → gid 1
         sub.extend_from_slice(&be(1)); // idDelta[1]
         sub.extend_from_slice(&be(0)); // idRangeOffset[0]
         sub.extend_from_slice(&be(0)); // idRangeOffset[1]
@@ -781,7 +781,15 @@ pub(crate) mod tests {
 
     /// Assembles a one-glyph (plus .notdef) sfnt with head/maxp/cmap/loca/glyf.
     pub(crate) fn build_font() -> Vec<u8> {
-        let glyph1 = rect_glyph(100, 0, 600, 700);
+        build_font_with(1000, 0x41)
+    }
+
+    /// [`build_font`] generalized: `upm` design units per em (the rect
+    /// glyph's coordinates scale along, keeping the same em-relative shape)
+    /// and `ch` the single cmap-mapped character.
+    pub(crate) fn build_font_with(upm: u16, ch: u16) -> Vec<u8> {
+        let s = |v: i32| (v * i32::from(upm) / 1000) as i16;
+        let glyph1 = rect_glyph(s(100), s(0), s(600), s(700));
         let glyf = glyph1.clone(); // gid 0 empty, gid 1 at offset 0
                                    // Short loca: [gid0=0, gid1=0, end=len/2].
         let mut loca = Vec::new();
@@ -790,9 +798,9 @@ pub(crate) mod tests {
         loca.extend_from_slice(&be((glyf.len() / 2) as u16));
 
         let tables: [(&[u8; 4], Vec<u8>); 6] = [
-            (b"cmap", table_cmap()),
+            (b"cmap", table_cmap(ch)),
             (b"glyf", glyf),
-            (b"head", table_head()),
+            (b"head", table_head(upm)),
             (b"loca", loca),
             (b"maxp", table_maxp(2)),
             (b"post", table_post()),
