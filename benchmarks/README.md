@@ -97,3 +97,15 @@ shown in the top-level README); `bench_render.py` writes
 Both datasets are local corpora of real-world PDFs and are not committed —
 `bench_scans.py` records the document's page count and geometry, never its
 name.
+
+## olmOCR-bench
+
+[olmocr/](olmocr/) wires pdfboss into
+[olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench), a
+public suite of 7,010 machine-checkable tests (text presence, reading order,
+table structure, math rendering) over 1,403 single-page PDFs.
+`olmocr/generate_candidates.py` writes the markdown candidate tree the
+suite's scorer reads; results land in `results-olmocr.json`. pdfboss is a
+non-OCR engine, so the honest headline is the born-digital buckets — the
+scan and LaTeX-math buckets score near zero by construction. The recipe and
+the full interpretation notes are in [olmocr/README.md](olmocr/README.md).
