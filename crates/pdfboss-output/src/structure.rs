@@ -91,6 +91,12 @@ const RULING_SNAP_TOLERANCE: f32 = 6.0;
 /// apply here — the structure is drawn, not implied by white space.
 const RULED_GRID_MIN_VERTICALS: usize = 2;
 const RULED_GRID_MIN_HORIZONTALS: usize = 3;
+/// How many lines a band must hold before rows are inferred inside it — the
+/// dominant band of a table drawn with column rules but no row rules, which
+/// otherwise folds its whole body into one line of cells. Below it, and in
+/// any band holding a minority of the claim's lines, a multi-line band is a
+/// wrapped row whose lines merge as ever.
+const BAND_INFER_MIN_LINES: usize = 4;
 /// Populated bands a fully boxed grid needs; an unboxed lattice needs
 /// [`TABLE_MIN_ROWS`], since stray separators reach three lines more easily
 /// than a drawn border box does.
@@ -971,10 +977,15 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 /// One connected component as a grid, or `None` when it is too sparse to be
 /// one: a lone separator, an underline, a pair of column rules with nothing
 /// across them.
+///
+/// The column rules often run past the outermost horizontal — a header row
+/// bounded above by nothing but its verticals, drawn one row box at a time.
+/// Where they reach beyond it, a synthetic boundary at their far end adds
+/// that band, so the rows it holds stay rows of this grid.
 fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGrid> {
     let xs = distinct_positions(verticals);
-    let ys = distinct_positions(horizontals);
-    if xs.len() < RULED_GRID_MIN_VERTICALS || ys.len() < RULED_GRID_MIN_HORIZONTALS {
+    let mut ys = distinct_positions(horizontals);
+    if xs.len() < RULED_GRID_MIN_VERTICALS || ys.is_empty() {
         return None;
     }
     let (x_lo, x_hi) = (xs[0], xs[xs.len() - 1]);
@@ -983,6 +994,23 @@ fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGr
         && covers(verticals, x_hi, y_lo, y_hi)
         && covers(horizontals, y_lo, x_lo, x_hi)
         && covers(horizontals, y_hi, x_lo, x_hi);
+    let reach_lo = verticals
+        .iter()
+        .map(|line| line.extent.start)
+        .fold(f32::INFINITY, f32::min);
+    let reach_hi = verticals
+        .iter()
+        .map(|line| line.extent.end)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if reach_lo < y_lo - RULING_SNAP_TOLERANCE {
+        ys.insert(0, reach_lo);
+    }
+    if reach_hi > y_hi + RULING_SNAP_TOLERANCE {
+        ys.push(reach_hi);
+    }
+    if ys.len() < RULED_GRID_MIN_HORIZONTALS {
+        return None;
+    }
     Some(RuledGrid { xs, ys, boxed })
 }
 
@@ -1050,12 +1078,14 @@ fn grid_claims(groups: &[Group], grids: &[RuledGrid]) -> Vec<GridClaim> {
 
 /// `groups` against one grid: the contiguous stretch of lines whose
 /// baselines fall inside the grid becomes the claim, one logical row per
-/// populated band — the y-range between consecutive horizontal rulings.
-/// `None` when a line will not sit in the grid's columns, when a column
-/// boundary lands inside a sub-word gap — the row would split a word the
-/// flat flow wrote whole — or when the populated bands number under
-/// [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid with
-/// all four borders drawn. Every line passes [`table_row`] before any
+/// populated band — the y-range between consecutive horizontal rulings —
+/// except a dominant rule-less band, whose rows [`anchored_rows`] infers.
+/// The columns are the grid's, opened outward where the stretch's ink
+/// overflows the outer verticals. `None` when a line will not sit in the
+/// columns, when a column boundary lands inside a sub-word gap — the row
+/// would split a word the flat flow wrote whole — or when the rows number
+/// under [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid
+/// with all four borders drawn. Every line passes [`table_row`] before any
 /// band's lines merge.
 fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
     let lo = groups.iter().position(|group| grid.holds(group.y))?;
@@ -1064,12 +1094,16 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         .take_while(|group| grid.holds(group.y))
         .count();
     let hi = lo + inside;
-    let columns = grid.columns();
+    let columns = open_columns(&groups[lo..hi], grid);
     let mut rows = Vec::new();
     for band in groups[lo..hi].chunk_by(|a, b| grid.band_of(a.y) == grid.band_of(b.y)) {
         let mut lines = Vec::with_capacity(band.len());
         for group in band {
             lines.push(table_row(group, &columns)?);
+        }
+        if lines.len() >= BAND_INFER_MIN_LINES && 2 * lines.len() > hi - lo {
+            rows.append(&mut anchored_rows(lines, columns.len()));
+            continue;
         }
         rows.push(logical_row(lines, columns.len()));
     }
@@ -1081,6 +1115,84 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         rows,
         bbox: grid.bbox(),
     })
+}
+
+/// The grid's columns, with an open outer column on each side the claimed
+/// lines' ink overflows: many tables rule only the interior boundaries and
+/// leave the first and last columns unboxed. The overflow may reach at most
+/// the widest drawn column's width — ink farther out is a neighbouring
+/// block, and without the extra column such a row fails [`table_row`]
+/// exactly as it always did.
+fn open_columns(groups: &[Group], grid: &RuledGrid) -> Vec<std::ops::Range<f32>> {
+    let spans: Vec<&TextSpan> = groups
+        .iter()
+        .flat_map(|group| group.spans.iter().copied())
+        .collect();
+    let (x_lo, x_hi) = x_bounds(&spans);
+    let mut columns = grid.columns();
+    let widest = columns
+        .iter()
+        .map(|column| column.end - column.start)
+        .fold(0.0f32, f32::max);
+    let first = grid.xs[0];
+    let last = grid.xs[grid.xs.len() - 1];
+    if x_lo < first - RULING_SNAP_TOLERANCE && first - x_lo <= widest {
+        columns.insert(0, x_lo..first);
+    }
+    if x_hi > last + RULING_SNAP_TOLERANCE && x_hi - last <= widest {
+        columns.push(last..x_hi);
+    }
+    columns
+}
+
+/// A rule-less band's lines as logical rows: a new row opens at every line
+/// that populates the band's leftmost populated column — the anchor a
+/// record's first line draws in a top-aligned table — and also stands like
+/// a record, populating [`TABLE_MIN_ROW_CELLS`] cells. The lines between
+/// openers are wrapped continuations, merged in behind their opener.
+///
+/// A band whose first line is no opener is not top-aligned: its records
+/// center their cells vertically, or it is one wrapped record whose long
+/// first column touches every line. There the anchor says nothing, and the
+/// band merges whole, exactly as a wrapped row always has.
+fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize) -> Vec<Vec<Cell>> {
+    let Some(anchor) =
+        (0..columns).find(|column| lines.iter().any(|line| populates(line, *column)))
+    else {
+        return vec![logical_row(lines, columns)];
+    };
+    let opens = |line: &Vec<Cell>| {
+        populates(line, anchor)
+            && line.iter().filter(|cell| cell.line.is_some()).count() >= TABLE_MIN_ROW_CELLS
+    };
+    if !lines.first().is_some_and(opens) {
+        return vec![logical_row(lines, columns)];
+    }
+    let mut rows = Vec::new();
+    let mut group: Vec<Vec<Cell>> = Vec::new();
+    for line in lines {
+        if opens(&line) && !group.is_empty() {
+            rows.push(logical_row(std::mem::take(&mut group), columns));
+        }
+        group.push(line);
+    }
+    if !group.is_empty() {
+        rows.push(logical_row(group, columns));
+    }
+    rows
+}
+
+/// True when the row's cell covering `column` carries a line.
+fn populates(row: &[Cell], column: usize) -> bool {
+    let mut at = 0usize;
+    for cell in row {
+        let width = cell.colspan as usize;
+        if at <= column && column < at + width {
+            return cell.line.is_some();
+        }
+        at += width;
+    }
+    false
 }
 
 /// One band's visual lines as its logical row. Cells whose column intervals
@@ -1389,8 +1501,11 @@ fn even_rows(baselines: &[f32]) -> bool {
 }
 
 /// One row's cells, left to right, with a lineless cell for every column
-/// nothing was drawn in. `None` when a span will not sit in a column: one
-/// starting inside a lane, or two cells claiming the same column.
+/// nothing was drawn in. `None` when a span will not sit in a column — one
+/// starting inside a lane. A span starting in any column the last cell
+/// already covers extends that cell: ink crossing a boundary means the cell
+/// is merged there, and everything under its covered columns reads as its
+/// contents.
 fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell>> {
     let mut claimed: Vec<(usize, usize, Vec<&TextSpan>)> = Vec::new();
     for &span in &group.spans {
@@ -1402,11 +1517,10 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         }
         let end = columns.iter().rposition(|column| column.start <= hi)?;
         match claimed.last_mut() {
-            Some(last) if last.0 == start => {
+            Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
                 last.2.push(span);
             }
-            Some(last) if start <= last.1 => return None,
             _ => claimed.push((start, end, vec![span])),
         }
     }
@@ -1845,6 +1959,9 @@ pub(crate) mod tests {
         contents.push(ruled_sub_word_gap_content());
         contents.push(ruled_wrapped_band_content());
         contents.push(ruled_grid_above_lane_grid_content());
+        contents.push(ruled_open_grid_content());
+        contents.push(ruled_wrapped_records_content());
+        contents.push(ruled_centered_record_content());
         contents
     }
 
@@ -1899,6 +2016,66 @@ pub(crate) mod tests {
              1 0 0 1 80 645 Tm (wrap one) Tj 1 0 0 1 210 645 Tm (solo) Tj \
              1 0 0 1 340 645 Tm (tail) Tj \
              1 0 0 1 80 625 Tm (wrap two) Tj 1 0 0 1 80 605 Tm (wrap three) Tj ET",
+        )
+    }
+
+    /// A registration-results shape: two interior verticals running past the
+    /// top horizontal, no rule between the data rows, and text overflowing
+    /// both unruled outer edges. The claim must extend to the verticals'
+    /// reach, open a column on each side, and infer the rule-less band's
+    /// rows at its anchor column.
+    pub(crate) fn ruled_open_grid_content() -> String {
+        String::from(
+            "150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 600 m 330 600 l S 70 700 m 330 700 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (name) Tj 1 0 0 1 160 703 Tm (count) Tj \
+             1 0 0 1 260 703 Tm (note) Tj \
+             1 0 0 1 80 685 Tm (alpha) Tj 1 0 0 1 160 685 Tm (one) Tj \
+             1 0 0 1 260 685 Tm (xx) Tj \
+             1 0 0 1 80 665 Tm (beta) Tj 1 0 0 1 160 665 Tm (two) Tj \
+             1 0 0 1 260 665 Tm (yy) Tj \
+             1 0 0 1 80 645 Tm (gamma) Tj 1 0 0 1 160 645 Tm (three) Tj \
+             1 0 0 1 260 645 Tm (zz) Tj \
+             1 0 0 1 80 625 Tm (delta) Tj 1 0 0 1 160 625 Tm (four) Tj \
+             1 0 0 1 260 625 Tm (ww) Tj ET",
+        )
+    }
+
+    /// [`ruled_open_grid_content`]'s lattice with records wrapping inside
+    /// the rule-less band: the second line of each record populates only the
+    /// middle column, so it must fold into the anchor line before it rather
+    /// than stand as a row of its own.
+    pub(crate) fn ruled_wrapped_records_content() -> String {
+        String::from(
+            "150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 600 m 330 600 l S 70 700 m 330 700 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (name) Tj 1 0 0 1 160 703 Tm (org) Tj \
+             1 0 0 1 260 703 Tm (count) Tj \
+             1 0 0 1 80 685 Tm (one) Tj 1 0 0 1 160 685 Tm (recordaa) Tj \
+             1 0 0 1 260 685 Tm (c1) Tj \
+             1 0 0 1 160 670 Tm (wrapa) Tj \
+             1 0 0 1 80 650 Tm (two) Tj 1 0 0 1 160 650 Tm (recordbb) Tj \
+             1 0 0 1 260 650 Tm (c2) Tj \
+             1 0 0 1 160 635 Tm (wrapb) Tj ET",
+        )
+    }
+
+    /// One record wrapping over the whole rule-less band, its long first
+    /// column inked on every line and its other cells centered on the second
+    /// line. The first line populates one cell only, so no line is an
+    /// opener: the band must merge whole, one record, not shatter at its
+    /// anchor column.
+    pub(crate) fn ruled_centered_record_content() -> String {
+        String::from(
+            "150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 600 m 330 600 l S 70 700 m 330 700 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (name) Tj 1 0 0 1 160 703 Tm (org) Tj \
+             1 0 0 1 260 703 Tm (count) Tj \
+             1 0 0 1 80 685 Tm (actlinea) Tj \
+             1 0 0 1 80 665 Tm (actlineb) Tj 1 0 0 1 160 665 Tm (union) Tj \
+             1 0 0 1 260 665 Tm (c9) Tj \
+             1 0 0 1 80 645 Tm (actlinec) Tj \
+             1 0 0 1 80 625 Tm (actlined) Tj ET",
         )
     }
 
@@ -2184,6 +2361,22 @@ pub(crate) mod tests {
         assert_eq!(grids.len(), 2);
         assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0], "topmost first");
         assert_eq!(grids[1].ys, vec![300.0, 340.0, 380.0]);
+    }
+
+    /// Column rules running past the outermost horizontals bound bands of
+    /// their own: the lattice gains a synthetic boundary at each far end.
+    #[test]
+    fn vertical_reach_beyond_the_horizontals_adds_bands() {
+        let rulings = vec![
+            ruling(150.0, 590.0, 150.0, 712.0),
+            ruling(250.0, 590.0, 250.0, 712.0),
+            ruling(70.0, 600.0, 330.0, 600.0),
+            ruling(70.0, 640.0, 330.0, 640.0),
+            ruling(70.0, 700.0, 330.0, 700.0),
+        ];
+        let grids = ruled_grids(&rulings);
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].ys, vec![590.0, 600.0, 640.0, 700.0, 712.0]);
     }
 
     /// A plain box has only its two border horizontals — a frame, not a

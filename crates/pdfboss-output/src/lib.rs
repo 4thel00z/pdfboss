@@ -505,6 +505,53 @@ mod tests {
         );
     }
 
+    /// A grid ruled only on its interior boundaries: the header band above
+    /// the top horizontal is claimed via the verticals' reach, the text
+    /// overflowing the outer verticals opens a column on each side, and the
+    /// rule-less data band's lines become one row per anchor line.
+    #[test]
+    fn an_open_edged_grid_becomes_a_full_table() {
+        let md = markdown_of_drawn(&structure::tests::ruled_open_grid_content());
+        assert!(
+            md.contains(
+                "| name | count | note |\n| --- | --- | --- |\n\
+                 | alpha | one | xx |\n| beta | two | yy |\n\
+                 | gamma | three | zz |\n| delta | four | ww |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// Records wrapping inside a rule-less band fold behind their anchor
+    /// lines: the continuation populates no anchor cell, so it is the same
+    /// row still being written, not a row of its own.
+    #[test]
+    fn wrapped_records_fold_behind_their_anchors() {
+        let md = markdown_of_drawn(&structure::tests::ruled_wrapped_records_content());
+        assert!(
+            md.contains(
+                "| name | org | count |\n| --- | --- | --- |\n\
+                 | one | recordaa wrapa | c1 |\n| two | recordbb wrapb | c2 |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// A rule-less band whose first line populates a single cell holds one
+    /// vertically centered record: it merges whole instead of shattering at
+    /// its anchor column.
+    #[test]
+    fn a_centered_record_band_merges_whole() {
+        let md = markdown_of_drawn(&structure::tests::ruled_centered_record_content());
+        assert!(
+            md.contains(
+                "| name | org | count |\n| --- | --- | --- |\n\
+                 | actlinea actlineb actlinec actlined | union | c9 |"
+            ),
+            "md: {md}"
+        );
+    }
+
     /// A drawn grid no longer claims its whole segment: the whitespace-laned
     /// rows below it still become a table of their own — exactly the table
     /// the lane path alone emits — and blocks stay in reading order.
