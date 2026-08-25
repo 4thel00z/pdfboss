@@ -480,7 +480,7 @@ impl ImageAssembler {
             components: siz.components.clone(),
             channels,
             palette,
-            color: header.map(|header| header.color),
+            color: header.map(|header| header.color.clone()),
             channel_definitions: header
                 .map(|header| header.channel_definitions.clone())
                 .unwrap_or_default(),
@@ -719,11 +719,25 @@ impl ImageAssembler {
         None
     }
 
+    /// Takes the METH = 2 profile bytes out of the colr declaration, for
+    /// export on `DecodedImage::icc_profile`; `None` when the box was not
+    /// ICC or the bytes were not carried (the empty-profile sentinel).
+    fn take_icc_profile(&mut self) -> Option<Vec<u8>> {
+        match &mut self.color {
+            Some(ColorSpec::Icc { profile }) if !profile.is_empty() => {
+                Some(std::mem::take(profile))
+            }
+            _ => None,
+        }
+    }
+
     /// Resolves the colr box (I.5.3.3) into a [`ColorKind`], converting
     /// sYCC in place. Raw codestreams guess from the component count.
-    fn resolve_color(&mut self) -> ColorKind {
+    /// `icc` is the profile [`Self::take_icc_profile`] extracted, consulted
+    /// only for the warning wording.
+    fn resolve_color(&mut self, icc: Option<&[u8]>) -> ColorKind {
         let colour = self.colour_channel_count();
-        match self.color {
+        match &self.color {
             None => match self.channels.len() {
                 1 => ColorKind::Gray,
                 3 => ColorKind::Rgb,
@@ -758,6 +772,7 @@ impl ImageAssembler {
                 }
             }
             Some(ColorSpec::Enumerated(enumeration)) => {
+                let enumeration = *enumeration;
                 self.warnings.push(JpxWarning::note(format!(
                     "colr enumeration {enumeration} is not converted (Table I.10 defines 16/17/18)"
                 )));
@@ -766,11 +781,20 @@ impl ImageAssembler {
                     components: colour,
                 }
             }
-            Some(ColorSpec::Icc { profile_len }) => {
-                self.warnings.push(JpxWarning::note(format!(
-                    "colr carries an ICC profile ({profile_len} bytes) the decoder does not \
-                     interpret; colour guessed from {colour} colour channels"
-                )));
+            Some(ColorSpec::Icc { .. }) => {
+                let message = match icc {
+                    Some(profile) => format!(
+                        "colr carries a restricted ICC profile ({} bytes), exported \
+                         for the consumer to apply; colour reported as a guess from \
+                         {colour} colour channels",
+                        profile.len()
+                    ),
+                    None => format!(
+                        "colr declares a restricted ICC profile the scan did not \
+                         carry; colour guessed from {colour} colour channels"
+                    ),
+                };
+                self.warnings.push(JpxWarning::note(message));
                 ColorKind::IccGuess { components: colour }
             }
         }
@@ -802,7 +826,8 @@ impl ImageAssembler {
     /// Finalizes the image, attaching the accumulated `warnings`.
     pub(crate) fn finish(mut self, warnings: Vec<JpxWarning>) -> Result<DecodedImage> {
         let mut all = warnings;
-        let color = self.resolve_color();
+        let icc_profile = self.take_icc_profile();
+        let color = self.resolve_color(icc_profile.as_deref());
         let alpha_index = self.resolve_alpha();
         all.append(&mut self.warnings);
         Ok(DecodedImage {
@@ -816,6 +841,7 @@ impl ImageAssembler {
             // component's Ssiz depth otherwise (DecodedImage contract).
             component_depths: self.channels.iter().map(|channel| channel.depth).collect(),
             color,
+            icc_profile,
             alpha_index,
             warnings: all,
         })
@@ -1412,26 +1438,62 @@ mod tests {
                 },
             ),
             (
-                ColorSpec::Icc { profile_len: 3144 },
+                ColorSpec::Icc {
+                    profile: vec![9; 20],
+                },
                 4,
                 ColorKind::IccGuess { components: 4 },
             ),
         ];
         for (spec, count, expected) in cases {
             let siz = siz_for(1, 1, 0, 0, 1, 1, vec![component(8, false, 1, 1); count]);
-            let header = plain_header(spec, count as u16, 1, 1);
+            let header = plain_header(spec.clone(), count as u16, 1, 1);
             let assembler =
                 ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
             let image = assembler.finish(Vec::new()).unwrap();
             assert_eq!(image.color, expected, "{spec:?}");
         }
-        // The ICC guess is recorded as a warning.
+        // The ICC guess is recorded as a warning, and the profile bytes
+        // ride out on the image for the consumer to interpret.
         let siz = siz_for(1, 1, 0, 0, 1, 1, vec![component(8, false, 1, 1); 4]);
-        let header = plain_header(ColorSpec::Icc { profile_len: 3144 }, 4, 1, 1);
+        let header = plain_header(
+            ColorSpec::Icc {
+                profile: vec![9; 20],
+            },
+            4,
+            1,
+            1,
+        );
         let assembler = ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
         let image = assembler.finish(Vec::new()).unwrap();
+        assert_eq!(image.icc_profile, Some(vec![9; 20]));
         assert!(
-            image.warnings.iter().any(|w| w.message.contains("ICC")),
+            image
+                .warnings
+                .iter()
+                .any(|w| !w.data_loss && w.message.contains("ICC profile (20 bytes), exported")),
+            "warnings: {:?}",
+            image.warnings
+        );
+        // The empty-profile sentinel (declared but not carried) exports
+        // nothing and words the guess accordingly.
+        let header = plain_header(
+            ColorSpec::Icc {
+                profile: Vec::new(),
+            },
+            4,
+            1,
+            1,
+        );
+        let assembler = ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
+        let image = assembler.finish(Vec::new()).unwrap();
+        assert_eq!(image.color, ColorKind::IccGuess { components: 4 });
+        assert_eq!(image.icc_profile, None);
+        assert!(
+            image
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("did not carry")),
             "warnings: {:?}",
             image.warnings
         );

@@ -1540,6 +1540,7 @@ mod tests {
             samples,
             component_depths: vec![8; usize::from(components)],
             color,
+            icc_profile: None,
             alpha_index,
             warnings: Vec::new(),
         }

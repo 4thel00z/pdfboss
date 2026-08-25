@@ -7,7 +7,7 @@
 //! carry them).
 
 use crate::error::{JpxError, Result};
-use crate::JpxWarning;
+use crate::{DecodeLimits, JpxWarning};
 
 /// What the leading bytes of the input identify (the container sniff).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,17 +47,21 @@ pub(crate) fn sniff(data: &[u8]) -> Result<ContainerKind> {
 /// Colour Specification box payload (colr, I.5.3.3).
 // Constructed by the boxes stage; the variants are the frozen seam.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum ColorSpec {
     /// METH = 1: enumerated colourspace. EnumCS 16 = sRGB, 17 = greyscale,
     /// 18 = sYCC (I.5.3.3); other values map to `ColorKind::Other`.
     Enumerated(u32),
-    /// METH = 2: restricted ICC profile. The profile itself is not
-    /// interpreted; the colour stage approximates by component count and
-    /// records the guess (`ColorKind::IccGuess`).
+    /// METH = 2: restricted ICC profile (Table I.9: a Monochrome Input or
+    /// Three-Component Matrix-Based Input profile). The bytes ride out on
+    /// `DecodedImage::icc_profile` for the consumer to interpret; the
+    /// colour stage still reports the component-count guess
+    /// (`ColorKind::IccGuess`) as the no-consumer fallback.
     Icc {
-        /// Byte length of the embedded profile (recorded for warnings).
-        profile_len: u32,
+        /// The PROFILE field, byte for byte. Empty means the box declared
+        /// a profile the scan did not carry (zero-length, or larger than
+        /// `DecodeLimits::max_decoded_bytes`).
+        profile: Vec<u8>,
     },
 }
 
@@ -160,14 +164,14 @@ pub(crate) struct Container<'a> {
 /// Hard errors: `NotJpeg2000` from the sniff, `Malformed` for a broken box
 /// structure or a missing jp2c/jp2h. Unknown boxes are skipped with a
 /// warning (I.8).
-pub(crate) fn scan(data: &[u8]) -> Result<Container<'_>> {
+pub(crate) fn scan<'a>(data: &'a [u8], limits: &DecodeLimits) -> Result<Container<'a>> {
     match sniff(data)? {
         ContainerKind::RawCodestream => Ok(Container {
             header: None,
             codestream: data,
             warnings: Vec::new(),
         }),
-        ContainerKind::Jp2 => scan_jp2(data),
+        ContainerKind::Jp2 => scan_jp2(data, limits),
     }
 }
 
@@ -317,7 +321,7 @@ fn jp2c_payload_to_eof(data: &[u8], offset: usize) -> Option<&[u8]> {
 /// Top-level walk of a JP2 file: signature (already verified by the
 /// sniff), then ftyp (I.5.2, immediately after the signature), then any
 /// mix of jp2h, jp2c and skippable boxes (I.8).
-fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
+fn scan_jp2<'a>(data: &'a [u8], limits: &DecodeLimits) -> Result<Container<'a>> {
     let mut warnings = Vec::new();
     // I.5.2: the File Type box shall immediately follow the signature box.
     let ftyp = read_box(data, 12)?;
@@ -364,7 +368,7 @@ fn scan_jp2(data: &[u8]) -> Result<Container<'_>> {
         };
         match next.kind {
             TYPE_JP2H if header.is_none() => {
-                header = Some(parse_jp2h(next.payload, &mut warnings)?);
+                header = Some(parse_jp2h(next.payload, limits, &mut warnings)?);
             }
             TYPE_JP2H => {
                 // I.5.3: one and only one JP2 Header box.
@@ -460,7 +464,11 @@ fn check_ftyp(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<()> {
 
 /// Walks the JP2 Header superbox (I.5.3): ihdr first, then bpcc, colr,
 /// pclr, cmap, cdef in any order; res and unknown boxes are skipped.
-fn parse_jp2h(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<Jp2Header> {
+fn parse_jp2h(
+    payload: &[u8],
+    limits: &DecodeLimits,
+    warnings: &mut Vec<JpxWarning>,
+) -> Result<Jp2Header> {
     // I.5.3.1: the contents shall start with the Image Header box.
     let ihdr = read_box(payload, 0)?;
     if ihdr.kind != TYPE_IHDR {
@@ -486,7 +494,7 @@ fn parse_jp2h(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<Jp2Heade
             TYPE_COLR if color.is_none() => {
                 // I.5.3.3: the first colr box a reader understands wins;
                 // reserved METH values make the whole box ignorable.
-                color = parse_colr(next.payload, warnings)?;
+                color = parse_colr(next.payload, limits, warnings)?;
             }
             TYPE_COLR => {
                 // Additional colr boxes offer alternative specifications
@@ -655,8 +663,15 @@ fn parse_bpcc(payload: &[u8], num_components: u16) -> Result<Vec<u8>> {
 
 /// Colour Specification box payload (I.5.3.3): METH, PREC, APPROX, then
 /// EnumCS (METH = 1) or an ICC profile (METH = 2). Reserved METH values
-/// make the whole box ignorable (Table I.9), reported as `None`.
-fn parse_colr(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<Option<ColorSpec>> {
+/// make the whole box ignorable (Table I.9), reported as `None`. The
+/// PROFILE copy is charged against `max_decoded_bytes` BEFORE it is
+/// allocated (the metadata-cost discipline); an over-limit profile is
+/// dropped with a warning, keeping only the declaration.
+fn parse_colr(
+    payload: &[u8],
+    limits: &DecodeLimits,
+    warnings: &mut Vec<JpxWarning>,
+) -> Result<Option<ColorSpec>> {
     if payload.len() < 3 {
         return Err(malformed("colr box shorter than METH/PREC/APPROX"));
     }
@@ -674,9 +689,22 @@ fn parse_colr(payload: &[u8], warnings: &mut Vec<JpxWarning>) -> Result<Option<C
             }
             Ok(Some(ColorSpec::Enumerated(be32(&payload[3..]))))
         }
-        2 => Ok(Some(ColorSpec::Icc {
-            profile_len: (payload.len() - 3) as u32,
-        })),
+        2 => {
+            let profile = &payload[3..];
+            if profile.len() as u64 > limits.max_decoded_bytes {
+                warnings.push(JpxWarning::note(format!(
+                    "colr ICC profile of {} bytes exceeds max_decoded_bytes; \
+                     profile not carried",
+                    profile.len()
+                )));
+                return Ok(Some(ColorSpec::Icc {
+                    profile: Vec::new(),
+                }));
+            }
+            Ok(Some(ColorSpec::Icc {
+                profile: profile.to_vec(),
+            }))
+        }
         other => {
             // Table I.9: reserved METH -> ignore the entire box.
             warnings.push(JpxWarning::note(format!(
@@ -874,6 +902,12 @@ mod tests {
     }
 
     // ---- test helpers -------------------------------------------------
+
+    /// The production `scan` under the default limits (shadowing wrapper:
+    /// every existing call site reads unchanged).
+    fn scan(data: &[u8]) -> Result<Container<'_>> {
+        super::scan(data, &DecodeLimits::default())
+    }
 
     fn fixture(name: &str) -> Vec<u8> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1165,7 +1199,7 @@ mod tests {
         assert_eq!(header.bit_depth, 255);
         assert_eq!(header.component_depths, vec![7, 137]);
         match header.color {
-            ColorSpec::Icc { profile_len } => assert_eq!(profile_len, 20),
+            ColorSpec::Icc { profile } => assert_eq!(profile, vec![9; 20]),
             ColorSpec::Enumerated(value) => panic!("expected ICC, got EnumCS {value}"),
         }
         let palette = header.palette.unwrap();
@@ -1221,6 +1255,39 @@ mod tests {
         let header = scan(&file).unwrap().header.unwrap();
         let palette = header.palette.unwrap();
         assert_eq!(palette.values, vec![771, -1]);
+    }
+
+    #[test]
+    fn oversize_icc_profile_is_dropped_before_allocation() {
+        // A METH = 2 PROFILE larger than max_decoded_bytes is never
+        // copied: the declaration survives with empty bytes plus a
+        // warning, so the colour stage still knows the box was ICC.
+        let mut colr = vec![2, 0, 0];
+        colr.extend_from_slice(&[9; 64]);
+        let children = vec![
+            boxed(b"ihdr", &ihdr_payload(5, 3, 1, 7)),
+            boxed(b"colr", &colr),
+        ];
+        let file = build_jp2(&children, &soc_siz());
+        let tight = DecodeLimits {
+            max_decoded_bytes: 16,
+            ..DecodeLimits::default()
+        };
+        let container = super::scan(&file, &tight).unwrap();
+        match container.header.unwrap().color {
+            ColorSpec::Icc { profile } => assert!(profile.is_empty()),
+            ColorSpec::Enumerated(value) => panic!("expected ICC, got EnumCS {value}"),
+        }
+        assert!(container
+            .warnings
+            .iter()
+            .any(|w| !w.data_loss && w.message.contains("profile not carried")));
+        // Under the default limits the same box carries its bytes.
+        let container = scan(&file).unwrap();
+        match container.header.unwrap().color {
+            ColorSpec::Icc { profile } => assert_eq!(profile, vec![9; 64]),
+            ColorSpec::Enumerated(value) => panic!("expected ICC, got EnumCS {value}"),
+        }
     }
 
     #[test]
