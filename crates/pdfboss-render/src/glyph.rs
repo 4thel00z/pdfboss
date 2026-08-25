@@ -31,7 +31,7 @@ use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Matrix, Ob
 
 use crate::cff::CffFont;
 use crate::path::{PathBuilder, Subpath};
-use crate::substitute::{FaceRequest, SubstituteProvider};
+use crate::substitute::{nonsymbolic, FaceRequest, SubstituteProvider};
 use crate::truetype::{Seg, TrueType};
 use crate::type1::Type1Font;
 use crate::GlyphPainting;
@@ -829,16 +829,24 @@ impl SubstituteInputs {
         // substitute paints nothing, even though the AFM width path further
         // down (`is_standard_encoding`) already defaults an absent `/Encoding`
         // to StandardEncoding for advances. Match that default here for the
-        // code -> glyph mapping too: a recognized standard-14 `/BaseFont` with
-        // no `/Encoding` key implies StandardEncoding (ISO 32000-1 9.6.6's
-        // built-in encoding for the standard 14), so this substitute face's
-        // `cmap` gets a real code -> char accessor instead of none at all. A
-        // `/Differences` entry (checked first, below) still takes precedence
-        // over this default, exactly as it does over an explicit `/Encoding`.
-        let base = base_encoding(src, font).await.or_else(|| {
-            pdfboss_encoding::is_standard_14(base_font)
-                .then_some(pdfboss_encoding::standard as fn(u8) -> Option<char>)
-        });
+        // code -> glyph mapping too, in two spec-anchored cases: a recognized
+        // standard-14 `/BaseFont` with no `/Encoding` key implies
+        // StandardEncoding (ISO 32000-1 9.6.6's built-in encoding for the
+        // standard 14); and a descriptor whose `/Flags` declare Nonsymbolic
+        // states outright that the font uses the Adobe standard Latin
+        // character set (Table 121), whose built-in encoding is the standard
+        // one (Annex D) -- without the font program the built-in table itself
+        // is unreadable, and StandardEncoding is its defined shape. A
+        // symbolic font's built-in encoding is unknowable here, so it is
+        // never guessed. A `/Differences` entry (checked first, below) still
+        // takes precedence over this default, exactly as it does over an
+        // explicit `/Encoding`.
+        let mut base = base_encoding(src, font).await;
+        if base.is_none()
+            && (pdfboss_encoding::is_standard_14(base_font) || nonsymbolic(src, font).await)
+        {
+            base = Some(pdfboss_encoding::standard);
+        }
         let diffs = differences(src, font).await;
         let widths = simple_widths(src, font).await;
         let afm_widths = afm_14_widths(src, font, base_font, &diffs).await;
@@ -2215,6 +2223,84 @@ mod tests {
         assert!(
             !plans_fallback(&metrics_only, GlyphPainting::Full, provider),
             "a metrics-only font's unpainted codes are tier behavior"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A one-page 200x200 document showing `content` with a NON-embedded
+    /// `/Type1 /PlainText` font (a name matching no standard-14 entry and no
+    /// family keyword) whose descriptor carries `flags` and whose dict has
+    /// no `/Encoding` at all -- the shape whose substitute table hinges
+    /// entirely on the descriptor's Nonsymbolic bit.
+    fn no_encoding_font_doc(flags: i64, content: &[u8]) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /PlainText \
+             /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            &format!("<< /Type /FontDescriptor /FontName /PlainText /Flags {flags} >>"),
+        );
+        b.build(1)
+    }
+
+    #[test]
+    fn nonsymbolic_font_without_encoding_substitutes_via_standard_encoding() {
+        let dir = write_temp_face("Tinos-Regular.ttf", &build_font());
+        let opts = || RenderOptions {
+            glyph_painting: GlyphPainting::Full,
+            substitutes: SubstituteSource::Dir(dir.clone()),
+        };
+
+        // Serif (0x2) + Nonsymbolic (0x20): the descriptor states the font
+        // uses the standard Latin character set, so the absent `/Encoding`
+        // defaults to StandardEncoding and 'A' resolves through the
+        // substitute face's cmap.
+        let bytes = no_encoding_font_doc(0x22, b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        let pix = render_with(&bytes, opts());
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "a nonsymbolic font with no /Encoding substitutes via StandardEncoding"
+        );
+
+        // Serif (0x2) + Symbolic (0x4): the built-in encoding is unknowable
+        // without the font program and is never guessed -- the code stays
+        // unpainted and is reported, exactly as before.
+        let bytes = no_encoding_font_doc(0x6, b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let (pix, report) =
+            crate::render_page_reporting(&doc, &page, 1.0, &opts()).expect("render");
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "a symbolic font's built-in encoding is never guessed"
+        );
+        let drops: Vec<_> = report
+            .skipped
+            .iter()
+            .map(|s| (s.kind, s.reason.clone(), s.count))
+            .collect();
+        assert_eq!(
+            drops,
+            vec![(
+                crate::SkippedKind::Glyph,
+                crate::SkipReason::NoGlyph {
+                    code: 65,
+                    font: "PlainText".to_string(),
+                },
+                1,
+            )],
         );
 
         std::fs::remove_dir_all(&dir).ok();
