@@ -72,9 +72,10 @@ fn level_shift_and_clamp(value: i64, depth: u8, signed: bool) -> i64 {
 /// Signed samples are first re-centred to unsigned by adding `2^(depth-1)`
 /// (the G.1.2 shift, applied at output time because the codestream carried
 /// them signed). Then, per the crate contract: depth > 8 right-shifts by
-/// `depth - 8` (drops the low bits, bit-exact with the 16-bit oracle
-/// convention); depth < 8 scales to the full range as
-/// `round(v * 255 / (2^depth - 1))` (computed as
+/// `depth - 8` with round-to-nearest — `(v + 2^(shift-1)) >> shift`,
+/// saturated at 255 (the midpoint `2^(depth-1)` still lands exactly on
+/// 128, which the sYCC chroma centring relies on); depth < 8 scales to
+/// the full range as `round(v * 255 / (2^depth - 1))` (computed as
 /// `(v*255 + floor(max/2)) / max`); depth 8 passes through.
 fn normalize_to_u8(value: i64, depth: u8, signed: bool) -> u8 {
     let d = usable_depth(depth);
@@ -82,7 +83,8 @@ fn normalize_to_u8(value: i64, depth: u8, signed: bool) -> u8 {
     let max = (1i64 << d) - 1;
     let v = if signed { value + half } else { value }.clamp(0, max);
     if d > 8 {
-        (v >> (d - 8)) as u8
+        let shift = d - 8;
+        ((v + (1i64 << (shift - 1))) >> shift).min(255) as u8
     } else if d < 8 {
         ((v * 255 + max / 2) / max) as u8
     } else {
@@ -357,9 +359,9 @@ fn apply_inverse_mct(
 /// tile's MCT flag is set (Table A.17); inverse DC level shift (G.1.2, and
 /// Table A.11 signedness); palette + component mapping (I.5.3.4/I.5.3.5);
 /// sYCC → RGB when colr signals EnumCS 18 (I.5.3.3); replication upsampling
-/// of subsampled components onto the reference grid (G.4/B.2); 16-bit
-/// depths right-shifted to 8 and everything clamped to 0..=255 (crate
-/// contract). `finish` crops to the image region — the canvas starts at
+/// of subsampled components onto the reference grid (G.4/B.2); deep
+/// depths right-shifted to 8 with round-to-nearest and everything clamped
+/// to 0..=255 (crate contract). `finish` crops to the image region — the canvas starts at
 /// (XOsiz, YOsiz), size (Xsiz - XOsiz) x (Ysiz - YOsiz) (B-1/B-2) — and
 /// reports the cdef opacity channel (I.5.3.6) as `alpha_index`.
 // Internal state is the colour stage's to design; only the three method
@@ -1071,20 +1073,35 @@ mod tests {
         // depth 8 signed: +2^7 recentre. -128 -> 0; 127 -> 255.
         assert_eq!(normalize_to_u8(-128, 8, true), 0);
         assert_eq!(normalize_to_u8(127, 8, true), 255);
-        // depth 12 (> 8): arithmetic right shift by 12 - 8 = 4.
-        // 4095 >> 4 = 255; 2048 >> 4 = 128; 100 >> 4 = 6.
+        // depth 12 (> 8): rounded right shift by 12 - 8 = 4, i.e.
+        // (v + 8) >> 4 capped at 255.
+        // 4095 -> 4103 >> 4 = 256, saturated 255; 2048 -> 2056 >> 4 = 128
+        // (128,5 floors to 128); 100 -> 108 >> 4 = 6 (6,75 floors to 6).
         assert_eq!(normalize_to_u8(4095, 12, false), 255);
         assert_eq!(normalize_to_u8(2048, 12, false), 128);
         assert_eq!(normalize_to_u8(100, 12, false), 6);
-        // depth 12 signed: -2048 + 2048 = 0 -> 0; 100 + 2048 = 2148 >> 4 = 134.
+        // depth 12 signed: -2048 + 2048 = 0 -> 0;
+        // 100 + 2048 = 2148 -> 2156 >> 4 = 134 (134,75 floors to 134).
         assert_eq!(normalize_to_u8(-2048, 12, true), 0);
         assert_eq!(normalize_to_u8(100, 12, true), 134);
-        // depth 16: shift by 8. 65535 >> 8 = 255; 26052 >> 8 = 101 (the
-        // crate's "drop the low byte" contract); 258 >> 8 = 1.
+        // depth 16: rounded shift by 8, (v + 128) >> 8 capped at 255.
+        // 65535 -> 65663 >> 8 = 256, saturated 255;
+        // 26052 -> 26180 >> 8 = 102 (26052 / 256 = 101,77 rounds UP —
+        // truncation gave 101); 258 -> 386 >> 8 = 1 (1,5 floors to 1).
         assert_eq!(normalize_to_u8(65535, 16, false), 255);
-        assert_eq!(normalize_to_u8(26052, 16, false), 101);
+        assert_eq!(normalize_to_u8(26052, 16, false), 102);
         assert_eq!(normalize_to_u8(258, 16, false), 1);
-        // depth 16 signed: 0 + 32768 = 32768 >> 8 = 128.
+        // A value where rounding and truncation disagree, pinned:
+        // 25800 / 256 = 100,78 -> 101; a plain 25800 >> 8 gave 100.
+        assert_eq!(normalize_to_u8(25800, 16, false), 101);
+        // The midpoint invariant the sYCC chroma centring relies on:
+        // 2^(d-1) -> exactly 128 at every deep depth.
+        for depth in 9..=32u8 {
+            let mid = 1i64 << (depth - 1);
+            assert_eq!(normalize_to_u8(mid, depth, false), 128, "depth {depth}");
+        }
+        // depth 16 signed: 0 + 32768 = 32768 -> 32896 >> 8 = 128 (the
+        // recentred midpoint, 128,5 flooring to 128).
         assert_eq!(normalize_to_u8(0, 16, true), 128);
         assert_eq!(normalize_to_u8(-32768, 16, true), 0);
         // depth 1 (< 8): scale by round(v*255/(2^1 - 1)) = v*255.

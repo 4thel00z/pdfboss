@@ -15,9 +15,9 @@
 //! code-block zeroes the remainder of its scope (at most its own tile;
 //! sibling tiles keep decoding), appends one warning to
 //! [`DecodedImage::warnings`], and decoding continues. Output samples are
-//! 8-bit: 16-bit sources are right-shifted to 8, signed samples are
-//! level-shifted per T.800 G.1.2. The decoder never panics on hostile
-//! input and contains no `unsafe`.
+//! 8-bit: deeper sources are right-shifted to 8 with round-to-nearest,
+//! signed samples are level-shifted per T.800 G.1.2. The decoder never
+//! panics on hostile input and contains no `unsafe`.
 
 mod boxes;
 mod color;

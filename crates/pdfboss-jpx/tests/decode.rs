@@ -270,9 +270,9 @@ fn expected_channels(mode: &str) -> u8 {
 // ---------------------------------------------------------------------
 // Minimal PNG reader for the oracle images (test-support): 8/16-bit,
 // colour types 0 (grey), 2 (RGB), 6 (RGBA), no interlace. 16-bit samples
-// are normalized to 8 bits by dropping the low byte — exactly the crate's
-// "right-shift 16-bit sources to 8" output contract, so oracle and
-// decoder output stay directly comparable.
+// are normalized to 8 bits as (v + 128) >> 8 capped at 255 — exactly the
+// crate's round-to-nearest deep-depth contract, so oracle and decoder
+// output stay directly comparable.
 // ---------------------------------------------------------------------
 
 struct Oracle {
@@ -340,8 +340,16 @@ fn decode_png(data: &[u8]) -> Oracle {
     let samples = if bit_depth == 8 {
         recon
     } else {
-        // Big-endian 16-bit: the high byte IS the value >> 8.
-        recon.iter().step_by(2).copied().collect()
+        // Big-endian 16-bit, rounded to nearest like the decoder.
+        recon
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let v = u32::from(u16::from_be_bytes(*pair));
+                ((v + 128) >> 8).min(255) as u8
+            })
+            .collect()
     };
     assert_eq!(
         samples.len(),
@@ -793,13 +801,14 @@ fn png_reader_matches_independently_verified_samples() {
         2_009_088
     );
 
-    // 16-bit greyscale, normalized by >> 8: last sample 26052 >> 8 = 101.
+    // 16-bit greyscale, normalized round-to-nearest: the last raw sample
+    // 26052 maps to (26052 + 128) >> 8 = 102 (truncation gave 101).
     let gray16 = read_oracle(&fixture_dir().join("gray16-53-jp2.src.png"));
     assert_eq!((gray16.width, gray16.height, gray16.channels), (80, 50, 1));
-    assert_eq!(*gray16.samples.last().unwrap(), 101);
+    assert_eq!(*gray16.samples.last().unwrap(), 102);
     assert_eq!(
         gray16.samples.iter().map(|&v| u64::from(v)).sum::<u64>(),
-        201_516
+        203_520
     );
 }
 
