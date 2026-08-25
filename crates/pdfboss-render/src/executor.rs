@@ -5879,6 +5879,7 @@ mod tests {
         let opts = RenderOptions {
             glyph_painting: GlyphPainting::Full,
             substitutes: SubstituteSource::Dir(dir.clone()),
+            ..Default::default()
         };
         let out = crate::render_page_reporting(&doc, &page, 1.0, &opts).expect("render");
         std::fs::remove_dir_all(&dir).ok();
@@ -6022,6 +6023,7 @@ mod tests {
         let opts = RenderOptions {
             glyph_painting: GlyphPainting::Full,
             substitutes: SubstituteSource::Dir(dir.clone()),
+            ..Default::default()
         };
         let (pix, report) = crate::render_page_reporting(&doc, &page, 1.0, &opts).expect("render");
         std::fs::remove_dir_all(&dir).ok();
