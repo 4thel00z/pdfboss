@@ -73,7 +73,8 @@ impl OcState {
     /// Whether content gated by `value` — the operand of a stream or
     /// annotation dictionary's `/OC` entry — is visible: a group reference
     /// is visible unless the group is off; a membership dictionary follows
-    /// [`OcState::ocmd_visible`]. A direct group dictionary has no
+    /// its `/VE` visibility expression, else its `/P` policy over `/OCGs`.
+    /// A direct group dictionary has no
     /// reference identity to be turned off by, and anything malformed is
     /// left visible.
     pub async fn visible_with<S: AsyncObjectSource>(&self, src: &S, value: &Object) -> bool {
