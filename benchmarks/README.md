@@ -170,3 +170,15 @@ writes `results-memory.json`. The real-world corpora are local and not
 committed — those results record page counts, sizes and directory basenames,
 never file names. The stress corpus is public (OSS-Fuzz) and its results name
 it, but it stays outside the repo too.
+
+## olmOCR-bench
+
+[olmocr/](olmocr/) wires pdfboss into
+[olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench), a
+public suite of 7,010 machine-checkable tests (text presence, reading order,
+table structure, math rendering) over 1,403 single-page PDFs.
+`olmocr/generate_candidates.py` writes the markdown candidate tree the
+suite's scorer reads; results land in `results-olmocr.json`. pdfboss is a
+non-OCR engine, so the honest headline is the born-digital buckets — the
+scan and LaTeX-math buckets score near zero by construction. The recipe and
+the full interpretation notes are in [olmocr/README.md](olmocr/README.md).
