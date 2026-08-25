@@ -250,6 +250,7 @@ fn resolve_render_options(
     Ok(pdfboss_render::RenderOptions {
         glyph_painting,
         substitutes,
+        ..Default::default()
     })
 }
 
@@ -1004,6 +1005,11 @@ impl AsyncDocument {
                 Some(wanted) => wanted,
                 None => (0..inner.page_count()).collect(),
             });
+            // The document's optional-content configuration, read once and
+            // shared by every worker — the async twin of what the sync
+            // entry points do per render.
+            let mut opts = opts;
+            opts.oc = inner.oc_state().await.map(Arc::new);
             let opts = Arc::new(opts);
             let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let workers = std::thread::available_parallelism()

@@ -5,8 +5,8 @@ use crate::font::Font;
 use crate::{Ruling, TextSpan};
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
-    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, ObjRef, Object,
-    Page, Point,
+    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Name, ObjRef,
+    Object, OcState, Page, Point,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -39,11 +39,20 @@ const RULING_MAX_FILL_THICKNESS: f32 = 3.0;
 pub struct ExtractReport {
     /// Every piece of content that yielded no text, in encounter order.
     pub skipped: Vec<SkippedText>,
+    /// Content the document's optional-content configuration turns off
+    /// (ISO 32000-1 §8.11): one count per `BDC /OC` span whose own
+    /// membership evaluated hidden and per form XObject with a hidden
+    /// `/OC` entry — a counter rather than entries, so a layer-heavy page
+    /// cannot balloon `skipped`. Configured behavior, not a loss:
+    /// [`ExtractReport::is_complete`] ignores it.
+    pub hidden: u64,
 }
 
 impl ExtractReport {
     /// True when every operator stream was fetched, parsed, and executed —
-    /// nothing the extraction saw was left out of the result.
+    /// nothing the extraction saw was left out of the result. Content the
+    /// document's optional-content configuration hides (`hidden`) was read
+    /// and deliberately excluded, so it does not count against this.
     pub fn is_complete(&self) -> bool {
         self.skipped.is_empty()
     }
@@ -171,6 +180,7 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     fonts: Option<&FontCache>,
+    oc: Option<&OcState>,
 ) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
     let mut report = ExtractReport::default();
     let content = match page_content_with(&src, page).await {
@@ -196,6 +206,7 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         report,
         loaded: HashMap::new(),
         shared: fonts,
+        oc,
     };
     let root = Frame::new(
         ops.into(),
@@ -386,6 +397,11 @@ struct Frame {
     /// Loaded fonts, per operator stream: every form invocation starts with an
     /// empty cache, as it did when each invocation was its own `run` call.
     fonts: HashMap<String, Arc<Font>>,
+    /// The marked-content stack: one entry per open `BMC`/`BDC`, `true` for
+    /// a `BDC /OC` span the optional-content configuration hides. Per frame
+    /// like `tm`/`tlm` — `BMC`/`EMC` nesting is not `q`/`Q` scoped and never
+    /// crosses a stream boundary. A stray `EMC` pops nothing.
+    marks: Vec<bool>,
 }
 
 impl Frame {
@@ -401,7 +417,15 @@ impl Frame {
             tlm: Matrix::identity(),
             subpaths: Vec::new(),
             fonts: HashMap::new(),
+            marks: Vec::new(),
         }
+    }
+
+    /// Whether the frame is inside a marked-content span the
+    /// optional-content configuration hides: state still executes, but the
+    /// span's text and rulings are excluded from the result.
+    fn suppressed(&self) -> bool {
+        self.marks.iter().any(|hidden| *hidden)
     }
 
     fn move_to(&mut self, x: f32, y: f32) {
@@ -478,6 +502,9 @@ struct Executor<'a, S> {
     /// Fonts carried across page walks, when the caller extracts a whole
     /// document and passes one [`FontCache`] to every page.
     shared: Option<&'a FontCache>,
+    /// The document's optional-content visibility; `None` extracts every
+    /// layer.
+    oc: Option<&'a OcState>,
 }
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
@@ -626,6 +653,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         }
                     }
                     Op::XObject(name) => {
+                        // Inside a hidden span the whole invocation is part
+                        // of the span: never entered, never reported.
+                        if frame.suppressed() {
+                            continue;
+                        }
                         let entered = self
                             .form_frame(&name.0, &frame.chain, &frame.gs, frame.depth)
                             .await;
@@ -638,6 +670,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                             frames.push(child);
                             continue 'frames;
                         }
+                    }
+                    Op::BeginMarkedContentProps(tag, props) => {
+                        let hidden = self.marked_hidden(tag, props, &frame.chain).await;
+                        if hidden {
+                            self.report.hidden += 1;
+                        }
+                        frame.marks.push(hidden);
                     }
                     op => self.step(&mut frame, op),
                 }
@@ -748,10 +787,32 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // `W`/`W*` never commit by themselves: the paint operator that
             // must follow them does, and after a clip that operator is `n`.
             Op::EndPath => frame.subpaths.clear(),
-            // Text render mode 3 (invisible) is still extracted, so `Tr` and
-            // everything else is a no-op here.
+            // Marked content: every open is pushed (hidden or not) so `EMC`
+            // stays balanced; `BDC` needs I/O and is handled in `run`.
+            Op::BeginMarkedContent(_) => frame.marks.push(false),
+            Op::EndMarkedContent => {
+                frame.marks.pop();
+            }
+            // Text render mode 3 (invisible) is still extracted — the
+            // document shows that text, a viewer just paints it blank.
+            // Optional content is the opposite species: the document
+            // declares the layer off, so a hidden span IS skipped (see
+            // `emit`). `Tr` and everything else is a no-op here.
             _ => {}
         }
+    }
+
+    /// Whether a `BDC` opens a span the optional-content configuration
+    /// hides: only `/OC` tags gate anything, and with no configuration (or
+    /// anything unresolvable) every span is visible.
+    async fn marked_hidden(&self, tag: &Name, props: &Object, chain: &[Arc<Dict>]) -> bool {
+        let Some(oc) = self.oc else {
+            return false;
+        };
+        if tag.0 != "OC" {
+            return false;
+        }
+        !oc.props_visible_with(self.src, chain, props).await
     }
 
     /// Commits the accumulated path on a painting operator and clears it.
@@ -759,6 +820,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// device-space line width; filled subpaths yield the centerline of a
     /// thin axis-aligned rectangle. Poisoned subpaths yield nothing.
     fn commit_rulings(&mut self, frame: &mut Frame, stroke: bool, fill: bool) {
+        // A hidden span's lines are configured away with its text; the
+        // path still clears, exactly as a paint operator leaves it.
+        if frame.suppressed() {
+            frame.subpaths.clear();
+            return;
+        }
         let ctm = frame.gs.ctm;
         let width = frame.gs.line_width * ctm_scale(&ctm);
         for sub in frame.subpaths.drain(..) {
@@ -785,10 +852,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
-    /// Shows one string, appending the span it produces (if any) to the page.
+    /// Shows one string, appending the span it produces (if any) to the
+    /// page. Inside a hidden optional-content span the advance still runs —
+    /// `show` moves the text matrix either way — but the text is excluded.
     fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
+        let suppressed = frame.suppressed();
         if let Some(span) = self.show(&frame.gs, &mut frame.tm, bytes) {
-            self.spans.push(span);
+            if !suppressed {
+                self.spans.push(span);
+            }
         }
     }
 
@@ -887,6 +959,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if !is_form {
             return None; // images and other XObjects carry no text
         }
+        // A form with a hidden `/OC` entry is configured away with its
+        // whole subtree: counted on the dedicated counter, never a skip.
+        if let (Some(oc), Some(gate)) = (self.oc, stream.dict.get("OC")) {
+            if !oc.visible_with(self.src, gate).await {
+                self.report.hidden += 1;
+                return None;
+            }
+        }
         // Through the content chokepoint, not raw stream_data: a form whose
         // trailing /Filter is an image codec holds passthrough bytes, not
         // operators (see `content_stream_data_with`). The refusal is a
@@ -964,17 +1044,151 @@ mod tests {
     /// asserts on exactly what a synchronous caller receives. The report is
     /// asserted complete: no test here expects to lose content.
     fn page_spans(doc: &Document, page: &Page) -> Vec<TextSpan> {
-        let (spans, _, report) = block_on(page_spans_and_rulings_with(Immediate(doc), page, None));
+        let (spans, _, report) = extract_all(doc, page);
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         spans
     }
 
     /// The synchronous rulings accessor, the twin of [`page_spans`].
     fn page_rulings(doc: &Document, page: &Page) -> Vec<Ruling> {
-        let (_, rulings, report) =
-            block_on(page_spans_and_rulings_with(Immediate(doc), page, None));
+        let (_, rulings, report) = extract_all(doc, page);
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         rulings
+    }
+
+    /// One walk with the document's own optional-content configuration —
+    /// exactly what the `lib.rs` document-level entries drive.
+    fn extract_all(doc: &Document, page: &Page) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
+        let oc = doc.oc_state();
+        block_on(page_spans_and_rulings_with(
+            Immediate(doc),
+            page,
+            None,
+            oc.as_ref(),
+        ))
+    }
+
+    /// One page over two optional content groups: object 8 stays on,
+    /// object 9 is off in the default configuration, reachable from
+    /// content as `/Properties` entries `/V` and `/H`; `/Fx` is a form
+    /// gated off by its own `/OC` entry.
+    fn oc_doc(content: &[u8]) -> Document {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties \
+             << /OCGs [8 0 R 9 0 R] /D << /OFF [9 0 R] >> >> >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> \
+             /Properties << /V 8 0 R /H 9 0 R >> \
+             /XObject << /Fx 6 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /OC 9 0 R",
+            b"BT /F1 12 Tf 72 600 Td (formtext) Tj ET",
+        );
+        b.object(8, "<< /Type /OCG /Name (shown) >>");
+        b.object(9, "<< /Type /OCG /Name (hidden) >>");
+        Document::load(b.build(1)).expect("load")
+    }
+
+    /// A hidden layer's text is excluded and counted once per span, while
+    /// its advances still run: the visible text that follows starts where
+    /// the hidden run ended, and the walk is still complete.
+    #[test]
+    fn hidden_layer_text_is_excluded_but_still_advances() {
+        let doc = oc_doc(
+            b"BT /F1 12 Tf 72 720 Td /OC /H BDC (wide hidden run) Tj EMC (kept) Tj \
+              /OC /V BDC ( on) Tj EMC ET",
+        );
+        let page = doc.page(0).unwrap();
+        let (spans, _, report) = extract_all(&doc, &page);
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["kept", " on"]);
+        assert!(
+            spans[0].x > 100.0,
+            "the hidden run must still advance: x = {}",
+            spans[0].x
+        );
+        assert_eq!(report.hidden, 1);
+        assert!(report.is_complete(), "hidden is not a skip: {report:?}");
+    }
+
+    /// A form whose own `/OC` entry is off contributes nothing — no spans,
+    /// no skip entry, one count — and rulings drawn in a hidden span are
+    /// excluded with the text.
+    #[test]
+    fn hidden_forms_and_rulings_are_excluded() {
+        let doc = oc_doc(b"/Fx Do /OC /H BDC 72 700 m 272 700 l S EMC 72 650 m 272 650 l S");
+        let page = doc.page(0).unwrap();
+        let (spans, rulings, report) = extract_all(&doc, &page);
+        assert_eq!(spans, vec![], "the gated form must not run");
+        assert_eq!(rulings.len(), 1, "only the visible line survives");
+        assert!((rulings[0].start.y - 650.0).abs() < 1e-3);
+        assert_eq!(report.hidden, 2, "one form, one span");
+        assert!(report.is_complete());
+    }
+
+    /// `3 Tr` text is a viewer-invisible layer the document still shows —
+    /// searchable-scan OCR — and stays extracted; an off optional-content
+    /// layer is declared off by the document itself and is excluded. The
+    /// two must not be conflated.
+    #[test]
+    fn invisible_render_mode_survives_where_hidden_layers_do_not() {
+        let doc = oc_doc(
+            b"BT /F1 12 Tf 3 Tr 72 720 Td (ocr) Tj ET \
+              /OC /H BDC BT /F1 12 Tf 72 700 Td (gone) Tj ET EMC",
+        );
+        let page = doc.page(0).unwrap();
+        let (spans, _, report) = extract_all(&doc, &page);
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["ocr"]);
+        assert_eq!(report.hidden, 1);
+    }
+
+    /// Without `/OCProperties` there is no configuration to be off in:
+    /// every `/OC` span extracts and nothing is counted.
+    #[test]
+    fn absent_configuration_extracts_every_layer() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> \
+             /Properties << /H 8 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf 72 720 Td /OC /H BDC (loose) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(8, "<< /Type /OCG /Name (loose) >>");
+        let doc = Document::load(b.build(1)).expect("load");
+        let page = doc.page(0).unwrap();
+        let (spans, _, report) = extract_all(&doc, &page);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "loose");
+        assert_eq!(report.hidden, 0);
     }
 
     /// Raw spans of a one-page document with `content` as its raw content
@@ -1101,8 +1315,12 @@ mod tests {
         let page = doc.page(0).unwrap();
         // Raw call: exhausting the budget is this test's point, so the
         // report is legitimately incomplete here.
-        let (spans, _, report) =
-            block_on(page_spans_and_rulings_with(Immediate(&doc), &page, None));
+        let (spans, _, report) = block_on(page_spans_and_rulings_with(
+            Immediate(&doc),
+            &page,
+            None,
+            None,
+        ));
         assert!(!spans.is_empty()); // nested forms still extract text
         assert!(
             spans.len() <= MAX_FORM_INVOCATIONS,

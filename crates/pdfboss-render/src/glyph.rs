@@ -2324,6 +2324,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::Dir(dir.clone()),
+                ..Default::default()
             },
         );
         assert!(
@@ -2338,6 +2339,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::None,
+                ..Default::default()
             },
         );
         assert!(
@@ -2352,6 +2354,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::AllEmbedded,
                 substitutes: SubstituteSource::Dir(dir.clone()),
+                ..Default::default()
             },
         );
         assert!(
@@ -2387,6 +2390,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::Dir(dir.clone()),
+                ..Default::default()
             },
         );
         assert!(
@@ -2419,6 +2423,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::Dir(dir.clone()),
+                ..Default::default()
             },
         );
         assert!(
@@ -2454,6 +2459,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::Dir(dir.clone()),
+                ..Default::default()
             },
         );
         assert!(
@@ -2508,6 +2514,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::Builtin,
+                ..Default::default()
             },
         );
         assert!(
@@ -2533,6 +2540,7 @@ mod tests {
             RenderOptions {
                 glyph_painting: GlyphPainting::Full,
                 substitutes: SubstituteSource::Builtin,
+                ..Default::default()
             },
         );
         assert!(

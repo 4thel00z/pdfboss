@@ -1362,6 +1362,15 @@ impl AsyncDocument {
         Some(decode_text_string(value.as_str_bytes()?))
     }
 
+    /// The document's optional-content visibility under its default
+    /// configuration, or `None` when the catalog declares no
+    /// `/OCProperties` — the async twin of the sync document's `oc_state`.
+    /// A rendering caller passes it on through
+    /// `pdfboss_render::RenderOptions::oc`.
+    pub async fn oc_state(&self) -> Option<pdfboss_core::OcState> {
+        pdfboss_core::OcState::load_with(self, &self.inner.xref.trailer).await
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.

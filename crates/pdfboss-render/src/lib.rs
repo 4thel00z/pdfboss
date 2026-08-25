@@ -46,8 +46,9 @@ mod type1;
 mod type3;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use pdfboss_core::{AsyncObjectSource, Document, Error, Page, Result};
+use pdfboss_core::{AsyncObjectSource, Document, Error, OcState, Page, Result};
 
 /// An RGBA8 raster image with straight (non-premultiplied) alpha, row-major
 /// from the top-left.
@@ -186,6 +187,14 @@ pub struct RenderOptions {
     /// Where `Full`-tier substitution draws replacement faces from. Ignored
     /// at every other tier.
     pub substitutes: SubstituteSource,
+    /// The document's optional-content visibility (ISO 32000-1 §8.11):
+    /// content in groups the default configuration turns off is not
+    /// painted, counted in [`RenderReport::hidden`]. The synchronous entry
+    /// points fill this from the document when it is `None`; an
+    /// asynchronous caller builds it itself (e.g.
+    /// `AsyncDocument::oc_state`), and leaving it `None` there renders
+    /// every layer.
+    pub oc: Option<Arc<OcState>>,
 }
 
 /// Whether this binary was built with the `substitute-fonts` feature, i.e.
@@ -236,7 +245,9 @@ pub fn render_page_reporting(
 /// Renders a page like [`render_page_reporting`] against any object source,
 /// awaiting whatever I/O the source needs — this is the asynchronous entry
 /// point, and the synchronous ones above are this implementation over
-/// `pdfboss_core::Immediate`, so the two APIs cannot render differently.
+/// `pdfboss_core::Immediate` (with [`RenderOptions::oc`] filled from the
+/// document when the caller left it unset), so under the same options the
+/// two APIs cannot render differently.
 ///
 /// The source is taken by value and the page by reference, which is the
 /// combination a consumer needs to spawn the result: the future is `Send`
@@ -430,6 +441,13 @@ pub struct RenderReport {
     /// Drops that arrived after `skipped` reached its 64-entry cap and so
     /// are counted but not described.
     pub unlisted: u64,
+    /// Content the document's optional-content configuration turns off
+    /// (ISO 32000-1 §8.11): one count per `BDC /OC` span whose own
+    /// membership evaluated hidden, per XObject with a hidden `/OC` entry,
+    /// and per annotation with a hidden `/OC` entry. Configured behavior,
+    /// not a loss, so it plays no part in [`RenderReport::is_empty`],
+    /// [`RenderReport::summary`], or [`RenderReport::warnings`].
+    pub hidden: u64,
 }
 
 impl RenderReport {

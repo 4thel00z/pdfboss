@@ -330,14 +330,13 @@ async fn shared_algorithms_run_over_the_async_document() {
             let text = pdfboss_output::extract_text_with(doc.clone(), &page)
                 .await
                 .expect("async text");
-            let (pix, _) = pdfboss_render::render_page_reporting_with(
-                doc,
-                &page,
-                1.0,
-                &pdfboss_render::RenderOptions::default(),
-            )
-            .await
-            .expect("async render");
+            let opts = pdfboss_render::RenderOptions {
+                oc: doc.oc_state().await.map(std::sync::Arc::new),
+                ..Default::default()
+            };
+            let (pix, _) = pdfboss_render::render_page_reporting_with(doc, &page, 1.0, &opts)
+                .await
+                .expect("async render");
             (text, pix)
         });
         let (text, pix) = handle.await.expect("spawned task");
@@ -347,6 +346,67 @@ async fn shared_algorithms_run_over_the_async_document() {
             "page {i}: rendered pixels must be byte-identical"
         );
     }
+}
+
+/// A document with optional content renders identically over both
+/// documents once the async caller passes `AsyncDocument::oc_state` through
+/// the render options — the synchronous entry reads the same configuration
+/// itself. Leaving the options bare paints the hidden layer, so the
+/// comparison genuinely exercises the gate.
+#[tokio::test]
+async fn optional_content_renders_identically() {
+    let mut b = PdfBuilder::new();
+    b.object(
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /OCProperties \
+         << /OCGs [8 0 R] /D << /OFF [8 0 R] >> >> >>",
+    );
+    b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+         /Resources << /Properties << /H 8 0 R >> >> /Contents 4 0 R >>",
+    );
+    b.stream(4, "", b"1 0 0 rg /OC /H BDC 10 10 80 80 re f EMC");
+    b.object(8, "<< /Type /OCG /Name (layer) >>");
+    let bytes = b.build(1);
+
+    let sync_doc = Document::load(bytes.clone()).expect("sync load");
+    let sync_page = sync_doc.page(0).expect("sync page");
+    let (expected, report) = pdfboss_render::render_page_reporting(
+        &sync_doc,
+        &sync_page,
+        1.0,
+        &pdfboss_render::RenderOptions::default(),
+    )
+    .expect("sync render");
+    assert_eq!(report.hidden, 1, "the sync entry reads the configuration");
+
+    let async_doc = AsyncDocument::from_bytes(bytes).await.expect("async open");
+    let page = async_doc.page(0).expect("async page");
+    let opts = pdfboss_render::RenderOptions {
+        oc: async_doc.oc_state().await.map(std::sync::Arc::new),
+        ..Default::default()
+    };
+    let (pix, report) =
+        pdfboss_render::render_page_reporting_with(async_doc.clone(), &page, 1.0, &opts)
+            .await
+            .expect("async render");
+    assert_eq!(report.hidden, 1);
+    assert_eq!(pix.data, expected.data, "pixels must be byte-identical");
+
+    let (bare, _) = pdfboss_render::render_page_reporting_with(
+        async_doc,
+        &page,
+        1.0,
+        &pdfboss_render::RenderOptions::default(),
+    )
+    .await
+    .expect("bare async render");
+    assert_ne!(
+        bare.data, expected.data,
+        "without the state the hidden layer paints, so the parity above is real"
+    );
 }
 
 /// An RC4-encrypted document (Standard handler, empty user password) opens

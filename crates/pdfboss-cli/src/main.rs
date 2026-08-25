@@ -602,6 +602,7 @@ fn cmd_render(
     let opts = pdfboss_render::RenderOptions {
         glyph_painting: fonts.to_painting(),
         substitutes,
+        ..Default::default()
     };
     let (pixmap, report) =
         pdfboss_render::render_page_reporting(&doc, &p, scale, &opts).map_err(|e| e.to_string())?;
