@@ -105,8 +105,12 @@ pub fn cid_to_unicode(ordering: &str) -> Option<Arc<CidToUnicode>> {
 
 /// Runs code-to-CID CMaps backward, earlier sources winning. Codes arrive
 /// lowest first within each layer (see `CidCmap::mappings`), so the first
-/// insert for a CID is the lowest code point that reaches it.
+/// insert for a CID is the lowest code point that reaches it — except that
+/// a radical-block code point (U+2E80..=U+2FDF) loses to the ideograph
+/// sharing its CID: 木 is what a page means, ⽊ is a dictionary artifact
+/// that happens to sort lower.
 fn invert(cmaps: &[Arc<CidCmap>]) -> CidToUnicode {
+    let radical = |c: char| ('\u{2E80}'..='\u{2FDF}').contains(&c);
     let mut map = crate::hash::FastMap::default();
     for cmap in cmaps {
         cmap.mappings(&mut |len, lo, hi, cid| {
@@ -114,7 +118,13 @@ fn invert(cmaps: &[Arc<CidCmap>]) -> CidToUnicode {
                 let Some(c) = unicode_of(lo + offset, len) else {
                     continue;
                 };
-                map.entry(cid.saturating_add(offset)).or_insert(c);
+                map.entry(cid.saturating_add(offset))
+                    .and_modify(|held| {
+                        if radical(*held) && !radical(c) {
+                            *held = c;
+                        }
+                    })
+                    .or_insert(c);
             }
         });
     }
@@ -321,6 +331,9 @@ mod tests {
         // The halfwidth-form digit 1 (CID 248, what Shift-JIS ASCII runs
         // select): reachable only through UniJIS-UCS2-HW-H.
         assert_eq!(inv.lookup(248), Some('1'));
+        // 木 (CID 3814): the Kangxi radical ⽊ shares the CID and sorts
+        // lower, but the ideograph is what a page means.
+        assert_eq!(inv.lookup(3814), Some('木'));
         assert!(cid_to_unicode("Identity").is_none());
         assert!(cid_to_unicode("Unknown").is_none());
     }
