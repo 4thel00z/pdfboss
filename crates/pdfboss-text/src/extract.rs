@@ -80,6 +80,11 @@ pub enum SkippedTextKind {
     /// An XObject name that resolved to nothing usable; whether it held
     /// text cannot be known.
     XObject,
+    /// A Type0 font whose `/Encoding` CMap did not resolve (an unknown
+    /// name, or predefined data this build does not carry): its text is
+    /// still extracted under the Identity guess, which usually reads as
+    /// U+FFFD.
+    FontEncoding,
 }
 
 impl std::fmt::Display for SkippedTextKind {
@@ -88,6 +93,7 @@ impl std::fmt::Display for SkippedTextKind {
             SkippedTextKind::PageContents => "the page contents",
             SkippedTextKind::Form => "a form XObject",
             SkippedTextKind::XObject => "an XObject",
+            SkippedTextKind::FontEncoding => "a font's CMap encoding",
         })
     }
 }
@@ -545,6 +551,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             return f.clone();
         }
         let loaded = self.load_font(chain, name).await;
+        if !loaded.simple && !loaded.encoding_known {
+            self.report
+                .record(SkippedTextKind::FontEncoding, SkipCause::Missing);
+        }
         cache.insert(name.to_string(), loaded.clone());
         loaded
     }
@@ -737,13 +747,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             Op::ShowText(s) => self.emit(frame, s),
             Op::ShowTextAdjusted(items) => {
+                // In vertical writing the TJ offset moves ty, and Tz does
+                // not apply to vertical displacements (ISO 32000-1 §9.4.4).
+                let vertical = frame.gs.font.as_ref().is_some_and(|f| f.vertical);
                 for item in items {
                     match item {
                         TextItem::Str(s) => self.emit(frame, s),
                         TextItem::Offset(n) => {
-                            let tx = -n / 1000.0 * frame.gs.size * frame.gs.horiz_scale;
-                            if tx.is_finite() {
-                                frame.tm = Matrix::translate(tx, 0.0).concat(frame.tm);
+                            let (tx, ty) = if vertical {
+                                (0.0, -n / 1000.0 * frame.gs.size)
+                            } else {
+                                (-n / 1000.0 * frame.gs.size * frame.gs.horiz_scale, 0.0)
+                            };
+                            if tx.is_finite() && ty.is_finite() {
+                                frame.tm = Matrix::translate(tx, ty).concat(frame.tm);
                             }
                         }
                     }
@@ -882,17 +899,28 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         // unit vector scaled by Tfs under Tm·CTM.
         let size = gs.size * (start.c * start.c + start.d * start.d).sqrt();
         let mut text = String::new();
-        for code in font.codes(bytes) {
-            font.decode_into(code, &mut text);
-            let word = if font.is_space(code) {
+        for cc in font.codes(bytes) {
+            font.decode_into(cc, &mut text);
+            let word = if font.is_space(cc) {
                 gs.word_spacing
             } else {
                 0.0
             };
-            let adv =
-                (font.width(code) / 1000.0 * gs.size + gs.char_spacing + word) * gs.horiz_scale;
+            // Vertical writing advances ty by w1 (negative for downward),
+            // with Tz not applied to vertical displacements (ISO 32000-1
+            // §9.4.4); horizontal advances tx as before.
+            let adv = if font.vertical {
+                font.vwidth(cc) / 1000.0 * gs.size + gs.char_spacing + word
+            } else {
+                (font.width(cc) / 1000.0 * gs.size + gs.char_spacing + word) * gs.horiz_scale
+            };
             if adv.is_finite() {
-                *tm = Matrix::translate(adv, 0.0).concat(*tm);
+                let (tx, ty) = if font.vertical {
+                    (0.0, adv)
+                } else {
+                    (adv, 0.0)
+                };
+                *tm = Matrix::translate(tx, ty).concat(*tm);
             }
         }
         let end = tm.concat(gs.ctm).apply(Point { x: 0.0, y: gs.rise });

@@ -14,3 +14,6 @@ pdfboss-encoding = { workspace = true }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
+# Tests exercise predefined CMap names, so the data rides along for the
+# test build even when a consumer leaves the feature off.
+pdfboss-core = { workspace = true, features = ["predefined-cmaps"] }

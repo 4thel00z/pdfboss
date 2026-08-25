@@ -13,7 +13,7 @@ name = "_pdfboss"
 crate-type = ["cdylib"]
 
 [dependencies]
-pdfboss-core = { path = "../pdfboss-core" }
+pdfboss-core = { path = "../pdfboss-core", features = ["predefined-cmaps"] }
 pdfboss-output = { path = "../pdfboss-output" }
 pdfboss-render = { path = "../pdfboss-render" }
 pdfboss-text = { path = "../pdfboss-text" }
