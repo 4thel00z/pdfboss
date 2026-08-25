@@ -1279,6 +1279,7 @@ dependencies = [
  "jpeg-decoder",
  "pdfboss-core",
  "pdfboss-encoding",
+ "pdfboss-icc",
  "pdfboss-jpx",
  "pdfboss-testkit",
  "png",
