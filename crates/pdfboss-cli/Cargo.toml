@@ -32,10 +32,14 @@ pdfboss-testkit = { path = "../pdfboss-testkit" }
 # must yield a binary whose `render`/`tui` can draw text for PDFs with
 # non-embedded fonts out of the box (~4 MB of OFL faces; opt out with
 # --no-default-features).
-default = ["substitute-fonts"]
+default = ["substitute-fonts", "predefined-cmaps"]
 # Passthrough so the feature is spelled `substitute-fonts` here too, without
 # the caller needing the non-obvious `pdfboss-render/substitute-fonts`.
 substitute-fonts = ["pdfboss-render/substitute-fonts"]
+# The predefined CJK CMap set (ISO 32000 Table 118, ~830 KB) is on by
+# default so `pdfboss text` reads Shift-JIS/EUC/Big5/GBK/UHC-coded Type0
+# fonts out of the box; opt out with --no-default-features.
+predefined-cmaps = ["pdfboss-core/predefined-cmaps"]
 
 [[bin]]
 name = "pdfboss"

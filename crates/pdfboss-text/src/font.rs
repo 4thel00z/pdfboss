@@ -1,28 +1,61 @@
 //! Font loading from a page's `/Font` resource dictionary: simple fonts
 //! (byte codes, `/Encoding` + `/Differences`, `/Widths`) and Type0/CID
-//! fonts (2-byte codes, `/ToUnicode`, descendant `/W` + `/DW`).
+//! fonts (`/Encoding` CMap code splitting and code-to-CID, `/ToUnicode`
+//! plus the collection's own CID-to-Unicode, descendant `/W` + `/DW` and
+//! the vertical `/W2` + `/DW2`).
 
 use crate::cmap::ToUnicode;
 use crate::sfnt;
+use pdfboss_core::cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode};
 use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Object};
 use pdfboss_encoding as encodings;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// One character code split out of a show string: its value and how many
+/// bytes it occupied (two codes with equal values but different widths are
+/// different codes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CharCode {
+    pub code: u32,
+    pub len: u8,
+}
 
 /// A loaded font: everything needed to decode show-string bytes to
 /// Unicode and to advance the text position.
 pub struct Font {
     /// True for simple (1-byte-code) fonts; false for Type0/CID fonts,
-    /// whose codes are two bytes.
+    /// whose code widths the `/Encoding` CMap decides (two bytes when
+    /// there is none).
     pub simple: bool,
-    /// `/ToUnicode` CMap when present — the highest-priority mapping.
+    /// `/ToUnicode` CMap when present — the highest-priority mapping,
+    /// keyed by character code.
     to_unicode: Option<ToUnicode>,
+    /// The Type0 `/Encoding` CMap: code splitting and code-to-CID.
+    /// `None` for simple fonts and for the Identity assumption.
+    cmap: Option<Arc<CidCmap>>,
+    /// The character collection's CID-to-Unicode mapping (from
+    /// `/CIDSystemInfo`), consulted for codes `/ToUnicode` misses.
+    cid_to_unicode: Option<Arc<CidToUnicode>>,
+    /// False when the Type0 `/Encoding` named a CMap that did not resolve
+    /// (or was absent), so the code==CID reading is a guess rather than
+    /// what the file states.
+    pub encoding_known: bool,
+    /// Writing mode 1: shown text advances downward by [`Font::vwidth`].
+    pub vertical: bool,
     /// Per-code Unicode from the `/Encoding` base table plus
     /// `/Differences` (simple fonts only).
     encoding: Option<Box<[Option<Decoded>; 256]>>,
-    /// Explicit widths per code, in glyph-space units (1/1000 em).
+    /// Explicit widths in glyph-space units (1/1000 em), keyed by code for
+    /// simple fonts and by CID for Type0 (`/W`).
     widths: HashMap<u32, f32>,
     /// Width used for codes without an explicit entry.
     default_width: f32,
+    /// Vertical displacements (`/W2` w1, negative for downward), keyed by
+    /// CID.
+    vwidths: HashMap<u32, f32>,
+    /// `/DW2`'s displacement, default -1000 (ISO 32000-1 §9.7.4.3).
+    default_vwidth: f32,
     /// The code that triggers word spacing (single-byte code 32).
     space_code: Option<u32>,
     /// The font states no `/Encoding`, but its embedded program advertises a
@@ -76,9 +109,15 @@ impl Font {
         Font {
             simple: true,
             to_unicode: None,
+            cmap: None,
+            cid_to_unicode: None,
+            encoding_known: true,
+            vertical: false,
             encoding: None,
             widths: HashMap::new(),
             default_width: 500.0,
+            vwidths: HashMap::new(),
+            default_vwidth: -1000.0,
             space_code: Some(32),
             winansi_high_codes: false,
             bold: false,
@@ -114,22 +153,49 @@ impl Font {
         (!cmap.is_empty()).then_some(cmap)
     }
 
-    /// Splits a show-string into character codes (1 or 2 bytes each).
-    /// A trailing odd byte of a 2-byte font becomes its own code.
-    pub fn codes(&self, bytes: &[u8]) -> Vec<u32> {
+    /// Splits a show-string into character codes: one byte each for simple
+    /// fonts, the `/Encoding` CMap's codespaces for Type0 fonts with one,
+    /// and two bytes otherwise (a trailing odd byte becomes its own code).
+    pub fn codes(&self, bytes: &[u8]) -> Vec<CharCode> {
         if self.simple {
-            bytes.iter().map(|&b| u32::from(b)).collect()
-        } else {
-            bytes
-                .chunks(2)
-                .map(|c| {
-                    if c.len() == 2 {
-                        u32::from(u16::from_be_bytes([c[0], c[1]]))
-                    } else {
-                        u32::from(c[0])
-                    }
+            return bytes
+                .iter()
+                .map(|&b| CharCode {
+                    code: u32::from(b),
+                    len: 1,
                 })
-                .collect()
+                .collect();
+        }
+        if let Some(cmap) = &self.cmap {
+            let mut out = Vec::with_capacity(bytes.len() / 2 + 1);
+            let mut pos = 0;
+            while pos < bytes.len() {
+                let (code, len) = cmap.code_at(bytes, pos);
+                out.push(CharCode { code, len });
+                pos += usize::from(len);
+            }
+            return out;
+        }
+        bytes
+            .chunks(2)
+            .map(|c| CharCode {
+                code: if c.len() == 2 {
+                    u32::from(u16::from_be_bytes([c[0], c[1]]))
+                } else {
+                    u32::from(c[0])
+                },
+                len: c.len() as u8,
+            })
+            .collect()
+    }
+
+    /// The CID a code selects in the descendant font: through the
+    /// `/Encoding` CMap when there is one (unmapped codes are CID 0, the
+    /// notdef), the code itself otherwise (simple fonts and Identity).
+    fn cid(&self, cc: CharCode) -> u32 {
+        match &self.cmap {
+            Some(cmap) => cmap.cid(cc.code, cc.len).unwrap_or(0),
+            None => cc.code,
         }
     }
 
@@ -138,7 +204,8 @@ impl Font {
     #[cfg(test)]
     pub fn decode(&self, code: u32) -> String {
         let mut out = String::new();
-        self.decode_into(code, &mut out);
+        let len = if self.simple { 1 } else { 2 };
+        self.decode_into(CharCode { code, len }, &mut out);
         out
     }
 
@@ -189,10 +256,17 @@ impl Font {
     /// about 1.9% of it. Measured by interleaved A/B runs of prebuilt
     /// benchmark binaries, which is the only method this machine's drift permits.
     #[inline]
-    pub fn decode_into(&self, code: u32, out: &mut String) {
+    pub fn decode_into(&self, cc: CharCode, out: &mut String) {
+        let code = cc.code;
         if let Some(c) = self.to_unicode.as_ref() {
             if let Some(s) = c.lookup(code) {
                 out.push_str(&s);
+                return;
+            }
+        }
+        if !self.simple {
+            if let Some(c) = self.collection_unicode(cc) {
+                out.push(c);
                 return;
             }
         }
@@ -223,21 +297,54 @@ impl Font {
         out.push('\u{FFFD}');
     }
 
-    /// Glyph-space width (1/1000 em) of `code`. `#[inline]` for the reason given
-    /// on [`Font::decode_into`].
+    /// The character collection's Unicode for the CID `cc` selects, when
+    /// the collection is known. The deepest `usecmap` layer answers first:
+    /// a vertical CMap only swaps in rotated-variant CIDs — presentation
+    /// forms to the collection's Unicode mapping, when it knows them at
+    /// all — while its horizontal base names the character itself.
+    fn collection_unicode(&self, cc: CharCode) -> Option<char> {
+        let inv = self.cid_to_unicode.as_ref()?;
+        let Some(cmap) = &self.cmap else {
+            return inv.lookup(cc.code); // Identity: the code is the CID
+        };
+        let mut layers = Vec::new();
+        let mut layer = Some(cmap);
+        while let Some(l) = layer {
+            layers.push(l);
+            layer = l.parent();
+        }
+        layers
+            .iter()
+            .rev()
+            .find_map(|l| l.cid(cc.code, cc.len).and_then(|cid| inv.lookup(cid)))
+    }
+
+    /// Glyph-space width (1/1000 em) of `cc` — `/W` and `/DW` key on the
+    /// CID, so the code maps first. `#[inline]` for the reason given on
+    /// [`Font::decode_into`].
     #[inline]
-    pub fn width(&self, code: u32) -> f32 {
+    pub fn width(&self, cc: CharCode) -> f32 {
         self.widths
-            .get(&code)
+            .get(&self.cid(cc))
             .copied()
             .unwrap_or(self.default_width)
     }
 
-    /// True when showing `code` applies word spacing (`Tw`). `#[inline]` for the
-    /// reason given on [`Font::decode_into`].
+    /// Glyph-space vertical displacement (1/1000 em, negative downward) of
+    /// `cc`, from `/W2` keyed by CID, else `/DW2`.
+    pub fn vwidth(&self, cc: CharCode) -> f32 {
+        self.vwidths
+            .get(&self.cid(cc))
+            .copied()
+            .unwrap_or(self.default_vwidth)
+    }
+
+    /// True when showing `cc` applies word spacing (`Tw`): the single-byte
+    /// code 32 (ISO 32000-1 §9.3.3 — a 2-byte code with value 32 is not a
+    /// space). `#[inline]` for the reason given on [`Font::decode_into`].
     #[inline]
-    pub fn is_space(&self, code: u32) -> bool {
-        self.space_code == Some(code)
+    pub fn is_space(&self, cc: CharCode) -> bool {
+        self.space_code == Some(cc.code) && cc.len == 1
     }
 
     /// Whether `/BaseFont` names a face whose glyphs are pictures rather than
@@ -368,9 +475,15 @@ impl Font {
         Font {
             simple: true,
             to_unicode,
+            cmap: None,
+            cid_to_unicode: None,
+            encoding_known: true,
+            vertical: false,
             encoding,
             widths,
             default_width,
+            vwidths: HashMap::new(),
+            default_vwidth: -1000.0,
             space_code: Some(32),
             winansi_high_codes,
             bold,
@@ -485,24 +598,49 @@ impl Font {
         Some(table)
     }
 
-    /// Loads a Type0/CID font: 2-byte codes (Identity or `-H`/`-V` CMap
-    /// names; any other encoding CMap is treated as 2-byte too), Unicode
-    /// via `/ToUnicode` only, widths from the descendant's `/W` + `/DW`.
+    /// Loads a Type0/CID font: `/Encoding` decides code splitting and the
+    /// code-to-CID mapping (Identity stays 2-byte code==CID; predefined
+    /// names and embedded CMap streams resolve through `pdfboss_core::
+    /// cmap`; anything unresolvable keeps the Identity guess, noted on
+    /// `encoding_known`). Unicode comes from `/ToUnicode` first, then the
+    /// `/CIDSystemInfo` collection's own mapping. Widths are the
+    /// descendant's `/W` + `/DW` keyed by CID; vertical displacements its
+    /// `/W2` + `/DW2`.
     async fn load_type0<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
         to_unicode: Option<ToUnicode>,
     ) -> Font {
         let descendant = Font::load_descendant(src, dict).await;
+        let encoding = type0_encoding(src, dict).await;
 
         let mut widths = HashMap::new();
         let mut default_width = 1000.0;
+        let mut vwidths = HashMap::new();
+        let mut default_vwidth = -1000.0;
+        let mut ordering = None;
         if let Some(desc) = &descendant {
             if let Some(dw) = rv(src, desc, "DW").await.and_then(|o| o.as_f64()) {
                 default_width = dw as f32;
             }
             if let Some(Object::Array(w)) = rv(src, desc, "W").await {
                 Font::parse_cid_widths(src, &w, &mut widths).await;
+            }
+            if let Some(Object::Array(dw2)) = rv(src, desc, "DW2").await {
+                if let Some(w1) = dw2.get(1).and_then(|o| o.as_f64()) {
+                    default_vwidth = w1 as f32;
+                }
+            }
+            if let Some(Object::Array(w2)) = rv(src, desc, "W2").await {
+                Font::parse_cid_vwidths(src, &w2, &mut vwidths).await;
+            }
+            if let Some(info) = rv(src, desc, "CIDSystemInfo")
+                .await
+                .and_then(|o| o.as_dict().cloned())
+            {
+                ordering = rv(src, &info, "Ordering")
+                    .await
+                    .and_then(|o| o.as_str_bytes().map(|b| b.to_vec()));
             }
         }
         // The descendant already holds the /FontDescriptor for a Type0 font
@@ -511,14 +649,28 @@ impl Font {
         let descriptor_holder = descendant.as_ref().unwrap_or(dict);
         let (bold, italic) = Font::style(src, dict, descriptor_holder).await;
 
+        let space_code = encoding
+            .cmap
+            .as_ref()
+            .is_some_and(|c| c.single_byte(32))
+            .then_some(32);
+        let collection = ordering
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|o| cid_to_unicode(&o));
         Font {
             simple: false,
             to_unicode,
+            cid_to_unicode: collection,
+            encoding_known: encoding.known,
+            vertical: encoding.vertical,
+            cmap: encoding.cmap,
             encoding: None,
             widths,
             default_width,
-            space_code: None,
-            // Two-byte codes never reach the single-byte fallbacks.
+            vwidths,
+            default_vwidth,
+            space_code,
+            // Composite codes never reach the single-byte fallbacks.
             winansi_high_codes: false,
             bold,
             italic,
@@ -579,6 +731,57 @@ impl Font {
             }
         }
     }
+
+    /// Parses a CID `/W2` array (ISO 32000-1 §9.7.4.3): `c [w1 vx vy …]`
+    /// gives per-CID triples from CID `c`; `c1 c2 w1 vx vy` gives every CID
+    /// in `c1..=c2` the same metrics (ranges capped at 65536 entries). Only
+    /// the vertical displacement `w1` matters to extraction; the position
+    /// vector shifts where the glyph paints, not where the text goes next.
+    async fn parse_cid_vwidths<S: AsyncObjectSource>(
+        src: &S,
+        items: &[Object],
+        vwidths: &mut HashMap<u32, f32>,
+    ) {
+        let mut resolved: Vec<Object> = Vec::with_capacity(items.len());
+        for item in items {
+            resolved.push(src.resolve(item).await.unwrap_or(Object::Null));
+        }
+        let mut i = 0;
+        while i < resolved.len() {
+            let Some(first) = resolved[i].as_int() else {
+                i += 1;
+                continue;
+            };
+            let first = first.max(0) as u32;
+            match resolved.get(i + 1) {
+                Some(Object::Array(list)) => {
+                    for (j, triple) in list.chunks(3).enumerate() {
+                        let Some(cid) = first.checked_add(j as u32) else {
+                            break; // start CID so large the CIDs overflow u32
+                        };
+                        if let Some(w1) =
+                            src.resolve(&triple[0]).await.ok().and_then(|o| o.as_f64())
+                        {
+                            vwidths.insert(cid, w1 as f32);
+                        }
+                    }
+                    i += 2;
+                }
+                Some(other) if other.as_f64().is_some() => {
+                    let last = other.as_int().unwrap_or(first as i64).max(0) as u32;
+                    let w1 = resolved.get(i + 2).and_then(|o| o.as_f64());
+                    if let Some(w1) = w1 {
+                        let end = last.min(first.saturating_add(65535));
+                        for c in first..=end.max(first) {
+                            vwidths.insert(c, w1 as f32);
+                        }
+                    }
+                    i += 5;
+                }
+                _ => i += 1,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +789,14 @@ mod tests {
     use super::*;
     use pdfboss_core::{block_on, Document, Immediate, ObjRef};
     use pdfboss_testkit::PdfBuilder;
+
+    fn one(code: u32) -> CharCode {
+        CharCode { code, len: 1 }
+    }
+
+    fn two(code: u32) -> CharCode {
+        CharCode { code, len: 2 }
+    }
 
     /// Builds a document whose object 5 is `font_body`. `extra` adds stream
     /// objects (ToUnicode CMaps, font programs) and `objects` adds plain
@@ -625,10 +836,10 @@ mod tests {
         assert!(f.simple);
         assert_eq!(f.decode(65), "A");
         assert_eq!(f.decode(0x93), "\u{201C}");
-        assert_eq!(f.width(65), 500.0);
-        assert!(f.is_space(32));
-        assert!(!f.is_space(65));
-        assert_eq!(f.codes(b"AB"), vec![65, 66]);
+        assert_eq!(f.width(one(65)), 500.0);
+        assert!(f.is_space(one(32)));
+        assert!(!f.is_space(one(65)));
+        assert_eq!(f.codes(b"AB"), vec![one(65), one(66)]);
     }
 
     /// A minimal sfnt whose `cmap` advertises exactly `platforms`. Enough for
@@ -899,9 +1110,9 @@ mod tests {
         assert_eq!(f.decode(65), "\u{3B1}"); // /alpha
         assert_eq!(f.decode(66), "B"); // /uni0042
         assert_eq!(f.decode(67), "C"); // untouched base
-        assert_eq!(f.width(65), 600.0);
-        assert_eq!(f.width(66), 700.0);
-        assert_eq!(f.width(67), 500.0); // default
+        assert_eq!(f.width(one(65)), 600.0);
+        assert_eq!(f.width(one(66)), 700.0);
+        assert_eq!(f.width(one(67)), 500.0); // default
     }
 
     #[test]
@@ -912,7 +1123,7 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(f.width(65), 300.0);
+        assert_eq!(f.width(one(65)), 300.0);
     }
 
     #[test]
@@ -939,16 +1150,122 @@ mod tests {
             &[],
         );
         assert!(!f.simple);
-        assert_eq!(f.codes(b"\x00\x01\x00\x02"), vec![1, 2]);
-        assert_eq!(f.codes(b"\x00\x01\x07"), vec![1, 7]); // odd tail
+        assert_eq!(f.codes(b"\x00\x01\x00\x02"), vec![two(1), two(2)]);
+        assert_eq!(
+            f.codes(b"\x00\x01\x07"),
+            vec![two(1), CharCode { code: 7, len: 1 }]
+        ); // odd tail
         assert_eq!(f.decode(1), "\u{3A9}");
         assert_eq!(f.decode(2), "\u{FFFD}"); // ToUnicode only for Type0
-        assert_eq!(f.width(1), 500.0);
-        assert_eq!(f.width(2), 600.0);
-        assert_eq!(f.width(10), 250.0);
-        assert_eq!(f.width(12), 250.0);
-        assert_eq!(f.width(99), 800.0); // /DW
-        assert!(!f.is_space(32));
+        assert_eq!(f.width(two(1)), 500.0);
+        assert_eq!(f.width(two(2)), 600.0);
+        assert_eq!(f.width(two(10)), 250.0);
+        assert_eq!(f.width(two(12)), 250.0);
+        assert_eq!(f.width(two(99)), 800.0); // /DW
+        assert!(!f.is_space(two(32)));
+    }
+
+    /// A predefined Shift-JIS CMap: 1-byte and 2-byte codes split by the
+    /// codespaces, `/W` keys on the CID the CMap yields (843 for あ, not
+    /// the code 0x82A0), and with no `/ToUnicode` the Japan1 collection's
+    /// own mapping supplies the Unicode.
+    #[test]
+    fn type0_predefined_rksj_maps_codes_to_cids() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /90ms-RKSJ-H \
+             /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> \
+             /DW 1000 /W [843 [750]] >>] >>",
+            &[],
+            &[],
+        );
+        assert!(!f.simple);
+        assert!(!f.vertical);
+        assert!(f.encoding_known);
+        assert_eq!(f.codes(b"A\x82\xA0"), vec![one(65), two(0x82A0)]);
+        assert_eq!(f.width(two(0x82A0)), 750.0);
+        assert_eq!(f.width(two(0x82A1)), 1000.0); // /DW
+        let mut s = String::new();
+        f.decode_into(two(0x82A0), &mut s);
+        assert_eq!(s, "あ");
+        assert!(f.is_space(one(32)), "RKSJ reads byte 32 as a 1-byte code");
+        assert!(!f.is_space(two(32)));
+    }
+
+    /// The vertical form: WMode from the CMap, `/W2` displacements keyed
+    /// on the CID (the rotated variant's), `/DW2` for the rest, and
+    /// Unicode answered by the horizontal base so punctuation reads as
+    /// the character rather than a presentation form.
+    #[test]
+    fn type0_predefined_rksj_vertical() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /90ms-RKSJ-V \
+             /DescendantFonts [<< /Type /Font /Subtype /CIDFontType0 \
+             /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) >> \
+             /DW2 [880 -1200] /W2 [7887 [-500 250 880]] >>] >>",
+            &[],
+            &[],
+        );
+        assert!(f.vertical);
+        assert_eq!(f.vwidth(two(0x8141)), -500.0); // 、 maps to CID 7887
+        assert_eq!(f.vwidth(two(0x82A0)), -1200.0); // /DW2
+        let mut s = String::new();
+        f.decode_into(two(0x8141), &mut s);
+        assert_eq!(s, "、");
+    }
+
+    /// The `c1 c2 w1 vx vy` form of `/W2`, and the -1000 default without
+    /// a `/DW2`.
+    #[test]
+    fn w2_range_form_and_default() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-V \
+             /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 \
+             /W2 [10 12 -800 500 880] >>] >>",
+            &[],
+            &[],
+        );
+        assert!(f.vertical, "Identity-V is writing mode 1");
+        assert_eq!(f.vwidth(two(10)), -800.0);
+        assert_eq!(f.vwidth(two(12)), -800.0);
+        assert_eq!(f.vwidth(two(13)), -1000.0); // default
+    }
+
+    /// An embedded CMap stream as `/Encoding`: 1-byte codes split per its
+    /// codespace and map through its cidranges — previously ignored and
+    /// read as 2-byte identity.
+    #[test]
+    fn type0_embedded_cmap_stream() {
+        let cmap: &[u8] = b"1 begincodespacerange <00> <FF> endcodespacerange\n\
+                            1 begincidrange <41> <5A> 100 endcidrange";
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 6 0 R \
+             /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 \
+             /DW 1000 /W [100 [650]] >>] >>",
+            &[(6, cmap)],
+            &[],
+        );
+        assert!(f.encoding_known);
+        assert_eq!(f.codes(b"AB"), vec![one(0x41), one(0x42)]);
+        assert_eq!(f.width(one(0x41)), 650.0); // /W keys on CID 100
+        assert_eq!(f.width(one(0x42)), 1000.0);
+    }
+
+    /// A named CMap that resolves to nothing keeps today's behavior —
+    /// 2-byte code==CID — and says so on the loaded font.
+    #[test]
+    fn type0_unresolvable_encoding_stays_identity_and_is_noted() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /NotACMap-H \
+             /DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 \
+             /DW 800 >>] >>",
+            &[],
+            &[],
+        );
+        assert!(!f.encoding_known);
+        assert!(!f.vertical);
+        assert_eq!(f.codes(b"\x00\x41"), vec![two(0x41)]);
+        assert_eq!(f.width(two(0x41)), 800.0);
     }
 
     #[test]
@@ -960,8 +1277,8 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(f.width(u32::MAX), 600.0);
-        assert_eq!(f.width(65), 500.0); // overflowed entry dropped
+        assert_eq!(f.width(one(u32::MAX)), 600.0);
+        assert_eq!(f.width(one(65)), 500.0); // overflowed entry dropped
     }
 
     #[test]
@@ -994,8 +1311,8 @@ mod tests {
             &[],
             &[],
         );
-        assert_eq!(f.width(u32::MAX), 10.0);
-        assert_eq!(f.width(0), 800.0); // overflowed entry dropped -> /DW
+        assert_eq!(f.width(two(u32::MAX)), 10.0);
+        assert_eq!(f.width(two(0)), 800.0); // overflowed entry dropped -> /DW
     }
 
     #[test]
@@ -1004,6 +1321,6 @@ mod tests {
         assert_eq!(f.decode(65), "A");
         assert_eq!(f.decode(0xA9), "\u{27}"); // Standard quotesingle
         assert_eq!(f.decode(0), "\u{FFFD}");
-        assert_eq!(f.width(65), 500.0);
+        assert_eq!(f.width(one(65)), 500.0);
     }
 }
