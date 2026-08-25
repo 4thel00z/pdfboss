@@ -141,7 +141,9 @@ pub enum GlyphPainting {
     /// Every embedded program: TrueType, CFF, Type1 and Type3. No bundled assets.
     #[default]
     AllEmbedded,
-    /// Also substitute bundled or caller-provided faces for non-embedded fonts.
+    /// Also substitute bundled or caller-provided faces for non-embedded
+    /// fonts, and per glyph for codes an embedded simple font's program
+    /// lacks.
     Full,
 }
 

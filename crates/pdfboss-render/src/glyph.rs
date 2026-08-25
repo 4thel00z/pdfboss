@@ -10,7 +10,10 @@
 //! `/TrueType`, `/Type1`, or `/MMType1` font, including the standard 14)
 //! instead substitutes a provider-supplied TrueType face
 //! (`crate::substitute`), with Adobe Core-14 AFM metrics filling in for a
-//! missing `/Widths`. Substitution is scoped to simple font subtypes only:
+//! missing `/Widths`; and an EMBEDDED simple font whose program lacks a
+//! drawn code falls back per glyph to the same provider-supplied face
+//! ([`GlyphFallback`]), keeping its own program for every code it does
+//! cover. Substitution is scoped to simple font subtypes only:
 //! a `/Type0` composite font's codes are two bytes wide and a substitute's
 //! 1-byte table would mis-split them, so a non-embedded `/Type0` never
 //! substitutes, at any tier. `/Type3` (whose glyphs paint via
@@ -20,7 +23,7 @@
 //! than guessing.
 
 use pdfboss_core::FastMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 #[cfg(test)]
 use pdfboss_core::{block_on, Document, Immediate};
@@ -93,6 +96,7 @@ enum GlyphKind {
 /// fonts, which rely on the embedded program's own `hmtx` table instead, so
 /// `GlyphFont::advance` must fall back to the program advance rather than
 /// treating every code as width 0.
+#[derive(Clone)]
 struct WidthMap {
     map: FastMap<u32, f32>,
     default: f32,
@@ -341,6 +345,39 @@ impl GlyphFont {
     /// configured tier behavior rather than reportable drops.
     pub(crate) fn paints(&self) -> bool {
         !matches!(self.outlines, Outlines::Metrics)
+    }
+
+    /// The per-glyph fallback for this loaded font (see [`GlyphFallback`]),
+    /// or `None` when fallback never applies: below the `Full` tier or with
+    /// no provider; a metrics-only font (unpainted codes there are
+    /// configured tier behavior); a composite font (two-byte codes that a
+    /// fallback's 1-byte table would mis-split); a substitute (its table was
+    /// already built through the substitute cmap, so a miss is final); or a
+    /// font with no substitute style at all (Symbol/ZapfDingbats).
+    pub(crate) async fn fallback<S: AsyncObjectSource>(
+        &self,
+        src: &S,
+        font: &Dict,
+        painting: GlyphPainting,
+        provider: Option<&dyn SubstituteProvider>,
+    ) -> Option<GlyphFallback> {
+        if painting != GlyphPainting::Full || provider.is_none() {
+            return None;
+        }
+        if !self.paints() {
+            return None;
+        }
+        if !matches!(self.kind, GlyphKind::Simple(_)) {
+            return None;
+        }
+        if matches!(self.outlines, Outlines::Substitute(_)) {
+            return None;
+        }
+        let inputs = SubstituteInputs::gather(src, font).await?;
+        Some(GlyphFallback {
+            inputs,
+            slot: OnceLock::new(),
+        })
     }
 }
 
@@ -758,66 +795,123 @@ async fn load_substitute<S: AsyncObjectSource>(
     font: &Dict,
     provider: &dyn SubstituteProvider,
 ) -> Option<GlyphFont> {
-    let req = FaceRequest::from_font_dict(src, font).await?;
-    let bytes = provider.face(&req)?;
-    let tt = TrueType::parse(bytes)?;
+    SubstituteInputs::gather(src, font).await?.build(provider)
+}
 
-    let base_font = font
-        .get_name("BaseFont")
-        .map(|n| n.0.as_str())
-        .unwrap_or("");
+/// The font-dictionary-derived inputs a substitute face is built from:
+/// everything [`load_substitute`] reads through the async object source,
+/// gathered apart from the synchronous [`SubstituteInputs::build`] so a
+/// per-glyph fallback ([`GlyphFallback`]) can construct the face inside the
+/// executor's show loop, which cannot await.
+struct SubstituteInputs {
+    req: FaceRequest,
+    base: Option<fn(u8) -> Option<char>>,
+    diffs: FastMap<u8, String>,
+    widths: WidthMap,
+    afm_widths: FastMap<u32, f32>,
+}
 
-    // `base_encoding` returns `None` when the font dict has no `/Encoding`
-    // key at all -- the COMMON shape for a non-embedded standard-14 font
-    // (e.g. bare `/Type1 /Helvetica`, no `/Encoding`, no `/Differences`).
-    // Left as `None`, every code below falls through to `.notdef` and this
-    // substitute paints nothing, even though the AFM width path further
-    // down (`is_standard_encoding`) already defaults an absent `/Encoding`
-    // to StandardEncoding for advances. Match that default here for the
-    // code -> glyph mapping too: a recognized standard-14 `/BaseFont` with
-    // no `/Encoding` key implies StandardEncoding (ISO 32000-1 9.6.6's
-    // built-in encoding for the standard 14), so this substitute face's
-    // `cmap` gets a real code -> char accessor instead of none at all. A
-    // `/Differences` entry (checked first, below) still takes precedence
-    // over this default, exactly as it does over an explicit `/Encoding`.
-    let base = base_encoding(src, font).await.or_else(|| {
-        pdfboss_encoding::is_standard_14(base_font)
-            .then_some(pdfboss_encoding::standard as fn(u8) -> Option<char>)
-    });
-    let diffs = differences(src, font).await;
+impl SubstituteInputs {
+    /// Resolves the substitute inputs from `font`, or `None` when the font
+    /// has no substitute style at all ([`FaceRequest::from_font_dict`]'s
+    /// Symbol/ZapfDingbats exclusion).
+    async fn gather<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<SubstituteInputs> {
+        let req = FaceRequest::from_font_dict(src, font).await?;
+        let base_font = font
+            .get_name("BaseFont")
+            .map(|n| n.0.as_str())
+            .unwrap_or("");
 
-    let mut table = Box::new([0u16; 256]);
-    for (code, slot) in table.iter_mut().enumerate() {
-        let code = code as u8;
-        // 1. A /Differences name, through the glyph list, into the
-        // SUBSTITUTE's own cmap.
-        if let Some(name) = diffs.get(&code) {
-            if let Some(ch) = pdfboss_encoding::glyph_to_unicode(name) {
+        // `base_encoding` returns `None` when the font dict has no `/Encoding`
+        // key at all -- the COMMON shape for a non-embedded standard-14 font
+        // (e.g. bare `/Type1 /Helvetica`, no `/Encoding`, no `/Differences`).
+        // Left as `None`, every code below falls through to `.notdef` and this
+        // substitute paints nothing, even though the AFM width path further
+        // down (`is_standard_encoding`) already defaults an absent `/Encoding`
+        // to StandardEncoding for advances. Match that default here for the
+        // code -> glyph mapping too: a recognized standard-14 `/BaseFont` with
+        // no `/Encoding` key implies StandardEncoding (ISO 32000-1 9.6.6's
+        // built-in encoding for the standard 14), so this substitute face's
+        // `cmap` gets a real code -> char accessor instead of none at all. A
+        // `/Differences` entry (checked first, below) still takes precedence
+        // over this default, exactly as it does over an explicit `/Encoding`.
+        let base = base_encoding(src, font).await.or_else(|| {
+            pdfboss_encoding::is_standard_14(base_font)
+                .then_some(pdfboss_encoding::standard as fn(u8) -> Option<char>)
+        });
+        let diffs = differences(src, font).await;
+        let widths = simple_widths(src, font).await;
+        let afm_widths = afm_14_widths(src, font, base_font, &diffs).await;
+
+        Some(SubstituteInputs {
+            req,
+            base,
+            diffs,
+            widths,
+            afm_widths,
+        })
+    }
+
+    /// Builds the substitute [`GlyphFont`] from the gathered inputs, or
+    /// `None` when `provider` has no face for the style or the face fails to
+    /// parse.
+    fn build(&self, provider: &dyn SubstituteProvider) -> Option<GlyphFont> {
+        let bytes = provider.face(&self.req)?;
+        let tt = TrueType::parse(bytes)?;
+
+        let mut table = Box::new([0u16; 256]);
+        for (code, slot) in table.iter_mut().enumerate() {
+            let code = code as u8;
+            // 1. A /Differences name, through the glyph list, into the
+            // SUBSTITUTE's own cmap.
+            if let Some(name) = self.diffs.get(&code) {
+                if let Some(ch) = pdfboss_encoding::glyph_to_unicode(name) {
+                    if let Some(gid) = tt.gid_for_unicode(ch as u32).filter(|&g| g != 0) {
+                        *slot = gid;
+                        continue;
+                    }
+                }
+            }
+            // 2. The base encoding's character, via the substitute's cmap.
+            if let Some(ch) = self.base.and_then(|f| f(code)) {
                 if let Some(gid) = tt.gid_for_unicode(ch as u32).filter(|&g| g != 0) {
                     *slot = gid;
-                    continue;
                 }
             }
         }
-        // 2. The base encoding's character, via the substitute's cmap.
-        if let Some(ch) = base.and_then(|f| f(code)) {
-            if let Some(gid) = tt.gid_for_unicode(ch as u32).filter(|&g| g != 0) {
-                *slot = gid;
-            }
-        }
+
+        Some(GlyphFont {
+            outline_cache: Mutex::new(FastMap::default()),
+            flat_cache: Mutex::new(FastMap::default()),
+            outlines: Outlines::Substitute(tt),
+            kind: GlyphKind::Simple(table),
+            widths: self.widths.clone(),
+            afm_widths: self.afm_widths.clone(),
+        })
     }
+}
 
-    let widths = simple_widths(src, font).await;
-    let afm_widths = afm_14_widths(src, font, base_font, &diffs).await;
+/// A per-font substitute face consulted glyph by glyph when an EMBEDDED
+/// simple font's own program lacks a drawn code (`gid` 0 at show time) --
+/// the `Full`-tier counterpart, for incomplete embedded programs, of the
+/// whole-font substitution [`load_substitute`] applies to non-embedded
+/// fonts. The inputs are gathered while the primary font loads (the async
+/// side); the face itself is built at most once, on the first miss, and a
+/// failed build is memoized as `None` so later misses stay cheap.
+pub(crate) struct GlyphFallback {
+    inputs: SubstituteInputs,
+    slot: OnceLock<Option<Arc<GlyphFont>>>,
+}
 
-    Some(GlyphFont {
-        outline_cache: Mutex::new(FastMap::default()),
-        flat_cache: Mutex::new(FastMap::default()),
-        outlines: Outlines::Substitute(tt),
-        kind: GlyphKind::Simple(table),
-        widths,
-        afm_widths,
-    })
+impl GlyphFallback {
+    /// The substitute face, built on first use and memoized -- including a
+    /// failed build (no provider face for the style, or an unparseable
+    /// face), so a page of misses pays for one attempt.
+    pub(crate) fn font(&self, provider: &dyn SubstituteProvider) -> Option<Arc<GlyphFont>> {
+        self.slot
+            .get_or_init(|| self.inputs.build(provider).map(Arc::new))
+            .clone()
+    }
 }
 
 /// The Adobe Core-14 AFM advance table for a recognized standard-14
@@ -2049,6 +2143,81 @@ mod tests {
         let doc = Document::load(bytes.to_vec()).expect("load");
         let page = doc.page(0).expect("page");
         crate::render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
+    }
+
+    /// Whether `GlyphFont::fallback` plans a per-glyph fallback for the font
+    /// at object 5 of `doc`, loaded and consulted with the same tier and
+    /// provider.
+    fn plans_fallback(
+        doc: &Document,
+        painting: GlyphPainting,
+        provider: Option<&dyn crate::substitute::SubstituteProvider>,
+    ) -> bool {
+        use pdfboss_core::ObjRef;
+        let font_obj = doc.get(ObjRef { num: 5, gen: 0 }).expect("font object");
+        let font = font_obj.as_dict().expect("font is a dict");
+        let gf = super::GlyphFont::load(doc, font, painting, provider).expect("font loads");
+        pdfboss_core::block_on(gf.fallback(&pdfboss_core::Immediate(doc), font, painting, provider))
+            .is_some()
+    }
+
+    /// `GlyphFont::fallback`'s scope guards, checked directly: a per-glyph
+    /// fallback is planned exactly for a paintable EMBEDDED simple font at
+    /// `Full` with a provider -- never below the tier, without a provider,
+    /// for a composite font, for a whole-font substitute, or for a
+    /// metrics-only font.
+    #[test]
+    fn per_glyph_fallback_plans_only_for_embedded_simple_fonts_at_full() {
+        use crate::substitute::{DirProvider, SubstituteProvider};
+
+        let dir = write_temp_face("Arimo[wght].ttf", &build_font());
+        let provider = DirProvider { dir: dir.clone() };
+        let provider: Option<&dyn SubstituteProvider> = Some(&provider);
+
+        let embedded = Document::load(simple_font_doc(
+            "/Encoding /WinAnsiEncoding",
+            b"BT /F0 10 Tf (A) Tj ET",
+        ))
+        .expect("load");
+        assert!(plans_fallback(&embedded, GlyphPainting::Full, provider));
+        assert!(
+            !plans_fallback(&embedded, GlyphPainting::AllEmbedded, provider),
+            "below Full no fallback is planned"
+        );
+        assert!(
+            !plans_fallback(&embedded, GlyphPainting::Full, None),
+            "no provider, no fallback"
+        );
+
+        let type0 = cid_map_doc("", &[0, 0, 0, 1]);
+        assert!(
+            !plans_fallback(&type0, GlyphPainting::Full, provider),
+            "two-byte codes never fall back"
+        );
+
+        let substituted = Document::load(non_embedded_font_doc(
+            "Helvetica",
+            "/Encoding /WinAnsiEncoding",
+            b"BT /F0 10 Tf (A) Tj ET",
+        ))
+        .expect("load");
+        assert!(
+            !plans_fallback(&substituted, GlyphPainting::Full, provider),
+            "a whole-font substitute's miss is final"
+        );
+
+        let metrics_only = Document::load(non_embedded_font_doc(
+            "Symbol",
+            "/FirstChar 65 /Widths [500]",
+            b"BT /F0 10 Tf (A) Tj ET",
+        ))
+        .expect("load");
+        assert!(
+            !plans_fallback(&metrics_only, GlyphPainting::Full, provider),
+            "a metrics-only font's unpainted codes are tier behavior"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
