@@ -21,7 +21,7 @@ use pdfboss_core::{
 };
 
 use crate::color::{self, ColorSpace};
-use crate::glyph::GlyphFont;
+use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
 use crate::raster::{fill_path, BlendMode, FillRule, Mask, RasterScratch};
@@ -188,9 +188,11 @@ impl GState {
 
 /// A loaded, paintable outline font paired with the name report entries
 /// know it by — its `/BaseFont`, or the `Tf` resource name when the
-/// dictionary has none — or `None` for a font whose glyphs cannot be drawn
-/// (the [`crate::GlyphPainting`] tier, or a load failure).
-type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>)>;
+/// dictionary has none — and its per-glyph fallback plan (`Some` only for
+/// an embedded simple font at `Full` with a provider, see
+/// [`GlyphFont::fallback`]) — or `None` for a font whose glyphs cannot be
+/// drawn (the [`crate::GlyphPainting`] tier, or a load failure).
+type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>, Option<Arc<GlyphFallback>>)>;
 
 /// Upper bound on tiles one pattern paint may plan. Real hatchings use
 /// hundreds to a few thousand cells; the cap only stops a hostile step
@@ -1573,9 +1575,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .map_or(name, |n| n.0.as_str())
             .into();
         let loaded = match dict {
-            Some(d) => GlyphFont::load_with(self.src, &d, self.painting, self.provider.as_deref())
-                .await
-                .map(|f| (Arc::new(f), label)),
+            Some(d) => {
+                match GlyphFont::load_with(self.src, &d, self.painting, self.provider.as_deref())
+                    .await
+                {
+                    Some(f) => {
+                        let fallback = f
+                            .fallback(self.src, &d, self.painting, self.provider.as_deref())
+                            .await
+                            .map(Arc::new);
+                        Some((Arc::new(f), label, fallback))
+                    }
+                    None => None,
+                }
+            }
             None => None,
         };
         cache.insert(name.to_string(), loaded.clone());
@@ -1630,6 +1643,63 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         );
     }
 
+    /// Paints `code` from the font's per-glyph fallback face (see
+    /// [`GlyphFallback`]), building the face on first use. `true` means the
+    /// code is handled — painted, or mapped to a genuinely empty outline —
+    /// so no `NoGlyph` report applies; `false` leaves the caller's report to
+    /// fire exactly as without a fallback (none planned, no provider face,
+    /// the fallback misses too, or a non-finite transform).
+    ///
+    /// `params` is the text-space parameter matrix `show_text` built for
+    /// this glyph; the device transform is recomposed here from the FALLBACK
+    /// face's own units-per-em, which need not match the primary font's. The
+    /// advance is untouched: it stays the primary font's (`/Widths` is keyed
+    /// per code, not per face).
+    fn paint_fallback(
+        &mut self,
+        fallback: Option<&GlyphFallback>,
+        code: u32,
+        params: Matrix,
+        tm: Matrix,
+        gs: &GState,
+        fill: [u8; 4],
+    ) -> bool {
+        let Some(fallback) = fallback else {
+            return false;
+        };
+        let Some(provider) = self.provider.as_deref() else {
+            return false;
+        };
+        let Some(font) = fallback.font(provider) else {
+            return false;
+        };
+        let gid = font.gid(code);
+        if gid == 0 {
+            return false;
+        }
+        let upm = font.units_per_em();
+        let to_device = Matrix::scale(1.0 / upm, 1.0 / upm)
+            .concat(params)
+            .concat(tm)
+            .concat(gs.ctm);
+        if !finite_matrix(&to_device) {
+            return false;
+        }
+        let linear = Matrix {
+            a: to_device.a,
+            b: to_device.b,
+            c: to_device.c,
+            d: to_device.d,
+            e: 0.0,
+            f: 0.0,
+        };
+        let polys = font.flattened(gid, linear);
+        if !polys.is_empty() {
+            self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
+        }
+        true
+    }
+
     /// Paints one show-string's glyphs and advances the text matrix. Codes with
     /// no drawable glyph still advance, so surrounding text stays positioned.
     ///
@@ -1659,7 +1729,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
         let gs = &frame.gs;
         let ts = &mut frame.ts;
-        let Some((font, label)) = ts.font.clone() else {
+        let Some((font, label, fallback)) = ts.font.clone() else {
             return;
         };
         let upm = font.units_per_em();
@@ -1712,19 +1782,24 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
                 }
             } else if gid == 0 && !(n == 1 && code == 32) {
-                // A loaded font with no glyph for this code: the advance
-                // below still happens, so surrounding text stays positioned,
-                // but nothing painted here — report it so a lossy render is
-                // never mistaken for a clean one. The single-byte space is
-                // exempt because a space paints nothing whether or not the
-                // font maps it; a two-byte 0x20 is a real CID, not a space.
-                self.skip(
-                    SkippedKind::Glyph,
-                    SkipReason::NoGlyph {
-                        code,
-                        font: label.to_string(),
-                    },
-                );
+                // A loaded font with no glyph for this code: at `Full` with
+                // a provider, a per-glyph substitute face gets the code
+                // first (`paint_fallback`); only an unhandled miss is
+                // reported, so a lossy render is never mistaken for a clean
+                // one. The advance below still happens either way, so
+                // surrounding text stays positioned. The single-byte space
+                // is exempt because a space paints nothing whether or not
+                // the font maps it; a two-byte 0x20 is a real CID, not a
+                // space.
+                if !self.paint_fallback(fallback.as_deref(), code, params, ts.tm, gs, fill) {
+                    self.skip(
+                        SkippedKind::Glyph,
+                        SkipReason::NoGlyph {
+                            code,
+                            font: label.to_string(),
+                        },
+                    );
+                }
             }
 
             // Advance: (w0·Tfs + Tc + Tw[single-byte space]) · Th.
@@ -5353,5 +5428,206 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A one-page 200x200 document showing `content` with `/F0`, a simple
+    /// EMBEDDED `/TrueType` font over [`crate::truetype::tests::build_font`]
+    /// -- whose cmap maps ONLY 'A' (0x41) -- under `/WinAnsiEncoding`, with
+    /// `/Widths` giving codes 65..=67 an advance of 500. Every other drawn
+    /// code resolves to gid 0 in the font's own program.
+    fn doc_with_incomplete_truetype_font(content: &[u8]) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /IncompleteFace \
+             /FirstChar 65 /Widths [500 500 500] /Encoding /WinAnsiEncoding \
+             /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /IncompleteFace /Flags 32 \
+             /FontFile2 7 0 R >>",
+        );
+        b.stream(7, "", &crate::truetype::tests::build_font());
+        b.build(1)
+    }
+
+    /// Renders page 0 of `bytes` at `Full` with a Dir provider whose sans
+    /// face (`Arimo[wght].ttf`, the style `/IncompleteFace` requests) is a
+    /// 2048-upm fixture mapping ONLY 'B' (0x42) to the rect glyph.
+    fn render_full_with_b_only_fallback(tag: &str, bytes: &[u8]) -> (Pixmap, RenderReport) {
+        let dir = write_temp_face(
+            tag,
+            "Arimo[wght].ttf",
+            &crate::truetype::tests::build_font_with(2048, 0x42),
+        );
+        let doc = Document::load(bytes.to_vec()).expect("load");
+        let page = doc.page(0).expect("page");
+        let opts = RenderOptions {
+            glyph_painting: GlyphPainting::Full,
+            substitutes: SubstituteSource::Dir(dir.clone()),
+        };
+        let out = crate::render_page_reporting(&doc, &page, 1.0, &opts).expect("render");
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    #[test]
+    fn embedded_font_missing_code_paints_via_per_glyph_fallback() {
+        // <4142>: 'A' paints from the embedded program's own cmap; 'B' has
+        // no glyph there (gid 0) and must paint from the fallback face
+        // instead of being reported. The fallback fixture's 2048 upm pins
+        // the device transform to the FALLBACK face's own units-per-em (a
+        // primary-upm transform would paint the 2048-unit rect at twice the
+        // size). The advance between the two glyphs is the PRIMARY font's
+        // /Widths entry (500/1000 em = 50pt at 100pt), so 'A' fills device
+        // x in [30,80] and 'B' x in [80,130], both y in [80,150].
+        let (pix, report) = render_full_with_b_only_fallback(
+            "per-glyph-fallback",
+            &doc_with_incomplete_truetype_font(b"BT /F0 100 Tf 20 50 Td <4142> Tj ET"),
+        );
+        assert!(
+            dark_at(&pix, 55, 115),
+            "'A' paints from the embedded program"
+        );
+        assert!(dark_at(&pix, 105, 115), "'B' paints from the fallback face");
+        assert!(
+            report.is_empty(),
+            "a fallback-painted code is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    #[test]
+    fn code_missing_from_fallback_too_still_reports_no_glyph() {
+        // 'C' (0x43) is in neither the embedded program's cmap nor the
+        // fallback face's ('B'-only): today's NoGlyph report must fire
+        // exactly as it would with no fallback at all.
+        let (pix, report) = render_full_with_b_only_fallback(
+            "per-glyph-fallback-miss",
+            &doc_with_incomplete_truetype_font(b"BT /F0 100 Tf 20 50 Td <43> Tj ET"),
+        );
+        assert!(
+            !dark_at(&pix, 55, 115),
+            "nothing painted for the double miss"
+        );
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Glyph,
+                SkipReason::NoGlyph {
+                    code: 67,
+                    font: "IncompleteFace".to_string(),
+                },
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn single_byte_space_stays_silent_with_fallback_available() {
+        // The single-byte space paints nothing whether or not any face maps
+        // it: no fallback paint, no report, exactly as without a provider.
+        let (pix, report) = render_full_with_b_only_fallback(
+            "per-glyph-fallback-space",
+            &doc_with_incomplete_truetype_font(b"BT /F0 100 Tf 20 50 Td <20> Tj ET"),
+        );
+        assert!(!dark_at(&pix, 55, 115), "a space paints nothing");
+        assert!(report.is_empty(), "a space is not a drop");
+    }
+
+    #[test]
+    fn type0_missing_gid_never_falls_back() {
+        // An embedded Type0/CIDFontType2 showing CID 0 (gid 0 under the
+        // Identity map): composite codes are two bytes wide, so the 1-byte
+        // fallback table never applies -- the NoGlyph report fires even at
+        // `Full` with a provider face on hand.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <0000> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+             /FontDescriptor 7 0 R /DW 1000 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
+        );
+        b.stream(8, "", &crate::truetype::tests::build_font());
+        let (pix, report) = render_full_with_b_only_fallback("type0-no-fallback", &b.build(1));
+        assert!(!dark_at(&pix, 55, 115), "nothing painted for CID 0");
+        assert_eq!(
+            drops(&report),
+            vec![(
+                SkippedKind::Glyph,
+                SkipReason::NoGlyph {
+                    code: 0,
+                    font: "X".to_string(),
+                },
+                1
+            )]
+        );
+    }
+
+    #[test]
+    fn metrics_only_font_never_falls_back() {
+        // Non-embedded /Symbol loads metrics-only at every tier (no
+        // license-clean substitute), so its unpainted codes are configured
+        // tier behavior: no fallback paint and no report, even at `Full`
+        // with a provider face that could draw the code.
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        b.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>");
+        let bytes = b.build(1);
+
+        let dir = write_temp_face(
+            "metrics-only-no-fallback",
+            "Arimo[wght].ttf",
+            &crate::truetype::tests::build_font(),
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let opts = RenderOptions {
+            glyph_painting: GlyphPainting::Full,
+            substitutes: SubstituteSource::Dir(dir.clone()),
+        };
+        let (pix, report) = crate::render_page_reporting(&doc, &page, 1.0, &opts).expect("render");
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            !dark_at(&pix, 55, 115),
+            "a metrics-only font paints nothing"
+        );
+        assert!(
+            report.is_empty(),
+            "metrics-only codes are configured behavior, not drops: {:?}",
+            report.warnings()
+        );
     }
 }
