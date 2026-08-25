@@ -1,9 +1,11 @@
-//! Shading dictionaries (ISO 32000-1 §8.7.4.5): axial (type 2) and radial
-//! (type 3) shadings evaluated through function types 0 (sampled), 2
-//! (exponential), 3 (stitching) and 4 (PostScript calculator), painted per
-//! device pixel under a coverage mask. Function-based (type 1) and mesh
-//! (types 4-7) shadings load as `None` so the caller reports them as
-//! unsupported instead of guessing.
+//! Shading dictionaries (ISO 32000-1 §8.7.4.5): every shading type paints.
+//! Axial and radial gradients (types 2, 3) and function-based grids
+//! (type 1) evaluate per device pixel through function types 0 (sampled),
+//! 2 (exponential), 3 (stitching) and 4 (PostScript calculator); Gouraud
+//! triangle meshes (types 4, 5) interpolate vertex colors barycentrically;
+//! Coons and tensor-product patch meshes (types 6, 7) tessellate to
+//! triangles at paint time. All painting honors the caller's coverage
+//! mask, constant alpha and blend mode.
 
 use pdfboss_core::geom::{Matrix, Point};
 use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Error, Object};
@@ -41,6 +43,17 @@ const MAX_CALC_OPS: usize = 65_536;
 /// Brace-nesting cap for calculator programs; compilation recurses over
 /// blocks, so the depth must stay bounded.
 const MAX_CALC_DEPTH: usize = 32;
+
+/// Upper bound on decoded mesh vertices or patches per shading; a hostile
+/// stream stops here with an error the caller reports.
+const MAX_MESH_VERTICES: usize = 65_536;
+
+/// Triangle budget one patch-mesh paint may tessellate into, shared across
+/// its patches so many patches mean coarser cells, never unbounded work.
+const MAX_MESH_TRIANGLES: usize = 1 << 18;
+
+/// Densest tessellation grid per patch (`n` × `n` cells).
+const MAX_PATCH_GRID: usize = 64;
 
 /// One parsed function. Stitching children are arena indices, so loading
 /// needs no recursion (a queue fills the arena) and evaluation recurses
@@ -817,13 +830,417 @@ fn clamp_extended(s: f32, extend: [bool; 2]) -> Option<f32> {
     Some(s)
 }
 
+/// How a loaded shading paints.
+enum Kind {
+    /// Types 2 and 3: a parametric gradient evaluated per device pixel.
+    Gradient {
+        geometry: Geometry,
+        functions: Functions,
+        domain: [f32; 2],
+        extend: [bool; 2],
+    },
+    /// Type 1: 2-in functions over a domain rectangle placed into the
+    /// target space by the shading's `/Matrix` (§8.7.4.5.2).
+    FunctionGrid {
+        domain: [f32; 4],
+        matrix: Matrix,
+        functions: Functions,
+    },
+    /// Types 4 and 5: Gouraud triangles with per-vertex color.
+    Mesh { triangles: Vec<[Vertex; 3]> },
+    /// Types 6 and 7: tensor-product patches, tessellated to triangles at
+    /// paint time so the subdivision density can follow the device size.
+    Patches { patches: Vec<Patch> },
+}
+
+/// One decoded mesh vertex: a position in the shading's target space and
+/// its color, already through `/Function` and the shading color space.
+#[derive(Clone, Copy, Debug)]
+struct Vertex {
+    p: Point,
+    rgb: [f32; 3],
+}
+
+/// One tensor-product patch: `grid[i][j]` is control point p_ij — column
+/// `i` along `u`, row `j` along `v` (§8.7.4.5.8) — and `rgb` holds the
+/// corner colors at (u,v) = (0,0), (0,1), (1,1), (1,0).
+#[derive(Clone, Copy, Debug)]
+struct Patch {
+    grid: [[Point; 4]; 4],
+    rgb: [[f32; 3]; 4],
+}
+
+/// The 12 boundary control points of a patch in data-stream order, as
+/// (column, row) tensor indices: counterclockwise from p_00 (Figure 30 /
+/// Table 86 of ISO 32000-1).
+const BOUNDARY: [(usize, usize); 12] = [
+    (0, 0),
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 3),
+    (2, 3),
+    (3, 3),
+    (3, 2),
+    (3, 1),
+    (3, 0),
+    (2, 0),
+    (1, 0),
+];
+
+/// The four interior points of a type 7 patch in data-stream order.
+const INTERIOR: [(usize, usize); 4] = [(1, 1), (1, 2), (2, 2), (2, 1)];
+
+/// Field widths and value mappings shared by one mesh stream's records
+/// (§8.7.4.5.5).
+struct MeshLayout {
+    bits_coord: u32,
+    bits_comp: u32,
+    bits_flag: u32,
+    /// Two `/Decode` entries per coordinate axis, then per color value.
+    decode: Vec<f32>,
+    /// Color values per vertex or corner: 1 with `/Function`, else the
+    /// shading color space's component count.
+    values: usize,
+    /// `/Function` remapping a vertex `t` to components. Evaluated per
+    /// vertex at load; interpolation then blends the resulting RGB, an
+    /// approximation of the spec's interpolate-t-then-evaluate for
+    /// nonlinear functions.
+    functions: Option<Functions>,
+}
+
+impl MeshLayout {
+    /// The RGB a decoded color record stands for.
+    fn rgb(&self, cs: &ColorSpace, comps: &[f32]) -> [f32; 3] {
+        let Some(f) = &self.functions else {
+            return cs.to_rgb(comps);
+        };
+        let mut out = [0f32; MAX_COMPS];
+        let n = f.eval(comps, &mut out);
+        cs.to_rgb(&out[..n])
+    }
+
+    /// Reads one coordinate pair; `None` = the stream ended.
+    fn read_point(&self, r: &mut BitReader) -> Option<Point> {
+        let x = mesh_decoded(
+            r.take(self.bits_coord)?,
+            self.bits_coord,
+            self.decode[0],
+            self.decode[1],
+        );
+        let y = mesh_decoded(
+            r.take(self.bits_coord)?,
+            self.bits_coord,
+            self.decode[2],
+            self.decode[3],
+        );
+        Some(Point { x, y })
+    }
+
+    /// Reads one color record and converts it.
+    fn read_color(&self, r: &mut BitReader, cs: &ColorSpace) -> Option<[f32; 3]> {
+        let mut comps = [0f32; MAX_COMPS];
+        for (i, slot) in comps.iter_mut().enumerate().take(self.values) {
+            *slot = mesh_decoded(
+                r.take(self.bits_comp)?,
+                self.bits_comp,
+                self.decode[4 + 2 * i],
+                self.decode[5 + 2 * i],
+            );
+        }
+        Some(self.rgb(cs, &comps[..self.values]))
+    }
+
+    /// Reads one `x y c…` vertex record and byte-aligns past its padding
+    /// (each record occupies whole bytes, §8.7.4.5.5).
+    fn read_vertex(&self, r: &mut BitReader, cs: &ColorSpace) -> Option<Vertex> {
+        let p = self.read_point(r)?;
+        let rgb = self.read_color(r, cs)?;
+        r.align();
+        Some(Vertex { p, rgb })
+    }
+}
+
+/// Sequential big-endian bit reader over a mesh stream. `None` from `take`
+/// means the stream ended: the caller stops decoding and paints what it
+/// already has (truncation leniency).
+struct BitReader<'a> {
+    data: &'a [u8],
+    pos: u64,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> BitReader<'a> {
+        BitReader { data, pos: 0 }
+    }
+
+    fn take(&mut self, bits: u32) -> Option<u64> {
+        let end = self.pos + u64::from(bits);
+        if end > self.data.len() as u64 * 8 {
+            return None;
+        }
+        let mut value = 0u64;
+        for bit in self.pos..end {
+            let byte = self.data[(bit / 8) as usize];
+            let within = 7 - (bit % 8) as u32;
+            value = (value << 1) | u64::from((byte >> within) & 1);
+        }
+        self.pos = end;
+        Some(value)
+    }
+
+    /// Skips to the next byte boundary.
+    fn align(&mut self) {
+        self.pos = self.pos.div_ceil(8) * 8;
+    }
+}
+
+/// Maps a raw mesh integer through its `/Decode` pair (the image-dictionary
+/// mapping, §8.9.5.2). `f64` keeps 32-bit raws exact.
+fn mesh_decoded(raw: u64, bits: u32, lo: f32, hi: f32) -> f32 {
+    let max = (1u64 << bits) - 1;
+    (f64::from(lo) + raw as f64 * (f64::from(hi) - f64::from(lo)) / max as f64) as f32
+}
+
+/// The budget error every mesh decoder returns past its cap.
+fn mesh_too_large() -> Error {
+    Error::Other("shading mesh too large".into())
+}
+
+/// Decodes a type 4 free-form triangle stream: flag 0 starts a fresh
+/// triangle (the companion vertices' flags are read and ignored), flags 1
+/// and 2 attach one vertex to the previous triangle's v_b v_c or v_a v_c
+/// edge (§8.7.4.5.5). A truncated or malformed record stops decoding; what
+/// already decoded still paints.
+fn free_triangles(
+    data: &[u8],
+    layout: &MeshLayout,
+    cs: &ColorSpace,
+) -> Result<Vec<[Vertex; 3]>, Error> {
+    let mut r = BitReader::new(data);
+    let mut triangles: Vec<[Vertex; 3]> = Vec::new();
+    let mut vertices = 0usize;
+    while let Some(flag) = r.take(layout.bits_flag) {
+        let prev = triangles.last().copied();
+        let corners = match (flag & 3, prev) {
+            (0, _) => {
+                let a = layout.read_vertex(&mut r, cs);
+                let b = r
+                    .take(layout.bits_flag)
+                    .and_then(|ignored| layout.read_vertex(&mut r, cs).map(|v| (ignored, v)));
+                let c = r
+                    .take(layout.bits_flag)
+                    .and_then(|ignored| layout.read_vertex(&mut r, cs).map(|v| (ignored, v)));
+                match (a, b, c) {
+                    (Some(a), Some((_, b)), Some((_, c))) => [a, b, c],
+                    _ => break,
+                }
+            }
+            (1, Some([_, b, c])) => match layout.read_vertex(&mut r, cs) {
+                Some(d) => [b, c, d],
+                None => break,
+            },
+            (2, Some([a, _, c])) => match layout.read_vertex(&mut r, cs) {
+                Some(d) => [a, c, d],
+                None => break,
+            },
+            _ => break,
+        };
+        vertices += if flag & 3 == 0 { 3 } else { 1 };
+        if vertices > MAX_MESH_VERTICES {
+            return Err(mesh_too_large());
+        }
+        triangles.push(corners);
+    }
+    Ok(triangles)
+}
+
+/// Decodes a type 5 lattice stream and triangulates each row pair as
+/// (V_i,j V_i,j+1 V_i+1,j) and (V_i,j+1 V_i+1,j V_i+1,j+1) (§8.7.4.5.6).
+fn lattice_triangles(
+    data: &[u8],
+    layout: &MeshLayout,
+    cs: &ColorSpace,
+    per_row: usize,
+) -> Result<Vec<[Vertex; 3]>, Error> {
+    let mut r = BitReader::new(data);
+    let mut verts: Vec<Vertex> = Vec::new();
+    while let Some(v) = layout.read_vertex(&mut r, cs) {
+        if verts.len() >= MAX_MESH_VERTICES {
+            return Err(mesh_too_large());
+        }
+        verts.push(v);
+    }
+    let rows = verts.len() / per_row;
+    let mut triangles = Vec::new();
+    for i in 1..rows {
+        for j in 1..per_row {
+            let v00 = verts[(i - 1) * per_row + j - 1];
+            let v01 = verts[(i - 1) * per_row + j];
+            let v10 = verts[i * per_row + j - 1];
+            let v11 = verts[i * per_row + j];
+            triangles.push([v00, v01, v10]);
+            triangles.push([v01, v10, v11]);
+        }
+    }
+    Ok(triangles)
+}
+
+/// Decodes a type 6/7 patch stream. Flag 0 reads a full boundary (plus the
+/// four interior points when `tensor`); flags 1-3 inherit the previous
+/// patch's shared edge and corner colors per Tables 85/86. Byte alignment
+/// is applied per patch record — §8.7.4.5.5 states it for vertices, and a
+/// patch is the analogous record here.
+fn patch_list(
+    data: &[u8],
+    layout: &MeshLayout,
+    cs: &ColorSpace,
+    tensor: bool,
+) -> Result<Vec<Patch>, Error> {
+    let mut r = BitReader::new(data);
+    let mut patches: Vec<Patch> = Vec::new();
+    'stream: while let Some(flag) = r.take(layout.bits_flag) {
+        let flag = flag & 3;
+        let mut grid = [[Point { x: 0.0, y: 0.0 }; 4]; 4];
+        let mut rgb = [[0f32; 3]; 4];
+        let mut boundary: &[(usize, usize)] = &BOUNDARY;
+        let mut color_from = 0usize;
+        if flag != 0 {
+            let Some(prev) = patches.last() else {
+                break;
+            };
+            let (edge, colors) = match flag {
+                1 => ([(0, 3), (1, 3), (2, 3), (3, 3)], [1, 2]),
+                2 => ([(3, 3), (3, 2), (3, 1), (3, 0)], [2, 3]),
+                _ => ([(3, 0), (2, 0), (1, 0), (0, 0)], [3, 0]),
+            };
+            for (row, (i, j)) in edge.iter().enumerate() {
+                grid[0][row] = prev.grid[*i][*j];
+            }
+            rgb[0] = prev.rgb[colors[0]];
+            rgb[1] = prev.rgb[colors[1]];
+            boundary = &BOUNDARY[4..];
+            color_from = 2;
+        }
+        for &(i, j) in boundary {
+            let Some(p) = layout.read_point(&mut r) else {
+                break 'stream;
+            };
+            grid[i][j] = p;
+        }
+        if tensor {
+            for &(i, j) in &INTERIOR {
+                let Some(p) = layout.read_point(&mut r) else {
+                    break 'stream;
+                };
+                grid[i][j] = p;
+            }
+        }
+        for slot in rgb.iter_mut().skip(color_from) {
+            let Some(c) = layout.read_color(&mut r, cs) else {
+                break 'stream;
+            };
+            *slot = c;
+        }
+        r.align();
+        if !tensor {
+            fill_coons_interior(&mut grid);
+        }
+        if patches.len() >= MAX_MESH_VERTICES {
+            return Err(mesh_too_large());
+        }
+        patches.push(Patch { grid, rgb });
+    }
+    Ok(patches)
+}
+
+/// The four interior control points a Coons patch implies: each is a fixed
+/// affine combination of the boundary points (§8.7.4.5.8).
+fn fill_coons_interior(g: &mut [[Point; 4]; 4]) {
+    let combine = |m4: Point,
+                   s6a: Point,
+                   s6b: Point,
+                   s2a: Point,
+                   s2b: Point,
+                   s3a: Point,
+                   s3b: Point,
+                   s1: Point| Point {
+        x: (-4.0 * m4.x + 6.0 * (s6a.x + s6b.x) - 2.0 * (s2a.x + s2b.x) + 3.0 * (s3a.x + s3b.x)
+            - s1.x)
+            / 9.0,
+        y: (-4.0 * m4.y + 6.0 * (s6a.y + s6b.y) - 2.0 * (s2a.y + s2b.y) + 3.0 * (s3a.y + s3b.y)
+            - s1.y)
+            / 9.0,
+    };
+    let p11 = combine(
+        g[0][0], g[0][1], g[1][0], g[0][3], g[3][0], g[3][1], g[1][3], g[3][3],
+    );
+    let p12 = combine(
+        g[0][3], g[0][2], g[1][3], g[0][0], g[3][3], g[3][2], g[1][0], g[3][0],
+    );
+    let p21 = combine(
+        g[3][0], g[3][1], g[2][0], g[3][3], g[0][0], g[0][1], g[2][3], g[0][3],
+    );
+    let p22 = combine(
+        g[3][3], g[3][2], g[2][3], g[3][0], g[0][3], g[0][2], g[2][0], g[0][0],
+    );
+    g[1][1] = p11;
+    g[1][2] = p12;
+    g[2][1] = p21;
+    g[2][2] = p22;
+}
+
+/// Reads the bit-layout entries of a mesh shading dictionary, validating
+/// the field widths §8.7.4.5.5-7 allow.
+async fn mesh_layout<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+    cs: &ColorSpace,
+    kind: i64,
+) -> Result<MeshLayout, Error> {
+    let bits_coord = match dict.get_int("BitsPerCoordinate") {
+        Some(b @ (1 | 2 | 4 | 8 | 12 | 16 | 24 | 32)) => b as u32,
+        _ => return Err(Error::Other("mesh /BitsPerCoordinate unusable".into())),
+    };
+    let bits_comp = match dict.get_int("BitsPerComponent") {
+        Some(b @ (1 | 2 | 4 | 8 | 12 | 16)) => b as u32,
+        _ => return Err(Error::Other("mesh /BitsPerComponent unusable".into())),
+    };
+    let bits_flag = match (kind, dict.get_int("BitsPerFlag")) {
+        (5, _) => 0,
+        (_, Some(b @ (2 | 4 | 8))) => b as u32,
+        _ => return Err(Error::Other("mesh /BitsPerFlag unusable".into())),
+    };
+    let functions = match dict.get("Function") {
+        Some(f) => Some(load_functions(src, f).await?),
+        None => None,
+    };
+    let values = if functions.is_some() {
+        1
+    } else {
+        cs.components()
+    };
+    if values == 0 || values > MAX_COMPS {
+        return Err(Error::Other("mesh color arity unusable".into()));
+    }
+    let decode = float_array(src, dict.get("Decode"))
+        .await
+        .filter(|d| d.len() >= 2 * (2 + values))
+        .ok_or_else(|| Error::Other("mesh /Decode unusable".into()))?;
+    Ok(MeshLayout {
+        bits_coord,
+        bits_comp,
+        bits_flag,
+        decode,
+        values,
+        functions,
+    })
+}
+
 /// A loaded, paintable shading.
 pub(crate) struct Shading {
-    geometry: Geometry,
+    kind: Kind,
     cs: ColorSpace,
-    functions: Functions,
-    domain: [f32; 2],
-    extend: [bool; 2],
     /// Optional clip in the shading's own target space (`/BBox`); the caller
     /// intersects it into the paint region under the same matrix the shading
     /// paints with.
@@ -1050,68 +1467,128 @@ pub(crate) async fn load_functions<S: AsyncObjectSource>(
 }
 
 impl Shading {
-    /// Loads a shading dictionary (or stream — mesh shadings are streams,
-    /// and they answer `Ok(None)`). `Ok(None)` = a shading type this
-    /// renderer does not paint, for the caller to report as unsupported;
-    /// `Err` = a structural failure, reported verbatim.
+    /// Loads a shading dictionary (types 1-3) or stream (mesh types 4-7).
+    /// `Err` is a structural failure, reported by the caller.
     pub(crate) async fn load_with<S: AsyncObjectSource>(
         src: &S,
         obj: &Object,
-    ) -> Result<Option<Shading>, Error> {
-        let dict = match src.resolve(obj).await? {
-            Object::Dict(d) => d,
-            Object::Stream(s) => s.dict.clone(),
+    ) -> Result<Shading, Error> {
+        let (dict, stream) = match src.resolve(obj).await? {
+            Object::Dict(d) => (d, None),
+            Object::Stream(s) => (s.dict.clone(), Some(s)),
             _ => return Err(Error::Other("shading is not a dictionary".into())),
         };
-        let kind = dict.get_int("ShadingType").unwrap_or(-1);
-        let geometry = match kind {
-            2 => {
-                let c = floats(src, dict.get("Coords"), 4)
-                    .await
-                    .ok_or_else(|| Error::Other("axial shading /Coords unusable".into()))?;
-                Geometry::Axial {
-                    p0: Point { x: c[0], y: c[1] },
-                    p1: Point { x: c[2], y: c[3] },
-                }
-            }
-            3 => {
-                let c = floats(src, dict.get("Coords"), 6)
-                    .await
-                    .ok_or_else(|| Error::Other("radial shading /Coords unusable".into()))?;
-                if c[2] < 0.0 || c[5] < 0.0 {
-                    return Err(Error::Other("radial shading radius negative".into()));
-                }
-                Geometry::Radial {
-                    c0: Point { x: c[0], y: c[1] },
-                    r0: c[2],
-                    c1: Point { x: c[3], y: c[4] },
-                    r1: c[5],
-                }
-            }
-            1 | 4..=7 => return Ok(None),
-            _ => return Err(Error::Other("unknown shading type".into())),
-        };
+        let type_num = dict.get_int("ShadingType").unwrap_or(-1);
         let cs_obj = dict
             .get("ColorSpace")
             .ok_or_else(|| Error::Other("shading has no /ColorSpace".into()))?;
         let cs = ColorSpace::parse_with(src, cs_obj).await;
-        let functions = match dict.get("Function") {
-            Some(f) => load_functions(src, f).await?,
-            None => return Err(Error::Other("shading has no /Function".into())),
-        };
-        let domain = match floats(src, dict.get("Domain"), 2).await {
-            Some(d) => [d[0], d[1]],
-            None => [0.0, 1.0],
-        };
-        let extend = match src
-            .resolve(dict.get("Extend").unwrap_or(&Object::Null))
-            .await
-        {
-            Ok(Object::Array(a)) if a.len() >= 2 => [
-                matches!(a[0], Object::Bool(true)),
-                matches!(a[1], Object::Bool(true)),
-            ],
-            _ => [false, false],
+        let kind = match type_num {
+            1 => {
+                let functions = match dict.get("Function") {
+                    Some(f) => load_functions(src, f).await?,
+                    None => return Err(Error::Other("shading has no /Function".into())),
+                };
+                let domain = match floats(src, dict.get("Domain"), 4).await {
+                    Some(d) => [
+                        d[0].min(d[1]),
+                        d[0].max(d[1]),
+                        d[2].min(d[3]),
+                        d[2].max(d[3]),
+                    ],
+                    None => [0.0, 1.0, 0.0, 1.0],
+                };
+                let matrix = match floats(src, dict.get("Matrix"), 6).await {
+                    Some(m) => Matrix {
+                        a: m[0],
+                        b: m[1],
+                        c: m[2],
+                        d: m[3],
+                        e: m[4],
+                        f: m[5],
+                    },
+                    None => Matrix::identity(),
+                };
+                Kind::FunctionGrid {
+                    domain,
+                    matrix,
+                    functions,
+                }
+            }
+            2 | 3 => {
+                let geometry = if type_num == 2 {
+                    let c = floats(src, dict.get("Coords"), 4)
+                        .await
+                        .ok_or_else(|| Error::Other("axial shading /Coords unusable".into()))?;
+                    Geometry::Axial {
+                        p0: Point { x: c[0], y: c[1] },
+                        p1: Point { x: c[2], y: c[3] },
+                    }
+                } else {
+                    let c = floats(src, dict.get("Coords"), 6)
+                        .await
+                        .ok_or_else(|| Error::Other("radial shading /Coords unusable".into()))?;
+                    if c[2] < 0.0 || c[5] < 0.0 {
+                        return Err(Error::Other("radial shading radius negative".into()));
+                    }
+                    Geometry::Radial {
+                        c0: Point { x: c[0], y: c[1] },
+                        r0: c[2],
+                        c1: Point { x: c[3], y: c[4] },
+                        r1: c[5],
+                    }
+                };
+                let functions = match dict.get("Function") {
+                    Some(f) => load_functions(src, f).await?,
+                    None => return Err(Error::Other("shading has no /Function".into())),
+                };
+                let domain = match floats(src, dict.get("Domain"), 2).await {
+                    Some(d) => [d[0], d[1]],
+                    None => [0.0, 1.0],
+                };
+                let extend = match src
+                    .resolve(dict.get("Extend").unwrap_or(&Object::Null))
+                    .await
+                {
+                    Ok(Object::Array(a)) if a.len() >= 2 => [
+                        matches!(a[0], Object::Bool(true)),
+                        matches!(a[1], Object::Bool(true)),
+                    ],
+                    _ => [false, false],
+                };
+                Kind::Gradient {
+                    geometry,
+                    functions,
+                    domain,
+                    extend,
+                }
+            }
+            4..=7 => {
+                let stream =
+                    stream.ok_or_else(|| Error::Other("mesh shading carries no stream".into()))?;
+                let data = decoded_stream_data_with(src, &stream).await?;
+                let layout = mesh_layout(src, &dict, &cs, type_num).await?;
+                match type_num {
+                    4 => Kind::Mesh {
+                        triangles: free_triangles(&data, &layout, &cs)?,
+                    },
+                    5 => {
+                        let per_row = match dict.get_int("VerticesPerRow") {
+                            Some(n) if n >= 2 => n as usize,
+                            _ => {
+                                return Err(Error::Other("lattice /VerticesPerRow unusable".into()))
+                            }
+                        };
+                        Kind::Mesh {
+                            triangles: lattice_triangles(&data, &layout, &cs, per_row)?,
+                        }
+                    }
+                    n => Kind::Patches {
+                        patches: patch_list(&data, &layout, &cs, n == 7)?,
+                    },
+                }
+            }
+            _ => return Err(Error::Other("unknown shading type".into())),
         };
         let bbox = floats(src, dict.get("BBox"), 4)
             .await
@@ -1119,15 +1596,12 @@ impl Shading {
         let background = float_array(src, dict.get("Background"))
             .await
             .map(|comps| cs.to_rgb(&comps));
-        Ok(Some(Shading {
-            geometry,
+        Ok(Shading {
+            kind,
             cs,
-            functions,
-            domain,
-            extend,
             bbox,
             background,
-        }))
+        })
     }
 
     /// Paints the shading over every pixel `region` covers (the whole page
@@ -1142,33 +1616,87 @@ impl Shading {
         to_device: Matrix,
         blend: BlendMode,
     ) {
-        let Some(inv) = to_device.invert() else {
-            return;
-        };
         let Some(alpha) = clamped_alpha(alpha) else {
             return;
         };
-        let (x_lo, x_hi, y_lo, y_hi) = region_bounds(pix, region);
         let normal = blend == BlendMode::Normal;
-        let mut comps = [0f32; MAX_COMPS];
-        for y in y_lo..y_hi {
-            for x in x_lo..x_hi {
-                let cov = region.map_or(255, |m| m.coverage(x, y));
-                if cov == 0 {
-                    continue;
-                }
-                let p = inv.apply(Point {
-                    x: x as f32 + 0.5,
-                    y: y as f32 + 0.5,
-                });
-                let Some(s) = self.geometry.param_at(p, self.extend) else {
-                    continue;
+        match &self.kind {
+            Kind::Gradient {
+                geometry,
+                functions,
+                domain,
+                extend,
+            } => {
+                let Some(inv) = to_device.invert() else {
+                    return;
                 };
-                let t = self.domain[0] + (self.domain[1] - self.domain[0]) * s;
-                let n = self.functions.eval(&[t], &mut comps);
-                let rgb8 = quantize_rgb(self.cs.to_rgb(&comps[..n]));
-                let a = alpha * cov as f32 / 255.0;
-                shade_pixel(pix, x, y, a, rgb8, normal, blend);
+                let (x_lo, x_hi, y_lo, y_hi) = region_bounds(pix, region);
+                let mut comps = [0f32; MAX_COMPS];
+                for y in y_lo..y_hi {
+                    for x in x_lo..x_hi {
+                        let cov = region.map_or(255, |m| m.coverage(x, y));
+                        if cov == 0 {
+                            continue;
+                        }
+                        let p = inv.apply(Point {
+                            x: x as f32 + 0.5,
+                            y: y as f32 + 0.5,
+                        });
+                        let Some(s) = geometry.param_at(p, *extend) else {
+                            continue;
+                        };
+                        let t = domain[0] + (domain[1] - domain[0]) * s;
+                        let n = functions.eval(&[t], &mut comps);
+                        let rgb8 = quantize_rgb(self.cs.to_rgb(&comps[..n]));
+                        shade_pixel(pix, x, y, alpha * cov as f32 / 255.0, rgb8, normal, blend);
+                    }
+                }
+            }
+            Kind::FunctionGrid {
+                domain,
+                matrix,
+                functions,
+            } => {
+                // Device pixel → target space → the function's own space.
+                let Some(inv) = matrix.concat(to_device).invert() else {
+                    return;
+                };
+                let (x_lo, x_hi, y_lo, y_hi) = region_bounds(pix, region);
+                let mut comps = [0f32; MAX_COMPS];
+                for y in y_lo..y_hi {
+                    for x in x_lo..x_hi {
+                        let cov = region.map_or(255, |m| m.coverage(x, y));
+                        if cov == 0 {
+                            continue;
+                        }
+                        let p = inv.apply(Point {
+                            x: x as f32 + 0.5,
+                            y: y as f32 + 0.5,
+                        });
+                        // Outside the domain rectangle nothing paints
+                        // (§8.7.4.5.2; a pattern's /Background already
+                        // covered the region).
+                        if p.x < domain[0] || p.x > domain[1] || p.y < domain[2] || p.y > domain[3]
+                        {
+                            continue;
+                        }
+                        let n = functions.eval(&[p.x, p.y], &mut comps);
+                        let rgb8 = quantize_rgb(self.cs.to_rgb(&comps[..n]));
+                        shade_pixel(pix, x, y, alpha * cov as f32 / 255.0, rgb8, normal, blend);
+                    }
+                }
+            }
+            Kind::Mesh { triangles } => {
+                for tri in triangles {
+                    let dev = tri.map(|v| Vertex {
+                        p: to_device.apply(v.p),
+                        rgb: v.rgb,
+                    });
+                    fill_triangle(pix, region, alpha, normal, blend, &dev);
+                }
+            }
+            Kind::Patches { patches } => {
+                paint_patches(pix, region, alpha, normal, blend, to_device, patches);
             }
         }
     }
@@ -1256,6 +1784,170 @@ fn shade_pixel(
     } else {
         paint_pixel::<false>(dst, a, rgb8, opaque, blend);
     }
+}
+
+/// Rasterizes one Gouraud triangle (device-space corners) under the region
+/// mask, interpolating the vertex colors barycentrically at each pixel
+/// center. Triangle edges are hard — pixel centers exactly on a shared
+/// edge belong to both neighbors — while the region mask still applies its
+/// anti-aliased coverage.
+fn fill_triangle(
+    pix: &mut Pixmap,
+    region: Option<&Mask>,
+    alpha: f32,
+    normal: bool,
+    blend: BlendMode,
+    v: &[Vertex; 3],
+) {
+    let area = (v[1].p.x - v[0].p.x) * (v[2].p.y - v[0].p.y)
+        - (v[2].p.x - v[0].p.x) * (v[1].p.y - v[0].p.y);
+    if !area.is_finite() || area == 0.0 {
+        return;
+    }
+    let inv_area = 1.0 / area;
+    let (rx0, rx1, ry0, ry1) = region_bounds(pix, region);
+    let min_x = v[0].p.x.min(v[1].p.x).min(v[2].p.x);
+    let max_x = v[0].p.x.max(v[1].p.x).max(v[2].p.x);
+    let min_y = v[0].p.y.min(v[1].p.y).min(v[2].p.y);
+    let max_y = v[0].p.y.max(v[1].p.y).max(v[2].p.y);
+    let x_lo = min_x.floor().max(rx0 as f32).max(0.0) as u32;
+    let x_hi = (max_x.ceil().min(rx1 as f32).max(0.0)) as u32;
+    let y_lo = min_y.floor().max(ry0 as f32).max(0.0) as u32;
+    let y_hi = (max_y.ceil().min(ry1 as f32).max(0.0)) as u32;
+    for y in y_lo..y_hi {
+        let py = y as f32 + 0.5;
+        for x in x_lo..x_hi {
+            let cov = region.map_or(255, |m| m.coverage(x, y));
+            if cov == 0 {
+                continue;
+            }
+            let px = x as f32 + 0.5;
+            let w0 =
+                ((v[1].p.x - px) * (v[2].p.y - py) - (v[2].p.x - px) * (v[1].p.y - py)) * inv_area;
+            let w1 =
+                ((v[2].p.x - px) * (v[0].p.y - py) - (v[0].p.x - px) * (v[2].p.y - py)) * inv_area;
+            let w2 = 1.0 - w0 - w1;
+            if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                continue;
+            }
+            let mut rgb = [0f32; 3];
+            for (i, c) in rgb.iter_mut().enumerate() {
+                *c = w0 * v[0].rgb[i] + w1 * v[1].rgb[i] + w2 * v[2].rgb[i];
+            }
+            shade_pixel(
+                pix,
+                x,
+                y,
+                alpha * cov as f32 / 255.0,
+                quantize_rgb(rgb),
+                normal,
+                blend,
+            );
+        }
+    }
+}
+
+/// Tessellates each patch into a device-size-driven grid of Gouraud
+/// triangles and rasterizes them immediately, patches in stream order so
+/// later ones paint over earlier ones. The grid density follows the
+/// transformed control polygon's extent (a Bézier surface stays inside its
+/// control polygon) and splits [`MAX_MESH_TRIANGLES`] across the patches,
+/// so a hostile patch count degrades to coarser cells, never unbounded
+/// work.
+fn paint_patches(
+    pix: &mut Pixmap,
+    region: Option<&Mask>,
+    alpha: f32,
+    normal: bool,
+    blend: BlendMode,
+    to_device: Matrix,
+    patches: &[Patch],
+) {
+    if patches.is_empty() {
+        return;
+    }
+    let budget_cells = (MAX_MESH_TRIANGLES / (2 * patches.len())).max(1);
+    let budget_n = (budget_cells as f32).sqrt() as usize;
+    let mut prev_row: Vec<Vertex> = Vec::new();
+    let mut row: Vec<Vertex> = Vec::new();
+    for patch in patches {
+        let mut dev = [[Point { x: 0.0, y: 0.0 }; 4]; 4];
+        let mut lo = Point {
+            x: f32::INFINITY,
+            y: f32::INFINITY,
+        };
+        let mut hi = Point {
+            x: f32::NEG_INFINITY,
+            y: f32::NEG_INFINITY,
+        };
+        for (col, out) in patch.grid.iter().zip(dev.iter_mut()) {
+            for (q, slot) in col.iter().zip(out.iter_mut()) {
+                let p = to_device.apply(*q);
+                *slot = p;
+                lo.x = lo.x.min(p.x);
+                lo.y = lo.y.min(p.y);
+                hi.x = hi.x.max(p.x);
+                hi.y = hi.y.max(p.y);
+            }
+        }
+        let extent = (hi.x - lo.x).max(hi.y - lo.y);
+        if !extent.is_finite() {
+            continue;
+        }
+        // A cell about every 3 device pixels keeps the piecewise-linear
+        // color and geometry error well under a quantization step.
+        let n = ((extent / 3.0).ceil().max(1.0) as usize)
+            .clamp(1, MAX_PATCH_GRID)
+            .min(budget_n.max(1));
+        prev_row.clear();
+        for j in 0..=n {
+            let vp = j as f32 / n as f32;
+            let bv = bernstein(vp);
+            row.clear();
+            for i in 0..=n {
+                let up = i as f32 / n as f32;
+                let bu = bernstein(up);
+                let mut p = Point { x: 0.0, y: 0.0 };
+                for (a, col) in dev.iter().enumerate() {
+                    for (b, q) in col.iter().enumerate() {
+                        let w = bu[a] * bv[b];
+                        p.x += q.x * w;
+                        p.y += q.y * w;
+                    }
+                }
+                row.push(Vertex {
+                    p,
+                    rgb: corner_blend(&patch.rgb, up, vp),
+                });
+            }
+            if j > 0 {
+                for i in 1..=n {
+                    let (a, b) = (prev_row[i - 1], prev_row[i]);
+                    let (c, d) = (row[i - 1], row[i]);
+                    fill_triangle(pix, region, alpha, normal, blend, &[a, b, c]);
+                    fill_triangle(pix, region, alpha, normal, blend, &[b, c, d]);
+                }
+            }
+            std::mem::swap(&mut prev_row, &mut row);
+        }
+    }
+}
+
+/// Bilinear corner-color blend at `(u, v)`; corners ordered (0,0), (0,1),
+/// (1,1), (1,0) as stored in [`Patch::rgb`].
+fn corner_blend(rgb: &[[f32; 3]; 4], u: f32, v: f32) -> [f32; 3] {
+    let w = [(1.0 - u) * (1.0 - v), (1.0 - u) * v, u * v, u * (1.0 - v)];
+    let mut out = [0f32; 3];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = w[0] * rgb[0][i] + w[1] * rgb[1][i] + w[2] * rgb[2][i] + w[3] * rgb[3][i];
+    }
+    out
+}
+
+/// The cubic Bernstein basis at `t` (§8.7.4.5.8).
+fn bernstein(t: f32) -> [f32; 4] {
+    let s = 1.0 - t;
+    [s * s * s, 3.0 * t * s * s, 3.0 * t * t * s, t * t * t]
 }
 
 #[cfg(test)]

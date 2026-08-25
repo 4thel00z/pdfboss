@@ -285,8 +285,8 @@ pub enum SkippedKind {
     /// subtype this renderer knows how to draw.
     XObject,
     /// A shading (`sh` or a shading pattern) this renderer could not
-    /// paint: an unsupported kind, a missing resource, or a structural
-    /// failure. Axial and radial gradients paint.
+    /// load: a missing resource or a structural failure. All seven
+    /// shading types paint.
     Shading,
     /// A pattern fill or stroke, painted as flat mid-gray instead of the
     /// pattern's own content.
