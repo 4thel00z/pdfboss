@@ -1,5 +1,6 @@
-//! Color spaces: DeviceGray/RGB/CMYK, Indexed, and approximations for the
-//! CIE-based and tint-transform families, converted to RGB.
+//! Color spaces: DeviceGray/RGB/CMYK, Indexed, Separation/DeviceN through
+//! their tint transforms, and approximations for the CIE-based families,
+//! converted to RGB.
 
 use std::sync::Arc;
 
@@ -27,22 +28,25 @@ pub(crate) enum ColorSpace {
         base: Box<ColorSpace>,
         lookup: Vec<u8>,
     },
-    /// A one-component `Separation`: its tint transform and the alternate
-    /// space the transform's output is read in (§8.6.6.4).
+    /// A `Separation` or `DeviceN` space (§8.6.6.4/§8.6.6.5): `inputs` tint
+    /// components run through the transform, whose outputs are read in the
+    /// alternate space. Separation is the one-input case.
     ///
     /// The transform is evaluated per colour, not per parse: a fill or stroke
-    /// costs one evaluation, and an image's samples reach it through the
-    /// reader's own per-value table (one entry per distinct sample, 256 at
-    /// eight bits) rather than once per pixel. `Arc` so cloning a space
-    /// shares one arena instead of copying a sampled function's data.
+    /// costs one evaluation, and a one-component image's samples reach it
+    /// through the reader's per-value table (one entry per distinct sample,
+    /// 256 at eight bits) rather than once per pixel; multi-colorant DeviceN
+    /// images pay one evaluation per pixel. `Arc` so cloning a space shares
+    /// one arena instead of copying a sampled function's data.
     Separation {
         tint: Arc<Functions>,
         alternate: Box<ColorSpace>,
+        inputs: usize,
     },
     /// Any other family, kept only for its component count. `to_rgb`
     /// approximates it as an ink tint: gray = 1 - max component (used for
-    /// `DeviceN`, whose multi-input transforms this does not evaluate, for a
-    /// `Separation` whose transform is a type 4, and for Lab).
+    /// Lab, for a `Separation`/`DeviceN` whose transform will not load, and
+    /// for `DeviceN` beyond 8 colorants).
     Other(usize),
 }
 
@@ -65,7 +69,7 @@ impl ColorSpace {
             ColorSpace::DeviceRGB => 3,
             ColorSpace::DeviceCMYK => 4,
             ColorSpace::Indexed { .. } => 1,
-            ColorSpace::Separation { .. } => 1,
+            ColorSpace::Separation { inputs, .. } => *inputs,
             ColorSpace::Other(n) => *n,
         }
     }
@@ -106,9 +110,17 @@ impl ColorSpace {
                 }
                 base.to_rgb(&base_comps[..n])
             }
-            ColorSpace::Separation { tint, alternate } => {
+            ColorSpace::Separation {
+                tint,
+                alternate,
+                inputs,
+            } => {
+                let mut tints = [0f32; MAX_COMPS];
+                for (i, slot) in tints.iter_mut().enumerate().take(*inputs) {
+                    *slot = comp(comps, i);
+                }
                 let mut components = [0f32; MAX_COMPS];
-                let written = tint.eval(&[comp(comps, 0)], &mut components);
+                let written = tint.eval(&tints[..*inputs], &mut components);
                 alternate.to_rgb(&components[..written])
             }
             ColorSpace::Other(n) => {
@@ -124,9 +136,11 @@ impl ColorSpace {
     /// Parses a color-space object from a resource dictionary. Lenient:
     /// anything unrecognized falls back to `DeviceGray`. `ICCBased` maps by
     /// `/N` (or its `/Alternate`), the CIE `Cal*` families map to their
-    /// device equivalents, `Lab` keeps its 3 components as [`Other`],
-    /// and `Separation`/`DeviceN` become [`Other`] with the documented
-    /// tint approximation (their tint transforms are not evaluated).
+    /// device equivalents, `Lab` keeps its 3 components as [`Other`], and
+    /// `Separation`/`DeviceN` evaluate their tint transforms into the
+    /// alternate space — falling back to [`Other`] with the documented ink
+    /// approximation when the transform will not load or a `DeviceN` names
+    /// more than 8 colorants.
     ///
     /// [`Other`]: ColorSpace::Other
     pub(crate) fn parse(doc: &Document, obj: &Object) -> ColorSpace {
@@ -146,11 +160,11 @@ impl ColorSpace {
     /// palettes, innermost last.
     pub(crate) async fn parse_with<S: AsyncObjectSource>(src: &S, obj: &Object) -> ColorSpace {
         let mut palettes: Vec<Vec<u8>> = Vec::new();
-        // Tint transforms met on the way down, innermost last — the same
-        // deferral `palettes` uses, for the same reason: the transform's
-        // output is read in the alternate space, which this loop has not
-        // resolved yet.
-        let mut tints: Vec<Functions> = Vec::new();
+        // Tint transforms met on the way down with their input arity,
+        // innermost last — the same deferral `palettes` uses, for the same
+        // reason: the transform's output is read in the alternate space,
+        // which this loop has not resolved yet.
+        let mut tints: Vec<(Functions, usize)> = Vec::new();
         let mut current: Object = obj.clone();
         // If the loop runs out of levels while still descending, this is the
         // answer — the same one the recursion's depth guard gave.
@@ -221,7 +235,7 @@ impl ColorSpace {
                             };
                             match (transform, items.get(2)) {
                                 (Some(funcs), Some(alternate)) => {
-                                    tints.push(funcs);
+                                    tints.push((funcs, 1));
                                     current = alternate.clone();
                                     continue;
                                 }
@@ -235,6 +249,9 @@ impl ColorSpace {
                             }
                         }
                         "DeviceN" => {
+                            // [/DeviceN names alternate transform]: Separation
+                            // with one tint per colorant (§8.6.6.5), deferred
+                            // the same way.
                             let n = match items.get(1) {
                                 Some(o) => match src.resolve(o).await {
                                     Ok(Object::Array(names)) => names.len().max(1),
@@ -242,8 +259,24 @@ impl ColorSpace {
                                 },
                                 None => 1,
                             };
-                            result = ColorSpace::Other(n);
-                            break;
+                            let transform = match items.get(3) {
+                                Some(o) if n <= MAX_COMPS => load_functions(src, o).await.ok(),
+                                _ => None,
+                            };
+                            match (transform, items.get(2)) {
+                                (Some(funcs), Some(alternate)) => {
+                                    tints.push((funcs, n));
+                                    current = alternate.clone();
+                                    continue;
+                                }
+                                // More colorants than the pipeline carries,
+                                // or a transform that will not load: the ink
+                                // approximation.
+                                _ => {
+                                    result = ColorSpace::Other(n);
+                                    break;
+                                }
+                            }
                         }
                         other => {
                             result = Self::from_name(other);
@@ -254,10 +287,11 @@ impl ColorSpace {
                 _ => break, // stays DeviceGray
             }
         }
-        for funcs in tints.into_iter().rev() {
+        for (funcs, inputs) in tints.into_iter().rev() {
             result = ColorSpace::Separation {
                 tint: Arc::new(funcs),
                 alternate: Box::new(result),
+                inputs,
             };
         }
         for lookup in palettes.into_iter().rev() {
@@ -513,6 +547,66 @@ mod tests {
         let [r, g, bl] = cs.to_rgb(&[0.5]);
         assert!((r - 0.5).abs() < 1e-5, "{r}");
         assert_eq!((g, bl), (0.0, 0.0));
+    }
+
+    /// DeviceN is Separation with n colorants (§8.6.6.5): every input
+    /// reaches the transform, whose outputs are read in the alternate space.
+    #[test]
+    fn devicen_evaluates_its_multi_input_tint_transform() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.stream(
+            5,
+            "/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]",
+            b"{ 0 }",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let cs = ColorSpace::parse(&doc, &obj(b"[/DeviceN [/A /B] /DeviceRGB 5 0 R]"));
+        assert_eq!(cs.components(), 2);
+        let [r, g, bl] = cs.to_rgb(&[0.2, 0.6]);
+        assert!((r - 0.2).abs() < 1e-5, "{r}");
+        assert!((g - 0.6).abs() < 1e-5, "{g}");
+        assert_eq!(bl, 0.0);
+    }
+
+    /// The same seam over a two-input sampled grid: the tint pair lands in
+    /// the gray computed by the bilinear blend of the 2x2 table.
+    #[test]
+    fn devicen_evaluates_a_sampled_grid_tint() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.stream(
+            5,
+            "/FunctionType 0 /Domain [0 1 0 1] /Range [0 1] /Size [2 2] /BitsPerSample 8",
+            &[0, 100, 200, 255],
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let cs = ColorSpace::parse(&doc, &obj(b"[/DeviceN [/A /B] /DeviceGray 5 0 R]"));
+        let [r, g, bl] = cs.to_rgb(&[0.5, 0.5]);
+        assert!((r - 138.75 / 255.0).abs() < 1e-4, "{r}");
+        assert_eq!(r, g);
+        assert_eq!(g, bl);
+    }
+
+    /// More colorants than the pipeline carries stay on the documented
+    /// ink approximation.
+    #[test]
+    fn devicen_beyond_eight_colorants_keeps_the_ink_approximation() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.stream(5, "/FunctionType 2 /Domain [0 1] /C0 [0] /C1 [1] /N 1", b"");
+        let doc = Document::load(b.build(1)).unwrap();
+        let cs = ColorSpace::parse(
+            &doc,
+            &obj(b"[/DeviceN [/A /B /C /D /E /F /G /H /I] /DeviceGray 5 0 R]"),
+        );
+        assert_eq!(cs, ColorSpace::Other(9));
     }
 
     #[test]

@@ -3807,6 +3807,24 @@ mod tests {
     }
 
     #[test]
+    fn devicen_paints_through_its_tint_transform() {
+        // Two tints map straight to red and green; blue stays 0.
+        let bytes = small_doc(
+            "/ColorSpace << /T 6 0 R >>",
+            b"/T cs 0.2 0.6 scn 0 0 100 100 re f",
+            |b| {
+                b.stream(
+                    5,
+                    "<< /FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1] >>",
+                    b"{ 0 }",
+                );
+                b.object(6, "[/DeviceN [/A /B] /DeviceRGB 5 0 R]");
+            },
+        );
+        assert_eq!(px(&render(bytes, 1.0), 50, 50), [51, 153, 0, 255]);
+    }
+
+    #[test]
     fn form_xobject_matrix_paints_displaced() {
         let bytes = small_doc("/XObject << /Fm1 5 0 R >>", b"/Fm1 Do", |b| {
             b.stream(
