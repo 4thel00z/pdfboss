@@ -109,9 +109,13 @@ impl From<CcittError> for Error {
 /// passed on, but not to decide whether an end-of-line pattern is *recognised*:
 /// producers set the flag inconsistently, and a decoder that trusts it over the
 /// bits reads a row separator as twelve bits of image data, which ruins every
-/// row after. The pattern is stepped over wherever it appears. What the flag
-/// genuinely settles is whether *fill* bits may precede one, and that is what it
-/// is passed on for.
+/// row after. The pattern is stepped over wherever it appears, and under `/K`
+/// of 0 or more so is the fill that may precede one — real scanners write fill
+/// with the flag unset, and refusing the fill also loses the pattern hiding
+/// behind it, which reads as the end of the data at the first row boundary.
+/// All the flag still settles is whether fill is accepted under pure
+/// two-dimensional coding, which has no patterns of its own for fill to
+/// precede.
 ///
 /// The last two decide nothing here, and are not read:
 ///

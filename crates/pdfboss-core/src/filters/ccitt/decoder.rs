@@ -60,8 +60,11 @@ pub(crate) struct Params {
     ///
     /// This does **not** decide whether the pattern is recognised: producers
     /// disagree about the flag, so an end-of-line pattern is stepped over
-    /// wherever it appears. What the flag decides is whether *fill* may
-    /// precede one — see `Rows::consume_eol`.
+    /// wherever it appears — and under one-dimensional or mixed coding, so is
+    /// the *fill* that may precede one, flag or no flag. All the flag still
+    /// decides is whether fill is accepted under pure two-dimensional coding,
+    /// which has no patterns of its own for fill to precede — see
+    /// `Rows::consume_eol`.
     pub(crate) end_of_line: bool,
     /// Whether each row starts on a byte boundary.
     pub(crate) byte_align: bool,
@@ -165,7 +168,9 @@ struct Rows<'a> {
     columns: u32,
     /// See [`Params::k`].
     k: i32,
-    /// Whether fill bits may precede an end-of-line pattern.
+    /// Whether a run of zero bits may be fill preceding an end-of-line
+    /// pattern. True for any coding that has such patterns (`k` of 0 and
+    /// above) whatever `/EndOfLine` says — see `consume_eol`.
     fill: bool,
     /// Whether every row begins on a byte boundary.
     byte_align: bool,
@@ -185,7 +190,7 @@ impl<'a> Rows<'a> {
             r: BitReader::new(data),
             columns: params.columns,
             k: params.k,
-            fill: params.end_of_line,
+            fill: params.end_of_line || params.k >= 0,
             byte_align: params.byte_align,
             reference: Vec::new(),
             coding: Vec::new(),
@@ -351,11 +356,18 @@ impl<'a> Rows<'a> {
     /// separator as image data — twelve bits of displacement that ruins every
     /// row after.
     ///
-    /// What the flag does decide is *fill*: a run of zero bits padding a row
-    /// out to a minimum transmission time, which T.4 §4.1.1 puts only before an
-    /// end-of-line pattern. A stream without those patterns has no fill, and a
-    /// long run of zeros in one is instead the padding in its last byte — which
-    /// the caller has to see as the end of the data rather than step over.
+    /// *Fill* — a run of zero bits padding a row out to a minimum transmission
+    /// time, which T.4 §4.1.1 puts only before an end-of-line pattern — is
+    /// treated the same way, because producers that write it without setting
+    /// the flag exist too, and fill does not merely precede the pattern, it
+    /// *hides* it: the zeros in front push the pattern's own zeros across the
+    /// recognition window, so a decoder that refuses the fill also misses the
+    /// pattern and reads the row boundary as the end of the data. The one
+    /// stream that truly has no fill is a pure two-dimensional one that does
+    /// not claim end-of-line patterns: T.6 has no patterns for fill to
+    /// precede, so a long run of zeros there is the padding in the last byte —
+    /// the end of the data rather than something to step over. `self.fill`
+    /// says which kind of stream this is.
     fn consume_eol(&mut self) -> bool {
         if self.r.peek(EOL_WINDOW) == u32::from(EOL_BITS) {
             self.r.skip(EOL_WINDOW);
@@ -663,6 +675,29 @@ mod tests {
             end_of_line: false,
             byte_align: false,
         }
+    }
+
+    /// A real scanner stream whose every row is written as fill bits and then
+    /// an end-of-line pattern, under `/K` 0 with `/EndOfLine` unset. The fill
+    /// makes the first twelve bits of the stream all zero, which must be read
+    /// as fill before the pattern rather than as the end of the data — a
+    /// decoder that trusts the flag over the bits here decodes no rows at all.
+    #[test]
+    fn fill_before_an_end_of_line_is_stepped_over_even_when_the_flag_is_unset() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/ccitt-fill-before-eol.bin"
+        );
+        let data = std::fs::read(path).expect("fixture");
+        let params = Params {
+            columns: 1251,
+            rows: 0,
+            k: 0,
+            end_of_line: false,
+            byte_align: false,
+        };
+        let out = decode(&data, &params).expect("decode");
+        assert_eq!(out.height(), 2064);
     }
 
     #[test]
