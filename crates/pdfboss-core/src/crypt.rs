@@ -470,6 +470,23 @@ fn inv_mix_columns(s: &mut [u8; 16]) {
 }
 
 fn aes_encrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]]) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        // SAFETY: the `aes` target feature was just detected at runtime.
+        unsafe { aes_hw::encrypt_block(s, rks) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("aes") {
+        // SAFETY: the `aes` target feature was just detected at runtime.
+        unsafe { aes_hw::encrypt_block(s, rks) };
+        return;
+    }
+    aes_encrypt_block_soft(s, rks);
+}
+
+/// The portable byte-oriented rounds, for CPUs without AES instructions.
+fn aes_encrypt_block_soft(s: &mut [u8; 16], rks: &[[u8; 16]]) {
     let nr = rks.len() - 1;
     add_round_key(s, &rks[0]);
     for rk in &rks[1..nr] {
@@ -484,6 +501,23 @@ fn aes_encrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]]) {
 }
 
 fn aes_decrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]], inv_sbox: &[u8; 256]) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("aes") {
+        // SAFETY: the `aes` target feature was just detected at runtime.
+        unsafe { aes_hw::decrypt_block(s, rks) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("aes") {
+        // SAFETY: the `aes` target feature was just detected at runtime.
+        unsafe { aes_hw::decrypt_block(s, rks) };
+        return;
+    }
+    aes_decrypt_block_soft(s, rks, inv_sbox);
+}
+
+/// The portable byte-oriented rounds, for CPUs without AES instructions.
+fn aes_decrypt_block_soft(s: &mut [u8; 16], rks: &[[u8; 16]], inv_sbox: &[u8; 256]) {
     let nr = rks.len() - 1;
     add_round_key(s, &rks[nr]);
     for rk in rks[1..nr].iter().rev() {
@@ -495,6 +529,98 @@ fn aes_decrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]], inv_sbox: &[u8; 256]) {
     inv_shift_rows(s);
     s.iter_mut().for_each(|b| *b = inv_sbox[*b as usize]);
     add_round_key(s, &rks[0]);
+}
+
+/// AES block rounds on the CPU's AES instructions. The R6 password hash
+/// CBC-encrypts about a megabyte per key derivation (Algorithm 2.B runs
+/// 64+ rounds over a 64-fold repeated block), which the byte-oriented
+/// software rounds above turn into ~500ms per encrypted document; these
+/// paths bring that under a millisecond. Callers detect the `aes` feature
+/// before entering; every function must produce bytes identical to the
+/// software rounds (pinned by the FIPS-197 vectors in the tests below).
+#[cfg(target_arch = "aarch64")]
+mod aes_hw {
+    use core::arch::aarch64::{
+        vaesdq_u8, vaeseq_u8, vaesimcq_u8, vaesmcq_u8, veorq_u8, vld1q_u8, vmovq_n_u8, vst1q_u8,
+    };
+
+    /// # Safety
+    /// Requires the `aes` target feature.
+    #[target_feature(enable = "aes")]
+    pub unsafe fn encrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]]) {
+        let nr = rks.len() - 1;
+        // AESE folds AddRoundKey into SubBytes+ShiftRows, so the loop
+        // consumes rks[0..nr-1] and the last round's key lands as a plain
+        // XOR after the final AESE.
+        let mut x = vld1q_u8(s.as_ptr());
+        for rk in &rks[..nr - 1] {
+            x = vaesmcq_u8(vaeseq_u8(x, vld1q_u8(rk.as_ptr())));
+        }
+        x = vaeseq_u8(x, vld1q_u8(rks[nr - 1].as_ptr()));
+        x = veorq_u8(x, vld1q_u8(rks[nr].as_ptr()));
+        vst1q_u8(s.as_mut_ptr(), x);
+    }
+
+    /// # Safety
+    /// Requires the `aes` target feature.
+    #[target_feature(enable = "aes")]
+    pub unsafe fn decrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]]) {
+        let nr = rks.len() - 1;
+        // AESD with a zero key is exactly InvSubBytes(InvShiftRows(x)),
+        // which lets the loop mirror the software inverse cipher's
+        // operation order with the round keys untransformed.
+        let zero = vmovq_n_u8(0);
+        let mut x = vld1q_u8(s.as_ptr());
+        x = veorq_u8(x, vld1q_u8(rks[nr].as_ptr()));
+        for rk in rks[1..nr].iter().rev() {
+            x = vaesdq_u8(x, zero);
+            x = veorq_u8(x, vld1q_u8(rk.as_ptr()));
+            x = vaesimcq_u8(x);
+        }
+        x = vaesdq_u8(x, zero);
+        x = veorq_u8(x, vld1q_u8(rks[0].as_ptr()));
+        vst1q_u8(s.as_mut_ptr(), x);
+    }
+}
+
+/// See the aarch64 twin above; same contract, AES-NI instructions.
+#[cfg(target_arch = "x86_64")]
+mod aes_hw {
+    use core::arch::x86_64::{
+        __m128i, _mm_aesdec_si128, _mm_aesdeclast_si128, _mm_aesenc_si128, _mm_aesenclast_si128,
+        _mm_aesimc_si128, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128,
+    };
+
+    /// # Safety
+    /// Requires the `aes` target feature.
+    #[target_feature(enable = "aes")]
+    pub unsafe fn encrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]]) {
+        let nr = rks.len() - 1;
+        let mut x = _mm_loadu_si128(s.as_ptr().cast::<__m128i>());
+        x = _mm_xor_si128(x, _mm_loadu_si128(rks[0].as_ptr().cast::<__m128i>()));
+        for rk in &rks[1..nr] {
+            x = _mm_aesenc_si128(x, _mm_loadu_si128(rk.as_ptr().cast::<__m128i>()));
+        }
+        x = _mm_aesenclast_si128(x, _mm_loadu_si128(rks[nr].as_ptr().cast::<__m128i>()));
+        _mm_storeu_si128(s.as_mut_ptr().cast::<__m128i>(), x);
+    }
+
+    /// # Safety
+    /// Requires the `aes` target feature.
+    #[target_feature(enable = "aes")]
+    pub unsafe fn decrypt_block(s: &mut [u8; 16], rks: &[[u8; 16]]) {
+        let nr = rks.len() - 1;
+        // AESDEC applies InvMixColumns before its key XOR, so the middle
+        // round keys go through AESIMC (the equivalent inverse cipher).
+        let mut x = _mm_loadu_si128(s.as_ptr().cast::<__m128i>());
+        x = _mm_xor_si128(x, _mm_loadu_si128(rks[nr].as_ptr().cast::<__m128i>()));
+        for rk in rks[1..nr].iter().rev() {
+            let dk = _mm_aesimc_si128(_mm_loadu_si128(rk.as_ptr().cast::<__m128i>()));
+            x = _mm_aesdec_si128(x, dk);
+        }
+        x = _mm_aesdeclast_si128(x, _mm_loadu_si128(rks[0].as_ptr().cast::<__m128i>()));
+        _mm_storeu_si128(s.as_mut_ptr().cast::<__m128i>(), x);
+    }
 }
 
 /// AES-CBC decryption of whole blocks (no IV prefix, no padding removal).
@@ -914,6 +1040,50 @@ mod tests {
         // 56 bytes forces a second padded block.
         let input = [b'a'; 56];
         assert_eq!(hex(&md5(&input)), "3b0c8ac703f828b04c6c197006d17218");
+    }
+
+    /// FIPS-197 Appendix C block vectors, both key sizes and both
+    /// directions, held against the dispatching entry (the hardware path
+    /// wherever this test runs on a CPU with AES instructions) AND the
+    /// portable rounds directly, so neither path can drift.
+    #[test]
+    fn aes_block_known_vectors() {
+        let plain: [u8; 16] = core::array::from_fn(|i| (i as u8) * 0x11);
+        let key128: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let key256: [u8; 32] = core::array::from_fn(|i| i as u8);
+
+        type Encrypt = fn(&mut [u8; 16], &[[u8; 16]]);
+        type Decrypt = fn(&mut [u8; 16], &[[u8; 16]], &[u8; 256]);
+        let paths: [(Encrypt, Decrypt); 2] = [
+            (aes_encrypt_block, aes_decrypt_block),
+            (aes_encrypt_block_soft, aes_decrypt_block_soft),
+        ];
+        for (encrypt, decrypt) in paths {
+            let mut s = plain;
+            encrypt(&mut s, &aes_expand_key(&key128));
+            assert_eq!(hex(&s), "69c4e0d86a7b0430d8cdb78070b4c55a");
+            decrypt(&mut s, &aes_expand_key(&key128), &aes_inv_sbox());
+            assert_eq!(s, plain);
+
+            let mut s = plain;
+            encrypt(&mut s, &aes_expand_key(&key256));
+            assert_eq!(hex(&s), "8ea2b7ca516745bfeafc49904b496089");
+            decrypt(&mut s, &aes_expand_key(&key256), &aes_inv_sbox());
+            assert_eq!(s, plain);
+        }
+    }
+
+    /// Multi-block CBC round-trips through the block paths, chaining
+    /// included: what the R6 hash encrypts, decryption must invert.
+    #[test]
+    fn aes_cbc_round_trips_multiple_blocks() {
+        let key: [u8; 16] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        let iv: [u8; 16] = core::array::from_fn(|i| 0xa5 ^ (i as u8));
+        let data: Vec<u8> = (0..64u8).collect();
+        let ct = aes_cbc_encrypt_blocks(&key, &iv, &data);
+        assert_eq!(ct.len(), data.len());
+        assert_ne!(ct, data);
+        assert_eq!(aes_cbc_decrypt_blocks(&key, &iv, &ct), data);
     }
 
     #[test]
