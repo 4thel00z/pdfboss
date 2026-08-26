@@ -13,6 +13,7 @@ members = [
     "crates/pdfboss-py",
     "crates/pdfboss-testkit",
     "crates/pdfboss-tui",
+    "crates/pdfboss-write",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ pdfboss-output = { path = "crates/pdfboss-output", version = "0.19.1" } # x-rele
 pdfboss-render = { path = "crates/pdfboss-render", version = "0.19.1" } # x-release-please-version
 pdfboss-aio = { path = "crates/pdfboss-aio", version = "0.19.1" } # x-release-please-version
 pdfboss-tui = { path = "crates/pdfboss-tui", version = "0.19.1" } # x-release-please-version
+pdfboss-write = { path = "crates/pdfboss-write", version = "0.19.1" } # x-release-please-version
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "sync", "io-util"] }
 futures-core = "0.3"

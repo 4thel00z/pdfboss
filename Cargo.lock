@@ -1314,6 +1314,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pdfboss-write"
+version = "0.19.1"
+dependencies = [
+ "flate2",
+ "pdfboss-core",
+ "pdfboss-encoding",
+ "pdfboss-render",
+ "png",
+ "thiserror",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
