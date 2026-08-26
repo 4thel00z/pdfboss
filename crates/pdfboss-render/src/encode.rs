@@ -289,8 +289,8 @@ mod filter_hw {
 mod filter_hw {
     use core::arch::x86_64::{
         __m128i, _mm_add_epi64, _mm_and_si128, _mm_andnot_si128, _mm_cmpeq_epi8, _mm_loadu_si128,
-        _mm_max_epu8, _mm_min_epu8, _mm_or_si128, _mm_sad_epu8, _mm_set1_epi8, _mm_setzero_si128,
-        _mm_srli_epi16, _mm_sub_epi8, _mm_subs_epu8, _mm_xor_si128,
+        _mm_min_epu8, _mm_or_si128, _mm_sad_epu8, _mm_set1_epi8, _mm_setzero_si128, _mm_srli_epi16,
+        _mm_sub_epi8, _mm_xor_si128,
     };
 
     #[inline]
@@ -553,7 +553,10 @@ enum Token<'a> {
     /// A stretch of literal bytes: incompressible regions cost one
     /// callback per stretch rather than one per byte.
     Literals(&'a [u8]),
-    Match { len: usize, dist: usize },
+    Match {
+        len: usize,
+        dist: usize,
+    },
 }
 
 /// Word-wise scan to the end of the zero run starting at `i`.
@@ -1147,7 +1150,11 @@ const CRC_TABLES: [[u32; 256]; 8] = {
         let mut c = n as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xedb88320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xedb88320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         tables[0][n] = c;
@@ -1280,7 +1287,11 @@ mod tests {
             })
             .collect();
         for len in [0usize, 1, 15, 16, 17, 5551, 5552, 5553, 20000] {
-            assert_eq!(adler32(&data[..len]), adler32_soft(&data[..len]), "len {len}");
+            assert_eq!(
+                adler32(&data[..len]),
+                adler32_soft(&data[..len]),
+                "len {len}"
+            );
         }
     }
 
@@ -1341,7 +1352,11 @@ mod stage_times {
         for _ in 0..reps {
             out = deflate_filtered(&filtered);
         }
-        println!("deflate:     {:?}/page ({} bytes)", t0.elapsed() / reps, out.len());
+        println!(
+            "deflate:     {:?}/page ({} bytes)",
+            t0.elapsed() / reps,
+            out.len()
+        );
 
         let t0 = std::time::Instant::now();
         let mut a = 0u32;
