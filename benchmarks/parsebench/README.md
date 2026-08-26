@@ -76,6 +76,7 @@ leaderboard's "Open Source - Local" bracket (numbers from the repo's
 
 | Engine | Overall |
 |---|--:|
+| PyMuPDF4LLM | 53.49 |
 | Warp Ingest | 40.18 |
 | LiteParse (no OCR) | 32.80 |
 | OpenDataLoader | 29.40 |
@@ -94,9 +95,10 @@ leaderboard's "Open Source - Local" bracket (numbers from the repo's
   436 need a per-page layout payload (`ParseLayoutPageIR` items with
   normalized bboxes) that this provider does not emit, plus the 42 image
   inputs. The zeroing is identical for the pypdf/PyMuPDF baselines
-  (verified in-harness). Follow-up: expose block geometry from pdfboss's
-  layout IR through the Python bindings and emit the payload — no non-ML
-  local engine on the public leaderboard does.
+  (verified in-harness). PyMuPDF4LLM shows the payload is within reach of a
+  text-layer engine — it builds one from native page boxes and scores
+  61.89 on the dimension. Follow-up: expose block geometry from pdfboss's
+  layout IR through the Python bindings and emit the payload.
 - **Content Faithfulness** is dragged by two by-design choices: pdfboss
   markdown drops page headers/footers (the is_header/is_footer rules score
   zero) and scan-only pages have no text layer to extract.
