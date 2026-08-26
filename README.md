@@ -14,40 +14,36 @@
 
 ---
 
-## Motivation
-
-Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification. It has no C dependencies and no bindings to another engine. It is safe Rust with a small, obvious API. The same core powers the CLI and the native Python extension, so a script and a service share one implementation.
-
-pdfboss is a **lenient reader**. Real-world files are damaged, so it recovers instead of refusing. It reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators.
+Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification: safe Rust, no C dependencies, no bindings to another engine, one core behind the CLI and the native Python extension. It is a **lenient reader** — real-world files are damaged, so it reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators instead of refusing.
 
 ## Install
 
-### Python
-
 ```bash
-pip install pdfboss
-```
-
-Prebuilt abi3 wheels (CPython 3.12+) for Linux and macOS. No toolchain required.
-
-### Rust
-
-```bash
-cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-aio pdfboss-tui   # library crates
-cargo install pdfboss-cli                                                                   # the `pdfboss` binary
+pip install pdfboss           # prebuilt abi3 wheels (CPython 3.12+), no toolchain required
+cargo install pdfboss-cli     # the `pdfboss` binary
 ```
 
 ## Usage
-
-### CLI
 
 ```bash
 pdfboss info    report.pdf                 # version, page count, sizes, metadata
 pdfboss text    report.pdf --page 2        # extract text (omit --page for all)
 pdfboss md      report.pdf                 # markdown: headings, lists, tables from layout
 pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
-pdfboss obj     report.pdf 5               # pretty-print object 5
+pdfboss tui     report.pdf                 # interactive terminal explorer
 ```
+
+```python
+import pdfboss
+
+doc = pdfboss.Document("report.pdf")       # or Document(data=raw_bytes)
+text = doc.extract_text()
+md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
+png  = doc[0].render(scale=2.0)            # PNG bytes
+```
+
+<details>
+<summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
 
 Explorer subcommands. Each accepts a local path or an `http(s)://` URL, fetched in ranges and never downloaded whole:
 
@@ -56,22 +52,12 @@ pdfboss json    report.pdf                    # dump the document as a JSON valu
 pdfboss json    report.pdf --layout           # ...plus per-page layout blocks
 pdfboss hex     report.pdf obj:5              # hexdump the file or a selected element
 pdfboss q       report.pdf '.header.version'  # jq-style queries over the JSON tree
-pdfboss tui     report.pdf                    # interactive terminal explorer
+pdfboss obj     report.pdf 5                  # pretty-print object 5
 ```
 
-### Python
-
 ```python
-import pdfboss
-
-doc = pdfboss.Document("report.pdf")       # or Document(data=raw_bytes)
-print(doc.page_count, doc.version, doc.metadata)
-
 page = doc[0]
 print(page.width, page.height, page.rotation)
-text = page.extract_text()                 # or doc.extract_text() for all pages
-md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
-png  = page.render(scale=2.0)              # PNG bytes
 
 for element in doc.elements():             # lazy: physical + logical, byte spans included
     print(element.kind, element.span)
@@ -82,7 +68,7 @@ async for element in doc.elements():
     print(element.kind, element.value)
 ```
 
-### Rust
+Rust — the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-aio pdfboss-tui`):
 
 ```rust
 use pdfboss_core::Document;
@@ -96,7 +82,112 @@ let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;
 pixmap.save_png("page.png")?;
 ```
 
+</details>
+
+## Benchmarks
+
+### Text and parsing
+
+Against other Python PDF libraries over 40 real-world PDFs (pages/sec, higher is faster):
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
+</p>
+
+**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF**: 9,000 pages/s extracting text against PyMuPDF's 449 (about 20×), and 357,000 pages/s opening + parsing against 99,000 (about 3.6×).
+
+<details>
+<summary><strong>Method and fine print</strong></summary>
+
+Best-of-3 per file, aggregated over the files every library handled. The pure-Python readers are 95× to 500× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
+
+Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
+
+</details>
+
+### Extraction quality
+
+On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) — the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons — pdfboss reads the whole corpus in about a seventh of a second, over 3× faster than the fastest competing Markdown engine, with a mid-field reading-order score (**NID**, higher is better):
+
+| Engine | Reading order (NID) | Output | Time (200 docs) |
+|---|--:|---|--:|
+| pdf-inspector 0.2.6 | 0.915 | Markdown | 0.44s |
+| liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
+| opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
+| pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
+| **pdfboss** (`md`) | **0.877** | Markdown | **0.14s** |
+| **pdfboss** | **0.868** | plain text | **0.13s** |
+| markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
+
+<details>
+<summary><strong>What the score is made of, and how it was measured</strong></summary>
+
+Per document, the plain-text output beats pdf-inspector's NID on 105 of the 200 files, ties on 23 and loses on 72. The losses concentrate in table regions, where structured output matches the ground truth more closely than flowed text can. On the benchmark's combined metric the Markdown adapter scores 0.801 (reading order 0.877, headings and lists 0.667, table structure 0.532). It detects tables from column gaps and from drawn borders, so bordered grids and boxed lists without column gaps are found too. Two-column layouts are read column-major. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
+
+Quality rows come from the benchmark's own evaluator over all 200 documents. The two pdfboss timings were measured together in one session on an Apple M3 Pro under the benchmark's protocol: median of five single-process runs after a warm-up, wheel built from main. pdf-inspector was measured the same way on the same machine in an earlier session. The other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro. Read them as order-of-magnitude context, not a same-machine race.
+
+</details>
+
+### Rendering
+
+A renderer that skips work looks fast, so every file is certified before the stopwatch starts: any page that reports dropped or approximated content excludes its file, and an ink-coverage gate across libraries catches work skipped silently. 37 of the 40 files (864 pages) certify:
+
+| Library | pages/sec |
+|---|--:|
+| pypdfium2 | 125.9 |
+| pdfboss | 112.0 |
+| pdfplumber (via pdfium) | 104.5 |
+| PyMuPDF | 94.8 |
+
+pdfboss rasterizes the mixed corpus second only to pdfium itself: about 11% behind it, ahead of pdfplumber's pdfium stack and PyMuPDF, with no C in it.
+
+<details>
+<summary><strong>Certification and stability details</strong></summary>
+
+pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees: a blank page renders instantly and means nothing. The three annotation-appearance files and the tiling-pattern file the earlier sample excluded now certify, leaving only three files whose fonts lack a glyph for a code the page draws.
+
+Caching loaded shadings and patterns across paints and reworking the rasterizer's hot paths moved pdfboss up a place since the last table, with every output byte identical. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 1.6%, the pdfboss-to-pdfium ratio held within 0.5%, and the ordering never moved.
+
+Reproduce with [`benchmarks/bench_render.py`](benchmarks/README.md).
+
+</details>
+
+### Scanned documents
+
+Scans are the other half of the world's PDFs: one full-page bilevel image per page, JBIG2- or CCITT-coded, no text operators. A 544-page JBIG2 book (1994 × 2832 samples per page) rasterized to PNG at 1:1:
+
+| Library | pages/sec | Ink on page 1 |
+|---|--:|--:|
+| pdfboss | 88.1 | 4.83% |
+| pdfplumber (via pdfium) | 57.8 | 4.87% |
+| PyMuPDF | 54.5 | 4.82% |
+| pypdfium2 | 52.6 | 4.85% |
+
+**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers**, and the only one of them with no C in it.
+
+<details>
+<summary><strong>Where the time goes, and why the ink column matters</strong></summary>
+
+All four are timed in one pass, and the ratio has landed within a few percent of 1.5× on every run (1.49× to 1.56×), while the absolute numbers varied by half as the machine warmed and cooled. Compare the four rows against each other, not against another machine's numbers.
+
+What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation that feeds it. That part is a serial dependency chain: every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded. It neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
+
+The ink column is what makes the timings mean anything. A library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel, because each library downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
+
+Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
+
+</details>
+
+### In the browser
+
+[pdfarena](https://pdfarena.tahrioui.de) races pdfboss against hayro, pdf.js and PDFium on any PDF you drop in, with pdfboss and hayro compiled to WebAssembly. Each engine renders in its own web worker, the stopwatch wraps only the render call, and every challenger is pixel-diffed against pdf.js as the reference. Nothing gets uploaded; the whole benchmark runs in your browser.
+
 ## What's inside
+
+Ten crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
+
+<details>
+<summary><strong>Crate map</strong></summary>
 
 | Crate | Responsibility |
 |---|---|
@@ -111,85 +202,27 @@ pixmap.save_png("page.png")?;
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
+</details>
+
+<details>
+<summary><strong>Everything supported, in one breath</strong></summary>
+
 **Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images: JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans: Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans: the full segment type table — generic, text, halftone and refinement regions, immediate or intermediate, symbol and pattern dictionaries, custom code tables, arithmetic- or Huffman-coded with the MMR variants throughout — with or without `/JBIG2Globals` · Standard-handler decryption: RC4 and AES-128/256, with the user or owner password (`--password`, `password=`; the empty user password opens transparently) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · Markdown output with headings, lists, emphasis and pipe/HTML tables inferred from the page layout and from drawn table borders · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, all blend modes (separable and non-separable), soft masks (image `/SMask`, stencil and color-key `/Mask`, and Luminosity/Alpha `/SMask` groups in `/ExtGState`), image/form XObjects, all seven shading types (the `sh` operator and shading-pattern fills and strokes: function-based, axial and radial through sampled, exponential, stitching and PostScript-calculator functions, plus Gouraud triangle meshes and Coons/tensor patch meshes), tiling patterns (colored and uncolored, each cell run as its own content stream), annotation normal appearances (`/AP` `/N`, with `/AS` state selection), `ICCBased` colour through the embedded profile (ICC.1:2010 v2/v4, matrix/TRC, grayTRC, and `A2B0` lookup transforms) and the CIE `CalRGB`/`CalGray`/`Lab` families through XYZ, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
 
-## Benchmarks
-
-### Text and parsing
-
-Against other Python PDF libraries over 40 real-world PDFs (best-of-3 per file, aggregated over the files every library handled; pages/sec, higher is faster):
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
-</p>
-
-**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF.** On text extraction it reaches 9,000 pages/s. PyMuPDF reaches 449 (about 20×), and the pure-Python readers are 95× to 500× slower. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed. On open + parse it reaches 357,000 pages/s against PyMuPDF's 99,000 (about 3.6×). Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
-
-Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
-
-### Extraction quality
-
-Speed without fidelity is worthless, so extraction quality is measured too. The corpus is [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (200 real-world PDFs), which PDF-to-Markdown engines use for their published comparisons. pdfboss appears twice: the default plain-text output and the Markdown adapter behind `pdfboss md`. The metric that is comparable across all rows is **NID**, the reading-order similarity against the ground truth (0 to 1, higher is better).
-
-| Engine | Reading order (NID) | Output | Time (200 docs) |
-|---|--:|---|--:|
-| pdf-inspector 0.2.6 | 0.915 | Markdown | 0.44s |
-| liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
-| opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
-| pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
-| **pdfboss** (`md`) | **0.877** | Markdown | **0.14s** |
-| **pdfboss** | **0.868** | plain text | **0.13s** |
-| markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
-
-pdfboss reads the whole corpus in about a seventh of a second in either mode. That is over 3× faster than the fastest competing Markdown engine measured on the same machine. Its reading-order score sits in the middle of the field: per document, the plain-text output beats pdf-inspector's NID on 105 of the 200 files, ties on 23 and loses on 72. The losses concentrate in table regions, where structured output matches the ground truth more closely than flowed text can. On the benchmark's combined metric the Markdown adapter scores 0.801 (reading order 0.877, headings and lists 0.667, table structure 0.532). It detects tables from column gaps and from drawn borders, so bordered grids and boxed lists without column gaps are found too. Two-column layouts are read column-major. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
-
-Quality rows come from the benchmark's own evaluator over all 200 documents. The two pdfboss timings were measured together in one session on an Apple M3 Pro under the benchmark's protocol: median of five single-process runs after a warm-up, wheel built from main. pdf-inspector was measured the same way on the same machine in an earlier session. The other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro. Read them as order-of-magnitude context, not a same-machine race.
-
-### Rendering
-
-A renderer that skips work looks fast, and pdfboss does not paint everything yet. So the render benchmark certifies every file before the stopwatch starts: pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees, which catches work skipped without a report: a blank page renders instantly and means nothing. Of the 40-file sample above, 37 files (864 pages) certify. The three annotation-appearance files and the tiling-pattern file the earlier sample excluded now certify, leaving only three files whose fonts lack a glyph for a code the page draws.
-
-| Library | pages/sec |
-|---|--:|
-| pypdfium2 | 125.9 |
-| pdfboss | 112.0 |
-| pdfplumber (via pdfium) | 104.5 |
-| PyMuPDF | 94.8 |
-
-pdfboss rasterizes the mixed corpus second only to pdfium itself: about 11% behind it, ahead of pdfplumber's pdfium stack and PyMuPDF, with no C in it. Caching loaded shadings and patterns across paints and reworking the rasterizer's hot paths moved it up a place since the last table, with every output byte identical. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 1.6%, the pdfboss-to-pdfium ratio held within 0.5%, and the ordering never moved.
-
-Reproduce with [`benchmarks/bench_render.py`](benchmarks/README.md).
-
-### Scanned documents
-
-Scans are the other half of the world's PDFs, and they are a different workload: one full-page bilevel image per page, JBIG2- or CCITT-coded, with no text operators at all. Rendering **is** comparable there, because with no glyphs to paint every library draws the same picture. So scans get their own benchmark: a 544-page JBIG2 book (1994 × 2832 samples per page) rasterized to PNG at 1:1.
-
-| Library | pages/sec | Ink on page 1 |
-|---|--:|--:|
-| pdfboss | 88.1 | 4.83% |
-| pdfplumber (via pdfium) | 57.8 | 4.87% |
-| PyMuPDF | 54.5 | 4.82% |
-| pypdfium2 | 52.6 | 4.85% |
-
-**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers**, and the only one of them with no C in it. Compare the four rows against each other, not against another machine's numbers. All four are timed in one pass, and the ratio has landed within a few percent of 1.5× on every run (1.49× to 1.56×), while the absolute numbers varied by half as the machine warmed and cooled.
-
-What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation that feeds it. That part is a serial dependency chain: every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded. It neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
-
-The ink column is what makes the timings mean anything. A library that cannot decode a scan's codec usually hands back a blank page instead of raising, and a blank page benchmarks superbly. Agreeing coverage says all four decoded the same picture. They do not agree pixel for pixel, because each library downsamples 1994 × 2832 samples onto a 462 × 663 page with its own resampling.
-
-Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
-
-### In the browser
-
-[pdfarena](https://pdfarena.tahrioui.de) races pdfboss against hayro, pdf.js and PDFium on any PDF you drop in, with pdfboss and hayro compiled to WebAssembly. Each engine renders in its own web worker, the stopwatch wraps only the render call, and every challenger is pixel-diffed against pdf.js as the reference. Nothing gets uploaded; the whole benchmark runs in your browser.
+</details>
 
 ## Limitations
+
+Rendering is lenient and it says so: content pdfboss cannot read is skipped so the rest of the page still rasterizes, and every dropped or approximated item lands in a report — `pdfboss render` warns on stderr, the TUI raises a notice, and the libraries return it through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python). The whole not-yet-supported list is two faces: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank rather than borrowing an unrelated face's glyphs.
+
+<details>
+<summary><strong>The full accounting: fonts, CMaps, JBIG2, colour, JPX, layers</strong></summary>
 
 Glyph painting is staged in tiers, selected with `--fonts`. The default, `all-embedded`, paints every embedded font program (TrueType, CFF, Type1 and Type3). `embedded-only` restricts that to TrueType. `full` additionally substitutes a replacement face for a **non-embedded** simple font, from either a directory you supply or the compiled-in OFL Croscore set (behind the `substitute-fonts` feature). Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
 
 Type0 `/Encoding` CMaps resolve — the predefined ISO 32000 Table 118 CJK set is compiled in (behind the `predefined-cmaps` feature, on by default in the CLI and the wheel), embedded CMap streams parse the same way, widths key on the mapped CID, vertical text (`WMode` 1) advances by `/W2`/`/DW2` with the default position vector, and extraction maps CIDs to Unicode through the character collection when `/ToUnicode` is absent; deferred: vertical runs still extract as horizontal-schema spans, one per show operator, with x/y at the glyph origin.
 
-What still does not paint: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank at every tier rather than borrowing an unrelated face's glyphs. A bold *sans* substitute is not visually distinct from regular weight. Text a tier leaves unpainted still advances — through the PDF's own `/Widths`, or the Adobe Core-14 AFM tables for a standard-14 face — so everything painted around it stays where the page put it.
+A bold *sans* substitute is not visually distinct from regular weight. Text a tier leaves unpainted still advances — through the PDF's own `/Widths`, or the Adobe Core-14 AFM tables for a standard-14 face — so everything painted around it stays where the page put it.
 
 `JBIG2Decode` covers the embedded stream format end to end: generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant — refinement/aggregate-coded symbols and refined instance placements included — pattern dictionaries and halftone regions, generic refinement regions (both templates, with TPGRON) refining either the page or a retained intermediate region, intermediate regions of every type, and custom code table segments. Nothing in the standard's segment type table is refused any more; a malformed or truncated stream still fails with a message naming what was wrong instead of rendering a blank.
 
@@ -199,9 +232,7 @@ Colour converts to sRGB. `ICCBased` spaces parse their embedded profile (v2 and 
 
 Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the document's default configuration: rendering and text extraction skip layers it turns off, counting them on the reports' `hidden` counters.
 
-Not yet supported (they error or degrade gracefully, and are on the roadmap): the unpainted faces listed above.
-
-Rendering is lenient: content pdfboss cannot read is skipped so the rest of the page still rasterizes. It says so rather than passing the result off as a faithful render. `pdfboss render` prints a warning line per dropped item on stderr and annotates its summary. The TUI preview raises a status-bar notice. The libraries expose the detail through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python), which return the pixels plus a report of everything dropped or approximated.
+</details>
 
 ## Development
 
