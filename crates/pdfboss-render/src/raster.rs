@@ -1518,3 +1518,109 @@ mod tests {
         assert_eq!(alpha_at(&pix, 5, 4), 255);
     }
 }
+
+#[cfg(test)]
+mod stage_times {
+    use super::*;
+    use pdfboss_core::geom::Point;
+
+    fn glyph_like(cx: f32, cy: f32) -> Vec<Subpath> {
+        // An 8-point closed blob roughly the size of a 12pt glyph.
+        let pts = [
+            (0.0, 0.0),
+            (4.0, -1.0),
+            (7.0, 2.0),
+            (8.0, 6.0),
+            (6.0, 9.0),
+            (3.0, 10.0),
+            (0.5, 8.0),
+            (-1.0, 4.0),
+        ];
+        vec![Subpath {
+            points: pts
+                .iter()
+                .map(|&(x, y)| Point::new(cx + x, cy + y))
+                .collect(),
+            closed: true,
+        }]
+    }
+
+    /// Not a correctness test: prints where a text-page-shaped fill
+    /// workload spends its time. Run explicitly:
+    /// `cargo test --release -p pdfboss-render raster::stage_times -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn print_stage_times() {
+        let mut pix = Pixmap::new(612, 792);
+        pix.fill([255, 255, 255, 255]);
+        let mut scratch = RasterScratch::default();
+        let glyphs: Vec<Vec<Subpath>> = (0..2000)
+            .map(|i| glyph_like(20.0 + (i % 60) as f32 * 9.5, 20.0 + (i / 60) as f32 * 12.0))
+            .collect();
+        let reps = 20;
+
+        // Whole fill (edges + sweep + blend).
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for polys in &glyphs {
+                fill_path(
+                    &mut pix,
+                    &mut scratch,
+                    polys,
+                    FillRule::NonZero,
+                    [20, 20, 20, 255],
+                    1.0,
+                    None,
+                    BlendMode::Normal,
+                );
+            }
+        }
+        println!("fill (2000 glyphs): {:?}/page", t0.elapsed() / reps);
+
+        // Sweep only: coverage accumulation with a no-op emit.
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for polys in &glyphs {
+                prepare_edges(&mut scratch.edges, polys);
+                sweep_rows(&mut scratch, 612, 792, FillRule::NonZero, |_, _, _, _| {});
+            }
+        }
+        println!("sweep only:         {:?}/page", t0.elapsed() / reps);
+
+        // Edge preparation alone.
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for polys in &glyphs {
+                prepare_edges(&mut scratch.edges, polys);
+            }
+        }
+        println!("prepare_edges:      {:?}/page", t0.elapsed() / reps);
+
+        // One big fill: a page-sized rounded blob, 40 of them.
+        let big: Vec<Subpath> = vec![Subpath {
+            points: (0..64)
+                .map(|i| {
+                    let a = i as f32 / 64.0 * std::f32::consts::TAU;
+                    Point::new(306.0 + 280.0 * a.cos(), 396.0 + 370.0 * a.sin())
+                })
+                .collect(),
+            closed: true,
+        }];
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            for _ in 0..40 {
+                fill_path(
+                    &mut pix,
+                    &mut scratch,
+                    &big,
+                    FillRule::NonZero,
+                    [40, 80, 120, 200],
+                    0.8,
+                    None,
+                    BlendMode::Normal,
+                );
+            }
+        }
+        println!("fill (40 big):      {:?}/page", t0.elapsed() / reps);
+    }
+}
