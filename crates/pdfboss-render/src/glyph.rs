@@ -909,7 +909,7 @@ impl SubstituteInputs {
         // StandardEncoding (ISO 32000-1 9.6.6's built-in encoding for the
         // standard 14); and a descriptor whose `/Flags` declare Nonsymbolic
         // states outright that the font uses the Adobe standard Latin
-        // character set (Table 121), whose built-in encoding is the standard
+        // character set (Table 123), whose built-in encoding is the standard
         // one (Annex D) -- without the font program the built-in table itself
         // is unreadable, and StandardEncoding is its defined shape. A
         // symbolic font's built-in encoding is unknowable here, so it is

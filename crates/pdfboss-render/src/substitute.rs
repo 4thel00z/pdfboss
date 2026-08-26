@@ -1,5 +1,5 @@
 //! Non-embedded font substitution: deriving a face request from a PDF font
-//! dictionary (ISO 32000-1 Table 121, `/FontDescriptor /Flags`) and mapping
+//! dictionary (ISO 32000-1 Table 123, `/FontDescriptor /Flags`) and mapping
 //! that request onto a replacement face, either compiled in or read from a
 //! directory at render time.
 //!
@@ -69,7 +69,7 @@ pub(crate) trait SubstituteProvider: Send + Sync {
     fn face(&self, req: &FaceRequest) -> Option<Vec<u8>>;
 }
 
-/// `/FontDescriptor /Flags` bits consulted here (ISO 32000-1 Table 121).
+/// `/FontDescriptor /Flags` bits consulted here (ISO 32000-1 Table 123).
 const FLAG_FIXED_PITCH: i64 = 0x1;
 const FLAG_SERIF: i64 = 0x2;
 const FLAG_NONSYMBOLIC: i64 = 0x20;
@@ -77,7 +77,7 @@ const FLAG_ITALIC: i64 = 0x40;
 const FLAG_FORCE_BOLD: i64 = 0x40000;
 
 /// Whether `font`'s descriptor declares the Nonsymbolic flag (ISO 32000-1
-/// Table 121): the font uses the Adobe standard Latin character set. An
+/// Table 123): the font uses the Adobe standard Latin character set. An
 /// absent descriptor or absent `/Flags` reads as `false` -- unknown is
 /// never nonsymbolic.
 pub(crate) async fn nonsymbolic<S: AsyncObjectSource>(src: &S, font: &Dict) -> bool {
