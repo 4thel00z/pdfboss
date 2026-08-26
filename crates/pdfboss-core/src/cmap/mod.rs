@@ -11,7 +11,7 @@ pub use predefined::{cid_to_unicode, predefined, CidToUnicode};
 
 use crate::document::decoded_stream_data_with;
 use crate::hash::FastMap;
-use crate::lexer::{Lexer, Token};
+use crate::lexer::{decode_hex, decode_hex_fixed, Lexer, RawToken, Token};
 use crate::object::{Dict, Object, Stream};
 use crate::source::AsyncObjectSource;
 use std::sync::Arc;
@@ -128,8 +128,8 @@ impl CidCmap {
         loop {
             match next_or_skip(&mut lx, data.len()) {
                 None => break,
-                Some(Token::Keyword(kw)) => {
-                    match kw.as_slice() {
+                Some(RawToken::Keyword(kw)) => {
+                    match kw {
                         b"begincodespacerange" => out.parse_codespaces(&mut lx, data.len()),
                         b"begincidchar" => out.parse_cidchars(&mut lx, data.len(), false),
                         b"begincidrange" => out.parse_cidranges(&mut lx, data.len(), false),
@@ -145,11 +145,11 @@ impl CidCmap {
                     pending_name = None;
                     wmode_pending = false;
                 }
-                Some(Token::Name(n)) => {
+                Some(RawToken::Owned(Token::Name(n))) => {
                     wmode_pending = n.0 == "WMode";
                     pending_name = (!wmode_pending).then_some(n.0);
                 }
-                Some(Token::Int(i)) => {
+                Some(RawToken::Owned(Token::Int(i))) => {
                     if wmode_pending {
                         out.wmode = u8::from(i == 1);
                     }
@@ -295,23 +295,27 @@ impl CidCmap {
     fn parse_codespaces(&mut self, lx: &mut Lexer<'_>, len: usize) {
         loop {
             let lo = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => h,
+                Some(RawToken::Hex(span)) => span,
                 Some(_) | None => return, // `endcodespacerange` or junk
             };
-            let Some(Token::HexString(hi)) = next_or_skip(lx, len) else {
+            let Some(RawToken::Hex(hi)) = next_or_skip(lx, len) else {
                 return;
             };
-            if lo.is_empty() || lo.len() > 4 || hi.len() != lo.len() {
+            // Over-long or empty codes are skipped, exactly like the
+            // over-long check the owned form made after decoding.
+            let (Some((lo, lo_len)), Some((hi, hi_len))) =
+                (decode_hex_fixed::<4>(lo), decode_hex_fixed::<4>(hi))
+            else {
+                continue;
+            };
+            if lo_len == 0 || hi_len != lo_len {
                 continue;
             }
-            let mut space = Codespace {
-                len: lo.len() as u8,
-                lo: [0; 4],
-                hi: [0; 4],
-            };
-            space.lo[..lo.len()].copy_from_slice(&lo);
-            space.hi[..hi.len()].copy_from_slice(&hi);
-            self.codespaces.push(space);
+            self.codespaces.push(Codespace {
+                len: lo_len as u8,
+                lo,
+                hi,
+            });
         }
     }
 
@@ -319,16 +323,19 @@ impl CidCmap {
     fn parse_cidchars(&mut self, lx: &mut Lexer<'_>, len: usize, notdef: bool) {
         loop {
             let code = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => h,
+                Some(RawToken::Hex(span)) => span,
                 Some(_) | None => return,
             };
-            let Some(Token::Int(cid)) = next_or_skip(lx, len) else {
+            let Some(RawToken::Owned(Token::Int(cid))) = next_or_skip(lx, len) else {
                 return;
             };
-            if code.is_empty() || code.len() > 4 {
+            let Some((code, code_len)) = decode_hex_fixed::<4>(code) else {
+                continue;
+            };
+            if code_len == 0 {
                 continue;
             }
-            let (value, width) = (code_value(&code), code.len() as u8);
+            let (value, width) = (code_value(&code[..code_len]), code_len as u8);
             let cid = cid.max(0) as u32;
             if notdef {
                 self.notdefs.push(CidRange {
@@ -347,24 +354,33 @@ impl CidCmap {
     fn parse_cidranges(&mut self, lx: &mut Lexer<'_>, len: usize, notdef: bool) {
         loop {
             let lo = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => h,
+                Some(RawToken::Hex(span)) => span,
                 Some(_) | None => return,
             };
-            let Some(Token::HexString(hi)) = next_or_skip(lx, len) else {
+            let Some(RawToken::Hex(hi)) = next_or_skip(lx, len) else {
                 return;
             };
-            let Some(Token::Int(cid)) = next_or_skip(lx, len) else {
+            let Some(RawToken::Owned(Token::Int(cid))) = next_or_skip(lx, len) else {
                 return;
             };
-            if lo.is_empty() || lo.len() > 4 {
+            let Some((lo, lo_len)) = decode_hex_fixed::<4>(lo) else {
+                continue;
+            };
+            if lo_len == 0 {
                 continue;
             }
-            let (lo_v, hi_v) = (code_value(&lo), code_value(&hi));
+            // An over-long `hi` still folds through all its bytes, exactly
+            // as the owned form's fold did (the low 32 bits win).
+            let hi_v = match decode_hex_fixed::<4>(hi) {
+                Some((hi, hi_len)) => code_value(&hi[..hi_len]),
+                None => code_value(&decode_hex(hi)),
+            };
+            let lo_v = code_value(&lo[..lo_len]);
             if hi_v < lo_v {
                 continue;
             }
             let range = CidRange {
-                len: lo.len() as u8,
+                len: lo_len as u8,
                 lo: lo_v,
                 hi: hi_v,
                 cid: cid.max(0) as u32,
@@ -475,11 +491,11 @@ async fn embedded_cmap<S: AsyncObjectSource>(src: &S, stream: &Stream) -> Option
 
 /// Fetches the next token, force-advancing past unlexable bytes; `None` at
 /// end of input.
-fn next_or_skip(lx: &mut Lexer<'_>, len: usize) -> Option<Token> {
+fn next_or_skip<'a>(lx: &mut Lexer<'a>, len: usize) -> Option<RawToken<'a>> {
     loop {
         let before = lx.pos();
-        match lx.next_token() {
-            Ok(Token::Eof) => return None,
+        match lx.next_raw_token() {
+            Ok(RawToken::Owned(Token::Eof)) => return None,
             Ok(t) => return Some(t),
             Err(_) => {
                 if lx.pos() <= before {

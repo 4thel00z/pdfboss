@@ -34,12 +34,12 @@ pub enum Token {
 }
 
 /// Whether `b` is PDF whitespace (ISO 32000 §7.2.2, Table 1).
-pub(crate) fn is_whitespace(b: u8) -> bool {
+pub(crate) const fn is_whitespace(b: u8) -> bool {
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0C' | b'\r' | b' ')
 }
 
 /// Whether `b` is a PDF delimiter character (ISO 32000 §7.2.2, Table 2).
-pub(crate) fn is_delimiter(b: u8) -> bool {
+pub(crate) const fn is_delimiter(b: u8) -> bool {
     matches!(
         b,
         b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%'
@@ -48,8 +48,20 @@ pub(crate) fn is_delimiter(b: u8) -> bool {
 
 /// Whether `b` is a regular character (neither whitespace nor delimiter).
 pub(crate) fn is_regular(b: u8) -> bool {
-    !is_whitespace(b) && !is_delimiter(b)
+    REGULAR[b as usize]
 }
+
+/// [`is_regular`] as a table: the token scanners classify every byte of
+/// every content stream and CMap, and one load beats two match chains.
+const REGULAR: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        table[b] = !is_whitespace(b as u8) && !is_delimiter(b as u8);
+        b += 1;
+    }
+    table
+};
 
 /// Value of an ASCII hex digit, if `b` is one.
 fn hex_val(b: u8) -> Option<u8> {
@@ -134,13 +146,19 @@ fn parse_number_fast(run: &[u8]) -> Option<Token> {
 /// to match on it and drop it dominated content-parse allocation.
 /// [`Lexer::next_token`] wraps this, copying keyword bytes into the public
 /// [`Token`], so the two forms cannot lex differently.
-pub(crate) enum RawToken<'a> {
-    /// Any non-keyword token, carried as the public type. Never
+pub enum RawToken<'a> {
+    /// Any non-keyword, non-hex token, carried as the public type. Never
     /// [`Token::Keyword`]: keywords always come out borrowed.
     Owned(Token),
     /// A bare regular-character run — or a lenient stray delimiter —
     /// borrowed from the input.
     Keyword(&'a [u8]),
+    /// A hex string's raw span (the bytes between `<` and `>`, undecoded),
+    /// borrowed from the input. CMaps are almost nothing but short hex
+    /// strings, and decoding each into a [`Token::HexString`] allocation
+    /// just to read a code out dominated CMap parsing; [`decode_hex`] and
+    /// [`decode_hex_fixed`] turn a span into bytes when they are wanted.
+    Hex(&'a [u8]),
 }
 
 /// Tokenizer over a byte slice.
@@ -175,13 +193,14 @@ impl<'a> Lexer<'a> {
         Ok(match self.next_raw_token()? {
             RawToken::Owned(token) => token,
             RawToken::Keyword(kw) => Token::Keyword(kw.to_vec()),
+            RawToken::Hex(span) => Token::HexString(decode_hex(span)),
         })
     }
 
-    /// [`Lexer::next_token`] with keyword bytes borrowed instead of copied.
-    /// This is the one lexing implementation; `next_token` merely copies the
-    /// borrow out.
-    pub(crate) fn next_raw_token(&mut self) -> Result<RawToken<'a>> {
+    /// [`Lexer::next_token`] with keyword and hex-string bytes borrowed
+    /// instead of copied. This is the one lexing implementation;
+    /// `next_token` merely copies the borrows out.
+    pub fn next_raw_token(&mut self) -> Result<RawToken<'a>> {
         self.skip_whitespace_and_comments();
         let Some(&b) = self.data.get(self.pos) else {
             return Ok(RawToken::Owned(Token::Eof));
@@ -201,7 +220,7 @@ impl<'a> Lexer<'a> {
                     Ok(RawToken::Owned(Token::DictOpen))
                 } else {
                     self.pos += 1;
-                    Ok(RawToken::Owned(self.lex_hex_string()))
+                    Ok(RawToken::Hex(self.hex_span()))
                 }
             }
             b'>' => {
@@ -243,20 +262,13 @@ impl<'a> Lexer<'a> {
     /// Advances past whitespace and `%` comments.
     pub fn skip_whitespace_and_comments(&mut self) {
         loop {
-            while self.data.get(self.pos).is_some_and(|&b| is_whitespace(b)) {
-                self.pos += 1;
-            }
-            if self.data.get(self.pos) == Some(&b'%') {
-                while self
-                    .data
-                    .get(self.pos)
-                    .is_some_and(|&b| b != b'\r' && b != b'\n')
-                {
-                    self.pos += 1;
-                }
-            } else {
+            let rest = &self.data[self.pos.min(self.data.len())..];
+            self.pos += rest.iter().take_while(|&&b| is_whitespace(b)).count();
+            if self.data.get(self.pos) != Some(&b'%') {
                 return;
             }
+            let rest = &self.data[self.pos..];
+            self.pos += memchr::memchr2(b'\r', b'\n', rest).unwrap_or(rest.len());
         }
     }
 
@@ -267,11 +279,11 @@ impl<'a> Lexer<'a> {
 
     /// Consumes the run of regular characters starting at the cursor.
     fn take_regular_run(&mut self) -> &'a [u8] {
-        let start = self.pos;
-        while self.data.get(self.pos).is_some_and(|&b| is_regular(b)) {
-            self.pos += 1;
-        }
-        &self.data[start..self.pos]
+        let start = self.pos.min(self.data.len());
+        let rest = &self.data[start..];
+        let run = rest.iter().take_while(|&&b| is_regular(b)).count();
+        self.pos = start + run;
+        &rest[..run]
     }
 
     /// Lexes a run starting with a digit, sign, or period: a number when the
@@ -480,29 +492,75 @@ impl<'a> Lexer<'a> {
     /// Lexes a hex string after the opening `<`: whitespace is ignored, a
     /// trailing odd digit is padded with `0`, non-hex bytes are skipped
     /// (lenient), and a missing `>` terminates at end of input.
-    fn lex_hex_string(&mut self) -> Token {
-        let rest = &self.data[self.pos..];
-        let digits = memchr::memchr(b'>', rest).unwrap_or(rest.len());
-        let mut out = Vec::with_capacity(digits.div_ceil(2).min(HEX_STRING_PREALLOC_CAP));
-        let mut pending: Option<u8> = None;
-        while let Some(&b) = self.data.get(self.pos) {
-            self.pos += 1;
-            if b == b'>' {
-                break;
+    /// Consumes a hex string's raw span: everything up to (and past) the
+    /// closing `>`, returned undecoded.
+    fn hex_span(&mut self) -> &'a [u8] {
+        let start = self.pos;
+        let rest = &self.data[start..];
+        match memchr::memchr(b'>', rest) {
+            Some(end) => {
+                self.pos = start + end + 1;
+                &rest[..end]
             }
-            let Some(v) = hex_val(b) else {
-                continue; // whitespace and invalid bytes are skipped
-            };
-            match pending.take() {
-                Some(hi) => out.push((hi << 4) | v),
-                None => pending = Some(v),
+            None => {
+                self.pos = self.data.len();
+                rest
             }
         }
-        if let Some(hi) = pending {
-            out.push(hi << 4);
-        }
-        Token::HexString(out)
     }
+}
+
+/// Decodes a hex string's raw span: hex digit pairs to bytes, whitespace
+/// and invalid bytes skipped, an odd trailing digit read as the high
+/// nibble (ISO 32000-1 §7.3.4.3).
+pub fn decode_hex(span: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(span.len().div_ceil(2).min(HEX_STRING_PREALLOC_CAP));
+    let mut pending: Option<u8> = None;
+    for &b in span {
+        let Some(v) = hex_val(b) else {
+            continue;
+        };
+        match pending.take() {
+            Some(hi) => out.push((hi << 4) | v),
+            None => pending = Some(v),
+        }
+    }
+    if let Some(hi) = pending {
+        out.push(hi << 4);
+    }
+    out
+}
+
+/// [`decode_hex`] into a stack buffer: `Some((bytes, len))`, or `None`
+/// when the span decodes to more than `N` bytes — the caller's cue that
+/// the value is not the short code it expected.
+pub fn decode_hex_fixed<const N: usize>(span: &[u8]) -> Option<([u8; N], usize)> {
+    let mut out = [0u8; N];
+    let mut len = 0usize;
+    let mut pending: Option<u8> = None;
+    for &b in span {
+        let Some(v) = hex_val(b) else {
+            continue;
+        };
+        match pending.take() {
+            Some(hi) => {
+                if len == N {
+                    return None;
+                }
+                out[len] = (hi << 4) | v;
+                len += 1;
+            }
+            None => pending = Some(v),
+        }
+    }
+    if let Some(hi) = pending {
+        if len == N {
+            return None;
+        }
+        out[len] = hi << 4;
+        len += 1;
+    }
+    Some((out, len))
 }
 
 #[cfg(test)]
