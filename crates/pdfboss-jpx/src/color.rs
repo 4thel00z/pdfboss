@@ -42,6 +42,14 @@ fn inverse_ict(y0: f64, y1: f64, y2: f64) -> (f64, f64, f64) {
     )
 }
 
+/// The BT.601-derived luma weight of R' in the sYCC encoding
+/// (IEC 61966-2-1 Amd. 1): Y' = KR*R' + KG*G' + KB*B' with
+/// Cb = (B' - Y') / (2 - 2*KB) and Cr = (R' - Y') / (2 - 2*KR).
+const SYCC_KR: f64 = 0.299;
+
+/// The luma weight of B' in the sYCC encoding (see [`SYCC_KR`]).
+const SYCC_KB: f64 = 0.114;
+
 /// Clamps a bit depth to the 1..=38 range both Table A.11 (Ssiz) and
 /// Table I.13 (palette B values) allow, so no shift below can overflow an
 /// i64 on hostile header bytes.
@@ -72,9 +80,10 @@ fn level_shift_and_clamp(value: i64, depth: u8, signed: bool) -> i64 {
 /// Signed samples are first re-centred to unsigned by adding `2^(depth-1)`
 /// (the G.1.2 shift, applied at output time because the codestream carried
 /// them signed). Then, per the crate contract: depth > 8 right-shifts by
-/// `depth - 8` (drops the low bits, bit-exact with the 16-bit oracle
-/// convention); depth < 8 scales to the full range as
-/// `round(v * 255 / (2^depth - 1))` (computed as
+/// `depth - 8` with round-to-nearest — `(v + 2^(shift-1)) >> shift`,
+/// saturated at 255 (the midpoint `2^(depth-1)` still lands exactly on
+/// 128, which the sYCC chroma centring relies on); depth < 8 scales to
+/// the full range as `round(v * 255 / (2^depth - 1))` (computed as
 /// `(v*255 + floor(max/2)) / max`); depth 8 passes through.
 fn normalize_to_u8(value: i64, depth: u8, signed: bool) -> u8 {
     let d = usable_depth(depth);
@@ -82,7 +91,8 @@ fn normalize_to_u8(value: i64, depth: u8, signed: bool) -> u8 {
     let max = (1i64 << d) - 1;
     let v = if signed { value + half } else { value }.clamp(0, max);
     if d > 8 {
-        (v >> (d - 8)) as u8
+        let shift = d - 8;
+        ((v + (1i64 << (shift - 1))) >> shift).min(255) as u8
     } else if d < 8 {
         ((v * 255 + max / 2) / max) as u8
     } else {
@@ -357,9 +367,9 @@ fn apply_inverse_mct(
 /// tile's MCT flag is set (Table A.17); inverse DC level shift (G.1.2, and
 /// Table A.11 signedness); palette + component mapping (I.5.3.4/I.5.3.5);
 /// sYCC → RGB when colr signals EnumCS 18 (I.5.3.3); replication upsampling
-/// of subsampled components onto the reference grid (G.4/B.2); 16-bit
-/// depths right-shifted to 8 and everything clamped to 0..=255 (crate
-/// contract). `finish` crops to the image region — the canvas starts at
+/// of subsampled components onto the reference grid (G.4/B.2); deep
+/// depths right-shifted to 8 with round-to-nearest and everything clamped
+/// to 0..=255 (crate contract). `finish` crops to the image region — the canvas starts at
 /// (XOsiz, YOsiz), size (Xsiz - XOsiz) x (Ysiz - YOsiz) (B-1/B-2) — and
 /// reports the cdef opacity channel (I.5.3.6) as `alpha_index`.
 // Internal state is the colour stage's to design; only the three method
@@ -480,7 +490,7 @@ impl ImageAssembler {
             components: siz.components.clone(),
             channels,
             palette,
-            color: header.map(|header| header.color),
+            color: header.map(|header| header.color.clone()),
             channel_definitions: header
                 .map(|header| header.channel_definitions.clone())
                 .unwrap_or_default(),
@@ -719,11 +729,25 @@ impl ImageAssembler {
         None
     }
 
+    /// Takes the METH = 2 profile bytes out of the colr declaration, for
+    /// export on `DecodedImage::icc_profile`; `None` when the box was not
+    /// ICC or the bytes were not carried (the empty-profile sentinel).
+    fn take_icc_profile(&mut self) -> Option<Vec<u8>> {
+        match &mut self.color {
+            Some(ColorSpec::Icc { profile }) if !profile.is_empty() => {
+                Some(std::mem::take(profile))
+            }
+            _ => None,
+        }
+    }
+
     /// Resolves the colr box (I.5.3.3) into a [`ColorKind`], converting
     /// sYCC in place. Raw codestreams guess from the component count.
-    fn resolve_color(&mut self) -> ColorKind {
+    /// `icc` is the profile [`Self::take_icc_profile`] extracted, consulted
+    /// only for the warning wording.
+    fn resolve_color(&mut self, icc: Option<&[u8]>) -> ColorKind {
         let colour = self.colour_channel_count();
-        match self.color {
+        match &self.color {
             None => match self.channels.len() {
                 1 => ColorKind::Gray,
                 3 => ColorKind::Rgb,
@@ -758,6 +782,7 @@ impl ImageAssembler {
                 }
             }
             Some(ColorSpec::Enumerated(enumeration)) => {
+                let enumeration = *enumeration;
                 self.warnings.push(JpxWarning::note(format!(
                     "colr enumeration {enumeration} is not converted (Table I.10 defines 16/17/18)"
                 )));
@@ -766,11 +791,20 @@ impl ImageAssembler {
                     components: colour,
                 }
             }
-            Some(ColorSpec::Icc { profile_len }) => {
-                self.warnings.push(JpxWarning::note(format!(
-                    "colr carries an ICC profile ({profile_len} bytes) the decoder does not \
-                     interpret; colour guessed from {colour} colour channels"
-                )));
+            Some(ColorSpec::Icc { .. }) => {
+                let message = match icc {
+                    Some(profile) => format!(
+                        "colr carries a restricted ICC profile ({} bytes), exported \
+                         for the consumer to apply; colour reported as a guess from \
+                         {colour} colour channels",
+                        profile.len()
+                    ),
+                    None => format!(
+                        "colr declares a restricted ICC profile the scan did not \
+                         carry; colour guessed from {colour} colour channels"
+                    ),
+                };
+                self.warnings.push(JpxWarning::note(message));
                 ColorKind::IccGuess { components: colour }
             }
         }
@@ -778,31 +812,57 @@ impl ImageAssembler {
 
     /// Converts the first three channels from sYCC to RGB in place. T.800
     /// defines sYCC only by reference (Table I.10, EnumCS 18 -> IEC
-    /// 61966-2-1 Amd. 1) and supplies no matrix of its own; the G.3.2
-    /// inverse ICT matrix applied to midpoint-centred (-128) 8-bit chroma
-    /// is the closest in-spec approximation, and the output is flagged as
-    /// approximate.
+    /// 61966-2-1 Amd. 1); the inverse is derived exactly from that
+    /// encoding's BT.601 weights ([`SYCC_KR`]/[`SYCC_KB`]):
+    ///
+    ///   R' = Y' + (2 - 2*KR) * Cr
+    ///   G' = Y' - (KB * (2 - 2*KB) / KG) * Cb - (KR * (2 - 2*KR) / KG) * Cr
+    ///   B' = Y' + (2 - 2*KB) * Cb
+    ///
+    /// applied in 8-bit code space with chroma centred at 128. The
+    /// centring is exact at every source depth because this runs AFTER
+    /// [`normalize_to_u8`], which maps the depth-d midpoint `2^(d-1)` to
+    /// exactly 128; the f64 arithmetic then rounds once at the output.
+    /// An 8-bit source therefore converts exactly; a deeper source was
+    /// rounded once to 8 bits beforehand, which the warning records.
     fn convert_sycc_to_rgb(&mut self) {
-        self.warnings.push(JpxWarning::note(
-            "sYCC converted to RGB with the G.3.2 matrix (approximate)",
-        ));
+        let deep = self
+            .channels
+            .iter()
+            .take(3)
+            .map(|channel| usable_depth(channel.depth))
+            .max()
+            .unwrap_or(8);
+        let message = if deep > 8 {
+            format!(
+                "sYCC converted to RGB per IEC 61966-2-1 Amd. 1, after the \
+                 {deep}-bit source rounded to 8 bits"
+            )
+        } else {
+            "sYCC converted to RGB per IEC 61966-2-1 Amd. 1".to_string()
+        };
+        self.warnings.push(JpxWarning::note(message));
+        let kg = 1.0 - SYCC_KR - SYCC_KB;
+        let cr_r = 2.0 - 2.0 * SYCC_KR;
+        let cb_b = 2.0 - 2.0 * SYCC_KB;
+        let cb_g = SYCC_KB * cb_b / kg;
+        let cr_g = SYCC_KR * cr_r / kg;
         let stride = self.channels.len();
         for pixel in self.buffer.chunks_mut(stride) {
             let y = f64::from(pixel[0]);
             let cb = f64::from(pixel[1]) - 128.0;
             let cr = f64::from(pixel[2]) - 128.0;
-            // (G-12)..(G-14) with (Y0, Y1, Y2) = (Y, Cb, Cr).
-            let (r, g, b) = inverse_ict(y, cb, cr);
-            pixel[0] = clamp_round_u8(r);
-            pixel[1] = clamp_round_u8(g);
-            pixel[2] = clamp_round_u8(b);
+            pixel[0] = clamp_round_u8(y + cr_r * cr);
+            pixel[1] = clamp_round_u8(y - cb_g * cb - cr_g * cr);
+            pixel[2] = clamp_round_u8(y + cb_b * cb);
         }
     }
 
     /// Finalizes the image, attaching the accumulated `warnings`.
     pub(crate) fn finish(mut self, warnings: Vec<JpxWarning>) -> Result<DecodedImage> {
         let mut all = warnings;
-        let color = self.resolve_color();
+        let icc_profile = self.take_icc_profile();
+        let color = self.resolve_color(icc_profile.as_deref());
         let alpha_index = self.resolve_alpha();
         all.append(&mut self.warnings);
         Ok(DecodedImage {
@@ -816,6 +876,7 @@ impl ImageAssembler {
             // component's Ssiz depth otherwise (DecodedImage contract).
             component_depths: self.channels.iter().map(|channel| channel.depth).collect(),
             color,
+            icc_profile,
             alpha_index,
             warnings: all,
         })
@@ -1045,20 +1106,35 @@ mod tests {
         // depth 8 signed: +2^7 recentre. -128 -> 0; 127 -> 255.
         assert_eq!(normalize_to_u8(-128, 8, true), 0);
         assert_eq!(normalize_to_u8(127, 8, true), 255);
-        // depth 12 (> 8): arithmetic right shift by 12 - 8 = 4.
-        // 4095 >> 4 = 255; 2048 >> 4 = 128; 100 >> 4 = 6.
+        // depth 12 (> 8): rounded right shift by 12 - 8 = 4, i.e.
+        // (v + 8) >> 4 capped at 255.
+        // 4095 -> 4103 >> 4 = 256, saturated 255; 2048 -> 2056 >> 4 = 128
+        // (128,5 floors to 128); 100 -> 108 >> 4 = 6 (6,75 floors to 6).
         assert_eq!(normalize_to_u8(4095, 12, false), 255);
         assert_eq!(normalize_to_u8(2048, 12, false), 128);
         assert_eq!(normalize_to_u8(100, 12, false), 6);
-        // depth 12 signed: -2048 + 2048 = 0 -> 0; 100 + 2048 = 2148 >> 4 = 134.
+        // depth 12 signed: -2048 + 2048 = 0 -> 0;
+        // 100 + 2048 = 2148 -> 2156 >> 4 = 134 (134,75 floors to 134).
         assert_eq!(normalize_to_u8(-2048, 12, true), 0);
         assert_eq!(normalize_to_u8(100, 12, true), 134);
-        // depth 16: shift by 8. 65535 >> 8 = 255; 26052 >> 8 = 101 (the
-        // crate's "drop the low byte" contract); 258 >> 8 = 1.
+        // depth 16: rounded shift by 8, (v + 128) >> 8 capped at 255.
+        // 65535 -> 65663 >> 8 = 256, saturated 255;
+        // 26052 -> 26180 >> 8 = 102 (26052 / 256 = 101,77 rounds UP —
+        // truncation gave 101); 258 -> 386 >> 8 = 1 (1,5 floors to 1).
         assert_eq!(normalize_to_u8(65535, 16, false), 255);
-        assert_eq!(normalize_to_u8(26052, 16, false), 101);
+        assert_eq!(normalize_to_u8(26052, 16, false), 102);
         assert_eq!(normalize_to_u8(258, 16, false), 1);
-        // depth 16 signed: 0 + 32768 = 32768 >> 8 = 128.
+        // A value where rounding and truncation disagree, pinned:
+        // 25800 / 256 = 100,78 -> 101; a plain 25800 >> 8 gave 100.
+        assert_eq!(normalize_to_u8(25800, 16, false), 101);
+        // The midpoint invariant the sYCC chroma centring relies on:
+        // 2^(d-1) -> exactly 128 at every deep depth.
+        for depth in 9..=32u8 {
+            let mid = 1i64 << (depth - 1);
+            assert_eq!(normalize_to_u8(mid, depth, false), 128, "depth {depth}");
+        }
+        // depth 16 signed: 0 + 32768 = 32768 -> 32896 >> 8 = 128 (the
+        // recentred midpoint, 128,5 flooring to 128).
         assert_eq!(normalize_to_u8(0, 16, true), 128);
         assert_eq!(normalize_to_u8(-32768, 16, true), 0);
         // depth 1 (< 8): scale by round(v*255/(2^1 - 1)) = v*255.
@@ -1333,7 +1409,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn sycc_converts_to_rgb_with_an_approximation_warning() {
+    fn sycc_converts_to_rgb_with_the_exact_inverse() {
         let siz = siz_for(2, 1, 0, 0, 2, 1, vec![component(8, false, 1, 1); 3]);
         let header = plain_header(ColorSpec::Enumerated(18), 3, 2, 1);
         let mut assembler =
@@ -1359,16 +1435,110 @@ mod tests {
             image
                 .warnings
                 .iter()
-                .any(|w| w.message.contains("approximate")),
+                .any(|w| !w.data_loss && w.message.contains("IEC 61966-2-1")),
             "warnings: {:?}",
             image.warnings
         );
         // Pixel 0: Cb-128 = Cr-128 = 0 -> R = G = B = Y = 100.
-        // Pixel 1: Cb' = 100, Cr' = -100 through the G.3.2 matrix:
-        //   R = 50 + 1.402*(-100)                 = -90.2  -> clamp 0
-        //   G = 50 - 0.34413*100 - 0.71414*(-100) = 87.001 -> 87
-        //   B = 50 + 1.772*100                    = 227.2  -> 227
+        // Pixel 1: Cb' = 100, Cr' = -100 through the exact inverse
+        // (KG = 0.587; the two G coefficients differ by exactly 0.37):
+        //   R = 50 + 1.402*(-100)          = -90.2 -> clamp 0
+        //   G = 50 - (0.202008/0.587)*100
+        //          + (0.419198/0.587)*100  = 50 + 37 = 87
+        //   B = 50 + 1.772*100             = 227.2 -> 227
         assert_eq!(image.samples, vec![100, 100, 100, 0, 87, 227]);
+    }
+
+    #[test]
+    fn sycc_hand_vectors_hit_the_gray_axis_and_the_primary_corners() {
+        let siz = siz_for(5, 1, 0, 0, 5, 1, vec![component(8, false, 1, 1); 3]);
+        let header = plain_header(ColorSpec::Enumerated(18), 3, 5, 1);
+        let mut assembler =
+            ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
+        // Five (Y, Cb, Cr) codes, given pre-level-shift (code - 128):
+        //   white (255, 128, 128), black (0, 128, 128),
+        //   red   ( 76,  85, 255): the forward encoding of R' = 255 —
+        //     Y = 0.299*255 = 76.245 -> 76,
+        //     Cb = (0 - 76.245)/1.772 + 128 = 84.97 -> 85,
+        //     Cr = (255 - 76.245)/1.402 + 128 = 255.5, clamped 255;
+        //   green (150,  43,  21): Y = 0.587*255 = 149.685 -> 150,
+        //     Cb = (0 - 150)/1.772 + 128 = 43.35 -> 43,
+        //     Cr = (0 - 150)/1.402 + 128 = 21.0 -> 21;
+        //   blue  ( 29, 255, 107): Y = 0.114*255 = 29.07 -> 29,
+        //     Cb = (255 - 29)/1.772 + 128 = 255.5, clamped 255,
+        //     Cr = (0 - 29)/1.402 + 128 = 107.3 -> 107.
+        assembler
+            .push_tile(
+                rect(0, 0, 5, 1),
+                0,
+                None,
+                vec![
+                    reversible(rect(0, 0, 5, 1), &[127, -128, -52, 22, -99]),
+                    reversible(rect(0, 0, 5, 1), &[0, 0, -43, -85, 127]),
+                    reversible(rect(0, 0, 5, 1), &[0, 0, 127, -107, -21]),
+                ],
+            )
+            .unwrap();
+        let image = assembler.finish(Vec::new()).unwrap();
+        // Hand-inverted with the exact coefficients (round half up,
+        // clamp to 0..=255):
+        //   white: R = 255, G = 255, B = 255;  black: 0, 0, 0.
+        //   red:   R = 76 + 1.402*127 = 254.054          -> 254
+        //          G = 76 + 0.344136*43 - 0.714136*127
+        //            = 76 + 14.798 - 90.695 = 0.103      -> 0
+        //          B = 76 - 1.772*43 = -0.196            -> 0
+        //   green: R = 150 - 1.402*107 = -0.014          -> 0
+        //          G = 150 + 0.344136*85 + 0.714136*107
+        //            = 150 + 29.252 + 76.413 = 255.66    -> 255
+        //          B = 150 - 1.772*85 = -0.62            -> 0
+        //   blue:  R = 29 - 1.402*21 = -0.442            -> 0
+        //          G = 29 - 0.344136*127 + 0.714136*21
+        //            = 29 - 43.705 + 14.997 = 0.292      -> 0
+        //          B = 29 + 1.772*127 = 254.044          -> 254
+        assert_eq!(
+            image.samples,
+            vec![255, 255, 255, 0, 0, 0, 254, 0, 0, 0, 255, 0, 0, 0, 254]
+        );
+    }
+
+    #[test]
+    fn sycc_at_16_bit_centres_chroma_on_the_rounded_midpoint() {
+        let siz = siz_for(2, 1, 0, 0, 2, 1, vec![component(16, false, 1, 1); 3]);
+        let header = plain_header(ColorSpec::Enumerated(18), 3, 2, 1);
+        let mut assembler =
+            ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
+        // 16-bit codes, given pre-level-shift (code - 32768):
+        //   pixel 0: (25800, 32768, 32768) — the chroma midpoint 2^15
+        //     normalizes to exactly 128 (neutral), and the luma rounds UP:
+        //     (25800 + 128) >> 8 = 101 where truncation gave 100;
+        //   pixel 1: (12800, 58368, 7168) — every code sits on a
+        //     half-step ((v + 128) >> 8 flooring x.5), landing on the
+        //     8-bit test's (50, 228, 28).
+        assembler
+            .push_tile(
+                rect(0, 0, 2, 1),
+                0,
+                None,
+                vec![
+                    reversible(rect(0, 0, 2, 1), &[-6968, -19968]),
+                    reversible(rect(0, 0, 2, 1), &[0, 25600]),
+                    reversible(rect(0, 0, 2, 1), &[0, -25600]),
+                ],
+            )
+            .unwrap();
+        let image = assembler.finish(Vec::new()).unwrap();
+        assert_eq!(image.color, ColorKind::Rgb);
+        assert!(
+            image
+                .warnings
+                .iter()
+                .any(|w| !w.data_loss && w.message.contains("16-bit source rounded to 8 bits")),
+            "warnings: {:?}",
+            image.warnings
+        );
+        // Pixel 0: neutral chroma -> gray (101, 101, 101).
+        // Pixel 1: identical to the 8-bit vector (0, 87, 227).
+        assert_eq!(image.samples, vec![101, 101, 101, 0, 87, 227]);
     }
 
     #[test]
@@ -1412,26 +1582,62 @@ mod tests {
                 },
             ),
             (
-                ColorSpec::Icc { profile_len: 3144 },
+                ColorSpec::Icc {
+                    profile: vec![9; 20],
+                },
                 4,
                 ColorKind::IccGuess { components: 4 },
             ),
         ];
         for (spec, count, expected) in cases {
             let siz = siz_for(1, 1, 0, 0, 1, 1, vec![component(8, false, 1, 1); count]);
-            let header = plain_header(spec, count as u16, 1, 1);
+            let header = plain_header(spec.clone(), count as u16, 1, 1);
             let assembler =
                 ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
             let image = assembler.finish(Vec::new()).unwrap();
             assert_eq!(image.color, expected, "{spec:?}");
         }
-        // The ICC guess is recorded as a warning.
+        // The ICC guess is recorded as a warning, and the profile bytes
+        // ride out on the image for the consumer to interpret.
         let siz = siz_for(1, 1, 0, 0, 1, 1, vec![component(8, false, 1, 1); 4]);
-        let header = plain_header(ColorSpec::Icc { profile_len: 3144 }, 4, 1, 1);
+        let header = plain_header(
+            ColorSpec::Icc {
+                profile: vec![9; 20],
+            },
+            4,
+            1,
+            1,
+        );
         let assembler = ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
         let image = assembler.finish(Vec::new()).unwrap();
+        assert_eq!(image.icc_profile, Some(vec![9; 20]));
         assert!(
-            image.warnings.iter().any(|w| w.message.contains("ICC")),
+            image
+                .warnings
+                .iter()
+                .any(|w| !w.data_loss && w.message.contains("ICC profile (20 bytes), exported")),
+            "warnings: {:?}",
+            image.warnings
+        );
+        // The empty-profile sentinel (declared but not carried) exports
+        // nothing and words the guess accordingly.
+        let header = plain_header(
+            ColorSpec::Icc {
+                profile: Vec::new(),
+            },
+            4,
+            1,
+            1,
+        );
+        let assembler = ImageAssembler::new(&siz, Some(&header), &DecodeLimits::default()).unwrap();
+        let image = assembler.finish(Vec::new()).unwrap();
+        assert_eq!(image.color, ColorKind::IccGuess { components: 4 });
+        assert_eq!(image.icc_profile, None);
+        assert!(
+            image
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("did not carry")),
             "warnings: {:?}",
             image.warnings
         );

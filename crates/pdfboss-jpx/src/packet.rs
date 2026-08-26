@@ -2307,7 +2307,7 @@ mod tests {
     fn parse_zoo_tiles(name: &str) -> Vec<(TilePackets, usize, usize, usize)> {
         let data = zoo_stream(name);
         let limits = DecodeLimits::default();
-        let container = crate::boxes::scan(&data).unwrap();
+        let container = crate::boxes::scan(&data, &limits).unwrap();
         let cs = crate::markers::parse_codestream(container.codestream, &limits).unwrap();
         assert!(
             cs.main.ppm.is_empty(),

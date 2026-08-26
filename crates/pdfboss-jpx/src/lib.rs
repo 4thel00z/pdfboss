@@ -15,9 +15,9 @@
 //! code-block zeroes the remainder of its scope (at most its own tile;
 //! sibling tiles keep decoding), appends one warning to
 //! [`DecodedImage::warnings`], and decoding continues. Output samples are
-//! 8-bit: 16-bit sources are right-shifted to 8, signed samples are
-//! level-shifted per T.800 G.1.2. The decoder never panics on hostile
-//! input and contains no `unsafe`.
+//! 8-bit: deeper sources are right-shifted to 8 with round-to-nearest,
+//! signed samples are level-shifted per T.800 G.1.2. The decoder never
+//! panics on hostile input and contains no `unsafe`.
 
 mod boxes;
 mod color;
@@ -81,8 +81,10 @@ pub enum ColorKind {
     /// Four-channel CMYK: the component-count guess for a RAW codestream
     /// with four channels (no colr box exists to say otherwise).
     Cmyk,
-    /// An ICC profile the decoder does not interpret: colour approximated
-    /// by component count (T.800 I.5.3.3 METH 2); a warning records it.
+    /// A restricted ICC profile (T.800 I.5.3.3 METH 2) this decoder does
+    /// not interpret itself: colour approximated by component count, with
+    /// the profile bytes exported on [`DecodedImage::icc_profile`] for the
+    /// consumer to apply; a warning records the guess.
     IccGuess {
         /// Colour channel count the guess is based on.
         components: u8,
@@ -155,6 +157,12 @@ pub struct DecodedImage {
     pub component_depths: Vec<u8>,
     /// Colour interpretation of the colour channels.
     pub color: ColorKind,
+    /// The embedded ICC profile, byte for byte, when the colr box carried
+    /// one (T.800 I.5.3.3 METH 2, always paired with
+    /// [`ColorKind::IccGuess`]). This crate ships the bytes without
+    /// interpreting them; a consumer applying the profile supersedes the
+    /// component-count guess.
+    pub icc_profile: Option<Vec<u8>>,
     /// Channel index of the opacity channel, when the JP2 cdef box defines
     /// one (T.800 I.5.3.6, association 0 with type 1 or 2).
     pub alpha_index: Option<u8>,
@@ -170,7 +178,7 @@ pub struct DecodedImage {
 /// the bytes). See the crate docs for the error-vs-warning contract.
 pub fn decode(data: &[u8], limits: &DecodeLimits) -> Result<DecodedImage> {
     // Container sniff + box walk (T.800 Annex I) -> codestream slice.
-    let container = boxes::scan(data)?;
+    let container = boxes::scan(data, limits)?;
     // Main header + every tile-part header/body (Annex A).
     let cs = markers::parse_codestream(container.codestream, limits)?;
     let siz = &cs.main.siz;
