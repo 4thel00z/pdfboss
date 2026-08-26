@@ -721,6 +721,33 @@ fn blend_row<const NORMAL: bool>(
                     fill_run(&mut dst_row[start * 4..x * 4], opaque);
                     continue;
                 }
+                // Anti-aliased stretches composite four pixels per step on
+                // vector lanes where the arithmetic is bit-identical to
+                // [`composite_over`]; lanes at full coverage or zero take
+                // the same shortcuts the scalar form takes.
+                if NORMAL {
+                    while x + 4 <= n && !(solid_src && covs[x..x + 4].iter().any(|&c| c >= 1.0)) {
+                        blend_normal4(
+                            &mut dst_row[x * 4..x * 4 + 16],
+                            &covs[x..x + 4],
+                            base_a,
+                            rgb,
+                            opaque,
+                        );
+                        x += 4;
+                    }
+                    if x >= n {
+                        break;
+                    }
+                    let cov = covs[x];
+                    if solid_src && cov >= 1.0 {
+                        continue;
+                    }
+                    let a = cov.clamp(0.0, 1.0) * base_a;
+                    paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
+                    x += 1;
+                    continue;
+                }
                 let a = cov.clamp(0.0, 1.0) * base_a;
                 paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
                 x += 1;
@@ -745,6 +772,188 @@ fn blend_row<const NORMAL: bool>(
                 x += 1;
             }
         }
+    }
+}
+
+/// Source-over composites four adjacent pixels of one row: the vector
+/// twin of four [`paint_pixel::<true>`] calls, byte-identical because the
+/// lanes perform [`composite_over`]'s exact f32 operations (no fused
+/// multiply-add, truncating converts) and the full/zero-coverage lanes
+/// reproduce its shortcuts.
+fn blend_normal4(dst: &mut [u8], covs: &[f32], base_a: f32, rgb: [u8; 3], opaque: [u8; 4]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64.
+        unsafe { blend_hw::normal4(dst, covs, base_a, rgb, opaque) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is baseline on x86_64.
+        unsafe { blend_hw::normal4(dst, covs, base_a, rgb, opaque) };
+        return;
+    }
+    #[allow(unreachable_code)]
+    for (i, &cov) in covs.iter().enumerate() {
+        let a = cov.clamp(0.0, 1.0) * base_a;
+        paint_pixel::<true>(
+            &mut dst[i * 4..i * 4 + 4],
+            a,
+            rgb,
+            opaque,
+            BlendMode::Normal,
+        );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod blend_hw {
+    use core::arch::aarch64::{
+        vaddq_f32, vbslq_u32, vceqq_f32, vcgeq_f32, vcleq_f32, vcvtq_f32_u32, vcvtq_u32_f32,
+        vdivq_f32, vdupq_n_f32, vdupq_n_u32, vld1q_f32, vld1q_u8, vmaxq_f32, vminq_f32, vmulq_f32,
+        vreinterpretq_u32_u8, vreinterpretq_u8_u32, vst1q_u8, vsubq_f32,
+    };
+
+    /// # Safety
+    /// NEON is baseline on aarch64; `dst` must hold 16 bytes and `covs`
+    /// four coverages.
+    pub unsafe fn normal4(
+        dst: &mut [u8],
+        covs: &[f32],
+        base_a: f32,
+        rgb: [u8; 3],
+        opaque: [u8; 4],
+    ) {
+        let one = vdupq_n_f32(1.0);
+        let zero = vdupq_n_f32(0.0);
+        // a = clamp(cov, 0, 1) * base_a, per pixel.
+        let cov = vld1q_f32(covs.as_ptr());
+        let a = vmulq_f32(vminq_f32(vmaxq_f32(cov, zero), one), vdupq_n_f32(base_a));
+
+        // Load 4 interleaved RGBA pixels and split channels via shifts.
+        let px = vreinterpretq_u32_u8(vld1q_u8(dst.as_ptr()));
+        let byte = |lane_shift: u32| {
+            use core::arch::aarch64::{vandq_u32, vdupq_n_u32, vshrq_n_u32};
+            let shifted = match lane_shift {
+                0 => px,
+                8 => vshrq_n_u32::<8>(px),
+                16 => vshrq_n_u32::<16>(px),
+                _ => vshrq_n_u32::<24>(px),
+            };
+            vcvtq_f32_u32(vandq_u32(shifted, vdupq_n_u32(0xff)))
+        };
+        let (dr, dg, db, da_bytes) = (byte(0), byte(8), byte(16), byte(24));
+
+        let da = vdivq_f32(da_bytes, vdupq_n_f32(255.0));
+        let one_minus_a = vsubq_f32(one, a);
+        let oa = vaddq_f32(a, vmulq_f32(da, one_minus_a));
+        let dw = vmulq_f32(da, one_minus_a);
+
+        let half = vdupq_n_f32(0.5);
+        let channel = |s: u8, d: core::arch::aarch64::float32x4_t| {
+            let c = vdivq_f32(
+                vaddq_f32(vmulq_f32(vdupq_n_f32(s as f32), a), vmulq_f32(d, dw)),
+                oa,
+            );
+            vcvtq_u32_f32(vaddq_f32(c, half))
+        };
+        let r = channel(rgb[0], dr);
+        let g = channel(rgb[1], dg);
+        let b = channel(rgb[2], db);
+        let out_a = vcvtq_u32_f32(vaddq_f32(vmulq_f32(oa, vdupq_n_f32(255.0)), half));
+
+        use core::arch::aarch64::{vorrq_u32, vshlq_n_u32};
+        let packed = vorrq_u32(
+            vorrq_u32(r, vshlq_n_u32::<8>(g)),
+            vorrq_u32(vshlq_n_u32::<16>(b), vshlq_n_u32::<24>(out_a)),
+        );
+
+        // Per-lane shortcuts, exactly the scalar branches: a <= 0 leaves
+        // the pixel; a >= 1 writes the opaque source; oa <= 0 writes
+        // transparent black.
+        let src_lane = vdupq_n_u32(u32::from_le_bytes(opaque));
+        let zero_lane = vdupq_n_u32(0);
+        let keep = vcleq_f32(a, zero);
+        let full = vcgeq_f32(a, one);
+        let clear = vceqq_f32(vminq_f32(oa, zero), oa); // oa <= 0
+        let mut out = vbslq_u32(clear, zero_lane, packed);
+        out = vbslq_u32(full, src_lane, out);
+        out = vbslq_u32(keep, px, out);
+        vst1q_u8(dst.as_mut_ptr(), vreinterpretq_u8_u32(out));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod blend_hw {
+    use core::arch::x86_64::{
+        __m128, __m128i, _mm_add_ps, _mm_and_si128, _mm_andnot_si128, _mm_castps_si128,
+        _mm_cmpge_ps, _mm_cmple_ps, _mm_cvtepi32_ps, _mm_cvttps_epi32, _mm_div_ps, _mm_loadu_ps,
+        _mm_loadu_si128, _mm_max_ps, _mm_min_ps, _mm_mul_ps, _mm_or_si128, _mm_set1_epi32,
+        _mm_set1_ps, _mm_slli_epi32, _mm_srli_epi32, _mm_storeu_si128, _mm_sub_ps,
+    };
+
+    /// # Safety
+    /// SSE2 is baseline on x86_64; `dst` must hold 16 bytes and `covs`
+    /// four coverages.
+    pub unsafe fn normal4(
+        dst: &mut [u8],
+        covs: &[f32],
+        base_a: f32,
+        rgb: [u8; 3],
+        opaque: [u8; 4],
+    ) {
+        let one = _mm_set1_ps(1.0);
+        let zero = _mm_set1_ps(0.0);
+        let cov = _mm_loadu_ps(covs.as_ptr());
+        let a = _mm_mul_ps(_mm_min_ps(_mm_max_ps(cov, zero), one), _mm_set1_ps(base_a));
+
+        let px = _mm_loadu_si128(dst.as_ptr().cast::<__m128i>());
+        let mask = _mm_set1_epi32(0xff);
+        let byte = |shift: i32| -> __m128 {
+            let shifted = match shift {
+                0 => px,
+                8 => _mm_srli_epi32(px, 8),
+                16 => _mm_srli_epi32(px, 16),
+                _ => _mm_srli_epi32(px, 24),
+            };
+            _mm_cvtepi32_ps(_mm_and_si128(shifted, mask))
+        };
+        let (dr, dg, db, da_bytes) = (byte(0), byte(8), byte(16), byte(24));
+
+        let da = _mm_div_ps(da_bytes, _mm_set1_ps(255.0));
+        let one_minus_a = _mm_sub_ps(one, a);
+        let oa = _mm_add_ps(a, _mm_mul_ps(da, one_minus_a));
+        let dw = _mm_mul_ps(da, one_minus_a);
+
+        let half = _mm_set1_ps(0.5);
+        let channel = |s: u8, d: __m128| -> __m128i {
+            let c = _mm_div_ps(
+                _mm_add_ps(_mm_mul_ps(_mm_set1_ps(s as f32), a), _mm_mul_ps(d, dw)),
+                oa,
+            );
+            _mm_cvttps_epi32(_mm_add_ps(c, half))
+        };
+        let r = channel(rgb[0], dr);
+        let g = channel(rgb[1], dg);
+        let b = channel(rgb[2], db);
+        let out_a = _mm_cvttps_epi32(_mm_add_ps(_mm_mul_ps(oa, _mm_set1_ps(255.0)), half));
+
+        let packed = _mm_or_si128(
+            _mm_or_si128(r, _mm_slli_epi32(g, 8)),
+            _mm_or_si128(_mm_slli_epi32(b, 16), _mm_slli_epi32(out_a, 24)),
+        );
+
+        let src_lane = _mm_set1_epi32(i32::from_le_bytes(opaque));
+        let keep = _mm_castps_si128(_mm_cmple_ps(a, zero));
+        let full = _mm_castps_si128(_mm_cmpge_ps(a, one));
+        let clear = _mm_castps_si128(_mm_cmple_ps(oa, zero));
+        let mut out = _mm_or_si128(
+            _mm_andnot_si128(clear, packed),
+            _mm_and_si128(clear, _mm_set1_epi32(0)),
+        );
+        out = _mm_or_si128(_mm_and_si128(full, src_lane), _mm_andnot_si128(full, out));
+        out = _mm_or_si128(_mm_and_si128(keep, px), _mm_andnot_si128(keep, out));
+        _mm_storeu_si128(dst.as_mut_ptr().cast::<__m128i>(), out);
     }
 }
 
@@ -785,6 +994,61 @@ pub(crate) fn paint_pixel<const NORMAL: bool>(
         dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
     } else {
         composite_over(dst, rgb, a);
+    }
+}
+
+#[cfg(test)]
+mod blend_hw_tests {
+    use super::*;
+
+    /// The vector composite must be byte-identical to four scalar
+    /// [`paint_pixel`] calls across every lane-shortcut combination:
+    /// zero coverage, full coverage, transparent destinations, and
+    /// anti-aliased fractions, mixed within one vector.
+    #[test]
+    fn vector_blend_matches_scalar_bytes() {
+        let mut state = 0x2468aceu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        };
+        for _ in 0..2000 {
+            let covs: Vec<f32> = (0..4)
+                .map(|_| match next() % 5 {
+                    0 => 0.0,
+                    1 => 1.0,
+                    2 => 1.5,
+                    3 => -0.25,
+                    _ => (next() % 1000) as f32 / 1000.0,
+                })
+                .collect();
+            let base_a = match next() % 3 {
+                0 => 1.0,
+                1 => 0.0,
+                _ => (next() % 1000) as f32 / 1000.0,
+            };
+            let rgb = [next() as u8, next() as u8, next() as u8];
+            let opaque = [rgb[0], rgb[1], rgb[2], 255];
+            let mut dst: Vec<u8> = (0..16).map(|_| next() as u8).collect();
+            if next() % 4 == 0 {
+                for px in dst.chunks_exact_mut(4) {
+                    px[3] = 0;
+                }
+            }
+            let mut scalar = dst.clone();
+            for (i, &cov) in covs.iter().enumerate() {
+                let a = cov.clamp(0.0, 1.0) * base_a;
+                paint_pixel::<true>(
+                    &mut scalar[i * 4..i * 4 + 4],
+                    a,
+                    rgb,
+                    opaque,
+                    BlendMode::Normal,
+                );
+            }
+            blend_normal4(&mut dst, &covs, base_a, rgb, opaque);
+            assert_eq!(dst, scalar, "covs {covs:?} base_a {base_a}");
+        }
     }
 }
 
