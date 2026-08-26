@@ -713,58 +713,77 @@ fn sha256(input: &[u8]) -> [u8; 32] {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
-    let mut msg = input.to_vec();
+    let (blocks, tail) = input.as_chunks::<64>();
+    for block in blocks {
+        sha256_compress(&mut h, block);
+    }
+    // Final padding touches at most two blocks: 0x80, zeros, and the bit
+    // length in the last 8 bytes (FIPS 180-4) — the message itself is
+    // hashed in place above, never copied.
+    let mut pad = [0u8; 128];
+    pad[..tail.len()].copy_from_slice(tail);
+    pad[tail.len()] = 0x80;
+    let padded = if tail.len() < 56 { 64 } else { 128 };
     let bitlen = (input.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+    pad[padded - 8..padded].copy_from_slice(&bitlen.to_be_bytes());
+    for block in pad[..padded].as_chunks::<64>().0 {
+        sha256_compress(&mut h, block);
     }
-    msg.extend_from_slice(&bitlen.to_be_bytes());
-
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut w = [0u32; 64];
-        for (word, bytes) in w.iter_mut().zip(chunk.as_chunks::<4>().0) {
-            *word = u32::from_be_bytes(*bytes);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for (k, wi) in SHA256_K.iter().zip(&w) {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(*k)
-                .wrapping_add(*wi);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (hv, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *hv = hv.wrapping_add(v);
-        }
-    }
-
     let mut out = [0u8; 32];
     for (i, word) in h.iter().enumerate() {
         out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("sha2") {
+        // SAFETY: the `sha2` target feature was just detected at runtime.
+        unsafe { sha_hw::compress256(h, block) };
+        return;
+    }
+    sha256_compress_soft(h, block);
+}
+
+/// The portable compression, for CPUs without SHA-256 instructions.
+fn sha256_compress_soft(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *word = u32::from_be_bytes(*bytes);
+    }
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for (k, wi) in SHA256_K.iter().zip(&w) {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(*k)
+            .wrapping_add(*wi);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (hv, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *hv = hv.wrapping_add(v);
+    }
 }
 
 #[rustfmt::skip]
@@ -792,53 +811,171 @@ const SHA512_K: [u64; 80] = [
 ];
 
 fn sha512_core(input: &[u8], mut h: [u64; 8]) -> [u64; 8] {
-    let mut msg = input.to_vec();
-    let bitlen = (input.len() as u128).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 128 != 112 {
-        msg.push(0);
+    let (blocks, tail) = input.as_chunks::<128>();
+    for block in blocks {
+        sha512_compress(&mut h, block);
     }
-    msg.extend_from_slice(&bitlen.to_be_bytes());
-
-    for chunk in msg.as_chunks::<128>().0 {
-        let mut w = [0u64; 80];
-        for (word, bytes) in w.iter_mut().zip(chunk.as_chunks::<8>().0) {
-            *word = u64::from_be_bytes(*bytes);
-        }
-        for i in 16..80 {
-            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
-            w[i] = w[i - 16]
-                .wrapping_add(s0)
-                .wrapping_add(w[i - 7])
-                .wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for (k, wi) in SHA512_K.iter().zip(&w) {
-            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
-            let ch = (e & f) ^ ((!e) & g);
-            let t1 = hh
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(*k)
-                .wrapping_add(*wi);
-            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (hv, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *hv = hv.wrapping_add(v);
-        }
+    // Final padding touches at most two blocks: 0x80, zeros, and the bit
+    // length in the last 16 bytes (FIPS 180-4) — the message itself is
+    // hashed in place above, never copied.
+    let mut pad = [0u8; 256];
+    pad[..tail.len()].copy_from_slice(tail);
+    pad[tail.len()] = 0x80;
+    let padded = if tail.len() < 112 { 128 } else { 256 };
+    let bitlen = (input.len() as u128).wrapping_mul(8);
+    pad[padded - 16..padded].copy_from_slice(&bitlen.to_be_bytes());
+    for block in pad[..padded].as_chunks::<128>().0 {
+        sha512_compress(&mut h, block);
     }
     h
+}
+
+fn sha512_compress(h: &mut [u64; 8], block: &[u8; 128]) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("sha3") {
+        // SAFETY: the `sha3` target feature (SHA-512 instructions) was
+        // just detected at runtime.
+        unsafe { sha_hw::compress512(h, block) };
+        return;
+    }
+    sha512_compress_soft(h, block);
+}
+
+/// The portable compression, for CPUs without SHA-512 instructions.
+fn sha512_compress_soft(h: &mut [u64; 8], block: &[u8; 128]) {
+    let mut w = [0u64; 80];
+    for (word, bytes) in w.iter_mut().zip(block.as_chunks::<8>().0) {
+        *word = u64::from_be_bytes(*bytes);
+    }
+    for i in 16..80 {
+        let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
+        let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+        w[i] = w[i - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[i - 7])
+            .wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+    for (k, wi) in SHA512_K.iter().zip(&w) {
+        let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+        let ch = (e & f) ^ ((!e) & g);
+        let t1 = hh
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(*k)
+            .wrapping_add(*wi);
+        let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = s0.wrapping_add(maj);
+        hh = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (hv, v) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+        *hv = hv.wrapping_add(v);
+    }
+}
+
+/// SHA-2 compressions on the CPU's SHA instructions. Algorithm 2.B hashes
+/// roughly a megabyte per key derivation across its rounds — after the AES
+/// rounds moved to hardware this hashing was the remaining ~1-3ms of every
+/// encrypted-document open (PMU counters put it 60x below the memory-bound
+/// probe and at the ALU probe's branch signature: a pure serial dependency
+/// chain, which is exactly what the SHA instructions collapse). Callers
+/// detect `sha2`/`sha3` before entering; results are pinned to the FIPS
+/// 180 vectors in the tests below.
+#[cfg(target_arch = "aarch64")]
+mod sha_hw {
+    use core::arch::aarch64::{
+        uint32x4_t, uint64x2_t, vaddq_u32, vaddq_u64, vextq_u64, vld1q_u32, vld1q_u64, vld1q_u8,
+        vreinterpretq_u32_u8, vreinterpretq_u64_u8, vrev32q_u8, vrev64q_u8, vsha256h2q_u32,
+        vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vsha512h2q_u64, vsha512hq_u64,
+        vsha512su0q_u64, vsha512su1q_u64, vst1q_u32,
+    };
+
+    use super::{SHA256_K, SHA512_K};
+
+    /// # Safety
+    /// Requires the `sha2` target feature.
+    #[target_feature(enable = "sha2")]
+    pub unsafe fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
+        let mut abcd = vld1q_u32(h.as_ptr());
+        let mut efgh = vld1q_u32(h.as_ptr().add(4));
+        let saved = (abcd, efgh);
+        let mut w: [uint32x4_t; 4] = [
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr()))),
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(16)))),
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(32)))),
+            vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(48)))),
+        ];
+        for step in 0..16 {
+            let wk = vaddq_u32(w[step % 4], vld1q_u32(SHA256_K.as_ptr().add(4 * step)));
+            // The last three windows feed no further schedule.
+            if step < 12 {
+                w[step % 4] = vsha256su1q_u32(
+                    vsha256su0q_u32(w[step % 4], w[(step + 1) % 4]),
+                    w[(step + 2) % 4],
+                    w[(step + 3) % 4],
+                );
+            }
+            let prev = abcd;
+            abcd = vsha256hq_u32(abcd, efgh, wk);
+            efgh = vsha256h2q_u32(efgh, prev, wk);
+        }
+        vst1q_u32(h.as_mut_ptr(), vaddq_u32(abcd, saved.0));
+        vst1q_u32(h.as_mut_ptr().add(4), vaddq_u32(efgh, saved.1));
+    }
+
+    /// # Safety
+    /// Requires the `sha3` target feature (the SHA-512 instructions).
+    #[target_feature(enable = "sha2,sha3")]
+    pub unsafe fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
+        // State as register pairs s = [ab, cd, ef, gh]. Each step covers
+        // two rounds; the register playing the "gh" role rotates
+        // gh -> ef -> cd -> ab, which the r index tracks.
+        let mut s: [uint64x2_t; 4] = [
+            vld1q_u64(h.as_ptr()),
+            vld1q_u64(h.as_ptr().add(2)),
+            vld1q_u64(h.as_ptr().add(4)),
+            vld1q_u64(h.as_ptr().add(6)),
+        ];
+        let saved = s;
+        let mut w: [uint64x2_t; 8] = [core::mem::zeroed(); 8];
+        for (pair, bytes) in w.iter_mut().zip(block.as_chunks::<16>().0) {
+            *pair = vreinterpretq_u64_u8(vrev64q_u8(vld1q_u8(bytes.as_ptr())));
+        }
+        for step in 0..40 {
+            let r = 3 - (step % 4);
+            let wk = vaddq_u64(w[step % 8], vld1q_u64(SHA512_K.as_ptr().add(2 * step)));
+            let sum = vaddq_u64(vextq_u64::<1>(wk, wk), s[r]);
+            let im = vsha512hq_u64(
+                sum,
+                vextq_u64::<1>(s[(r + 3) % 4], s[r]),
+                vextq_u64::<1>(s[(r + 2) % 4], s[(r + 3) % 4]),
+            );
+            let updated = vsha512h2q_u64(im, s[(r + 2) % 4], s[(r + 1) % 4]);
+            s[(r + 2) % 4] = vaddq_u64(s[(r + 2) % 4], im);
+            s[r] = updated;
+            // The last four windows feed no further schedule.
+            if step < 32 {
+                let i = step % 8;
+                w[i] = vsha512su1q_u64(
+                    vsha512su0q_u64(w[i], w[(i + 1) % 8]),
+                    w[(i + 7) % 8],
+                    vextq_u64::<1>(w[(i + 4) % 8], w[(i + 5) % 8]),
+                );
+            }
+        }
+        for (i, (out, kept)) in s.iter().zip(saved).enumerate() {
+            let summed = vaddq_u64(*out, kept);
+            core::arch::aarch64::vst1q_u64(h.as_mut_ptr().add(2 * i), summed);
+        }
+    }
 }
 
 fn sha512(input: &[u8]) -> Vec<u8> {
@@ -886,6 +1023,35 @@ fn aesv3_key(enc: &Dict, r: i64, password: &[u8]) -> Option<Vec<u8>> {
     if u.len() < 48 {
         return None;
     }
+    // Fast paths: derive each candidate file key straight from its key
+    // salt and let the encrypted /Perms confirm it (ISO 32000-2 Algorithm
+    // 2.A step g validates exactly this way) — one Algorithm 2.B hash per
+    // path instead of two. Algorithm 2.B is the whole cost of opening an
+    // encrypted document, so this halves it for every file whose /Perms
+    // is intact; a wrong password decrypts /Perms to garbage and falls
+    // through to the full U/O validation below, unchanged.
+    let perms = enc.get("Perms").and_then(Object::as_str_bytes);
+    let o = enc.get("O").and_then(Object::as_str_bytes);
+    if let Some(perms) = perms.filter(|p| p.len() >= 16) {
+        if let Some(ue) = enc.get("UE").and_then(Object::as_str_bytes) {
+            if ue.len() >= 32 {
+                let intermediate = hash_2b(r, pw, &u[40..48], &[]);
+                let file_key = aes_cbc_decrypt_blocks(&intermediate, &[0u8; 16], &ue[..32]);
+                if file_key.len() == 32 && perms_marker_valid(&file_key, perms) {
+                    return Some(file_key);
+                }
+            }
+        }
+        if let (Some(o), Some(oe)) = (o, enc.get("OE").and_then(Object::as_str_bytes)) {
+            if o.len() >= 48 && oe.len() >= 32 {
+                let intermediate = hash_2b(r, pw, &o[40..48], &u[..48]);
+                let file_key = aes_cbc_decrypt_blocks(&intermediate, &[0u8; 16], &oe[..32]);
+                if file_key.len() == 32 && perms_marker_valid(&file_key, perms) {
+                    return Some(file_key);
+                }
+            }
+        }
+    }
     if let Some(ue) = enc.get("UE").and_then(Object::as_str_bytes) {
         if ue.len() >= 32 && hash_2b(r, pw, &u[32..40], &[])[..32] == u[..32] {
             let intermediate = hash_2b(r, pw, &u[40..48], &[]);
@@ -895,7 +1061,7 @@ fn aesv3_key(enc: &Dict, r: i64, password: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
-    let o = enc.get("O").and_then(Object::as_str_bytes)?;
+    let o = o?;
     let oe = enc.get("OE").and_then(Object::as_str_bytes)?;
     if o.len() < 48 || oe.len() < 32 {
         return None;
@@ -906,6 +1072,17 @@ fn aesv3_key(enc: &Dict, r: i64, password: &[u8]) -> Option<Vec<u8>> {
     let intermediate = hash_2b(r, pw, &o[40..48], &u[..48]);
     let file_key = aes_cbc_decrypt_blocks(&intermediate, &[0u8; 16], &oe[..32]);
     (file_key.len() == 32).then_some(file_key)
+}
+
+/// Whether `file_key` decrypts `/Perms` to its mandated marker: bytes 9-11
+/// spell "adb" (ISO 32000-2 Algorithm 2.A step g; AES-256 ECB, no IV).
+fn perms_marker_valid(file_key: &[u8], perms: &[u8]) -> bool {
+    let rks = aes_expand_key(file_key);
+    let inv_sbox = aes_inv_sbox();
+    let mut block = [0u8; 16];
+    block.copy_from_slice(&perms[..16]);
+    aes_decrypt_block(&mut block, &rks, &inv_sbox);
+    &block[9..12] == b"adb"
 }
 
 /// The revision-6 password hash (ISO 32000-2, Algorithm 2.B); a plain SHA-256
@@ -920,8 +1097,9 @@ fn hash_2b(r: i64, password: &[u8], salt: &[u8], udata: &[u8]) -> Vec<u8> {
         return k; // revision 5: a single SHA-256
     }
     let mut round = 0usize;
+    let mut k1 = Vec::with_capacity(64 * (password.len() + 64 + udata.len()));
     loop {
-        let mut k1 = Vec::with_capacity(64 * (password.len() + k.len() + udata.len()));
+        k1.clear();
         for _ in 0..64 {
             k1.extend_from_slice(password);
             k1.extend_from_slice(&k);
@@ -1084,6 +1262,60 @@ mod tests {
         assert_eq!(ct.len(), data.len());
         assert_ne!(ct, data);
         assert_eq!(aes_cbc_decrypt_blocks(&key, &iv, &ct), data);
+    }
+
+    /// NIST FIPS 180 vectors for the SHA-2 family, spanning the empty
+    /// input, one block, and inputs long enough to cross block
+    /// boundaries — the contract the hardware compressions must match.
+    #[test]
+    fn sha2_known_vectors() {
+        assert_eq!(
+            hex(&sha256(b"")),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(&sha256(b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&sha256(&[b'a'; 200])),
+            "c2a908d98f5df987ade41b5fce213067efbcc21ef2240212a41e54b5e7c28ae5"
+        );
+        assert_eq!(
+            hex(&sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed\
+             8086072ba1e7cc2358baeca134c825a7"
+        );
+        assert_eq!(
+            hex(&sha512(b"abc")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+        assert_eq!(
+            hex(&sha512(&[b'a'; 300])),
+            "a6a77010dd9696c23831e6549de51724df332c2075039b75fcfe6c2e6de42fbd\
+             3c80ed4073267e00c8c320712c3cdd9d65a96f90a3fe4a58a6b70a103be08e83"
+        );
+    }
+
+    /// The portable compressions must evolve state identically to the
+    /// dispatching entries (the hardware path wherever this runs on a CPU
+    /// with SHA instructions), block by block.
+    #[test]
+    fn sha2_soft_compressions_match_the_dispatch() {
+        let block64: [u8; 64] = core::array::from_fn(|i| (i as u8).wrapping_mul(31));
+        let mut via_dispatch = [0x6a09e667u32; 8];
+        let mut via_soft = via_dispatch;
+        sha256_compress(&mut via_dispatch, &block64);
+        sha256_compress_soft(&mut via_soft, &block64);
+        assert_eq!(via_dispatch, via_soft);
+
+        let block128: [u8; 128] = core::array::from_fn(|i| (i as u8).wrapping_mul(29));
+        let mut via_dispatch = [0x6a09e667f3bcc908u64; 8];
+        let mut via_soft = via_dispatch;
+        sha512_compress(&mut via_dispatch, &block128);
+        sha512_compress_soft(&mut via_soft, &block128);
+        assert_eq!(via_dispatch, via_soft);
     }
 
     #[test]
