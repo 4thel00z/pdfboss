@@ -265,15 +265,40 @@ fn inherited_attrs_doc() -> Vec<u8> {
     b.build(1)
 }
 
+/// One page declaring `/BleedBox`, `/TrimBox` and `/ArtBox` on the leaf
+/// (with an indirect coordinate), one declaring none, and a `/TrimBox` on
+/// the `/Pages` node that must NOT leak down: the boxes are not in ISO
+/// 32000-1 Table 30's inheritable set, so both walks must read them from
+/// the leaf dictionary only.
+fn page_boxes_doc() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 \
+         /MediaBox [0 0 600 800] /TrimBox [1 1 2 2] >>",
+    );
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /CropBox [50 50 550 750] \
+         /BleedBox [40 40 560 760] /TrimBox [60 70 540 5 0 R] \
+         /ArtBox [100 100 700 700] >>",
+    );
+    b.object(4, "<< /Type /Page /Parent 2 0 R >>");
+    b.object(5, "730");
+    b.build(1)
+}
+
 /// Every page attribute the two APIs hand out must be identical: media box,
-/// crop box, rotation, size, object reference and dictionary. The fixture
-/// declares everything on `/Pages` nodes, so a traversal that fails to
-/// inherit reports US Letter for an A4 page — silently, which is why this
-/// compares every field rather than probing one.
+/// crop box, bleed/trim/art boxes, rotation, size, object reference and
+/// dictionary. The fixture declares everything on `/Pages` nodes, so a
+/// traversal that fails to inherit reports US Letter for an A4 page —
+/// silently, which is why this compares every field rather than probing one.
 #[tokio::test]
 async fn pages_agree_with_the_sync_document() {
     let mut cases = fixtures();
     cases.push(("inherited_attrs", inherited_attrs_doc()));
+    cases.push(("page_boxes", page_boxes_doc()));
     for (name, bytes) in cases {
         let sync_doc = Document::load(bytes.clone()).expect("sync load");
         let async_doc = AsyncDocument::from_bytes(bytes).await.expect("async open");
@@ -287,6 +312,9 @@ async fn pages_agree_with_the_sync_document() {
             let a = async_doc.page(i).expect("async page");
             assert_eq!(s.media_box, a.media_box, "{name} page {i}: media box");
             assert_eq!(s.crop_box, a.crop_box, "{name} page {i}: crop box");
+            assert_eq!(s.bleed_box, a.bleed_box, "{name} page {i}: bleed box");
+            assert_eq!(s.trim_box, a.trim_box, "{name} page {i}: trim box");
+            assert_eq!(s.art_box, a.art_box, "{name} page {i}: art box");
             assert_eq!(s.rotate, a.rotate, "{name} page {i}: rotation");
             assert_eq!(s.size(), a.size(), "{name} page {i}: size");
             assert_eq!(

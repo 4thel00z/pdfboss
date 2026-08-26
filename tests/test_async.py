@@ -97,6 +97,18 @@ class TestAsyncDocumentQueries:
         )
         assert [d.page_count for d in docs] == [1, 3]
 
+    @pytest.mark.asyncio
+    async def test_page_boxes_match_sync(self, boxed_pdf: bytes) -> None:
+        sync_page = Document(data=boxed_pdf)[0]
+        page = (await AsyncDocument.from_bytes(boxed_pdf))[0]
+        assert page.media_box == sync_page.media_box
+        assert page.crop_box == sync_page.crop_box
+        assert page.bleed_box == sync_page.bleed_box
+        assert page.trim_box == sync_page.trim_box
+        assert page.art_box == sync_page.art_box
+        assert page.trim_box == pytest.approx((60.0, 70.0, 540.0, 730.0))
+        assert page.art_box == page.crop_box, "undeclared art box is the crop box"
+
 
 def element_key(element: Element) -> tuple[object, ...]:
     """A comparable identity for an element (everything but value())."""
