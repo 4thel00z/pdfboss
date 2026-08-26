@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.18.0](https://github.com/4thel00z/pdfboss/compare/v0.17.1...v0.18.0) (2026-08-26)
+
+
+### Features
+
+* **bench:** corpus-diversity quality harness and fetch scripts ([#63](https://github.com/4thel00z/pdfboss/issues/63)) ([23a22ea](https://github.com/4thel00z/pdfboss/commit/23a22ea960319d075bd5653ff9ef574320719aac))
+* **bench:** parallel-throughput benchmark for render and text extraction ([#61](https://github.com/4thel00z/pdfboss/issues/61)) ([9ea6b68](https://github.com/4thel00z/pdfboss/commit/9ea6b68b58937f6099b6742d655862791a7c0637))
+* **bench:** robustness and peak-memory benchmarks on a subprocess-isolation harness ([#60](https://github.com/4thel00z/pdfboss/issues/60)) ([aaaba1a](https://github.com/4thel00z/pdfboss/commit/aaaba1a4ddf1b36a8cfc0c58b6b9739958affa27))
+* **bench:** visual-fidelity score against a reference rasterizer ([#59](https://github.com/4thel00z/pdfboss/issues/59)) ([9002b9a](https://github.com/4thel00z/pdfboss/commit/9002b9a0549996a3374a876b9e57db22828b8a9e))
+* close the biggest table and heading extraction gaps ([#73](https://github.com/4thel00z/pdfboss/issues/73)) ([5fa9516](https://github.com/4thel00z/pdfboss/commit/5fa951660b9447a49950921ec74f471b57c6bc53))
+* **core:** complete the JBIG2 segment type table ([#79](https://github.com/4thel00z/pdfboss/issues/79)) ([3d8ea7b](https://github.com/4thel00z/pdfboss/commit/3d8ea7b7dc5db6641262fbbbef876a582168827d))
+* **core:** expose the bleed, trim and art boxes on every page ([#81](https://github.com/4thel00z/pdfboss/issues/81)) ([24095c8](https://github.com/4thel00z/pdfboss/commit/24095c806c0e01353fb63e27863ee674c70460a9))
+* honor optional content (ISO 32000-1 §8.11) in rendering and extraction ([#65](https://github.com/4thel00z/pdfboss/issues/65)) ([03dcb08](https://github.com/4thel00z/pdfboss/commit/03dcb082c2eff25c187aa76ae1c242c0e70aeaf1))
+* interpret ICC profiles and the CIE colour families ([#70](https://github.com/4thel00z/pdfboss/issues/70)) ([642bfbf](https://github.com/4thel00z/pdfboss/commit/642bfbfcda85ce08e11a90453594d1dc0a330818))
+* JPX ICC profiles, exact sYCC, and round-to-nearest depth normalization ([#75](https://github.com/4thel00z/pdfboss/issues/75)) ([00dbac7](https://github.com/4thel00z/pdfboss/commit/00dbac7b4ebf08d7ee4a3951368522f916a25a35))
+* predefined and embedded CID CMaps with vertical writing ([#71](https://github.com/4thel00z/pdfboss/issues/71)) ([e5e0655](https://github.com/4thel00z/pdfboss/commit/e5e065535732a37f6375b2efedd8059a6fc913f1))
+* **render:** composite shadings through blend modes and soft masks ([#67](https://github.com/4thel00z/pdfboss/issues/67)) ([4d00be9](https://github.com/4thel00z/pdfboss/commit/4d00be99054fbe2085addfc5de33b8c16eca01c5))
+* **render:** non-separable blend modes and /SMask transfer functions ([#69](https://github.com/4thel00z/pdfboss/issues/69)) ([fc224b9](https://github.com/4thel00z/pdfboss/commit/fc224b91c688b27fc4dec099bdcfb3bd3d822cde))
+* **render:** paint mesh and function-based shadings (types 1, 4-7) ([#68](https://github.com/4thel00z/pdfboss/issues/68)) ([f505ebd](https://github.com/4thel00z/pdfboss/commit/f505ebdee7316764b4df60041a8f892774df8f86))
+* **render:** per-glyph substitute fallback and Standard encoding for nonsymbolic substitutes ([#64](https://github.com/4thel00z/pdfboss/issues/64)) ([fab4032](https://github.com/4thel00z/pdfboss/commit/fab40321db2bf062d4caeecf24c97cb6223b8d52))
+* **render:** PostScript calculator functions, multi-input evaluation, DeviceN tints ([#66](https://github.com/4thel00z/pdfboss/issues/66)) ([4ad0778](https://github.com/4thel00z/pdfboss/commit/4ad0778fc8528fe9106e3c8abdc62d8ca3d22efb))
+
+
+### Bug Fixes
+
+* **render:** carry the RenderOptions oc field into the fallback tests ([#77](https://github.com/4thel00z/pdfboss/issues/77)) ([3e16776](https://github.com/4thel00z/pdfboss/commit/3e16776d12cee01be2b4f2f968f4106825ac23aa))
+
+
+### Documentation
+
+* apply the PR-claim audit's citation corrections ([#78](https://github.com/4thel00z/pdfboss/issues/78)) ([f819ab1](https://github.com/4thel00z/pdfboss/commit/f819ab1fbf8c2377e2f312b4068ed294da7d4b0c))
+* **bench:** tighten the benchmark prose ([#74](https://github.com/4thel00z/pdfboss/issues/74)) ([c8abb69](https://github.com/4thel00z/pdfboss/commit/c8abb69c21a86951398b2bcb8094889bafab8fe7))
+* **core:** describe membership visibility instead of linking a private item ([#76](https://github.com/4thel00z/pdfboss/issues/76)) ([e46b505](https://github.com/4thel00z/pdfboss/commit/e46b505f5de546e2be2c387e7f405486c14b6885))
+* fold the README's deep-dive prose into collapsibles ([#80](https://github.com/4thel00z/pdfboss/issues/80)) ([55e3d24](https://github.com/4thel00z/pdfboss/commit/55e3d246ec3a1ac4f956655107fa200555c2e75b))
+
 ## [0.17.1](https://github.com/4thel00z/pdfboss/compare/v0.17.0...v0.17.1) (2026-08-24)
 
 
