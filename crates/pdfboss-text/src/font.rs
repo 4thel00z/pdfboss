@@ -7,9 +7,8 @@
 use crate::cmap::ToUnicode;
 use crate::sfnt;
 use pdfboss_core::cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode};
-use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, Object};
+use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, FastMap, Object};
 use pdfboss_encoding as encodings;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// One character code split out of a show string: its value and how many
@@ -53,12 +52,12 @@ pub struct Font {
     encoding: Option<Box<[Option<Decoded>; 256]>>,
     /// Explicit widths in glyph-space units (1/1000 em), keyed by code for
     /// simple fonts and by CID for Type0 (`/W`).
-    widths: HashMap<u32, f32>,
+    widths: FastMap<u32, f32>,
     /// Width used for codes without an explicit entry.
     default_width: f32,
     /// Vertical displacements (`/W2` w1, negative for downward), keyed by
     /// CID.
-    vwidths: HashMap<u32, f32>,
+    vwidths: FastMap<u32, f32>,
     /// `/DW2`'s displacement, default -1000 (ISO 32000-1 §9.7.4.3).
     default_vwidth: f32,
     /// The code that triggers word spacing (single-byte code 32).
@@ -145,9 +144,9 @@ impl Font {
             encoding_known: true,
             vertical: false,
             encoding: None,
-            widths: HashMap::new(),
+            widths: FastMap::default(),
             default_width: 500.0,
-            vwidths: HashMap::new(),
+            vwidths: FastMap::default(),
             default_vwidth: -1000.0,
             space_code: Some(32),
             winansi_high_codes: false,
@@ -520,7 +519,7 @@ impl Font {
     ) -> Font {
         let encoding = Font::load_encoding(src, dict).await;
 
-        let mut widths = HashMap::new();
+        let mut widths = FastMap::default();
         let first = rv(src, dict, "FirstChar")
             .await
             .and_then(|o| o.as_int())
@@ -562,7 +561,7 @@ impl Font {
             encoding,
             widths,
             default_width,
-            vwidths: HashMap::new(),
+            vwidths: FastMap::default(),
             default_vwidth: -1000.0,
             space_code: Some(32),
             winansi_high_codes,
@@ -699,9 +698,9 @@ impl Font {
         let descendant = Font::load_descendant(src, dict).await;
         let encoding = type0_encoding(src, dict).await;
 
-        let mut widths = HashMap::new();
+        let mut widths = FastMap::default();
         let mut default_width = 1000.0;
-        let mut vwidths = HashMap::new();
+        let mut vwidths = FastMap::default();
         let mut default_vwidth = -1000.0;
         let mut ordering = None;
         if let Some(desc) = &descendant {
@@ -781,7 +780,7 @@ impl Font {
     async fn parse_cid_widths<S: AsyncObjectSource>(
         src: &S,
         items: &[Object],
-        widths: &mut HashMap<u32, f32>,
+        widths: &mut FastMap<u32, f32>,
     ) {
         let mut resolved: Vec<Object> = Vec::with_capacity(items.len());
         for item in items {
@@ -830,7 +829,7 @@ impl Font {
     async fn parse_cid_vwidths<S: AsyncObjectSource>(
         src: &S,
         items: &[Object],
-        vwidths: &mut HashMap<u32, f32>,
+        vwidths: &mut FastMap<u32, f32>,
     ) {
         let mut resolved: Vec<Object> = Vec::with_capacity(items.len());
         for item in items {

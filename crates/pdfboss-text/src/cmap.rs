@@ -1,7 +1,7 @@
 //! ToUnicode CMap parsing: `begincodespacerange`, `beginbfchar`, and both
 //! `beginbfrange` forms; destination hex is UTF-16BE and may be multi-char.
 
-use pdfboss_core::lexer::{Lexer, Token};
+use pdfboss_core::lexer::{decode_hex, decode_hex_fixed, Lexer, RawToken, Token};
 use pdfboss_core::FastMap;
 
 /// A parsed ToUnicode CMap mapping character codes to Unicode strings.
@@ -22,6 +22,19 @@ pub struct ToUnicode {
 /// Folds up to the last 4 bytes of a hex-string source code, big-endian.
 fn code_value(bytes: &[u8]) -> u32 {
     bytes.iter().fold(0u32, |acc, &b| (acc << 8) | u32::from(b))
+}
+
+/// Decodes a source code's raw hex span without allocating: its folded
+/// value and byte length. An over-long code (past 4 bytes) still folds
+/// through all its bytes, exactly as the owned form's fold did.
+fn hex_code(span: &[u8]) -> (u32, usize) {
+    match decode_hex_fixed::<4>(span) {
+        Some((bytes, len)) => (code_value(&bytes[..len]), len),
+        None => {
+            let bytes = decode_hex(span);
+            (code_value(&bytes), bytes.len())
+        }
+    }
 }
 
 /// Splits destination hex bytes into UTF-16BE code units; a trailing odd
@@ -55,7 +68,7 @@ impl ToUnicode {
         loop {
             match next_or_skip(&mut lx, data.len()) {
                 None => break,
-                Some(Token::Keyword(kw)) => match kw.as_slice() {
+                Some(RawToken::Keyword(kw)) => match kw {
                     b"begincodespacerange" => out.parse_codespaces(&mut lx, data.len()),
                     b"beginbfchar" => out.parse_bfchars(&mut lx, data.len()),
                     b"beginbfrange" => out.parse_bfranges(&mut lx, data.len()),
@@ -116,17 +129,17 @@ impl ToUnicode {
     fn parse_codespaces(&mut self, lx: &mut Lexer<'_>, len: usize) {
         loop {
             let lo = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => h,
+                Some(RawToken::Hex(span)) => span,
                 Some(_) | None => return, // `endcodespacerange` or junk
             };
-            let Some(Token::HexString(hi)) = next_or_skip(lx, len) else {
+            let Some(RawToken::Hex(hi)) = next_or_skip(lx, len) else {
                 return;
             };
-            if lo.is_empty() {
+            let (lo_v, lo_len) = hex_code(lo);
+            if lo_len == 0 {
                 continue;
             }
-            self.codespaces
-                .push((lo.len(), code_value(&lo), code_value(&hi)));
+            self.codespaces.push((lo_len, lo_v, hex_code(hi).0));
         }
     }
 
@@ -134,15 +147,15 @@ impl ToUnicode {
     fn parse_bfchars(&mut self, lx: &mut Lexer<'_>, len: usize) {
         loop {
             let src = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => h,
+                Some(RawToken::Hex(span)) => span,
                 Some(_) | None => return,
             };
             match next_or_skip(lx, len) {
-                Some(Token::HexString(dst)) => {
-                    let units = utf16_units(&dst);
+                Some(RawToken::Hex(dst)) => {
+                    let units = utf16_units(&decode_hex(dst));
                     if !units.is_empty() && !is_replacement(&units) {
                         self.singles
-                            .insert(code_value(&src), String::from_utf16_lossy(&units));
+                            .insert(hex_code(src).0, String::from_utf16_lossy(&units));
                     }
                 }
                 // A name destination (base-font form) or junk: skip entry.
@@ -156,32 +169,32 @@ impl ToUnicode {
     fn parse_bfranges(&mut self, lx: &mut Lexer<'_>, len: usize) {
         loop {
             let lo = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => code_value(&h),
+                Some(RawToken::Hex(span)) => hex_code(span).0,
                 Some(_) | None => return,
             };
             let hi = match next_or_skip(lx, len) {
-                Some(Token::HexString(h)) => code_value(&h),
+                Some(RawToken::Hex(span)) => hex_code(span).0,
                 Some(_) | None => return,
             };
             match next_or_skip(lx, len) {
-                Some(Token::HexString(dst)) => {
-                    let units = utf16_units(&dst);
+                Some(RawToken::Hex(dst)) => {
+                    let units = utf16_units(&decode_hex(dst));
                     if !units.is_empty() && !is_replacement(&units) && lo <= hi {
                         self.ranges.push((lo, hi, units));
                     }
                 }
-                Some(Token::ArrayOpen) => {
+                Some(RawToken::Owned(Token::ArrayOpen)) => {
                     let mut code = lo;
                     loop {
                         match next_or_skip(lx, len) {
-                            Some(Token::HexString(dst)) => {
-                                let units = utf16_units(&dst);
+                            Some(RawToken::Hex(dst)) => {
+                                let units = utf16_units(&decode_hex(dst));
                                 if !units.is_empty() && !is_replacement(&units) && code <= hi {
                                     self.singles.insert(code, String::from_utf16_lossy(&units));
                                 }
                                 code = code.saturating_add(1);
                             }
-                            Some(Token::ArrayClose) => break,
+                            Some(RawToken::Owned(Token::ArrayClose)) => break,
                             Some(_) => {}
                             None => return,
                         }
@@ -196,11 +209,11 @@ impl ToUnicode {
 
 /// Fetches the next token, force-advancing past unlexable bytes; `None`
 /// at end of input.
-fn next_or_skip(lx: &mut Lexer<'_>, len: usize) -> Option<Token> {
+fn next_or_skip<'a>(lx: &mut Lexer<'a>, len: usize) -> Option<RawToken<'a>> {
     loop {
         let before = lx.pos();
-        match lx.next_token() {
-            Ok(Token::Eof) => return None,
+        match lx.next_raw_token() {
+            Ok(RawToken::Owned(Token::Eof)) => return None,
             Ok(t) => return Some(t),
             Err(_) => {
                 if lx.pos() <= before {

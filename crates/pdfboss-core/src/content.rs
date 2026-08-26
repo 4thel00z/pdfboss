@@ -5,7 +5,7 @@
 use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::geom::Matrix;
-use crate::lexer::{is_whitespace, Lexer, RawToken, Token};
+use crate::lexer::{decode_hex, is_whitespace, Lexer, RawToken, Token};
 use crate::object::{Dict, Name, Object};
 
 /// Maximum operand container (array/dictionary) nesting depth. Composing
@@ -248,6 +248,13 @@ fn parse_content_ops(data: &[u8], mut emit: impl FnMut(Op, Span)) -> Result<()> 
                     run_start = Some(token_start);
                 }
                 kw
+            }
+            RawToken::Hex(span) => {
+                if run_start.is_none() {
+                    run_start = Some(token_start);
+                }
+                stack.push(Object::String(decode_hex(span)));
+                continue;
             }
             RawToken::Owned(token) => {
                 if !matches!(token, Token::Eof) && run_start.is_none() {
