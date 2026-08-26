@@ -355,7 +355,8 @@ async fn shared_algorithms_run_over_the_async_document() {
         let doc = async_doc.clone();
         let handle = tokio::spawn(async move {
             let page = doc.page(i).expect("async page");
-            let text = pdfboss_output::extract_text_with(doc.clone(), &page)
+            let oc = doc.oc_state().await;
+            let text = pdfboss_output::extract_text_with(doc.clone(), &page, oc.as_ref())
                 .await
                 .expect("async text");
             let opts = pdfboss_render::RenderOptions {
@@ -468,7 +469,8 @@ async fn encrypted_documents_decrypt_identically() {
     let sync_page = sync_doc.page(0).expect("sync page");
     let async_page = async_doc.page(0).expect("async page");
     let sync_text = pdfboss_output::extract_text(&sync_doc, &sync_page).expect("sync text");
-    let async_text = pdfboss_output::extract_text_with(async_doc.clone(), &async_page)
+    let oc = async_doc.oc_state().await;
+    let async_text = pdfboss_output::extract_text_with(async_doc.clone(), &async_page, oc.as_ref())
         .await
         .expect("async text");
     assert_eq!(sync_text, "Top secret message");
@@ -479,8 +481,9 @@ async fn encrypted_documents_decrypt_identically() {
 
     // Markdown extraction over the same encrypted content agrees too.
     let sync_md = pdfboss_output::extract_page_markdown(&sync_doc, &sync_page).expect("sync md");
-    let async_md = pdfboss_output::extract_page_markdown_with(async_doc.clone(), &async_page)
-        .await
-        .expect("async md");
+    let async_md =
+        pdfboss_output::extract_page_markdown_with(async_doc.clone(), &async_page, oc.as_ref())
+            .await
+            .expect("async md");
     assert_eq!(sync_md, async_md, "markdown agrees on encrypted files");
 }

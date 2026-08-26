@@ -6,7 +6,7 @@ mod markdown;
 mod output;
 mod structure;
 
-use pdfboss_core::{AsyncObjectSource, Document, Page, Result};
+use pdfboss_core::{AsyncObjectSource, Document, OcState, Page, Result};
 
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 pub use markdown::Markdown;
@@ -37,17 +37,21 @@ pub fn extract_text(doc: &Document, page: &Page) -> Result<String> {
 }
 
 /// [`extract_text`] against any object source, awaiting whatever I/O the
-/// source needs to read the page — the same span extraction and layout,
-/// minus the document's optional-content configuration, which a bare
-/// source cannot supply: every layer extracts here.
+/// source needs to read the page — the same span extraction and layout.
+/// `oc` is the document's optional-content visibility (the async document's
+/// `oc_state()`); `None` extracts every layer.
 ///
 /// The source is taken by value and the page by reference. That combination is
 /// what a consumer needs to spawn the result: the future is `Send` over a source
 /// that is `Send + Sync`, and `'static` as long as the borrow of `page` is
 /// created inside the consumer's own `async move` block, which owns the page.
 /// See `pdfboss_core::source`'s "Signing a shared algorithm".
-pub async fn extract_text_with<S: AsyncObjectSource>(src: S, page: &Page) -> Result<String> {
-    let (text, _) = extract_text_reporting_with(src, page).await?;
+pub async fn extract_text_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+) -> Result<String> {
+    let (text, _) = extract_text_reporting_with(src, page, oc).await?;
     Ok(text)
 }
 
@@ -62,13 +66,13 @@ pub fn extract_text_reporting(doc: &Document, page: &Page) -> Result<(String, Ex
 }
 
 /// [`extract_text_reporting`] against any object source. Signed like
-/// [`extract_text_with`], for the same reasons — every optional-content
-/// layer included.
+/// [`extract_text_with`], for the same reasons — `oc` gating included.
 pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
+    oc: Option<&OcState>,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting_with(src, page).await?;
+    let (spans, report) = pdfboss_text::extract_spans_reporting_with(src, page, oc).await?;
     Ok((Text.render(&[page_layout(&spans)]), report))
 }
 
@@ -135,8 +139,7 @@ pub fn extract_page_markdown(doc: &Document, page: &Page) -> Result<String> {
 }
 
 /// [`extract_page_markdown`] against any object source. Signed like
-/// [`extract_text_with`], for the same reasons — every optional-content
-/// layer included.
+/// [`extract_text_with`], for the same reasons — `oc` gating included.
 ///
 /// There is no document-level `_with`: an asynchronous caller collects each
 /// page's spans and rulings with
@@ -146,9 +149,10 @@ pub fn extract_page_markdown(doc: &Document, page: &Page) -> Result<String> {
 pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
+    oc: Option<&OcState>,
 ) -> Result<String> {
     let (spans, rulings, _) =
-        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page).await?;
+        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc).await?;
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings)]))
 }
 
@@ -1185,6 +1189,7 @@ mod tests {
                     payload: Vec::new(),
                 },
                 &text_page,
+                None,
             )
             .await
         };

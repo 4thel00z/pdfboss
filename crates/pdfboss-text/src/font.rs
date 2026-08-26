@@ -73,6 +73,32 @@ pub struct Font {
     /// BaseFont-name substrings as fallback.
     pub bold: bool,
     pub italic: bool,
+    /// `/BaseFont` verbatim — subset prefix included — falling back to the
+    /// FontDescriptor's `/FontName`; empty when the file states neither.
+    pub base_name: String,
+    /// Upper edge of the em box in per-mille units: `/Ascent`, else
+    /// `/CapHeight`, else 800.
+    pub ascent: f32,
+    /// Lower edge of the em box in per-mille units, never positive:
+    /// `/Descent`, else -200.
+    pub descent: f32,
+    /// FontDescriptor `/Flags` FixedPitch (ISO 32000-1 Table 123 bit 1).
+    pub monospace: bool,
+    /// FontDescriptor `/Flags` Serif (ISO 32000-1 Table 123 bit 2).
+    pub serif: bool,
+}
+
+/// Everything [`Font::style`] reads in one descriptor pass: the font's
+/// stated name, the weight/slant evidence, and the vertical metrics
+/// extraction turns into span boxes.
+struct Style {
+    name: String,
+    bold: bool,
+    italic: bool,
+    ascent: f32,
+    descent: f32,
+    monospace: bool,
+    serif: bool,
 }
 
 /// One `/Encoding` table cell. Base-table entries and most `/Differences`
@@ -127,6 +153,11 @@ impl Font {
             winansi_high_codes: false,
             bold: false,
             italic: false,
+            base_name: String::new(),
+            ascent: 800.0,
+            descent: -200.0,
+            monospace: false,
+            serif: false,
         }
     }
 
@@ -400,26 +431,61 @@ impl Font {
     /// already-resolved descendant dict for Type0 — refining the guess with
     /// `/Flags`, `/FontWeight`, and `/ItalicAngle` (ISO 32000-1 §9.8.1,
     /// Table 123).
-    async fn style<S: AsyncObjectSource>(
-        src: &S,
-        dict: &Dict,
-        descriptor_holder: &Dict,
-    ) -> (bool, bool) {
+    async fn style<S: AsyncObjectSource>(src: &S, dict: &Dict, descriptor_holder: &Dict) -> Style {
         let name = rv(src, dict, "BaseFont")
             .await
             .and_then(|o| o.as_name().map(|n| n.0.clone()))
             .unwrap_or_default();
-        let mut bold = name.contains("Bold");
-        let mut italic = name.contains("Italic") || name.contains("Oblique");
+        let mut style = Style {
+            bold: name.contains("Bold"),
+            italic: name.contains("Italic") || name.contains("Oblique"),
+            name,
+            ascent: 800.0,
+            descent: -200.0,
+            monospace: false,
+            serif: false,
+        };
         let Some(descriptor) = rv(src, descriptor_holder, "FontDescriptor")
             .await
             .and_then(|o| o.as_dict().cloned())
         else {
-            return (bold, italic);
+            return style;
         };
+        if style.name.is_empty() {
+            style.name = rv(src, &descriptor, "FontName")
+                .await
+                .and_then(|o| o.as_name().map(|n| n.0.clone()))
+                .unwrap_or_default();
+        }
+        let ascent = match rv(src, &descriptor, "Ascent")
+            .await
+            .and_then(|o| o.as_f64())
+        {
+            Some(a) if a != 0.0 => Some(a),
+            _ => rv(src, &descriptor, "CapHeight")
+                .await
+                .and_then(|o| o.as_f64())
+                .filter(|c| *c != 0.0),
+        };
+        if let Some(a) = ascent {
+            style.ascent = a as f32;
+        }
+        if let Some(d) = rv(src, &descriptor, "Descent")
+            .await
+            .and_then(|o| o.as_f64())
+            .filter(|d| *d != 0.0)
+        {
+            // Stated as negative (ISO 32000-1 Table 122); some producers
+            // write the magnitude.
+            style.descent = -(d as f32).abs();
+        }
+        let mut bold = style.bold;
+        let mut italic = style.italic;
         if let Some(flags) = rv(src, &descriptor, "Flags").await.and_then(|o| o.as_int()) {
             italic = italic || flags & (1 << 6) != 0; // Table 123 bit 7: Italic
             bold = bold || flags & (1 << 18) != 0; // Table 123 bit 19: ForceBold
+            style.monospace = flags & 1 != 0; // Table 123 bit 1: FixedPitch
+            style.serif = flags & 2 != 0; // Table 123 bit 2: Serif
         }
         if let Some(weight) = rv(src, &descriptor, "FontWeight")
             .await
@@ -440,7 +506,9 @@ impl Font {
         {
             italic = italic || angle != 0.0;
         }
-        (bold, italic)
+        style.bold = bold;
+        style.italic = italic;
+        style
     }
 
     /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
@@ -482,7 +550,7 @@ impl Font {
         // Only a font that states no `/Encoding` has anything to gain here, and
         // only then is the embedded program worth inflating.
         let winansi_high_codes = encoding.is_none() && Font::built_for_windows(src, dict).await;
-        let (bold, italic) = Font::style(src, dict, dict).await;
+        let style = Font::style(src, dict, dict).await;
 
         Font {
             simple: true,
@@ -498,8 +566,13 @@ impl Font {
             default_vwidth: -1000.0,
             space_code: Some(32),
             winansi_high_codes,
-            bold,
-            italic,
+            bold: style.bold,
+            italic: style.italic,
+            base_name: style.name,
+            ascent: style.ascent,
+            descent: style.descent,
+            monospace: style.monospace,
+            serif: style.serif,
         }
     }
 
@@ -659,7 +732,7 @@ impl Font {
         // (ISO 32000-1 §9.7.4); reuse the dict just resolved above rather
         // than resolving /DescendantFonts a second time.
         let descriptor_holder = descendant.as_ref().unwrap_or(dict);
-        let (bold, italic) = Font::style(src, dict, descriptor_holder).await;
+        let style = Font::style(src, dict, descriptor_holder).await;
 
         let space_code = encoding
             .cmap
@@ -684,8 +757,13 @@ impl Font {
             space_code,
             // Composite codes never reach the single-byte fallbacks.
             winansi_high_codes: false,
-            bold,
-            italic,
+            bold: style.bold,
+            italic: style.italic,
+            base_name: style.name,
+            ascent: style.ascent,
+            descent: style.descent,
+            monospace: style.monospace,
+            serif: style.serif,
         }
     }
 

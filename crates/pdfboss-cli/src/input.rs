@@ -118,10 +118,15 @@ impl Input {
             Input::Remote { rt, doc } => {
                 let page = doc.page(index).map_err(|e| e.to_string())?;
                 let (spans, rulings, _) = rt
-                    .block_on(pdfboss_text::extract_spans_and_rulings_reporting_with(
-                        doc.clone(),
-                        &page,
-                    ))
+                    .block_on(async {
+                        let oc = doc.oc_state().await;
+                        pdfboss_text::extract_spans_and_rulings_reporting_with(
+                            doc.clone(),
+                            &page,
+                            oc.as_ref(),
+                        )
+                        .await
+                    })
                     .map_err(|e| e.to_string())?;
                 Ok((spans, rulings))
             }
