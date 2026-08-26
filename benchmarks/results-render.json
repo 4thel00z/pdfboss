@@ -1,34 +1,34 @@
 {
   "corpus": "pdfs",
   "files_sampled": 40,
-  "files_certified": 37,
-  "files_compared": 37,
+  "files_certified": 38,
+  "files_compared": 38,
   "excluded": {
-    "glyph skipped": 3
+    "glyph skipped": 2
   },
   "scale": 1.0,
   "fonts": "full",
   "repeat": 3,
   "libraries": {
     "pdfboss": {
-      "time": 7.713684126007138,
-      "pages": 864,
-      "ok": 37
+      "time": 7.881685162952635,
+      "pages": 888,
+      "ok": 38
     },
     "PyMuPDF": {
-      "time": 9.11467183197965,
-      "pages": 864,
-      "ok": 37
+      "time": 9.665676956879906,
+      "pages": 888,
+      "ok": 38
     },
     "pypdfium2": {
-      "time": 6.863686247030273,
-      "pages": 864,
-      "ok": 37
+      "time": 7.278520208201371,
+      "pages": 888,
+      "ok": 38
     },
     "pdfplumber": {
-      "time": 8.265065874002175,
-      "pages": 864,
-      "ok": 37
+      "time": 8.549782248970587,
+      "pages": 888,
+      "ok": 38
     }
   }
 }
