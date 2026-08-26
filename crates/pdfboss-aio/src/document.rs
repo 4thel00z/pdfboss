@@ -235,6 +235,13 @@ pub(crate) struct PageRecord {
     pub(crate) media_box: Option<pdfboss_core::Rect>,
     /// Inherited `/CropBox`, raw as above.
     pub(crate) crop_box: Option<pdfboss_core::Rect>,
+    /// Leaf `/BleedBox`, raw as above. Not inheritable (ISO 32000
+    /// §7.7.3.3, Table 30), so read from the leaf dictionary only.
+    pub(crate) bleed_box: Option<pdfboss_core::Rect>,
+    /// Leaf `/TrimBox`, raw as above.
+    pub(crate) trim_box: Option<pdfboss_core::Rect>,
+    /// Leaf `/ArtBox`, raw as above.
+    pub(crate) art_box: Option<pdfboss_core::Rect>,
     /// Inherited `/Rotate`, raw as above.
     pub(crate) rotate: Option<i32>,
 }
@@ -1401,6 +1408,9 @@ impl AsyncDocument {
             Some(record.resources),
             record.media_box,
             record.crop_box,
+            record.bleed_box,
+            record.trim_box,
+            record.art_box,
             record.rotate,
             record.dict,
             record.r,
@@ -1482,14 +1492,25 @@ impl AsyncDocument {
                         stack.push((kid.clone(), inherited.clone(), depth + 1));
                     }
                 }
-                None => pages.push(PageRecord {
-                    r: node_ref,
-                    dict: dict.clone(),
-                    resources: inherited.resources.clone(),
-                    media_box: inherited.media_box,
-                    crop_box: inherited.crop_box,
-                    rotate: inherited.rotate,
-                }),
+                None => {
+                    // BleedBox, TrimBox and ArtBox are not inheritable
+                    // (ISO 32000 §7.7.3.3, Table 30): read them from the
+                    // leaf dictionary only, mirroring the synchronous walk.
+                    let bleed_box = self.rect_value(dict, "BleedBox", &mut chain).await;
+                    let trim_box = self.rect_value(dict, "TrimBox", &mut chain).await;
+                    let art_box = self.rect_value(dict, "ArtBox", &mut chain).await;
+                    pages.push(PageRecord {
+                        r: node_ref,
+                        dict: dict.clone(),
+                        resources: inherited.resources.clone(),
+                        media_box: inherited.media_box,
+                        crop_box: inherited.crop_box,
+                        bleed_box,
+                        trim_box,
+                        art_box,
+                        rotate: inherited.rotate,
+                    });
+                }
             }
         }
         pages

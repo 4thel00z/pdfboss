@@ -79,6 +79,9 @@ struct PageRec {
     obj_ref: Option<ObjRef>,
     media_box: Rect,
     crop_box: Rect,
+    bleed_box: Rect,
+    trim_box: Rect,
+    art_box: Rect,
     rotate: i32,
     resources: Dict,
     dict: Dict,
@@ -447,6 +450,9 @@ impl Document {
             index,
             media_box: rec.media_box,
             crop_box: rec.crop_box,
+            bleed_box: rec.bleed_box,
+            trim_box: rec.trim_box,
+            art_box: rec.art_box,
             rotate: rec.rotate,
             resources: rec.resources.clone(),
             dict: rec.dict.clone(),
@@ -558,7 +564,22 @@ impl Document {
                         stack.push((kid.clone(), inherited.clone(), depth + 1));
                     }
                 }
-                None => pages.push(make_page_rec(node_ref, dict.clone(), &inherited)),
+                None => {
+                    // BleedBox, TrimBox and ArtBox are not inheritable
+                    // (ISO 32000 §7.7.3.3, Table 30): read them from the
+                    // leaf dictionary only.
+                    let bleed = self.rect_value(dict, "BleedBox");
+                    let trim = self.rect_value(dict, "TrimBox");
+                    let art = self.rect_value(dict, "ArtBox");
+                    pages.push(make_page_rec(
+                        node_ref,
+                        dict.clone(),
+                        &inherited,
+                        bleed,
+                        trim,
+                        art,
+                    ));
+                }
             }
         }
         pages
@@ -684,12 +705,22 @@ where
 /// attributes. The defaults live in [`Page::from_tree_attrs`] — the one
 /// implementation of page defaulting, shared with the asynchronous API —
 /// and this only reshapes its output into the index-less cache record.
-fn make_page_rec(obj_ref: Option<ObjRef>, dict: Dict, inherited: &Inherited) -> PageRec {
+fn make_page_rec(
+    obj_ref: Option<ObjRef>,
+    dict: Dict,
+    inherited: &Inherited,
+    bleed_box: Option<Rect>,
+    trim_box: Option<Rect>,
+    art_box: Option<Rect>,
+) -> PageRec {
     let page = Page::from_tree_attrs(
         0,
         inherited.resources.clone(),
         inherited.media_box,
         inherited.crop_box,
+        bleed_box,
+        trim_box,
+        art_box,
         inherited.rotate,
         dict,
         obj_ref,
@@ -698,6 +729,9 @@ fn make_page_rec(obj_ref: Option<ObjRef>, dict: Dict, inherited: &Inherited) -> 
         obj_ref: page.obj_ref,
         media_box: page.media_box,
         crop_box: page.crop_box,
+        bleed_box: page.bleed_box,
+        trim_box: page.trim_box,
+        art_box: page.art_box,
         rotate: page.rotate,
         resources: page.resources,
         dict: page.dict,
@@ -765,17 +799,25 @@ pub struct Metadata {
 ///
 /// Defaults: `media_box` falls back to US Letter (612x792) when absent or
 /// invalid, `crop_box` falls back to (and is intersected with) `media_box`,
-/// and `rotate` is normalized to one of {0, 90, 180, 270}. Every construction
-/// path normalizes `rotate` — [`Document::page`] and [`Page::from_parts`]
-/// alike — so the invariant holds however a `Page` was built. `rotate` is a
-/// public field, so a caller may still overwrite it afterwards; [`Page::size`]
+/// `bleed_box`, `trim_box` and `art_box` fall back to `crop_box` (and are
+/// clipped to `media_box`) per ISO 32000 §14.11.2, and `rotate` is
+/// normalized to one of {0, 90, 180, 270}. Every construction path
+/// normalizes `rotate` — [`Document::page`] and [`Page::from_parts`] alike —
+/// so the invariant holds however a `Page` was built. `rotate` is a public
+/// field, so a caller may still overwrite it afterwards; [`Page::size`]
 /// reads it modulo a full turn and so stays correct if they do.
+///
+/// All five boxes are in unrotated PDF user space: [`Page::size`] swaps
+/// width and height under a quarter-turn `/Rotate`, the boxes never do.
 #[derive(Clone)]
 pub struct Page {
     /// 0-based page index.
     pub index: usize,
     pub media_box: Rect,
     pub crop_box: Rect,
+    pub bleed_box: Rect,
+    pub trim_box: Rect,
+    pub art_box: Rect,
     pub rotate: i32,
     /// The page's (inherited) `/Resources` dictionary.
     pub resources: Dict,
@@ -797,6 +839,10 @@ impl Page {
     /// reduced, and a value that is not a multiple of 90 falls back to 0
     /// (lenient). The caller does not have to pre-normalize, and the [`Page`]
     /// invariant holds whichever constructor built it.
+    ///
+    /// `bleed_box`, `trim_box` and `art_box` are set to `crop_box` — their
+    /// ISO 32000 §14.11.2 default. A caller that resolved real values
+    /// overwrites the public fields afterwards.
     pub fn from_parts(
         index: usize,
         media_box: Rect,
@@ -810,6 +856,9 @@ impl Page {
             index,
             media_box,
             crop_box,
+            bleed_box: crop_box,
+            trim_box: crop_box,
+            art_box: crop_box,
             rotate: normalize_rotation(rotate),
             resources,
             dict,
@@ -825,10 +874,11 @@ impl Page {
 
     /// Builds a page from raw, possibly missing page-tree attributes,
     /// applying the same defaults [`Document::page`] applies (ISO 32000
-    /// §7.7.3.3): a missing or degenerate `/MediaBox` reads as
+    /// §7.7.3.3, §14.11.2): a missing or degenerate `/MediaBox` reads as
     /// [`Page::US_LETTER`], `/CropBox` clips to the media box and falls back
-    /// to it, a missing `/Rotate` reads as 0 and is normalized, and missing
-    /// `/Resources` read as empty.
+    /// to it, `/BleedBox`, `/TrimBox` and `/ArtBox` clip to the media box
+    /// and fall back to the crop box, a missing `/Rotate` reads as 0 and is
+    /// normalized, and missing `/Resources` read as empty.
     ///
     /// This is the one implementation of page defaulting. The synchronous
     /// tree walk routes through it, and a caller that resolved inheritance
@@ -836,11 +886,15 @@ impl Page {
     /// page tree while reading it — gets the identical `Page` back, so the
     /// two APIs cannot disagree about what an attribute-less page looks
     /// like.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_tree_attrs(
         index: usize,
         resources: Option<Dict>,
         media_box: Option<Rect>,
         crop_box: Option<Rect>,
+        bleed_box: Option<Rect>,
+        trim_box: Option<Rect>,
+        art_box: Option<Rect>,
         rotate: Option<i32>,
         dict: Dict,
         obj_ref: Option<ObjRef>,
@@ -852,10 +906,19 @@ impl Page {
             .and_then(|c| c.intersect(media_box))
             .filter(|r| r.width() > 0.0 && r.height() > 0.0)
             .unwrap_or(media_box);
+        let clip = |declared: Option<Rect>| {
+            declared
+                .and_then(|b| b.intersect(media_box))
+                .filter(|r| r.width() > 0.0 && r.height() > 0.0)
+                .unwrap_or(crop_box)
+        };
         Page {
             index,
             media_box,
             crop_box,
+            bleed_box: clip(bleed_box),
+            trim_box: clip(trim_box),
+            art_box: clip(art_box),
             rotate: normalize_rotation(rotate.unwrap_or(0)),
             resources: resources.unwrap_or_default(),
             dict,
@@ -1404,6 +1467,92 @@ mod tests {
     }
 
     #[test]
+    fn page_boxes_declared_and_defaulted() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] \
+             /CropBox [50 50 550 750] /BleedBox [40 40 560 760] \
+             /TrimBox [5 0 R 6 0 R 7 0 R 8 0 R] >>",
+        );
+        b.object(4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] >>");
+        b.object(5, "60");
+        b.object(6, "70");
+        b.object(7, "540");
+        b.object(8, "730");
+        let doc = Document::load(b.build(1)).unwrap();
+
+        let page = doc.page(0).unwrap();
+        assert_eq!(page.bleed_box, Rect::new(40.0, 40.0, 560.0, 760.0));
+        assert_eq!(
+            page.trim_box,
+            Rect::new(60.0, 70.0, 540.0, 730.0),
+            "indirect array elements resolve"
+        );
+        assert_eq!(
+            page.art_box, page.crop_box,
+            "undeclared box is the crop box"
+        );
+
+        let bare = doc.page(1).unwrap();
+        assert_eq!(bare.bleed_box, bare.crop_box);
+        assert_eq!(bare.trim_box, bare.crop_box);
+        assert_eq!(bare.art_box, bare.crop_box);
+    }
+
+    #[test]
+    fn page_boxes_clip_to_media_and_fall_back() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /CropBox [10 10 190 190] /TrimBox [100 100 400 400] \
+             /BleedBox [0 0 0 0] /ArtBox [300 300 400 400] >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+
+        let page = doc.page(0).unwrap();
+        assert_eq!(
+            page.trim_box,
+            Rect::new(100.0, 100.0, 200.0, 200.0),
+            "a trim box past the media box clips to it"
+        );
+        assert_eq!(
+            page.bleed_box, page.crop_box,
+            "a degenerate bleed box falls back to the crop box"
+        );
+        assert_eq!(
+            page.art_box, page.crop_box,
+            "an art box disjoint from the media box falls back to the crop box"
+        );
+    }
+
+    /// `/BleedBox`, `/TrimBox` and `/ArtBox` are not in ISO 32000 Table 30's
+    /// inheritable set: a value on a `/Pages` node must not leak into its
+    /// leaves, which read their spec default (the crop box) instead.
+    #[test]
+    fn page_boxes_are_not_inherited() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(
+            2,
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 \
+             /TrimBox [10 10 90 90] /BleedBox [5 5 95 95] /ArtBox [20 20 80 80] >>",
+        );
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = Document::load(b.build(1)).unwrap();
+
+        let page = doc.page(0).unwrap();
+        assert_eq!(page.trim_box, page.crop_box);
+        assert_eq!(page.bleed_box, page.crop_box);
+        assert_eq!(page.art_box, page.crop_box);
+    }
+
+    #[test]
     fn kids_cycle_truncates_without_hanging() {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -1830,6 +1979,10 @@ mod tests {
         assert_eq!(page.dict(), &dict);
         // /Rotate 90 swaps the reported page size.
         assert_eq!(page.size(), (400.0, 200.0));
+        // The boxes from_parts does not take read as their spec default.
+        assert_eq!(page.bleed_box, page.crop_box);
+        assert_eq!(page.trim_box, page.crop_box);
+        assert_eq!(page.art_box, page.crop_box);
     }
 
     /// `from_parts` normalizes `/Rotate` just as the page tree does, so an

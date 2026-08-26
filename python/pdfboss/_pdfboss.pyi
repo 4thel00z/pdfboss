@@ -144,6 +144,32 @@ class Page:
     def rotation(self) -> int:
         """Page rotation in degrees: 0, 90, 180 or 270."""
 
+    @property
+    def media_box(self) -> tuple[float, float, float, float]:
+        """The media box ``(x0, y0, x1, y1)`` in unrotated PDF user space
+        — ``width``/``height`` swap under ``rotation``, the boxes never do.
+        US Letter ``(0, 0, 612, 792)`` when the file declares none."""
+
+    @property
+    def crop_box(self) -> tuple[float, float, float, float]:
+        """The crop box, clipped to the media box; defaults to the media
+        box."""
+
+    @property
+    def bleed_box(self) -> tuple[float, float, float, float]:
+        """The bleed box, clipped to the media box; defaults to the crop
+        box."""
+
+    @property
+    def trim_box(self) -> tuple[float, float, float, float]:
+        """The trim box, clipped to the media box; defaults to the crop
+        box."""
+
+    @property
+    def art_box(self) -> tuple[float, float, float, float]:
+        """The art box, clipped to the media box; defaults to the crop
+        box."""
+
     def extract_text(self) -> str:
         """Extracts the page's text."""
 
@@ -265,6 +291,32 @@ class AsyncPage:
     def height(self) -> float: ...
     @property
     def rotation(self) -> int: ...
+    @property
+    def media_box(self) -> tuple[float, float, float, float]:
+        """The media box ``(x0, y0, x1, y1)`` in unrotated PDF user space
+        — ``width``/``height`` swap under ``rotation``, the boxes never do.
+        US Letter ``(0, 0, 612, 792)`` when the file declares none."""
+
+    @property
+    def crop_box(self) -> tuple[float, float, float, float]:
+        """The crop box, clipped to the media box; defaults to the media
+        box."""
+
+    @property
+    def bleed_box(self) -> tuple[float, float, float, float]:
+        """The bleed box, clipped to the media box; defaults to the crop
+        box."""
+
+    @property
+    def trim_box(self) -> tuple[float, float, float, float]:
+        """The trim box, clipped to the media box; defaults to the crop
+        box."""
+
+    @property
+    def art_box(self) -> tuple[float, float, float, float]:
+        """The art box, clipped to the media box; defaults to the crop
+        box."""
+
     async def extract_text(self) -> str: ...
     async def extract_markdown(self) -> str: ...
     async def render(

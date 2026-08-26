@@ -110,6 +110,12 @@ fn version_string(version: (u8, u8)) -> String {
     format!("{}.{}", version.0, version.1)
 }
 
+/// Flattens a core [`Rect`](pdfboss_core::Rect) to the `(x0, y0, x1, y1)`
+/// tuple the page-box getters return.
+fn rect_tuple(r: pdfboss_core::Rect) -> (f32, f32, f32, f32) {
+    (r.x0, r.y0, r.x1, r.y1)
+}
+
 /// Converts a core [`Object`] to plain Python data: dict/list/str/bytes/
 /// int/float/bool/None. Names become `str`; strings decode as UTF-8 where
 /// valid, else stay `bytes`; streams become `{"dict": ..., "length": n}`
@@ -546,6 +552,37 @@ impl Page {
     #[getter]
     fn rotation(&self) -> i32 {
         self.page.rotate
+    }
+
+    /// The media box `(x0, y0, x1, y1)` in unrotated PDF user space;
+    /// US Letter (0, 0, 612, 792) when the file declares none.
+    #[getter]
+    fn media_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.media_box)
+    }
+
+    /// The crop box, clipped to the media box; defaults to the media box.
+    #[getter]
+    fn crop_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.crop_box)
+    }
+
+    /// The bleed box, clipped to the media box; defaults to the crop box.
+    #[getter]
+    fn bleed_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.bleed_box)
+    }
+
+    /// The trim box, clipped to the media box; defaults to the crop box.
+    #[getter]
+    fn trim_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.trim_box)
+    }
+
+    /// The art box, clipped to the media box; defaults to the crop box.
+    #[getter]
+    fn art_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.art_box)
     }
 
     /// Extracts the page's text. Releases the GIL and runs on a private
@@ -1154,6 +1191,37 @@ impl AsyncPage {
     #[getter]
     fn rotation(&self) -> i32 {
         self.page.rotate
+    }
+
+    /// The media box `(x0, y0, x1, y1)` in unrotated PDF user space;
+    /// US Letter (0, 0, 612, 792) when the file declares none.
+    #[getter]
+    fn media_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.media_box)
+    }
+
+    /// The crop box, clipped to the media box; defaults to the media box.
+    #[getter]
+    fn crop_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.crop_box)
+    }
+
+    /// The bleed box, clipped to the media box; defaults to the crop box.
+    #[getter]
+    fn bleed_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.bleed_box)
+    }
+
+    /// The trim box, clipped to the media box; defaults to the crop box.
+    #[getter]
+    fn trim_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.trim_box)
+    }
+
+    /// The art box, clipped to the media box; defaults to the crop box.
+    #[getter]
+    fn art_box(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.page.art_box)
     }
 
     /// Extracts the page's text. Coroutine resolving to str.

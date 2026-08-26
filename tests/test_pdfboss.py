@@ -217,6 +217,24 @@ class TestPageGeometry:
         assert page.rotation in (0, 90, 180, 270)
 
 
+class TestPageBoxes:
+    def test_undeclared_boxes_fall_back_per_spec(self, hello_pdf: Path) -> None:
+        page = Document(str(hello_pdf))[0]
+        assert page.media_box == pytest.approx((0.0, 0.0, 612.0, 792.0))
+        assert page.crop_box == page.media_box
+        assert page.bleed_box == page.crop_box
+        assert page.trim_box == page.crop_box
+        assert page.art_box == page.crop_box
+
+    def test_declared_boxes_are_reported(self, boxed_pdf: bytes) -> None:
+        page = Document(data=boxed_pdf)[0]
+        assert page.media_box == pytest.approx((0.0, 0.0, 600.0, 800.0))
+        assert page.crop_box == pytest.approx((50.0, 50.0, 550.0, 750.0))
+        assert page.bleed_box == pytest.approx((40.0, 40.0, 560.0, 760.0))
+        assert page.trim_box == pytest.approx((60.0, 70.0, 540.0, 730.0))
+        assert page.art_box == page.crop_box, "undeclared art box is the crop box"
+
+
 class TestRender:
     def test_render_returns_png_bytes(self, hello_pdf: Path) -> None:
         png = Document(str(hello_pdf))[0].render()
