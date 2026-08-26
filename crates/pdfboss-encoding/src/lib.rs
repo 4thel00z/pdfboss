@@ -52,6 +52,165 @@ pub fn win_ansi(code: u8) -> Option<char> {
     }
 }
 
+/// WinAnsiEncoding glyph name for `code` (ISO 32000-1 Annex D.2
+/// "WinAnsiEncoding" column). `None` for exactly the codes [`win_ansi`]
+/// leaves unassigned. Two ASCII codes diverge from StandardEncoding's
+/// names: `0x27` is `quotesingle` and `0x60` is `grave` (the straight
+/// marks, matching `win_ansi`'s identity mapping there). Two codes render
+/// an existing glyph rather than owning one: `0xA0` carries `space` (the
+/// nonbreaking space draws as the space glyph) and `0xAD` carries `hyphen`
+/// (likewise the soft hyphen) — see the self-verifying
+/// `win_ansi_glyph_name_matches_win_ansi_table` test below.
+pub fn win_ansi_glyph_name(code: u8) -> Option<&'static str> {
+    match code {
+        0x27 => Some("quotesingle"),
+        0x60 => Some("grave"),
+        0x20..=0x7E => Some(STANDARD_ASCII_NAMES[(code - 0x20) as usize]),
+        0x80..=0x9F => WIN_ANSI_80_9F_NAMES[(code - 0x80) as usize],
+        0xA0..=0xFF => Some(WIN_ANSI_A0_FF_NAMES[(code - 0xA0) as usize]),
+        _ => None,
+    }
+}
+
+/// WinAnsiEncoding glyph names for codes `0x80..=0x9F`, parallel to
+/// [`WIN_ANSI_80_9F`]; `None` marks the same unassigned codes.
+const WIN_ANSI_80_9F_NAMES: [Option<&str>; 32] = [
+    Some("Euro"),
+    None,
+    Some("quotesinglbase"),
+    Some("florin"),
+    Some("quotedblbase"),
+    Some("ellipsis"),
+    Some("dagger"),
+    Some("daggerdbl"),
+    Some("circumflex"),
+    Some("perthousand"),
+    Some("Scaron"),
+    Some("guilsinglleft"),
+    Some("OE"),
+    None,
+    Some("Zcaron"),
+    None,
+    None,
+    Some("quoteleft"),
+    Some("quoteright"),
+    Some("quotedblleft"),
+    Some("quotedblright"),
+    Some("bullet"),
+    Some("endash"),
+    Some("emdash"),
+    Some("tilde"),
+    Some("trademark"),
+    Some("scaron"),
+    Some("guilsinglright"),
+    Some("oe"),
+    None,
+    Some("zcaron"),
+    Some("Ydieresis"),
+];
+
+/// WinAnsiEncoding glyph names for codes `0xA0..=0xFF` (ISO 32000-1
+/// Annex D.2 "WinAnsiEncoding" column), in code order (index `0` is code
+/// `0xA0`).
+const WIN_ANSI_A0_FF_NAMES: [&str; 96] = [
+    "space",
+    "exclamdown",
+    "cent",
+    "sterling",
+    "currency",
+    "yen",
+    "brokenbar",
+    "section",
+    "dieresis",
+    "copyright",
+    "ordfeminine",
+    "guillemotleft",
+    "logicalnot",
+    "hyphen",
+    "registered",
+    "macron",
+    "degree",
+    "plusminus",
+    "twosuperior",
+    "threesuperior",
+    "acute",
+    "mu",
+    "paragraph",
+    "periodcentered",
+    "cedilla",
+    "onesuperior",
+    "ordmasculine",
+    "guillemotright",
+    "onequarter",
+    "onehalf",
+    "threequarters",
+    "questiondown",
+    "Agrave",
+    "Aacute",
+    "Acircumflex",
+    "Atilde",
+    "Adieresis",
+    "Aring",
+    "AE",
+    "Ccedilla",
+    "Egrave",
+    "Eacute",
+    "Ecircumflex",
+    "Edieresis",
+    "Igrave",
+    "Iacute",
+    "Icircumflex",
+    "Idieresis",
+    "Eth",
+    "Ntilde",
+    "Ograve",
+    "Oacute",
+    "Ocircumflex",
+    "Otilde",
+    "Odieresis",
+    "multiply",
+    "Oslash",
+    "Ugrave",
+    "Uacute",
+    "Ucircumflex",
+    "Udieresis",
+    "Yacute",
+    "Thorn",
+    "germandbls",
+    "agrave",
+    "aacute",
+    "acircumflex",
+    "atilde",
+    "adieresis",
+    "aring",
+    "ae",
+    "ccedilla",
+    "egrave",
+    "eacute",
+    "ecircumflex",
+    "edieresis",
+    "igrave",
+    "iacute",
+    "icircumflex",
+    "idieresis",
+    "eth",
+    "ntilde",
+    "ograve",
+    "oacute",
+    "ocircumflex",
+    "otilde",
+    "odieresis",
+    "divide",
+    "oslash",
+    "ugrave",
+    "uacute",
+    "ucircumflex",
+    "udieresis",
+    "yacute",
+    "thorn",
+    "ydieresis",
+];
+
 /// MacRomanEncoding codes `0x80..=0xFF` (codes below coincide with ASCII).
 const MAC_ROMAN_HIGH: [char; 128] = [
     '\u{C4}', '\u{C5}', '\u{C7}', '\u{C9}', '\u{D1}', '\u{D6}', '\u{DC}', '\u{E1}', '\u{E0}',
@@ -689,6 +848,54 @@ mod tests {
         assert_eq!(win_ansi(0xE9), Some('\u{E9}')); // e acute (Latin-1)
         assert_eq!(win_ansi(0x81), None); // unassigned
         assert_eq!(win_ansi(0x0A), None); // control
+    }
+
+    #[test]
+    fn win_ansi_glyph_name_spot_checks() {
+        assert_eq!(win_ansi_glyph_name(0x41), Some("A"));
+        assert_eq!(win_ansi_glyph_name(0x20), Some("space"));
+        assert_eq!(win_ansi_glyph_name(0x27), Some("quotesingle")); // not quoteright
+        assert_eq!(win_ansi_glyph_name(0x60), Some("grave")); // not quoteleft
+        assert_eq!(win_ansi_glyph_name(0x80), Some("Euro"));
+        assert_eq!(win_ansi_glyph_name(0x93), Some("quotedblleft"));
+        assert_eq!(win_ansi_glyph_name(0xE9), Some("eacute"));
+        assert_eq!(win_ansi_glyph_name(0xFF), Some("ydieresis"));
+        assert_eq!(win_ansi_glyph_name(0x81), None); // unassigned
+        assert_eq!(win_ansi_glyph_name(0x0A), None); // control
+    }
+
+    /// Self-verifying anchor for `win_ansi_glyph_name`: ties the name table
+    /// to the pre-existing, trusted `win_ansi` (code -> Unicode) and
+    /// `glyph_to_unicode` (name -> Unicode) tables. Domain equality must
+    /// hold for every code, and every name must resolve to the code's
+    /// Unicode value — with exactly two documented exceptions, codes that
+    /// render an existing glyph rather than owning one: `0xA0` (nonbreaking
+    /// space, drawn by `space`) and `0xAD` (soft hyphen, drawn by `hyphen`).
+    #[test]
+    fn win_ansi_glyph_name_matches_win_ansi_table() {
+        assert_eq!(win_ansi_glyph_name(0xA0), Some("space"));
+        assert_eq!(win_ansi_glyph_name(0xAD), Some("hyphen"));
+        for code in 0u16..=255 {
+            let code = code as u8;
+            assert_eq!(
+                win_ansi_glyph_name(code).is_some(),
+                win_ansi(code).is_some(),
+                "code {code:#04x}: win_ansi_glyph_name/win_ansi domain mismatch"
+            );
+            let Some(name) = win_ansi_glyph_name(code) else {
+                continue;
+            };
+            let expected = match code {
+                0xA0 => ' ',
+                0xAD => '-',
+                _ => win_ansi(code).unwrap(),
+            };
+            assert_eq!(
+                glyph_to_unicode(name),
+                Some(expected),
+                "code {code:#04x} name {name:?}: glyph_to_unicode disagrees with win_ansi"
+            );
+        }
     }
 
     #[test]

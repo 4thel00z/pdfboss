@@ -15,6 +15,7 @@ pdfboss-output = { workspace = true }
 pdfboss-render = { workspace = true }
 pdfboss-aio = { workspace = true, features = ["http"] }
 pdfboss-tui = { workspace = true }
+pdfboss-write = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"
@@ -26,6 +27,7 @@ jaq-json = { version = "1", features = ["serde_json"] }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
+png = "0.18"
 
 [features]
 # Bundled substitute faces are on by default: `cargo install pdfboss-cli`
