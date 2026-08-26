@@ -440,6 +440,7 @@ class AsyncDocument:
         """Whole-document markdown — the async twin of
         ``Document.extract_markdown``: headings, lists and tables inferred
         from layout, heading sizes judged across the document."""
+
     async def render_pages(
         self,
         pages: list[int] | None = None,
@@ -462,6 +463,7 @@ class AsyncDocument:
         """Fetches and parses the indirect object ``num gen``, returning
         its value converted to plain Python data (the same conversion as
         ``Element.value``)."""
+
     def elements(
         self,
         *,
