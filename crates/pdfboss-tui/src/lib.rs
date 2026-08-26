@@ -481,9 +481,12 @@ async fn extract_markdown(
     page: usize,
 ) {
     let result = match doc.page(page) {
-        Ok(page_object) => pdfboss_output::extract_page_markdown_with(doc, &page_object)
-            .await
-            .map_err(|error| error.to_string()),
+        Ok(page_object) => {
+            let oc = doc.oc_state().await;
+            pdfboss_output::extract_page_markdown_with(&doc, &page_object, oc.as_ref())
+                .await
+                .map_err(|error| error.to_string())
+        }
         Err(error) => Err(error.to_string()),
     };
     tx.send(Msg::MarkdownReady { generation, result }).ok();

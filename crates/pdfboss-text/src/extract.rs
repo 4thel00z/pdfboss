@@ -6,7 +6,7 @@ use crate::{Ruling, TextSpan};
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Name, ObjRef,
-    Object, OcState, Page, Point,
+    Object, OcState, Page, Point, Rect,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -221,7 +221,58 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         0,
     );
     exec.run(root).await;
-    (exec.spans, exec.rulings, exec.report)
+    let mut spans = exec.spans;
+    for span in &mut spans {
+        span.page = page.index;
+        mark_underline_and_strikethrough(span, &exec.rulings);
+    }
+    (spans, exec.rulings, exec.report)
+}
+
+/// How far below the baseline (in fractions of the effective size) an
+/// underline may sit, and the slack above it for lines drawn exactly on
+/// the baseline.
+const UNDERLINE_BELOW: f32 = 0.3;
+const UNDERLINE_ABOVE: f32 = 0.05;
+
+/// The x-height band (in fractions of the effective size above the
+/// baseline) a strikethrough crosses.
+const STRIKETHROUGH_LOW: f32 = 0.15;
+const STRIKETHROUGH_HIGH: f32 = 0.6;
+
+/// The fraction of a span's width a ruling must cover to decorate it: a
+/// neighbour's underline running past a word boundary is not this span's.
+const DECORATED_MIN_OVERLAP: f32 = 0.6;
+
+/// Sets `underline`/`strikethrough` from the page's horizontal rulings:
+/// underline when one sits just below the baseline covering most of the
+/// span, strikethrough when one crosses the x-height band. Vertical
+/// writing is left unmarked — its decorations are vertical lines beside
+/// the text, which are indistinguishable from column rules here.
+fn mark_underline_and_strikethrough(span: &mut TextSpan, rulings: &[Ruling]) {
+    if span.vertical || span.size <= 0.0 {
+        return;
+    }
+    let width = span.bbox.x1 - span.bbox.x0;
+    if width <= 0.0 {
+        return;
+    }
+    for r in rulings {
+        if r.start.y != r.end.y {
+            continue;
+        }
+        let overlap = r.end.x.min(span.bbox.x1) - r.start.x.max(span.bbox.x0);
+        if overlap < DECORATED_MIN_OVERLAP * width {
+            continue;
+        }
+        let above = r.start.y - span.y;
+        if above >= -UNDERLINE_BELOW * span.size && above <= UNDERLINE_ABOVE * span.size {
+            span.underline = true;
+        }
+        if above >= STRIKETHROUGH_LOW * span.size && above <= STRIKETHROUGH_HIGH * span.size {
+            span.strikethrough = true;
+        }
+    }
 }
 
 /// The graphics-state parameters text extraction cares about. Saved and
@@ -238,6 +289,10 @@ struct GState {
     font: Option<Arc<Font>>,
     font_name: String,
     size: f32,
+    /// `Tr` (ISO 32000-1 Table 106); modes 3 and 7 paint nothing.
+    render_mode: i32,
+    /// Fill color as RGB; `None` inside a pattern fill.
+    fill_color: Option<(f32, f32, f32)>,
     /// `w` and ExtGState `/LW`; scales rulings' stroke width.
     line_width: f32,
 }
@@ -254,8 +309,33 @@ impl GState {
             font: None,
             font_name: String::new(),
             size: 0.0,
+            render_mode: 0,
+            fill_color: Some((0.0, 0.0, 0.0)),
             line_width: 1.0,
         }
+    }
+}
+
+/// Reads color components by count — 1 gray, 3 RGB, 4 CMYK, clamped to
+/// `[0, 1]` — the approximation span colors carry for spaces whose
+/// transform extraction does not run. Any other count is no color.
+fn components_color(comps: &[f32]) -> Option<(f32, f32, f32)> {
+    let c = |v: f32| {
+        if v.is_finite() {
+            v.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    match comps {
+        [v] => Some((c(*v), c(*v), c(*v))),
+        [r, g, b] => Some((c(*r), c(*g), c(*b))),
+        [cy, m, y, k] => Some((
+            (1.0 - c(*cy)) * (1.0 - c(*k)),
+            (1.0 - c(*m)) * (1.0 - c(*k)),
+            (1.0 - c(*y)) * (1.0 - c(*k)),
+        )),
+        _ => None,
     }
 }
 
@@ -728,6 +808,26 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             Op::SetHorizScaling(v) => frame.gs.horiz_scale = v / 100.0,
             Op::SetLeading(v) => frame.gs.leading = *v,
             Op::SetTextRise(v) => frame.gs.rise = *v,
+            Op::SetTextRender(mode) => frame.gs.render_mode = *mode,
+            Op::SetFillGray(v) => frame.gs.fill_color = components_color(&[*v]),
+            Op::SetFillRGB(r, g, b) => frame.gs.fill_color = components_color(&[*r, *g, *b]),
+            Op::SetFillCMYK(c, m, y, k) => {
+                frame.gs.fill_color = components_color(&[*c, *m, *y, *k])
+            }
+            // Selecting a fill space resets the fill color to the space's
+            // initial color (ISO 32000-1 §8.6.8): black everywhere but
+            // Pattern, which has no single color.
+            Op::SetFillColorSpace(name) => {
+                frame.gs.fill_color = (name.0 != "Pattern").then_some((0.0, 0.0, 0.0));
+            }
+            Op::SetFillColor(comps) => frame.gs.fill_color = components_color(comps),
+            Op::SetFillColorN(comps, pattern) => {
+                frame.gs.fill_color = if pattern.is_some() {
+                    None
+                } else {
+                    components_color(comps)
+                };
+            }
             Op::TextMove(tx, ty) => {
                 frame.tlm = Matrix::translate(*tx, *ty).concat(frame.tlm);
                 frame.tm = frame.tlm;
@@ -924,15 +1024,42 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         let end = tm.concat(gs.ctm).apply(Point { x: 0.0, y: gs.rise });
+        let size = if size.is_finite() { size } else { 0.0 };
+        let bbox = if font.vertical {
+            Rect {
+                x0: origin.x - size / 2.0,
+                y0: origin.y.min(end.y),
+                x1: origin.x + size / 2.0,
+                y1: origin.y.max(end.y),
+            }
+        } else {
+            Rect {
+                x0: origin.x.min(end.x),
+                y0: origin.y + font.descent / 1000.0 * size,
+                x1: origin.x.max(end.x),
+                y1: origin.y + font.ascent / 1000.0 * size,
+            }
+        };
         (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| TextSpan {
             text,
             x: origin.x,
             y: origin.y,
             end_x: end.x,
-            size: if size.is_finite() { size } else { 0.0 },
+            size,
+            bbox,
             font: gs.font_name.clone(),
+            font_name: font.base_name.clone(),
+            page: 0,
             bold: font.bold,
             italic: font.italic,
+            monospace: font.monospace,
+            serif: font.serif,
+            rise: gs.rise,
+            vertical: font.vertical,
+            invisible: matches!(gs.render_mode, 3 | 7),
+            color: gs.fill_color,
+            underline: false,
+            strikethrough: false,
         })
     }
 

@@ -23,8 +23,9 @@ use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, Xref
 use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
-use pdfboss_core::{Dict, DocumentSeed, ObjRef, Object};
+use pdfboss_core::{Dict, DocumentSeed, ObjRef, Object, OcState};
 use pdfboss_output::Output;
+use pdfboss_text::{FontCache, TextSpan};
 
 create_exception!(
     pdfboss,
@@ -516,6 +517,28 @@ impl Document {
         };
         ElementIter { doc, iter }
     }
+
+    /// Lazily iterates the document's styled text spans, page by page:
+    /// every page's, or the 0-based `pages` given, in the order given.
+    /// Each step releases the GIL, runs on a private materialization of
+    /// the document, and shares one font cache across the walk, so a font
+    /// loads once for the document.
+    #[pyo3(signature = (pages=None))]
+    fn spans(&self, pages: Option<Vec<usize>>) -> SpanIter {
+        let (seed, count) = {
+            let doc = self.inner.lock();
+            (doc.seed(), doc.page_count())
+        };
+        let pages = pages.unwrap_or_else(|| (0..count).collect());
+        SpanIter {
+            state: Mutex::new(SpanIterState {
+                seed,
+                fonts: FontCache::default(),
+                pages: pages.into_iter(),
+                buffer: Vec::new().into_iter(),
+            }),
+        }
+    }
 }
 
 /// A single page of a document.
@@ -605,6 +628,18 @@ impl Page {
         })
     }
 
+    /// The page's styled text spans, in emission order. Releases the GIL
+    /// and runs on a private materialization of the document, like
+    /// `extract_text`. Lenient the same way: unreadable content yields no
+    /// spans rather than raising.
+    fn spans(&self, py: Python<'_>) -> PyResult<Vec<Span>> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            let spans = pdfboss_text::extract_spans(&doc, &self.page).map_err(pdf_err)?;
+            Ok(spans.into_iter().map(|inner| Span { inner }).collect())
+        })
+    }
+
     /// Renders the page and returns PNG bytes. Releases the GIL while the
     /// rasterization and PNG encoding run, on a private materialization of
     /// the document — no lock is held, so renders called from multiple
@@ -666,6 +701,192 @@ impl Page {
             ))
         })?;
         Ok((PyBytes::new(py, &png), warnings))
+    }
+}
+
+/// One styled text span: a positioned run of text with everything the
+/// file states about how it is shown — font, size, weight and slant,
+/// drawn underline/strikethrough, fill color, visibility, writing mode.
+#[pyclass(frozen)]
+struct Span {
+    inner: TextSpan,
+}
+
+#[pymethods]
+impl Span {
+    /// The decoded text.
+    #[getter]
+    fn text(&self) -> &str {
+        &self.inner.text
+    }
+
+    /// Device-space x coordinate of the span origin.
+    #[getter]
+    fn x(&self) -> f32 {
+        self.inner.x
+    }
+
+    /// Device-space y coordinate of the span baseline.
+    #[getter]
+    fn y(&self) -> f32 {
+        self.inner.y
+    }
+
+    /// Device-space x after the last glyph's advance.
+    #[getter]
+    fn end_x(&self) -> f32 {
+        self.inner.end_x
+    }
+
+    /// Effective font size.
+    #[getter]
+    fn size(&self) -> f32 {
+        self.inner.size
+    }
+
+    /// Font resource name (e.g. "F1").
+    #[getter]
+    fn font(&self) -> &str {
+        &self.inner.font
+    }
+
+    /// The font's /BaseFont name verbatim — subset prefix included —
+    /// falling back to the FontDescriptor's /FontName; empty when the
+    /// file names the font nowhere.
+    #[getter]
+    fn font_name(&self) -> &str {
+        &self.inner.font_name
+    }
+
+    /// 0-based index of the page the span came from.
+    #[getter]
+    fn page(&self) -> usize {
+        self.inner.page
+    }
+
+    /// Device-space box `(x0, y0, x1, y1)`, y-up: origin to advance
+    /// horizontally, the font's descent..ascent vertically.
+    #[getter]
+    fn bbox(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.inner.bbox)
+    }
+
+    /// Bold, from FontDescriptor evidence with BaseFont-name fallback.
+    #[getter]
+    fn bold(&self) -> bool {
+        self.inner.bold
+    }
+
+    /// Italic, from FontDescriptor evidence with BaseFont-name fallback.
+    #[getter]
+    fn italic(&self) -> bool {
+        self.inner.italic
+    }
+
+    /// FontDescriptor /Flags FixedPitch.
+    #[getter]
+    fn monospace(&self) -> bool {
+        self.inner.monospace
+    }
+
+    /// FontDescriptor /Flags Serif.
+    #[getter]
+    fn serif(&self) -> bool {
+        self.inner.serif
+    }
+
+    /// A drawn ruling sits just below the baseline covering most of the
+    /// span. Read from the page's geometry — PDF has no underline
+    /// attribute — so a table border hugging a cell's text can read as
+    /// one.
+    #[getter]
+    fn underline(&self) -> bool {
+        self.inner.underline
+    }
+
+    /// A drawn ruling crosses the span's x-height band — geometry-read,
+    /// like `underline`.
+    #[getter]
+    fn strikethrough(&self) -> bool {
+        self.inner.strikethrough
+    }
+
+    /// The text rise (Ts) the span was shown under: positive above the
+    /// baseline — a superscript/subscript signal.
+    #[getter]
+    fn rise(&self) -> f32 {
+        self.inner.rise
+    }
+
+    /// Writing mode 1: the text advances downward.
+    #[getter]
+    fn vertical(&self) -> bool {
+        self.inner.vertical
+    }
+
+    /// Shown under render mode 3 or 7, which paint nothing — the shape of
+    /// an OCR text layer under a scanned image.
+    #[getter]
+    fn invisible(&self) -> bool {
+        self.inner.invisible
+    }
+
+    /// Fill color as RGB in [0, 1]; None for pattern fills, which have no
+    /// single color.
+    #[getter]
+    fn color(&self) -> Option<(f32, f32, f32)> {
+        self.inner.color
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Span(page={}, text={:?}, font_name={:?})",
+            self.inner.page, self.inner.text, self.inner.font_name
+        )
+    }
+}
+
+/// Lazy sync iterator over a document's styled spans, returned by
+/// `Document.spans()`. Buffers one page's spans at a time; each page is
+/// extracted with the GIL released on a private materialization of the
+/// document, with one font cache shared across the walk.
+#[pyclass(frozen)]
+struct SpanIter {
+    state: Mutex<SpanIterState>,
+}
+
+struct SpanIterState {
+    seed: DocumentSeed,
+    fonts: FontCache,
+    pages: std::vec::IntoIter<usize>,
+    buffer: std::vec::IntoIter<TextSpan>,
+}
+
+#[pymethods]
+impl SpanIter {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<Span>> {
+        let state = &self.state;
+        py.allow_threads(|| {
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if let Some(span) = state.buffer.next() {
+                    return Ok(Some(Span { inner: span }));
+                }
+                let Some(index) = state.pages.next() else {
+                    return Ok(None);
+                };
+                let doc = CoreDocument::from_seed(state.seed.clone());
+                let page = doc.page(index).map_err(pdf_err)?;
+                let (spans, _) =
+                    pdfboss_text::extract_spans_reporting_cached(&doc, &page, &state.fonts)
+                        .map_err(pdf_err)?;
+                state.buffer = spans.into_iter();
+            }
+        })
     }
 }
 
@@ -978,13 +1199,14 @@ impl AsyncDocument {
     fn extract_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let oc = inner.oc_state().await;
             let mut out = String::new();
             for i in 0..inner.page_count() {
                 if i > 0 {
                     out.push('\u{c}');
                 }
                 let page = inner.page(i).map_err(aio_err)?;
-                let text = pdfboss_output::extract_text_with(inner.clone(), &page)
+                let text = pdfboss_output::extract_text_with(inner.clone(), &page, oc.as_ref())
                     .await
                     .map_err(pdf_err)?;
                 out.push_str(&text);
@@ -1000,13 +1222,17 @@ impl AsyncDocument {
     fn extract_markdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let oc = inner.oc_state().await;
             let mut pages = Vec::new();
             for i in 0..inner.page_count() {
                 let page = inner.page(i).map_err(aio_err)?;
-                let (spans, rulings, _) =
-                    pdfboss_text::extract_spans_and_rulings_reporting_with(inner.clone(), &page)
-                        .await
-                        .map_err(pdf_err)?;
+                let (spans, rulings, _) = pdfboss_text::extract_spans_and_rulings_reporting_with(
+                    inner.clone(),
+                    &page,
+                    oc.as_ref(),
+                )
+                .await
+                .map_err(pdf_err)?;
                 pages.push((spans, rulings));
             }
             Ok(pdfboss_output::Markdown
@@ -1154,6 +1380,26 @@ impl AsyncDocument {
             stream: Arc::new(tokio::sync::Mutex::new(self.inner.elements(opts))),
         }
     }
+
+    /// Streams the document's styled text spans page by page — the async
+    /// twin of `Document.spans`, over range-fetching reads; use with
+    /// `async for`. Every page's, or the 0-based `pages` given, in the
+    /// order given, with one font cache shared across the walk.
+    #[pyo3(signature = (pages=None))]
+    fn spans(&self, pages: Option<Vec<usize>>) -> AsyncSpanIter {
+        let doc = self.inner.clone();
+        let pages = pages.unwrap_or_else(|| (0..doc.page_count()).collect());
+        AsyncSpanIter {
+            state: Arc::new(tokio::sync::Mutex::new(AsyncSpanIterState {
+                doc,
+                fonts: FontCache::default(),
+                oc: None,
+                oc_loaded: false,
+                pages: pages.into_iter(),
+                buffer: Vec::new().into_iter(),
+            })),
+        }
+    }
 }
 
 /// A single page of an async document. Attributes are synchronous — the
@@ -1229,7 +1475,8 @@ impl AsyncPage {
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            pdfboss_output::extract_text_with(doc, &page)
+            let oc = doc.oc_state().await;
+            pdfboss_output::extract_text_with(&doc, &page, oc.as_ref())
                 .await
                 .map_err(pdf_err)
         })
@@ -1241,9 +1488,27 @@ impl AsyncPage {
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            pdfboss_output::extract_page_markdown_with(doc, &page)
+            let oc = doc.oc_state().await;
+            pdfboss_output::extract_page_markdown_with(&doc, &page, oc.as_ref())
                 .await
                 .map_err(pdf_err)
+        })
+    }
+
+    /// The page's styled text spans — the async twin of `Page.spans`.
+    /// Coroutine resolving to a list of `Span`.
+    fn spans<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let oc = doc.oc_state().await;
+            let spans = pdfboss_text::extract_spans_with(&doc, &page, oc.as_ref())
+                .await
+                .map_err(pdf_err)?;
+            Ok(spans
+                .into_iter()
+                .map(|inner| Span { inner })
+                .collect::<Vec<Span>>())
         })
     }
 
@@ -1341,6 +1606,64 @@ impl AsyncElementIter {
     }
 }
 
+/// Async iterator over a document's styled spans, returned by
+/// `AsyncDocument.spans()`. Buffers one page's spans at a time; each
+/// `__anext__` is a coroutine driving the shared extraction over the
+/// async document's range-fetching reads, with one font cache — and the
+/// document's optional-content state, loaded once — shared across the
+/// walk.
+#[pyclass(frozen)]
+struct AsyncSpanIter {
+    state: Arc<tokio::sync::Mutex<AsyncSpanIterState>>,
+}
+
+struct AsyncSpanIterState {
+    doc: AioDocument,
+    fonts: FontCache,
+    oc: Option<OcState>,
+    oc_loaded: bool,
+    pages: std::vec::IntoIter<usize>,
+    buffer: std::vec::IntoIter<TextSpan>,
+}
+
+#[pymethods]
+impl AsyncSpanIter {
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Coroutine resolving to the next Span; raises StopAsyncIteration
+    /// when the walk is exhausted.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut state = state.lock().await;
+            if !state.oc_loaded {
+                state.oc = state.doc.oc_state().await;
+                state.oc_loaded = true;
+            }
+            loop {
+                if let Some(span) = state.buffer.next() {
+                    return Ok(Span { inner: span });
+                }
+                let Some(index) = state.pages.next() else {
+                    return Err(PyStopAsyncIteration::new_err("span walk exhausted"));
+                };
+                let page = state.doc.page(index).map_err(aio_err)?;
+                let (spans, _) = pdfboss_text::extract_spans_reporting_cached_with(
+                    state.doc.clone(),
+                    &page,
+                    &state.fonts,
+                    state.oc.as_ref(),
+                )
+                .await
+                .map_err(pdf_err)?;
+                state.buffer = spans.into_iter();
+            }
+        })
+    }
+}
+
 #[pymodule]
 fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1352,6 +1675,9 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ElementIter>()?;
     m.add_class::<AsyncDocument>()?;
     m.add_class::<AsyncElementIter>()?;
+    m.add_class::<Span>()?;
+    m.add_class::<SpanIter>()?;
+    m.add_class::<AsyncSpanIter>()?;
     Ok(())
 }
 
@@ -1409,6 +1735,9 @@ mod tests {
         assert_send_sync::<super::ElementIter>();
         assert_send_sync::<super::AsyncDocument>();
         assert_send_sync::<super::AsyncElementIter>();
+        assert_send_sync::<super::Span>();
+        assert_send_sync::<super::SpanIter>();
+        assert_send_sync::<super::AsyncSpanIter>();
     }
 
     #[test]

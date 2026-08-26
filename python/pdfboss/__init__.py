@@ -4,11 +4,14 @@ from pdfboss._pdfboss import (
     AsyncDocument,
     AsyncElementIter,
     AsyncPage,
+    AsyncSpanIter,
     Document,
     Element,
     ElementIter,
     Page,
     PdfError,
+    Span,
+    SpanIter,
     __version__,
 )
 
@@ -16,10 +19,13 @@ __all__ = [
     "AsyncDocument",
     "AsyncElementIter",
     "AsyncPage",
+    "AsyncSpanIter",
     "Document",
     "Element",
     "ElementIter",
     "Page",
     "PdfError",
+    "Span",
+    "SpanIter",
     "__version__",
 ]
