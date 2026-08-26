@@ -9,16 +9,17 @@
 //! Two templates exist (6.3.5.3): template 0 gathers thirteen pixels and has
 //! two adaptive pixels, template 1 gathers ten and has none.
 //!
-//! The refinement region segment of 7.4.7 reaches this. The two other callers
-//! the standard defines — the refinement/aggregate symbol coding of 6.5.8.2 and
-//! the text region symbol refinement of 6.4.11 — still refuse their streams,
-//! and are wired up in turn.
+//! The refinement region segment of 7.4.7 reaches this, and so do the text
+//! region symbol refinement of 6.4.11 and the refinement/aggregate symbol
+//! coding of a symbol dictionary (6.5.8.2) — every caller the standard
+//! defines.
 
 use super::bitmap::Bitmap;
 use super::budget::Budget;
 #[cfg(test)]
 use super::mq::{encoder::MqEncoder, MqContext};
 use super::mq::{MqContexts, MqDecoder};
+use super::reader::Reader;
 use super::Jbig2Error;
 
 /// Contexts the refinement templates address, one per value of the widest
@@ -168,6 +169,37 @@ impl RefinementParams {
     }
 }
 
+/// Reads a refinement AT pixel field — SBRATX1 to SBRATY2 of T.88 7.4.3.1.3,
+/// or SDRATX1 to SDRATY2 of 7.4.2.1.3, one signed byte each — and folds it,
+/// with the template bit, into this procedure's parameters.
+///
+/// Template 1 has no adaptive pixels, so both clauses omit the field for it
+/// and the nominal offsets stand in for values nothing will read. TPGRON is 0
+/// for every embedded refinement — Tables 12 and 18 both fix it — which is why
+/// it is not a parameter here; the refinement region segment of 7.4.7 carries
+/// its own flag and parses its own field.
+pub(crate) fn parse_refinement_at(
+    r: &mut Reader<'_>,
+    template_1: bool,
+) -> Result<RefinementParams, Jbig2Error> {
+    if template_1 {
+        return Ok(RefinementParams {
+            template: 1,
+            at: NOMINAL_AT,
+            tpgron: false,
+        });
+    }
+    let mut at = NOMINAL_AT;
+    for pixel in &mut at {
+        *pixel = (r.u8()? as i8, r.u8()? as i8);
+    }
+    Ok(RefinementParams {
+        template: 0,
+        at,
+        tpgron: false,
+    })
+}
+
 /// Decodes a refinement region against `reference` (T.88 6.3.5.6).
 ///
 /// The pixel of the reference corresponding to `(x, y)` here is the one at
@@ -261,11 +293,10 @@ fn uniform_reference(reference: &Bitmap, x: i64, y: i64) -> Option<u8> {
 }
 
 #[cfg(test)]
-/// The encoder side of 6.3.5.6, used only by these tests. It has to make
-/// exactly the decisions the decoder expects to read, including skipping
-/// the pixels typical prediction covers.
-/// Returns the coded bytes and the number of pixels coded explicitly —
-/// the ones typical prediction did not cover.
+/// The encoder side of 6.3.5.6 with its own coder and fresh statistics, which
+/// is the shape a refinement region segment's fixture wants. Returns the coded
+/// bytes and the number of pixels coded explicitly — the ones typical
+/// prediction did not cover.
 pub(crate) fn encode_refinement_at(
     target: &Bitmap,
     reference: &Bitmap,
@@ -273,10 +304,33 @@ pub(crate) fn encode_refinement_at(
     dx: i32,
     dy: i32,
 ) -> (Vec<u8>, usize) {
-    let taps = taps_for(params.template);
-    let sltp_cx = usize::from(sltp_context(params.template));
     let mut cx = vec![MqContext::default(); GR_CONTEXT_LEN];
     let mut enc = MqEncoder::new();
+    let explicit = encode_refinement_into(&mut enc, &mut cx, target, reference, params, dx, dy);
+    (enc.finish(), explicit)
+}
+
+#[cfg(test)]
+/// The encoder side of 6.3.5.6 into a caller-owned coder and context array,
+/// mirroring the decoder decision for decision — including skipping the pixels
+/// typical prediction covers. Returns the number of pixels coded explicitly.
+///
+/// The coder and contexts are the caller's because a text region owns both
+/// across its instances: the arithmetic variant braids every refinement into
+/// the segment's one codeword, and even the Huffman variant, whose refinements
+/// are separate codewords, adapts one set of GR statistics across them —
+/// E.3.7 resets statistics per segment, not per bitmap.
+pub(crate) fn encode_refinement_into(
+    enc: &mut MqEncoder,
+    cx: &mut [MqContext],
+    target: &Bitmap,
+    reference: &Bitmap,
+    params: &RefinementParams,
+    dx: i32,
+    dy: i32,
+) -> usize {
+    let taps = taps_for(params.template);
+    let sltp_cx = usize::from(sltp_context(params.template));
     let (dx, dy) = (i64::from(dx), i64::from(dy));
     let mut ltp = false;
     let mut explicit = 0usize;
@@ -324,7 +378,7 @@ pub(crate) fn encode_refinement_at(
             explicit += 1;
         }
     }
-    (enc.finish(), explicit)
+    explicit
 }
 
 /// A template pixel of the region being decoded, as the decoder would see

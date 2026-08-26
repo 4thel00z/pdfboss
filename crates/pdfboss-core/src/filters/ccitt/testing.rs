@@ -154,6 +154,24 @@ pub(crate) fn encode_g4(bm: &Bitmap) -> Vec<u8> {
     encode_g4_tallied(bm).0
 }
 
+/// [`encode_g4`] with the end-of-facsimile block appended: two end-of-line
+/// codes straight after the last row's data (T.6 §2.2.1), then padding out to
+/// a byte boundary.
+///
+/// This is the form ITU-T T.88 6.2.6 requires wherever the byte count is not
+/// known in advance — the bitplanes of a gray-scale image, whose streams sit
+/// end to end with nothing but the terminator to separate them.
+pub(crate) fn encode_g4_with_eofb(bm: &Bitmap) -> Vec<u8> {
+    let mut bits = Vec::new();
+    let mut tally = ModeTally::default();
+    for y in 0..bm.height() {
+        encode_row_2d(&mut bits, bm, y, &mut tally);
+    }
+    push_eol(&mut bits);
+    push_eol(&mut bits);
+    pack(&bits)
+}
+
 /// [`encode_g4`], reporting which modes it chose.
 pub(crate) fn encode_g4_tallied(bm: &Bitmap) -> (Vec<u8>, ModeTally) {
     let mut bits = Vec::new();

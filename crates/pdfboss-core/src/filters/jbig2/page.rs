@@ -6,15 +6,17 @@
 //! own bitmap and composites onto it at the coordinates its region information
 //! field gives.
 //!
-//! The walk carries two pieces of state between segments: the symbols each
-//! symbol dictionary exported, and the Huffman table each code table segment
-//! carries, both keyed by segment number. A text region names the dictionaries
-//! it draws on in its header's referred-to list, and the concatenation of their
-//! exports in that order is the list its symbol IDs index; a dictionary or a
-//! region coded with the Huffman variant names its custom tables the same way
-//! (7.4.2.1.6, 7.4.3.1.6). So both stores have to outlive the segment that
-//! filled them,
-//! and have to span the globals stream and the page stream as one sequence.
+//! The walk carries state between segments, keyed by segment number: the
+//! symbols each symbol dictionary exported, the Huffman table each code table
+//! segment carries, the patterns each pattern dictionary exported, and the
+//! bitmap each intermediate region segment retained. A text region names the
+//! dictionaries it draws on in its header's referred-to list, and the
+//! concatenation of their exports in that order is the list its symbol IDs
+//! index; a dictionary or a region coded with the Huffman variant names its
+//! custom tables the same way (7.4.2.1.6, 7.4.3.1.6); a refinement region
+//! names the retained region it refines (7.4.7.4). So every store has to
+//! outlive the segment that filled it, and has to span the globals stream and
+//! the page stream as one sequence.
 //!
 //! Two rules shape everything else here.
 //!
@@ -44,6 +46,7 @@ use super::budget::Budget;
 use super::generic::{
     decode_generic_region, decode_mmr_region, parse_generic_flags, GB_CONTEXT_LEN,
 };
+use super::halftone::{decode_halftone_region, decode_pattern_dict};
 use super::huffman::{parse_table_segment, Table};
 use super::mq::{MqContexts, MqDecoder};
 use super::reader::Reader;
@@ -153,6 +156,20 @@ fn decode_embedded_within(
     // set to "user-supplied", in the order its referred-to list names them
     // (7.4.2.1.6).
     let mut tables: HashMap<u32, Table> = HashMap::new();
+    // Pattern dictionaries' exports, keyed the same way once more: a halftone
+    // region names the dictionary supplying its patterns by segment number
+    // (7.4.5.2 step 2).
+    let mut patterns: HashMap<u32, Vec<Bitmap>> = HashMap::new();
+    // The auxiliary buffers of 8.2 step 5: each intermediate region segment's
+    // decoded bitmap, held with the region information field that says where
+    // on the page it will eventually land. A refinement region that names one
+    // reads it as its reference (7.4.7.4) and either composites the result
+    // onto the page, discarding the buffer (step 5 d), or retains the result
+    // in its place (step 5 e). A buffer nothing ever names is decoded, held to
+    // the end of the walk and dropped: 8.2 step 6 says none should remain, but
+    // a leftover buffer costs the page no pixels, so it is not worth refusing
+    // a page over.
+    let mut retained: HashMap<u32, (RegionInfo, Bitmap)> = HashMap::new();
     let mut page: Option<Bitmap> = None;
     for segment in global_segments.iter().chain(page_segments.iter()) {
         match segment.header.kind {
@@ -175,15 +192,27 @@ fn decode_embedded_within(
                 // The borrow of `symbols` ends with this block, because the
                 // insert that follows needs the map mutably.
                 let exported = {
-                    let inputs =
-                        gather_referred_to(&symbols, &tables, &segment.header.referred_to, budget)?;
+                    let inputs = gather_referred_to(
+                        &symbols,
+                        &tables,
+                        &patterns,
+                        &retained,
+                        &segment.header.referred_to,
+                        budget,
+                    )?;
                     decode_symbol_dict(segment.data, &inputs.symbols, &inputs.tables, budget)?
                 };
                 symbols.insert(segment.header.number, exported);
             }
             SegmentKind::ImmediateTextRegion | SegmentKind::ImmediateLosslessTextRegion => {
-                let inputs =
-                    gather_referred_to(&symbols, &tables, &segment.header.referred_to, budget)?;
+                let inputs = gather_referred_to(
+                    &symbols,
+                    &tables,
+                    &patterns,
+                    &retained,
+                    &segment.header.referred_to,
+                    budget,
+                )?;
                 let (info, region) =
                     decode_text_region(segment.data, &inputs.symbols, &inputs.tables, budget)?;
                 let mut target = match page.take() {
@@ -192,6 +221,24 @@ fn decode_embedded_within(
                 };
                 target.combine(&region, offset(info.x), offset(info.y), info.op);
                 page = Some(target);
+            }
+            // An intermediate region decodes exactly like its immediate twin
+            // and goes into the retained store instead of onto the page
+            // (8.2 step 5 b): its region information field takes effect when
+            // the refinement segment that names it composites the result.
+            SegmentKind::IntermediateTextRegion => {
+                let region = {
+                    let inputs = gather_referred_to(
+                        &symbols,
+                        &tables,
+                        &patterns,
+                        &retained,
+                        &segment.header.referred_to,
+                        budget,
+                    )?;
+                    decode_text_region(segment.data, &inputs.symbols, &inputs.tables, budget)?
+                };
+                retain_region(&mut retained, segment.header.number, region, budget)?;
             }
             // Segments that carry no pixels for this decoder. End of stripe
             // (7.4.10) states the Y coordinate of a stripe's last row, which is
@@ -202,28 +249,81 @@ fn decode_embedded_within(
             | SegmentKind::EndOfFile
             | SegmentKind::Profiles
             | SegmentKind::Extension => {}
-            // An intermediate region is not composited onto the page: it is
-            // retained in an auxiliary buffer for a later refinement segment to
-            // read, which is a mechanism this build does not have.
-            SegmentKind::IntermediateTextRegion => {
-                return Err(Jbig2Error::Unimplemented("intermediate region"))
-            }
             SegmentKind::PatternDictionary => {
-                return Err(Jbig2Error::Unimplemented("pattern dictionary"))
+                let exported = decode_pattern_dict(segment.data, budget)?;
+                patterns.insert(segment.header.number, exported);
             }
-            SegmentKind::IntermediateHalftoneRegion
-            | SegmentKind::ImmediateHalftoneRegion
-            | SegmentKind::ImmediateLosslessHalftoneRegion => {
-                return Err(Jbig2Error::Unimplemented("halftone region"))
+            SegmentKind::ImmediateHalftoneRegion | SegmentKind::ImmediateLosslessHalftoneRegion => {
+                let inputs = gather_referred_to(
+                    &symbols,
+                    &tables,
+                    &patterns,
+                    &retained,
+                    &segment.header.referred_to,
+                    budget,
+                )?;
+                let (info, region) =
+                    decode_halftone_region(segment.data, single_pattern_dict(&inputs)?, budget)?;
+                let mut target = match page.take() {
+                    Some(existing) => existing,
+                    None => Bitmap::new(width, height)?,
+                };
+                target.combine(&region, offset(info.x), offset(info.y), info.op);
+                page = Some(target);
+            }
+            SegmentKind::IntermediateHalftoneRegion => {
+                let region = {
+                    let inputs = gather_referred_to(
+                        &symbols,
+                        &tables,
+                        &patterns,
+                        &retained,
+                        &segment.header.referred_to,
+                        budget,
+                    )?;
+                    decode_halftone_region(segment.data, single_pattern_dict(&inputs)?, budget)?
+                };
+                retain_region(&mut retained, segment.header.number, region, budget)?;
             }
             SegmentKind::IntermediateGenericRegion => {
-                return Err(Jbig2Error::Unimplemented("intermediate region"))
+                let region = decode_generic_region_segment(segment, budget)?;
+                retain_region(&mut retained, segment.header.number, region, budget)?;
             }
-            // An intermediate refinement region, like any other intermediate
-            // region, is retained for a later segment rather than composited,
-            // and there is no auxiliary buffer here to retain it in.
+            // An intermediate refinement region rewrites the retained buffer it
+            // names in place of the page (8.2 step 5 e): the refined bitmap
+            // replaces the buffer's contents, and the buffer moves to this
+            // segment's number so that only the segment consuming the *result*
+            // of the chain can name it. The buffer's own region information —
+            // where the chain finally lands — travels with it unchanged.
             SegmentKind::IntermediateRefinementRegion => {
-                return Err(Jbig2Error::Unimplemented("intermediate region"))
+                let (consumed, aux_info, refined) = {
+                    let inputs = gather_referred_to(
+                        &symbols,
+                        &tables,
+                        &patterns,
+                        &retained,
+                        &segment.header.referred_to,
+                        budget,
+                    )?;
+                    let &[(number, aux_info, aux)] = inputs.regions.as_slice() else {
+                        return Err(Jbig2Error::Malformed(
+                            "intermediate refinement region must name exactly one retained region",
+                        ));
+                    };
+                    let (_, refined) = decode_refinement_region_segment(
+                        segment,
+                        RefinementReference::Retained(aux),
+                        budget,
+                    )?;
+                    (number, *aux_info, refined)
+                };
+                retained.remove(&consumed);
+                retain_region(
+                    &mut retained,
+                    segment.header.number,
+                    (aux_info, refined),
+                    budget,
+                )?;
             }
             SegmentKind::ImmediateRefinementRegion
             | SegmentKind::ImmediateLosslessRefinementRegion => {
@@ -231,8 +331,57 @@ fn decode_embedded_within(
                     Some(existing) => existing,
                     None => Bitmap::new(width, height)?,
                 };
-                let (info, region) = decode_refinement_region_segment(segment, &target, budget)?;
-                target.combine(&region, offset(info.x), offset(info.y), info.op);
+                let consumed = {
+                    let inputs = gather_referred_to(
+                        &symbols,
+                        &tables,
+                        &patterns,
+                        &retained,
+                        &segment.header.referred_to,
+                        budget,
+                    )?;
+                    match inputs.regions.as_slice() {
+                        // No referred-to region: the segment refines the page
+                        // beneath its own box (8.2 step 5 c).
+                        [] => {
+                            let (info, region) = decode_refinement_region_segment(
+                                segment,
+                                RefinementReference::Page(&target),
+                                budget,
+                            )?;
+                            target.combine(&region, offset(info.x), offset(info.y), info.op);
+                            None
+                        }
+                        // One referred-to region: the segment refines that
+                        // buffer and composites the result where the buffer
+                        // was headed, with this segment's own operator
+                        // (8.2 step 5 d). The buffer is discarded below, which
+                        // is what makes a second segment naming it a dangling
+                        // reference.
+                        &[(number, aux_info, aux)] => {
+                            let (info, region) = decode_refinement_region_segment(
+                                segment,
+                                RefinementReference::Retained(aux),
+                                budget,
+                            )?;
+                            target.combine(
+                                &region,
+                                offset(aux_info.x),
+                                offset(aux_info.y),
+                                info.op,
+                            );
+                            Some(number)
+                        }
+                        _ => {
+                            return Err(Jbig2Error::Malformed(
+                                "refinement region names more than one retained region",
+                            ))
+                        }
+                    }
+                };
+                if let Some(number) = consumed {
+                    retained.remove(&number);
+                }
                 page = Some(target);
             }
             // A code table segment carries no pixels and names no region: it
@@ -270,10 +419,20 @@ struct Referred<'a> {
     /// segments, which is the order the selectors of 7.4.2.1.6 and 7.4.3.1.6
     /// consume them in.
     tables: Vec<&'a Table>,
+    /// The pattern dictionaries' exports, one entry per dictionary named. A
+    /// halftone region requires exactly one (7.4.5.2 step 2), and that is its
+    /// caller's check to make: this list only reports what the stream said.
+    patterns: Vec<&'a [Bitmap]>,
+    /// The retained regions named, as the retaining segment's number alongside
+    /// its buffer. A refinement region reads at most one as its reference
+    /// (7.4.7.4) and needs the number to discard or re-key the buffer once the
+    /// reference is spent (8.2 step 5 d and e); how many it may name is, like
+    /// the patterns, its caller's check to make.
+    regions: Vec<(u32, &'a RegionInfo, &'a Bitmap)>,
 }
 
-/// Splits a segment's referred-to list into the symbols and the tables it
-/// supplies (T.88 7.4.2.2, 7.4.3.2, 7.4.2.1.6).
+/// Splits a segment's referred-to list into the symbols, tables and patterns
+/// it supplies (T.88 7.4.2.2, 7.4.3.2, 7.4.2.1.6, 7.4.5.2).
 ///
 /// Order is the whole point, and the two orders are independent: a symbol ID
 /// indexes the concatenated symbols, so naming two dictionaries the other way
@@ -304,16 +463,22 @@ struct Referred<'a> {
 /// as long as SBNUMSYMS however short the segment is, and every later segment
 /// that names the same dictionary builds it over again. A unit per symbol is
 /// far above what appending a borrow costs and far below anything a document
-/// would notice.
+/// would notice. Pattern dictionaries and retained regions go uncharged for
+/// the tables' reason: an entry contributes one borrow of the whole export or
+/// buffer, never a per-item copy.
 fn gather_referred_to<'a>(
     symbols: &'a HashMap<u32, Vec<Bitmap>>,
     tables: &'a HashMap<u32, Table>,
+    patterns: &'a HashMap<u32, Vec<Bitmap>>,
+    retained: &'a HashMap<u32, (RegionInfo, Bitmap)>,
     referred_to: &[u32],
     budget: &mut Budget,
 ) -> Result<Referred<'a>, Jbig2Error> {
     let mut out = Referred {
         symbols: Vec::new(),
         tables: Vec::new(),
+        patterns: Vec::new(),
+        regions: Vec::new(),
     };
     for number in referred_to {
         if let Some(exported) = symbols.get(number) {
@@ -324,13 +489,53 @@ fn gather_referred_to<'a>(
             out.symbols.extend(exported.iter());
         } else if let Some(table) = tables.get(number) {
             out.tables.push(table);
+        } else if let Some(exported) = patterns.get(number) {
+            out.patterns.push(exported);
+        } else if let Some((info, buffer)) = retained.get(number) {
+            out.regions.push((*number, info, buffer));
         } else {
             return Err(Jbig2Error::Malformed(
-                "referred-to segment supplies neither symbols nor a table",
+                "referred-to segment supplies no symbols, patterns, table, or retained region",
             ));
         }
     }
     Ok(out)
+}
+
+/// The one pattern dictionary a halftone region's referred-to list must name.
+///
+/// 7.4.5.2 step 2 speaks of *the* referred-to pattern dictionary: exactly one
+/// supplies HPATS, and a region naming none or several has no single
+/// dictionary to mean.
+fn single_pattern_dict<'a>(inputs: &Referred<'a>) -> Result<&'a [Bitmap], Jbig2Error> {
+    let &[dictionary] = inputs.patterns.as_slice() else {
+        return Err(Jbig2Error::Malformed(
+            "halftone region must name exactly one pattern dictionary",
+        ));
+    };
+    Ok(dictionary)
+}
+
+/// Keeps an intermediate region's decoded bitmap for the refinement segment
+/// that will name it (T.88 8.2 step 5 b and e).
+///
+/// The bitmap is charged for over again at retention, exactly as a symbol
+/// dictionary charges for the exported symbols it copies rather than decodes:
+/// what the decode charge paid for was bringing the pixels into existence, and
+/// what this pays for is holding them for the rest of the walk instead of
+/// compositing and dropping them. The entry itself needs no fixed price — one
+/// retained buffer costs at least a whole segment header of stream, so the
+/// count is bounded by the stream's own length.
+fn retain_region(
+    retained: &mut HashMap<u32, (RegionInfo, Bitmap)>,
+    number: u32,
+    region: (RegionInfo, Bitmap),
+    budget: &mut Budget,
+) -> Result<(), Jbig2Error> {
+    let (_, bitmap) = &region;
+    budget.charge_region(bitmap.width(), bitmap.height())?;
+    retained.insert(number, region);
+    Ok(())
 }
 
 /// Decodes one immediate generic region segment (T.88 7.4.6) into its own
@@ -385,35 +590,51 @@ fn decode_generic_region_segment(
     Ok((info, bitmap))
 }
 
-/// Decodes a generic refinement region segment (T.88 7.4.7.5).
+/// What a generic refinement region segment refines (T.88 7.4.7.4).
+enum RefinementReference<'a> {
+    /// The segment names no region segment: the reference is the page buffer,
+    /// restricted to the segment's own box.
+    Page(&'a Bitmap),
+    /// The segment names a retained region: the reference is that buffer,
+    /// whole and as it stands.
+    Retained(&'a Bitmap),
+}
+
+/// Decodes a generic refinement region segment (T.88 7.4.7.5) against the
+/// reference 7.4.7.4 selects for it.
 ///
-/// The reference is the page buffer restricted to this segment's own box, as
-/// 7.4.7.4 directs for a segment that refers to no other region segment. The
-/// other case it describes — reading the auxiliary buffer of a referred-to
-/// region segment — cannot arise here: the only segments that fill such a
-/// buffer are the intermediate regions, and every one of those is refused
-/// before it can be retained.
-///
-/// 7.4.7.5 also says the external combination operator "must be REPLACE" in
-/// this case. That is not enforced. It is a constraint on encoders, and a
-/// stream that composites its refinement with OR is still telling this decoder
-/// exactly what it means; rejecting it would lose a page over a technicality
-/// that costs nothing to honour.
+/// 7.4.7.5 also constrains the header: the external combination operator "must
+/// be REPLACE" when the reference is the page, and the segment's box and
+/// operator "must be equal" to the referred-to segment's when it is not. None
+/// of that is enforced. They are constraints on encoders, and a stream that
+/// breaks them is still telling this decoder exactly what it means — Table 35
+/// takes the refinement's size from this segment's own header either way, and
+/// a reference pixel past the buffer reads as 0 (6.3.5.2) — so rejecting one
+/// would lose a page over a technicality that costs nothing to honour.
 fn decode_refinement_region_segment(
     segment: &Segment<'_>,
-    page: &Bitmap,
+    reference: RefinementReference<'_>,
     budget: &mut Budget,
 ) -> Result<(RegionInfo, Bitmap), Jbig2Error> {
     let mut r = Reader::new(segment.data);
     let info = parse_region_info(&mut r)?;
     let params = parse_refinement_flags(&mut r)?;
 
-    // Lifting the region's own rectangle out of the page: composing the page
-    // onto an empty bitmap of the region's size, shifted so that the region's
-    // top-left lands at the origin. Whatever falls outside the page stays 0,
-    // which is what 6.3.5.2 asks of an out-of-bounds reference pixel anyway.
-    let mut reference = Bitmap::new(info.width, info.height)?;
-    reference.combine(page, -offset(info.x), -offset(info.y), CombOp::Replace);
+    let page_box;
+    let reference = match reference {
+        RefinementReference::Retained(buffer) => buffer,
+        RefinementReference::Page(page) => {
+            // Lifting the region's own rectangle out of the page: composing
+            // the page onto an empty bitmap of the region's size, shifted so
+            // that the region's top-left lands at the origin. Whatever falls
+            // outside the page stays 0, which is what 6.3.5.2 asks of an
+            // out-of-bounds reference pixel anyway.
+            let mut lifted = Bitmap::new(info.width, info.height)?;
+            lifted.combine(page, -offset(info.x), -offset(info.y), CombOp::Replace);
+            page_box = lifted;
+            &page_box
+        }
+    };
 
     let mut dec = MqDecoder::new(r.rest());
     let mut cx = MqContexts::new(GR_CONTEXT_LEN);
@@ -423,7 +644,7 @@ fn decode_refinement_region_segment(
         budget,
         info.width,
         info.height,
-        Reference::aligned(&reference),
+        Reference::aligned(reference),
         &params,
     )?;
     Ok((info, bitmap))
@@ -482,10 +703,10 @@ mod tests {
     use crate::filters::jbig2::mq::{encoder::MqEncoder, MqContext};
     use crate::filters::jbig2::symbol_dict::SYMBOL_COST;
     use crate::filters::jbig2::testing::{
-        code_table_segment, dictionary_segment, expect_at, glyph, header,
-        huffman_dictionary_segment, huffman_text_segment, reexport_segment,
-        rowless_dictionary_segment, split_after_segment, text_segment_for_page, Collective, Op,
-        Placement, Shape,
+        code_table_segment, dictionary_segment, encode_generic_sequence, expect_at, glyph,
+        halftone_segment, header, huffman_dictionary_segment, huffman_text_segment,
+        pattern_dict_segment, reexport_segment, rowless_dictionary_segment, split_after_segment,
+        text_segment_for_page, Collective, Op, Placement, Shape,
     };
 
     /// Handing a segment the symbols its header names is work the segment buys
@@ -497,11 +718,15 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(1u32, vec![glyph(&["1"]); 64]);
         let tables = HashMap::new();
+        let patterns = HashMap::new();
+        let retained = HashMap::new();
 
         let mut budget = Budget::with_limit(64);
-        assert!(gather_referred_to(&symbols, &tables, &[1], &mut budget).is_ok());
+        assert!(
+            gather_referred_to(&symbols, &tables, &patterns, &retained, &[1], &mut budget).is_ok()
+        );
         assert!(matches!(
-            gather_referred_to(&symbols, &tables, &[1], &mut budget),
+            gather_referred_to(&symbols, &tables, &patterns, &retained, &[1], &mut budget),
             Err(Jbig2Error::WorkLimit),
         ));
     }
@@ -528,6 +753,19 @@ mod tests {
         out.extend_from_slice(&header(0, 48, &[], 1, info.len() as u32));
         out.extend_from_slice(&info);
 
+        let region = generic_region_data(bm, x, y, op);
+        out.extend_from_slice(&header(1, 38, &[], 1, region.len() as u32));
+        out.extend_from_slice(&region);
+
+        out.extend_from_slice(&header(2, 49, &[], 1, 0)); // end of page
+        out.extend_from_slice(&header(3, 51, &[], 1, 0)); // end of file
+        out
+    }
+
+    /// The data part of a generic region segment — immediate or intermediate,
+    /// the two are coded identically — carrying `bm` at (`x`, `y`) with the
+    /// external combination operator `op`.
+    fn generic_region_data(bm: &Bitmap, x: u32, y: u32, op: u8) -> Vec<u8> {
         let params = GenericParams::nominal(0);
         let mut region = Vec::new();
         region.extend_from_slice(&bm.width().to_be_bytes());
@@ -541,22 +779,47 @@ mod tests {
             region.push(dy as u8);
         }
         region.extend_from_slice(&encode_bitmap(bm, &params));
-        out.extend_from_slice(&header(1, 38, &[], 1, region.len() as u32));
-        out.extend_from_slice(&region);
-
-        out.extend_from_slice(&header(2, 49, &[], 1, 0)); // end of page
-        out.extend_from_slice(&header(3, 51, &[], 1, 0)); // end of file
-        out
+        region
     }
 
-    /// One immediate generic region segment declaring `width` by `height` and
-    /// carrying no coded data at all.
+    /// The data part of a refinement region segment — any of the three types —
+    /// coding `target` against `reference` with template 1, placed at (`x`,
+    /// `y`) with the external combination operator `op`.
+    fn refinement_region_data(
+        target: &Bitmap,
+        reference: &Bitmap,
+        x: u32,
+        y: u32,
+        op: u8,
+    ) -> Vec<u8> {
+        use super::super::refinement::encode_refinement_at;
+
+        let params = RefinementParams {
+            template: 1,
+            at: NOMINAL_AT,
+            tpgron: false,
+        };
+        let (coded, _) = encode_refinement_at(target, reference, &params, 0, 0);
+        let mut data = Vec::new();
+        data.extend_from_slice(&target.width().to_be_bytes());
+        data.extend_from_slice(&target.height().to_be_bytes());
+        data.extend_from_slice(&x.to_be_bytes());
+        data.extend_from_slice(&y.to_be_bytes());
+        data.push(op);
+        data.push(1); // GRTEMPLATE 1, TPGRON 0: no AT bytes (7.4.7.3)
+        data.extend_from_slice(&coded);
+        data
+    }
+
+    /// One generic region segment of the given type (38 immediate, 36
+    /// intermediate) declaring `width` by `height` and carrying no coded data
+    /// at all.
     ///
     /// A stream does not have to supply the bits it asks to have decoded: past
     /// the end of the data the arithmetic decoder keeps answering (T.88
     /// E.3.4). That is what makes 31 bytes enough to demand any amount of
     /// decoding, and it is the shape every cost test below uses.
-    fn empty_region_segment(number: u32, width: u32, height: u32) -> Vec<u8> {
+    fn empty_region_segment(number: u32, kind: u8, width: u32, height: u32) -> Vec<u8> {
         let mut region = Vec::new();
         region.extend_from_slice(&width.to_be_bytes());
         region.extend_from_slice(&height.to_be_bytes());
@@ -568,7 +831,7 @@ mod tests {
             region.push(dx as u8);
             region.push(dy as u8);
         }
-        let mut out = header(number, 38, &[], 1, region.len() as u32);
+        let mut out = header(number, kind, &[], 1, region.len() as u32);
         out.extend_from_slice(&region);
         out
     }
@@ -706,23 +969,49 @@ mod tests {
         }
     }
 
-    /// Segment types later plans own must fail loudly, naming themselves, so
-    /// the render report can say what is missing rather than showing a blank.
+    /// An intermediate region that no refinement segment ever names is decoded
+    /// and retained, and the page never sees a pixel of it: 8.2 composites
+    /// intermediate regions only through the refinement that consumes them,
+    /// and a buffer left over at the end of the walk (step 6 says none should
+    /// be) is dropped rather than either drawn or complained about.
+    ///
+    /// One stream per intermediate direct region type, each carrying ink that
+    /// would be visible if the region were wrongly treated as immediate.
     #[test]
-    fn unimplemented_segment_types_are_named_errors() {
-        for (kind, want) in [
-            (4u8, "intermediate region"),
-            (16, "pattern dictionary"),
-            (22, "halftone region"),
-            (36, "intermediate region"),
-            (40, "intermediate region"),
-        ] {
-            let stream = header(0, kind, &[], 1, 0);
-            assert_eq!(
-                decode_embedded(&[], &stream, 8, 8),
-                Err(Jbig2Error::Unimplemented(want)),
-                "segment type {kind}",
-            );
+    fn an_unreferenced_intermediate_region_leaves_the_page_blank() {
+        // Type 36: a generic region of solid ink.
+        let region = generic_region_data(&Bitmap::filled(4, 4, 1).expect("4x4"), 0, 0, 0);
+        let mut generic = page_info_segment(0, (8, 8));
+        generic.extend_from_slice(&header(1, 36, &[], 1, region.len() as u32));
+        generic.extend_from_slice(&region);
+
+        // Type 4: a text region placing one solid symbol.
+        let dict = dictionary_segment(&[glyph(&["11", "11"])], 0);
+        let region = text_segment_for_page((4, 4), 1, &[Op::Strip(0), Op::First(0, 0)]);
+        let mut text = page_info_segment(0, (8, 8));
+        text.extend_from_slice(&header(1, 0, &[], 1, dict.len() as u32));
+        text.extend_from_slice(&dict);
+        text.extend_from_slice(&header(2, 4, &[1], 1, region.len() as u32));
+        text.extend_from_slice(&region);
+
+        // Type 20: a halftone region drawing one solid pattern.
+        let dict = pattern_dict_segment(&[glyph(&["00", "00"]), glyph(&["11", "11"])], false);
+        let plane = glyph(&["1"]);
+        let coded = encode_generic_sequence(&[&plane], &GenericParams::nominal(0), None);
+        let region = halftone_segment((2, 2), (0, 0), 0, 0, (1, 1, 0, 0, 512, 0), &coded);
+        let mut halftone = page_info_segment(0, (8, 8));
+        halftone.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        halftone.extend_from_slice(&dict);
+        halftone.extend_from_slice(&header(2, 20, &[1], 1, region.len() as u32));
+        halftone.extend_from_slice(&region);
+
+        for (stream, kind) in [(generic, "generic"), (text, "text"), (halftone, "halftone")] {
+            let page = decode_embedded(&[], &stream, 8, 8).expect(kind);
+            for y in 0..8u32 {
+                for x in 0..8u32 {
+                    assert_eq!(page.get(i64::from(x), i64::from(y)), 0, "{kind} ({x}, {y})");
+                }
+            }
         }
     }
 
@@ -784,12 +1073,177 @@ mod tests {
         }
     }
 
-    /// An intermediate refinement region (type 40) is retained for a later
-    /// segment rather than composited, and there is no buffer here to retain
-    /// it in, so it is refused by name rather than quietly treated as
-    /// immediate.
+    /// An intermediate generic region (type 36) is retained rather than
+    /// composited, and the immediate refinement region that names it refines
+    /// *that* bitmap, not the page beneath (7.4.7.4) — then composites the
+    /// result where the buffer's own region information field said, with the
+    /// refinement segment's operator (8.2 step 5 d).
+    ///
+    /// The hand-derived composite: the page starts all 0, the buffer is solid
+    /// ink the page never shows, and the refinement REPLACEs the buffer's box
+    /// with `target` — so the finished page is exactly `target` at (2, 1) and
+    /// 0 everywhere else. The refinement is *encoded* against the solid
+    /// buffer, so a decoder that read the page's zeros as its reference
+    /// instead would diverge from the coded data and fail the comparison.
     #[test]
-    fn an_intermediate_refinement_region_is_still_refused() {
+    fn an_intermediate_generic_region_feeds_the_refinement_that_names_it() {
+        let source = glyph(&["11111", "11111", "11111", "11111"]);
+        let target = glyph(&["01110", "01110", "01110", "00010"]);
+
+        let mut stream = page_info_segment(0, (9, 7));
+        let region = generic_region_data(&source, 2, 1, 0);
+        stream.extend_from_slice(&header(1, 36, &[], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        let refine = refinement_region_data(&target, &source, 2, 1, 4); // REPLACE
+        stream.extend_from_slice(&header(2, 42, &[1], 1, refine.len() as u32));
+        stream.extend_from_slice(&refine);
+
+        let page = decode_embedded(&[], &stream, 9, 7).expect("page");
+        expect_at(&page, &target, 2, 1);
+        // The retained bitmap itself never reached the page: where the buffer
+        // held ink and the refinement holds none, the page holds none.
+        assert_eq!(page.get(2, 1), 0, "the buffer's own ink was composited");
+        assert_eq!(page.get(0, 0), 0, "outside the region");
+        assert_eq!(page.get(8, 6), 0);
+    }
+
+    /// The same consumption for an intermediate text region (type 4): the
+    /// retained buffer is the text region's decoded bitmap — symbols placed
+    /// and all — and the refinement reads it as its reference.
+    #[test]
+    fn an_intermediate_text_region_feeds_the_refinement_that_names_it() {
+        let symbols = vec![glyph(&["111", "101", "111"])];
+        let target = glyph(&["111111", "100001", "100001", "100001", "100001", "111111"]);
+
+        let mut stream = page_info_segment(0, (6, 6));
+        let dict = dictionary_segment(&symbols, 0);
+        stream.extend_from_slice(&header(1, 0, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        let region = text_segment_for_page((6, 6), 1, &[Op::Strip(2), Op::First(1, 0)]);
+        stream.extend_from_slice(&header(2, 4, &[1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        // What the retained buffer holds: the symbol at (1, 2) of an otherwise
+        // blank 6 x 6 region, built here so the refinement can be encoded
+        // against the same reference the decoder must select.
+        let mut buffer = Bitmap::new(6, 6).expect("6x6");
+        buffer.combine(&symbols[0], 1, 2, CombOp::Or);
+        let refine = refinement_region_data(&target, &buffer, 0, 0, 4); // REPLACE
+        stream.extend_from_slice(&header(3, 42, &[2], 1, refine.len() as u32));
+        stream.extend_from_slice(&refine);
+
+        let page = decode_embedded(&[], &stream, 6, 6).expect("page");
+        expect_at(&page, &target, 0, 0);
+        assert_eq!(page.get(2, 3), 0, "the symbol's own ink was composited");
+    }
+
+    /// An intermediate refinement region (type 40) rewrites the buffer it
+    /// names and takes the buffer over under its own segment number
+    /// (8.2 step 5 e), so a chain of refinements reaches the page only through
+    /// its last link. The middle link pins both halves: the final segment's
+    /// coded data only decodes against the *rewritten* contents, and its
+    /// referred-to number only resolves if the buffer moved to the middle
+    /// segment's number.
+    #[test]
+    fn an_intermediate_refinement_region_rewrites_the_buffer_it_names() {
+        let first = glyph(&["1111", "1111", "1111", "1111"]);
+        let second = glyph(&["1001", "0110", "0110", "1001"]);
+        let third = glyph(&["0110", "1111", "1111", "0110"]);
+
+        let mut stream = page_info_segment(0, (6, 6));
+        let region = generic_region_data(&first, 1, 1, 0);
+        stream.extend_from_slice(&header(1, 36, &[], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        let rewrite = refinement_region_data(&second, &first, 1, 1, 4);
+        stream.extend_from_slice(&header(2, 40, &[1], 1, rewrite.len() as u32));
+        stream.extend_from_slice(&rewrite);
+        let refine = refinement_region_data(&third, &second, 1, 1, 0); // OR
+        stream.extend_from_slice(&header(3, 42, &[2], 1, refine.len() as u32));
+        stream.extend_from_slice(&refine);
+
+        let page = decode_embedded(&[], &stream, 6, 6).expect("page");
+        expect_at(&page, &third, 1, 1);
+        assert_eq!(page.get(0, 0), 0, "outside the region");
+        assert_eq!(page.get(5, 5), 0);
+    }
+
+    /// Consuming a retained region discards it (8.2 step 5 d), so a second
+    /// refinement naming the same number is a reference to a segment that no
+    /// longer supplies anything — the spec's "has not yet had a refinement
+    /// region segment refer to it", enforced by the buffer being gone.
+    #[test]
+    fn a_consumed_retained_region_cannot_be_named_again() {
+        let source = glyph(&["11", "11"]);
+        let target = glyph(&["10", "01"]);
+
+        let mut stream = page_info_segment(0, (4, 4));
+        let region = generic_region_data(&source, 0, 0, 0);
+        stream.extend_from_slice(&header(1, 36, &[], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        for number in [2u32, 3] {
+            let refine = refinement_region_data(&target, &source, 0, 0, 4);
+            stream.extend_from_slice(&header(number, 42, &[1], 1, refine.len() as u32));
+            stream.extend_from_slice(&refine);
+        }
+        assert_eq!(
+            decode_embedded(&[], &stream, 4, 4),
+            Err(Jbig2Error::Malformed(
+                "referred-to segment supplies no symbols, patterns, table, or retained region",
+            )),
+        );
+    }
+
+    /// 7.4.7.4 reads *the* auxiliary buffer of *the* region segment referred
+    /// to: a refinement naming two retained regions has no single reference to
+    /// mean, and refining against a guess would be wrong either way.
+    #[test]
+    fn a_refinement_region_may_not_name_two_retained_regions() {
+        let source = glyph(&["11", "11"]);
+        let mut stream = page_info_segment(0, (4, 4));
+        for number in [1u32, 2] {
+            let region = generic_region_data(&source, 0, 0, 0);
+            stream.extend_from_slice(&header(number, 36, &[], 1, region.len() as u32));
+            stream.extend_from_slice(&region);
+        }
+        let refine = refinement_region_data(&source, &source, 0, 0, 4);
+        stream.extend_from_slice(&header(3, 42, &[1, 2], 1, refine.len() as u32));
+        stream.extend_from_slice(&refine);
+        assert_eq!(
+            decode_embedded(&[], &stream, 4, 4),
+            Err(Jbig2Error::Malformed(
+                "refinement region names more than one retained region",
+            )),
+        );
+    }
+
+    /// Retention is charged on top of the decode, the way a symbol
+    /// dictionary's exported copies are: the buffer is held for the rest of
+    /// the walk instead of composited and dropped, so an intermediate region
+    /// costs its pixels twice — once to decode, once to keep.
+    #[test]
+    fn a_retained_region_is_charged_for_its_retention() {
+        // Decoding a 16 x 16 region costs (16 + ROW_COST) * 16; retaining the
+        // decoded bitmap costs the same again.
+        let each = (16 + ROW_COST) * 16;
+        let stream = empty_region_segment(0, 36, 16, 16);
+
+        let mut budget = Budget::with_limit(each * 2);
+        assert!(decode_embedded_within(&[], &stream, 16, 16, &mut budget).is_ok());
+
+        let mut budget = Budget::with_limit(each * 2 - 1);
+        assert_eq!(
+            decode_embedded_within(&[], &stream, 16, 16, &mut budget),
+            Err(Jbig2Error::WorkLimit),
+        );
+    }
+
+    /// An intermediate refinement region (type 40) "must refer to one other
+    /// region segment" (8.2 step 5 e): with nothing named there is no buffer
+    /// for it to rewrite, and unlike its immediate twin it has no page-reading
+    /// fallback in 7.4.7.4's terms — a page-refining segment that composites
+    /// nothing would be meaningless.
+    #[test]
+    fn an_intermediate_refinement_region_must_name_a_retained_region() {
         let mut data = Vec::new();
         data.extend_from_slice(&1u32.to_be_bytes());
         data.extend_from_slice(&1u32.to_be_bytes());
@@ -802,7 +1256,9 @@ mod tests {
         stream.extend_from_slice(&data);
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
-            Err(Jbig2Error::Unimplemented("intermediate region")),
+            Err(Jbig2Error::Malformed(
+                "intermediate refinement region must name exactly one retained region",
+            )),
         );
     }
 
@@ -840,6 +1296,105 @@ mod tests {
         let page = decode_embedded(&[], &stream, 8, 8).expect("page");
         assert_eq!((page.width(), page.height()), (8, 8));
         assert_eq!(page.get(0, 0), 0);
+    }
+
+    /// A pattern dictionary and the halftone region drawing from it, end to
+    /// end through the page walk: the dictionary is decoded and kept by
+    /// segment number, the region finds it through its referred-to list, and
+    /// the finished region composites onto the page like any other.
+    ///
+    /// The two combination operators in play are deliberately different. The
+    /// region's flags say HDEFPIXEL 1 with HCOMBOP XNOR, which writes each
+    /// pattern verbatim over the ones background — OR there would have left
+    /// solid ink. The region information field then says REPLACE, which puts
+    /// the region onto the page as-is at (2, 1).
+    #[test]
+    fn decodes_a_halftone_page_end_to_end() {
+        let dot = glyph(&["000", "010", "000"]);
+        let ring = glyph(&["111", "101", "111"]);
+        let dict = pattern_dict_segment(&[dot.clone(), ring.clone()], false);
+
+        // Two patterns take one gray-scale plane, and GI = (0 1): the grid is
+        // axis-aligned with a step of three pixels (HRX = 768), so the dot
+        // lands at region (0, 0) and the ring at (3, 0).
+        let plane = glyph(&["01"]);
+        let coded = encode_generic_sequence(&[&plane], &GenericParams::nominal(0), None);
+        let region = halftone_segment((6, 3), (2, 1), 4, 0xB0, (2, 1, 0, 0, 768, 0), &coded);
+
+        let mut stream = page_info_segment(0, (10, 6));
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 22, &[1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 10, 6).expect("page");
+        expect_at(&page, &dot, 2, 1);
+        expect_at(&page, &ring, 5, 1);
+        assert_eq!(page.get(0, 0), 0, "outside the region");
+        assert_eq!(page.get(9, 5), 0);
+    }
+
+    /// A lossless halftone region (type 23) composites exactly like an
+    /// immediate one; only the encoder's promise about fidelity differs.
+    #[test]
+    fn a_lossless_halftone_region_paints_too() {
+        let ring = glyph(&["111", "101", "111"]);
+        let dict = pattern_dict_segment(&[glyph(&["000", "000", "000"]), ring.clone()], false);
+        let plane = glyph(&["1"]);
+        let coded = encode_generic_sequence(&[&plane], &GenericParams::nominal(0), None);
+        let region = halftone_segment((3, 3), (1, 2), 0, 0, (1, 1, 0, 0, 768, 0), &coded);
+
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 23, &[1], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+
+        let page = decode_embedded(&[], &stream, 8, 8).expect("page");
+        expect_at(&page, &ring, 1, 2);
+    }
+
+    /// A pattern dictionary carries no pixels of its own, so a stream holding
+    /// one and nothing else decodes to a blank page rather than to a refusal:
+    /// the patterns are kept for whichever halftone region names them.
+    #[test]
+    fn a_pattern_dictionary_segment_is_kept_rather_than_refused() {
+        let dict = pattern_dict_segment(&[glyph(&["11", "11"])], false);
+        let mut stream = page_info_segment(0, (8, 8));
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        let page = decode_embedded(&[], &stream, 8, 8).expect("page");
+        assert_eq!(page.get(0, 0), 0);
+    }
+
+    /// 7.4.5.2 step 2 speaks of *the* referred-to pattern dictionary, so a
+    /// halftone region naming none — or two — has no single dictionary to
+    /// mean, and painting from a guess would be wrong either way.
+    #[test]
+    fn a_halftone_region_must_name_exactly_one_pattern_dictionary() {
+        let want = Err(Jbig2Error::Malformed(
+            "halftone region must name exactly one pattern dictionary",
+        ));
+
+        let region = halftone_segment((4, 4), (0, 0), 0, 0, (1, 1, 0, 0, 256, 0), &[]);
+        let mut stream = header(0, 22, &[], 1, region.len() as u32);
+        stream.extend_from_slice(&region);
+        assert_eq!(decode_embedded(&[], &stream, 8, 8), want, "no dictionary");
+
+        let dict = pattern_dict_segment(&[glyph(&["1"])], false);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&header(1, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        stream.extend_from_slice(&header(2, 16, &[], 1, dict.len() as u32));
+        stream.extend_from_slice(&dict);
+        let region = halftone_segment((4, 4), (0, 0), 0, 0, (1, 1, 0, 0, 256, 0), &[]);
+        stream.extend_from_slice(&header(3, 22, &[1, 2], 1, region.len() as u32));
+        stream.extend_from_slice(&region);
+        assert_eq!(
+            decode_embedded(&[], &stream, 8, 8),
+            want,
+            "two dictionaries"
+        );
     }
 
     /// A table segment whose bytes are not a table is a malformed stream, not a
@@ -1160,7 +1715,7 @@ mod tests {
     #[test]
     fn a_narrow_region_of_enormous_height_is_refused() {
         for width in [0u32, 1, 2] {
-            let stream = empty_region_segment(0, width, u32::MAX);
+            let stream = empty_region_segment(0, 38, width, u32::MAX);
             assert!(stream.len() < 64, "the demand is {} bytes", stream.len());
             assert_eq!(
                 decode_embedded(&[], &stream, 8, 8),
@@ -1213,7 +1768,7 @@ mod tests {
         // coded, because the charge is made from the declared dimensions.
         let each = (16 + ROW_COST) * 16;
         let mut stream = empty_mmr_region_segment(0, 16, 16);
-        stream.extend_from_slice(&empty_region_segment(1, 16, 16));
+        stream.extend_from_slice(&empty_region_segment(1, 38, 16, 16));
 
         let mut budget = Budget::with_limit(each * 2);
         assert!(decode_embedded_within(&[], &stream, 16, 16, &mut budget).is_ok());
@@ -1285,7 +1840,7 @@ mod tests {
         let each = (16 + ROW_COST) * 16;
         let mut stream = Vec::new();
         for number in 0..4u32 {
-            stream.extend_from_slice(&empty_region_segment(number, 16, 16));
+            stream.extend_from_slice(&empty_region_segment(number, 38, 16, 16));
         }
 
         let mut budget = Budget::with_limit(each * 4);
@@ -1303,8 +1858,8 @@ mod tests {
     #[test]
     fn globals_draw_on_the_same_budget_as_the_page() {
         let each = (16 + ROW_COST) * 16;
-        let globals = empty_region_segment(0, 16, 16);
-        let stream = empty_region_segment(1, 16, 16);
+        let globals = empty_region_segment(0, 38, 16, 16);
+        let stream = empty_region_segment(1, 38, 16, 16);
 
         let mut budget = Budget::with_limit(each * 2);
         assert!(decode_embedded_within(&globals, &stream, 16, 16, &mut budget).is_ok());
@@ -1407,7 +1962,7 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed(
-                "referred-to segment supplies neither symbols nor a table",
+                "referred-to segment supplies no symbols, patterns, table, or retained region",
             )),
         );
     }
@@ -1423,7 +1978,7 @@ mod tests {
         assert_eq!(
             decode_embedded(&[], &stream, 8, 8),
             Err(Jbig2Error::Malformed(
-                "referred-to segment supplies neither symbols nor a table",
+                "referred-to segment supplies no symbols, patterns, table, or retained region",
             )),
         );
     }
@@ -1457,15 +2012,29 @@ mod tests {
 
         let within = vec![1u32; 8_192];
         assert_eq!(
-            gather_referred_to(&store, &tables, &within, &mut Budget::new())
-                .map(|r| r.symbols.len()),
+            gather_referred_to(
+                &store,
+                &tables,
+                &HashMap::new(),
+                &HashMap::new(),
+                &within,
+                &mut Budget::new()
+            )
+            .map(|r| r.symbols.len()),
             Ok(65_536),
         );
 
         let beyond = vec![1u32; 8_193];
         assert_eq!(
-            gather_referred_to(&store, &tables, &beyond, &mut Budget::new())
-                .map(|r| r.symbols.len()),
+            gather_referred_to(
+                &store,
+                &tables,
+                &HashMap::new(),
+                &HashMap::new(),
+                &beyond,
+                &mut Budget::new()
+            )
+            .map(|r| r.symbols.len()),
             Err(Jbig2Error::Malformed("symbol count exceeds the limit")),
         );
     }

@@ -213,6 +213,25 @@ impl Bitmap {
         self.data.copy_within(src..src + stride, dst);
     }
 
+    /// The `width` columns starting at column `left`, over this bitmap's full
+    /// height, as a bitmap of their own.
+    ///
+    /// This is how a collective bitmap is cut back into the pieces it
+    /// concatenated left to right: a symbol dictionary's height class into its
+    /// symbols (T.88 6.5.5 step 4 d)) and a pattern dictionary into its
+    /// patterns (6.7.5 step 4 a)). Columns past the right edge read as 0, the
+    /// value 6.2.5.2 gives the surroundings of a region, so a cut that
+    /// overhangs is padded rather than out of bounds.
+    pub(crate) fn columns(&self, left: u32, width: u32) -> Result<Bitmap, Jbig2Error> {
+        let mut piece = Bitmap::new(width, self.height)?;
+        for y in 0..self.height {
+            for x in 0..width {
+                piece.set(x, y, self.get(i64::from(left) + i64::from(x), i64::from(y)));
+            }
+        }
+        Ok(piece)
+    }
+
     /// Composites `src` onto this bitmap with its top-left corner at `(x, y)`,
     /// clipped to this bitmap's extent.
     ///

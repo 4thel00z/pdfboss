@@ -13,21 +13,29 @@
 //! [`segment`] splits a PDF-embedded stream into the segments of clause 7;
 //! [`generic`] decodes a region of pixels out of the arithmetic decoder, which
 //! is the procedure every other region type is ultimately built from;
-//! [`huffman`] is the prefix-code table machinery of Annex B, which the
-//! Huffman variant of the format uses wherever the arithmetic variant reaches
-//! for [`arith_int`]; [`symbol_dict`] and [`text_region`] are the pair a
-//! scanned page of text is actually made of, and each decodes both variants;
-//! and [`page`] walks a segment sequence, compositing each region onto the
-//! page.
+//! [`refinement`] decodes a region against a reference bitmap it is expected
+//! to resemble (6.3); [`huffman`] is the prefix-code table machinery of
+//! Annex B, which the Huffman variant of the format uses wherever the
+//! arithmetic variant reaches for [`arith_int`]; [`symbol_dict`] and
+//! [`text_region`] are the pair a scanned page of text is actually made of,
+//! and each decodes both variants along with the refinement each may embed —
+//! per placed instance in a text region (6.4.11), per coded symbol in a
+//! dictionary (SDREFAGG, 6.5.8.2); [`halftone`] is the corresponding pair for
+//! tone — a pattern dictionary and the halftone region that draws its
+//! patterns over a grid (6.6, 6.7, with the gray-scale image coding of
+//! Annex C between them); and [`page`] walks a segment sequence, compositing
+//! each region onto the page.
 //!
-//! What that leaves undecoded is two things, both refused by name. A symbol
-//! instance or a dictionary symbol may be coded as a *refinement* of another
-//! bitmap rather than outright (6.3, SDREFAGG and SBREFINE), and a region of
-//! greyscale-like tone may be coded as a halftone over a pattern dictionary
-//! (6.6, 6.7). Everything else a scanner emits — generic regions in all four
-//! templates, symbol dictionaries, text regions, custom code tables, and the
-//! MMR coding any of them may use in place of the arithmetic decoder — decodes
-//! here.
+//! Nothing in the segment type table (7.3) is left undecoded. The last gap to
+//! close was the intermediate region segments: [`page`] retains each one's
+//! bitmap — the auxiliary buffer of 8.2 — instead of compositing it, hands it
+//! to the refinement region that names it as that segment's reference
+//! (7.4.7.4), and composites the refined result. So generic regions in all
+//! four templates, symbol dictionaries with and without refinement/aggregate
+//! coding, text regions and their instance refinements, refinement regions
+//! over the page or over a retained region, pattern dictionaries and halftone
+//! regions, custom code tables, and the MMR coding any of them may use in
+//! place of the arithmetic decoder all decode here.
 //!
 //! One region coding is not decoded here at all. A generic region may say that
 //! its pixels are coded with the two-dimensional facsimile scheme of ITU-T T.6
@@ -47,6 +55,7 @@ pub(crate) mod arith_int;
 pub(crate) mod bitmap;
 pub(crate) mod budget;
 pub(crate) mod generic;
+pub(crate) mod halftone;
 pub(crate) mod huffman;
 pub(crate) mod mq;
 pub(crate) mod page;

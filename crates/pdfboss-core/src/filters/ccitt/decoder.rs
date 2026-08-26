@@ -104,6 +104,34 @@ pub(crate) fn decode(data: &[u8], params: &Params) -> Result<Bitmap, CcittError>
     }
 }
 
+/// [`decode`] for a stream that carries several images end to end, reporting
+/// how many bytes this one consumed alongside the bitmap.
+///
+/// The JBIG2 gray-scale image procedure (ITU-T T.88 Annex C) is the caller
+/// that needs it: the bitplanes of one image are consecutive facsimile
+/// streams, each closed by an end-of-facsimile block because nothing else
+/// says where it stops, and each beginning on the byte boundary after the
+/// previous one — T.88 6.2.6 has every invocation consume a whole number of
+/// bytes. So after the stated rows are painted, the terminator is consumed if
+/// it is present, and the count is rounded up to the byte the next image
+/// starts on.
+///
+/// A stated row count is required. The "as many rows as the data holds"
+/// reading of 0 cannot delimit one image of several — it would read them all
+/// as one — and no caller of this form wants it.
+pub(crate) fn decode_consumed(data: &[u8], params: &Params) -> Result<(Bitmap, usize), CcittError> {
+    check_dimensions(params.columns, params.rows)?;
+    if params.rows == 0 {
+        return Err(CcittError::BadParameter(
+            "a consumed-length decode needs a stated row count",
+        ));
+    }
+    let mut rows = Rows::new(data, params);
+    let bm = rows.paint(params.rows)?;
+    rows.consume_eols();
+    Ok((bm, rows.r.bit_pos().div_ceil(8)))
+}
+
 /// Refuses dimensions no facsimile decode may be attempted at.
 ///
 /// Separate from [`decode`] so that a caller holding a resource of its own can
@@ -168,7 +196,7 @@ impl<'a> Rows<'a> {
     ///
     /// A stream holding fewer rows than that leaves the rest white, which is
     /// what makes both truncation and an early terminator harmless.
-    fn paint(mut self, height: u32) -> Result<Bitmap, CcittError> {
+    fn paint(&mut self, height: u32) -> Result<Bitmap, CcittError> {
         let mut out = Bitmap::new(self.columns, height).map_err(|_| CcittError::TooLarge {
             width: self.columns,
             height,
