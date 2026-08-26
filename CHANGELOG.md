@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.1](https://github.com/4thel00z/pdfboss/compare/v0.19.0...v0.19.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **core:** run AES rounds on the CPU's AES instructions ([#86](https://github.com/4thel00z/pdfboss/issues/86)) ([844392f](https://github.com/4thel00z/pdfboss/commit/844392fcb88bd583dfe9e38a4a26db60cf0c4649))
+
+
+### Documentation
+
+* **python:** separate stub docstrings from the following method ([9758c61](https://github.com/4thel00z/pdfboss/commit/9758c61f8f1895e9db3d8d8a86f72961a233f910))
+
 ## [0.19.0](https://github.com/4thel00z/pdfboss/compare/v0.18.0...v0.19.0) (2026-08-26)
 
 
