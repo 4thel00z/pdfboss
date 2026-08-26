@@ -51,3 +51,10 @@ pub fn write_real(value: f64, out: &mut Vec<u8>) {
     let unused = (value, out);
     todo!("write real: {unused:?}")
 }
+
+/// Like [`write_real`], for `f32` values (content-stream operands): the
+/// shortest decimal that parses back to the identical `f32`.
+pub fn write_real_f32(value: f32, out: &mut Vec<u8>) {
+    let unused = (value, out);
+    todo!("write f32: {unused:?}")
+}

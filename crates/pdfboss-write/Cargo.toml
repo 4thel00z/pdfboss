@@ -17,3 +17,5 @@ png = "0.18"
 
 [dev-dependencies]
 pdfboss-render = { workspace = true }
+pdfboss-text = { workspace = true }
+pdfboss-output = { workspace = true }
