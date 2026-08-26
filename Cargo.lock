@@ -1196,6 +1196,7 @@ dependencies = [
  "pdfboss-output",
  "pdfboss-render",
  "pdfboss-testkit",
+ "pdfboss-write",
  "reqwest",
  "thiserror",
  "tokio",

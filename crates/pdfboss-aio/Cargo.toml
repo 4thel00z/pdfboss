@@ -10,6 +10,7 @@ keywords.workspace = true
 
 [dependencies]
 pdfboss-core = { workspace = true }
+pdfboss-write = { workspace = true, optional = true }
 tokio = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
@@ -20,6 +21,8 @@ reqwest = { workspace = true, optional = true, features = ["stream"] }
 [features]
 # Remote documents over HTTP range requests.
 http = ["dep:reqwest"]
+# Streaming created documents into tokio writers.
+write = ["dep:pdfboss-write"]
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }

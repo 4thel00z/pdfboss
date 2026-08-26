@@ -11,10 +11,12 @@ use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use pdfboss_core::{Dict, Name, ObjRef, Object, Stream};
+use pdfboss_core::crypt::Sha256;
+use pdfboss_core::{block_on, Dict, Name, ObjRef, Object, Stream};
 
 use crate::error::{Error, Result};
 use crate::ser::{serialize_dict, serialize_object};
+use crate::sink::{AsyncByteSink, Immediate};
 
 /// Which cross-reference flavor `finish` emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -147,6 +149,25 @@ impl Writer {
     /// registered info dictionary, and a `/ID` pair derived from a
     /// SHA-256 of the emitted body.
     pub fn finish(self, root: ObjRef) -> Result<Vec<u8>> {
+        block_on(self.finish_into_with(root, Vec::new()))
+    }
+
+    /// [`Writer::finish`] streaming into a [`std::io::Write`]: the same
+    /// bytes, delivered in bounded chunks, so the whole file never sits in
+    /// one buffer. Unlike `finish`, an error can leave a prefix of the
+    /// file already written to `out`. No flush is performed.
+    pub fn finish_into(self, root: ObjRef, out: impl Write) -> Result<()> {
+        block_on(self.finish_into_with(root, Immediate(out)))?;
+        Ok(())
+    }
+
+    /// [`Writer::finish`] streaming into any [`AsyncByteSink`] — the
+    /// asynchronous twin of [`Writer::finish_into`], and the one emission
+    /// implementation all three finishes drive. Bytes arrive in bounded
+    /// chunks (per header, object and cross-reference section; a stream's
+    /// data is its own chunk). An error can leave a prefix of the file
+    /// already written. Hands the sink back unflushed.
+    pub async fn finish_into_with<S: AsyncByteSink>(self, root: ObjRef, sink: S) -> Result<S> {
         let Writer {
             options,
             slots,
@@ -164,10 +185,45 @@ impl Writer {
                 Slot::Filled(obj) => bodies.push(obj),
             }
         }
+        let mut emit = Emit::new(sink);
         match options.xref {
-            XrefStyle::Table => finish_table(options, &bodies, root, info),
-            XrefStyle::Stream => finish_stream(options, &bodies, root, info),
+            XrefStyle::Table => emit_table(options, &bodies, root, info, &mut emit).await?,
+            XrefStyle::Stream => emit_stream(options, &bodies, root, info, &mut emit).await?,
         }
+        Ok(emit.sink)
+    }
+}
+
+/// Counts and hashes every byte on its way to the sink: cross-reference
+/// offsets come from `count` and the `/ID` digest from `hasher`, so
+/// emission never needs the finished file in one buffer.
+struct Emit<S> {
+    sink: S,
+    count: usize,
+    hasher: Sha256,
+}
+
+impl<S: AsyncByteSink> Emit<S> {
+    fn new(sink: S) -> Emit<S> {
+        Emit {
+            sink,
+            count: 0,
+            hasher: Sha256::new(),
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.hasher.update(bytes);
+        self.count += bytes.len();
+        self.sink.write_all(bytes).await
+    }
+
+    /// The `/ID` array at this point of emission: two identical 16-byte
+    /// strings from a SHA-256 of every byte written so far.
+    fn file_id(&self) -> Object {
+        let digest = self.hasher.clone().finalize();
+        let id = Object::String(digest[..16].to_vec());
+        Object::Array(vec![id.clone(), id])
     }
 }
 
@@ -184,31 +240,33 @@ enum Row {
 
 /// Emits the classic-table flavor: bodies, `xref` table, `trailer`
 /// dictionary, `startxref` and `%%EOF`.
-fn finish_table(
+async fn emit_table<S: AsyncByteSink>(
     options: WriteOptions,
     bodies: &[Object],
     root: ObjRef,
     info: Option<ObjRef>,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    write_header(&mut out, options.version);
+    emit: &mut Emit<S>,
+) -> Result<()> {
+    let mut head = Vec::new();
+    write_header(&mut head, options.version);
+    emit.write(&head).await?;
     let mut offsets = Vec::with_capacity(bodies.len());
     for (index, body) in bodies.iter().enumerate() {
-        offsets.push(out.len());
-        write_indirect(&mut out, index as u32 + 1, body)?;
+        offsets.push(emit.count);
+        write_indirect(emit, index as u32 + 1, body).await?;
     }
-    let id = file_id(&out);
-    let xref_off = out.len();
-    out.extend_from_slice(format!("xref\n0 {}\n", bodies.len() + 1).as_bytes());
-    out.extend_from_slice(b"0000000000 65535 f\r\n");
+    let id = emit.file_id();
+    let xref_off = emit.count;
+    let mut section = format!("xref\n0 {}\n", bodies.len() + 1).into_bytes();
+    section.extend_from_slice(b"0000000000 65535 f\r\n");
     for offset in offsets {
-        out.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
+        section.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
     }
-    out.extend_from_slice(b"trailer\n");
+    section.extend_from_slice(b"trailer\n");
     let trailer = trailer_dict(bodies.len() as i64 + 1, root, info, id);
-    serialize_dict(&trailer, &mut out)?;
-    out.extend_from_slice(format!("\nstartxref\n{xref_off}\n%%EOF").as_bytes());
-    Ok(out)
+    serialize_dict(&trailer, &mut section)?;
+    section.extend_from_slice(format!("\nstartxref\n{xref_off}\n%%EOF").as_bytes());
+    emit.write(&section).await
 }
 
 /// Emits the cross-reference-stream flavor: bodies (non-stream objects
@@ -216,14 +274,16 @@ fn finish_table(
 /// stream as the last object, `startxref` and `%%EOF`. Object numbering is
 /// dense from 0 through the xref stream itself, so `/Index` is never
 /// needed.
-fn finish_stream(
+async fn emit_stream<S: AsyncByteSink>(
     options: WriteOptions,
     bodies: &[Object],
     root: ObjRef,
     info: Option<ObjRef>,
-) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    write_header(&mut out, options.version);
+    emit: &mut Emit<S>,
+) -> Result<()> {
+    let mut head = Vec::new();
+    write_header(&mut head, options.version);
+    emit.write(&head).await?;
     let user_count = bodies.len() as u32;
 
     let packed: Vec<u32> = if options.object_streams {
@@ -252,8 +312,8 @@ fn finish_stream(
         if matches!(rows[index], Row::Packed { .. }) {
             continue;
         }
-        rows[index] = Row::Top(field_offset(out.len())?);
-        write_indirect(&mut out, index as u32 + 1, body)?;
+        rows[index] = Row::Top(field_offset(emit.count)?);
+        write_indirect(emit, index as u32 + 1, body).await?;
     }
 
     let mut container_offsets = Vec::with_capacity(chunks.len());
@@ -263,17 +323,13 @@ fn finish_stream(
             .map(|&num| (num, &bodies[num as usize - 1]))
             .collect();
         let container = build_objstm(&pairs, options.compress)?;
-        container_offsets.push(field_offset(out.len())?);
-        write_indirect(
-            &mut out,
-            user_count + c as u32 + 1,
-            &Object::Stream(container),
-        )?;
+        container_offsets.push(field_offset(emit.count)?);
+        write_indirect(emit, user_count + c as u32 + 1, &Object::Stream(container)).await?;
     }
 
     let xref_num = user_count + chunks.len() as u32 + 1;
-    let id = file_id(&out);
-    let xref_off = field_offset(out.len())?;
+    let id = emit.file_id();
+    let xref_off = field_offset(emit.count)?;
 
     let mut data = Vec::with_capacity(7 * (xref_num as usize + 1));
     push_row(&mut data, 0, 0, 65535);
@@ -295,9 +351,9 @@ fn finish_stream(
         Object::Array(vec![Object::Int(1), Object::Int(4), Object::Int(2)]),
     );
     let data = compress_into(&mut dict, data, options.compress);
-    write_indirect(&mut out, xref_num, &Object::Stream(Stream { dict, data }))?;
-    out.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF").as_bytes());
-    Ok(out)
+    write_indirect(emit, xref_num, &Object::Stream(Stream { dict, data })).await?;
+    emit.write(format!("startxref\n{xref_off}\n%%EOF").as_bytes())
+        .await
 }
 
 /// `%PDF-M.m` plus the binary comment marking the file as 8-bit data.
@@ -309,22 +365,30 @@ fn write_header(out: &mut Vec<u8>, version: (u8, u8)) {
 /// Emits `num 0 obj` through `endobj`. Every top-level `Object::Stream` —
 /// however it entered the writer — is framed as a stream with a direct
 /// `/Length` of its stored byte count; everything else serializes through
-/// [`crate::ser`].
-fn write_indirect(out: &mut Vec<u8>, num: u32, obj: &Object) -> Result<()> {
-    out.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+/// [`crate::ser`]. A stream's data goes to the sink as its own chunk,
+/// borrowed rather than copied; everything else is one chunk per object.
+async fn write_indirect<S: AsyncByteSink>(
+    emit: &mut Emit<S>,
+    num: u32,
+    obj: &Object,
+) -> Result<()> {
+    let mut lead = format!("{num} 0 obj\n").into_bytes();
     match obj {
         Object::Stream(s) => {
             let mut dict = s.dict.clone();
             dict.insert(literal("Length"), Object::Int(s.data.len() as i64));
-            serialize_dict(&dict, out)?;
-            out.extend_from_slice(b"\nstream\n");
-            out.extend_from_slice(&s.data);
-            out.extend_from_slice(b"\nendstream");
+            serialize_dict(&dict, &mut lead)?;
+            lead.extend_from_slice(b"\nstream\n");
+            emit.write(&lead).await?;
+            emit.write(&s.data).await?;
+            emit.write(b"\nendstream\nendobj\n").await
         }
-        direct => serialize_object(direct, out)?,
+        direct => {
+            serialize_object(direct, &mut lead)?;
+            lead.extend_from_slice(b"\nendobj\n");
+            emit.write(&lead).await
+        }
     }
-    out.extend_from_slice(b"\nendobj\n");
-    Ok(())
 }
 
 /// Serializes one object-stream container from `(num, body)` pairs: `2·N`
@@ -358,14 +422,6 @@ fn trailer_dict(size: i64, root: ObjRef, info: Option<ObjRef>, id: Object) -> Di
     }
     trailer.insert(literal("ID"), id);
     trailer
-}
-
-/// The `/ID` array: two identical 16-byte strings from a SHA-256 of every
-/// byte emitted before the cross-reference.
-fn file_id(emitted: &[u8]) -> Object {
-    let digest = pdfboss_core::crypt::sha256(emitted);
-    let id = Object::String(digest[..16].to_vec());
-    Object::Array(vec![id.clone(), id])
 }
 
 /// Flate-compresses `data` and records `/Filter /FlateDecode` in `dict`
@@ -468,14 +524,14 @@ mod tests {
         page
     }
 
-    /// Builds a one-page document around the given content stream, going
-    /// through `put_stream_raw` when `raw` is set.
-    fn skeleton(
+    /// Builds a one-page document around the given content stream without
+    /// finishing it, going through `put_stream_raw` when `raw` is set.
+    fn build(
         options: WriteOptions,
         content_dict: Dict,
         content_data: Vec<u8>,
         raw: bool,
-    ) -> (Vec<u8>, Refs) {
+    ) -> (Writer, Refs) {
         let mut w = Writer::new(options);
         let content = if raw {
             w.put_stream_raw(content_dict, content_data)
@@ -494,9 +550,8 @@ mod tests {
         catalog.insert(name("Type"), Object::Name(name("Catalog")));
         catalog.insert(name("Pages"), Object::Ref(pages));
         let root = w.put(Object::Dict(catalog));
-        let bytes = w.finish(root).expect("minimal document finishes");
         (
-            bytes,
+            w,
             Refs {
                 content,
                 pages,
@@ -504,6 +559,18 @@ mod tests {
                 root,
             },
         )
+    }
+
+    /// [`build`], finished into bytes.
+    fn skeleton(
+        options: WriteOptions,
+        content_dict: Dict,
+        content_data: Vec<u8>,
+        raw: bool,
+    ) -> (Vec<u8>, Refs) {
+        let (w, refs) = build(options, content_dict, content_data, raw);
+        let bytes = w.finish(refs.root).expect("minimal document finishes");
+        (bytes, refs)
     }
 
     fn minimal_pdf(options: WriteOptions) -> (Vec<u8>, Refs) {
@@ -757,6 +824,98 @@ mod tests {
             let (second, again) = minimal_pdf(options);
             assert_eq!(refs.content, again.content);
             assert_eq!(first, second, "options {options:?} must be deterministic");
+        }
+    }
+
+    #[test]
+    fn finish_into_matches_finish() {
+        for options in [table_options(), stream_options(), objstm_options()] {
+            let (bytes, _) = minimal_pdf(options);
+            let (w, refs) = build(options, Dict::new(), CONTENT.to_vec(), false);
+            let mut out = Vec::new();
+            w.finish_into(refs.root, &mut out)
+                .expect("finish_into succeeds");
+            assert_eq!(out, bytes, "options {options:?}");
+        }
+    }
+
+    #[test]
+    fn finish_into_with_matches_finish() {
+        for options in [table_options(), stream_options(), objstm_options()] {
+            let (bytes, _) = minimal_pdf(options);
+            let (w, refs) = build(options, Dict::new(), CONTENT.to_vec(), false);
+            let sink = pdfboss_core::block_on(w.finish_into_with(refs.root, Vec::new()))
+                .expect("finish_into_with succeeds");
+            assert_eq!(sink, bytes, "options {options:?}");
+        }
+    }
+
+    /// Records every chunk it is handed, so tests can see how emission
+    /// arrives — the write happens eagerly, the future is already complete.
+    struct Recording {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl crate::sink::AsyncByteSink for Recording {
+        fn write_all<'a>(
+            &'a mut self,
+            buf: &'a [u8],
+        ) -> pdfboss_core::source::BoxFuture<'a, Result<()>> {
+            self.chunks.push(buf.to_vec());
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+
+    /// Emission must actually stream: many bounded chunks, never one
+    /// whole-file buffer — and their concatenation must be the `finish`
+    /// bytes exactly.
+    #[test]
+    fn emission_arrives_in_bounded_chunks() {
+        for options in [table_options(), stream_options(), objstm_options()] {
+            let (bytes, _) = minimal_pdf(options);
+            let (w, refs) = build(options, Dict::new(), CONTENT.to_vec(), false);
+            let sink = pdfboss_core::block_on(
+                w.finish_into_with(refs.root, Recording { chunks: Vec::new() }),
+            )
+            .expect("finish_into_with succeeds");
+            assert_eq!(sink.chunks.concat(), bytes, "options {options:?}");
+            assert!(
+                sink.chunks.len() > 3,
+                "options {options:?}: emission must arrive in many chunks, got {}",
+                sink.chunks.len()
+            );
+            assert!(
+                sink.chunks.iter().all(|chunk| chunk.len() < bytes.len()),
+                "options {options:?}: no chunk may be the whole file"
+            );
+        }
+    }
+
+    /// The emission future over an owned sink must be `Send + 'static`,
+    /// so it can cross a runtime's `spawn` — the write-side counterpart of
+    /// the source module's by-value rule.
+    #[test]
+    fn finish_into_with_over_an_owned_sink_is_spawnable() {
+        fn assert_send_static<F: std::future::Future + Send + 'static>(_: &F) {}
+
+        let (w, refs) = build(stream_options(), Dict::new(), CONTENT.to_vec(), false);
+        let future = w.finish_into_with(refs.root, Vec::new());
+        assert_send_static(&future);
+        let bytes = pdfboss_core::block_on(future).expect("emission succeeds");
+        assert!(bytes.ends_with(b"%%EOF"));
+    }
+
+    /// An unfilled reserve must surface from the streaming finishes too,
+    /// before any byte reaches the sink.
+    #[test]
+    fn finish_into_with_reports_unfilled_reserves() {
+        let mut w = Writer::new(table_options());
+        let root = w.put(Object::Dict(Dict::new()));
+        let reserved = w.reserve();
+        let sink = Recording { chunks: Vec::new() };
+        match pdfboss_core::block_on(w.finish_into_with(root, sink)) {
+            Err(Error::Unfilled(seen)) => assert_eq!(seen, reserved),
+            other => panic!("expected Unfilled, got {:?}", other.map(|s| s.chunks.len())),
         }
     }
 }

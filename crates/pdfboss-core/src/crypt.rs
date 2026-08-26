@@ -708,33 +708,91 @@ const SHA256_K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// Streaming SHA-256 (FIPS 180-4): feed bytes with [`Sha256::update`],
+/// close with [`Sha256::finalize`]. Public so the writer can hash a file's
+/// body as it emits it, without holding the whole file in memory; the
+/// one-shot [`sha256`] delegates here.
+#[derive(Debug, Clone)]
+pub struct Sha256 {
+    h: [u32; 8],
+    tail: [u8; 64],
+    tail_len: usize,
+    total: u64,
+}
+
+impl Default for Sha256 {
+    fn default() -> Sha256 {
+        Sha256::new()
+    }
+}
+
+impl Sha256 {
+    /// A hasher in the FIPS 180-4 initial state.
+    pub fn new() -> Sha256 {
+        Sha256 {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            tail: [0u8; 64],
+            tail_len: 0,
+            total: 0,
+        }
+    }
+
+    /// Absorbs `input`. Slice boundaries do not affect the digest: any
+    /// sequence of updates whose concatenation is the same message yields
+    /// the same [`Sha256::finalize`] result. Whole blocks are compressed
+    /// straight from `input`; only a partial trailing block is buffered.
+    pub fn update(&mut self, input: &[u8]) {
+        self.total = self.total.wrapping_add(input.len() as u64);
+        let mut input = input;
+        if self.tail_len > 0 {
+            let take = input.len().min(64 - self.tail_len);
+            self.tail[self.tail_len..self.tail_len + take].copy_from_slice(&input[..take]);
+            self.tail_len += take;
+            input = &input[take..];
+            if self.tail_len < 64 {
+                return;
+            }
+            let block = self.tail;
+            sha256_compress(&mut self.h, &block);
+            self.tail_len = 0;
+        }
+        let (blocks, rest) = input.as_chunks::<64>();
+        for block in blocks {
+            sha256_compress(&mut self.h, block);
+        }
+        self.tail[..rest.len()].copy_from_slice(rest);
+        self.tail_len = rest.len();
+    }
+
+    /// Pads and returns the digest of everything absorbed so far.
+    pub fn finalize(mut self) -> [u8; 32] {
+        // Final padding touches at most two blocks: 0x80, zeros, and the
+        // bit length in the last 8 bytes (FIPS 180-4).
+        let mut pad = [0u8; 128];
+        pad[..self.tail_len].copy_from_slice(&self.tail[..self.tail_len]);
+        pad[self.tail_len] = 0x80;
+        let padded = if self.tail_len < 56 { 64 } else { 128 };
+        let bitlen = self.total.wrapping_mul(8);
+        pad[padded - 8..padded].copy_from_slice(&bitlen.to_be_bytes());
+        for block in pad[..padded].as_chunks::<64>().0 {
+            sha256_compress(&mut self.h, block);
+        }
+        let mut out = [0u8; 32];
+        for (i, word) in self.h.iter().enumerate() {
+            out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// SHA-256 of `input` (FIPS 180-4); public so the writer can derive its `/ID`.
 pub fn sha256(input: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let (blocks, tail) = input.as_chunks::<64>();
-    for block in blocks {
-        sha256_compress(&mut h, block);
-    }
-    // Final padding touches at most two blocks: 0x80, zeros, and the bit
-    // length in the last 8 bytes (FIPS 180-4) — the message itself is
-    // hashed in place above, never copied.
-    let mut pad = [0u8; 128];
-    pad[..tail.len()].copy_from_slice(tail);
-    pad[tail.len()] = 0x80;
-    let padded = if tail.len() < 56 { 64 } else { 128 };
-    let bitlen = (input.len() as u64).wrapping_mul(8);
-    pad[padded - 8..padded].copy_from_slice(&bitlen.to_be_bytes());
-    for block in pad[..padded].as_chunks::<64>().0 {
-        sha256_compress(&mut h, block);
-    }
-    let mut out = [0u8; 32];
-    for (i, word) in h.iter().enumerate() {
-        out[4 * i..4 * i + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    hasher.finalize()
 }
 
 fn sha256_compress(h: &mut [u32; 8], block: &[u8; 64]) {
@@ -1317,6 +1375,30 @@ mod tests {
         sha512_compress(&mut via_dispatch, &block128);
         sha512_compress_soft(&mut via_soft, &block128);
         assert_eq!(via_dispatch, via_soft);
+    }
+
+    /// The incremental hasher must match the one-shot digest whatever the
+    /// slice boundaries: odd sizes, block-straddling feeds, empty updates.
+    #[test]
+    fn incremental_sha256_matches_the_one_shot() {
+        let input: Vec<u8> = (0..300u16).map(|i| (i % 251) as u8).collect();
+        for splits in [
+            vec![0, 1, 3, 7, 60, 63, 64, 65, 37],
+            vec![300],
+            vec![128, 128, 44],
+            vec![55, 9, 236],
+        ] {
+            let mut hasher = Sha256::new();
+            let mut fed = 0usize;
+            for len in splits {
+                hasher.update(&input[fed..fed + len]);
+                fed += len;
+            }
+            hasher.update(&input[fed..]);
+            assert_eq!(hasher.finalize(), sha256(&input));
+        }
+        assert_eq!(Sha256::new().finalize(), sha256(b""));
+        assert_eq!(Sha256::default().finalize(), sha256(b""));
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod font;
 pub mod image;
 pub mod pdf;
 pub mod ser;
+pub mod sink;
 pub mod writer;
 
 pub use canvas::{Canvas, CanvasParts, ImageHandle, LineCap, LineJoin};
@@ -33,4 +34,5 @@ pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;
 pub use pdf::{Date, Metadata, Page, PageSize, Pdf};
+pub use sink::{AsyncByteSink, Immediate};
 pub use writer::{WriteOptions, Writer, XrefStyle};

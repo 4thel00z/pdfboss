@@ -10,6 +10,7 @@ use crate::canvas::Canvas;
 use crate::content::serialize_ops;
 use crate::error::{Error, Result};
 use crate::font::Standard14;
+use crate::sink::AsyncByteSink;
 use crate::writer::{WriteOptions, Writer};
 
 /// A page size, in default user-space units (1/72 inch), portrait.
@@ -171,6 +172,30 @@ impl Pdf {
     /// page with no cross-page deduplication — the same raster drawn on
     /// two pages is stored twice.
     pub fn to_bytes(self) -> Result<Vec<u8>> {
+        let (w, root) = self.assemble()?;
+        w.finish(root)
+    }
+
+    /// [`Pdf::to_bytes`] streaming into a [`std::io::Write`]: the same
+    /// bytes, delivered in bounded chunks instead of one buffer. Unlike
+    /// `to_bytes`, an error can leave a prefix of the file already written
+    /// to `out`. No flush is performed.
+    pub fn write_into(self, out: impl std::io::Write) -> Result<()> {
+        let (w, root) = self.assemble()?;
+        w.finish_into(root, out)
+    }
+
+    /// [`Pdf::to_bytes`] streaming into any [`AsyncByteSink`] — the
+    /// asynchronous twin of [`Pdf::write_into`]. An error can leave a
+    /// prefix of the file already written. Hands the sink back unflushed.
+    pub async fn write_into_with<S: AsyncByteSink>(self, sink: S) -> Result<S> {
+        let (w, root) = self.assemble()?;
+        w.finish_into_with(root, sink).await
+    }
+
+    /// Builds the writer every write path finishes: all objects placed,
+    /// the catalog's reference returned alongside.
+    fn assemble(self) -> Result<(Writer, ObjRef)> {
         let Pdf {
             metadata,
             pages,
@@ -251,7 +276,7 @@ impl Pdf {
         catalog.insert(name("Type"), Object::Name(name("Catalog")));
         catalog.insert(name("Pages"), Object::Ref(pages_root));
         let root = w.put(Object::Dict(catalog));
-        w.finish(root)
+        Ok((w, root))
     }
 
     /// Serializes and writes the document to `path`.
@@ -397,5 +422,44 @@ mod tests {
             utc_offset_minutes: -330,
         };
         assert_eq!(date.to_pdf_string(), "D:19991231235958-05'30");
+    }
+
+    /// Two pages with text and an image — enough to exercise fonts,
+    /// XObjects and the reserved page tree through every write path.
+    fn two_page_doc() -> Pdf {
+        let mut first = Page::new(PageSize::A4);
+        first
+            .canvas
+            .text("Streamed parity", 72.0, 720.0, Standard14::Helvetica, 14.0)
+            .expect("ASCII encodes");
+        let image = crate::image::ImageData::gray8(2, 2, vec![0, 85, 170, 255])
+            .expect("2x2 grayscale builds");
+        let handle = first.canvas.add_image(image);
+        first.canvas.draw_image(handle, 72.0, 400.0, 144.0, 144.0);
+        let mut second = Page::new(PageSize::Letter);
+        second
+            .canvas
+            .text("Page two", 72.0, 700.0, Standard14::TimesRoman, 12.0)
+            .expect("ASCII encodes");
+        Pdf {
+            pages: vec![first, second],
+            ..Pdf::default()
+        }
+    }
+
+    /// The three write paths are one assembly and one emission: identical
+    /// bytes whether buffered, streamed into an `io::Write`, or streamed
+    /// into an async sink.
+    #[test]
+    fn write_into_and_write_into_with_match_to_bytes() {
+        let bytes = two_page_doc().to_bytes().expect("to_bytes succeeds");
+        let mut via_io = Vec::new();
+        two_page_doc()
+            .write_into(&mut via_io)
+            .expect("write_into succeeds");
+        assert_eq!(via_io, bytes);
+        let via_sink = pdfboss_core::block_on(two_page_doc().write_into_with(Vec::new()))
+            .expect("write_into_with succeeds");
+        assert_eq!(via_sink, bytes);
     }
 }
