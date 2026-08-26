@@ -224,8 +224,23 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
     let mut spans = exec.spans;
     for span in &mut spans {
         span.page = page.index;
-        mark_underline_and_strikethrough(span, &exec.rulings);
     }
+    // The decoration pass touches only pages that draw horizontal rulings,
+    // and each span consults only the rulings inside its vertical band —
+    // sorting once keeps a page full of table borders from turning the
+    // pass into spans × rulings work.
+    let mut horizontals: Vec<&Ruling> = exec
+        .rulings
+        .iter()
+        .filter(|r| r.start.y == r.end.y)
+        .collect();
+    if !horizontals.is_empty() {
+        horizontals.sort_by(|a, b| a.start.y.total_cmp(&b.start.y));
+        for span in &mut spans {
+            mark_underline_and_strikethrough(span, &horizontals);
+        }
+    }
+    drop(horizontals);
     (spans, exec.rulings, exec.report)
 }
 
@@ -244,12 +259,13 @@ const STRIKETHROUGH_HIGH: f32 = 0.6;
 /// neighbour's underline running past a word boundary is not this span's.
 const DECORATED_MIN_OVERLAP: f32 = 0.6;
 
-/// Sets `underline`/`strikethrough` from the page's horizontal rulings:
-/// underline when one sits just below the baseline covering most of the
-/// span, strikethrough when one crosses the x-height band. Vertical
-/// writing is left unmarked — its decorations are vertical lines beside
-/// the text, which are indistinguishable from column rules here.
-fn mark_underline_and_strikethrough(span: &mut TextSpan, rulings: &[Ruling]) {
+/// Sets `underline`/`strikethrough` from the page's horizontal rulings
+/// (pre-sorted by y): underline when one sits just below the baseline
+/// covering most of the span, strikethrough when one crosses the x-height
+/// band. Vertical writing is left unmarked — its decorations are vertical
+/// lines beside the text, which are indistinguishable from column rules
+/// here.
+fn mark_underline_and_strikethrough(span: &mut TextSpan, horizontals: &[&Ruling]) {
     if span.vertical || span.size <= 0.0 {
         return;
     }
@@ -257,19 +273,22 @@ fn mark_underline_and_strikethrough(span: &mut TextSpan, rulings: &[Ruling]) {
     if width <= 0.0 {
         return;
     }
-    for r in rulings {
-        if r.start.y != r.end.y {
-            continue;
+    let low = span.y - UNDERLINE_BELOW * span.size;
+    let high = span.y + STRIKETHROUGH_HIGH * span.size;
+    let first = horizontals.partition_point(|r| r.start.y < low);
+    for r in &horizontals[first..] {
+        if r.start.y > high {
+            break;
         }
         let overlap = r.end.x.min(span.bbox.x1) - r.start.x.max(span.bbox.x0);
         if overlap < DECORATED_MIN_OVERLAP * width {
             continue;
         }
         let above = r.start.y - span.y;
-        if above >= -UNDERLINE_BELOW * span.size && above <= UNDERLINE_ABOVE * span.size {
+        if above <= UNDERLINE_ABOVE * span.size {
             span.underline = true;
         }
-        if above >= STRIKETHROUGH_LOW * span.size && above <= STRIKETHROUGH_HIGH * span.size {
+        if above >= STRIKETHROUGH_LOW * span.size {
             span.strikethrough = true;
         }
     }
