@@ -6,4 +6,4 @@ render at that commit's parent, `<hash>-after.png` the render at the commit.
 
 | Commit | Failure |
 | --- | --- |
-| `6c54436` | Group 3 fax stream with fill bits before every end-of-line pattern and `/EndOfLine` unset decoded zero rows; the page's only image was skipped as truncated and the page rendered blank. |
+| `6c54436` | Group 3 fax stream with fill bits before every end-of-line pattern and `/EndOfLine` unset decoded zero rows; the page's only image was skipped as truncated and painted as zero samples — a solid black page under `/DeviceGray`. |
