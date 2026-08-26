@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.19.0](https://github.com/4thel00z/pdfboss/compare/v0.18.0...v0.19.0) (2026-08-26)
+
+
+### Features
+
+* **text:** expose styled spans with bbox, decorations, color and page ([#83](https://github.com/4thel00z/pdfboss/issues/83)) ([9529f73](https://github.com/4thel00z/pdfboss/commit/9529f73dd03d5a19d24cde6e841b2079f0b49169))
+
+
+### Bug Fixes
+
+* **core:** step over fill before an end-of-line pattern under one-dimensional coding ([#82](https://github.com/4thel00z/pdfboss/issues/82)) ([ac63897](https://github.com/4thel00z/pdfboss/commit/ac63897989ad0bed421c38c42a4de611503eba0a))
+
+
+### Documentation
+
+* rename the failure-mode images to the squash hash that landed on main ([424cb72](https://github.com/4thel00z/pdfboss/commit/424cb726844b59e6c63d178816299642dd587716))
+
 ## [0.18.0](https://github.com/4thel00z/pdfboss/compare/v0.17.1...v0.18.0) (2026-08-26)
 
 
