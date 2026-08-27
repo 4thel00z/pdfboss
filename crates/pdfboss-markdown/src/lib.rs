@@ -3,5 +3,6 @@
 
 pub mod block;
 pub mod report;
+mod wrap;
 
 pub use report::Report;
