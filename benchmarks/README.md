@@ -63,6 +63,7 @@ non-crash rate and a first-page ink check.
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|---|
 | pdfboss | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | this project (Rust) |
 | PyMuPDF | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | C-backed |
+| pdf_oxide | ✓ | ✓ | | | | | | | Rust-backed |
 | pypdf | ✓ | ✓ | | | | | | | pure Python; no rasterizer |
 | pdfplumber | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | text via pdfminer.six, rasterizing via pdfium |
 | pypdfium2 | | | ✓ | ✓ | ref | ✓ | ✓ | ✓ | pdfium bindings; text API used by bench_memory.py |
@@ -359,7 +360,7 @@ predefined-CMap feature work will be measured against.
 ## Running
 
 ```bash
-pip install pypdf pdfminer.six pdfplumber pikepdf pymupdf pypdfium2 pillow numpy matplotlib
+pip install pypdf pdfminer.six pdfplumber pikepdf pymupdf pypdfium2 pdf_oxide pillow numpy matplotlib
 pip install pdfboss-fonts               # substitute faces for the full fonts tier
 maturin develop --release           # build pdfboss into the venv
 python benchmarks/bench.py          /path/to/pdfs --sample 40 --repeat 3

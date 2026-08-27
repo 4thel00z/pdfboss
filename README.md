@@ -97,12 +97,12 @@ Against other Python PDF libraries over 40 real-world PDFs (pages/sec, higher is
   <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF**: 9,000 pages/s extracting text against PyMuPDF's 449 (about 20×), and 357,000 pages/s opening + parsing against 99,000 (about 3.6×).
+**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF and the Rust-backed pdf_oxide**: 6,700 pages/s extracting text against PyMuPDF's 460 (about 15×) and pdf_oxide's 300 (about 22×), and 383,000 pages/s opening + parsing against pdf_oxide's 173,000 (about 2.2×).
 
 <details>
 <summary><strong>Method and fine print</strong></summary>
 
-Best-of-3 per file, aggregated over the files every library handled. The pure-Python readers are 95× to 500× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
+Best-of-3 per file, aggregated over the files every library handled; measured with pdfboss 0.20.0 on an Apple M3 Pro, every table on this page from one session. The pure-Python readers are roughly 70× to 360× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed; since 0.19.0 every span also carries its style (font, weight, decorations, color), which costs the extraction rows a few percent against older tables. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
@@ -110,7 +110,7 @@ Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks
 
 ### Extraction quality
 
-On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) — the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons — pdfboss reads the whole corpus in about a seventh of a second, over 3× faster than the fastest competing Markdown engine, with a mid-field reading-order score (**NID**, higher is better):
+On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) — the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons — pdfboss reads the whole corpus in about a seventh of a second, about 3× faster than the fastest competing Markdown engine, with a mid-field reading-order score (**NID**, higher is better):
 
 | Engine | Reading order (NID) | Output | Time (200 docs) |
 |---|--:|---|--:|
@@ -118,8 +118,8 @@ On [opendataloader-bench](https://github.com/opendataloader-project/opendataload
 | liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
 | opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
 | pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
-| **pdfboss** (`md`) | **0.877** | Markdown | **0.14s** |
-| **pdfboss** | **0.868** | plain text | **0.13s** |
+| **pdfboss** (`md`) | **0.877** | Markdown | **0.15s** |
+| **pdfboss** | **0.868** | plain text | **0.16s** |
 | markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
 
 <details>
@@ -133,23 +133,23 @@ Quality rows come from the benchmark's own evaluator over all 200 documents. The
 
 ### Rendering
 
-A renderer that skips work looks fast, so every file is certified before the stopwatch starts: any page that reports dropped or approximated content excludes its file, and an ink-coverage gate across libraries catches work skipped silently. 37 of the 40 files (864 pages) certify:
+A renderer that skips work looks fast, so every file is certified before the stopwatch starts: any page that reports dropped or approximated content excludes its file, and an ink-coverage gate across libraries catches work skipped silently. 38 of the 40 files (888 pages) certify:
 
 | Library | pages/sec |
 |---|--:|
-| pypdfium2 | 125.9 |
-| pdfboss | 112.0 |
-| pdfplumber (via pdfium) | 104.5 |
-| PyMuPDF | 94.8 |
+| pypdfium2 | 122.0 |
+| pdfboss | 112.7 |
+| pdfplumber (via pdfium) | 103.9 |
+| PyMuPDF | 91.9 |
 
-pdfboss rasterizes the mixed corpus second only to pdfium itself: about 11% behind it, ahead of pdfplumber's pdfium stack and PyMuPDF, with no C in it.
+pdfboss rasterizes the mixed corpus second only to pdfium itself — about 8% behind it, ahead of pdfplumber's pdfium stack and PyMuPDF — with no C in it.
 
 <details>
 <summary><strong>Certification and stability details</strong></summary>
 
-pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees: a blank page renders instantly and means nothing. The three annotation-appearance files and the tiling-pattern file the earlier sample excluded now certify, leaving only three files whose fonts lack a glyph for a code the page draws.
+pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees: a blank page renders instantly and means nothing. Only two files fail certification now, each over a font that lacks a glyph for a code the page draws.
 
-Caching loaded shadings and patterns across paints and reworking the rasterizer's hot paths moved pdfboss up a place since the last table, with every output byte identical. Compare the rows against each other, not against another machine's numbers. Across three back-to-back passes every library repeated within 1.6%, the pdfboss-to-pdfium ratio held within 0.5%, and the ordering never moved.
+Compare the rows against each other, not against another machine's numbers.
 
 Reproduce with [`benchmarks/bench_render.py`](benchmarks/README.md).
 
@@ -161,17 +161,17 @@ Scans are the other half of the world's PDFs: one full-page bilevel image per pa
 
 | Library | pages/sec | Ink on page 1 |
 |---|--:|--:|
-| pdfboss | 88.1 | 4.83% |
-| pdfplumber (via pdfium) | 57.8 | 4.87% |
-| PyMuPDF | 54.5 | 4.82% |
-| pypdfium2 | 52.6 | 4.85% |
+| pdfboss | 66.4 | 4.71% |
+| pypdfium2 | 56.5 | 4.85% |
+| pdfplumber (via pdfium) | 56.1 | 4.87% |
+| PyMuPDF | 55.6 | 4.82% |
 
-**pdfboss is the fastest of the four here, at about 1.5× the C-backed renderers**, and the only one of them with no C in it.
+**pdfboss is the fastest of the four, about 18% ahead of the C-backed renderers**, and the only one of them with no C in it.
 
 <details>
 <summary><strong>Where the time goes, and why the ink column matters</strong></summary>
 
-All four are timed in one pass, and the ratio has landed within a few percent of 1.5× on every run (1.49× to 1.56×), while the absolute numbers varied by half as the machine warmed and cooled. Compare the four rows against each other, not against another machine's numbers.
+All four are timed in one pass. The absolute numbers vary by half as the machine warms and cools — compare the four rows against each other, not against another machine's numbers.
 
 What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation that feeds it. That part is a serial dependency chain: every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded. It neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
 
