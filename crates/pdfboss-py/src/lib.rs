@@ -25,6 +25,7 @@ use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
 use pdfboss_core::{Dict, DocumentSeed, ObjRef, Object, OcState};
 use pdfboss_output::Output;
+use pdfboss_render::RenderCache;
 use pdfboss_text::{FontCache, TextSpan};
 
 create_exception!(
@@ -290,6 +291,9 @@ impl SharedDocument {
 #[pyclass(frozen)]
 struct Document {
     inner: Arc<SharedDocument>,
+    /// Fonts loaded once per document across every page render; handed to
+    /// each page and to the `render_pages` fan-out workers.
+    render_cache: Arc<RenderCache>,
 }
 
 #[pymethods]
@@ -308,6 +312,7 @@ impl Document {
         };
         Ok(Document {
             inner: SharedDocument::new(core),
+            render_cache: Arc::new(RenderCache::default()),
         })
     }
 
@@ -357,6 +362,7 @@ impl Document {
         };
         Ok(Page {
             doc: Arc::clone(&self.inner),
+            render_cache: Arc::clone(&self.render_cache),
             seed,
             page,
         })
@@ -426,7 +432,8 @@ impl Document {
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
-        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        opts.cache = Some(Arc::clone(&self.render_cache));
         let compression = png_compression_from_str(compression)?;
         let inner = &self.inner;
         let pngs = py.allow_threads(move || {
@@ -553,6 +560,9 @@ struct Page {
     /// caches accumulate across the document's pages — while concurrent
     /// callers fall back to a private materialization below.
     doc: Arc<SharedDocument>,
+    /// Fonts loaded once per document across every page render
+    /// (`RenderOptions::cache`); shared by all of this document's pages.
+    render_cache: Arc<RenderCache>,
     /// The document's shareable core: the fallback that keeps per-page
     /// work lock-free when another thread holds the shared document.
     seed: DocumentSeed,
@@ -696,7 +706,8 @@ impl Page {
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
-        let opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
+        opts.cache = Some(Arc::clone(&self.render_cache));
         let compression = png_compression_from_str(compression)?;
         let (png, warnings) = py.allow_threads(|| {
             // Uncontended, reuse the shared parsed document so fonts,

@@ -659,9 +659,19 @@ fn tokenize(data: &[u8], mut emit: impl FnMut(Token<'_>)) {
 /// pass builds the image's own Huffman tables, a second identical pass
 /// writes the stream.
 fn deflate_filtered(data: &[u8]) -> Vec<u8> {
-    let mut lit_freq = [0u32; 286];
-    let mut dist_freq = [0u32; 30];
-    tokenize(data, |token| match token {
+    let mut lit_freq = [1u32; 286];
+    let mut dist_freq = [1u32; 30];
+    // The tables come from a sample: half the image reads statistically
+    // like all of it, at half the counting cost. The 1-floors above keep
+    // every code the emission pass may need describable even when the
+    // sample never produced it (the two tokenizations genuinely differ —
+    // the emission pass sees hash-table state the sample pass did not).
+    let sample_len = if data.len() > 256 * 1024 {
+        data.len() / 2
+    } else {
+        data.len()
+    };
+    tokenize(&data[..sample_len], |token| match token {
         Token::Literals(bytes) => {
             for &b in bytes {
                 lit_freq[b as usize] += 1;
@@ -672,16 +682,10 @@ fn deflate_filtered(data: &[u8]) -> Vec<u8> {
             dist_freq[distance_code(dist).0 as usize] += 1;
         }
     });
-    lit_freq[256] += 1; // end of block
 
     let lit_lens = huffman_lengths(&lit_freq, 15);
     let lit_codes = canonical_codes(&lit_lens);
-    let mut dist_lens = huffman_lengths(&dist_freq, 15);
-    if dist_lens.iter().all(|&l| l == 0) {
-        // RFC 1951 requires at least one describable distance code even
-        // when no match is emitted.
-        dist_lens[0] = 1;
-    }
+    let dist_lens = huffman_lengths(&dist_freq, 15);
     let dist_codes = canonical_codes(&dist_lens);
     let hdist = dist_lens.iter().rposition(|&l| l != 0).map_or(1, |p| p + 1);
 
