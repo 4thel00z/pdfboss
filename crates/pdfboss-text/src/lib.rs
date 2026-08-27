@@ -992,6 +992,45 @@ mod tests {
         );
     }
 
+    /// Repeated `gs` operators naming resources from one indirect
+    /// `/ExtGState` category dictionary resolve that dictionary once per
+    /// page walk, not once per operator — resolving hands out a deep clone
+    /// of the whole category dictionary, which measured as a third of a
+    /// form-heavy corpus extraction pass.
+    #[test]
+    fn a_resource_category_resolves_once_per_walk() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /ExtGState 5 0 R >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"/G1 gs 10 10 m 100 10 l S \
+              /G1 gs 10 20 m 100 20 l S \
+              /G1 gs 10 30 m 100 30 l S",
+        );
+        b.object(5, "<< /G1 << /LW 2 >> >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let counting = Counting::new(&doc);
+        let (_, rulings, report) = block_on(extract_spans_and_rulings_reporting_with(
+            &counting, &page, None,
+        ))
+        .unwrap();
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        assert_eq!(rulings.len(), 3, "all three strokes extract");
+        assert_eq!(
+            counting.resolutions(5),
+            1,
+            "one category dictionary resolution per page walk"
+        );
+    }
+
     /// A two-page document whose pages bind the same font dictionary: with
     /// one [`FontCache`] passed to both extractions the dictionary is
     /// fetched once, and the spans are exactly the uncached call's.
