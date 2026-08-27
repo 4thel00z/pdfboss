@@ -29,6 +29,7 @@
 mod cff;
 #[allow(dead_code)]
 mod color;
+mod encode;
 mod executor;
 mod glyph;
 mod image;
@@ -113,6 +114,9 @@ impl Pixmap {
     pub fn encode_png_with(&self, compression: PngCompression) -> Result<Vec<u8>> {
         fn err(e: png::EncodingError) -> Error {
             Error::Other(format!("png encode: {e}"))
+        }
+        if compression == PngCompression::Balanced {
+            return Ok(encode::encode_rgba(self.width, self.height, &self.data));
         }
         let mut out = Vec::new();
         let mut enc = png::Encoder::new(&mut out, self.width, self.height);

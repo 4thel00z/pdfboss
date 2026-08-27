@@ -355,7 +355,11 @@ impl Document {
             // clones a few `Arc`s and the key material.
             (doc.seed(), page)
         };
-        Ok(Page { seed, page })
+        Ok(Page {
+            doc: Arc::clone(&self.inner),
+            seed,
+            page,
+        })
     }
 
     /// Extracts text from all pages, joined by form feed ("\f").
@@ -544,9 +548,13 @@ impl Document {
 /// A single page of a document.
 #[pyclass(frozen)]
 struct Page {
-    /// The document's shareable core. Every text or render call
-    /// materializes its own private document from this, so per-page work
-    /// holds no lock and runs concurrently across Python threads.
+    /// The parsed document, shared with every other handle. A sequential
+    /// caller's renders reuse it uncontended — its object and stream
+    /// caches accumulate across the document's pages — while concurrent
+    /// callers fall back to a private materialization below.
+    doc: Arc<SharedDocument>,
+    /// The document's shareable core: the fallback that keeps per-page
+    /// work lock-free when another thread holds the shared document.
     seed: DocumentSeed,
     page: CorePage,
 }
@@ -691,10 +699,19 @@ impl Page {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
         let compression = png_compression_from_str(compression)?;
         let (png, warnings) = py.allow_threads(|| {
-            let doc = CoreDocument::from_seed(self.seed.clone());
-            let (pixmap, report) =
-                pdfboss_render::render_page_reporting(&doc, &self.page, scale, &opts)
-                    .map_err(pdf_err)?;
+            // Uncontended, reuse the shared parsed document so fonts,
+            // images and decoded streams carry across this document's
+            // pages; under contention, render on a private
+            // materialization exactly as before.
+            let (pixmap, report) = match self.doc.0.try_lock() {
+                Ok(doc) => pdfboss_render::render_page_reporting(&doc, &self.page, scale, &opts)
+                    .map_err(pdf_err)?,
+                Err(_) => {
+                    let doc = CoreDocument::from_seed(self.seed.clone());
+                    pdfboss_render::render_page_reporting(&doc, &self.page, scale, &opts)
+                        .map_err(pdf_err)?
+                }
+            };
             Ok::<_, PyErr>((
                 pixmap.encode_png_with(compression).map_err(pdf_err)?,
                 report.warnings(),
