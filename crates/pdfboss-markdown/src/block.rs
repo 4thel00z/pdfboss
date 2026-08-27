@@ -148,15 +148,21 @@ impl Builder {
                     text: text.trim_end_matches('\n').to_string(),
                 });
             }
-            Event::Start(Tag::BlockQuote(_)) => self.stack.push(Vec::new()),
+            Event::Start(Tag::BlockQuote(_)) => {
+                self.flush_loose_runs();
+                self.stack.push(Vec::new());
+            }
             Event::End(TagEnd::BlockQuote(_)) => {
                 let blocks = self.stack.pop().unwrap_or_default();
                 self.push_block(Block::BlockQuote { blocks });
             }
-            Event::Start(Tag::List(start)) => self.lists.push(ListContext {
-                start,
-                ..ListContext::default()
-            }),
+            Event::Start(Tag::List(start)) => {
+                self.flush_loose_runs();
+                self.lists.push(ListContext {
+                    start,
+                    ..ListContext::default()
+                });
+            }
             Event::End(TagEnd::List(_)) => {
                 let Some(list) = self.lists.pop() else { return };
                 self.push_block(Block::List {
@@ -164,7 +170,10 @@ impl Builder {
                     items: list.items,
                 });
             }
-            Event::Start(Tag::Item) => self.stack.push(Vec::new()),
+            Event::Start(Tag::Item) => {
+                self.flush_loose_runs();
+                self.stack.push(Vec::new());
+            }
             Event::End(TagEnd::Item) => {
                 self.flush_loose_runs();
                 let blocks = self.stack.pop().unwrap_or_default();
@@ -182,10 +191,13 @@ impl Builder {
                 };
                 list.pending_task = Some(checked);
             }
-            Event::Start(Tag::Table(aligns)) => self.tables.push(TableContext {
-                aligns: aligns.iter().map(cell_align).collect(),
-                ..TableContext::default()
-            }),
+            Event::Start(Tag::Table(aligns)) => {
+                self.flush_loose_runs();
+                self.tables.push(TableContext {
+                    aligns: aligns.iter().map(cell_align).collect(),
+                    ..TableContext::default()
+                });
+            }
             Event::End(TagEnd::Table) => {
                 let Some(table) = self.tables.pop() else {
                     return;
@@ -420,6 +432,29 @@ mod tests {
             items[1].blocks.last(),
             Some(Block::List { start: None, .. })
         ));
+    }
+
+    #[test]
+    fn tight_list_text_stays_in_its_item() {
+        let (blocks, _) = parse_blocks("1. first\n2. [x] done\n   - inner\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            items[1].blocks[0],
+            Block::Paragraph {
+                runs: vec![plain("done")]
+            }
+        );
+        let Block::List { items: inner, .. } = items[1].blocks.last().unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            inner[0].blocks[0],
+            Block::Paragraph {
+                runs: vec![plain("inner")]
+            }
+        );
     }
 
     #[test]
