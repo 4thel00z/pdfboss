@@ -5,8 +5,8 @@ use crate::font::Font;
 use crate::{Ruling, TextSpan};
 use pdfboss_core::content::{parse_content, Op, TextItem};
 use pdfboss_core::{
-    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Matrix, Name, ObjRef,
-    Object, OcState, Page, Point, Rect,
+    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, Matrix, Name,
+    ObjRef, Object, OcState, Page, Point, Rect,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -213,6 +213,7 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         loaded: HashMap::new(),
         shared: fonts,
         oc,
+        categories: FastMap::default(),
     };
     let root = Frame::new(
         ops.into(),
@@ -610,6 +611,35 @@ struct Executor<'a, S> {
     /// The document's optional-content visibility; `None` extracts every
     /// layer.
     oc: Option<&'a OcState>,
+    /// Resolved resource-category dictionaries, keyed by the resource
+    /// dictionary's allocation address plus a category slot. Resolving a
+    /// category hands out a deep clone of the whole dictionary, and `gs`
+    /// and `Do` used to pay that per operator — a third of a form-heavy
+    /// corpus extraction pass. `None` remembers a category the dictionary
+    /// does not carry (or that is not a dictionary). The held [`Arc`] keeps
+    /// the resource dictionary's allocation alive, so the address cannot be
+    /// reused while its entry exists. See [`MAX_CATEGORY_CACHE`].
+    categories: FastMap<(usize, u8), ResolvedCategory>,
+}
+
+/// One memoized resource category: the resource dictionary whose allocation
+/// the entry pins (its address is the cache key) and its resolved category
+/// dictionary, or `None` for a remembered absence.
+type ResolvedCategory = (Arc<Dict>, Option<Arc<Dict>>);
+
+/// Upper bound on memoized (resource dictionary, category) pairs per page
+/// walk; past it, lookups resolve uncached, so a hostile file minting
+/// resource dictionaries per form invocation caps the memo's memory.
+const MAX_CATEGORY_CACHE: usize = 4096;
+
+/// The memo slot for a resource category name, [`None`] for a category no
+/// caller looks up hot (left uncached rather than given an open-ended key).
+fn category_slot(category: &str) -> Option<u8> {
+    match category {
+        "ExtGState" => Some(0),
+        "XObject" => Some(1),
+        _ => None,
+    }
 }
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
@@ -621,12 +651,37 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// renderer's `find_res`; the two crates must agree on which resource a
     /// name refers to, or the same file extracts different text than it
     /// paints.
-    async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
+    async fn find_res(
+        &mut self,
+        chain: &[Arc<Dict>],
+        category: &str,
+        name: &str,
+    ) -> Option<Object> {
+        let slot = category_slot(category);
         for res in chain {
-            let Some(cat) = res.get(category) else {
-                continue;
+            let key = (Arc::as_ptr(res) as usize, slot.unwrap_or(0));
+            let remembered = slot.and_then(|_| {
+                self.categories
+                    .get(&key)
+                    .map(|(_, category)| category.clone())
+            });
+            let resolved = match remembered {
+                Some(dict) => dict,
+                None => {
+                    let dict = match res.get(category) {
+                        Some(cat) => match self.src.resolve(cat).await {
+                            Ok(Object::Dict(d)) => Some(Arc::new(d)),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if slot.is_some() && self.categories.len() < MAX_CATEGORY_CACHE {
+                        self.categories.insert(key, (Arc::clone(res), dict.clone()));
+                    }
+                    dict
+                }
             };
-            let Ok(Object::Dict(dict)) = self.src.resolve(cat).await else {
+            let Some(dict) = resolved else {
                 continue;
             };
             if let Some(value) = dict.get(name) {
@@ -798,7 +853,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Negative values are ignored, matching the renderer; non-finite ones
     /// too, because an infinite line width would otherwise silently drop
     /// every later stroked ruling at the segment gate.
-    async fn ext_gstate_line_width(&self, chain: &[Arc<Dict>], name: &str) -> Option<f32> {
+    async fn ext_gstate_line_width(&mut self, chain: &[Arc<Dict>], name: &str) -> Option<f32> {
         let resolved = self.find_res(chain, "ExtGState", name).await?;
         let dict = resolved.as_dict()?;
         let lw = self.src.resolve(dict.get("LW")?).await.ok()?.as_f64()? as f32;
