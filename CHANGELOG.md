@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.20.0](https://github.com/4thel00z/pdfboss/compare/v0.19.1...v0.20.0) (2026-08-27)
+
+
+### Features
+
+* **write:** PDF creation suite — pdfboss-write crate, async parity, create CLI ([#94](https://github.com/4thel00z/pdfboss/issues/94)) ([da62e42](https://github.com/4thel00z/pdfboss/commit/da62e42f71d27bed638e6d4c0e78f81d8a29ffaa))
+
+
+### Bug Fixes
+
+* **core:** run SHA-2 compressions on the CPU's SHA instructions ([#87](https://github.com/4thel00z/pdfboss/issues/87)) ([ffff442](https://github.com/4thel00z/pdfboss/commit/ffff4429d66debd882c853f940f5430d22cad29a))
+
+
+### Performance Improvements
+
+* **core:** take the token and font hot paths off the allocator ([#89](https://github.com/4thel00z/pdfboss/issues/89)) ([df12438](https://github.com/4thel00z/pdfboss/commit/df12438399ec2703dd1b55688650d6731ec16e01))
+* **render:** cross-page font cache, sampled Huffman counting, vector composite ([#93](https://github.com/4thel00z/pdfboss/issues/93)) ([#95](https://github.com/4thel00z/pdfboss/issues/95)) ([04903fe](https://github.com/4thel00z/pdfboss/commit/04903fe653ab6193fbfae4732a4621ba394a33bc))
+* **render:** specialized PNG encoder and shared-document page renders ([#92](https://github.com/4thel00z/pdfboss/issues/92)) ([191b43a](https://github.com/4thel00z/pdfboss/commit/191b43a23579a9ae4a81806d8a1e9e96a7bce79c))
+* **text:** match decorations through a sorted y-band, not every ruling ([#90](https://github.com/4thel00z/pdfboss/issues/90)) ([9c4476a](https://github.com/4thel00z/pdfboss/commit/9c4476af45977cf4d37ec08f20fbf3c6b5721995))
+
+
+### Documentation
+
+* re-measure the README benchmarks for 0.20.0 ([#91](https://github.com/4thel00z/pdfboss/issues/91)) ([7a85eb3](https://github.com/4thel00z/pdfboss/commit/7a85eb35e830f835aaf140c9946eacd5bd49d8bb))
+
 ## [0.19.1](https://github.com/4thel00z/pdfboss/compare/v0.19.0...v0.19.1) (2026-08-26)
 
 
