@@ -502,6 +502,10 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         provider,
         oc: opts.oc.clone(),
         shared_fonts: opts.cache.clone(),
+        icc: match &opts.cache {
+            Some(cache) => Arc::clone(&cache.colorspaces),
+            None => Arc::default(),
+        },
         glyph_blit: Vec::new(),
         raster: RasterScratch::default(),
         clip_cache: FastMap::default(),
@@ -556,6 +560,10 @@ struct Executor<'a, S> {
     /// Fonts shared across this document's page renders
     /// ([`RenderOptions::cache`]); `None` keeps loads page-local.
     shared_fonts: Option<Arc<crate::RenderCache>>,
+    /// Parsed `ICCBased` outcomes: the document cache's own handle when one
+    /// is set, else a render-local one, so repeated `cs`/`CS` operators,
+    /// images and shadings never re-decode a profile stream either way.
+    icc: Arc<crate::color::IccCache>,
     /// Reused scratch for painting a cached glyph outline: the flattened
     /// (origin-relative) subpaths from [`GlyphFont::flattened`] are copied
     /// here translated to the glyph's device origin, so a whole page of text
@@ -1271,7 +1279,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     self.skip(SkippedKind::Pattern, SkipReason::Missing);
                     return None;
                 };
-                match Shading::load_with(self.src, shading_obj).await {
+                match Shading::load_with(self.src, shading_obj, &self.icc).await {
                     Ok(s) => {
                         let s = Arc::new(s);
                         self.cache_pattern(pref, CachedPattern::Shading(matrix, Arc::clone(&s)));
@@ -2312,14 +2320,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     if let Some(Object::Name(n)) = items.first() {
                         if n.0 == "Pattern" {
                             let base = match items.get(1) {
-                                Some(base) => ColorSpace::parse_with(self.src, base).await,
+                                Some(base) => {
+                                    ColorSpace::parse_with(self.src, base, &self.icc).await
+                                }
                                 None => ColorSpace::DeviceGray,
                             };
                             return (base, true);
                         }
                     }
                 }
-                (ColorSpace::parse_with(self.src, &obj).await, false)
+                (
+                    ColorSpace::parse_with(self.src, &obj, &self.icc).await,
+                    false,
+                )
             }
             None => (ColorSpace::DeviceGray, false),
         }
@@ -2839,7 +2852,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Shading, SkipReason::Missing);
             return;
         };
-        let loaded = match Shading::load_with(self.src, &obj).await {
+        let loaded = match Shading::load_with(self.src, &obj, &self.icc).await {
             Ok(s) => s,
             Err(e) => {
                 self.skip(SkippedKind::Shading, skip_reason_for(&e));
@@ -3038,7 +3051,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     };
                     let cs_obj = s.dict.get("ColorSpace").cloned();
                     let meta =
-                        image::ImageMeta::read_with(self.src, &s.dict, cs_obj.as_ref()).await;
+                        image::ImageMeta::read_with(self.src, &s.dict, cs_obj.as_ref(), &self.icc)
+                            .await;
                     let mask = image::decode_alpha(&meta, &data);
                     if mask.is_none() {
                         self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
@@ -3064,7 +3078,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                             return None;
                         }
                     };
-                    let meta = image::ImageMeta::read_with(self.src, &s.dict, None).await;
+                    let meta =
+                        image::ImageMeta::read_with(self.src, &s.dict, None, &self.icc).await;
                     if !meta.stencil {
                         // A stream-valued /Mask must be a stencil (§8.9.6.4).
                         self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
@@ -3119,7 +3134,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(e) = palette_err {
             self.skip(SkippedKind::Image, skip_reason_for(&e));
         }
-        let meta = image::ImageMeta::read_with(self.src, dict, cs_obj.as_ref()).await;
+        let meta = image::ImageMeta::read_with(self.src, dict, cs_obj.as_ref(), &self.icc).await;
         let smask = self.image_alpha_mask(dict, &meta, data).await;
         if gs.fill_pattern && meta.stencil {
             // The stencil paints the pattern's stand-in gray, not the
@@ -6860,6 +6875,77 @@ mod render_cache_tests {
         let (cached_resolutions, cached) = render_both(Some(Arc::new(RenderCache::default())));
         assert_eq!(uncached_resolutions, 2, "one load per page uncached");
         assert_eq!(cached_resolutions, 1, "one load per document cached");
+        for (a, b) in cached.iter().zip(&uncached) {
+            assert_eq!(a.data, b.data, "pixels must not depend on the cache");
+        }
+    }
+
+    /// Two pages whose content sets the same `ICCBased` space twice each:
+    /// four `cs` operators over one profile stream (object 6).
+    fn two_page_shared_icc_doc() -> Vec<u8> {
+        let contents = b"/CS0 cs 1 0 0 sc 10 10 50 50 re f \
+                         /CS0 cs 0 1 0 sc 20 20 30 30 re f";
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 7 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Resources << /ColorSpace << /CS0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", contents);
+        b.object(5, "[/ICCBased 6 0 R]");
+        b.stream(6, "/N 3", &crate::color::tests::gamma18_rgb_profile());
+        b.object(
+            7,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Resources << /ColorSpace << /CS0 5 0 R >> >> /Contents 8 0 R >>",
+        );
+        b.stream(8, "", contents);
+        b.build(1)
+    }
+
+    fn render_both_icc(cache: Option<Arc<RenderCache>>) -> (usize, Vec<Pixmap>) {
+        let doc = Document::load(two_page_shared_icc_doc()).expect("load");
+        let counting = Counting {
+            inner: Immediate(&doc),
+            resolutions: AtomicUsize::new(0),
+            watched: 6,
+        };
+        let opts = RenderOptions {
+            cache,
+            ..Default::default()
+        };
+        let mut pages = Vec::new();
+        for index in 0..2 {
+            let page = doc.page(index).expect("page");
+            let (pix, report) =
+                block_on(render_page_reporting_with(&counting, &page, 1.0, &opts)).expect("render");
+            assert!(report.warnings().is_empty(), "unexpected skips: {report:?}");
+            pages.push(pix);
+        }
+        (counting.resolutions.load(Ordering::Relaxed), pages)
+    }
+
+    /// Repeated `cs` operators naming the same `ICCBased` stream decode and
+    /// parse the profile once per page render, not once per operator.
+    #[test]
+    fn an_icc_profile_parses_once_per_page() {
+        let (resolutions, _) = render_both_icc(None);
+        assert_eq!(resolutions, 2, "one parse per page, not one per cs op");
+    }
+
+    /// One [`RenderCache`] across a document's pages parses the shared
+    /// profile once, and the pixels are exactly the uncached render's.
+    #[test]
+    fn a_shared_icc_profile_parses_once_per_document() {
+        let (uncached_resolutions, uncached) = render_both_icc(None);
+        let (cached_resolutions, cached) = render_both_icc(Some(Arc::new(RenderCache::default())));
+        assert_eq!(cached_resolutions, 1, "one parse per document cached");
+        assert!(
+            uncached_resolutions > cached_resolutions,
+            "the document cache must save work over per-render caches"
+        );
         for (a, b) in cached.iter().zip(&uncached) {
             assert_eq!(a.data, b.data, "pixels must not depend on the cache");
         }

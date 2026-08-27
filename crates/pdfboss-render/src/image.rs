@@ -374,7 +374,12 @@ impl ImageMeta {
     /// [`Immediate`].
     #[cfg(test)]
     pub(crate) fn read(doc: &Document, dict: &Dict, cs_obj: Option<&Object>) -> ImageMeta {
-        block_on(Self::read_with(&Immediate(doc), dict, cs_obj))
+        block_on(Self::read_with(
+            &Immediate(doc),
+            dict,
+            cs_obj,
+            &crate::color::IccCache::default(),
+        ))
     }
 
     /// Resolves every dictionary entry the decode consults. `cs_obj` is the
@@ -384,9 +389,10 @@ impl ImageMeta {
         src: &S,
         dict: &Dict,
         cs_obj: Option<&Object>,
+        icc: &crate::color::IccCache,
     ) -> ImageMeta {
         let cs = match cs_obj {
-            Some(obj) => Some(ColorSpace::parse_with(src, obj).await),
+            Some(obj) => Some(ColorSpace::parse_with(src, obj, icc).await),
             None => None,
         };
         ImageMeta {
