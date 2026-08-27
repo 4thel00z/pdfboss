@@ -415,6 +415,194 @@ fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
     }
 }
 
+/// Anti-aliased coverage of one path, captured as per-subsample span lists
+/// instead of painted pixels, so a glyph repeated along a baseline sweeps
+/// its edges once: a repeat replays the recorded spans shifted by its own
+/// device offset, skipping edge preparation, the active-edge walk, per-
+/// crossing interpolation and the per-subsample sort. Coordinates are the
+/// swept geometry's own (unclamped by any page); the pixel-row index `r`
+/// maps to device row `y0 + r + iy` at fill time.
+#[derive(Debug, Default)]
+pub(crate) struct SpanSet {
+    /// Topmost pixel row the geometry touches, in its own frame.
+    y0: i64,
+    /// Number of pixel rows captured.
+    rows: usize,
+    /// Prefix offsets into `spans`, one slot per `(row, subsample)` pair
+    /// plus a terminator: row `r`, subsample `s` owns
+    /// `spans[offs[r * SUBSAMPLES + s]..offs[r * SUBSAMPLES + s + 1]]`.
+    offs: Vec<u32>,
+    /// `(x0, x1)` span endpoints, each contributing one subsample's weight.
+    spans: Vec<(f32, f32)>,
+}
+
+impl SpanSet {
+    /// How many spans the capture recorded — the cache's size measure.
+    pub(crate) fn span_count(&self) -> usize {
+        self.spans.len()
+    }
+}
+
+/// Row-count and span-count bounds on a capture: geometry taller or busier
+/// than any honest glyph refuses to be captured (the caller falls back to a
+/// direct fill, which page bounds keep proportional), so a hostile stream
+/// cannot mint an arbitrarily large [`SpanSet`].
+const MAX_CAPTURE_ROWS: i64 = 8192;
+const MAX_CAPTURE_SPANS: usize = 1 << 16;
+
+/// Sweeps `polys` under `rule` with the same edge preparation, activation
+/// order, crossing sort and winding pairing as [`fill_path`]'s rasterizer,
+/// recording the resulting spans instead of painting them. No page clamps
+/// apply: the capture is in the geometry's own frame, and [`fill_spans`]
+/// clamps to the page it paints — analytic coverage distributes per column,
+/// so clamping late lands on the same in-page values a clamped sweep
+/// produces. `None` means the geometry exceeded a capture bound.
+pub(crate) fn capture_spans(
+    scratch: &mut RasterScratch,
+    polys: &[Subpath],
+    rule: FillRule,
+) -> Option<SpanSet> {
+    let RasterScratch {
+        edges,
+        active,
+        crossings,
+        ..
+    } = scratch;
+    prepare_edges(edges, polys);
+    if edges.is_empty() {
+        return Some(SpanSet::default());
+    }
+    let mut ymin = f32::MAX;
+    let mut ymax = f32::MIN;
+    for e in edges.iter() {
+        ymin = ymin.min(e.y0);
+        ymax = ymax.max(e.y1);
+    }
+    if !ymin.is_finite() || !ymax.is_finite() {
+        return None;
+    }
+    let row_start = ymin.floor() as i64;
+    let row_end = ymax.ceil() as i64;
+    let rows = row_end.saturating_sub(row_start);
+    if rows <= 0 || rows > MAX_CAPTURE_ROWS {
+        return None;
+    }
+    let rows = rows as usize;
+    let mut set = SpanSet {
+        y0: row_start,
+        rows,
+        offs: Vec::with_capacity(rows * SUBSAMPLES as usize + 1),
+        spans: Vec::new(),
+    };
+    set.offs.push(0);
+    active.clear();
+    let mut next = 0usize;
+    for r in 0..rows {
+        let y = row_start + r as i64;
+        for s in 0..SUBSAMPLES {
+            let ys = y as f32 + (s as f32 + 0.5) / SUBSAMPLES as f32;
+            while next < edges.len() && edges[next].y0 <= ys {
+                active.push(next);
+                next += 1;
+            }
+            active.retain(|&i| edges[i].y1 > ys);
+            crossings.clear();
+            for &i in active.iter() {
+                crossings.push((edges[i].x_at(ys), edges[i].dir));
+            }
+            if crossings.len() >= 2 {
+                crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut wind = 0i32;
+                let mut span_start = 0.0f32;
+                for &(x, dir) in crossings.iter() {
+                    let was_inside = inside(wind, rule);
+                    wind += dir;
+                    let is_inside = inside(wind, rule);
+                    if !was_inside && is_inside {
+                        span_start = x;
+                    } else if was_inside && !is_inside && x > span_start {
+                        // A zero-width span adds no coverage, so only real
+                        // extents are recorded.
+                        set.spans.push((span_start, x));
+                    }
+                }
+            }
+            if set.spans.len() > MAX_CAPTURE_SPANS {
+                return None;
+            }
+            set.offs.push(set.spans.len() as u32);
+        }
+    }
+    Some(set)
+}
+
+/// Paints a captured [`SpanSet`] onto `pix` at horizontal offset `dx` and
+/// integer row offset `iy`, with the color, alpha, clip and blend semantics
+/// of [`fill_path`] — the coverage accumulation and row painting are the
+/// same code paths, so a capture-and-fill of a path is bit-identical to a
+/// direct fill of it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_spans(
+    pix: &mut Pixmap,
+    scratch: &mut RasterScratch,
+    set: &SpanSet,
+    dx: f32,
+    iy: i64,
+    rgba: [u8; 4],
+    alpha: f32,
+    clip: Option<&Mask>,
+    blend: BlendMode,
+) {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let base_a = rgba[3] as f32 / 255.0 * alpha;
+    if base_a <= 0.0 || pix.width == 0 || pix.height == 0 {
+        return;
+    }
+    let rgb = [rgba[0], rgba[1], rgba[2]];
+    let full = pix.width as usize;
+    if scratch.row.len() < full {
+        scratch.row.resize(full, 0.0);
+    }
+    let row = &mut scratch.row[..full];
+    let weight = 1.0 / SUBSAMPLES as f32;
+    let subs = SUBSAMPLES as usize;
+    for r in 0..set.rows {
+        let page_y = set.y0 + r as i64 + iy;
+        if page_y < 0 || page_y >= pix.height as i64 {
+            continue;
+        }
+        let mut dirty_lo = full;
+        let mut dirty_hi = 0usize;
+        for s in 0..subs {
+            let slot = r * subs + s;
+            let from = set.offs[slot] as usize;
+            let to = set.offs[slot + 1] as usize;
+            for &(x0, x1) in &set.spans[from..to] {
+                add_span(row, x0 + dx, x1 + dx, weight, &mut dirty_lo, &mut dirty_hi);
+            }
+        }
+        if dirty_lo < dirty_hi {
+            paint_row(
+                pix,
+                page_y as u32,
+                row,
+                dirty_lo,
+                dirty_hi,
+                clip,
+                base_a,
+                rgb,
+                blend,
+            );
+            // Restore the all-zero invariant `RasterScratch::row` promises.
+            row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
+        }
+    }
+}
+
 /// Whether a winding count is "inside" under `rule`.
 fn inside(wind: i32, rule: FillRule) -> bool {
     match rule {
@@ -643,49 +831,61 @@ pub(crate) fn fill_path(
         return;
     }
     let rgb = [rgba[0], rgba[1], rgba[2]];
-    let w = pix.width as usize;
     prepare_edges(&mut scratch.edges, polys);
-    sweep_rows(
-        scratch,
-        pix.width,
-        pix.height,
-        rule,
-        |y, row, mut lo, mut hi| {
-            let mask_row = match clip {
-                None => None,
-                Some(m) => {
-                    // Pixels outside the mask's stored bbox read coverage 0, so
-                    // the fill cannot touch them; narrow the span to the overlap
-                    // and hand the pixel loop the mask bytes for what remains.
-                    if y < m.y0 || y - m.y0 >= m.bbox_h {
-                        return;
-                    }
-                    let mx0 = m.x0 as usize;
-                    lo = lo.max(mx0);
-                    hi = hi.min(mx0 + m.bbox_w as usize);
-                    if hi <= lo {
-                        return;
-                    }
-                    if m.opaque {
-                        // Every byte in range is 255 and scaling by 255/255.0
-                        // == 1.0 is exactly the identity, so the clip reduces
-                        // to the bbox narrowing above.
-                        None
-                    } else {
-                        let base = (y - m.y0) as usize * m.bbox_w as usize;
-                        Some(&m.data[base + lo - mx0..base + hi - mx0])
-                    }
-                }
-            };
-            let base = (y as usize * w + lo) * 4;
-            let dst_row = &mut pix.data[base..base + (hi - lo) * 4];
-            if blend == BlendMode::Normal {
-                blend_row::<true>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
-            } else {
-                blend_row::<false>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
+    sweep_rows(scratch, pix.width, pix.height, rule, |y, row, lo, hi| {
+        paint_row(pix, y, row, lo, hi, clip, base_a, rgb, blend)
+    });
+}
+
+/// Paints one coverage row's `[lo, hi)` columns onto `pix` at row `y`,
+/// narrowing to the clip mask's stored bbox and dispatching to the blend
+/// loop — the single row-painting path behind both [`fill_path`] and
+/// [`fill_spans`].
+#[allow(clippy::too_many_arguments)]
+fn paint_row(
+    pix: &mut Pixmap,
+    y: u32,
+    row: &[f32],
+    mut lo: usize,
+    mut hi: usize,
+    clip: Option<&Mask>,
+    base_a: f32,
+    rgb: [u8; 3],
+    blend: BlendMode,
+) {
+    let mask_row = match clip {
+        None => None,
+        Some(m) => {
+            // Pixels outside the mask's stored bbox read coverage 0, so
+            // the fill cannot touch them; narrow the span to the overlap
+            // and hand the pixel loop the mask bytes for what remains.
+            if y < m.y0 || y - m.y0 >= m.bbox_h {
+                return;
             }
-        },
-    );
+            let mx0 = m.x0 as usize;
+            lo = lo.max(mx0);
+            hi = hi.min(mx0 + m.bbox_w as usize);
+            if hi <= lo {
+                return;
+            }
+            if m.opaque {
+                // Every byte in range is 255 and scaling by 255/255.0
+                // == 1.0 is exactly the identity, so the clip reduces
+                // to the bbox narrowing above.
+                None
+            } else {
+                let base = (y - m.y0) as usize * m.bbox_w as usize;
+                Some(&m.data[base + lo - mx0..base + hi - mx0])
+            }
+        }
+    };
+    let base = (y as usize * pix.width as usize + lo) * 4;
+    let dst_row = &mut pix.data[base..base + (hi - lo) * 4];
+    if blend == BlendMode::Normal {
+        blend_row::<true>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
+    } else {
+        blend_row::<false>(dst_row, &row[lo..hi], mask_row, base_a, rgb, blend);
+    }
 }
 
 /// Paints one emitted coverage row into `dst_row` (4 bytes per pixel).
@@ -1622,5 +1822,169 @@ mod stage_times {
             }
         }
         println!("fill (40 big):      {:?}/page", t0.elapsed() / reps);
+    }
+}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+    use pdfboss_core::geom::Point;
+
+    /// A self-intersecting star on subpixel coordinates: exercises the
+    /// nonzero winding rule, coincident-crossing ordering and fractional
+    /// coverage at every edge.
+    fn star(cx: f32, cy: f32, r: f32) -> Subpath {
+        Subpath {
+            points: (0..5)
+                .map(|i| {
+                    let a = (i * 2) as f32 / 5.0 * std::f32::consts::TAU - 0.37;
+                    Point::new(cx + r * a.cos(), cy + r * a.sin())
+                })
+                .collect(),
+            closed: true,
+        }
+    }
+
+    fn subpixel_rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Subpath {
+        Subpath {
+            points: vec![
+                Point::new(x0, y0),
+                Point::new(x1, y0),
+                Point::new(x1, y1),
+                Point::new(x0, y1),
+            ],
+            closed: true,
+        }
+    }
+
+    const INK: [u8; 4] = [30, 60, 200, 255];
+
+    fn direct(polys: &[Subpath], alpha: f32, clip: Option<&Mask>, blend: BlendMode) -> Pixmap {
+        let mut pix = Pixmap::new(24, 24);
+        fill_path(
+            &mut pix,
+            &mut RasterScratch::default(),
+            polys,
+            FillRule::NonZero,
+            INK,
+            alpha,
+            clip,
+            blend,
+        );
+        pix
+    }
+
+    fn replayed(polys: &[Subpath], alpha: f32, clip: Option<&Mask>, blend: BlendMode) -> Pixmap {
+        let mut scratch = RasterScratch::default();
+        let set = capture_spans(&mut scratch, polys, FillRule::NonZero).expect("captured");
+        let mut pix = Pixmap::new(24, 24);
+        fill_spans(
+            &mut pix,
+            &mut scratch,
+            &set,
+            0.0,
+            0,
+            INK,
+            alpha,
+            clip,
+            blend,
+        );
+        pix
+    }
+
+    /// Capturing a path's spans and replaying them at offset zero paints
+    /// exactly the pixels a direct fill paints.
+    #[test]
+    fn captured_spans_rebuild_the_exact_coverage() {
+        let polys = [star(11.3, 12.7, 9.4), subpixel_rect(1.2, 1.7, 5.8, 4.3)];
+        let a = direct(&polys, 1.0, None, BlendMode::Normal);
+        let b = replayed(&polys, 1.0, None, BlendMode::Normal);
+        assert!(a.data.iter().any(|&v| v != 0), "the direct fill painted");
+        assert_eq!(a.data, b.data);
+    }
+
+    /// Alpha scaling, a coverage clip and a non-normal blend mode reach the
+    /// replay through the same row-painting path as a direct fill.
+    #[test]
+    fn span_fill_applies_alpha_clip_and_blend_like_fill_path() {
+        let polys = [star(11.3, 12.7, 9.4)];
+        let clip = Mask::from_path(
+            24,
+            24,
+            &mut RasterScratch::default(),
+            &[subpixel_rect(3.4, 2.2, 19.7, 21.3)],
+            FillRule::NonZero,
+        );
+        let a = direct(&polys, 0.6, Some(&clip), BlendMode::Multiply);
+        let b = replayed(&polys, 0.6, Some(&clip), BlendMode::Multiply);
+        assert!(a.data.iter().any(|&v| v != 0), "the direct fill painted");
+        assert_eq!(a.data, b.data);
+    }
+
+    /// A replay shifted by integer offsets clamps to the page exactly like a
+    /// direct fill of the same translated rectangle: a rectangle's vertical
+    /// edges interpolate to their stored x, so translating the geometry and
+    /// translating the spans round identically and the comparison is exact.
+    #[test]
+    fn span_fill_shifts_and_clips_to_the_page_like_a_direct_fill() {
+        let rect = subpixel_rect(2.3, 2.6, 9.7, 8.4);
+        let translated = subpixel_rect(2.3 + 16.0, 2.6 + 19.0, 9.7 + 16.0, 8.4 + 19.0);
+        let a = direct(&[translated], 1.0, None, BlendMode::Normal);
+        let mut scratch = RasterScratch::default();
+        let set = capture_spans(&mut scratch, &[rect], FillRule::NonZero).expect("captured");
+        let mut b = Pixmap::new(24, 24);
+        fill_spans(
+            &mut b,
+            &mut scratch,
+            &set,
+            16.0,
+            19,
+            INK,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
+        assert!(a.data.iter().any(|&v| v != 0), "the direct fill painted");
+        assert_eq!(a.data, b.data);
+    }
+
+    /// Rows shifted entirely off the page are skipped, not wrapped or
+    /// painted at clamped rows.
+    #[test]
+    fn span_fill_skips_rows_off_the_page() {
+        let rect = subpixel_rect(2.3, 2.6, 9.7, 8.4);
+        let mut scratch = RasterScratch::default();
+        let set = capture_spans(&mut scratch, &[rect], FillRule::NonZero).expect("captured");
+        let mut pix = Pixmap::new(24, 24);
+        fill_spans(
+            &mut pix,
+            &mut scratch,
+            &set,
+            0.0,
+            -100,
+            INK,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
+        assert!(
+            pix.data.iter().all(|&v| v == 0),
+            "everything above the page"
+        );
+        fill_spans(
+            &mut pix,
+            &mut scratch,
+            &set,
+            0.0,
+            100,
+            INK,
+            1.0,
+            None,
+            BlendMode::Normal,
+        );
+        assert!(
+            pix.data.iter().all(|&v| v == 0),
+            "everything below the page"
+        );
     }
 }
