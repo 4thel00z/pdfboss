@@ -7,8 +7,8 @@ use pdfboss_core::{Document, Name, Rect};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Color, Date, Error, ImageData, Metadata, Page, PageSize, Pdf, Standard14, WriteOptions,
-    XrefStyle,
+    Color, Date, Error, ImageData, LinkAnnotation, Metadata, Page, PageSize, Pdf, Standard14,
+    WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -257,4 +257,39 @@ fn both_xref_styles_load() {
         let loaded = doc.page(0).unwrap();
         assert!(extract_text(&doc, &loaded).unwrap().contains("Xref"));
     }
+}
+
+#[test]
+fn link_annotations_round_trip() {
+    let mut page = Page::new(PageSize::A4);
+    page.canvas
+        .text("pdfboss", 72.0, 700.0, Standard14::Helvetica, 12.0)
+        .unwrap();
+    page.links.push(LinkAnnotation {
+        rect: [72.0, 697.0, 130.0, 712.0],
+        uri: "https://example.com/docs".to_string(),
+    });
+    let bytes = Pdf {
+        pages: vec![page],
+        options: WriteOptions {
+            xref: XrefStyle::Table,
+            ..WriteOptions::default()
+        },
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    assert!(contains(&bytes, b"/Annots"));
+    assert!(contains(&bytes, b"/Link"));
+    assert!(contains(&bytes, b"https://example.com/docs"));
+    let doc = Document::load(bytes).unwrap();
+    assert_eq!(doc.page_count(), 1);
+}
+
+#[test]
+fn decode_sniffs_png_and_jpeg_by_content() {
+    assert!(ImageData::decode(&[0x89, b'P', b'N', b'G']).is_err());
+    assert!(ImageData::decode(b"plain text").is_err());
+    let jpeg = tiny_jpeg(4, 4);
+    assert_eq!(ImageData::decode(&jpeg).unwrap().width(), 4);
 }

@@ -285,6 +285,7 @@ fn page_with(size: PageSize, canvas: Canvas) -> Page {
         size,
         rotation: 0,
         canvas,
+        ..Page::default()
     }
 }
 
@@ -391,16 +392,10 @@ fn measured(face: Standard14, line_no: usize, piece: &str, size: f32) -> Result<
     })
 }
 
-/// Sniffs PNG (`89 50 4E 47`) or JPEG (`FF D8`) by magic bytes — never by
-/// file extension — and imports accordingly.
+/// Sniffs PNG or JPEG by content — never by file extension — and imports
+/// accordingly.
 fn decode_image(bytes: &[u8]) -> Result<ImageData, String> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        return ImageData::png(bytes).map_err(|e| e.to_string());
-    }
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        return ImageData::jpeg(bytes).map_err(|e| e.to_string());
-    }
-    Err("not a PNG or JPEG (unrecognized magic bytes)".to_string())
+    ImageData::decode(bytes).map_err(|e| e.to_string())
 }
 
 /// One page holding `image`: sized to the pixels at 72 dpi when `size` is
@@ -785,6 +780,9 @@ mod tests {
         let image = decode_image(&tiny_jpeg()).unwrap();
         assert_eq!((image.width(), image.height()), (3, 2));
         let err = decode_image(b"GIF89a not really").unwrap_err();
-        assert!(err.contains("magic"), "unexpected message: {err}");
+        assert!(
+            err.contains("not a png or jpeg"),
+            "unexpected message: {err}"
+        );
     }
 }

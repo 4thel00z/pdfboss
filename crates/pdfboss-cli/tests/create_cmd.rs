@@ -241,7 +241,10 @@ fn images_reject_files_without_image_magic() {
     ]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(stderr.contains("magic"), "unexpected message: {stderr}");
+    assert!(
+        stderr.contains("not a png or jpeg"),
+        "unexpected message: {stderr}"
+    );
     assert!(
         stderr.contains("not-an-image.txt"),
         "no file name in: {stderr}"

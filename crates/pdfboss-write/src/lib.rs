@@ -33,6 +33,6 @@ pub use content::serialize_ops;
 pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;
-pub use pdf::{Date, Metadata, Page, PageSize, Pdf};
+pub use pdf::{Date, LinkAnnotation, Metadata, Page, PageSize, Pdf};
 pub use sink::{AsyncByteSink, Immediate};
 pub use writer::{WriteOptions, Writer, XrefStyle};
