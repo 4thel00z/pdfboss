@@ -69,7 +69,7 @@ imgs = doc[0].extract_images()             # embedded images: .data (PNG), .widt
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
 
-Explorer subcommands. Each accepts a local path or an `http(s)://` URL, fetched in ranges and never downloaded whole:
+Explorer subcommands. Each except `obj` accepts a local path or an `http(s)://` URL, fetched in ranges and never downloaded whole:
 
 ```bash
 pdfboss json    report.pdf                    # dump the document as a JSON value tree
