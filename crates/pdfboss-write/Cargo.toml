@@ -1,0 +1,21 @@
+[package]
+name = "pdfboss-write"
+description = "PDF creation for pdfboss: COS object writer, content canvas and document assembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pdfboss-core = { workspace = true }
+pdfboss-encoding = { workspace = true }
+thiserror = "2"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+png = "0.18"
+
+[dev-dependencies]
+pdfboss-render = { workspace = true }
+pdfboss-text = { workspace = true }
+pdfboss-output = { workspace = true }

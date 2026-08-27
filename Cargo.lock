@@ -1196,6 +1196,7 @@ dependencies = [
  "pdfboss-output",
  "pdfboss-render",
  "pdfboss-testkit",
+ "pdfboss-write",
  "reqwest",
  "thiserror",
  "tokio",
@@ -1218,6 +1219,8 @@ dependencies = [
  "pdfboss-testkit",
  "pdfboss-text",
  "pdfboss-tui",
+ "pdfboss-write",
+ "png",
  "serde_json",
  "tokio",
 ]
@@ -1311,6 +1314,20 @@ dependencies = [
  "pdfboss-testkit",
  "ratatui",
  "tokio",
+]
+
+[[package]]
+name = "pdfboss-write"
+version = "0.19.1"
+dependencies = [
+ "flate2",
+ "pdfboss-core",
+ "pdfboss-encoding",
+ "pdfboss-output",
+ "pdfboss-render",
+ "pdfboss-text",
+ "png",
+ "thiserror",
 ]
 
 [[package]]

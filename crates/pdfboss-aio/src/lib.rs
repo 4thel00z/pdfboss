@@ -9,6 +9,8 @@ pub mod backend;
 pub mod cache;
 pub mod document;
 pub mod error;
+#[cfg(feature = "write")]
+pub mod sink;
 pub mod stream;
 
 #[cfg(feature = "http")]
@@ -17,4 +19,6 @@ pub use backend::{Backend, BoxFuture, FileBackend, MemBackend};
 pub use cache::CachedBackend;
 pub use document::AsyncDocument;
 pub use error::{Error, Result};
+#[cfg(feature = "write")]
+pub use sink::TokioSink;
 pub use stream::ElementStream;

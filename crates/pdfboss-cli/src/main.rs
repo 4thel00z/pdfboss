@@ -1,6 +1,7 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
+mod create;
 mod hexdump;
 mod input;
 mod json;
@@ -62,6 +63,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create a new PDF: blank pages, word-wrapped text, or image pages.
+    Create {
+        #[command(subcommand)]
+        command: create::CreateCommand,
+    },
     /// Show version, page count, page sizes and metadata.
     Info {
         /// Path to the PDF file.
@@ -275,6 +281,7 @@ impl PngCompressionArg {
 fn main() {
     let cli = Cli::parse();
     let result: Result<(), Failure> = match cli.command {
+        Command::Create { command } => create::cmd_create(command).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,
