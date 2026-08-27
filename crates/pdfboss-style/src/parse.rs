@@ -2,10 +2,6 @@
 //! property set from `style.rs`, driven directly off `cssparser` tokens
 //! so every error carries a 1-indexed source location.
 
-// Reached once the theme cascade lands and calls `parse_sheet`; until then
-// this module's `pub(crate)` surface is only exercised by its own tests.
-#![allow(dead_code)]
-
 use std::fmt;
 
 use cssparser::{ParseError, ParseErrorKind, Parser, ParserInput, SourceLocation, Token};
