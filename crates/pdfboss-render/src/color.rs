@@ -3,9 +3,11 @@
 //! through their tint transforms,
 //! converted to RGB.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use pdfboss_core::{block_on, AsyncObjectSource, Dict, Document, Error, Immediate, Object, Stream};
+use pdfboss_core::{
+    block_on, AsyncObjectSource, Dict, Document, Error, FastMap, Immediate, ObjRef, Object, Stream,
+};
 use pdfboss_icc::{
     lab_to_xyz, mat_apply, mat_mul, srgb_encode, xyz_to_linear_srgb, DeviceSpace, Mat3, Profile,
 };
@@ -16,6 +18,37 @@ use crate::shading::{load_functions, Functions, MAX_COMPS};
 /// (Indexed bases, ICCBased `/Alternate` chains): levels `0..=MAX_DEPTH`
 /// are read, anything deeper reads as `DeviceGray`.
 const MAX_DEPTH: u32 = 8;
+
+/// Parsed `ICCBased` outcomes keyed by the profile stream's reference.
+///
+/// Decoding and parsing a profile is a pure function of the stream object,
+/// so one entry serves every colorspace resource, image, and shading that
+/// names the same stream — within one page render (the executor's own
+/// handle) or across a document's pages (`crate::RenderCache`). Without a
+/// cache the profile re-inflates on every `cs`/`CS` operator, which
+/// measured as a quarter of a mixed-corpus render pass. `None` remembers a
+/// profile that failed to decode or parse, so a broken stream costs one
+/// attempt rather than one per operator. Behind a `Mutex` because the
+/// document-level cache is shared by parallel page walks; first writer
+/// wins, like the font cache.
+#[derive(Default)]
+pub(crate) struct IccCache {
+    outcomes: Mutex<FastMap<ObjRef, Option<ColorSpace>>>,
+}
+
+impl IccCache {
+    /// The remembered outcome for `r`: `Some(None)` is a remembered parse
+    /// failure, `None` a stream this cache has not seen.
+    fn get(&self, r: ObjRef) -> Option<Option<ColorSpace>> {
+        self.outcomes.lock().ok()?.get(&r).cloned()
+    }
+
+    fn store(&self, r: ObjRef, outcome: Option<ColorSpace>) {
+        if let Ok(mut outcomes) = self.outcomes.lock() {
+            outcomes.entry(r).or_insert(outcome);
+        }
+    }
+}
 
 /// A color space reduced to what the rasterizer can paint.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,7 +264,7 @@ impl ColorSpace {
     ///
     /// [`Other`]: ColorSpace::Other
     pub(crate) fn parse(doc: &Document, obj: &Object) -> ColorSpace {
-        block_on(Self::parse_with(&Immediate(doc), obj))
+        block_on(Self::parse_with(&Immediate(doc), obj, &IccCache::default()))
     }
 
     /// [`ColorSpace::parse`] against any object source; the synchronous form
@@ -245,7 +278,11 @@ impl ColorSpace {
     /// level covers it. Descending through `/Indexed` pushes its palette;
     /// whatever the loop finally resolves to gets wrapped in the pending
     /// palettes, innermost last.
-    pub(crate) async fn parse_with<S: AsyncObjectSource>(src: &S, obj: &Object) -> ColorSpace {
+    pub(crate) async fn parse_with<S: AsyncObjectSource>(
+        src: &S,
+        obj: &Object,
+        icc: &IccCache,
+    ) -> ColorSpace {
         let mut palettes: Vec<Vec<u8>> = Vec::new();
         // Tint transforms met on the way down with their input arity,
         // innermost last — the same deferral `palettes` uses, for the same
@@ -270,14 +307,33 @@ impl ColorSpace {
                     };
                     match family.as_str() {
                         "ICCBased" => {
+                            let key = match items.get(1) {
+                                Some(Object::Ref(r)) => Some(*r),
+                                _ => None,
+                            };
+                            let remembered = key.and_then(|r| icc.get(r));
+                            if let Some(Some(cs)) = remembered {
+                                result = cs;
+                                break;
+                            }
                             let stream = match items.get(1) {
                                 Some(o) => src.resolve(o).await.ok(),
                                 None => None,
                             };
                             if let Some(Object::Stream(s)) = stream {
-                                if let Some(cs) = Self::from_icc(src, &s).await {
-                                    result = cs;
-                                    break;
+                                // `Some(None)` is a remembered failure: skip
+                                // straight to the `/N`-or-`/Alternate`
+                                // fallback instead of re-decoding a stream
+                                // that already refused to parse.
+                                if remembered.is_none() {
+                                    let parsed = Self::from_icc(src, &s).await;
+                                    if let Some(r) = key {
+                                        icc.store(r, parsed.clone());
+                                    }
+                                    if let Some(cs) = parsed {
+                                        result = cs;
+                                        break;
+                                    }
                                 }
                                 if let Some(n) = s.dict.get_int("N") {
                                     result = match n {
@@ -591,10 +647,20 @@ pub(crate) async fn palette_error_with<S: AsyncObjectSource>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use pdfboss_core::parser::{NoResolve, Parser};
     use pdfboss_testkit::PdfBuilder;
+
+    /// A matrix/TRC RGB profile with a gamma-1,8 curve — NOT equivalent to
+    /// a device space, so parsing it yields a real [`ColorSpace::Icc`].
+    /// Shared with the executor's cache tests, like `truetype::tests`'
+    /// `build_font`.
+    pub(crate) fn gamma18_rgb_profile() -> Vec<u8> {
+        let mut trc = b"curv\0\0\0\0\0\0\0\x01".to_vec();
+        trc.extend_from_slice(&((1.8f64 * 256.0).round() as u16).to_be_bytes());
+        rgb_profile(&trc)
+    }
 
     fn test_doc() -> Document {
         let mut b = PdfBuilder::new();

@@ -1472,6 +1472,7 @@ impl Shading {
     pub(crate) async fn load_with<S: AsyncObjectSource>(
         src: &S,
         obj: &Object,
+        icc: &crate::color::IccCache,
     ) -> Result<Shading, Error> {
         let (dict, stream) = match src.resolve(obj).await? {
             Object::Dict(d) => (d, None),
@@ -1482,7 +1483,7 @@ impl Shading {
         let cs_obj = dict
             .get("ColorSpace")
             .ok_or_else(|| Error::Other("shading has no /ColorSpace".into()))?;
-        let cs = ColorSpace::parse_with(src, cs_obj).await;
+        let cs = ColorSpace::parse_with(src, cs_obj, icc).await;
         let kind = match type_num {
             1 => {
                 let functions = match dict.get("Function") {

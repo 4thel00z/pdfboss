@@ -209,11 +209,16 @@ pub struct RenderOptions {
     pub cache: Option<Arc<RenderCache>>,
 }
 
-/// Cross-page render state: fonts by their dictionary's object reference.
+/// Cross-page render state: fonts by their dictionary's object reference,
+/// and parsed `ICCBased` colorspace outcomes by their profile stream's.
 /// `Send + Sync`, so a parallel page walk may share one.
 #[derive(Default)]
 pub struct RenderCache {
     fonts: std::sync::Mutex<pdfboss_core::FastMap<pdfboss_core::ObjRef, executor::SharedGlyphFont>>,
+    /// Shared as one handle with every page's executor, which otherwise
+    /// builds a render-local one — the same two-level shape as `fonts`
+    /// without a second lookup tier.
+    colorspaces: Arc<color::IccCache>,
 }
 
 impl std::fmt::Debug for RenderCache {
