@@ -1031,7 +1031,7 @@ mod blend_hw_tests {
             let opaque = [rgb[0], rgb[1], rgb[2], 255];
             let mut dst: Vec<u8> = (0..16).map(|_| next() as u8).collect();
             if next() % 4 == 0 {
-                for px in dst.chunks_exact_mut(4) {
+                for px in dst.as_chunks_mut::<4>().0 {
                     px[3] = 0;
                 }
             }
