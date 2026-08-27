@@ -301,6 +301,11 @@ fn sniff_sof(bytes: &[u8], pos: usize) -> Result<ImageData> {
     }
     let height = u32::from(u16::from_be_bytes([bytes[pos + 3], bytes[pos + 4]]));
     let width = u32::from(u16::from_be_bytes([bytes[pos + 5], bytes[pos + 6]]));
+    if width == 0 || height == 0 {
+        return Err(Error::Image(format!(
+            "jpeg declares degenerate dimensions {width}x{height}"
+        )));
+    }
     let gray = match bytes[pos + 7] {
         1 => true,
         3 => false,
@@ -865,5 +870,14 @@ mod tests {
             Some([Object::Int(1), Object::Int(0)].as_slice())
         );
         assert_eq!(doc.stream_data(&stream).unwrap(), rows);
+    }
+
+    #[test]
+    fn jpeg_rejects_degenerate_dimensions() {
+        for (width, height) in [(0u16, 8u16), (8, 0), (0, 0)] {
+            let bytes = jpeg_bytes(&[jpeg_sof(0xC0, 8, width, height, 3)]);
+            let msg = image_message(ImageData::jpeg(&bytes));
+            assert!(msg.contains("degenerate"), "{width}x{height}: {msg}");
+        }
     }
 }

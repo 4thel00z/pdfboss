@@ -260,6 +260,7 @@ async fn emit_table<S: AsyncByteSink>(
     let mut section = format!("xref\n0 {}\n", bodies.len() + 1).into_bytes();
     section.extend_from_slice(b"0000000000 65535 f\r\n");
     for offset in offsets {
+        let offset = table_offset(offset)?;
         section.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
     }
     section.extend_from_slice(b"trailer\n");
@@ -452,6 +453,18 @@ fn push_row(rows: &mut Vec<u8>, kind: u8, second: u32, third: u16) {
 fn field_offset(position: usize) -> Result<u32> {
     u32::try_from(position)
         .map_err(|_| Error::Other("file offset exceeds the 4-byte xref field".to_string()))
+}
+
+/// A byte position as the 10-digit offset field of a classic xref table
+/// (ISO 32000-1 §7.5.4 mandates exactly-20-byte entries; a wider offset
+/// would silently desynchronize every later entry).
+fn table_offset(position: usize) -> Result<usize> {
+    if position as u64 <= 9_999_999_999 {
+        return Ok(position);
+    }
+    Err(Error::Other(
+        "file offset exceeds the 10-digit xref table field".to_string(),
+    ))
 }
 
 /// A `Name` from a string literal.
@@ -800,6 +813,38 @@ mod tests {
         assert_eq!(stream.data, CONTENT);
         assert!(stream.dict.get("Filter").is_none());
         assert_eq!(stream.dict.get_int("Length"), Some(CONTENT.len() as i64));
+    }
+
+    #[test]
+    fn table_offsets_past_ten_digits_are_rejected() {
+        assert_eq!(table_offset(9_999_999_999).ok(), Some(9_999_999_999));
+        assert!(table_offset(10_000_000_000).is_err());
+    }
+
+    #[test]
+    fn id_derives_from_the_emitted_content() {
+        let (a, refs) = minimal_pdf(table_options());
+        assert_eq!(refs.root.gen, 0);
+        let (b, other_refs) = skeleton(
+            table_options(),
+            Dict::new(),
+            b"BT /F1 12 Tf 72 720 Td (Hello, other) Tj ET".to_vec(),
+            false,
+        );
+        assert_eq!(other_refs.root.gen, 0);
+        let id_of = |bytes: &[u8]| {
+            let xref = load_xref(bytes).expect("xref loads");
+            let id = xref.trailer.get_array("ID").expect("/ID array present");
+            id[0]
+                .as_str_bytes()
+                .expect("/ID entry is a string")
+                .to_vec()
+        };
+        assert_ne!(
+            id_of(&a),
+            id_of(&b),
+            "/ID must depend on the emitted content"
+        );
     }
 
     #[test]

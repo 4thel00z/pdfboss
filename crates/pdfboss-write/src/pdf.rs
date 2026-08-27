@@ -201,6 +201,11 @@ impl Pdf {
             pages,
             options,
         } = self;
+        if pages.is_empty() {
+            return Err(Error::Other(
+                "a document needs at least one page".to_string(),
+            ));
+        }
         let mut w = Writer::new(options);
         let pages_root = w.reserve();
         let mut font_cache: Vec<(Standard14, ObjRef)> = Vec::new();
@@ -461,5 +466,13 @@ mod tests {
         let via_sink = pdfboss_core::block_on(two_page_doc().write_into_with(Vec::new()))
             .expect("write_into_with succeeds");
         assert_eq!(via_sink, bytes);
+    }
+
+    #[test]
+    fn zero_page_document_is_an_error() {
+        let err = Pdf::default()
+            .to_bytes()
+            .expect_err("a page-less document must not serialize");
+        assert!(err.to_string().contains("at least one page"), "{err}");
     }
 }

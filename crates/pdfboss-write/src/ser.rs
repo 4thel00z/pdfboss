@@ -23,7 +23,10 @@ pub fn serialize_object(obj: &Object, out: &mut Vec<u8>) -> Result<()> {
         Object::Int(i) => out.extend_from_slice(i.to_string().as_bytes()),
         Object::Real(r) => write_real(*r, out),
         Object::String(bytes) => write_string(bytes, out),
-        Object::Name(n) => write_name(&n.0, out),
+        Object::Name(n) => {
+            nul_free(n)?;
+            write_name(&n.0, out);
+        }
         Object::Array(items) => {
             out.push(b'[');
             for (i, item) in items.iter().enumerate() {
@@ -53,6 +56,7 @@ pub fn serialize_dict(dict: &Dict, out: &mut Vec<u8>) -> Result<()> {
     let mut entries: Vec<(&Name, &Object)> = dict.iter().collect();
     entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
     for (key, value) in entries {
+        nul_free(key)?;
         out.push(b' ');
         write_name(&key.0, out);
         out.push(b' ');
@@ -132,6 +136,20 @@ pub fn write_real_f32(value: f32, out: &mut Vec<u8>) {
         return;
     }
     out.extend_from_slice(plain_decimal(&value.to_string()).as_bytes());
+}
+
+/// Rejects a name containing NUL: ISO 32000 forbids the `#00` escape, so
+/// such a name has no legal spelling. Object and dictionary serialization
+/// validate here; [`write_name`] itself stays infallible for callers whose
+/// names are structurally NUL-free (content-stream resource names).
+fn nul_free(name: &Name) -> Result<()> {
+    if name.0.bytes().all(|b| b != 0) {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "name {:?} contains NUL, which has no legal escape in a name",
+        name.0
+    )))
 }
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -477,5 +495,17 @@ mod tests {
             .parse_object(&NoResolve)
             .expect("serialized bytes parse");
         assert_eq!(parsed, Object::Int(72));
+    }
+
+    #[test]
+    fn names_with_nul_bytes_are_rejected() {
+        let mut out = Vec::new();
+        let err = serialize_object(&Object::Name(name("a\0b")), &mut out)
+            .expect_err("a NUL in a name must not serialize");
+        assert!(err.to_string().contains("NUL"), "{err}");
+        let mut d = Dict::new();
+        d.insert(name("a\0b"), Object::Int(1));
+        let mut out = Vec::new();
+        assert!(serialize_dict(&d, &mut out).is_err());
     }
 }
