@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.1](https://github.com/4thel00z/pdfboss/compare/v0.21.0...v0.21.1) (2026-08-27)
+
+
+### Performance Improvements
+
+* **render:** sweep a repeating glyph's coverage once per baseline, replay it per occurrence ([#99](https://github.com/4thel00z/pdfboss/issues/99)) ([#100](https://github.com/4thel00z/pdfboss/issues/100)) ([87b14b8](https://github.com/4thel00z/pdfboss/commit/87b14b8f922d219677828bde5a15354d370d11ab))
+
 ## [0.21.0](https://github.com/4thel00z/pdfboss/compare/v0.20.0...v0.21.0) (2026-08-27)
 
 
