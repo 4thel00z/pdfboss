@@ -86,7 +86,7 @@ fn next_rule<'i>(parser: &mut Parser<'i, '_>) -> Result<Option<Rule>, Failure<'i
         };
         match token {
             Token::Ident(name) => {
-                let element = Element::from_name(&name).ok_or_else(|| {
+                let element = Element::from_name(&name.to_ascii_lowercase()).ok_or_else(|| {
                     location.new_custom_error(format!(
                         "unsupported selector {name:?}: only element type selectors are supported"
                     ))
@@ -343,7 +343,7 @@ fn rgb_component<'i>(parser: &mut Parser<'i, '_>) -> Result<f32, Failure<'i>> {
     let location = parser.current_source_location();
     let token = parser.next()?.clone();
     match &token {
-        Token::Number { value, .. } => Ok(value / 255.0),
+        Token::Number { value, .. } if (0.0..=255.0).contains(value) => Ok(value / 255.0),
         _ => Err(location.new_custom_error(format!(
             "rgb() takes three numbers 0-255, found {}",
             render_token(&token)
@@ -527,5 +527,17 @@ mod tests {
     fn comments_and_whitespace_are_ignored() {
         let rules = sheet("/* heading */\nh1 { /* big */ font-size: 20pt; }");
         assert_eq!(rules[0].declared.size, Some(FontSize::Pt(20.0)));
+    }
+
+    #[test]
+    fn selectors_match_case_insensitively() {
+        let rules = sheet("H1, P { font-size: 20pt; }");
+        assert_eq!(rules[0].elements, vec![Element::H1, Element::P]);
+    }
+
+    #[test]
+    fn rejects_rgb_components_outside_0_255() {
+        let e = error("p { color: rgb(500, -10, 0); }");
+        assert!(e.message.contains("500"));
     }
 }
