@@ -34,7 +34,7 @@ use crate::{
 /// Maximum `q`/`Q` nesting depth.
 const MAX_GSTATE_DEPTH: usize = 64;
 /// Maximum form XObject recursion depth.
-const MAX_FORM_DEPTH: u32 = 16;
+pub(crate) const MAX_FORM_DEPTH: u32 = 16;
 /// Maximum pixmap side length, guarding malformed boxes and huge scales.
 const MAX_SIDE: f32 = 16384.0;
 /// Bound on `Executor::clip_cache`'s size: many real documents repeat the
@@ -2281,23 +2281,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// — so neither could survive being stored in a work-stack frame, which is how
     /// the asynchronous path has to express this recursion.
     async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
-        for res in chain {
-            let Some(cat) = res.get(category) else {
-                continue;
-            };
-            let Ok(Object::Dict(dict)) = self.src.resolve(cat).await else {
-                continue;
-            };
-            let Some(value) = dict.get(name) else {
-                continue;
-            };
-            if let Ok(obj) = self.src.resolve(value).await {
-                if !obj.is_null() {
-                    return Some(obj);
-                }
-            }
-        }
-        None
+        crate::extract::find_res(self.src, chain, category, name).await
     }
 
     /// Resolves a `cs`/`CS` operand: a device space name directly, the
@@ -2530,6 +2514,100 @@ fn skip_reason_for(e: &Error) -> SkipReason {
     match e {
         Error::UnsupportedFilter(name) => SkipReason::UnsupportedFilter(name.clone()),
         other => SkipReason::DecodeFailed(other.to_string()),
+    }
+}
+
+/// The per-sample alpha an image's `/SMask` or `/Mask` entry asks for
+/// (`/SMask` wins when both are present, §8.9.6.4). A mask that exists but
+/// cannot be honored records as an ignored soft mask and the image stays
+/// unmasked — exactly the pre-mask behavior, now the exception instead of
+/// the rule. Shared between drawing and extraction, so both honor a mask
+/// identically.
+pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+    base: &image::ImageMeta,
+    base_data: &[u8],
+    icc: &crate::color::IccCache,
+    report: &mut RenderReport,
+) -> Option<image::SampleMask> {
+    if let Some(obj) = dict.get("SMask") {
+        match src.resolve(obj).await {
+            Ok(Object::Stream(s)) => {
+                if s.dict.get("Matte").is_some() {
+                    // Pre-blended matte colors are not un-blended here;
+                    // the alpha still applies, the colors approximate.
+                    report.record(SkippedKind::SoftMask, SkipReason::Unsupported);
+                }
+                let data = match src.stream_data(&s).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        report.record(SkippedKind::SoftMask, skip_reason_for(&e));
+                        return None;
+                    }
+                };
+                let cs_obj = s.dict.get("ColorSpace").cloned();
+                let meta = image::ImageMeta::read_with(src, &s.dict, cs_obj.as_ref(), icc).await;
+                let mask = image::decode_alpha(&meta, &data);
+                if mask.is_none() {
+                    report.record(SkippedKind::SoftMask, SkipReason::Undecodable);
+                }
+                return mask;
+            }
+            Ok(Object::Name(n)) if n.0 == "None" => {}
+            Ok(Object::Null) => {}
+            _ => {
+                report.record(SkippedKind::SoftMask, SkipReason::Missing);
+                return None;
+            }
+        }
+    }
+    match dict.get("Mask") {
+        None => None,
+        Some(obj) => match src.resolve(obj).await {
+            Ok(Object::Stream(s)) => {
+                let data = match src.stream_data(&s).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        report.record(SkippedKind::SoftMask, skip_reason_for(&e));
+                        return None;
+                    }
+                };
+                let meta = image::ImageMeta::read_with(src, &s.dict, None, icc).await;
+                if !meta.stencil {
+                    // A stream-valued /Mask must be a stencil (§8.9.6.4).
+                    report.record(SkippedKind::SoftMask, SkipReason::Undecodable);
+                    return None;
+                }
+                let mask = image::decode_alpha(&meta, &data);
+                if mask.is_none() {
+                    report.record(SkippedKind::SoftMask, SkipReason::Undecodable);
+                }
+                mask
+            }
+            Ok(Object::Array(items)) => {
+                let mut key = Vec::with_capacity(items.len());
+                for item in &items {
+                    match src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
+                        Some(v) => key.push(v as i64),
+                        None => {
+                            report.record(SkippedKind::SoftMask, SkipReason::Undecodable);
+                            return None;
+                        }
+                    }
+                }
+                let mask = image::color_key_mask(base, base_data, &key);
+                if mask.is_none() {
+                    report.record(SkippedKind::SoftMask, SkipReason::Unsupported);
+                }
+                mask
+            }
+            Ok(Object::Null) => None,
+            _ => {
+                report.record(SkippedKind::SoftMask, SkipReason::Missing);
+                None
+            }
+        },
     }
 }
 
@@ -3023,98 +3101,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         self.blit_image(&img.dict, &data, cs_obj, gs).await;
     }
 
-    /// The per-sample alpha an image's `/SMask` or `/Mask` entry asks for
-    /// (`/SMask` wins when both are present, §8.9.6.4). A mask that exists
-    /// but cannot be honored reports as an ignored soft mask and the image
-    /// draws unmasked — exactly the pre-mask behavior, now the exception
-    /// instead of the rule.
+    /// The per-sample alpha an image's `/SMask` or `/Mask` entry asks for,
+    /// via the shared [`image_alpha_mask`], recording every miss in this
+    /// render's report.
     async fn image_alpha_mask(
         &mut self,
         dict: &Dict,
         base: &image::ImageMeta,
         base_data: &[u8],
     ) -> Option<image::SampleMask> {
-        if let Some(obj) = dict.get("SMask") {
-            match self.src.resolve(obj).await {
-                Ok(Object::Stream(s)) => {
-                    if s.dict.get("Matte").is_some() {
-                        // Pre-blended matte colors are not un-blended here;
-                        // the alpha still applies, the colors approximate.
-                        self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
-                    }
-                    let data = match self.src.stream_data(&s).await {
-                        Ok(data) => data,
-                        Err(e) => {
-                            self.skip(SkippedKind::SoftMask, skip_reason_for(&e));
-                            return None;
-                        }
-                    };
-                    let cs_obj = s.dict.get("ColorSpace").cloned();
-                    let meta =
-                        image::ImageMeta::read_with(self.src, &s.dict, cs_obj.as_ref(), &self.icc)
-                            .await;
-                    let mask = image::decode_alpha(&meta, &data);
-                    if mask.is_none() {
-                        self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
-                    }
-                    return mask;
-                }
-                Ok(Object::Name(n)) if n.0 == "None" => {}
-                Ok(Object::Null) => {}
-                _ => {
-                    self.skip(SkippedKind::SoftMask, SkipReason::Missing);
-                    return None;
-                }
-            }
-        }
-        match dict.get("Mask") {
-            None => None,
-            Some(obj) => match self.src.resolve(obj).await {
-                Ok(Object::Stream(s)) => {
-                    let data = match self.src.stream_data(&s).await {
-                        Ok(data) => data,
-                        Err(e) => {
-                            self.skip(SkippedKind::SoftMask, skip_reason_for(&e));
-                            return None;
-                        }
-                    };
-                    let meta =
-                        image::ImageMeta::read_with(self.src, &s.dict, None, &self.icc).await;
-                    if !meta.stencil {
-                        // A stream-valued /Mask must be a stencil (§8.9.6.4).
-                        self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
-                        return None;
-                    }
-                    let mask = image::decode_alpha(&meta, &data);
-                    if mask.is_none() {
-                        self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
-                    }
-                    mask
-                }
-                Ok(Object::Array(items)) => {
-                    let mut key = Vec::with_capacity(items.len());
-                    for item in &items {
-                        match self.src.resolve(item).await.ok().and_then(|o| o.as_f64()) {
-                            Some(v) => key.push(v as i64),
-                            None => {
-                                self.skip(SkippedKind::SoftMask, SkipReason::Undecodable);
-                                return None;
-                            }
-                        }
-                    }
-                    let mask = image::color_key_mask(base, base_data, &key);
-                    if mask.is_none() {
-                        self.skip(SkippedKind::SoftMask, SkipReason::Unsupported);
-                    }
-                    mask
-                }
-                Ok(Object::Null) => None,
-                _ => {
-                    self.skip(SkippedKind::SoftMask, SkipReason::Missing);
-                    None
-                }
-            },
-        }
+        image_alpha_mask(self.src, dict, base, base_data, &self.icc, &mut self.report).await
     }
 
     async fn blit_image(&mut self, dict: &Dict, data: &[u8], cs_obj: Option<Object>, gs: &GState) {
@@ -3176,19 +3172,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// The image's `/ColorSpace` value with resource-name indirection
     /// resolved: a non-device name is looked up in `/ColorSpace` resources.
     async fn image_colorspace(&self, dict: &Dict, chain: &[Arc<Dict>]) -> Option<Object> {
-        let resolved = self.src.resolve(dict.get("ColorSpace")?).await.ok()?;
-        if let Object::Name(n) = &resolved {
-            let device = matches!(
-                n.0.as_str(),
-                "DeviceGray" | "DeviceRGB" | "DeviceCMYK" | "G" | "RGB" | "CMYK"
-            );
-            if !device {
-                if let Some(from_res) = self.find_res(chain, "ColorSpace", &n.0).await {
-                    return Some(from_res);
-                }
-            }
-        }
-        Some(resolved)
+        crate::extract::image_colorspace(self.src, dict, chain).await
     }
 }
 

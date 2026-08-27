@@ -31,6 +31,7 @@ mod cff;
 mod color;
 mod encode;
 mod executor;
+mod extract;
 mod glyph;
 mod image;
 #[allow(dead_code)]
@@ -50,6 +51,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use pdfboss_core::{AsyncObjectSource, Document, Error, OcState, Page, Result};
+
+pub use extract::{extract_page_images, extract_page_images_with};
 
 /// An RGBA8 raster image with straight (non-premultiplied) alpha, row-major
 /// from the top-left.

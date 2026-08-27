@@ -376,6 +376,37 @@ class Page:
         rasterized exactly as it describes itself.
         """
 
+    def extract_images(self, compression: str = "default") -> list[PageImage]:
+        """Every image the page draws, each decoded at its native pixel
+        dimensions and re-encoded as PNG, in drawing order.
+
+        An image drawn twice appears twice; an XObject the content never
+        draws does not appear; stencil masks (``/ImageMask true``) paint a
+        fill color rather than carrying pixels of their own and are
+        skipped. An image's ``/SMask`` becomes the PNG alpha channel.
+
+        ``compression`` trades PNG encode time against file size exactly
+        as in ``render``. Lenient like rendering: content that cannot be
+        read or decoded contributes nothing rather than raising.
+        """
+
+class PageImage:
+    """One embedded image extracted from a page: PNG-encoded pixels at
+    the image's own native dimensions, straight alpha, ``/SMask``
+    applied."""
+
+    @property
+    def width(self) -> int:
+        """Native pixel width of the embedded image."""
+
+    @property
+    def height(self) -> int:
+        """Native pixel height of the embedded image."""
+
+    @property
+    def data(self) -> bytes:
+        """The image re-encoded as PNG (RGBA8)."""
+
 class AsyncDocument:
     """A PDF document opened for async I/O.
 
@@ -567,3 +598,8 @@ class AsyncPage:
         """Renders the page like ``render``, resolving to
         ``(png, warnings)`` — the async twin of ``Page.render_reporting``,
         with the same warning semantics."""
+
+    async def extract_images(self, compression: str = "default") -> list[PageImage]:
+        """Every image the page draws, as PNG-encoded ``PageImage``
+        entries — the async twin of ``Page.extract_images``, with the
+        same drawing-order, native-size and leniency semantics."""

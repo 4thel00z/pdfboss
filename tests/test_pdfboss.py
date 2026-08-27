@@ -531,3 +531,21 @@ class TestThreadedPageCalls:
         del doc
         gc.collect()
         assert page.render(scale=1.0) == expected
+
+
+class TestExtractImages:
+    def test_extracts_the_drawn_image_as_png_with_smask_alpha(
+        self, image_pdf: bytes
+    ) -> None:
+        images = Document(data=image_pdf)[0].extract_images()
+        assert len(images) == 1
+        img = images[0]
+        assert (img.width, img.height) == (2, 2)
+        assert img.data[:8] == PNG_MAGIC
+        width, height, pixels = decode_png(img.data)
+        assert (width, height) == (2, 2)
+        assert pixels[0:4] == bytes([255, 0, 0, 0]), "smask zero masks out"
+        assert pixels[12:16] == bytes([255, 255, 0, 255]), "smask 255 is opaque"
+
+    def test_a_page_without_images_extracts_nothing(self, hello_pdf: Path) -> None:
+        assert Document(str(hello_pdf))[0].extract_images() == []
