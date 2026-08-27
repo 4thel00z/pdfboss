@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.21.0](https://github.com/4thel00z/pdfboss/compare/v0.20.0...v0.21.0) (2026-08-27)
+
+
+### Features
+
+* **render:** embedded-image extraction — extract_page_images, Python extract_images, images CLI ([#98](https://github.com/4thel00z/pdfboss/issues/98)) ([174a8fb](https://github.com/4thel00z/pdfboss/commit/174a8fbb21999bdac6b7963cbca2953c7c28fcbe))
+
+
+### Performance Improvements
+
+* **render:** parse an ICCBased profile once per render, not once per operator ([#96](https://github.com/4thel00z/pdfboss/issues/96)) ([23309ec](https://github.com/4thel00z/pdfboss/commit/23309ecba627851d078249480e894e74a2eace69))
+
 ## [0.20.0](https://github.com/4thel00z/pdfboss/compare/v0.19.1...v0.20.0) (2026-08-27)
 
 
