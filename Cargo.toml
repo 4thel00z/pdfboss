@@ -9,6 +9,7 @@ members = [
     "crates/pdfboss-icc",
     "crates/pdfboss-render",
     "crates/pdfboss-style",
+    "crates/pdfboss-markdown",
     "crates/pdfboss-aio",
     "crates/pdfboss-cli",
     "crates/pdfboss-py",
@@ -40,6 +41,7 @@ pdfboss-aio = { path = "crates/pdfboss-aio", version = "0.21.1" } # x-release-pl
 pdfboss-tui = { path = "crates/pdfboss-tui", version = "0.21.1" } # x-release-please-version
 pdfboss-write = { path = "crates/pdfboss-write", version = "0.21.1" } # x-release-please-version
 pdfboss-style = { path = "crates/pdfboss-style", version = "0.21.1" } # x-release-please-version
+pdfboss-markdown = { path = "crates/pdfboss-markdown", version = "0.21.1" } # x-release-please-version
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "sync", "io-util"] }
 futures-core = "0.3"
