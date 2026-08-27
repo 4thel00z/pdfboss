@@ -552,6 +552,29 @@ mod tests {
     }
 
     #[test]
+    fn heading_keep_reserves_its_bottom_margin() {
+        let mut md = "filler\n\n".repeat(33);
+        md.push_str("# Trailing heading\n\nbody after\n");
+        let pages = laid(&md, MONO);
+        let heading_page = pages
+            .iter()
+            .position(|p| {
+                p.items.iter().any(
+                    |item| matches!(item, Item::Text { text, .. } if text.contains("Trailing")),
+                )
+            })
+            .unwrap();
+        assert!(pages[heading_page]
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Text { text, .. } if text.contains("body after"))));
+        assert!(!pages[heading_page]
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Text { text, .. } if text == "filler")));
+    }
+
+    #[test]
     fn margins_collapse_between_blocks() {
         let pages = laid(
             "first\n\nsecond\n",
