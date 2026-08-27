@@ -38,6 +38,18 @@ def pdfboss_text(path):
     return pdfboss.Document(path).extract_text()
 
 
+def pdf_oxide_open(path):
+    import pdf_oxide
+
+    return pdf_oxide.PdfDocument(path).page_count()
+
+
+def pdf_oxide_text(path):
+    import pdf_oxide
+
+    return pdf_oxide.PdfDocument(path).to_plain_text_all()
+
+
 def pypdf_open(path):
     from pypdf import PdfReader
 
@@ -101,6 +113,7 @@ def pymupdf_text(path):
 LIBS = {
     "pdfboss": {"open": pdfboss_open, "text": pdfboss_text},
     "PyMuPDF": {"open": pymupdf_open, "text": pymupdf_text},
+    "pdf_oxide": {"open": pdf_oxide_open, "text": pdf_oxide_text},
     "pypdf": {"open": pypdf_open, "text": pypdf_text},
     "pdfplumber": {"open": pdfplumber_open, "text": pdfplumber_text},
     "pdfminer.six": {"text": pdfminer_text},
@@ -205,10 +218,13 @@ def plot(results, out_png):
         colors = ["#e8552d" if n == "pdfboss" else "#9aa4b2" for n in names]
         bars = ax.barh(names, vals, color=colors)
         ax.set_title(f"{titles[op]}  (pages/sec, higher is faster)", fontsize=11)
-        ax.bar_label(bars, fmt="%.0f", padding=3, fontsize=9)
+        ax.bar_label(bars, fmt="{:,.0f}".format, padding=3, fontsize=9)
         ax.margins(x=0.15)
         ax.spines[["top", "right"]].set_visible(False)
         ax.tick_params(length=0)
+        ax.xaxis.set_major_formatter(
+            lambda v, _: f"{v / 1000:g}k" if v >= 1000 else f"{v:g}"
+        )
     n = results["operations"]["text"]["files_compared"]
     fig.suptitle(
         f"pdfboss vs. Python PDF libraries — {n} real-world PDFs",
