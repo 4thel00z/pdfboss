@@ -189,6 +189,9 @@ impl GState {
 /// drawn (the [`crate::GlyphPainting`] tier, or a load failure).
 type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>, Option<Arc<GlyphFallback>>)>;
 
+/// [`LoadedFont`] as the cross-page [`crate::RenderCache`] stores it.
+pub(crate) type SharedGlyphFont = LoadedFont;
+
 /// Upper bound on tiles one pattern paint may plan. Real hatchings use
 /// hundreds to a few thousand cells; the cap only stops a hostile step
 /// (`/XStep 0.001` over a full page) from demanding unbounded work, and
@@ -453,8 +456,14 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
     let (w_pt, h_pt) = page.size();
     let pw = (w_pt * scale).ceil().clamp(1.0, MAX_SIDE) as u32;
     let ph = (h_pt * scale).ceil().clamp(1.0, MAX_SIDE) as u32;
-    let mut pix = Pixmap::new(pw, ph);
-    pix.fill([255, 255, 255, 255]);
+    // White is every byte 255, so the page allocates already-white
+    // instead of allocating zeroed and repainting.
+    let mut pix = Pixmap {
+        width: pw,
+        height: ph,
+        data: vec![255; pw as usize * ph as usize * 4],
+    };
+    let _ = &mut pix;
     let mut report = RenderReport::default();
     // A page whose own `/Contents` will not decode or will not parse
     // rasterizes blank, which is indistinguishable from an empty page unless
@@ -492,6 +501,7 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         color_locked: false,
         provider,
         oc: opts.oc.clone(),
+        shared_fonts: opts.cache.clone(),
         glyph_blit: Vec::new(),
         raster: RasterScratch::default(),
         clip_cache: FastMap::default(),
@@ -543,6 +553,9 @@ struct Executor<'a, S> {
     /// The document's optional-content visibility from
     /// [`RenderOptions::oc`]; `None` renders every layer.
     oc: Option<Arc<pdfboss_core::OcState>>,
+    /// Fonts shared across this document's page renders
+    /// ([`RenderOptions::cache`]); `None` keeps loads page-local.
+    shared_fonts: Option<Arc<crate::RenderCache>>,
     /// Reused scratch for painting a cached glyph outline: the flattened
     /// (origin-relative) subpaths from [`GlyphFont::flattened`] are copied
     /// here translated to the glyph's device origin, so a whole page of text
@@ -1621,10 +1634,48 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(f) = cache.get(name) {
             return f.clone();
         }
-        let dict = self
-            .find_res(chain, "Font", name)
-            .await
-            .and_then(|o| o.as_dict().cloned());
+        // Walk the resource chain exactly as `find_res` does — an entry
+        // that resolves to null falls through to an outer scope — but
+        // check the cross-page cache by each entry's object reference
+        // first: a hit never resolves the dictionary at all. The cache is
+        // keyed by reference, never resource name: a reference resolves to
+        // the same dictionary on every page, while `/F0` may not.
+        let mut font_ref = None;
+        let mut dict = None;
+        for res in chain {
+            let Some(cat) = res.get("Font") else {
+                continue;
+            };
+            let Ok(Object::Dict(fonts)) = self.src.resolve(cat).await else {
+                continue;
+            };
+            let Some(value) = fonts.get(name) else {
+                continue;
+            };
+            let entry_ref = match value {
+                Object::Ref(r) => Some(*r),
+                _ => None,
+            };
+            if let (Some(shared), Some(r)) = (&self.shared_fonts, entry_ref) {
+                if let Some(loaded) = shared.font(r) {
+                    cache.insert(name.to_string(), loaded.clone());
+                    return loaded;
+                }
+            }
+            if let Ok(obj) = self.src.resolve(value).await {
+                if let Some(d) = obj.as_dict() {
+                    font_ref = entry_ref;
+                    dict = Some(d.clone());
+                    break;
+                }
+                if !obj.is_null() {
+                    // A non-dict font resource loads as nothing, exactly
+                    // as the resolved lookup treated it.
+                    font_ref = entry_ref;
+                    break;
+                }
+            }
+        }
         let label: Arc<str> = dict
             .as_ref()
             .and_then(|d| d.get_name("BaseFont"))
@@ -1647,6 +1698,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             None => None,
         };
+        if let (Some(shared), Some(r)) = (&self.shared_fonts, font_ref) {
+            shared.store(r, loaded.clone());
+        }
         cache.insert(name.to_string(), loaded.clone());
         loaded
     }
@@ -6700,5 +6754,114 @@ mod tests {
             "metrics-only codes are configured behavior, not drops: {:?}",
             report.warnings()
         );
+    }
+}
+
+#[cfg(test)]
+mod render_cache_tests {
+    use super::*;
+    use crate::{RenderCache, RenderOptions};
+    use pdfboss_core::{block_on, BoxFuture, Document, Immediate, ObjRef};
+    use pdfboss_testkit::PdfBuilder;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts each reference resolution by object number while delegating
+    /// to the document — loading a font resolves its dictionary's
+    /// reference exactly once, so the count makes cross-page cache hits
+    /// observable without instrumenting production code (the same trick
+    /// pdfboss-text's FontCache tests use).
+    struct Counting<'a> {
+        inner: Immediate<&'a Document>,
+        resolutions: AtomicUsize,
+        watched: u32,
+    }
+
+    impl AsyncObjectSource for Counting<'_> {
+        fn get(&self, r: ObjRef) -> BoxFuture<'_, pdfboss_core::Result<Object>> {
+            self.inner.get(r)
+        }
+
+        fn stream_data<'b>(
+            &'b self,
+            s: &'b pdfboss_core::Stream,
+        ) -> BoxFuture<'b, pdfboss_core::Result<Vec<u8>>> {
+            self.inner.stream_data(s)
+        }
+
+        fn resolve<'b>(&'b self, o: &'b Object) -> BoxFuture<'b, pdfboss_core::Result<Object>> {
+            if let Object::Ref(r) = o {
+                if r.num == self.watched {
+                    self.resolutions.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.inner.resolve(o)
+        }
+    }
+
+    /// Two pages binding the same embedded TrueType font dictionary.
+    fn two_page_shared_font_doc() -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 8 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 30 80 Td (A) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /Shared \
+             /FirstChar 65 /Widths [500] /Encoding /WinAnsiEncoding \
+             /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Shared /Flags 32 \
+             /FontFile2 7 0 R >>",
+        );
+        b.stream(7, "", &crate::truetype::tests::build_font());
+        b.object(
+            8,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 9 0 R >>",
+        );
+        b.stream(9, "", b"BT /F0 100 Tf 30 80 Td (A) Tj ET");
+        b.build(1)
+    }
+
+    fn render_both(cache: Option<Arc<RenderCache>>) -> (usize, Vec<Pixmap>) {
+        let doc = Document::load(two_page_shared_font_doc()).expect("load");
+        let counting = Counting {
+            inner: Immediate(&doc),
+            resolutions: AtomicUsize::new(0),
+            watched: 5,
+        };
+        let opts = RenderOptions {
+            cache,
+            ..Default::default()
+        };
+        let mut pages = Vec::new();
+        for index in 0..2 {
+            let page = doc.page(index).expect("page");
+            let (pix, report) =
+                block_on(render_page_reporting_with(&counting, &page, 1.0, &opts)).expect("render");
+            assert!(report.warnings().is_empty(), "unexpected skips: {report:?}");
+            pages.push(pix);
+        }
+        (counting.resolutions.load(Ordering::Relaxed), pages)
+    }
+
+    /// One [`RenderCache`] across a document's pages loads the shared font
+    /// dictionary once, and the pixels are exactly the uncached render's.
+    #[test]
+    fn a_shared_font_loads_once_per_document() {
+        let (uncached_resolutions, uncached) = render_both(None);
+        let (cached_resolutions, cached) = render_both(Some(Arc::new(RenderCache::default())));
+        assert_eq!(uncached_resolutions, 2, "one load per page uncached");
+        assert_eq!(cached_resolutions, 1, "one load per document cached");
+        for (a, b) in cached.iter().zip(&uncached) {
+            assert_eq!(a.data, b.data, "pixels must not depend on the cache");
+        }
     }
 }

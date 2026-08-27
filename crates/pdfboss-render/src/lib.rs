@@ -199,6 +199,45 @@ pub struct RenderOptions {
     /// `AsyncDocument::oc_state`), and leaving it `None` there renders
     /// every layer.
     pub oc: Option<Arc<OcState>>,
+    /// Fonts loaded once for the document instead of once per page: a
+    /// caller rendering a whole document passes one [`RenderCache`] to
+    /// every page, and each font program — outline parsing included —
+    /// loads once. `None` keeps every load page-local. Keyed by the font
+    /// dictionary's object reference, so identical resource names on
+    /// different pages never collide, exactly like text extraction's
+    /// `FontCache`.
+    pub cache: Option<Arc<RenderCache>>,
+}
+
+/// Cross-page render state: fonts by their dictionary's object reference.
+/// `Send + Sync`, so a parallel page walk may share one.
+#[derive(Default)]
+pub struct RenderCache {
+    fonts: std::sync::Mutex<pdfboss_core::FastMap<pdfboss_core::ObjRef, executor::SharedGlyphFont>>,
+}
+
+impl std::fmt::Debug for RenderCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fonts = self.fonts.lock().map(|m| m.len()).unwrap_or(0);
+        f.debug_struct("RenderCache")
+            .field("fonts", &fonts)
+            .finish()
+    }
+}
+
+impl RenderCache {
+    pub(crate) fn font(&self, r: pdfboss_core::ObjRef) -> Option<executor::SharedGlyphFont> {
+        self.fonts.lock().ok()?.get(&r).cloned()
+    }
+
+    /// First writer wins, exactly like the text-side cache: concurrent
+    /// workers may load the same font twice and the copies are
+    /// interchangeable.
+    pub(crate) fn store(&self, r: pdfboss_core::ObjRef, font: executor::SharedGlyphFont) {
+        if let Ok(mut fonts) = self.fonts.lock() {
+            fonts.entry(r).or_insert(font);
+        }
+    }
 }
 
 /// Whether this binary was built with the `substitute-fonts` feature, i.e.
