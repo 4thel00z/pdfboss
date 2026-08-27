@@ -2,11 +2,11 @@
 //! `/Decode` arrays, image masks, JPEG, JPEG 2000, Indexed lookup) and
 //! drawing via inverse mapping with nearest-neighbor sampling.
 //!
-//! Limitation (v0.1): `/SMask` and `/Mask` masking is ignored; images blend
-//! with the constant fill alpha only. The executor reports every image whose
-//! dictionary carries one, so the approximation is never silent. The alpha a
-//! JPEG 2000 codestream carries *inside* itself (`/SMaskInData`, ISO 32000-1
-//! 7.4.9) IS applied, since it arrives with the samples.
+//! `/SMask` and `/Mask` masking applies per sample via [`SampleMask`]
+//! (built by the executor's `image_alpha_mask`); a mask that exists but
+//! cannot be honored is reported and the image draws unmasked. The alpha a
+//! JPEG 2000 codestream carries *inside* itself (`/SMaskInData`, ISO
+//! 32000-1 7.4.9) is applied with the samples.
 
 use std::sync::Arc;
 
@@ -606,6 +606,49 @@ pub(crate) fn color_key_mask(meta: &ImageMeta, data: &[u8], key: &[i64]) -> Opti
         height,
         data: out,
     })
+}
+
+/// Decodes an image at its native pixel dimensions to a straight-alpha
+/// RGBA pixmap, merging `smask` per sample exactly as drawing does.
+/// `None` when the image is malformed beyond recovery. Stencils are the
+/// caller's to reject: they paint a fill color, they are not images.
+pub(crate) fn decode_native(
+    meta: &ImageMeta,
+    data: &[u8],
+    smask: Option<&SampleMask>,
+) -> Option<Pixmap> {
+    let img = if meta.jpx {
+        let decoded = pdfboss_jpx::decode(data, &jpx_limits()).ok()?;
+        jpx_rgba(meta, decoded).ok()?.0
+    } else {
+        decode_rgba(meta, data, [0, 0, 0])?
+    };
+    let (w, h) = (img.width, img.height);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut pix = Pixmap::new(w as u32, h as u32);
+    if smask.is_none() {
+        if let Pixels::Quads(quads) = &img.pixels {
+            if quads.len() == w * h * 4 {
+                pix.data.copy_from_slice(quads);
+                return Some(pix);
+            }
+        }
+    }
+    for j in 0..h {
+        for i in 0..w {
+            let mut s = img.at(i, j);
+            if let Some(m) = smask {
+                let u = (i as f32 + 0.5) / w as f32;
+                let v = 1.0 - (j as f32 + 0.5) / h as f32;
+                s[3] = (f32::from(s[3]) * f32::from(m.sample(u, v)) / 255.0).round() as u8;
+            }
+            let off = (j * w + i) * 4;
+            pix.data[off..off + 4].copy_from_slice(&s);
+        }
+    }
+    Some(pix)
 }
 
 /// Decodes an image's `data` to RGBA under its resolved metadata. Pure —

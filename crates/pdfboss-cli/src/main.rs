@@ -127,6 +127,23 @@ enum Command {
         #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
         png_compression: PngCompressionArg,
     },
+    /// Extract every image a page draws, each as a native-size PNG.
+    Images {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+        /// 1-based page number (default: all pages).
+        #[arg(long)]
+        page: Option<usize>,
+        /// Output directory (default: current directory).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// PNG compression: encode time against file size, same pixels.
+        #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
+        png_compression: PngCompressionArg,
+    },
     /// Pretty-print a single object.
     Obj {
         /// Path to the PDF file.
@@ -313,6 +330,13 @@ fn main() {
             png_compression,
         )
         .map_err(Failure::from),
+        Command::Images {
+            file,
+            page,
+            out,
+            password,
+            png_compression,
+        } => cmd_images(&file, page, out, &password, png_compression).map_err(Failure::from),
         Command::Obj {
             file,
             num,
@@ -638,6 +662,49 @@ fn cmd_render(
             pixmap.width,
             pixmap.height
         ),
+    }
+    Ok(())
+}
+
+/// `pdfboss images`: writes every image the selected pages draw as
+/// `page-N-image-M.png` (both numbers 1-based, M counting in drawing
+/// order). Extraction is lenient like rendering, so a page whose images
+/// cannot be decoded writes nothing for them and still exits 0.
+fn cmd_images(
+    file: &Path,
+    page: Option<usize>,
+    out: Option<PathBuf>,
+    password: &str,
+    png_compression: PngCompressionArg,
+) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
+    let pages = match page {
+        Some(p) => vec![page_index(p, doc.page_count())?],
+        None => (0..doc.page_count()).collect(),
+    };
+    let dir = out.unwrap_or_else(|| PathBuf::from("."));
+    let mut written = 0usize;
+    for index in pages {
+        let p = doc.page(index).map_err(|e| e.to_string())?;
+        let images = pdfboss_render::extract_page_images(&doc, &p).map_err(|e| e.to_string())?;
+        for (i, pix) in images.iter().enumerate() {
+            let path = dir.join(format!("page-{}-image-{}.png", index + 1, i + 1));
+            let png = pix
+                .encode_png_with(png_compression.to_compression())
+                .map_err(|e| e.to_string())?;
+            std::fs::write(&path, png).map_err(|e| e.to_string())?;
+            println!(
+                "wrote {} ({} x {} px)",
+                path.display(),
+                pix.width,
+                pix.height
+            );
+            written += 1;
+        }
+    }
+    match written {
+        1 => println!("extracted 1 image"),
+        n => println!("extracted {n} images"),
     }
     Ok(())
 }
@@ -1104,5 +1171,60 @@ mod tests {
             "spec.pdf"
         );
         assert_eq!(display_title("trailing/"), "trailing/");
+    }
+
+    #[test]
+    fn cmd_images_writes_each_drawn_image_as_png() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Resources << /XObject << /Im1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"q 50 0 0 50 0 0 cm /Im1 Do Q q 50 0 0 50 50 50 cm /Im1 Do Q",
+        );
+        b.stream(
+            5,
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceRGB /BitsPerComponent 8",
+            &[255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0],
+        );
+        let dir = std::env::temp_dir().join(format!("pdfboss-images-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pdf = dir.join("two-draws.pdf");
+        std::fs::write(&pdf, b.build(1)).expect("fixture");
+        cmd_images(
+            &pdf,
+            None,
+            Some(dir.clone()),
+            "",
+            PngCompressionArg::Default,
+        )
+        .expect("extract");
+        for name in ["page-1-image-1.png", "page-1-image-2.png"] {
+            let png = std::fs::read(dir.join(name)).expect(name);
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{name} is a PNG");
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn images_subcommand_parses_with_defaults() {
+        let cli = Cli::parse_from(["pdfboss", "images", "in.pdf"]);
+        let Command::Images {
+            file, page, out, ..
+        } = cli.command
+        else {
+            panic!("expected images command");
+        };
+        assert_eq!(file, PathBuf::from("in.pdf"));
+        assert_eq!(page, None);
+        assert_eq!(out, None);
     }
 }

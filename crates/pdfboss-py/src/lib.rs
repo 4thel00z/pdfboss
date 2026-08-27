@@ -553,6 +553,74 @@ impl Document {
 }
 
 /// A single page of a document.
+/// One embedded image extracted from a page: PNG-encoded pixels at the
+/// image's own native dimensions, straight alpha, `/SMask` applied.
+#[pyclass(frozen)]
+struct PageImage {
+    width: u32,
+    height: u32,
+    data: Py<PyBytes>,
+}
+
+#[pymethods]
+impl PageImage {
+    /// Native pixel width of the embedded image.
+    #[getter]
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Native pixel height of the embedded image.
+    #[getter]
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// The image re-encoded as PNG (RGBA8).
+    #[getter]
+    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        self.data.bind(py).clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("PageImage(width={}, height={})", self.width, self.height)
+    }
+}
+
+/// Builds the `PageImage` list from encoded `(width, height, png)` rows;
+/// the shared shape of the sync and async extraction returns.
+fn page_images_from(
+    py: Python<'_>,
+    rows: Vec<(u32, u32, Vec<u8>)>,
+) -> PyResult<Vec<Py<PageImage>>> {
+    rows.into_iter()
+        .map(|(width, height, png)| {
+            Py::new(
+                py,
+                PageImage {
+                    width,
+                    height,
+                    data: PyBytes::new(py, &png).unbind(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Encodes extracted pixmaps as `(width, height, png)` rows.
+fn encode_page_images(
+    pixmaps: Vec<pdfboss_render::Pixmap>,
+    compression: pdfboss_render::PngCompression,
+) -> PyResult<Vec<(u32, u32, Vec<u8>)>> {
+    pixmaps
+        .into_iter()
+        .map(|pix| {
+            let png = pix.encode_png_with(compression).map_err(pdf_err)?;
+            Ok((pix.width, pix.height, png))
+        })
+        .collect()
+}
+
 #[pyclass(frozen)]
 struct Page {
     /// The parsed document, shared with every other handle. A sequential
@@ -729,6 +797,29 @@ impl Page {
             ))
         })?;
         Ok((PyBytes::new(py, &png), warnings))
+    }
+
+    /// Every image the page draws, each decoded at its native pixel
+    /// dimensions and re-encoded as PNG, in drawing order. An image drawn
+    /// twice appears twice; stencil masks (`/ImageMask true`) are not
+    /// images and are skipped. Lenient like rendering: undecodable
+    /// content contributes nothing rather than raising.
+    #[pyo3(signature = (compression="default"))]
+    fn extract_images(&self, py: Python<'_>, compression: &str) -> PyResult<Vec<Py<PageImage>>> {
+        let compression = png_compression_from_str(compression)?;
+        let rows = py.allow_threads(|| {
+            let pixmaps = match self.doc.0.try_lock() {
+                Ok(doc) => {
+                    pdfboss_render::extract_page_images(&doc, &self.page).map_err(pdf_err)?
+                }
+                Err(_) => {
+                    let doc = CoreDocument::from_seed(self.seed.clone());
+                    pdfboss_render::extract_page_images(&doc, &self.page).map_err(pdf_err)?
+                }
+            };
+            encode_page_images(pixmaps, compression)
+        })?;
+        page_images_from(py, rows)
     }
 }
 
@@ -1595,6 +1686,26 @@ impl AsyncPage {
             })
         })
     }
+
+    /// Every image the page draws, like the sync `Page.extract_images`;
+    /// same drawing-order, native-size and leniency semantics. Coroutine.
+    #[pyo3(signature = (compression="default"))]
+    fn extract_images<'py>(
+        &self,
+        py: Python<'py>,
+        compression: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let compression = png_compression_from_str(compression)?;
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pixmaps = pdfboss_render::extract_page_images_with(doc, &page)
+                .await
+                .map_err(pdf_err)?;
+            let rows = encode_page_images(pixmaps, compression)?;
+            Python::with_gil(|py| page_images_from(py, rows))
+        })
+    }
 }
 
 /// Async iterator over a document's elements, returned by
@@ -1706,6 +1817,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Span>()?;
     m.add_class::<SpanIter>()?;
     m.add_class::<AsyncSpanIter>()?;
+    m.add_class::<PageImage>()?;
     Ok(())
 }
 

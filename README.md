@@ -30,6 +30,7 @@ pdfboss info    report.pdf                 # version, page count, sizes, metadat
 pdfboss text    report.pdf --page 2        # extract text (omit --page for all)
 pdfboss md      report.pdf                 # markdown: headings, lists, tables from layout
 pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
+pdfboss images  report.pdf -o out/         # extract embedded images as native-size PNGs
 pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
@@ -43,6 +44,7 @@ doc = pdfboss.Document("report.pdf")       # or Document(data=raw_bytes)
 text = doc.extract_text()
 md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
 png  = doc[0].render(scale=2.0)            # PNG bytes
+imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
 ```
 
 <details>
@@ -83,6 +85,7 @@ let text = pdfboss_output::extract_text(&doc, &page)?;
 let markdown = pdfboss_output::extract_markdown(&doc)?;
 let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;
 pixmap.save_png("page.png")?;
+let images = pdfboss_render::extract_page_images(&doc, &page)?; // native-size RGBA pixmaps
 ```
 
 </details>

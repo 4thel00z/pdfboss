@@ -472,3 +472,16 @@ class TestAsyncRenderCompression:
         for call in (page.render, page.render_reporting, doc.render_pages):
             with pytest.raises(ValueError, match="'none', 'fast', 'default' or 'best'"):
                 await call(compression="bogus")
+
+
+class TestAsyncExtractImages:
+    @pytest.mark.asyncio
+    async def test_matches_the_sync_extraction(self, image_pdf: bytes) -> None:
+        doc = await AsyncDocument.from_bytes(image_pdf)
+        images = await doc[0].extract_images()
+        sync_images = Document(data=image_pdf)[0].extract_images()
+        assert [(i.width, i.height, i.data) for i in images] == [
+            (i.width, i.height, i.data) for i in sync_images
+        ]
+        assert len(images) == 1
+        assert images[0].data[:8] == b"\x89PNG\r\n\x1a\n"
