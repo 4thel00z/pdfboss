@@ -130,7 +130,8 @@ impl Builder {
             Event::Start(Tag::Paragraph) => self.leaf = Leaf::Paragraph,
             Event::End(TagEnd::Paragraph) => self.flush_paragraph(),
             Event::Start(Tag::Heading { level, .. }) => {
-                self.leaf = Leaf::Heading(heading_level(level))
+                self.flush_loose_runs();
+                self.leaf = Leaf::Heading(heading_level(level));
             }
             Event::End(TagEnd::Heading(_)) => {
                 let Leaf::Heading(level) = std::mem::take(&mut self.leaf) else {
@@ -139,7 +140,10 @@ impl Builder {
                 let runs = std::mem::take(&mut self.runs);
                 self.push_block(Block::Heading { level, runs });
             }
-            Event::Start(Tag::CodeBlock(_)) => self.leaf = Leaf::Code(String::new()),
+            Event::Start(Tag::CodeBlock(_)) => {
+                self.flush_loose_runs();
+                self.leaf = Leaf::Code(String::new());
+            }
             Event::End(TagEnd::CodeBlock) => {
                 let Leaf::Code(text) = std::mem::take(&mut self.leaf) else {
                     return;
@@ -243,10 +247,13 @@ impl Builder {
             }
             Event::End(TagEnd::Image) => self.image_depth = self.image_depth.saturating_sub(1),
             Event::Text(text) => self.text(&text),
-            Event::Code(text) => self.run(&text, true),
+            Event::Code(text) => self.code(&text),
             Event::SoftBreak => self.text(" "),
             Event::HardBreak => self.text("\n"),
-            Event::Rule => self.push_block(Block::Rule),
+            Event::Rule => {
+                self.flush_loose_runs();
+                self.push_block(Block::Rule);
+            }
             Event::Html(_) | Event::InlineHtml(_) => self.skipped_html += 1,
             _ => {}
         }
@@ -261,6 +268,13 @@ impl Builder {
             return;
         }
         self.run(text, false);
+    }
+
+    fn code(&mut self, text: &str) {
+        if self.image_depth > 0 {
+            return;
+        }
+        self.run(text, true);
     }
 
     fn run(&mut self, text: &str, code: bool) {
@@ -302,11 +316,14 @@ impl Builder {
     }
 
     fn flush_loose_runs(&mut self) {
-        if self.runs.is_empty() {
-            return;
+        if !self.runs.is_empty() {
+            let runs = std::mem::take(&mut self.runs);
+            self.push_block(Block::Paragraph { runs });
         }
-        let runs = std::mem::take(&mut self.runs);
-        self.push_block(Block::Paragraph { runs });
+        let images = std::mem::take(&mut self.pending_images);
+        for path in images {
+            self.push_block(Block::Image { path });
+        }
     }
 
     fn close_row(&mut self) {
@@ -328,6 +345,7 @@ impl Builder {
     }
 
     fn finish(mut self) -> (Vec<Block>, u32) {
+        self.flush_loose_runs();
         let blocks = self.stack.pop().unwrap_or_default();
         (blocks, self.skipped_html)
     }
@@ -454,6 +472,70 @@ mod tests {
             Block::Paragraph {
                 runs: vec![plain("inner")]
             }
+        );
+    }
+
+    #[test]
+    fn tight_item_image_becomes_the_items_own_block() {
+        let (blocks, _) = parse_blocks("- ![a](x.png)\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            items[0].blocks,
+            vec![Block::Image {
+                path: "x.png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn code_inside_alt_text_is_suppressed() {
+        let (blocks, _) = parse_blocks("![see `foo`](x.png)\n");
+        assert_eq!(
+            blocks,
+            vec![Block::Image {
+                path: "x.png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn tight_item_text_precedes_a_following_heading() {
+        let (blocks, _) = parse_blocks("- text\n  # h\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            items[0].blocks,
+            vec![
+                Block::Paragraph {
+                    runs: vec![plain("text")]
+                },
+                Block::Heading {
+                    level: 1,
+                    runs: vec![plain("h")]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tight_item_text_precedes_a_following_code_block() {
+        let (blocks, _) = parse_blocks("- text\n  ```\n  code\n  ```\n");
+        let Block::List { items, .. } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(
+            items[0].blocks,
+            vec![
+                Block::Paragraph {
+                    runs: vec![plain("text")]
+                },
+                Block::CodeBlock {
+                    text: "code".into()
+                },
+            ]
         );
     }
 
