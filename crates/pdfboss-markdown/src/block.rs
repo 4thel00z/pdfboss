@@ -1,8 +1,6 @@
 //! The Markdown block tree: a CommonMark+GFM document parsed into blocks
 //! and inline runs, independent of any layout or wrapping concern.
 
-#![allow(dead_code)]
-
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 /// A run of inline text sharing one set of styling flags.
@@ -65,6 +63,7 @@ pub enum CellAlign {
 
 /// Parse a CommonMark+GFM document into a block tree. The `u32` counts
 /// raw-HTML fragments that were skipped rather than represented.
+#[allow(dead_code)]
 pub(crate) fn parse_blocks(md: &str) -> (Vec<Block>, u32) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;

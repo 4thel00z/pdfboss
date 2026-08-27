@@ -12,3 +12,4 @@ keywords.workspace = true
 pdfboss-write = { workspace = true }
 pdfboss-style = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false }
+thiserror = "2"

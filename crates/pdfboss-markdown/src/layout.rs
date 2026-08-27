@@ -1,0 +1,606 @@
+//! Layout engine: turns a parsed Markdown block tree into positioned draw
+//! items, paginated to the theme's page size.
+
+use std::path::Path;
+
+use pdfboss_style::{Align, Decoration, Element, TextStyle, Theme};
+use pdfboss_write::{Color, ImageData, PageSize, Standard14};
+
+use crate::block::{Block, Run};
+use crate::report::{sanitize, Report};
+use crate::wrap::{wrap, LineBox, StyledRun};
+use crate::Error;
+
+/// Fraction of a line's max glyph size the baseline sits below the
+/// line-box top. Shared by later tasks laying out other block kinds.
+const BASELINE: f32 = 0.8;
+
+/// One positioned draw primitive on a page.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Item {
+    /// A run of text set in one font, size and color.
+    Text {
+        x: f32,
+        y: f32,
+        text: String,
+        font: Standard14,
+        size: f32,
+        color: Color,
+    },
+    /// A filled rectangle.
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: Color,
+    },
+    /// A single straight line.
+    Stroke {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        width: f32,
+        color: Color,
+    },
+    /// A stroked (unfilled) rectangle.
+    #[allow(dead_code)]
+    Frame {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        width: f32,
+        color: Color,
+    },
+    /// An embedded raster or passthrough image.
+    #[allow(dead_code)]
+    Image {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        data: ImageData,
+    },
+    /// A clickable link rectangle, `y` at the bottom.
+    Link {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        uri: String,
+    },
+}
+
+/// One paginated page's worth of positioned draw items.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct LaidPage {
+    pub items: Vec<Item>,
+}
+
+/// One page-spanning region opened by [`Engine::begin_span`] and closed by
+/// [`Engine::end_span`], broken into per-page pieces at every page break.
+#[allow(dead_code)]
+pub(crate) struct Segment {
+    pub page: usize,
+    pub top: f32,
+    pub bottom: f32,
+    pub item_index: usize,
+}
+
+/// An open span being tracked across page breaks.
+struct Span {
+    page: usize,
+    top: f32,
+    item_index: usize,
+    closed: Vec<Segment>,
+}
+
+/// Lays out a parsed block tree into paginated draw items for `page_size`,
+/// cascading styles from `theme` and resolving image paths against
+/// `base_dir`.
+#[allow(dead_code)]
+pub(crate) fn layout(
+    blocks: &[Block],
+    theme: &Theme,
+    page_size: PageSize,
+    base_dir: &Path,
+    report: &mut Report,
+) -> Result<Vec<LaidPage>, Error> {
+    let mut engine = Engine::new(theme, page_size);
+    let base = theme.base();
+    engine.blocks(blocks, &base, engine.left, engine.right, base_dir, report)?;
+    Ok(engine.pages)
+}
+
+/// The paginating layout engine: tracks the current write position, page
+/// margins and open spans while blocks are placed in order.
+pub(crate) struct Engine<'a> {
+    theme: &'a Theme,
+    left: f32,
+    right: f32,
+    top: f32,
+    bottom: f32,
+    pages: Vec<LaidPage>,
+    y: f32,
+    pending: f32,
+    at_top: bool,
+    spans: Vec<Span>,
+}
+
+impl<'a> Engine<'a> {
+    /// A fresh engine for `page_size`, positioned at the top of one empty
+    /// page inside `theme`'s body margins.
+    fn new(theme: &'a Theme, page_size: PageSize) -> Engine<'a> {
+        let (width, height) = page_size.dimensions();
+        let margin = theme.margin(Element::Body);
+        let top = height - margin.top;
+        Engine {
+            theme,
+            left: margin.left,
+            right: width - margin.right,
+            top,
+            bottom: margin.bottom,
+            pages: vec![LaidPage::default()],
+            y: top,
+            pending: 0.0,
+            at_top: true,
+            spans: Vec::new(),
+        }
+    }
+
+    /// The current (last) page.
+    fn page(&mut self) -> &mut LaidPage {
+        self.pages
+            .last_mut()
+            .expect("engine always holds at least one page")
+    }
+
+    /// The current page's index.
+    fn page_index(&self) -> usize {
+        self.pages.len() - 1
+    }
+
+    /// Appends one draw item to the current page.
+    fn push(&mut self, item: Item) {
+        self.page().items.push(item);
+    }
+
+    /// Applies a block's leading margin: collapses with the still-pending
+    /// bottom margin of the previous block, and is a no-op at the top of a
+    /// page.
+    fn gap(&mut self, top_margin: f32) {
+        if self.at_top {
+            self.pending = 0.0;
+            return;
+        }
+        self.y -= self.pending.max(top_margin);
+        self.pending = 0.0;
+    }
+
+    /// Records a block's trailing margin as pending, to collapse with the
+    /// next block's leading margin.
+    fn after(&mut self, bottom_margin: f32) {
+        self.pending = self.pending.max(bottom_margin);
+        self.at_top = false;
+    }
+
+    /// Closes every open span's current page-piece, starts a fresh page,
+    /// and resets the write position to its top.
+    fn break_page(&mut self) {
+        let page = self.pages.len();
+        for span in &mut self.spans {
+            span.closed.push(Segment {
+                page: span.page,
+                top: span.top,
+                bottom: self.bottom,
+                item_index: span.item_index,
+            });
+            span.top = self.top;
+            span.item_index = 0;
+            span.page = page;
+        }
+        self.pages.push(LaidPage::default());
+        self.y = self.top;
+        self.at_top = true;
+        self.pending = 0.0;
+    }
+
+    /// Breaks to a new page first if placing `h` more points of content
+    /// would run past the bottom margin. Never breaks at the top of an
+    /// already-empty page.
+    fn need(&mut self, h: f32) {
+        if self.at_top {
+            return;
+        }
+        if self.y - h < self.bottom {
+            self.break_page();
+        }
+    }
+
+    /// Opens a new span at the current write position.
+    #[allow(dead_code)]
+    fn begin_span(&mut self) {
+        let page = self.page_index();
+        let item_index = self.page().items.len();
+        self.spans.push(Span {
+            page,
+            top: self.y,
+            item_index,
+            closed: Vec::new(),
+        });
+    }
+
+    /// Closes the innermost open span, returning every page-piece it spans,
+    /// including the one still open at the current write position.
+    #[allow(dead_code)]
+    fn end_span(&mut self) -> Vec<Segment> {
+        let Some(span) = self.spans.pop() else {
+            return Vec::new();
+        };
+        let mut closed = span.closed;
+        closed.push(Segment {
+            page: span.page,
+            top: span.top,
+            bottom: self.y,
+            item_index: span.item_index,
+        });
+        closed
+    }
+
+    /// Places already-wrapped lines top-down from the current write
+    /// position, breaking pages as needed, and advances past them.
+    fn place_lines(&mut self, lines: Vec<LineBox>, style: &TextStyle, left: f32, right: f32) {
+        for line in lines {
+            let h = style.line_height * line.max_size;
+            self.need(h);
+            let baseline = self.y - BASELINE * line.max_size;
+            let origin = match style.align {
+                Align::Left => left,
+                Align::Center => left + (right - left - line.width) / 2.0,
+                Align::Right => right - line.width,
+            };
+            let mut open_link: Option<(String, f32, f32, f32, f32)> = None;
+            for frag in &line.frags {
+                let x = origin + frag.dx;
+                if let Some(color) = frag.background {
+                    self.push(Item::Rect {
+                        x,
+                        y: baseline - 0.25 * frag.size,
+                        w: frag.width,
+                        h: 1.10 * frag.size,
+                        color,
+                    });
+                }
+                self.push(Item::Text {
+                    x,
+                    y: baseline,
+                    text: frag.text.clone(),
+                    font: frag.font,
+                    size: frag.size,
+                    color: frag.color,
+                });
+                match frag.decoration {
+                    Decoration::Underline => self.push(Item::Stroke {
+                        x1: x,
+                        y1: baseline - 0.10 * frag.size,
+                        x2: x + frag.width,
+                        y2: baseline - 0.10 * frag.size,
+                        width: 0.05 * frag.size,
+                        color: frag.color,
+                    }),
+                    Decoration::LineThrough => self.push(Item::Stroke {
+                        x1: x,
+                        y1: baseline + 0.25 * frag.size,
+                        x2: x + frag.width,
+                        y2: baseline + 0.25 * frag.size,
+                        width: 0.05 * frag.size,
+                        color: frag.color,
+                    }),
+                    Decoration::None => {}
+                }
+                let bottom = baseline - 0.25 * frag.size;
+                let top = baseline + 0.85 * frag.size;
+                let Some(uri) = &frag.link else {
+                    if let Some((uri, x1, x2, y1, y2)) = open_link.take() {
+                        self.push(Item::Link {
+                            x: x1,
+                            y: y1,
+                            w: x2 - x1,
+                            h: y2 - y1,
+                            uri,
+                        });
+                    }
+                    continue;
+                };
+                match &mut open_link {
+                    Some((open_uri, _, x2, y1, y2)) if open_uri.as_str() == uri.as_str() => {
+                        *x2 = x + frag.width;
+                        *y1 = y1.min(bottom);
+                        *y2 = y2.max(top);
+                    }
+                    _ => {
+                        if let Some((old_uri, x1, x2, y1, y2)) = open_link.take() {
+                            self.push(Item::Link {
+                                x: x1,
+                                y: y1,
+                                w: x2 - x1,
+                                h: y2 - y1,
+                                uri: old_uri,
+                            });
+                        }
+                        open_link = Some((uri.clone(), x, x + frag.width, bottom, top));
+                    }
+                }
+            }
+            if let Some((uri, x1, x2, y1, y2)) = open_link.take() {
+                self.push(Item::Link {
+                    x: x1,
+                    y: y1,
+                    w: x2 - x1,
+                    h: y2 - y1,
+                    uri,
+                });
+            }
+            self.y -= h;
+            self.at_top = false;
+        }
+    }
+
+    /// Dispatches each block in document order, appending items to the
+    /// current page. `Paragraph`, `Heading` and `Rule` land here;
+    /// `CodeBlock`, `BlockQuote`, `List`, `Table` and `Image` land in
+    /// later tasks.
+    fn blocks(
+        &mut self,
+        blocks: &[Block],
+        base: &TextStyle,
+        left: f32,
+        right: f32,
+        base_dir: &Path,
+        report: &mut Report,
+    ) -> Result<(), Error> {
+        let _ = base_dir;
+        for block in blocks {
+            match block {
+                Block::Paragraph { runs } => {
+                    let style = base.apply(self.theme.declared(Element::P));
+                    let margin = self.theme.margin(Element::P);
+                    self.gap(margin.top);
+                    let styled = styled_runs(self.theme, runs, &style, report);
+                    let lines = wrap(&styled, right - left, style.size)?;
+                    self.place_lines(lines, &style, left, right);
+                    self.after(margin.bottom);
+                }
+                Block::Heading { level, runs } => {
+                    let element = heading_element(*level);
+                    let style = base.apply(self.theme.declared(element));
+                    let margin = self.theme.margin(element);
+                    self.gap(margin.top);
+                    let styled = styled_runs(self.theme, runs, &style, report);
+                    let lines = wrap(&styled, right - left, style.size)?;
+                    let total: f32 = lines
+                        .iter()
+                        .map(|line| style.line_height * line.max_size)
+                        .sum();
+                    let follow = margin.bottom + base.line_height * base.size;
+                    if total + follow <= self.top - self.bottom {
+                        self.need(total + follow);
+                    }
+                    self.place_lines(lines, &style, left, right);
+                    self.after(margin.bottom);
+                }
+                Block::Rule => {
+                    let margin = self.theme.margin(Element::Hr);
+                    self.gap(margin.top);
+                    let style = base.apply(self.theme.declared(Element::Hr));
+                    self.need(1.0);
+                    self.push(Item::Stroke {
+                        x1: left,
+                        y1: self.y - 0.5,
+                        x2: right,
+                        y2: self.y - 0.5,
+                        width: 0.75,
+                        color: style.color,
+                    });
+                    self.y -= 1.0;
+                    self.at_top = false;
+                    self.after(margin.bottom);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolves a run's declared styling onto `base`: theme rules for code,
+/// link, and strikethrough runs, then explicit bold/italic flags.
+fn run_style(theme: &Theme, base: &TextStyle, run: &Run) -> TextStyle {
+    let mut style = *base;
+    if run.code {
+        style = style.apply(theme.declared(Element::Code));
+    }
+    if run.link.is_some() {
+        style = style.apply(theme.declared(Element::A));
+    }
+    if run.strike {
+        style = style.apply(theme.declared(Element::Del));
+    }
+    if run.bold {
+        style.bold = true;
+    }
+    if run.italic {
+        style.italic = true;
+    }
+    style
+}
+
+/// Resolves and sanitizes a paragraph or heading's inline runs into
+/// wrap-ready styled runs.
+fn styled_runs(
+    theme: &Theme,
+    runs: &[Run],
+    base: &TextStyle,
+    report: &mut Report,
+) -> Vec<StyledRun> {
+    runs.iter()
+        .map(|run| {
+            let style = run_style(theme, base, run);
+            StyledRun {
+                text: sanitize(&run.text, style.font(), report),
+                font: style.font(),
+                size: style.size,
+                color: style.color,
+                background: run.code.then(|| theme.background(Element::Code)).flatten(),
+                decoration: style.decoration,
+                link: run.link.clone(),
+            }
+        })
+        .collect()
+}
+
+/// The heading element for a level 1-6 (anything outside that range
+/// clamps to `H6`).
+fn heading_element(level: u8) -> Element {
+    match level {
+        1 => Element::H1,
+        2 => Element::H2,
+        3 => Element::H3,
+        4 => Element::H4,
+        5 => Element::H5,
+        _ => Element::H6,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use pdfboss_style::Theme;
+
+    use super::*;
+    use crate::block::parse_blocks;
+    use crate::report::Report;
+
+    fn laid(md: &str, css: &str) -> Vec<LaidPage> {
+        let theme = Theme::parse(css).unwrap();
+        let (blocks, _) = parse_blocks(md);
+        let mut report = Report::default();
+        layout(&blocks, &theme, PageSize::A4, Path::new("."), &mut report).unwrap()
+    }
+
+    const MONO: &str =
+        "body { font-family: courier; font-size: 10pt; line-height: 1.0; margin: 100pt; }";
+
+    #[test]
+    fn paragraph_lines_stack_top_down() {
+        let pages = laid("hello world\n", MONO);
+        assert_eq!(pages.len(), 1);
+        let texts: Vec<(&str, f32, f32)> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { text, x, y, .. } => Some((text.as_str(), *x, *y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec![("hello world", 100.0, 741.89 - 8.0)]);
+    }
+
+    #[test]
+    fn page_breaks_when_the_column_is_full() {
+        let many_lines = "word\n\n".repeat(80);
+        let pages = laid(&many_lines, MONO);
+        assert!(pages.len() > 1);
+        let first_page_min_y = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { y, .. } => Some(*y),
+                _ => None,
+            })
+            .fold(f32::MAX, f32::min);
+        assert!(
+            first_page_min_y >= 100.0,
+            "text stays above the bottom margin: {first_page_min_y}"
+        );
+    }
+
+    #[test]
+    fn heading_never_ends_a_page() {
+        let mut md = "filler\n\n".repeat(200);
+        md.push_str("# Trailing heading\n\nbody after\n");
+        let pages = laid(&md, MONO);
+        let on_page_with_heading: Vec<&LaidPage> = pages
+            .iter()
+            .filter(|p| {
+                p.items.iter().any(
+                    |item| matches!(item, Item::Text { text, .. } if text.contains("Trailing")),
+                )
+            })
+            .collect();
+        let heading_page = on_page_with_heading[0];
+        assert!(
+            heading_page
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Text { text, .. } if text.contains("body after"))),
+            "the heading brought its following line along"
+        );
+    }
+
+    #[test]
+    fn margins_collapse_between_blocks() {
+        let pages = laid(
+            "first\n\nsecond\n",
+            "body { font-family: courier; font-size: 10pt; line-height: 1.0; margin: 100pt; } \
+             p { margin-top: 10pt; margin-bottom: 30pt; }",
+        );
+        let ys: Vec<f32> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { y, .. } => Some(*y),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ys[0] - ys[1], 40.0, "collapsed max(30,10) + line height 10");
+    }
+
+    #[test]
+    fn alignment_centers_and_right_aligns() {
+        let pages = laid(
+            "mid\n",
+            "body { font-family: courier; font-size: 10pt; margin: 100pt; text-align: center; }",
+        );
+        let Item::Text { x, .. } = pages[0]
+            .items
+            .iter()
+            .find(|i| matches!(i, Item::Text { .. }))
+            .unwrap()
+        else {
+            panic!()
+        };
+        let width = 3.0 * 6.0;
+        let avail = 595.28 - 200.0;
+        assert!((x - (100.0 + (avail - width) / 2.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn links_underline_and_emit_rects() {
+        let pages = laid("[docs](https://x.y)\n", MONO);
+        assert!(pages[0]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Link { uri, .. } if uri == "https://x.y")));
+        assert!(
+            pages[0]
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Stroke { .. })),
+            "underline stroked"
+        );
+    }
+}

@@ -1293,6 +1293,7 @@ dependencies = [
  "pdfboss-style",
  "pdfboss-write",
  "pulldown-cmark",
+ "thiserror",
 ]
 
 [[package]]

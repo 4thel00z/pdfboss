@@ -66,7 +66,6 @@ impl Report {
 /// Replaces characters that cannot be encoded in the given font with '?',
 /// tallying them in the report. Newlines are preserved. All other unencodable
 /// or width-unmeasurable characters are replaced.
-#[allow(dead_code)]
 pub(crate) fn sanitize(text: &str, font: Standard14, report: &mut Report) -> String {
     text.chars()
         .map(|ch| {

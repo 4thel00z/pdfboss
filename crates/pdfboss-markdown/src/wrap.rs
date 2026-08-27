@@ -5,7 +5,6 @@ use pdfboss_write::{Color, Error, Standard14};
 
 /// A run of text sharing one set of styling and layout properties.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct StyledRun {
     /// The run's text.
     pub text: String,
@@ -26,7 +25,6 @@ pub(crate) struct StyledRun {
 /// A positioned, measured slice of text within a line, carrying its run's
 /// style.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Frag {
     /// X offset from the start of the line.
     pub dx: f32,
@@ -52,7 +50,6 @@ pub(crate) struct Frag {
 /// line-height purposes (the largest fragment size, or `empty_size` when the
 /// line has no fragments).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct LineBox {
     /// The line's fragments, in order.
     pub frags: Vec<Frag>,
@@ -64,7 +61,6 @@ pub(crate) struct LineBox {
 
 /// One token of the piece stream: a word, a run of whitespace (not
 /// containing a newline), or a hard line break.
-#[allow(dead_code)]
 enum Piece<'a> {
     Word { run: usize, text: &'a str },
     Space { run: usize, text: &'a str },
@@ -73,7 +69,6 @@ enum Piece<'a> {
 
 /// Splits each run's text into maximal newline, whitespace, and word
 /// segments, tagged with their originating run index.
-#[allow(dead_code)]
 fn pieces(runs: &[StyledRun]) -> Vec<Piece<'_>> {
     let mut out = Vec::new();
     for (index, run) in runs.iter().enumerate() {
@@ -100,7 +95,6 @@ fn pieces(runs: &[StyledRun]) -> Vec<Piece<'_>> {
     out
 }
 
-#[allow(dead_code)]
 fn push_segment<'a>(
     out: &mut Vec<Piece<'a>>,
     run: usize,
@@ -122,7 +116,6 @@ fn push_segment<'a>(
 }
 
 /// Measures `text` set in `run`'s font and size.
-#[allow(dead_code)]
 fn measure(run: &StyledRun, text: &str) -> Result<f32, Error> {
     run.font.text_width(text, run.size)
 }
@@ -130,7 +123,6 @@ fn measure(run: &StyledRun, text: &str) -> Result<f32, Error> {
 /// Wraps `runs` into lines no wider than `max_width`. Break opportunities
 /// are whitespace runs; a word may span multiple styled runs. `empty_size`
 /// is the `max_size` given to fragment-less lines produced by hard breaks.
-#[allow(dead_code)]
 pub(crate) fn wrap(
     runs: &[StyledRun],
     max_width: f32,
@@ -143,7 +135,6 @@ pub(crate) fn wrap(
     wrapper.finish()
 }
 
-#[allow(dead_code)]
 struct Wrapper<'a> {
     runs: &'a [StyledRun],
     max_width: f32,
@@ -157,7 +148,6 @@ struct Wrapper<'a> {
     space_width: f32,
 }
 
-#[allow(dead_code)]
 impl<'a> Wrapper<'a> {
     fn new(runs: &'a [StyledRun], max_width: f32, empty_size: f32) -> Wrapper<'a> {
         Wrapper {
