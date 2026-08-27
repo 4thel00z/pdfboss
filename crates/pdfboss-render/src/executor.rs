@@ -20,7 +20,9 @@ use crate::color::{self, ColorSpace};
 use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
-use crate::raster::{fill_path, BlendMode, FillRule, Mask, RasterScratch};
+use crate::raster::{
+    capture_spans, fill_path, fill_spans, BlendMode, FillRule, Mask, RasterScratch, SpanSet,
+};
 use crate::shading::{load_functions, Functions, Shading, MAX_COMPS};
 use crate::stroke::stroke_path;
 #[cfg(feature = "substitute-fonts")]
@@ -511,6 +513,8 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         clip_cache: FastMap::default(),
         charproc_cache: FastMap::default(),
         pattern_cache: FastMap::default(),
+        glyph_spans: FastMap::default(),
+        glyph_seen: FastMap::default(),
         report,
     };
     let root = Frame::new(
@@ -535,6 +539,25 @@ const INVISIBLE_ANNOTS: i64 = (1 << 1) | (1 << 5);
 /// honestly; past the cap a glyph re-parses uncached, bounding memory
 /// against a hostile file minting CharProcs.
 const MAX_CHARPROC_CACHE: usize = 1024;
+
+/// Upper bound on distinct captured glyph span sets kept per page render.
+/// Body text holds a page's distinct (outline, baseline-fraction) pairs in
+/// the hundreds; past the cap a glyph still paints correctly through the
+/// direct fill, so a hostile file minting endless sizes or baselines only
+/// loses the reuse, never correctness. Each entry is glyph-sized (a few
+/// hundred spans), so the cap also bounds the cache's memory.
+const MAX_GLYPH_SPAN_CACHE: usize = 4096;
+
+/// One captured glyph in [`Executor::glyph_spans`]: the outline whose
+/// allocation the entry pins (its address is the cache key) and the span
+/// set swept from it.
+type CapturedGlyph = (Arc<Vec<Subpath>>, Arc<SpanSet>);
+
+/// Upper bound on once-sighted keys remembered per page render
+/// ([`Executor::glyph_seen`]); past it, further first sights paint direct
+/// and are not recorded, so a hostile file minting endless keys caps the
+/// set's memory at a few hundred kilobytes.
+const MAX_GLYPH_SEEN: usize = 1 << 16;
 
 /// Executes parsed content operators against a shared pixmap; forms and
 /// Type3 CharProcs run as frames on [`Executor::run`]'s explicit stack.
@@ -591,6 +614,26 @@ struct Executor<'a, S> {
     /// names through a reference — see [`CachedPattern`] and
     /// [`MAX_PATTERN_CACHE`].
     pattern_cache: FastMap<pdfboss_core::ObjRef, CachedPattern>,
+    /// Captured glyph coverage spans, keyed by the flattened outline's
+    /// allocation address plus the exact bits of the device offset's
+    /// fractional y — the pair that determines the sweep's output, since
+    /// text on one baseline repeats its fractional y while fractional x
+    /// almost never repeats (measured 69.5% key repeats corpus-wide against
+    /// 4.9% with fractional x in the key). The held [`Arc`] keeps the
+    /// outline allocation alive, so the address cannot be reused by another
+    /// outline while its entry exists. See [`MAX_GLYPH_SPAN_CACHE`].
+    glyph_spans: FastMap<(usize, u32), CapturedGlyph>,
+    /// How often each span-cache key has been sighted before admission.
+    /// Admission to [`Executor::glyph_spans`] waits for the third sight: a
+    /// capture costs a second coverage accumulation plus allocations, which
+    /// a key seen once or twice can never pay back (measured 60-67%
+    /// per-file regressions capturing on first sight, still 10-22% on
+    /// second — page headers and folios repeat a glyph only once or twice
+    /// per page render), while body text repeats far past three. A stale
+    /// count (its outline dropped, the address reused) only admits a
+    /// genuine first sight early — the capture always sweeps the outline
+    /// actually being painted. See [`MAX_GLYPH_SEEN`].
+    glyph_seen: FastMap<(usize, u32), u8>,
     /// Content this render dropped rather than painted, accumulated across
     /// the page (forms and Type3 CharProcs included, since they run through
     /// the same [`Executor`]).
@@ -1731,24 +1774,86 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// Paints a cached, origin-relative flattened glyph outline at device
-    /// origin `(dx, dy)` in color `fill`, reusing [`Executor::glyph_blit`] so
-    /// a page of text paints without a fresh polygon allocation per glyph.
-    /// The fill is anti-aliased, nonzero-rule, alpha- and clip-scaled exactly
-    /// as a direct `fill_path` on the untranslated glyph would be.
-    fn blit_glyph(&mut self, cached: &[Subpath], dx: f32, dy: f32, fill: [u8; 4], gs: &GState) {
-        for (i, src) in cached.iter().enumerate() {
-            if i == self.glyph_blit.len() {
-                self.glyph_blit.push(Subpath {
-                    points: Vec::new(),
-                    closed: src.closed,
-                });
-            }
-            let dst = &mut self.glyph_blit[i];
-            dst.points.clear();
-            dst.points
-                .extend(src.points.iter().map(|p| Point::new(p.x + dx, p.y + dy)));
-            dst.closed = src.closed;
+    /// origin `(dx, dy)` in color `fill`. The fill is anti-aliased,
+    /// nonzero-rule, alpha- and clip-scaled through the same row painting a
+    /// direct `fill_path` uses.
+    ///
+    /// The outline's coverage is swept once per repeating (outline,
+    /// fractional-y) pair and replayed from [`Executor::glyph_spans`] for
+    /// every further occurrence — text on a baseline shares its fractional
+    /// y, so a line of body text sweeps each distinct glyph's edges once.
+    /// Admission waits for a key's third sight: most keys on irregular or
+    /// rotated text never repeat, and one or two repeats cannot pay a capture
+    /// back (measured 60-67% and 10-22% per-file regressions on first- and
+    /// second-sight admission), so early sights paint the direct fused way and
+    /// only count in [`Executor::glyph_seen`].
+    fn blit_glyph(
+        &mut self,
+        cached: &Arc<Vec<Subpath>>,
+        dx: f32,
+        dy: f32,
+        fill: [u8; 4],
+        gs: &GState,
+    ) {
+        let iy = dy.floor();
+        let fy = dy - iy;
+        let key = (Arc::as_ptr(cached) as usize, fy.to_bits());
+        if let Some((_, set)) = self.glyph_spans.get(&key) {
+            let set = Arc::clone(set);
+            fill_spans(
+                &mut self.pix,
+                &mut self.raster,
+                &set,
+                dx,
+                iy as i64,
+                fill,
+                gs.fill_alpha,
+                effective_mask(gs).as_deref(),
+                gs.blend_mode,
+            );
+            return;
         }
+        let sightings = match self.glyph_seen.get_mut(&key) {
+            Some(count) => {
+                *count = count.saturating_add(1);
+                *count
+            }
+            None => {
+                if self.glyph_seen.len() < MAX_GLYPH_SEEN {
+                    self.glyph_seen.insert(key, 1);
+                }
+                1
+            }
+        };
+        if sightings >= 3 && self.glyph_spans.len() < MAX_GLYPH_SPAN_CACHE {
+            self.translate_into_blit_scratch(cached, 0.0, fy);
+            let captured = capture_spans(
+                &mut self.raster,
+                &self.glyph_blit[..cached.len()],
+                FillRule::NonZero,
+            );
+            // `None` means a capture bound tripped (geometry taller or
+            // busier than any honest glyph); the direct fill below handles
+            // it, kept proportional by the page bounds.
+            if let Some(set) = captured {
+                let set = Arc::new(set);
+                self.glyph_spans
+                    .insert(key, (Arc::clone(cached), Arc::clone(&set)));
+                fill_spans(
+                    &mut self.pix,
+                    &mut self.raster,
+                    &set,
+                    dx,
+                    iy as i64,
+                    fill,
+                    gs.fill_alpha,
+                    effective_mask(gs).as_deref(),
+                    gs.blend_mode,
+                );
+                return;
+            }
+        }
+        self.translate_into_blit_scratch(cached, dx, dy);
         fill_path(
             &mut self.pix,
             &mut self.raster,
@@ -1759,6 +1864,25 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             effective_mask(gs).as_deref(),
             gs.blend_mode,
         );
+    }
+
+    /// Copies `cached` translated by `(tx, ty)` into the reused
+    /// [`Executor::glyph_blit`] scratch, so glyph painting never allocates a
+    /// fresh polygon set per occurrence.
+    fn translate_into_blit_scratch(&mut self, cached: &[Subpath], tx: f32, ty: f32) {
+        for (i, src) in cached.iter().enumerate() {
+            if i == self.glyph_blit.len() {
+                self.glyph_blit.push(Subpath {
+                    points: Vec::new(),
+                    closed: src.closed,
+                });
+            }
+            let dst = &mut self.glyph_blit[i];
+            dst.points.clear();
+            dst.points
+                .extend(src.points.iter().map(|p| Point::new(p.x + tx, p.y + ty)));
+            dst.closed = src.closed;
+        }
     }
 
     /// Paints `code` from the font's per-glyph fallback face (see
@@ -6925,6 +7049,72 @@ mod render_cache_tests {
             pages.push(pix);
         }
         (counting.resolutions.load(Ordering::Relaxed), pages)
+    }
+
+    /// Two pages that each show the same glyph three times on one baseline
+    /// (the first two overprinted), with different early positions: the
+    /// third occurrence is a span-cache replay on both pages (admission
+    /// happens on the third sight), captured from the same canonical
+    /// fractional frame, so the replayed region must be bit-identical
+    /// regardless of where the earlier occurrences sat.
+    #[test]
+    fn a_span_replay_paints_identically_regardless_of_history() {
+        fn font_page_doc(contents: &[u8]) -> Vec<u8> {
+            let mut b = PdfBuilder::new();
+            b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+            b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+            b.object(
+                3,
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+                 /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+            );
+            b.stream(4, "", contents);
+            b.object(
+                5,
+                "<< /Type /Font /Subtype /TrueType /BaseFont /Shared \
+                 /FirstChar 65 /Widths [500] /Encoding /WinAnsiEncoding \
+                 /FontDescriptor 6 0 R >>",
+            );
+            b.object(
+                6,
+                "<< /Type /FontDescriptor /FontName /Shared /Flags 32 \
+                 /FontFile2 7 0 R >>",
+            );
+            b.stream(7, "", &crate::truetype::tests::build_font());
+            b.build(1)
+        }
+        fn render(doc: &[u8]) -> Pixmap {
+            let doc = Document::load(doc.to_vec()).expect("load");
+            let page = doc.page(0).expect("page");
+            let (pix, report) = block_on(render_page_reporting_with(
+                &Immediate(&doc),
+                &page,
+                1.0,
+                &RenderOptions::default(),
+            ))
+            .expect("render");
+            assert!(report.warnings().is_empty(), "unexpected skips: {report:?}");
+            pix
+        }
+        let near = render(&font_page_doc(
+            b"BT /F0 100 Tf 10 80 Td (A) Tj 0 0 Td (A) Tj 110 0 Td (A) Tj ET",
+        ));
+        let far = render(&font_page_doc(
+            b"BT /F0 100 Tf 15 80 Td (A) Tj 0 0 Td (A) Tj 105 0 Td (A) Tj ET",
+        ));
+        let mut painted = false;
+        for y in 0..200usize {
+            for x in 115..200usize {
+                let off = (y * 200 + x) * 4;
+                assert_eq!(
+                    &near.data[off..off + 4],
+                    &far.data[off..off + 4],
+                    "pixel ({x}, {y}) differs between two replays of one capture"
+                );
+                painted |= far.data[off + 3] != 0;
+            }
+        }
+        assert!(painted, "the compared region holds the second glyph");
     }
 
     /// Repeated `cs` operators naming the same `ICCBased` stream decode and
