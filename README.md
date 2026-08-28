@@ -1,20 +1,39 @@
 <h1 align="center">pdfboss</h1>
 
 <p align="center">
-  <strong>A PDF engine written from scratch in Rust: parse, extract text, rasterize to PNG. One core, a CLI, and pythonic bindings.</strong>
+  <strong>A PDF engine written from scratch in Rust: parse, extract text and images, rasterize to PNG, create PDFs. One core, a CLI, and pythonic bindings.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/4thel00z/pdfboss/actions/workflows/ci.yaml"><img src="https://github.com/4thel00z/pdfboss/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
   <a href="https://github.com/4thel00z/pdfboss/actions/workflows/python-ci.yml"><img src="https://github.com/4thel00z/pdfboss/actions/workflows/python-ci.yml/badge.svg" alt="python-ci"></a>
+  <a href="https://4thel00z.github.io/pdfboss/"><img src="https://img.shields.io/badge/docs-book-blue?logo=mdbook&logoColor=white" alt="Documentation"></a>
   <a href="https://pypi.org/project/pdfboss/"><img src="https://img.shields.io/pypi/v/pdfboss?logo=pypi&logoColor=white" alt="PyPI"></a>
   <img src="https://img.shields.io/badge/rust-2021-000000?logo=rust&logoColor=white" alt="Rust 2021">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="MIT OR Apache-2.0"></a>
 </p>
 
+<p align="center">
+  <a href="https://4thel00z.github.io/pdfboss/">Docs</a> ·
+  <a href="https://pypi.org/project/pdfboss/">PyPI</a> ·
+  <a href="https://crates.io/crates/pdfboss-cli">crates.io</a> ·
+  <a href="#benchmarks">Benchmarks</a>
+</p>
+
 ---
 
 Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification: safe Rust, no C dependencies, no bindings to another engine, one core behind the CLI and the native Python extension. It is a **lenient reader** — real-world files are damaged, so it reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators instead of refusing.
+
+## Highlights
+
+- **Clean-room engine** — implemented from the ISO 32000 specification in safe Rust: no C dependencies, no bindings to another engine.
+- **Fastest text extraction measured** — 6,700 pages/s over a 40-file real-world corpus, about 15× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
+- **Its own codecs** — JPEG 2000, JBIG2, CCITT and ICC are decoded in-tree, implemented from their specifications, not linked in.
+- **Embedded-image extraction** — every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
+- **PDF creation** — document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).
+- **Async, range-fetching I/O** — documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, never the whole file.
+- **Lenient, and it says so** — broken cross-references are reconstructed and unreadable content is skipped, with every dropped or approximated item reported.
+- **Terminal explorer** — `pdfboss tui`: element tree, object inspector, hex view, page and Markdown previews.
 
 ## Install
 
@@ -30,24 +49,13 @@ pdfboss info    report.pdf                 # version, page count, sizes, metadat
 pdfboss text    report.pdf --page 2        # extract text (omit --page for all)
 pdfboss md      report.pdf                 # markdown: headings, lists, tables from layout
 pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
-pdfboss images  report.pdf -o out/         # extract embedded images as native-size PNGs
+pdfboss images  report.pdf                 # extract embedded images as native-size PNGs
 pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
 pdfboss create md     notes.md -o out.pdf     # new PDF: markdown composed with a CSS theme
 ```
-
-`create md` composes CommonMark+GFM into a themed PDF. `--theme` takes a small CSS subset over element-type selectors, overlaid on the built-in default theme:
-
-```css
-body { font-family: times; font-size: 10.5pt; color: #222; }
-h1   { font-family: helvetica; font-size: 2.2em; color: #a33; }
-code { font-family: courier; background-color: #eee; }
-pre  { background-color: #eee; padding: 8pt; }
-```
-
-Themes choose between the Helvetica, Times and Courier families; characters outside those fonts are replaced with `?` and reported.
 
 ```python
 import pdfboss
@@ -63,7 +71,7 @@ pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF byte
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
 
-Explorer subcommands. Each accepts a local path or an `http(s)://` URL, fetched in ranges and never downloaded whole:
+Explorer subcommands. Each except `obj` accepts a local path or an `http(s)://` URL, fetched in ranges and never downloaded whole:
 
 ```bash
 pdfboss json    report.pdf                    # dump the document as a JSON value tree
@@ -83,25 +91,136 @@ for element in doc.elements():             # lazy: physical + logical, byte span
 # Async access over files or http(s) URLs, without reading the whole document.
 doc = await pdfboss.AsyncDocument.open_url("https://example.com/report.pdf")
 async for element in doc.elements():
-    print(element.kind, element.value)
+    print(element.kind, element.value())
 ```
 
-Rust — the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-aio pdfboss-tui`):
+Rust — the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-markdown pdfboss-aio pdfboss-tui`):
 
-```rust
+```rust,no_run
 use pdfboss_core::Document;
 
-let doc = Document::open("report.pdf")?;
-let page = doc.page(0)?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    let page = doc.page(0)?;
 
-let text = pdfboss_output::extract_text(&doc, &page)?;
-let markdown = pdfboss_output::extract_markdown(&doc)?;
-let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;
-pixmap.save_png("page.png")?;
-let images = pdfboss_render::extract_page_images(&doc, &page)?; // native-size RGBA pixmaps
+    let text = pdfboss_output::extract_text(&doc, &page)?;
+    let markdown = pdfboss_output::extract_markdown(&doc)?;
+    println!("{text}\n{markdown}");
+
+    let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;
+    pixmap.save_png("page.png")?;
+
+    let images = pdfboss_render::extract_page_images(&doc, &page)?;
+    println!("{} embedded images", images.len());
+    Ok(())
+}
 ```
 
 </details>
+
+## Extract embedded images
+
+`pdfboss images`, `Page.extract_images()` and `pdfboss_render::extract_page_images` decode every image a page draws — inline images included — at the image's own pixel dimensions, in drawing order, with `/SMask` alpha applied. An image drawn twice appears twice, and stencil masks (`/ImageMask true`) paint a fill color rather than carrying pixels of their own, so they are skipped.
+
+Real pages draw one-pixel strips and spacers; a size filter keeps the pictures:
+
+```python
+import pdfboss
+
+doc = pdfboss.Document("report.pdf")
+for index in range(len(doc)):
+    for n, image in enumerate(doc[index].extract_images()):
+        if image.width < 64 or image.height < 64:
+            continue
+        with open(f"page-{index}-img-{n}.png", "wb") as out:
+            out.write(image.data)
+```
+
+The same walk from Rust, one `Pixmap` per image:
+
+```rust,no_run
+use pdfboss_core::Document;
+use pdfboss_render::extract_page_images;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    for index in 0..doc.page_count() {
+        let page = doc.page(index)?;
+        for (n, image) in extract_page_images(&doc, &page)?.iter().enumerate() {
+            if image.width < 64 || image.height < 64 {
+                continue;
+            }
+            image.save_png(format!("page-{index}-img-{n}.png"))?;
+        }
+    }
+    Ok(())
+}
+```
+
+## Create PDFs
+
+`pdfboss-write` is the write-side twin of the reader: plain structs compose the document (`Pdf`, `Page`, `PageSize`), a `Canvas` paints content, and a COS-level writer serializes it. Output is deterministic — the same input produces byte-identical files, and the crate never reads clocks or randomness, so dates appear only when supplied.
+
+```rust,no_run
+use pdfboss_write::{Color, ImageData, Page, PageSize, Pdf, Standard14};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut page = Page::new(PageSize::A4);
+    let canvas = &mut page.canvas;
+
+    canvas.text("Quarterly report", 72.0, 760.0, Standard14::HelveticaBold, 24.0)?;
+
+    canvas.set_fill(Color::Rgb(0.13, 0.45, 0.85));
+    canvas.rect(72.0, 744.0, 451.0, 4.0);
+    canvas.fill();
+
+    let chart = canvas.add_image(ImageData::png(&std::fs::read("chart.png")?)?);
+    canvas.draw_image(chart, 72.0, 480.0, 320.0, 240.0);
+
+    let pdf = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    };
+    pdf.save("report.pdf")?;
+    Ok(())
+}
+```
+
+The CLI covers the common shapes as one-liners:
+
+```bash
+pdfboss create blank  -o blank.pdf --pages 3 --size letter
+pdfboss create text   notes.txt -o notes.pdf --font times-roman --font-size 12
+pdfboss create images scan1.png photo.jpg -o scans.pdf
+```
+
+And CommonMark+GFM composes straight into a themed, paginated PDF — headings, lists, tables, code blocks, clickable links and images — deterministically, from all three surfaces. A theme is a small CSS subset over element-type selectors, overlaid on the built-in default; the Helvetica, Times and Courier families are available, and characters outside them are replaced with `?` and reported:
+
+```css
+body { font-family: times; font-size: 10.5pt; color: #222; }
+h1   { font-family: helvetica; font-size: 2.2em; color: #a33; }
+code { font-family: courier; background-color: #eee; }
+pre  { background-color: #eee; padding: 8pt; }
+```
+
+```python
+from pathlib import Path
+
+import pdfboss
+
+pdf = pdfboss.md.to_pdf(
+    Path("notes.md").read_text(),
+    theme=Path("theme.css").read_text(),   # CSS source text, not a path
+    size="letter",
+)
+Path("notes.pdf").write_bytes(pdf)
+```
+
+```bash
+pdfboss create md notes.md -o notes.pdf --theme theme.css --size letter
+```
+
+In Rust, `pdfboss_markdown::to_pdf` returns the composed `Pdf` value plus a report of anything sanitized, ready for `save`/`to_bytes` or further canvas work.
 
 ## Benchmarks
 
@@ -203,7 +322,7 @@ Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
 ## What's inside
 
-Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, PDF creation with CSS-subset themed Markdown composition, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
+Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, a deterministic PDF writer with CSS-themed Markdown composition, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
 
 <details>
 <summary><strong>Crate map</strong></summary>
@@ -216,13 +335,13 @@ Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000,
 | `pdfboss-output` | Layout analysis over those spans (lines, columns, headings, lists, tables, repeated page headers), rendered as plain text or Markdown |
 | `pdfboss-jpx` | JPEG 2000 decoder for `JPXDecode` image streams, implemented from ITU-T T.800 |
 | `pdfboss-icc` | ICC profile parser and colour transform to sRGB, implemented from ICC.1:2010 |
-| `pdfboss-render` | Anti-aliased vector rasterizer (paths, fills, strokes, clipping, color, images, glyph outlines) to RGBA/PNG |
-| `pdfboss-write` | PDF creation: documents, pages, canvas painting, link annotations |
+| `pdfboss-render` | Anti-aliased vector rasterizer (paths, fills, strokes, clipping, color, images, glyph outlines) to RGBA/PNG, plus embedded-image extraction |
+| `pdfboss-write` | PDF creation: COS object writer, content canvas, link annotations and document assembly, deterministic output |
 | `pdfboss-style` | CSS-subset themes for document composition |
 | `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
-| `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
+| `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`): element tree, object inspector, hex view, page and Markdown previews — built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
 </details>
@@ -257,6 +376,10 @@ Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the docum
 
 </details>
 
+## Documentation
+
+The [pdfboss book](https://4thel00z.github.io/pdfboss/) covers installation, guides for every surface (text, Markdown, styled spans, rendering, image extraction, creation, Markdown-to-PDF composition, async and remote documents, the explorer, encryption) and CLI/Python/Rust reference chapters. It is built with mdBook from [`docs/`](docs/) and deployed through GitHub Pages. Per-crate Rust API documentation is on [docs.rs](https://docs.rs/pdfboss-core).
+
 ## Development
 
 ```bash
@@ -264,6 +387,7 @@ cargo test --workspace          # Rust test suite
 cargo clippy --workspace --all-targets -- -D warnings
 maturin develop                 # build the Python extension into your venv
 pytest                          # Python integration tests
+mdbook serve docs               # live-preview the documentation book
 ```
 
 ## License

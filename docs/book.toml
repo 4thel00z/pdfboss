@@ -1,0 +1,13 @@
+[book]
+title = "pdfboss"
+description = "A PDF engine written from scratch in Rust: parse, extract text and Markdown, rasterize to PNG, extract images, create PDFs."
+authors = ["4thel00z"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/4thel00z/pdfboss"
+edit-url-template = "https://github.com/4thel00z/pdfboss/edit/main/docs/{path}"
+
+[output.html.playground]
+runnable = false
