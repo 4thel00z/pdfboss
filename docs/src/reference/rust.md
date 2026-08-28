@@ -23,12 +23,12 @@ A further workspace member, `pdfboss-testkit`, is an internal PDF fixture builde
 
 ## Where to start
 
-- Reading a document: `pdfboss_core::Document` — `open`, `load`, and their `_with_password` twins, then `page`, `page_count`, `metadata`, `version`.
+- Reading a document: `pdfboss_core::Document` (`open`, `load`, and their `_with_password` twins), then `page`, `page_count`, `metadata`, `version`.
 - Text and markdown: `pdfboss_output::{extract_text, extract_markdown}`; positioned styled spans via `pdfboss_text::extract_spans`.
 - Rasterizing: `pdfboss_render::{render_page, render_page_with_options, render_page_reporting}` and `Pixmap::save_png`; embedded images via `extract_page_images`.
-- Creating: `pdfboss_write::{Pdf, Page, Canvas, Content}`, see [Creating PDFs](../guide/creating.md).
-- Composing Markdown: `pdfboss_markdown::to_pdf` with a `pdfboss_style::Theme` — see [Markdown to PDF](../guide/md-to-pdf.md).
-- Async and HTTP sources: `pdfboss_aio::AsyncDocument` — `open`, `open_url`, `from_bytes` — see [Async and remote documents](../guide/async.md).
+- Creating: `pdfboss_write::{Pdf, Page, Canvas, Content}`; see [Creating PDFs](../guide/creating.md).
+- Composing Markdown: `pdfboss_markdown::to_pdf` with a `pdfboss_style::Theme`; see [Markdown to PDF](../guide/md-to-pdf.md).
+- Async and HTTP sources: `pdfboss_aio::AsyncDocument` (`open`, `open_url`, `from_bytes`); see [Async and remote documents](../guide/async.md).
 - Element iteration: `pdfboss_core::Document::elements(ElementOpts)`, a lazy iterator over physical and logical elements, and the async `AsyncDocument::elements`, which returns an `ElementStream`; see [Exploring PDF internals](../guide/explorer.md).
 
 The guide chapters carry compiled examples for each of these; the [Quickstart](../quickstart.md) has the shortest end-to-end one.

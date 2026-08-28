@@ -2,8 +2,8 @@
 
 pdfboss is a PDF engine written from scratch in safe Rust against the ISO 32000
 specification. It is a clean-room implementation: no C dependencies, no
-bindings to another engine, and the image and color codecs a PDF needs —
-JPEG 2000, JBIG2, CCITT, ICC — are its own. One core sits behind every
+bindings to another engine, and the image and color codecs a PDF needs
+(JPEG 2000, JBIG2, CCITT, ICC) are its own. One core sits behind every
 surface: the `pdfboss` command-line tool, an interactive terminal explorer
 (`pdfboss tui`), a set of Rust library crates, and a native Python extension.
 
@@ -31,8 +31,8 @@ pdfboss reads them anyway:
 
 Leniency never hides what it cost. Every dropped or approximated piece of
 content lands in a report: `pdfboss render` warns on stderr, the terminal
-explorer raises a notice, and the libraries return the report as a value —
-`render_page_reporting` and `extract_text_reporting` in Rust,
+explorer raises a notice, and the libraries return the report as a value,
+through `render_page_reporting` and `extract_text_reporting` in Rust and
 `Page.render_reporting()` in Python. A page that came out exactly as the file
 describes it carries an empty report, so silence means fidelity, not luck.
 
@@ -49,7 +49,7 @@ documents from the CLI, Python `pdfboss.md.to_pdf` and Rust), and reads document
 asynchronously over range-fetching I/O, from local files or HTTP, without
 ever reading the whole file.
 
-Encrypted files open through the standard security handler — RC4 and
+Encrypted files open through the standard security handler: RC4 and
 AES-128/256, with either the user or the owner password; a file whose user
 password is empty opens without one.
 
@@ -59,25 +59,25 @@ password is empty opens without one.
 the [Quickstart](./quickstart.md) shows each surface doing real work. The
 guide then takes one task per chapter:
 
-- [Extracting text](./guide/text.md) — plain text, reading order, page
+- [Extracting text](./guide/text.md): plain text, reading order, page
   selection.
-- [Markdown output](./guide/markdown.md) — headings, lists and tables
+- [Markdown output](./guide/markdown.md): headings, lists and tables
   inferred from layout.
-- [Styled spans](./guide/spans.md) — positioned text runs with font, size,
+- [Styled spans](./guide/spans.md): positioned text runs with font, size,
   weight, decorations and color.
-- [Rendering pages](./guide/rendering.md) — PNG output, scale, font tiers,
+- [Rendering pages](./guide/rendering.md): PNG output, scale, font tiers,
   render reports.
-- [Extracting images](./guide/images.md) — every image a page draws, at
+- [Extracting images](./guide/images.md): every image a page draws, at
   native size.
 - [Creating PDFs](./guide/creating.md): canvas painting, composed elements
   and document slots from the CLI, Python and Rust.
-- [Markdown to PDF](./guide/md-to-pdf.md) — CommonMark+GFM composed into
+- [Markdown to PDF](./guide/md-to-pdf.md): CommonMark+GFM composed into
   themed, paginated documents.
-- [Async and remote documents](./guide/async.md) — range-fetching access to
+- [Async and remote documents](./guide/async.md): range-fetching access to
   local files and HTTP URLs.
-- [Exploring PDF internals](./guide/explorer.md) — the JSON value tree, jq
+- [Exploring PDF internals](./guide/explorer.md): the JSON value tree, jq
   queries, hexdumps and the terminal explorer.
-- [Encrypted documents](./guide/encryption.md) — passwords on every surface.
+- [Encrypted documents](./guide/encryption.md): passwords on every surface.
 
 The reference section holds the [CLI reference](./reference/cli.md), the
 [Python API](./reference/python.md), the [Rust crates](./reference/rust.md)
