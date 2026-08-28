@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.25.0](https://github.com/4thel00z/pdfboss/compare/v0.24.0...v0.25.0) (2026-08-28)
+
+
+### Features
+
+* **cli:** bundled Claude Code skill and pdfboss skill install ([#120](https://github.com/4thel00z/pdfboss/issues/120)) ([6ef6df3](https://github.com/4thel00z/pdfboss/commit/6ef6df37661c3cb3386cacef0ae7652798224815))
+* **tui:** resize the panes with Ctrl+Shift+arrows ([#118](https://github.com/4thel00z/pdfboss/issues/118)) ([5ed6f4c](https://github.com/4thel00z/pdfboss/commit/5ed6f4c16dacd7b6008425e53f18e193a085e4cc))
+
+
+### Documentation
+
+* remove every em dash from the book and README ([#117](https://github.com/4thel00z/pdfboss/issues/117)) ([b73cfea](https://github.com/4thel00z/pdfboss/commit/b73cfea62a749c524c68a63350d4afcd09efb437))
+
 ## [0.24.0](https://github.com/4thel00z/pdfboss/compare/v0.23.0...v0.24.0) (2026-08-28)
 
 
