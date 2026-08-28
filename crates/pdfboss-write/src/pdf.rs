@@ -207,7 +207,7 @@ pub enum LinkTarget {
     /// An external URI, opened with a `/URI` action.
     Uri(String),
     /// A page within the same document, by index, opened with a `/GoTo`
-    /// action landing at the top of the page.
+    /// action that keeps the viewer's current position and zoom.
     Page(usize),
 }
 
@@ -234,7 +234,8 @@ pub struct Outline {
 pub struct Bookmark {
     /// Text shown in the outline panel.
     pub title: String,
-    /// Target page index, jumped to at the page's top-left corner.
+    /// Target page index, opened keeping the viewer's current position
+    /// and zoom.
     pub page: usize,
     /// Nested bookmarks, in reading order.
     pub children: Vec<Bookmark>,
@@ -346,8 +347,8 @@ pub struct Viewer {
     pub layout: Option<PageLayout>,
     /// `/PageMode`, omitted when `None`.
     pub mode: Option<PageMode>,
-    /// Page index opened at its top-left corner via `/OpenAction`,
-    /// omitted when `None`.
+    /// Page index opened via `/OpenAction`, keeping the viewer's current
+    /// position and zoom, omitted when `None`.
     pub open_to: Option<usize>,
 }
 
