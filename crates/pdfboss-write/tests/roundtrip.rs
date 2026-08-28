@@ -1033,8 +1033,27 @@ fn page_labels_duplicate_first_page_errors() {
     };
     let err = pdf.to_bytes().unwrap_err();
     match err {
-        Error::Other(msg) => assert!(msg.contains('0'), "{msg}"),
+        Error::Other(msg) => assert!(msg.contains("duplicate page label at page 0"), "{msg}"),
         other => panic!("expected Error::Other naming the duplicate page, got {other:?}"),
+    }
+}
+
+#[test]
+fn page_labels_zero_start_at_errors() {
+    let pdf = Pdf {
+        pages: four_pages(),
+        page_labels: vec![PageLabel {
+            first_page: 0,
+            style: Some(LabelStyle::Decimal),
+            prefix: None,
+            start_at: 0,
+        }],
+        ..Pdf::default()
+    };
+    let err = pdf.to_bytes().unwrap_err();
+    match err {
+        Error::Other(msg) => assert!(msg.contains("page label at page 0 has start_at 0"), "{msg}"),
+        other => panic!("expected Error::Other naming the zero start_at, got {other:?}"),
     }
 }
 

@@ -743,10 +743,19 @@ fn embedded_files_dict(w: &mut Writer, mut attachments: Vec<Attachment>) -> Resu
 /// when there are none. Ranges are reordered by `first_page` to satisfy
 /// the number tree's sorted-key requirement. A non-empty set must include
 /// a range starting at page 0; a repeated `first_page` is an error naming
-/// the page.
+/// the page; a `start_at` of 0 is an error naming the page, since ISO
+/// 32000 page-label numbering starts at 1.
 fn page_labels_dict(mut labels: Vec<PageLabel>) -> Result<Option<Dict>> {
     if labels.is_empty() {
         return Ok(None);
+    }
+    for label in &labels {
+        if label.start_at == 0 {
+            return Err(Error::Other(format!(
+                "page label at page {} has start_at 0: numbering starts at 1",
+                label.first_page
+            )));
+        }
     }
     labels.sort_by_key(|label| label.first_page);
     if labels[0].first_page != 0 {
