@@ -150,6 +150,19 @@ impl ImageData {
         }
     }
 
+    /// Imports a PNG or JPEG, dispatched by content rather than by file
+    /// extension: a PNG signature selects [`ImageData::png`], a JPEG SOI
+    /// marker selects [`ImageData::jpeg`], anything else is an error.
+    pub fn decode(bytes: &[u8]) -> Result<ImageData> {
+        if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']) {
+            return ImageData::png(bytes);
+        }
+        if bytes.starts_with(&[0xFF, 0xD8]) {
+            return ImageData::jpeg(bytes);
+        }
+        Err(Error::Image("not a png or jpeg (by content)".into()))
+    }
+
     /// Wraps an 8-bit grayscale raster; `data` is `width * height` bytes.
     pub fn gray8(width: u32, height: u32, data: Vec<u8>) -> Result<ImageData> {
         let expected = checked_dims("gray8", width, height)?;

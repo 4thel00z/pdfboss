@@ -131,7 +131,7 @@ pub struct Metadata {
     pub modification_date: Option<Date>,
 }
 
-/// One page: its size, rotation and painted content.
+/// One page: its size, rotation, painted content and link annotations.
 #[derive(Debug, Default)]
 pub struct Page {
     /// Page size (the `/MediaBox`).
@@ -140,6 +140,18 @@ pub struct Page {
     pub rotation: i32,
     /// The page's painted content.
     pub canvas: Canvas,
+    /// Clickable link areas, emitted as `/Annots`.
+    pub links: Vec<LinkAnnotation>,
+}
+
+/// A clickable rectangle on a page that opens a URI (a `/Link` annotation
+/// with a `/URI` action; ISO 32000 §12.5.6.5, §12.6.4.7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkAnnotation {
+    /// The clickable area, `[x0, y0, x1, y1]` in the page's user space.
+    pub rect: [f32; 4],
+    /// The URI opened on click.
+    pub uri: String,
 }
 
 impl Page {
@@ -211,15 +223,19 @@ impl Pdf {
         let mut font_cache: Vec<(Standard14, ObjRef)> = Vec::new();
         let mut kids = Vec::with_capacity(pages.len());
         for page in pages {
-            if page.rotation % 90 != 0 {
+            let Page {
+                size,
+                rotation,
+                canvas,
+                links,
+            } = page;
+            if rotation % 90 != 0 {
                 return Err(Error::Other(format!(
-                    "page rotation {} is not a multiple of 90",
-                    page.rotation
+                    "page rotation {rotation} is not a multiple of 90"
                 )));
             }
-            let (width, height) = page.size.dimensions();
-            let rotation = page.rotation;
-            let parts = page.canvas.into_parts();
+            let (width, height) = size.dimensions();
+            let parts = canvas.into_parts();
             let content = w.put_stream(Dict::new(), serialize_ops(&parts.ops));
             let mut fonts = Dict::new();
             for (index, face) in parts.fonts.iter().enumerate() {
@@ -263,6 +279,35 @@ impl Pdf {
             );
             dict.insert(name("Contents"), Object::Ref(content));
             dict.insert(name("Resources"), Object::Dict(resources));
+            if !links.is_empty() {
+                let annots = links
+                    .iter()
+                    .map(|link| {
+                        let mut action = Dict::new();
+                        action.insert(name("S"), Object::Name(name("URI")));
+                        action.insert(name("URI"), text_string(&link.uri));
+                        let mut annot = Dict::new();
+                        annot.insert(name("Type"), Object::Name(name("Annot")));
+                        annot.insert(name("Subtype"), Object::Name(name("Link")));
+                        annot.insert(
+                            name("Rect"),
+                            Object::Array(
+                                link.rect
+                                    .iter()
+                                    .map(|v| Object::Real(f64::from(*v)))
+                                    .collect(),
+                            ),
+                        );
+                        annot.insert(
+                            name("Border"),
+                            Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(0)]),
+                        );
+                        annot.insert(name("A"), Object::Dict(action));
+                        Object::Ref(w.put(Object::Dict(annot)))
+                    })
+                    .collect();
+                dict.insert(name("Annots"), Object::Array(annots));
+            }
             if rotation != 0 {
                 dict.insert(name("Rotate"), Object::Int(i64::from(rotation)));
             }

@@ -35,7 +35,19 @@ pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
+pdfboss create md     notes.md -o out.pdf     # new PDF: markdown composed with a CSS theme
 ```
+
+`create md` composes CommonMark+GFM into a themed PDF. `--theme` takes a small CSS subset over element-type selectors, overlaid on the built-in default theme:
+
+```css
+body { font-family: times; font-size: 10.5pt; color: #222; }
+h1   { font-family: helvetica; font-size: 2.2em; color: #a33; }
+code { font-family: courier; background-color: #eee; }
+pre  { background-color: #eee; padding: 8pt; }
+```
+
+Themes choose between the Helvetica, Times and Courier families; characters outside those fonts are replaced with `?` and reported.
 
 ```python
 import pdfboss
@@ -45,6 +57,7 @@ text = doc.extract_text()
 md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
 png  = doc[0].render(scale=2.0)            # PNG bytes
 imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
+pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```
 
 <details>
@@ -190,7 +203,7 @@ Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
 ## What's inside
 
-Ten crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
+Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, PDF creation with CSS-subset themed Markdown composition, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
 
 <details>
 <summary><strong>Crate map</strong></summary>
@@ -199,10 +212,14 @@ Ten crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG
 |---|---|
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
 | `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text spans |
+| `pdfboss-encoding` | Shared font-encoding tables (WinAnsi/MacRoman/Standard, ISO 32000 Appendix D) and glyph-name-to-Unicode mappings, consumed by the text and render crates |
 | `pdfboss-output` | Layout analysis over those spans (lines, columns, headings, lists, tables, repeated page headers), rendered as plain text or Markdown |
 | `pdfboss-jpx` | JPEG 2000 decoder for `JPXDecode` image streams, implemented from ITU-T T.800 |
 | `pdfboss-icc` | ICC profile parser and colour transform to sRGB, implemented from ICC.1:2010 |
 | `pdfboss-render` | Anti-aliased vector rasterizer (paths, fills, strokes, clipping, color, images, glyph outlines) to RGBA/PNG |
+| `pdfboss-write` | PDF creation: documents, pages, canvas painting, link annotations |
+| `pdfboss-style` | CSS-subset themes for document composition |
+| `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
