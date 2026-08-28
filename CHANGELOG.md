@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.23.0](https://github.com/4thel00z/pdfboss/compare/v0.22.0...v0.23.0) (2026-08-28)
+
+
+### Features
+
+* default fonts=full when substitute faces are available; scope RenderCache to options ([#111](https://github.com/4thel00z/pdfboss/issues/111)) ([1876742](https://github.com/4thel00z/pdfboss/commit/187674240af24e73c9db855a90247ee94522aa4d))
+
+
+### Bug Fixes
+
+* **render:** restore text state on Q; keep deep-CMYK hue ([#108](https://github.com/4thel00z/pdfboss/issues/108)) ([2ddb64f](https://github.com/4thel00z/pdfboss/commit/2ddb64fbcb533f6d70d60310f3a70ffbb96d4787))
+
+
+### Performance Improvements
+
+* **text:** iterate a show string's codes instead of collecting them, size the span text up front ([#110](https://github.com/4thel00z/pdfboss/issues/110)) ([649f384](https://github.com/4thel00z/pdfboss/commit/649f384487f1519da2d22dcc943d2fda1e47130a))
+
+
+### Documentation
+
+* mdBook user guide, Pages deploy, README refresh ([#103](https://github.com/4thel00z/pdfboss/issues/103)) ([6a438d2](https://github.com/4thel00z/pdfboss/commit/6a438d2043c6af4b203257b72fca9a677da841ec))
+* rename the failure-mode images to the squash hash that landed on main ([8470e8f](https://github.com/4thel00z/pdfboss/commit/8470e8f05686969db604de60e70b3e349087df53))
+
 ## [0.22.0](https://github.com/4thel00z/pdfboss/compare/v0.21.1...v0.22.0) (2026-08-28)
 
 
