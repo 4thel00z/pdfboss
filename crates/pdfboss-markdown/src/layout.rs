@@ -58,7 +58,6 @@ pub(crate) enum Item {
         color: Color,
     },
     /// An embedded raster or passthrough image.
-    #[allow(dead_code)]
     Image {
         x: f32,
         y: f32,
@@ -272,8 +271,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Dispatches each block in document order, appending items to the
-    /// current page. `Paragraph`, `Heading`, `Rule`, `List`, `BlockQuote`,
-    /// `CodeBlock` and `Table` land here; `Image` lands in a later task.
+    /// current page: `Paragraph`, `Heading`, `Rule`, `List`, `BlockQuote`,
+    /// `CodeBlock`, `Table` and `Image` all land here.
     fn blocks(
         &mut self,
         blocks: &[Block],
@@ -341,7 +340,9 @@ impl<'a> Engine<'a> {
                 Block::Table { aligns, head, rows } => {
                     place_table(self, aligns, head, rows, base, left, right, report)?;
                 }
-                Block::Image { .. } => {}
+                Block::Image { path } => {
+                    self.image(path, base, left, right, base_dir)?;
+                }
             }
         }
         Ok(())
@@ -548,6 +549,65 @@ impl<'a> Engine<'a> {
                     .insert(segment.item_index, item);
             }
         }
+        self.after(margin.bottom);
+        Ok(())
+    }
+
+    /// Lays out an `Image` block: the image at its natural size (72 dpi),
+    /// scaled down to fit the column width and, failing that, the page's
+    /// full content height. `path` resolves against `base_dir`; a
+    /// `http://` or `https://` path is rejected rather than fetched.
+    fn image(
+        &mut self,
+        path: &str,
+        base: &TextStyle,
+        left: f32,
+        right: f32,
+        base_dir: &Path,
+    ) -> Result<(), Error> {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Err(Error::Image {
+                path: path.to_string(),
+                message: "remote images are not supported; copy the file next to the markdown"
+                    .to_string(),
+            });
+        }
+        let full = base_dir.join(path);
+        let bytes = std::fs::read(&full).map_err(|e| Error::Image {
+            path: path.to_string(),
+            message: e.to_string(),
+        })?;
+        let data = ImageData::decode(&bytes).map_err(|e| Error::Image {
+            path: path.to_string(),
+            message: e.to_string(),
+        })?;
+        let margin = self.theme.margin(Element::P);
+        self.gap(margin.top);
+        let mut w = data.width() as f32;
+        let mut h = data.height() as f32;
+        let avail = right - left;
+        let column_scale = (avail / w).min(1.0);
+        w *= column_scale;
+        h *= column_scale;
+        let capacity = self.top - self.bottom;
+        let height_scale = (capacity / h).min(1.0);
+        w *= height_scale;
+        h *= height_scale;
+        self.need(h);
+        let x = match base.align {
+            Align::Left => left,
+            Align::Center => left + (avail - w) / 2.0,
+            Align::Right => right - w,
+        };
+        self.push(Item::Image {
+            x,
+            y: self.y - h,
+            w,
+            h,
+            data,
+        });
+        self.y -= h;
+        self.at_top = false;
         self.after(margin.bottom);
         Ok(())
     }
@@ -1028,5 +1088,47 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["    body();"]);
+    }
+
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x3A,
+        0x7E, 0x9B, 0x55, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x62,
+        0x00, 0x00, 0x00, 0x06, 0x00, 0x03, 0x36, 0x37, 0x7C, 0xA8, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    #[test]
+    fn image_places_at_natural_size_and_missing_file_errors() {
+        let dir = std::env::temp_dir().join("pdfboss-markdown-image-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pic.png"), TINY_PNG).unwrap();
+        let theme = Theme::parse(MONO).unwrap();
+        let (blocks, _) = parse_blocks("![alt](pic.png)\n");
+        let mut report = Report::default();
+        let pages = layout(&blocks, &theme, PageSize::A4, &dir, &mut report).unwrap();
+        assert!(pages[0]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Image { w, h, .. } if *w == 1.0 && *h == 1.0)));
+
+        let (blocks, _) = parse_blocks("![alt](missing.png)\n");
+        let err = layout(&blocks, &theme, PageSize::A4, &dir, &mut Report::default()).unwrap_err();
+        assert!(err.to_string().contains("missing.png"));
+    }
+
+    #[test]
+    fn remote_images_error_clearly() {
+        let theme = Theme::parse(MONO).unwrap();
+        let (blocks, _) = parse_blocks("![x](https://cdn.example/pic.png)\n");
+        let err = layout(
+            &blocks,
+            &theme,
+            PageSize::A4,
+            Path::new("."),
+            &mut Report::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("remote"));
     }
 }
