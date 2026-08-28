@@ -17,7 +17,10 @@ can prove fair. pdfboss does not yet paint everything (see the top-level
 README's Limitations), and timing a renderer that skipped work against full
 renderers would credit it for the skipping. So every sampled file is certified
 before the stopwatch starts, and the files that fail are excluded with their
-reasons printed — never silently.
+reasons printed — never silently. pdfboss is always timed at all three
+`fonts=` tiers on that one certified set, so the table shows what each mode
+costs; `full` is the like-for-like row against the other engines, which
+substitute non-embedded fonts by default.
 
 `bench_scans.py` benchmarks rendering where certification is unnecessary. A
 scanned page is a single full-page bilevel image — JBIG2 or CCITT G3/G4 — with
