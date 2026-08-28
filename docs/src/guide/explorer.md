@@ -1,6 +1,6 @@
 # Exploring PDF internals
 
-A PDF is two structures at once: a physical file — header, numbered objects, cross-reference sections, trailer — and the logical document those objects encode — pages, fonts, images, annotations. pdfboss exposes both as one lazy stream of elements, reachable from Python, and from the CLI as a JSON tree, jq queries, hexdumps and an interactive terminal explorer.
+A PDF is two structures at once: a physical file — header, numbered objects, cross-reference sections, trailer — and the logical document those objects encode — pages, fonts, images, annotations. pdfboss exposes both as one lazy stream of elements, reachable from Python and Rust, and from the CLI as a JSON tree, jq queries, hexdumps and an interactive terminal explorer.
 
 ## The element model
 
@@ -38,7 +38,18 @@ for element in doc.elements(logical=False):
     print(element.kind, element.span, element.ref)
 ```
 
-Each `Element` carries `kind`, `span` (byte range, where applicable), `ref` (the `(num, gen)` object reference, where applicable) and `page` (0-based index for logical elements). `value()` converts the element lazily to plain Python data: dicts, lists, `str`, `bytes`, numbers, `bool`, `None`; PDF names become `str`, streams become `{"dict": ..., "length": n}`, references become `{"ref": (num, gen)}`.
+Each `Element` carries `kind`, `span` (byte range, where applicable), `ref` (the `(num, gen)` object reference, where applicable) and `page` (0-based index for logical elements). `value()` converts the element lazily to plain Python data: dicts, lists, `str`, `bytes`, numbers, `bool`, `None`; PDF names become `str`, streams become `{"dict": ..., "length": n}`, references become `{"ref": (num, gen)}`. That full conversion applies to `object` and `trailer` elements; the other kinds convert to fixed shapes:
+
+| kind | `value()` |
+|---|---|
+| `header` | the version string, e.g. `"1.7"` |
+| `xref` | `{"kind": "table" or "stream", "entries": int}` |
+| `startxref` | the offset as `int` |
+| `font` | `{"subtype": str, "base_font": str or None}` |
+| `image` | `{"width": int, "height": int}` |
+| `annotation` | `{"subtype": str}` |
+| `content_op` | the operator rendered as a string |
+| `eof`, `page` | `None` |
 
 ```python
 import pdfboss
@@ -71,6 +82,49 @@ while True:
 ```
 
 `AsyncDocument.elements()` is the async twin — same arguments, same ordering, same salvage semantics, consumed with `async for` ([Async and remote documents](./async.md)).
+
+## Rust
+
+The same walk in Rust is `pdfboss_core::Document::elements(ElementOpts)`, an iterator of `Result<Element>`. `ElementOpts` selects the layers with the same four knobs (`physical`, `logical`, `pages`, `content_ops`); `Element` is an enum; variants carry their payload fields directly, with byte spans on the physical variants.
+
+```rust,no_run
+use pdfboss_core::{Document, Element, ElementOpts};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    for element in doc.elements(ElementOpts::default()) {
+        match element {
+            Ok(Element::IndirectObject { r, span, .. }) => {
+                println!("{} {} obj at {}..{}", r.num, r.gen, span.start, span.end);
+            }
+            Ok(_) => {}
+            Err(err) => eprintln!("unreadable element: {err}"),
+        }
+    }
+    Ok(())
+}
+```
+
+`pdfboss_aio::AsyncDocument::elements(ElementOpts)` returns an `ElementStream`, a `futures_core::Stream` of `Result<Element>` with the same ordering and salvage semantics. The stream owns an `Arc` clone of the document, so it is `'static` and can be spawned:
+
+```rust,no_run
+use futures_util::StreamExt;
+use pdfboss_aio::AsyncDocument;
+use pdfboss_core::ElementOpts;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = AsyncDocument::open("report.pdf").await?;
+    let mut elements = doc.elements(ElementOpts::default());
+    while let Some(element) = elements.next().await {
+        match element {
+            Ok(element) => println!("{element:?}"),
+            Err(err) => eprintln!("unreadable element: {err}"),
+        }
+    }
+    Ok(())
+}
+```
 
 ## CLI
 

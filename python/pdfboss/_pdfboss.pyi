@@ -42,9 +42,14 @@ class Element:
     """The 0-based page index for logical elements, ``None`` otherwise."""
     def value(self) -> object:
         """Lazy conversion to plain Python data:
-        dict/list/str/bytes/int/float/bool/None. PDF names -> str,
-        strings -> str where UTF-8-valid else bytes, streams ->
-        {"dict": ..., "length": int}, references -> {"ref": (num, gen)}.
+        dict/list/str/bytes/int/float/bool/None. Objects and the trailer
+        convert fully: PDF names -> str, strings -> str where UTF-8-valid
+        else bytes, streams -> {"dict": ..., "length": int}, references ->
+        {"ref": (num, gen)}. Other kinds: header -> the version string;
+        xref -> {"kind": ..., "entries": ...}; startxref -> int; font ->
+        {"subtype": ..., "base_font": ...}; image -> {"width": ...,
+        "height": ...}; annotation -> {"subtype": ...}; content ops ->
+        the operator rendered as a string; eof and page -> None.
         """
 
 class ElementIter:
@@ -459,10 +464,10 @@ class AsyncDocument:
         end). Raises ``IndexError`` when out of range."""
 
     def page(self, index: int) -> "AsyncPage":
-        """The page at 0-based ``index``. Synchronous — the page tree and
-        its inherited attributes were resolved at open — and negative
-        indexes are NOT accepted here (use subscription, ``doc[-1]``, for
-        that), mirroring the sync ``Document`` split."""
+        """The page at 0-based ``index``, a method form of subscription
+        (``doc[i]``). Synchronous, since the page tree and its inherited
+        attributes were resolved at open. Negative indexes are NOT
+        accepted here; use subscription, ``doc[-1]``, for those."""
 
     async def extract_text(self) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``) —

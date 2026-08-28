@@ -1317,10 +1317,10 @@ impl AsyncDocument {
         })
     }
 
-    /// The page at 0-based `index`. Synchronous — the page tree and its
-    /// inherited attributes were resolved at open — and negative indexes are
-    /// NOT accepted here (use subscription, `doc[-1]`, for that), mirroring
-    /// the sync `Document.page` split.
+    /// The page at 0-based `index`, a method form of subscription
+    /// (`doc[i]`). Synchronous, since the page tree and its inherited
+    /// attributes were resolved at open. Negative indexes are NOT accepted
+    /// here; use subscription, `doc[-1]`, for those.
     fn page(&self, index: usize) -> PyResult<AsyncPage> {
         let page = self.inner.page(index).map_err(aio_err)?;
         Ok(AsyncPage {

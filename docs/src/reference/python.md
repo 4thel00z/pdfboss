@@ -1,12 +1,12 @@
 # Python API
 
-The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public surface is twelve classes plus the `md` submodule; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
+The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public surface is twelve classes, the `md` submodule and the `__version__` string; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
 
 ## The twelve classes
 
 | Name | What it is |
 |---|---|
-| `Document` | A loaded PDF, from a path or bytes; pages by index, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans` |
+| `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans` |
 | `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `render`, `render_reporting`, `extract_images` |
 | `AsyncDocument` | The async twin of `Document`, opened from a path, bytes, or an HTTP URL via range requests; data-fetching methods are coroutines |
 | `AsyncPage` | The async twin of `Page`; attributes are synchronous, extraction and rendering are coroutines |
@@ -18,6 +18,14 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | `AsyncSpanIter` | Async iterator over a document's spans |
 | `PageImage` | One embedded image extracted from a page: native `width`/`height` and PNG-encoded `data` |
 | `PdfError` | The exception type for any PDF processing error |
+
+`Document.metadata` is a property returning the document information
+dictionary as a `dict[str, str]`, only keys present in the file included;
+`AsyncDocument.metadata()` is a coroutine yielding the same mapping.
+`AsyncDocument` also has `page(index)` (synchronous, 0-based, no negative
+indexes; subscription `doc[i]` accepts them) and `get_object(num, gen=0)`, a
+coroutine fetching one indirect object and returning it through the same
+plain-Python conversion as `Element.value()`.
 
 Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Markdown to PDF](../guide/md-to-pdf.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md).
 
@@ -40,7 +48,7 @@ except pdfboss.PdfError as e:
     print(f"could not open: {e}")
 ```
 
-Two conventional exceptions apply where Python conventions demand them: constructing a `Document` with neither or both of `path` and `data` raises `ValueError` (as does a non-positive `scale` or an unusable `fonts="full"` setup in `render`), and an out-of-range page index raises `IndexError`. Element iterators have salvage semantics: a per-item failure raises `PdfError` for that item, and iteration may be continued. Span iterators raise `PdfError` when a page cannot be materialized.
+Two conventional exceptions apply where Python conventions demand them: constructing a `Document` with neither or both of `path` and `data` raises `ValueError` (as does a non-positive `scale`, an unknown `fonts=` or `compression=` string, or an unusable `fonts="full"` setup in `render`), and an out-of-range page index raises `IndexError`. Element iterators have salvage semantics: a per-item failure raises `PdfError` for that item, and iteration may be continued. Span iterators raise `PdfError` when a page cannot be materialized.
 
 ## Threading
 

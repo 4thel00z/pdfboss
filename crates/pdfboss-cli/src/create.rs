@@ -60,7 +60,7 @@ pub enum CreateCommand {
         /// Page size (default: each page matches its image at 72 dpi).
         #[arg(long, value_enum)]
         size: Option<SizeArg>,
-        /// Swap page width and height (only meaningful with --size).
+        /// Swap page width and height (requires --size).
         #[arg(long, requires = "size")]
         landscape: bool,
     },

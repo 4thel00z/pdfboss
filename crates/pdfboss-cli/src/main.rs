@@ -122,9 +122,10 @@ enum Command {
         /// compiled-in OFL set or --font-dir), otherwise all-embedded.
         #[arg(long, value_enum)]
         fonts: Option<FontsArg>,
-        /// Directory of substitute faces for `--fonts full` (one file per
-        /// `pdfboss_render::substitute::face_filename`, e.g. an installed
-        /// `pdfboss-fonts` package). Overrides the compiled-in OFL set.
+        /// Directory of substitute faces for `--fonts full`: one file per
+        /// face, named like `Arimo[wght].ttf` (the book's rendering chapter
+        /// lists all of them), e.g. an installed `pdfboss-fonts` package.
+        /// Overrides the compiled-in OFL set.
         #[arg(long)]
         font_dir: Option<PathBuf>,
         /// PNG compression: encode time against file size, same pixels.
