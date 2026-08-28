@@ -1,5 +1,6 @@
 //! `pdfboss create`: making new PDFs — blank pages, word-wrapped text
-//! files, and one-page-per-image albums — on top of `pdfboss-write`.
+//! files, one-page-per-image albums, and themed Markdown documents — on
+//! top of `pdfboss-write` and `pdfboss-markdown`.
 
 use std::path::{Path, PathBuf};
 

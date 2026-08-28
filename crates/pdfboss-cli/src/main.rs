@@ -63,7 +63,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new PDF: blank pages, word-wrapped text, or image pages.
+    /// Create a new PDF: blank pages, word-wrapped text, image pages, or a
+    /// themed Markdown document.
     Create {
         #[command(subcommand)]
         command: create::CreateCommand,
