@@ -47,7 +47,9 @@ fn skills_root(global: bool) -> Result<PathBuf, String> {
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
-        .ok_or_else(|| "cannot locate the home directory: neither HOME nor USERPROFILE is set".to_string())?;
+        .ok_or_else(|| {
+            "cannot locate the home directory: neither HOME nor USERPROFILE is set".to_string()
+        })?;
     Ok(PathBuf::from(home).join(".claude").join("skills"))
 }
 
@@ -55,8 +57,7 @@ fn skills_root(global: bool) -> Result<PathBuf, String> {
 /// needed and overwriting any previous install, and returns the file path.
 fn install_into(root: &Path) -> Result<PathBuf, String> {
     let dir = root.join("pdfboss");
-    fs::create_dir_all(&dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join("SKILL.md");
     fs::write(&path, SKILL_MD).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     Ok(path)
@@ -67,10 +68,7 @@ mod tests {
     use super::*;
 
     fn scratch_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pdfboss-skill-{tag}-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("pdfboss-skill-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
     }
