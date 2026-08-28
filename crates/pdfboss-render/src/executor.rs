@@ -1022,9 +1022,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                                         (0.0, -n / 1000.0 * frame.gs.text.size)
                                     } else {
                                         (
-                                            -n / 1000.0
-                                                * frame.gs.text.size
-                                                * frame.gs.text.horiz,
+                                            -n / 1000.0 * frame.gs.text.size * frame.gs.text.horiz,
                                             0.0,
                                         )
                                     };
@@ -1888,8 +1886,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // frame is pushed at `depth + 1`, so painting stops at
             // `MAX_FORM_DEPTH` while the advances still happen.
             let paint = visible && frame.depth < MAX_FORM_DEPTH;
-            let planned =
-                type3_glyph_plan(&frame.gs.text, &mut frame.ts, &t3, bytes, frame.gs.ctm, paint);
+            let planned = type3_glyph_plan(
+                &frame.gs.text,
+                &mut frame.ts,
+                &t3,
+                bytes,
+                frame.gs.ctm,
+                paint,
+            );
             frame.pending_glyphs.extend(planned);
             frame.pending_t3 = Some(t3);
             return;
@@ -1994,7 +1998,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 (0.0, w1 * text.size + text.char_spacing + word)
             } else {
                 let w0 = font.advance(cid) / upm;
-                ((w0 * text.size + text.char_spacing + word) * text.horiz, 0.0)
+                (
+                    (w0 * text.size + text.char_spacing + word) * text.horiz,
+                    0.0,
+                )
             };
             if tx.is_finite() && ty.is_finite() {
                 ts.tm = Matrix::translate(tx, ty).concat(ts.tm);
@@ -6727,7 +6734,9 @@ mod tests {
         // rect x in [100,600]/1000 em, /Widths 500) would paint at device x
         // in [120,170] instead of [70,120].
         let pix = render_at_tier(
-            &doc_with_incomplete_truetype_font(b"q BT 50 Tc ET Q BT /F0 100 Tf 10 50 Td (AA) Tj ET"),
+            &doc_with_incomplete_truetype_font(
+                b"q BT 50 Tc ET Q BT /F0 100 Tf 10 50 Td (AA) Tj ET",
+            ),
             GlyphPainting::AllEmbedded,
         );
         assert!(dark_at(&pix, 45, 115), "first 'A' at the text origin");
