@@ -28,6 +28,8 @@ use pdfboss_output::Output;
 use pdfboss_render::RenderCache;
 use pdfboss_text::{FontCache, TextSpan};
 
+mod write;
+
 create_exception!(
     pdfboss,
     PdfError,
@@ -1824,16 +1826,11 @@ impl AsyncSpanIter {
 /// Maps the Python `size=` string to a [`pdfboss_markdown::PageSize`],
 /// case-insensitively.
 fn page_size_by_name(size: &str) -> PyResult<pdfboss_markdown::PageSize> {
-    match size.to_ascii_lowercase().as_str() {
-        "a3" => Ok(pdfboss_markdown::PageSize::A3),
-        "a4" => Ok(pdfboss_markdown::PageSize::A4),
-        "a5" => Ok(pdfboss_markdown::PageSize::A5),
-        "letter" => Ok(pdfboss_markdown::PageSize::Letter),
-        "legal" => Ok(pdfboss_markdown::PageSize::Legal),
-        other => Err(PdfError::new_err(format!(
-            "unknown page size {other:?}: a3, a4, a5, letter or legal"
-        ))),
-    }
+    pdfboss_write::PageSize::by_name(size).ok_or_else(|| {
+        PdfError::new_err(format!(
+            "unknown page size {size:?}: a3, a4, a5, letter or legal"
+        ))
+    })
 }
 
 /// Composes CommonMark+GFM `markdown` into a themed PDF and returns the
@@ -1898,6 +1895,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsyncSpanIter>()?;
     m.add_class::<PageImage>()?;
     m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
+    write::register(m.py(), m)?;
     Ok(())
 }
 

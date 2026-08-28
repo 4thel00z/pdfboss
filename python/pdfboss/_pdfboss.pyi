@@ -5,7 +5,8 @@ typed surface editors and type checkers see.
 """
 
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
+from typing import Literal, Protocol, Self
 
 __version__: str
 """The installed pdfboss version, e.g. ``"0.18.0"``."""
@@ -626,3 +627,298 @@ def md_to_pdf(
     and reported through a single ``UserWarning`` naming what changed; a
     clean document warns about nothing.
     """
+
+class write:
+    """Type stubs for ``pdfboss._pdfboss.write``: composing new PDFs from
+    frozen pyclasses accumulated with ``|`` and lowered once at
+    ``Pdf.save``/``Pdf.to_bytes`` time.
+
+    Declared as a nested namespace class rather than a stub-package file
+    (``_pdfboss/write.pyi``) because pyo3 registers ``write`` as one
+    ``PyModule`` object, not a real subpackage on disk, and this single
+    ``_pdfboss.pyi`` file is the existing stub layout. Every name below is
+    actually an attribute of the real ``pdfboss._pdfboss.write`` module at
+    runtime, not of this class; cross-references below are written as
+    ``"write.Name"`` rather than a bare name, since a bare nested-class
+    name would resolve against this file's top-level (read-side) names —
+    ``Page`` above is a different class from ``write.Page`` below.
+    """
+
+    class Standard14:
+        """One of the fourteen standard fonts every PDF consumer
+        provides."""
+
+        HELVETICA: "write.Standard14"
+        HELVETICA_BOLD: "write.Standard14"
+        HELVETICA_OBLIQUE: "write.Standard14"
+        HELVETICA_BOLD_OBLIQUE: "write.Standard14"
+        TIMES_ROMAN: "write.Standard14"
+        TIMES_BOLD: "write.Standard14"
+        TIMES_ITALIC: "write.Standard14"
+        TIMES_BOLD_ITALIC: "write.Standard14"
+        COURIER: "write.Standard14"
+        COURIER_BOLD: "write.Standard14"
+        COURIER_OBLIQUE: "write.Standard14"
+        COURIER_BOLD_OBLIQUE: "write.Standard14"
+        SYMBOL: "write.Standard14"
+        ZAPF_DINGBATS: "write.Standard14"
+
+    class Draw(Protocol):
+        """The draw protocol: any object exposing a callable
+        ``draw(canvas)`` method composes onto a ``Page`` like ``Text`` or
+        ``Image``, painting through the canvas handed to it. The return
+        value is ignored, so any return type satisfies this protocol."""
+
+        def draw(self, canvas: "write.Canvas") -> object:
+            """Paints onto ``canvas``, in the page's content order."""
+
+    class Text:
+        """One line of text at a fixed baseline origin."""
+
+        def __init__(
+            self,
+            value: str,
+            at: tuple[float, float],
+            font: "write.Standard14" = ...,
+            size: float = 12.0,
+            color: tuple[float, float, float] | None = None,
+        ) -> None:
+            """``font`` defaults to ``Standard14.HELVETICA``. ``color`` is
+            an ``(r, g, b)`` tuple in ``[0, 1]``, defaulting to black."""
+
+    class Image:
+        """A raster image placed at a point."""
+
+        def __init__(
+            self,
+            data: str | bytes,
+            at: tuple[float, float],
+            width: float | None = None,
+            height: float | None = None,
+        ) -> None:
+            """``data`` is a filesystem path, read only at
+            ``save``/``to_bytes`` time, or raw image bytes decoded eagerly.
+            Raises ``TypeError`` for any other type. ``width``/``height``
+            default to the image's native size in points."""
+
+    class Link:
+        """A clickable rectangle, lowered into a link annotation on the
+        page."""
+
+        def __init__(
+            self,
+            rect: tuple[float, float, float, float],
+            url: str | None = None,
+            page: int | None = None,
+        ) -> None:
+            """Exactly one of ``url`` or ``page`` must be given; passing
+            neither or both raises ``TypeError``."""
+
+    class Paragraph:
+        """A block of text wrapped, aligned, and (for
+        ``align="justify"``) stretched to fill a rectangle."""
+
+        def __init__(
+            self,
+            text: str,
+            rect: tuple[float, float, float, float],
+            font: "write.Standard14" = ...,
+            size: float = 11.0,
+            leading: float | None = None,
+            align: Literal["left", "center", "right", "justify"] = "left",
+        ) -> None:
+            """``leading`` defaults to a size-derived line height. Raises
+            ``TypeError`` for an unknown ``align``, and ``PdfError`` at
+            lowering time if the wrapped text overflows ``rect``."""
+
+    class Metadata:
+        """Document information written to the ``/Info`` dictionary. Dates
+        are deferred: the write surface stays clock-free."""
+
+        def __init__(
+            self,
+            title: str | None = None,
+            author: str | None = None,
+            subject: str | None = None,
+            keywords: str | None = None,
+            creator: str | None = None,
+            producer: str | None = None,
+        ) -> None: ...
+
+    class Bookmark:
+        """One outline entry: a title, the page it jumps to, and nested
+        children, composed by nesting ``Bookmark`` instances rather than
+        ``|``."""
+
+        def __init__(
+            self,
+            title: str,
+            page: int,
+            *,
+            children: Sequence["write.Bookmark"] = (),
+        ) -> None: ...
+
+    class Outline:
+        """A document's bookmark panel: an ordered forest of ``Bookmark``
+        nodes. A singleton ``Pdf`` slot."""
+
+        def __init__(self, *bookmarks: "write.Bookmark") -> None: ...
+
+    class Attachment:
+        """A document-level attachment, embedded via the catalog's
+        embedded-files name tree. Carries no dates: the write surface
+        stays clock-free."""
+
+        def __init__(
+            self,
+            name: str,
+            data: bytes,
+            mime: str | None = None,
+            description: str | None = None,
+        ) -> None: ...
+
+    class PageLabel:
+        """One page-numbering range, taking effect from ``first_page``
+        until the next range or the document's end. A singleton-free
+        sequence: a ``Pdf`` may carry any number of these."""
+
+        def __init__(
+            self,
+            first_page: int,
+            style: Literal[
+                "decimal",
+                "roman-upper",
+                "roman-lower",
+                "letters-upper",
+                "letters-lower",
+            ]
+            | None = None,
+            prefix: str | None = None,
+            start_at: int = 1,
+        ) -> None:
+            """Raises ``TypeError`` for an unknown ``style``."""
+
+    class Viewer:
+        """Viewer preferences written to the catalog: initial layout,
+        navigation mode, and the page opened at document start. A
+        singleton ``Pdf`` slot."""
+
+        def __init__(
+            self,
+            layout: Literal[
+                "single-page",
+                "one-column",
+                "two-column-left",
+                "two-column-right",
+                "two-page-left",
+                "two-page-right",
+            ]
+            | None = None,
+            mode: Literal["use-none", "use-outlines", "use-thumbs", "full-screen"] | None = None,
+            open_to: int | None = None,
+        ) -> None:
+            """Raises ``TypeError`` for an unknown ``layout`` or ``mode``."""
+
+    class Canvas:
+        """The imperative painting surface handed to a draw object's
+        ``draw`` method: the page's in-progress canvas, moved in for the
+        call's duration and moved back out afterward. Has no public
+        constructor — only ``Page``'s draw protocol hands one out. Every
+        method raises ``PdfError`` once the canvas has been taken back
+        after ``draw`` returns; it must not outlive that call."""
+
+        def text(
+            self,
+            value: str,
+            at: tuple[float, float],
+            font: "write.Standard14" = ...,
+            size: float = 12.0,
+        ) -> None:
+            """Shows one line of text with its baseline origin at
+            ``at``."""
+
+        def line(
+            self, x1: float, y1: float, x2: float, y2: float, width: float = 1.0
+        ) -> None:
+            """Strokes a straight line from ``(x1, y1)`` to ``(x2, y2)`` at
+            ``width``."""
+
+        def rect(self, x: float, y: float, w: float, h: float) -> None:
+            """Appends a rectangle subpath."""
+
+        def move_to(self, x: float, y: float) -> None:
+            """Begins a new subpath at ``(x, y)``."""
+
+        def line_to(self, x: float, y: float) -> None:
+            """Straight segment to ``(x, y)``."""
+
+        def curve_to(
+            self, x1: float, y1: float, x2: float, y2: float, x3: float, y3: float
+        ) -> None:
+            """Cubic Bezier with two control points."""
+
+        def close(self) -> None:
+            """Closes the current subpath."""
+
+        def stroke(self) -> None:
+            """Strokes the current path."""
+
+        def fill(self) -> None:
+            """Fills the current path, nonzero winding."""
+
+        def set_fill(self, rgb: tuple[float, float, float]) -> None:
+            """Sets the fill color from an ``(r, g, b)`` tuple."""
+
+        def set_stroke(self, rgb: tuple[float, float, float]) -> None:
+            """Sets the stroke color from an ``(r, g, b)`` tuple."""
+
+        def set_line_width(self, width: float) -> None:
+            """Sets the stroke line width."""
+
+    class Page:
+        """One page: its size and the content composed onto it with
+        ``|``."""
+
+        def __init__(self, size: str = "a4", landscape: bool = False) -> None:
+            """``size`` names a page size case-insensitively, resolved at
+            lowering time."""
+
+        def __or__(
+            self,
+            rhs: "write.Text | write.Image | write.Link | write.Paragraph "
+            "| write.Draw",
+        ) -> Self:
+            """Composes one more element onto the page: ``Text``,
+            ``Image``, ``Link``, ``Paragraph``, or any object with a
+            callable ``draw`` attribute (the draw protocol). Returns a new
+            ``Page``; the receiver is unchanged. Raises ``TypeError`` for
+            an unsupported type."""
+
+    class Pdf:
+        """A document under construction: pages in reading order, the
+        singleton ``Metadata``/``Outline``/``Viewer`` slots, and the
+        ``Attachment``/``PageLabel`` sequences. ``|`` accumulates cheap
+        handle copies; nothing is built or read until
+        ``save``/``to_bytes``."""
+
+        def __init__(self) -> None: ...
+
+        def __or__(
+            self,
+            rhs: "write.Page | write.Metadata | write.Outline | write.Viewer "
+            "| write.Attachment | write.PageLabel",
+        ) -> Self:
+            """Composes one more ``Page``, ``Attachment`` or ``PageLabel``
+            (each appended), or ``Metadata``/``Outline``/``Viewer`` (each a
+            singleton slot) onto the document. Returns a new ``Pdf``; the
+            receiver is unchanged. A second ``Metadata``, ``Outline`` or
+            ``Viewer`` raises ``TypeError``."""
+
+        def save(self, path: str | os.PathLike[str]) -> None:
+            """Serializes and writes the document to ``path``."""
+
+        def to_bytes(self) -> bytes:
+            """Serializes the document to file bytes, like ``save``. May
+            be called more than once — each call lowers a fresh document
+            from the accumulated handles, so the composed value is never
+            consumed."""

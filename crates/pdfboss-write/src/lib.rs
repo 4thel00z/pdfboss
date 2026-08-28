@@ -19,6 +19,7 @@
 pub mod canvas;
 pub mod color;
 pub mod content;
+pub mod element;
 pub mod error;
 pub mod font;
 pub mod image;
@@ -26,13 +27,18 @@ pub mod pdf;
 pub mod ser;
 pub mod sink;
 pub mod writer;
+mod xmp;
 
-pub use canvas::{Canvas, CanvasParts, ImageHandle, LineCap, LineJoin};
+pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
 pub use content::serialize_ops;
+pub use element::{Content, Draw, Image, Link, Paragraph, ParagraphAlign, Text};
 pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;
-pub use pdf::{Date, LinkAnnotation, Metadata, Page, PageSize, Pdf};
+pub use pdf::{
+    Attachment, Bookmark, Date, LabelStyle, LinkAnnotation, LinkTarget, Metadata, Outline, Page,
+    PageLabel, PageLayout, PageMode, PageSize, Pdf, Viewer,
+};
 pub use sink::{AsyncByteSink, Immediate};
 pub use writer::{WriteOptions, Writer, XrefStyle};

@@ -227,6 +227,88 @@ fn images_with_size_scale_into_the_page() {
     assert!((h - 841.89).abs() < 0.01, "unexpected height {h}");
 }
 
+const Q3_MANIFEST: &str = r#"
+[meta]
+title  = "Q3 Report"
+author = "Mo"
+
+[[page]]
+size = "a4"
+
+  [[page.text]]
+  value = "Q3 Report"
+  at    = [72, 770]
+  font  = "Helvetica-Bold"
+  size  = 28
+
+  [[page.paragraph]]
+  value   = "Body copy for the quarter."
+  rect    = [72, 380, 523, 720]
+  size    = 11
+  leading = 15
+  align   = "left"
+
+  [[page.image]]
+  path  = "chart.png"
+  at    = [72, 96]
+  width = 200
+
+  [[page.link]]
+  rect = [72, 88, 523, 380]
+  url  = "https://example.com/q3"
+
+[[page]]
+"#;
+
+/// The design's own exit test for the TOML manifest: a q3-style manifest
+/// with a tiny PNG fixture on disk and a second bare `[[page]]`, loaded back
+/// through `pdfboss-core` — two pages, the text reaches the content stream,
+/// the metadata reaches `/Info`, and the link's `/URI` resolves structurally
+/// (mirroring the markdown crate's own roundtrip idiom: `/Annots` -> `Annot`
+/// dict -> `/A` -> `/URI`, since the annotation dict is packed into a
+/// compressed object stream and never appears literally in the file).
+#[test]
+fn manifest_maps_toml_through_the_compose_layer() {
+    let dir = tmp("manifest");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("chart.png"), png_bytes(3, 2)).unwrap();
+    let manifest_path = dir.join("q3.toml");
+    std::fs::write(&manifest_path, Q3_MANIFEST).unwrap();
+    let out = dir.join("q3.pdf");
+
+    let output = pdfboss(&[
+        "create",
+        "manifest",
+        manifest_path.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "create manifest failed: {output:?}"
+    );
+
+    let doc = load(&out);
+    assert_eq!(doc.page_count(), 2);
+    assert_eq!(doc.metadata().title.as_deref(), Some("Q3 Report"));
+    assert_eq!(doc.metadata().author.as_deref(), Some("Mo"));
+
+    let page = doc.page(0).unwrap();
+    let text = pdfboss_output::extract_text(&doc, &page).unwrap();
+    assert!(text.contains("Q3 Report"), "text was: {text}");
+
+    let annots = page.dict().get_array("Annots").unwrap_or(&[]);
+    let uris: Vec<Vec<u8>> = annots
+        .iter()
+        .filter_map(|annot| doc.resolve(annot).ok())
+        .filter_map(|annot| annot.as_dict().cloned())
+        .filter_map(|annot| annot.get_dict("A").cloned())
+        .filter_map(|action| action.get("URI").cloned())
+        .filter_map(|uri| uri.as_str_bytes().map(<[u8]>::to_vec))
+        .collect();
+    assert_eq!(uris, vec![b"https://example.com/q3".to_vec()]);
+}
+
 #[test]
 fn images_reject_files_without_image_magic() {
     let input = tmp("not-an-image.txt");

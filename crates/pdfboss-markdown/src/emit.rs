@@ -1,7 +1,7 @@
 //! Canvas emission: turns paginated draw items into [`pdfboss_write::Page`]
 //! values ready for [`pdfboss_write::Pdf`] assembly.
 
-use pdfboss_write::{LinkAnnotation, Page, PageSize};
+use pdfboss_write::{LinkAnnotation, LinkTarget, Page, PageSize};
 
 use crate::layout::{Item, LaidPage};
 use crate::Error;
@@ -64,7 +64,7 @@ pub(crate) fn emit(laid: Vec<LaidPage>, page_size: PageSize) -> Result<Vec<Page>
                     Item::Link { x, y, w, h, uri } => {
                         page.links.push(LinkAnnotation {
                             rect: [x, y, x + w, y + h],
-                            uri,
+                            target: LinkTarget::Uri(uri),
                         });
                     }
                 }
