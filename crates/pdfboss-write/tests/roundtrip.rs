@@ -4,7 +4,7 @@
 //! toolkit's own readers rather than against expected byte dumps.
 
 use pdfboss_core::object::decode_text_string;
-use pdfboss_core::{Dict, Document, Name, Object, Rect};
+use pdfboss_core::{Dict, Document, Name, Object, Rect, Stream};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
@@ -425,6 +425,139 @@ fn catalog(doc: &Document) -> Dict {
         .expect("/Root present")
         .clone();
     resolve_dict(doc, &root)
+}
+
+/// Resolves an object to its stream, cloned so the borrow does not outlive
+/// a temporary `Document::resolve` result.
+fn resolve_stream(doc: &Document, obj: &Object) -> Stream {
+    doc.resolve(obj)
+        .expect("reference resolves")
+        .as_stream()
+        .expect("resolved object is a stream")
+        .clone()
+}
+
+/// The catalog's `/Metadata` stream, decoded, or `None` when the catalog
+/// carries no such entry.
+fn xmp_packet(doc: &Document) -> Option<String> {
+    let entry = catalog(doc).get("Metadata")?.clone();
+    let stream = resolve_stream(doc, &entry);
+    assert_eq!(stream.dict.get_name("Type"), Some(&Name("Metadata".into())));
+    assert_eq!(stream.dict.get_name("Subtype"), Some(&Name("XML".into())));
+    assert!(
+        stream.dict.get("Filter").is_none(),
+        "the XMP stream must stay uncompressed regardless of WriteOptions::compress"
+    );
+    let bytes = doc.stream_data(&stream).expect("XMP stream decodes");
+    Some(String::from_utf8(bytes).expect("XMP packet is valid UTF-8"))
+}
+
+#[test]
+fn xmp_packet_maps_full_metadata_and_stays_uncompressed() {
+    let pdf = Pdf {
+        metadata: Some(Metadata {
+            title: Some("Q3 & Q4 Report".into()),
+            author: Some("Jane Doe".into()),
+            subject: Some("Quarterly numbers".into()),
+            keywords: Some("finance, quarterly".into()),
+            creator: Some("pdfboss".into()),
+            producer: Some("pdfboss-write".into()),
+            creation_date: Some(Date {
+                year: 2026,
+                month: 8,
+                day: 27,
+                hour: 12,
+                minute: 30,
+                second: 15,
+                utc_offset_minutes: 0,
+            }),
+            modification_date: Some(Date {
+                year: 2026,
+                month: 8,
+                day: 28,
+                hour: 9,
+                minute: 0,
+                second: 0,
+                utc_offset_minutes: 120,
+            }),
+        }),
+        pages: vec![Page::new(PageSize::A4)],
+        options: WriteOptions {
+            compress: true,
+            ..WriteOptions::default()
+        },
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let xml = xmp_packet(&doc).expect("/Metadata present when metadata is Some");
+    assert!(xml.contains("Q3 &amp; Q4 Report"), "{xml}");
+    assert!(xml.contains("Jane Doe"), "{xml}");
+    assert!(xml.contains("pdfboss-write"), "{xml}");
+    assert!(xml.contains("2026-08-27T12:30:15Z"), "{xml}");
+    assert!(xml.contains("2026-08-28T09:00:00+02:00"), "{xml}");
+    assert!(!xml.contains("InstanceID"), "{xml}");
+    assert!(!xml.contains("DocumentID"), "{xml}");
+    let meta = doc.metadata();
+    assert_eq!(meta.title.as_deref(), Some("Q3 & Q4 Report"));
+    assert_eq!(meta.author.as_deref(), Some("Jane Doe"));
+}
+
+#[test]
+fn xmp_packet_escapes_all_five_special_characters() {
+    let pdf = Pdf {
+        metadata: Some(Metadata {
+            title: Some("<&>\"'".into()),
+            ..Metadata::default()
+        }),
+        pages: vec![Page::new(PageSize::A4)],
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let xml = xmp_packet(&doc).expect("/Metadata present when metadata is Some");
+    assert!(xml.contains("&lt;&amp;&gt;&quot;&apos;"), "{xml}");
+    assert!(!xml.contains("<&>\"'"), "{xml}");
+}
+
+#[test]
+fn xmp_packet_is_deterministic_across_builds() {
+    fn build() -> Vec<u8> {
+        Pdf {
+            metadata: Some(Metadata {
+                title: Some("Determinism".into()),
+                creation_date: Some(Date {
+                    year: 2026,
+                    month: 8,
+                    day: 27,
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                    utc_offset_minutes: 0,
+                }),
+                ..Metadata::default()
+            }),
+            pages: vec![Page::new(PageSize::A4)],
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .unwrap()
+    }
+    let first = build();
+    let second = build();
+    assert_eq!(first, second);
+    let doc = Document::load(first).unwrap();
+    let xml = xmp_packet(&doc).expect("/Metadata present when metadata is Some");
+    assert!(xml.contains("Determinism"), "{xml}");
+}
+
+#[test]
+fn no_metadata_writes_no_xmp_stream() {
+    let pdf = Pdf {
+        metadata: None,
+        pages: vec![Page::new(PageSize::A4)],
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    assert!(catalog(&doc).get("Metadata").is_none());
 }
 
 /// Asserts an outline item's `/Dest` resolves to a `/Type /Page` dict whose

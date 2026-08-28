@@ -108,6 +108,34 @@ impl Date {
         ));
         out
     }
+
+    /// Formats as an ISO-8601 date-time, `YYYY-MM-DDTHH:mm:SS±HH:MM` — with
+    /// a literal `Z` in place of the offset when the date is exactly UTC.
+    /// Used for the XMP `xmp:CreateDate`/`xmp:ModifyDate` elements.
+    pub(crate) fn to_iso8601(self) -> String {
+        let Date {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            utc_offset_minutes,
+        } = self;
+        let mut out = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
+        if utc_offset_minutes == 0 {
+            out.push('Z');
+            return out;
+        }
+        let sign = if utc_offset_minutes < 0 { '-' } else { '+' };
+        let magnitude = utc_offset_minutes.unsigned_abs();
+        out.push_str(&format!(
+            "{sign}{:02}:{:02}",
+            magnitude / 60,
+            magnitude % 60
+        ));
+        out
+    }
 }
 
 /// Document information written to the `/Info` dictionary. Every field is
@@ -393,10 +421,20 @@ impl Pdf {
         tree.insert(name("Count"), Object::Int(kids.len() as i64));
         tree.insert(name("Kids"), Object::Array(kids));
         w.fill(pages_root, Object::Dict(tree))?;
-        if let Some(info) = metadata.and_then(info_dict) {
-            let info_ref = w.put(Object::Dict(info));
-            w.set_info(info_ref);
-        }
+        let xmp_ref = match metadata {
+            Some(meta) => {
+                let packet = crate::xmp::packet(&meta);
+                if let Some(info) = info_dict(meta) {
+                    let info_ref = w.put(Object::Dict(info));
+                    w.set_info(info_ref);
+                }
+                let mut xmp_dict = Dict::new();
+                xmp_dict.insert(name("Type"), Object::Name(name("Metadata")));
+                xmp_dict.insert(name("Subtype"), Object::Name(name("XML")));
+                Some(w.put_stream_raw(xmp_dict, packet))
+            }
+            None => None,
+        };
         let outline_ref = match outline {
             Some(outline) if !outline.bookmarks.is_empty() => {
                 let root_ref = w.reserve();
@@ -424,6 +462,9 @@ impl Pdf {
         catalog.insert(name("Pages"), Object::Ref(pages_root));
         if let Some(outline_ref) = outline_ref {
             catalog.insert(name("Outlines"), Object::Ref(outline_ref));
+        }
+        if let Some(xmp_ref) = xmp_ref {
+            catalog.insert(name("Metadata"), Object::Ref(xmp_ref));
         }
         let root = w.put(Object::Dict(catalog));
         Ok((w, root))
@@ -661,6 +702,48 @@ mod tests {
             utc_offset_minutes: -330,
         };
         assert_eq!(date.to_pdf_string(), "D:19991231235958-05'30");
+    }
+
+    #[test]
+    fn iso8601_utc_formats_with_z() {
+        let date = Date {
+            year: 2026,
+            month: 8,
+            day: 27,
+            hour: 12,
+            minute: 30,
+            second: 15,
+            utc_offset_minutes: 0,
+        };
+        assert_eq!(date.to_iso8601(), "2026-08-27T12:30:15Z");
+    }
+
+    #[test]
+    fn iso8601_positive_offset_pads_single_digits() {
+        let date = Date {
+            year: 987,
+            month: 1,
+            day: 2,
+            hour: 3,
+            minute: 4,
+            second: 5,
+            utc_offset_minutes: 120,
+        };
+        assert_eq!(date.to_iso8601(), "0987-01-02T03:04:05+02:00");
+    }
+
+    #[test]
+    fn iso8601_negative_offset_keeps_minutes() {
+        let date = Date {
+            year: 1999,
+            month: 12,
+            day: 31,
+            hour: 23,
+            minute: 59,
+            second: 58,
+            utc_offset_minutes: -330,
+        };
+        assert_eq!(date.to_iso8601(), "1999-12-31T23:59:58-05:30");
     }
 
     /// Two pages with text and an image — enough to exercise fonts,
