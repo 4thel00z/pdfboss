@@ -160,13 +160,13 @@ pdfboss q report.pdf -r '.pages[].fonts[].base_font'
 
 ## create
 
-Create a new PDF: blank pages, word-wrapped text, image pages, or a themed Markdown document.
+Create a new PDF: blank pages, word-wrapped text, image pages, a themed Markdown document, or a TOML manifest of composed pages.
 
 ```text
 pdfboss create <COMMAND>
 ```
 
-Four subcommands, each writing to `-o, --out <OUT>`. All four share `--size a3|a4|a5|letter|legal` and `--landscape` (swap page width and height). See [Creating PDFs](../guide/creating.md) and [Markdown to PDF](../guide/md-to-pdf.md).
+Five subcommands, each writing to `-o, --out <OUT>`. The first four share `--size a3|a4|a5|letter|legal` and `--landscape` (swap page width and height); `manifest` takes neither, since page size and orientation live per page inside the TOML. See [Creating PDFs](../guide/creating.md) and [Markdown to PDF](../guide/md-to-pdf.md).
 
 ### create blank
 
@@ -223,4 +223,58 @@ Relative image paths in the markdown resolve against the input file's directory.
 
 ```bash
 pdfboss create md notes.md -o notes.pdf --theme theme.css --size letter
+```
+
+### create manifest
+
+A TOML manifest describing metadata and pages: text, paragraphs, images and links mapped onto the compose vocabulary of `pdfboss-write`. See [Creating PDFs](../guide/creating.md#composing-pages) for that vocabulary.
+
+```text
+pdfboss create manifest --out <OUT> <INPUT>
+```
+
+The manifest's tables:
+
+- `[meta]`: optional document information, mapped onto `/Info`: `title`, `author`, `subject`, `keywords`, `creator`, `producer`, each a string.
+- `[[page]]`: one table per page, in reading order. `size` names a page size case-insensitively (`a3`, `a4`, `a5`, `letter`, `legal`; absent defaults to `a4`) and `landscape` (boolean) swaps width and height, both per page.
+- `[[page.text]]`: one line of text: `value`, `at = [x, y]` (the baseline origin), optional `font` and `size`.
+- `[[page.paragraph]]`: wrapped text: `value`, `rect = [x0, y0, x1, y1]`, optional `font`, `size`, `leading` and `align` (`left`, `center`, `right`, `justify`).
+- `[[page.image]]`: a placed raster: `path` (resolved relative to the manifest's directory, decoded by content as PNG or JPEG), `at = [x, y]`, optional `width` and `height`.
+- `[[page.link]]`: a clickable rectangle: `rect` plus exactly one of `url` or `page` (a 0-based page index in the same document).
+
+Font names are PostScript base names (`Helvetica`, `Helvetica-Bold`, `Times-Roman`, `Courier-Oblique`, …), unlike the kebab-case values of `create text --font`; an unknown name errors listing the valid set, and an absent one defaults to `Helvetica`. Unknown TOML keys are rejected, and every error message is prefixed with the manifest's path. Within a page, content lowers in schema order (text, then paragraphs, then images, then links) regardless of how the tables interleave in the file; TOML's separate arrays of tables carry no cross-type order.
+
+```toml
+[meta]
+title  = "Q3 Report"
+author = "pdfboss"
+
+[[page]]
+size = "a4"
+
+  [[page.text]]
+  value = "Q3 Report"
+  at    = [72, 770]
+  font  = "Helvetica-Bold"
+  size  = 28
+
+  [[page.paragraph]]
+  value   = "Body copy for the quarter."
+  rect    = [72, 380, 523, 720]
+  size    = 11
+  leading = 15
+  align   = "left"
+
+  [[page.image]]
+  path  = "chart.png"
+  at    = [72, 96]
+  width = 200
+
+  [[page.link]]
+  rect = [72, 88, 523, 380]
+  url  = "https://example.com/q3"
+```
+
+```bash
+pdfboss create manifest q3.toml -o q3.pdf
 ```
