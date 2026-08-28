@@ -753,32 +753,46 @@ impl PyDraw {
 }
 
 impl Draw for PyDraw {
-    /// Moves `canvas` into a fresh `Canvas`, calls the wrapped
-    /// object's `draw(canvas)` under a reacquired GIL, and moves the
-    /// (possibly painted-on) canvas back. A raised Python exception is
-    /// stashed in `DRAW_ERROR` for `draw_error_or` to re-raise untouched;
-    /// this call returns a sentinel `pdfboss_write::Error` instead, since
-    /// that type cannot carry a `PyErr`.
+    /// Moves `canvas` into a fresh `Canvas`, calls the wrapped object's
+    /// `draw(canvas)` under a reacquired GIL, and reclaims the
+    /// (possibly painted-on) canvas back into `*canvas` — unconditionally,
+    /// whether `draw` raised or not, so a shim the Python object smuggled
+    /// out (say, stashed on `self` before raising) is left holding no
+    /// canvas either way and errors on any further use. Only when the
+    /// shim itself could never be created (`Py::new` failing) is there
+    /// nothing to reclaim. A raised Python exception is stashed in
+    /// `DRAW_ERROR` for `draw_error_or` to re-raise untouched; this call
+    /// returns a sentinel `pdfboss_write::Error` instead, since that type
+    /// cannot carry a `PyErr`.
     fn draw(&self, canvas: &mut CoreCanvas) -> pdfboss_write::Result<()> {
         let taken = std::mem::take(canvas);
-        let outcome = Python::with_gil(|py| -> PyResult<CoreCanvas> {
+        let outcome = Python::with_gil(|py| -> PyResult<(CoreCanvas, Option<PyErr>)> {
             let shim = Py::new(py, Canvas::new(taken))?;
-            self.obj
+            let draw_result = self
+                .obj
                 .bind(py)
-                .call_method1("draw", (shim.clone_ref(py),))?;
+                .call_method1("draw", (shim.clone_ref(py),));
             let shim_ref = shim.borrow(py);
             let mut guard = shim_ref
                 .inner
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            guard
+            let restored = guard
                 .take()
-                .ok_or_else(|| PdfError::new_err("canvas shim lost its canvas unexpectedly"))
+                .ok_or_else(|| PdfError::new_err("canvas shim lost its canvas unexpectedly"))?;
+            Ok((restored, draw_result.err()))
         });
         match outcome {
-            Ok(restored) => {
+            Ok((restored, None)) => {
                 *canvas = restored;
                 Ok(())
+            }
+            Ok((restored, Some(err))) => {
+                *canvas = restored;
+                DRAW_ERROR.with(|cell| *cell.borrow_mut() = Some(err));
+                Err(pdfboss_write::Error::Other(
+                    "python draw() raised an exception".to_string(),
+                ))
             }
             Err(err) => {
                 DRAW_ERROR.with(|cell| *cell.borrow_mut() = Some(err));

@@ -201,6 +201,24 @@ def test_canvas_is_unusable_after_draw_returns() -> None:
         escaping.canvas.text("late", at=(0, 0))
 
 
+def test_canvas_is_unusable_after_draw_raises() -> None:
+    class EscapingBomb:
+        def __init__(self) -> None:
+            self.canvas: Canvas | None = None
+
+        def draw(self, canvas: Canvas) -> None:
+            self.canvas = canvas
+            raise RuntimeError("boom")
+
+    escaping = EscapingBomb()
+    page = Page(size="a4") | escaping
+    with pytest.raises(RuntimeError, match="boom"):
+        (Pdf() | page).to_bytes()
+    assert escaping.canvas is not None
+    with pytest.raises(pdfboss.PdfError, match="canvas is no longer usable outside draw"):
+        escaping.canvas.text("late", at=(0, 0))
+
+
 def test_outline_duplicate_slot_raises() -> None:
     with pytest.raises(TypeError, match="already has Outline"):
         Pdf() | Outline(Bookmark("A", 0)) | Outline(Bookmark("B", 0))
