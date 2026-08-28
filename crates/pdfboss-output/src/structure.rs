@@ -407,18 +407,20 @@ fn push_segment_blocks(
     push_stretch(&groups[next..], stats, out);
 }
 
-/// The lane path: one [`table_band`] attempt over the spans, else prose.
+/// The lane path: one [`table_band`] attempt over the spans' line groups,
+/// else prose. The groups are built once and feed both paths.
 fn push_lane_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
-    let Some(band) = table_band(spans) else {
-        push_blocks(&assemble_lines(spans), stats, out);
+    let groups = line_groups(spans);
+    let Some(band) = table_band(&groups) else {
+        push_blocks(groups.iter().map(assembled).collect(), stats, out);
         return;
     };
-    push_blocks(&band.above, stats, out);
+    push_blocks(band.above, stats, out);
     out.push(Block::Table {
         bbox: table_bbox(&band.rows),
         rows: band.rows,
     });
-    push_blocks(&band.below, stats, out);
+    push_blocks(band.below, stats, out);
 }
 
 /// A remainder stretch between grid claims, back as spans, through the same
@@ -515,45 +517,64 @@ struct Assembled {
     min_size: f32,
 }
 
-/// Emits one segment's lines as blocks, walking them once: a heading line
-/// closes the paragraph run before it and takes any tightly-spaced
-/// continuation lines of the same size with it.
-fn push_blocks(lines: &[Assembled], stats: &SizeStats, out: &mut Vec<Block>) {
-    let mut run: Vec<Line> = Vec::new();
+/// Emits one segment's lines as blocks: a heading line closes the paragraph
+/// run before it and takes any tightly-spaced continuation lines of the same
+/// size with it. Classification walks the lines borrowed — stretches of
+/// (line count, heading level or `None` for a run) — and only then are the
+/// lines moved into their blocks, never cloned.
+fn push_blocks(lines: Vec<Assembled>, stats: &SizeStats, out: &mut Vec<Block>) {
+    let mut stretches: Vec<(usize, Option<u8>)> = Vec::new();
     let mut index = 0;
     while index < lines.len() {
-        let Some(level) = heading_level(&lines[index], stats) else {
-            run.push(lines[index].line.clone());
-            index += 1;
+        let heading = heading_level(&lines[index], stats).map(|level| {
+            let mut end = index + 1;
+            while end < lines.len() && continues_heading(&lines[end - 1], &lines[end], stats, level)
+            {
+                end += 1;
+            }
+            (end, level)
+        });
+        let run_length = match heading {
+            None => 1,
+            Some((end, level)) => {
+                let candidate = lines[index..end].iter().map(|a| &a.line);
+                if heading_chars(candidate) <= HEADING_MAX_CHARS {
+                    stretches.push((end - index, Some(level)));
+                    index = end;
+                    continue;
+                }
+                // Too long for a heading: the candidate folds into the run.
+                end - index
+            }
+        };
+        match stretches.last_mut() {
+            Some((count, None)) => *count += run_length,
+            _ => stretches.push((run_length, None)),
+        }
+        index += run_length;
+    }
+    let mut moved = lines.into_iter();
+    let mut run: Vec<Line> = Vec::new();
+    for (count, level) in stretches {
+        let Some(level) = level else {
+            run.extend(moved.by_ref().take(count).map(|a| a.line));
+            push_run(&mut run, out);
             continue;
         };
-        let mut end = index + 1;
-        while end < lines.len() && continues_heading(&lines[end - 1], &lines[end], stats, level) {
-            end += 1;
-        }
-        let heading: Vec<Line> = lines[index..end].iter().map(|a| a.line.clone()).collect();
-        if heading_chars(&heading) > HEADING_MAX_CHARS {
-            run.extend(heading);
-            index = end;
-            continue;
-        }
-        push_run(&mut run, out);
+        let heading: Vec<Line> = moved.by_ref().take(count).map(|a| a.line).collect();
         let bbox = bbox(&heading);
         out.push(Block::Heading {
             level,
             lines: heading,
             bbox,
         });
-        index = end;
     }
-    push_run(&mut run, out);
 }
 
 /// A candidate heading's text length, counted as the Markdown adapter joins
 /// its lines: one space between them, ends trimmed.
-fn heading_chars(lines: &[Line]) -> usize {
+fn heading_chars<'l>(lines: impl Iterator<Item = &'l Line>) -> usize {
     lines
-        .iter()
         .map(line_text)
         .collect::<Vec<String>>()
         .join(" ")
@@ -612,52 +633,79 @@ fn is_bold_title(line: &Line) -> bool {
 /// its own leading.
 fn push_run(run: &mut Vec<Line>, out: &mut Vec<Block>) {
     let lines = std::mem::take(run);
-    let mut prose: Vec<Line> = Vec::new();
+    if lines.is_empty() {
+        return;
+    }
+    let markers: Vec<Option<(Marker, usize)>> = lines
+        .iter()
+        .map(|line| list_marker(&line_text(line)))
+        .collect();
+    // Each list found, with the prose line count standing before it; the
+    // lines only move into their blocks once the whole run is walked.
+    let mut lists: Vec<(usize, Vec<ListRunItem>)> = Vec::new();
+    let mut prose_count = 0usize;
     let mut index = 0;
     while index < lines.len() {
-        let Some(items) = list_run(&lines[index..]) else {
-            prose.push(lines[index].clone());
+        let Some(items) = list_run(&lines[index..], &markers[index..]) else {
+            prose_count += 1;
             index += 1;
             continue;
         };
+        index += items.iter().map(|(_, _, count)| count).sum::<usize>();
+        lists.push((prose_count, items));
+        prose_count = 0;
+    }
+    let mut moved = lines.into_iter();
+    let mut prose: Vec<Line> = Vec::new();
+    for (count, items) in lists {
+        prose.extend(moved.by_ref().take(count));
         push_paragraphs(&mut prose, out);
-        index += items.iter().map(|item| item.lines.len()).sum::<usize>();
+        let items: Vec<ListItem> = items
+            .into_iter()
+            .map(|(marker, marker_len, count)| ListItem {
+                marker,
+                marker_len,
+                lines: moved.by_ref().take(count).collect(),
+            })
+            .collect();
         out.push(Block::List {
-            bbox: list_bbox(&items),
+            bbox: bbox(items.iter().flat_map(|item| &item.lines)),
             items,
         });
     }
+    prose.extend(moved);
     push_paragraphs(&mut prose, out);
 }
 
-/// The list opening at `lines[0]`, or `None` when that line does not open
-/// one or the candidate falls short of [`LIST_MIN_LINES`] — in which case
-/// the line is left for [`push_run`] to fold back into prose.
-fn list_run(lines: &[Line]) -> Option<Vec<ListItem>> {
+/// One item of a list found by [`list_run`]: its marker, the marker's
+/// length in characters, and how many of the run's lines the item takes.
+type ListRunItem = (Marker, usize, usize);
+
+/// The list opening at `lines[0]` as one [`ListRunItem`] per item, or `None`
+/// when that line does not open one or the candidate falls short of
+/// [`LIST_MIN_LINES`] — in which case the line is left for [`push_run`] to
+/// fold back into prose. `markers` carries every line's [`list_marker`],
+/// computed once for the whole run.
+fn list_run(lines: &[Line], markers: &[Option<(Marker, usize)>]) -> Option<Vec<ListRunItem>> {
     let mut items = Vec::new();
     let mut consumed = 0usize;
     let mut index = 0;
     while index < lines.len() {
-        let Some((marker, marker_len)) = list_marker(&line_text(&lines[index])) else {
+        let Some((marker, marker_len)) = markers[index].clone() else {
             break;
         };
         let item_x = lines[index].x;
         let item_size = lines[index].size;
-        let mut item_lines = vec![lines[index].clone()];
+        let opened = index;
         index += 1;
         while index < lines.len()
-            && list_marker(&line_text(&lines[index])).is_none()
+            && markers[index].is_none()
             && lines[index].x > item_x + LIST_CONTINUATION_INDENT * item_size
         {
-            item_lines.push(lines[index].clone());
             index += 1;
         }
-        consumed += item_lines.len();
-        items.push(ListItem {
-            marker,
-            marker_len,
-            lines: item_lines,
-        });
+        consumed += index - opened;
+        items.push((marker, marker_len, index - opened));
     }
     (consumed >= LIST_MIN_LINES).then_some(items)
 }
@@ -707,40 +755,34 @@ fn list_marker(text: &str) -> Option<(Marker, usize)> {
     ))
 }
 
-/// The list's device-space box: every item's lines combined.
-fn list_bbox(items: &[ListItem]) -> BBox {
-    let lines: Vec<Line> = items.iter().flat_map(|item| item.lines.clone()).collect();
-    bbox(&lines)
-}
-
 /// Drains a paragraph run into blocks, cutting it where a baseline step
-/// exceeds [`PARAGRAPH_GAP`] times the run's median step.
+/// exceeds [`PARAGRAPH_GAP`] times the run's median step. The cuts are found
+/// first, borrowed; the lines then move into their paragraphs uncloned.
 fn push_paragraphs(run: &mut Vec<Line>, out: &mut Vec<Block>) {
     let lines = std::mem::take(run);
     if lines.is_empty() {
         return;
     }
     let limit = PARAGRAPH_GAP * median_step(&lines);
+    let mut counts: Vec<usize> = Vec::new();
     let mut start = 0;
     for index in 1..lines.len() {
         if limit <= 0.0 || lines[index - 1].y - lines[index].y <= limit {
             continue;
         }
-        push_paragraph(&lines[start..index], out);
+        counts.push(index - start);
         start = index;
     }
-    push_paragraph(&lines[start..], out);
-}
-
-fn push_paragraph(lines: &[Line], out: &mut Vec<Block>) {
-    if lines.is_empty() {
-        return;
+    counts.push(lines.len() - start);
+    let mut moved = lines.into_iter();
+    for count in counts {
+        let paragraph: Vec<Line> = moved.by_ref().take(count).collect();
+        out.push(Block::Paragraph {
+            bbox: bbox(&paragraph),
+            lines: paragraph,
+            role: Role::Body,
+        });
     }
-    out.push(Block::Paragraph {
-        lines: lines.to_vec(),
-        bbox: bbox(lines),
-        role: Role::Body,
-    });
 }
 
 /// Median baseline step of consecutive lines, or zero when there is no step
@@ -769,34 +811,45 @@ struct Group<'s> {
 
 /// One reading-order segment's spans grouped into lines — baselines within
 /// `0.5 · size` — top of page first, spans left to right inside each.
+/// Two passes: the first assigns every span its group — each span tests
+/// against the group's size as it stood when the span arrived — and counts,
+/// the second fills exact-sized span lists, so no list grows push by push.
 fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
     let mut groups: Vec<Group> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    let mut homes: Vec<usize> = Vec::with_capacity(spans.len());
     for &span in spans {
         let found = groups
-            .iter_mut()
-            .find(|group| (group.y - span.y).abs() <= 0.5 * group.size.max(span.size));
+            .iter()
+            .position(|group| (group.y - span.y).abs() <= 0.5 * group.size.max(span.size));
         match found {
-            Some(group) => {
-                group.size = group.size.max(span.size);
-                group.spans.push(span);
+            Some(index) => {
+                groups[index].size = groups[index].size.max(span.size);
+                counts[index] += 1;
+                homes.push(index);
             }
-            None => groups.push(Group {
-                y: span.y,
-                size: span.size,
-                spans: vec![span],
-            }),
+            None => {
+                homes.push(groups.len());
+                groups.push(Group {
+                    y: span.y,
+                    size: span.size,
+                    spans: Vec::new(),
+                });
+                counts.push(1);
+            }
         }
+    }
+    for (group, count) in groups.iter_mut().zip(&counts) {
+        group.spans.reserve_exact(*count);
+    }
+    for (&span, &home) in spans.iter().zip(&homes) {
+        groups[home].spans.push(span);
     }
     groups.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
     for group in &mut groups {
         group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
     groups
-}
-
-/// One reading-order segment's spans as lines, top of page first.
-fn assemble_lines(spans: &[&TextSpan]) -> Vec<Assembled> {
-    line_groups(spans).iter().map(assembled).collect()
 }
 
 /// A grid and the page-edge lines around it: the lines above the first
@@ -1305,14 +1358,13 @@ fn merged_line(fragments: &[&Line]) -> Line {
 /// [`TABLE_MIN_LANES`], and that is its end. A wrapped cell standing alone in
 /// one column survives inside the stretch for free: it puts ink where that
 /// column already held some.
-fn table_band(segment: &[&TextSpan]) -> Option<TableBand> {
-    let groups = line_groups(segment);
+fn table_band(groups: &[Group]) -> Option<TableBand> {
     for start in 0..groups.len() {
-        let (end, lanes) = lane_run(&groups, start);
+        let (end, lanes) = lane_run(groups, start);
         if end - start < TABLE_MIN_ROWS {
             continue;
         }
-        if let Some(band) = grid(&groups, start, end, &lanes) {
+        if let Some(band) = grid(groups, start, end, &lanes) {
             return Some(band);
         }
     }
@@ -1526,8 +1578,10 @@ fn even_rows(baselines: &[f32]) -> bool {
 /// is merged there, and everything under its covered columns reads as its
 /// contents.
 fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell>> {
-    let mut claimed: Vec<(usize, usize, Vec<&TextSpan>)> = Vec::new();
-    for &span in &group.spans {
+    // A span only ever extends the last claim, so each claim's spans are a
+    // contiguous stretch of `group.spans` — held as a range, never copied.
+    let mut claimed: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
+    for (position, &span) in group.spans.iter().enumerate() {
         let lo = span.x.min(span.end_x);
         let hi = span.x.max(span.end_x);
         let start = columns.iter().rposition(|column| column.start <= lo)?;
@@ -1538,9 +1592,9 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         match claimed.last_mut() {
             Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
-                last.2.push(span);
+                last.2.end = position + 1;
             }
-            _ => claimed.push((start, end, vec![span])),
+            _ => claimed.push((start, end, position..position + 1)),
         }
     }
     // `next` counts columns, `row` counts cells: a colspan cell is one cell
@@ -1552,7 +1606,7 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
             row.push(empty_cell());
         }
         row.push(Cell {
-            line: Some(assemble_line(group.y, group.size, spans).line),
+            line: Some(assemble_line(group.y, group.size, &group.spans[spans.clone()]).line),
             colspan: (end - start + 1) as u8,
             rowspan: 1,
         });
@@ -1585,12 +1639,7 @@ fn spaced_cells(row: &[Cell], size: f32) -> bool {
 
 /// The table's device-space box: every populated cell's line.
 fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
-    let lines: Vec<Line> = rows
-        .iter()
-        .flatten()
-        .filter_map(|cell| cell.line.clone())
-        .collect();
-    bbox(&lines)
+    bbox(rows.iter().flatten().filter_map(|cell| cell.line.as_ref()))
 }
 
 /// One line from its spans in left-to-right order: a gap wider than
@@ -1642,7 +1691,7 @@ fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
 
 /// The lines' device-space box. Spans carry no glyph extents, so the top is
 /// the highest baseline plus the largest size — an ascender approximation.
-fn bbox(lines: &[Line]) -> BBox {
+fn bbox<'l>(lines: impl IntoIterator<Item = &'l Line>) -> BBox {
     let mut x0 = f32::INFINITY;
     let mut y0 = f32::INFINITY;
     let mut x1 = f32::NEG_INFINITY;
