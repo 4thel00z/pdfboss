@@ -36,6 +36,7 @@ pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
 pdfboss create md     notes.md -o out.pdf     # new PDF: markdown composed with a CSS theme
+pdfboss create manifest q3.toml -o out.pdf    # new PDF: TOML manifest — metadata, pages, text, paragraphs, images, links
 ```
 
 `create md` composes CommonMark+GFM into a themed PDF. `--theme` takes a small CSS subset over element-type selectors, overlaid on the built-in default theme:
@@ -59,6 +60,21 @@ png  = doc[0].render(scale=2.0)            # PNG bytes
 imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
 pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```
+
+`pdfboss.write` composes a `Pdf` from Python: pages and elements join with `|`, and `save`/`to_bytes` builds the file bytes once:
+
+```python
+from pdfboss.write import Link, Metadata, Page, Paragraph, Pdf, Standard14, Text
+cover = (
+    Page(size="a4")
+    | Text("Q3 Report", at=(72, 770), font=Standard14.HELVETICA_BOLD, size=28)
+    | Paragraph("Prepared for the board.", rect=(72, 700, 500, 740))
+    | Link(rect=(72, 60, 200, 80), url="https://example.com/q3")
+)
+data = (Pdf() | Metadata(title="Q3 Report") | cover).to_bytes()
+```
+
+An `Outline` of nested `Bookmark`s becomes the document's bookmark panel (`Pdf.outline`); `Attachment` objects embed arbitrary files inside the document (`Pdf.attachments`); `PageLabel` ranges control how page numbers render in viewer UI (`Pdf.page_labels`); and a `Viewer` sets the document's opening layout, mode, and page (`Pdf.viewer`) — each slots into `Pdf` with `|`, exactly like `Metadata`.
 
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
