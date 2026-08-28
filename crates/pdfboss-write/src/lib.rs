@@ -35,6 +35,6 @@ pub use element::{Content, Draw, Image, Link, Paragraph, ParagraphAlign, Text};
 pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;
-pub use pdf::{Date, LinkAnnotation, LinkTarget, Metadata, Page, PageSize, Pdf};
+pub use pdf::{Bookmark, Date, LinkAnnotation, LinkTarget, Metadata, Outline, Page, PageSize, Pdf};
 pub use sink::{AsyncByteSink, Immediate};
 pub use writer::{WriteOptions, Writer, XrefStyle};

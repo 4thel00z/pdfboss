@@ -3,12 +3,13 @@
 //! rasterized with `pdfboss-render`, so the writer is verified against the
 //! toolkit's own readers rather than against expected byte dumps.
 
-use pdfboss_core::{Document, Name, Rect};
+use pdfboss_core::object::decode_text_string;
+use pdfboss_core::{Dict, Document, Name, Object, Rect};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget, Metadata, Page,
-    PageSize, Paragraph, Pdf, Standard14, WriteOptions, XrefStyle,
+    Bookmark, Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget, Metadata,
+    Outline, Page, PageSize, Paragraph, Pdf, Standard14, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -57,6 +58,7 @@ fn metadata_and_multipage_round_trip() {
             ..Metadata::default()
         }),
         pages: vec![Page::new(PageSize::A4), second, Page::new(PageSize::Letter)],
+        outline: None,
         options: WriteOptions::default(),
     };
     let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
@@ -215,6 +217,7 @@ fn two_page_document() -> Pdf {
             ..Metadata::default()
         }),
         pages: vec![first, second],
+        outline: None,
         options: WriteOptions::default(),
     }
 }
@@ -401,6 +404,172 @@ fn goto_link_out_of_range_errors() {
     .to_bytes()
     .unwrap_err();
     assert!(err.to_string().contains("out of range"));
+}
+
+/// Resolves an object to its dictionary, cloned so the borrow does not
+/// outlive a temporary `Document::resolve` result.
+fn resolve_dict(doc: &Document, obj: &Object) -> Dict {
+    doc.resolve(obj)
+        .expect("reference resolves")
+        .as_dict()
+        .expect("resolved object is a dictionary")
+        .clone()
+}
+
+/// The catalog dictionary reached from the trailer's `/Root`.
+fn catalog(doc: &Document) -> Dict {
+    let root = doc
+        .xref()
+        .trailer
+        .get("Root")
+        .expect("/Root present")
+        .clone();
+    resolve_dict(doc, &root)
+}
+
+/// Asserts an outline item's `/Dest` resolves to a `/Type /Page` dict whose
+/// `/MediaBox` matches `expected` — distinguishing "resolves to some page"
+/// from "resolves to the right page".
+fn assert_dest_page(doc: &Document, item: &Dict, expected: PageSize) {
+    let dest = item.get_array("Dest").expect("/Dest present");
+    assert_eq!(dest.len(), 5);
+    assert_eq!(dest[1].as_name(), Some(&Name("XYZ".into())));
+    assert!(dest[2].is_null() && dest[3].is_null() && dest[4].is_null());
+    let target = doc.resolve(&dest[0]).expect("/Dest target resolves");
+    let target = target.as_dict().expect("/Dest target is a dictionary");
+    assert_eq!(target.get_name("Type"), Some(&Name("Page".into())));
+    let media_box = target.get_array("MediaBox").expect("/MediaBox present");
+    let (width, height) = expected.dimensions();
+    assert_eq!(media_box[2].as_f64(), Some(f64::from(width)));
+    assert_eq!(media_box[3].as_f64(), Some(f64::from(height)));
+}
+
+fn title_of(item: &Dict) -> String {
+    decode_text_string(
+        item.get("Title")
+            .expect("/Title present")
+            .as_str_bytes()
+            .expect("/Title is a string"),
+    )
+}
+
+/// Two top-level bookmarks, the first with one nested child — each pointing
+/// at a page of a distinct size, so a `/Dest` that resolves to the wrong
+/// page shows up as a mismatched `/MediaBox` rather than passing by luck.
+#[test]
+fn outline_tree_walks_prev_next_and_dest_pages() {
+    let pages: Vec<Page> = [PageSize::A4, PageSize::Letter, PageSize::A5]
+        .into_iter()
+        .map(Page::new)
+        .collect();
+    let bookmarks = vec![
+        Bookmark {
+            title: "Chapter One".to_string(),
+            page: 0,
+            children: vec![Bookmark::new("Section 1.1", 1)],
+        },
+        Bookmark::new("Chapter Two", 2),
+    ];
+    let bytes = Pdf {
+        pages,
+        outline: Some(Outline { bookmarks }),
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+
+    let catalog = catalog(&doc);
+    let outlines_obj = catalog.get("Outlines").expect("/Outlines present").clone();
+    let outlines = resolve_dict(&doc, &outlines_obj);
+    assert_eq!(outlines.get_name("Type"), Some(&Name("Outlines".into())));
+    assert_eq!(outlines.get_int("Count"), Some(3));
+
+    let first_obj = outlines.get("First").expect("/First present").clone();
+    let chapter_one = resolve_dict(&doc, &first_obj);
+    assert_eq!(title_of(&chapter_one), "Chapter One");
+    assert_eq!(chapter_one.get_ref("Parent"), outlines_obj.as_ref());
+    assert!(chapter_one.get("Prev").is_none());
+    assert_eq!(chapter_one.get_int("Count"), Some(1));
+
+    let next_obj = chapter_one.get("Next").expect("/Next present").clone();
+    let chapter_two = resolve_dict(&doc, &next_obj);
+    assert_eq!(title_of(&chapter_two), "Chapter Two");
+    assert_eq!(chapter_two.get_ref("Prev"), first_obj.as_ref());
+    assert_eq!(chapter_two.get_ref("Parent"), outlines_obj.as_ref());
+    assert!(chapter_two.get("Next").is_none());
+    assert!(chapter_two.get("First").is_none());
+    assert!(chapter_two.get("Count").is_none());
+    assert_eq!(outlines.get("Last").unwrap().as_ref(), next_obj.as_ref());
+
+    let child_obj = chapter_one.get("First").expect("/First present").clone();
+    assert_eq!(
+        chapter_one.get("Last").unwrap().as_ref(),
+        child_obj.as_ref()
+    );
+    let section = resolve_dict(&doc, &child_obj);
+    assert_eq!(title_of(&section), "Section 1.1");
+    assert_eq!(section.get_ref("Parent"), first_obj.as_ref());
+    assert!(section.get("Prev").is_none());
+    assert!(section.get("Next").is_none());
+    assert!(section.get("First").is_none());
+    assert!(section.get("Count").is_none());
+
+    assert_dest_page(&doc, &chapter_one, PageSize::A4);
+    assert_dest_page(&doc, &section, PageSize::Letter);
+    assert_dest_page(&doc, &chapter_two, PageSize::A5);
+}
+
+#[test]
+fn outline_document_serializes_byte_identically() {
+    fn build() -> Vec<u8> {
+        Pdf {
+            pages: vec![Page::new(PageSize::A4), Page::new(PageSize::A4)],
+            outline: Some(Outline {
+                bookmarks: vec![
+                    Bookmark::new("One", 0),
+                    Bookmark {
+                        title: "Two".to_string(),
+                        page: 1,
+                        children: vec![Bookmark::new("Two.a", 0), Bookmark::new("Two.b", 1)],
+                    },
+                ],
+            }),
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .unwrap()
+    }
+    assert_eq!(build(), build());
+}
+
+#[test]
+fn empty_outline_emits_no_outlines_entry() {
+    let bytes = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        outline: Some(Outline::default()),
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    assert!(catalog(&doc).get("Outlines").is_none());
+}
+
+#[test]
+fn bookmark_out_of_range_page_errors() {
+    let err = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        outline: Some(Outline {
+            bookmarks: vec![Bookmark::new("Nowhere", 9)],
+        }),
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("out of range"), "{msg}");
+    assert!(msg.contains("bookmark"), "{msg}");
 }
 
 #[test]

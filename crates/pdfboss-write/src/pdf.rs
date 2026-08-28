@@ -179,6 +179,36 @@ impl Page {
     }
 }
 
+/// A document's bookmark panel: an ordered forest of [`Bookmark`] nodes,
+/// each linking to a page via an explicit `/XYZ` destination.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Outline {
+    /// Top-level bookmarks, in reading order.
+    pub bookmarks: Vec<Bookmark>,
+}
+
+/// One outline entry: a title, the page it jumps to, and nested children.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Bookmark {
+    /// Text shown in the outline panel.
+    pub title: String,
+    /// Target page index, jumped to at the page's top-left corner.
+    pub page: usize,
+    /// Nested bookmarks, in reading order.
+    pub children: Vec<Bookmark>,
+}
+
+impl Bookmark {
+    /// A leaf bookmark: `title` targeting `page`, with no children.
+    pub fn new(title: impl Into<String>, page: usize) -> Bookmark {
+        Bookmark {
+            title: title.into(),
+            page,
+            children: Vec::new(),
+        }
+    }
+}
+
 /// A document under construction. The fields are the composition:
 /// singleton slots are `Option`s, pages keep the order given.
 #[derive(Debug, Default)]
@@ -187,6 +217,8 @@ pub struct Pdf {
     pub metadata: Option<Metadata>,
     /// Pages, in reading order.
     pub pages: Vec<Page>,
+    /// Bookmark panel, if any.
+    pub outline: Option<Outline>,
     /// File-emission options.
     pub options: WriteOptions,
 }
@@ -226,6 +258,7 @@ impl Pdf {
         let Pdf {
             metadata,
             pages,
+            outline,
             options,
         } = self;
         if pages.is_empty() {
@@ -364,9 +397,34 @@ impl Pdf {
             let info_ref = w.put(Object::Dict(info));
             w.set_info(info_ref);
         }
+        let outline_ref = match outline {
+            Some(outline) if !outline.bookmarks.is_empty() => {
+                let root_ref = w.reserve();
+                let refs = reserve_bookmarks(&mut w, &outline.bookmarks);
+                let (first, last, count) = fill_bookmarks(
+                    &mut w,
+                    outline.bookmarks,
+                    &refs,
+                    root_ref,
+                    &page_refs,
+                    page_count,
+                )?;
+                let mut dict = Dict::new();
+                dict.insert(name("Type"), Object::Name(name("Outlines")));
+                dict.insert(name("First"), Object::Ref(first));
+                dict.insert(name("Last"), Object::Ref(last));
+                dict.insert(name("Count"), Object::Int(count));
+                w.fill(root_ref, Object::Dict(dict))?;
+                Some(root_ref)
+            }
+            _ => None,
+        };
         let mut catalog = Dict::new();
         catalog.insert(name("Type"), Object::Name(name("Catalog")));
         catalog.insert(name("Pages"), Object::Ref(pages_root));
+        if let Some(outline_ref) = outline_ref {
+            catalog.insert(name("Outlines"), Object::Ref(outline_ref));
+        }
         let root = w.put(Object::Dict(catalog));
         Ok((w, root))
     }
@@ -414,6 +472,95 @@ fn info_dict(meta: Metadata) -> Option<Dict> {
         return None;
     }
     Some(dict)
+}
+
+/// One bookmark's reserved object number, mirroring the tree shape so the
+/// fill pass can wire parent, sibling and child refs before any of their
+/// dictionary bodies exist.
+struct BookmarkRef {
+    r: ObjRef,
+    children: Vec<BookmarkRef>,
+}
+
+/// Reserves an object number for every node in `bookmarks`, recursively —
+/// the reserve half of the reserve/fill idiom: an outline item's `/Parent`,
+/// `/Prev`, `/Next`, `/First` and `/Last` may all point at nodes that do
+/// not have a body yet.
+fn reserve_bookmarks(w: &mut Writer, bookmarks: &[Bookmark]) -> Vec<BookmarkRef> {
+    bookmarks
+        .iter()
+        .map(|bookmark| BookmarkRef {
+            r: w.reserve(),
+            children: reserve_bookmarks(w, &bookmark.children),
+        })
+        .collect()
+}
+
+/// Fills one sibling chain of outline items against their already-reserved
+/// refs: `/Title`, `/Parent`, the `/Prev`/`/Next` chain, `/Dest`, and — for
+/// any bookmark with children — `/First`/`/Last`/`/Count` from a recursive
+/// fill of that subtree. Returns the chain's first and last refs and the
+/// total number of items in the whole subtree, which doubles as `/Count`
+/// wherever the caller needs it (every bookmark is open).
+fn fill_bookmarks(
+    w: &mut Writer,
+    bookmarks: Vec<Bookmark>,
+    refs: &[BookmarkRef],
+    parent: ObjRef,
+    page_refs: &[ObjRef],
+    page_count: usize,
+) -> Result<(ObjRef, ObjRef, i64)> {
+    let last_index = bookmarks.len() - 1;
+    let mut total = 0i64;
+    for (index, bookmark) in bookmarks.into_iter().enumerate() {
+        let Bookmark {
+            title,
+            page,
+            children,
+        } = bookmark;
+        let dest = page_refs.get(page).copied().ok_or_else(|| {
+            Error::Other(format!(
+                "bookmark target page {page} is out of range: the document has {page_count} pages"
+            ))
+        })?;
+        let mut dict = Dict::new();
+        dict.insert(name("Title"), text_string(&title));
+        dict.insert(name("Parent"), Object::Ref(parent));
+        if index > 0 {
+            dict.insert(name("Prev"), Object::Ref(refs[index - 1].r));
+        }
+        if index < last_index {
+            dict.insert(name("Next"), Object::Ref(refs[index + 1].r));
+        }
+        dict.insert(
+            name("Dest"),
+            Object::Array(vec![
+                Object::Ref(dest),
+                Object::Name(name("XYZ")),
+                Object::Null,
+                Object::Null,
+                Object::Null,
+            ]),
+        );
+        let mut subtree_count = 0i64;
+        if !children.is_empty() {
+            let (first, last, count) = fill_bookmarks(
+                w,
+                children,
+                &refs[index].children,
+                refs[index].r,
+                page_refs,
+                page_count,
+            )?;
+            dict.insert(name("First"), Object::Ref(first));
+            dict.insert(name("Last"), Object::Ref(last));
+            dict.insert(name("Count"), Object::Int(count));
+            subtree_count = count;
+        }
+        w.fill(refs[index].r, Object::Dict(dict))?;
+        total += 1 + subtree_count;
+    }
+    Ok((refs[0].r, refs[last_index].r, total))
 }
 
 /// Encodes a text string (ISO 32000 §7.9.2.2): pure ASCII passes through
