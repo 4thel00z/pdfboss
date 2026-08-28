@@ -22,18 +22,18 @@
 
 ---
 
-Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification: safe Rust, no C dependencies, no bindings to another engine, one core behind the CLI and the native Python extension. It is a **lenient reader** — real-world files are damaged, so it reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators instead of refusing.
+Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification: safe Rust, no C dependencies, no bindings to another engine, one core behind the CLI and the native Python extension. It is a **lenient reader**: real-world files are damaged, so it reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators instead of refusing.
 
 ## Highlights
 
-- **Clean-room engine** — implemented from the ISO 32000 specification in safe Rust: no C dependencies, no bindings to another engine.
-- **Fastest text extraction measured** — 6,850 pages/s over a 40-file real-world corpus, about 15× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
-- **Its own codecs** — JPEG 2000, JBIG2, CCITT and ICC are decoded in-tree, implemented from their specifications, not linked in.
-- **Embedded-image extraction** — every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
-- **PDF creation** — document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).
-- **Async, range-fetching I/O** — documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, never the whole file.
-- **Lenient, and it says so** — broken cross-references are reconstructed and unreadable content is skipped, with every dropped or approximated item reported.
-- **Terminal explorer** — `pdfboss tui`: element tree, object inspector, hex view, page and Markdown previews.
+- **Clean-room engine**: implemented from the ISO 32000 specification in safe Rust; no C dependencies, no bindings to another engine.
+- **Fastest text extraction measured**: 6,850 pages/s over a 40-file real-world corpus, about 15× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
+- **Its own codecs**: JPEG 2000, JBIG2, CCITT and ICC are decoded in-tree, implemented from their specifications, not linked in.
+- **Embedded-image extraction**: every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
+- **PDF creation**: document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).
+- **Async, range-fetching I/O**: documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, never the whole file.
+- **Lenient, and it says so**: broken cross-references are reconstructed and unreadable content is skipped, with every dropped or approximated item reported.
+- **Terminal explorer** (`pdfboss tui`): element tree, object inspector, hex view, page and Markdown previews.
 
 ## Install
 
@@ -55,7 +55,7 @@ pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
 pdfboss create md     notes.md -o out.pdf     # new PDF: markdown composed with a CSS theme
-pdfboss create manifest q3.toml -o out.pdf    # new PDF: TOML manifest — metadata, pages, text, paragraphs, images, links
+pdfboss create manifest q3.toml -o out.pdf    # new PDF: TOML manifest (metadata, pages, text, paragraphs, images, links)
 ```
 
 ```python
@@ -82,7 +82,7 @@ cover = (
 data = (Pdf() | Metadata(title="Q3 Report") | cover).to_bytes()
 ```
 
-An `Outline` of nested `Bookmark`s becomes the document's bookmark panel (`Pdf.outline`); `Attachment` objects embed arbitrary files inside the document (`Pdf.attachments`); `PageLabel` ranges control how page numbers render in viewer UI (`Pdf.page_labels`); and a `Viewer` sets the document's opening layout, mode, and page (`Pdf.viewer`) — each slots into `Pdf` with `|`, exactly like `Metadata`.
+An `Outline` of nested `Bookmark`s becomes the document's bookmark panel (`Pdf.outline`); `Attachment` objects embed arbitrary files inside the document (`Pdf.attachments`); `PageLabel` ranges control how page numbers render in viewer UI (`Pdf.page_labels`); and a `Viewer` sets the document's opening layout, mode, and page (`Pdf.viewer`). Each slots into `Pdf` with `|`, exactly like `Metadata`.
 
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
@@ -110,7 +110,7 @@ async for element in doc.elements():
     print(element.kind, element.value())
 ```
 
-Rust — the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-markdown pdfboss-aio pdfboss-tui`):
+Rust: the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-markdown pdfboss-aio pdfboss-tui`):
 
 ```rust,no_run
 use pdfboss_core::Document;
@@ -136,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Extract embedded images
 
-`pdfboss images`, `Page.extract_images()` and `pdfboss_render::extract_page_images` decode every image a page draws — inline images included — at the image's own pixel dimensions, in drawing order, with `/SMask` alpha applied. An image drawn twice appears twice, and stencil masks (`/ImageMask true`) paint a fill color rather than carrying pixels of their own, so they are skipped.
+`pdfboss images`, `Page.extract_images()` and `pdfboss_render::extract_page_images` decode every image a page draws (inline images included) at the image's own pixel dimensions, in drawing order, with `/SMask` alpha applied. An image drawn twice appears twice, and stencil masks (`/ImageMask true`) paint a fill color rather than carrying pixels of their own, so they are skipped.
 
 Real pages draw one-pixel strips and spacers; a size filter keeps the pictures:
 
@@ -175,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Create PDFs
 
-`pdfboss-write` is the write-side twin of the reader: plain structs compose the document (`Pdf`, `Page`, `PageSize`), a `Canvas` paints content, and a COS-level writer serializes it. Output is deterministic — the same input produces byte-identical files, and the crate never reads clocks or randomness, so dates appear only when supplied.
+`pdfboss-write` is the write-side twin of the reader: plain structs compose the document (`Pdf`, `Page`, `PageSize`), a `Canvas` paints content, and a COS-level writer serializes it. Output is deterministic: the same input produces byte-identical files, and the crate never reads clocks or randomness, so dates appear only when supplied.
 
 ```rust,no_run
 use pdfboss_write::{Color, ImageData, Page, PageSize, Pdf, Standard14};
@@ -210,7 +210,7 @@ pdfboss create text   notes.txt -o notes.pdf --font times-roman --font-size 12
 pdfboss create images scan1.png photo.jpg -o scans.pdf
 ```
 
-And CommonMark+GFM composes straight into a themed, paginated PDF — headings, lists, tables, code blocks, clickable links and images — deterministically, from all three surfaces. A theme is a small CSS subset over element-type selectors, overlaid on the built-in default; the Helvetica, Times and Courier families are available, and characters outside them are replaced with `?` and reported:
+And CommonMark+GFM composes straight into a themed, paginated PDF (headings, lists, tables, code blocks, clickable links and images), deterministically, from all three surfaces. A theme is a small CSS subset over element-type selectors, overlaid on the built-in default; the Helvetica, Times and Courier families are available, and characters outside them are replaced with `?` and reported:
 
 ```css
 body { font-family: times; font-size: 10.5pt; color: #222; }
@@ -253,7 +253,7 @@ Against other Python PDF libraries over 40 real-world PDFs (pages/sec, higher is
 <details>
 <summary><strong>Method and fine print</strong></summary>
 
-Best-of-3 per file, aggregated over the files every library handled; measured with pdfboss 0.22.0 on an Apple M3 Pro, every table on this page from one session. The pure-Python readers are roughly 85× to 380× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed; since 0.19.0 every span also carries its style (font, weight, decorations, color), which costs the extraction rows a few percent against older tables. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
+Best-of-3 per file, aggregated over the files every library handled; measured with pdfboss 0.22.0 on an Apple M3 Pro, every table on this page from one session. The pure-Python readers are roughly 85× to 380× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed; since 0.19.0 every span also carries its style (font, weight, decorations, color), which costs the extraction rows a few percent against older tables. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely: timing it against full renderers on the rest would credit it for work it skips.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
@@ -261,7 +261,7 @@ Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks
 
 ### Extraction quality
 
-On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) — the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons — pdfboss reads the whole corpus in about a seventh of a second, about 3× faster than the fastest competing Markdown engine, with a mid-field reading-order score (**NID**, higher is better):
+On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons), pdfboss reads the whole corpus in about a seventh of a second, about 3× faster than the fastest competing Markdown engine, with a mid-field reading-order score (**NID**, higher is better):
 
 | Engine | Reading order (NID) | Output | Time (200 docs) |
 |---|--:|---|--:|
@@ -293,12 +293,12 @@ A renderer that skips work looks fast, so every file is certified before the sto
 | pdfplumber (via pdfium) | 102.0 |
 | PyMuPDF | 89.5 |
 
-pdfboss rasterizes the mixed corpus fastest — about 19% ahead of pdfium itself — with no C in it.
+pdfboss rasterizes the mixed corpus fastest, about 19% ahead of pdfium itself, with no C in it.
 
 <details>
 <summary><strong>Certification and stability details</strong></summary>
 
-pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier — substituting non-embedded fonts, which is what the other engines do by default — and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees: a blank page renders instantly and means nothing. Only two files fail certification now, each over a font that lacks a glyph for a code the page draws.
+pdfboss rasterizes each page through `render_reporting` at the `full` fonts tier (substituting non-embedded fonts, which is what the other engines do by default), and a file where any page reports dropped or approximated content is excluded, with its reason printed and counted. A second gate renders each file's first page in every library and excludes files whose ink coverage disagrees: a blank page renders instantly and means nothing. Only two files fail certification now, each over a font that lacks a glyph for a code the page draws.
 
 Compare the rows against each other, not against another machine's numbers.
 
@@ -322,7 +322,7 @@ Scans are the other half of the world's PDFs: one full-page bilevel image per pa
 <details>
 <summary><strong>Where the time goes, and why the ink column matters</strong></summary>
 
-All four are timed in one pass. The absolute numbers vary by half as the machine warms and cools — compare the four rows against each other, not against another machine's numbers.
+All four are timed in one pass. The absolute numbers vary by half as the machine warms and cools. Compare the four rows against each other, not against another machine's numbers.
 
 What is left is the codec itself. Four fifths of the time goes to the JBIG2 arithmetic decoder and the context formation that feeds it. That part is a serial dependency chain: every decision needs the interval state the previous one wrote, and every pixel's context contains the pixels just decoded. It neither vectorizes nor parallelizes. The rest was arithmetic that did not need doing: expanding a packed scan into eight times its size in RGBA before sampling a fraction of it, blending opaque pixels through an alpha formula that returns them unchanged, and walking bitmaps a pixel at a time where a row of bytes would do.
 
@@ -357,7 +357,7 @@ Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000,
 | `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
-| `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`): element tree, object inspector, hex view, page and Markdown previews — built on `pdfboss-aio` |
+| `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`): element tree, object inspector, hex view, page and Markdown previews, built on `pdfboss-aio` |
 | `pdfboss-py` | PyO3 extension module (`pdfboss._pdfboss`) built with maturin |
 
 </details>
@@ -365,28 +365,28 @@ Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000,
 <details>
 <summary><strong>Everything supported, in one breath</strong></summary>
 
-**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images: JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans: Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans: the full segment type table — generic, text, halftone and refinement regions, immediate or intermediate, symbol and pattern dictionaries, custom code tables, arithmetic- or Huffman-coded with the MMR variants throughout — with or without `/JBIG2Globals` · Standard-handler decryption: RC4 and AES-128/256, with the user or owner password (`--password`, `password=`; the empty user password opens transparently) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · Markdown output with headings, lists, emphasis and pipe/HTML tables inferred from the page layout and from drawn table borders · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, all blend modes (separable and non-separable), soft masks (image `/SMask`, stencil and color-key `/Mask`, and Luminosity/Alpha `/SMask` groups in `/ExtGState`), image/form XObjects, all seven shading types (the `sh` operator and shading-pattern fills and strokes: function-based, axial and radial through sampled, exponential, stitching and PostScript-calculator functions, plus Gouraud triangle meshes and Coons/tensor patch meshes), tiling patterns (colored and uncolored, each cell run as its own content stream), annotation normal appearances (`/AP` `/N`, with `/AS` state selection), `ICCBased` colour through the embedded profile (ICC.1:2010 v2/v4, matrix/TRC, grayTRC, and `A2B0` lookup transforms) and the CIE `CalRGB`/`CalGray`/`Lab` families through XYZ, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
+**Supported:** classic, stream, and hybrid cross-references with recovery scanning · object streams · FlateDecode, LZWDecode, ASCII85Decode, ASCIIHexDecode, RunLengthDecode + PNG/TIFF predictors · DCTDecode (JPEG) images · JPXDecode (JPEG 2000) images: JP2 containers and raw codestreams, every progression order, both wavelets, palettes, and `/SMaskInData` alpha (ITU-T T.800) · CCITTFaxDecode scans: Group 3 one-dimensional, Group 3 mixed and Group 4 coding (ITU-T T.4/T.6) · JBIG2Decode scans: the full segment type table (generic, text, halftone and refinement regions, immediate or intermediate, symbol and pattern dictionaries, custom code tables, arithmetic- or Huffman-coded with the MMR variants throughout), with or without `/JBIG2Globals` · Standard-handler decryption: RC4 and AES-128/256, with the user or owner password (`--password`, `password=`; the empty user password opens transparently) · page-tree attribute inheritance · text extraction with `ToUnicode` and WinAnsi/MacRoman/Standard encodings · Markdown output with headings, lists, emphasis and pipe/HTML tables inferred from the page layout and from drawn table borders · rasterization of paths, fills (nonzero & even-odd), strokes, transforms, clipping, all blend modes (separable and non-separable), soft masks (image `/SMask`, stencil and color-key `/Mask`, and Luminosity/Alpha `/SMask` groups in `/ExtGState`), image/form XObjects, all seven shading types (the `sh` operator and shading-pattern fills and strokes: function-based, axial and radial through sampled, exponential, stitching and PostScript-calculator functions, plus Gouraud triangle meshes and Coons/tensor patch meshes), tiling patterns (colored and uncolored, each cell run as its own content stream), annotation normal appearances (`/AP` `/N`, with `/AS` state selection), `ICCBased` colour through the embedded profile (ICC.1:2010 v2/v4, matrix/TRC, grayTRC, and `A2B0` lookup transforms) and the CIE `CalRGB`/`CalGray`/`Lab` families through XYZ, and the glyph outlines of every embedded font program (TrueType, CFF, Type1, Type3), with optional substitution for non-embedded simple fonts · lazy element iteration over physical (objects, xref sections, trailer, with byte spans) and logical (pages, fonts, images, annotations, content operators) elements.
 
 </details>
 
 ## Limitations
 
-Rendering is lenient and it says so: content pdfboss cannot read is skipped so the rest of the page still rasterizes, and every dropped or approximated item lands in a report — `pdfboss render` warns on stderr, the TUI raises a notice, and the libraries return it through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python). The whole not-yet-supported list is two faces: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank rather than borrowing an unrelated face's glyphs.
+Rendering is lenient and it says so: content pdfboss cannot read is skipped so the rest of the page still rasterizes, and every dropped or approximated item lands in a report. `pdfboss render` warns on stderr, the TUI raises a notice, and the libraries return it through `render_page_reporting` (Rust) and `Page.render_reporting()` (Python). The whole not-yet-supported list is two faces: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank rather than borrowing an unrelated face's glyphs.
 
 <details>
 <summary><strong>The full accounting: fonts, CMaps, JBIG2, colour, JPX, layers</strong></summary>
 
-Glyph painting is staged in tiers, selected with `--fonts`. `all-embedded` paints every embedded font program (TrueType, CFF, Type1 and Type3). `embedded-only` restricts that to TrueType. `full` additionally substitutes a replacement face for a **non-embedded** simple font, from either a directory you supply or the compiled-in OFL Croscore set (behind the `substitute-fonts` feature). The default is `full` whenever substitute faces are available — the CLI's compiled-in set, a `--font-dir`/`font_dir=`, or the `pdfboss-fonts` Python package — and `all-embedded` otherwise. Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
+Glyph painting is staged in tiers, selected with `--fonts`. `all-embedded` paints every embedded font program (TrueType, CFF, Type1 and Type3). `embedded-only` restricts that to TrueType. `full` additionally substitutes a replacement face for a **non-embedded** simple font, from either a directory you supply or the compiled-in OFL Croscore set (behind the `substitute-fonts` feature). The default is `full` whenever substitute faces are available (the CLI's compiled-in set, a `--font-dir`/`font_dir=`, or the `pdfboss-fonts` Python package), and `all-embedded` otherwise. Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
 
-Type0 `/Encoding` CMaps resolve — the predefined ISO 32000 Table 118 CJK set is compiled in (behind the `predefined-cmaps` feature, on by default in the CLI and the wheel), embedded CMap streams parse the same way, widths key on the mapped CID, vertical text (`WMode` 1) advances by `/W2`/`/DW2` with the default position vector, and extraction maps CIDs to Unicode through the character collection when `/ToUnicode` is absent; deferred: vertical runs still extract as horizontal-schema spans, one per show operator, with x/y at the glyph origin.
+Type0 `/Encoding` CMaps resolve: the predefined ISO 32000 Table 118 CJK set is compiled in (behind the `predefined-cmaps` feature, on by default in the CLI and the wheel), embedded CMap streams parse the same way, widths key on the mapped CID, vertical text (`WMode` 1) advances by `/W2`/`/DW2` with the default position vector, and extraction maps CIDs to Unicode through the character collection when `/ToUnicode` is absent; deferred: vertical runs still extract as horizontal-schema spans, one per show operator, with x/y at the glyph origin.
 
-A bold *sans* substitute is not visually distinct from regular weight. Text a tier leaves unpainted still advances — through the PDF's own `/Widths`, or the Adobe Core-14 AFM tables for a standard-14 face — so everything painted around it stays where the page put it.
+A bold *sans* substitute is not visually distinct from regular weight. Text a tier leaves unpainted still advances (through the PDF's own `/Widths`, or the Adobe Core-14 AFM tables for a standard-14 face), so everything painted around it stays where the page put it.
 
-`JBIG2Decode` covers the embedded stream format end to end: generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant — refinement/aggregate-coded symbols and refined instance placements included — pattern dictionaries and halftone regions, generic refinement regions (both templates, with TPGRON) refining either the page or a retained intermediate region, intermediate regions of every type, and custom code table segments. Nothing in the standard's segment type table is refused any more; a malformed or truncated stream still fails with a message naming what was wrong instead of rendering a blank.
+`JBIG2Decode` covers the embedded stream format end to end: generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant (refinement/aggregate-coded symbols and refined instance placements included), pattern dictionaries and halftone regions, generic refinement regions (both templates, with TPGRON) refining either the page or a retained intermediate region, intermediate regions of every type, and custom code table segments. Nothing in the standard's segment type table is refused any more; a malformed or truncated stream still fails with a message naming what was wrong instead of rendering a blank.
 
-Colour converts to sRGB. `ICCBased` spaces parse their embedded profile (v2 and v4; matrix/TRC and grayTRC models, and `A2B0` lookup pipelines): a profile equivalent to sRGB keeps the exact device-RGB path, others transform per colour with Bradford adaptation from the D50 connection space, and a profile that will not parse falls back to the `/N` channel-count reduction. `CalRGB`, `CalGray`, and `Lab` convert through CIE XYZ the same way. Only a profile's default transform is used — rendering intents are not switched — and `DeviceN` keeps a tint approximation.
+Colour converts to sRGB. `ICCBased` spaces parse their embedded profile (v2 and v4; matrix/TRC and grayTRC models, and `A2B0` lookup pipelines): a profile equivalent to sRGB keeps the exact device-RGB path, others transform per colour with Bradford adaptation from the D50 connection space, and a profile that will not parse falls back to the `/N` channel-count reduction. `CalRGB`, `CalGray`, and `Lab` convert through CIE XYZ the same way. Only a profile's default transform is used (rendering intents are not switched), and `DeviceN` keeps a tint approximation.
 
-`JPXDecode` implements ITU-T T.800 (JPEG 2000 Part 1); what it approximates it reports as a render warning rather than passing off silently. ICC profiles embedded in the JPEG 2000 container are interpreted through the same ICC engine as `ICCBased` colour — a profile equivalent to sRGB or device gray keeps the exact device path, others transform per sample — and only a profile that will not parse falls back to the channel-count approximation. sYCC converts with the exact IEC 61966-2-1 Amd. 1 inverse. Part 2 (ISO/IEC 15444-2) extensions are tolerated in the container but not decoded. Every output sample is normalized to 8 bits per channel with round-to-nearest, so sources deeper than 8 bits (the spec allows up to 38) still land on an 8-bit output grid.
+`JPXDecode` implements ITU-T T.800 (JPEG 2000 Part 1); what it approximates it reports as a render warning rather than passing off silently. ICC profiles embedded in the JPEG 2000 container are interpreted through the same ICC engine as `ICCBased` colour (a profile equivalent to sRGB or device gray keeps the exact device path, others transform per sample), and only a profile that will not parse falls back to the channel-count approximation. sYCC converts with the exact IEC 61966-2-1 Amd. 1 inverse. Part 2 (ISO/IEC 15444-2) extensions are tolerated in the container but not decoded. Every output sample is normalized to 8 bits per channel with round-to-nearest, so sources deeper than 8 bits (the spec allows up to 38) still land on an 8-bit output grid.
 
 Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the document's default configuration: rendering and text extraction skip layers it turns off, counting them on the reports' `hidden` counters.
 
