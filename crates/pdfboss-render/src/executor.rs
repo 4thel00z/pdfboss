@@ -134,6 +134,59 @@ struct GState {
     /// without copying the full-page mask buffer; a new clip always builds a
     /// fresh `Mask`, so this is effectively clone-on-write.
     clip: Option<Arc<Mask>>,
+    /// Text state parameters (`Tc`/`Tw`/`Tz`/`TL`/`Tf`/`Ts`). Graphics
+    /// state per ISO 32000-1 §9.3.1 (Table 51), exactly like `text_render`:
+    /// `Q` restores them — Quartz brackets each run as `q BT … Tc … ET Q`
+    /// and relies on it — while `BT`/`ET` leaves them alone.
+    text: TextParams,
+}
+
+/// The `q`/`Q`-scoped text parameters carried inside [`GState`]. The text
+/// and line matrices stay outside in [`TextState`]: they reset at `BT`.
+#[derive(Clone)]
+struct TextParams {
+    font: LoadedFont,
+    /// A `/Type3` font whose glyphs paint by re-entering the executor per
+    /// CharProc (ISO 32000-1 §9.6.5). Invariant: at most one of `font`
+    /// (outline) / `type3` is `Some`.
+    type3: Option<Arc<Type3Font>>,
+    size: f32,
+    char_spacing: f32,
+    word_spacing: f32,
+    /// Horizontal scale as a fraction (`Tz` / 100).
+    horiz: f32,
+    leading: f32,
+    rise: f32,
+}
+
+impl Default for TextParams {
+    fn default() -> TextParams {
+        TextParams {
+            font: None,
+            type3: None,
+            size: 0.0,
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horiz: 1.0,
+            leading: 0.0,
+            rise: 0.0,
+        }
+    }
+}
+
+impl std::fmt::Debug for TextParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TextParams")
+            .field("font", &self.font.as_ref().map(|(_, label, _)| label))
+            .field("type3", &self.type3.is_some())
+            .field("size", &self.size)
+            .field("char_spacing", &self.char_spacing)
+            .field("word_spacing", &self.word_spacing)
+            .field("horiz", &self.horiz)
+            .field("leading", &self.leading)
+            .field("rise", &self.rise)
+            .finish()
+    }
 }
 
 impl GState {
@@ -160,6 +213,7 @@ impl GState {
             fill_alpha: 1.0,
             stroke_alpha: 1.0,
             clip: None,
+            text: TextParams::default(),
         }
     }
 
@@ -254,24 +308,12 @@ enum FoundPattern {
     Resolved(Option<pdfboss_core::ObjRef>, Object),
 }
 
-/// Text-showing state within a `BT`/`ET` block. Held per content stream (not
-/// saved by `q`/`Q`), matching how the extractor tracks text.
+/// The text and line matrices, reset by every `BT` (ISO 32000-1 §9.4.1).
+/// Held per content stream: unlike [`TextParams`] they are not part of the
+/// graphics state, so `q`/`Q` never touches them.
 struct TextState {
-    /// Text matrix and line matrix.
     tm: Matrix,
     tlm: Matrix,
-    font: LoadedFont,
-    /// A `/Type3` font whose glyphs paint by re-entering the executor per
-    /// CharProc (ISO 32000-1 §9.6.5). Invariant: at most one of `font`
-    /// (outline) / `type3` is `Some`.
-    type3: Option<Arc<Type3Font>>,
-    size: f32,
-    char_spacing: f32,
-    word_spacing: f32,
-    /// Horizontal scale as a fraction (`Tz` / 100).
-    horiz: f32,
-    leading: f32,
-    rise: f32,
 }
 
 impl Default for TextState {
@@ -279,14 +321,6 @@ impl Default for TextState {
         TextState {
             tm: Matrix::identity(),
             tlm: Matrix::identity(),
-            font: None,
-            type3: None,
-            size: 0.0,
-            char_spacing: 0.0,
-            word_spacing: 0.0,
-            horiz: 1.0,
-            leading: 0.0,
-            rise: 0.0,
         }
     }
 }
@@ -969,22 +1003,22 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         frame.ts.tm = Matrix::identity();
                         frame.ts.tlm = Matrix::identity();
                     }
-                    Op::SetCharSpacing(v) if v.is_finite() => frame.ts.char_spacing = *v,
-                    Op::SetWordSpacing(v) if v.is_finite() => frame.ts.word_spacing = *v,
-                    Op::SetHorizScaling(v) if v.is_finite() => frame.ts.horiz = v / 100.0,
-                    Op::SetLeading(v) if v.is_finite() => frame.ts.leading = *v,
-                    Op::SetTextRise(v) if v.is_finite() => frame.ts.rise = *v,
+                    Op::SetCharSpacing(v) if v.is_finite() => frame.gs.text.char_spacing = *v,
+                    Op::SetWordSpacing(v) if v.is_finite() => frame.gs.text.word_spacing = *v,
+                    Op::SetHorizScaling(v) if v.is_finite() => frame.gs.text.horiz = v / 100.0,
+                    Op::SetLeading(v) if v.is_finite() => frame.gs.text.leading = *v,
+                    Op::SetTextRise(v) if v.is_finite() => frame.gs.text.rise = *v,
                     Op::SetTextRender(mode) => frame.gs.text_render = *mode,
                     Op::SetFont(name, size) => {
-                        frame.ts.size = if size.is_finite() { *size } else { 0.0 };
-                        frame.ts.font = self
+                        frame.gs.text.size = if size.is_finite() { *size } else { 0.0 };
+                        frame.gs.text.font = self
                             .glyph_font(&name.0, &frame.chain, &mut frame.fonts)
                             .await;
                         // Type3 is the fallback when no outline font loads: a
                         // `/Type3` dict at a tier that paints embedded programs.
                         // The invariant (at most one of font/type3) holds because
-                        // this only runs when `frame.ts.font` is `None`.
-                        frame.ts.type3 = if frame.ts.font.is_some() {
+                        // this only runs when `frame.gs.text.font` is `None`.
+                        frame.gs.text.type3 = if frame.gs.text.font.is_some() {
                             None
                         } else {
                             self.type3_font(&name.0, &frame.chain).await
@@ -999,13 +1033,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         frame.ts.tm = frame.ts.tlm;
                     }
                     Op::TextMoveSetLeading(tx, ty) if all_finite(&[*tx, *ty]) => {
-                        frame.ts.leading = -*ty;
+                        frame.gs.text.leading = -*ty;
                         frame.ts.tlm = Matrix::translate(*tx, *ty).concat(frame.ts.tlm);
                         frame.ts.tm = frame.ts.tlm;
                     }
                     Op::TextNextLine => {
                         frame.ts.tlm =
-                            Matrix::translate(0.0, -frame.ts.leading).concat(frame.ts.tlm);
+                            Matrix::translate(0.0, -frame.gs.text.leading).concat(frame.ts.tlm);
                         frame.ts.tm = frame.ts.tlm;
                     }
                     Op::ShowText(s) => {
@@ -1017,15 +1051,23 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     Op::ShowTextAdjusted(items) => {
                         // In vertical writing the TJ offset moves ty, with
                         // Th not applied (ISO 32000-1 §9.4.4).
-                        let vertical = frame.ts.font.as_ref().is_some_and(|(f, ..)| f.vertical());
+                        let vertical = frame
+                            .gs
+                            .text
+                            .font
+                            .as_ref()
+                            .is_some_and(|(f, ..)| f.vertical());
                         for item in items {
                             match item {
                                 TextItem::Str(s) => self.show_text(frame, s),
                                 TextItem::Offset(n) => {
                                     let (tx, ty) = if vertical {
-                                        (0.0, -n / 1000.0 * frame.ts.size)
+                                        (0.0, -n / 1000.0 * frame.gs.text.size)
                                     } else {
-                                        (-n / 1000.0 * frame.ts.size * frame.ts.horiz, 0.0)
+                                        (
+                                            -n / 1000.0 * frame.gs.text.size * frame.gs.text.horiz,
+                                            0.0,
+                                        )
                                     };
                                     if tx.is_finite() && ty.is_finite() {
                                         frame.ts.tm = Matrix::translate(tx, ty).concat(frame.ts.tm);
@@ -1036,19 +1078,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     }
                     Op::NextLineShowText(s) => {
                         frame.ts.tlm =
-                            Matrix::translate(0.0, -frame.ts.leading).concat(frame.ts.tlm);
+                            Matrix::translate(0.0, -frame.gs.text.leading).concat(frame.ts.tlm);
                         frame.ts.tm = frame.ts.tlm;
                         self.show_text(frame, s);
                     }
                     Op::NextLineShowTextSpaced(aw, ac, s) => {
                         if aw.is_finite() {
-                            frame.ts.word_spacing = *aw;
+                            frame.gs.text.word_spacing = *aw;
                         }
                         if ac.is_finite() {
-                            frame.ts.char_spacing = *ac;
+                            frame.gs.text.char_spacing = *ac;
                         }
                         frame.ts.tlm =
-                            Matrix::translate(0.0, -frame.ts.leading).concat(frame.ts.tlm);
+                            Matrix::translate(0.0, -frame.gs.text.leading).concat(frame.ts.tlm);
                         frame.ts.tm = frame.ts.tlm;
                         self.show_text(frame, s);
                     }
@@ -1963,19 +2005,27 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() && !suppressed {
             self.skip(SkippedKind::TextClip, SkipReason::Unsupported);
         }
-        if let Some(t3) = frame.ts.type3.clone() {
+        if let Some(t3) = frame.gs.text.type3.clone() {
             // The depth guard bounds a self-referential glyph: each CharProc
             // frame is pushed at `depth + 1`, so painting stops at
             // `MAX_FORM_DEPTH` while the advances still happen.
             let paint = visible && frame.depth < MAX_FORM_DEPTH;
-            let planned = type3_glyph_plan(&mut frame.ts, &t3, bytes, frame.gs.ctm, paint);
+            let planned = type3_glyph_plan(
+                &frame.gs.text,
+                &mut frame.ts,
+                &t3,
+                bytes,
+                frame.gs.ctm,
+                paint,
+            );
             frame.pending_glyphs.extend(planned);
             frame.pending_t3 = Some(t3);
             return;
         }
         let gs = &frame.gs;
+        let text = &gs.text;
         let ts = &mut frame.ts;
-        let Some((font, label, fallback)) = ts.font.clone() else {
+        let Some((font, label, fallback)) = text.font.clone() else {
             return;
         };
         let upm = font.units_per_em();
@@ -1995,19 +2045,22 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // not — Tz applies to horizontal quantities only.
             let (ve, vf) = if vertical {
                 let [_, vx, vy] = font.vmetrics(cid);
-                (-vx / 1000.0 * ts.size * ts.horiz, -vy / 1000.0 * ts.size)
+                (
+                    -vx / 1000.0 * text.size * text.horiz,
+                    -vy / 1000.0 * text.size,
+                )
             } else {
                 (0.0, 0.0)
             };
             // glyph units -> text space (÷ em, then the text-scaling params),
             // -> user space (Tm) -> device (CTM).
             let params = Matrix {
-                a: ts.size * ts.horiz,
+                a: text.size * text.horiz,
                 b: 0.0,
                 c: 0.0,
-                d: ts.size,
+                d: text.size,
                 e: ve,
-                f: ts.rise + vf,
+                f: text.rise + vf,
             };
             let to_device = Matrix::scale(1.0 / upm, 1.0 / upm)
                 .concat(params)
@@ -2060,16 +2113,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // vertical writing w1·Tfs + Tc + Tw on ty with Th not applied
             // (ISO 32000-1 §9.4.4).
             let word = if n == 1 && code == 32 {
-                ts.word_spacing
+                text.word_spacing
             } else {
                 0.0
             };
             let (tx, ty) = if vertical {
                 let w1 = font.vmetrics(cid)[0] / 1000.0;
-                (0.0, w1 * ts.size + ts.char_spacing + word)
+                (0.0, w1 * text.size + text.char_spacing + word)
             } else {
                 let w0 = font.advance(cid) / upm;
-                ((w0 * ts.size + ts.char_spacing + word) * ts.horiz, 0.0)
+                (
+                    (w0 * text.size + text.char_spacing + word) * text.horiz,
+                    0.0,
+                )
             };
             if tx.is_finite() && ty.is_finite() {
                 ts.tm = Matrix::translate(tx, ty).concat(ts.tm);
@@ -2333,6 +2389,7 @@ struct Type3Glyph {
 /// is at the recursion limit) still advance, keeping surrounding text
 /// positioned.
 fn type3_glyph_plan(
+    text: &TextParams,
     ts: &mut TextState,
     t3: &Type3Font,
     bytes: &[u8],
@@ -2348,12 +2405,12 @@ fn type3_glyph_plan(
         // params, -> user space (Tm) -> device (CTM): the outline chain
         // with `font_matrix` substituted for `scale(1/upm)`.
         let params = Matrix {
-            a: ts.size * ts.horiz,
+            a: text.size * text.horiz,
             b: 0.0,
             c: 0.0,
-            d: ts.size,
+            d: text.size,
             e: 0.0,
-            f: ts.rise,
+            f: text.rise,
         };
         let glyph_ctm = font_matrix.concat(params).concat(ts.tm).concat(ctm);
         if paint && finite_matrix(&glyph_ctm) {
@@ -2368,8 +2425,8 @@ fn type3_glyph_plan(
         // Advance: the glyph-space width becomes a text-space displacement
         // via the matrix x-scale, then (w0·Tfs + Tc + Tw[space]) · Th.
         let w0 = t3.width(code).unwrap_or(0.0) * font_matrix.a;
-        let word = if code == 32 { ts.word_spacing } else { 0.0 };
-        let tx = (w0 * ts.size + ts.char_spacing + word) * ts.horiz;
+        let word = if code == 32 { text.word_spacing } else { 0.0 };
+        let tx = (w0 * text.size + text.char_spacing + word) * text.horiz;
         if tx.is_finite() {
             ts.tm = Matrix::translate(tx, 0.0).concat(ts.tm);
         }
@@ -6789,6 +6846,49 @@ mod tests {
         );
         assert!(!dark_at(&pix, 55, 115), "a space paints nothing");
         assert!(report.is_empty(), "a space is not a drop");
+    }
+
+    #[test]
+    fn grestore_restores_char_spacing() {
+        // Tc is a graphics-state parameter (ISO 32000-1 §9.3.1, Table 51):
+        // the `50 Tc` inside `q`/`Q` must not leak into the show that
+        // follows. Quartz-generated pages bracket every run as
+        // `q BT ... Tc ... ET Q` and rely on the restore; a leaked Tc=50 at
+        // 100pt adds a full 50pt to each advance, so the second 'A' (glyph
+        // rect x in [100,600]/1000 em, /Widths 500) would paint at device x
+        // in [120,170] instead of [70,120].
+        let pix = render_at_tier(
+            &doc_with_incomplete_truetype_font(
+                b"q BT 50 Tc ET Q BT /F0 100 Tf 10 50 Td (AA) Tj ET",
+            ),
+            GlyphPainting::AllEmbedded,
+        );
+        assert!(dark_at(&pix, 45, 115), "first 'A' at the text origin");
+        assert!(
+            dark_at(&pix, 95, 115),
+            "second 'A' advances by /Widths alone once Q restored Tc"
+        );
+        assert!(
+            !dark_at(&pix, 145, 115),
+            "the q/Q-scoped Tc must not widen the advance"
+        );
+    }
+
+    #[test]
+    fn char_spacing_persists_across_text_blocks() {
+        // The flip side of the q/Q rule: BT/ET reset only the text and line
+        // matrices — Tc set in one text block still applies in the next
+        // (§9.4.1). With Tc=50 live, the second 'A' advances 100pt.
+        let pix = render_at_tier(
+            &doc_with_incomplete_truetype_font(b"BT 50 Tc ET BT /F0 100 Tf 10 50 Td (AA) Tj ET"),
+            GlyphPainting::AllEmbedded,
+        );
+        assert!(dark_at(&pix, 45, 115), "first 'A' at the text origin");
+        assert!(
+            dark_at(&pix, 145, 115),
+            "Tc from the previous text block still spaces this one"
+        );
+        assert!(!dark_at(&pix, 95, 115), "the unspaced position stays blank");
     }
 
     #[test]
