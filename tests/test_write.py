@@ -57,6 +57,19 @@ def test_slots_are_order_free() -> None:
     assert first == second
 
 
+def test_all_singleton_slots_are_order_free() -> None:
+    page = Page() | Text("same", at=(72, 700))
+    metadata = Metadata(title="fine")
+    outline = Outline(Bookmark("Only", 0))
+    viewer = Viewer(mode="use-none")
+
+    slots_first = (Pdf() | metadata | outline | viewer | page).to_bytes()
+    slots_last = (Pdf() | page | metadata | outline | viewer).to_bytes()
+    shuffled = (Pdf() | viewer | page | metadata | outline).to_bytes()
+
+    assert slots_first == slots_last == shuffled
+
+
 def test_duplicate_slot_raises() -> None:
     with pytest.raises(TypeError, match="already has Metadata"):
         Pdf() | Metadata(title="a") | Metadata(title="b")
