@@ -257,6 +257,35 @@ mod tests {
     }
 
     #[test]
+    fn columns_scale_down_proportionally_when_natural_widths_overflow() {
+        let long = "a".repeat(80);
+        let md = format!("| {long} | {long} |\n|---|---|\n| c | d |\n");
+        let pages = laid(&md, MONO);
+        let frames: Vec<f32> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Frame { w, .. } => Some(*w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames.len(), 4);
+        let available = 595.28 - 200.0;
+        let natural = 80.0 * 6.0 + 8.0;
+        let header_row_total: f32 = frames[..2].iter().sum();
+        assert!(
+            header_row_total <= available + 0.5,
+            "scaled widths sum to the available width: {frames:?}"
+        );
+        for width in &frames {
+            assert!(
+                *width < natural,
+                "each column narrower than its natural width: {width}"
+            );
+        }
+    }
+
+    #[test]
     fn header_cells_are_bold_with_background() {
         let pages = laid("| h |\n|---|\n| b |\n", MONO);
         assert!(
