@@ -1,6 +1,6 @@
 """PDF parsing, text extraction and rendering in pure Rust."""
 
-from pdfboss import md
+from pdfboss import md, write
 from pdfboss._pdfboss import (
     AsyncDocument,
     AsyncElementIter,
@@ -32,4 +32,5 @@ __all__ = [
     "SpanIter",
     "__version__",
     "md",
+    "write",
 ]

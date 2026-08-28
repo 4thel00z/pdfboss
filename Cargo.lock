@@ -1323,6 +1323,7 @@ dependencies = [
  "pdfboss-output",
  "pdfboss-render",
  "pdfboss-text",
+ "pdfboss-write",
  "pyo3",
  "pyo3-async-runtimes",
  "tokio",

@@ -28,6 +28,8 @@ use pdfboss_output::Output;
 use pdfboss_render::RenderCache;
 use pdfboss_text::{FontCache, TextSpan};
 
+mod write;
+
 create_exception!(
     pdfboss,
     PdfError,
@@ -1880,6 +1882,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsyncSpanIter>()?;
     m.add_class::<PageImage>()?;
     m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
+    write::register(m.py(), m)?;
     Ok(())
 }
 
