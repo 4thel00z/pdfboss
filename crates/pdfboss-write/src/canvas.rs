@@ -5,11 +5,14 @@
 //!
 //! Resource naming contract: the font first used gets resource name `F1`,
 //! the next distinct font `F2`, …; image handles map to `Im1`, `Im2`, … in
-//! [`add_image`](Canvas::add_image) order. Assembly builds the matching
-//! `/Resources` dictionary from [`CanvasParts`].
+//! [`add_image`](Canvas::add_image) order; groups registered with
+//! [`group`](Canvas::group) map to `Gp1`, `Gp2`, …; distinct `/ExtGState`
+//! entries pushed by the alpha/blend-mode setters map to `Gs1`, `Gs2`, ….
+//! Assembly builds the matching `/Resources` dictionary from
+//! [`CanvasParts`].
 
 use pdfboss_core::content::Op;
-use pdfboss_core::{Matrix, Name, Point};
+use pdfboss_core::{Dict, Matrix, Name, Object, Point};
 
 use crate::color::Color;
 use crate::error::Result;
@@ -47,6 +50,93 @@ pub enum LineJoin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageHandle(pub(crate) usize);
 
+/// Handle to a sub-canvas registered with [`Canvas::group`], painted with
+/// [`Canvas::draw_group`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupHandle(pub(crate) usize);
+
+/// A separable blend mode (ISO 32000 §11.3.5, Table 136), set with
+/// [`Canvas::set_blend_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendMode {
+    /// Source color replaces the backdrop.
+    Normal,
+    /// Product of source and backdrop.
+    Multiply,
+    /// Complement of the product of the complements.
+    Screen,
+    /// Multiply or screen, chosen by the backdrop.
+    Overlay,
+    /// The darker of source and backdrop, per component.
+    Darken,
+    /// The lighter of source and backdrop, per component.
+    Lighten,
+    /// Brightens the backdrop toward the source.
+    ColorDodge,
+    /// Darkens the backdrop toward the source.
+    ColorBurn,
+    /// Multiply or screen, chosen by the source (Overlay with roles swapped).
+    HardLight,
+    /// A softer variant of `HardLight`.
+    SoftLight,
+    /// Absolute difference of source and backdrop.
+    Difference,
+    /// Like `Difference`, with lower contrast.
+    Exclusion,
+}
+
+impl BlendMode {
+    /// The `/BM` name for this mode.
+    fn pdf_name(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::ColorDodge => "ColorDodge",
+            BlendMode::ColorBurn => "ColorBurn",
+            BlendMode::HardLight => "HardLight",
+            BlendMode::SoftLight => "SoftLight",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+        }
+    }
+}
+
+/// One deduped `/ExtGState` entry. Each [`Canvas`] setter writes only its
+/// own key, so at most one field is ever set — a `gs` referencing `/ca`
+/// alone must leave `/CA` and `/BM` untouched (ISO 32000 §8.4.5).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub(crate) struct GState {
+    pub(crate) fill_alpha: Option<f32>,
+    pub(crate) stroke_alpha: Option<f32>,
+    pub(crate) blend_mode: Option<BlendMode>,
+}
+
+impl GState {
+    /// The `/ExtGState` dictionary for this entry.
+    pub(crate) fn ext_gstate_dict(self) -> Dict {
+        let mut dict = Dict::new();
+        if let Some(alpha) = self.fill_alpha {
+            dict.insert(name("ca"), Object::Real(f64::from(alpha)));
+        }
+        if let Some(alpha) = self.stroke_alpha {
+            dict.insert(name("CA"), Object::Real(f64::from(alpha)));
+        }
+        if let Some(mode) = self.blend_mode {
+            dict.insert(name("BM"), Object::Name(name(mode.pdf_name())));
+        }
+        dict
+    }
+}
+
+/// A `Name` from a string literal.
+fn name(text: &str) -> Name {
+    Name(text.to_string())
+}
+
 /// The accumulated output of a finished canvas.
 #[derive(Debug)]
 pub struct CanvasParts {
@@ -56,6 +146,12 @@ pub struct CanvasParts {
     pub fonts: Vec<Standard14>,
     /// Images in registration order; index `i` is resource `Im{i+1}`.
     pub images: Vec<ImageData>,
+    /// Sub-canvases registered with [`Canvas::group`], paired with their
+    /// `/BBox`; index `i` is resource `Gp{i+1}`.
+    pub(crate) groups: Vec<(CanvasParts, [f32; 4])>,
+    /// Distinct `/ExtGState` entries in first-use order; index `i` is
+    /// resource `Gs{i+1}`.
+    pub(crate) gstates: Vec<GState>,
 }
 
 /// An imperative painter producing content-stream operators.
@@ -64,6 +160,8 @@ pub struct Canvas {
     ops: Vec<Op>,
     fonts: Vec<Standard14>,
     images: Vec<ImageData>,
+    groups: Vec<(CanvasParts, [f32; 4])>,
+    gstates: Vec<GState>,
 }
 
 impl Canvas {
@@ -275,6 +373,63 @@ impl Canvas {
         self.ops.push(Op::Restore);
     }
 
+    /// Registers a finished sub-canvas as a form group, with `bbox`
+    /// (`[llx, lly, urx, ury]`) becoming the form's `/BBox`. Paint it with
+    /// [`draw_group`](Canvas::draw_group).
+    pub fn group(&mut self, canvas: Canvas, bbox: [f32; 4]) -> GroupHandle {
+        let handle = GroupHandle(self.groups.len());
+        self.groups.push((canvas.into_parts(), bbox));
+        handle
+    }
+
+    /// Paints a registered group under `matrix` (`q cm /GpN Do Q`). Two
+    /// calls with the same `group` reference the same form resource.
+    pub fn draw_group(&mut self, group: GroupHandle, matrix: Matrix) {
+        self.ops.push(Op::Save);
+        self.ops.push(Op::Concat(matrix));
+        self.ops
+            .push(Op::XObject(Name(format!("Gp{}", group.0 + 1))));
+        self.ops.push(Op::Restore);
+    }
+
+    /// Sets the nonstroking alpha constant (`gs` referencing `/ca`).
+    pub fn set_fill_alpha(&mut self, alpha: f32) {
+        self.push_gstate(GState {
+            fill_alpha: Some(alpha),
+            ..GState::default()
+        });
+    }
+
+    /// Sets the stroking alpha constant (`gs` referencing `/CA`).
+    pub fn set_stroke_alpha(&mut self, alpha: f32) {
+        self.push_gstate(GState {
+            stroke_alpha: Some(alpha),
+            ..GState::default()
+        });
+    }
+
+    /// Sets the blend mode (`gs` referencing `/BM`).
+    pub fn set_blend_mode(&mut self, mode: BlendMode) {
+        self.push_gstate(GState {
+            blend_mode: Some(mode),
+            ..GState::default()
+        });
+    }
+
+    /// Emits a `gs` referencing `state`'s resource, reusing an identical
+    /// prior entry instead of adding a duplicate.
+    fn push_gstate(&mut self, state: GState) {
+        let index = match self.gstates.iter().position(|seen| *seen == state) {
+            Some(index) => index,
+            None => {
+                self.gstates.push(state);
+                self.gstates.len() - 1
+            }
+        };
+        self.ops
+            .push(Op::SetExtGState(Name(format!("Gs{}", index + 1))));
+    }
+
     /// Pushes a raw operator — the escape hatch for anything the methods
     /// above don't cover. Resource-referencing operators are the caller's
     /// responsibility to keep consistent with the naming contract.
@@ -293,15 +448,19 @@ impl Canvas {
             ops: self.ops,
             fonts: self.fonts,
             images: self.images,
+            groups: self.groups,
+            gstates: self.gstates,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use pdfboss_core::content::parse_content;
     use pdfboss_core::Name;
 
     use super::*;
+    use crate::content::serialize_ops;
     use crate::error::Error;
 
     fn name(text: &str) -> Name {
@@ -629,5 +788,160 @@ mod tests {
             ]
         );
         assert_eq!(canvas.into_parts().images.len(), 2);
+    }
+
+    #[test]
+    fn group_registers_subcanvas_parts_and_bbox() {
+        let mut sub = Canvas::new();
+        sub.rect(1.0, 2.0, 3.0, 4.0);
+        sub.fill();
+        let mut canvas = Canvas::new();
+        let handle = canvas.group(sub, [0.0, 0.0, 50.0, 20.0]);
+        assert_eq!(handle, GroupHandle(0));
+        let parts = canvas.into_parts();
+        assert_eq!(parts.groups.len(), 1);
+        let (group_parts, bbox) = &parts.groups[0];
+        assert_eq!(*bbox, [0.0, 0.0, 50.0, 20.0]);
+        assert_eq!(group_parts.ops, [Op::Rect(1.0, 2.0, 3.0, 4.0), Op::Fill]);
+    }
+
+    #[test]
+    fn second_group_gets_index_one() {
+        let mut canvas = Canvas::new();
+        let first = canvas.group(Canvas::new(), [0.0, 0.0, 1.0, 1.0]);
+        let second = canvas.group(Canvas::new(), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(first, GroupHandle(0));
+        assert_eq!(second, GroupHandle(1));
+    }
+
+    #[test]
+    fn draw_group_emits_save_cm_xobject_restore_and_round_trips() {
+        let mut canvas = Canvas::new();
+        let handle = canvas.group(Canvas::new(), [0.0, 0.0, 10.0, 10.0]);
+        let matrix = Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 72.0,
+            f: 144.0,
+        };
+        canvas.draw_group(handle, matrix);
+        assert_eq!(
+            canvas.ops(),
+            [
+                Op::Save,
+                Op::Concat(matrix),
+                Op::XObject(name("Gp1")),
+                Op::Restore,
+            ]
+        );
+        let bytes = serialize_ops(canvas.ops());
+        let parsed = parse_content(&bytes).unwrap();
+        assert_eq!(parsed, canvas.ops());
+    }
+
+    #[test]
+    fn two_draws_of_one_group_reference_the_same_resource_name() {
+        let mut canvas = Canvas::new();
+        let handle = canvas.group(Canvas::new(), [0.0, 0.0, 10.0, 10.0]);
+        canvas.draw_group(handle, Matrix::identity());
+        canvas.draw_group(handle, Matrix::translate(5.0, 5.0));
+        let names: Vec<&Op> = canvas
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::XObject(_)))
+            .collect();
+        assert_eq!(
+            names,
+            [&Op::XObject(name("Gp1")), &Op::XObject(name("Gp1"))]
+        );
+    }
+
+    #[test]
+    fn second_registered_group_gets_gp2() {
+        let mut canvas = Canvas::new();
+        let first = canvas.group(Canvas::new(), [0.0, 0.0, 1.0, 1.0]);
+        let second = canvas.group(Canvas::new(), [0.0, 0.0, 1.0, 1.0]);
+        canvas.draw_group(first, Matrix::identity());
+        canvas.draw_group(second, Matrix::identity());
+        let names: Vec<&Op> = canvas
+            .ops()
+            .iter()
+            .filter(|op| matches!(op, Op::XObject(_)))
+            .collect();
+        assert_eq!(
+            names,
+            [&Op::XObject(name("Gp1")), &Op::XObject(name("Gp2"))]
+        );
+    }
+
+    #[test]
+    fn nested_groups_recurse() {
+        let mut innermost = Canvas::new();
+        innermost.fill();
+        let mut outer = Canvas::new();
+        let inner_handle = outer.group(innermost, [0.0, 0.0, 1.0, 1.0]);
+        outer.draw_group(inner_handle, Matrix::identity());
+        let mut canvas = Canvas::new();
+        let outer_handle = canvas.group(outer, [0.0, 0.0, 2.0, 2.0]);
+        canvas.draw_group(outer_handle, Matrix::identity());
+        let parts = canvas.into_parts();
+        let (outer_parts, _) = &parts.groups[0];
+        assert_eq!(outer_parts.groups.len(), 1);
+        let (inner_parts, _) = &outer_parts.groups[0];
+        assert_eq!(inner_parts.ops, [Op::Fill]);
+    }
+
+    #[test]
+    fn set_fill_alpha_pushes_gs_referencing_gs1() {
+        let mut canvas = Canvas::new();
+        canvas.set_fill_alpha(0.5);
+        assert_eq!(canvas.ops(), [Op::SetExtGState(name("Gs1"))]);
+        let parts = canvas.into_parts();
+        assert_eq!(parts.gstates.len(), 1);
+        assert_eq!(parts.gstates[0].fill_alpha, Some(0.5));
+        assert_eq!(parts.gstates[0].stroke_alpha, None);
+        assert_eq!(parts.gstates[0].blend_mode, None);
+    }
+
+    #[test]
+    fn set_stroke_alpha_and_blend_mode_get_distinct_resources() {
+        let mut canvas = Canvas::new();
+        canvas.set_fill_alpha(0.5);
+        canvas.set_stroke_alpha(0.5);
+        canvas.set_blend_mode(BlendMode::Multiply);
+        assert_eq!(
+            canvas.ops(),
+            [
+                Op::SetExtGState(name("Gs1")),
+                Op::SetExtGState(name("Gs2")),
+                Op::SetExtGState(name("Gs3")),
+            ]
+        );
+        assert_eq!(canvas.into_parts().gstates.len(), 3);
+    }
+
+    #[test]
+    fn identical_setter_calls_dedupe_to_one_resource() {
+        let mut canvas = Canvas::new();
+        canvas.set_fill_alpha(0.5);
+        canvas.set_fill_alpha(0.5);
+        assert_eq!(
+            canvas.ops(),
+            [Op::SetExtGState(name("Gs1")), Op::SetExtGState(name("Gs1"))]
+        );
+        assert_eq!(canvas.into_parts().gstates.len(), 1);
+    }
+
+    #[test]
+    fn gstate_setters_round_trip() {
+        let mut canvas = Canvas::new();
+        canvas.set_fill_alpha(0.25);
+        canvas.set_stroke_alpha(0.75);
+        canvas.set_blend_mode(BlendMode::Screen);
+        let bytes = serialize_ops(canvas.ops());
+        let parsed = parse_content(&bytes).unwrap();
+        assert_eq!(parsed, canvas.ops());
     }
 }

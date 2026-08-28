@@ -29,7 +29,7 @@ pub mod sink;
 pub mod writer;
 mod xmp;
 
-pub use canvas::{Canvas, CanvasParts, ImageHandle, LineCap, LineJoin};
+pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
 pub use content::serialize_ops;
 pub use element::{Content, Draw, Image, Link, Paragraph, ParagraphAlign, Text};

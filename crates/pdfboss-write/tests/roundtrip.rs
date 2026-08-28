@@ -4,13 +4,13 @@
 //! toolkit's own readers rather than against expected byte dumps.
 
 use pdfboss_core::object::decode_text_string;
-use pdfboss_core::{Dict, Document, Name, Object, Rect, Stream};
+use pdfboss_core::{Dict, Document, Matrix, Name, Object, Rect, Stream};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Attachment, Bookmark, Color, Content, Date, Error, ImageData, LabelStyle, Link, LinkAnnotation,
-    LinkTarget, Metadata, Outline, Page, PageLabel, PageLayout, PageMode, PageSize, Paragraph, Pdf,
-    Standard14, Viewer, WriteOptions, XrefStyle,
+    Attachment, BlendMode, Bookmark, Canvas, Color, Content, Date, Error, ImageData, LabelStyle,
+    Link, LinkAnnotation, LinkTarget, Metadata, Outline, Page, PageLabel, PageLayout, PageMode,
+    PageSize, Paragraph, Pdf, Standard14, Viewer, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -194,6 +194,254 @@ fn jpeg_passthrough_keeps_dct_stream() {
     assert_eq!(stream.dict.get_int("Width"), Some(5));
     assert_eq!(stream.dict.get_int("Height"), Some(7));
     assert_eq!(stream.data, jpeg);
+}
+
+fn letterhead() -> Canvas {
+    let mut canvas = Canvas::new();
+    canvas.set_fill(Color::Gray(0.9));
+    canvas.rect(0.0, 0.0, 200.0, 40.0);
+    canvas.fill();
+    canvas
+        .text("Letterhead", 5.0, 10.0, Standard14::Helvetica, 12.0)
+        .unwrap();
+    canvas
+}
+
+/// Resolves the page/form resource named `resource_name` under `/XObject`
+/// to its stream, cloned so the borrow does not outlive a temporary
+/// `Document::resolve` result.
+fn resolve_form(doc: &Document, resources: &Dict, resource_name: &str) -> Stream {
+    let xobjects = resources
+        .get_dict("XObject")
+        .expect("resources carry an XObject dict");
+    let entry = xobjects
+        .get(resource_name)
+        .unwrap_or_else(|| panic!("XObject resource {resource_name} present"));
+    doc.resolve(entry)
+        .expect("form reference resolves")
+        .as_stream()
+        .expect("form XObject is a stream")
+        .clone()
+}
+
+#[test]
+fn draw_group_paints_the_registered_subcanvas() {
+    let mut page = Page::new(PageSize::A4);
+    let handle = page.canvas.group(letterhead(), [0.0, 0.0, 200.0, 40.0]);
+    page.canvas
+        .draw_group(handle, Matrix::translate(50.0, 700.0));
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let text = extract_text(&doc, &loaded).unwrap();
+    assert!(text.contains("Letterhead"), "extracted: {text:?}");
+    let form = resolve_form(&doc, &loaded.resources, "Gp1");
+    assert_eq!(form.dict.get_name("Type"), Some(&Name("XObject".into())));
+    assert_eq!(form.dict.get_name("Subtype"), Some(&Name("Form".into())));
+    assert_eq!(bbox_values(&form.dict), [0.0, 0.0, 200.0, 40.0]);
+}
+
+/// A form's `/BBox` as four `f64`s. Integral values round-trip through the
+/// object parser as `Object::Int`, not `Object::Real` (the crate's
+/// documented integral-`Real` corner), so numeric comparison goes through
+/// `as_f64` rather than comparing `Object` variants directly.
+fn bbox_values(dict: &Dict) -> [f64; 4] {
+    let array = dict.get_array("BBox").expect("BBox present");
+    let mut values = [0.0; 4];
+    for (slot, value) in values.iter_mut().zip(array) {
+        *slot = value.as_f64().expect("BBox entry is numeric");
+    }
+    values
+}
+
+/// Two pages each register their own copy of the same letterhead canvas.
+/// Cross-page form reuse is not implemented (groups live per-canvas, and a
+/// `Canvas` cannot be shared across pages) — this asserts the two resulting
+/// forms are structurally equal instead, and that the document-wide font
+/// cache is still shared between them.
+#[test]
+fn letterhead_group_on_two_pages_yields_structurally_equal_forms() {
+    let mut first = Page::new(PageSize::A4);
+    let first_handle = first.canvas.group(letterhead(), [0.0, 0.0, 200.0, 40.0]);
+    first
+        .canvas
+        .draw_group(first_handle, Matrix::translate(50.0, 700.0));
+    let mut second = Page::new(PageSize::A4);
+    let second_handle = second.canvas.group(letterhead(), [0.0, 0.0, 200.0, 40.0]);
+    second
+        .canvas
+        .draw_group(second_handle, Matrix::translate(50.0, 700.0));
+    let bytes = Pdf {
+        pages: vec![first, second],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let page0 = doc.page(0).unwrap();
+    let page1 = doc.page(1).unwrap();
+    assert!(extract_text(&doc, &page0).unwrap().contains("Letterhead"));
+    assert!(extract_text(&doc, &page1).unwrap().contains("Letterhead"));
+
+    let form0 = resolve_form(&doc, &page0.resources, "Gp1");
+    let form1 = resolve_form(&doc, &page1.resources, "Gp1");
+    assert_eq!(form0.dict.get_array("BBox"), form1.dict.get_array("BBox"));
+    assert_eq!(
+        doc.stream_data(&form0).unwrap(),
+        doc.stream_data(&form1).unwrap(),
+        "identical sub-canvases must serialize to identical form content"
+    );
+
+    let font0 = form0
+        .dict
+        .get_dict("Resources")
+        .and_then(|r| r.get_dict("Font"))
+        .and_then(|f| f.get_ref("F1"))
+        .expect("form0 references F1");
+    let font1 = form1
+        .dict
+        .get_dict("Resources")
+        .and_then(|r| r.get_dict("Font"))
+        .and_then(|f| f.get_ref("F1"))
+        .expect("form1 references F1");
+    assert_eq!(
+        font0, font1,
+        "the document-wide font cache must be shared with nested forms"
+    );
+
+    let gp0 = page0
+        .resources
+        .get_dict("XObject")
+        .and_then(|x| x.get_ref("Gp1"))
+        .expect("page0 Gp1 ref");
+    let gp1 = page1
+        .resources
+        .get_dict("XObject")
+        .and_then(|x| x.get_ref("Gp1"))
+        .expect("page1 Gp1 ref");
+    assert_ne!(
+        gp0, gp1,
+        "cross-page group reuse is deferred: each page gets its own form object"
+    );
+}
+
+#[test]
+fn drawing_one_group_twice_shares_the_same_form_xobject() {
+    let mut page = Page::new(PageSize::A4);
+    let handle = page.canvas.group(letterhead(), [0.0, 0.0, 200.0, 40.0]);
+    page.canvas
+        .draw_group(handle, Matrix::translate(10.0, 10.0));
+    page.canvas
+        .draw_group(handle, Matrix::translate(10.0, 400.0));
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let xobjects = loaded
+        .resources
+        .get_dict("XObject")
+        .expect("XObject resource dict");
+    assert_eq!(
+        xobjects.len(),
+        1,
+        "two draw_group calls on one handle must reference one form"
+    );
+    let text = extract_text(&doc, &loaded).unwrap();
+    assert_eq!(
+        text.matches("Letterhead").count(),
+        2,
+        "the shared form paints once per draw_group call"
+    );
+}
+
+#[test]
+fn nested_groups_recurse_through_extraction() {
+    let mut inner = Canvas::new();
+    inner
+        .text("Inner", 2.0, 2.0, Standard14::Helvetica, 8.0)
+        .unwrap();
+    let mut outer = Canvas::new();
+    let inner_handle = outer.group(inner, [0.0, 0.0, 40.0, 12.0]);
+    outer.draw_group(inner_handle, Matrix::identity());
+    let mut page = Page::new(PageSize::A4);
+    let outer_handle = page.canvas.group(outer, [0.0, 0.0, 40.0, 12.0]);
+    page.canvas
+        .draw_group(outer_handle, Matrix::translate(100.0, 500.0));
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let text = extract_text(&doc, &loaded).unwrap();
+    assert!(text.contains("Inner"), "extracted: {text:?}");
+}
+
+#[test]
+fn fill_alpha_resolves_to_ca_in_extgstate() {
+    let mut page = Page::new(PageSize::A4);
+    page.canvas.set_fill_alpha(0.5);
+    page.canvas.rect(0.0, 0.0, 10.0, 10.0);
+    page.canvas.fill();
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let ext_gstates = loaded
+        .resources
+        .get_dict("ExtGState")
+        .expect("ExtGState resource dict");
+    let gs1_ref = ext_gstates.get_ref("Gs1").expect("Gs1 entry");
+    let gs1 = resolve_dict(&doc, &Object::Ref(gs1_ref));
+    assert_eq!(gs1.get_f64("ca"), Some(0.5));
+    assert!(gs1.get("CA").is_none());
+    assert!(gs1.get("BM").is_none());
+}
+
+#[test]
+fn stroke_alpha_and_blend_mode_resolve_to_distinct_extgstates() {
+    let mut page = Page::new(PageSize::A4);
+    page.canvas.set_stroke_alpha(0.75);
+    page.canvas.set_blend_mode(BlendMode::Multiply);
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let ext_gstates = loaded
+        .resources
+        .get_dict("ExtGState")
+        .expect("ExtGState resource dict");
+    assert_eq!(ext_gstates.len(), 2);
+    let gs1 = resolve_dict(
+        &doc,
+        &Object::Ref(ext_gstates.get_ref("Gs1").expect("Gs1 entry")),
+    );
+    assert_eq!(gs1.get_f64("CA"), Some(0.75));
+    assert!(gs1.get("ca").is_none());
+    let gs2 = resolve_dict(
+        &doc,
+        &Object::Ref(ext_gstates.get_ref("Gs2").expect("Gs2 entry")),
+    );
+    assert_eq!(gs2.get_name("BM"), Some(&Name("Multiply".into())));
 }
 
 fn two_page_document() -> Pdf {

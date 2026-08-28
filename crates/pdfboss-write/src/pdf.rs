@@ -6,7 +6,7 @@ use std::path::Path;
 
 use pdfboss_core::{Dict, Name, ObjRef, Object};
 
-use crate::canvas::Canvas;
+use crate::canvas::{Canvas, CanvasParts};
 use crate::content::serialize_ops;
 use crate::element::{self, Content};
 use crate::error::{Error, Result};
@@ -368,7 +368,9 @@ impl Pdf {
     /// Fonts are shared document-wide: each distinct [`Standard14`] face
     /// gets one font object, in first-use order. Images are embedded per
     /// page with no cross-page deduplication — the same raster drawn on
-    /// two pages is stored twice.
+    /// two pages is stored twice. Groups follow the same rule: a canvas
+    /// registered with `Canvas::group` on two different pages produces two
+    /// Form XObjects — cross-page group sharing is deferred.
     pub fn to_bytes(self) -> Result<Vec<u8>> {
         let (w, root) = self.assemble()?;
         w.finish(root)
@@ -432,18 +434,7 @@ impl Pdf {
             let content_ref = w.put_stream(Dict::new(), serialize_ops(&parts.ops));
             let mut fonts = Dict::new();
             for (index, face) in parts.fonts.iter().enumerate() {
-                let cached = font_cache
-                    .iter()
-                    .find(|(seen, _)| seen == face)
-                    .map(|(_, r)| *r);
-                let font_ref = match cached {
-                    Some(r) => r,
-                    None => {
-                        let r = w.put(Object::Dict(face.font_dict()));
-                        font_cache.push((*face, r));
-                        r
-                    }
-                };
+                let font_ref = cached_font(&mut w, &mut font_cache, face);
                 fonts.insert(Name(format!("F{}", index + 1)), Object::Ref(font_ref));
             }
             let mut xobjects = Dict::new();
@@ -451,12 +442,24 @@ impl Pdf {
                 let image_ref = image.build_xobject(&mut w);
                 xobjects.insert(Name(format!("Im{}", index + 1)), Object::Ref(image_ref));
             }
+            for (index, (group_parts, bbox)) in parts.groups.into_iter().enumerate() {
+                let group_ref = build_form(&mut w, group_parts, bbox, &mut font_cache)?;
+                xobjects.insert(Name(format!("Gp{}", index + 1)), Object::Ref(group_ref));
+            }
+            let mut ext_gstates = Dict::new();
+            for (index, state) in parts.gstates.iter().enumerate() {
+                let gstate_ref = w.put(Object::Dict(state.ext_gstate_dict()));
+                ext_gstates.insert(Name(format!("Gs{}", index + 1)), Object::Ref(gstate_ref));
+            }
             let mut resources = Dict::new();
             if !fonts.is_empty() {
                 resources.insert(name("Font"), Object::Dict(fonts));
             }
             if !xobjects.is_empty() {
                 resources.insert(name("XObject"), Object::Dict(xobjects));
+            }
+            if !ext_gstates.is_empty() {
+                resources.insert(name("ExtGState"), Object::Dict(ext_gstates));
             }
             let mut dict = Dict::new();
             dict.insert(name("Type"), Object::Name(name("Page")));
@@ -915,6 +918,76 @@ fn fill_bookmarks(
         total += 1 + subtree_count;
     }
     Ok((refs[0].r, refs[last_index].r, total))
+}
+
+/// The document-wide font object for `face`: an existing entry from
+/// `font_cache` when one matches, otherwise a freshly built one that is
+/// cached for the next lookup. Shared by the page loop and every nested
+/// [`build_form`] so a face used both on a page and inside a group still
+/// gets exactly one font object.
+fn cached_font(
+    w: &mut Writer,
+    font_cache: &mut Vec<(Standard14, ObjRef)>,
+    face: &Standard14,
+) -> ObjRef {
+    if let Some((_, r)) = font_cache.iter().find(|(seen, _)| seen == face) {
+        return *r;
+    }
+    let r = w.put(Object::Dict(face.font_dict()));
+    font_cache.push((*face, r));
+    r
+}
+
+/// Builds one Form XObject from a registered group's parts: `/Type
+/// /XObject /Subtype /Form /BBox /Resources`, with the sub-canvas's
+/// operators as its content stream. Recurses for groups nested inside
+/// groups, and shares `font_cache` with the page loop so nested forms
+/// never duplicate a font already emitted elsewhere in the document.
+fn build_form(
+    w: &mut Writer,
+    parts: CanvasParts,
+    bbox: [f32; 4],
+    font_cache: &mut Vec<(Standard14, ObjRef)>,
+) -> Result<ObjRef> {
+    let content = serialize_ops(&parts.ops);
+    let mut fonts = Dict::new();
+    for (index, face) in parts.fonts.iter().enumerate() {
+        let font_ref = cached_font(w, font_cache, face);
+        fonts.insert(Name(format!("F{}", index + 1)), Object::Ref(font_ref));
+    }
+    let mut xobjects = Dict::new();
+    for (index, image) in parts.images.iter().enumerate() {
+        let image_ref = image.build_xobject(w);
+        xobjects.insert(Name(format!("Im{}", index + 1)), Object::Ref(image_ref));
+    }
+    for (index, (group_parts, group_bbox)) in parts.groups.into_iter().enumerate() {
+        let group_ref = build_form(w, group_parts, group_bbox, font_cache)?;
+        xobjects.insert(Name(format!("Gp{}", index + 1)), Object::Ref(group_ref));
+    }
+    let mut ext_gstates = Dict::new();
+    for (index, state) in parts.gstates.iter().enumerate() {
+        let gstate_ref = w.put(Object::Dict(state.ext_gstate_dict()));
+        ext_gstates.insert(Name(format!("Gs{}", index + 1)), Object::Ref(gstate_ref));
+    }
+    let mut resources = Dict::new();
+    if !fonts.is_empty() {
+        resources.insert(name("Font"), Object::Dict(fonts));
+    }
+    if !xobjects.is_empty() {
+        resources.insert(name("XObject"), Object::Dict(xobjects));
+    }
+    if !ext_gstates.is_empty() {
+        resources.insert(name("ExtGState"), Object::Dict(ext_gstates));
+    }
+    let mut dict = Dict::new();
+    dict.insert(name("Type"), Object::Name(name("XObject")));
+    dict.insert(name("Subtype"), Object::Name(name("Form")));
+    dict.insert(
+        name("BBox"),
+        Object::Array(bbox.iter().map(|v| Object::Real(f64::from(*v))).collect()),
+    );
+    dict.insert(name("Resources"), Object::Dict(resources));
+    Ok(w.put_stream(dict, content))
 }
 
 /// Encodes a text string (ISO 32000 §7.9.2.2): pure ASCII passes through
