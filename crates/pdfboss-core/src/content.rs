@@ -240,9 +240,8 @@ fn parse_content_ops(data: &[u8], mut emit: impl FnMut(Op, Span)) -> Result<()> 
     // stray closer flushed it).
     let mut run_start: Option<usize> = None;
     loop {
-        lexer.skip_whitespace_and_comments();
-        let token_start = lexer.pos();
-        let kw = match lexer.next_raw_token()? {
+        let (token_start, raw) = lexer.next_raw_token_spanned()?;
+        let kw = match raw {
             RawToken::Keyword(kw) => {
                 if run_start.is_none() {
                     run_start = Some(token_start);
@@ -318,10 +317,10 @@ fn parse_array(lexer: &mut Lexer, depth: usize) -> Result<Object> {
     }
     let mut items = Vec::new();
     loop {
-        match lexer.next_token()? {
-            Token::ArrayClose | Token::Eof => break,
-            tok => {
-                if let Some(v) = compose_value(lexer, tok, depth)? {
+        match lexer.next_raw_token()? {
+            RawToken::Owned(Token::ArrayClose | Token::Eof) => break,
+            raw => {
+                if let Some(v) = compose_raw_value(lexer, raw, depth)? {
                     items.push(v);
                 }
             }
@@ -397,15 +396,15 @@ fn parse_dict(lexer: &mut Lexer, depth: usize) -> Result<Dict> {
     }
     let mut dict = Dict::new();
     loop {
-        match lexer.next_token()? {
-            Token::DictClose | Token::Eof => break,
-            Token::Name(key) => {
-                let tok = lexer.next_token()?;
-                if matches!(tok, Token::DictClose | Token::Eof) {
+        match lexer.next_raw_token()? {
+            RawToken::Owned(Token::DictClose | Token::Eof) => break,
+            RawToken::Owned(Token::Name(key)) => {
+                let raw = lexer.next_raw_token()?;
+                if matches!(raw, RawToken::Owned(Token::DictClose | Token::Eof)) {
                     // Key with no value: drop it.
                     break;
                 }
-                if let Some(v) = compose_value(lexer, tok, depth)? {
+                if let Some(v) = compose_raw_value(lexer, raw, depth)? {
                     dict.insert(key, v);
                 }
             }
@@ -571,13 +570,11 @@ fn dispatch_color_text(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
             let Object::Array(items) = stack.last_mut()? else {
                 return None;
             };
-            let adjusted = items
-                .iter_mut()
-                .filter_map(|o| match o {
-                    Object::String(s) => Some(TextItem::Str(std::mem::take(s))),
-                    other => num(other).map(TextItem::Offset),
-                })
-                .collect();
+            let mut adjusted = Vec::with_capacity(items.len());
+            adjusted.extend(items.iter_mut().filter_map(|o| match o {
+                Object::String(s) => Some(TextItem::Str(std::mem::take(s))),
+                other => num(other).map(TextItem::Offset),
+            }));
             Op::ShowTextAdjusted(adjusted)
         }
         b"'" => Op::NextLineShowText(str1(stack)?),
@@ -786,6 +783,22 @@ fn expand_colorspace(value: Object) -> Object {
         })),
         Object::Array(items) => Object::Array(items.into_iter().map(expand_colorspace).collect()),
         other => other,
+    }
+}
+
+/// [`compose_value`] over a raw token: a borrowed keyword matches the
+/// three value keywords without the copy [`Lexer::next_token`] would
+/// make, and a hex span decodes straight to its string bytes.
+fn compose_raw_value(lexer: &mut Lexer, raw: RawToken, depth: usize) -> Result<Option<Object>> {
+    match raw {
+        RawToken::Owned(tok) => compose_value(lexer, tok, depth),
+        RawToken::Keyword(kw) => Ok(match kw {
+            b"true" => Some(Object::Bool(true)),
+            b"false" => Some(Object::Bool(false)),
+            b"null" => Some(Object::Null),
+            _ => None,
+        }),
+        RawToken::Hex(span) => Ok(Some(Object::String(decode_hex(span)))),
     }
 }
 
