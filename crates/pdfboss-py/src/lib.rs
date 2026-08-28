@@ -215,14 +215,18 @@ fn png_compression_from_str(s: &str) -> PyResult<pdfboss_render::PngCompression>
 /// Validates a render request and resolves it to [`RenderOptions`]: the
 /// glyph-painting tier from `fonts`, and — at the `full` tier — a substitute
 /// face directory from `font_dir` or the optional `pdfboss-fonts` data
-/// package. The package import needs the GIL, so this runs on the calling
-/// thread, before any `allow_threads`/coroutine boundary; both the sync and
-/// the async render route through it, so the two cannot diverge in how they
-/// read these arguments.
+/// package. `fonts=None` (the default) resolves to `"full"` when a face
+/// source is at hand — an explicit `font_dir`, or the discovered package —
+/// and degrades to `"all-embedded"` when neither is; only an explicit
+/// `fonts="full"` without a source is an error. The package import needs
+/// the GIL, so this runs on the calling thread, before any
+/// `allow_threads`/coroutine boundary; both the sync and the async render
+/// route through it, so the two cannot diverge in how they read these
+/// arguments.
 fn resolve_render_options(
     py: Python<'_>,
     scale: f32,
-    fonts: &str,
+    fonts: Option<&str>,
     font_dir: Option<String>,
 ) -> PyResult<pdfboss_render::RenderOptions> {
     use pdfboss_render::{GlyphPainting, SubstituteSource};
@@ -232,28 +236,42 @@ fn resolve_render_options(
             "scale must be a positive, finite number",
         ));
     }
-    let glyph_painting = glyph_painting_from_str(fonts)?;
-    let substitutes = if glyph_painting == GlyphPainting::Full {
-        if let Some(dir) = font_dir {
-            SubstituteSource::Dir(dir.into())
-        } else {
-            // The binding discovers the pdfboss-fonts data package.
-            match py.import("pdfboss_fonts") {
-                Ok(module) => {
-                    let dir: String = module.getattr("font_dir")?.call0()?.extract()?;
-                    SubstituteSource::Dir(dir.into())
-                }
-                Err(_) => {
-                    return Err(PyValueError::new_err(
-                        "fonts=\"full\" requires the pdfboss-fonts package; \
-                         install it with `pip install pdfboss[full]`, or pass \
-                         an explicit font_dir=...",
-                    ));
-                }
-            }
+    let discovered_dir = |py: Python<'_>| -> PyResult<Option<String>> {
+        match py.import("pdfboss_fonts") {
+            Ok(module) => Ok(Some(module.getattr("font_dir")?.call0()?.extract()?)),
+            Err(_) => Ok(None),
         }
-    } else {
-        SubstituteSource::None
+    };
+    let (glyph_painting, substitutes) = match fonts {
+        None => match font_dir {
+            Some(dir) => (GlyphPainting::Full, SubstituteSource::Dir(dir.into())),
+            None => match discovered_dir(py)? {
+                Some(dir) => (GlyphPainting::Full, SubstituteSource::Dir(dir.into())),
+                None => (GlyphPainting::AllEmbedded, SubstituteSource::None),
+            },
+        },
+        Some(s) => {
+            let glyph_painting = glyph_painting_from_str(s)?;
+            let substitutes = if glyph_painting == GlyphPainting::Full {
+                if let Some(dir) = font_dir {
+                    SubstituteSource::Dir(dir.into())
+                } else {
+                    match discovered_dir(py)? {
+                        Some(dir) => SubstituteSource::Dir(dir.into()),
+                        None => {
+                            return Err(PyValueError::new_err(
+                                "fonts=\"full\" requires the pdfboss-fonts package; \
+                                 install it with `pip install pdfboss[full]`, or pass \
+                                 an explicit font_dir=...",
+                            ));
+                        }
+                    }
+                }
+            } else {
+                SubstituteSource::None
+            };
+            (glyph_painting, substitutes)
+        }
     };
     Ok(pdfboss_render::RenderOptions {
         glyph_painting,
@@ -422,13 +440,13 @@ impl Document {
     /// document this is the convenient fast path: one call renders them all
     /// at once, where per-page `render` calls only parallelize if you run
     /// them from your own threads.
-    #[pyo3(signature = (pages=None, scale=1.0, fonts="all-embedded", font_dir=None, compression="default"))]
+    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default"))]
     fn render_pages<'py>(
         &self,
         py: Python<'py>,
         pages: Option<Vec<usize>>,
         scale: f32,
-        fonts: &str,
+        fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
@@ -745,12 +763,12 @@ impl Page {
     ///
     /// Content pdfboss cannot read is skipped, so a page can come out blank
     /// without raising. Use `render_reporting` to see what was dropped.
-    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
     fn render<'py>(
         &self,
         py: Python<'py>,
         scale: f32,
-        fonts: &str,
+        fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<Bound<'py, PyBytes>> {
@@ -765,12 +783,12 @@ impl Page {
     /// unsupported filter /Crypt"`. It is empty when the page
     /// rasterized exactly as it describes itself, so a blank page is never
     /// mistaken for a clean render.
-    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
     fn render_reporting<'py>(
         &self,
         py: Python<'py>,
         scale: f32,
-        fonts: &str,
+        fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
@@ -1369,13 +1387,13 @@ impl AsyncDocument {
     /// never idles the others — except the workers are tokio tasks, so the
     /// asyncio loop stays free and it works over any source, including
     /// `open_url` documents (each worker range-fetches what its page needs).
-    #[pyo3(signature = (pages=None, scale=1.0, fonts="all-embedded", font_dir=None, compression="default"))]
+    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default"))]
     fn render_pages<'py>(
         &self,
         py: Python<'py>,
         pages: Option<Vec<usize>>,
         scale: f32,
-        fonts: &str,
+        fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1633,12 +1651,12 @@ impl AsyncPage {
 
     /// Renders the page and resolves to PNG bytes; same arguments and
     /// leniency as the sync `Page.render`. Coroutine.
-    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
     fn render<'py>(
         &self,
         py: Python<'py>,
         scale: f32,
-        fonts: &str,
+        fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -1660,12 +1678,12 @@ impl AsyncPage {
     /// Renders the page like `render`, resolving to `(png_bytes, warnings)`;
     /// same reporting semantics as the sync `Page.render_reporting`.
     /// Coroutine.
-    #[pyo3(signature = (scale=1.0, fonts="all-embedded", font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
     fn render_reporting<'py>(
         &self,
         py: Python<'py>,
         scale: f32,
-        fonts: &str,
+        fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
     ) -> PyResult<Bound<'py, PyAny>> {

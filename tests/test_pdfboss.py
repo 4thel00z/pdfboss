@@ -296,6 +296,38 @@ class TestRender:
         assert page.render(fonts="all-embedded")[:8] == PNG_MAGIC
         assert page.render(fonts="embedded-only")[:8] == PNG_MAGIC
 
+    def test_default_fonts_is_full_when_package_present(self, hello_pdf: Path) -> None:
+        pytest.importorskip("pdfboss_fonts")
+        # hello.pdf draws non-embedded Helvetica, so the tiers disagree in
+        # pixels: the default must match "full", not "all-embedded".
+        page = Document(str(hello_pdf))[0]
+        assert page.render() == page.render(fonts="full")
+        assert page.render() != page.render(fonts="all-embedded")
+
+    def test_default_fonts_falls_back_without_package(
+        self, hello_pdf: Path, monkeypatch
+    ) -> None:
+        # Without pdfboss_fonts the default degrades to all-embedded
+        # silently -- only an explicit fonts="full" may raise.
+        monkeypatch.setitem(sys.modules, "pdfboss_fonts", None)
+        page = Document(str(hello_pdf))[0]
+        assert page.render() == page.render(fonts="all-embedded")
+
+    def test_default_with_font_dir_substitutes(
+        self, hello_pdf: Path, monkeypatch
+    ) -> None:
+        # A font_dir alone asks for substitution: the default resolves to
+        # "full" over that directory, without touching discovery.
+        pytest.importorskip("pdfboss_fonts")
+        import pdfboss_fonts
+
+        real_dir = pdfboss_fonts.font_dir()
+        monkeypatch.setitem(sys.modules, "pdfboss_fonts", None)
+        page = Document(str(hello_pdf))[0]
+        assert page.render(font_dir=real_dir) == page.render(
+            fonts="full", font_dir=real_dir
+        )
+
 
 class TestRenderCompression:
     def test_every_level_round_trips_the_same_pixels(self, hello_pdf: Path) -> None:

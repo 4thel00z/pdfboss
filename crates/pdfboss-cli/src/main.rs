@@ -117,8 +117,10 @@ enum Command {
         #[arg(long, default_value_t = 1.0)]
         scale: f32,
         /// Which fonts to paint: embedded-only, all-embedded, or full.
-        #[arg(long, value_enum, default_value_t = FontsArg::AllEmbedded)]
-        fonts: FontsArg,
+        /// Defaults to full when substitute faces are available (the
+        /// compiled-in OFL set or --font-dir), otherwise all-embedded.
+        #[arg(long, value_enum)]
+        fonts: Option<FontsArg>,
         /// Directory of substitute faces for `--fonts full` (one file per
         /// `pdfboss_render::substitute::face_filename`, e.g. an installed
         /// `pdfboss-fonts` package). Overrides the compiled-in OFL set.
@@ -247,12 +249,11 @@ enum Command {
 }
 
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum FontsArg {
     /// Only embedded TrueType outlines (fastest).
     EmbeddedOnly,
-    /// Every embedded program (default).
-    #[default]
+    /// Every embedded program.
     AllEmbedded,
     /// Also substitute bundled faces for non-embedded fonts.
     Full,
@@ -266,6 +267,18 @@ impl FontsArg {
             FontsArg::AllEmbedded => GlyphPainting::AllEmbedded,
             FontsArg::Full => GlyphPainting::Full,
         }
+    }
+}
+
+/// Resolves an omitted `--fonts` to a tier: `full` when substitute faces
+/// are at hand — an explicit `--font-dir`, or the compiled-in OFL set —
+/// and `all-embedded` when neither is, so a default render paints
+/// non-embedded fonts wherever it can and never errors over the choice.
+fn default_fonts(font_dir: &Option<PathBuf>) -> FontsArg {
+    if font_dir.is_some() || pdfboss_render::builtin_fonts_available() {
+        FontsArg::Full
+    } else {
+        FontsArg::AllEmbedded
     }
 }
 
@@ -619,7 +632,7 @@ fn cmd_render(
     page: usize,
     out: Option<PathBuf>,
     scale: f32,
-    fonts: FontsArg,
+    fonts: Option<FontsArg>,
     font_dir: Option<PathBuf>,
     password: &str,
     png_compression: PngCompressionArg,
@@ -627,6 +640,7 @@ fn cmd_render(
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
     }
+    let fonts = fonts.unwrap_or_else(|| default_fonts(&font_dir));
     let substitutes = substitute_source(fonts, font_dir)?;
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let index = page_index(page, doc.page_count())?;
@@ -801,12 +815,26 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn fonts_flag_defaults_to_all_embedded() {
+    fn omitted_fonts_flag_resolves_by_face_availability() {
         let cli = Cli::parse_from(["pdfboss", "render", "in.pdf", "--page", "1"]);
-        let Command::Render { fonts, .. } = cli.command else {
+        let Command::Render {
+            fonts, font_dir, ..
+        } = cli.command
+        else {
             panic!("expected render command");
         };
-        assert!(matches!(fonts, FontsArg::AllEmbedded));
+        assert!(fonts.is_none(), "no flag parses as no explicit tier");
+        let expected = if pdfboss_render::builtin_fonts_available() {
+            FontsArg::Full
+        } else {
+            FontsArg::AllEmbedded
+        };
+        assert_eq!(default_fonts(&font_dir), expected);
+        assert_eq!(
+            default_fonts(&Some(PathBuf::from("/faces"))),
+            FontsArg::Full,
+            "a --font-dir alone asks for substitution"
+        );
     }
 
     #[test]
@@ -823,7 +851,7 @@ mod tests {
         let Command::Render { fonts, .. } = cli.command else {
             panic!("expected render command");
         };
-        assert!(matches!(fonts, FontsArg::EmbeddedOnly));
+        assert!(matches!(fonts, Some(FontsArg::EmbeddedOnly)));
     }
 
     #[test]
@@ -845,10 +873,11 @@ mod tests {
         else {
             panic!("expected render command");
         };
-        assert!(matches!(fonts, FontsArg::Full));
+        assert!(matches!(fonts, Some(FontsArg::Full)));
         assert_eq!(font_dir, Some(PathBuf::from("X")));
 
-        let source = substitute_source(fonts, font_dir).expect("--font-dir given, always Ok");
+        let source =
+            substitute_source(FontsArg::Full, font_dir).expect("--font-dir given, always Ok");
         assert!(matches!(source, pdfboss_render::SubstituteSource::Dir(p) if p == Path::new("X")));
     }
 
