@@ -35,7 +35,19 @@ pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
+pdfboss create md     notes.md -o out.pdf     # new PDF: markdown composed with a CSS theme
 ```
+
+`create md` composes CommonMark+GFM into a themed PDF. `--theme` takes a small CSS subset over element-type selectors, overlaid on the built-in default theme:
+
+```css
+body { font-family: times; font-size: 10.5pt; color: #222; }
+h1   { font-family: helvetica; font-size: 2.2em; color: #a33; }
+code { font-family: courier; background-color: #eee; }
+pre  { background-color: #eee; padding: 8pt; }
+```
+
+Themes choose between the Helvetica, Times and Courier families; characters outside those fonts are replaced with `?` and reported.
 
 ```python
 import pdfboss
@@ -45,6 +57,7 @@ text = doc.extract_text()
 md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
 png  = doc[0].render(scale=2.0)            # PNG bytes
 imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
+pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```
 
 <details>
