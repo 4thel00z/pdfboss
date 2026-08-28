@@ -16,6 +16,14 @@ def test_stub_declares_every_exported_class() -> None:
         assert f"class {name}" in stub, f"missing stub for {name}"
 
 
+def test_stub_declares_every_write_export() -> None:
+    stub = STUB.read_text()
+    for name in pdfboss.write.__all__:
+        if not inspect.isclass(getattr(pdfboss.write, name)):
+            continue
+        assert f"class {name}" in stub, f"missing stub for pdfboss.write.{name}"
+
+
 def test_stub_declares_the_element_and_async_surface() -> None:
     stub = STUB.read_text()
     assert "def elements(" in stub

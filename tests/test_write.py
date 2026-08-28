@@ -325,6 +325,28 @@ def test_viewer_rejects_unknown_mode() -> None:
         Viewer(mode="whatever")
 
 
+def test_write_module_exports_full_vocabulary_sorted() -> None:
+    from pdfboss.write import Pdf, Page, Text, Standard14  # noqa: F401
+
+    assert pdfboss.write.__all__ == sorted(pdfboss.write.__all__)
+    assert pdfboss.write.__all__ == [
+        "Attachment",
+        "Bookmark",
+        "Canvas",
+        "Image",
+        "Link",
+        "Metadata",
+        "Outline",
+        "Page",
+        "PageLabel",
+        "Paragraph",
+        "Pdf",
+        "Standard14",
+        "Text",
+        "Viewer",
+    ]
+
+
 def test_standard14_exposes_all_fourteen_names() -> None:
     names = [
         "HELVETICA",

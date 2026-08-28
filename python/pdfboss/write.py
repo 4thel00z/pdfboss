@@ -1,6 +1,4 @@
-"""PDF document creation: pages composed with `|`, saved once with
-`Pdf.save`/`Pdf.to_bytes`.
-"""
+"""Composing new PDFs: pages, elements and document slots joined with |."""
 
 import pdfboss._pdfboss  # noqa: F401  registers pdfboss._pdfboss.write in sys.modules
 from pdfboss._pdfboss.write import (
