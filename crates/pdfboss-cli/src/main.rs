@@ -1098,6 +1098,54 @@ mod tests {
     }
 
     #[test]
+    fn create_md_parses_theme_and_size() {
+        let cli = Cli::try_parse_from([
+            "pdfboss",
+            "create",
+            "md",
+            "in.md",
+            "-o",
+            "out.pdf",
+            "--theme",
+            "dark.css",
+            "--size",
+            "letter",
+            "--landscape",
+        ])
+        .unwrap();
+        let Command::Create {
+            command:
+                create::CreateCommand::Md {
+                    input,
+                    out,
+                    theme,
+                    landscape,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected create md");
+        };
+        assert_eq!(input, PathBuf::from("in.md"));
+        assert_eq!(out, PathBuf::from("out.pdf"));
+        assert_eq!(theme, Some(PathBuf::from("dark.css")));
+        assert!(landscape);
+    }
+
+    #[test]
+    fn create_md_theme_defaults_to_none() {
+        let cli =
+            Cli::try_parse_from(["pdfboss", "create", "md", "in.md", "-o", "out.pdf"]).unwrap();
+        let Command::Create {
+            command: create::CreateCommand::Md { theme, .. },
+        } = cli.command
+        else {
+            panic!("expected create md");
+        };
+        assert!(theme.is_none());
+    }
+
+    #[test]
     fn hex_flags_parse() {
         let cli = Cli::parse_from([
             "pdfboss",

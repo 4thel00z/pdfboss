@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use pdfboss_markdown::Theme;
 use pdfboss_write::{Canvas, ImageData, Page, PageSize, Pdf, Standard14};
 
 /// The nested subcommands of `pdfboss create`.
@@ -60,6 +61,23 @@ pub enum CreateCommand {
         size: Option<SizeArg>,
         /// Swap page width and height (only meaningful with --size).
         #[arg(long, requires = "size")]
+        landscape: bool,
+    },
+    /// A markdown file composed into a themed document.
+    Md {
+        /// Path to the markdown file.
+        input: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// CSS theme file (default: the built-in theme).
+        #[arg(long)]
+        theme: Option<PathBuf>,
+        /// Page size.
+        #[arg(long, value_enum, default_value_t = SizeArg::A4)]
+        size: SizeArg,
+        /// Swap page width and height.
+        #[arg(long)]
         landscape: bool,
     },
 }
@@ -195,6 +213,41 @@ pub fn cmd_create(command: CreateCommand) -> Result<(), String> {
                 pages.push(image_page(image, page_size));
             }
             (pages, out)
+        }
+        CreateCommand::Md {
+            input,
+            out,
+            theme,
+            size,
+            landscape,
+        } => {
+            let markdown =
+                std::fs::read_to_string(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let theme = match &theme {
+                Some(path) => {
+                    let css = std::fs::read_to_string(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    Theme::parse(&css).map_err(|e| format!("{}: {e}", path.display()))?
+                }
+                None => Theme::default_theme(),
+            };
+            let base_dir = input.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let options = pdfboss_markdown::Options {
+                theme,
+                page_size: resolved_size(size, landscape),
+                base_dir,
+            };
+            let (pdf, report) =
+                pdfboss_markdown::to_pdf(&markdown, &options).map_err(|e| e.to_string())?;
+            if !report.is_empty() {
+                eprintln!("{}", report.summary());
+            }
+            let count = pdf.pages.len();
+            pdf.save(&out)
+                .map_err(|e| format!("{}: {e}", out.display()))?;
+            let plural = if count == 1 { "" } else { "s" };
+            println!("wrote {} ({count} page{plural})", out.display());
+            return Ok(());
         }
     };
     save(pages, &out)
