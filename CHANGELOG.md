@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.24.0](https://github.com/4thel00z/pdfboss/compare/v0.23.0...v0.24.0) (2026-08-28)
+
+
+### Features
+
+* **write:** composition layer — element vocabulary, document slots, pdfboss.write, create manifest ([#112](https://github.com/4thel00z/pdfboss/issues/112)) ([67e2229](https://github.com/4thel00z/pdfboss/commit/67e22290eb04d2138a0a7439f2190d851a52f922))
+
+
+### Performance Improvements
+
+* **render:** extend deflate matches a word at a time, reuse the hash table across the two passes ([#114](https://github.com/4thel00z/pdfboss/issues/114)) ([0d61430](https://github.com/4thel00z/pdfboss/commit/0d61430b124edbfad5abd111eb58a1bda99ff3ff))
+
+
+### Documentation
+
+* close the doc-gap audit findings ([#113](https://github.com/4thel00z/pdfboss/issues/113)) ([98f61e5](https://github.com/4thel00z/pdfboss/commit/98f61e56cb96b64c7e40fd3a743335d5e3e2c6e8))
+* cover the composition layer in the book ([#116](https://github.com/4thel00z/pdfboss/issues/116)) ([bd80e34](https://github.com/4thel00z/pdfboss/commit/bd80e3469635d1f9f317ab2623def241dfc4cbd4))
+
 ## [0.23.0](https://github.com/4thel00z/pdfboss/compare/v0.22.0...v0.23.0) (2026-08-28)
 
 
