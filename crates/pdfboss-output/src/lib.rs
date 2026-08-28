@@ -358,6 +358,22 @@ mod tests {
         assert!(!md.contains('\u{2022}'), "marker replaced, not kept: {md}");
     }
 
+    /// A marker line whose candidate falls short of the list minimum stays
+    /// prose, and the scan resumes at the very next line — a later list on
+    /// the same run must still form.
+    #[test]
+    fn a_lone_marker_line_stays_prose() {
+        let content = "BT /F1 12 Tf 72 720 Td (- stray dash line) Tj \
+                       0 -14 Td (Body sentence at the same indent.) Tj \
+                       0 -14 Td (- alpha) Tj 0 -14 Td (- beta) Tj ET";
+        let md = markdown_of(content);
+        assert!(md.contains("- alpha\n- beta"), "md: {md}");
+        assert!(
+            md.contains("- stray dash line\nBody sentence at the same indent."),
+            "the stray marker line stays in the paragraph: {md}"
+        );
+    }
+
     #[test]
     fn numbered_items_keep_their_numbers() {
         let content = "BT /F1 12 Tf 72 720 Td (1. alpha) Tj 0 -14 Td (2. beta) Tj \
