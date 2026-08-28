@@ -14,6 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pdfboss-core = { path = "../pdfboss-core", features = ["predefined-cmaps"] }
+pdfboss-markdown = { path = "../pdfboss-markdown" }
 pdfboss-output = { path = "../pdfboss-output" }
 pdfboss-render = { path = "../pdfboss-render" }
 pdfboss-text = { path = "../pdfboss-text" }

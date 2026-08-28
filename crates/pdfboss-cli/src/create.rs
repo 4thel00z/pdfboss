@@ -1,9 +1,11 @@
 //! `pdfboss create`: making new PDFs — blank pages, word-wrapped text
-//! files, and one-page-per-image albums — on top of `pdfboss-write`.
+//! files, one-page-per-image albums, and themed Markdown documents — on
+//! top of `pdfboss-write` and `pdfboss-markdown`.
 
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use pdfboss_markdown::Theme;
 use pdfboss_write::{Canvas, ImageData, Page, PageSize, Pdf, Standard14};
 
 /// The nested subcommands of `pdfboss create`.
@@ -60,6 +62,23 @@ pub enum CreateCommand {
         size: Option<SizeArg>,
         /// Swap page width and height (only meaningful with --size).
         #[arg(long, requires = "size")]
+        landscape: bool,
+    },
+    /// A markdown file composed into a themed document.
+    Md {
+        /// Path to the markdown file.
+        input: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// CSS theme file (default: the built-in theme).
+        #[arg(long)]
+        theme: Option<PathBuf>,
+        /// Page size.
+        #[arg(long, value_enum, default_value_t = SizeArg::A4)]
+        size: SizeArg,
+        /// Swap page width and height.
+        #[arg(long)]
         landscape: bool,
     },
 }
@@ -196,6 +215,41 @@ pub fn cmd_create(command: CreateCommand) -> Result<(), String> {
             }
             (pages, out)
         }
+        CreateCommand::Md {
+            input,
+            out,
+            theme,
+            size,
+            landscape,
+        } => {
+            let markdown =
+                std::fs::read_to_string(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+            let theme = match &theme {
+                Some(path) => {
+                    let css = std::fs::read_to_string(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    Theme::parse(&css).map_err(|e| format!("{}: {e}", path.display()))?
+                }
+                None => Theme::default_theme(),
+            };
+            let base_dir = input.parent().unwrap_or(Path::new(".")).to_path_buf();
+            let options = pdfboss_markdown::Options {
+                theme,
+                page_size: resolved_size(size, landscape),
+                base_dir,
+            };
+            let (pdf, report) =
+                pdfboss_markdown::to_pdf(&markdown, &options).map_err(|e| e.to_string())?;
+            if !report.is_empty() {
+                eprintln!("{}", report.summary());
+            }
+            let count = pdf.pages.len();
+            pdf.save(&out)
+                .map_err(|e| format!("{}: {e}", out.display()))?;
+            let plural = if count == 1 { "" } else { "s" };
+            println!("wrote {} ({count} page{plural})", out.display());
+            return Ok(());
+        }
     };
     save(pages, &out)
 }
@@ -285,6 +339,7 @@ fn page_with(size: PageSize, canvas: Canvas) -> Page {
         size,
         rotation: 0,
         canvas,
+        ..Page::default()
     }
 }
 
@@ -391,16 +446,10 @@ fn measured(face: Standard14, line_no: usize, piece: &str, size: f32) -> Result<
     })
 }
 
-/// Sniffs PNG (`89 50 4E 47`) or JPEG (`FF D8`) by magic bytes — never by
-/// file extension — and imports accordingly.
+/// Sniffs PNG or JPEG by content — never by file extension — and imports
+/// accordingly.
 fn decode_image(bytes: &[u8]) -> Result<ImageData, String> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-        return ImageData::png(bytes).map_err(|e| e.to_string());
-    }
-    if bytes.starts_with(&[0xFF, 0xD8]) {
-        return ImageData::jpeg(bytes).map_err(|e| e.to_string());
-    }
-    Err("not a PNG or JPEG (unrecognized magic bytes)".to_string())
+    ImageData::decode(bytes).map_err(|e| e.to_string())
 }
 
 /// One page holding `image`: sized to the pixels at 72 dpi when `size` is
@@ -785,6 +834,9 @@ mod tests {
         let image = decode_image(&tiny_jpeg()).unwrap();
         assert_eq!((image.width(), image.height()), (3, 2));
         let err = decode_image(b"GIF89a not really").unwrap_err();
-        assert!(err.contains("magic"), "unexpected message: {err}");
+        assert!(
+            err.contains("not a png or jpeg"),
+            "unexpected message: {err}"
+        );
     }
 }

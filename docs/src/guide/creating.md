@@ -1,10 +1,10 @@
 # Creating PDFs
 
-The write side of pdfboss is the `pdfboss-write` Rust crate plus the `pdfboss create` CLI. There is no Python creation API — Python reads PDFs, it does not write them. Everything the writer emits uses the same content-stream IR the reader parses, so a created file round-trips through the rest of the toolkit.
+The write side of pdfboss is the `pdfboss-write` Rust crate plus the `pdfboss create` CLI. This chapter is the canvas level: you place every shape, glyph run and image yourself. To compose a document from CommonMark+GFM source instead — the one creation path Python also exposes, as `pdfboss.md.to_pdf` — see [Markdown to PDF](./md-to-pdf.md); the canvas level itself has no Python API. Everything the writer emits uses the same content-stream IR the reader parses, so a created file round-trips through the rest of the toolkit.
 
 ## The document model
 
-A document is plain data: `Pdf { metadata, pages, options }`. The fields are the composition — pages appear in the output in the order of the `Vec`, singleton slots are `Option`s, and `Default` fills everything optional. Each `Page { size, rotation, canvas }` carries its own painted content.
+A document is plain data: `Pdf { metadata, pages, options }`. The fields are the composition — pages appear in the output in the order of the `Vec`, singleton slots are `Option`s, and `Default` fills everything optional. Each `Page { size, rotation, canvas, links }` carries its own painted content, plus its clickable areas: a `LinkAnnotation { rect, uri }` marks a rectangle in page user space that opens a URI, emitted as a `/Link` annotation under `/Annots`.
 
 ```rust,no_run
 use pdfboss_write::{Page, PageSize, Pdf, Standard14};
@@ -48,6 +48,7 @@ Fonts are deduplicated document-wide: each distinct face gets one font object, i
 - `ImageData::jpeg(&bytes)` — baseline or progressive JPEG by passthrough: the original bytes are embedded as `/DCTDecode`, dimensions sniffed from the SOF marker. Grayscale and three-component images only.
 - `ImageData::rgb8(w, h, data)`, `gray8(w, h, data)` — 8-bit rasters, `data` length checked against the dimensions.
 - `ImageData::mono(w, h, data)` — 1-bit rasters, rows packed MSB-first and byte-padded; a set bit is black.
+- `ImageData::decode(&bytes)` — dispatches on content rather than file extension: a PNG signature goes to `png`, a JPEG SOI marker to `jpeg`, anything else is an error.
 
 Images are embedded per page with no cross-page deduplication — the same raster drawn on two pages is stored twice.
 
@@ -195,7 +196,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## CLI
 
-`pdfboss create` covers the three common cases without writing Rust. Blank pages, with `--pages`, `--size` (`a3`, `a4`, `a5`, `letter`, `legal`) and `--landscape`:
+`pdfboss create` covers the common cases without writing Rust — plus [`create md`](./md-to-pdf.md#cli), which composes a Markdown file with a CSS theme and has its own chapter. Blank pages, with `--pages`, `--size` (`a3`, `a4`, `a5`, `letter`, `legal`) and `--landscape`:
 
 ```bash
 pdfboss create blank --out blank.pdf --pages 3 --size a5 --landscape

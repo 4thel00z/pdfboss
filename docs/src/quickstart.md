@@ -14,6 +14,7 @@ pdfboss render  report.pdf --page 1 -o page.png --scale 2.0
 mkdir out
 pdfboss images  report.pdf -o out/            # embedded images as native-size PNGs
 pdfboss create text notes.txt -o notes.pdf    # a new PDF from a word-wrapped text file
+pdfboss create md   notes.md -o notes.pdf     # markdown composed with a CSS theme
 ```
 
 `render` prints what it wrote (`wrote page.png (1224 x 1584 px)`) and warns on
@@ -38,13 +39,17 @@ Path("page.png").write_bytes(page.render(scale=2.0))
 
 for image in page.extract_images():
     print(image.width, image.height, len(image.data))
+
+pdf = pdfboss.md.to_pdf(Path("notes.md").read_text())  # markdown -> PDF bytes
 ```
 
 `Document` also opens from memory (`Document(data=raw_bytes)`), pages index
 0-based with negative indexes from the end, and `render` returns PNG bytes
 directly. `extract_images` yields each image the page draws at its native
-pixel size, PNG-encoded. PDF creation has no Python API — it lives in the CLI
-and the `pdfboss-write` crate; see [Creating PDFs](./guide/creating.md).
+pixel size, PNG-encoded. `pdfboss.md.to_pdf` composes CommonMark+GFM into a
+themed PDF ([Markdown to PDF](./guide/md-to-pdf.md)); canvas-level creation
+lives in the CLI and the `pdfboss-write` crate
+([Creating PDFs](./guide/creating.md)).
 
 ## Rust
 
@@ -79,5 +84,7 @@ Python; only the CLI counts from 1.
   compression.
 - [Extracting images](./guide/images.md) for what counts as an embedded image.
 - [Creating PDFs](./guide/creating.md) for blank, text and image pages.
+- [Markdown to PDF](./guide/md-to-pdf.md) for themed CommonMark+GFM
+  composition.
 - [Async and remote documents](./guide/async.md) for `AsyncDocument` and HTTP
   range fetching.

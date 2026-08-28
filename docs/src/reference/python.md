@@ -1,8 +1,8 @@
 # Python API
 
-The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public surface is twelve names; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
+The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public surface is twelve classes plus the `md` submodule; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
 
-## The twelve names
+## The twelve classes
 
 | Name | What it is |
 |---|---|
@@ -19,9 +19,13 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | `PageImage` | One embedded image extracted from a page: native `width`/`height` and PNG-encoded `data` |
 | `PdfError` | The exception type for any PDF processing error |
 
-Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md).
+Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Markdown to PDF](../guide/md-to-pdf.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md).
 
-There is no PDF-creation API in Python; creating PDFs is the Rust crate [`pdfboss-write`](./rust.md) and the [`pdfboss create`](./cli.md#create) CLI.
+## The md submodule
+
+`pdfboss.md.to_pdf(markdown, theme=None, size="a4", landscape=False, base_dir=None)` composes CommonMark+GFM source into a themed PDF and returns the file bytes. `theme` is CSS source text, not a path; an unknown `size` raises `PdfError`; replaced characters and skipped raw HTML surface as one `UserWarning`. Details and examples in [Markdown to PDF](../guide/md-to-pdf.md).
+
+That is Python's one creation path. Canvas-level creation — shapes, glyph runs, image placement — is the Rust crate [`pdfboss-write`](./rust.md) and the [`pdfboss create`](./cli.md#create) CLI.
 
 ## Error handling
 

@@ -157,13 +157,13 @@ pdfboss q report.pdf -r '.pages[].fonts[].base_font'
 
 ## create
 
-Create a new PDF: blank pages, word-wrapped text, or image pages.
+Create a new PDF: blank pages, word-wrapped text, image pages, or a themed Markdown document.
 
 ```text
 pdfboss create <COMMAND>
 ```
 
-Three subcommands, each writing to `-o, --out <OUT>`. All three share `--size a3|a4|a5|letter|legal` and `--landscape` (swap page width and height). See [Creating PDFs](../guide/creating.md).
+Four subcommands, each writing to `-o, --out <OUT>`. All four share `--size a3|a4|a5|letter|legal` and `--landscape` (swap page width and height). See [Creating PDFs](../guide/creating.md) and [Markdown to PDF](../guide/md-to-pdf.md).
 
 ### create blank
 
@@ -203,4 +203,21 @@ pdfboss create images [OPTIONS] --out <OUT> <INPUTS>...
 
 ```bash
 pdfboss create images scan-1.png scan-2.png -o scans.pdf
+```
+
+### create md
+
+A markdown file composed into a themed document. See [Markdown to PDF](../guide/md-to-pdf.md).
+
+```text
+pdfboss create md [OPTIONS] --out <OUT> <INPUT>
+```
+
+- `--theme <THEME>` — CSS theme file (default: the built-in theme)
+- `--size <SIZE>` — as above; `--landscape` swaps width and height
+
+Relative image paths in the markdown resolve against the input file's directory.
+
+```bash
+pdfboss create md notes.md -o notes.pdf --theme theme.css --size letter
 ```

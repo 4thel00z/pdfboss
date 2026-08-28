@@ -16,6 +16,7 @@ pdfboss-render = { workspace = true }
 pdfboss-aio = { workspace = true, features = ["http"] }
 pdfboss-tui = { workspace = true }
 pdfboss-write = { workspace = true }
+pdfboss-markdown = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 base64 = "0.22"

@@ -1,0 +1,13 @@
+[package]
+name = "pdfboss-style"
+description = "CSS-subset theme parsing for pdfboss document composition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+
+[dependencies]
+pdfboss-write = { workspace = true }
+cssparser = "0.35"

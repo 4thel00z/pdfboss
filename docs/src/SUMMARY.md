@@ -15,6 +15,7 @@
 - [Rendering pages](guide/rendering.md)
 - [Extracting images](guide/images.md)
 - [Creating PDFs](guide/creating.md)
+- [Markdown to PDF](guide/md-to-pdf.md)
 - [Async and remote documents](guide/async.md)
 - [Exploring PDF internals](guide/explorer.md)
 - [Encrypted documents](guide/encryption.md)

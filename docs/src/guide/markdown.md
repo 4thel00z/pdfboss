@@ -122,4 +122,6 @@ Emphasis survives into the output: bold and italic runs render as `**bold**` and
 `*italic*` inside paragraphs and list items. Headings drop emphasis markers — a
 heading is already the strongest thing on the page. Blocks are separated by a blank
 line, across page boundaries too, so the document reads as one continuous Markdown
-file. For the raw style information itself, see [Styled spans](./spans.md).
+file. For the raw style information itself, see [Styled spans](./spans.md); for the
+reverse direction — Markdown composed into a PDF — see
+[Markdown to PDF](./md-to-pdf.md).

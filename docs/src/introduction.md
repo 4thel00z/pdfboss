@@ -41,10 +41,11 @@ pdfboss extracts plain text and Markdown (headings, lists and tables inferred
 from page layout), yields styled text spans carrying position, font, weight,
 decorations and color, rasterizes pages to PNG through its own JPEG 2000,
 JBIG2, CCITT and ICC codecs, extracts embedded images at their native pixel
-size, creates new PDFs (the `pdfboss-write` crate and the `pdfboss create`
-subcommand — creation has no Python API), and reads documents asynchronously
-over range-fetching I/O, from local files or HTTP, without ever reading the
-whole file.
+size, creates new PDFs — canvas-level through the `pdfboss-write` crate and
+`pdfboss create`, and CommonMark+GFM composed into CSS-themed documents from
+the CLI, Python (`pdfboss.md.to_pdf`) and Rust — and reads documents
+asynchronously over range-fetching I/O, from local files or HTTP, without
+ever reading the whole file.
 
 Encrypted files open through the standard security handler — RC4 and
 AES-128/256, with either the user or the owner password; a file whose user
@@ -68,6 +69,8 @@ guide then takes one task per chapter:
   native size.
 - [Creating PDFs](./guide/creating.md) — blank, text and image pages from
   the CLI and Rust.
+- [Markdown to PDF](./guide/md-to-pdf.md) — CommonMark+GFM composed into
+  themed, paginated documents.
 - [Async and remote documents](./guide/async.md) — range-fetching access to
   local files and HTTP URLs.
 - [Exploring PDF internals](./guide/explorer.md) — the JSON value tree, jq

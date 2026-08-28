@@ -30,7 +30,7 @@ Reading a PDF should not require a C library. pdfboss is a clean-room reader bui
 - **Fastest text extraction measured** — 6,700 pages/s over a 40-file real-world corpus, about 15× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
 - **Its own codecs** — JPEG 2000, JBIG2, CCITT and ICC are decoded in-tree, implemented from their specifications, not linked in.
 - **Embedded-image extraction** — every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
-- **PDF creation** — document structs, a canvas painter and a COS writer with deterministic output, plus `pdfboss create` ([example](#create-pdfs)).
+- **PDF creation** — document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).
 - **Async, range-fetching I/O** — documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, never the whole file.
 - **Lenient, and it says so** — broken cross-references are reconstructed and unreadable content is skipped, with every dropped or approximated item reported.
 - **Terminal explorer** — `pdfboss tui`: element tree, object inspector, hex view, page and Markdown previews.
@@ -54,6 +54,7 @@ pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
+pdfboss create md     notes.md -o out.pdf     # new PDF: markdown composed with a CSS theme
 ```
 
 ```python
@@ -64,6 +65,7 @@ text = doc.extract_text()
 md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
 png  = doc[0].render(scale=2.0)            # PNG bytes
 imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
+pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```
 
 <details>
@@ -92,7 +94,7 @@ async for element in doc.elements():
     print(element.kind, element.value())
 ```
 
-Rust — the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-aio pdfboss-tui`):
+Rust — the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-markdown pdfboss-aio pdfboss-tui`):
 
 ```rust,no_run
 use pdfboss_core::Document;
@@ -191,6 +193,34 @@ pdfboss create blank  -o blank.pdf --pages 3 --size letter
 pdfboss create text   notes.txt -o notes.pdf --font times-roman --font-size 12
 pdfboss create images scan1.png photo.jpg -o scans.pdf
 ```
+
+And CommonMark+GFM composes straight into a themed, paginated PDF — headings, lists, tables, code blocks, clickable links and images — deterministically, from all three surfaces. A theme is a small CSS subset over element-type selectors, overlaid on the built-in default; the Helvetica, Times and Courier families are available, and characters outside them are replaced with `?` and reported:
+
+```css
+body { font-family: times; font-size: 10.5pt; color: #222; }
+h1   { font-family: helvetica; font-size: 2.2em; color: #a33; }
+code { font-family: courier; background-color: #eee; }
+pre  { background-color: #eee; padding: 8pt; }
+```
+
+```python
+from pathlib import Path
+
+import pdfboss
+
+pdf = pdfboss.md.to_pdf(
+    Path("notes.md").read_text(),
+    theme=Path("theme.css").read_text(),   # CSS source text, not a path
+    size="letter",
+)
+Path("notes.pdf").write_bytes(pdf)
+```
+
+```bash
+pdfboss create md notes.md -o notes.pdf --theme theme.css --size letter
+```
+
+In Rust, `pdfboss_markdown::to_pdf` returns the composed `Pdf` value plus a report of anything sanitized, ready for `save`/`to_bytes` or further canvas work.
 
 ## Benchmarks
 
@@ -292,7 +322,7 @@ Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
 ## What's inside
 
-Twelve crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, a deterministic PDF writer, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
+Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, a deterministic PDF writer with CSS-themed Markdown composition, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
 
 <details>
 <summary><strong>Crate map</strong></summary>
@@ -301,12 +331,14 @@ Twelve crates, one implementation: a from-scratch core with its own JPEG 2000, J
 |---|---|
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
 | `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text spans |
-| `pdfboss-encoding` | Shared font encoding tables and glyph-name mappings (ISO 32000 Appendix D) |
+| `pdfboss-encoding` | Shared font-encoding tables (WinAnsi/MacRoman/Standard, ISO 32000 Appendix D) and glyph-name-to-Unicode mappings, consumed by the text and render crates |
 | `pdfboss-output` | Layout analysis over those spans (lines, columns, headings, lists, tables, repeated page headers), rendered as plain text or Markdown |
 | `pdfboss-jpx` | JPEG 2000 decoder for `JPXDecode` image streams, implemented from ITU-T T.800 |
 | `pdfboss-icc` | ICC profile parser and colour transform to sRGB, implemented from ICC.1:2010 |
 | `pdfboss-render` | Anti-aliased vector rasterizer (paths, fills, strokes, clipping, color, images, glyph outlines) to RGBA/PNG, plus embedded-image extraction |
-| `pdfboss-write` | PDF creation: COS object writer, content canvas and document assembly, deterministic output |
+| `pdfboss-write` | PDF creation: COS object writer, content canvas, link annotations and document assembly, deterministic output |
+| `pdfboss-style` | CSS-subset themes for document composition |
+| `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`): element tree, object inspector, hex view, page and Markdown previews — built on `pdfboss-aio` |
@@ -346,7 +378,7 @@ Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the docum
 
 ## Documentation
 
-The [pdfboss book](https://4thel00z.github.io/pdfboss/) covers installation, guides for every surface (text, Markdown, styled spans, rendering, image extraction, creation, async and remote documents, the explorer, encryption) and CLI/Python/Rust reference chapters. It is built with mdBook from [`docs/`](docs/) and deployed through GitHub Pages. Per-crate Rust API documentation is on [docs.rs](https://docs.rs/pdfboss-core).
+The [pdfboss book](https://4thel00z.github.io/pdfboss/) covers installation, guides for every surface (text, Markdown, styled spans, rendering, image extraction, creation, Markdown-to-PDF composition, async and remote documents, the explorer, encryption) and CLI/Python/Rust reference chapters. It is built with mdBook from [`docs/`](docs/) and deployed through GitHub Pages. Per-crate Rust API documentation is on [docs.rs](https://docs.rs/pdfboss-core).
 
 ## Development
 

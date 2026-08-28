@@ -48,7 +48,7 @@ cargo install pdfboss-cli --no-default-features
 The library crates are on crates.io:
 
 ```bash
-cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-aio
+cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-markdown pdfboss-aio
 ```
 
 | Crate | Responsibility |
@@ -58,6 +58,7 @@ cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write 
 | `pdfboss-output` | Layout analysis to plain text and Markdown |
 | `pdfboss-render` | Rasterization to RGBA pixmaps and PNG, embedded-image extraction |
 | `pdfboss-write` | PDF creation |
+| `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs (pulls in `pdfboss-style`) |
 | `pdfboss-aio` | Async, range-fetching document access |
 
 Add only what you use — `pdfboss-core` alone parses; the others build on it.

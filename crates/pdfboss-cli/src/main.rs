@@ -63,7 +63,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new PDF: blank pages, word-wrapped text, or image pages.
+    /// Create a new PDF: blank pages, word-wrapped text, image pages, or a
+    /// themed Markdown document.
     Create {
         #[command(subcommand)]
         command: create::CreateCommand,
@@ -1095,6 +1096,54 @@ mod tests {
             panic!("expected md command");
         };
         assert_eq!(page, None);
+    }
+
+    #[test]
+    fn create_md_parses_theme_and_size() {
+        let cli = Cli::try_parse_from([
+            "pdfboss",
+            "create",
+            "md",
+            "in.md",
+            "-o",
+            "out.pdf",
+            "--theme",
+            "dark.css",
+            "--size",
+            "letter",
+            "--landscape",
+        ])
+        .unwrap();
+        let Command::Create {
+            command:
+                create::CreateCommand::Md {
+                    input,
+                    out,
+                    theme,
+                    landscape,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected create md");
+        };
+        assert_eq!(input, PathBuf::from("in.md"));
+        assert_eq!(out, PathBuf::from("out.pdf"));
+        assert_eq!(theme, Some(PathBuf::from("dark.css")));
+        assert!(landscape);
+    }
+
+    #[test]
+    fn create_md_theme_defaults_to_none() {
+        let cli =
+            Cli::try_parse_from(["pdfboss", "create", "md", "in.md", "-o", "out.pdf"]).unwrap();
+        let Command::Create {
+            command: create::CreateCommand::Md { theme, .. },
+        } = cli.command
+        else {
+            panic!("expected create md");
+        };
+        assert!(theme.is_none());
     }
 
     #[test]
