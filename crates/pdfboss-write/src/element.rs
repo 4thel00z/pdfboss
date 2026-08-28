@@ -205,6 +205,10 @@ fn lines_that_fit(y0: f32, y1: f32, size: f32, leading: f32) -> usize {
     (((first_baseline - y0) / leading) + EPSILON).floor() as usize + 1
 }
 
+/// `Tw` (word spacing) is persistent text state that `BeginText` does not
+/// clear, so a stretch an earlier line left active must be reset before the
+/// first following line that does not itself stretch — not only once, at
+/// the very end.
 impl Draw for Paragraph {
     fn draw(&self, canvas: &mut Canvas) -> Result<()> {
         let [x0, y0, x1, y1] = self.rect;
@@ -218,8 +222,8 @@ impl Draw for Paragraph {
                 lines.len()
             )));
         }
-        let last = lines.len().saturating_sub(1);
-        let mut stretched = false;
+        let last_visible = lines.iter().rposition(|words| !words.is_empty());
+        let mut stretch_active = false;
         for (index, words) in lines.iter().enumerate() {
             if words.is_empty() {
                 continue;
@@ -227,7 +231,7 @@ impl Draw for Paragraph {
             let baseline = y1 - self.size - index as f32 * leading;
             let line_text = words.join(" ");
             let line_width = self.font.text_width(&line_text, self.size)?;
-            let is_final = index == last;
+            let is_final = Some(index) == last_visible;
             let stretch = match self.align {
                 ParagraphAlign::Justify if !is_final && words.len() >= 2 => {
                     Some((width - line_width) / (words.len() as f32 - 1.0))
@@ -239,13 +243,17 @@ impl Draw for Paragraph {
                 ParagraphAlign::Center => x0 + (width - line_width) / 2.0,
                 ParagraphAlign::Left | ParagraphAlign::Justify => x0,
             };
+            if stretch.is_none() && stretch_active {
+                canvas.op(Op::SetWordSpacing(0.0));
+                stretch_active = false;
+            }
             if let Some(spacing) = stretch {
                 canvas.op(Op::SetWordSpacing(spacing));
-                stretched = true;
+                stretch_active = true;
             }
             canvas.text(&line_text, x, baseline, self.font, self.size)?;
         }
-        if stretched {
+        if stretch_active {
             canvas.op(Op::SetWordSpacing(0.0));
         }
         Ok(())
@@ -573,13 +581,15 @@ mod tests {
                 Op::TextMove(0.0, 90.0),
                 Op::ShowText(b"aaaaaaa bbbbbbb".to_vec()),
                 Op::EndText,
+                Op::SetWordSpacing(0.0),
                 Op::BeginText,
                 Op::SetFont(Name("F1".into()), 10.0),
                 Op::TextMove(0.0, 78.0),
                 Op::ShowText(b"ddddd".to_vec()),
                 Op::EndText,
-                Op::SetWordSpacing(0.0),
-            ]
+            ],
+            "the reset must land before the final line's BeginText, not after it \
+             (Tw is persistent text state that BeginText does not clear)"
         );
 
         let bytes = crate::content::serialize_ops(canvas.ops());
@@ -593,6 +603,141 @@ mod tests {
             .collect();
         assert_eq!(stretched, [30.0]);
         assert!(parsed.contains(&Op::SetWordSpacing(0.0)));
+    }
+
+    #[test]
+    fn paragraph_justify_final_line_with_multiple_words_gets_no_leftover_spacing() {
+        let mut canvas = Canvas::new();
+        let mut links = Vec::new();
+        let paragraph = Paragraph {
+            text: "aaaaaaa bbbbbbb ccccc dd".into(),
+            rect: [0.0, 0.0, 120.0, 100.0],
+            font: Standard14::Courier,
+            size: 10.0,
+            align: ParagraphAlign::Justify,
+            ..Paragraph::default()
+        };
+        lower(vec![paragraph.into()], &mut canvas, &mut links).unwrap();
+        let expected = [
+            Op::SetWordSpacing(30.0),
+            Op::BeginText,
+            Op::SetFont(Name("F1".into()), 10.0),
+            Op::TextMove(0.0, 90.0),
+            Op::ShowText(b"aaaaaaa bbbbbbb".to_vec()),
+            Op::EndText,
+            Op::SetWordSpacing(0.0),
+            Op::BeginText,
+            Op::SetFont(Name("F1".into()), 10.0),
+            Op::TextMove(0.0, 78.0),
+            Op::ShowText(b"ccccc dd".to_vec()),
+            Op::EndText,
+        ];
+        assert_eq!(
+            canvas.ops(),
+            expected,
+            "the final line has 2 words (a space glyph) — a leftover non-zero \
+             Tw here would visibly over-stretch it, which is exactly the bug"
+        );
+
+        let bytes = crate::content::serialize_ops(canvas.ops());
+        let parsed = parse_content(&bytes).unwrap();
+        let reset_index = parsed
+            .iter()
+            .position(|op| *op == Op::SetWordSpacing(0.0))
+            .expect("a zero reset must be present");
+        let final_show_index = parsed
+            .iter()
+            .position(|op| matches!(op, Op::ShowText(s) if s == b"ccccc dd"))
+            .expect("final line's ShowText must be present");
+        assert!(
+            reset_index < final_show_index,
+            "reset (index {reset_index}) must precede the final line's ShowText \
+             (index {final_show_index}): {parsed:?}"
+        );
+        let stray_nonzero_between = parsed[reset_index..final_show_index]
+            .iter()
+            .any(|op| matches!(op, Op::SetWordSpacing(value) if *value != 0.0));
+        assert!(
+            !stray_nonzero_between,
+            "no non-zero word spacing may sit between the reset and the final \
+             line's ShowText: {:?}",
+            &parsed[reset_index..final_show_index]
+        );
+    }
+
+    #[test]
+    fn paragraph_trailing_blank_line_does_not_become_the_justify_final_line() {
+        let text = "aaaaaaa bbbbbbb ccccc dd\n";
+
+        let mut canvas = Canvas::new();
+        let mut links = Vec::new();
+        let paragraph = Paragraph {
+            text: text.into(),
+            rect: [0.0, 0.0, 120.0, 100.0],
+            font: Standard14::Courier,
+            size: 10.0,
+            align: ParagraphAlign::Justify,
+            ..Paragraph::default()
+        };
+        lower(vec![paragraph.into()], &mut canvas, &mut links).unwrap();
+        assert_eq!(
+            canvas.ops(),
+            [
+                Op::SetWordSpacing(30.0),
+                Op::BeginText,
+                Op::SetFont(Name("F1".into()), 10.0),
+                Op::TextMove(0.0, 90.0),
+                Op::ShowText(b"aaaaaaa bbbbbbb".to_vec()),
+                Op::EndText,
+                Op::SetWordSpacing(0.0),
+                Op::BeginText,
+                Op::SetFont(Name("F1".into()), 10.0),
+                Op::TextMove(0.0, 78.0),
+                Op::ShowText(b"ccccc dd".to_vec()),
+                Op::EndText,
+            ],
+            "the trailing blank line (from the trailing \\n) must not steal the \
+             'final line never stretches' exemption from \"ccccc dd\""
+        );
+
+        let tight_rect_without_trailing_newline = Paragraph {
+            text: "aaaaaaa bbbbbbb ccccc dd".into(),
+            rect: [0.0, 0.0, 120.0, 24.0],
+            font: Standard14::Courier,
+            size: 10.0,
+            align: ParagraphAlign::Justify,
+            ..Paragraph::default()
+        };
+        let mut fits_canvas = Canvas::new();
+        lower(
+            vec![tight_rect_without_trailing_newline.into()],
+            &mut fits_canvas,
+            &mut links,
+        )
+        .expect("two visible lines fit in a rect sized for exactly two lines");
+
+        let tight_rect_with_trailing_newline = Paragraph {
+            text: text.into(),
+            rect: [0.0, 0.0, 120.0, 24.0],
+            font: Standard14::Courier,
+            size: 10.0,
+            align: ParagraphAlign::Justify,
+            ..Paragraph::default()
+        };
+        let mut overflow_canvas = Canvas::new();
+        let err = lower(
+            vec![tight_rect_with_trailing_newline.into()],
+            &mut overflow_canvas,
+            &mut links,
+        )
+        .unwrap_err();
+        match err {
+            Error::Other(msg) => assert_eq!(
+                msg, "paragraph overflows its rect: 2 lines fit, 3 needed",
+                "the trailing blank line must still count toward vertical advance"
+            ),
+            other => panic!("expected Error::Other, got {other:?}"),
+        }
     }
 
     #[test]
