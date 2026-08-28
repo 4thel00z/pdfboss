@@ -373,6 +373,7 @@ impl<'a> Engine<'a> {
         for (i, item) in items.iter().enumerate() {
             let style = base.apply(self.theme.declared(Element::Li));
             self.gap(li_margin.top);
+            self.need(style.line_height * style.size);
             let baseline = self.y - BASELINE * style.size;
             match item.task {
                 Some(checked) => self.checkbox(checked, &style, left, baseline),
@@ -979,6 +980,29 @@ mod tests {
             texts.iter().any(|(t, _)| t == "\u{2022}"),
             "bullet marker painted"
         );
+    }
+
+    #[test]
+    fn list_markers_stay_with_their_first_line() {
+        let md: String = (0..120).map(|i| format!("- item{i}\n")).collect();
+        let pages = laid(&md, MONO);
+        assert!(pages.len() >= 2);
+        for page in &pages {
+            let markers = page
+                .items
+                .iter()
+                .filter(|i| matches!(i, Item::Text { text, .. } if text == "\u{2022}"))
+                .count();
+            let items = page
+                .items
+                .iter()
+                .filter(|i| matches!(i, Item::Text { text, .. } if text.starts_with("item")))
+                .count();
+            assert_eq!(
+                markers, items,
+                "every bullet shares its page with its item text"
+            );
+        }
     }
 
     #[test]
