@@ -1072,8 +1072,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         // Device-space font size: the length of the text-space vertical
         // unit vector scaled by Tfs under Tm·CTM.
         let size = gs.size * (start.c * start.c + start.d * start.d).sqrt();
-        let mut text = String::new();
-        for cc in font.codes(bytes) {
+        // One byte per code is the floor on the decoded length, so this
+        // reservation removes the per-glyph regrowth of typical text.
+        let mut text = String::with_capacity(bytes.len());
+        for cc in font.codes_in(bytes) {
             font.decode_into(cc, &mut text);
             let word = if font.is_space(cc) {
                 gs.word_spacing

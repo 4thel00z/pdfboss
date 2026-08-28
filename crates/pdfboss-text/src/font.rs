@@ -20,6 +20,43 @@ pub struct CharCode {
     pub len: u8,
 }
 
+/// One show string's codes, yielded in order; built by [`Font::codes_in`].
+pub(crate) struct Codes<'f> {
+    bytes: &'f [u8],
+    pos: usize,
+    split: Split<'f>,
+}
+
+/// How the active font splits a show string into codes.
+#[derive(Clone, Copy)]
+enum Split<'f> {
+    /// One byte per code (simple fonts).
+    Single,
+    /// The `/Encoding` CMap's codespaces (Type0 fonts with one).
+    Codespaces(&'f CidCmap),
+    /// Two bytes per code, a trailing odd byte its own code.
+    Pairs,
+}
+
+impl Iterator for Codes<'_> {
+    type Item = CharCode;
+
+    fn next(&mut self) -> Option<CharCode> {
+        let rest = &self.bytes[self.pos..];
+        let first = *rest.first()?;
+        let (code, len) = match self.split {
+            Split::Single => (u32::from(first), 1),
+            Split::Codespaces(cmap) => cmap.code_at(self.bytes, self.pos),
+            Split::Pairs => match rest.get(1) {
+                Some(&second) => (u32::from(u16::from_be_bytes([first, second])), 2),
+                None => (u32::from(first), 1),
+            },
+        };
+        self.pos += usize::from(len);
+        Some(CharCode { code, len })
+    }
+}
+
 /// The descriptor `/StemV` (glyph-space units) at which a face reads as
 /// bold. Regular text faces report dominant vertical stems up to ~110 and
 /// bold faces from ~140, so the cut sits in the gap between the clusters.
@@ -188,40 +225,31 @@ impl Font {
         (!cmap.is_empty()).then_some(cmap)
     }
 
+    /// Splits a show-string into character codes as a list (test helper;
+    /// lib code iterates [`Font::codes_in`] to avoid the allocation).
+    #[cfg(test)]
+    pub fn codes(&self, bytes: &[u8]) -> Vec<CharCode> {
+        self.codes_in(bytes).collect()
+    }
+
     /// Splits a show-string into character codes: one byte each for simple
     /// fonts, the `/Encoding` CMap's codespaces for Type0 fonts with one,
     /// and two bytes otherwise (a trailing odd byte becomes its own code).
-    pub fn codes(&self, bytes: &[u8]) -> Vec<CharCode> {
-        if self.simple {
-            return bytes
-                .iter()
-                .map(|&b| CharCode {
-                    code: u32::from(b),
-                    len: 1,
-                })
-                .collect();
+    /// An iterator because the show loop reads each code once — the hottest
+    /// operator on a text page never pays a per-string list allocation.
+    pub(crate) fn codes_in<'f>(&'f self, bytes: &'f [u8]) -> Codes<'f> {
+        let split = if self.simple {
+            Split::Single
+        } else if let Some(cmap) = self.cmap.as_deref() {
+            Split::Codespaces(cmap)
+        } else {
+            Split::Pairs
+        };
+        Codes {
+            bytes,
+            pos: 0,
+            split,
         }
-        if let Some(cmap) = &self.cmap {
-            let mut out = Vec::with_capacity(bytes.len() / 2 + 1);
-            let mut pos = 0;
-            while pos < bytes.len() {
-                let (code, len) = cmap.code_at(bytes, pos);
-                out.push(CharCode { code, len });
-                pos += usize::from(len);
-            }
-            return out;
-        }
-        bytes
-            .chunks(2)
-            .map(|c| CharCode {
-                code: if c.len() == 2 {
-                    u32::from(u16::from_be_bytes([c[0], c[1]]))
-                } else {
-                    u32::from(c[0])
-                },
-                len: c.len() as u8,
-            })
-            .collect()
     }
 
     /// The CID a code selects in the descendant font: through the
