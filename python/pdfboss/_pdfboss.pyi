@@ -701,8 +701,8 @@ class write:
             width: float | None = None,
             height: float | None = None,
         ) -> None:
-            """``data`` is a filesystem path, read only at
-            ``save``/``to_bytes`` time, or raw image bytes decoded eagerly.
+            """``data`` is a filesystem path or raw image bytes; either
+            source is read and decoded at ``save``/``to_bytes`` time.
             Raises ``TypeError`` for any other type. ``width``/``height``
             default to the image's native size in points."""
 

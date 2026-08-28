@@ -11,7 +11,8 @@ The surfaces expose the same engine at different altitudes. The CLI covers
 extraction, rendering, creation and explorer subcommands over a document's
 structure; the terminal explorer browses a file interactively, local or
 remote. Python gets `Document` and its async twin `AsyncDocument`, with
-pages, styled spans, lazy element iteration, rendering and image extraction.
+pages, styled spans, lazy element iteration, rendering and image extraction,
+plus document creation through `pdfboss.write` and `pdfboss.md.to_pdf`.
 The Rust crates split the core by concern, from parsing (`pdfboss-core`)
 through layout analysis (`pdfboss-output`) and rasterization
 (`pdfboss-render`) to creation (`pdfboss-write`).
@@ -41,9 +42,10 @@ pdfboss extracts plain text and Markdown (headings, lists and tables inferred
 from page layout), yields styled text spans carrying position, font, weight,
 decorations and color, rasterizes pages to PNG through its own JPEG 2000,
 JBIG2, CCITT and ICC codecs, extracts embedded images at their native pixel
-size, creates new PDFs — canvas-level through the `pdfboss-write` crate and
-`pdfboss create`, and CommonMark+GFM composed into CSS-themed documents from
-the CLI, Python (`pdfboss.md.to_pdf`) and Rust — and reads documents
+size, creates new PDFs (canvas painting and element composition through the
+`pdfboss-write` crate, the `pdfboss.write` Python module and `pdfboss create`,
+a TOML manifest form included, plus CommonMark+GFM composed into CSS-themed
+documents from the CLI, Python `pdfboss.md.to_pdf` and Rust), and reads documents
 asynchronously over range-fetching I/O, from local files or HTTP, without
 ever reading the whole file.
 
@@ -67,8 +69,8 @@ guide then takes one task per chapter:
   render reports.
 - [Extracting images](./guide/images.md) — every image a page draws, at
   native size.
-- [Creating PDFs](./guide/creating.md) — blank, text and image pages from
-  the CLI and Rust.
+- [Creating PDFs](./guide/creating.md): canvas painting, composed elements
+  and document slots from the CLI, Python and Rust.
 - [Markdown to PDF](./guide/md-to-pdf.md) — CommonMark+GFM composed into
   themed, paginated documents.
 - [Async and remote documents](./guide/async.md) — range-fetching access to

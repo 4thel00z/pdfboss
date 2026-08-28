@@ -47,9 +47,9 @@ pdf = pdfboss.md.to_pdf(Path("notes.md").read_text())  # markdown -> PDF bytes
 0-based with negative indexes from the end, and `render` returns PNG bytes
 directly. `extract_images` yields each image the page draws at its native
 pixel size, PNG-encoded. `pdfboss.md.to_pdf` composes CommonMark+GFM into a
-themed PDF ([Markdown to PDF](./guide/md-to-pdf.md)); canvas-level creation
-lives in the CLI and the `pdfboss-write` crate
-([Creating PDFs](./guide/creating.md)).
+themed PDF ([Markdown to PDF](./guide/md-to-pdf.md)); `pdfboss.write` composes
+pages, elements and document slots with `|`, the same vocabulary the CLI and
+the `pdfboss-write` crate expose ([Creating PDFs](./guide/creating.md)).
 
 ## Rust
 
@@ -83,7 +83,8 @@ Python; only the CLI counts from 1.
 - [Rendering pages](./guide/rendering.md) for scale, font tiers and PNG
   compression.
 - [Extracting images](./guide/images.md) for what counts as an embedded image.
-- [Creating PDFs](./guide/creating.md) for blank, text and image pages.
+- [Creating PDFs](./guide/creating.md) for canvas painting, composed pages
+  and document slots.
 - [Markdown to PDF](./guide/md-to-pdf.md) for themed CommonMark+GFM
   composition.
 - [Async and remote documents](./guide/async.md) for `AsyncDocument` and HTTP

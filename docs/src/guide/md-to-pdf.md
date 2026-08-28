@@ -127,8 +127,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Because the result is a plain `Pdf`, everything from
-[Creating PDFs](./creating.md) applies afterwards: set `metadata`, append
-canvas-painted pages of your own, or stream the bytes asynchronously.
+[Creating PDFs](./creating.md) applies afterwards: set `metadata`, attach an
+outline or embedded files, add page labels or viewer preferences, append
+pages of your own, or stream the bytes asynchronously.
 
 ## Round trip
 
