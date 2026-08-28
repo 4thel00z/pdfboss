@@ -8,6 +8,7 @@ use pdfboss_core::{Dict, Name, ObjRef, Object};
 
 use crate::canvas::Canvas;
 use crate::content::serialize_ops;
+use crate::element::{self, Content};
 use crate::error::{Error, Result};
 use crate::font::Standard14;
 use crate::sink::AsyncByteSink;
@@ -140,6 +141,9 @@ pub struct Page {
     pub rotation: i32,
     /// The page's painted content.
     pub canvas: Canvas,
+    /// Composed elements, painted onto `canvas` at assemble time, after
+    /// any content already painted there directly.
+    pub content: Vec<Content>,
     /// Clickable link areas, emitted as `/Annots`.
     pub links: Vec<LinkAnnotation>,
 }
@@ -238,17 +242,19 @@ impl Pdf {
             let Page {
                 size,
                 rotation,
-                canvas,
-                links,
+                mut canvas,
+                content,
+                mut links,
             } = page;
             if rotation % 90 != 0 {
                 return Err(Error::Other(format!(
                     "page rotation {rotation} is not a multiple of 90"
                 )));
             }
+            element::lower(content, &mut canvas, &mut links)?;
             let (width, height) = size.dimensions();
             let parts = canvas.into_parts();
-            let content = w.put_stream(Dict::new(), serialize_ops(&parts.ops));
+            let content_ref = w.put_stream(Dict::new(), serialize_ops(&parts.ops));
             let mut fonts = Dict::new();
             for (index, face) in parts.fonts.iter().enumerate() {
                 let cached = font_cache
@@ -289,7 +295,7 @@ impl Pdf {
                     Object::Real(f64::from(height)),
                 ]),
             );
-            dict.insert(name("Contents"), Object::Ref(content));
+            dict.insert(name("Contents"), Object::Ref(content_ref));
             dict.insert(name("Resources"), Object::Dict(resources));
             if !links.is_empty() {
                 let mut annots = Vec::with_capacity(links.len());

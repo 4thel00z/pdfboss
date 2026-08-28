@@ -19,6 +19,7 @@
 pub mod canvas;
 pub mod color;
 pub mod content;
+pub mod element;
 pub mod error;
 pub mod font;
 pub mod image;
@@ -30,6 +31,7 @@ pub mod writer;
 pub use canvas::{Canvas, CanvasParts, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
 pub use content::serialize_ops;
+pub use element::{Content, Draw, Image, Link, Text};
 pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;

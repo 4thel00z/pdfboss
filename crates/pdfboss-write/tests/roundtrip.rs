@@ -7,8 +7,8 @@ use pdfboss_core::{Document, Name, Rect};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Color, Date, Error, ImageData, LinkAnnotation, LinkTarget, Metadata, Page, PageSize, Pdf,
-    Standard14, WriteOptions, XrefStyle,
+    Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget, Metadata, Page,
+    PageSize, Pdf, Standard14, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -322,6 +322,34 @@ fn goto_links_resolve_to_their_page() {
         resolved_page_types.push(page_type.0.clone());
     }
     assert_eq!(resolved_page_types, vec!["Page".to_string()]);
+}
+
+#[test]
+fn link_element_lands_in_page_links() {
+    let mut page = Page::new(PageSize::A4);
+    page.content.push(Content::from(Link {
+        rect: [10.0, 10.0, 60.0, 24.0],
+        target: LinkTarget::Uri("https://example.com".into()),
+    }));
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let annots = loaded.dict().get_array("Annots").unwrap_or(&[]);
+    assert_eq!(annots.len(), 1);
+    let annot = doc.resolve(&annots[0]).unwrap();
+    let annot = annot.as_dict().unwrap();
+    assert_eq!(annot.get_name("Subtype"), Some(&Name("Link".into())));
+    let action = annot.get_dict("A").unwrap();
+    assert_eq!(action.get_name("S"), Some(&Name("URI".into())));
+    assert_eq!(
+        action.get("URI").unwrap().as_str_bytes(),
+        Some(b"https://example.com".as_slice())
+    );
 }
 
 #[test]
