@@ -6,7 +6,7 @@ use std::path::Path;
 use pdfboss_style::{Align, Decoration, Element, TextStyle, Theme};
 use pdfboss_write::{Color, ImageData, PageSize, Standard14};
 
-use crate::block::{Block, Run};
+use crate::block::{Block, ListItem, Run};
 use crate::report::{sanitize, Report};
 use crate::wrap::{wrap, LineBox, StyledRun};
 use crate::Error;
@@ -14,6 +14,9 @@ use crate::Error;
 /// Fraction of a line's max glyph size the baseline sits below the
 /// line-box top. Shared by later tasks laying out other block kinds.
 const BASELINE: f32 = 0.8;
+
+/// Left indent added per list-nesting level, in points.
+const GUTTER: f32 = 18.0;
 
 /// One positioned draw primitive on a page.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,7 +48,6 @@ pub(crate) enum Item {
         color: Color,
     },
     /// A stroked (unfilled) rectangle.
-    #[allow(dead_code)]
     Frame {
         x: f32,
         y: f32,
@@ -81,7 +83,6 @@ pub(crate) struct LaidPage {
 
 /// One page-spanning region opened by [`Engine::begin_span`] and closed by
 /// [`Engine::end_span`], broken into per-page pieces at every page break.
-#[allow(dead_code)]
 pub(crate) struct Segment {
     pub page: usize,
     pub top: f32,
@@ -127,6 +128,7 @@ pub(crate) struct Engine<'a> {
     pending: f32,
     at_top: bool,
     spans: Vec<Span>,
+    depth: u32,
 }
 
 impl<'a> Engine<'a> {
@@ -147,6 +149,7 @@ impl<'a> Engine<'a> {
             pending: 0.0,
             at_top: true,
             spans: Vec::new(),
+            depth: 0,
         }
     }
 
@@ -220,7 +223,6 @@ impl<'a> Engine<'a> {
     }
 
     /// Opens a new span at the current write position.
-    #[allow(dead_code)]
     fn begin_span(&mut self) {
         let page = self.page_index();
         let item_index = self.page().items.len();
@@ -234,7 +236,6 @@ impl<'a> Engine<'a> {
 
     /// Closes the innermost open span, returning every page-piece it spans,
     /// including the one still open at the current write position.
-    #[allow(dead_code)]
     fn end_span(&mut self) -> Vec<Segment> {
         let Some(span) = self.spans.pop() else {
             return Vec::new();
@@ -349,8 +350,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Dispatches each block in document order, appending items to the
-    /// current page. `Paragraph`, `Heading` and `Rule` land here;
-    /// `CodeBlock`, `BlockQuote`, `List`, `Table` and `Image` land in
+    /// current page. `Paragraph`, `Heading`, `Rule`, `List` and
+    /// `BlockQuote` land here; `CodeBlock`, `Table` and `Image` land in
     /// later tasks.
     fn blocks(
         &mut self,
@@ -361,7 +362,6 @@ impl<'a> Engine<'a> {
         base_dir: &Path,
         report: &mut Report,
     ) -> Result<(), Error> {
-        let _ = base_dir;
         for block in blocks {
             match block {
                 Block::Paragraph { runs } => {
@@ -408,9 +408,159 @@ impl<'a> Engine<'a> {
                     self.at_top = false;
                     self.after(margin.bottom);
                 }
+                Block::List { start, items } => {
+                    self.list(*start, items, base, left, right, base_dir, report)?;
+                }
+                Block::BlockQuote { blocks } => {
+                    self.quote(blocks, base, left, right, base_dir, report)?;
+                }
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// Lays out a `List` block: a marker or task checkbox to the left of
+    /// each item, then the item's own blocks recursively laid out one
+    /// `GUTTER` further in.
+    #[allow(clippy::too_many_arguments)]
+    fn list(
+        &mut self,
+        start: Option<u64>,
+        items: &[ListItem],
+        base: &TextStyle,
+        left: f32,
+        right: f32,
+        base_dir: &Path,
+        report: &mut Report,
+    ) -> Result<(), Error> {
+        let element = if start.is_some() {
+            Element::Ol
+        } else {
+            Element::Ul
+        };
+        let margin = self.theme.margin(element);
+        self.gap(margin.top);
+        let depth = self.depth;
+        let li_margin = self.theme.margin(Element::Li);
+        for (i, item) in items.iter().enumerate() {
+            let style = base.apply(self.theme.declared(Element::Li));
+            self.gap(li_margin.top);
+            let baseline = self.y - BASELINE * style.size;
+            match item.task {
+                Some(checked) => self.checkbox(checked, &style, left, baseline),
+                None => self.marker(start, i, depth, &style, left, baseline)?,
+            }
+            self.depth = depth + 1;
+            self.blocks(&item.blocks, &style, left + GUTTER, right, base_dir, report)?;
+            self.depth = depth;
+            self.after(li_margin.bottom);
+        }
+        self.after(margin.bottom);
+        Ok(())
+    }
+
+    /// Paints an ordered numeral (`start` given, counting from it) or an
+    /// unordered bullet (dot at `depth` zero, dash when nested), right-
+    /// aligned to end `4pt` left of the item's text edge.
+    fn marker(
+        &mut self,
+        start: Option<u64>,
+        index: usize,
+        depth: u32,
+        style: &TextStyle,
+        left: f32,
+        baseline: f32,
+    ) -> Result<(), Error> {
+        let text = match start {
+            Some(start_value) => format!("{}.", start_value + index as u64),
+            None if depth == 0 => "\u{2022}".to_string(),
+            None => "\u{2013}".to_string(),
+        };
+        let width = style.font().text_width(&text, style.size)?;
+        self.push(Item::Text {
+            x: left + GUTTER - 4.0 - width,
+            y: baseline,
+            text,
+            font: style.font(),
+            size: style.size,
+            color: style.color,
+        });
+        Ok(())
+    }
+
+    /// Paints a task item's checkbox: a stroked square, with two strokes
+    /// drawing a check mark inside it when `checked`.
+    fn checkbox(&mut self, checked: bool, style: &TextStyle, left: f32, baseline: f32) {
+        let side = 0.66 * style.size;
+        let x = left + GUTTER - 4.0 - side;
+        let y = baseline;
+        self.push(Item::Frame {
+            x,
+            y,
+            w: side,
+            h: side,
+            width: 0.9,
+            color: style.color,
+        });
+        if !checked {
+            return;
+        }
+        self.push(Item::Stroke {
+            x1: x + 0.2 * side,
+            y1: y + 0.45 * side,
+            x2: x + 0.42 * side,
+            y2: y + 0.2 * side,
+            width: 0.9,
+            color: style.color,
+        });
+        self.push(Item::Stroke {
+            x1: x + 0.42 * side,
+            y1: y + 0.2 * side,
+            x2: x + 0.85 * side,
+            y2: y + 0.8 * side,
+            width: 0.9,
+            color: style.color,
+        });
+    }
+
+    /// Lays out a `BlockQuote` block: its inner blocks indented by the
+    /// blockquote's left margin, then a vertical bar painted beside each
+    /// page-piece the quote spans.
+    fn quote(
+        &mut self,
+        blocks: &[Block],
+        base: &TextStyle,
+        left: f32,
+        right: f32,
+        base_dir: &Path,
+        report: &mut Report,
+    ) -> Result<(), Error> {
+        let style = base.apply(self.theme.declared(Element::Blockquote));
+        let margin = self.theme.margin(Element::Blockquote);
+        self.gap(margin.top);
+        self.begin_span();
+        self.blocks(
+            blocks,
+            &style,
+            left + margin.left,
+            right - margin.right,
+            base_dir,
+            report,
+        )?;
+        for segment in self.end_span().into_iter().rev() {
+            let item = Item::Rect {
+                x: left + margin.left - 8.0,
+                y: segment.bottom,
+                w: 2.0,
+                h: segment.top - segment.bottom,
+                color: style.color,
+            };
+            self.pages[segment.page]
+                .items
+                .insert(segment.item_index, item);
+        }
+        self.after(margin.bottom);
         Ok(())
     }
 }
@@ -625,5 +775,71 @@ mod tests {
                 .any(|i| matches!(i, Item::Stroke { .. })),
             "underline stroked"
         );
+    }
+
+    #[test]
+    fn bullets_indent_and_mark() {
+        let pages = laid("- one\n- two\n  - inner\n", MONO);
+        let texts: Vec<(String, f32)> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { text, x, .. } => Some((text.clone(), *x)),
+                _ => None,
+            })
+            .collect();
+        assert!(texts
+            .iter()
+            .any(|(t, x)| t == "one" && (*x - 118.0).abs() < 0.01));
+        assert!(texts
+            .iter()
+            .any(|(t, x)| t == "inner" && (*x - 136.0).abs() < 0.01));
+        assert!(
+            texts.iter().any(|(t, _)| t == "\u{2022}"),
+            "bullet marker painted"
+        );
+    }
+
+    #[test]
+    fn ordered_markers_count_from_start() {
+        let pages = laid("3. three\n4. four\n", MONO);
+        let markers: Vec<String> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { text, .. } if text.ends_with('.') => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, vec!["3.", "4."]);
+    }
+
+    #[test]
+    fn task_items_draw_checkboxes() {
+        let pages = laid("- [ ] open\n- [x] done\n", MONO);
+        let frames = pages[0]
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Frame { .. }))
+            .count();
+        let checks = pages[0]
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Stroke { .. }))
+            .count();
+        assert_eq!(frames, 2);
+        assert_eq!(checks, 2, "two strokes draw one check mark");
+    }
+
+    #[test]
+    fn blockquote_draws_a_bar_and_indents() {
+        let pages = laid("> quoted text\n", MONO);
+        assert!(pages[0].items.iter().any(
+            |i| matches!(i, Item::Rect { x, w, .. } if (*w - 2.0).abs() < 0.01 && *x < 124.0)
+        ));
+        assert!(pages[0]
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Text { x, .. } if (*x - 124.0).abs() < 0.01)));
     }
 }
