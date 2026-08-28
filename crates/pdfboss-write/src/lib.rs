@@ -37,7 +37,8 @@ pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;
 pub use pdf::{
-    Attachment, Bookmark, Date, LinkAnnotation, LinkTarget, Metadata, Outline, Page, PageSize, Pdf,
+    Attachment, Bookmark, Date, LabelStyle, LinkAnnotation, LinkTarget, Metadata, Outline, Page,
+    PageLabel, PageLayout, PageMode, PageSize, Pdf, Viewer,
 };
 pub use sink::{AsyncByteSink, Immediate};
 pub use writer::{WriteOptions, Writer, XrefStyle};

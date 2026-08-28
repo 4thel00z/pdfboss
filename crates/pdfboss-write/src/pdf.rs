@@ -258,6 +258,85 @@ pub struct Attachment {
     pub description: Option<String>,
 }
 
+/// A page-numbering style for a [`PageLabel`] range, written as its `/S`
+/// (ISO 32000 §12.4.2, Table 159).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LabelStyle {
+    /// Arabic numerals: 1, 2, 3…
+    Decimal,
+    /// Uppercase Roman numerals: I, II, III…
+    RomanUpper,
+    /// Lowercase Roman numerals: i, ii, iii…
+    RomanLower,
+    /// Uppercase letters: A, B, …, Z, AA…
+    LettersUpper,
+    /// Lowercase letters: a, b, …, z, aa…
+    LettersLower,
+}
+
+/// One page-numbering range, taking effect from `first_page` (0-based)
+/// until the next range's `first_page` or the document's end (ISO 32000
+/// §12.4.2). A document's `page_labels` must include a range with
+/// `first_page == 0` whenever it is non-empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageLabel {
+    /// 0-based page index where this range begins.
+    pub first_page: usize,
+    /// Numbering style, written as `/S`; `None` omits it, showing only
+    /// `prefix` for every page in the range.
+    pub style: Option<LabelStyle>,
+    /// Text prepended to every number in the range, written as `/P`.
+    pub prefix: Option<String>,
+    /// The number shown on `first_page`, written as `/St` only when not
+    /// `1`. Conventionally `1`.
+    pub start_at: u32,
+}
+
+/// Initial page-layout mode, written as the catalog's `/PageLayout` (ISO
+/// 32000 §7.7.2, Table 27).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PageLayout {
+    /// One page at a time.
+    SinglePage,
+    /// One continuously scrolling column of pages.
+    OneColumn,
+    /// Two columns, an odd-numbered page on the left.
+    TwoColumnLeft,
+    /// Two columns, an odd-numbered page on the right.
+    TwoColumnRight,
+    /// Two pages at a time, an odd-numbered page on the left.
+    TwoPageLeft,
+    /// Two pages at a time, an odd-numbered page on the right.
+    TwoPageRight,
+}
+
+/// Initial navigation-panel mode, written as the catalog's `/PageMode`
+/// (ISO 32000 §7.7.2, Table 28).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PageMode {
+    /// No panel open.
+    UseNone,
+    /// The outline (bookmarks) panel.
+    UseOutlines,
+    /// The page-thumbnails panel.
+    UseThumbs,
+    /// Full-screen presentation mode.
+    FullScreen,
+}
+
+/// Viewer preferences written to the catalog: initial layout, navigation
+/// mode, and the page opened at document start (ISO 32000 §7.7.2).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Viewer {
+    /// `/PageLayout`, omitted when `None`.
+    pub layout: Option<PageLayout>,
+    /// `/PageMode`, omitted when `None`.
+    pub mode: Option<PageMode>,
+    /// Page index opened at its top-left corner via `/OpenAction`,
+    /// omitted when `None`.
+    pub open_to: Option<usize>,
+}
+
 /// A document under construction. The fields are the composition:
 /// singleton slots are `Option`s, pages keep the order given.
 #[derive(Debug, Default)]
@@ -272,6 +351,13 @@ pub struct Pdf {
     /// by bytes, at emission — the name-tree keys must be sorted, so the
     /// order given here is not preserved. Duplicate names are an error.
     pub attachments: Vec<Attachment>,
+    /// Page-numbering ranges shown in viewer UI as `/PageLabels`.
+    /// Reordered by `first_page` at emission. Must include a range
+    /// starting at page 0 when non-empty; duplicate `first_page` values
+    /// are an error.
+    pub page_labels: Vec<PageLabel>,
+    /// Viewer preferences, if any.
+    pub viewer: Option<Viewer>,
     /// File-emission options.
     pub options: WriteOptions,
 }
@@ -313,6 +399,8 @@ impl Pdf {
             pages,
             outline,
             attachments,
+            page_labels,
+            viewer,
             options,
         } = self;
         if pages.is_empty() {
@@ -484,6 +572,7 @@ impl Pdf {
             _ => None,
         };
         let names = embedded_files_dict(&mut w, attachments)?;
+        let page_labels_entry = page_labels_dict(page_labels)?;
         let mut catalog = Dict::new();
         catalog.insert(name("Type"), Object::Name(name("Catalog")));
         catalog.insert(name("Pages"), Object::Ref(pages_root));
@@ -495,6 +584,42 @@ impl Pdf {
         }
         if let Some(names) = names {
             catalog.insert(name("Names"), Object::Dict(names));
+        }
+        if let Some(page_labels_entry) = page_labels_entry {
+            catalog.insert(name("PageLabels"), Object::Dict(page_labels_entry));
+        }
+        if let Some(viewer) = viewer {
+            let Viewer {
+                layout,
+                mode,
+                open_to,
+            } = viewer;
+            if let Some(layout) = layout {
+                catalog.insert(
+                    name("PageLayout"),
+                    Object::Name(name(page_layout_name(layout))),
+                );
+            }
+            if let Some(mode) = mode {
+                catalog.insert(name("PageMode"), Object::Name(name(page_mode_name(mode))));
+            }
+            if let Some(open_to) = open_to {
+                let target = page_refs.get(open_to).copied().ok_or_else(|| {
+                    Error::Other(format!(
+                        "open_to target page {open_to} is out of range: the document has {page_count} pages"
+                    ))
+                })?;
+                catalog.insert(
+                    name("OpenAction"),
+                    Object::Array(vec![
+                        Object::Ref(target),
+                        Object::Name(name("XYZ")),
+                        Object::Null,
+                        Object::Null,
+                        Object::Null,
+                    ]),
+                );
+            }
         }
         let root = w.put(Object::Dict(catalog));
         Ok((w, root))
@@ -612,6 +737,86 @@ fn embedded_files_dict(w: &mut Writer, mut attachments: Vec<Attachment>) -> Resu
     let mut embedded_files = Dict::new();
     embedded_files.insert(name("EmbeddedFiles"), Object::Dict(name_tree));
     Ok(Some(embedded_files))
+}
+
+/// Builds the catalog's `/PageLabels` dictionary from `labels`, or `None`
+/// when there are none. Ranges are reordered by `first_page` to satisfy
+/// the number tree's sorted-key requirement. A non-empty set must include
+/// a range starting at page 0; a repeated `first_page` is an error naming
+/// the page.
+fn page_labels_dict(mut labels: Vec<PageLabel>) -> Result<Option<Dict>> {
+    if labels.is_empty() {
+        return Ok(None);
+    }
+    labels.sort_by_key(|label| label.first_page);
+    if labels[0].first_page != 0 {
+        return Err(Error::Other("page labels must start at page 0".to_string()));
+    }
+    for pair in labels.windows(2) {
+        if pair[0].first_page == pair[1].first_page {
+            return Err(Error::Other(format!(
+                "duplicate page label at page {}",
+                pair[0].first_page
+            )));
+        }
+    }
+    let mut nums = Vec::with_capacity(labels.len() * 2);
+    for label in labels {
+        let PageLabel {
+            first_page,
+            style,
+            prefix,
+            start_at,
+        } = label;
+        let mut range = Dict::new();
+        if let Some(style) = style {
+            range.insert(name("S"), Object::Name(name(label_style_name(style))));
+        }
+        if let Some(prefix) = prefix {
+            range.insert(name("P"), text_string(&prefix));
+        }
+        if start_at != 1 {
+            range.insert(name("St"), Object::Int(i64::from(start_at)));
+        }
+        nums.push(Object::Int(first_page as i64));
+        nums.push(Object::Dict(range));
+    }
+    let mut dict = Dict::new();
+    dict.insert(name("Nums"), Object::Array(nums));
+    Ok(Some(dict))
+}
+
+/// The `/S` name for a [`LabelStyle`].
+fn label_style_name(style: LabelStyle) -> &'static str {
+    match style {
+        LabelStyle::Decimal => "D",
+        LabelStyle::RomanUpper => "R",
+        LabelStyle::RomanLower => "r",
+        LabelStyle::LettersUpper => "A",
+        LabelStyle::LettersLower => "a",
+    }
+}
+
+/// The `/PageLayout` name for a [`PageLayout`].
+fn page_layout_name(layout: PageLayout) -> &'static str {
+    match layout {
+        PageLayout::SinglePage => "SinglePage",
+        PageLayout::OneColumn => "OneColumn",
+        PageLayout::TwoColumnLeft => "TwoColumnLeft",
+        PageLayout::TwoColumnRight => "TwoColumnRight",
+        PageLayout::TwoPageLeft => "TwoPageLeft",
+        PageLayout::TwoPageRight => "TwoPageRight",
+    }
+}
+
+/// The `/PageMode` name for a [`PageMode`].
+fn page_mode_name(mode: PageMode) -> &'static str {
+    match mode {
+        PageMode::UseNone => "UseNone",
+        PageMode::UseOutlines => "UseOutlines",
+        PageMode::UseThumbs => "UseThumbs",
+        PageMode::FullScreen => "FullScreen",
+    }
 }
 
 /// One bookmark's reserved object number, mirroring the tree shape so the

@@ -8,8 +8,9 @@ use pdfboss_core::{Dict, Document, Name, Object, Rect, Stream};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Attachment, Bookmark, Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget,
-    Metadata, Outline, Page, PageSize, Paragraph, Pdf, Standard14, WriteOptions, XrefStyle,
+    Attachment, Bookmark, Color, Content, Date, Error, ImageData, LabelStyle, Link, LinkAnnotation,
+    LinkTarget, Metadata, Outline, Page, PageLabel, PageLayout, PageMode, PageSize, Paragraph, Pdf,
+    Standard14, Viewer, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -60,6 +61,8 @@ fn metadata_and_multipage_round_trip() {
         pages: vec![Page::new(PageSize::A4), second, Page::new(PageSize::Letter)],
         outline: None,
         attachments: Vec::new(),
+        page_labels: Vec::new(),
+        viewer: None,
         options: WriteOptions::default(),
     };
     let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
@@ -220,6 +223,8 @@ fn two_page_document() -> Pdf {
         pages: vec![first, second],
         outline: None,
         attachments: Vec::new(),
+        page_labels: Vec::new(),
+        viewer: None,
         options: WriteOptions::default(),
     }
 }
@@ -924,6 +929,222 @@ fn attachments_document_serializes_byte_identically() {
                 attachment("b.txt", b"B", Some("text/plain")),
                 attachment("a.txt", b"A", Some("text/plain")),
             ],
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .unwrap()
+    }
+    assert_eq!(build(), build());
+}
+
+fn four_pages() -> Vec<Page> {
+    (0..4).map(|_| Page::new(PageSize::A4)).collect()
+}
+
+/// The design's own use case: roman-numeral front matter for pages 0–1,
+/// then a decimal range from page 2 on with a chapter prefix and a
+/// numbering offset — `/PageLabels /Nums` must carry both ranges, sorted
+/// by `first_page`, each with the right `/S`, `/P` and `/St`.
+#[test]
+fn page_labels_resolve_roman_front_matter_and_offset_decimal() {
+    let pdf = Pdf {
+        pages: four_pages(),
+        page_labels: vec![
+            PageLabel {
+                first_page: 0,
+                style: Some(LabelStyle::RomanLower),
+                prefix: None,
+                start_at: 1,
+            },
+            PageLabel {
+                first_page: 2,
+                style: Some(LabelStyle::Decimal),
+                prefix: Some("A-".to_string()),
+                start_at: 5,
+            },
+        ],
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let page_labels = catalog(&doc)
+        .get_dict("PageLabels")
+        .expect("/PageLabels present")
+        .clone();
+    let nums = page_labels.get_array("Nums").expect("/Nums present");
+    assert_eq!(nums.len(), 4, "two ranges make four Nums slots");
+
+    let keys: Vec<i64> = (0..2)
+        .map(|range_index| nums[range_index * 2].as_int().expect("key is an int"))
+        .collect();
+    assert_eq!(keys, vec![0, 2]);
+
+    let front_matter = nums[1].as_dict().expect("range dict");
+    assert_eq!(front_matter.get_name("S"), Some(&Name("r".into())));
+    assert!(front_matter.get("P").is_none());
+    assert!(front_matter.get("St").is_none());
+
+    let body = nums[3].as_dict().expect("range dict");
+    assert_eq!(body.get_name("S"), Some(&Name("D".into())));
+    assert_eq!(
+        decode_text_string(body.get("P").expect("/P present").as_str_bytes().unwrap()),
+        "A-"
+    );
+    assert_eq!(body.get_int("St"), Some(5));
+}
+
+#[test]
+fn page_labels_missing_zero_page_errors() {
+    let pdf = Pdf {
+        pages: four_pages(),
+        page_labels: vec![PageLabel {
+            first_page: 1,
+            style: Some(LabelStyle::Decimal),
+            prefix: None,
+            start_at: 1,
+        }],
+        ..Pdf::default()
+    };
+    let err = pdf.to_bytes().unwrap_err();
+    match err {
+        Error::Other(msg) => assert!(msg.contains("page 0"), "{msg}"),
+        other => panic!("expected Error::Other naming page 0, got {other:?}"),
+    }
+}
+
+#[test]
+fn page_labels_duplicate_first_page_errors() {
+    let pdf = Pdf {
+        pages: four_pages(),
+        page_labels: vec![
+            PageLabel {
+                first_page: 0,
+                style: None,
+                prefix: None,
+                start_at: 1,
+            },
+            PageLabel {
+                first_page: 0,
+                style: Some(LabelStyle::RomanUpper),
+                prefix: None,
+                start_at: 1,
+            },
+        ],
+        ..Pdf::default()
+    };
+    let err = pdf.to_bytes().unwrap_err();
+    match err {
+        Error::Other(msg) => assert!(msg.contains('0'), "{msg}"),
+        other => panic!("expected Error::Other naming the duplicate page, got {other:?}"),
+    }
+}
+
+#[test]
+fn no_page_labels_emits_no_page_labels_entry() {
+    let bytes = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    assert!(catalog(&doc).get("PageLabels").is_none());
+}
+
+/// Viewer preferences resolve structurally: `/PageLayout` and `/PageMode`
+/// as catalog names, `/OpenAction` as an `/XYZ` destination landing on the
+/// requested page.
+#[test]
+fn viewer_preferences_resolve_layout_mode_and_open_to() {
+    let pdf = Pdf {
+        pages: vec![Page::new(PageSize::A4), Page::new(PageSize::Letter)],
+        viewer: Some(Viewer {
+            layout: Some(PageLayout::TwoColumnLeft),
+            mode: Some(PageMode::UseOutlines),
+            open_to: Some(1),
+        }),
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let catalog = catalog(&doc);
+    assert_eq!(
+        catalog.get_name("PageLayout"),
+        Some(&Name("TwoColumnLeft".into()))
+    );
+    assert_eq!(
+        catalog.get_name("PageMode"),
+        Some(&Name("UseOutlines".into()))
+    );
+    let open_action = catalog
+        .get_array("OpenAction")
+        .expect("/OpenAction present");
+    assert_eq!(open_action.len(), 5);
+    assert_eq!(open_action[1].as_name(), Some(&Name("XYZ".into())));
+    assert!(open_action[2].is_null() && open_action[3].is_null() && open_action[4].is_null());
+    let target = doc
+        .resolve(&open_action[0])
+        .expect("/OpenAction target resolves");
+    let target = target.as_dict().expect("target is a dictionary");
+    assert_eq!(target.get_name("Type"), Some(&Name("Page".into())));
+    let media_box = target.get_array("MediaBox").expect("/MediaBox present");
+    assert_eq!(media_box[2].as_f64(), Some(612.0));
+    assert_eq!(media_box[3].as_f64(), Some(792.0));
+}
+
+#[test]
+fn no_viewer_emits_no_viewer_entries() {
+    let bytes = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let catalog = catalog(&doc);
+    assert!(catalog.get("PageLayout").is_none());
+    assert!(catalog.get("PageMode").is_none());
+    assert!(catalog.get("OpenAction").is_none());
+}
+
+#[test]
+fn viewer_open_to_out_of_range_errors() {
+    let pdf = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        viewer: Some(Viewer {
+            open_to: Some(5),
+            ..Viewer::default()
+        }),
+        ..Pdf::default()
+    };
+    let err = pdf.to_bytes().unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("out of range"), "{msg}");
+    assert!(msg.contains("open_to"), "{msg}");
+}
+
+#[test]
+fn page_labels_and_viewer_document_serializes_byte_identically() {
+    fn build() -> Vec<u8> {
+        Pdf {
+            pages: four_pages(),
+            page_labels: vec![
+                PageLabel {
+                    first_page: 0,
+                    style: Some(LabelStyle::RomanLower),
+                    prefix: None,
+                    start_at: 1,
+                },
+                PageLabel {
+                    first_page: 2,
+                    style: Some(LabelStyle::Decimal),
+                    prefix: Some("A-".to_string()),
+                    start_at: 5,
+                },
+            ],
+            viewer: Some(Viewer {
+                layout: Some(PageLayout::TwoColumnLeft),
+                mode: Some(PageMode::UseOutlines),
+                open_to: Some(1),
+            }),
             ..Pdf::default()
         }
         .to_bytes()
