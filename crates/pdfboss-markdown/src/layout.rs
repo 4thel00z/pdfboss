@@ -588,7 +588,8 @@ impl<'a> Engine<'a> {
         self.begin_span();
         self.y -= padding.top;
         for line in text.split('\n') {
-            let clean = sanitize(line, style.font(), report);
+            let expanded = line.replace('\t', "    ");
+            let clean = sanitize(&expanded, style.font(), report);
             for row in char_rows(&clean, style.font(), style.size, inner_width)? {
                 self.need(h);
                 let baseline = self.y - BASELINE * style.size;
@@ -674,23 +675,21 @@ fn styled_runs(
 }
 
 /// Greedily splits `text` into rows no wider than `max_width`, breaking at
-/// character boundaries only (no word-boundary preference). Tabs expand to
-/// four spaces first, same as `create text`. Empty text yields one empty
-/// row so a blank code line keeps its vertical space.
+/// character boundaries only (no word-boundary preference). Empty text
+/// yields one empty row so a blank code line keeps its vertical space.
 fn char_rows(
     text: &str,
     font: Standard14,
     size: f32,
     max_width: f32,
 ) -> Result<Vec<String>, pdfboss_write::Error> {
-    let expanded = text.replace('\t', "    ");
-    if expanded.is_empty() {
+    if text.is_empty() {
         return Ok(vec![String::new()]);
     }
     let mut rows = Vec::new();
     let mut row = String::new();
     let mut row_width = 0.0f32;
-    for ch in expanded.chars() {
+    for ch in text.chars() {
         let mut buffer = [0u8; 4];
         let piece = ch.encode_utf8(&mut buffer);
         let width = font.text_width(piece, size)?;
@@ -986,5 +985,19 @@ mod tests {
         for page in &pages[..2] {
             assert!(page.items.iter().any(|i| matches!(i, Item::Rect { .. })));
         }
+    }
+
+    #[test]
+    fn code_block_tabs_become_four_spaces() {
+        let pages = laid("```\n\tbody();\n```\n", MONO);
+        let texts: Vec<String> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["    body();"]);
     }
 }
