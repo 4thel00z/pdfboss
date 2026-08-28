@@ -58,6 +58,20 @@ impl PageSize {
             height: width,
         }
     }
+
+    /// Parses one of the five named sizes case-insensitively: `a3`, `a4`,
+    /// `a5`, `letter`, `legal`. `None` for anything else — a custom size
+    /// has no name to parse.
+    pub fn by_name(name: &str) -> Option<PageSize> {
+        match name.to_ascii_lowercase().as_str() {
+            "a3" => Some(PageSize::A3),
+            "a4" => Some(PageSize::A4),
+            "a5" => Some(PageSize::A5),
+            "letter" => Some(PageSize::Letter),
+            "legal" => Some(PageSize::Legal),
+            _ => None,
+        }
+    }
 }
 
 /// A calendar date and time with a UTC offset, for `/CreationDate` and
@@ -1023,6 +1037,25 @@ mod tests {
             .dimensions(),
             (10.0, 20.0)
         );
+    }
+
+    #[test]
+    fn by_name_parses_the_five_named_sizes_case_insensitively() {
+        for (name, expected) in [
+            ("a3", PageSize::A3),
+            ("A4", PageSize::A4),
+            ("a5", PageSize::A5),
+            ("Letter", PageSize::Letter),
+            ("LEGAL", PageSize::Legal),
+        ] {
+            assert_eq!(PageSize::by_name(name), Some(expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn by_name_rejects_anything_else() {
+        assert_eq!(PageSize::by_name("tabloid"), None);
+        assert_eq!(PageSize::by_name(""), None);
     }
 
     #[test]

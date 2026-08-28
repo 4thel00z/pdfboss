@@ -81,6 +81,15 @@ pub enum CreateCommand {
         #[arg(long)]
         landscape: bool,
     },
+    /// A TOML manifest describing metadata and pages — text, paragraphs,
+    /// images and links mapped onto the compose vocabulary.
+    Manifest {
+        /// Path to the TOML manifest.
+        input: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+    },
 }
 
 /// `--font` choices for `create text`, mirroring
@@ -243,6 +252,15 @@ pub fn cmd_create(command: CreateCommand) -> Result<(), String> {
             if !report.is_empty() {
                 eprintln!("{}", report.summary());
             }
+            let count = pdf.pages.len();
+            pdf.save(&out)
+                .map_err(|e| format!("{}: {e}", out.display()))?;
+            let plural = if count == 1 { "" } else { "s" };
+            println!("wrote {} ({count} page{plural})", out.display());
+            return Ok(());
+        }
+        CreateCommand::Manifest { input, out } => {
+            let pdf = crate::manifest::build(&input)?;
             let count = pdf.pages.len();
             pdf.save(&out)
                 .map_err(|e| format!("{}: {e}", out.display()))?;

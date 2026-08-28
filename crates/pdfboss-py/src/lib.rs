@@ -1808,16 +1808,11 @@ impl AsyncSpanIter {
 /// Maps the Python `size=` string to a [`pdfboss_markdown::PageSize`],
 /// case-insensitively.
 fn page_size_by_name(size: &str) -> PyResult<pdfboss_markdown::PageSize> {
-    match size.to_ascii_lowercase().as_str() {
-        "a3" => Ok(pdfboss_markdown::PageSize::A3),
-        "a4" => Ok(pdfboss_markdown::PageSize::A4),
-        "a5" => Ok(pdfboss_markdown::PageSize::A5),
-        "letter" => Ok(pdfboss_markdown::PageSize::Letter),
-        "legal" => Ok(pdfboss_markdown::PageSize::Legal),
-        other => Err(PdfError::new_err(format!(
-            "unknown page size {other:?}: a3, a4, a5, letter or legal"
-        ))),
-    }
+    pdfboss_write::PageSize::by_name(size).ok_or_else(|| {
+        PdfError::new_err(format!(
+            "unknown page size {size:?}: a3, a4, a5, letter or legal"
+        ))
+    })
 }
 
 /// Composes CommonMark+GFM `markdown` into a themed PDF and returns the

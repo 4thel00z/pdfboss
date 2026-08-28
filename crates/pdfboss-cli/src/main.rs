@@ -5,6 +5,7 @@ mod create;
 mod hexdump;
 mod input;
 mod json;
+mod manifest;
 mod q;
 
 use pdfboss_core::pretty;
@@ -1144,6 +1145,26 @@ mod tests {
             panic!("expected create md");
         };
         assert!(theme.is_none());
+    }
+
+    #[test]
+    fn create_manifest_parses_input_and_out() {
+        let cli = Cli::try_parse_from(["pdfboss", "create", "manifest", "q3.toml", "-o", "q3.pdf"])
+            .unwrap();
+        let Command::Create {
+            command: create::CreateCommand::Manifest { input, out },
+        } = cli.command
+        else {
+            panic!("expected create manifest");
+        };
+        assert_eq!(input, PathBuf::from("q3.toml"));
+        assert_eq!(out, PathBuf::from("q3.pdf"));
+    }
+
+    #[test]
+    fn create_manifest_requires_out() {
+        let outcome = Cli::try_parse_from(["pdfboss", "create", "manifest", "q3.toml"]);
+        assert!(outcome.is_err());
     }
 
     #[test]

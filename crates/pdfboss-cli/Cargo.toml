@@ -18,7 +18,9 @@ pdfboss-tui = { workspace = true }
 pdfboss-write = { workspace = true }
 pdfboss-markdown = { workspace = true }
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
 base64 = "0.22"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 futures-core = "0.3"
