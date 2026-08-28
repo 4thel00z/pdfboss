@@ -4,6 +4,7 @@
 pub mod block;
 mod layout;
 pub mod report;
+mod table;
 mod wrap;
 
 pub use report::Report;

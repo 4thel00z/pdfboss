@@ -8,12 +8,13 @@ use pdfboss_write::{Color, ImageData, PageSize, Standard14};
 
 use crate::block::{Block, ListItem, Run};
 use crate::report::{sanitize, Report};
-use crate::wrap::{wrap, LineBox, StyledRun};
+use crate::table::place_table;
+use crate::wrap::{wrap, Frag, LineBox, StyledRun};
 use crate::Error;
 
 /// Fraction of a line's max glyph size the baseline sits below the
-/// line-box top. Shared by later tasks laying out other block kinds.
-const BASELINE: f32 = 0.8;
+/// line-box top. Shared by table cell layout.
+pub(crate) const BASELINE: f32 = 0.8;
 
 /// Left indent added per list-nesting level, in points.
 const GUTTER: f32 = 18.0;
@@ -118,15 +119,15 @@ pub(crate) fn layout(
 /// The paginating layout engine: tracks the current write position, page
 /// margins and open spans while blocks are placed in order.
 pub(crate) struct Engine<'a> {
-    theme: &'a Theme,
+    pub(crate) theme: &'a Theme,
     left: f32,
     right: f32,
     top: f32,
     bottom: f32,
     pages: Vec<LaidPage>,
-    y: f32,
+    pub(crate) y: f32,
     pending: f32,
-    at_top: bool,
+    pub(crate) at_top: bool,
     spans: Vec<Span>,
     depth: u32,
 }
@@ -166,14 +167,14 @@ impl<'a> Engine<'a> {
     }
 
     /// Appends one draw item to the current page.
-    fn push(&mut self, item: Item) {
+    pub(crate) fn push(&mut self, item: Item) {
         self.page().items.push(item);
     }
 
     /// Applies a block's leading margin: collapses with the still-pending
     /// bottom margin of the previous block, and is a no-op at the top of a
     /// page.
-    fn gap(&mut self, top_margin: f32) {
+    pub(crate) fn gap(&mut self, top_margin: f32) {
         if self.at_top {
             self.pending = 0.0;
             return;
@@ -184,7 +185,7 @@ impl<'a> Engine<'a> {
 
     /// Records a block's trailing margin as pending, to collapse with the
     /// next block's leading margin.
-    fn after(&mut self, bottom_margin: f32) {
+    pub(crate) fn after(&mut self, bottom_margin: f32) {
         self.pending = self.pending.max(bottom_margin);
         self.at_top = false;
     }
@@ -213,7 +214,7 @@ impl<'a> Engine<'a> {
     /// Breaks to a new page first if placing `h` more points of content
     /// would run past the bottom margin. Never breaks at the top of an
     /// already-empty page.
-    fn need(&mut self, h: f32) {
+    pub(crate) fn need(&mut self, h: f32) {
         if self.at_top {
             return;
         }
@@ -262,87 +263,8 @@ impl<'a> Engine<'a> {
                 Align::Center => left + (right - left - line.width) / 2.0,
                 Align::Right => right - line.width,
             };
-            let mut open_link: Option<(String, f32, f32, f32, f32)> = None;
-            for frag in &line.frags {
-                let x = origin + frag.dx;
-                if let Some(color) = frag.background {
-                    self.push(Item::Rect {
-                        x,
-                        y: baseline - 0.25 * frag.size,
-                        w: frag.width,
-                        h: 1.10 * frag.size,
-                        color,
-                    });
-                }
-                self.push(Item::Text {
-                    x,
-                    y: baseline,
-                    text: frag.text.clone(),
-                    font: frag.font,
-                    size: frag.size,
-                    color: frag.color,
-                });
-                match frag.decoration {
-                    Decoration::Underline => self.push(Item::Stroke {
-                        x1: x,
-                        y1: baseline - 0.10 * frag.size,
-                        x2: x + frag.width,
-                        y2: baseline - 0.10 * frag.size,
-                        width: 0.05 * frag.size,
-                        color: frag.color,
-                    }),
-                    Decoration::LineThrough => self.push(Item::Stroke {
-                        x1: x,
-                        y1: baseline + 0.25 * frag.size,
-                        x2: x + frag.width,
-                        y2: baseline + 0.25 * frag.size,
-                        width: 0.05 * frag.size,
-                        color: frag.color,
-                    }),
-                    Decoration::None => {}
-                }
-                let bottom = baseline - 0.25 * frag.size;
-                let top = baseline + 0.85 * frag.size;
-                let Some(uri) = &frag.link else {
-                    if let Some((uri, x1, x2, y1, y2)) = open_link.take() {
-                        self.push(Item::Link {
-                            x: x1,
-                            y: y1,
-                            w: x2 - x1,
-                            h: y2 - y1,
-                            uri,
-                        });
-                    }
-                    continue;
-                };
-                match &mut open_link {
-                    Some((open_uri, _, x2, y1, y2)) if open_uri.as_str() == uri.as_str() => {
-                        *x2 = x + frag.width;
-                        *y1 = y1.min(bottom);
-                        *y2 = y2.max(top);
-                    }
-                    _ => {
-                        if let Some((old_uri, x1, x2, y1, y2)) = open_link.take() {
-                            self.push(Item::Link {
-                                x: x1,
-                                y: y1,
-                                w: x2 - x1,
-                                h: y2 - y1,
-                                uri: old_uri,
-                            });
-                        }
-                        open_link = Some((uri.clone(), x, x + frag.width, bottom, top));
-                    }
-                }
-            }
-            if let Some((uri, x1, x2, y1, y2)) = open_link.take() {
-                self.push(Item::Link {
-                    x: x1,
-                    y: y1,
-                    w: x2 - x1,
-                    h: y2 - y1,
-                    uri,
-                });
+            for item in frag_items(&line.frags, origin, baseline) {
+                self.push(item);
             }
             self.y -= h;
             self.at_top = false;
@@ -350,8 +272,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Dispatches each block in document order, appending items to the
-    /// current page. `Paragraph`, `Heading`, `Rule`, `List`, `BlockQuote`
-    /// and `CodeBlock` land here; `Table` and `Image` land in later tasks.
+    /// current page. `Paragraph`, `Heading`, `Rule`, `List`, `BlockQuote`,
+    /// `CodeBlock` and `Table` land here; `Image` lands in a later task.
     fn blocks(
         &mut self,
         blocks: &[Block],
@@ -416,7 +338,10 @@ impl<'a> Engine<'a> {
                 Block::CodeBlock { text } => {
                     self.code_block(text, base, left, right, report)?;
                 }
-                _ => {}
+                Block::Table { aligns, head, rows } => {
+                    place_table(self, aligns, head, rows, base, left, right, report)?;
+                }
+                Block::Image { .. } => {}
             }
         }
         Ok(())
@@ -628,6 +553,110 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// A link rect folded across consecutive same-URI fragments on one line,
+/// widened as later fragments extend it, and flushed to one `Item::Link`
+/// once the run of matching fragments ends.
+struct OpenLink {
+    uri: String,
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+impl OpenLink {
+    fn item(self) -> Item {
+        Item::Link {
+            x: self.x1,
+            y: self.y1,
+            w: self.x2 - self.x1,
+            h: self.y2 - self.y1,
+            uri: self.uri,
+        }
+    }
+}
+
+/// Emits the background/text/decoration/link items for one line's
+/// fragments, `origin` being the line's left edge and `baseline` its text
+/// baseline. Consecutive fragments sharing a link URI fold into one
+/// `Item::Link` rect. Shared by [`Engine::place_lines`] and table cell
+/// line placement, since table rows place lines manually rather than
+/// through `place_lines` (which page-breaks).
+pub(crate) fn frag_items(frags: &[Frag], origin: f32, baseline: f32) -> Vec<Item> {
+    let mut items = Vec::new();
+    let mut open_link: Option<OpenLink> = None;
+    for frag in frags {
+        let x = origin + frag.dx;
+        if let Some(color) = frag.background {
+            items.push(Item::Rect {
+                x,
+                y: baseline - 0.25 * frag.size,
+                w: frag.width,
+                h: 1.10 * frag.size,
+                color,
+            });
+        }
+        items.push(Item::Text {
+            x,
+            y: baseline,
+            text: frag.text.clone(),
+            font: frag.font,
+            size: frag.size,
+            color: frag.color,
+        });
+        match frag.decoration {
+            Decoration::Underline => items.push(Item::Stroke {
+                x1: x,
+                y1: baseline - 0.10 * frag.size,
+                x2: x + frag.width,
+                y2: baseline - 0.10 * frag.size,
+                width: 0.05 * frag.size,
+                color: frag.color,
+            }),
+            Decoration::LineThrough => items.push(Item::Stroke {
+                x1: x,
+                y1: baseline + 0.25 * frag.size,
+                x2: x + frag.width,
+                y2: baseline + 0.25 * frag.size,
+                width: 0.05 * frag.size,
+                color: frag.color,
+            }),
+            Decoration::None => {}
+        }
+        let bottom = baseline - 0.25 * frag.size;
+        let top = baseline + 0.85 * frag.size;
+        let Some(uri) = &frag.link else {
+            if let Some(open) = open_link.take() {
+                items.push(open.item());
+            }
+            continue;
+        };
+        match &mut open_link {
+            Some(open) if open.uri == *uri => {
+                open.x2 = x + frag.width;
+                open.y1 = open.y1.min(bottom);
+                open.y2 = open.y2.max(top);
+            }
+            _ => {
+                if let Some(old) = open_link.take() {
+                    items.push(old.item());
+                }
+                open_link = Some(OpenLink {
+                    uri: uri.clone(),
+                    x1: x,
+                    x2: x + frag.width,
+                    y1: bottom,
+                    y2: top,
+                });
+            }
+        }
+    }
+    if let Some(open) = open_link.take() {
+        items.push(open.item());
+    }
+    items
+}
+
 /// Resolves a run's declared styling onto `base`: theme rules for code,
 /// link, and strikethrough runs, then explicit bold/italic flags.
 fn run_style(theme: &Theme, base: &TextStyle, run: &Run) -> TextStyle {
@@ -650,9 +679,9 @@ fn run_style(theme: &Theme, base: &TextStyle, run: &Run) -> TextStyle {
     style
 }
 
-/// Resolves and sanitizes a paragraph or heading's inline runs into
-/// wrap-ready styled runs.
-fn styled_runs(
+/// Resolves and sanitizes a paragraph, heading, or table cell's inline
+/// runs into wrap-ready styled runs.
+pub(crate) fn styled_runs(
     theme: &Theme,
     runs: &[Run],
     base: &TextStyle,
