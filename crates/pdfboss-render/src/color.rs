@@ -157,11 +157,17 @@ impl ColorSpace {
             }
             ColorSpace::DeviceRGB => [comp(comps, 0), comp(comps, 1), comp(comps, 2)],
             ColorSpace::DeviceCMYK => {
-                let k = comp(comps, 3);
+                // Multiplicative, not the spec's additive 1 − min(1, ink+K)
+                // (§8.6.4.4): the additive form saturates any deep color
+                // (ink + K ≥ 1) to pure black, losing its hue — a rich navy
+                // fill reads as black. Scaling the ink by the black
+                // remainder keeps the hue, matching what CMYK-native
+                // viewers show.
+                let k1 = 1.0 - comp(comps, 3);
                 [
-                    1.0 - (comp(comps, 0) + k).min(1.0),
-                    1.0 - (comp(comps, 1) + k).min(1.0),
-                    1.0 - (comp(comps, 2) + k).min(1.0),
+                    (1.0 - comp(comps, 0)) * k1,
+                    (1.0 - comp(comps, 1)) * k1,
+                    (1.0 - comp(comps, 2)) * k1,
                 ]
             }
             ColorSpace::Indexed { base, lookup } => {
@@ -689,7 +695,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn cmyk_to_rgb_naive() {
+    fn cmyk_to_rgb_multiplicative() {
         assert_eq!(
             ColorSpace::DeviceCMYK.to_rgb(&[1.0, 0.0, 0.0, 0.0]),
             [0.0, 1.0, 1.0]
@@ -699,9 +705,22 @@ pub(crate) mod tests {
             [0.0, 0.0, 0.0]
         );
         let [r, g, b] = ColorSpace::DeviceCMYK.to_rgb(&[0.5, 0.2, 0.0, 0.3]);
-        assert!((r - 0.2).abs() < 1e-6);
-        assert!((g - 0.5).abs() < 1e-6);
+        assert!((r - 0.35).abs() < 1e-6);
+        assert!((g - 0.56).abs() < 1e-6);
         assert!((b - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn deep_cmyk_keeps_its_hue() {
+        // A rich navy (every channel's ink sum over 1.0). The additive
+        // formula 1 − min(1, ink + K) saturates all three channels to zero
+        // and paints the color black; the multiplicative form keeps the
+        // blue-leaning hue that CMYK-native viewers show.
+        let [r, g, b] = ColorSpace::DeviceCMYK.to_rgb(&[0.938, 0.759, 0.507, 0.57]);
+        assert!((r - 0.062 * 0.43).abs() < 1e-4);
+        assert!((g - 0.241 * 0.43).abs() < 1e-4);
+        assert!((b - 0.493 * 0.43).abs() < 1e-4);
+        assert!(b > g && g > r, "hue must survive: {r} {g} {b}");
     }
 
     #[test]
