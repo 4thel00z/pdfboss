@@ -14,9 +14,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pdfboss-core = { path = "../pdfboss-core", features = ["predefined-cmaps"] }
+pdfboss-markdown = { path = "../pdfboss-markdown" }
 pdfboss-output = { path = "../pdfboss-output" }
 pdfboss-render = { path = "../pdfboss-render" }
 pdfboss-text = { path = "../pdfboss-text" }
+pdfboss-write = { path = "../pdfboss-write" }
 # `http` is enabled here so every wheel/sdist build ships open_url support.
 pdfboss-aio = { path = "../pdfboss-aio", features = ["http"] }
 pyo3 = { version = "0.25", features = ["abi3-py312"] }

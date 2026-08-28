@@ -603,3 +603,24 @@ class AsyncPage:
         """Every image the page draws, as PNG-encoded ``PageImage``
         entries — the async twin of ``Page.extract_images``, with the
         same drawing-order, native-size and leniency semantics."""
+
+def md_to_pdf(
+    markdown: str,
+    theme: str | None = None,
+    size: str = "a4",
+    landscape: bool = False,
+    base_dir: str | None = None,
+) -> bytes:
+    """Composes CommonMark+GFM ``markdown`` into a themed PDF and returns
+    the file bytes. ``theme`` is CSS source text, not a path; omitted, the
+    built-in default theme applies. ``size`` names a page size
+    case-insensitively: ``"a3"``, ``"a4"``, ``"a5"``, ``"letter"`` or
+    ``"legal"``, raising ``PdfError`` for anything else. ``base_dir``
+    anchors relative image paths and defaults to the current directory.
+
+    Deterministic: the same arguments always produce the same bytes.
+
+    Unencodable characters and skipped raw HTML fragments are replaced
+    and reported through a single ``UserWarning`` naming what changed; a
+    clean document warns about nothing.
+    """

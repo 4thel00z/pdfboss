@@ -1803,6 +1803,67 @@ impl AsyncSpanIter {
     }
 }
 
+/// Maps the Python `size=` string to a [`pdfboss_markdown::PageSize`],
+/// case-insensitively.
+fn page_size_by_name(size: &str) -> PyResult<pdfboss_markdown::PageSize> {
+    match size.to_ascii_lowercase().as_str() {
+        "a3" => Ok(pdfboss_markdown::PageSize::A3),
+        "a4" => Ok(pdfboss_markdown::PageSize::A4),
+        "a5" => Ok(pdfboss_markdown::PageSize::A5),
+        "letter" => Ok(pdfboss_markdown::PageSize::Letter),
+        "legal" => Ok(pdfboss_markdown::PageSize::Legal),
+        other => Err(PdfError::new_err(format!(
+            "unknown page size {other:?}: a3, a4, a5, letter or legal"
+        ))),
+    }
+}
+
+/// Composes CommonMark+GFM `markdown` into a themed PDF and returns the
+/// file bytes. `theme` is CSS source text (not a path); omitted, the
+/// built-in default theme applies. `size` names a page size
+/// case-insensitively: a3, a4, a5, letter or legal. `base_dir` anchors
+/// relative image paths and defaults to the current directory.
+///
+/// Deterministic: the same arguments always produce the same bytes.
+///
+/// Unencodable characters and skipped raw HTML fragments are replaced and
+/// reported through a single `UserWarning` naming what changed; a clean
+/// document warns about nothing.
+#[pyfunction]
+#[pyo3(signature = (markdown, theme=None, size="a4", landscape=false, base_dir=None))]
+fn md_to_pdf<'py>(
+    py: Python<'py>,
+    markdown: &str,
+    theme: Option<&str>,
+    size: &str,
+    landscape: bool,
+    base_dir: Option<PathBuf>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let theme = match theme {
+        Some(css) => pdfboss_markdown::Theme::parse(css).map_err(pdf_err)?,
+        None => pdfboss_markdown::Theme::default_theme(),
+    };
+    let page_size = page_size_by_name(size)?;
+    let page_size = if landscape {
+        page_size.landscape()
+    } else {
+        page_size
+    };
+    let options = pdfboss_markdown::Options {
+        theme,
+        page_size,
+        base_dir: base_dir.unwrap_or_else(|| PathBuf::from(".")),
+    };
+    let (pdf, report) = py
+        .allow_threads(|| pdfboss_markdown::to_pdf(markdown, &options))
+        .map_err(pdf_err)?;
+    let bytes = py.allow_threads(|| pdf.to_bytes()).map_err(pdf_err)?;
+    if !report.is_empty() {
+        PyModule::import(py, "warnings")?.call_method1("warn", (report.summary(),))?;
+    }
+    Ok(PyBytes::new(py, &bytes))
+}
+
 #[pymodule]
 fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -1818,6 +1879,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpanIter>()?;
     m.add_class::<AsyncSpanIter>()?;
     m.add_class::<PageImage>()?;
+    m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
     Ok(())
 }
 

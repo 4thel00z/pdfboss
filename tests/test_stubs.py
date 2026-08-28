@@ -1,5 +1,6 @@
 """The type stubs must cover every name and method the package exports."""
 
+import inspect
 from pathlib import Path
 
 import pdfboss
@@ -10,7 +11,7 @@ STUB = Path(__file__).parent.parent / "python" / "pdfboss" / "_pdfboss.pyi"
 def test_stub_declares_every_exported_class() -> None:
     stub = STUB.read_text()
     for name in pdfboss.__all__:
-        if name == "__version__":
+        if not inspect.isclass(getattr(pdfboss, name)):
             continue
         assert f"class {name}" in stub, f"missing stub for {name}"
 
