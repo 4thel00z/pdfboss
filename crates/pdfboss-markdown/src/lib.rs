@@ -1,6 +1,7 @@
-//! Markdown to PDF composition for pdfboss: takes CommonMark+GFM source and
-//! a CSS theme in, and produces a [`pdfboss_write::Pdf`] plus a
-//! replace-and-report [`Report`] of anything sanitized along the way.
+//! Markdown to PDF composition for pdfboss, taking CommonMark+GFM source
+//! and a CSS theme as input.
+//! It produces a [`pdfboss_write::Pdf`] alongside a replace-and-report
+//! [`Report`] of anything sanitized along the way.
 //! Given the same markdown and options, [`to_pdf`] always emits the same
 //! bytes: no clock, no randomness, no environment dependence.
 
