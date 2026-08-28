@@ -27,7 +27,7 @@ Reading a PDF should not require a C library. pdfboss is a clean-room reader bui
 ## Highlights
 
 - **Clean-room engine** — implemented from the ISO 32000 specification in safe Rust: no C dependencies, no bindings to another engine.
-- **Fastest text extraction measured** — 6,700 pages/s over a 40-file real-world corpus, about 15× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
+- **Fastest text extraction measured** — 6,850 pages/s over a 40-file real-world corpus, about 15× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
 - **Its own codecs** — JPEG 2000, JBIG2, CCITT and ICC are decoded in-tree, implemented from their specifications, not linked in.
 - **Embedded-image extraction** — every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
 - **PDF creation** — document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).

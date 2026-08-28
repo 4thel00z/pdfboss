@@ -6,6 +6,7 @@ language = "en"
 src = "src"
 
 [output.html]
+site-url = "/pdfboss/"
 git-repository-url = "https://github.com/4thel00z/pdfboss"
 edit-url-template = "https://github.com/4thel00z/pdfboss/edit/main/docs/{path}"
 

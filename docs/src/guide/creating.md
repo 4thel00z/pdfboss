@@ -145,7 +145,7 @@ Four paths produce the same bytes:
 - `pdf.save(path)` — serialize and write to a file.
 - `pdf.to_bytes()` — the whole file as one `Vec<u8>`.
 - `pdf.write_into(impl std::io::Write)` — the same bytes streamed in bounded chunks. An error can leave a prefix of the file already written, and no flush is performed — flush a buffered writer yourself.
-- `pdf.write_into_with(sink).await` — the asynchronous twin over any `AsyncByteSink`; it hands the sink back unflushed. `Vec<u8>` is a sink, and `Immediate` presents any `std::io::Write` as one.
+- `pdf.write_into_with(sink).await` — the asynchronous twin over any `AsyncByteSink`; it hands the sink back unflushed. `Vec<u8>` is a sink, `Immediate` presents any `std::io::Write` as one, and `pdfboss_aio::TokioSink` (behind that crate's `write` feature) presents any `tokio::io::AsyncWrite`.
 
 ```rust,no_run
 use pdfboss_write::{Page, PageSize, Pdf, Standard14};
@@ -161,6 +161,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bytes = pdf.write_into_with(Vec::new()).await?;
     tokio::fs::write("async.pdf", &bytes).await?;
+    Ok(())
+}
+```
+
+To stream into a tokio writer directly, wrap it in `pdfboss_aio::TokioSink`
+(the `write` feature of `pdfboss-aio`). The one line is
+`pdf.write_into_with(TokioSink(writer)).await?`; the writer comes back out of
+the returned sink's `.0` field, unflushed, so flush it yourself:
+
+```rust,no_run
+use pdfboss_aio::TokioSink;
+use pdfboss_write::{Page, PageSize, Pdf, Standard14};
+use tokio::io::AsyncWriteExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut page = Page::new(PageSize::A4);
+    page.canvas
+        .text("Streamed through tokio", 72.0, 770.0, Standard14::Helvetica, 14.0)?;
+    let pdf = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    };
+    let file = tokio::fs::File::create("streamed.pdf").await?;
+    let mut sink = pdf.write_into_with(TokioSink(file)).await?;
+    sink.0.flush().await?;
     Ok(())
 }
 ```

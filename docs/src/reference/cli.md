@@ -55,7 +55,7 @@ pdfboss render [OPTIONS] --page <PAGE> <FILE>
 - `--page <PAGE>` — 1-based page number (required)
 - `-o, --out <OUT>` — output file (default: `page-N.png`)
 - `--scale <SCALE>` — scale factor (default: 1)
-- `--fonts <FONTS>` — which fonts to paint: `embedded-only` (only embedded TrueType outlines, fastest), `all-embedded` (every embedded program, the default), `full` (also substitute bundled faces for non-embedded fonts)
+- `--fonts <FONTS>` — which fonts to paint: `embedded-only` (only embedded TrueType outlines, fastest), `all-embedded` (every embedded program), `full` (also substitute bundled faces for non-embedded fonts); the default resolves to `full` when substitute faces are available (the compiled-in OFL set or `--font-dir`), otherwise `all-embedded`
 - `--font-dir <FONT_DIR>` — directory of substitute faces for `--fonts full`; overrides the compiled-in OFL set
 - `--png-compression <PNG_COMPRESSION>` — `none`, `fast`, `default` or `best`: encode time against file size, same pixels
 
@@ -111,7 +111,7 @@ Dump the document as a JSON value tree, for piping to external tools.
 pdfboss json [OPTIONS] <INPUT>
 ```
 
-- `--raw` — embed raw (still encoded) stream data as base64
+- `--raw` — embed raw (still encoded) stream data as base64; combining it with `--decode` is a usage error
 - `--decode` — embed decoded stream data as base64
 - `--pages <PAGES>` — restrict logical elements to these 1-based pages (comma separated)
 - `--no-logical` — skip the logical layer (pages/fonts/images/annotations)
@@ -135,6 +135,9 @@ The selector is one of `obj:N[,G]`, `header`, `xref:N`, `trailer` or `range:STAR
 - `--annotate` — print labeled element boundaries as the dump crosses them
 - `--width <WIDTH>` — bytes per row (default: 16)
 
+The dump is colorized with ANSI escapes when stdout is a tty; setting the
+`NO_COLOR` environment variable (any value) disables color.
+
 ```bash
 pdfboss hex report.pdf header
 ```
@@ -147,8 +150,8 @@ Run a jq program over the document's JSON value tree (the same tree `json` print
 pdfboss q [OPTIONS] <INPUT> <PROGRAM>
 ```
 
-- `--raw`, `--decode`, `--pages <PAGES>`, `--no-logical`, `--content-ops` — as in `json`
-- `--hex` — hexdump results carrying a `_span` instead of printing JSON
+- `--raw`, `--decode`, `--pages <PAGES>`, `--no-logical`, `--content-ops` — as in `json`, including the `--raw`/`--decode` usage error when combined
+- `--hex` — hexdump results carrying a `_span` instead of printing JSON; colorized on a tty like `hex`, with `NO_COLOR` honored
 - `-r` — print string results raw, without quotes (like `jq -r`)
 
 ```bash
@@ -195,7 +198,7 @@ pdfboss create text notes.txt -o notes.pdf --font times-roman --font-size 12
 
 ### create images
 
-One page per input image (PNG or JPEG, detected by content). Without `--size`, each page matches its image at 72 dpi; `--landscape` is only meaningful with `--size`.
+One page per input image (PNG or JPEG, detected by content). Without `--size`, each page matches its image at 72 dpi. `--landscape` requires `--size`: passing it alone is a usage error, not a no-op.
 
 ```text
 pdfboss create images [OPTIONS] --out <OUT> <INPUTS>...

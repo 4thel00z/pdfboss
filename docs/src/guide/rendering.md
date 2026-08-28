@@ -19,10 +19,13 @@ pdfboss render report.pdf --page 1 --scale 2 -o page-1@2x.png
 The first form writes `page-1.png` (`--page` is 1-based). Further flags:
 
 - `--fonts <FONTS>` — which fonts to paint: `embedded-only`, `all-embedded`
-  (default) or `full` (see the tiers below).
+  or `full` (see the tiers below). The default resolves to `full` when
+  substitute faces are available (the compiled-in OFL set or `--font-dir`),
+  otherwise `all-embedded`.
 - `--font-dir <FONT_DIR>` — a directory of substitute faces for `--fonts
-  full`, one file per `pdfboss_render::substitute::face_filename` (e.g. an
-  installed `pdfboss-fonts` package). Overrides the compiled-in OFL set.
+  full` (e.g. an installed `pdfboss-fonts` package), named as listed under
+  [Substitute face files](#substitute-face-files). Overrides the compiled-in
+  OFL set.
 - `--png-compression <PNG_COMPRESSION>` — `none`, `fast`, `default` or
   `best`.
 - `--password <PASSWORD>` — for encrypted files, covered in
@@ -37,9 +40,10 @@ previous one.
 
 - **`embedded-only`** paints only embedded TrueType outlines — the fastest
   tier, and TrueType only, not every embedded font.
-- **`all-embedded`** (the default) paints every embedded font program:
-  TrueType, CFF, Type1 and Type3.
-- **`full`** additionally substitutes a replacement face for non-embedded
+- **`all-embedded`** (the default when no substitute faces are available)
+  paints every embedded font program: TrueType, CFF, Type1 and Type3.
+- **`full`** (the default whenever substitute faces are available)
+  additionally substitutes a replacement face for non-embedded
   simple fonts: from a directory you supply (`--font-dir`, `font_dir=`), or
   from the compiled-in OFL Croscore set (Arimo/Tinos/Cousine,
   metric-compatible with Helvetica/Times/Courier). In Python, `pip install
@@ -52,6 +56,20 @@ or the Adobe Core-14 AFM tables for a standard-14 face — so everything painted
 around it stays where the page put it. `/Symbol` and `/ZapfDingbats` have no
 license-clean substitute and stay blank; see
 [Limitations](../reference/limitations.md).
+
+### Substitute face files
+
+A substitute directory (`--font-dir`, `font_dir=`, `SubstituteSource::Dir`)
+holds one file per face, looked up by these exact names:
+
+| Family | Files |
+|---|---|
+| Sans (Arimo) | `Arimo[wght].ttf`, `Arimo-Italic[wght].ttf` (weight rides the variable-font `[wght]` axis) |
+| Serif (Tinos) | `Tinos-Regular.ttf`, `Tinos-Bold.ttf`, `Tinos-Italic.ttf`, `Tinos-BoldItalic.ttf` |
+| Mono (Cousine) | `Cousine-Regular.ttf`, `Cousine-Bold.ttf`, `Cousine-Italic.ttf`, `Cousine-BoldItalic.ttf` |
+
+A file that is missing or unreadable means no substitution for the faces that
+map to it; nothing else in the directory is read.
 
 ## Leniency and reporting
 
@@ -88,7 +106,9 @@ Path("page-1.png").write_bytes(png)
 
 `render` accepts `fonts=` (`"embedded-only"`, `"all-embedded"`, `"full"`),
 `font_dir=` and `compression=` (`"none"`, `"fast"`, `"default"`, `"best"`),
-and releases the GIL while it runs. `Page.render_reporting` renders the same
+and releases the GIL while it runs. `fonts=` defaults to `None`, which
+resolves to `"full"` when `font_dir=` is given or the `pdfboss-fonts`
+package is importable, and to `"all-embedded"` otherwise. `Page.render_reporting` renders the same
 way and returns `(png, warnings)`:
 
 ```python
@@ -105,6 +125,13 @@ order given.
 pngs = doc.render_pages(scale=2.0)
 first_two_reversed = doc.render_pages(pages=[1, 0])
 ```
+
+The full signature is `render_pages(pages=None, scale=1.0, fonts=None,
+font_dir=None, compression="default")`; `fonts`, `font_dir` and
+`compression` mean the same as on `Page.render`, applied to every page,
+and a `fonts` of `None` resolves the same way. The stub file
+[`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi)
+documents each parameter.
 
 All three have async twins on `AsyncPage`/`AsyncDocument`, which also render
 documents opened over HTTP — see
@@ -127,14 +154,31 @@ row-major from the top-left). `Pixmap::save_png` writes it to a file;
 `PngCompression` (`None`, `Fast`, `Balanced` — the level the other surfaces
 call `default` — or `Best`).
 
-`render_page_with_options` adds `RenderOptions`: `glyph_painting` selects the
-`GlyphPainting` tier (`EmbeddedTrueTypeOnly`, `AllEmbedded`, `Full`),
-`substitutes` says where the `Full` tier's replacement faces come from
-(`SubstituteSource::Builtin` for the compiled-in OFL set, behind the
-`substitute-fonts` Cargo feature, or `SubstituteSource::Dir(path)`; the
-default `SubstituteSource::None` substitutes nothing, so `Full` behaves like
-`AllEmbedded` until you opt in), and `cache` shares one `RenderCache` of
-loaded fonts across a whole-document walk. `render_page_reporting` returns the
+`render_page_with_options` adds `RenderOptions`, a struct of four public
+fields:
+
+- `glyph_painting` selects the `GlyphPainting` tier: `EmbeddedTrueTypeOnly`,
+  `AllEmbedded` or `Full`.
+- `substitutes` says where the `Full` tier's replacement faces come from.
+  `SubstituteSource::Builtin` is the compiled-in OFL set, present only when
+  the crate is built with the `substitute-fonts` Cargo feature; without that
+  feature, `Builtin` degrades to no substitution, so `Full` behaves exactly
+  like `AllEmbedded`. The probe `pdfboss_render::builtin_fonts_available()`
+  reports whether the compiled-in set exists.
+  `SubstituteSource::Dir(path)` reads faces from a directory named as in
+  [Substitute face files](#substitute-face-files). The default
+  `SubstituteSource::None` substitutes nothing, so `Full` behaves like
+  `AllEmbedded` until you opt in.
+- `oc: Option<Arc<OcState>>` is the document's optional-content visibility.
+  The synchronous entry points fill it from the document when it is `None`;
+  an asynchronous caller builds it itself, from `AsyncDocument::oc_state`,
+  and leaving it `None` there renders every layer. See
+  [Async and remote documents](./async.md).
+- `cache: Option<Arc<RenderCache>>` shares one `RenderCache` across a
+  whole-document walk. It retains loaded fonts and parsed `ICCBased`
+  colorspace outcomes across pages; `None` keeps every load page-local.
+
+`render_page_reporting` returns the
 `RenderReport` alongside the pixels; `report.summary()` is a one-line count
 per kind, `report.warnings()` one line per distinct drop.
 
@@ -164,6 +208,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let png = pixmap.encode_png_with(PngCompression::Best)?;
     std::fs::write("page-1-small.png", png)?;
+    Ok(())
+}
+```
+
+For a whole document, pass one `RenderCache` to every page, so each font
+program and each `ICCBased` profile loads once per document rather than once
+per page:
+
+```rust,no_run
+use std::sync::Arc;
+
+use pdfboss_core::{map_pages, Document};
+use pdfboss_render::{render_page_with_options, RenderCache, RenderOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    let opts = RenderOptions {
+        cache: Some(Arc::new(RenderCache::default())),
+        ..RenderOptions::default()
+    };
+    let outcomes = map_pages(&doc, |doc, page| {
+        render_page_with_options(doc, page, 2.0, &opts)
+    });
+    for (index, pixmap) in outcomes.into_iter().enumerate() {
+        pixmap?.save_png(format!("page-{}.png", index + 1))?;
+    }
     Ok(())
 }
 ```

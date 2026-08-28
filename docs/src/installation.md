@@ -68,7 +68,9 @@ The library crates keep their optional features off by default:
 - `pdfboss-render` `substitute-fonts` — the bundled substitute faces.
 - `pdfboss-core` `predefined-cmaps` — the predefined CJK CMap set.
 - `pdfboss-aio` `http` — remote documents over HTTP range requests.
-- `pdfboss-aio` `write` — streaming created documents into tokio writers.
+- `pdfboss-aio` `write` — streaming created documents into tokio writers:
+  ships `TokioSink`, which presents any `tokio::io::AsyncWrite` to
+  `Pdf::write_into_with` (see [Creating PDFs](./guide/creating.md)).
 
 Enable a feature at add time, for example:
 
