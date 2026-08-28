@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.22.0](https://github.com/4thel00z/pdfboss/compare/v0.21.1...v0.22.0) (2026-08-28)
+
+
+### Features
+
+* markdown → PDF composition with CSS themes (create md, pdfboss.md.to_pdf) ([#105](https://github.com/4thel00z/pdfboss/issues/105)) ([7ffe233](https://github.com/4thel00z/pdfboss/commit/7ffe2337e8865f6f3ce9989e3b4eb816abc397cc))
+
+
+### Performance Improvements
+
+* **text:** move layout assembly's lines instead of cloning them, group spans into lines once ([#106](https://github.com/4thel00z/pdfboss/issues/106)) ([2ede975](https://github.com/4thel00z/pdfboss/commit/2ede97532b270249fd3ff4303596d0e129f22a1e))
+* **text:** resolve a resource category dictionary once per walk, not once per operator ([#102](https://github.com/4thel00z/pdfboss/issues/102)) ([50ce6dd](https://github.com/4thel00z/pdfboss/commit/50ce6dda43f67b11c3d951fa10685eb00abbf22d))
+
+
+### Documentation
+
+* re-measure the README benchmarks at 0.22.0 ([#107](https://github.com/4thel00z/pdfboss/issues/107)) ([1adce73](https://github.com/4thel00z/pdfboss/commit/1adce730f57432a4254279e4ee567dd9fb473812))
+
 ## [0.21.1](https://github.com/4thel00z/pdfboss/compare/v0.21.0...v0.21.1) (2026-08-27)
 
 
