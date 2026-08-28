@@ -7,6 +7,7 @@ mod input;
 mod json;
 mod manifest;
 mod q;
+mod skill;
 
 use pdfboss_core::pretty;
 
@@ -248,6 +249,11 @@ enum Command {
         #[arg(long)]
         content_ops: bool,
     },
+    /// Install or print the bundled Claude Code skill for coding agents.
+    Skill {
+        #[command(subcommand)]
+        command: skill::SkillCommand,
+    },
 }
 
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
@@ -315,6 +321,7 @@ fn main() {
     let cli = Cli::parse();
     let result: Result<(), Failure> = match cli.command {
         Command::Create { command } => create::cmd_create(command).map_err(Failure::from),
+        Command::Skill { command } => skill::cmd_skill(command).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,
