@@ -237,7 +237,7 @@ class Document:
         self,
         pages: list[int] | None = None,
         scale: float = 1.0,
-        fonts: str = "all-embedded",
+        fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
     ) -> list[bytes]:
@@ -336,7 +336,7 @@ class Page:
     def render(
         self,
         scale: float = 1.0,
-        fonts: str = "all-embedded",
+        fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
     ) -> bytes:
@@ -346,12 +346,14 @@ class Page:
         otherwise); 1.0 maps one PDF point to one pixel.
 
         ``fonts`` selects how aggressively non-embedded glyphs are painted:
-        ``"embedded-only"``, ``"all-embedded"`` (default) or ``"full"``.
-        ``"full"`` substitutes replacement faces for non-embedded fonts,
-        read from ``font_dir`` if given, or else discovered from the
-        optional ``pdfboss-fonts`` package; if neither is available this
-        raises ``ValueError`` (install with ``pip install pdfboss[full]``,
-        or pass ``font_dir=...``).
+        ``"embedded-only"``, ``"all-embedded"`` or ``"full"``. ``"full"``
+        substitutes replacement faces for non-embedded fonts, read from
+        ``font_dir`` if given, or else discovered from the optional
+        ``pdfboss-fonts`` package; if neither is available an explicit
+        ``fonts="full"`` raises ``ValueError`` (install with ``pip install
+        pdfboss[full]``, or pass ``font_dir=...``). The default, ``None``,
+        resolves to ``"full"`` when a face source is at hand and to
+        ``"all-embedded"`` when none is.
 
         ``compression`` trades PNG encode time against file size:
         ``"none"``, ``"fast"``, ``"default"`` or ``"best"``. Every level
@@ -364,7 +366,7 @@ class Page:
     def render_reporting(
         self,
         scale: float = 1.0,
-        fonts: str = "all-embedded",
+        fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
     ) -> tuple[bytes, list[str]]:
@@ -476,7 +478,7 @@ class AsyncDocument:
         self,
         pages: list[int] | None = None,
         scale: float = 1.0,
-        fonts: str = "all-embedded",
+        fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
     ) -> list[bytes]:
@@ -580,7 +582,7 @@ class AsyncPage:
     async def render(
         self,
         scale: float = 1.0,
-        fonts: str = "all-embedded",
+        fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
     ) -> bytes:
@@ -591,7 +593,7 @@ class AsyncPage:
     async def render_reporting(
         self,
         scale: float = 1.0,
-        fonts: str = "all-embedded",
+        fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
     ) -> tuple[bytes, list[str]]:

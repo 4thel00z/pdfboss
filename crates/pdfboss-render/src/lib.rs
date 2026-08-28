@@ -142,7 +142,7 @@ impl Pixmap {
 /// How aggressively the rasterizer turns text into filled outlines. Each tier is
 /// a strict superset of the previous one; the difference is only observable once
 /// the corresponding glyph loaders exist.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum GlyphPainting {
     /// Only embedded TrueType (`glyf`) outlines — the cheapest tier.
     EmbeddedTrueTypeOnly,
@@ -166,7 +166,7 @@ impl GlyphPainting {
 /// Where non-embedded glyph substitution (the `Full` [`GlyphPainting`] tier)
 /// draws replacement faces from. The default, `None`, substitutes nothing --
 /// `Full` behaves exactly like `AllEmbedded` until a caller opts in.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SubstituteSource {
     /// No substitution: non-embedded fonts stay unpainted.
     #[default]
@@ -217,11 +217,24 @@ pub struct RenderOptions {
 /// `Send + Sync`, so a parallel page walk may share one.
 #[derive(Default)]
 pub struct RenderCache {
-    fonts: std::sync::Mutex<pdfboss_core::FastMap<pdfboss_core::ObjRef, executor::SharedGlyphFont>>,
+    fonts: std::sync::Mutex<pdfboss_core::FastMap<FontKey, executor::SharedGlyphFont>>,
     /// Shared as one handle with every page's executor, which otherwise
     /// builds a render-local one — the same two-level shape as `fonts`
     /// without a second lookup tier.
     colorspaces: Arc<color::IccCache>,
+}
+
+/// What a cached font load depended on besides the dictionary itself: the
+/// painting tier and the substitute source. One cache handle may serve
+/// renders with different options — a load made at `all-embedded` paints
+/// nothing for a non-embedded font and must not be handed to a `full`
+/// render, so the options are part of the key rather than an invariant the
+/// caller polices.
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub(crate) struct FontKey {
+    pub(crate) font: pdfboss_core::ObjRef,
+    pub(crate) painting: GlyphPainting,
+    pub(crate) substitutes: SubstituteSource,
 }
 
 impl std::fmt::Debug for RenderCache {
@@ -234,16 +247,16 @@ impl std::fmt::Debug for RenderCache {
 }
 
 impl RenderCache {
-    pub(crate) fn font(&self, r: pdfboss_core::ObjRef) -> Option<executor::SharedGlyphFont> {
-        self.fonts.lock().ok()?.get(&r).cloned()
+    pub(crate) fn font(&self, key: &FontKey) -> Option<executor::SharedGlyphFont> {
+        self.fonts.lock().ok()?.get(key).cloned()
     }
 
     /// First writer wins, exactly like the text-side cache: concurrent
     /// workers may load the same font twice and the copies are
     /// interchangeable.
-    pub(crate) fn store(&self, r: pdfboss_core::ObjRef, font: executor::SharedGlyphFont) {
+    pub(crate) fn store(&self, key: FontKey, font: executor::SharedGlyphFont) {
         if let Ok(mut fonts) = self.fonts.lock() {
-            fonts.entry(r).or_insert(font);
+            fonts.entry(key).or_insert(font);
         }
     }
 }

@@ -104,6 +104,23 @@ LIBS = {
     "pdfplumber": pdfplumber_render,
 }
 
+# pdfboss is always timed at every tier, so the published table shows what
+# each fonts= mode costs; certification and the ink gate still run at the
+# --fonts tier (full by default, the like-for-like comparison against the
+# other engines).
+PDFBOSS_TIERS = ("full", "all-embedded", "embedded-only")
+
+
+def timed_rows(fonts):
+    """(display name, renderer, fonts tier) per timed table row."""
+    rows = []
+    for name, fn in LIBS.items():
+        if name == "pdfboss":
+            rows += [(f"pdfboss (fonts={t})", fn, t) for t in PDFBOSS_TIERS]
+        else:
+            rows.append((name, fn, fonts))
+    return rows
+
 # A file is excluded when any library's first-page ink coverage lands outside
 # [median / INK_BAND, median * INK_BAND] of the libraries' median — wide
 # enough for anti-aliasing and resampling differences, narrow enough to catch
@@ -245,28 +262,30 @@ def run(corpus, sample_n, repeat, scale, fonts):
     if not certified:
         raise SystemExit("no file passed certification; nothing to time")
 
+    rows = timed_rows(fonts)
+
     # Warm the OS file cache and every import before the timed passes.
-    for fn in LIBS.values():
+    for _, fn, tier in rows:
         for f, indices in certified.items():
             try:
-                fn(f, indices, scale, fonts)
+                fn(f, indices, scale, tier)
             except Exception:
                 pass
 
-    # Time each file, then keep only files EVERY library handled, so the
+    # Time each file, then keep only files EVERY row handled, so the
     # aggregate compares the same workload.
-    timings = {name: {} for name in LIBS}
+    timings = {name: {} for name, _, _ in rows}
     for f, indices in certified.items():
-        for name, fn in LIBS.items():
-            t = time_one(fn, f, indices, scale, fonts, repeat)
+        for name, fn, tier in rows:
+            t = time_one(fn, f, indices, scale, tier, repeat)
             if t is not None:
                 timings[name][f] = t
     common = set(certified)
-    for name in LIBS:
+    for name, _, _ in rows:
         common &= set(timings[name])
 
     libraries = {}
-    for name in LIBS:
+    for name, _, _ in rows:
         total = sum(timings[name][f] for f in common)
         pages = sum(len(certified[f]) for f in common)
         libraries[name] = {"time": total, "pages": pages, "ok": len(common)}
@@ -294,7 +313,7 @@ def run(corpus, sample_n, repeat, scale, fonts):
     print(f"[render] {len(common)} files at scale {scale}")
     for name, r in sorted(libraries.items(), key=lambda kv: kv[1]["time"] or 1e9):
         pps = r["pages"] / r["time"] if r["time"] else 0
-        print(f"    {name:14} {r['time']:8.3f}s   {pps:9.1f} pages/s")
+        print(f"    {name:30} {r['time']:8.3f}s   {pps:9.1f} pages/s")
     return results
 
 

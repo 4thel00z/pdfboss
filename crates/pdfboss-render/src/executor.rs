@@ -538,6 +538,7 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
         provider,
         oc: opts.oc.clone(),
         shared_fonts: opts.cache.clone(),
+        substitutes: opts.substitutes.clone(),
         icc: match &opts.cache {
             Some(cache) => Arc::clone(&cache.colorspaces),
             None => Arc::default(),
@@ -617,6 +618,11 @@ struct Executor<'a, S> {
     /// Fonts shared across this document's page renders
     /// ([`RenderOptions::cache`]); `None` keeps loads page-local.
     shared_fonts: Option<Arc<crate::RenderCache>>,
+    /// The substitute source these renders load with, kept verbatim for the
+    /// shared cache's key: a load depends on the tier and the source, so
+    /// one cache handle serving renders with different options must scope
+    /// entries to both (see [`crate::FontKey`]).
+    substitutes: SubstituteSource,
     /// Parsed `ICCBased` outcomes: the document cache's own handle when one
     /// is set, else a render-local one, so repeated `cs`/`CS` operators,
     /// images and shadings never re-decode a profile stream either way.
@@ -1750,7 +1756,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 _ => None,
             };
             if let (Some(shared), Some(r)) = (&self.shared_fonts, entry_ref) {
-                if let Some(loaded) = shared.font(r) {
+                if let Some(loaded) = shared.font(&self.font_key(r)) {
                     cache.insert(name.to_string(), loaded.clone());
                     return loaded;
                 }
@@ -1792,10 +1798,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             None => None,
         };
         if let (Some(shared), Some(r)) = (&self.shared_fonts, font_ref) {
-            shared.store(r, loaded.clone());
+            shared.store(self.font_key(r), loaded.clone());
         }
         cache.insert(name.to_string(), loaded.clone());
         loaded
+    }
+
+    /// The shared-cache key for a font dictionary's reference under this
+    /// render's options.
+    fn font_key(&self, font: pdfboss_core::ObjRef) -> crate::FontKey {
+        crate::FontKey {
+            font,
+            painting: self.painting,
+            substitutes: self.substitutes.clone(),
+        }
     }
 
     /// Resolves a `/Type3` font resource for painting, or `None` when the tier
@@ -6846,6 +6862,60 @@ mod tests {
         );
         assert!(!dark_at(&pix, 55, 115), "a space paints nothing");
         assert!(report.is_empty(), "a space is not a drop");
+    }
+
+    /// A font load depends on the painting tier and substitute source, so a
+    /// shared [`crate::RenderCache`] must scope its entries to them: a
+    /// document rendered at `all-embedded` first must still substitute when
+    /// the same cache handle is passed to a `full` render.
+    #[test]
+    fn a_cached_font_load_is_scoped_to_its_options() {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td (A) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        let doc = Document::load(b.build(1)).expect("load");
+        let page = doc.page(0).expect("page");
+        let dir = write_temp_face(
+            "cache-tier",
+            "Arimo[wght].ttf",
+            &crate::truetype::tests::build_font(),
+        );
+        let cache = Arc::new(crate::RenderCache::default());
+
+        let all_embedded = RenderOptions {
+            cache: Some(Arc::clone(&cache)),
+            ..Default::default()
+        };
+        let first = render_page_with_options(&doc, &page, 1.0, &all_embedded).expect("render");
+        let full = RenderOptions {
+            glyph_painting: GlyphPainting::Full,
+            substitutes: SubstituteSource::Dir(dir.clone()),
+            cache: Some(cache),
+            ..Default::default()
+        };
+        let second = render_page_with_options(&doc, &page, 1.0, &full).expect("render");
+
+        assert!(
+            !dark_at(&first, 55, 115),
+            "all-embedded paints no substitute"
+        );
+        assert!(
+            dark_at(&second, 55, 115),
+            "a font loaded at all-embedded must not be reused for a full render"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
