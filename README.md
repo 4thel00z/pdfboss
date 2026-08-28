@@ -203,7 +203,7 @@ Reproduce with [`benchmarks/bench_scans.py`](benchmarks/README.md).
 
 ## What's inside
 
-Ten crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
+Fourteen crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG2, CCITT and ICC codecs, an anti-aliased rasterizer, layout analysis to plain text and Markdown, PDF creation with CSS-subset themed Markdown composition, async range-fetching I/O, a CLI and TUI, and PyO3 bindings.
 
 <details>
 <summary><strong>Crate map</strong></summary>
@@ -212,10 +212,14 @@ Ten crates, one implementation: a from-scratch core with its own JPEG 2000, JBIG
 |---|---|
 | `pdfboss-core` | Tokenizer, object model, stream filters, cross-references, object streams, document & page tree, content-stream operators |
 | `pdfboss-text` | Simple and CID/Type0 fonts, standard encodings, `ToUnicode` CMaps, positional text spans |
+| `pdfboss-encoding` | Shared font-encoding tables (WinAnsi/MacRoman/Standard, ISO 32000 Appendix D) and glyph-name-to-Unicode mappings, consumed by the text and render crates |
 | `pdfboss-output` | Layout analysis over those spans (lines, columns, headings, lists, tables, repeated page headers), rendered as plain text or Markdown |
 | `pdfboss-jpx` | JPEG 2000 decoder for `JPXDecode` image streams, implemented from ITU-T T.800 |
 | `pdfboss-icc` | ICC profile parser and colour transform to sRGB, implemented from ICC.1:2010 |
 | `pdfboss-render` | Anti-aliased vector rasterizer (paths, fills, strokes, clipping, color, images, glyph outlines) to RGBA/PNG |
+| `pdfboss-write` | PDF creation: documents, pages, canvas painting, link annotations |
+| `pdfboss-style` | CSS-subset themes for document composition |
+| `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs |
 | `pdfboss-aio` | Async I/O: range-fetching document access over files or HTTP, without reading the whole file |
 | `pdfboss-cli` | The `pdfboss` command-line tool |
 | `pdfboss-tui` | Interactive terminal explorer (`pdfboss tui`), built on `pdfboss-aio` |
