@@ -141,6 +141,8 @@ pub struct App {
     pub toast: Option<String>,
     toast_ticks: u8,
     pub size: (u16, u16),
+    /// The adjustable pane splits (Ctrl+Shift+arrows).
+    pub splits: ui::Splits,
     pub should_quit: bool,
     pub inspector_generation: u64,
     pub hex_generation: u64,
@@ -163,6 +165,7 @@ impl App {
             toast: None,
             toast_ticks: 0,
             size,
+            splits: ui::Splits::default(),
             should_quit: false,
             inspector_generation: 0,
             hex_generation: 0,
@@ -187,8 +190,15 @@ impl App {
         if let Some(message) = &self.toast {
             return message.clone();
         }
+        // The resize hint only where it fits: on a narrow terminal it would
+        // push [q] quit off the end of the bar instead of informing anyone.
+        let resize = if self.size.0 >= 110 {
+            "[ctrl+shift+arrows] resize  "
+        } else {
+            ""
+        };
         format!(
-            "{} \u{b7} {} \u{b7} [/] search  [p] preview  [m] markdown  [q] quit",
+            "{} \u{b7} {} \u{b7} [/] search  [p] preview  [m] markdown  {resize}[q] quit",
             self.title,
             self.tree.breadcrumb()
         )
@@ -380,6 +390,12 @@ impl App {
                 };
                 Vec::new()
             }
+            Action::ResizeLeft => self.resize(|s| s.tree = s.tree.saturating_sub(ui::SPLIT_STEP)),
+            Action::ResizeRight => self.resize(|s| s.tree += ui::SPLIT_STEP),
+            Action::ResizeUp => {
+                self.resize(|s| s.right_top = s.right_top.saturating_sub(ui::SPLIT_STEP))
+            }
+            Action::ResizeDown => self.resize(|s| s.right_top += ui::SPLIT_STEP),
             Action::TogglePreview => {
                 if self.preview.active {
                     self.preview.active = false;
@@ -784,6 +800,27 @@ impl App {
         }
     }
 
+    /// Moves a divider, clamps the result, and re-renders an active page
+    /// preview: its raster was fit to the old pane size.
+    fn resize(&mut self, adjust: impl FnOnce(&mut ui::Splits)) -> Vec<Cmd> {
+        let mut next = self.splits;
+        adjust(&mut next);
+        next.tree = next
+            .tree
+            .clamp(*ui::TREE_SPLIT.start(), *ui::TREE_SPLIT.end());
+        next.right_top = next
+            .right_top
+            .clamp(*ui::RIGHT_TOP_SPLIT.start(), *ui::RIGHT_TOP_SPLIT.end());
+        if next == self.splits {
+            return Vec::new();
+        }
+        self.splits = next;
+        if self.preview.active {
+            return self.request_preview();
+        }
+        Vec::new()
+    }
+
     fn request_preview(&mut self) -> Vec<Cmd> {
         if self.tree.page_count == 0 {
             self.toast("document has no pages to preview");
@@ -823,7 +860,7 @@ impl App {
     /// and under-scale every rendered page.
     fn preview_budget(&self) -> (u32, u32) {
         let area = ratatui::layout::Rect::new(0, 0, self.size.0, self.size.1);
-        let split = ui::panes(area);
+        let split = ui::panes(area, self.splits);
         let width = u32::from(split.right_top.width.saturating_sub(2)).max(1);
         // Two vertical pixels per cell row (`▀` half-blocks).
         let height = (u32::from(split.right_top.height.saturating_sub(2)) * 2).max(1);
@@ -832,7 +869,11 @@ impl App {
 
     fn hex_visible_rows(&self) -> u16 {
         let area = ratatui::layout::Rect::new(0, 0, self.size.0, self.size.1);
-        ui::panes(area).hex.height.saturating_sub(2).max(1)
+        ui::panes(area, self.splits)
+            .hex
+            .height
+            .saturating_sub(2)
+            .max(1)
     }
 }
 
@@ -845,6 +886,68 @@ mod tests {
 
     fn key(code: KeyCode) -> Msg {
         Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn resize_key(code: KeyCode) -> Msg {
+        Msg::Key(KeyEvent::new(
+            code,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ))
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_move_the_dividers_and_clamp() {
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        assert_eq!(app.splits, ui::Splits::default());
+
+        app.update(resize_key(KeyCode::Right));
+        assert_eq!(app.splits.tree, ui::Splits::default().tree + ui::SPLIT_STEP);
+        app.update(resize_key(KeyCode::Left));
+        assert_eq!(app.splits.tree, ui::Splits::default().tree);
+
+        app.update(resize_key(KeyCode::Down));
+        assert_eq!(
+            app.splits.right_top,
+            ui::Splits::default().right_top + ui::SPLIT_STEP
+        );
+
+        for _ in 0..40 {
+            app.update(resize_key(KeyCode::Left));
+            app.update(resize_key(KeyCode::Up));
+        }
+        assert_eq!(app.splits.tree, *ui::TREE_SPLIT.start());
+        assert_eq!(app.splits.right_top, *ui::RIGHT_TOP_SPLIT.start());
+        for _ in 0..40 {
+            app.update(resize_key(KeyCode::Right));
+            app.update(resize_key(KeyCode::Down));
+        }
+        assert_eq!(app.splits.tree, *ui::TREE_SPLIT.end());
+        assert_eq!(app.splits.right_top, *ui::RIGHT_TOP_SPLIT.end());
+    }
+
+    #[test]
+    fn resizing_rerenders_an_active_preview() {
+        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let cmds = app.update(key(KeyCode::Char('p')));
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::RenderPreview { .. }]),
+            "opening the preview renders it"
+        );
+        let cmds = app.update(resize_key(KeyCode::Down));
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::RenderPreview { .. }]),
+            "the raster was fit to the old pane size, so a resize re-renders"
+        );
+        let at_bound = app.splits;
+        for _ in 0..40 {
+            app.update(resize_key(KeyCode::Down));
+        }
+        assert_eq!(app.splits.right_top, *ui::RIGHT_TOP_SPLIT.end());
+        let cmds = app.update(resize_key(KeyCode::Down));
+        assert!(
+            cmds.is_empty(),
+            "a keypress that moves nothing renders nothing (from {at_bound:?})"
+        );
     }
 
     fn obj_ref(num: u32) -> ObjRef {
