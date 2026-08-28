@@ -10,23 +10,33 @@
   "fonts": "full",
   "repeat": 3,
   "libraries": {
-    "pdfboss": {
-      "time": 6.147256252996158,
+    "pdfboss (fonts=full)": {
+      "time": 5.951727873034542,
+      "pages": 888,
+      "ok": 38
+    },
+    "pdfboss (fonts=all-embedded)": {
+      "time": 4.0615278770565055,
+      "pages": 888,
+      "ok": 38
+    },
+    "pdfboss (fonts=embedded-only)": {
+      "time": 3.4734719149564626,
       "pages": 888,
       "ok": 38
     },
     "PyMuPDF": {
-      "time": 9.923625163020915,
+      "time": 9.937340000004042,
       "pages": 888,
       "ok": 38
     },
     "pypdfium2": {
-      "time": 7.318546456990589,
+      "time": 7.821416335034883,
       "pages": 888,
       "ok": 38
     },
     "pdfplumber": {
-      "time": 8.704063957025937,
+      "time": 8.903103248972911,
       "pages": 888,
       "ok": 38
     }
