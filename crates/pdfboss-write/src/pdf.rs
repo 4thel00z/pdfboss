@@ -144,14 +144,25 @@ pub struct Page {
     pub links: Vec<LinkAnnotation>,
 }
 
-/// A clickable rectangle on a page that opens a URI (a `/Link` annotation
-/// with a `/URI` action; ISO 32000 §12.5.6.5, §12.6.4.7).
+/// A clickable rectangle on a page that opens a URI or jumps to a page in
+/// the same document (a `/Link` annotation with a `/URI` or `/GoTo`
+/// action; ISO 32000 §12.5.6.5, §12.6.4.7, §12.3.2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkAnnotation {
     /// The clickable area, `[x0, y0, x1, y1]` in the page's user space.
     pub rect: [f32; 4],
-    /// The URI opened on click.
-    pub uri: String,
+    /// Where the link goes.
+    pub target: LinkTarget,
+}
+
+/// Where a [`LinkAnnotation`] leads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkTarget {
+    /// An external URI, opened with a `/URI` action.
+    Uri(String),
+    /// A page within the same document, by index, opened with a `/GoTo`
+    /// action landing at the top of the page.
+    Page(usize),
 }
 
 impl Page {
@@ -220,9 +231,10 @@ impl Pdf {
         }
         let mut w = Writer::new(options);
         let pages_root = w.reserve();
+        let page_count = pages.len();
+        let page_refs: Vec<ObjRef> = pages.iter().map(|_| w.reserve()).collect();
         let mut font_cache: Vec<(Standard14, ObjRef)> = Vec::new();
-        let mut kids = Vec::with_capacity(pages.len());
-        for page in pages {
+        for (index, page) in pages.into_iter().enumerate() {
             let Page {
                 size,
                 rotation,
@@ -280,39 +292,63 @@ impl Pdf {
             dict.insert(name("Contents"), Object::Ref(content));
             dict.insert(name("Resources"), Object::Dict(resources));
             if !links.is_empty() {
-                let annots = links
-                    .iter()
-                    .map(|link| {
-                        let mut action = Dict::new();
-                        action.insert(name("S"), Object::Name(name("URI")));
-                        action.insert(name("URI"), text_string(&link.uri));
-                        let mut annot = Dict::new();
-                        annot.insert(name("Type"), Object::Name(name("Annot")));
-                        annot.insert(name("Subtype"), Object::Name(name("Link")));
-                        annot.insert(
-                            name("Rect"),
-                            Object::Array(
-                                link.rect
-                                    .iter()
-                                    .map(|v| Object::Real(f64::from(*v)))
-                                    .collect(),
-                            ),
-                        );
-                        annot.insert(
-                            name("Border"),
-                            Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(0)]),
-                        );
-                        annot.insert(name("A"), Object::Dict(action));
-                        Object::Ref(w.put(Object::Dict(annot)))
-                    })
-                    .collect();
+                let mut annots = Vec::with_capacity(links.len());
+                for link in links {
+                    let action = match link.target {
+                        LinkTarget::Uri(uri) => {
+                            let mut action = Dict::new();
+                            action.insert(name("S"), Object::Name(name("URI")));
+                            action.insert(name("URI"), text_string(&uri));
+                            action
+                        }
+                        LinkTarget::Page(target_index) => {
+                            let target = page_refs.get(target_index).copied().ok_or_else(|| {
+                                Error::Other(format!(
+                                    "link target page {target_index} is out of range: the document has {page_count} pages"
+                                ))
+                            })?;
+                            let mut action = Dict::new();
+                            action.insert(name("S"), Object::Name(name("GoTo")));
+                            action.insert(
+                                name("D"),
+                                Object::Array(vec![
+                                    Object::Ref(target),
+                                    Object::Name(name("XYZ")),
+                                    Object::Null,
+                                    Object::Null,
+                                    Object::Null,
+                                ]),
+                            );
+                            action
+                        }
+                    };
+                    let mut annot = Dict::new();
+                    annot.insert(name("Type"), Object::Name(name("Annot")));
+                    annot.insert(name("Subtype"), Object::Name(name("Link")));
+                    annot.insert(
+                        name("Rect"),
+                        Object::Array(
+                            link.rect
+                                .iter()
+                                .map(|v| Object::Real(f64::from(*v)))
+                                .collect(),
+                        ),
+                    );
+                    annot.insert(
+                        name("Border"),
+                        Object::Array(vec![Object::Int(0), Object::Int(0), Object::Int(0)]),
+                    );
+                    annot.insert(name("A"), Object::Dict(action));
+                    annots.push(Object::Ref(w.put(Object::Dict(annot))));
+                }
                 dict.insert(name("Annots"), Object::Array(annots));
             }
             if rotation != 0 {
                 dict.insert(name("Rotate"), Object::Int(i64::from(rotation)));
             }
-            kids.push(Object::Ref(w.put(Object::Dict(dict))));
+            w.fill(page_refs[index], Object::Dict(dict))?;
         }
+        let kids: Vec<Object> = page_refs.iter().copied().map(Object::Ref).collect();
         let mut tree = Dict::new();
         tree.insert(name("Type"), Object::Name(name("Pages")));
         tree.insert(name("Count"), Object::Int(kids.len() as i64));

@@ -7,8 +7,8 @@ use pdfboss_core::{Document, Name, Rect};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Color, Date, Error, ImageData, LinkAnnotation, Metadata, Page, PageSize, Pdf, Standard14,
-    WriteOptions, XrefStyle,
+    Color, Date, Error, ImageData, LinkAnnotation, LinkTarget, Metadata, Page, PageSize, Pdf,
+    Standard14, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -267,7 +267,7 @@ fn link_annotations_round_trip() {
         .unwrap();
     page.links.push(LinkAnnotation {
         rect: [72.0, 697.0, 130.0, 712.0],
-        uri: "https://example.com/docs".to_string(),
+        target: LinkTarget::Uri("https://example.com/docs".to_string()),
     });
     let bytes = Pdf {
         pages: vec![page],
@@ -284,6 +284,60 @@ fn link_annotations_round_trip() {
     assert!(contains(&bytes, b"https://example.com/docs"));
     let doc = Document::load(bytes).unwrap();
     assert_eq!(doc.page_count(), 1);
+}
+
+#[test]
+fn goto_links_resolve_to_their_page() {
+    let mut first = Page::new(PageSize::A4);
+    first
+        .canvas
+        .text("to appendix", 72.0, 700.0, Standard14::Helvetica, 12.0)
+        .unwrap();
+    first.links.push(LinkAnnotation {
+        rect: [72.0, 697.0, 150.0, 712.0],
+        target: LinkTarget::Page(1),
+    });
+    let second = Page::new(PageSize::A4);
+    let bytes = Pdf {
+        pages: vec![first, second],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    assert_eq!(doc.page_count(), 2);
+    let page = doc.page(0).unwrap();
+    let annots = page.dict().get_array("Annots").unwrap_or(&[]);
+    let mut resolved_page_types: Vec<String> = Vec::new();
+    for annot in annots {
+        let annot = doc.resolve(annot).unwrap();
+        let annot = annot.as_dict().unwrap();
+        let action = annot.get_dict("A").unwrap();
+        let subtype = action.get("S").unwrap().as_name().unwrap();
+        assert_eq!(subtype.0, "GoTo");
+        let destination = action.get_array("D").unwrap();
+        let target = doc.resolve(&destination[0]).unwrap();
+        let target = target.as_dict().unwrap();
+        let page_type = target.get("Type").unwrap().as_name().unwrap();
+        resolved_page_types.push(page_type.0.clone());
+    }
+    assert_eq!(resolved_page_types, vec!["Page".to_string()]);
+}
+
+#[test]
+fn goto_link_out_of_range_errors() {
+    let mut page = Page::new(PageSize::A4);
+    page.links.push(LinkAnnotation {
+        rect: [0.0, 0.0, 1.0, 1.0],
+        target: LinkTarget::Page(7),
+    });
+    let err = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap_err();
+    assert!(err.to_string().contains("out of range"));
 }
 
 #[test]
