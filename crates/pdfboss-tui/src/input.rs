@@ -1,6 +1,6 @@
 //! Key-event → intent mapping. Pure so bindings are unit-testable.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 /// Every intent a key press can express.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,6 +26,12 @@ pub enum Action {
     SearchCancel,
     NextHit,
     PrevHit,
+    /// Move the pane divider the arrow points at: left/right the vertical
+    /// tree divider, up/down the inspector/hex divider.
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     Quit,
     Noop,
 }
@@ -44,6 +50,18 @@ pub fn action_for(key: KeyEvent, search_input: bool) -> Action {
             KeyCode::Char(c) => Action::SearchChar(c),
             _ => Action::Noop,
         };
+    }
+    // Ctrl+Shift+arrows resize the panes. Matched on Ctrl alone because
+    // several terminals report Ctrl+Shift+arrow without the Shift bit —
+    // plain Ctrl+arrow was unbound, so nothing is shadowed.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Left => return Action::ResizeLeft,
+            KeyCode::Right => return Action::ResizeRight,
+            KeyCode::Up => return Action::ResizeUp,
+            KeyCode::Down => return Action::ResizeDown,
+            _ => {}
+        }
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
@@ -149,6 +167,29 @@ mod tests {
             Action::SearchBackspace
         );
         assert_eq!(action_for(press(KeyCode::Tab), true), Action::Noop);
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_resize() {
+        let chord = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        for (code, action) in [
+            (KeyCode::Left, Action::ResizeLeft),
+            (KeyCode::Right, Action::ResizeRight),
+            (KeyCode::Up, Action::ResizeUp),
+            (KeyCode::Down, Action::ResizeDown),
+        ] {
+            assert_eq!(action_for(KeyEvent::new(code, chord), false), action);
+            // Terminals that drop the Shift bit still resize on Ctrl+arrow.
+            assert_eq!(
+                action_for(KeyEvent::new(code, KeyModifiers::CONTROL), false),
+                action
+            );
+        }
+        // Shift alone keeps the plain movement meaning.
+        assert_eq!(
+            action_for(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT), false),
+            Action::Collapse
+        );
     }
 
     #[test]

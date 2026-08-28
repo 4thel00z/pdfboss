@@ -22,14 +22,47 @@ pub struct Panes {
     pub status: Rect,
 }
 
+/// The two adjustable pane splits, each a percentage: the tree column's
+/// width, and the inspector's share of the right column. Moved by
+/// Ctrl+Shift+arrows in [`SPLIT_STEP`] increments, clamped so every pane
+/// keeps a usable sliver.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Splits {
+    pub tree: u16,
+    pub right_top: u16,
+}
+
+impl Default for Splits {
+    fn default() -> Splits {
+        Splits {
+            tree: 35,
+            right_top: 60,
+        }
+    }
+}
+
+/// Percentage points one resize keypress moves a divider.
+pub const SPLIT_STEP: u16 = 5;
+/// Bounds for [`Splits::tree`].
+pub const TREE_SPLIT: std::ops::RangeInclusive<u16> = 15..=70;
+/// Bounds for [`Splits::right_top`].
+pub const RIGHT_TOP_SPLIT: std::ops::RangeInclusive<u16> = 20..=85;
+
 /// Splits the terminal: status bar (1 row) at the bottom; tree pane at
-/// ~35% width; right column split 60/40 into inspector and hex.
-pub fn panes(area: Rect) -> Panes {
+/// `splits.tree` percent width; right column split `splits.right_top` /
+/// remainder into inspector and hex.
+pub fn panes(area: Rect, splits: Splits) -> Panes {
     let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(area);
-    let columns =
-        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(rows[0]);
-    let right = Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(columns[1]);
+    let columns = Layout::horizontal([
+        Constraint::Percentage(splits.tree),
+        Constraint::Percentage(100 - splits.tree),
+    ])
+    .split(rows[0]);
+    let right = Layout::vertical([
+        Constraint::Percentage(splits.right_top),
+        Constraint::Percentage(100 - splits.right_top),
+    ])
+    .split(columns[1]);
     Panes {
         tree: columns[0],
         right_top: right[0],
@@ -40,7 +73,7 @@ pub fn panes(area: Rect) -> Panes {
 
 /// Renders the whole app into one frame.
 pub fn draw(app: &App, frame: &mut Frame) {
-    let split = panes(frame.area());
+    let split = panes(frame.area(), app.splits);
     draw_tree(app, frame, split.tree);
     if app.markdown.active {
         draw_markdown(app, frame, split.right_top);
@@ -260,15 +293,36 @@ mod tests {
 
     #[test]
     fn panes_split_80_by_24_deterministically() {
-        let split = panes(Rect::new(0, 0, 80, 24));
+        let split = panes(Rect::new(0, 0, 80, 24), Splits::default());
         assert_eq!(split.tree, Rect::new(0, 0, 28, 23));
         assert_eq!(split.right_top, Rect::new(28, 0, 52, 14));
         assert_eq!(split.hex, Rect::new(28, 14, 52, 9));
         assert_eq!(split.status, Rect::new(0, 23, 80, 1));
     }
 
+    #[test]
+    fn panes_follow_the_splits() {
+        let wide_tree = panes(
+            Rect::new(0, 0, 80, 24),
+            Splits {
+                tree: 50,
+                right_top: 25,
+            },
+        );
+        assert_eq!(wide_tree.tree.width, 40, "tree takes its percentage");
+        assert_eq!(
+            wide_tree.right_top.height + wide_tree.hex.height,
+            23,
+            "right column still fills the area above the status bar"
+        );
+        assert!(
+            wide_tree.right_top.height < wide_tree.hex.height,
+            "a 25% inspector sits above a larger hex pane"
+        );
+    }
+
     fn test_split() -> Panes {
-        panes(Rect::new(0, 0, 80, 24))
+        panes(Rect::new(0, 0, 80, 24), Splits::default())
     }
 
     fn draw_frame(app: &App) -> Terminal<TestBackend> {
