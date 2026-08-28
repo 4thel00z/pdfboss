@@ -13,3 +13,9 @@ pdfboss-write = { workspace = true }
 pdfboss-style = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false }
 thiserror = "2"
+
+[dev-dependencies]
+pdfboss-core = { workspace = true }
+pdfboss-output = { workspace = true }
+pdfboss-render = { workspace = true }
+pdfboss-text = { workspace = true }

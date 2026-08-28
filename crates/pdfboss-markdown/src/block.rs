@@ -63,7 +63,6 @@ pub enum CellAlign {
 
 /// Parse a CommonMark+GFM document into a block tree. The `u32` counts
 /// raw-HTML fragments that were skipped rather than represented.
-#[allow(dead_code)]
 pub(crate) fn parse_blocks(md: &str) -> (Vec<Block>, u32) {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;

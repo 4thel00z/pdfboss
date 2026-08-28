@@ -101,7 +101,6 @@ struct Span {
 /// Lays out a parsed block tree into paginated draw items for `page_size`,
 /// cascading styles from `theme` and resolving image paths against
 /// `base_dir`.
-#[allow(dead_code)]
 pub(crate) fn layout(
     blocks: &[Block],
     theme: &Theme,
