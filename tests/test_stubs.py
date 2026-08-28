@@ -21,7 +21,7 @@ def test_stub_declares_every_write_export() -> None:
     for name in pdfboss.write.__all__:
         if not inspect.isclass(getattr(pdfboss.write, name)):
             continue
-        assert f"class {name}" in stub, f"missing stub for pdfboss.write.{name}"
+        assert f"\n    class {name}:" in stub, f"missing stub for pdfboss.write.{name}"
 
 
 def test_stub_declares_the_element_and_async_surface() -> None:
