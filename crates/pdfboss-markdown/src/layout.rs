@@ -350,9 +350,8 @@ impl<'a> Engine<'a> {
     }
 
     /// Dispatches each block in document order, appending items to the
-    /// current page. `Paragraph`, `Heading`, `Rule`, `List` and
-    /// `BlockQuote` land here; `CodeBlock`, `Table` and `Image` land in
-    /// later tasks.
+    /// current page. `Paragraph`, `Heading`, `Rule`, `List`, `BlockQuote`
+    /// and `CodeBlock` land here; `Table` and `Image` land in later tasks.
     fn blocks(
         &mut self,
         blocks: &[Block],
@@ -413,6 +412,9 @@ impl<'a> Engine<'a> {
                 }
                 Block::BlockQuote { blocks } => {
                     self.quote(blocks, base, left, right, base_dir, report)?;
+                }
+                Block::CodeBlock { text } => {
+                    self.code_block(text, base, left, right, report)?;
                 }
                 _ => {}
             }
@@ -563,6 +565,66 @@ impl<'a> Engine<'a> {
         self.after(margin.bottom);
         Ok(())
     }
+
+    /// Lays out a `CodeBlock` block: preformatted lines set in the code
+    /// font and broken hard at character boundaries, with the element's
+    /// background painted behind each page-piece the block spans.
+    fn code_block(
+        &mut self,
+        text: &str,
+        base: &TextStyle,
+        left: f32,
+        right: f32,
+        report: &mut Report,
+    ) -> Result<(), Error> {
+        let style = base.apply(self.theme.declared(Element::Pre));
+        let margin = self.theme.margin(Element::Pre);
+        let padding = self.theme.padding(Element::Pre);
+        let background = self.theme.background(Element::Pre);
+        self.gap(margin.top);
+        let inner_width = (right - left) - padding.left - padding.right;
+        let h = style.line_height * style.size;
+        self.need(h + padding.top);
+        self.begin_span();
+        self.y -= padding.top;
+        for line in text.split('\n') {
+            let clean = sanitize(line, style.font(), report);
+            for row in char_rows(&clean, style.font(), style.size, inner_width)? {
+                self.need(h);
+                let baseline = self.y - BASELINE * style.size;
+                if !row.is_empty() {
+                    self.push(Item::Text {
+                        x: left + padding.left,
+                        y: baseline,
+                        text: row,
+                        font: style.font(),
+                        size: style.size,
+                        color: style.color,
+                    });
+                }
+                self.y -= h;
+                self.at_top = false;
+            }
+        }
+        self.y -= padding.bottom;
+        let segments = self.end_span();
+        if let Some(color) = background {
+            for segment in segments.into_iter().rev() {
+                let item = Item::Rect {
+                    x: left,
+                    y: segment.bottom,
+                    w: right - left,
+                    h: segment.top - segment.bottom,
+                    color,
+                };
+                self.pages[segment.page]
+                    .items
+                    .insert(segment.item_index, item);
+            }
+        }
+        self.after(margin.bottom);
+        Ok(())
+    }
 }
 
 /// Resolves a run's declared styling onto `base`: theme rules for code,
@@ -609,6 +671,38 @@ fn styled_runs(
             }
         })
         .collect()
+}
+
+/// Greedily splits `text` into rows no wider than `max_width`, breaking at
+/// character boundaries only (no word-boundary preference). Tabs expand to
+/// four spaces first, same as `create text`. Empty text yields one empty
+/// row so a blank code line keeps its vertical space.
+fn char_rows(
+    text: &str,
+    font: Standard14,
+    size: f32,
+    max_width: f32,
+) -> Result<Vec<String>, pdfboss_write::Error> {
+    let expanded = text.replace('\t', "    ");
+    if expanded.is_empty() {
+        return Ok(vec![String::new()]);
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_width = 0.0f32;
+    for ch in expanded.chars() {
+        let mut buffer = [0u8; 4];
+        let piece = ch.encode_utf8(&mut buffer);
+        let width = font.text_width(piece, size)?;
+        if !row.is_empty() && row_width + width > max_width {
+            rows.push(std::mem::take(&mut row));
+            row_width = 0.0;
+        }
+        row.push(ch);
+        row_width += width;
+    }
+    rows.push(row);
+    Ok(rows)
 }
 
 /// The heading element for a level 1-6 (anything outside that range
@@ -841,5 +935,56 @@ mod tests {
             .items
             .iter()
             .any(|i| matches!(i, Item::Text { x, .. } if (*x - 124.0).abs() < 0.01)));
+    }
+
+    #[test]
+    fn code_block_paints_background_and_preserves_lines() {
+        let pages = laid("```\nfn main() {\n    body();\n}\n```\n", MONO);
+        let texts: Vec<String> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["fn main() {", "    body();", "}"]);
+        assert!(
+            pages[0]
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Rect { w, .. } if *w > 300.0)),
+            "full-width background"
+        );
+        assert!(
+            matches!(pages[0].items[0], Item::Rect { .. }),
+            "background painted beneath the text"
+        );
+    }
+
+    #[test]
+    fn overlong_code_lines_break_at_characters_not_words() {
+        let long = format!("```\n{}\n```\n", "x".repeat(200));
+        let pages = laid(&long, MONO);
+        let texts: Vec<String> = pages[0]
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.len() >= 2);
+        assert!(texts[0].chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn code_block_splits_across_pages_with_backgrounds_on_both() {
+        let long = format!("```\n{}```\n", "line\n".repeat(120));
+        let pages = laid(&long, MONO);
+        assert!(pages.len() >= 2);
+        for page in &pages[..2] {
+            assert!(page.items.iter().any(|i| matches!(i, Item::Rect { .. })));
+        }
     }
 }
