@@ -8,8 +8,8 @@ use pdfboss_core::{Dict, Document, Name, Object, Rect, Stream};
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
-    Bookmark, Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget, Metadata,
-    Outline, Page, PageSize, Paragraph, Pdf, Standard14, WriteOptions, XrefStyle,
+    Attachment, Bookmark, Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget,
+    Metadata, Outline, Page, PageSize, Paragraph, Pdf, Standard14, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -59,6 +59,7 @@ fn metadata_and_multipage_round_trip() {
         }),
         pages: vec![Page::new(PageSize::A4), second, Page::new(PageSize::Letter)],
         outline: None,
+        attachments: Vec::new(),
         options: WriteOptions::default(),
     };
     let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
@@ -218,6 +219,7 @@ fn two_page_document() -> Pdf {
         }),
         pages: vec![first, second],
         outline: None,
+        attachments: Vec::new(),
         options: WriteOptions::default(),
     }
 }
@@ -711,4 +713,221 @@ fn decode_sniffs_png_and_jpeg_by_content() {
     assert!(ImageData::decode(b"plain text").is_err());
     let jpeg = tiny_jpeg(4, 4);
     assert_eq!(ImageData::decode(&jpeg).unwrap().width(), 4);
+}
+
+/// The `/Names /EmbeddedFiles /Names` array, as raw entries: alternating
+/// name-tree keys and refs, straight off the catalog with no indirection
+/// in between (the writer nests `/Names` and `/EmbeddedFiles` directly).
+fn embedded_files_entries(doc: &Document) -> Vec<Object> {
+    catalog(doc)
+        .get_dict("Names")
+        .expect("/Names present")
+        .get_dict("EmbeddedFiles")
+        .expect("/EmbeddedFiles present")
+        .get_array("Names")
+        .expect("/EmbeddedFiles /Names array present")
+        .to_vec()
+}
+
+fn attachment(name: &str, data: &[u8], mime: Option<&str>) -> Attachment {
+    Attachment {
+        name: name.to_string(),
+        data: data.to_vec(),
+        mime: mime.map(str::to_string),
+        modified: None,
+        description: None,
+    }
+}
+
+#[test]
+fn no_attachments_emits_no_names_entry() {
+    let bytes = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    assert!(catalog(&doc).get("Names").is_none());
+}
+
+/// Two attachments given in reverse lexical order must land sorted in the
+/// emitted name tree, and each filespec's `/EF /F` stream must decode back
+/// to the exact bytes given.
+#[test]
+fn attachments_sort_by_name_and_round_trip_bytes() {
+    let pdf = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        attachments: vec![
+            attachment("zeta.txt", b"zeta contents", Some("text/plain")),
+            attachment("alpha.txt", b"alpha contents", Some("text/plain")),
+        ],
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let entries = embedded_files_entries(&doc);
+    assert_eq!(entries.len(), 4, "two attachments make four array slots");
+
+    let key_at = |index: usize| {
+        decode_text_string(
+            entries[index]
+                .as_str_bytes()
+                .expect("name-tree key is a string"),
+        )
+    };
+    assert_eq!(key_at(0), "alpha.txt", "sorted before zeta.txt");
+    assert_eq!(key_at(2), "zeta.txt");
+
+    let alpha_filespec = resolve_dict(&doc, &entries[1]);
+    assert_eq!(
+        alpha_filespec.get_name("Type"),
+        Some(&Name("Filespec".into()))
+    );
+    assert_eq!(
+        decode_text_string(alpha_filespec.get("F").unwrap().as_str_bytes().unwrap()),
+        "alpha.txt"
+    );
+    assert_eq!(
+        decode_text_string(alpha_filespec.get("UF").unwrap().as_str_bytes().unwrap()),
+        "alpha.txt"
+    );
+    let ef = alpha_filespec.get_dict("EF").expect("/EF present");
+    let stream = resolve_stream(&doc, ef.get("F").expect("/EF /F present"));
+    assert_eq!(
+        stream.dict.get_name("Type"),
+        Some(&Name("EmbeddedFile".into()))
+    );
+    let decoded = doc.stream_data(&stream).expect("embedded stream decodes");
+    assert_eq!(decoded, b"alpha contents");
+}
+
+/// A mime type containing `/` must come out of the writer's existing
+/// `#xx` name-escaping as an escaped `/Subtype` — verified against the raw
+/// emitted bytes, since a re-parsed `Name` stores its escapes already
+/// resolved.
+#[test]
+fn attachment_subtype_escapes_mime_slash() {
+    let pdf = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        attachments: vec![attachment("data.csv", b"a,b,c", Some("text/csv"))],
+        ..Pdf::default()
+    };
+    let bytes = pdf.to_bytes().unwrap();
+    assert!(
+        contains(&bytes, b"/Subtype /text#2Fcsv"),
+        "the mime's slash must be #-escaped in the emitted Subtype name"
+    );
+    let doc = Document::load(bytes).unwrap();
+    let entries = embedded_files_entries(&doc);
+    let filespec = resolve_dict(&doc, &entries[1]);
+    let ef = filespec.get_dict("EF").expect("/EF present");
+    let stream = resolve_stream(&doc, ef.get("F").expect("/EF /F present"));
+    assert_eq!(
+        stream.dict.get_name("Subtype"),
+        Some(&Name("text/csv".into())),
+        "decoded back to the unescaped mime"
+    );
+}
+
+/// `/Params` always carries `/Size`; `/ModDate` appears only when
+/// `modified` is supplied. A missing `mime` defaults to
+/// `application/octet-stream`, and `/Desc` appears only when given.
+#[test]
+fn attachment_params_size_and_conditional_moddate() {
+    let with_date = Attachment {
+        description: Some("has a date".to_string()),
+        modified: Some(Date {
+            year: 2026,
+            month: 8,
+            day: 28,
+            hour: 10,
+            minute: 0,
+            second: 0,
+            utc_offset_minutes: 0,
+        }),
+        ..attachment("with-date.bin", &[1, 2, 3, 4, 5], None)
+    };
+    let without_date = attachment("no-date.bin", &[9, 9], None);
+    let pdf = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        attachments: vec![with_date, without_date],
+        ..Pdf::default()
+    };
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let entries = embedded_files_entries(&doc);
+    assert_eq!(entries.len(), 4);
+
+    // "no-date.bin" sorts before "with-date.bin".
+    let no_date_filespec = resolve_dict(&doc, &entries[1]);
+    let no_date_ef = no_date_filespec.get_dict("EF").expect("/EF present");
+    let no_date_stream = resolve_stream(&doc, no_date_ef.get("F").unwrap());
+    assert_eq!(
+        no_date_stream.dict.get_name("Subtype"),
+        Some(&Name("application/octet-stream".into())),
+        "no mime given defaults to application/octet-stream"
+    );
+    let no_date_params = no_date_stream
+        .dict
+        .get_dict("Params")
+        .expect("/Params present");
+    assert_eq!(no_date_params.get_int("Size"), Some(2));
+    assert!(no_date_params.get("ModDate").is_none());
+    assert!(no_date_filespec.get("Desc").is_none());
+
+    let with_date_filespec = resolve_dict(&doc, &entries[3]);
+    assert_eq!(
+        decode_text_string(
+            with_date_filespec
+                .get("Desc")
+                .unwrap()
+                .as_str_bytes()
+                .unwrap()
+        ),
+        "has a date"
+    );
+    let with_date_ef = with_date_filespec.get_dict("EF").expect("/EF present");
+    let with_date_stream = resolve_stream(&doc, with_date_ef.get("F").unwrap());
+    let with_date_params = with_date_stream
+        .dict
+        .get_dict("Params")
+        .expect("/Params present");
+    assert_eq!(with_date_params.get_int("Size"), Some(5));
+    assert_eq!(
+        with_date_params.get("ModDate").unwrap().as_str_bytes(),
+        Some(b"D:20260828100000Z".as_slice())
+    );
+}
+
+#[test]
+fn duplicate_attachment_name_errors() {
+    let pdf = Pdf {
+        pages: vec![Page::new(PageSize::A4)],
+        attachments: vec![
+            attachment("dup.txt", b"one", None),
+            attachment("dup.txt", b"two", None),
+        ],
+        ..Pdf::default()
+    };
+    let err = pdf.to_bytes().unwrap_err();
+    match err {
+        Error::Other(msg) => assert!(msg.contains("dup.txt"), "{msg}"),
+        other => panic!("expected Error::Other naming the duplicate, got {other:?}"),
+    }
+}
+
+#[test]
+fn attachments_document_serializes_byte_identically() {
+    fn build() -> Vec<u8> {
+        Pdf {
+            pages: vec![Page::new(PageSize::A4)],
+            attachments: vec![
+                attachment("b.txt", b"B", Some("text/plain")),
+                attachment("a.txt", b"A", Some("text/plain")),
+            ],
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .unwrap()
+    }
+    assert_eq!(build(), build());
 }

@@ -237,6 +237,27 @@ impl Bookmark {
     }
 }
 
+/// A document-level attachment, embedded via the catalog's `/Names
+/// /EmbeddedFiles` name tree (ISO 32000 §7.11.4). Unlike a page's painted
+/// content, an attachment carries no rendering — only the bytes and the
+/// metadata a viewer shows about them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attachment {
+    /// The file name: written as both the filespec's `/F` and `/UF`, and
+    /// as the name-tree key.
+    pub name: String,
+    /// The attachment's raw bytes, stored as the embedded-file stream
+    /// (compressed like any other stream, per [`WriteOptions::compress`]).
+    pub data: Vec<u8>,
+    /// MIME type, written as the embedded-file stream's `/Subtype`.
+    /// `None` writes `application/octet-stream`.
+    pub mime: Option<String>,
+    /// `/Params /ModDate`, written only when given.
+    pub modified: Option<Date>,
+    /// `/Desc` on the filespec, written only when given.
+    pub description: Option<String>,
+}
+
 /// A document under construction. The fields are the composition:
 /// singleton slots are `Option`s, pages keep the order given.
 #[derive(Debug, Default)]
@@ -247,6 +268,10 @@ pub struct Pdf {
     pub pages: Vec<Page>,
     /// Bookmark panel, if any.
     pub outline: Option<Outline>,
+    /// Document-level attachments. Reordered by `name`, lexicographically
+    /// by bytes, at emission — the name-tree keys must be sorted, so the
+    /// order given here is not preserved. Duplicate names are an error.
+    pub attachments: Vec<Attachment>,
     /// File-emission options.
     pub options: WriteOptions,
 }
@@ -287,6 +312,7 @@ impl Pdf {
             metadata,
             pages,
             outline,
+            attachments,
             options,
         } = self;
         if pages.is_empty() {
@@ -457,6 +483,7 @@ impl Pdf {
             }
             _ => None,
         };
+        let names = embedded_files_dict(&mut w, attachments)?;
         let mut catalog = Dict::new();
         catalog.insert(name("Type"), Object::Name(name("Catalog")));
         catalog.insert(name("Pages"), Object::Ref(pages_root));
@@ -465,6 +492,9 @@ impl Pdf {
         }
         if let Some(xmp_ref) = xmp_ref {
             catalog.insert(name("Metadata"), Object::Ref(xmp_ref));
+        }
+        if let Some(names) = names {
+            catalog.insert(name("Names"), Object::Dict(names));
         }
         let root = w.put(Object::Dict(catalog));
         Ok((w, root))
@@ -513,6 +543,75 @@ fn info_dict(meta: Metadata) -> Option<Dict> {
         return None;
     }
     Some(dict)
+}
+
+/// Default MIME type for an [`Attachment`] whose `mime` is `None`.
+const DEFAULT_ATTACHMENT_MIME: &str = "application/octet-stream";
+
+/// Builds the catalog's `/Names` dictionary from `attachments`, or `None`
+/// when there are none. Attachments are reordered by `name`, bytewise, to
+/// satisfy the name tree's sorted-key requirement — string comparison in
+/// Rust is already a byte comparison, so sorting `String` values sorts
+/// their bytes. A repeated name is an error naming the duplicate.
+fn embedded_files_dict(w: &mut Writer, mut attachments: Vec<Attachment>) -> Result<Option<Dict>> {
+    if attachments.is_empty() {
+        return Ok(None);
+    }
+    attachments.sort_by(|a, b| a.name.cmp(&b.name));
+    for pair in attachments.windows(2) {
+        if pair[0].name == pair[1].name {
+            return Err(Error::Other(format!(
+                "duplicate attachment name: {:?}",
+                pair[0].name
+            )));
+        }
+    }
+    let mut entries = Vec::with_capacity(attachments.len() * 2);
+    for attachment in attachments {
+        let Attachment {
+            name: file_name,
+            data,
+            mime,
+            modified,
+            description,
+        } = attachment;
+        let mime = mime.unwrap_or_else(|| DEFAULT_ATTACHMENT_MIME.to_string());
+
+        let mut params = Dict::new();
+        params.insert(name("Size"), Object::Int(data.len() as i64));
+        if let Some(modified) = modified {
+            params.insert(
+                name("ModDate"),
+                Object::String(modified.to_pdf_string().into_bytes()),
+            );
+        }
+        let mut stream_dict = Dict::new();
+        stream_dict.insert(name("Type"), Object::Name(name("EmbeddedFile")));
+        stream_dict.insert(name("Subtype"), Object::Name(Name(mime)));
+        stream_dict.insert(name("Params"), Object::Dict(params));
+        let stream_ref = w.put_stream(stream_dict, data);
+
+        let mut ef = Dict::new();
+        ef.insert(name("F"), Object::Ref(stream_ref));
+
+        let mut filespec = Dict::new();
+        filespec.insert(name("Type"), Object::Name(name("Filespec")));
+        filespec.insert(name("F"), text_string(&file_name));
+        filespec.insert(name("UF"), text_string(&file_name));
+        if let Some(description) = description {
+            filespec.insert(name("Desc"), text_string(&description));
+        }
+        filespec.insert(name("EF"), Object::Dict(ef));
+        let filespec_ref = w.put(Object::Dict(filespec));
+
+        entries.push(text_string(&file_name));
+        entries.push(Object::Ref(filespec_ref));
+    }
+    let mut name_tree = Dict::new();
+    name_tree.insert(name("Names"), Object::Array(entries));
+    let mut embedded_files = Dict::new();
+    embedded_files.insert(name("EmbeddedFiles"), Object::Dict(name_tree));
+    Ok(Some(embedded_files))
 }
 
 /// One bookmark's reserved object number, mirroring the tree shape so the
