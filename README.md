@@ -113,12 +113,12 @@ Against other Python PDF libraries over 40 real-world PDFs (pages/sec, higher is
   <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/benchmarks/results.png" alt="pdfboss vs. Python PDF libraries" width="100%">
 </p>
 
-**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF and the Rust-backed pdf_oxide**: 6,700 pages/s extracting text against PyMuPDF's 460 (about 15×) and pdf_oxide's 300 (about 22×), and 383,000 pages/s opening + parsing against pdf_oxide's 173,000 (about 2.2×).
+**pdfboss is the fastest library measured on both operations, including against the C-backed PyMuPDF and the Rust-backed pdf_oxide**: 6,850 pages/s extracting text against PyMuPDF's 450 (about 15×) and pdf_oxide's 290 (about 23×), and 405,000 pages/s opening + parsing against pdf_oxide's 190,000 (about 2.1×).
 
 <details>
 <summary><strong>Method and fine print</strong></summary>
 
-Best-of-3 per file, aggregated over the files every library handled; measured with pdfboss 0.20.0 on an Apple M3 Pro, every table on this page from one session. The pure-Python readers are roughly 70× to 360× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed; since 0.19.0 every span also carries its style (font, weight, decorations, color), which costs the extraction rows a few percent against older tables. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
+Best-of-3 per file, aggregated over the files every library handled; measured with pdfboss 0.22.0 on an Apple M3 Pro, every table on this page from one session. The pure-Python readers are roughly 85× to 380× slower on extraction. Since 0.9.0, `doc.extract_text()` spreads pages across cores, which widened the gap over the sequential libraries from the 7× measured before that landed; since 0.19.0 every span also carries its style (font, weight, decorations, color), which costs the extraction rows a few percent against older tables. Lazy page-tree loading means opening a document reads only its declared page count instead of parsing every page dictionary up front. Opening is close to free, so the ratio says more about what the others do eagerly than about pdfboss. Rendering is compared in its own section below, restricted to the files pdfboss provably rasterizes completely — timing it against full renderers on the rest would credit it for work it skips.
 
 Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks/README.md).
 
@@ -134,14 +134,14 @@ On [opendataloader-bench](https://github.com/opendataloader-project/opendataload
 | liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
 | opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
 | pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
-| **pdfboss** (`md`) | **0.877** | Markdown | **0.15s** |
-| **pdfboss** | **0.868** | plain text | **0.16s** |
+| **pdfboss** (`md`) | **0.882** | Markdown | **0.15s** |
+| **pdfboss** | **0.868** | plain text | **0.15s** |
 | markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
 
 <details>
 <summary><strong>What the score is made of, and how it was measured</strong></summary>
 
-Per document, the plain-text output beats pdf-inspector's NID on 105 of the 200 files, ties on 23 and loses on 72. The losses concentrate in table regions, where structured output matches the ground truth more closely than flowed text can. On the benchmark's combined metric the Markdown adapter scores 0.801 (reading order 0.877, headings and lists 0.667, table structure 0.532). It detects tables from column gaps and from drawn borders, so bordered grids and boxed lists without column gaps are found too. Two-column layouts are read column-major. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
+Per document, the plain-text output beats pdf-inspector's NID on 105 of the 200 files, ties on 23 and loses on 72. The losses concentrate in table regions, where structured output matches the ground truth more closely than flowed text can. On the benchmark's combined metric the Markdown adapter scores 0.820 (reading order 0.882, headings and lists 0.702, table structure 0.622). It detects tables from column gaps and from drawn borders, so bordered grids and boxed lists without column gaps are found too. Two-column layouts are read column-major. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
 
 Quality rows come from the benchmark's own evaluator over all 200 documents. The two pdfboss timings were measured together in one session on an Apple M3 Pro under the benchmark's protocol: median of five single-process runs after a warm-up, wheel built from main. pdf-inspector was measured the same way on the same machine in an earlier session. The other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro. Read them as order-of-magnitude context, not a same-machine race.
 
@@ -153,12 +153,12 @@ A renderer that skips work looks fast, so every file is certified before the sto
 
 | Library | pages/sec |
 |---|--:|
-| pypdfium2 | 122.0 |
-| pdfboss | 112.7 |
-| pdfplumber (via pdfium) | 103.9 |
-| PyMuPDF | 91.9 |
+| pdfboss | 144.5 |
+| pypdfium2 | 121.3 |
+| pdfplumber (via pdfium) | 102.0 |
+| PyMuPDF | 89.5 |
 
-pdfboss rasterizes the mixed corpus second only to pdfium itself — about 8% behind it, ahead of pdfplumber's pdfium stack and PyMuPDF — with no C in it.
+pdfboss rasterizes the mixed corpus fastest — about 19% ahead of pdfium itself — with no C in it.
 
 <details>
 <summary><strong>Certification and stability details</strong></summary>
@@ -177,12 +177,12 @@ Scans are the other half of the world's PDFs: one full-page bilevel image per pa
 
 | Library | pages/sec | Ink on page 1 |
 |---|--:|--:|
-| pdfboss | 66.4 | 4.71% |
-| pypdfium2 | 56.5 | 4.85% |
-| pdfplumber (via pdfium) | 56.1 | 4.87% |
-| PyMuPDF | 55.6 | 4.82% |
+| pdfboss | 65.4 | 4.71% |
+| pypdfium2 | 57.4 | 4.85% |
+| pdfplumber (via pdfium) | 56.5 | 4.87% |
+| PyMuPDF | 54.6 | 4.82% |
 
-**pdfboss is the fastest of the four, about 18% ahead of the C-backed renderers**, and the only one of them with no C in it.
+**pdfboss is the fastest of the four, about 14% ahead of the C-backed renderers**, and the only one of them with no C in it.
 
 <details>
 <summary><strong>Where the time goes, and why the ink column matters</strong></summary>
