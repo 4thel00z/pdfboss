@@ -4,8 +4,8 @@ One binary, `pdfboss`, with a subcommand per job. This chapter is the flag inven
 
 Shared behavior:
 
-- Every subcommand that reads a PDF takes `--password <PASSWORD>` for encrypted files — user or owner password; the empty user password opens transparently. See [Encrypted documents](../guide/encryption.md).
-- The explorer subcommands — `tui`, `json`, `hex`, `q` — accept either a local path or an `http(s)://` URL as input; URLs are range-fetched, never downloaded whole. The other subcommands take a local path.
+- Every subcommand that reads a PDF takes `--password <PASSWORD>` for encrypted files: user or owner password; the empty user password opens transparently. See [Encrypted documents](../guide/encryption.md).
+- The explorer subcommands (`tui`, `json`, `hex`, `q`) accept either a local path or an `http(s)://` URL as input; URLs are range-fetched, never downloaded whole. The other subcommands take a local path.
 - Exit codes: 0 on success, 1 for PDF and I/O problems, 2 for an invalid jq program (mirroring clap's own usage-error code). `render` and `images` are lenient: content that cannot be read is skipped with a warning on stderr, and the exit code stays 0.
 
 ## info
@@ -34,7 +34,7 @@ pdfboss text report.pdf --page 1
 
 ## md
 
-Extract markdown, with headings, lists and tables inferred from layout. `--page <PAGE>` restricts to one 1-based page — heading sizes are then judged per page, not across the document. See [Markdown output](../guide/markdown.md).
+Extract markdown, with headings, lists and tables inferred from layout. `--page <PAGE>` restricts to one 1-based page: heading sizes are then judged per page, not across the document. See [Markdown output](../guide/markdown.md).
 
 ```text
 pdfboss md [OPTIONS] <FILE>
@@ -52,12 +52,12 @@ Render a page to PNG. See [Rendering pages](../guide/rendering.md).
 pdfboss render [OPTIONS] --page <PAGE> <FILE>
 ```
 
-- `--page <PAGE>` — 1-based page number (required)
-- `-o, --out <OUT>` — output file (default: `page-N.png`)
-- `--scale <SCALE>` — scale factor (default: 1)
-- `--fonts <FONTS>` — which fonts to paint: `embedded-only` (only embedded TrueType outlines, fastest), `all-embedded` (every embedded program), `full` (also substitute bundled faces for non-embedded fonts); the default resolves to `full` when substitute faces are available (the compiled-in OFL set or `--font-dir`), otherwise `all-embedded`
-- `--font-dir <FONT_DIR>` — directory of substitute faces for `--fonts full`; overrides the compiled-in OFL set
-- `--png-compression <PNG_COMPRESSION>` — `none`, `fast`, `default` or `best`: encode time against file size, same pixels
+- `--page <PAGE>`: 1-based page number (required)
+- `-o, --out <OUT>`: output file (default: `page-N.png`)
+- `--scale <SCALE>`: scale factor (default: 1)
+- `--fonts <FONTS>`: which fonts to paint, one of `embedded-only` (only embedded TrueType outlines, fastest), `all-embedded` (every embedded program), `full` (also substitute bundled faces for non-embedded fonts); the default resolves to `full` when substitute faces are available (the compiled-in OFL set or `--font-dir`), otherwise `all-embedded`
+- `--font-dir <FONT_DIR>`: directory of substitute faces for `--fonts full`; overrides the compiled-in OFL set
+- `--png-compression <PNG_COMPRESSION>`: `none`, `fast`, `default` or `best` (encode time against file size, same pixels)
 
 ```bash
 pdfboss render --page 1 --scale 2 -o page-1.png report.pdf
@@ -71,9 +71,9 @@ Extract every image a page draws, each as a native-size PNG. See [Extracting ima
 pdfboss images [OPTIONS] <FILE>
 ```
 
-- `--page <PAGE>` — 1-based page number (default: all pages)
-- `-o, --out <OUT>` — output directory, which must already exist (default: current directory)
-- `--png-compression <PNG_COMPRESSION>` — as in `render`
+- `--page <PAGE>`: 1-based page number (default: all pages)
+- `-o, --out <OUT>`: output directory, which must already exist (default: current directory)
+- `--png-compression <PNG_COMPRESSION>`: as in `render`
 
 ```bash
 pdfboss images report.pdf --page 1 -o out
@@ -111,12 +111,12 @@ Dump the document as a JSON value tree, for piping to external tools.
 pdfboss json [OPTIONS] <INPUT>
 ```
 
-- `--raw` — embed raw (still encoded) stream data as base64; combining it with `--decode` is a usage error
-- `--decode` — embed decoded stream data as base64
-- `--pages <PAGES>` — restrict logical elements to these 1-based pages (comma separated)
-- `--no-logical` — skip the logical layer (pages/fonts/images/annotations)
-- `--content-ops` — include per-page content-stream operators (high volume)
-- `--layout` — include per-page layout blocks (headings, paragraphs, lists, tables)
+- `--raw`: embed raw (still encoded) stream data as base64; combining it with `--decode` is a usage error
+- `--decode`: embed decoded stream data as base64
+- `--pages <PAGES>`: restrict logical elements to these 1-based pages (comma separated)
+- `--no-logical`: skip the logical layer (pages/fonts/images/annotations)
+- `--content-ops`: include per-page content-stream operators (high volume)
+- `--layout`: include per-page layout blocks (headings, paragraphs, lists, tables)
 
 ```bash
 pdfboss json report.pdf --no-logical > tree.json
@@ -132,8 +132,8 @@ pdfboss hex [OPTIONS] <INPUT> [SELECTOR]
 
 The selector is one of `obj:N[,G]`, `header`, `xref:N`, `trailer` or `range:START-END` (offsets decimal or `0x`-hex; xref sections indexed in chain order, newest first); without one, the whole file is dumped.
 
-- `--annotate` — print labeled element boundaries as the dump crosses them
-- `--width <WIDTH>` — bytes per row (default: 16)
+- `--annotate`: print labeled element boundaries as the dump crosses them
+- `--width <WIDTH>`: bytes per row (default: 16)
 
 The dump is colorized with ANSI escapes when stdout is a tty; setting the
 `NO_COLOR` environment variable (any value) disables color.
@@ -150,9 +150,9 @@ Run a jq program over the document's JSON value tree (the same tree `json` print
 pdfboss q [OPTIONS] <INPUT> <PROGRAM>
 ```
 
-- `--raw`, `--decode`, `--pages <PAGES>`, `--no-logical`, `--content-ops` — as in `json`, including the `--raw`/`--decode` usage error when combined
-- `--hex` — hexdump results carrying a `_span` instead of printing JSON; colorized on a tty like `hex`, with `NO_COLOR` honored
-- `-r` — print string results raw, without quotes (like `jq -r`)
+- `--raw`, `--decode`, `--pages <PAGES>`, `--no-logical`, `--content-ops`: as in `json`, including the `--raw`/`--decode` usage error when combined
+- `--hex`: hexdump results carrying a `_span` instead of printing JSON; colorized on a tty like `hex`, with `NO_COLOR` honored
+- `-r`: print string results raw, without quotes (like `jq -r`)
 
 ```bash
 pdfboss q report.pdf -r '.pages[].fonts[].base_font'
@@ -188,9 +188,9 @@ A UTF-8 text file, word-wrapped into pages.
 pdfboss create text [OPTIONS] --out <OUT> <INPUT>
 ```
 
-- `--font <FONT>` — one of the fourteen standard fonts: `helvetica` (default), `helvetica-bold`, `helvetica-oblique`, `helvetica-bold-oblique`, `times-roman`, `times-bold`, `times-italic`, `times-bold-italic`, `courier`, `courier-bold`, `courier-oblique`, `courier-bold-oblique`, `symbol`, `zapf-dingbats`
-- `--font-size <FONT_SIZE>` — font size in points (default: 11)
-- `--margin <MARGIN>` — page margin in points, all four sides (default: 72)
+- `--font <FONT>`: one of the fourteen standard fonts, `helvetica` (default), `helvetica-bold`, `helvetica-oblique`, `helvetica-bold-oblique`, `times-roman`, `times-bold`, `times-italic`, `times-bold-italic`, `courier`, `courier-bold`, `courier-oblique`, `courier-bold-oblique`, `symbol`, `zapf-dingbats`
+- `--font-size <FONT_SIZE>`: font size in points (default: 11)
+- `--margin <MARGIN>`: page margin in points, all four sides (default: 72)
 
 ```bash
 pdfboss create text notes.txt -o notes.pdf --font times-roman --font-size 12
@@ -216,8 +216,8 @@ A markdown file composed into a themed document. See [Markdown to PDF](../guide/
 pdfboss create md [OPTIONS] --out <OUT> <INPUT>
 ```
 
-- `--theme <THEME>` — CSS theme file (default: the built-in theme)
-- `--size <SIZE>` — as above; `--landscape` swaps width and height
+- `--theme <THEME>`: CSS theme file (default: the built-in theme)
+- `--size <SIZE>`: as above; `--landscape` swaps width and height
 
 Relative image paths in the markdown resolve against the input file's directory.
 

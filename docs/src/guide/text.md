@@ -3,7 +3,7 @@
 Text extraction turns a page's positioned glyphs back into readable text: spans are
 grouped into lines, lines are ordered top to bottom and joined with `\n`, and spaces
 are inserted at horizontal gaps. Whole-document extraction joins pages with a form
-feed (`\f`). For structured output — headings, lists, tables — see
+feed (`\f`). For structured output (headings, lists, tables), see
 [Markdown output](./markdown.md); for the spans themselves, with fonts, sizes and
 positions, see [Styled spans](./spans.md).
 
@@ -27,7 +27,7 @@ warning: page 17: skipped a form XObject (form limit exceeded)
 ```
 
 stdout carries only the extracted text, so the output stays safe to pipe. Encrypted
-files take `--password` — see [Encrypted documents](./encryption.md).
+files take `--password`. See [Encrypted documents](./encryption.md).
 
 ## Python
 
@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Asynchronous callers use `extract_text_with` against any object source — see
+Asynchronous callers use `extract_text_with` against any object source. See
 [Async and remote documents](./async.md).
 
 ## Lenient semantics and reporting
@@ -96,7 +96,7 @@ Asynchronous callers use `extract_text_with` against any object source — see
 Extraction is lenient the way rendering is: content that will not fetch, decode, or
 parse yields no text rather than an error, so one unreadable stream never costs the
 rest of the document. `extract_text_reporting` is what keeps that leniency
-accountable — it returns the text together with an `ExtractReport`:
+accountable. It returns the text together with an `ExtractReport`:
 
 ```rust,no_run
 use pdfboss_core::Document;
@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`report.skipped` names each stream that yielded no text — the kind (the page's own
+`report.skipped` names each stream that yielded no text: the kind (the page's own
 contents, a form XObject, an unresolvable XObject, a font's CMap encoding) and the
 cause (an unsupported filter, a stream that would not read, content that would not
 parse, a missing resource, an exhausted form nesting or invocation limit).

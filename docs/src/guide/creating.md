@@ -30,15 +30,15 @@ Serialization validates rather than guesses. A document with zero pages is an er
 
 `Canvas` is an imperative painter. Path construction (`move_to`, `line_to`, `curve_to`, `close`) is separate from painting (`fill`, `fill_even_odd`, `stroke`, `close_stroke`, `fill_stroke`, `end_path`), exactly as in PDF content streams. Convenience shapes append complete subpaths: `rect`, `circle` and `ellipse` (four Bézier arcs), and `polygon` over a slice of `pdfboss_core::Point` (fewer than three points appends nothing).
 
-Graphics state follows the same operators: `save`/`restore` push and pop, `transform` concatenates a `pdfboss_core::Matrix` onto the CTM, and `set_line_width`, `set_line_cap`, `set_line_join`, `set_miter_limit` and `set_dash` control stroking. `clip` and `clip_even_odd` intersect the clip region with the current path and consume it. Colors are device colors — `Color::Gray(g)`, `Color::Rgb(r, g, b)`, `Color::Cmyk(c, m, y, k)`, components in `0.0..=1.0`, with `Color::BLACK` and `Color::WHITE` constants — set independently for fill (`set_fill`) and stroke (`set_stroke`). For anything the methods do not cover, `op` pushes a raw `pdfboss_core::content::Op`.
+Graphics state follows the same operators: `save`/`restore` push and pop, `transform` concatenates a `pdfboss_core::Matrix` onto the CTM, and `set_line_width`, `set_line_cap`, `set_line_join`, `set_miter_limit` and `set_dash` control stroking. `clip` and `clip_even_odd` intersect the clip region with the current path and consume it. Colors are device colors (`Color::Gray(g)`, `Color::Rgb(r, g, b)`, `Color::Cmyk(c, m, y, k)`, components in `0.0..=1.0`, with `Color::BLACK` and `Color::WHITE` constants), set independently for fill (`set_fill`) and stroke (`set_stroke`). For anything the methods do not cover, `op` pushes a raw `pdfboss_core::content::Op`.
 
 Canvases nest and carry transparency state. `group(canvas, bbox)` registers a finished sub-canvas as a Form XObject and returns a `GroupHandle`; `draw_group(handle, matrix)` paints it under a matrix, and two calls with the same handle reference one form resource. `set_fill_alpha`, `set_stroke_alpha` and `set_blend_mode` each emit a `gs` operator over a deduplicated single-key `/ExtGState` entry (`/ca`, `/CA` and `/BM` respectively); `BlendMode` covers the twelve separable modes. The resource naming contract, which `op` callers must keep consistent, is fixed: fonts are `F1`, `F2`, …, images `Im1`, …, groups `Gp1`, …, graphics states `Gs1`, …. Fonts are deduplicated document-wide, nested groups included, but a canvas registered as a group on two pages produces two Form XObjects; cross-page group sharing is deferred.
 
 ### Text
 
-`canvas.text(text, x, y, font, size)` shows one line with its baseline origin at `(x, y)`. The faces are the fourteen standard fonts every conforming reader provides, as `Standard14` variants: `Helvetica`, `HelveticaBold`, `HelveticaOblique`, `HelveticaBoldOblique`, `TimesRoman`, `TimesBold`, `TimesItalic`, `TimesBoldItalic`, `Courier`, `CourierBold`, `CourierOblique`, `CourierBoldOblique`, `Symbol`, `ZapfDingbats`. No font program is embedded — readers carry these faces.
+`canvas.text(text, x, y, font, size)` shows one line with its baseline origin at `(x, y)`. The faces are the fourteen standard fonts every conforming reader provides, as `Standard14` variants: `Helvetica`, `HelveticaBold`, `HelveticaOblique`, `HelveticaBoldOblique`, `TimesRoman`, `TimesBold`, `TimesItalic`, `TimesBoldItalic`, `Courier`, `CourierBold`, `CourierOblique`, `CourierBoldOblique`, `Symbol`, `ZapfDingbats`. No font program is embedded: readers carry these faces.
 
-The twelve text faces encode as WinAnsi. A character outside the encoding is an error, never silently dropped or replaced, and the error is raised before any operator is pushed, leaving the canvas untouched. `Symbol` and `ZapfDingbats` have no encoding tables, so every character is an encoding error in those faces. The library does not wrap or lay out text — one call is one line; `Standard14::text_width(text, size)` returns a string's width from the AFM metrics (bare advance widths, no kerning) for callers doing their own layout.
+The twelve text faces encode as WinAnsi. A character outside the encoding is an error, never silently dropped or replaced, and the error is raised before any operator is pushed, leaving the canvas untouched. `Symbol` and `ZapfDingbats` have no encoding tables, so every character is an encoding error in those faces. The library does not wrap or lay out text: one call is one line; `Standard14::text_width(text, size)` returns a string's width from the AFM metrics (bare advance widths, no kerning) for callers doing their own layout.
 
 Fonts are deduplicated document-wide: each distinct face gets one font object, in first-use order, no matter how many pages use it.
 
@@ -46,13 +46,13 @@ Fonts are deduplicated document-wide: each distinct face gets one font object, i
 
 `ImageData` imports or wraps pixels; `add_image` registers it on a canvas and `draw_image(handle, x, y, width, height)` paints it into an axis-aligned box:
 
-- `ImageData::png(&bytes)` — decodes a PNG: truecolor and grayscale (16-bit reduced to 8), palette expanded, alpha split into a soft mask.
-- `ImageData::jpeg(&bytes)` — baseline or progressive JPEG by passthrough: the original bytes are embedded as `/DCTDecode`, dimensions sniffed from the SOF marker. Grayscale and three-component images only.
-- `ImageData::rgb8(w, h, data)`, `gray8(w, h, data)` — 8-bit rasters, `data` length checked against the dimensions.
-- `ImageData::mono(w, h, data)` — 1-bit rasters, rows packed MSB-first and byte-padded; a set bit is black.
-- `ImageData::decode(&bytes)` — dispatches on content rather than file extension: a PNG signature goes to `png`, a JPEG SOI marker to `jpeg`, anything else is an error.
+- `ImageData::png(&bytes)`: decodes a PNG; truecolor and grayscale (16-bit reduced to 8), palette expanded, alpha split into a soft mask.
+- `ImageData::jpeg(&bytes)`: baseline or progressive JPEG by passthrough. The original bytes are embedded as `/DCTDecode`, dimensions sniffed from the SOF marker. Grayscale and three-component images only.
+- `ImageData::rgb8(w, h, data)`, `gray8(w, h, data)`: 8-bit rasters, `data` length checked against the dimensions.
+- `ImageData::mono(w, h, data)`: 1-bit rasters, rows packed MSB-first and byte-padded; a set bit is black.
+- `ImageData::decode(&bytes)`: dispatches on content rather than file extension. A PNG signature goes to `png`, a JPEG SOI marker to `jpeg`, anything else is an error.
 
-Images are embedded per page with no cross-page deduplication — the same raster drawn on two pages is stored twice.
+Images are embedded per page with no cross-page deduplication: the same raster drawn on two pages is stored twice.
 
 ## A complete page
 
@@ -291,10 +291,10 @@ Any `Some` metadata, all-`None` included, also writes an XMP metadata stream wir
 
 Four paths produce the same bytes:
 
-- `pdf.save(path)` — serialize and write to a file.
-- `pdf.to_bytes()` — the whole file as one `Vec<u8>`.
-- `pdf.write_into(impl std::io::Write)` — the same bytes streamed in bounded chunks. An error can leave a prefix of the file already written, and no flush is performed — flush a buffered writer yourself.
-- `pdf.write_into_with(sink).await` — the asynchronous twin over any `AsyncByteSink`; it hands the sink back unflushed. `Vec<u8>` is a sink, `Immediate` presents any `std::io::Write` as one, and `pdfboss_aio::TokioSink` (behind that crate's `write` feature) presents any `tokio::io::AsyncWrite`.
+- `pdf.save(path)`: serialize and write to a file.
+- `pdf.to_bytes()`: the whole file as one `Vec<u8>`.
+- `pdf.write_into(impl std::io::Write)`: the same bytes streamed in bounded chunks. An error can leave a prefix of the file already written, and no flush is performed. Flush a buffered writer yourself.
+- `pdf.write_into_with(sink).await`: the asynchronous twin over any `AsyncByteSink`; it hands the sink back unflushed. `Vec<u8>` is a sink, `Immediate` presents any `std::io::Write` as one, and `pdfboss_aio::TokioSink` (behind that crate's `write` feature) presents any `tokio::io::AsyncWrite`.
 
 ```rust,no_run
 use pdfboss_write::{Page, PageSize, Pdf, Standard14};
@@ -371,13 +371,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## CLI
 
-`pdfboss create` covers the common cases without writing Rust — plus [`create md`](./md-to-pdf.md#cli), which composes a Markdown file with a CSS theme and has its own chapter. Blank pages, with `--pages`, `--size` (`a3`, `a4`, `a5`, `letter`, `legal`) and `--landscape`:
+`pdfboss create` covers the common cases without writing Rust, plus [`create md`](./md-to-pdf.md#cli), which composes a Markdown file with a CSS theme and has its own chapter. Blank pages, with `--pages`, `--size` (`a3`, `a4`, `a5`, `letter`, `legal`) and `--landscape`:
 
 ```bash
 pdfboss create blank --out blank.pdf --pages 3 --size a5 --landscape
 ```
 
-A UTF-8 text file, word-wrapped into pages — `--font` takes any of the fourteen standard faces, plus `--font-size` and `--margin` in points:
+A UTF-8 text file, word-wrapped into pages. `--font` takes any of the fourteen standard faces, plus `--font-size` and `--margin` in points:
 
 ```bash
 pdfboss create text notes.txt --out notes.pdf --font times-roman --font-size 12
@@ -422,4 +422,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This prints `Round trip`. The same holds across tools: `pdfboss info` reads back the metadata, [`pdfboss text`](./text.md) extracts the drawn strings, and [`pdfboss render`](./rendering.md) rasterizes the page. One render detail: the standard fourteen faces carry no embedded font program, and rendering paints embedded programs by default — pass `--fonts full` to substitute bundled faces and see the text in the raster.
+This prints `Round trip`. The same holds across tools: `pdfboss info` reads back the metadata, [`pdfboss text`](./text.md) extracts the drawn strings, and [`pdfboss render`](./rendering.md) rasterizes the page. One render detail: the standard fourteen faces carry no embedded font program, and rendering paints embedded programs by default. Pass `--fonts full` to substitute bundled faces and see the text in the raster.

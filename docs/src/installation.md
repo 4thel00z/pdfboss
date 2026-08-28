@@ -19,7 +19,7 @@ pip install "pdfboss[full]"
 ```
 
 This installs `pdfboss-fonts` alongside the wheel. Without it, `fonts="full"`
-requires a `font_dir` argument pointing at faces of your own — see
+requires a `font_dir` argument pointing at faces of your own. See
 [Rendering pages](./guide/rendering.md).
 
 ## CLI
@@ -30,10 +30,10 @@ cargo install pdfboss-cli
 
 This installs the `pdfboss` binary. Two features are on by default:
 
-- `substitute-fonts` — bundles the OFL Croscore substitute faces (about 4 MB)
+- `substitute-fonts`: bundles the OFL Croscore substitute faces (about 4 MB)
   so `render` and `tui` can paint text for PDFs with non-embedded fonts out of
   the box.
-- `predefined-cmaps` — compiles in the predefined CJK CMap set of ISO 32000
+- `predefined-cmaps`: compiles in the predefined CJK CMap set of ISO 32000
   Table 118 (about 830 KB) so `text` reads Shift-JIS/EUC/Big5/GBK/UHC-coded
   Type0 fonts.
 
@@ -61,14 +61,14 @@ cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write 
 | `pdfboss-markdown` | CommonMark+GFM composed into themed PDFs (pulls in `pdfboss-style`) |
 | `pdfboss-aio` | Async, range-fetching document access |
 
-Add only what you use — `pdfboss-core` alone parses; the others build on it.
+Add only what you use: `pdfboss-core` alone parses; the others build on it.
 
 The library crates keep their optional features off by default:
 
-- `pdfboss-render` `substitute-fonts` — the bundled substitute faces.
-- `pdfboss-core` `predefined-cmaps` — the predefined CJK CMap set.
-- `pdfboss-aio` `http` — remote documents over HTTP range requests.
-- `pdfboss-aio` `write` — streaming created documents into tokio writers:
+- `pdfboss-render` `substitute-fonts`: the bundled substitute faces.
+- `pdfboss-core` `predefined-cmaps`: the predefined CJK CMap set.
+- `pdfboss-aio` `http`: remote documents over HTTP range requests.
+- `pdfboss-aio` `write`: streaming created documents into tokio writers;
   ships `TokioSink`, which presents any `tokio::io::AsyncWrite` to
   `Pdf::write_into_with` (see [Creating PDFs](./guide/creating.md)).
 

@@ -12,7 +12,7 @@ revisions, Latin-1 encoded as well, covering both encodings real files use.
 
 ## Checking whether a file needs a password
 
-`pdfboss info` never fails on an encrypted file — whether the file needs a
+`pdfboss info` never fails on an encrypted file. Whether the file needs a
 password is the very question being asked:
 
 ```bash
@@ -26,8 +26,8 @@ pages:     unknown
 ```
 
 `encrypted: true` means the file did not open with the password supplied (by
-default, none). A file that opens — because it is unencrypted, protected only
-by an owner password, or because `--password` carried the right value —
+default, none). A file that opens (because it is unencrypted, protected only
+by an owner password, or because `--password` carried the right value)
 reports `encrypted: false` along with the full page and metadata listing:
 
 ```bash
@@ -43,9 +43,9 @@ pages:     1
 
 ## CLI
 
-Every subcommand that reads a PDF takes `--password` — `info`, `text`, `md`,
-`render`, `images`, `obj`, `tui`, `json`, `hex` and `q` — accepted as either
-the user or the owner password:
+Every subcommand that reads a PDF (`info`, `text`, `md`,
+`render`, `images`, `obj`, `tui`, `json`, `hex` and `q`) takes `--password`,
+accepted as either the user or the owner password:
 
 ```bash
 pdfboss text --password hunter2 locked.pdf
@@ -70,7 +70,7 @@ print(doc.extract_text())
 ```
 
 The same keyword exists on the `data=` form of the constructor and on all
-three async constructors — `AsyncDocument.open`, `AsyncDocument.open_url` and
+three async constructors: `AsyncDocument.open`, `AsyncDocument.open_url` and
 `AsyncDocument.from_bytes` (see
 [Async and remote documents](./async.md)):
 
@@ -120,8 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Once a document is open, every operation — [text](./text.md),
+Once a document is open, every operation ([text](./text.md),
 [markdown](./markdown.md), [rendering](./rendering.md),
-[images](./images.md) — works exactly as on an unencrypted file; decryption
+[images](./images.md)) works exactly as on an unencrypted file; decryption
 happens transparently underneath. Full option listings live in the
 [CLI reference](../reference/cli.md).

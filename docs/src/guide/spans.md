@@ -2,8 +2,8 @@
 
 [Text extraction](./text.md) gives you a page as flowing plain text. Spans are
 the layer underneath: each span is one positioned run of text together with
-everything the file states about how it is shown — position, size, font,
-weight, color, visibility. Use spans when you need to know not just *what* a
+everything the file states about how it is shown (position, size, font,
+weight, color, visibility). Use spans when you need to know not just *what* a
 page says but *where* and *in what style*: finding headings, separating an OCR
 layer from printed text, or feeding a layout analysis of your own.
 
@@ -21,8 +21,8 @@ layer from printed text, or feeding a layout analysis of your own.
 | `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up: origin to advance horizontally, the font's descent..ascent vertically. |
 | `bold`, `italic` | From FontDescriptor evidence, falling back to the `/BaseFont` name. |
 | `monospace`, `serif` | FontDescriptor `/Flags` FixedPitch and Serif. |
-| `underline`, `strikethrough` | A drawn ruling below the baseline / across the x-height band — see the caveat below. |
-| `rise` | The text rise (`Ts`) the span was shown under: positive above the baseline — a superscript/subscript signal. |
+| `underline`, `strikethrough` | A drawn ruling below the baseline / across the x-height band. See the caveat below. |
+| `rise` | The text rise (`Ts`) the span was shown under: positive above the baseline, a superscript/subscript signal. |
 | `vertical` | Writing mode 1: the text advances downward. |
 | `invisible` | Shown under render mode 3 or 7, which paint nothing. |
 | `color` | Fill color as RGB in `[0, 1]`; `None` for pattern fills. |
@@ -35,7 +35,7 @@ Three of these deserve honesty up front:
   text can read as an underline.
 - **`invisible` is the signature of an OCR text layer.** Scanned PDFs with a
   text layer draw the page image and then show the recognized text under
-  render mode 3 or 7, which paint nothing. The text extracts normally — it is
+  render mode 3 or 7, which paint nothing. The text extracts normally: it is
   just never painted.
 - **`color` is `None` for pattern fills**, which have no single color.
 
@@ -60,7 +60,7 @@ buffers one page's spans at a time, extracts each page with the GIL released,
 and shares one font cache across the walk, so a font used on every page loads
 once. Pass `pages=[...]` (0-based) to restrict the walk, in the order given.
 
-Finding headings — bold text larger than the document's body size — is a
+Finding headings (bold text larger than the document's body size) is a
 document-level walk:
 
 ```python
@@ -91,8 +91,8 @@ ocr = [span for span in spans if span.invisible]
 print(f"{len(ocr)} of {len(spans)} spans are invisible (an OCR text layer)")
 ```
 
-Both have async twins — `await page.spans()` and `async for span in
-doc.spans()` — described in [Async and remote documents](./async.md).
+Both have async twins, `await page.spans()` and `async for span in
+doc.spans()`, described in [Async and remote documents](./async.md).
 
 ## Rust
 
@@ -122,11 +122,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The crate also offers `extract_spans_reporting` (an `ExtractReport` naming
-each stream that could not be read — an empty span list with an empty report
+each stream that could not be read: an empty span list with an empty report
 really is an empty page), `extract_spans_reporting_cached` (one `FontCache`
 shared across a whole-document walk, the same trick `Document.spans()` uses),
 and `extract_spans_and_rulings_reporting`, which additionally returns the
-page's `Ruling` segments — the drawn lines the underline and strikethrough
+page's `Ruling` segments, the drawn lines the underline and strikethrough
 flags are derived from.
 
 Spans are the input to the layout analysis behind

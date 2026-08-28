@@ -1,6 +1,6 @@
 # Async and remote documents
 
-`AsyncDocument` opens a PDF without reading the whole file. The open flow fetches only what it needs — the header, the cross-reference chain and the page tree — and every later operation fetches only the byte ranges it touches. The file backend reads windows of the file on demand; the HTTP backend turns each read into a `Range` request, so a document on a server can be paged through without downloading it. A server that ignores `Range` and answers `200` with the full body cannot be range-read: the open fails (in Python, a `PdfError` reading `http: server does not support Range requests`) instead of falling back to a full download.
+`AsyncDocument` opens a PDF without reading the whole file. The open flow fetches only what it needs (the header, the cross-reference chain and the page tree) and every later operation fetches only the byte ranges it touches. The file backend reads windows of the file on demand; the HTTP backend turns each read into a `Range` request, so a document on a server can be paged through without downloading it. A server that ignores `Range` and answers `200` with the full body cannot be range-read: the open fails (in Python, a `PdfError` reading `http: server does not support Range requests`) instead of falling back to a full download.
 
 ## Python
 
@@ -12,7 +12,7 @@ Three constructors, all coroutines. Each takes `password=` for encrypted files (
 | `AsyncDocument.open_url(url)` | An http(s) URL, fetched via `Range` requests |
 | `AsyncDocument.from_bytes(data)` | Bytes already in memory |
 
-What is sync and what is a coroutine follows from what the open flow already parsed. `page_count`, `version`, `len(doc)` and page access — `doc[i]`, `doc.page(i)` and every `AsyncPage` geometry property — are plain sync attributes: the xref chain and the page tree were parsed at open, so nothing there needs I/O. Everything that must read more of the file is a coroutine: `extract_text`, `extract_markdown`, `render_pages`, `metadata`, `get_object` on the document, and `extract_text`, `extract_markdown`, `render`, `render_reporting`, `extract_images` and `spans` on a page.
+What is sync and what is a coroutine follows from what the open flow already parsed. `page_count`, `version`, `len(doc)` and page access (`doc[i]`, `doc.page(i)` and every `AsyncPage` geometry property) are plain sync attributes: the xref chain and the page tree were parsed at open, so nothing there needs I/O. Everything that must read more of the file is a coroutine: `extract_text`, `extract_markdown`, `render_pages`, `metadata`, `get_object` on the document, and `extract_text`, `extract_markdown`, `render`, `render_reporting`, `extract_images` and `spans` on a page.
 
 Coroutines are driven by one shared multi-thread tokio runtime behind the asyncio loop. `render_pages` fans pages across the machine's cores as tokio tasks, so the loop stays free while pages rasterize.
 
@@ -37,7 +37,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`doc.elements()` and `doc.spans()` return async iterators, consumed with `async for`, with the same ordering and salvage semantics as their sync twins — see [Exploring PDF internals](./explorer.md) and [Styled spans](./spans.md).
+`doc.elements()` and `doc.spans()` return async iterators, consumed with `async for`, with the same ordering and salvage semantics as their sync twins. See [Exploring PDF internals](./explorer.md) and [Styled spans](./spans.md).
 
 A remote document differs only in the constructor:
 
@@ -58,7 +58,7 @@ asyncio.run(main())
 
 ## Rust
 
-`pdfboss_aio::AsyncDocument` has the same constructors: `open`/`open_with_password`, `from_bytes`/`from_bytes_with_password` and — behind the crate's `http` feature — `open_url`/`open_url_with_password`. `with_backend` opens a document over any byte source you build yourself.
+`pdfboss_aio::AsyncDocument` has the same constructors: `open`/`open_with_password`, `from_bytes`/`from_bytes_with_password` and, behind the crate's `http` feature, `open_url`/`open_url_with_password`. `with_backend` opens a document over any byte source you build yourself.
 
 ```rust,no_run
 use pdfboss_aio::AsyncDocument;
@@ -78,10 +78,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 A document reads through the `Backend` trait: `len()` and `read_at(offset, buf)`, both returning boxed futures so the trait is object-safe and a document can hold `Arc<dyn Backend>`. Four implementations ship with the crate:
 
-- `MemBackend` — bytes fully resident in memory; `from_bytes` uses it directly, with no cache.
-- `FileBackend` — positioned reads (`pread`-style, no shared cursor) run on tokio's blocking thread pool, so disk I/O never stalls the async runtime. The length is captured once at open; the file is treated as immutable while the backend lives.
-- `HttpBackend` (feature `http`) — the length comes from a `HEAD` request's `Content-Length`; each read is a `GET` with a `Range: bytes=` header. A `200` answer where `206` was asked for yields `Error::RangeUnsupported`, and a response body is collected only up to the requested size, so a buggy or hostile server cannot balloon memory.
-- `CachedBackend` — a chunked LRU read cache over any backend: many small reads become few chunk-sized fetches, and hot chunks stay resident up to a byte budget. Defaults: 64 KiB chunks, 32 MiB total.
+- `MemBackend`: bytes fully resident in memory; `from_bytes` uses it directly, with no cache.
+- `FileBackend`: positioned reads (`pread`-style, no shared cursor) run on tokio's blocking thread pool, so disk I/O never stalls the async runtime. The length is captured once at open; the file is treated as immutable while the backend lives.
+- `HttpBackend` (feature `http`): the length comes from a `HEAD` request's `Content-Length`; each read is a `GET` with a `Range: bytes=` header. A `200` answer where `206` was asked for yields `Error::RangeUnsupported`, and a response body is collected only up to the requested size, so a buggy or hostile server cannot balloon memory.
+- `CachedBackend`: a chunked LRU read cache over any backend: many small reads become few chunk-sized fetches, and hot chunks stay resident up to a byte budget. Defaults: 64 KiB chunks, 32 MiB total.
 
 `open` and `open_url` wrap their backend in a `CachedBackend` automatically. `from_bytes` stays uncached, and `with_backend` adds nothing, so a composition of your own is used exactly as given:
 
@@ -125,4 +125,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The `oc` parameter carries the document's optional-content visibility (`doc.oc_state().await`); text and markdown extraction use it to exclude layers the document's default configuration turns off, exactly as the sync entry points do. Rendering takes the same state through `RenderOptions::oc`: set `opts.oc = doc.oc_state().await.map(Arc::new);` before calling `render_page_reporting_with`. Leaving it `None` renders every layer; only the sync entry points fill it from the document. What the extracted images contain — drawing order, native size, `/SMask` alpha — is described in [Extracting images](./images.md); the sync Rust and Python surfaces are in [Rust crates](../reference/rust.md) and [Python API](../reference/python.md).
+The `oc` parameter carries the document's optional-content visibility (`doc.oc_state().await`); text and markdown extraction use it to exclude layers the document's default configuration turns off, exactly as the sync entry points do. Rendering takes the same state through `RenderOptions::oc`: set `opts.oc = doc.oc_state().await.map(Arc::new);` before calling `render_page_reporting_with`. Leaving it `None` renders every layer; only the sync entry points fill it from the document. What the extracted images contain (drawing order, native size, `/SMask` alpha) is described in [Extracting images](./images.md); the sync Rust and Python surfaces are in [Rust crates](../reference/rust.md) and [Python API](../reference/python.md).

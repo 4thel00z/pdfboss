@@ -10,14 +10,14 @@ What the composition covers: headings, paragraphs, bulleted and numbered
 lists (nested included), GFM tables with per-column alignment, fenced and
 indented code blocks, block quotes, thematic breaks, emphasis, strong,
 strikethrough and inline code runs, hyperlinks (emitted as real clickable
-`/Link` annotations), and images — PNG or JPEG, detected by content, with
-relative paths resolved against a base directory. Raw HTML fragments are
+`/Link` annotations), and images (PNG or JPEG, detected by content, with
+relative paths resolved against a base directory). Raw HTML fragments are
 skipped and reported rather than half-rendered.
 
 Two properties worth designing around:
 
 - **Deterministic.** The same markdown, theme and options always produce
-  byte-identical output — nothing reads a clock, randomness or the
+  byte-identical output: nothing reads a clock, randomness or the
   environment.
 - **Replace-and-report.** Text renders in the standard Helvetica, Times and
   Courier families, which encode as WinAnsi. A character outside that
@@ -35,7 +35,7 @@ include `font-family` (`helvetica`, `times`, `courier`, or the `sans-serif`/
 `in`), `font-style`, `font-weight`, `color` and `background-color` (named,
 `#hex` or `rgb()`), `text-align`, `text-decoration`, `line-height`, and
 `margin`/`padding` with their per-side forms. Parse errors are strict and
-located — a typo fails with a line and column rather than being ignored.
+located: a typo fails with a line and column rather than being ignored.
 
 ```css
 body { font-family: times; font-size: 10.5pt; color: #222; }
@@ -64,7 +64,7 @@ pdfboss text themed.pdf     # the composed text back out
 ## Python
 
 `pdfboss.md.to_pdf` returns the PDF as bytes. `theme` is **CSS source text,
-not a path** — read the file yourself when the theme lives in one. `size`
+not a path**: read the file yourself when the theme lives in one. `size`
 names the page size case-insensitively, `landscape` swaps the dimensions,
 and `base_dir` anchors relative image paths (default: the current
 directory).
@@ -100,7 +100,7 @@ An unknown `size` or an invalid theme raises `PdfError`.
 ## Rust
 
 `pdfboss_markdown::to_pdf(markdown, &options)` returns the composed
-[`pdfboss_write::Pdf`](./creating.md) — still a value, not yet bytes —
+[`pdfboss_write::Pdf`](./creating.md) (still a value, not yet bytes)
 alongside the replace-and-report `Report`. `Options` carries the parsed
 `Theme`, the `PageSize` and the image `base_dir`; `Theme::parse` reads CSS
 source, `Theme::default_theme()` is the built-in look. Serialize the `Pdf`
@@ -135,7 +135,7 @@ pages of your own, or stream the bytes asynchronously.
 
 Composition and extraction are the two directions of one engine. A document
 composed from Markdown reads back with `pdfboss text`, renders with
-`pdfboss render`, and — closing the loop — `pdfboss md` re-infers headings,
+`pdfboss render`, and, closing the loop, `pdfboss md` re-infers headings,
 lists and tables from the composed layout. The composed text uses only
 standard-14 faces, so rendering paints it at the `full`
 [font tier](./rendering.md#font-tiers).

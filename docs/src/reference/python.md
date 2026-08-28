@@ -79,6 +79,6 @@ The `write` submodule splits its failures by phase. `TypeError` is raised at con
 
 ## Threading
 
-A `Document` — and any `Page` it hands out — may be used from any thread. Access to the underlying parsed document is serialized internally, and `extract_text`/`render` release the GIL while they run, so other Python threads keep making progress during long extractions or renders. Element and span iteration release the GIL per step the same way. `Document.render_pages` fans page rendering out across the machine's cores.
+A `Document` (and any `Page` it hands out) may be used from any thread. Access to the underlying parsed document is serialized internally, and `extract_text`/`render` release the GIL while they run, so other Python threads keep making progress during long extractions or renders. Element and span iteration release the GIL per step the same way. `Document.render_pages` fans page rendering out across the machine's cores.
 
 The async API needs no thread juggling: `AsyncDocument`'s coroutines are driven by one global multi-thread tokio runtime, and `AsyncDocument.render_pages` fans out as tokio tasks so the asyncio loop stays free.

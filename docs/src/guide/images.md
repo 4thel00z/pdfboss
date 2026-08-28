@@ -1,6 +1,6 @@
 # Extracting images
 
-pdfboss extracts the images a page draws — photographs, scans, logos, figures —
+pdfboss extracts the images a page draws (photographs, scans, logos, figures),
 each decoded at its own pixel dimensions and delivered as RGBA with alpha.
 Three surfaces expose it: the `pdfboss images` CLI command,
 `Page.extract_images` in Python, and `pdfboss_render::extract_page_images` in
@@ -16,8 +16,8 @@ point where one is drawn:
   resources contain. An image drawn twice appears twice; an image XObject
   listed in the resources but never drawn does not appear at all.
 - **Drawing order.** Images come back in the order the content draws them.
-- **Form XObjects are followed.** An image drawn inside a form — a reused
-  header graphic, a stamped figure — is reached through the form, to the same
+- **Form XObjects are followed.** An image drawn inside a form (a reused
+  header graphic, a stamped figure) is reached through the form, to the same
   bounded nesting depth the renderer uses, so a form that draws itself
   terminates instead of recursing forever.
 - **Inline images are included.** `BI … ID … EI` sequences embedded directly
@@ -40,7 +40,7 @@ point where one is drawn:
 
 There is no hidden minimum-size filter: every drawn image comes back,
 including one-pixel spacers and thin decorative strips. Each result carries
-its native width and height, so callers apply their own threshold — the
+its native width and height, so callers apply their own threshold: the
 synchronous Python and Rust examples below skip anything under 100 × 100
 pixels.
 
@@ -70,7 +70,7 @@ extracted 9 images
 
 Without `--page` every page is processed. `-o` names the output directory
 (default: the current directory); it must already exist. `--png-compression`
-trades encode time against file size — `none`, `fast`, `default` or `best`,
+trades encode time against file size: `none`, `fast`, `default` or `best`,
 all producing the same pixels. A page whose images cannot be decoded writes
 nothing for them and still exits 0.
 
@@ -122,7 +122,7 @@ asyncio.run(main())
 
 ## Rust
 
-`pdfboss_render::extract_page_images` returns `Vec<Pixmap>` — RGBA8 pixels
+`pdfboss_render::extract_page_images` returns `Vec<Pixmap>`: RGBA8 pixels
 with straight alpha, row-major from the top-left, with public `width`,
 `height` and `data` fields. `Pixmap::save_png` writes one to disk;
 `encode_png`/`encode_png_with` produce the bytes in memory. With

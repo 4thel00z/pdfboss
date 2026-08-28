@@ -1,6 +1,6 @@
 # Exploring PDF internals
 
-A PDF is two structures at once: a physical file — header, numbered objects, cross-reference sections, trailer — and the logical document those objects encode — pages, fonts, images, annotations. pdfboss exposes both as one lazy stream of elements, reachable from Python and Rust, and from the CLI as a JSON tree, jq queries, hexdumps and an interactive terminal explorer.
+A PDF is two structures at once: a physical file (header, numbered objects, cross-reference sections, trailer) and the logical document those objects encode (pages, fonts, images, annotations). pdfboss exposes both as one lazy stream of elements, reachable from Python and Rust, and from the CLI as a JSON tree, jq queries, hexdumps and an interactive terminal explorer.
 
 ## The element model
 
@@ -62,7 +62,7 @@ for element in doc.elements(physical=False, pages=[0]):
     print(element.value())
 ```
 
-A `for` loop stops at the first raising element, so a walk that must survive damage drives the iterator explicitly — a per-item `PdfError` leaves the iterator usable:
+A `for` loop stops at the first raising element, so a walk that must survive damage drives the iterator explicitly. A per-item `PdfError` leaves the iterator usable:
 
 ```python
 import pdfboss
@@ -81,7 +81,7 @@ while True:
     print(element.kind)
 ```
 
-`AsyncDocument.elements()` is the async twin — same arguments, same ordering, same salvage semantics, consumed with `async for` ([Async and remote documents](./async.md)).
+`AsyncDocument.elements()` is the async twin: same arguments, same ordering, same salvage semantics, consumed with `async for` ([Async and remote documents](./async.md)).
 
 ## Rust
 
@@ -128,17 +128,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## CLI
 
-Four subcommands plus the terminal explorer. `json`, `q`, `hex` and `tui` accept a local path or an http(s) URL — a URL is fetched in ranges and never downloaded whole; `obj` takes a local path. Full flag listings are in the [CLI reference](../reference/cli.md).
+Four subcommands plus the terminal explorer. `json`, `q`, `hex` and `tui` accept a local path or an http(s) URL (a URL is fetched in ranges and never downloaded whole); `obj` takes a local path. Full flag listings are in the [CLI reference](../reference/cli.md).
 
-### json — the document as a JSON value tree
+### json: the document as a JSON value tree
 
 ```bash
 pdfboss json report.pdf > report.json
 ```
 
-The tree's top-level keys are `header`, `objects` (keyed `"N G"`), `pages`, `xref`, `trailer` and `startxref`. Physical entries carry a `_span` byte range; indirect references appear as `{"_r": [num, gen]}`. `--layout` adds a top-level `layout` array — per page, the inferred blocks: headings, paragraphs, lists, tables. `--pages` restricts the logical layer, `--no-logical` skips it, `--content-ops` adds per-page operators, and `--raw`/`--decode` embed stream data as base64 (still encoded, or decoded).
+The tree's top-level keys are `header`, `objects` (keyed `"N G"`), `pages`, `xref`, `trailer` and `startxref`. Physical entries carry a `_span` byte range; indirect references appear as `{"_r": [num, gen]}`. `--layout` adds a top-level `layout` array: per page, the inferred blocks (headings, paragraphs, lists, tables). `--pages` restricts the logical layer, `--no-logical` skips it, `--content-ops` adds per-page operators, and `--raw`/`--decode` embed stream data as base64 (still encoded, or decoded).
 
-### q — jq programs over the same tree
+### q: jq programs over the same tree
 
 ```bash
 pdfboss q report.pdf '. | keys'
@@ -158,9 +158,9 @@ The second one answers "which fonts does this document use" in one line:
 ]
 ```
 
-`-r` prints string results raw, and `--hex` hexdumps any result that carries a `_span` instead of printing its JSON — a query language for choosing what to dump.
+`-r` prints string results raw, and `--hex` hexdumps any result that carries a `_span` instead of printing its JSON: a query language for choosing what to dump.
 
-### hex — the bytes themselves
+### hex: the bytes themselves
 
 ```bash
 pdfboss hex report.pdf obj:2              # one object's bytes
@@ -175,7 +175,7 @@ pdfboss hex report.pdf --annotate         # whole file, element boundaries label
 
 Selectors: `obj:N[,G]`, `header`, `xref:N` (sections indexed in chain order, newest first), `trailer`, `range:START-END` (offsets decimal or 0x-hex); without one, the whole file. `--annotate` prints a labeled boundary line as the dump crosses each element.
 
-### obj — one object, pretty-printed
+### obj: one object, pretty-printed
 
 ```bash
 pdfboss obj report.pdf 2
@@ -199,12 +199,12 @@ pdfboss obj report.pdf 2
 >>
 ```
 
-### tui — the interactive explorer
+### tui: the interactive explorer
 
 ```bash
 pdfboss tui report.pdf
 ```
 
-The screen splits into a tree pane on the left, an inspector above a hex pane on the right, and a status bar. The tree is the element model as a lazy hierarchy — Document → Pages (each with its Fonts, Images, Annotations and Contents) → Objects → Xref sections → Trailer — populated by background tasks as sections expand. The inspector pretty-prints the selection; `d` cycles it through raw bytes, decoded bytes and disassembled content operators for streams, and `Enter` jumps through any `N G R` reference under the cursor (`Backspace` goes back). `p` swaps the inspector for a rasterized page preview and `m` for the page's Markdown. The hex pane tracks the selection's bytes.
+The screen splits into a tree pane on the left, an inspector above a hex pane on the right, and a status bar. The tree is the element model as a lazy hierarchy, populated by background tasks as sections expand: Document → Pages (each with its Fonts, Images, Annotations and Contents) → Objects → Xref sections → Trailer. The inspector pretty-prints the selection; `d` cycles it through raw bytes, decoded bytes and disassembled content operators for streams, and `Enter` jumps through any `N G R` reference under the cursor (`Backspace` goes back). `p` swaps the inspector for a rasterized page preview and `m` for the page's Markdown. The hex pane tracks the selection's bytes.
 
-`Tab` cycles focus, arrows or `j`/`k`/`h`/`l` move, `g`/`G` jump to top/bottom, `/` searches (with `n`/`N` for next/previous hit), `q` quits. Long operations — element streaming, hex fetches, search, preview rasterization — run off the event loop, so input never blocks, including over an HTTP-backed document.
+`Tab` cycles focus, arrows or `j`/`k`/`h`/`l` move, `g`/`G` jump to top/bottom, `/` searches (with `n`/`N` for next/previous hit), `q` quits. Long operations (element streaming, hex fetches, search, preview rasterization) run off the event loop, so input never blocks, including over an HTTP-backed document.

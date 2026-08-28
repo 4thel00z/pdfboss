@@ -18,17 +18,17 @@ pdfboss render report.pdf --page 1 --scale 2 -o page-1@2x.png
 
 The first form writes `page-1.png` (`--page` is 1-based). Further flags:
 
-- `--fonts <FONTS>` — which fonts to paint: `embedded-only`, `all-embedded`
-  or `full` (see the tiers below). The default resolves to `full` when
-  substitute faces are available (the compiled-in OFL set or `--font-dir`),
-  otherwise `all-embedded`.
-- `--font-dir <FONT_DIR>` — a directory of substitute faces for `--fonts
+- `--fonts <FONTS>`: which fonts to paint, one of `embedded-only`,
+  `all-embedded` or `full` (see the tiers below). The default resolves to
+  `full` when substitute faces are available (the compiled-in OFL set or
+  `--font-dir`), otherwise `all-embedded`.
+- `--font-dir <FONT_DIR>`: a directory of substitute faces for `--fonts
   full` (e.g. an installed `pdfboss-fonts` package), named as listed under
   [Substitute face files](#substitute-face-files). Overrides the compiled-in
   OFL set.
-- `--png-compression <PNG_COMPRESSION>` — `none`, `fast`, `default` or
+- `--png-compression <PNG_COMPRESSION>`: `none`, `fast`, `default` or
   `best`.
-- `--password <PASSWORD>` — for encrypted files, covered in
+- `--password <PASSWORD>`: for encrypted files, covered in
   [Encrypted documents](./encryption.md).
 
 Anything the render dropped is warned on stderr.
@@ -38,7 +38,7 @@ Anything the render dropped is warned on stderr.
 Glyph painting is staged in tiers; each tier is a strict superset of the
 previous one.
 
-- **`embedded-only`** paints only embedded TrueType outlines — the fastest
+- **`embedded-only`** paints only embedded TrueType outlines: the fastest
   tier, and TrueType only, not every embedded font.
 - **`all-embedded`** (the default when no substitute faces are available)
   paints every embedded font program: TrueType, CFF, Type1 and Type3.
@@ -51,8 +51,8 @@ previous one.
   neither `font_dir` nor that package available, `fonts="full"` raises
   `ValueError`.
 
-Text a tier leaves unpainted still advances — through the PDF's own `/Widths`,
-or the Adobe Core-14 AFM tables for a standard-14 face — so everything painted
+Text a tier leaves unpainted still advances (through the PDF's own `/Widths`,
+or the Adobe Core-14 AFM tables for a standard-14 face), so everything painted
 around it stays where the page put it. `/Symbol` and `/ZapfDingbats` have no
 license-clean substitute and stay blank; see
 [Limitations](../reference/limitations.md).
@@ -77,7 +77,7 @@ Rendering never fails because one construct in a page would not read: content
 pdfboss cannot fetch, decode or parse is skipped and the rest of the page
 still rasterizes. The honest consequence is that a page can come back blank
 without an error. The reporting variants return what was dropped or
-approximated, one line per distinct loss — for example
+approximated, one line per distinct loss, for example
 `"153 glyphs skipped: no glyph for code 9 in /MBIPWP+Times-Roman"` or
 `"6 annotations skipped: the resource is missing"`. An empty report means the
 page rasterized exactly as it describes itself.
@@ -85,7 +85,7 @@ page rasterized exactly as it describes itself.
 Two things are deliberately not reported, because they are configured behavior
 rather than a failure: text left unpainted by the requested font tier, and
 content in optional-content layers (PDF layers) the document's default
-configuration turns off — the latter is counted separately, on the report's
+configuration turns off. The latter is counted separately, on the report's
 `hidden` counter in Rust.
 
 ## Python
@@ -134,7 +134,7 @@ and a `fonts` of `None` resolves the same way. The stub file
 documents each parameter.
 
 All three have async twins on `AsyncPage`/`AsyncDocument`, which also render
-documents opened over HTTP — see
+documents opened over HTTP. See
 [Async and remote documents](./async.md).
 
 ## PNG compression
@@ -142,7 +142,7 @@ documents opened over HTTP — see
 The compression level trades encode time against file size; every level
 produces the same pixels. `none` is fastest and largest, `fast` is very fast
 with a decent ratio, `default` balances the two, and `best` produces the
-smallest files, much slower. The level only touches the PNG encoder — pick it
+smallest files, much slower. The level only touches the PNG encoder. Pick it
 by whether you are writing throwaway intermediates or archiving.
 
 ## Rust
@@ -151,8 +151,8 @@ by whether you are writing throwaway intermediates or archiving.
 `height`, and `data` holding `width * height * 4` RGBA bytes (straight alpha,
 row-major from the top-left). `Pixmap::save_png` writes it to a file;
 `encode_png`/`encode_png_with` return the bytes, the latter taking a
-`PngCompression` (`None`, `Fast`, `Balanced` — the level the other surfaces
-call `default` — or `Best`).
+`PngCompression` (`None`, `Fast`, `Balanced` or `Best`; `Balanced` is the
+level the other surfaces call `default`).
 
 `render_page_with_options` adds `RenderOptions`, a struct of four public
 fields:
