@@ -578,11 +578,14 @@ fn zero_run_end(data: &[u8], mut i: usize) -> usize {
 /// One pass over the filtered image, reporting each token to `emit`. The
 /// tokenization is deterministic, so running it twice — once to count,
 /// once to write — costs two cheap scans instead of one buffered token
-/// stream. After repeated probe misses the scan accelerates LZ4-style,
-/// stepping further between probes so incompressible stretches cost a
-/// fraction of a probe per byte.
-fn tokenize(data: &[u8], mut emit: impl FnMut(Token<'_>)) {
-    let mut table = vec![u32::MAX; 1 << HASH_BITS];
+/// stream; `table` is the hash table's storage, cleared here so both scans
+/// start from the same empty state without paying a second allocation.
+/// After repeated probe misses the scan accelerates LZ4-style, stepping
+/// further between probes so incompressible stretches cost a fraction of a
+/// probe per byte.
+fn tokenize(data: &[u8], table: &mut Vec<u32>, mut emit: impl FnMut(Token<'_>)) {
+    table.clear();
+    table.resize(1 << HASH_BITS, u32::MAX);
     let mut i = 0;
     let mut lit_start = 0;
     let mut misses = 0u32;
@@ -622,8 +625,25 @@ fn tokenize(data: &[u8], mut emit: impl FnMut(Token<'_>)) {
             && i - candidate <= WINDOW
             && data[candidate..candidate + MIN_MATCH] == data[i..i + MIN_MATCH]
         {
+            // Word-wise extension: XOR eight bytes at a time and read the
+            // first mismatch out of the trailing zeros — the same length
+            // the byte loop finds, so the token stream is unchanged.
             let mut len = MIN_MATCH;
             let max = (data.len() - i).min(258);
+            while len + 8 <= max {
+                let held = u64::from_le_bytes(
+                    data[candidate + len..candidate + len + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let here = u64::from_le_bytes(data[i + len..i + len + 8].try_into().unwrap());
+                let diff = held ^ here;
+                if diff != 0 {
+                    len += (diff.trailing_zeros() / 8) as usize;
+                    break;
+                }
+                len += 8;
+            }
             while len < max && data[candidate + len] == data[i + len] {
                 len += 1;
             }
@@ -671,7 +691,8 @@ fn deflate_filtered(data: &[u8]) -> Vec<u8> {
     } else {
         data.len()
     };
-    tokenize(&data[..sample_len], |token| match token {
+    let mut table = Vec::new();
+    tokenize(&data[..sample_len], &mut table, |token| match token {
         Token::Literals(bytes) => {
             for &b in bytes {
                 lit_freq[b as usize] += 1;
@@ -693,7 +714,7 @@ fn deflate_filtered(data: &[u8]) -> Vec<u8> {
     bits.write(1, 1); // BFINAL
     bits.write(2, 2); // dynamic Huffman
     write_code_lengths(&mut bits, &lit_lens, &dist_lens[..hdist]);
-    tokenize(data, |token| match token {
+    tokenize(data, &mut table, |token| match token {
         Token::Literals(bytes) => {
             for &b in bytes {
                 let (code, len) = lit_codes[b as usize];
