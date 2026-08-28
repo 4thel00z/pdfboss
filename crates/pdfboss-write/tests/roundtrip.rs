@@ -8,7 +8,7 @@ use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
     Color, Content, Date, Error, ImageData, Link, LinkAnnotation, LinkTarget, Metadata, Page,
-    PageSize, Pdf, Standard14, WriteOptions, XrefStyle,
+    PageSize, Paragraph, Pdf, Standard14, WriteOptions, XrefStyle,
 };
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -349,6 +349,41 @@ fn link_element_lands_in_page_links() {
     assert_eq!(
         action.get("URI").unwrap().as_str_bytes(),
         Some(b"https://example.com".as_slice())
+    );
+}
+
+#[test]
+fn paragraph_wraps_and_extracts_across_lines() {
+    let mut page = Page::new(PageSize::A4);
+    page.content.push(Content::from(Paragraph {
+        text: "aaaaaaaaa bbbbbbbbbb cccccccccc".into(),
+        rect: [72.0, 680.0, 192.0, 780.0],
+        font: Standard14::Courier,
+        size: 10.0,
+        ..Paragraph::default()
+    }));
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let text = extract_text(&doc, &loaded).unwrap();
+    assert!(
+        text.contains("aaaaaaaaa bbbbbbbbbb"),
+        "expected the first wrapped line intact, got {text:?}"
+    );
+    assert!(
+        text.contains("cccccccccc"),
+        "expected the second wrapped line intact, got {text:?}"
+    );
+    let first_line_pos = text.find("aaaaaaaaa").expect("first line present");
+    let second_line_pos = text.find("cccccccccc").expect("second line present");
+    assert!(
+        first_line_pos < second_line_pos,
+        "wrapped lines should extract in top-to-bottom order: {text:?}"
     );
 }
 
