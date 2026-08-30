@@ -5,7 +5,7 @@ One binary, `pdfboss`, with a subcommand per job. This chapter is the flag inven
 Shared behavior:
 
 - Every subcommand that reads a PDF takes `--password <PASSWORD>` for encrypted files: user or owner password; the empty user password opens transparently. See [Encrypted documents](../guide/encryption.md).
-- The explorer subcommands (`tui`, `json`, `hex`, `q`) accept either a local path or an `http(s)://` URL as input; URLs are range-fetched, and a server that ignores `Range` costs one full download instead. The other subcommands take a local path.
+- The explorer subcommands (`tui`, `json`, `hex`, `q`) accept either a local path or an `http(s)://` URL as input; URLs are range-fetched, and a server that ignores `Range` costs one full download instead, reported with a progress bar on stderr when stderr is a terminal. The other subcommands take a local path.
 - Exit codes: 0 on success, 1 for PDF and I/O problems, 2 for an invalid jq program (mirroring clap's own usage-error code). `render` and `images` are lenient: content that cannot be read is skipped with a warning on stderr, and the exit code stays 0.
 
 ## info

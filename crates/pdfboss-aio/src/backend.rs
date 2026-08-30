@@ -153,6 +153,7 @@ pub struct HttpBackend {
     url: reqwest::Url,
     len: u64,
     full: std::sync::OnceLock<Bytes>,
+    progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 }
 
 #[cfg(feature = "http")]
@@ -192,7 +193,22 @@ impl HttpBackend {
             url,
             len,
             full: std::sync::OnceLock::new(),
+            progress: None,
         })
+    }
+
+    /// Registers a fallback-download observer: when a range-ignoring server
+    /// forces the one-time full download, `progress(collected, declared)` is
+    /// called once before the first byte (`collected == 0`) and after every
+    /// received chunk, with `declared` the HEAD-declared total. Ranged reads
+    /// against a range-honoring server never call it. The callback runs on
+    /// the async runtime, so it must not block.
+    pub fn on_fallback_progress(
+        mut self,
+        progress: impl Fn(u64, u64) + Send + Sync + 'static,
+    ) -> HttpBackend {
+        self.progress = Some(Arc::new(progress));
+        self
     }
 
     /// Collects a 200 response body (the whole resource) capped at the
@@ -205,6 +221,9 @@ impl HttpBackend {
         let cap = usize::try_from(self.len).unwrap_or(usize::MAX);
         let mut collected = Vec::new();
         let mut chunks = response.bytes_stream();
+        if let Some(progress) = &self.progress {
+            progress(0, self.len);
+        }
         while collected.len() < cap {
             let chunk = match chunks.next().await {
                 Some(Ok(chunk)) => chunk,
@@ -218,6 +237,9 @@ impl HttpBackend {
             };
             let take = (cap - collected.len()).min(chunk.len());
             collected.extend_from_slice(&chunk[..take]);
+            if let Some(progress) = &self.progress {
+                progress(collected.len() as u64, self.len);
+            }
         }
         Ok(Bytes::from(collected))
     }

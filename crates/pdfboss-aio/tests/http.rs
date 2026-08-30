@@ -6,10 +6,10 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pdfboss_aio::{AsyncDocument, Backend, HttpBackend};
+use pdfboss_aio::{AsyncDocument, Backend, CachedBackend, HttpBackend};
 use pdfboss_testkit::simple_doc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -142,6 +142,63 @@ async fn range_refusing_server_falls_back_to_one_full_download() {
         1,
         "every read after the 200 fallback must come from memory, not new GETs"
     );
+}
+
+#[tokio::test]
+async fn fallback_reports_progress_through_the_whole_download() {
+    let data = simple_doc("progress");
+    let total = data.len() as u64;
+    let (addr, _) = spawn_server(data, false).await;
+    let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let backend = HttpBackend::new(format!("http://{addr}/progress.pdf"))
+        .await
+        .unwrap()
+        .on_fallback_progress(move |collected, declared| {
+            sink.lock().unwrap().push((collected, declared));
+        });
+    let doc = AsyncDocument::with_backend_with_password(CachedBackend::new(backend), "")
+        .await
+        .unwrap();
+    assert_eq!(doc.page_count(), 1);
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen.first(),
+        Some(&(0, total)),
+        "the fallback announces itself before the first byte"
+    );
+    assert_eq!(
+        seen.last(),
+        Some(&(total, total)),
+        "the last report covers the whole body"
+    );
+    assert!(
+        seen.windows(2).all(|pair| pair[0].0 <= pair[1].0),
+        "collected bytes only grow"
+    );
+    assert!(
+        seen.iter().all(|&(_, declared)| declared == total),
+        "the declared total never changes"
+    );
+}
+
+#[tokio::test]
+async fn range_honoring_server_never_reports_fallback_progress() {
+    let data = simple_doc("no progress");
+    let (addr, _) = spawn_server(data, true).await;
+    let fired = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&fired);
+    let backend = HttpBackend::new(format!("http://{addr}/plain.pdf"))
+        .await
+        .unwrap()
+        .on_fallback_progress(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+    let doc = AsyncDocument::with_backend_with_password(CachedBackend::new(backend), "")
+        .await
+        .unwrap();
+    assert_eq!(doc.page_count(), 1);
+    assert_eq!(fired.load(Ordering::SeqCst), 0);
 }
 
 /// Serves a HEAD with a small declared length, but answers every GET with a
