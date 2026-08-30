@@ -201,54 +201,64 @@ impl<'a> Lexer<'a> {
     /// instead of copied. This is the one lexing implementation;
     /// `next_token` merely copies the borrows out.
     pub fn next_raw_token(&mut self) -> Result<RawToken<'a>> {
+        Ok(self.next_raw_token_spanned()?.1)
+    }
+
+    /// [`Lexer::next_raw_token`] plus the byte offset where the token
+    /// begins (after any whitespace and comments). The content parser
+    /// needs that offset for operator spans, and reading it from here
+    /// skips the whitespace once per token instead of twice.
+    pub fn next_raw_token_spanned(&mut self) -> Result<(usize, RawToken<'a>)> {
         self.skip_whitespace_and_comments();
+        let start = self.pos;
         let Some(&b) = self.data.get(self.pos) else {
-            return Ok(RawToken::Owned(Token::Eof));
+            return Ok((start, RawToken::Owned(Token::Eof)));
         };
-        match b {
+        let token = match b {
             b'[' => {
                 self.pos += 1;
-                Ok(RawToken::Owned(Token::ArrayOpen))
+                RawToken::Owned(Token::ArrayOpen)
             }
             b']' => {
                 self.pos += 1;
-                Ok(RawToken::Owned(Token::ArrayClose))
+                RawToken::Owned(Token::ArrayClose)
             }
             b'<' => {
                 if self.data.get(self.pos + 1) == Some(&b'<') {
                     self.pos += 2;
-                    Ok(RawToken::Owned(Token::DictOpen))
+                    RawToken::Owned(Token::DictOpen)
                 } else {
                     self.pos += 1;
-                    Ok(RawToken::Hex(self.hex_span()))
+                    RawToken::Hex(self.hex_span())
                 }
             }
             b'>' => {
                 if self.data.get(self.pos + 1) == Some(&b'>') {
                     self.pos += 2;
-                    Ok(RawToken::Owned(Token::DictClose))
+                    RawToken::Owned(Token::DictClose)
                 } else {
                     // Stray `>`: surfaced leniently as a one-byte keyword.
                     self.pos += 1;
-                    Ok(RawToken::Keyword(&self.data[self.pos - 1..self.pos]))
+                    RawToken::Keyword(&self.data[self.pos - 1..self.pos])
                 }
             }
             b'(' => {
                 self.pos += 1;
-                Ok(RawToken::Owned(self.lex_literal_string()))
+                RawToken::Owned(self.lex_literal_string())
             }
             b'/' => {
                 self.pos += 1;
-                Ok(RawToken::Owned(self.lex_name()))
+                RawToken::Owned(self.lex_name())
             }
             // Stray delimiters with no token of their own: kept lenient.
             b')' | b'{' | b'}' => {
                 self.pos += 1;
-                Ok(RawToken::Keyword(&self.data[self.pos - 1..self.pos]))
+                RawToken::Keyword(&self.data[self.pos - 1..self.pos])
             }
-            b'0'..=b'9' | b'+' | b'-' | b'.' => Ok(self.lex_number_or_keyword()),
-            _ => Ok(RawToken::Keyword(self.take_regular_run())),
-        }
+            b'0'..=b'9' | b'+' | b'-' | b'.' => self.lex_number_or_keyword(),
+            _ => RawToken::Keyword(self.take_regular_run()),
+        };
+        Ok((start, token))
     }
 
     /// Returns the next token without consuming it.
@@ -259,12 +269,18 @@ impl<'a> Lexer<'a> {
         token
     }
 
-    /// Advances past whitespace and `%` comments.
+    /// Advances past whitespace and `%` comments. The cursor sits on a
+    /// token byte far more often than on whitespace (tokens are separated
+    /// by a single space or newline, and the content parser skips before
+    /// every token), so this checks one byte at a time and returns on the
+    /// first non-whitespace instead of setting up a run scan.
     pub fn skip_whitespace_and_comments(&mut self) {
-        loop {
-            let rest = &self.data[self.pos.min(self.data.len())..];
-            self.pos += rest.iter().take_while(|&&b| is_whitespace(b)).count();
-            if self.data.get(self.pos) != Some(&b'%') {
+        while let Some(&b) = self.data.get(self.pos) {
+            if is_whitespace(b) {
+                self.pos += 1;
+                continue;
+            }
+            if b != b'%' {
                 return;
             }
             let rest = &self.data[self.pos..];
