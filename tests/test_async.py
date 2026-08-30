@@ -359,12 +359,12 @@ class TestOpenUrl:
         assert catalog["Type"] == "Catalog"
 
     @pytest.mark.asyncio
-    async def test_server_without_range_support_raises_http_error(
-        self, no_range_server: str
+    async def test_server_without_range_support_falls_back_to_full_download(
+        self, no_range_server: str, hello_pdf: Path
     ) -> None:
-        with pytest.raises(PdfError) as exc:
-            await AsyncDocument.open_url(no_range_server)
-        assert str(exc.value).startswith("http:")
+        doc = await AsyncDocument.open_url(no_range_server)
+        assert doc.page_count == 1
+        assert doc.version == Document(str(hello_pdf)).version
 
     @pytest.mark.asyncio
     async def test_unreachable_url_raises_http_error(self) -> None:

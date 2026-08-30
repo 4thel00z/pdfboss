@@ -59,7 +59,6 @@ fn aio_err(e: pdfboss_aio::Error) -> PyErr {
             Some(code) => format!("http: {code}: {msg}"),
             None => format!("http: {msg}"),
         },
-        AioError::RangeUnsupported => "http: server does not support Range requests".to_string(),
         AioError::TruncatedRead {
             offset,
             wanted,
