@@ -1,6 +1,6 @@
 ---
 name: pdfboss
-description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
+description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
 ---
 
 # pdfboss
@@ -73,6 +73,10 @@ page = (
     | Paragraph("Body text.", rect=(72, 100, 451, 640))
 )
 data = (Pdf() | Metadata(title="Title") | page).to_bytes()
+
+# watermark an existing file: overlay's first page drawn over every page, as an
+# incremental update appended to the original bytes (rewrite=True writes a fresh, compressed file)
+stamped = pdfboss.write.watermark(original_bytes, overlay_bytes)
 
 # markdown to PDF: returns the file bytes
 data = pdfboss.md.to_pdf("# Hello\n\nWorld", theme=None, size="a4")
