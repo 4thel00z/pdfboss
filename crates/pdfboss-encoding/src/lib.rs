@@ -1,8 +1,10 @@
 //! Shared PDF font-encoding tables (WinAnsi / MacRoman / Standard, from
-//! ISO 32000 Appendix D) and a bundled glyph-name-to-Unicode subset, consumed
+//! ISO 32000 Appendix D), glyph-name-to-Unicode resolution over the Adobe
+//! Glyph List, and the built-in encoding of a Type 1 font program, consumed
 //! by the pdfboss text-extraction and rendering crates.
 
 mod afm;
+mod agl;
 pub use afm::{is_standard_14, standard_14_width};
 
 /// WinAnsiEncoding codes `0x80..=0x9F` (the region that differs from
@@ -492,8 +494,10 @@ pub fn standard_encoding_name(code: u8) -> Option<&'static str> {
 }
 
 /// Resolves a glyph name (as used in `/Differences`) to a Unicode scalar:
-/// `uniXXXX` and `uXXXX`–`uXXXXXX` hex forms, single ASCII letters, and a
-/// bundled subset of the standard glyph list.
+/// `uniXXXX` and `uXXXX`–`uXXXXXX` hex forms, single ASCII letters, the
+/// Adobe Glyph List, and the TeX math names the list never adopted. `None`
+/// for an unknown name, and for a listed name whose text is more than one
+/// scalar; [`glyph_to_text`] resolves those.
 pub fn glyph_to_unicode(name: &str) -> Option<char> {
     if let Some(hex) = name.strip_prefix("uni") {
         if hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -511,11 +515,14 @@ pub fn glyph_to_unicode(name: &str) -> Option<char> {
             return Some(c);
         }
     }
-    GLYPH_TABLES
-        .iter()
-        .flat_map(|t| t.iter())
-        .find(|&&(n, _)| n == name)
-        .map(|&(_, u)| u)
+    if let Some(text) = agl_text(name) {
+        let mut chars = text.chars();
+        return match (chars.next(), chars.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        };
+    }
+    tex_glyph(name)
 }
 
 /// Resolves a glyph name to the text it represents, per the Adobe Glyph
@@ -551,290 +558,322 @@ fn push_component(component: &str, out: &mut String) -> Option<()> {
         }
         return Some(());
     }
+    if let Some(text) = agl_text(component) {
+        out.push_str(text);
+        return Some(());
+    }
     out.push(glyph_to_unicode(component)?);
     Some(())
 }
 
-/// All bundled glyph-name tables, searched in order.
-const GLYPH_TABLES: [&[(&str, char)]; 5] = [
-    GLYPHS_ASCII,
-    GLYPHS_LATIN1,
-    GLYPHS_PUNCT,
-    GLYPHS_GREEK,
-    GLYPHS_MISC,
-];
+/// The Adobe Glyph List text for `name`, when the list carries it.
+fn agl_text(name: &str) -> Option<&'static str> {
+    let index = agl::AGL.binary_search_by(|(n, _)| n.cmp(&name)).ok()?;
+    Some(agl::AGL[index].1)
+}
 
-/// Names for the ASCII range (letters are handled separately).
-const GLYPHS_ASCII: &[(&str, char)] = &[
-    ("space", ' '),
-    ("exclam", '!'),
-    ("quotedbl", '"'),
-    ("numbersign", '#'),
-    ("dollar", '$'),
-    ("percent", '%'),
-    ("ampersand", '&'),
-    ("quotesingle", '\''),
-    ("parenleft", '('),
-    ("parenright", ')'),
-    ("asterisk", '*'),
-    ("plus", '+'),
-    ("comma", ','),
-    ("hyphen", '-'),
-    ("period", '.'),
-    ("slash", '/'),
-    ("zero", '0'),
-    ("one", '1'),
-    ("two", '2'),
-    ("three", '3'),
-    ("four", '4'),
-    ("five", '5'),
-    ("six", '6'),
-    ("seven", '7'),
-    ("eight", '8'),
-    ("nine", '9'),
-    ("colon", ':'),
-    ("semicolon", ';'),
-    ("less", '<'),
-    ("equal", '='),
-    ("greater", '>'),
-    ("question", '?'),
-    ("at", '@'),
-    ("bracketleft", '['),
-    ("backslash", '\\'),
-    ("bracketright", ']'),
-    ("asciicircum", '^'),
-    ("underscore", '_'),
-    ("grave", '`'),
-    ("braceleft", '{'),
-    ("bar", '|'),
-    ("braceright", '}'),
-    ("asciitilde", '~'),
-];
+/// The TeX math name's scalar, when [`GLYPHS_TEX`] carries it.
+fn tex_glyph(name: &str) -> Option<char> {
+    let index = GLYPHS_TEX.binary_search_by(|(n, _)| n.cmp(&name)).ok()?;
+    Some(GLYPHS_TEX[index].1)
+}
 
-/// Names for the Latin-1 supplement.
-const GLYPHS_LATIN1: &[(&str, char)] = &[
-    ("exclamdown", '\u{A1}'),
-    ("cent", '\u{A2}'),
-    ("sterling", '\u{A3}'),
-    ("currency", '\u{A4}'),
-    ("yen", '\u{A5}'),
-    ("brokenbar", '\u{A6}'),
-    ("section", '\u{A7}'),
-    ("dieresis", '\u{A8}'),
-    ("copyright", '\u{A9}'),
-    ("ordfeminine", '\u{AA}'),
-    ("guillemotleft", '\u{AB}'),
-    ("logicalnot", '\u{AC}'),
-    ("registered", '\u{AE}'),
-    ("macron", '\u{AF}'),
-    ("degree", '\u{B0}'),
-    ("plusminus", '\u{B1}'),
-    ("twosuperior", '\u{B2}'),
-    ("threesuperior", '\u{B3}'),
-    ("acute", '\u{B4}'),
-    ("mu", '\u{B5}'),
-    ("paragraph", '\u{B6}'),
-    ("periodcentered", '\u{B7}'),
-    ("cedilla", '\u{B8}'),
-    ("onesuperior", '\u{B9}'),
-    ("ordmasculine", '\u{BA}'),
-    ("guillemotright", '\u{BB}'),
-    ("onequarter", '\u{BC}'),
-    ("onehalf", '\u{BD}'),
-    ("threequarters", '\u{BE}'),
-    ("questiondown", '\u{BF}'),
-    ("Agrave", '\u{C0}'),
-    ("Aacute", '\u{C1}'),
-    ("Acircumflex", '\u{C2}'),
-    ("Atilde", '\u{C3}'),
-    ("Adieresis", '\u{C4}'),
-    ("Aring", '\u{C5}'),
-    ("AE", '\u{C6}'),
-    ("Ccedilla", '\u{C7}'),
-    ("Egrave", '\u{C8}'),
-    ("Eacute", '\u{C9}'),
-    ("Ecircumflex", '\u{CA}'),
-    ("Edieresis", '\u{CB}'),
-    ("Igrave", '\u{CC}'),
-    ("Iacute", '\u{CD}'),
-    ("Icircumflex", '\u{CE}'),
-    ("Idieresis", '\u{CF}'),
-    ("Eth", '\u{D0}'),
-    ("Ntilde", '\u{D1}'),
-    ("Ograve", '\u{D2}'),
-    ("Oacute", '\u{D3}'),
-    ("Ocircumflex", '\u{D4}'),
-    ("Otilde", '\u{D5}'),
-    ("Odieresis", '\u{D6}'),
-    ("multiply", '\u{D7}'),
-    ("Oslash", '\u{D8}'),
-    ("Ugrave", '\u{D9}'),
-    ("Uacute", '\u{DA}'),
-    ("Ucircumflex", '\u{DB}'),
-    ("Udieresis", '\u{DC}'),
-    ("Yacute", '\u{DD}'),
-    ("Thorn", '\u{DE}'),
-    ("germandbls", '\u{DF}'),
-    ("agrave", '\u{E0}'),
-    ("aacute", '\u{E1}'),
-    ("acircumflex", '\u{E2}'),
-    ("atilde", '\u{E3}'),
-    ("adieresis", '\u{E4}'),
-    ("aring", '\u{E5}'),
-    ("ae", '\u{E6}'),
-    ("ccedilla", '\u{E7}'),
-    ("egrave", '\u{E8}'),
-    ("eacute", '\u{E9}'),
-    ("ecircumflex", '\u{EA}'),
-    ("edieresis", '\u{EB}'),
-    ("igrave", '\u{EC}'),
-    ("iacute", '\u{ED}'),
-    ("icircumflex", '\u{EE}'),
-    ("idieresis", '\u{EF}'),
-    ("eth", '\u{F0}'),
-    ("ntilde", '\u{F1}'),
-    ("ograve", '\u{F2}'),
-    ("oacute", '\u{F3}'),
-    ("ocircumflex", '\u{F4}'),
-    ("otilde", '\u{F5}'),
-    ("odieresis", '\u{F6}'),
-    ("divide", '\u{F7}'),
-    ("oslash", '\u{F8}'),
-    ("ugrave", '\u{F9}'),
-    ("uacute", '\u{FA}'),
-    ("ucircumflex", '\u{FB}'),
-    ("udieresis", '\u{FC}'),
-    ("yacute", '\u{FD}'),
-    ("thorn", '\u{FE}'),
-    ("ydieresis", '\u{FF}'),
-];
-
-/// Typographic punctuation, ligatures, and accents.
-const GLYPHS_PUNCT: &[(&str, char)] = &[
-    ("quoteleft", '\u{2018}'),
-    ("quoteright", '\u{2019}'),
-    ("quotesinglbase", '\u{201A}'),
-    ("quotedblleft", '\u{201C}'),
-    ("quotedblright", '\u{201D}'),
-    ("quotedblbase", '\u{201E}'),
-    ("endash", '\u{2013}'),
-    ("emdash", '\u{2014}'),
-    ("bullet", '\u{2022}'),
-    ("ellipsis", '\u{2026}'),
-    ("dagger", '\u{2020}'),
-    ("daggerdbl", '\u{2021}'),
-    ("perthousand", '\u{2030}'),
-    ("guilsinglleft", '\u{2039}'),
-    ("guilsinglright", '\u{203A}'),
-    ("fraction", '\u{2044}'),
-    ("minus", '\u{2212}'),
-    ("florin", '\u{192}'),
-    ("Euro", '\u{20AC}'),
-    ("trademark", '\u{2122}'),
-    ("fi", '\u{FB01}'),
-    ("fl", '\u{FB02}'),
-    ("ff", '\u{FB00}'),
-    ("ffi", '\u{FB03}'),
-    ("ffl", '\u{FB04}'),
-    ("circumflex", '\u{2C6}'),
-    ("caron", '\u{2C7}'),
-    ("breve", '\u{2D8}'),
-    ("dotaccent", '\u{2D9}'),
-    ("ring", '\u{2DA}'),
-    ("ogonek", '\u{2DB}'),
-    ("tilde", '\u{2DC}'),
-    ("hungarumlaut", '\u{2DD}'),
-    ("OE", '\u{152}'),
-    ("oe", '\u{153}'),
-    ("Scaron", '\u{160}'),
-    ("scaron", '\u{161}'),
-    ("Zcaron", '\u{17D}'),
-    ("zcaron", '\u{17E}'),
-    ("Ydieresis", '\u{178}'),
-    ("Lslash", '\u{141}'),
-    ("lslash", '\u{142}'),
-    ("dotlessi", '\u{131}'),
-    ("nbspace", '\u{A0}'),
-    ("sfthyphen", '\u{AD}'),
-];
-
-/// Greek letters (per the glyph list, `Delta`/`Omega`/`mu` map to their
-/// technical-symbol codepoints; `mu` lives in the Latin-1 table).
-const GLYPHS_GREEK: &[(&str, char)] = &[
-    ("Alpha", '\u{391}'),
-    ("Beta", '\u{392}'),
-    ("Gamma", '\u{393}'),
-    ("Delta", '\u{2206}'),
-    ("Epsilon", '\u{395}'),
-    ("Zeta", '\u{396}'),
-    ("Eta", '\u{397}'),
-    ("Theta", '\u{398}'),
-    ("Iota", '\u{399}'),
-    ("Kappa", '\u{39A}'),
-    ("Lambda", '\u{39B}'),
-    ("Mu", '\u{39C}'),
-    ("Nu", '\u{39D}'),
-    ("Xi", '\u{39E}'),
-    ("Omicron", '\u{39F}'),
-    ("Pi", '\u{3A0}'),
-    ("Rho", '\u{3A1}'),
-    ("Sigma", '\u{3A3}'),
-    ("Tau", '\u{3A4}'),
-    ("Upsilon", '\u{3A5}'),
-    ("Phi", '\u{3A6}'),
-    ("Chi", '\u{3A7}'),
-    ("Psi", '\u{3A8}'),
-    ("Omega", '\u{2126}'),
-    ("alpha", '\u{3B1}'),
-    ("beta", '\u{3B2}'),
-    ("gamma", '\u{3B3}'),
-    ("delta", '\u{3B4}'),
-    ("epsilon", '\u{3B5}'),
-    ("zeta", '\u{3B6}'),
-    ("eta", '\u{3B7}'),
-    ("theta", '\u{3B8}'),
-    ("iota", '\u{3B9}'),
-    ("kappa", '\u{3BA}'),
-    ("lambda", '\u{3BB}'),
-    ("nu", '\u{3BD}'),
-    ("xi", '\u{3BE}'),
-    ("omicron", '\u{3BF}'),
-    ("pi", '\u{3C0}'),
-    ("rho", '\u{3C1}'),
-    ("sigma", '\u{3C3}'),
+/// Glyph names of the TeX symbol, math-italic and extension fonts that the
+/// Adobe Glyph List does not carry, sorted by name. The extension font's
+/// size variants of a delimiter or operator (`parenleftbig`, `parenleftBig`,
+/// `summationdisplay`) all stand for the one character.
+const GLYPHS_TEX: &[(&str, char)] = &[
+    ("Ifractur", '\u{2111}'),
+    ("Rfractur", '\u{211C}'),
+    ("angbracketleft", '\u{27E8}'),
+    ("angbracketleftBig", '\u{27E8}'),
+    ("angbracketleftBigg", '\u{27E8}'),
+    ("angbracketleftbig", '\u{27E8}'),
+    ("angbracketleftbigg", '\u{27E8}'),
+    ("angbracketright", '\u{27E9}'),
+    ("angbracketrightBig", '\u{27E9}'),
+    ("angbracketrightBigg", '\u{27E9}'),
+    ("angbracketrightbig", '\u{27E9}'),
+    ("angbracketrightbigg", '\u{27E9}'),
+    ("arrowbothv", '\u{2195}'),
+    ("arrowdblbothv", '\u{21D5}'),
+    ("arrowhookleft", '\u{21A9}'),
+    ("arrowhookright", '\u{21AA}'),
+    ("arrowleftbothalf", '\u{21BD}'),
+    ("arrowlefttophalf", '\u{21BC}'),
+    ("arrownortheast", '\u{2197}'),
+    ("arrownorthwest", '\u{2196}'),
+    ("arrowrightbothalf", '\u{21C1}'),
+    ("arrowrighttophalf", '\u{21C0}'),
+    ("arrowsoutheast", '\u{2198}'),
+    ("arrowsouthwest", '\u{2199}'),
+    ("asteriskmath", '\u{2217}'),
+    ("backslashBig", '\\'),
+    ("backslashBigg", '\\'),
+    ("backslashbig", '\\'),
+    ("backslashbigg", '\\'),
+    ("bardbl", '\u{2016}'),
+    ("braceleftBig", '{'),
+    ("braceleftBigg", '{'),
+    ("braceleftbig", '{'),
+    ("braceleftbigg", '{'),
+    ("bracerightBig", '}'),
+    ("bracerightBigg", '}'),
+    ("bracerightbig", '}'),
+    ("bracerightbigg", '}'),
+    ("bracketleftBig", '['),
+    ("bracketleftBigg", '['),
+    ("bracketleftbig", '['),
+    ("bracketleftbigg", '['),
+    ("bracketrightBig", ']'),
+    ("bracketrightBigg", ']'),
+    ("bracketrightbig", ']'),
+    ("bracketrightbigg", ']'),
+    ("ceilingleft", '\u{2308}'),
+    ("ceilingleftBig", '\u{2308}'),
+    ("ceilingleftBigg", '\u{2308}'),
+    ("ceilingleftbig", '\u{2308}'),
+    ("ceilingleftbigg", '\u{2308}'),
+    ("ceilingright", '\u{2309}'),
+    ("ceilingrightBig", '\u{2309}'),
+    ("ceilingrightBigg", '\u{2309}'),
+    ("ceilingrightbig", '\u{2309}'),
+    ("ceilingrightbigg", '\u{2309}'),
+    ("circlecopyrt", '\u{A9}'),
+    ("circledivide", '\u{2298}'),
+    ("circledot", '\u{2299}'),
+    ("circledotdisplay", '\u{2A00}'),
+    ("circledottext", '\u{2A00}'),
+    ("circleminus", '\u{2296}'),
+    ("circlemultiply", '\u{2297}'),
+    ("circlemultiplydisplay", '\u{2A02}'),
+    ("circlemultiplytext", '\u{2A02}'),
+    ("circleplus", '\u{2295}'),
+    ("circleplusdisplay", '\u{2A01}'),
+    ("circleplustext", '\u{2A01}'),
+    ("contintegraldisplay", '\u{222E}'),
+    ("contintegraltext", '\u{222E}'),
+    ("coproduct", '\u{2210}'),
+    ("coproductdisplay", '\u{2210}'),
+    ("coproducttext", '\u{2210}'),
+    ("diamondmath", '\u{22C4}'),
+    ("dotlessj", '\u{237}'),
+    ("epsilon1", '\u{3F5}'),
+    ("equivasymptotic", '\u{224D}'),
+    ("flat", '\u{266D}'),
+    ("floorleft", '\u{230A}'),
+    ("floorleftBig", '\u{230A}'),
+    ("floorleftBigg", '\u{230A}'),
+    ("floorleftbig", '\u{230A}'),
+    ("floorleftbigg", '\u{230A}'),
+    ("floorright", '\u{230B}'),
+    ("floorrightBig", '\u{230B}'),
+    ("floorrightBigg", '\u{230B}'),
+    ("floorrightbig", '\u{230B}'),
+    ("floorrightbigg", '\u{230B}'),
+    ("followsequal", '\u{227D}'),
+    ("greatermuch", '\u{226B}'),
+    ("hatwide", '^'),
+    ("hatwider", '^'),
+    ("hatwidest", '^'),
+    ("integraldisplay", '\u{222B}'),
+    ("integraltext", '\u{222B}'),
+    ("intersectiondisplay", '\u{22C2}'),
+    ("intersectionsq", '\u{2293}'),
+    ("intersectionsqdisplay", '\u{2A05}'),
+    ("intersectionsqtext", '\u{2A05}'),
+    ("intersectiontext", '\u{22C2}'),
+    ("latticetop", '\u{22A4}'),
+    ("lessmuch", '\u{226A}'),
+    ("logicalanddisplay", '\u{22C0}'),
+    ("logicalandtext", '\u{22C0}'),
+    ("logicalordisplay", '\u{22C1}'),
+    ("logicalortext", '\u{22C1}'),
+    ("lscript", '\u{2113}'),
+    ("mapsto", '\u{21A6}'),
+    ("minusplus", '\u{2213}'),
+    ("natural", '\u{266E}'),
+    ("openbullet", '\u{25E6}'),
+    ("owner", '\u{220B}'),
+    ("parenleftBig", '('),
+    ("parenleftBigg", '('),
+    ("parenleftbig", '('),
+    ("parenleftbigg", '('),
+    ("parenrightBig", ')'),
+    ("parenrightBigg", ')'),
+    ("parenrightbig", ')'),
+    ("parenrightbigg", ')'),
+    ("phi1", '\u{3D5}'),
+    ("pi1", '\u{3D6}'),
+    ("precedesequal", '\u{227C}'),
+    ("productdisplay", '\u{220F}'),
+    ("producttext", '\u{220F}'),
+    ("radicalBig", '\u{221A}'),
+    ("radicalBigg", '\u{221A}'),
+    ("radicalbig", '\u{221A}'),
+    ("radicalbigg", '\u{221A}'),
+    ("rho1", '\u{3F1}'),
+    ("sharp", '\u{266F}'),
     ("sigma1", '\u{3C2}'),
-    ("tau", '\u{3C4}'),
-    ("upsilon", '\u{3C5}'),
-    ("phi", '\u{3C6}'),
-    ("chi", '\u{3C7}'),
-    ("psi", '\u{3C8}'),
-    ("omega", '\u{3C9}'),
+    ("similarequal", '\u{2243}'),
+    ("slashBig", '/'),
+    ("slashBigg", '/'),
+    ("slashbig", '/'),
+    ("slashbigg", '/'),
+    ("slurabove", '\u{2322}'),
+    ("slurbelow", '\u{2323}'),
+    ("star", '\u{22C6}'),
+    ("subsetsqequal", '\u{2291}'),
+    ("summationdisplay", '\u{2211}'),
+    ("summationtext", '\u{2211}'),
+    ("supersetsqequal", '\u{2292}'),
+    ("theta1", '\u{3D1}'),
+    ("tie", '\u{2040}'),
+    ("tildewide", '~'),
+    ("tildewider", '~'),
+    ("tildewidest", '~'),
+    ("triangle", '\u{25B3}'),
+    ("triangleinv", '\u{25BD}'),
+    ("triangleleft", '\u{25C1}'),
+    ("triangleright", '\u{25B7}'),
+    ("turnstileleft", '\u{22A2}'),
+    ("turnstileright", '\u{22A3}'),
+    ("uniondisplay", '\u{22C3}'),
+    ("unionmulti", '\u{228E}'),
+    ("unionmultidisplay", '\u{2A04}'),
+    ("unionmultitext", '\u{2A04}'),
+    ("unionsq", '\u{2294}'),
+    ("unionsqdisplay", '\u{2A06}'),
+    ("unionsqtext", '\u{2A06}'),
+    ("uniontext", '\u{22C3}'),
+    ("vector", '\u{20D7}'),
+    ("weierstrass", '\u{2118}'),
+    ("wreathproduct", '\u{2240}'),
 ];
 
-/// Mathematical and miscellaneous symbols.
-const GLYPHS_MISC: &[(&str, char)] = &[
-    ("infinity", '\u{221E}'),
-    ("notequal", '\u{2260}'),
-    ("lessequal", '\u{2264}'),
-    ("greaterequal", '\u{2265}'),
-    ("partialdiff", '\u{2202}'),
-    ("summation", '\u{2211}'),
-    ("product", '\u{220F}'),
-    ("integral", '\u{222B}'),
-    ("radical", '\u{221A}'),
-    ("approxequal", '\u{2248}'),
-    ("equivalence", '\u{2261}'),
-    ("element", '\u{2208}'),
-    ("intersection", '\u{2229}'),
-    ("union", '\u{222A}'),
-    ("arrowleft", '\u{2190}'),
-    ("arrowup", '\u{2191}'),
-    ("arrowright", '\u{2192}'),
-    ("arrowdown", '\u{2193}'),
-    ("arrowboth", '\u{2194}'),
-    ("lozenge", '\u{25CA}'),
-    ("apple", '\u{F8FF}'),
-];
+/// The built-in encoding of an embedded Type 1 font program: code to glyph
+/// name, read from the program's clear-text portion, which is where ISO
+/// 32000-1 9.6.6 sends a simple font that states no usable `/Encoding` of
+/// its own. A bare `StandardEncoding` token expands to that table, and any
+/// `dup <code> /<name> put` entries override it code by code. `None` when
+/// the program states no `/Encoding` at all.
+pub fn type1_builtin_encoding(program: &[u8]) -> Option<Box<[Option<String>; 256]>> {
+    let clear = type1_clear_text(program);
+    let mut tokens = PsTokens {
+        bytes: clear,
+        at: 0,
+    };
+    tokens.find(|t| *t == b"/Encoding")?;
+    let mut table: Box<[Option<String>; 256]> = Box::new(std::array::from_fn(|_| None));
+    let tokens: Vec<&[u8]> = tokens.collect();
+    if tokens.first() == Some(&b"StandardEncoding".as_slice()) {
+        for (code, slot) in table.iter_mut().enumerate() {
+            *slot = standard_encoding_name(code as u8).map(String::from);
+        }
+    }
+    for entry in tokens.windows(4) {
+        if entry[0] != b"dup" || entry[3] != b"put" {
+            continue;
+        }
+        let Some(code) = std::str::from_utf8(entry[1])
+            .ok()
+            .and_then(|t| t.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(name) = entry[2]
+            .strip_prefix(b"/")
+            .and_then(|n| std::str::from_utf8(n).ok())
+        else {
+            continue;
+        };
+        if let Some(slot) = table.get_mut(code) {
+            *slot = Some(name.to_string());
+        }
+    }
+    Some(table)
+}
+
+/// The clear-text portion of a Type 1 program: the type-1 segments of a PFB
+/// wrapper, or everything up to the `eexec` token of a raw program (the
+/// whole program when there is none).
+fn type1_clear_text(program: &[u8]) -> &[u8] {
+    if program.first() == Some(&0x80) {
+        return pfb_clear_text(program);
+    }
+    const TOKEN: &[u8] = b"eexec";
+    let end = program
+        .windows(TOKEN.len())
+        .position(|w| w == TOKEN)
+        .unwrap_or(program.len());
+    &program[..end]
+}
+
+/// The first PFB segment's payload when it is clear text; the clear text of
+/// every real font is one segment, and a header claiming more bytes than
+/// the program holds yields whatever the program does hold.
+fn pfb_clear_text(program: &[u8]) -> &[u8] {
+    if program.get(1) != Some(&0x01) || program.len() < 6 {
+        return &[];
+    }
+    let len = u32::from_le_bytes([program[2], program[3], program[4], program[5]]) as usize;
+    let end = len.saturating_add(6).min(program.len());
+    &program[6..end]
+}
+
+/// PostScript tokens of a clear-text font header: whitespace-separated
+/// runs, with `%` comments skipped and each of `()<>[]{}` a token of its
+/// own. A `/` starts a name token.
+struct PsTokens<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Iterator for PsTokens<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        loop {
+            let &b = self.bytes.get(self.at)?;
+            if is_ps_whitespace(b) {
+                self.at += 1;
+                continue;
+            }
+            if b != b'%' {
+                break;
+            }
+            while self
+                .bytes
+                .get(self.at)
+                .is_some_and(|&b| b != b'\n' && b != b'\r')
+            {
+                self.at += 1;
+            }
+        }
+        let start = self.at;
+        if is_ps_delimiter(self.bytes[start]) {
+            self.at += 1;
+            return Some(&self.bytes[start..self.at]);
+        }
+        self.at += 1;
+        while self
+            .bytes
+            .get(self.at)
+            .is_some_and(|&b| !is_ps_whitespace(b) && !is_ps_delimiter(b) && b != b'/')
+        {
+            self.at += 1;
+        }
+        Some(&self.bytes[start..self.at])
+    }
+}
+
+fn is_ps_whitespace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0C' | b'\0')
+}
+
+fn is_ps_delimiter(b: u8) -> bool {
+    matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}')
+}
 
 #[cfg(test)]
 mod tests {
@@ -1018,5 +1057,72 @@ mod tests {
         // Every component must resolve, or the whole name is unknown.
         assert_eq!(glyph_to_text("f_glorp"), None);
         assert_eq!(glyph_to_text("f__i"), None);
+    }
+
+    /// The math and symbol names a TeX-produced document's fonts carry in
+    /// their built-in encodings are all in the Adobe Glyph List, as are the
+    /// Hebrew names whose text is two scalars.
+    #[test]
+    fn glyph_names_cover_the_full_adobe_glyph_list() {
+        assert_eq!(glyph_to_unicode("universal"), Some('\u{2200}'));
+        assert_eq!(glyph_to_unicode("existential"), Some('\u{2203}'));
+        assert_eq!(glyph_to_unicode("emptyset"), Some('\u{2205}'));
+        assert_eq!(glyph_to_unicode("copyright"), Some('\u{A9}'));
+        assert_eq!(glyph_to_unicode("ff"), Some('\u{FB00}'));
+        assert_eq!(glyph_to_unicode("afii57414"), Some('\u{0626}'));
+        assert_eq!(
+            glyph_to_text("dalethatafpatah").as_deref(),
+            Some("\u{05D3}\u{05B2}")
+        );
+        assert_eq!(glyph_to_unicode("dalethatafpatah"), None);
+    }
+
+    /// Names the Computer Modern symbol fonts use that the Adobe Glyph
+    /// List never adopted.
+    #[test]
+    fn tex_math_glyph_names_resolve() {
+        assert_eq!(glyph_to_unicode("owner"), Some('\u{220B}'));
+        assert_eq!(glyph_to_unicode("arrowbothv"), Some('\u{2195}'));
+        assert_eq!(glyph_to_unicode("angbracketleft"), Some('\u{27E8}'));
+        assert_eq!(glyph_to_unicode("lessmuch"), Some('\u{226A}'));
+    }
+
+    #[test]
+    fn type1_program_encoding_reads_dup_put_entries() {
+        let program: &[u8] = b"%!PS-AdobeFont-1.0: CMSY10\n/FontName /CMSY10 def\n\
+            /Encoding 256 array\n0 1 255 {1 index exch /.notdef put} for\n\
+            dup 56 /universal put\ndup 169 /copyright put\nreadonly def\n\
+            currentdict end\ncurrentfile eexec\n\x80\x01dup 57 /existential put";
+        let table = type1_builtin_encoding(program).expect("an /Encoding is present");
+        assert_eq!(table[56].as_deref(), Some("universal"));
+        assert_eq!(table[169].as_deref(), Some("copyright"));
+        assert_eq!(table[57], None, "nothing past eexec is read");
+        assert_eq!(table[0], None);
+    }
+
+    #[test]
+    fn type1_program_encoding_expands_the_standard_token() {
+        let program: &[u8] = b"/Encoding StandardEncoding def\ncurrentfile eexec\n";
+        let table = type1_builtin_encoding(program).unwrap();
+        assert_eq!(table[0x41].as_deref(), Some("A"));
+        assert_eq!(table[0x27].as_deref(), Some("quoteright"));
+    }
+
+    #[test]
+    fn type1_program_encoding_reads_pfb_segments() {
+        let clear: &[u8] =
+            b"/Encoding 256 array\ndup 65 /alpha put\nreadonly def\ncurrentfile eexec\n";
+        let mut program = vec![0x80, 0x01];
+        program.extend_from_slice(&(clear.len() as u32).to_le_bytes());
+        program.extend_from_slice(clear);
+        program.extend_from_slice(&[0x80, 0x02, 4, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF, 0x80, 0x03]);
+        let table = type1_builtin_encoding(&program).unwrap();
+        assert_eq!(table[65].as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn type1_program_without_an_encoding_yields_none() {
+        let program: &[u8] = b"/FontName /X def\ncurrentfile eexec\n";
+        assert!(type1_builtin_encoding(program).is_none());
     }
 }

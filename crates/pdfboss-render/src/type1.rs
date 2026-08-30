@@ -1136,69 +1136,14 @@ fn parse_charstrings(
     (charstrings, names, name_to_gid)
 }
 
-/// Parses the clear-text header's `/Encoding` declaration (spec ch. 6). Two
-/// legal forms: the bare token `StandardEncoding`, expanded here into a full
-/// code -> name table via `pdfboss_encoding::standard_encoding_name`; or a
-/// custom encoding array, whose `dup <code> /<name> put` entries populate
-/// `builtin_encoding[code]` (and, when both forms somehow appear, still
-/// override the `StandardEncoding` base per-code). A font with no
-/// `/Encoding` at all yields every slot `None`.
+/// The clear-text header's `/Encoding` declaration (spec ch. 6) as a code ->
+/// name table, read by `pdfboss_encoding::type1_builtin_encoding`: the bare
+/// `StandardEncoding` token expanded, `dup <code> /<name> put` entries
+/// overriding per code. A font with no `/Encoding` at all yields every slot
+/// `None`.
 fn parse_encoding(clear: &[u8]) -> Box<[Option<String>; 256]> {
-    let mut table: Box<[Option<String>; 256]> = Box::new(std::array::from_fn(|_| None));
-    let Some(enc_pos) = find_token(clear, b"/Encoding") else {
-        return table;
-    };
-
-    let after_enc = enc_pos.saturating_add(b"/Encoding".len());
-    if let Some((tok, _)) = next_token(clear, after_enc) {
-        if tok == b"StandardEncoding" {
-            for (code, slot) in table.iter_mut().enumerate() {
-                *slot = pdfboss_encoding::standard_encoding_name(code as u8).map(String::from);
-            }
-        }
-    }
-
-    let mut i = enc_pos;
-    while i < clear.len() {
-        let Some((tok, after_tok)) = next_token(clear, i) else {
-            break;
-        };
-        if tok != b"dup" {
-            i = after_tok;
-            continue;
-        }
-        let Some((code_tok, after_code)) = next_token(clear, after_tok) else {
-            i = after_tok;
-            continue;
-        };
-        let Some(code) = parse_uint_token(code_tok) else {
-            i = after_code;
-            continue;
-        };
-        let Some((name_tok, after_name)) = next_token(clear, after_code) else {
-            i = after_code;
-            continue;
-        };
-        let Some(name_bytes) = name_tok.strip_prefix(b"/") else {
-            i = after_code;
-            continue;
-        };
-        let Some((put_tok, after_put)) = next_token(clear, after_name) else {
-            i = after_name;
-            continue;
-        };
-        if put_tok != b"put" {
-            i = after_name;
-            continue;
-        }
-        if let Ok(name) = std::str::from_utf8(name_bytes) {
-            if let Some(slot) = table.get_mut(code) {
-                *slot = Some(name.to_string());
-            }
-        }
-        i = after_put;
-    }
-    table
+    pdfboss_encoding::type1_builtin_encoding(clear)
+        .unwrap_or_else(|| Box::new(std::array::from_fn(|_| None)))
 }
 
 /// Computes units-per-em from the clear-text header's `/FontMatrix [a b c d
