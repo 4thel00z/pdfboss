@@ -6,6 +6,7 @@ mod hexdump;
 mod input;
 mod json;
 mod manifest;
+mod progress;
 mod q;
 mod skill;
 
@@ -767,10 +768,11 @@ fn cmd_tui(target: &str, password: &str) -> Result<(), String> {
     })
 }
 
-/// Builds the async document: the HTTP backend for URLs, the file backend
-/// otherwise -- exactly the split `json`/`hex`/`q` already make via
-/// `Input::open` (`pdfboss-aio`'s `http` feature is unconditionally on for
-/// this crate, so there is no cfg gate to make here).
+/// Builds the async document: the HTTP backend (with fallback-download
+/// progress on stderr) for URLs, the file backend otherwise -- exactly the
+/// split `json`/`hex`/`q` already make via `Input::open` (`pdfboss-aio`'s
+/// `http` feature is unconditionally on for this crate, so there is no cfg
+/// gate to make here).
 ///
 /// Both branches wrap the aio error with `target`, the same
 /// `format!("{spec}: {err}")` shape `Input::open` uses for its local
@@ -782,7 +784,7 @@ async fn open_async_document(
     password: &str,
 ) -> Result<pdfboss_aio::AsyncDocument, String> {
     if is_url(target) {
-        return pdfboss_aio::AsyncDocument::open_url_with_password(target, password)
+        return crate::progress::open_url_with_progress(target, password)
             .await
             .map_err(|e| format!("{target}: {e}"));
     }

@@ -31,8 +31,9 @@ impl MockServer {
     /// Starts serving `data` in the background. Each connection is handled
     /// on its own thread (mirroring the aio mock's per-connection
     /// `tokio::spawn`), so a kept-alive HEAD connection never blocks a
-    /// concurrent GET.
-    fn start(data: Vec<u8>) -> MockServer {
+    /// concurrent GET. `honor_range` selects whether ranged GETs receive
+    /// `206` slices or the full `200` body (a range-ignoring server).
+    fn start(data: Vec<u8>, honor_range: bool) -> MockServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let addr = listener.local_addr().expect("local addr");
         let done = Arc::new(AtomicBool::new(false));
@@ -44,7 +45,7 @@ impl MockServer {
                 }
                 let Ok(socket) = incoming else { continue };
                 let data = data.clone();
-                thread::spawn(move || handle_connection(socket, &data));
+                thread::spawn(move || handle_connection(socket, &data, honor_range));
             }
         });
         MockServer {
@@ -76,9 +77,9 @@ impl Drop for MockServer {
 
 /// Serves requests on one connection until the client closes it: a HEAD
 /// gets `Content-Length`; a GET with a satisfiable `Range` gets a `206` +
-/// `Content-Range` + partial body; anything else gets the full `200` body
-/// (exercised by neither test here, but keeps the server honest).
-fn handle_connection(mut socket: TcpStream, data: &[u8]) {
+/// `Content-Range` + partial body when `honor_range` is set; anything else
+/// gets the full `200` body (a range-ignoring server, or a rangeless GET).
+fn handle_connection(mut socket: TcpStream, data: &[u8], honor_range: bool) {
     let total = data.len();
     loop {
         let Some(head) = read_request_head(&mut socket) else {
@@ -93,7 +94,7 @@ fn handle_connection(mut socket: TcpStream, data: &[u8]) {
             }
             continue;
         }
-        match parse_range_header(&head) {
+        match parse_range_header(&head).filter(|_| honor_range) {
             Some((start, end)) if start < total && start <= end => {
                 let end = end.min(total - 1);
                 let body = &data[start..=end];
@@ -160,7 +161,7 @@ fn hello_bytes() -> Vec<u8> {
 
 #[test]
 fn json_over_url_matches_local() {
-    let server = MockServer::start(hello_bytes());
+    let server = MockServer::start(hello_bytes(), true);
     let url = server.url("hello.pdf");
 
     let remote = pdfboss(&["json", &url]);
@@ -181,7 +182,7 @@ fn json_over_url_matches_local() {
 
 #[test]
 fn json_layout_over_url_matches_local() {
-    let server = MockServer::start(hello_bytes());
+    let server = MockServer::start(hello_bytes(), true);
     let url = server.url("hello.pdf");
 
     let remote = pdfboss(&["json", &url, "--layout"]);
@@ -211,7 +212,7 @@ fn hex_over_url_range_guard_fires() {
         len < 999_999,
         "fixture grew past the selector's hard-coded out-of-range bound"
     );
-    let server = MockServer::start(data);
+    let server = MockServer::start(data, true);
     let url = server.url("hello.pdf");
 
     let output = pdfboss(&["hex", &url, "range:0-999999"]);
@@ -229,12 +230,35 @@ fn hex_over_url_range_guard_fires() {
 
 #[test]
 fn q_over_url_basic() {
-    let server = MockServer::start(hello_bytes());
+    let server = MockServer::start(hello_bytes(), true);
     let url = server.url("hello.pdf");
 
     let output = pdfboss(&["q", &url, ".header.version"]);
     assert!(output.status.success(), "q over url failed: {output:?}");
     assert_eq!(stdout_str(&output), "\"1.7\"\n");
+}
+
+/// A range-ignoring server still works through the CLI (the aio fallback
+/// downloads the whole body once), and the progress reporting stays
+/// completely silent when stderr is not a terminal, as in this subprocess
+/// capture: stdout must match the range-honoring answer, stderr must be
+/// empty.
+#[test]
+fn q_over_range_ignoring_url_works_with_silent_stderr() {
+    let server = MockServer::start(hello_bytes(), false);
+    let url = server.url("hello.pdf");
+
+    let output = pdfboss(&["q", &url, ".header.version"]);
+    assert!(
+        output.status.success(),
+        "q over range-less url failed: {output:?}"
+    );
+    assert_eq!(stdout_str(&output), "\"1.7\"\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr must stay empty off-terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// `tui` must accept `http(s)://` targets unconditionally in the default
