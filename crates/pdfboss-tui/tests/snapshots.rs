@@ -62,6 +62,7 @@ fn document_overview_frame() {
         .collect();
     let mut app = App::new(
         "fixture.pdf".to_string(),
+        "fixture.pdf".to_string(),
         doc.version(),
         doc.page_count(),
         (80, 24),
@@ -125,7 +126,13 @@ fn object_inspection_frame() {
             in_objstm: None,
         },
     ];
-    let mut app = App::new("fixture.pdf".to_string(), (1, 7), 1, (80, 24));
+    let mut app = App::new(
+        "fixture.pdf".to_string(),
+        "fixture.pdf".to_string(),
+        (1, 7),
+        1,
+        (80, 24),
+    );
     app.update(Msg::TreeBatch {
         req: TreeReq::Physical,
         elements,
@@ -201,6 +208,7 @@ fn markdown_pane_frame() {
         .filter_map(Result::ok)
         .collect();
     let mut app = App::new(
+        "fixture.pdf".to_string(),
         "fixture.pdf".to_string(),
         doc.version(),
         doc.page_count(),

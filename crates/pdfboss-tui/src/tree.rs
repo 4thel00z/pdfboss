@@ -666,6 +666,45 @@ impl TreeState {
         }
     }
 
+    /// The `pdfboss q` expression addressing node `id` in the wire tree.
+    /// Nodes carrying an object ref address `.objects["N G"]` (the wire
+    /// entries under `.pages[]` are summaries, not the objects); `%%EOF`
+    /// has no wire form at all.
+    pub fn query(&self, id: NodeId) -> Option<String> {
+        match self.nodes[id].kind {
+            NodeKind::Document => Some(".".to_string()),
+            NodeKind::PagesFolder => Some(".pages".to_string()),
+            NodeKind::Page { index, .. } => Some(format!(".pages[{index}]")),
+            NodeKind::FontsFolder { page } => Some(format!(".pages[{page}].fonts")),
+            NodeKind::ImagesFolder { page } => Some(format!(".pages[{page}].images")),
+            NodeKind::AnnotationsFolder { page } => Some(format!(".pages[{page}].annotations")),
+            NodeKind::ContentsFolder { page } => {
+                let r = self.page_ref(page)?;
+                Some(format!(".objects[\"{} {}\"].value.Contents", r.num, r.gen))
+            }
+            NodeKind::ObjectsFolder => Some(".objects".to_string()),
+            NodeKind::Object { r, .. }
+            | NodeKind::Font { r, .. }
+            | NodeKind::Image { r, .. }
+            | NodeKind::Annotation { r, .. }
+            | NodeKind::ContentsStream { r } => Some(format!(".objects[\"{} {}\"]", r.num, r.gen)),
+            NodeKind::XrefFolder => Some(".xref".to_string()),
+            NodeKind::XrefSection { .. } => {
+                let index = self.nodes[self.xref_folder]
+                    .children
+                    .iter()
+                    .filter(|child| {
+                        matches!(self.nodes[**child].kind, NodeKind::XrefSection { .. })
+                    })
+                    .position(|child| *child == id)?;
+                Some(format!(".xref[{index}]"))
+            }
+            NodeKind::StartXref { .. } => Some(".startxref".to_string()),
+            NodeKind::Trailer => Some(".trailer".to_string()),
+            NodeKind::Eof { .. } => None,
+        }
+    }
+
     /// The physical span (and objstm placement) recorded for object `num`.
     pub fn object_span(&self, num: u32) -> Option<(Span, Option<(ObjRef, Span)>)> {
         self.object_spans.get(&num).copied()
@@ -897,6 +936,85 @@ mod tests {
             labels,
             vec!["xref table · 3 entries", "startxref → 120", "%%EOF"]
         );
+    }
+
+    #[test]
+    fn query_addresses_every_node_kind_in_the_wire_tree() {
+        let mut tree = TreeState::new((1, 7), 1);
+        tree.apply_batch(TreeReq::Physical, &physical_batch(), true);
+        tree.apply_batch(TreeReq::Logical, &logical_batch(), true);
+        tree.apply_contents(0, &[obj_ref(4)]);
+
+        assert_eq!(tree.query(tree.root).as_deref(), Some("."));
+        assert_eq!(tree.query(tree.pages_folder).as_deref(), Some(".pages"));
+        assert_eq!(tree.query(tree.objects_folder).as_deref(), Some(".objects"));
+        assert_eq!(tree.query(tree.xref_folder).as_deref(), Some(".xref"));
+        assert_eq!(tree.query(tree.trailer_node).as_deref(), Some(".trailer"));
+
+        let objects = tree.node(tree.objects_folder).children.clone();
+        assert_eq!(tree.query(objects[0]).as_deref(), Some(".objects[\"1 0\"]"));
+        assert_eq!(tree.query(objects[1]).as_deref(), Some(".objects[\"2 0\"]"));
+
+        let xref_children = tree.node(tree.xref_folder).children.clone();
+        assert_eq!(tree.query(xref_children[0]).as_deref(), Some(".xref[0]"));
+        assert_eq!(tree.query(xref_children[1]).as_deref(), Some(".startxref"));
+        assert_eq!(tree.query(xref_children[2]), None, "%%EOF has no wire form");
+
+        let page = tree.node(tree.pages_folder).children[0];
+        assert_eq!(tree.query(page).as_deref(), Some(".pages[0]"));
+        for folder in tree.node(page).children.clone() {
+            let expected = match tree.node(folder).kind {
+                NodeKind::FontsFolder { .. } => ".pages[0].fonts",
+                NodeKind::ImagesFolder { .. } => ".pages[0].images",
+                NodeKind::AnnotationsFolder { .. } => ".pages[0].annotations",
+                // The wire tree has no contents array; the page object's
+                // /Contents entry is the addressable form.
+                NodeKind::ContentsFolder { .. } => ".objects[\"3 0\"].value.Contents",
+                ref other => panic!("unexpected page child {other:?}"),
+            };
+            assert_eq!(tree.query(folder).as_deref(), Some(expected));
+            for leaf in tree.node(folder).children.clone() {
+                let expected = match tree.node(leaf).kind {
+                    NodeKind::Font { .. } => ".objects[\"5 0\"]",
+                    NodeKind::Image { .. } => ".objects[\"7 0\"]",
+                    NodeKind::Annotation { .. } => ".objects[\"8 0\"]",
+                    NodeKind::ContentsStream { .. } => ".objects[\"4 0\"]",
+                    ref other => panic!("unexpected leaf {other:?}"),
+                };
+                assert_eq!(tree.query(leaf).as_deref(), Some(expected));
+            }
+        }
+    }
+
+    /// `.xref[i]` must index xref *sections* in element-stream order, the
+    /// exact order `build_tree` pushes them into the wire array, skipping
+    /// the startxref/%%EOF siblings interleaved in the tree.
+    #[test]
+    fn xref_query_index_counts_sections_only() {
+        let elements = vec![
+            Element::XrefSection {
+                kind: XrefKind::Table,
+                span: Span { start: 0, end: 10 },
+                entries: 1,
+            },
+            Element::StartXref {
+                offset: 0,
+                span: Span { start: 10, end: 20 },
+            },
+            Element::Eof {
+                span: Span { start: 20, end: 26 },
+            },
+            Element::XrefSection {
+                kind: XrefKind::Stream,
+                span: Span { start: 26, end: 40 },
+                entries: 2,
+            },
+        ];
+        let mut tree = TreeState::new((1, 7), 0);
+        tree.apply_batch(TreeReq::Physical, &elements, true);
+        let children = tree.node(tree.xref_folder).children.clone();
+        assert_eq!(tree.query(children[0]).as_deref(), Some(".xref[0]"));
+        assert_eq!(tree.query(children[3]).as_deref(), Some(".xref[1]"));
     }
 
     #[test]

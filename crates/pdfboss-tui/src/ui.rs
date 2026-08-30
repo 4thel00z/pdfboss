@@ -357,7 +357,13 @@ mod tests {
     #[test]
     fn focused_pane_title_is_bold_others_are_not() {
         let split = test_split();
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         assert_eq!(app.focus, Pane::Tree, "default focus starts on Tree");
 
         let terminal = draw_frame(&app);
@@ -397,7 +403,13 @@ mod tests {
     #[test]
     fn selected_tree_row_is_reversed() {
         let split = test_split();
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         app.tree.selected = app.tree.pages_folder;
         let terminal = draw_frame(&app);
         let buffer = terminal.backend().buffer();
@@ -421,7 +433,13 @@ mod tests {
     #[test]
     fn inspector_cursor_line_is_reversed_when_focused() {
         let split = test_split();
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         let mut dict = Dict::new();
         dict.insert(
             Name("Ref".to_string()),
@@ -469,7 +487,13 @@ mod tests {
     #[test]
     fn preview_active_pixmap_replaces_inspector_with_half_blocks() {
         let split = test_split();
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         let pixmap = two_by_four_pixmap();
         let expected_rows = pixmap.height.div_ceil(2);
         app.preview.active = true;
@@ -521,7 +545,13 @@ mod tests {
     #[test]
     fn preview_rendering_without_pixmap_shows_spinner() {
         let split = test_split();
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         app.preview.active = true;
         app.preview.rendering = true;
         app.preview.spinner_frame = 2; // SPINNER[2] == '-'

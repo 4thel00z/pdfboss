@@ -10,6 +10,7 @@
 //! block input.
 
 pub mod app;
+pub mod clipboard;
 pub mod hexview;
 pub mod input;
 pub mod inspector;
@@ -18,6 +19,7 @@ pub mod preview;
 pub mod search;
 pub mod tree;
 pub mod ui;
+pub mod yank;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,9 +83,10 @@ impl Drop for TerminalGuard {
 }
 
 /// Runs the explorer until the user quits. `doc` supplies all data (file-
-/// or HTTP-backed); `title` labels the status bar. Document-level errors
-/// become status-bar toasts; only terminal I/O errors are returned.
-pub async fn run(doc: AsyncDocument, title: String) -> std::io::Result<()> {
+/// or HTTP-backed); `title` labels the status bar; `target` is the path
+/// or URL as given, used verbatim in yanked shell commands. Document-level
+/// errors become status-bar toasts; only terminal I/O errors are returned.
+pub async fn run(doc: AsyncDocument, title: String, target: String) -> std::io::Result<()> {
     enable_raw_mode().map_err(friendly_no_tty_error)?;
     // The guard is constructed before `EnterAlternateScreen` (not after) so
     // that an early return from *that* fallible call still restores raw
@@ -96,6 +99,7 @@ pub async fn run(doc: AsyncDocument, title: String) -> std::io::Result<()> {
     let size = terminal.size()?;
     let mut app = App::new(
         title,
+        target,
         doc.version(),
         doc.page_count(),
         (size.width, size.height),
@@ -204,7 +208,86 @@ fn execute_cmd(
         Cmd::ExtractMarkdown { generation, page } => {
             tokio::spawn(extract_markdown(doc, tx, generation, page));
         }
+        Cmd::Copy { text, what } => {
+            tx.send(Msg::Yanked {
+                result: copy_toast(&text, what),
+            })
+            .ok();
+        }
+        Cmd::YankSpan {
+            source,
+            slice,
+            base,
+            format,
+        } => {
+            tokio::spawn(async move {
+                let what = match format {
+                    yank::YankFormat::Hexdump => "hexdump",
+                    yank::YankFormat::Bytes => "bytes",
+                };
+                let result = match yank_span_text(&doc, source, slice, base, format).await {
+                    Ok(text) => copy_toast(&text, what),
+                    Err(error) => Err(error),
+                };
+                tx.send(Msg::Yanked { result }).ok();
+            });
+        }
     }
+}
+
+/// Copies `text` and words the toast: a native-clipboard copy is
+/// confirmed, an OSC 52 one is only sent.
+fn copy_toast(text: &str, what: &str) -> Result<String, String> {
+    let size = yank::human_size(text.len() as u64);
+    match clipboard::copy(text)? {
+        clipboard::Transport::Native => Ok(format!("copied {what} ({size})")),
+        clipboard::Transport::Osc52 => Ok(format!("sent {what} ({size}) via OSC 52")),
+    }
+}
+
+/// The over-cap refusal, or `None` when `len` fits.
+fn cap_error(len: u64) -> Option<String> {
+    if len <= yank::CAP_BYTES {
+        return None;
+    }
+    Some(format!(
+        "{} exceeds the {} yank cap",
+        yank::human_size(len),
+        yank::human_size(yank::CAP_BYTES)
+    ))
+}
+
+/// Fetches a yank's bytes (a file span, or a decoded objstm container
+/// narrowed to `slice`) and renders them as clipboard text.
+async fn yank_span_text(
+    doc: &AsyncDocument,
+    source: HexSource,
+    slice: Option<Span>,
+    base: u64,
+    format: yank::YankFormat,
+) -> Result<String, String> {
+    let bytes = match source {
+        HexSource::File { span } => doc
+            .read_span(span)
+            .await
+            .map_err(|error| error.to_string())?,
+        HexSource::DecodedObjStm { container } => decoded_stream_data(doc, container).await?.0,
+    };
+    let bytes = match slice {
+        Some(member) => {
+            let start = (member.start as usize).min(bytes.len());
+            let end = (member.end as usize).min(bytes.len()).max(start);
+            bytes[start..end].to_vec()
+        }
+        None => bytes,
+    };
+    if let Some(error) = cap_error(bytes.len() as u64) {
+        return Err(error);
+    }
+    Ok(match format {
+        yank::YankFormat::Hexdump => yank::hexdump_text(&bytes, base),
+        yank::YankFormat::Bytes => String::from_utf8_lossy(&bytes).into_owned(),
+    })
 }
 
 /// Whether a completed tree-population pass should be reported as an
@@ -560,6 +643,57 @@ mod tests {
             }
             other => panic!("expected MarkdownReady, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn yank_span_text_formats_a_file_span() {
+        let data = pdfboss_testkit::simple_doc("Hello");
+        let doc = AsyncDocument::from_bytes(data.clone())
+            .await
+            .expect("fixture opens");
+        let source = HexSource::File {
+            span: Span { start: 0, end: 8 },
+        };
+        let bytes_text = yank_span_text(&doc, source.clone(), None, 0, yank::YankFormat::Bytes)
+            .await
+            .expect("bytes");
+        assert_eq!(bytes_text, String::from_utf8_lossy(&data[0..8]));
+        let hexdump = yank_span_text(&doc, source, None, 0, yank::YankFormat::Hexdump)
+            .await
+            .expect("hexdump");
+        assert!(
+            hexdump.starts_with("00000000: 25 "),
+            "%PDF starts with 0x25: {hexdump}"
+        );
+        assert_eq!(hexdump.lines().count(), 1, "8 bytes fit one line");
+    }
+
+    #[tokio::test]
+    async fn yank_span_text_slices_the_member_range() {
+        let data = pdfboss_testkit::simple_doc("Hello");
+        let doc = AsyncDocument::from_bytes(data.clone())
+            .await
+            .expect("fixture opens");
+        let source = HexSource::File {
+            span: Span { start: 0, end: 8 },
+        };
+        let text = yank_span_text(
+            &doc,
+            source,
+            Some(Span { start: 2, end: 4 }),
+            2,
+            yank::YankFormat::Bytes,
+        )
+        .await
+        .expect("sliced bytes");
+        assert_eq!(text, String::from_utf8_lossy(&data[2..4]));
+    }
+
+    #[test]
+    fn cap_error_rejects_over_cap_payloads() {
+        assert!(cap_error(yank::CAP_BYTES).is_none());
+        let message = cap_error(yank::CAP_BYTES + 1).expect("over cap");
+        assert!(message.contains("1.0 MiB"), "{message}");
     }
 
     #[tokio::test]
