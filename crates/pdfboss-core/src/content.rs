@@ -229,83 +229,130 @@ fn ops_estimate(len: usize) -> usize {
     (len / 16).min(1 << 17)
 }
 
-/// The parse loop behind both public entry points: one pass over the
-/// tokens, each finished operator handed to `emit` — so the span-less
-/// caller never materializes spans it will throw away.
+/// The parse loop behind both public entry points, as a wrapper over the
+/// pull parser: each finished operator is handed to `emit` — so the
+/// span-less caller never materializes spans it will throw away.
 fn parse_content_ops(data: &[u8], mut emit: impl FnMut(Op, Span)) -> Result<()> {
-    let mut lexer = Lexer::new(data);
-    let mut stack: Vec<Object> = Vec::new();
-    // Start of the current operand run; cleared whenever the run dies
-    // (an operator was emitted, an unknown operator dropped it, or a
-    // stray closer flushed it).
-    let mut run_start: Option<usize> = None;
-    loop {
-        let (token_start, raw) = lexer.next_raw_token_spanned()?;
-        let kw = match raw {
-            RawToken::Keyword(kw) => {
-                if run_start.is_none() {
-                    run_start = Some(token_start);
-                }
-                kw
-            }
-            RawToken::Hex(span) => {
-                if run_start.is_none() {
-                    run_start = Some(token_start);
-                }
-                stack.push(Object::String(decode_hex(span)));
-                continue;
-            }
-            RawToken::Owned(token) => {
-                if !matches!(token, Token::Eof) && run_start.is_none() {
-                    run_start = Some(token_start);
-                }
-                match token {
-                    Token::Eof => break,
-                    Token::Int(i) => stack.push(Object::Int(i)),
-                    Token::Real(r) => stack.push(Object::Real(r)),
-                    Token::Name(n) => stack.push(Object::Name(n)),
-                    Token::LitString(s) | Token::HexString(s) => stack.push(Object::String(s)),
-                    Token::ArrayOpen => {
-                        let a = parse_array(&mut lexer, 0)?;
-                        stack.push(a);
+    let mut ops = ContentOps::new(data);
+    while let Some((op, span)) = ops.next_op()? {
+        emit(op, span);
+    }
+    Ok(())
+}
+
+/// A pull parser over one content stream: each [`ContentOps::next_op`]
+/// yields the next operator with its byte range, in stream order — an
+/// executor consumes operators one at a time without materializing the
+/// whole vector.
+pub struct ContentOps<'a> {
+    lexer: Lexer<'a>,
+    stack: Vec<Object>,
+    /// Start of the current operand run; cleared whenever the run dies
+    /// (an operator was emitted, an unknown operator dropped it, or a
+    /// stray closer flushed it).
+    run_start: Option<usize>,
+}
+
+impl<'a> ContentOps<'a> {
+    /// Starts a pull parse at the beginning of `data`.
+    pub fn new(data: &'a [u8]) -> ContentOps<'a> {
+        ContentOps::at(data, 0)
+    }
+
+    /// Resumes a pull parse at byte offset `pos`. The operand stack is
+    /// empty at every operator boundary, so the offset [`ContentOps::pos`]
+    /// reported between two `next_op` calls is the parser's whole state —
+    /// an executor that suspends a stream mid-walk (a form invocation)
+    /// rebuilds from it exactly.
+    pub fn at(data: &'a [u8], pos: usize) -> ContentOps<'a> {
+        ContentOps {
+            lexer: Lexer::at(data, pos),
+            stack: Vec::new(),
+            run_start: None,
+        }
+    }
+
+    /// The cursor's byte offset — a resume point between `next_op` calls.
+    pub fn pos(&self) -> usize {
+        self.lexer.pos()
+    }
+
+    /// Parses forward to the next complete operator and returns it with
+    /// its span, or `None` at the end of the stream.
+    pub fn next_op(&mut self) -> Result<Option<(Op, Span)>> {
+        loop {
+            let (token_start, raw) = self.lexer.next_raw_token_spanned()?;
+            let kw = match raw {
+                RawToken::Keyword(kw) => {
+                    if self.run_start.is_none() {
+                        self.run_start = Some(token_start);
                     }
-                    Token::DictOpen => {
-                        let d = parse_dict(&mut lexer, 0)?;
-                        stack.push(Object::Dict(d));
+                    kw
+                }
+                RawToken::Hex(span) => {
+                    if self.run_start.is_none() {
+                        self.run_start = Some(token_start);
                     }
-                    // Stray closers: malformed input, drop pending operands.
-                    Token::ArrayClose | Token::DictClose => {
-                        stack.clear();
-                        run_start = None;
+                    self.stack.push(Object::String(decode_hex(span)));
+                    continue;
+                }
+                RawToken::Owned(token) => {
+                    if !matches!(token, Token::Eof) && self.run_start.is_none() {
+                        self.run_start = Some(token_start);
                     }
-                    Token::Keyword(_) => {
-                        unreachable!("next_raw_token yields keywords borrowed")
+                    match token {
+                        Token::Eof => return Ok(None),
+                        Token::Int(i) => self.stack.push(Object::Int(i)),
+                        Token::Real(r) => self.stack.push(Object::Real(r)),
+                        Token::Name(n) => self.stack.push(Object::Name(n)),
+                        Token::LitString(s) | Token::HexString(s) => {
+                            self.stack.push(Object::String(s))
+                        }
+                        Token::ArrayOpen => {
+                            let a = parse_array(&mut self.lexer, 0)?;
+                            self.stack.push(a);
+                        }
+                        Token::DictOpen => {
+                            let d = parse_dict(&mut self.lexer, 0)?;
+                            self.stack.push(Object::Dict(d));
+                        }
+                        // Stray closers: malformed input, drop pending operands.
+                        Token::ArrayClose | Token::DictClose => {
+                            self.stack.clear();
+                            self.run_start = None;
+                        }
+                        Token::Keyword(_) => {
+                            unreachable!("next_raw_token yields keywords borrowed")
+                        }
+                    }
+                    continue;
+                }
+            };
+            match kw {
+                b"true" => self.stack.push(Object::Bool(true)),
+                b"false" => self.stack.push(Object::Bool(false)),
+                b"null" => self.stack.push(Object::Null),
+                b"BI" => {
+                    let start = self.run_start.take().unwrap_or(token_start);
+                    let image = parse_inline_image(&mut self.lexer);
+                    self.stack.clear();
+                    if let Some(op) = image {
+                        let span = Span::new(start as u64, self.lexer.pos() as u64);
+                        return Ok(Some((op, span)));
                     }
                 }
-                continue;
-            }
-        };
-        match kw {
-            b"true" => stack.push(Object::Bool(true)),
-            b"false" => stack.push(Object::Bool(false)),
-            b"null" => stack.push(Object::Null),
-            b"BI" => {
-                let start = run_start.take().unwrap_or(token_start);
-                if let Some(op) = parse_inline_image(&mut lexer) {
-                    emit(op, Span::new(start as u64, lexer.pos() as u64));
+                _ => {
+                    let start = self.run_start.take().unwrap_or(token_start);
+                    let op = dispatch(kw, &mut self.stack);
+                    self.stack.clear();
+                    if let Some(op) = op {
+                        let span = Span::new(start as u64, self.lexer.pos() as u64);
+                        return Ok(Some((op, span)));
+                    }
                 }
-                stack.clear();
-            }
-            _ => {
-                let start = run_start.take().unwrap_or(token_start);
-                if let Some(op) = dispatch(kw, &mut stack) {
-                    emit(op, Span::new(start as u64, lexer.pos() as u64));
-                }
-                stack.clear();
             }
         }
     }
-    Ok(())
 }
 
 /// Composes an array value; the opening `[` has already been consumed.
