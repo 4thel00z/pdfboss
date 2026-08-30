@@ -29,6 +29,18 @@ def test_watermark_keeps_the_base_bytes_and_draws_the_overlay_on_every_page() ->
         assert "DRAFT" in text
 
 
+def test_watermark_rewrite_writes_one_fresh_section() -> None:
+    base = two_page_base()
+    out = watermark(base, overlay(), rewrite=True)
+    assert not out.startswith(base)
+    doc = pdfboss.Document(data=out)
+    assert doc.page_count == 2
+    for index, expected in enumerate(["Base page one", "Base page two"]):
+        text = doc[index].extract_text()
+        assert expected in text
+        assert "DRAFT" in text
+
+
 def test_watermark_refuses_bytes_that_are_not_a_pdf() -> None:
     with pytest.raises(pdfboss.PdfError):
         watermark(b"not a pdf", overlay())

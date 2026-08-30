@@ -42,5 +42,5 @@ pub use pdf::{
     PageLabel, PageLayout, PageMode, PageSize, Pdf, Viewer,
 };
 pub use sink::{AsyncByteSink, Immediate};
-pub use update::watermark;
+pub use update::{watermark, watermark_with};
 pub use writer::{WriteOptions, Writer, XrefStyle};

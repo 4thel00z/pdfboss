@@ -440,7 +440,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-From Python, `pdfboss.write.watermark(data, overlay)` takes and returns bytes:
+`watermark_with(base, overlay, WriteOptions::default())` is the other shape of the same operation: a fresh file written through the `Writer`, every object the catalog reaches copied over, filterless streams compressed and the rest packed into object streams, so unreachable objects and earlier update sections are left behind and the result is usually smaller than the base.
+
+From Python, `pdfboss.write.watermark(data, overlay)` takes and returns bytes; `rewrite=True` selects the fresh-file shape:
 
 ```python
 import pdfboss

@@ -1071,18 +1071,32 @@ impl WritePdf {
 /// pdfboss._pdfboss.write import Pdf` additionally need the submodule
 /// registered in `sys.modules` under its dotted name.
 /// Draws the first page of `overlay` over every page of `data`, returning
-/// the watermarked file: `data`'s bytes followed by an incremental update
-/// that adds the overlay page as a form and rewrites each page to draw it.
-/// Releases the GIL while both files are parsed and the update is built.
+/// the watermarked file. By default that is `data`'s bytes followed by an
+/// incremental update that adds the overlay page as a form and rewrites
+/// each page to draw it; with `rewrite=True` the whole file is written
+/// afresh through the writer with compression and object streams, which
+/// leaves unreachable objects behind and usually comes out smaller than
+/// `data`. Releases the GIL while both files are parsed and the result is
+/// built.
 #[pyfunction]
+#[pyo3(signature = (data, overlay, *, rewrite=false))]
 fn watermark<'py>(
     py: Python<'py>,
     data: Vec<u8>,
     overlay: Vec<u8>,
+    rewrite: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let bytes = py.allow_threads(|| {
         let base = pdfboss_core::Document::load(data).map_err(crate::pdf_err)?;
         let overlay = pdfboss_core::Document::load(overlay).map_err(crate::pdf_err)?;
+        if rewrite {
+            return pdfboss_write::watermark_with(
+                &base,
+                &overlay,
+                pdfboss_write::WriteOptions::default(),
+            )
+            .map_err(crate::pdf_err);
+        }
         pdfboss_write::watermark(&base, &overlay).map_err(crate::pdf_err)
     })?;
     Ok(PyBytes::new(py, &bytes))

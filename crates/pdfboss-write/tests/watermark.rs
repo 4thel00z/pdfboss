@@ -6,7 +6,9 @@
 use pdfboss_core::Document;
 use pdfboss_output::extract_text;
 use pdfboss_render::{render_page_reporting, RenderOptions};
-use pdfboss_write::{watermark, Page, PageSize, Pdf, Standard14, WriteOptions, XrefStyle};
+use pdfboss_write::{
+    watermark, watermark_with, Page, PageSize, Pdf, Standard14, WriteOptions, XrefStyle,
+};
 
 fn base_pdf(xref: XrefStyle) -> Vec<u8> {
     let mut first = Page::new(PageSize::A4);
@@ -86,4 +88,69 @@ fn watermark_updates_a_table_xref_file() {
 #[test]
 fn watermark_updates_a_stream_xref_file() {
     assert_watermarked(base_pdf(XrefStyle::Stream));
+}
+
+/// The rewrite variant writes a fresh file through the writer, so an
+/// uncompressed base comes out smaller than it went in, with no `/Prev`
+/// chain, and still carries both texts on every page.
+#[test]
+fn watermark_with_rewrites_the_file_compressed() {
+    let mut first = Page::new(PageSize::A4);
+    let mut second = Page::new(PageSize::A4);
+    for line in 0..150 {
+        let y = 780.0 - line as f32 * 5.0;
+        first
+            .canvas
+            .text(
+                "Base page one, a line of running text",
+                72.0,
+                y,
+                Standard14::Helvetica,
+                4.0,
+            )
+            .unwrap();
+        second
+            .canvas
+            .text(
+                "Base page two, a line of running text",
+                72.0,
+                y,
+                Standard14::TimesRoman,
+                4.0,
+            )
+            .unwrap();
+    }
+    let base = Pdf {
+        pages: vec![first, second],
+        options: WriteOptions {
+            compress: false,
+            object_streams: false,
+            xref: XrefStyle::Table,
+            ..WriteOptions::default()
+        },
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let base_doc = Document::load(base.clone()).unwrap();
+    let overlay_doc = Document::load(overlay_pdf()).unwrap();
+    let out = watermark_with(&base_doc, &overlay_doc, WriteOptions::default()).unwrap();
+    assert!(
+        out.len() < base.len(),
+        "{} bytes from a {} byte base",
+        out.len(),
+        base.len()
+    );
+    let doc = Document::load(out).unwrap();
+    assert!(
+        doc.xref().trailer.get("Prev").is_none(),
+        "a rewrite has one section"
+    );
+    assert_eq!(doc.page_count(), 2);
+    for (index, expected) in ["Base page one", "Base page two"].iter().enumerate() {
+        let page = doc.page(index).unwrap();
+        let text = extract_text(&doc, &page).unwrap();
+        assert!(text.contains(expected), "page {index}: {text:?}");
+        assert!(text.contains("DRAFT"), "page {index}: {text:?}");
+    }
 }
