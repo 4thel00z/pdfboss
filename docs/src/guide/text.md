@@ -1,11 +1,16 @@
 # Extracting text from PDFs
 
 Text extraction turns a page's positioned glyphs back into readable text: spans are
-grouped into lines, lines are ordered top to bottom and joined with `\n`, and spaces
-are inserted at horizontal gaps. Whole-document extraction joins pages with a form
-feed (`\f`). For structured output (headings, lists, tables), see
-[Markdown output](./markdown.md); for the spans themselves, with fonts, sizes and
-positions, see [Styled spans](./spans.md).
+grouped into lines, lines are joined with `\n`, and spaces are inserted at horizontal
+gaps. Reading order follows the content stream: a typeset document writes each
+column whole before the next begins, so the text comes out column by column, and a
+figure caption or a footnote reads where the producer placed it. Geometry corrects
+the streams that write across two columns row by row (a page with a clear gutter
+still reads column-major) and takes over entirely when a stream was not written in
+reading order at all, which then reads top to bottom. Whole-document extraction
+joins pages with a form feed (`\f`). For structured output (headings, lists,
+tables), see [Markdown output](./markdown.md); for the spans themselves, with
+fonts, sizes and positions, see [Styled spans](./spans.md).
 
 ## CLI
 

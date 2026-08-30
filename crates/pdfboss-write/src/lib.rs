@@ -26,6 +26,7 @@ pub mod image;
 pub mod pdf;
 pub mod ser;
 pub mod sink;
+pub mod update;
 pub mod writer;
 mod xmp;
 
@@ -41,4 +42,5 @@ pub use pdf::{
     PageLabel, PageLayout, PageMode, PageSize, Pdf, Viewer,
 };
 pub use sink::{AsyncByteSink, Immediate};
+pub use update::watermark;
 pub use writer::{WriteOptions, Writer, XrefStyle};

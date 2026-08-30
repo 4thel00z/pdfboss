@@ -60,6 +60,8 @@ Every `|` returns a new value and leaves the receiver unchanged; copies are chea
 
 The draw protocol is structural: any object with a callable `draw` attribute composes onto a `Page`, and its `draw(canvas)` receives a `Canvas` with twelve methods (`text`, `line`, `rect`, `move_to`, `line_to`, `curve_to`, `close`, `stroke`, `fill`, `set_fill`, `set_stroke`, `set_line_width`) that paints in content order. The stub declares a `Draw` protocol type for checkers only; there is no runtime `Draw` class to import or inherit. The canvas is only usable inside the call, and every method raises `PdfError` once `draw` has returned.
 
+One function works on existing files: `watermark(data, overlay)` takes two PDFs as bytes and returns `data` with the first page of `overlay` drawn over every page, as an incremental update appended to `data`'s bytes (see [Watermarking an existing file](../guide/creating.md#watermarking-an-existing-file)). It releases the GIL while it runs and raises `PdfError` for an encrypted `data`.
+
 ## Error handling
 
 Everything raises `PdfError`: bad or truncated data, unsupported encryption, stream decode failures and I/O errors, with the underlying detail in the message. Messages from the element and async APIs are prefixed by the layer they came from: `"parse: …"`, `"io: …"` or `"http: …"`.

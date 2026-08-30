@@ -1070,8 +1070,27 @@ impl WritePdf {
 /// access); `import pdfboss._pdfboss.write` or `from
 /// pdfboss._pdfboss.write import Pdf` additionally need the submodule
 /// registered in `sys.modules` under its dotted name.
+/// Draws the first page of `overlay` over every page of `data`, returning
+/// the watermarked file: `data`'s bytes followed by an incremental update
+/// that adds the overlay page as a form and rewrites each page to draw it.
+/// Releases the GIL while both files are parsed and the update is built.
+#[pyfunction]
+fn watermark<'py>(
+    py: Python<'py>,
+    data: Vec<u8>,
+    overlay: Vec<u8>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = py.allow_threads(|| {
+        let base = pdfboss_core::Document::load(data).map_err(crate::pdf_err)?;
+        let overlay = pdfboss_core::Document::load(overlay).map_err(crate::pdf_err)?;
+        pdfboss_write::watermark(&base, &overlay).map_err(crate::pdf_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
 pub(crate) fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let module = PyModule::new(py, "write")?;
+    module.add_function(wrap_pyfunction!(watermark, &module)?)?;
     module.add_class::<Standard14>()?;
     module.add_class::<Text>()?;
     module.add_class::<Image>()?;

@@ -357,6 +357,7 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
         "Standard14",
         "Text",
         "Viewer",
+        "watermark",
     ]
 
 
