@@ -12,6 +12,11 @@ use pdfboss_text::{Ruling, TextSpan};
 /// kerns, which stay under 0.1 em; 0.25 em sat exactly on the nominal
 /// Times space width and swallowed every shrunk line's spaces.
 const WORD_GAP: f32 = 0.15;
+/// A span whose baseline falls outside the line's tolerance still joins the
+/// line when its nominal vertical extent overlaps the line's by this
+/// fraction of the smaller height: a superscript or subscript, never a
+/// fraction's numerator or denominator.
+const LINE_OVERLAP: f32 = 0.5;
 
 /// Minimum column-candidate spans on a page before a gutter is looked for.
 const COLUMN_MIN_SPANS: usize = 40;
@@ -826,8 +831,25 @@ struct Group<'s> {
     spans: Vec<&'s TextSpan>,
 }
 
-/// One reading-order segment's spans grouped into lines — baselines within
-/// `0.5 · size` — top of page first, spans left to right inside each.
+/// True when `span` belongs on the line at baseline `y` and size `size`:
+/// its baseline lies within `0.5 · size`, or its own vertical extent
+/// overlaps the line's by at least [`LINE_OVERLAP`] of the smaller height.
+/// The extents are the nominal ones a baseline and size imply, a quarter
+/// size below and three quarters above, so a raised superscript or a sunk
+/// subscript shares most of its height with the line while a fraction's
+/// numerator, a whole line up, shares little.
+fn same_line(y: f32, size: f32, span: &TextSpan) -> bool {
+    if (y - span.y).abs() <= 0.5 * size.max(span.size) {
+        return true;
+    }
+    let line_extent = (y - 0.25 * size, y + 0.75 * size);
+    let span_extent = (span.y - 0.25 * span.size, span.y + 0.75 * span.size);
+    let overlap = line_extent.1.min(span_extent.1) - line_extent.0.max(span_extent.0);
+    overlap >= LINE_OVERLAP * size.min(span.size)
+}
+
+/// One reading-order segment's spans grouped into lines (see
+/// [`same_line`]), top of page first, spans left to right inside each.
 /// Two passes: the first assigns every span its group — each span tests
 /// against the group's size as it stood when the span arrived — and counts,
 /// the second fills exact-sized span lists, so no list grows push by push.
@@ -838,7 +860,7 @@ fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
     for &span in spans {
         let found = groups
             .iter()
-            .position(|group| (group.y - span.y).abs() <= 0.5 * group.size.max(span.size));
+            .position(|group| same_line(group.y, group.size, span));
         match found {
             Some(index) => {
                 groups[index].size = groups[index].size.max(span.size);
@@ -2075,7 +2097,7 @@ fn flow(spans: &[&TextSpan], out: &mut String) {
     for &span in spans {
         let found = lines
             .iter_mut()
-            .find(|line| (line.y - span.y).abs() <= 0.5 * line.size.max(span.size));
+            .find(|line| same_line(line.y, line.size, span));
         match found {
             Some(line) => {
                 line.size = line.size.max(span.size);
@@ -2646,6 +2668,17 @@ pub(crate) mod tests {
                 "at the center and outside.",
             ]
         );
+    }
+
+    /// A superscript raised past half the line size still overlaps most of
+    /// the line's height, so it stays on the line rather than opening one of
+    /// its own above it.
+    #[test]
+    fn a_raised_superscript_stays_on_its_line() {
+        let content = "BT /F1 10 Tf 72 700 Td (10) Tj ET \
+                       BT /F1 7 Tf 83.5 705.5 Td (9) Tj ET \
+                       BT /F1 10 Tf 92 700 Td (stars) Tj ET";
+        assert_eq!(text_of(content), "109 stars");
     }
 
     /// A display fraction's numerator sits a line above the baseline it is
