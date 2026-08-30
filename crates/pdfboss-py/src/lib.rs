@@ -206,6 +206,20 @@ fn png_compression_from_str(s: &str) -> PyResult<pdfboss_render::PngCompression>
     }
 }
 
+/// Maps the Python `format=` and `compression=` strings to a
+/// [`pdfboss_render::ImageFormat`]; `compression` only shapes PNG.
+fn image_format_from_str(format: &str, compression: &str) -> PyResult<pdfboss_render::ImageFormat> {
+    use pdfboss_render::ImageFormat;
+    let compression = png_compression_from_str(compression)?;
+    match ImageFormat::from_name(format) {
+        Some(ImageFormat::Png(_)) => Ok(ImageFormat::Png(compression)),
+        Some(other) => Ok(other),
+        None => Err(PyValueError::new_err(format!(
+            "unknown format {format:?}: expected 'png', 'ppm' or 'bmp'"
+        ))),
+    }
+}
+
 /// The core document behind a lock, shareable across threads.
 ///
 /// [`CoreDocument`] itself is neither `Send` nor `Sync`: its interior
@@ -436,12 +450,14 @@ impl Document {
     }
 
     /// Renders every page (or the 0-based `pages` given, in the order given)
-    /// to PNG bytes, fanned out across the machine's cores — same arguments
-    /// and leniency as `Page.render`, one PNG per page. For a multi-page
-    /// document this is the convenient fast path: one call renders them all
-    /// at once, where per-page `render` calls only parallelize if you run
-    /// them from your own threads.
-    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default"))]
+    /// to image bytes (PNG unless `format` says otherwise), fanned out
+    /// across the machine's cores — same arguments and leniency as
+    /// `Page.render`, one image per page. For a multi-page document this is
+    /// the convenient fast path: one call renders them all at once, where
+    /// per-page `render` calls only parallelize if you run them from your
+    /// own threads.
+    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default", format="png"))]
+    #[allow(clippy::too_many_arguments)]
     fn render_pages<'py>(
         &self,
         py: Python<'py>,
@@ -450,19 +466,20 @@ impl Document {
         fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
+        format: &str,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
         opts.cache = Some(Arc::clone(&self.render_cache));
-        let compression = png_compression_from_str(compression)?;
+        let format = image_format_from_str(format, compression)?;
         let inner = &self.inner;
-        let pngs = py.allow_threads(move || {
+        let images = py.allow_threads(move || {
             // The lock is held only long enough to seed; the fan-out runs
             // on a private materialization.
             let doc = CoreDocument::from_seed(inner.lock().seed());
             let outcomes = match &pages {
                 None => pdfboss_core::map_pages(&doc, |doc, page| {
                     let (pix, _) = pdfboss_render::render_page_reporting(doc, page, scale, &opts)?;
-                    pix.encode_png_with(compression)
+                    pix.encode(format)
                 }),
                 Some(wanted) => {
                     // An explicit list renders exactly those pages, in the
@@ -494,7 +511,7 @@ impl Document {
                                         let (pix, _) = pdfboss_render::render_page_reporting(
                                             &worker, &page, scale, opts,
                                         )?;
-                                        pix.encode_png_with(compression)
+                                        pix.encode(format)
                                     });
                                     slots[s].set(outcome).ok();
                                 }
@@ -509,10 +526,13 @@ impl Document {
             };
             outcomes
                 .into_iter()
-                .map(|png| png.map_err(pdf_err))
+                .map(|image| image.map_err(pdf_err))
                 .collect::<PyResult<Vec<Vec<u8>>>>()
         })?;
-        Ok(pngs.into_iter().map(|png| PyBytes::new(py, &png)).collect())
+        Ok(images
+            .into_iter()
+            .map(|image| PyBytes::new(py, &image))
+            .collect())
     }
 
     /// Lazily iterates the document's elements: physical file structure in
@@ -745,8 +765,9 @@ impl Page {
         })
     }
 
-    /// Renders the page and returns PNG bytes. Releases the GIL while the
-    /// rasterization and PNG encoding run, on a private materialization of
+    /// Renders the page and returns the encoded image: PNG unless `format`
+    /// is `"ppm"` or `"bmp"`. Releases the GIL while the
+    /// rasterization and encoding run, on a private materialization of
     /// the document — no lock is held, so renders called from multiple
     /// Python threads run truly in parallel (or let
     /// `Document.render_pages` do the fan-out for you).
@@ -758,13 +779,15 @@ impl Page {
     /// message rather than silently degrading or leaking a raw import
     /// error.
     ///
-    /// `compression` trades PNG encode time against file size: `"none"`,
-    /// `"fast"`, `"default"` or `"best"`. Every level produces the same
-    /// pixels.
+    /// `format` picks the file format: `"png"`, `"ppm"` (binary P6, RGB) or
+    /// `"bmp"` (24-bit). PPM and BMP are a header plus the pixels, dropping
+    /// alpha; `compression` trades PNG encode time against file size:
+    /// `"none"`, `"fast"`, `"default"` or `"best"`, and only shapes PNG.
+    /// Every choice produces the same pixels.
     ///
     /// Content pdfboss cannot read is skipped, so a page can come out blank
     /// without raising. Use `render_reporting` to see what was dropped.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png"))]
     fn render<'py>(
         &self,
         py: Python<'py>,
@@ -772,8 +795,9 @@ impl Page {
         fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
+        format: &str,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let rendered = self.render_reporting(py, scale, fonts, font_dir, compression)?;
+        let rendered = self.render_reporting(py, scale, fonts, font_dir, compression, format)?;
         Ok(rendered.0)
     }
 
@@ -784,7 +808,7 @@ impl Page {
     /// unsupported filter /Crypt"`. It is empty when the page
     /// rasterized exactly as it describes itself, so a blank page is never
     /// mistaken for a clean render.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png"))]
     fn render_reporting<'py>(
         &self,
         py: Python<'py>,
@@ -792,11 +816,12 @@ impl Page {
         fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
+        format: &str,
     ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
         let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
         opts.cache = Some(Arc::clone(&self.render_cache));
-        let compression = png_compression_from_str(compression)?;
-        let (png, warnings) = py.allow_threads(|| {
+        let format = image_format_from_str(format, compression)?;
+        let (image, warnings) = py.allow_threads(|| {
             // Uncontended, reuse the shared parsed document so fonts,
             // images and decoded streams carry across this document's
             // pages; under contention, render on a private
@@ -810,12 +835,9 @@ impl Page {
                         .map_err(pdf_err)?
                 }
             };
-            Ok::<_, PyErr>((
-                pixmap.encode_png_with(compression).map_err(pdf_err)?,
-                report.warnings(),
-            ))
+            Ok::<_, PyErr>((pixmap.encode(format).map_err(pdf_err)?, report.warnings()))
         })?;
-        Ok((PyBytes::new(py, &png), warnings))
+        Ok((PyBytes::new(py, &image), warnings))
     }
 
     /// Every image the page draws, each decoded at its native pixel
@@ -1388,7 +1410,8 @@ impl AsyncDocument {
     /// never idles the others — except the workers are tokio tasks, so the
     /// asyncio loop stays free and it works over any source, including
     /// `open_url` documents (each worker range-fetches what its page needs).
-    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default"))]
+    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default", format="png"))]
+    #[allow(clippy::too_many_arguments)]
     fn render_pages<'py>(
         &self,
         py: Python<'py>,
@@ -1397,9 +1420,10 @@ impl AsyncDocument {
         fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
+        format: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
-        let compression = png_compression_from_str(compression)?;
+        let format = image_format_from_str(format, compression)?;
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let selection: Arc<Vec<usize>> = Arc::new(match pages {
@@ -1441,7 +1465,7 @@ impl AsyncDocument {
                                 &opts,
                             )
                             .await
-                            .and_then(|(pix, _)| pix.encode_png_with(compression))
+                            .and_then(|(pix, _)| pix.encode(format))
                             .map_err(pdf_err),
                         };
                         done.push((s, outcome));
@@ -1449,20 +1473,20 @@ impl AsyncDocument {
                     done
                 }));
             }
-            let mut pngs: Vec<Option<Vec<u8>>> = vec![None; selection.len()];
+            let mut images: Vec<Option<Vec<u8>>> = vec![None; selection.len()];
             for handle in handles {
                 let done = handle
                     .await
                     .map_err(|e| PdfError::new_err(format!("render worker failed: {e}")))?;
                 for (s, outcome) in done {
-                    pngs[s] = Some(outcome?);
+                    images[s] = Some(outcome?);
                 }
             }
             Python::with_gil(|py| {
-                let list: Vec<Py<PyAny>> = pngs
+                let list: Vec<Py<PyAny>> = images
                     .into_iter()
-                    .map(|png| {
-                        PyBytes::new(py, &png.expect("every slot was dispatched"))
+                    .map(|image| {
+                        PyBytes::new(py, &image.expect("every slot was dispatched"))
                             .into_any()
                             .unbind()
                     })
@@ -1650,9 +1674,10 @@ impl AsyncPage {
         })
     }
 
-    /// Renders the page and resolves to PNG bytes; same arguments and
-    /// leniency as the sync `Page.render`. Coroutine.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
+    /// Renders the page and resolves to the encoded image (PNG unless
+    /// `format` says otherwise); same arguments and leniency as the sync
+    /// `Page.render`. Coroutine.
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png"))]
     fn render<'py>(
         &self,
         py: Python<'py>,
@@ -1660,18 +1685,19 @@ impl AsyncPage {
         fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
+        format: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
-        let compression = png_compression_from_str(compression)?;
+        let format = image_format_from_str(format, compression)?;
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (pixmap, _) = pdfboss_render::render_page_reporting_with(doc, &page, scale, &opts)
                 .await
                 .map_err(pdf_err)?;
-            let png = pixmap.encode_png_with(compression).map_err(pdf_err)?;
+            let image = pixmap.encode(format).map_err(pdf_err)?;
             Python::with_gil(|py| {
-                Ok::<Py<PyAny>, PyErr>(PyBytes::new(py, &png).into_any().unbind())
+                Ok::<Py<PyAny>, PyErr>(PyBytes::new(py, &image).into_any().unbind())
             })
         })
     }
@@ -1679,7 +1705,7 @@ impl AsyncPage {
     /// Renders the page like `render`, resolving to `(png_bytes, warnings)`;
     /// same reporting semantics as the sync `Page.render_reporting`.
     /// Coroutine.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default"))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png"))]
     fn render_reporting<'py>(
         &self,
         py: Python<'py>,
@@ -1687,9 +1713,10 @@ impl AsyncPage {
         fonts: Option<&str>,
         font_dir: Option<String>,
         compression: &str,
+        format: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
-        let compression = png_compression_from_str(compression)?;
+        let format = image_format_from_str(format, compression)?;
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1697,10 +1724,10 @@ impl AsyncPage {
                 pdfboss_render::render_page_reporting_with(doc, &page, scale, &opts)
                     .await
                     .map_err(pdf_err)?;
-            let png = pixmap.encode_png_with(compression).map_err(pdf_err)?;
+            let image = pixmap.encode(format).map_err(pdf_err)?;
             let warnings = report.warnings();
             Python::with_gil(|py| {
-                let bytes = PyBytes::new(py, &png).into_any().unbind();
+                let bytes = PyBytes::new(py, &image).into_any().unbind();
                 Ok::<(Py<PyAny>, Vec<String>), PyErr>((bytes, warnings))
             })
         })

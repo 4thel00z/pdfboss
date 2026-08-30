@@ -1,7 +1,7 @@
 # Rendering pages
 
 pdfboss rasterizes pages to RGBA pixels with anti-aliasing and encodes them as
-PNG. The scale factor is the points-to-pixels ratio: at `1.0` one PDF point
+PNG, PPM or BMP. The scale factor is the points-to-pixels ratio: at `1.0` one PDF point
 becomes one pixel, so a US Letter page renders to 612 × 792 pixels; at `2.0`
 to 1224 × 1584. The pixel size is `ceil(crop_w * scale) × ceil(crop_h *
 scale)` after page rotation, on a white background.
@@ -14,10 +14,14 @@ This chapter is about rasterizing whole pages. To pull out the images a page
 ```bash
 pdfboss render report.pdf --page 1
 pdfboss render report.pdf --page 1 --scale 2 -o page-1@2x.png
+pdfboss render report.pdf --page 1 --scale 2 -o page-1.ppm
 ```
 
 The first form writes `page-1.png` (`--page` is 1-based). Further flags:
 
+- `-o <OUT>`: the output file; its extension picks the format, `.png`,
+  `.ppm` or `.bmp` (see [Output formats](#output-formats)). Any other
+  extension is an error.
 - `--fonts <FONTS>`: which fonts to paint, one of `embedded-only`,
   `all-embedded` or `full` (see the tiers below). The default resolves to
   `full` when substitute faces are available (the compiled-in OFL set or
@@ -27,7 +31,7 @@ The first form writes `page-1.png` (`--page` is 1-based). Further flags:
   [Substitute face files](#substitute-face-files). Overrides the compiled-in
   OFL set.
 - `--png-compression <PNG_COMPRESSION>`: `none`, `fast`, `default` or
-  `best`.
+  `best`; PNG only.
 - `--password <PASSWORD>`: for encrypted files, covered in
   [Encrypted documents](./encryption.md).
 
@@ -105,7 +109,8 @@ Path("page-1.png").write_bytes(png)
 ```
 
 `render` accepts `fonts=` (`"embedded-only"`, `"all-embedded"`, `"full"`),
-`font_dir=` and `compression=` (`"none"`, `"fast"`, `"default"`, `"best"`),
+`font_dir=`, `compression=` (`"none"`, `"fast"`, `"default"`, `"best"`) and
+`format=` (`"png"`, `"ppm"`, `"bmp"`, see [Output formats](#output-formats)),
 and releases the GIL while it runs. `fonts=` defaults to `None`, which
 resolves to `"full"` when `font_dir=` is given or the `pdfboss-fonts`
 package is importable, and to `"all-embedded"` otherwise. `Page.render_reporting` renders the same
@@ -127,9 +132,9 @@ first_two_reversed = doc.render_pages(pages=[1, 0])
 ```
 
 The full signature is `render_pages(pages=None, scale=1.0, fonts=None,
-font_dir=None, compression="default")`; `fonts`, `font_dir` and
-`compression` mean the same as on `Page.render`, applied to every page,
-and a `fonts` of `None` resolves the same way. The stub file
+font_dir=None, compression="default", format="png")`; `fonts`, `font_dir`,
+`compression` and `format` mean the same as on `Page.render`, applied to
+every page, and a `fonts` of `None` resolves the same way. The stub file
 [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi)
 documents each parameter.
 
@@ -137,13 +142,38 @@ All three have async twins on `AsyncPage`/`AsyncDocument`, which also render
 documents opened over HTTP. See
 [Async and remote documents](./async.md).
 
+## Output formats
+
+Every render entry point writes one of three formats, chosen by `format=`
+in Python, by the `-o` extension on the CLI, and by
+`pdfboss_render::ImageFormat` in Rust:
+
+| format | pixels | what it costs |
+|---|---|---|
+| `png` (default) | RGBA 8-bit, filtered and deflated | the compression level below |
+| `ppm` | binary P6: `P6 <w> <h> 255\n` then RGB rows, top-down | one packing pass |
+| `bmp` | 24-bit BGR, bottom-up rows padded to four bytes, 54-byte header | one packing pass |
+
+PPM and BMP drop the alpha channel; a rendered page is filled white, so
+alpha is 255 everywhere and nothing is lost. Reach for them when the
+pixels are consumed right away (a benchmark, an OCR or vision pipeline, a
+diff against another renderer) and the PNG encode would be wasted work:
+Pillow, numpy and ImageMagick read both directly.
+
+```python
+ppm = page.render(scale=2.0, format="ppm")
+bmp, warnings = page.render_reporting(scale=2.0, format="bmp")
+```
+
 ## PNG compression
 
 The compression level trades encode time against file size; every level
 produces the same pixels. `none` is fastest and largest, `fast` is very fast
 with a decent ratio, `default` balances the two, and `best` produces the
-smallest files, much slower. The level only touches the PNG encoder. Pick it
-by whether you are writing throwaway intermediates or archiving.
+smallest files, much slower. The level only touches the PNG encoder; even
+`none` still filters rows and writes checksums, so a raw-pixel consumer is
+better served by `ppm` or `bmp`. Pick it by whether you are writing
+throwaway intermediates or archiving.
 
 ## Rust
 

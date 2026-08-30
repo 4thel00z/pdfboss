@@ -1,6 +1,7 @@
-//! A PNG encoder specialized for rasterized pages: per-row filter choice,
-//! one image-tuned dynamic Huffman table, and zero-run coding instead of
-//! LZ77 match search (RFC 1950/1951, ISO 15948).
+//! Image writers for rasterized pages: PPM and BMP as a header plus one
+//! packing pass, and a PNG encoder specialized for page rasters: per-row
+//! filter choice, one image-tuned dynamic Huffman table, and zero-run
+//! coding instead of LZ77 match search (RFC 1950/1951, ISO 15948).
 //!
 //! A general deflate encoder spends most of its time in hash-chain match
 //! search. Filtered scanlines don't reward that search: their redundancy
@@ -48,6 +49,72 @@ pub(crate) fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     push_chunk(&mut out, b"IHDR", &ihdr);
     push_chunk(&mut out, b"IDAT", &zlib);
     push_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+/// Encodes `rgba` as a binary PPM (`P6`): the ASCII header, then RGB
+/// triples row-major from the top-left. Alpha is dropped.
+pub(crate) fn encode_ppm(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let header = format!("P6\n{width} {height}\n255\n").into_bytes();
+    let mut out = vec![0u8; header.len() + width as usize * height as usize * 3];
+    out[..header.len()].copy_from_slice(&header);
+    pack_rgb(&mut out[header.len()..], rgba);
+    out
+}
+
+/// Packs RGBA pixels into `rgb`, three bytes per pixel, dropping alpha.
+fn pack_rgb(rgb: &mut [u8], rgba: &[u8]) {
+    for (dst, src) in rgb
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(rgba.as_chunks::<BPP>().0)
+    {
+        *dst = [src[0], src[1], src[2]];
+    }
+}
+
+/// Packs RGBA pixels into `bgr`, three bytes per pixel with red and blue
+/// swapped, dropping alpha.
+fn pack_bgr(bgr: &mut [u8], rgba: &[u8]) {
+    for (dst, src) in bgr
+        .as_chunks_mut::<3>()
+        .0
+        .iter_mut()
+        .zip(rgba.as_chunks::<BPP>().0)
+    {
+        *dst = [src[2], src[1], src[0]];
+    }
+}
+
+/// Encodes `rgba` as a 24-bit BMP with a BITMAPINFOHEADER: BGR triples,
+/// rows bottom-up and padded to four bytes, alpha dropped. The resolution
+/// fields stay zero, since a pixmap carries no physical size.
+pub(crate) fn encode_bmp(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 14 + 40;
+    let row = width as usize * 3;
+    let stride = (row + 3) & !3;
+    let pixels = stride * height as usize;
+    let mut out = Vec::with_capacity(HEADER + pixels);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((HEADER + pixels) as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(HEADER as u32).to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(pixels as u32).to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    out.resize(HEADER + pixels, 0);
+    for (dst_row, src_row) in out[HEADER..]
+        .chunks_exact_mut(stride)
+        .zip(rgba.chunks_exact(width as usize * BPP).rev())
+    {
+        pack_bgr(&mut dst_row[..row], src_row);
+    }
     out
 }
 

@@ -103,7 +103,7 @@ enum Command {
         #[arg(long)]
         page: Option<usize>,
     },
-    /// Render a page to PNG.
+    /// Render a page to PNG, PPM or BMP.
     Render {
         /// Path to the PDF file.
         file: PathBuf,
@@ -113,7 +113,8 @@ enum Command {
         /// 1-based page number.
         #[arg(long)]
         page: usize,
-        /// Output file (default: page-N.png).
+        /// Output file; its extension picks the format, .png, .ppm or .bmp
+        /// (default: page-N.png).
         #[arg(short, long)]
         out: Option<PathBuf>,
         /// Scale factor.
@@ -130,7 +131,8 @@ enum Command {
         /// Overrides the compiled-in OFL set.
         #[arg(long)]
         font_dir: Option<PathBuf>,
-        /// PNG compression: encode time against file size, same pixels.
+        /// PNG compression: encode time against file size, same pixels
+        /// (.ppm and .bmp are never compressed).
         #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
         png_compression: PngCompressionArg,
     },
@@ -635,7 +637,8 @@ fn substitute_source(
     }
 }
 
-/// `pdfboss render`: rasterizes one page to a PNG file.
+/// `pdfboss render`: rasterizes one page to the image file `out`'s
+/// extension names.
 #[allow(clippy::too_many_arguments)]
 fn cmd_render(
     file: &Path,
@@ -650,6 +653,8 @@ fn cmd_render(
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
     }
+    let out = out.unwrap_or_else(|| default_out(page));
+    let format = output_format(&out, png_compression)?;
     let fonts = fonts.unwrap_or_else(|| default_fonts(&font_dir));
     let substitutes = substitute_source(fonts, font_dir)?;
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
@@ -662,13 +667,10 @@ fn cmd_render(
     };
     let (pixmap, report) =
         pdfboss_render::render_page_reporting(&doc, &p, scale, &opts).map_err(|e| e.to_string())?;
-    let out = out.unwrap_or_else(|| default_out(page));
-    let png = pixmap
-        .encode_png_with(png_compression.to_compression())
-        .map_err(|e| e.to_string())?;
-    std::fs::write(&out, png).map_err(|e| e.to_string())?;
+    let image = pixmap.encode(format).map_err(|e| e.to_string())?;
+    std::fs::write(&out, image).map_err(|e| e.to_string())?;
     // Rendering is lenient, so a page whose content pdfboss could not read
-    // still writes a PNG and still exits 0. Say what was lost, on stderr and
+    // still writes the image and still exits 0. Say what was lost, on stderr and
     // in the summary line, rather than reporting a clean render.
     for warning in report.warnings() {
         eprintln!("warning: page {page}: {warning}");
@@ -818,6 +820,23 @@ fn page_index(page: usize, count: usize) -> Result<usize, String> {
 /// Default output path for `render`: `page-N.png`.
 fn default_out(page: usize) -> PathBuf {
     PathBuf::from(format!("page-{page}.png"))
+}
+
+/// The image format `out`'s extension names, PNG carrying the requested
+/// compression level.
+fn output_format(
+    out: &Path,
+    png_compression: PngCompressionArg,
+) -> Result<pdfboss_render::ImageFormat, String> {
+    use pdfboss_render::ImageFormat;
+    let extension = out.extension().and_then(|e| e.to_str()).unwrap_or("");
+    match ImageFormat::from_name(extension) {
+        Some(ImageFormat::Png(_)) => Ok(ImageFormat::Png(png_compression.to_compression())),
+        Some(format) => Ok(format),
+        None => Err(format!(
+            "unsupported output format {extension:?}: use .png, .ppm or .bmp"
+        )),
+    }
 }
 
 #[cfg(test)]

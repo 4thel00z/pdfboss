@@ -246,9 +246,11 @@ class Document:
         fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
+        format: str = "png",
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
-        given) to PNG bytes, fanned out across the machine's cores."""
+        given) to image bytes (PNG unless ``format`` says otherwise), fanned
+        out across the machine's cores."""
 
     def extract_text(self) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``)."""
@@ -345,8 +347,10 @@ class Page:
         fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
+        format: str = "png",
     ) -> bytes:
-        """Renders the page at ``scale`` and returns PNG bytes.
+        """Renders the page at ``scale`` and returns the encoded image: PNG
+        unless ``format`` says otherwise.
 
         ``scale`` must be a positive, finite number (``ValueError``
         otherwise); 1.0 maps one PDF point to one pixel.
@@ -361,9 +365,12 @@ class Page:
         resolves to ``"full"`` when a face source is at hand and to
         ``"all-embedded"`` when none is.
 
-        ``compression`` trades PNG encode time against file size:
-        ``"none"``, ``"fast"``, ``"default"`` or ``"best"``. Every level
-        produces the same pixels.
+        ``format`` picks the file format: ``"png"``, ``"ppm"`` (binary P6,
+        RGB) or ``"bmp"`` (24-bit). PPM and BMP are a header plus the
+        pixels, dropping alpha; ``compression`` trades PNG encode time
+        against file size (``"none"``, ``"fast"``, ``"default"`` or
+        ``"best"``) and only shapes PNG. Every choice produces the same
+        pixels.
 
         Content pdfboss cannot read is skipped rather than raising, so a
         page can come out blank; ``render_reporting`` says what was lost.
@@ -375,8 +382,9 @@ class Page:
         fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
+        format: str = "png",
     ) -> tuple[bytes, list[str]]:
-        """Renders the page like ``render``, returning ``(png, warnings)``.
+        """Renders the page like ``render``, returning ``(image, warnings)``.
 
         ``warnings`` holds one line per distinct piece of content the
         render dropped or approximated, e.g. ``"1 image skipped:
@@ -487,9 +495,10 @@ class AsyncDocument:
         fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
+        format: str = "png",
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
-        given) to PNG bytes — the async twin of ``Document.render_pages``,
+        given) to image bytes — the async twin of ``Document.render_pages``,
         fanned out across the cores as tokio tasks so the asyncio loop
         stays free. Works over any source, including ``open_url``."""
 
@@ -591,8 +600,9 @@ class AsyncPage:
         fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
+        format: str = "png",
     ) -> bytes:
-        """Renders the page at ``scale`` and resolves to PNG bytes — the
+        """Renders the page at ``scale`` and resolves to image bytes — the
         async twin of ``Page.render``, with the same arguments and the
         same leniency."""
 
@@ -602,9 +612,10 @@ class AsyncPage:
         fonts: str | None = None,
         font_dir: str | None = None,
         compression: str = "default",
+        format: str = "png",
     ) -> tuple[bytes, list[str]]:
         """Renders the page like ``render``, resolving to
-        ``(png, warnings)`` — the async twin of ``Page.render_reporting``,
+        ``(image, warnings)`` — the async twin of ``Page.render_reporting``,
         with the same warning semantics."""
 
     async def extract_images(self, compression: str = "default") -> list[PageImage]:
