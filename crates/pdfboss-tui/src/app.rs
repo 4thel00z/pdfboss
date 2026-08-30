@@ -129,6 +129,8 @@ pub enum Cmd {
     ExtractMarkdown { generation: u64, page: usize },
     /// Put `text` on the clipboard; `what` names it in the result toast.
     Copy { text: String, what: &'static str },
+    /// Extract page `page` as Markdown and copy it.
+    YankMarkdown { page: usize },
     /// Fetch the selection's bytes and copy them as `format`. `slice`
     /// narrows a decoded objstm container to the member's range; `base`
     /// is the offset the hexdump's first line shows.
@@ -215,8 +217,8 @@ impl App {
             return self.search.status_line();
         }
         if self.yank_open {
-            return "yank \u{b7} [q] query  [c] command  [x] hexdump  [b] bytes  \
-                    [v] value  [o] obj ref  [esc] cancel"
+            return "yank \u{b7} [q]uery [c]ommand [x] hex [b]ytes [e]lement \
+                    [m]arkdown [o]bj ref [esc]"
                 .to_string();
         }
         if let Some(message) = &self.toast {
@@ -227,7 +229,7 @@ impl App {
         // anyone.
         let yank = if self.size.0 >= 90 { "[y] yank  " } else { "" };
         let resize = if self.size.0 >= 110 {
-            "[ctrl+shift+arrows] resize  "
+            "[alt+arrows] resize  "
         } else {
             ""
         };
@@ -592,13 +594,20 @@ impl App {
                     Vec::new()
                 }
             },
-            YankTarget::Value => match self.value_text() {
+            YankTarget::Element => match self.element_text() {
                 Some(text) => vec![Cmd::Copy {
                     text,
-                    what: "value",
+                    what: "element",
                 }],
                 None => {
-                    self.toast("value still loading");
+                    self.toast("element still loading");
+                    Vec::new()
+                }
+            },
+            YankTarget::Markdown => match self.tree.page_of(self.tree.selected) {
+                Some(page) => vec![Cmd::YankMarkdown { page }],
+                None => {
+                    self.toast("selection has no page");
                     Vec::new()
                 }
             },
@@ -643,7 +652,7 @@ impl App {
     /// The selection pretty-printed: the fetched object when there is one,
     /// otherwise whatever informational lines the inspector shows (the
     /// trailer dict, folder summaries).
-    fn value_text(&self) -> Option<String> {
+    fn element_text(&self) -> Option<String> {
         if self.inspector.loading {
             return None;
         }
@@ -1676,7 +1685,7 @@ mod tests {
             "menu hints replace the status line: {}",
             app.status_line()
         );
-        for hint in ["[q]", "[c]", "[x]", "[b]", "[v]", "[o]", "[esc]"] {
+        for hint in ["[q]", "[c]", "[x]", "[b]", "[e]", "[m]", "[o]", "[esc]"] {
             assert!(
                 app.status_line().contains(hint),
                 "missing {hint} in {}",
@@ -1815,7 +1824,7 @@ mod tests {
     }
 
     #[test]
-    fn yank_value_copies_the_pretty_object() {
+    fn yank_element_copies_the_pretty_object() {
         let mut app = loaded_app();
         select_obj_1(&mut app);
         let mut dict = Dict::new();
@@ -1830,27 +1839,71 @@ mod tests {
                 object: Object::Dict(dict),
             },
         });
-        let cmds = yank(&mut app, 'v');
+        let cmds = yank(&mut app, 'e');
         assert!(
             matches!(
                 cmds.as_slice(),
-                [Cmd::Copy { text, what: "value" }] if text.contains("/Type /Catalog")
+                [Cmd::Copy { text, what: "element" }] if text.contains("/Type /Catalog")
             ),
             "got {cmds:?}"
         );
     }
 
     #[test]
-    fn yank_value_while_loading_toasts() {
+    fn yank_element_while_loading_toasts() {
         let mut app = loaded_app();
         select_obj_1(&mut app); // inspector fetch still in flight
-        let cmds = yank(&mut app, 'v');
+        let cmds = yank(&mut app, 'e');
         assert!(cmds.is_empty());
         assert!(
             app.status_line().contains("loading"),
             "toast explains: {}",
             app.status_line()
         );
+    }
+
+    #[test]
+    fn yank_markdown_extracts_the_selected_page() {
+        let mut app = loaded_app();
+        app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Logical,
+            elements: vec![Element::Page {
+                index: 0,
+                r: obj_ref(1),
+            }],
+            errors: 0,
+            done: true,
+        });
+        app.update(key(KeyCode::Char('j'))); // Pages folder
+        app.update(key(KeyCode::Char('l'))); // expand
+        app.update(key(KeyCode::Char('j'))); // Page 1
+        let cmds = yank(&mut app, 'm');
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::YankMarkdown { page: 0 }]),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn yank_markdown_without_a_page_ancestor_toasts() {
+        let mut app = loaded_app();
+        app.update(key(KeyCode::Char('G'))); // Trailer
+        let cmds = yank(&mut app, 'm');
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line().contains("no page"),
+            "toast explains: {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn alt_arrows_move_the_dividers() {
+        let mut app = loaded_app();
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT)));
+        assert_eq!(app.splits.tree, ui::Splits::default().tree + ui::SPLIT_STEP);
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT)));
+        assert_eq!(app.splits.tree, ui::Splits::default().tree);
     }
 
     #[test]

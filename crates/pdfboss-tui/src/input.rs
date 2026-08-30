@@ -73,20 +73,31 @@ pub fn action_for(key: KeyEvent, context: KeyContext) -> Action {
             KeyCode::Char('c') => Action::Yank(YankTarget::Command),
             KeyCode::Char('x') => Action::Yank(YankTarget::Hexdump),
             KeyCode::Char('b') => Action::Yank(YankTarget::Bytes),
-            KeyCode::Char('v') => Action::Yank(YankTarget::Value),
+            KeyCode::Char('e') => Action::Yank(YankTarget::Element),
+            KeyCode::Char('m') => Action::Yank(YankTarget::Markdown),
             KeyCode::Char('o') => Action::Yank(YankTarget::ObjRef),
             _ => Action::YankCancel,
         };
     }
-    // Ctrl+Shift+arrows resize the panes. Matched on Ctrl alone because
-    // several terminals report Ctrl+Shift+arrow without the Shift bit —
-    // plain Ctrl+arrow was unbound, so nothing is shadowed.
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Alt+arrows (Option on macOS) resize the panes. Ctrl+arrows stay as
+    // a fallback for terminals that swallow the Alt modifier, matched on
+    // Ctrl alone because several terminals report Ctrl+Shift+arrow
+    // without the Shift bit; neither chord shadows anything.
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Left => return Action::ResizeLeft,
             KeyCode::Right => return Action::ResizeRight,
             KeyCode::Up => return Action::ResizeUp,
             KeyCode::Down => return Action::ResizeDown,
+            _ => {}
+        }
+    }
+    // Stock iTerm2 and Terminal.app map Option+Left/Right to the Emacs
+    // word motions `ESC b` / `ESC f`, which arrive as Alt+b / Alt+f.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char('b') => return Action::ResizeLeft,
+            KeyCode::Char('f') => return Action::ResizeRight,
             _ => {}
         }
     }
@@ -263,7 +274,8 @@ mod tests {
             (KeyCode::Char('c'), YankTarget::Command),
             (KeyCode::Char('x'), YankTarget::Hexdump),
             (KeyCode::Char('b'), YankTarget::Bytes),
-            (KeyCode::Char('v'), YankTarget::Value),
+            (KeyCode::Char('e'), YankTarget::Element),
+            (KeyCode::Char('m'), YankTarget::Markdown),
             (KeyCode::Char('o'), YankTarget::ObjRef),
         ] {
             assert_eq!(
@@ -281,9 +293,59 @@ mod tests {
             "an unmapped key closes the menu instead of leaking through"
         );
         assert_eq!(
+            action_for(press(KeyCode::Char('v')), KeyContext::Yank),
+            Action::YankCancel,
+            "v moved to e; the old key cancels instead of copying"
+        );
+        assert_eq!(
             action_for(press(KeyCode::Enter), KeyContext::Yank),
             Action::YankCancel
         );
+    }
+
+    /// Stock iTerm2 and Terminal.app map Option+Left/Right to the Emacs
+    /// word motions `ESC b` / `ESC f`, which crossterm reports as Alt+b /
+    /// Alt+f; those must resize like the Alt+arrows they stand in for.
+    #[test]
+    fn alt_b_and_f_resize_like_alt_left_right() {
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+                KeyContext::Normal
+            ),
+            Action::ResizeLeft
+        );
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+                KeyContext::Normal
+            ),
+            Action::ResizeRight
+        );
+        // Plain b/f stay unbound.
+        assert_eq!(
+            action_for(press(KeyCode::Char('b')), KeyContext::Normal),
+            Action::Noop
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('f')), KeyContext::Normal),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn alt_arrows_resize() {
+        for (code, action) in [
+            (KeyCode::Left, Action::ResizeLeft),
+            (KeyCode::Right, Action::ResizeRight),
+            (KeyCode::Up, Action::ResizeUp),
+            (KeyCode::Down, Action::ResizeDown),
+        ] {
+            assert_eq!(
+                action_for(KeyEvent::new(code, KeyModifiers::ALT), KeyContext::Normal),
+                action
+            );
+        }
     }
 
     #[test]
