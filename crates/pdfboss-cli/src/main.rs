@@ -761,7 +761,7 @@ fn cmd_tui(target: &str, password: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     runtime.block_on(async {
         let doc = open_async_document(target, password).await?;
-        pdfboss_tui::run(doc, display_title(target))
+        pdfboss_tui::run(doc, display_title(target), target.to_string())
             .await
             .map_err(|e| e.to_string())
     })

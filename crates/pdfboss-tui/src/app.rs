@@ -7,16 +7,17 @@ use std::sync::Arc;
 
 use crossterm::event::KeyEvent;
 use pdfboss_core::elements::{Element, Span};
-use pdfboss_core::ObjRef;
+use pdfboss_core::{pretty, ObjRef};
 
 use crate::hexview::{HexSource, HexState};
-use crate::input::{action_for, Action};
+use crate::input::{action_for, Action, KeyContext};
 use crate::inspector::{InspectorPayload, InspectorState};
 use crate::markdown::MarkdownState;
 use crate::preview::{PreviewFrame, PreviewState, RESIZE_DEBOUNCE_TICKS};
 use crate::search::{SearchHit, SearchState};
 use crate::tree::{LoadState, NodeId, NodeKind, TreeReq, TreeState};
 use crate::ui;
+use crate::yank::{self, YankFormat, YankTarget};
 
 /// Ticks (100 ms) a toast stays visible.
 const TOAST_TICKS: u8 = 30;
@@ -87,6 +88,8 @@ pub enum Msg {
         generation: u64,
         result: Result<String, String>,
     },
+    /// A yank finished: the toast text, or what went wrong.
+    Yanked { result: Result<String, String> },
 }
 
 /// Side effects `update` requests; the event loop executes them by
@@ -124,11 +127,25 @@ pub enum Cmd {
     },
     /// Extract page `page` as Markdown.
     ExtractMarkdown { generation: u64, page: usize },
+    /// Put `text` on the clipboard; `what` names it in the result toast.
+    Copy { text: String, what: &'static str },
+    /// Fetch the selection's bytes and copy them as `format`. `slice`
+    /// narrows a decoded objstm container to the member's range; `base`
+    /// is the offset the hexdump's first line shows.
+    YankSpan {
+        source: HexSource,
+        slice: Option<Span>,
+        base: u64,
+        format: YankFormat,
+    },
 }
 
 /// The whole TUI state.
 pub struct App {
     pub title: String,
+    /// The path or URL the document was opened from, verbatim, for the
+    /// yank menu's shell-command target.
+    pub target: String,
     pub tree: TreeState,
     pub inspector: InspectorState,
     pub hex: HexState,
@@ -139,6 +156,8 @@ pub struct App {
     pub history: Vec<NodeId>,
     pub pending_jump: Option<ObjRef>,
     pub toast: Option<String>,
+    /// Whether the yank menu is capturing the next key.
+    pub yank_open: bool,
     toast_ticks: u8,
     pub size: (u16, u16),
     /// The adjustable pane splits (Ctrl+Shift+arrows).
@@ -150,9 +169,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(title: String, version: (u8, u8), page_count: usize, size: (u16, u16)) -> App {
+    pub fn new(
+        title: String,
+        target: String,
+        version: (u8, u8),
+        page_count: usize,
+        size: (u16, u16),
+    ) -> App {
         let mut app = App {
             title,
+            target,
             tree: TreeState::new(version, page_count),
             inspector: InspectorState::new(),
             hex: HexState::new(),
@@ -163,6 +189,7 @@ impl App {
             history: Vec::new(),
             pending_jump: None,
             toast: None,
+            yank_open: false,
             toast_ticks: 0,
             size,
             splits: ui::Splits::default(),
@@ -187,18 +214,25 @@ impl App {
         if self.search.active {
             return self.search.status_line();
         }
+        if self.yank_open {
+            return "yank \u{b7} [q] query  [c] command  [x] hexdump  [b] bytes  \
+                    [v] value  [o] obj ref  [esc] cancel"
+                .to_string();
+        }
         if let Some(message) = &self.toast {
             return message.clone();
         }
-        // The resize hint only where it fits: on a narrow terminal it would
-        // push [q] quit off the end of the bar instead of informing anyone.
+        // Optional hints only where they fit: on a narrow terminal they
+        // would push [q] quit off the end of the bar instead of informing
+        // anyone.
+        let yank = if self.size.0 >= 90 { "[y] yank  " } else { "" };
         let resize = if self.size.0 >= 110 {
             "[ctrl+shift+arrows] resize  "
         } else {
             ""
         };
         format!(
-            "{} \u{b7} {} \u{b7} [/] search  [p] preview  [m] markdown  {resize}[q] quit",
+            "{} \u{b7} {} \u{b7} [/] search  [p] preview  [m] markdown  {yank}{resize}[q] quit",
             self.title,
             self.tree.breadcrumb()
         )
@@ -323,6 +357,13 @@ impl App {
                 }
                 Vec::new()
             }
+            Msg::Yanked { result } => {
+                match result {
+                    Ok(text) => self.toast(text),
+                    Err(error) => self.toast(format!("yank failed: {error}")),
+                }
+                Vec::new()
+            }
         }
     }
 
@@ -341,8 +382,14 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Vec<Cmd> {
-        let action = action_for(key, self.search.active);
-        self.on_action(action)
+        let context = if self.search.active {
+            KeyContext::Search
+        } else if self.yank_open {
+            KeyContext::Yank
+        } else {
+            KeyContext::Normal
+        };
+        self.on_action(action_for(key, context))
     }
 
     fn on_action(&mut self, action: Action) -> Vec<Cmd> {
@@ -382,6 +429,18 @@ impl App {
                 Some(hit) => self.jump_to(hit.r),
                 None => Vec::new(),
             },
+            Action::OpenYank => {
+                self.yank_open = true;
+                Vec::new()
+            }
+            Action::Yank(target) => {
+                self.yank_open = false;
+                self.on_yank(target)
+            }
+            Action::YankCancel => {
+                self.yank_open = false;
+                Vec::new()
+            }
             Action::FocusNext => {
                 self.focus = match self.focus {
                     Pane::Tree => Pane::Inspector,
@@ -499,6 +558,102 @@ impl App {
                 }
             },
         }
+    }
+
+    fn on_yank(&mut self, target: YankTarget) -> Vec<Cmd> {
+        match target {
+            YankTarget::Query => match self.tree.query(self.tree.selected) {
+                Some(query) => vec![Cmd::Copy {
+                    text: query,
+                    what: "query",
+                }],
+                None => {
+                    self.toast("no query for %%EOF");
+                    Vec::new()
+                }
+            },
+            YankTarget::Command => match self.tree.query(self.tree.selected) {
+                Some(query) => vec![Cmd::Copy {
+                    text: yank::q_command(&self.target, &query),
+                    what: "command",
+                }],
+                None => {
+                    self.toast("no query for %%EOF");
+                    Vec::new()
+                }
+            },
+            YankTarget::ObjRef => match self.tree.selection_ref(self.tree.selected) {
+                Some(r) => vec![Cmd::Copy {
+                    text: format!("{} {} R", r.num, r.gen),
+                    what: "obj ref",
+                }],
+                None => {
+                    self.toast("selection has no object ref");
+                    Vec::new()
+                }
+            },
+            YankTarget::Value => match self.value_text() {
+                Some(text) => vec![Cmd::Copy {
+                    text,
+                    what: "value",
+                }],
+                None => {
+                    self.toast("value still loading");
+                    Vec::new()
+                }
+            },
+            YankTarget::Hexdump | YankTarget::Bytes => {
+                let format = match target {
+                    YankTarget::Hexdump => YankFormat::Hexdump,
+                    _ => YankFormat::Bytes,
+                };
+                let Some(source) = self.hex.source.clone() else {
+                    self.toast("selection has no bytes");
+                    return Vec::new();
+                };
+                match &source {
+                    HexSource::File { span }
+                        if span.end.saturating_sub(span.start) > yank::CAP_BYTES =>
+                    {
+                        let selector = format!("range:{}-{}", span.start, span.end);
+                        vec![Cmd::Copy {
+                            text: yank::hex_command(&self.target, &selector),
+                            what: "hex command (selection exceeds the yank cap)",
+                        }]
+                    }
+                    HexSource::File { span } => vec![Cmd::YankSpan {
+                        base: span.start,
+                        source,
+                        slice: None,
+                        format,
+                    }],
+                    // A decoded objstm container: the member's range is
+                    // the pane's highlight.
+                    HexSource::DecodedObjStm { .. } => vec![Cmd::YankSpan {
+                        base: self.hex.highlight.map_or(0, |member| member.start),
+                        source,
+                        slice: self.hex.highlight,
+                        format,
+                    }],
+                }
+            }
+        }
+    }
+
+    /// The selection pretty-printed: the fetched object when there is one,
+    /// otherwise whatever informational lines the inspector shows (the
+    /// trailer dict, folder summaries).
+    fn value_text(&self) -> Option<String> {
+        if self.inspector.loading {
+            return None;
+        }
+        if let Some((.., object)) = &self.inspector.object {
+            return Some(pretty::format_object(object));
+        }
+        if self.inspector.lines.is_empty() {
+            return None;
+        }
+        Some(self.inspector.lines.join("\n"))
     }
 
     fn on_move(&mut self, delta: i32) -> Vec<Cmd> {
@@ -897,7 +1052,13 @@ mod tests {
 
     #[test]
     fn ctrl_shift_arrows_move_the_dividers_and_clamp() {
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         assert_eq!(app.splits, ui::Splits::default());
 
         app.update(resize_key(KeyCode::Right));
@@ -927,7 +1088,13 @@ mod tests {
 
     #[test]
     fn resizing_rerenders_an_active_preview() {
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         let cmds = app.update(key(KeyCode::Char('p')));
         assert!(
             matches!(cmds.as_slice(), [Cmd::RenderPreview { .. }]),
@@ -975,7 +1142,7 @@ mod tests {
                     start: 64,
                     end: 120,
                 },
-                in_objstm: None,
+                in_objstm: Some((obj_ref(9), Span { start: 4, end: 30 })),
             },
             Element::XrefSection {
                 kind: XrefKind::Table,
@@ -996,7 +1163,13 @@ mod tests {
     }
 
     fn loaded_app() -> App {
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         let cmds = app.update(Msg::TreeBatch {
             req: crate::tree::TreeReq::Physical,
             elements: physical_elements(),
@@ -1094,7 +1267,13 @@ mod tests {
 
     #[test]
     fn jump_before_physical_load_defers() {
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         let cmds = app.jump_to(obj_ref(2));
         assert!(matches!(
             cmds.as_slice(),
@@ -1375,6 +1554,292 @@ mod tests {
     }
 
     #[test]
+    fn y_opens_the_yank_menu_and_esc_closes_it_without_quitting() {
+        let mut app = loaded_app();
+        assert!(app.update(key(KeyCode::Char('y'))).is_empty());
+        assert!(app.yank_open);
+        assert!(
+            app.status_line().starts_with("yank"),
+            "menu hints replace the status line: {}",
+            app.status_line()
+        );
+        for hint in ["[q]", "[c]", "[x]", "[b]", "[v]", "[o]", "[esc]"] {
+            assert!(
+                app.status_line().contains(hint),
+                "missing {hint} in {}",
+                app.status_line()
+            );
+        }
+        app.update(key(KeyCode::Esc));
+        assert!(!app.yank_open);
+        assert!(!app.should_quit, "Esc closed the menu, not the app");
+    }
+
+    #[test]
+    fn unmapped_key_cancels_the_yank_menu_and_does_not_leak_through() {
+        let mut app = loaded_app();
+        let selected = app.tree.selected;
+        app.update(key(KeyCode::Char('y')));
+        let cmds = app.update(key(KeyCode::Char('j')));
+        assert!(!app.yank_open);
+        assert!(cmds.is_empty());
+        assert_eq!(app.tree.selected, selected, "j cancelled instead of moving");
+    }
+
+    fn select_obj_1(app: &mut App) {
+        app.update(key(KeyCode::Char('j'))); // Pages
+        app.update(key(KeyCode::Char('j'))); // Objects
+        app.update(key(KeyCode::Char('l'))); // expand (already loaded)
+        app.update(key(KeyCode::Char('j'))); // obj 1 0
+    }
+
+    fn yank(app: &mut App, target: char) -> Vec<Cmd> {
+        app.update(key(KeyCode::Char('y')));
+        app.update(key(KeyCode::Char(target)))
+    }
+
+    #[test]
+    fn yank_query_copies_the_selection_expression() {
+        let mut app = loaded_app();
+        select_obj_1(&mut app);
+        let cmds = yank(&mut app, 'q');
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Copy { text, what: "query" }] if text == ".objects[\"1 0\"]"
+            ),
+            "got {cmds:?}"
+        );
+        assert!(!app.yank_open, "the menu closes after a yank");
+    }
+
+    #[test]
+    fn yank_command_quotes_the_target_and_query() {
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "my docs/o'clock.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
+        app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Physical,
+            elements: physical_elements(),
+            errors: 0,
+            done: true,
+        });
+        select_obj_1(&mut app);
+        let cmds = yank(&mut app, 'c');
+        let expected = "pdfboss q 'my docs/o'\\''clock.pdf' '.objects[\"1 0\"]'";
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Copy { text, what: "command" }] if text == expected
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn yank_query_on_eof_toasts_instead_of_copying() {
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
+        let mut elements = physical_elements();
+        elements.push(Element::Eof {
+            span: Span {
+                start: 300,
+                end: 306,
+            },
+        });
+        app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Physical,
+            elements,
+            errors: 0,
+            done: true,
+        });
+        let eof_node = *app
+            .tree
+            .node(app.tree.xref_folder)
+            .children
+            .last()
+            .expect("xref children");
+        app.tree.reveal(eof_node);
+        app.tree.selected = eof_node;
+        let cmds = yank(&mut app, 'q');
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line().contains("no query"),
+            "toast explains: {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn yank_obj_ref_copies_n_g_r_and_toasts_without_a_ref() {
+        let mut app = loaded_app();
+        select_obj_1(&mut app);
+        let cmds = yank(&mut app, 'o');
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Copy { text, what: "obj ref" }] if text == "1 0 R"
+            ),
+            "got {cmds:?}"
+        );
+        app.update(key(KeyCode::Char('g'))); // Document root
+        let cmds = yank(&mut app, 'o');
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line().contains("no object ref"),
+            "toast explains: {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn yank_value_copies_the_pretty_object() {
+        let mut app = loaded_app();
+        select_obj_1(&mut app);
+        let mut dict = Dict::new();
+        dict.insert(
+            Name("Type".to_string()),
+            Object::Name(Name("Catalog".to_string())),
+        );
+        app.update(Msg::InspectorLoaded {
+            generation: app.inspector_generation,
+            payload: crate::inspector::InspectorPayload::Object {
+                r: obj_ref(1),
+                object: Object::Dict(dict),
+            },
+        });
+        let cmds = yank(&mut app, 'v');
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Copy { text, what: "value" }] if text.contains("/Type /Catalog")
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn yank_value_while_loading_toasts() {
+        let mut app = loaded_app();
+        select_obj_1(&mut app); // inspector fetch still in flight
+        let cmds = yank(&mut app, 'v');
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line().contains("loading"),
+            "toast explains: {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn yank_hexdump_fetches_the_file_span() {
+        let mut app = loaded_app();
+        select_obj_1(&mut app);
+        let cmds = yank(&mut app, 'x');
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::YankSpan {
+                    source: HexSource::File { span },
+                    slice: None,
+                    base: 15,
+                    format: YankFormat::Hexdump,
+                }] if span.start == 15 && span.end == 64
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn yank_bytes_of_an_objstm_member_slices_the_decoded_container() {
+        let mut app = loaded_app();
+        select_obj_1(&mut app);
+        app.update(key(KeyCode::Char('j'))); // obj 2 0, member of objstm 9 0
+        let cmds = yank(&mut app, 'b');
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::YankSpan {
+                    source: HexSource::DecodedObjStm { container },
+                    slice: Some(member),
+                    base: 4,
+                    format: YankFormat::Bytes,
+                }] if container.num == 9 && member.start == 4 && member.end == 30
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn yank_hexdump_over_the_cap_copies_the_cli_command_instead() {
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "big file.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
+        app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Physical,
+            elements: vec![Element::IndirectObject {
+                r: obj_ref(1),
+                object: Object::Null,
+                span: Span {
+                    start: 0,
+                    end: 2 * 1024 * 1024,
+                },
+                in_objstm: None,
+            }],
+            errors: 0,
+            done: true,
+        });
+        select_obj_1(&mut app);
+        let cmds = yank(&mut app, 'x');
+        let expected = "pdfboss hex 'big file.pdf' 'range:0-2097152'";
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [Cmd::Copy { text, what }] if text == expected && what.contains("hex command")
+            ),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn yank_hexdump_without_bytes_toasts() {
+        let mut app = loaded_app(); // Document root: the hex pane is empty
+        let cmds = yank(&mut app, 'x');
+        assert!(cmds.is_empty());
+        assert!(
+            app.status_line().contains("no bytes"),
+            "toast explains: {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn yanked_message_toasts_success_and_failure() {
+        let mut app = loaded_app();
+        app.update(Msg::Yanked {
+            result: Ok("copied query (18 B)".to_string()),
+        });
+        assert_eq!(app.status_line(), "copied query (18 B)");
+        app.update(Msg::Yanked {
+            result: Err("no clipboard".to_string()),
+        });
+        assert_eq!(app.status_line(), "yank failed: no clipboard");
+    }
+
+    #[test]
     fn toast_expires_after_ticks() {
         let mut app = loaded_app();
         app.toast("hello");
@@ -1391,7 +1856,13 @@ mod tests {
         let mut app = loaded_app();
         assert_eq!(
             app.status_line(),
-            "t.pdf \u{b7} /Document \u{b7} [/] search  [p] preview  [m] markdown  [q] quit"
+            "t.pdf \u{b7} /Document \u{b7} [/] search  [p] preview  [m] markdown  [q] quit",
+            "at 80 cols the yank hint would push [q] quit off the bar"
+        );
+        app.update(Msg::Resize(100, 24));
+        assert_eq!(
+            app.status_line(),
+            "t.pdf \u{b7} /Document \u{b7} [/] search  [p] preview  [m] markdown  [y] yank  [q] quit"
         );
         app.update(key(KeyCode::Char('/')));
         app.update(key(KeyCode::Char('a')));
@@ -1400,7 +1871,13 @@ mod tests {
 
     #[test]
     fn trailer_node_shows_message_when_physical_pass_found_no_trailer() {
-        let mut app = App::new("t.pdf".to_string(), (1, 7), 1, (80, 24));
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            1,
+            (80, 24),
+        );
         // Physical pass completes without ever emitting `Element::Trailer`
         // (e.g. a damaged trailer region): `trailer_dict` stays `None`
         // even though the pass is done.

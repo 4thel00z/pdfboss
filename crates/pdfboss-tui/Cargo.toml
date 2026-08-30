@@ -17,6 +17,8 @@ ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 futures-util = "0.3"
+arboard = { version = "3", default-features = false }
+base64 = "0.22"
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
