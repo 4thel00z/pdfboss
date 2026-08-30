@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.0.0](https://github.com/4thel00z/pdfboss/compare/v0.25.0...v1.0.0) (2026-08-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **aio:** pdfboss_aio::Error::RangeUnsupported is removed; range-less servers now open successfully via a single full download.
+
+### Features
+
+* **aio:** adaptive miss batching, 5xx retry, fallback progress bar ([#131](https://github.com/4thel00z/pdfboss/issues/131)) ([f89c179](https://github.com/4thel00z/pdfboss/commit/f89c179b58d00ea1d00d0abccc01e44a69dc5f32))
+* **aio:** fall back to one full download when the server ignores Range ([#123](https://github.com/4thel00z/pdfboss/issues/123)) ([fd35379](https://github.com/4thel00z/pdfboss/commit/fd353794a916794432c59d28d63ad3dc23ccdd1d))
+* **tui:** y e element and y m markdown yanks, alt+arrow resizing ([#127](https://github.com/4thel00z/pdfboss/issues/127)) ([27ddcce](https://github.com/4thel00z/pdfboss/commit/27ddccec335182a2b94de1fae5b86ce44f7924b8))
+* **tui:** yank menu copying query, command, hexdump, bytes, value, obj ref ([#122](https://github.com/4thel00z/pdfboss/issues/122)) ([932d821](https://github.com/4thel00z/pdfboss/commit/932d821469d4a5e7e5f5479cf4ce5658e8bd29e6))
+
+
+### Bug Fixes
+
+* **tui:** active preview and markdown panes follow the selection ([#126](https://github.com/4thel00z/pdfboss/issues/126)) ([dc471c2](https://github.com/4thel00z/pdfboss/commit/dc471c23724cf4a833d6e9644fbc40a256631ad5))
+
+
+### Performance Improvements
+
+* **core:** skip whitespace once per token, compose operands from raw tokens ([#128](https://github.com/4thel00z/pdfboss/issues/128)) ([d5e6f6f](https://github.com/4thel00z/pdfboss/commit/d5e6f6f0bc91f2b46669821cfd982e30217ebdbd))
+* **render:** tokenize once into a buffered stream, look deflate codes up directly ([#129](https://github.com/4thel00z/pdfboss/issues/129)) ([9bfa5cf](https://github.com/4thel00z/pdfboss/commit/9bfa5cf53d548c664fb16021cf0923b3a84e526e))
+* **text:** pull-parse content operators, lex numeric runs in one pass ([#130](https://github.com/4thel00z/pdfboss/issues/130)) ([fadc5fb](https://github.com/4thel00z/pdfboss/commit/fadc5fb7907a405d465687c794bcea7e5ac782e7))
+
+
+### Documentation
+
+* re-measure the README benchmarks at 1.0.0 ([#132](https://github.com/4thel00z/pdfboss/issues/132)) ([cfe4c08](https://github.com/4thel00z/pdfboss/commit/cfe4c08ad36e2d3f5524b89de5dee3cdfb644679))
+
 ## [0.25.0](https://github.com/4thel00z/pdfboss/compare/v0.24.0...v0.25.0) (2026-08-28)
 
 

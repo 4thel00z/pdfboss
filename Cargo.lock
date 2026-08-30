@@ -1355,7 +1355,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pdfboss-aio"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "flate2",
@@ -1373,7 +1373,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-cli"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "clap",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-core"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "criterion",
  "flate2",
@@ -1410,19 +1410,19 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-encoding"
-version = "0.25.0"
+version = "1.0.0"
 
 [[package]]
 name = "pdfboss-icc"
-version = "0.25.0"
+version = "1.0.0"
 
 [[package]]
 name = "pdfboss-jpx"
-version = "0.25.0"
+version = "1.0.0"
 
 [[package]]
 name = "pdfboss-markdown"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "pdfboss-core",
  "pdfboss-output",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-output"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "criterion",
  "pdfboss-core",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-py"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "futures-util",
  "pdfboss-aio",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-render"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "criterion",
  "jpeg-decoder",
@@ -1478,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-style"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "cssparser",
  "pdfboss-write",
@@ -1486,11 +1486,11 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-testkit"
-version = "0.25.0"
+version = "1.0.0"
 
 [[package]]
 name = "pdfboss-text"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "pdfboss-core",
  "pdfboss-encoding",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-tui"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "base64",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "pdfboss-write"
-version = "0.25.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "pdfboss-core",
