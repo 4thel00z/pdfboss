@@ -583,6 +583,7 @@ fn tex_glyph(name: &str) -> Option<char> {
 /// size variants of a delimiter or operator (`parenleftbig`, `parenleftBig`,
 /// `summationdisplay`) all stand for the one character.
 const GLYPHS_TEX: &[(&str, char)] = &[
+    ("Circle", '\u{25CB}'),
     ("Ifractur", '\u{2111}'),
     ("Rfractur", '\u{211C}'),
     ("angbracketleft", '\u{27E8}'),
@@ -673,11 +674,13 @@ const GLYPHS_TEX: &[(&str, char)] = &[
     ("floorrightbigg", '\u{230B}'),
     ("followsequal", '\u{227D}'),
     ("greatermuch", '\u{226B}'),
+    ("greaterorsimilar", '\u{2273}'),
     ("hatwide", '^'),
     ("hatwider", '^'),
     ("hatwidest", '^'),
     ("integraldisplay", '\u{222B}'),
     ("integraltext", '\u{222B}'),
+    ("intercal", '\u{22BA}'),
     ("intersectiondisplay", '\u{22C2}'),
     ("intersectionsq", '\u{2293}'),
     ("intersectionsqdisplay", '\u{2A05}'),
@@ -685,14 +688,19 @@ const GLYPHS_TEX: &[(&str, char)] = &[
     ("intersectiontext", '\u{22C2}'),
     ("latticetop", '\u{22A4}'),
     ("lessmuch", '\u{226A}'),
+    ("lessorsimilar", '\u{2272}'),
     ("logicalanddisplay", '\u{22C0}'),
     ("logicalandtext", '\u{22C0}'),
     ("logicalordisplay", '\u{22C1}'),
     ("logicalortext", '\u{22C1}'),
     ("lscript", '\u{2113}'),
     ("mapsto", '\u{21A6}'),
+    ("measuredangle", '\u{2221}'),
     ("minusplus", '\u{2213}'),
     ("natural", '\u{266E}'),
+    ("negationslash", '\u{0338}'),
+    ("nequal", '\u{2260}'),
+    ("notexistential", '\u{2204}'),
     ("openbullet", '\u{25E6}'),
     ("owner", '\u{220B}'),
     ("parenleftBig", '('),
@@ -706,6 +714,7 @@ const GLYPHS_TEX: &[(&str, char)] = &[
     ("phi1", '\u{3D5}'),
     ("pi1", '\u{3D6}'),
     ("precedesequal", '\u{227C}'),
+    ("prime", '\u{2032}'),
     ("productdisplay", '\u{220F}'),
     ("producttext", '\u{220F}'),
     ("radicalBig", '\u{221A}'),
@@ -722,7 +731,9 @@ const GLYPHS_TEX: &[(&str, char)] = &[
     ("slashbigg", '/'),
     ("slurabove", '\u{2322}'),
     ("slurbelow", '\u{2323}'),
+    ("squaresolid", '\u{25A0}'),
     ("star", '\u{22C6}'),
+    ("subsetnoteql", '\u{228A}'),
     ("subsetsqequal", '\u{2291}'),
     ("summationdisplay", '\u{2211}'),
     ("summationtext", '\u{2211}'),
@@ -747,6 +758,8 @@ const GLYPHS_TEX: &[(&str, char)] = &[
     ("unionsqtext", '\u{2A06}'),
     ("uniontext", '\u{22C3}'),
     ("vector", '\u{20D7}'),
+    ("vextenddouble", '\u{2016}'),
+    ("vextendsingle", '|'),
     ("weierstrass", '\u{2118}'),
     ("wreathproduct", '\u{2240}'),
 ];
@@ -1085,6 +1098,12 @@ mod tests {
         assert_eq!(glyph_to_unicode("arrowbothv"), Some('\u{2195}'));
         assert_eq!(glyph_to_unicode("angbracketleft"), Some('\u{27E8}'));
         assert_eq!(glyph_to_unicode("lessmuch"), Some('\u{226A}'));
+        assert_eq!(glyph_to_unicode("prime"), Some('\u{2032}'));
+        assert_eq!(glyph_to_unicode("negationslash"), Some('\u{0338}'));
+        assert_eq!(glyph_to_unicode("lessorsimilar"), Some('\u{2272}'));
+        assert_eq!(glyph_to_unicode("notexistential"), Some('\u{2204}'));
+        assert_eq!(glyph_to_unicode("vextendsingle"), Some('|'));
+        assert_eq!(glyph_to_unicode("Circle"), Some('\u{25CB}'));
     }
 
     #[test]
