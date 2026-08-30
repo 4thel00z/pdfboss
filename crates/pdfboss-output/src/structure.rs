@@ -46,8 +46,12 @@ const GUTTER_MAX_CROSSING: f32 = 0.1;
 /// column's foot to the next column's head, never a fraction's numerator a
 /// line above the text it follows.
 const FLOW_STEP_UP: f32 = 2.0;
-/// When a page's flows outnumber this fraction of its lines, the stream was
-/// not written in reading order and the page is ordered by geometry alone.
+/// A flow with fewer distinct baselines than this is a fragment: a stray
+/// label, a page number, one line of a stream written out of order.
+const FLOW_MIN_LINES: usize = 3;
+/// When more than this fraction of a page's text sits in fragments, the
+/// stream was not written in reading order and the page is ordered by
+/// geometry alone.
 const FLOW_FRAGMENT_FRACTION: f32 = 0.5;
 
 /// How far above body size a size bucket must sit before it reads as a
@@ -1749,9 +1753,12 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
 /// opens another; a display fraction's numerator, a line above the baseline
 /// it follows, does not. Side-by-side flows too sparse to be text columns
 /// merge back into one, so a table written column by column still reaches
-/// the lane detector as rows. A page whose flows outnumber
-/// [`FLOW_FRAGMENT_FRACTION`] of its lines was not written in reading order
-/// at all, and is one flow ordered by geometry.
+/// the lane detector as rows. A page with more than
+/// [`FLOW_FRAGMENT_FRACTION`] of its text in flows shorter than
+/// [`FLOW_MIN_LINES`] was not written in reading order at all, and is one
+/// flow ordered by geometry; a figure's scattered labels beside a body
+/// column are a sliver of the page's text and leave the column in content
+/// order.
 fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     let mut flows: Vec<Vec<&TextSpan>> = Vec::new();
     for span in spans {
@@ -1760,10 +1767,15 @@ fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
             _ => flows.push(vec![span]),
         }
     }
-    let all: Vec<&TextSpan> = spans.iter().collect();
-    if flows.len() > 1 && flows.len() as f32 > FLOW_FRAGMENT_FRACTION * baseline_count(&all) as f32
-    {
-        return vec![all];
+    let chars = |flow: &[&TextSpan]| -> usize { flow.iter().map(|s| s.text.chars().count()).sum() };
+    let fragmented: usize = flows
+        .iter()
+        .filter(|flow| baseline_count(flow) < FLOW_MIN_LINES)
+        .map(|flow| chars(flow))
+        .sum();
+    let total: usize = flows.iter().map(|flow| chars(flow)).sum();
+    if flows.len() > 1 && fragmented as f32 > FLOW_FRAGMENT_FRACTION * total as f32 {
+        return vec![spans.iter().collect()];
     }
     merge_sparse_neighbours(flows)
 }
@@ -1773,9 +1785,13 @@ fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
     next.y - prev.y > FLOW_STEP_UP * prev.size.max(next.size)
 }
 
-/// Merges each flow into the one before it when both are too sparse to be
-/// text columns and they overlap vertically: the columns of a table written
-/// column by column, which read as rows only once they share a segment.
+/// Merges a flow into the one before it when that one is multi-line yet too
+/// sparse to be a text column, this one is no text column either, and the
+/// two overlap vertically: the columns of a table written column by column,
+/// and a wrapped cell written after its grid, read as rows only once they
+/// share a segment. A fragment (see [`FLOW_MIN_LINES`]) never starts such a
+/// merge, so a figure's scattered labels beside a body column stay in
+/// content order rather than sorting by height.
 fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
     let mut merged: Vec<Vec<&TextSpan>> = Vec::new();
     for flow in flows {
@@ -1783,7 +1799,8 @@ fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
             merged.push(flow);
             continue;
         };
-        if column_shaped(prev) || column_shaped(&flow) || !y_overlaps(prev, &flow) {
+        let table_like = !column_shaped(prev) && baseline_count(prev) >= FLOW_MIN_LINES;
+        if !table_like || column_shaped(&flow) || !y_overlaps(prev, &flow) {
             merged.push(flow);
             continue;
         }
@@ -2557,6 +2574,33 @@ pub(crate) mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "Line0");
         assert_eq!(lines[11], "Line11");
+    }
+
+    /// A figure's scattered labels, emitted in no vertical order after the
+    /// body, open a flow apiece; they are a sliver of the page's text and
+    /// do not send the body column back to geometry, where the labels would
+    /// interleave with its lines.
+    #[test]
+    fn scattered_figure_labels_do_not_force_geometric_order() {
+        let body: String = (0..12)
+            .map(|i| {
+                format!(
+                    "BT /F1 12 Tf 72 {} Td (Body line number {i} of the column) Tj ET ",
+                    720 - i * 14
+                )
+            })
+            .collect();
+        let labels: String = [600, 700, 580, 690, 566, 650, 720, 610, 640, 680, 590, 630]
+            .iter()
+            .enumerate()
+            .map(|(i, y)| format!("BT /F1 8 Tf 420 {y} Td (t{i}) Tj ET "))
+            .collect();
+        let text = text_of(&(body + &labels));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Body line number 0 of the column");
+        assert_eq!(lines[11], "Body line number 11 of the column");
+        assert_eq!(lines[12], "t0");
+        assert_eq!(lines.len(), 24);
     }
 
     /// A display fraction's numerator sits a line above the baseline it is
