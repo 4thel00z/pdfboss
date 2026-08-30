@@ -1,7 +1,8 @@
 //! Random-access byte sources: in-memory bytes, positioned file reads on a
 //! blocking thread, and (behind the `http` feature) remote HTTP range
-//! requests. The trait is object-safe — futures are boxed — so documents
-//! can hold `Arc<dyn Backend>`.
+//! requests with a one-time full-download fallback for range-less servers.
+//! The trait is object-safe — futures are boxed — so documents can hold
+//! `Arc<dyn Backend>`.
 
 use std::io;
 use std::path::Path;
@@ -38,6 +39,18 @@ impl From<Bytes> for MemBackend {
     }
 }
 
+/// One bounded read from an in-memory byte source: offsets at or past the
+/// end read zero bytes, everything else fills as much of `buf` as the data
+/// allows.
+fn read_from_bytes(data: &[u8], offset: u64, buf: &mut [u8]) -> usize {
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(data.len());
+    let count = buf.len().min(data.len() - start);
+    buf[..count].copy_from_slice(&data[start..start + count]);
+    count
+}
+
 impl Backend for MemBackend {
     fn len(&self) -> BoxFuture<'_, io::Result<u64>> {
         let total = self.0.len() as u64;
@@ -45,15 +58,7 @@ impl Backend for MemBackend {
     }
 
     fn read_at<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> BoxFuture<'a, io::Result<usize>> {
-        Box::pin(async move {
-            let data = &self.0;
-            let start = usize::try_from(offset)
-                .unwrap_or(usize::MAX)
-                .min(data.len());
-            let count = buf.len().min(data.len() - start);
-            buf[..count].copy_from_slice(&data[start..start + count]);
-            Ok(count)
-        })
+        Box::pin(async move { Ok(read_from_bytes(&self.0, offset, buf)) })
     }
 }
 
@@ -136,14 +141,18 @@ impl Backend for FileBackend {
 }
 
 /// A byte source over HTTP: length via `HEAD`/`Content-Length`, reads via
-/// `Range: bytes=` requests. A server that ignores Range (answers 200
-/// with the full body instead of 206) yields
-/// [`crate::Error::RangeUnsupported`].
+/// `Range: bytes=` requests. A server that ignores Range (answers 200 with
+/// the full body instead of 206, like `python3 -m http.server`) triggers a
+/// one-time fallback: that very response body is the whole resource, so it
+/// is collected into memory (capped at the declared length) and every read
+/// is served from it. Range-less servers cost one full download held
+/// resident instead of failing.
 #[cfg(feature = "http")]
 pub struct HttpBackend {
     client: reqwest::Client,
     url: reqwest::Url,
     len: u64,
+    full: std::sync::OnceLock<Bytes>,
 }
 
 #[cfg(feature = "http")]
@@ -178,7 +187,39 @@ impl HttpBackend {
                 status: Some(response.status().as_u16()),
                 msg: format!("HEAD {url}: missing or malformed Content-Length"),
             })?;
-        Ok(HttpBackend { client, url, len })
+        Ok(HttpBackend {
+            client,
+            url,
+            len,
+            full: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// Collects a 200 response body (the whole resource) capped at the
+    /// declared length, so a hostile (or merely buggy) server whose body
+    /// is larger, or never finishes, cannot grow memory past `len` or
+    /// stall the read; a body that ends short of `len` is kept as-is and
+    /// later reads past it come back short.
+    async fn collect_full_body(&self, response: reqwest::Response) -> io::Result<Bytes> {
+        use futures_util::StreamExt;
+        let cap = usize::try_from(self.len).unwrap_or(usize::MAX);
+        let mut collected = Vec::new();
+        let mut chunks = response.bytes_stream();
+        while collected.len() < cap {
+            let chunk = match chunks.next().await {
+                Some(Ok(chunk)) => chunk,
+                Some(Err(err)) => {
+                    return Err(http_io_error(crate::error::TransportMarker {
+                        status: None,
+                        msg: format!("GET {}: {err}", self.url),
+                    }))
+                }
+                None => break, // body ended short of the declared length
+            };
+            let take = (cap - collected.len()).min(chunk.len());
+            collected.extend_from_slice(&chunk[..take]);
+        }
+        Ok(Bytes::from(collected))
     }
 }
 
@@ -202,6 +243,9 @@ impl Backend for HttpBackend {
             if offset >= self.len || buf.is_empty() {
                 return Ok(0);
             }
+            if let Some(body) = self.full.get() {
+                return Ok(read_from_bytes(body, offset, buf));
+            }
             let last = (offset + buf.len() as u64 - 1).min(self.len - 1);
             let response = self
                 .client
@@ -210,7 +254,7 @@ impl Backend for HttpBackend {
                 .send()
                 .await
                 .map_err(|err| {
-                    http_io_error(crate::error::TransportMarker::Http {
+                    http_io_error(crate::error::TransportMarker {
                         status: err.status().map(|status| status.as_u16()),
                         msg: format!("GET {} range {offset}-{last}: {err}", self.url),
                     })
@@ -218,14 +262,18 @@ impl Backend for HttpBackend {
             match response.status().as_u16() {
                 206 => {}
                 200 => {
-                    // The server ignored the Range header and answered
-                    // with the whole body: range fetching cannot work.
-                    return Err(http_io_error(
-                        crate::error::TransportMarker::RangeUnsupported,
-                    ));
+                    // The server ignored the Range header and answered with
+                    // the whole resource: keep it and serve every read,
+                    // this one included, from memory. Losing the OnceLock
+                    // race to a concurrent read just drops a redundant
+                    // body, the same stance CachedBackend documents for
+                    // concurrent chunk misses.
+                    let collected = self.collect_full_body(response).await?;
+                    let body = self.full.get_or_init(|| collected);
+                    return Ok(read_from_bytes(body, offset, buf));
                 }
                 status => {
-                    return Err(http_io_error(crate::error::TransportMarker::Http {
+                    return Err(http_io_error(crate::error::TransportMarker {
                         status: Some(status),
                         msg: format!("GET {} range {offset}-{last} failed", self.url),
                     }));
@@ -247,7 +295,7 @@ impl Backend for HttpBackend {
                 let chunk = match chunks.next().await {
                     Some(Ok(chunk)) => chunk,
                     Some(Err(err)) => {
-                        return Err(http_io_error(crate::error::TransportMarker::Http {
+                        return Err(http_io_error(crate::error::TransportMarker {
                             status: None,
                             msg: format!("GET {} range {offset}-{last}: {err}", self.url),
                         }))
@@ -324,13 +372,8 @@ mod tests {
 
     #[cfg(feature = "http")]
     #[test]
-    fn range_refusal_marker_round_trips_through_io_error() {
-        let refused = http_io_error(crate::error::TransportMarker::RangeUnsupported);
-        assert!(matches!(
-            crate::Error::from(refused),
-            crate::Error::RangeUnsupported
-        ));
-        let failed = http_io_error(crate::error::TransportMarker::Http {
+    fn transport_marker_round_trips_through_io_error() {
+        let failed = http_io_error(crate::error::TransportMarker {
             status: Some(503),
             msg: "unavailable".to_string(),
         });

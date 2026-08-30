@@ -2,42 +2,49 @@
 
 //! The HTTP backend against a local mock server: a Range-honoring server
 //! yields a working document; a Range-refusing server (200 with the full
-//! body) yields `Error::RangeUnsupported`.
+//! body) yields a working document too, from a single full download.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use pdfboss_aio::{AsyncDocument, Backend, Error, HttpBackend};
+use pdfboss_aio::{AsyncDocument, Backend, HttpBackend};
 use pdfboss_testkit::simple_doc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Serves `data` from a minimal hand-rolled HTTP/1.1 responder.
 /// `honor_range` selects whether GETs with a Range header receive 206
-/// slices or the full 200 body.
-async fn spawn_server(data: Vec<u8>, honor_range: bool) -> SocketAddr {
+/// slices or the full 200 body. The returned counter tracks GET requests
+/// (HEADs excluded).
+async fn spawn_server(data: Vec<u8>, honor_range: bool) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let gets = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&gets);
     tokio::spawn(async move {
         loop {
             let Ok((socket, peer)) = listener.accept().await else {
                 break;
             };
             let payload = data.clone();
+            let counter = Arc::clone(&counter);
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(socket, payload, honor_range).await {
+                if let Err(err) = handle_connection(socket, payload, honor_range, counter).await {
                     eprintln!("mock server, peer {peer}: {err}");
                 }
             });
         }
     });
-    addr
+    (addr, gets)
 }
 
 async fn handle_connection(
     mut socket: TcpStream,
     data: Vec<u8>,
     honor_range: bool,
+    gets: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     loop {
         let Some(head) = read_request_head(&mut socket).await? else {
@@ -51,6 +58,7 @@ async fn handle_connection(
             socket.write_all(response.as_bytes()).await?;
             continue;
         }
+        gets.fetch_add(1, Ordering::SeqCst);
         match parse_range_header(&head).filter(|_| honor_range) {
             Some((start, end)) => {
                 let end = end.min(total - 1);
@@ -109,7 +117,7 @@ fn parse_range_header(head: &str) -> Option<(usize, usize)> {
 async fn open_url_works_against_a_range_honoring_server() {
     let data = simple_doc("remote");
     let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
-    let addr = spawn_server(data, true).await;
+    let (addr, _) = spawn_server(data, true).await;
     let doc = AsyncDocument::open_url(format!("http://{addr}/remote.pdf"))
         .await
         .unwrap();
@@ -119,17 +127,21 @@ async fn open_url_works_against_a_range_honoring_server() {
 }
 
 #[tokio::test]
-async fn range_refusing_server_yields_range_unsupported() {
+async fn range_refusing_server_falls_back_to_one_full_download() {
     let data = simple_doc("no ranges");
-    let addr = spawn_server(data, false).await;
-    match AsyncDocument::open_url(format!("http://{addr}/no-ranges.pdf")).await {
-        Err(Error::RangeUnsupported) => {}
-        Err(other) => panic!("expected RangeUnsupported, got {other:?}"),
-        Ok(doc) => panic!(
-            "expected failure, opened a document with {} pages",
-            doc.page_count()
-        ),
-    }
+    let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+    let (addr, gets) = spawn_server(data, false).await;
+    let doc = AsyncDocument::open_url(format!("http://{addr}/no-ranges.pdf"))
+        .await
+        .unwrap();
+    assert_eq!(doc.version(), sync_doc.version());
+    assert_eq!(doc.page_count(), sync_doc.page_count());
+    assert_eq!(doc.metadata().await.unwrap(), sync_doc.metadata());
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        1,
+        "every read after the 200 fallback must come from memory, not new GETs"
+    );
 }
 
 /// Serves a HEAD with a small declared length, but answers every GET with a
@@ -181,6 +193,96 @@ async fn handle_oversized_connection(
         tokio::time::sleep(Duration::from_secs(3600)).await;
         return Ok(());
     }
+}
+
+/// Serves a HEAD declaring `declared_len`, and answers every GET with a
+/// plain 200 (no Range support at all, like `python3 -m http.server`)
+/// promising `promised_len` bytes, delivering only `body`, then either
+/// hanging forever or closing cleanly.
+async fn spawn_200_server(
+    declared_len: usize,
+    promised_len: usize,
+    body: Vec<u8>,
+    hang: bool,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                break;
+            };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let _ = handle_200_connection(socket, declared_len, promised_len, body, hang).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn handle_200_connection(
+    mut socket: TcpStream,
+    declared_len: usize,
+    promised_len: usize,
+    body: Vec<u8>,
+    hang: bool,
+) -> std::io::Result<()> {
+    loop {
+        let Some(head) = read_request_head(&mut socket).await? else {
+            return Ok(()); // client closed the connection
+        };
+        if head.starts_with("HEAD ") {
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared_len}\r\n\r\n");
+            socket.write_all(response.as_bytes()).await?;
+            continue;
+        }
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {promised_len}\r\n\r\n");
+        socket.write_all(response.as_bytes()).await?;
+        socket.write_all(&body).await?;
+        socket.flush().await?;
+        if hang {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        return Ok(());
+    }
+}
+
+#[tokio::test]
+async fn fallback_caps_collection_of_an_oversized_200_body() {
+    let full = b"ABCDEFGH".to_vec();
+    // The 200 promises ~100 MB and never finishes; collection must stop at
+    // the HEAD-declared length and serve reads from what arrived.
+    let addr = spawn_200_server(full.len(), 100_000_000, full.clone(), true).await;
+    let backend = HttpBackend::new(format!("http://{addr}/big.bin"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 8];
+    let outcome = tokio::time::timeout(Duration::from_secs(5), backend.read_at(0, &mut buf)).await;
+    let count = outcome
+        .expect(
+            "read_at must return once the declared length has arrived, not \
+             block waiting for the rest of a never-finishing 200 body",
+        )
+        .unwrap();
+    assert_eq!(count, buf.len(), "reads exactly the declared length");
+    assert_eq!(&buf, full.as_slice(), "correct content, no error");
+}
+
+#[tokio::test]
+async fn fallback_body_shorter_than_declared_length_yields_short_reads() {
+    let body = b"ABCDEFGH".to_vec();
+    // HEAD declared 16 bytes but the 200 delivers only 8 and closes: reads
+    // past the delivered body are short, never a panic.
+    let addr = spawn_200_server(16, body.len(), body.clone(), false).await;
+    let backend = HttpBackend::new(format!("http://{addr}/short.bin"))
+        .await
+        .unwrap();
+    let mut tail = [0u8; 4];
+    assert_eq!(backend.read_at(12, &mut tail).await.unwrap(), 0);
+    let mut head = [0u8; 8];
+    assert_eq!(backend.read_at(0, &mut head).await.unwrap(), 8);
+    assert_eq!(&head, body.as_slice());
 }
 
 #[tokio::test]

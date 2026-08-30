@@ -1,6 +1,6 @@
 # Async and remote documents
 
-`AsyncDocument` opens a PDF without reading the whole file. The open flow fetches only what it needs (the header, the cross-reference chain and the page tree) and every later operation fetches only the byte ranges it touches. The file backend reads windows of the file on demand; the HTTP backend turns each read into a `Range` request, so a document on a server can be paged through without downloading it. A server that ignores `Range` and answers `200` with the full body cannot be range-read: the open fails (in Python, a `PdfError` reading `http: server does not support Range requests`) instead of falling back to a full download.
+`AsyncDocument` opens a PDF without reading the whole file. The open flow fetches only what it needs (the header, the cross-reference chain and the page tree) and every later operation fetches only the byte ranges it touches. The file backend reads windows of the file on demand; the HTTP backend turns each read into a `Range` request, so a document on a server can be paged through without downloading it. A server that ignores `Range` and answers `200` with the full body (`python3 -m http.server`, for one) still works: the first such answer is kept as the whole resource and every read is served from it, at the cost of one full download held in memory for the life of the document.
 
 ## Python
 
@@ -80,7 +80,7 @@ A document reads through the `Backend` trait: `len()` and `read_at(offset, buf)`
 
 - `MemBackend`: bytes fully resident in memory; `from_bytes` uses it directly, with no cache.
 - `FileBackend`: positioned reads (`pread`-style, no shared cursor) run on tokio's blocking thread pool, so disk I/O never stalls the async runtime. The length is captured once at open; the file is treated as immutable while the backend lives.
-- `HttpBackend` (feature `http`): the length comes from a `HEAD` request's `Content-Length`; each read is a `GET` with a `Range: bytes=` header. A `200` answer where `206` was asked for yields `Error::RangeUnsupported`, and a response body is collected only up to the requested size, so a buggy or hostile server cannot balloon memory.
+- `HttpBackend` (feature `http`): the length comes from a `HEAD` request's `Content-Length`; each read is a `GET` with a `Range: bytes=` header. A `200` answer where `206` was asked for means the server ignores `Range`; its body is the whole resource, so it is collected once (capped at the declared length, so a buggy or hostile server cannot balloon memory) and all reads are served from it. A `206` body is likewise collected only up to the requested size.
 - `CachedBackend`: a chunked LRU read cache over any backend: many small reads become few chunk-sized fetches, and hot chunks stay resident up to a byte budget. Defaults: 64 KiB chunks, 32 MiB total.
 
 `open` and `open_url` wrap their backend in a `CachedBackend` automatically. `from_bytes` stays uncached, and `with_backend` adds nothing, so a composition of your own is used exactly as given:

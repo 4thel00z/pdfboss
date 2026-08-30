@@ -26,7 +26,7 @@ pdfboss images  doc.pdf -o out/             # embedded images as native-size PNG
 pdfboss tui     doc.pdf                     # interactive terminal explorer
 ```
 
-Every command takes a local path or an `http(s)://` URL; remote files are fetched in byte ranges rather than downloaded whole. Encrypted files take `--password` (an empty user password opens transparently).
+Every command takes a local path or an `http(s)://` URL; remote files are fetched in byte ranges rather than downloaded whole (a server that ignores `Range` costs one full download). Encrypted files take `--password` (an empty user password opens transparently).
 
 Creation:
 

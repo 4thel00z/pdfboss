@@ -1,7 +1,7 @@
 //! Error type for pdfboss-aio: wraps core parse errors and transport
-//! failures, with dedicated variants for range-refusing HTTP servers and
-//! short reads. Messages are prefixed by layer ("parse:", "io:", "http:")
-//! so downstream consumers can present them uniformly.
+//! failures, with a dedicated variant for short reads. Messages are
+//! prefixed by layer ("parse:", "io:", "http:") so downstream consumers
+//! can present them uniformly.
 
 /// Convenience alias used throughout pdfboss-aio.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -26,12 +26,6 @@ pub enum Error {
     #[cfg(feature = "http")]
     #[error("http{}: {msg}", status.map(|code| format!(" {code}")).unwrap_or_default())]
     Http { status: Option<u16>, msg: String },
-    /// The server ignored `Range` requests (answered 200 with the full
-    /// body instead of 206), so range-fetching cannot work. Wording matches
-    /// what the Python binding independently produces for this variant
-    /// (`crates/pdfboss-py/src/lib.rs`'s `aio_err`), so both surfaces agree.
-    #[error("http: server does not support Range requests")]
-    RangeUnsupported,
     /// A read stopped short of the requested range while more bytes were
     /// expected (the source is shorter than its declared length).
     #[error("truncated read at offset {offset}: wanted {wanted} bytes, got {got}")]
@@ -49,12 +43,9 @@ impl From<std::io::Error> for Error {
             .get_ref()
             .and_then(|source| source.downcast_ref::<TransportMarker>())
         {
-            return match marker {
-                TransportMarker::RangeUnsupported => Error::RangeUnsupported,
-                TransportMarker::Http { status, msg } => Error::Http {
-                    status: *status,
-                    msg: msg.clone(),
-                },
+            return Error::Http {
+                status: marker.status,
+                msg: marker.msg.clone(),
             };
         }
         Error::Io(inner)
@@ -81,18 +72,15 @@ impl From<Error> for pdfboss_core::Error {
 /// [`From<std::io::Error>`] above. Only the HTTP backend produces these.
 #[cfg(feature = "http")]
 #[derive(Debug)]
-pub(crate) enum TransportMarker {
-    RangeUnsupported,
-    Http { status: Option<u16>, msg: String },
+pub(crate) struct TransportMarker {
+    pub(crate) status: Option<u16>,
+    pub(crate) msg: String,
 }
 
 #[cfg(feature = "http")]
 impl std::fmt::Display for TransportMarker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransportMarker::RangeUnsupported => write!(f, "server ignored Range requests"),
-            TransportMarker::Http { status, msg } => write!(f, "http {status:?}: {msg}"),
-        }
+        write!(f, "http {:?}: {}", self.status, self.msg)
     }
 }
 
@@ -129,10 +117,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "truncated read at offset 512: wanted 100 bytes, got 3"
-        );
-        assert_eq!(
-            Error::RangeUnsupported.to_string(),
-            "http: server does not support Range requests"
         );
     }
 
