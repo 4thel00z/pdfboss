@@ -907,7 +907,24 @@ impl App {
                 self.hex.clear();
             }
         }
+        cmds.extend(self.refresh_page_panes());
         cmds
+    }
+
+    /// Re-requests an active preview or markdown pane when the selection
+    /// moved to a different page. A selection with no page ancestor
+    /// (objects, xref, trailer) keeps the pane on the page it shows.
+    fn refresh_page_panes(&mut self) -> Vec<Cmd> {
+        let Some(page) = self.tree.page_of(self.tree.selected) else {
+            return Vec::new();
+        };
+        if self.preview.active && self.preview.page != Some(page) {
+            return self.request_preview();
+        }
+        if self.markdown.active && self.markdown.page != Some(page) {
+            return self.request_markdown();
+        }
+        Vec::new()
     }
 
     fn hex_for(&mut self, span: Span, in_objstm: Option<(ObjRef, Span)>) -> Vec<Cmd> {
@@ -1185,6 +1202,102 @@ mod tests {
         let mut app = loaded_app();
         app.update(key(KeyCode::Char('q')));
         assert!(app.should_quit);
+    }
+
+    /// Two pages loaded (physical and logical passes applied), selection
+    /// left on the Pages folder's first page node.
+    fn two_page_app() -> App {
+        let mut app = App::new(
+            "t.pdf".to_string(),
+            "t.pdf".to_string(),
+            (1, 7),
+            2,
+            (80, 24),
+        );
+        app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Physical,
+            elements: physical_elements(),
+            errors: 0,
+            done: true,
+        });
+        app.update(Msg::TreeBatch {
+            req: crate::tree::TreeReq::Logical,
+            elements: vec![
+                Element::Page {
+                    index: 0,
+                    r: obj_ref(1),
+                },
+                Element::Page {
+                    index: 1,
+                    r: obj_ref(2),
+                },
+            ],
+            errors: 0,
+            done: true,
+        });
+        app.update(key(KeyCode::Char('j'))); // Pages folder
+        app.update(key(KeyCode::Char('l'))); // expand
+        app.update(key(KeyCode::Char('j'))); // Page 1
+        app
+    }
+
+    #[test]
+    fn active_preview_follows_the_selection_to_another_page() {
+        let mut app = two_page_app();
+        let cmds = app.update(key(KeyCode::Char('p')));
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::RenderPreview { page: 0, .. }]),
+            "preview opens on the selected page: {cmds:?}"
+        );
+        let cmds = app.update(key(KeyCode::Char('j'))); // Page 2
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::RenderPreview { page: 1, .. })),
+            "moving to page 2 must re-render the active preview: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn active_markdown_follows_the_selection_to_another_page() {
+        let mut app = two_page_app();
+        let cmds = app.update(key(KeyCode::Char('m')));
+        assert!(
+            matches!(cmds.as_slice(), [Cmd::ExtractMarkdown { page: 0, .. }]),
+            "markdown opens on the selected page: {cmds:?}"
+        );
+        let cmds = app.update(key(KeyCode::Char('j'))); // Page 2
+        assert!(
+            cmds.iter()
+                .any(|cmd| matches!(cmd, Cmd::ExtractMarkdown { page: 1, .. })),
+            "moving to page 2 must re-extract the active markdown: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn selection_without_a_page_ancestor_keeps_the_preview() {
+        let mut app = two_page_app();
+        app.update(key(KeyCode::Char('p')));
+        let cmds = app.update(key(KeyCode::Char('G'))); // Trailer
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RenderPreview { .. })),
+            "browsing outside the page tree must not re-render: {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn selection_within_the_same_page_does_not_rerender() {
+        let mut app = two_page_app();
+        app.update(key(KeyCode::Char('p')));
+        app.update(key(KeyCode::Char('l'))); // expand Page 1
+        let cmds = app.update(key(KeyCode::Char('j'))); // Fonts folder of page 1
+        assert!(
+            !cmds
+                .iter()
+                .any(|cmd| matches!(cmd, Cmd::RenderPreview { .. })),
+            "same page needs no re-render: {cmds:?}"
+        );
     }
 
     #[test]
