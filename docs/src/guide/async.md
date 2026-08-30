@@ -1,4 +1,4 @@
-# Async and remote documents
+# Async and remote PDFs over HTTP
 
 `AsyncDocument` opens a PDF without reading the whole file. The open flow fetches only what it needs (the header, the cross-reference chain and the page tree) and every later operation fetches only the byte ranges it touches. The file backend reads windows of the file on demand; the HTTP backend turns each read into a `Range` request, so a document on a server can be paged through without downloading it. A server that ignores `Range` and answers `200` with the full body (`python3 -m http.server`, for one) still works: the first such answer is kept as the whole resource and every read is served from it, at the cost of one full download held in memory for the life of the document.
 

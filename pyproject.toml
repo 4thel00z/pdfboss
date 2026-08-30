@@ -5,13 +5,13 @@ build-backend = "maturin"
 [project]
 name = "pdfboss"
 version = "1.0.0"
-description = "PDF parsing, text extraction and rendering in pure Rust with pythonic bindings"
+description = "Fast PDF text extraction, Markdown conversion and page rendering in pure Rust, with pythonic bindings"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 authors = [{ name = "4thel00z" }]
-keywords = ["pdf", "parser", "text-extraction", "rendering", "rasterizer", "rust"]
+keywords = ["pdf", "parser", "text-extraction", "pdf-to-text", "pdf-to-markdown", "markdown", "rendering", "pdf-to-png", "rasterizer", "images", "rust"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -23,8 +23,11 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://pdfboss.dev"
+Documentation = "https://pdfboss.dev/docs/"
 Repository = "https://github.com/4thel00z/pdfboss"
 Issues = "https://github.com/4thel00z/pdfboss/issues"
+Changelog = "https://github.com/4thel00z/pdfboss/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # Pulls in the bundled OFL substitute fonts (packages/pdfboss-fonts) so

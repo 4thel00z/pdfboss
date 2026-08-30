@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-core"
-description = "PDF syntax, objects, filters, cross-references and document model (ISO 32000)"
+description = "PDF parser in pure Rust: syntax, objects, filters, cross-references and the document model (ISO 32000)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "parser", "pdf-parser", "iso-32000", "document"]
+categories = ["parser-implementations", "text-processing"]
 
 [dependencies]
 thiserror = "2"

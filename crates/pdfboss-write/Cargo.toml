@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-write"
-description = "PDF creation for pdfboss: COS object writer, content canvas and document assembly"
+description = "PDF creation in pure Rust: COS object writer, content canvas, composed elements and document assembly"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "pdf-generation", "pdf-writer", "create-pdf", "document"]
+categories = ["text-processing", "encoding"]
 
 [dependencies]
 pdfboss-core = { workspace = true }

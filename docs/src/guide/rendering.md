@@ -1,4 +1,4 @@
-# Rendering pages
+# Rendering PDF pages to PNG
 
 pdfboss rasterizes pages to RGBA pixels with anti-aliasing and encodes them as
 PNG. The scale factor is the points-to-pixels ratio: at `1.0` one PDF point

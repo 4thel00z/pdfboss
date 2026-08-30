@@ -1,4 +1,4 @@
-# Extracting text
+# Extracting text from PDFs
 
 Text extraction turns a page's positioned glyphs back into readable text: spans are
 grouped into lines, lines are ordered top to bottom and joined with `\n`, and spaces

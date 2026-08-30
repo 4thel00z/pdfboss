@@ -1,4 +1,4 @@
-# Python API
+# Python API reference
 
 The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public surface is twelve top-level classes, the `md` and `write` submodules and the `__version__` string; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
 

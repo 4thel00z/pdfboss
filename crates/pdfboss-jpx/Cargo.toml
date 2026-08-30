@@ -1,11 +1,12 @@
 [package]
 name = "pdfboss-jpx"
-description = "Cleanroom JPEG 2000 (JPXDecode) decoder for pdfboss (ITU-T T.800)"
+description = "Cleanroom JPEG 2000 (JPXDecode) decoder in pure Rust for pdfboss (ITU-T T.800)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["jpeg2000", "jpx", "decoder", "image", "pdf"]
+categories = ["multimedia::images", "multimedia::encoding"]
 
 [dependencies]

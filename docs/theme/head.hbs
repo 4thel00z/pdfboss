@@ -1,0 +1,10 @@
+<meta name="theme-color" content="#0c0c09">
+<script>
+  (function () {
+    if (location.hostname !== "4thel00z.github.io") {
+      return;
+    }
+    var path = location.pathname.replace(/^\/pdfboss\/?/, "");
+    location.replace("https://pdfboss.dev/docs/" + path + location.search + location.hash);
+  })();
+</script>

@@ -1,4 +1,4 @@
-# Markdown output
+# PDF to Markdown
 
 Markdown output runs layout analysis over the same positioned spans that
 [plain text extraction](./text.md) flattens, and renders the result as CommonMark.

@@ -1,4 +1,4 @@
-# Rust crates
+# Rust crate reference
 
 pdfboss is a workspace of focused crates, all sharing one version. Add the ones you need with `cargo add`; each crate's API reference lives on docs.rs.
 

@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-cli"
-description = "Command-line interface for pdfboss: info, text, render, obj, and the json/hex/q/tui explorer subcommands"
+description = "PDF command line: PDF to text, Markdown and PNG, image extraction, PDF creation, and the json/hex/q/tui explorer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "cli", "pdf-to-text", "pdf-to-png", "markdown"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 pdfboss-core = { workspace = true }
