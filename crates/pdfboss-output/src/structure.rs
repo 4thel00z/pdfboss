@@ -46,11 +46,15 @@ const GUTTER_MAX_CROSSING: f32 = 0.1;
 /// column's foot to the next column's head, never a fraction's numerator a
 /// line above the text it follows.
 const FLOW_STEP_UP: f32 = 2.0;
-/// A flow with fewer distinct baselines than this is a fragment: a stray
-/// label, a page number, one line of a stream written out of order.
-const FLOW_MIN_LINES: usize = 3;
-/// When more than this fraction of a page's text sits in fragments, the
-/// stream was not written in reading order and the page is ordered by
+/// A baseline rising by more than this multiple of the line size also opens
+/// a flow when the span lands more than [`FLOW_STEP_ASIDE`] sizes to the
+/// side of the one before it: the first line of a caption or column set
+/// beside the block just written, where a numerator or a stacked limit
+/// stays over the text it belongs to.
+const FLOW_LINE_UP: f32 = 1.0;
+const FLOW_STEP_ASIDE: f32 = 2.0;
+/// When more than this fraction of a page's text sits in single-line flows,
+/// the stream was not written in reading order and the page is ordered by
 /// geometry alone.
 const FLOW_FRAGMENT_FRACTION: f32 = 0.5;
 
@@ -1754,11 +1758,10 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
 /// it follows, does not. Side-by-side flows too sparse to be text columns
 /// merge back into one, so a table written column by column still reaches
 /// the lane detector as rows. A page with more than
-/// [`FLOW_FRAGMENT_FRACTION`] of its text in flows shorter than
-/// [`FLOW_MIN_LINES`] was not written in reading order at all, and is one
-/// flow ordered by geometry; a figure's scattered labels beside a body
-/// column are a sliver of the page's text and leave the column in content
-/// order.
+/// [`FLOW_FRAGMENT_FRACTION`] of its text in single-line flows was not
+/// written in reading order at all, and is one flow ordered by geometry; a
+/// figure's scattered labels beside a body column are a sliver of the
+/// page's text and leave the column in content order.
 fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     let mut flows: Vec<Vec<&TextSpan>> = Vec::new();
     for span in spans {
@@ -1770,7 +1773,7 @@ fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     let chars = |flow: &[&TextSpan]| -> usize { flow.iter().map(|s| s.text.chars().count()).sum() };
     let fragmented: usize = flows
         .iter()
-        .filter(|flow| baseline_count(flow) < FLOW_MIN_LINES)
+        .filter(|flow| baseline_count(flow) == 1)
         .map(|flow| chars(flow))
         .sum();
     let total: usize = flows.iter().map(|flow| chars(flow)).sum();
@@ -1780,20 +1783,33 @@ fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     merge_sparse_neighbours(flows)
 }
 
-/// True when `next` sits more than [`FLOW_STEP_UP`] line sizes above `prev`.
+/// True when `next` opens a new flow: it sits more than [`FLOW_STEP_UP`]
+/// line sizes above `prev`, or a full line above it and displaced sideways
+/// by more than [`FLOW_STEP_ASIDE`] sizes. A fraction's numerator is less
+/// than a line up and continues where the text left off; the first line of
+/// a caption set beside the one just written is a line up and far to the
+/// right.
 fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
-    next.y - prev.y > FLOW_STEP_UP * prev.size.max(next.size)
+    let size = prev.size.max(next.size);
+    let rise = next.y - prev.y;
+    if rise > FLOW_STEP_UP * size {
+        return true;
+    }
+    let (prev_lo, prev_hi) = (prev.x.min(prev.end_x), prev.x.max(prev.end_x));
+    let aside =
+        next.x > prev_hi + FLOW_STEP_ASIDE * size || next.x < prev_lo - FLOW_STEP_ASIDE * size;
+    rise > FLOW_LINE_UP * size && aside
 }
 
-/// Merges a flow into the one before it when both are multi-line yet too
-/// sparse to be text columns and they overlap vertically: the columns of a
-/// table written column by column, which read as rows only once they share
-/// a segment. A fragment (see [`FLOW_MIN_LINES`]) never merges, so a
-/// figure's scattered labels stay in content order rather than sorting by
-/// height.
+/// Merges a flow into the one before it when both hold at least
+/// [`TABLE_MIN_ROWS`] lines yet are too sparse to be text columns, and they
+/// overlap vertically: the columns of a table written column by column,
+/// which read as rows only once they share a segment. Anything shorter, a
+/// figure's scattered labels or a two-line caption, stays in content order
+/// rather than sorting by height.
 fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
     let table_column =
-        |flow: &[&TextSpan]| !column_shaped(flow) && baseline_count(flow) >= FLOW_MIN_LINES;
+        |flow: &[&TextSpan]| !column_shaped(flow) && baseline_count(flow) >= TABLE_MIN_ROWS;
     let mut merged: Vec<Vec<&TextSpan>> = Vec::new();
     for flow in flows {
         let Some(prev) = merged.last_mut() else {
@@ -2607,6 +2623,29 @@ pub(crate) mod tests {
         assert_eq!(lines[11], "Body line number 11 of the column");
         assert_eq!(lines[12], "t0");
         assert_eq!(lines.len(), 24);
+    }
+
+    /// Two sub-figure captions set side by side, each written whole: the
+    /// step from the first caption's last line back up to the second's
+    /// first line, one line up and well to the right, opens a new flow, so
+    /// each caption reads whole rather than line by line across both.
+    #[test]
+    fn side_by_side_captions_read_one_after_the_other() {
+        let content = "BT /F1 10 Tf 72 300 Td (\\(a\\) The marked triangles meet) Tj ET \
+                       BT /F1 10 Tf 72 288 Td (at the center and on a side.) Tj ET \
+                       BT /F1 10 Tf 300 300 Td (\\(b\\) The marked triangles meet) Tj ET \
+                       BT /F1 10 Tf 300 288 Td (at the center and outside.) Tj ET ";
+        let text = text_of(content);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "(a) The marked triangles meet",
+                "at the center and on a side.",
+                "(b) The marked triangles meet",
+                "at the center and outside.",
+            ]
+        );
     }
 
     /// A display fraction's numerator sits a line above the baseline it is
