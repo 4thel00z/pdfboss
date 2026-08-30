@@ -1785,22 +1785,22 @@ fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
     next.y - prev.y > FLOW_STEP_UP * prev.size.max(next.size)
 }
 
-/// Merges a flow into the one before it when that one is multi-line yet too
-/// sparse to be a text column, this one is no text column either, and the
-/// two overlap vertically: the columns of a table written column by column,
-/// and a wrapped cell written after its grid, read as rows only once they
-/// share a segment. A fragment (see [`FLOW_MIN_LINES`]) never starts such a
-/// merge, so a figure's scattered labels beside a body column stay in
-/// content order rather than sorting by height.
+/// Merges a flow into the one before it when both are multi-line yet too
+/// sparse to be text columns and they overlap vertically: the columns of a
+/// table written column by column, which read as rows only once they share
+/// a segment. A fragment (see [`FLOW_MIN_LINES`]) never merges, so a
+/// figure's scattered labels stay in content order rather than sorting by
+/// height.
 fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
+    let table_column =
+        |flow: &[&TextSpan]| !column_shaped(flow) && baseline_count(flow) >= FLOW_MIN_LINES;
     let mut merged: Vec<Vec<&TextSpan>> = Vec::new();
     for flow in flows {
         let Some(prev) = merged.last_mut() else {
             merged.push(flow);
             continue;
         };
-        let table_like = !column_shaped(prev) && baseline_count(prev) >= FLOW_MIN_LINES;
-        if !table_like || column_shaped(&flow) || !y_overlaps(prev, &flow) {
+        if !table_column(prev) || !table_column(&flow) || !y_overlaps(prev, &flow) {
             merged.push(flow);
             continue;
         }
@@ -2325,15 +2325,21 @@ pub(crate) mod tests {
 
     /// [`lane_grid_content`] with the lines a real page puts around a
     /// grid: a running header above, a page number below, and one wrapped
-    /// cell between two rows. All three populate a single cell; only the
-    /// wrapped one is inside the grid.
+    /// cell between two rows, written where a typesetter writes it, right
+    /// after the row it continues. All three populate a single cell; only
+    /// the wrapped one is inside the grid.
     pub(crate) fn grid_with_edge_lines_content() -> String {
-        format!(
-            "BT /F1 10 Tf 1 0 0 1 72 760 Tm ({RUNNING_HEADER}) Tj ET {} \
-             BT /F1 10 Tf 1 0 0 1 72 670 Tm (wrapped cell) Tj ET \
-             BT /F1 10 Tf 1 0 0 1 72 600 Tm (24) Tj ET",
-            lane_grid_content()
-        )
+        let mut content = format!("BT /F1 10 Tf 1 0 0 1 72 760 Tm ({RUNNING_HEADER}) Tj ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+            if row == 1 {
+                content += "1 0 0 1 72 670 Tm (wrapped cell) Tj ";
+            }
+        }
+        content += "1 0 0 1 72 600 Tm (24) Tj ET";
+        content
     }
 
     /// The page's spans, asserting the extraction report is complete: no
