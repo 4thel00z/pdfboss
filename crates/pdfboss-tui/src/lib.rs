@@ -214,6 +214,15 @@ fn execute_cmd(
             })
             .ok();
         }
+        Cmd::YankMarkdown { page } => {
+            tokio::spawn(async move {
+                let result = match page_markdown(&doc, page).await {
+                    Ok(text) => copy_toast(&text, "markdown"),
+                    Err(error) => Err(error),
+                };
+                tx.send(Msg::Yanked { result }).ok();
+            });
+        }
         Cmd::YankSpan {
             source,
             slice,
@@ -563,16 +572,17 @@ async fn extract_markdown(
     generation: u64,
     page: usize,
 ) {
-    let result = match doc.page(page) {
-        Ok(page_object) => {
-            let oc = doc.oc_state().await;
-            pdfboss_output::extract_page_markdown_with(&doc, &page_object, oc.as_ref())
-                .await
-                .map_err(|error| error.to_string())
-        }
-        Err(error) => Err(error.to_string()),
-    };
+    let result = page_markdown(&doc, page).await;
     tx.send(Msg::MarkdownReady { generation, result }).ok();
+}
+
+/// One page extracted as Markdown, shared by the pane and the yank menu.
+async fn page_markdown(doc: &AsyncDocument, page: usize) -> Result<String, String> {
+    let page_object = doc.page(page).map_err(|error| error.to_string())?;
+    let oc = doc.oc_state().await;
+    pdfboss_output::extract_page_markdown_with(doc, &page_object, oc.as_ref())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Fetches the entire file via one `read_span` over

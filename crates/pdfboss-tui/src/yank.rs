@@ -83,7 +83,9 @@ pub enum YankTarget {
     /// The selection's raw bytes (UTF-8 lossy).
     Bytes,
     /// The pretty-printed element the inspector shows.
-    Value,
+    Element,
+    /// The selected page extracted as Markdown.
+    Markdown,
     /// The object reference, e.g. `12 0 R`.
     ObjRef,
 }
