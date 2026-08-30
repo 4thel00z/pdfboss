@@ -92,6 +92,15 @@ pub fn action_for(key: KeyEvent, context: KeyContext) -> Action {
             _ => {}
         }
     }
+    // Stock iTerm2 and Terminal.app map Option+Left/Right to the Emacs
+    // word motions `ESC b` / `ESC f`, which arrive as Alt+b / Alt+f.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char('b') => return Action::ResizeLeft,
+            KeyCode::Char('f') => return Action::ResizeRight,
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
         KeyCode::Char('/') => Action::OpenSearch,
@@ -291,6 +300,36 @@ mod tests {
         assert_eq!(
             action_for(press(KeyCode::Enter), KeyContext::Yank),
             Action::YankCancel
+        );
+    }
+
+    /// Stock iTerm2 and Terminal.app map Option+Left/Right to the Emacs
+    /// word motions `ESC b` / `ESC f`, which crossterm reports as Alt+b /
+    /// Alt+f; those must resize like the Alt+arrows they stand in for.
+    #[test]
+    fn alt_b_and_f_resize_like_alt_left_right() {
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+                KeyContext::Normal
+            ),
+            Action::ResizeLeft
+        );
+        assert_eq!(
+            action_for(
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+                KeyContext::Normal
+            ),
+            Action::ResizeRight
+        );
+        // Plain b/f stay unbound.
+        assert_eq!(
+            action_for(press(KeyCode::Char('b')), KeyContext::Normal),
+            Action::Noop
+        );
+        assert_eq!(
+            action_for(press(KeyCode::Char('f')), KeyContext::Normal),
+            Action::Noop
         );
     }
 
