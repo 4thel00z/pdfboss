@@ -48,7 +48,7 @@ impl Input {
                 .build()
                 .map_err(|e| e.to_string())?;
             let doc = rt
-                .block_on(AsyncDocument::open_url_with_password(spec, password))
+                .block_on(crate::progress::open_url_with_progress(spec, password))
                 .map_err(|e| e.to_string())?;
             Ok(Input::Remote { rt, doc })
         } else {

@@ -675,6 +675,15 @@ impl AsyncDocument {
         AsyncDocument::from_arc(Arc::new(backend), "").await
     }
 
+    /// [`AsyncDocument::with_backend`] with the password that opens the
+    /// file, accepted as either the user or the owner password.
+    pub async fn with_backend_with_password(
+        backend: impl Backend,
+        password: &str,
+    ) -> Result<AsyncDocument> {
+        AsyncDocument::from_arc(Arc::new(backend), password).await
+    }
+
     /// Opens a remote document over HTTP range requests, wrapped in a
     /// [`CachedBackend`] with default capacity.
     ///
