@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-text"
-description = "Font loading, encodings, ToUnicode CMaps and text extraction for pdfboss"
+description = "PDF text extraction in pure Rust: font loading, encodings, ToUnicode CMaps and positioned text spans"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "text-extraction", "pdf-to-text", "fonts", "cmap"]
+categories = ["text-processing", "parser-implementations"]
 
 [dependencies]
 pdfboss-core = { workspace = true }

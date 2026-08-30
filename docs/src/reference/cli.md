@@ -1,4 +1,4 @@
-# CLI reference
+# pdfboss CLI reference
 
 One binary, `pdfboss`, with a subcommand per job. This chapter is the flag inventory; worked examples live in the guide chapters linked from each entry.
 

@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-style"
-description = "CSS-subset theme parsing for pdfboss document composition"
+description = "CSS-subset theme parsing for pdfboss Markdown-to-PDF composition"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["css", "theme", "pdf", "stylesheet", "typesetting"]
+categories = ["text-processing", "parser-implementations"]
 
 [dependencies]
 pdfboss-write = { workspace = true }

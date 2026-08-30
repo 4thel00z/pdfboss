@@ -7,14 +7,14 @@
 <p align="center">
   <a href="https://github.com/4thel00z/pdfboss/actions/workflows/ci.yaml"><img src="https://github.com/4thel00z/pdfboss/actions/workflows/ci.yaml/badge.svg" alt="CI"></a>
   <a href="https://github.com/4thel00z/pdfboss/actions/workflows/python-ci.yml"><img src="https://github.com/4thel00z/pdfboss/actions/workflows/python-ci.yml/badge.svg" alt="python-ci"></a>
-  <a href="https://4thel00z.github.io/pdfboss/"><img src="https://img.shields.io/badge/docs-book-blue?logo=mdbook&logoColor=white" alt="Documentation"></a>
+  <a href="https://pdfboss.dev/docs/"><img src="https://img.shields.io/badge/docs-book-blue?logo=mdbook&logoColor=white" alt="Documentation"></a>
   <a href="https://pypi.org/project/pdfboss/"><img src="https://img.shields.io/pypi/v/pdfboss?logo=pypi&logoColor=white" alt="PyPI"></a>
   <img src="https://img.shields.io/badge/rust-2021-000000?logo=rust&logoColor=white" alt="Rust 2021">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="MIT OR Apache-2.0"></a>
 </p>
 
 <p align="center">
-  <a href="https://4thel00z.github.io/pdfboss/">Docs</a> ·
+  <a href="https://pdfboss.dev/docs/">Docs</a> ·
   <a href="https://pypi.org/project/pdfboss/">PyPI</a> ·
   <a href="https://crates.io/crates/pdfboss-cli">crates.io</a> ·
   <a href="#benchmarks">Benchmarks</a>
@@ -394,7 +394,7 @@ Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the docum
 
 ## Documentation
 
-The [pdfboss book](https://4thel00z.github.io/pdfboss/) covers installation, guides for every surface (text, Markdown, styled spans, rendering, image extraction, creation, Markdown-to-PDF composition, async and remote documents, the explorer, encryption) and CLI/Python/Rust reference chapters. It is built with mdBook from [`docs/`](docs/) and deployed through GitHub Pages. Per-crate Rust API documentation is on [docs.rs](https://docs.rs/pdfboss-core).
+The [pdfboss book](https://pdfboss.dev/docs/) covers installation, guides for every surface (text, Markdown, styled spans, rendering, image extraction, creation, Markdown-to-PDF composition, async and remote documents, the explorer, encryption) and CLI/Python/Rust reference chapters. It is built with mdBook from [`docs/`](docs/) by the `book` workflow and served at pdfboss.dev/docs. Per-crate Rust API documentation is on [docs.rs](https://docs.rs/pdfboss-core).
 
 ## Development
 

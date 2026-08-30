@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-render"
-description = "Page rasterization to RGBA pixmaps and PNG for pdfboss"
+description = "PDF rendering in pure Rust: rasterize pages to RGBA pixmaps and PNG, extract embedded images"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "rendering", "rasterizer", "pdf-to-png", "png"]
+categories = ["rendering", "multimedia::images", "graphics"]
 
 [dependencies]
 pdfboss-core = { workspace = true }

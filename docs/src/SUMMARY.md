@@ -9,20 +9,20 @@
 
 # Guide
 
-- [Extracting text](guide/text.md)
-- [Markdown output](guide/markdown.md)
+- [Extracting text from PDFs](guide/text.md)
+- [PDF to Markdown](guide/markdown.md)
 - [Styled spans](guide/spans.md)
-- [Rendering pages](guide/rendering.md)
-- [Extracting images](guide/images.md)
+- [Rendering PDF pages to PNG](guide/rendering.md)
+- [Extracting images from PDFs](guide/images.md)
 - [Creating PDFs](guide/creating.md)
 - [Markdown to PDF](guide/md-to-pdf.md)
-- [Async and remote documents](guide/async.md)
+- [Async and remote PDFs over HTTP](guide/async.md)
 - [Exploring PDF internals](guide/explorer.md)
-- [Encrypted documents](guide/encryption.md)
+- [Encrypted PDFs](guide/encryption.md)
 
 # Reference
 
-- [CLI reference](reference/cli.md)
-- [Python API](reference/python.md)
-- [Rust crates](reference/rust.md)
+- [pdfboss CLI reference](reference/cli.md)
+- [Python API reference](reference/python.md)
+- [Rust crate reference](reference/rust.md)
 - [Limitations](reference/limitations.md)

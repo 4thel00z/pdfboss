@@ -1,4 +1,4 @@
-# Extracting images
+# Extracting images from PDFs
 
 pdfboss extracts the images a page draws (photographs, scans, logos, figures),
 each decoded at its own pixel dimensions and delivered as RGBA with alpha.

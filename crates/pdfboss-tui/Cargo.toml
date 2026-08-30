@@ -6,7 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "tui", "terminal", "explorer", "ratatui"]
+categories = ["command-line-interface", "visualization"]
 
 [dependencies]
 pdfboss-aio = { workspace = true }

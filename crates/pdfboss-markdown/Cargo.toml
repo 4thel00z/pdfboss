@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-markdown"
-description = "Markdown to PDF composition for pdfboss"
+description = "Markdown to PDF in pure Rust: CommonMark+GFM composed into CSS-themed documents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["markdown", "pdf", "markdown-to-pdf", "commonmark", "gfm"]
+categories = ["text-processing"]
 
 [dependencies]
 pdfboss-write = { workspace = true }

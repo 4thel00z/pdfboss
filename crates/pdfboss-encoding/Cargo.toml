@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "encoding", "glyph", "fonts", "iso-32000"]
+categories = ["encoding", "text-processing"]
 
 [dependencies]

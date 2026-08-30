@@ -1,12 +1,13 @@
 [package]
 name = "pdfboss-aio"
-description = "Async, range-fetching PDF access for pdfboss: huge files, many documents, remote HTTP sources (ISO 32000)"
+description = "Async, range-fetching PDF reader: huge files, many documents, remote PDFs over HTTP (ISO 32000)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 readme.workspace = true
-keywords.workspace = true
+keywords = ["pdf", "async", "http", "range-requests", "tokio"]
+categories = ["asynchronous", "network-programming"]
 
 [dependencies]
 pdfboss-core = { workspace = true }

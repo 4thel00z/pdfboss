@@ -94,7 +94,7 @@ Library crates on crates.io: `pdfboss-core` (the reader), `pdfboss-text`, `pdfbo
 
 ## Links
 
-- User guide: https://4thel00z.github.io/pdfboss/
+- User guide: https://pdfboss.dev/docs/
 - Site and benchmarks: https://pdfboss.dev
 - Race it in a browser: https://pdfarena.tahrioui.de
 - Repository: https://github.com/4thel00z/pdfboss

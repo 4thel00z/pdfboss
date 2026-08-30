@@ -24,6 +24,7 @@ jobs:
         with:
           mdbook-version: "0.4.52"
       - run: mdbook build docs
+      - run: docs/finalize-book.sh docs/book
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/book

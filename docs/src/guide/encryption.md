@@ -1,4 +1,4 @@
-# Encrypted documents
+# Encrypted PDFs
 
 pdfboss opens files encrypted with the PDF Standard security handler: RC4
 (40–128-bit, `/V` 1–2, and `/V` 4 with crypt filter `V2`), AES-128 (`/V` 4,
