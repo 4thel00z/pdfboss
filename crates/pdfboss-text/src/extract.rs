@@ -3,7 +3,7 @@
 
 use crate::font::Font;
 use crate::{Ruling, TextSpan};
-use pdfboss_core::content::{parse_content, Op, TextItem};
+use pdfboss_core::content::{ContentOps, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, Matrix, Name,
     ObjRef, Object, OcState, Page, Point, Rect,
@@ -196,13 +196,6 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
             Vec::new()
         }
     };
-    let ops = match parse_content(&content) {
-        Ok(ops) => ops,
-        Err(_) => {
-            report.record(SkippedTextKind::PageContents, SkipCause::Parse);
-            Vec::new()
-        }
-    };
     let mut exec = Executor {
         src: &src,
         spans: Vec::new(),
@@ -216,10 +209,11 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         categories: FastMap::default(),
     };
     let root = Frame::new(
-        ops.into(),
+        Arc::new(content),
         vec![Arc::new(page.resources.clone())],
         GState::new(),
         0,
+        (0, 0),
     );
     exec.run(root).await;
     let mut spans = exec.spans;
@@ -480,15 +474,24 @@ struct Subpath {
 /// `Send` over an asynchronous source and merely non-`Send` over a synchronous
 /// one, which is correct for both.
 struct Frame {
-    /// Shared rather than owned so a handle can be held while the frame stack is
-    /// pushed onto. Cloned once per visit to the frame, never per operator.
-    ops: Arc<[Op]>,
+    /// The stream's decoded bytes; operators are pull-parsed from it one at
+    /// a time, never materialized as a vector. Shared rather than owned so
+    /// a handle can be held while the frame stack is pushed onto — cloned
+    /// once per visit to the frame, never per operator.
+    content: Arc<Vec<u8>>,
     /// Resource dictionaries, innermost first. Owned, because a form's own
     /// `/Resources` is read out of its stream dictionary and so outlives nothing
     /// already on the stack.
     chain: Vec<Arc<Dict>>,
-    /// Index of the next operator to execute.
-    pc: usize,
+    /// Byte offset of the next operator: the pull parser's whole state at
+    /// an operator boundary, so a suspended frame resumes from it exactly.
+    pos: usize,
+    /// Lengths of the executor's spans and rulings when this frame was
+    /// created. A stream that stops parsing mid-way contributes nothing —
+    /// exactly as it contributed nothing when the whole stream was parsed
+    /// up front — so its error truncates both back to these marks.
+    spans_mark: usize,
+    rulings_mark: usize,
     /// Form-XObject nesting depth, checked against `MAX_FORM_DEPTH`.
     depth: usize,
     gs: GState,
@@ -511,11 +514,19 @@ struct Frame {
 }
 
 impl Frame {
-    fn new(ops: Arc<[Op]>, chain: Vec<Arc<Dict>>, gs: GState, depth: usize) -> Frame {
+    fn new(
+        content: Arc<Vec<u8>>,
+        chain: Vec<Arc<Dict>>,
+        gs: GState,
+        depth: usize,
+        (spans_mark, rulings_mark): (usize, usize),
+    ) -> Frame {
         Frame {
-            ops,
+            content,
             chain,
-            pc: 0,
+            pos: 0,
+            spans_mark,
+            rulings_mark,
             depth,
             gs,
             saved: Vec::new(),
@@ -800,11 +811,28 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         'frames: while let Some(mut frame) = frames.pop() {
             // Cloned once per visit rather than once per operator: the handle has
             // to outlive the `&mut frame` borrows below.
-            let ops = Arc::clone(&frame.ops);
-            while frame.pc < ops.len() {
-                let op = &ops[frame.pc];
-                frame.pc += 1;
-                match op {
+            let content = Arc::clone(&frame.content);
+            let mut ops = ContentOps::at(&content, frame.pos);
+            loop {
+                let op = match ops.next_op() {
+                    Ok(Some((op, _))) => op,
+                    Ok(None) => break,
+                    Err(_) => {
+                        // The stream stops parsing mid-way: it contributes
+                        // nothing, exactly as it contributed nothing when
+                        // the whole stream was parsed up front.
+                        self.spans.truncate(frame.spans_mark);
+                        self.rulings.truncate(frame.rulings_mark);
+                        let kind = if frame.depth == 0 {
+                            SkippedTextKind::PageContents
+                        } else {
+                            SkippedTextKind::Form
+                        };
+                        self.report.record(kind, SkipCause::Parse);
+                        continue 'frames;
+                    }
+                };
+                match &op {
                     Op::SetFont(name, size) => {
                         let loaded = self.font(&frame.chain, &name.0, &mut frame.fonts).await;
                         frame.gs.font = Some(loaded);
@@ -830,6 +858,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                             // runs to completion, then the caller resumes at the
                             // operator after its `Do`. That is the depth-first
                             // order the recursive version emitted.
+                            frame.pos = ops.pos();
                             frames.push(frame);
                             frames.push(child);
                             continue 'frames;
@@ -1209,13 +1238,6 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 return None;
             }
         };
-        let ops = match parse_content(&data) {
-            Ok(ops) => ops,
-            Err(_) => {
-                self.report.record(SkippedTextKind::Form, SkipCause::Parse);
-                return None;
-            }
-        };
         // The form's own /Resources shadows the caller's for the names it
         // defines and falls through for the ones it does not, so it is
         // prepended rather than substituted. A form that declares
@@ -1231,7 +1253,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(m) = self.form_matrix(&stream.dict).await {
             inner.ctm = m.concat(inner.ctm);
         }
-        Some(Frame::new(ops.into(), inner_chain, inner, depth + 1))
+        Some(Frame::new(
+            Arc::new(data),
+            inner_chain,
+            inner,
+            depth + 1,
+            (self.spans.len(), self.rulings.len()),
+        ))
     }
 
     /// A stream dictionary's own `/Resources`, when it has a usable one.

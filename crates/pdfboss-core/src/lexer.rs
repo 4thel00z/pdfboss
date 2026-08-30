@@ -119,6 +119,19 @@ fn parse_number_fast(run: &[u8]) -> Option<Token> {
             _ => return None,
         }
     }
+    number_from_parts(negative, mantissa, digit_count, frac_len)
+}
+
+/// The fast path's finish: the accumulated parts become a token, or `None`
+/// when the parts fall outside the exact ranges and the caller must take
+/// the standard parse. Shared by [`parse_number_fast`] and the fused scan
+/// in [`Lexer::lex_number_or_keyword`], so the two cannot drift.
+fn number_from_parts(
+    negative: bool,
+    mantissa: u64,
+    digit_count: usize,
+    frac_len: Option<usize>,
+) -> Option<Token> {
     if digit_count == 0 {
         return None;
     }
@@ -304,13 +317,73 @@ impl<'a> Lexer<'a> {
 
     /// Lexes a run starting with a digit, sign, or period: a number when the
     /// run contains only numeric characters, otherwise a keyword (lenient).
+    /// One pass over the run finds its end, classifies it, and accumulates
+    /// the fast-path number as it goes — content streams are mostly numeric
+    /// operands, and three separate scans of each run showed up in profiles.
+    /// A run the fast path cannot represent exactly (a stray sign or second
+    /// period, an overflowing mantissa) falls back to [`number_token`]'s
+    /// full parse, unchanged.
     fn lex_number_or_keyword(&mut self) -> RawToken<'a> {
-        let run = self.take_regular_run();
-        if !run
-            .iter()
-            .all(|&b| matches!(b, b'0'..=b'9' | b'+' | b'-' | b'.'))
-        {
+        let start = self.pos;
+        let mut numeric = true;
+        let mut exact = true;
+        let mut negative = false;
+        let mut mantissa = 0u64;
+        let mut digit_count = 0usize;
+        let mut frac_len: Option<usize> = None;
+        let mut i = start;
+        while let Some(&b) = self.data.get(i) {
+            if !is_regular(b) {
+                break;
+            }
+            match b {
+                b'0'..=b'9' => {
+                    match mantissa
+                        .checked_mul(10)
+                        .and_then(|m| m.checked_add(u64::from(b - b'0')))
+                    {
+                        Some(next) => {
+                            mantissa = next;
+                            digit_count += 1;
+                            if let Some(count) = frac_len.as_mut() {
+                                *count += 1;
+                            }
+                        }
+                        None => exact = false,
+                    }
+                }
+                b'.' => {
+                    if frac_len.is_none() {
+                        frac_len = Some(0);
+                    } else {
+                        exact = false;
+                    }
+                }
+                b'-' => {
+                    if i == start {
+                        negative = true;
+                    } else {
+                        exact = false;
+                    }
+                }
+                b'+' => {
+                    if i != start {
+                        exact = false;
+                    }
+                }
+                _ => numeric = false,
+            }
+            i += 1;
+        }
+        self.pos = i;
+        let run = &self.data[start..i];
+        if !numeric {
             return RawToken::Keyword(run);
+        }
+        if exact {
+            if let Some(token) = number_from_parts(negative, mantissa, digit_count, frac_len) {
+                return RawToken::Owned(token);
+            }
         }
         RawToken::Owned(number_token(run))
     }
