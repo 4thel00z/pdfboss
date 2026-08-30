@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.0](https://github.com/4thel00z/pdfboss/compare/v0.25.0...v1.0.0) (2026-08-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **aio:** pdfboss_aio::Error::RangeUnsupported is removed; range-less servers now open successfully via a single full download.
+
+### Features
+
+* **aio:** fall back to one full download when the server ignores Range ([#123](https://github.com/4thel00z/pdfboss/issues/123)) ([fd35379](https://github.com/4thel00z/pdfboss/commit/fd353794a916794432c59d28d63ad3dc23ccdd1d))
+* **tui:** yank menu copying query, command, hexdump, bytes, value, obj ref ([#122](https://github.com/4thel00z/pdfboss/issues/122)) ([932d821](https://github.com/4thel00z/pdfboss/commit/932d821469d4a5e7e5f5479cf4ce5658e8bd29e6))
+
 ## [0.25.0](https://github.com/4thel00z/pdfboss/compare/v0.24.0...v0.25.0) (2026-08-28)
 
 
