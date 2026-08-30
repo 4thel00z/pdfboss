@@ -459,80 +459,127 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
 
 /// The deflate length codes for lengths 3..=258: `(code, extra_bits,
 /// base_length)` rows of RFC 1951 §3.2.5, consulted from a length.
+/// The encoder asks once per match, so the row comes from a direct
+/// table indexed by `len - 3` — one load instead of a binary search.
 fn length_code(len: usize) -> (u16, u32, usize) {
-    const TABLE: [(u16, u32, usize); 29] = [
-        (257, 0, 3),
-        (258, 0, 4),
-        (259, 0, 5),
-        (260, 0, 6),
-        (261, 0, 7),
-        (262, 0, 8),
-        (263, 0, 9),
-        (264, 0, 10),
-        (265, 1, 11),
-        (266, 1, 13),
-        (267, 1, 15),
-        (268, 1, 17),
-        (269, 2, 19),
-        (270, 2, 23),
-        (271, 2, 27),
-        (272, 2, 31),
-        (273, 3, 35),
-        (274, 3, 43),
-        (275, 3, 51),
-        (276, 3, 59),
-        (277, 4, 67),
-        (278, 4, 83),
-        (279, 4, 99),
-        (280, 4, 115),
-        (281, 5, 131),
-        (282, 5, 163),
-        (283, 5, 195),
-        (284, 5, 227),
-        (285, 0, 258),
-    ];
-    let idx = TABLE.partition_point(|&(_, _, base)| base <= len) - 1;
-    TABLE[idx]
+    const ROW_BY_LEN: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut row = 0;
+            while row + 1 < LENGTH_ROWS.len() && LENGTH_ROWS[row + 1].2 <= i + 3 {
+                row += 1;
+            }
+            table[i] = row as u8;
+            i += 1;
+        }
+        table
+    };
+    LENGTH_ROWS[ROW_BY_LEN[len - 3] as usize]
 }
 
+const LENGTH_ROWS: [(u16, u32, usize); 29] = [
+    (257, 0, 3),
+    (258, 0, 4),
+    (259, 0, 5),
+    (260, 0, 6),
+    (261, 0, 7),
+    (262, 0, 8),
+    (263, 0, 9),
+    (264, 0, 10),
+    (265, 1, 11),
+    (266, 1, 13),
+    (267, 1, 15),
+    (268, 1, 17),
+    (269, 2, 19),
+    (270, 2, 23),
+    (271, 2, 27),
+    (272, 2, 31),
+    (273, 3, 35),
+    (274, 3, 43),
+    (275, 3, 51),
+    (276, 3, 59),
+    (277, 4, 67),
+    (278, 4, 83),
+    (279, 4, 99),
+    (280, 4, 115),
+    (281, 5, 131),
+    (282, 5, 163),
+    (283, 5, 195),
+    (284, 5, 227),
+    (285, 0, 258),
+];
+
 /// The deflate distance codes: `(code, extra_bits, base_distance)` rows of
-/// RFC 1951 §3.2.5, consulted from a distance.
+/// RFC 1951 §3.2.5, consulted from a distance. Distances 1..=256 index a
+/// row table directly; every longer row spans whole 128-wide buckets (its
+/// extra bits are at least 7), so `(dist - 1) >> 7` picks the row for
+/// 257..=32768 exactly — zlib's classic two-level shape.
 fn distance_code(dist: usize) -> (u16, u32, usize) {
-    const TABLE: [(u16, u32, usize); 30] = [
-        (0, 0, 1),
-        (1, 0, 2),
-        (2, 0, 3),
-        (3, 0, 4),
-        (4, 1, 5),
-        (5, 1, 7),
-        (6, 2, 9),
-        (7, 2, 13),
-        (8, 3, 17),
-        (9, 3, 25),
-        (10, 4, 33),
-        (11, 4, 49),
-        (12, 5, 65),
-        (13, 5, 97),
-        (14, 6, 129),
-        (15, 6, 193),
-        (16, 7, 257),
-        (17, 7, 385),
-        (18, 8, 513),
-        (19, 8, 769),
-        (20, 9, 1025),
-        (21, 9, 1537),
-        (22, 10, 2049),
-        (23, 10, 3073),
-        (24, 11, 4097),
-        (25, 11, 6145),
-        (26, 12, 8193),
-        (27, 12, 12289),
-        (28, 13, 16385),
-        (29, 13, 24577),
-    ];
-    let idx = TABLE.partition_point(|&(_, _, base)| base <= dist) - 1;
-    TABLE[idx]
+    const ROW_BY_DIST: [u8; 512] = {
+        let mut table = [0u8; 512];
+        let mut d = 1;
+        while d <= 256 {
+            table[d - 1] = distance_row(d);
+            d += 1;
+        }
+        let mut bucket = 2;
+        while bucket < 256 {
+            table[256 + bucket] = distance_row((bucket << 7) + 1);
+            bucket += 1;
+        }
+        table
+    };
+    let row = if dist <= 256 {
+        ROW_BY_DIST[dist - 1]
+    } else {
+        ROW_BY_DIST[256 + ((dist - 1) >> 7)]
+    };
+    DISTANCE_ROWS[row as usize]
 }
+
+/// The [`DISTANCE_ROWS`] row covering `dist`, for building the lookup
+/// table at compile time.
+const fn distance_row(dist: usize) -> u8 {
+    let mut row = 0;
+    while row + 1 < DISTANCE_ROWS.len() && DISTANCE_ROWS[row + 1].2 <= dist {
+        row += 1;
+    }
+    row as u8
+}
+
+const DISTANCE_ROWS: [(u16, u32, usize); 30] = [
+    (0, 0, 1),
+    (1, 0, 2),
+    (2, 0, 3),
+    (3, 0, 4),
+    (4, 1, 5),
+    (5, 1, 7),
+    (6, 2, 9),
+    (7, 2, 13),
+    (8, 3, 17),
+    (9, 3, 25),
+    (10, 4, 33),
+    (11, 4, 49),
+    (12, 5, 65),
+    (13, 5, 97),
+    (14, 6, 129),
+    (15, 6, 193),
+    (16, 7, 257),
+    (17, 7, 385),
+    (18, 8, 513),
+    (19, 8, 769),
+    (20, 9, 1025),
+    (21, 9, 1537),
+    (22, 10, 2049),
+    (23, 10, 3073),
+    (24, 11, 4097),
+    (25, 11, 6145),
+    (26, 12, 8193),
+    (27, 12, 12289),
+    (28, 13, 16385),
+    (29, 13, 24577),
+];
 
 /// Greedy tokenizer state: a single-probe hash table over 4-byte windows,
 /// the cheap end of the zlib family's match search. One probe per input
@@ -541,6 +588,18 @@ fn distance_code(dist: usize) -> (u16, u32, usize) {
 const HASH_BITS: u32 = 15;
 const MIN_MATCH: usize = 4;
 const WINDOW: usize = 32 * 1024;
+
+/// The tokenizer's hash table: one slot per [`HASH_BITS`]-bit hash. A
+/// fixed-size array, so indexing with a hash — below the size by
+/// construction — compiles without a bounds check.
+type HashTable = [u32; 1 << HASH_BITS];
+
+fn hash_table() -> Box<HashTable> {
+    vec![0u32; 1 << HASH_BITS]
+        .into_boxed_slice()
+        .try_into()
+        .expect("length matches by construction")
+}
 
 #[inline]
 fn hash4(data: &[u8], i: usize) -> usize {
@@ -575,17 +634,12 @@ fn zero_run_end(data: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// One pass over the filtered image, reporting each token to `emit`. The
-/// tokenization is deterministic, so running it twice — once to count,
-/// once to write — costs two cheap scans instead of one buffered token
-/// stream; `table` is the hash table's storage, cleared here so both scans
-/// start from the same empty state without paying a second allocation.
+/// One pass over the filtered image, reporting each token to `emit`.
 /// After repeated probe misses the scan accelerates LZ4-style, stepping
 /// further between probes so incompressible stretches cost a fraction of a
 /// probe per byte.
-fn tokenize(data: &[u8], table: &mut Vec<u32>, mut emit: impl FnMut(Token<'_>)) {
-    table.clear();
-    table.resize(1 << HASH_BITS, u32::MAX);
+fn tokenize(data: &[u8], table: &mut HashTable, mut emit: impl FnMut(Token<'_>)) {
+    table.fill(u32::MAX);
     let mut i = 0;
     let mut lit_start = 0;
     let mut misses = 0u32;
@@ -675,63 +729,103 @@ fn tokenize(data: &[u8], table: &mut Vec<u32>, mut emit: impl FnMut(Token<'_>)) 
     }
 }
 
-/// Deflates the filtered image as one dynamic-Huffman block: a counting
-/// pass builds the image's own Huffman tables, a second identical pass
-/// writes the stream.
+/// One buffered [`Token`]: `literals` bytes verbatim from the walk's
+/// cursor, then a match of `len` at `dist` back. `len == 0` means no
+/// match follows — only the stream's final literal stretch produces that.
+struct BufferedToken {
+    literals: u32,
+    len: u16,
+    dist: u16,
+}
+
+/// Deflates the filtered image as one dynamic-Huffman block. The match
+/// search runs once, into a buffered token stream; counting that stream
+/// builds the image's exact Huffman tables, and the emission walk writes
+/// the same tokens under them. (The tables used to come from re-tokenizing
+/// a sample of the image — the buffer makes the second search unnecessary
+/// and the statistics exact, which also reads slightly smaller.)
 fn deflate_filtered(data: &[u8]) -> Vec<u8> {
-    let mut lit_freq = [1u32; 286];
-    let mut dist_freq = [1u32; 30];
-    // The tables come from a sample: half the image reads statistically
-    // like all of it, at half the counting cost. The 1-floors above keep
-    // every code the emission pass may need describable even when the
-    // sample never produced it (the two tokenizations genuinely differ —
-    // the emission pass sees hash-table state the sample pass did not).
-    let sample_len = if data.len() > 256 * 1024 {
-        data.len() / 2
-    } else {
-        data.len()
-    };
-    let mut table = Vec::new();
-    tokenize(&data[..sample_len], &mut table, |token| match token {
-        Token::Literals(bytes) => {
-            for &b in bytes {
-                lit_freq[b as usize] += 1;
-            }
-        }
+    let mut table = hash_table();
+    let mut tokens: Vec<BufferedToken> = Vec::new();
+    let mut literals = 0u32;
+    tokenize(data, &mut table, |token| match token {
+        Token::Literals(bytes) => literals += bytes.len() as u32,
         Token::Match { len, dist } => {
-            lit_freq[length_code(len).0 as usize] += 1;
-            dist_freq[distance_code(dist).0 as usize] += 1;
+            tokens.push(BufferedToken {
+                literals,
+                len: len as u16,
+                dist: dist as u16,
+            });
+            literals = 0;
         }
     });
+    if literals > 0 {
+        tokens.push(BufferedToken {
+            literals,
+            len: 0,
+            dist: 0,
+        });
+    }
+
+    let mut lit_freq = [0u32; 286];
+    let mut dist_freq = [0u32; 30];
+    // The end-of-block symbol is written exactly once, after the walk.
+    lit_freq[256] = 1;
+    let mut pos = 0usize;
+    for token in &tokens {
+        for &b in &data[pos..pos + token.literals as usize] {
+            lit_freq[b as usize] += 1;
+        }
+        pos += token.literals as usize;
+        if token.len == 0 {
+            continue;
+        }
+        lit_freq[length_code(token.len as usize).0 as usize] += 1;
+        dist_freq[distance_code(token.dist as usize).0 as usize] += 1;
+        pos += token.len as usize;
+    }
+    if !dist_freq.iter().any(|&f| f != 0) {
+        // No matches at all: still describe one distance code — decoders
+        // expect the alphabet to exist even when nothing references it.
+        dist_freq[0] = 1;
+    }
 
     let lit_lens = huffman_lengths(&lit_freq, 15);
     let lit_codes = canonical_codes(&lit_lens);
     let dist_lens = huffman_lengths(&dist_freq, 15);
     let dist_codes = canonical_codes(&dist_lens);
+    let hlit = lit_lens
+        .iter()
+        .rposition(|&l| l != 0)
+        .map_or(257, |p| (p + 1).max(257));
     let hdist = dist_lens.iter().rposition(|&l| l != 0).map_or(1, |p| p + 1);
 
     let mut bits = BitWriter::with_capacity(data.len() / 2 + 64);
     bits.write(1, 1); // BFINAL
     bits.write(2, 2); // dynamic Huffman
-    write_code_lengths(&mut bits, &lit_lens, &dist_lens[..hdist]);
-    tokenize(data, &mut table, |token| match token {
-        Token::Literals(bytes) => {
-            for &b in bytes {
-                let (code, len) = lit_codes[b as usize];
-                bits.write_rev(code, len);
-            }
+    write_code_lengths(&mut bits, &lit_lens[..hlit], &dist_lens[..hdist]);
+    let mut pos = 0usize;
+    for token in &tokens {
+        for &b in &data[pos..pos + token.literals as usize] {
+            let (code, len) = lit_codes[b as usize];
+            bits.write_rev(code, len);
         }
-        Token::Match { len, dist } => {
-            let (lcode, extra, base) = length_code(len);
-            let (code, nbits) = lit_codes[lcode as usize];
-            bits.write_rev(code, nbits);
-            bits.write((len - base) as u32, extra);
-            let (dcode, dextra, dbase) = distance_code(dist);
-            let (code, nbits) = dist_codes[dcode as usize];
-            bits.write_rev(code, nbits);
-            bits.write((dist - dbase) as u32, dextra);
+        pos += token.literals as usize;
+        if token.len == 0 {
+            continue;
         }
-    });
+        let len = token.len as usize;
+        let dist = token.dist as usize;
+        let (lcode, extra, base) = length_code(len);
+        let (code, nbits) = lit_codes[lcode as usize];
+        bits.write_rev(code, nbits);
+        bits.write((len - base) as u32, extra);
+        let (dcode, dextra, dbase) = distance_code(dist);
+        let (code, nbits) = dist_codes[dcode as usize];
+        bits.write_rev(code, nbits);
+        bits.write((dist - dbase) as u32, dextra);
+        pos += len;
+    }
     let (code, len) = lit_codes[256];
     bits.write_rev(code, len);
     bits.finish()
