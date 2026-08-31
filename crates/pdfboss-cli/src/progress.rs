@@ -1,7 +1,7 @@
 //! Stderr progress reporting for HTTP opens, never touching stdout, drawn
 //! only when stderr is a terminal, and erased once the document is open.
 //! Two renderers: a notice plus bar for the full-download fallback, and a
-//! two-line coverage minimap for ranged opens — a caret marking the byte
+//! two-line coverage minimap for ranged opens: a caret marking the byte
 //! region being fetched over a map of which stretches of the file have
 //! arrived, fed by the read cache's fetch observer.
 
@@ -87,7 +87,7 @@ fn caret_line(cell: usize) -> String {
 }
 
 /// The coverage row: fetched stretches solid, the rest shaded, then the
-/// running byte count over the file size. Fetched can exceed the total —
+/// running byte count over the file size. Fetched can exceed the total:
 /// evicted chunks fetched again are real traffic, and the count stays
 /// honest about it.
 fn map_line(cells: &[bool], fetched: u64, total: u64) -> String {
@@ -213,9 +213,9 @@ impl DownloadBar {
 /// `HttpBackend`, like `AsyncDocument::open_url_with_password`), drawing on
 /// stderr when it is a terminal: the coverage minimap during a ranged open,
 /// or the notice and progress bar when the full-download fallback runs (the
-/// fallback suppresses the minimap — once the body is resident, fetches are
-/// free and the map would only flicker). Both erase themselves, so a short
-/// body or a mid-open error still leaves the terminal on a clean line.
+/// fallback suppresses the minimap, since once the body is resident fetches
+/// are free and the map would only flicker). Both erase themselves, so a
+/// short body or a mid-open error still leaves the terminal on a clean line.
 pub async fn open_url_with_progress(
     url: &str,
     password: &str,
