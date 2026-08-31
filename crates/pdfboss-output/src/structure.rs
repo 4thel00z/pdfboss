@@ -388,10 +388,7 @@ fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeSt
     let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
     for segment in segments(spans) {
-        if segment.is_empty() {
-            continue;
-        }
-        push_segment_blocks(&segment, &grids, stats, &mut blocks);
+        push_segment_blocks(segment, &grids, stats, &mut blocks);
     }
     PageLayout { blocks }
 }
@@ -402,19 +399,19 @@ fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeSt
 /// table and every uncovered remainder stretch gets that same lane attempt,
 /// so a drawn grid and a whitespace-laned table can share a segment.
 fn push_segment_blocks(
-    segment: &[&TextSpan],
+    segment: Segment<'_>,
     grids: &[RuledGrid],
     stats: &SizeStats,
     out: &mut Vec<Block>,
 ) {
+    let groups = segment.into_groups();
     if grids.is_empty() {
-        push_lane_blocks(segment, stats, out);
+        push_lane_blocks(&groups, stats, out);
         return;
     }
-    let groups = line_groups(segment);
     let claims = grid_claims(&groups, grids);
     if claims.is_empty() {
-        push_lane_blocks(segment, stats, out);
+        push_lane_blocks(&groups, stats, out);
         return;
     }
     let mut next = 0usize;
@@ -429,11 +426,10 @@ fn push_segment_blocks(
     push_stretch(&groups[next..], stats, out);
 }
 
-/// The lane path: one [`table_band`] attempt over the spans' line groups,
-/// else prose. The groups are built once and feed both paths.
-fn push_lane_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
-    let groups = line_groups(spans);
-    let Some(band) = table_band(&groups) else {
+/// The lane path: one [`table_band`] attempt over the segment's line
+/// groups, else prose. The groups are built once and feed both paths.
+fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+    let Some(band) = table_band(groups) else {
         push_blocks(groups.iter().map(assembled).collect(), stats, out);
         return;
     };
@@ -445,8 +441,8 @@ fn push_lane_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>
     push_blocks(band.below, stats, out);
 }
 
-/// A remainder stretch between grid claims, back as spans, through the same
-/// lane attempt a whole segment gets.
+/// A remainder stretch between grid claims, back as spans and regrouped,
+/// through the same lane attempt a whole segment gets.
 fn push_stretch(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     if groups.is_empty() {
         return;
@@ -455,7 +451,7 @@ fn push_stretch(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
         .iter()
         .flat_map(|group| group.spans.iter().copied())
         .collect();
-    push_lane_blocks(&spans, stats, out);
+    push_lane_blocks(&line_groups(&spans), stats, out);
 }
 
 /// Character-weighted histogram of span sizes rounded to half a point. Body
@@ -506,15 +502,23 @@ fn half_points(size: f32) -> i32 {
 /// The document's size statistics, weighted by characters shown: a title
 /// carries a handful, body text carries thousands.
 fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
-    let mut weights: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    // A page holds a handful of distinct sizes, so a sorted vector beats a
+    // map; the weight counts scalar starts, which is the character count of
+    // valid UTF-8 without decoding it.
+    let mut weights: Vec<(i32, usize)> = Vec::new();
     for span in pages.iter().flat_map(|page| page.iter()) {
-        *weights.entry(half_points(span.size)).or_default() += span.text.chars().count();
+        let bucket = half_points(span.size);
+        let chars = span.text.bytes().filter(|b| (b & 0xC0) != 0x80).count();
+        match weights.binary_search_by_key(&bucket, |(b, _)| *b) {
+            Ok(index) => weights[index].1 += chars,
+            Err(index) => weights.insert(index, (bucket, chars)),
+        }
     }
     // Ties go to the smaller size: body text is what a document has most of
     // and, at equal weight, the likelier of the two to be it.
     let body = weights
         .iter()
-        .min_by_key(|(bucket, weight)| (std::cmp::Reverse(**weight), **bucket))
+        .min_by_key(|(bucket, weight)| (std::cmp::Reverse(*weight), *bucket))
         .map(|(bucket, _)| *bucket as f32 / 2.0);
     let Some(body) = body else {
         return SizeStats {
@@ -523,9 +527,9 @@ fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
         };
     };
     let ladder: Vec<f32> = weights
-        .keys()
+        .iter()
         .rev()
-        .map(|bucket| *bucket as f32 / 2.0)
+        .map(|(bucket, _)| *bucket as f32 / 2.0)
         .filter(|size| *size >= body + HEADING_MIN_DELTA)
         .collect();
     SizeStats { body, ladder }
@@ -853,14 +857,32 @@ fn same_line(y: f32, size: f32, span: &TextSpan) -> bool {
 /// Two passes: the first assigns every span its group — each span tests
 /// against the group's size as it stood when the span arrived — and counts,
 /// the second fills exact-sized span lists, so no list grows push by push.
+///
+/// A span with exactly the baseline and size of the span before it goes
+/// where that one went without scanning, provided that line's baseline
+/// still lies within half a size of it: every earlier group rejected the
+/// same coordinates a moment ago and has not changed since, and the
+/// baseline test only loosens as a line's size grows. Consecutive words of
+/// a typeset line share both values, so the scan runs once per line rather
+/// than once per word.
 fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
     let mut groups: Vec<Group> = Vec::new();
     let mut counts: Vec<usize> = Vec::new();
     let mut homes: Vec<usize> = Vec::with_capacity(spans.len());
+    let mut last: Option<(&TextSpan, usize)> = None;
     for &span in spans {
-        let found = groups
-            .iter()
-            .position(|group| same_line(group.y, group.size, span));
+        let repeat = last.filter(|(prev, home)| {
+            prev.y == span.y
+                && prev.size == span.size
+                && (groups[*home].y - span.y).abs() <= 0.5 * groups[*home].size.max(span.size)
+        });
+        let found = match repeat {
+            Some((_, home)) => Some(home),
+            None => groups
+                .iter()
+                .position(|group| same_line(group.y, group.size, span)),
+        };
+        last = Some((span, found.unwrap_or(groups.len())));
         match found {
             Some(index) => {
                 groups[index].size = groups[index].size.max(span.size);
@@ -1685,13 +1707,16 @@ fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
 /// [`WORD_GAP`] times the size becomes a space, and a change of
 /// `(bold, italic)` opens a new [`Inline`].
 fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
-    let mut inlines: Vec<Inline> = Vec::new();
+    // Most lines are one inline run; its text is sized once for every
+    // span's text and a space apiece rather than grown span by span.
+    let capacity = spans.iter().map(|span| span.text.len() + 1).sum();
+    let mut inlines: Vec<Inline> = Vec::with_capacity(1);
     let mut prev_end: Option<f32> = None;
     let mut prev_size = 0.0f32;
     let mut min_size = f32::INFINITY;
     for span in spans {
         let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
-        push_span(&mut inlines, span, spaced);
+        push_span(&mut inlines, span, spaced, capacity);
         prev_end = Some(span.end_x);
         prev_size = span.size;
         min_size = min_size.min(span.size);
@@ -1711,7 +1736,7 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 /// Extends the run the span continues, or opens one when its style differs.
 /// A `spaced` span puts its word-gap space at the end of the run before it,
 /// so the space is never lost at a style boundary.
-fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
+fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity: usize) {
     if let Some(last) = inlines.last_mut() {
         let already_spaced =
             last.text.ends_with(char::is_whitespace) || span.text.starts_with(char::is_whitespace);
@@ -1723,8 +1748,10 @@ fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
             return;
         }
     }
+    let mut text = String::with_capacity(capacity);
+    text.push_str(&span.text);
     inlines.push(Inline {
-        text: span.text.clone(),
+        text,
         bold: span.bold,
         italic: span.italic,
     });
@@ -1753,6 +1780,31 @@ fn bbox<'l>(lines: impl IntoIterator<Item = &'l Line>) -> BBox {
     }
 }
 
+/// One reading-order segment: its spans, and their line groups when the
+/// gutter search already built them, so the block pass need not group the
+/// same spans a second time.
+struct Segment<'s> {
+    spans: Vec<&'s TextSpan>,
+    groups: Option<Vec<Group<'s>>>,
+}
+
+impl<'s> Segment<'s> {
+    fn ungrouped(spans: Vec<&'s TextSpan>) -> Segment<'s> {
+        Segment {
+            spans,
+            groups: None,
+        }
+    }
+
+    /// The segment's line groups, built now if the gutter search did not.
+    fn into_groups(self) -> Vec<Group<'s>> {
+        match self.groups {
+            Some(groups) => groups,
+            None => line_groups(&self.spans),
+        }
+    }
+}
+
 /// The page's spans in reading order, cut into segments: the content
 /// stream's flows first, each then split at its gutter when it has one.
 ///
@@ -1765,11 +1817,11 @@ fn bbox<'l>(lines: impl IntoIterator<Item = &'l Line>) -> BBox {
 /// Lanes are not carried out: a table is looked for inside a segment, over
 /// its own rows, because a page's lanes are whatever every line on it leaves
 /// clear together, which is nothing as soon as one line runs the full width.
-fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
+fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
     flows(spans)
         .into_iter()
         .flat_map(gutter_split)
-        .filter(|segment| !segment.is_empty())
+        .filter(|segment| !segment.spans.is_empty())
         .collect()
 }
 
@@ -1865,19 +1917,32 @@ fn y_overlaps(a: &[&TextSpan], b: &[&TextSpan]) -> bool {
 /// only happens when both sides look like real columns (enough spans,
 /// enough distinct baselines, enough shared height); anything less reads
 /// top to bottom as one segment.
-fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
+fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Segment<'_>> {
     if spans.len() < COLUMN_MIN_SPANS {
-        return vec![spans];
+        return vec![Segment::ungrouped(spans)];
     }
     let (x_min, x_max) = x_bounds(&spans);
     let width = x_max - x_min;
     if !width.is_finite() || width <= 0.0 {
-        return vec![spans];
+        return vec![Segment::ungrouped(spans)];
     }
     let lines = line_groups(&spans);
+    match split_at_gutter(&lines, x_min, width) {
+        Some(bands) => bands,
+        None => vec![Segment {
+            spans,
+            groups: Some(lines),
+        }],
+    }
+}
+
+/// The bands of a flow that has a gutter, or `None` when it has none and
+/// reads whole. `lines` are the flow's line groups, which the caller keeps
+/// for the block pass when the flow stays whole.
+fn split_at_gutter<'s>(lines: &[Group<'s>], x_min: f32, width: f32) -> Option<Vec<Segment<'s>>> {
     let scale = GUTTER_BINS as f32 / width;
     let mut coverage = [0usize; GUTTER_BINS];
-    for line in &lines {
+    for line in lines {
         let mut covered = [false; GUTTER_BINS];
         fill_bins(&mut covered, &line.spans, x_min, scale);
         for (count, hit) in coverage.iter_mut().zip(covered) {
@@ -1890,11 +1955,11 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
     // Exactly one wide interior lane is a gutter; several are the cell
     // columns of a data table, whose rows must keep reading left to right.
     let [gutter] = gaps.as_slice() else {
-        return vec![spans];
+        return None;
     };
     let center = (gutter.start + gutter.end) as f32 / 2.0 / GUTTER_BINS as f32;
     if !GUTTER_BAND.contains(&center) {
-        return vec![spans];
+        return None;
     }
     let cut = x_min + (gutter.start + gutter.end) as f32 / 2.0 / scale;
 
@@ -1918,16 +1983,16 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
     if body_hi - body_lo <= width {
         let gutter_width = (gutter.end - gutter.start) as f32 / scale;
         if gutter_width < TWO_UP_MIN_GUTTER * width || !portrait(&left) || !portrait(&right) {
-            return vec![spans];
+            return None;
         }
     }
     if !column_shaped(&left) || !column_shaped(&right) {
-        return vec![spans];
+        return None;
     }
     if x_span(&left) < COLUMN_MIN_SIDE_WIDTH * width
         || x_span(&right) < COLUMN_MIN_SIDE_WIDTH * width
     {
-        return vec![spans];
+        return None;
     }
     let (left_lo, left_hi) = y_extent(&left);
     let (right_lo, right_hi) = y_extent(&right);
@@ -1936,7 +2001,7 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
         || left_hi - left_lo < COLUMN_MIN_HEIGHT * height
         || right_hi - right_lo < COLUMN_MIN_HEIGHT * height
     {
-        return vec![spans];
+        return None;
     }
 
     // Bands run top to bottom; each crossing line closes the columns above
@@ -1944,21 +2009,21 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
     let mut cuts: Vec<f32> = crossing.iter().map(|line| line.y).collect();
     cuts.sort_by(|a, b| b.total_cmp(a));
     cuts.dedup();
-    let mut out: Vec<Vec<&TextSpan>> = Vec::new();
+    let mut out: Vec<Segment<'s>> = Vec::new();
     let mut top = f32::INFINITY;
     for &sep_y in &cuts {
         push_band(&left, &right, top, sep_y, &mut out);
-        out.push(
+        out.push(Segment::ungrouped(
             crossing
                 .iter()
                 .filter(|line| line.y == sep_y)
                 .flat_map(|line| line.spans.iter().copied())
                 .collect(),
-        );
+        ));
         top = sep_y;
     }
     push_band(&left, &right, top, f32::NEG_INFINITY, &mut out);
-    out
+    Some(out)
 }
 
 /// Pushes one band's columns — the spans with baseline in `(bottom, top]` —
@@ -1969,15 +2034,15 @@ fn push_band<'s>(
     right: &[&'s TextSpan],
     top: f32,
     bottom: f32,
-    out: &mut Vec<Vec<&'s TextSpan>>,
+    out: &mut Vec<Segment<'s>>,
 ) {
     for side in [left, right] {
-        out.push(
+        out.push(Segment::ungrouped(
             side.iter()
                 .filter(|s| s.y <= top && s.y > bottom)
                 .copied()
                 .collect(),
-        );
+        ));
     }
 }
 
@@ -2074,13 +2139,10 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
 pub(crate) fn layout_reference(spans: &[TextSpan]) -> String {
     let mut out = String::new();
     for segment in segments(spans) {
-        if segment.is_empty() {
-            continue;
-        }
         if !out.is_empty() {
             out.push('\n');
         }
-        flow(&segment, &mut out);
+        flow(&segment.spans, &mut out);
     }
     out
 }
