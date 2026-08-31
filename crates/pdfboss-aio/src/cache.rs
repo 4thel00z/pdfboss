@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::backend::{Backend, BoxFuture};
 
@@ -31,6 +31,7 @@ pub struct CachedBackend<B: Backend> {
     max_bytes: usize,
     state: Mutex<CacheState>,
     len: tokio::sync::OnceCell<u64>,
+    fetch: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
 }
 
 struct CacheState {
@@ -72,7 +73,17 @@ impl<B: Backend> CachedBackend<B> {
                 previous_miss: None,
             }),
             len: tokio::sync::OnceCell::new(),
+            fetch: None,
         }
+    }
+
+    /// Registers a fetch observer: `fetch(offset, len)` is called after
+    /// every inner read a cache miss triggers, with the byte offset and
+    /// length actually fetched. Cache hits never call it. The callback runs
+    /// on the async runtime, so it must not block.
+    pub fn on_fetch(mut self, fetch: impl Fn(u64, u64) + Send + Sync + 'static) -> Self {
+        self.fetch = Some(Arc::new(fetch));
+        self
     }
 
     /// The chunk at `index`: from cache when resident (touching its LRU
@@ -100,6 +111,9 @@ impl<B: Backend> CachedBackend<B> {
             filled += count;
         }
         data.truncate(filled);
+        if let Some(fetch) = &self.fetch {
+            fetch(start, filled as u64);
+        }
         let wanted = (index - first) as usize;
         let mut result = Vec::new();
         for (step, piece) in data.chunks(self.chunk_size).enumerate() {
@@ -419,6 +433,21 @@ mod tests {
         let mut tail = [0u8; 64];
         assert_eq!(cached.read_at(4032, &mut tail).await.unwrap(), 64);
         assert_eq!(tail[63], 4095u32 as u8);
+    }
+
+    #[tokio::test]
+    async fn fetch_observer_reports_offset_and_length_of_each_inner_fetch() {
+        let data: Vec<u8> = (0..4096u32).map(|v| v as u8).collect();
+        let (inner, _) = counting(data);
+        let seen: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let cached = CachedBackend::with_capacity(inner, 64, 1 << 20)
+            .on_fetch(move |offset, len| sink.lock().unwrap().push((offset, len)));
+        let mut buf = [0u8; 16];
+        cached.read_at(5 * 64, &mut buf).await.unwrap(); // miss: run [5]
+        cached.read_at(4 * 64, &mut buf).await.unwrap(); // dense miss: run [3, 4]
+        cached.read_at(5 * 64, &mut buf).await.unwrap(); // hit: no report
+        assert_eq!(*seen.lock().unwrap(), vec![(320, 64), (192, 128)]);
     }
 
     #[test]
