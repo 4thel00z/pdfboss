@@ -1,11 +1,11 @@
 ---
 name: pdfboss
-description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
+description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
 ---
 
 # pdfboss
 
-A PDF engine written from scratch in safe Rust: parse, extract text and Markdown, rasterize to PNG, extract embedded images, and create PDFs. One core behind the `pdfboss` CLI and the `pdfboss` Python package. Clean-room from ISO 32000, no C dependencies. The reader is lenient: broken cross-reference tables are reconstructed, wrong stream lengths tolerated, garbage operators skipped, and every dropped or approximated item is reported instead of silently lost.
+A PDF engine written from scratch in safe Rust: parse, extract text and Markdown, rasterize to PNG, PPM, BMP or JPEG, extract embedded images, and create PDFs. One core behind the `pdfboss` CLI and the `pdfboss` Python package. Clean-room from ISO 32000, no C dependencies. The reader is lenient: broken cross-reference tables are reconstructed, wrong stream lengths tolerated, garbage operators skipped, and every dropped or approximated item is reported instead of silently lost.
 
 ## Install
 
@@ -21,7 +21,7 @@ cargo install pdfboss-cli      # the `pdfboss` binary
 pdfboss info    doc.pdf                     # version, page count, sizes, metadata
 pdfboss text    doc.pdf --page 2            # omit --page for all pages
 pdfboss md      doc.pdf                     # Markdown: headings, lists, tables from layout
-pdfboss render  doc.pdf --page 1 -o p.png --scale 2.0
+pdfboss render  doc.pdf --page 1 -o p.png --scale 2.0   # -o extension picks .png/.ppm/.bmp/.jpg; --jpeg-quality 1-100
 pdfboss images  doc.pdf -o out/             # embedded images as native-size PNGs
 pdfboss tui     doc.pdf                     # interactive terminal explorer
 ```
@@ -57,7 +57,7 @@ import pdfboss
 doc  = pdfboss.Document("doc.pdf")            # or Document(data=raw_bytes), password=""
 text = doc.extract_text()                     # pages fan out across cores
 md   = doc.extract_markdown()
-png  = doc[0].render(scale=2.0)               # PNG bytes
+png  = doc[0].render(scale=2.0)               # PNG bytes; format="ppm"/"bmp" for raw RGB pixels, "jpeg" (quality=90) for lossy
 png, warnings = doc[0].render_reporting()     # warnings list every drop or approximation
 images = doc[0].extract_images()              # each: .data (PNG bytes), .width, .height
 spans  = list(doc.spans())                    # styled spans: font, weight, color, position
@@ -82,7 +82,7 @@ stamped = pdfboss.write.watermark(original_bytes, overlay_bytes)
 data = pdfboss.md.to_pdf("# Hello\n\nWorld", theme=None, size="a4")
 ```
 
-`fonts=` on the render methods defaults to `None`, resolving to `"full"` when `font_dir=` is given or the `pdfboss-fonts` package is importable, else `"all-embedded"`; an explicit `fonts="full"` with no face source raises `ValueError`. The type stubs in `pdfboss/_pdfboss.pyi` are the authoritative signatures.
+`fonts=` on the render methods defaults to `None`, resolving to `"full"` when `font_dir=` is given or the `pdfboss-fonts` package is importable, else `"all-embedded"`; an explicit `fonts="full"` with no face source raises `ValueError`. `format=` is `"png"` (default), `"ppm"`, `"bmp"` or `"jpeg"`: PPM and BMP are the pixels behind a header (no encode cost, alpha dropped), JPEG is the lossy one with `quality=` 1 to 100. The type stubs in `pdfboss/_pdfboss.pyi` are the authoritative signatures.
 
 ## Rust
 
