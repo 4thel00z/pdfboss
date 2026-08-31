@@ -84,6 +84,13 @@ pub fn load_xref(data: &[u8]) -> Result<Xref> {
     }
 }
 
+/// The byte offset of the file's newest cross-reference section, as the
+/// trailing `startxref` announces it; `None` when the file has none. An
+/// incremental update names it as the `/Prev` of the section it appends.
+pub fn startxref(data: &[u8]) -> Option<usize> {
+    find_startxref(data)
+}
+
 /// Finds the byte offset announced after the last `startxref` keyword,
 /// searching the last 1 KiB first and widening to the last 64 KiB when the
 /// keyword is absent from the smaller window.

@@ -660,6 +660,17 @@ class write:
     ``Page`` above is a different class from ``write.Page`` below.
     """
 
+    @staticmethod
+    def watermark(data: bytes, overlay: bytes, *, rewrite: bool = False) -> bytes:
+        """Draws the first page of ``overlay`` over every page of ``data``
+        and returns the watermarked file. By default that is ``data``'s
+        bytes followed by an incremental update, so the original is
+        untouched and the result grows by the overlay page's size; with
+        ``rewrite=True`` the whole file is written afresh with compression
+        and object streams, dropping unreachable objects, which usually
+        comes out smaller than ``data``. An encrypted ``data`` raises
+        ``PdfError``."""
+
     class Standard14:
         """One of the fourteen standard fonts every PDF consumer
         provides."""

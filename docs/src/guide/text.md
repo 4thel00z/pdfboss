@@ -1,11 +1,16 @@
 # Extracting text from PDFs
 
 Text extraction turns a page's positioned glyphs back into readable text: spans are
-grouped into lines, lines are ordered top to bottom and joined with `\n`, and spaces
-are inserted at horizontal gaps. Whole-document extraction joins pages with a form
-feed (`\f`). For structured output (headings, lists, tables), see
-[Markdown output](./markdown.md); for the spans themselves, with fonts, sizes and
-positions, see [Styled spans](./spans.md).
+grouped into lines, lines are joined with `\n`, and spaces are inserted at horizontal
+gaps. Reading order follows the content stream: a typeset document writes each
+column whole before the next begins, so the text comes out column by column, and a
+figure caption or a footnote reads where the producer placed it. Geometry corrects
+the streams that write across two columns row by row (a page with a clear gutter
+still reads column-major) and takes over entirely when a stream was not written in
+reading order at all, which then reads top to bottom. Whole-document extraction
+joins pages with a form feed (`\f`). For structured output (headings, lists,
+tables), see [Markdown output](./markdown.md); for the spans themselves, with
+fonts, sizes and positions, see [Styled spans](./spans.md).
 
 ## CLI
 
@@ -127,9 +132,12 @@ optional-content configuration disables are excluded from the text.
 ## Encodings
 
 Character decoding covers `ToUnicode` CMaps, the WinAnsi, MacRoman and Standard
-simple-font encodings, and CID-keyed Type0 fonts: embedded `/Encoding` CMap streams
-parse, the predefined ISO 32000 CJK CMap set is compiled in (behind the
+simple-font encodings, the built-in encoding of an embedded Type 1 program (the base
+table of a simple font that names no `/Encoding` of its own, which is how TeX's
+symbol and math fonts arrive), and CID-keyed Type0 fonts: embedded `/Encoding` CMap
+streams parse, the predefined ISO 32000 CJK CMap set is compiled in (behind the
 `predefined-cmaps` feature, on by default in the CLI and the Python wheel), and when
 `/ToUnicode` is absent CIDs map to Unicode through the font's character collection.
-Glyph names resolve through the full Adobe Glyph List conventions, so ligatures
-(`fi`, `fl`, …) and small-caps variants decode to their proper Unicode text.
+Glyph names resolve through the full Adobe Glyph List plus the TeX symbol-font names
+the list lacks, so ligatures (`fi`, `fl`, …), small-caps variants and math symbols
+(`∀`, `∃`, `↦`, `′`) decode to their proper Unicode text.

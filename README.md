@@ -84,6 +84,8 @@ data = (Pdf() | Metadata(title="Q3 Report") | cover).to_bytes()
 
 An `Outline` of nested `Bookmark`s becomes the document's bookmark panel (`Pdf.outline`); `Attachment` objects embed arbitrary files inside the document (`Pdf.attachments`); `PageLabel` ranges control how page numbers render in viewer UI (`Pdf.page_labels`); and a `Viewer` sets the document's opening layout, mode, and page (`Pdf.viewer`). Each slots into `Pdf` with `|`, exactly like `Metadata`.
 
+Existing files are watermarked in place: `pdfboss.write.watermark(data, overlay)` returns `data` with the first page of `overlay` drawn over every page, as an incremental update appended to the original bytes, so the result grows by the overlay page's size and takes no longer than parsing the two files. `rewrite=True` writes a fresh, compressed file instead, which usually comes out smaller than the original.
+
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
 

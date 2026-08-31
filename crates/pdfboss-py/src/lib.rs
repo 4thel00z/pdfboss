@@ -327,6 +327,9 @@ struct Document {
     /// Fonts loaded once per document across every page render; handed to
     /// each page and to the `render_pages` fan-out workers.
     render_cache: Arc<RenderCache>,
+    /// Fonts loaded once per document across every text extraction, page
+    /// by page or whole; handed to each page like `render_cache`.
+    text_cache: Arc<pdfboss_output::FontCache>,
 }
 
 #[pymethods]
@@ -346,6 +349,7 @@ impl Document {
         Ok(Document {
             inner: SharedDocument::new(core),
             render_cache: Arc::new(RenderCache::default()),
+            text_cache: Arc::new(pdfboss_output::FontCache::default()),
         })
     }
 
@@ -396,6 +400,7 @@ impl Document {
         Ok(Page {
             doc: Arc::clone(&self.inner),
             render_cache: Arc::clone(&self.render_cache),
+            text_cache: Arc::clone(&self.text_cache),
             seed,
             page,
         })
@@ -413,16 +418,16 @@ impl Document {
     /// itself could not be read.
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         let inner = &self.inner;
+        let fonts = Arc::clone(&self.text_cache);
         py.allow_threads(move || {
             // The lock is held only long enough to seed; the fan-out runs
             // on a private materialization.
             let doc = CoreDocument::from_seed(inner.lock().seed());
             // `map_pages` visits exactly the materializable pages — the
             // flattened tree, not the declared `/Count`, which on a damaged
-            // file can exceed (or fall short of) what the tree yields. One
-            // font cache serves every worker, so a font loads once per
-            // document rather than once per page.
-            let fonts = pdfboss_output::FontCache::default();
+            // file can exceed (or fall short of) what the tree yields. The
+            // document's font cache serves every worker, so a font loads
+            // once per document rather than once per page.
             let texts = pdfboss_core::map_pages(&doc, |doc, page| {
                 let (text, _) = pdfboss_output::extract_text_reporting_cached(doc, page, &fonts)?;
                 Ok(text)
@@ -670,6 +675,9 @@ struct Page {
     /// Fonts loaded once per document across every page render
     /// (`RenderOptions::cache`); shared by all of this document's pages.
     render_cache: Arc<RenderCache>,
+    /// Fonts loaded once per document across every text extraction; shared
+    /// by all of this document's pages the same way.
+    text_cache: Arc<pdfboss_output::FontCache>,
     /// The document's shareable core: the fallback that keeps per-page
     /// work lock-free when another thread holds the shared document.
     seed: DocumentSeed,
@@ -739,7 +747,10 @@ impl Page {
     fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            pdfboss_output::extract_text(&doc, &self.page).map_err(pdf_err)
+            let (text, _) =
+                pdfboss_output::extract_text_reporting_cached(&doc, &self.page, &self.text_cache)
+                    .map_err(pdf_err)?;
+            Ok(text)
         })
     }
 
@@ -760,7 +771,9 @@ impl Page {
     fn spans(&self, py: Python<'_>) -> PyResult<Vec<Span>> {
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            let spans = pdfboss_text::extract_spans(&doc, &self.page).map_err(pdf_err)?;
+            let (spans, _) =
+                pdfboss_text::extract_spans_reporting_cached(&doc, &self.page, &self.text_cache)
+                    .map_err(pdf_err)?;
             Ok(spans.into_iter().map(|inner| Span { inner }).collect())
         })
     }

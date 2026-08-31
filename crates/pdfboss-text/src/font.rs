@@ -157,6 +157,19 @@ impl Decoded {
     }
 }
 
+/// What a code reads as when a Type 1 program's own encoding names `name`
+/// there: the name's text, or U+FFFD for a name nothing resolves. A code
+/// the program maps to `.notdef` draws nothing and stays unmapped.
+fn program_glyph(name: &str) -> Option<Decoded> {
+    if name == ".notdef" {
+        return None;
+    }
+    let decoded = encodings::glyph_to_text(name)
+        .map(Decoded::from_text)
+        .unwrap_or(Decoded::Char('\u{FFFD}'));
+    Some(decoded)
+}
+
 /// Resolves `dict[key]`, treating resolution failures and `null` as absent.
 ///
 /// Every function in this module borrows its source rather than owning it: they
@@ -639,7 +652,7 @@ impl Font {
         for key in ["FontFile2", "FontFile3"] {
             // Absent, not a stream, and undecodable all mean the same thing
             // here: this entry says nothing, try the next one.
-            let Some(data) = Font::sfnt_program(src, &descriptor, key).await else {
+            let Some(data) = Font::font_program(src, &descriptor, key).await else {
                 continue;
             };
             let platforms = sfnt::cmap_platforms(&data);
@@ -655,7 +668,7 @@ impl Font {
     /// program whose trailing `/Filter` is an image codec holds a
     /// passthrough codestream, and reading one as an sfnt table directory
     /// would let arbitrary JPEG bytes decide the WinAnsi guess.
-    async fn sfnt_program<S: AsyncObjectSource>(
+    async fn font_program<S: AsyncObjectSource>(
         src: &S,
         descriptor: &Dict,
         key: &str,
@@ -664,31 +677,62 @@ impl Font {
         decoded_stream_data_with(src, obj.as_stream()?).await.ok()
     }
 
+    /// The built-in encoding of the font's embedded Type 1 program
+    /// (`/FontFile`), code to glyph name, when it embeds one that states an
+    /// `/Encoding`.
+    async fn program_encoding<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+    ) -> Option<Box<[Option<String>; 256]>> {
+        let descriptor = rv(src, dict, "FontDescriptor").await?.as_dict().cloned()?;
+        let data = Font::font_program(src, &descriptor, "FontFile").await?;
+        encodings::type1_builtin_encoding(&data)
+    }
+
     /// Builds the 256-entry Unicode table from `/Encoding`: a base table
-    /// (named directly or via `/BaseEncoding`, default Standard) with
-    /// `/Differences` glyph names applied on top.
+    /// with `/Differences` glyph names applied on top. The base is the
+    /// encoding named directly or via `/BaseEncoding`; failing that, the
+    /// embedded Type 1 program's own encoding (ISO 32000-1 9.6.6.2); failing
+    /// that, Standard. A font naming no `/Encoding` and embedding no Type 1
+    /// program has no table and decodes through StandardEncoding directly.
     async fn load_encoding<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
     ) -> Option<Box<[Option<Decoded>; 256]>> {
-        let enc = rv(src, dict, "Encoding").await?;
+        let enc = rv(src, dict, "Encoding").await;
         let base_name = match &enc {
-            Object::Name(n) => Some(n.0.clone()),
-            Object::Dict(d) => rv(src, d, "BaseEncoding")
+            Some(Object::Name(n)) => Some(n.0.clone()),
+            Some(Object::Dict(d)) => rv(src, d, "BaseEncoding")
                 .await
                 .and_then(|o| o.as_name().map(|n| n.0.clone())),
             _ => None,
         };
-        let base: fn(u8) -> Option<char> = match base_name.as_deref() {
-            Some("WinAnsiEncoding") => encodings::win_ansi,
-            Some("MacRomanEncoding") => encodings::mac_roman,
-            _ => encodings::standard,
+        let program = match base_name {
+            Some(_) => None,
+            None => Font::program_encoding(src, dict).await,
         };
-        let mut table: Box<[Option<Decoded>; 256]> = Box::new(std::array::from_fn(|_| None));
-        for (code, slot) in table.iter_mut().enumerate() {
-            *slot = base(code as u8).map(Decoded::Char);
+        if enc.is_none() && program.is_none() {
+            return None;
         }
-        if let Object::Dict(d) = &enc {
+        let mut table: Box<[Option<Decoded>; 256]> = Box::new(std::array::from_fn(|_| None));
+        match program {
+            Some(names) => {
+                for (slot, name) in table.iter_mut().zip(names.iter()) {
+                    *slot = name.as_deref().and_then(program_glyph);
+                }
+            }
+            None => {
+                let base: fn(u8) -> Option<char> = match base_name.as_deref() {
+                    Some("WinAnsiEncoding") => encodings::win_ansi,
+                    Some("MacRomanEncoding") => encodings::mac_roman,
+                    _ => encodings::standard,
+                };
+                for (code, slot) in table.iter_mut().enumerate() {
+                    *slot = base(code as u8).map(Decoded::Char);
+                }
+            }
+        }
+        if let Some(Object::Dict(d)) = &enc {
             if let Some(Object::Array(diffs)) = rv(src, d, "Differences").await {
                 let mut code: u32 = 0;
                 for item in &diffs {
@@ -996,6 +1040,61 @@ mod tests {
         assert_eq!(f.decode(0x92), "\u{2019}", "right single quote");
         assert_eq!(f.decode(0x96), "\u{2013}", "en dash");
         assert_eq!(f.decode(0x97), "\u{2014}", "em dash");
+    }
+
+    /// The clear-text head of a TeX symbol font's program: its own
+    /// `/Encoding` names `universal` at code 56 and `copyright` at 169,
+    /// codes StandardEncoding reads as `8` and `quotesingle`.
+    const TYPE1_SYMBOL_PROGRAM: &[u8] = b"%!PS-AdobeFont-1.0: CMSY10\n\
+        /FontName /CMSY10 def\n/Encoding 256 array\n\
+        0 1 255 {1 index exch /.notdef put} for\n\
+        dup 56 /universal put\ndup 169 /copyright put\nreadonly def\n\
+        currentdict end\ncurrentfile eexec\n";
+
+    /// A simple font stating no `/Encoding` reads its embedded Type 1
+    /// program's own encoding (ISO 32000-1 9.6.6.2), so a symbol font's
+    /// codes are the glyphs the program names rather than StandardEncoding's
+    /// characters at those codes.
+    #[test]
+    fn an_embedded_type1_program_supplies_the_base_encoding() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /MOMGJX+CMSY10 \
+             /FirstChar 56 /LastChar 169 /FontDescriptor 7 0 R >>",
+            &[(6, TYPE1_SYMBOL_PROGRAM)],
+            &[(7, "<< /Type /FontDescriptor /Flags 4 /FontFile 6 0 R >>")],
+        );
+        assert_eq!(f.decode(56), "\u{2200}", "universal, not the digit eight");
+        assert_eq!(f.decode(0xA9), "\u{A9}", "copyright, not quotesingle");
+    }
+
+    /// `/Differences` without a `/BaseEncoding` apply on top of the
+    /// program's encoding, not on top of StandardEncoding.
+    #[test]
+    fn differences_apply_over_the_embedded_program_encoding() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /MOMGJX+CMSY10 \
+             /Encoding << /Differences [56 /bullet] >> /FontDescriptor 7 0 R >>",
+            &[(6, TYPE1_SYMBOL_PROGRAM)],
+            &[(7, "<< /Type /FontDescriptor /Flags 4 /FontFile 6 0 R >>")],
+        );
+        assert_eq!(f.decode(56), "\u{2022}", "the difference wins at its code");
+        assert_eq!(
+            f.decode(0xA9),
+            "\u{A9}",
+            "the program's encoding stays the base"
+        );
+    }
+
+    /// A named `/Encoding` replaces the program's encoding outright.
+    #[test]
+    fn a_named_encoding_outranks_the_embedded_program_encoding() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /MOMGJX+CMSY10 \
+             /Encoding /WinAnsiEncoding /FontDescriptor 7 0 R >>",
+            &[(6, TYPE1_SYMBOL_PROGRAM)],
+            &[(7, "<< /Type /FontDescriptor /Flags 4 /FontFile 6 0 R >>")],
+        );
+        assert_eq!(f.decode(56), "8");
     }
 
     /// `/Differences` names using the AGL conventions — underscore-joined

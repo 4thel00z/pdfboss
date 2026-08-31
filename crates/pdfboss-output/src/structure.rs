@@ -12,6 +12,11 @@ use pdfboss_text::{Ruling, TextSpan};
 /// kerns, which stay under 0.1 em; 0.25 em sat exactly on the nominal
 /// Times space width and swallowed every shrunk line's spaces.
 const WORD_GAP: f32 = 0.15;
+/// A span whose baseline falls outside the line's tolerance still joins the
+/// line when its nominal vertical extent overlaps the line's by this
+/// fraction of the smaller height: a superscript or subscript, never a
+/// fraction's numerator or denominator.
+const LINE_OVERLAP: f32 = 0.5;
 
 /// Minimum column-candidate spans on a page before a gutter is looked for.
 const COLUMN_MIN_SPANS: usize = 40;
@@ -35,11 +40,28 @@ const TWO_UP_MIN_GUTTER: f32 = 0.05;
 /// width the gutter's center must fall in.
 const GUTTER_MIN_WIDTH: f32 = 6.0;
 const GUTTER_BAND: std::ops::RangeInclusive<f32> = 0.25..=0.75;
-/// A span wider than this fraction of the text width separates bands
-/// (headings, footers) rather than belonging to either column.
-const SEPARATOR_FRACTION: f32 = 0.5;
 /// Occupancy-histogram resolution for gutter detection.
 const GUTTER_BINS: usize = 128;
+/// The fraction of a segment's lines that may cross a lane and still leave
+/// it a gutter: a running header, a page number, a heading over both
+/// columns.
+const GUTTER_MAX_CROSSING: f32 = 0.1;
+/// A baseline rising by more than this multiple of the line size between
+/// consecutive spans opens a new content-order flow: the jump from a
+/// column's foot to the next column's head, never a fraction's numerator a
+/// line above the text it follows.
+const FLOW_STEP_UP: f32 = 2.0;
+/// A baseline rising by more than this multiple of the line size also opens
+/// a flow when the span lands more than [`FLOW_STEP_ASIDE`] sizes to the
+/// side of the one before it: the first line of a caption or column set
+/// beside the block just written, where a numerator or a stacked limit
+/// stays over the text it belongs to.
+const FLOW_LINE_UP: f32 = 1.0;
+const FLOW_STEP_ASIDE: f32 = 2.0;
+/// When more than this fraction of a page's text sits in single-line flows,
+/// the stream was not written in reading order and the page is ordered by
+/// geometry alone.
+const FLOW_FRAGMENT_FRACTION: f32 = 0.5;
 
 /// How far above body size a size bucket must sit before it reads as a
 /// heading rather than as emphasis or a stray measurement.
@@ -809,8 +831,25 @@ struct Group<'s> {
     spans: Vec<&'s TextSpan>,
 }
 
-/// One reading-order segment's spans grouped into lines — baselines within
-/// `0.5 · size` — top of page first, spans left to right inside each.
+/// True when `span` belongs on the line at baseline `y` and size `size`:
+/// its baseline lies within `0.5 · size`, or its own vertical extent
+/// overlaps the line's by at least [`LINE_OVERLAP`] of the smaller height.
+/// The extents are the nominal ones a baseline and size imply, a quarter
+/// size below and three quarters above, so a raised superscript or a sunk
+/// subscript shares most of its height with the line while a fraction's
+/// numerator, a whole line up, shares little.
+fn same_line(y: f32, size: f32, span: &TextSpan) -> bool {
+    if (y - span.y).abs() <= 0.5 * size.max(span.size) {
+        return true;
+    }
+    let line_extent = (y - 0.25 * size, y + 0.75 * size);
+    let span_extent = (span.y - 0.25 * span.size, span.y + 0.75 * span.size);
+    let overlap = line_extent.1.min(span_extent.1) - line_extent.0.max(span_extent.0);
+    overlap >= LINE_OVERLAP * size.min(span.size)
+}
+
+/// One reading-order segment's spans grouped into lines (see
+/// [`same_line`]), top of page first, spans left to right inside each.
 /// Two passes: the first assigns every span its group — each span tests
 /// against the group's size as it stood when the span arrived — and counts,
 /// the second fills exact-sized span lists, so no list grows push by push.
@@ -821,7 +860,7 @@ fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
     for &span in spans {
         let found = groups
             .iter()
-            .position(|group| (group.y - span.y).abs() <= 0.5 * group.size.max(span.size));
+            .position(|group| same_line(group.y, group.size, span));
         match found {
             Some(index) => {
                 groups[index].size = groups[index].size.max(span.size);
@@ -1674,7 +1713,9 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 /// so the space is never lost at a style boundary.
 fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
     if let Some(last) = inlines.last_mut() {
-        if spaced {
+        let already_spaced =
+            last.text.ends_with(char::is_whitespace) || span.text.starts_with(char::is_whitespace);
+        if spaced && !already_spaced {
             last.text.push(' ');
         }
         if last.bold == span.bold && last.italic == span.italic {
@@ -1712,54 +1753,160 @@ fn bbox<'l>(lines: impl IntoIterator<Item = &'l Line>) -> BBox {
     }
 }
 
-/// The page's spans in reading order, cut into segments.
+/// The page's spans in reading order, cut into segments: the content
+/// stream's flows first, each then split at its gutter when it has one.
 ///
-/// Detects a two-column layout by x-occupancy: full-width spans are set
-/// aside as band separators, the rest are histogrammed, and the widest
-/// empty run whose center sits in the middle of the text width is the
-/// gutter candidate. The split only happens when both sides look like
-/// real columns (enough spans, enough distinct baselines, enough shared
-/// height) — anything less reads top-to-bottom as one segment, which is
-/// exactly the old behavior.
+/// Content order is the order the producer wrote and, in a typeset
+/// document, the order it meant: a column is emitted whole before the next
+/// begins. Geometry corrects the streams that write across two columns row
+/// by row, and takes over entirely when content order fragments into no
+/// order at all (see [`flows`]).
 ///
 /// Lanes are not carried out: a table is looked for inside a segment, over
 /// its own rows, because a page's lanes are whatever every line on it leaves
 /// clear together, which is nothing as soon as one line runs the full width.
 fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
-    let mut x_min = f32::INFINITY;
-    let mut x_max = f32::NEG_INFINITY;
+    flows(spans)
+        .into_iter()
+        .flat_map(gutter_split)
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
+/// The content stream's flows: runs of consecutive spans whose baselines
+/// never step back up by more than [`FLOW_STEP_UP`] line sizes. A typeset
+/// column is one flow, and the jump from its foot to the next column's head
+/// opens another; a display fraction's numerator, a line above the baseline
+/// it follows, does not. Side-by-side flows too sparse to be text columns
+/// merge back into one, so a table written column by column still reaches
+/// the lane detector as rows. A page with more than
+/// [`FLOW_FRAGMENT_FRACTION`] of its text in single-line flows was not
+/// written in reading order at all, and is one flow ordered by geometry; a
+/// figure's scattered labels beside a body column are a sliver of the
+/// page's text and leave the column in content order.
+fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
+    let mut flows: Vec<Vec<&TextSpan>> = Vec::new();
     for span in spans {
-        x_min = x_min.min(span.x.min(span.end_x));
-        x_max = x_max.max(span.x.max(span.end_x));
+        match flows.last_mut() {
+            Some(flow) if flow.last().is_some_and(|prev| !steps_up(prev, span)) => flow.push(span),
+            _ => flows.push(vec![span]),
+        }
     }
-    let width = x_max - x_min;
-    if !width.is_finite() || width <= 0.0 {
+    let chars = |flow: &[&TextSpan]| -> usize { flow.iter().map(|s| s.text.chars().count()).sum() };
+    let fragmented: usize = flows
+        .iter()
+        .filter(|flow| baseline_count(flow) == 1)
+        .map(|flow| chars(flow))
+        .sum();
+    let total: usize = flows.iter().map(|flow| chars(flow)).sum();
+    if flows.len() > 1 && fragmented as f32 > FLOW_FRAGMENT_FRACTION * total as f32 {
         return vec![spans.iter().collect()];
     }
-    let (separators, body): (Vec<&TextSpan>, Vec<&TextSpan>) = spans
-        .iter()
-        .partition(|s| (s.end_x - s.x).abs() > SEPARATOR_FRACTION * width);
+    merge_sparse_neighbours(flows)
+}
 
-    let mut occupied = [false; GUTTER_BINS];
-    let scale = GUTTER_BINS as f32 / width;
-    fill_bins(&mut occupied, &body, x_min, scale);
-    let gaps = wide_gaps(&occupied, scale);
-    let whole = || vec![spans.iter().collect::<Vec<&TextSpan>>()];
-
-    if body.len() < COLUMN_MIN_SPANS {
-        return whole();
+/// True when `next` opens a new flow: it sits more than [`FLOW_STEP_UP`]
+/// line sizes above `prev`, or a full line above it and displaced sideways
+/// by more than [`FLOW_STEP_ASIDE`] sizes. A fraction's numerator is less
+/// than a line up and continues where the text left off; the first line of
+/// a caption set beside the one just written is a line up and far to the
+/// right.
+fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
+    let size = prev.size.max(next.size);
+    let rise = next.y - prev.y;
+    if rise > FLOW_STEP_UP * size {
+        return true;
     }
+    let (prev_lo, prev_hi) = (prev.x.min(prev.end_x), prev.x.max(prev.end_x));
+    let aside =
+        next.x > prev_hi + FLOW_STEP_ASIDE * size || next.x < prev_lo - FLOW_STEP_ASIDE * size;
+    rise > FLOW_LINE_UP * size && aside
+}
+
+/// Merges a flow into the one before it when both hold at least
+/// [`TABLE_MIN_ROWS`] lines yet are too sparse to be text columns, and they
+/// overlap vertically: the columns of a table written column by column,
+/// which read as rows only once they share a segment. Anything shorter, a
+/// figure's scattered labels or a two-line caption, stays in content order
+/// rather than sorting by height.
+fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
+    let table_column =
+        |flow: &[&TextSpan]| !column_shaped(flow) && baseline_count(flow) >= TABLE_MIN_ROWS;
+    let mut merged: Vec<Vec<&TextSpan>> = Vec::new();
+    for flow in flows {
+        let Some(prev) = merged.last_mut() else {
+            merged.push(flow);
+            continue;
+        };
+        if !table_column(prev) || !table_column(&flow) || !y_overlaps(prev, &flow) {
+            merged.push(flow);
+            continue;
+        }
+        prev.extend(flow);
+    }
+    merged
+}
+
+/// True when the baseline ranges of two span sets overlap.
+fn y_overlaps(a: &[&TextSpan], b: &[&TextSpan]) -> bool {
+    let (a_lo, a_hi) = y_extent(a);
+    let (b_lo, b_hi) = y_extent(b);
+    a_lo <= b_hi && b_lo <= a_hi
+}
+
+/// One flow split at its gutter, when it has one.
+///
+/// The gutter is found by x-coverage per line: each line marks the bins its
+/// spans cover, and a bin more than [`GUTTER_MAX_CROSSING`] of the lines
+/// cover is occupied. The one free interior run whose center sits in the
+/// middle of the text width is the gutter, and the few lines that cross it
+/// — a running header, a page number, a heading over both columns — are
+/// the band separators between the columns above and below them. The split
+/// only happens when both sides look like real columns (enough spans,
+/// enough distinct baselines, enough shared height); anything less reads
+/// top to bottom as one segment.
+fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
+    if spans.len() < COLUMN_MIN_SPANS {
+        return vec![spans];
+    }
+    let (x_min, x_max) = x_bounds(&spans);
+    let width = x_max - x_min;
+    if !width.is_finite() || width <= 0.0 {
+        return vec![spans];
+    }
+    let lines = line_groups(&spans);
+    let scale = GUTTER_BINS as f32 / width;
+    let mut coverage = [0usize; GUTTER_BINS];
+    for line in &lines {
+        let mut covered = [false; GUTTER_BINS];
+        fill_bins(&mut covered, &line.spans, x_min, scale);
+        for (count, hit) in coverage.iter_mut().zip(covered) {
+            *count += usize::from(hit);
+        }
+    }
+    let allowed = (GUTTER_MAX_CROSSING * lines.len() as f32) as usize;
+    let occupied: [bool; GUTTER_BINS] = std::array::from_fn(|bin| coverage[bin] > allowed);
+    let gaps = wide_gaps(&occupied, scale);
     // Exactly one wide interior lane is a gutter; several are the cell
     // columns of a data table, whose rows must keep reading left to right.
     let [gutter] = gaps.as_slice() else {
-        return whole();
+        return vec![spans];
     };
     let center = (gutter.start + gutter.end) as f32 / 2.0 / GUTTER_BINS as f32;
     if !GUTTER_BAND.contains(&center) {
-        return whole();
+        return vec![spans];
     }
     let cut = x_min + (gutter.start + gutter.end) as f32 / 2.0 / scale;
 
+    let (crossing, columns): (Vec<&Group>, Vec<&Group>) = lines.iter().partition(|line| {
+        line.spans
+            .iter()
+            .any(|s| s.x.min(s.end_x) < cut && s.x.max(s.end_x) > cut)
+    });
+    let body: Vec<&TextSpan> = columns
+        .iter()
+        .flat_map(|line| line.spans.iter().copied())
+        .collect();
     let (left, right): (Vec<&TextSpan>, Vec<&TextSpan>) =
         body.iter().partition(|s| s.x.max(s.end_x) <= cut);
     // Two-column flow lives on portrait-shaped text blocks. A block wider
@@ -1771,16 +1918,16 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     if body_hi - body_lo <= width {
         let gutter_width = (gutter.end - gutter.start) as f32 / scale;
         if gutter_width < TWO_UP_MIN_GUTTER * width || !portrait(&left) || !portrait(&right) {
-            return whole();
+            return vec![spans];
         }
     }
     if !column_shaped(&left) || !column_shaped(&right) {
-        return whole();
+        return vec![spans];
     }
     if x_span(&left) < COLUMN_MIN_SIDE_WIDTH * width
         || x_span(&right) < COLUMN_MIN_SIDE_WIDTH * width
     {
-        return whole();
+        return vec![spans];
     }
     let (left_lo, left_hi) = y_extent(&left);
     let (right_lo, right_hi) = y_extent(&right);
@@ -1789,12 +1936,12 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
         || left_hi - left_lo < COLUMN_MIN_HEIGHT * height
         || right_hi - right_lo < COLUMN_MIN_HEIGHT * height
     {
-        return whole();
+        return vec![spans];
     }
 
-    // Bands run top to bottom; each separator line closes the columns
-    // above it and reads between them and the columns below.
-    let mut cuts: Vec<f32> = separators.iter().map(|s| s.y).collect();
+    // Bands run top to bottom; each crossing line closes the columns above
+    // it and reads between them and the columns below.
+    let mut cuts: Vec<f32> = crossing.iter().map(|line| line.y).collect();
     cuts.sort_by(|a, b| b.total_cmp(a));
     cuts.dedup();
     let mut out: Vec<Vec<&TextSpan>> = Vec::new();
@@ -1802,10 +1949,10 @@ fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     for &sep_y in &cuts {
         push_band(&left, &right, top, sep_y, &mut out);
         out.push(
-            separators
+            crossing
                 .iter()
-                .filter(|s| s.y == sep_y)
-                .copied()
+                .filter(|line| line.y == sep_y)
+                .flat_map(|line| line.spans.iter().copied())
                 .collect(),
         );
         top = sep_y;
@@ -1870,6 +2017,14 @@ fn wide_gaps(occupied: &[bool; GUTTER_BINS], scale: f32) -> Vec<std::ops::Range<
     gaps
 }
 
+/// The number of distinct baselines in a span set, rounded to whole points.
+fn baseline_count(spans: &[&TextSpan]) -> usize {
+    let mut baselines: Vec<i32> = spans.iter().map(|s| s.y.round() as i32).collect();
+    baselines.sort_unstable();
+    baselines.dedup();
+    baselines.len()
+}
+
 /// True when a span set stands taller than it runs wide — the shape of one
 /// page of a 2-up sheet.
 fn portrait(spans: &[&TextSpan]) -> bool {
@@ -1880,13 +2035,7 @@ fn portrait(spans: &[&TextSpan]) -> bool {
 /// True when a gutter side has enough spans on enough distinct baselines
 /// to be a text column rather than a stray cluster.
 fn column_shaped(spans: &[&TextSpan]) -> bool {
-    if spans.len() < COLUMN_MIN_SIDE_SPANS {
-        return false;
-    }
-    let mut baselines: Vec<i32> = spans.iter().map(|s| s.y.round() as i32).collect();
-    baselines.sort_unstable();
-    baselines.dedup();
-    baselines.len() >= COLUMN_MIN_SIDE_LINES
+    spans.len() >= COLUMN_MIN_SIDE_SPANS && baseline_count(spans) >= COLUMN_MIN_SIDE_LINES
 }
 
 /// Lowest and highest baseline of a span set.
@@ -1948,7 +2097,7 @@ fn flow(spans: &[&TextSpan], out: &mut String) {
     for &span in spans {
         let found = lines
             .iter_mut()
-            .find(|line| (line.y - span.y).abs() <= 0.5 * line.size.max(span.size));
+            .find(|line| same_line(line.y, line.size, span));
         match found {
             Some(line) => {
                 line.size = line.size.max(span.size);
@@ -2214,15 +2363,21 @@ pub(crate) mod tests {
 
     /// [`lane_grid_content`] with the lines a real page puts around a
     /// grid: a running header above, a page number below, and one wrapped
-    /// cell between two rows. All three populate a single cell; only the
-    /// wrapped one is inside the grid.
+    /// cell between two rows, written where a typesetter writes it, right
+    /// after the row it continues. All three populate a single cell; only
+    /// the wrapped one is inside the grid.
     pub(crate) fn grid_with_edge_lines_content() -> String {
-        format!(
-            "BT /F1 10 Tf 1 0 0 1 72 760 Tm ({RUNNING_HEADER}) Tj ET {} \
-             BT /F1 10 Tf 1 0 0 1 72 670 Tm (wrapped cell) Tj ET \
-             BT /F1 10 Tf 1 0 0 1 72 600 Tm (24) Tj ET",
-            lane_grid_content()
-        )
+        let mut content = format!("BT /F1 10 Tf 1 0 0 1 72 760 Tm ({RUNNING_HEADER}) Tj ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+            if row == 1 {
+                content += "1 0 0 1 72 670 Tm (wrapped cell) Tj ";
+            }
+        }
+        content += "1 0 0 1 72 600 Tm (24) Tj ET";
+        content
     }
 
     /// The page's spans, asserting the extraction report is complete: no
@@ -2385,6 +2540,191 @@ pub(crate) mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0], "L0a L0b L0c L0d R0a R0b R0c R0d");
+    }
+
+    /// A space glyph followed by a positioning gap is one word break, not
+    /// two: the gap only says where the next word starts.
+    #[test]
+    fn a_space_glyph_before_a_word_gap_is_one_space() {
+        let text = text_of("BT /F1 12 Tf 72 700 Td [(Hello ) -300 (world) -300 ( again)] TJ ET");
+        assert_eq!(text, "Hello world again");
+    }
+
+    /// A running header set as one span per word, the middle word sitting
+    /// over the gutter.
+    fn running_header() -> String {
+        "BT /F1 9 Tf 80 790 Td (Journal of) Tj 100 0 Td (manuscript) Tj 80 0 Td (no. 12345) Tj ET "
+            .to_string()
+    }
+
+    /// A page number centered on the gutter, under both columns.
+    fn page_number() -> String {
+        "BT /F1 10 Tf 214 40 Td (7) Tj ET ".to_string()
+    }
+
+    /// The same two-column body as [`two_column_content`], emitted the way a
+    /// typesetter writes it: the whole left column, then the whole right.
+    fn column_by_column_content(lines: u32) -> String {
+        let left: String = (0..lines)
+            .map(|i| column_line(72, 720 - i * 14, &format!("L{i}")))
+            .collect();
+        let right: String = (0..lines)
+            .map(|i| column_line(240, 720 - i * 14, &format!("R{i}")))
+            .collect();
+        left + &right
+    }
+
+    /// Text emitted column by column reads in that order even when the
+    /// running header's words and the page number cross the gutter: the
+    /// content stream already says which column comes first.
+    #[test]
+    fn column_by_column_emission_reads_in_content_order() {
+        let text = text_of(&(running_header() + &column_by_column_content(25) + &page_number()));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 52);
+        assert_eq!(lines[0], "Journal of manuscript no. 12345");
+        assert_eq!(lines[1], "L0a L0b L0c L0d");
+        assert_eq!(lines[25], "L24a L24b L24c L24d");
+        assert_eq!(lines[26], "R0a R0b R0c R0d");
+        assert_eq!(lines[50], "R24a R24b R24c R24d");
+        assert_eq!(lines[51], "7");
+    }
+
+    /// Text emitted row by row across both columns still splits at the
+    /// gutter when a header word and a page number cross it: a lane a
+    /// couple of lines cross out of dozens is a gutter, and the lines that
+    /// cross it are the bands between the columns.
+    #[test]
+    fn a_header_crossing_the_gutter_does_not_break_the_columns() {
+        let text = text_of(&(running_header() + &two_column_content(25) + &page_number()));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 52);
+        assert_eq!(lines[0], "Journal of manuscript no. 12345");
+        assert_eq!(lines[1], "L0a L0b L0c L0d");
+        assert_eq!(lines[26], "R0a R0b R0c R0d");
+        assert_eq!(lines[51], "7");
+    }
+
+    /// A stream that emits its lines bottom-up is not reading order: when
+    /// content order fragments into as many flows as there are lines, the
+    /// page falls back to top-to-bottom geometry.
+    #[test]
+    fn a_bottom_up_stream_still_reads_top_to_bottom() {
+        let content: String = (0..12)
+            .rev()
+            .map(|i| format!("BT /F1 12 Tf 72 {} Td (Line{i}) Tj ET ", 720 - i * 14))
+            .collect();
+        let text = text_of(&content);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Line0");
+        assert_eq!(lines[11], "Line11");
+    }
+
+    /// A figure's scattered labels, emitted in no vertical order after the
+    /// body, open a flow apiece; they are a sliver of the page's text and
+    /// do not send the body column back to geometry, where the labels would
+    /// interleave with its lines.
+    #[test]
+    fn scattered_figure_labels_do_not_force_geometric_order() {
+        let body: String = (0..12)
+            .map(|i| {
+                format!(
+                    "BT /F1 12 Tf 72 {} Td (Body line number {i} of the column) Tj ET ",
+                    720 - i * 14
+                )
+            })
+            .collect();
+        let labels: String = [600, 700, 580, 690, 566, 650, 720, 610, 640, 680, 590, 630]
+            .iter()
+            .enumerate()
+            .map(|(i, y)| format!("BT /F1 8 Tf 420 {y} Td (t{i}) Tj ET "))
+            .collect();
+        let text = text_of(&(body + &labels));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Body line number 0 of the column");
+        assert_eq!(lines[11], "Body line number 11 of the column");
+        assert_eq!(lines[12], "t0");
+        assert_eq!(lines.len(), 24);
+    }
+
+    /// Two sub-figure captions set side by side, each written whole: the
+    /// step from the first caption's last line back up to the second's
+    /// first line, one line up and well to the right, opens a new flow, so
+    /// each caption reads whole rather than line by line across both.
+    #[test]
+    fn side_by_side_captions_read_one_after_the_other() {
+        let content = "BT /F1 10 Tf 72 300 Td (\\(a\\) The marked triangles meet) Tj ET \
+                       BT /F1 10 Tf 72 288 Td (at the center and on a side.) Tj ET \
+                       BT /F1 10 Tf 300 300 Td (\\(b\\) The marked triangles meet) Tj ET \
+                       BT /F1 10 Tf 300 288 Td (at the center and outside.) Tj ET ";
+        let text = text_of(content);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "(a) The marked triangles meet",
+                "at the center and on a side.",
+                "(b) The marked triangles meet",
+                "at the center and outside.",
+            ]
+        );
+    }
+
+    /// A superscript raised past half the line size still overlaps most of
+    /// the line's height, so it stays on the line rather than opening one of
+    /// its own above it.
+    #[test]
+    fn a_raised_superscript_stays_on_its_line() {
+        let content = "BT /F1 10 Tf 72 700 Td (10) Tj ET \
+                       BT /F1 7 Tf 83.5 705.5 Td (9) Tj ET \
+                       BT /F1 10 Tf 92 700 Td (stars) Tj ET";
+        assert_eq!(text_of(content), "109 stars");
+    }
+
+    /// A display fraction's numerator sits a line above the baseline it is
+    /// emitted after; that small step back up does not open a new flow, so
+    /// the equation still reads top to bottom.
+    #[test]
+    fn a_fraction_numerator_stays_in_its_flow() {
+        let content = "BT /F1 12 Tf 72 700 Td (Before the fraction) Tj ET \
+                       BT /F1 12 Tf 200 708 Td (numerator) Tj ET \
+                       BT /F1 12 Tf 200 692 Td (denominator) Tj ET \
+                       BT /F1 12 Tf 300 700 Td (after it) Tj ET \
+                       BT /F1 12 Tf 72 680 Td (Next line of prose) Tj ET ";
+        let text = text_of(content);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "numerator",
+                "Before the fraction after it",
+                "denominator",
+                "Next line of prose"
+            ]
+        );
+    }
+
+    /// A table emitted column by column, each column too sparse to be a text
+    /// column, is read by rows: the side-by-side flows merge back into one
+    /// segment so its lanes are found.
+    #[test]
+    fn sparse_side_by_side_flows_read_as_table_rows() {
+        let content: String = [72, 240, 400]
+            .iter()
+            .enumerate()
+            .flat_map(|(column, &x)| {
+                (0..4).map(move |row| {
+                    format!(
+                        "BT /F1 12 Tf {x} {} Td (C{column}R{row}) Tj ET ",
+                        720 - row * 14
+                    )
+                })
+            })
+            .collect();
+        let text = text_of(&content);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "C0R0 C1R0 C2R0");
+        assert_eq!(lines[3], "C0R3 C1R3 C2R3");
     }
 
     /// A text block wider than it is tall is a slide or a table sheet, not

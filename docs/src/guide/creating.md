@@ -423,3 +423,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 This prints `Round trip`. The same holds across tools: `pdfboss info` reads back the metadata, [`pdfboss text`](./text.md) extracts the drawn strings, and [`pdfboss render`](./rendering.md) rasterizes the page. One render detail: the standard fourteen faces carry no embedded font program, and rendering paints embedded programs by default. Pass `--fonts full` to substitute bundled faces and see the text in the raster.
+
+## Watermarking an existing file
+
+`watermark` draws the first page of one document over every page of another. It does not rewrite the base file: the result is the base's bytes followed by an incremental update (ISO 32000-1 §7.5.6) holding the overlay page as a form XObject, its resources copied into the base's object space, and one replacement dictionary per page whose content is wrapped in `q … Q` before the form is drawn. The output therefore grows by the overlay page's size, keeps the base's cross-reference style, and takes no longer than parsing the two files. An encrypted base is refused.
+
+```rust,no_run
+use pdfboss_core::Document;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let base = Document::open("report.pdf")?;
+    let overlay = Document::open("draft-stamp.pdf")?;
+    let bytes = pdfboss_write::watermark(&base, &overlay)?;
+    std::fs::write("report-stamped.pdf", bytes)?;
+    Ok(())
+}
+```
+
+`watermark_with(base, overlay, WriteOptions::default())` is the other shape of the same operation: a fresh file written through the `Writer`, every object the catalog reaches copied over, filterless streams compressed and the rest packed into object streams, so unreachable objects and earlier update sections are left behind and the result is usually smaller than the base.
+
+From Python, `pdfboss.write.watermark(data, overlay)` takes and returns bytes; `rewrite=True` selects the fresh-file shape:
+
+```python
+import pdfboss
+
+stamped = pdfboss.write.watermark(open("report.pdf", "rb").read(), open("draft-stamp.pdf", "rb").read())
+open("report-stamped.pdf", "wb").write(stamped)
+```
