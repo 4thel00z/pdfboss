@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "pdfboss"
-version = "1.0.0"
+version = "1.1.0"
 description = "Fast PDF text extraction, Markdown conversion and page rendering in pure Rust, with pythonic bindings"
 readme = "README.md"
 requires-python = ">=3.12"

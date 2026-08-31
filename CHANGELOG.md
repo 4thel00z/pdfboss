@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.1.0](https://github.com/4thel00z/pdfboss/compare/v1.0.0...v1.1.0) (2026-08-31)
+
+
+### Features
+
+* content-order text extraction, Type 1 program encodings, watermarking ([#139](https://github.com/4thel00z/pdfboss/issues/139)) ([d5c27b1](https://github.com/4thel00z/pdfboss/commit/d5c27b192ab31af72cd62ca8cc471c556a6b4cb3))
+* **render:** jpeg output with an in-tree baseline encoder ([#138](https://github.com/4thel00z/pdfboss/issues/138)) ([#141](https://github.com/4thel00z/pdfboss/issues/141)) ([7734b82](https://github.com/4thel00z/pdfboss/commit/7734b827afbdda0f5556d6c629815af91d4f6e18))
+* **render:** ppm and bmp output formats next to png ([#134](https://github.com/4thel00z/pdfboss/issues/134)) ([fc2398a](https://github.com/4thel00z/pdfboss/commit/fc2398a1af8846cdc4f63885cdb3395d772d7790))
+
+
+### Documentation
+
+* book theme matching pdfboss.dev ([9b25db2](https://github.com/4thel00z/pdfboss/commit/9b25db2e899cf0a145d954affb13f395b3513946))
+* serve the book at pdfboss.dev/docs, keyword crate metadata ([#135](https://github.com/4thel00z/pdfboss/issues/135)) ([c4b55ae](https://github.com/4thel00z/pdfboss/commit/c4b55ae019c83be5870c40570f574d65437a911b))
+
 ## [1.0.0](https://github.com/4thel00z/pdfboss/compare/v0.25.0...v1.0.0) (2026-08-30)
 
 
