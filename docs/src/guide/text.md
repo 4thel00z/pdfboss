@@ -132,9 +132,12 @@ optional-content configuration disables are excluded from the text.
 ## Encodings
 
 Character decoding covers `ToUnicode` CMaps, the WinAnsi, MacRoman and Standard
-simple-font encodings, and CID-keyed Type0 fonts: embedded `/Encoding` CMap streams
-parse, the predefined ISO 32000 CJK CMap set is compiled in (behind the
+simple-font encodings, the built-in encoding of an embedded Type 1 program (the base
+table of a simple font that names no `/Encoding` of its own, which is how TeX's
+symbol and math fonts arrive), and CID-keyed Type0 fonts: embedded `/Encoding` CMap
+streams parse, the predefined ISO 32000 CJK CMap set is compiled in (behind the
 `predefined-cmaps` feature, on by default in the CLI and the Python wheel), and when
 `/ToUnicode` is absent CIDs map to Unicode through the font's character collection.
-Glyph names resolve through the full Adobe Glyph List conventions, so ligatures
-(`fi`, `fl`, …) and small-caps variants decode to their proper Unicode text.
+Glyph names resolve through the full Adobe Glyph List plus the TeX symbol-font names
+the list lacks, so ligatures (`fi`, `fl`, …), small-caps variants and math symbols
+(`∀`, `∃`, `↦`, `′`) decode to their proper Unicode text.
