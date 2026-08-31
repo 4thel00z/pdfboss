@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.2.0](https://github.com/4thel00z/pdfboss/compare/v1.1.0...v1.2.0) (2026-08-31)
+
+
+### Features
+
+* **cli:** coverage minimap on stderr for ranged HTTP opens ([#143](https://github.com/4thel00z/pdfboss/issues/143)) ([c368201](https://github.com/4thel00z/pdfboss/commit/c368201377996a4a9c30b630cbe3aa926eb71d95))
+
+
+### Performance Improvements
+
+* **output:** group lines once, skip the scan for repeated baselines ([#144](https://github.com/4thel00z/pdfboss/issues/144)) ([96f3135](https://github.com/4thel00z/pdfboss/commit/96f31355faad0fbc3d36e649c0fce28a29783e32))
+
+
+### Documentation
+
+* re-measure every benchmark table on main with the content-order engine ([#148](https://github.com/4thel00z/pdfboss/issues/148)) ([d1ac900](https://github.com/4thel00z/pdfboss/commit/d1ac9005265f6b80d213a340a309120f25692eef))
+* **skill:** refresh the bundled skill, mirror it for skills.sh discovery ([#147](https://github.com/4thel00z/pdfboss/issues/147)) ([7da253f](https://github.com/4thel00z/pdfboss/commit/7da253fdfc0d8dac0bf41b384c63de1a3f8a14c6))
+
 ## [1.1.0](https://github.com/4thel00z/pdfboss/compare/v1.0.0...v1.1.0) (2026-08-31)
 
 
