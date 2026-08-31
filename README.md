@@ -48,7 +48,7 @@ cargo install pdfboss-cli     # the `pdfboss` binary
 pdfboss info    report.pdf                 # version, page count, sizes, metadata
 pdfboss text    report.pdf --page 2        # extract text (omit --page for all)
 pdfboss md      report.pdf                 # markdown: headings, lists, tables from layout
-pdfboss render  report.pdf --page 1 -o page.png --scale 2.0   # or .ppm / .bmp
+pdfboss render  report.pdf --page 1 -o page.png --scale 2.0   # or .ppm / .bmp / .jpg
 pdfboss images  report.pdf                 # extract embedded images as native-size PNGs
 pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
@@ -64,7 +64,7 @@ import pdfboss
 doc = pdfboss.Document("report.pdf")       # or Document(data=raw_bytes)
 text = doc.extract_text()
 md   = doc.extract_markdown()              # headings, lists and tables inferred from layout
-png  = doc[0].render(scale=2.0)            # PNG bytes; format="ppm" or "bmp" for raw pixels
+png  = doc[0].render(scale=2.0)            # PNG bytes; format="ppm"/"bmp" for raw pixels, "jpeg" for lossy
 imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
 pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```

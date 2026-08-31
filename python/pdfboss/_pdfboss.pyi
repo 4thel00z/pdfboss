@@ -247,6 +247,7 @@ class Document:
         font_dir: str | None = None,
         compression: str = "default",
         format: str = "png",
+        quality: int = 90,
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
         given) to image bytes (PNG unless ``format`` says otherwise), fanned
@@ -348,6 +349,7 @@ class Page:
         font_dir: str | None = None,
         compression: str = "default",
         format: str = "png",
+        quality: int = 90,
     ) -> bytes:
         """Renders the page at ``scale`` and returns the encoded image: PNG
         unless ``format`` says otherwise.
@@ -366,11 +368,12 @@ class Page:
         ``"all-embedded"`` when none is.
 
         ``format`` picks the file format: ``"png"``, ``"ppm"`` (binary P6,
-        RGB) or ``"bmp"`` (24-bit). PPM and BMP are a header plus the
-        pixels, dropping alpha; ``compression`` trades PNG encode time
-        against file size (``"none"``, ``"fast"``, ``"default"`` or
-        ``"best"``) and only shapes PNG. Every choice produces the same
-        pixels.
+        RGB), ``"bmp"`` (24-bit) or ``"jpeg"`` (``"jpg"`` is accepted too).
+        PPM and BMP are a header plus the pixels, dropping alpha;
+        ``compression`` trades PNG encode time against file size
+        (``"none"``, ``"fast"``, ``"default"`` or ``"best"``) and only
+        shapes PNG; ``quality`` (1 to 100) is the JPEG quality and only
+        shapes JPEG. Apart from JPEG, every choice produces the same pixels.
 
         Content pdfboss cannot read is skipped rather than raising, so a
         page can come out blank; ``render_reporting`` says what was lost.
@@ -383,6 +386,7 @@ class Page:
         font_dir: str | None = None,
         compression: str = "default",
         format: str = "png",
+        quality: int = 90,
     ) -> tuple[bytes, list[str]]:
         """Renders the page like ``render``, returning ``(image, warnings)``.
 
@@ -496,6 +500,7 @@ class AsyncDocument:
         font_dir: str | None = None,
         compression: str = "default",
         format: str = "png",
+        quality: int = 90,
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
         given) to image bytes — the async twin of ``Document.render_pages``,
@@ -601,6 +606,7 @@ class AsyncPage:
         font_dir: str | None = None,
         compression: str = "default",
         format: str = "png",
+        quality: int = 90,
     ) -> bytes:
         """Renders the page at ``scale`` and resolves to image bytes — the
         async twin of ``Page.render``, with the same arguments and the
@@ -613,6 +619,7 @@ class AsyncPage:
         font_dir: str | None = None,
         compression: str = "default",
         format: str = "png",
+        quality: int = 90,
     ) -> tuple[bytes, list[str]]:
         """Renders the page like ``render``, resolving to
         ``(image, warnings)`` — the async twin of ``Page.render_reporting``,
