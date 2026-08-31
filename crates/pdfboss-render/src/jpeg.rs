@@ -4,7 +4,7 @@
 //! tables written verbatim. Chroma is not subsampled because a page is
 //! mostly sharp edges, where 4:2:0 smears colored text.
 
-use std::f32::consts::PI;
+use std::f32::consts::FRAC_1_SQRT_2;
 
 use crate::{Error, Result};
 
@@ -111,7 +111,8 @@ pub(crate) fn encode_jpeg(width: u32, height: u32, rgba: &[u8], quality: u8) -> 
     let mut out = Vec::with_capacity((width as usize * height as usize) / 4 + 1024);
     write_headers(&mut out, width, height, &luma_quant, &chroma_quant);
 
-    let cos = cos_table();
+    let luma_quantizer = Quantizer::new(&luma_quant);
+    let chroma_quantizer = Quantizer::new(&chroma_quant);
     let mut writer = BitWriter::new(out);
     let mut previous_dc = [0i32; 3];
     let mut blocks = [[0f32; 64]; 3];
@@ -119,11 +120,11 @@ pub(crate) fn encode_jpeg(width: u32, height: u32, rgba: &[u8], quality: u8) -> 
         for block_x in 0..width.div_ceil(8) {
             gather_block(rgba, width, height, block_x, block_y, &mut blocks);
             for (component, samples) in blocks.iter().enumerate() {
-                let (quant, dc, ac) = match component {
-                    0 => (&luma_quant, &dc_luma, &ac_luma),
-                    _ => (&chroma_quant, &dc_chroma, &ac_chroma),
+                let (quantizer, dc, ac) = match component {
+                    0 => (&luma_quantizer, &dc_luma, &ac_luma),
+                    _ => (&chroma_quantizer, &dc_chroma, &ac_chroma),
                 };
-                let coefficients = fdct_quantize(samples, quant, &cos);
+                let coefficients = fdct_quantize(samples, quantizer);
                 encode_block(
                     &mut writer,
                     &coefficients,
@@ -237,39 +238,83 @@ fn gather_block(
     }
 }
 
-/// `COS[k][n] = c(k) / 2 * cos((2n + 1) k pi / 16)`, the separable DCT-II
-/// basis with the normalization of A.3.3 folded in.
-fn cos_table() -> [[f32; 8]; 8] {
-    let mut table = [[0f32; 8]; 8];
-    for (k, row) in table.iter_mut().enumerate() {
-        let c = if k == 0 {
-            std::f32::consts::FRAC_1_SQRT_2
-        } else {
-            1.0
-        };
-        for (n, entry) in row.iter_mut().enumerate() {
-            *entry = c / 2.0 * (((2 * n + 1) * k) as f32 * PI / 16.0).cos();
-        }
-    }
-    table
+/// What each 1-D output of [`aan`] is scaled by relative to the DCT-II of
+/// A.3.3: `1` at k = 0, `sqrt(2) cos(k pi / 16)` above, times `2 sqrt 2`
+/// per pass.
+const AAN_SCALE: [f32; 8] = [
+    1.0, 1.3870399, 1.306563, 1.1758755, 1.0, 0.78569496, 0.5411961, 0.27589938,
+];
+
+/// One multiplier per coefficient, row-major, folding the AAN scale of
+/// both passes and the quantizer, so quantizing is a multiply and a round.
+struct Quantizer {
+    scale: [f32; 64],
 }
 
-/// The forward DCT of one level-shifted block, quantized by `quant` and
-/// returned in zig-zag order.
-fn fdct_quantize(samples: &[f32; 64], quant: &[u8; 64], cos: &[[f32; 8]; 8]) -> [i32; 64] {
-    let mut rows = [[0f32; 8]; 8];
-    for v in 0..8 {
-        for x in 0..8 {
-            rows[v][x] = (0..8).map(|y| cos[v][y] * samples[y * 8 + x]).sum();
+impl Quantizer {
+    fn new(quant: &[u8; 64]) -> Quantizer {
+        let mut scale = [0f32; 64];
+        for (n, entry) in scale.iter_mut().enumerate() {
+            let (v, u) = (n / 8, n % 8);
+            *entry = 1.0 / (AAN_SCALE[v] * AAN_SCALE[u] * 8.0 * f32::from(quant[n]));
+        }
+        Quantizer { scale }
+    }
+}
+
+/// The forward DCT of one level-shifted block, rows then columns through
+/// [`aan`], quantized through `quantizer` and returned in zig-zag order.
+fn fdct_quantize(samples: &[f32; 64], quantizer: &Quantizer) -> [i32; 64] {
+    let mut block = *samples;
+    for row in block.as_chunks_mut::<8>().0 {
+        aan(row);
+    }
+    for x in 0..8 {
+        let mut column = [0f32; 8];
+        for (y, value) in column.iter_mut().enumerate() {
+            *value = block[y * 8 + x];
+        }
+        aan(&mut column);
+        for (y, value) in column.iter().enumerate() {
+            block[y * 8 + x] = *value;
         }
     }
     let mut zigzag = [0i32; 64];
     for (k, &natural) in ZIGZAG.iter().enumerate() {
-        let (v, u) = (natural / 8, natural % 8);
-        let coefficient: f32 = (0..8).map(|x| rows[v][x] * cos[u][x]).sum();
-        zigzag[k] = (coefficient / f32::from(quant[natural])).round() as i32;
+        zigzag[k] = (block[natural] * quantizer.scale[natural]).round() as i32;
     }
     zigzag
+}
+
+/// One 8-point pass of the Arai, Agui and Nakajima factorization of the
+/// DCT-II: 5 multiplies and 29 additions, leaving each output scaled by
+/// its [`AAN_SCALE`] entry.
+fn aan(d: &mut [f32; 8]) {
+    let (sum07, diff07) = (d[0] + d[7], d[0] - d[7]);
+    let (sum16, diff16) = (d[1] + d[6], d[1] - d[6]);
+    let (sum25, diff25) = (d[2] + d[5], d[2] - d[5]);
+    let (sum34, diff34) = (d[3] + d[4], d[3] - d[4]);
+
+    let (even0, even3) = (sum07 + sum34, sum07 - sum34);
+    let (even1, even2) = (sum16 + sum25, sum16 - sum25);
+    d[0] = even0 + even1;
+    d[4] = even0 - even1;
+    let rotated = (even2 + even3) * FRAC_1_SQRT_2;
+    d[2] = even3 + rotated;
+    d[6] = even3 - rotated;
+
+    let odd0 = diff34 + diff25;
+    let odd1 = diff25 + diff16;
+    let odd2 = diff16 + diff07;
+    let shared = (odd0 - odd2) * 0.38268343;
+    let low = 0.5411961 * odd0 + shared;
+    let high = 1.306563 * odd2 + shared;
+    let middle = odd1 * FRAC_1_SQRT_2;
+    let (plus, minus) = (diff07 + middle, diff07 - middle);
+    d[5] = minus + low;
+    d[3] = minus - low;
+    d[1] = plus + high;
+    d[7] = plus - high;
 }
 
 /// Writes one block's DC difference and run-length coded AC coefficients.
@@ -414,6 +459,74 @@ mod tests {
         (0..256).filter(|&s| table.len[s] > 0).collect()
     }
 
+    /// The separable DCT-II written out directly from A.3.3 and quantized
+    /// with a division per coefficient: the reference the fast transform
+    /// is held to.
+    fn reference_fdct_quantize(samples: &[f32; 64], quant: &[u8; 64]) -> [i32; 64] {
+        let mut cos = [[0f32; 8]; 8];
+        for (k, row) in cos.iter_mut().enumerate() {
+            let c = if k == 0 {
+                std::f32::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            };
+            for (n, entry) in row.iter_mut().enumerate() {
+                *entry = c / 2.0 * (((2 * n + 1) * k) as f32 * std::f32::consts::PI / 16.0).cos();
+            }
+        }
+        let mut rows = [[0f32; 8]; 8];
+        for v in 0..8 {
+            for x in 0..8 {
+                rows[v][x] = (0..8).map(|y| cos[v][y] * samples[y * 8 + x]).sum();
+            }
+        }
+        let mut zigzag = [0i32; 64];
+        for (k, &natural) in ZIGZAG.iter().enumerate() {
+            let (v, u) = (natural / 8, natural % 8);
+            let coefficient: f32 = (0..8).map(|x| rows[v][x] * cos[u][x]).sum();
+            zigzag[k] = (coefficient / f32::from(quant[natural])).round() as i32;
+        }
+        zigzag
+    }
+
+    /// Level-shifted noise blocks from a fixed-seed linear congruential
+    /// generator, so the comparison is deterministic and dependency-free.
+    fn noise_blocks(count: usize) -> Vec<[f32; 64]> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        (0..count)
+            .map(|_| {
+                let mut block = [0f32; 64];
+                for sample in &mut block {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    *sample = ((state >> 40) & 0xFF) as f32 - 128.0;
+                }
+                block
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fast_dct_matches_the_reference_within_one_quantized_step() {
+        let flat = [1u8; 64];
+        for quant in [flat, LUMA_QUANT, CHROMA_QUANT] {
+            let quantizer = Quantizer::new(&quant);
+            for block in noise_blocks(200) {
+                let fast = fdct_quantize(&block, &quantizer);
+                let reference = reference_fdct_quantize(&block, &quant);
+                for k in 0..64 {
+                    assert!(
+                        (fast[k] - reference[k]).abs() <= 1,
+                        "coefficient {k}: fast {} vs reference {}",
+                        fast[k],
+                        reference[k]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn ac_tables_cover_every_run_size_pair_plus_eob_and_zrl() {
         let mut expected: Vec<usize> = (0..16)
@@ -488,7 +601,7 @@ mod tests {
     #[test]
     fn a_flat_block_quantizes_to_a_lone_dc_coefficient() {
         let samples = [64.0f32; 64];
-        let coefficients = fdct_quantize(&samples, &LUMA_QUANT, &cos_table());
+        let coefficients = fdct_quantize(&samples, &Quantizer::new(&LUMA_QUANT));
         assert_eq!(coefficients[0], (8.0f32 * 64.0 / 16.0).round() as i32);
         assert!(coefficients[1..].iter().all(|&c| c == 0));
     }

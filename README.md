@@ -1,7 +1,7 @@
 <h1 align="center">pdfboss</h1>
 
 <p align="center">
-  <strong>A PDF engine written from scratch in Rust: parse, extract text and images, rasterize to PNG, create PDFs. One core, a CLI, and pythonic bindings.</strong>
+  <strong>A PDF engine written from scratch in Rust: parse, extract text and images, rasterize to PNG, PPM, BMP or JPEG, create PDFs. One core, a CLI, and pythonic bindings.</strong>
 </p>
 
 <p align="center">
@@ -29,6 +29,7 @@ Reading a PDF should not require a C library. pdfboss is a clean-room reader bui
 - **Clean-room engine**: implemented from the ISO 32000 specification in safe Rust; no C dependencies, no bindings to another engine.
 - **Fastest text extraction measured**: 7,477 pages/s over a 40-file real-world corpus, about 18× the C-backed PyMuPDF ([benchmarks](#benchmarks)).
 - **Its own codecs**: JPEG 2000, JBIG2, CCITT and ICC are decoded in-tree, implemented from their specifications, not linked in.
+- **Four render formats**: PNG through its own page-tuned encoder, PPM and BMP as the raw pixels behind a header (about 0.3 ms a page, for pipelines that consume the pixels right away), and JPEG from its own baseline encoder with a quality knob; picked by `format=` in Python and by the `-o` extension on the CLI ([guide](https://pdfboss.dev/docs/guide/rendering.html#output-formats)).
 - **Embedded-image extraction**: every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
 - **PDF creation**: document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).
 - **Async, range-fetching I/O**: documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, never the whole file.

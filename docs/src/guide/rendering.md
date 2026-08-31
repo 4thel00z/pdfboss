@@ -170,7 +170,7 @@ quantization tables (50 uses them as printed, 100 keeps every
 coefficient). On a mostly white text page PNG stays both smaller and
 exact, so prefer JPEG only where the content is continuous-tone. Chroma
 is not subsampled, so colored text keeps sharp edges. The encoder is
-pdfboss's own, written from the JPEG specification, and costs about four
+pdfboss's own, written from the JPEG specification, and costs two to three
 times the default PNG encode per page.
 
 ```python
