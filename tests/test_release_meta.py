@@ -161,3 +161,16 @@ class TestPdfbossFontsReleasePipeline:
         assert "packages/pdfboss-fonts" in run_steps, (
             "the build step must target the packages/pdfboss-fonts directory"
         )
+
+
+class TestSkillCopiesMatch:
+    def test_registry_skill_matches_the_crate_copy(self) -> None:
+        """skills/pdfboss/SKILL.md mirrors the copy compiled into the CLI.
+
+        The CLI embeds crates/pdfboss-cli/skill/SKILL.md via include_str, and
+        the skills.sh registry discovers skills/pdfboss/SKILL.md; the two are
+        the same document and must stay byte-identical.
+        """
+        crate_copy = (REPO / "crates" / "pdfboss-cli" / "skill" / "SKILL.md").read_text()
+        registry_copy = (REPO / "skills" / "pdfboss" / "SKILL.md").read_text()
+        assert registry_copy == crate_copy
