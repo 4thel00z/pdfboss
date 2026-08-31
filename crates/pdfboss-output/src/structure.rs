@@ -388,10 +388,10 @@ fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeSt
     let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
     for segment in segments(spans) {
-        if segment.is_empty() {
+        if segment.spans.is_empty() {
             continue;
         }
-        push_segment_blocks(&segment, &grids, stats, &mut blocks);
+        push_segment_blocks(segment, &grids, stats, &mut blocks);
     }
     PageLayout { blocks }
 }
@@ -400,21 +400,25 @@ fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeSt
 /// page has no rulings — takes the single lane attempt it always has.
 /// Otherwise the segment is walked top-down: each claimed stretch becomes a
 /// table and every uncovered remainder stretch gets that same lane attempt,
-/// so a drawn grid and a whitespace-laned table can share a segment.
+/// so a drawn grid and a whitespace-laned table can share a segment. The
+/// segment's line groups come with it when [`gutter_split`] already built
+/// them, and are built here otherwise — never twice.
 fn push_segment_blocks(
-    segment: &[&TextSpan],
+    segment: Segment,
     grids: &[RuledGrid],
     stats: &SizeStats,
     out: &mut Vec<Block>,
 ) {
+    let groups = segment
+        .groups
+        .unwrap_or_else(|| line_groups(&segment.spans));
     if grids.is_empty() {
-        push_lane_blocks(segment, stats, out);
+        push_group_blocks(&groups, stats, out);
         return;
     }
-    let groups = line_groups(segment);
     let claims = grid_claims(&groups, grids);
     if claims.is_empty() {
-        push_lane_blocks(segment, stats, out);
+        push_group_blocks(&groups, stats, out);
         return;
     }
     let mut next = 0usize;
@@ -432,8 +436,12 @@ fn push_segment_blocks(
 /// The lane path: one [`table_band`] attempt over the spans' line groups,
 /// else prose. The groups are built once and feed both paths.
 fn push_lane_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
-    let groups = line_groups(spans);
-    let Some(band) = table_band(&groups) else {
+    push_group_blocks(&line_groups(spans), stats, out);
+}
+
+/// The lane path over line groups already built.
+fn push_group_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+    let Some(band) = table_band(groups) else {
         push_blocks(groups.iter().map(assembled).collect(), stats, out);
         return;
     };
@@ -854,33 +862,41 @@ fn same_line(y: f32, size: f32, span: &TextSpan) -> bool {
 /// against the group's size as it stood when the span arrived — and counts,
 /// the second fills exact-sized span lists, so no list grows push by push.
 fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
-    let mut groups: Vec<Group> = Vec::new();
+    // The scan runs over two flat f32 rows rather than the groups
+    // themselves, so finding a span's line touches no span lists.
+    let mut ys: Vec<f32> = Vec::new();
+    let mut sizes: Vec<f32> = Vec::new();
     let mut counts: Vec<usize> = Vec::new();
     let mut homes: Vec<usize> = Vec::with_capacity(spans.len());
     for &span in spans {
-        let found = groups
+        let found = ys
             .iter()
-            .position(|group| same_line(group.y, group.size, span));
+            .zip(&sizes)
+            .position(|(&y, &size)| same_line(y, size, span));
         match found {
             Some(index) => {
-                groups[index].size = groups[index].size.max(span.size);
+                sizes[index] = sizes[index].max(span.size);
                 counts[index] += 1;
                 homes.push(index);
             }
             None => {
-                homes.push(groups.len());
-                groups.push(Group {
-                    y: span.y,
-                    size: span.size,
-                    spans: Vec::new(),
-                });
+                homes.push(ys.len());
+                ys.push(span.y);
+                sizes.push(span.size);
                 counts.push(1);
             }
         }
     }
-    for (group, count) in groups.iter_mut().zip(&counts) {
-        group.spans.reserve_exact(*count);
-    }
+    let mut groups: Vec<Group> = ys
+        .into_iter()
+        .zip(sizes)
+        .zip(&counts)
+        .map(|((y, size), &count)| Group {
+            y,
+            size,
+            spans: Vec::with_capacity(count),
+        })
+        .collect();
     for (&span, &home) in spans.iter().zip(&homes) {
         groups[home].spans.push(span);
     }
@@ -1753,6 +1769,14 @@ fn bbox<'l>(lines: impl IntoIterator<Item = &'l Line>) -> BBox {
     }
 }
 
+/// One reading-order segment: its spans, and the line groups
+/// [`gutter_split`] built for them when it looked for a gutter — carried
+/// along so [`push_segment_blocks`] never groups the same span list twice.
+struct Segment<'s> {
+    spans: Vec<&'s TextSpan>,
+    groups: Option<Vec<Group<'s>>>,
+}
+
 /// The page's spans in reading order, cut into segments: the content
 /// stream's flows first, each then split at its gutter when it has one.
 ///
@@ -1765,11 +1789,11 @@ fn bbox<'l>(lines: impl IntoIterator<Item = &'l Line>) -> BBox {
 /// Lanes are not carried out: a table is looked for inside a segment, over
 /// its own rows, because a page's lanes are whatever every line on it leaves
 /// clear together, which is nothing as soon as one line runs the full width.
-fn segments(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
+fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
     flows(spans)
         .into_iter()
         .flat_map(gutter_split)
-        .filter(|segment| !segment.is_empty())
+        .filter(|segment| !segment.spans.is_empty())
         .collect()
 }
 
@@ -1792,15 +1816,20 @@ fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
             _ => flows.push(vec![span]),
         }
     }
-    let chars = |flow: &[&TextSpan]| -> usize { flow.iter().map(|s| s.text.chars().count()).sum() };
-    let fragmented: usize = flows
-        .iter()
-        .filter(|flow| baseline_count(flow) == 1)
-        .map(|flow| chars(flow))
-        .sum();
-    let total: usize = flows.iter().map(|flow| chars(flow)).sum();
-    if flows.len() > 1 && fragmented as f32 > FLOW_FRAGMENT_FRACTION * total as f32 {
-        return vec![spans.iter().collect()];
+    if flows.len() > 1 {
+        let chars =
+            |flow: &[&TextSpan]| -> usize { flow.iter().map(|s| s.text.chars().count()).sum() };
+        let counts: Vec<usize> = flows.iter().map(|flow| chars(flow)).collect();
+        let fragmented: usize = flows
+            .iter()
+            .zip(&counts)
+            .filter(|(flow, _)| baseline_count(flow) == 1)
+            .map(|(_, &count)| count)
+            .sum();
+        let total: usize = counts.iter().sum();
+        if fragmented as f32 > FLOW_FRAGMENT_FRACTION * total as f32 {
+            return vec![spans.iter().collect()];
+        }
     }
     merge_sparse_neighbours(flows)
 }
@@ -1865,14 +1894,20 @@ fn y_overlaps(a: &[&TextSpan], b: &[&TextSpan]) -> bool {
 /// only happens when both sides look like real columns (enough spans,
 /// enough distinct baselines, enough shared height); anything less reads
 /// top to bottom as one segment.
-fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
+fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Segment<'_>> {
     if spans.len() < COLUMN_MIN_SPANS {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: None,
+        }];
     }
     let (x_min, x_max) = x_bounds(&spans);
     let width = x_max - x_min;
     if !width.is_finite() || width <= 0.0 {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: None,
+        }];
     }
     let lines = line_groups(&spans);
     let scale = GUTTER_BINS as f32 / width;
@@ -1890,11 +1925,17 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
     // Exactly one wide interior lane is a gutter; several are the cell
     // columns of a data table, whose rows must keep reading left to right.
     let [gutter] = gaps.as_slice() else {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: Some(lines),
+        }];
     };
     let center = (gutter.start + gutter.end) as f32 / 2.0 / GUTTER_BINS as f32;
     if !GUTTER_BAND.contains(&center) {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: Some(lines),
+        }];
     }
     let cut = x_min + (gutter.start + gutter.end) as f32 / 2.0 / scale;
 
@@ -1918,16 +1959,25 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
     if body_hi - body_lo <= width {
         let gutter_width = (gutter.end - gutter.start) as f32 / scale;
         if gutter_width < TWO_UP_MIN_GUTTER * width || !portrait(&left) || !portrait(&right) {
-            return vec![spans];
+            return vec![Segment {
+                spans,
+                groups: Some(lines),
+            }];
         }
     }
     if !column_shaped(&left) || !column_shaped(&right) {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: Some(lines),
+        }];
     }
     if x_span(&left) < COLUMN_MIN_SIDE_WIDTH * width
         || x_span(&right) < COLUMN_MIN_SIDE_WIDTH * width
     {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: Some(lines),
+        }];
     }
     let (left_lo, left_hi) = y_extent(&left);
     let (right_lo, right_hi) = y_extent(&right);
@@ -1936,7 +1986,10 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
         || left_hi - left_lo < COLUMN_MIN_HEIGHT * height
         || right_hi - right_lo < COLUMN_MIN_HEIGHT * height
     {
-        return vec![spans];
+        return vec![Segment {
+            spans,
+            groups: Some(lines),
+        }];
     }
 
     // Bands run top to bottom; each crossing line closes the columns above
@@ -1944,17 +1997,18 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Vec<&TextSpan>> {
     let mut cuts: Vec<f32> = crossing.iter().map(|line| line.y).collect();
     cuts.sort_by(|a, b| b.total_cmp(a));
     cuts.dedup();
-    let mut out: Vec<Vec<&TextSpan>> = Vec::new();
+    let mut out: Vec<Segment> = Vec::new();
     let mut top = f32::INFINITY;
     for &sep_y in &cuts {
         push_band(&left, &right, top, sep_y, &mut out);
-        out.push(
-            crossing
+        out.push(Segment {
+            spans: crossing
                 .iter()
                 .filter(|line| line.y == sep_y)
                 .flat_map(|line| line.spans.iter().copied())
                 .collect(),
-        );
+            groups: None,
+        });
         top = sep_y;
     }
     push_band(&left, &right, top, f32::NEG_INFINITY, &mut out);
@@ -1969,15 +2023,17 @@ fn push_band<'s>(
     right: &[&'s TextSpan],
     top: f32,
     bottom: f32,
-    out: &mut Vec<Vec<&'s TextSpan>>,
+    out: &mut Vec<Segment<'s>>,
 ) {
     for side in [left, right] {
-        out.push(
-            side.iter()
+        out.push(Segment {
+            spans: side
+                .iter()
                 .filter(|s| s.y <= top && s.y > bottom)
                 .copied()
                 .collect(),
-        );
+            groups: None,
+        });
     }
 }
 
@@ -2074,13 +2130,13 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
 pub(crate) fn layout_reference(spans: &[TextSpan]) -> String {
     let mut out = String::new();
     for segment in segments(spans) {
-        if segment.is_empty() {
+        if segment.spans.is_empty() {
             continue;
         }
         if !out.is_empty() {
             out.push('\n');
         }
-        flow(&segment, &mut out);
+        flow(&segment.spans, &mut out);
     }
     out
 }
