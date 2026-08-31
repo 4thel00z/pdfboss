@@ -261,6 +261,23 @@ fn q_over_range_ignoring_url_works_with_silent_stderr() {
     );
 }
 
+/// The ranged-open coverage minimap is likewise terminal-only: over a
+/// range-honoring server, a piped stderr must stay byte-for-byte empty.
+#[test]
+fn q_over_range_honoring_url_keeps_stderr_silent() {
+    let server = MockServer::start(hello_bytes(), true);
+    let url = server.url("hello.pdf");
+
+    let output = pdfboss(&["q", &url, ".header.version"]);
+    assert!(output.status.success(), "q over url failed: {output:?}");
+    assert_eq!(stdout_str(&output), "\"1.7\"\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr must stay empty off-terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// `tui` must accept `http(s)://` targets unconditionally in the default
 /// build, exactly like `json`/`hex`/`q` above -- no opt-in cargo feature.
 /// No mock server needed: an unreachable loopback port still proves the
