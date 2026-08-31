@@ -89,3 +89,39 @@ async def test_async_twins_take_the_format(hello_pdf: Path) -> None:
 
 def test_stub_declares_the_format_on_every_render_entry_point() -> None:
     assert STUB.read_text().count('format: str = "png"') == 6
+
+
+def test_jpeg_is_a_jfif_stream_and_jpg_is_the_same_format(hello_pdf: Path) -> None:
+    page = Document(hello_pdf)[0]
+    jpeg = page.render(scale=0.5, format="jpeg")
+    assert jpeg[:4] == b"\xff\xd8\xff\xe0"
+    assert jpeg[6:11] == b"JFIF\0"
+    assert jpeg[-2:] == b"\xff\xd9"
+    assert page.render(scale=0.5, format="jpg") == jpeg
+
+
+def test_jpeg_quality_orders_file_size(fixtures_dir: Path) -> None:
+    page = Document(fixtures_dir / "shapes.pdf")[0]
+    sizes = [len(page.render(scale=0.5, format="jpeg", quality=q)) for q in (20, 60, 95)]
+    assert sizes == sorted(sizes) and len(set(sizes)) == 3, sizes
+    assert page.render(scale=0.5, format="jpeg") == page.render(scale=0.5, format="jpeg", quality=90)
+
+
+def test_jpeg_quality_outside_one_to_hundred_raises(hello_pdf: Path) -> None:
+    page = Document(hello_pdf)[0]
+    for quality in (0, 101):
+        with pytest.raises(ValueError, match="quality"):
+            page.render(scale=0.5, format="jpeg", quality=quality)
+
+
+@pytest.mark.asyncio
+async def test_async_render_takes_jpeg_quality(fixtures_dir: Path) -> None:
+    doc = await AsyncDocument.open(fixtures_dir / "shapes.pdf")
+    small = await doc[0].render(scale=0.5, format="jpeg", quality=30)
+    large = await doc[0].render(scale=0.5, format="jpeg", quality=95)
+    assert small[:2] == b"\xff\xd8"
+    assert len(small) < len(large)
+
+
+def test_stub_declares_the_jpeg_quality_on_every_render_entry_point() -> None:
+    assert STUB.read_text().count("quality: int = 90") == 6
