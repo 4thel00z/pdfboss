@@ -7,6 +7,10 @@ src = "src"
 
 [output.html]
 site-url = "/docs/"
+default-theme = "light"
+preferred-dark-theme = "light"
+additional-css = ["theme/pdfboss.css"]
+additional-js = ["theme/pdfboss.js"]
 git-repository-url = "https://github.com/4thel00z/pdfboss"
 edit-url-template = "https://github.com/4thel00z/pdfboss/edit/main/docs/{path}"
 
