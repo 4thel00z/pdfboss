@@ -1,7 +1,7 @@
 # Rendering PDF pages to PNG
 
 pdfboss rasterizes pages to RGBA pixels with anti-aliasing and encodes them as
-PNG, PPM or BMP. The scale factor is the points-to-pixels ratio: at `1.0` one PDF point
+PNG, PPM, BMP or JPEG. The scale factor is the points-to-pixels ratio: at `1.0` one PDF point
 becomes one pixel, so a US Letter page renders to 612 × 792 pixels; at `2.0`
 to 1224 × 1584. The pixel size is `ceil(crop_w * scale) × ceil(crop_h *
 scale)` after page rotation, on a white background.
@@ -20,8 +20,8 @@ pdfboss render report.pdf --page 1 --scale 2 -o page-1.ppm
 The first form writes `page-1.png` (`--page` is 1-based). Further flags:
 
 - `-o <OUT>`: the output file; its extension picks the format, `.png`,
-  `.ppm` or `.bmp` (see [Output formats](#output-formats)). Any other
-  extension is an error.
+  `.ppm`, `.bmp` or `.jpg` (see [Output formats](#output-formats)). Any
+  other extension is an error.
 - `--fonts <FONTS>`: which fonts to paint, one of `embedded-only`,
   `all-embedded` or `full` (see the tiers below). The default resolves to
   `full` when substitute faces are available (the compiled-in OFL set or
@@ -32,6 +32,7 @@ The first form writes `page-1.png` (`--page` is 1-based). Further flags:
   OFL set.
 - `--png-compression <PNG_COMPRESSION>`: `none`, `fast`, `default` or
   `best`; PNG only.
+- `--jpeg-quality <1-100>`: the JPEG quality (default 90); JPEG only.
 - `--password <PASSWORD>`: for encrypted files, covered in
   [Encrypted documents](./encryption.md).
 
@@ -109,8 +110,9 @@ Path("page-1.png").write_bytes(png)
 ```
 
 `render` accepts `fonts=` (`"embedded-only"`, `"all-embedded"`, `"full"`),
-`font_dir=`, `compression=` (`"none"`, `"fast"`, `"default"`, `"best"`) and
-`format=` (`"png"`, `"ppm"`, `"bmp"`, see [Output formats](#output-formats)),
+`font_dir=`, `compression=` (`"none"`, `"fast"`, `"default"`, `"best"`),
+`format=` (`"png"`, `"ppm"`, `"bmp"`, `"jpeg"`, see
+[Output formats](#output-formats)) and `quality=` (1 to 100, JPEG only),
 and releases the GIL while it runs. `fonts=` defaults to `None`, which
 resolves to `"full"` when `font_dir=` is given or the `pdfboss-fonts`
 package is importable, and to `"all-embedded"` otherwise. `Page.render_reporting` renders the same
@@ -132,9 +134,10 @@ first_two_reversed = doc.render_pages(pages=[1, 0])
 ```
 
 The full signature is `render_pages(pages=None, scale=1.0, fonts=None,
-font_dir=None, compression="default", format="png")`; `fonts`, `font_dir`,
-`compression` and `format` mean the same as on `Page.render`, applied to
-every page, and a `fonts` of `None` resolves the same way. The stub file
+font_dir=None, compression="default", format="png", quality=90)`; `fonts`,
+`font_dir`, `compression`, `format` and `quality` mean the same as on
+`Page.render`, applied to every page, and a `fonts` of `None` resolves the
+same way. The stub file
 [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi)
 documents each parameter.
 
@@ -144,7 +147,7 @@ documents opened over HTTP. See
 
 ## Output formats
 
-Every render entry point writes one of three formats, chosen by `format=`
+Every render entry point writes one of four formats, chosen by `format=`
 in Python, by the `-o` extension on the CLI, and by
 `pdfboss_render::ImageFormat` in Rust:
 
@@ -153,6 +156,7 @@ in Python, by the `-o` extension on the CLI, and by
 | `png` (default) | RGBA 8-bit, filtered and deflated | the compression level below |
 | `ppm` | binary P6: `P6 <w> <h> 255\n` then RGB rows, top-down | one packing pass |
 | `bmp` | 24-bit BGR, bottom-up rows padded to four bytes, 54-byte header | one packing pass |
+| `jpeg` (`jpg`) | baseline JFIF, 4:4:4, lossy at `quality` 1 to 100 (default 90) | a DCT per 8×8 block |
 
 PPM and BMP drop the alpha channel; a rendered page is filled white, so
 alpha is 255 everywhere and nothing is lost. Reach for them when the
@@ -160,9 +164,19 @@ pixels are consumed right away (a benchmark, an OCR or vision pipeline, a
 diff against another renderer) and the PNG encode would be wasted work:
 Pillow, numpy and ImageMagick read both directly.
 
+JPEG is the one lossy choice: it trades exact pixels for smaller files on
+photographic and scanned pages, with the quality knob scaling the standard
+quantization tables (50 uses them as printed, 100 keeps every
+coefficient). On a mostly white text page PNG stays both smaller and
+exact, so prefer JPEG only where the content is continuous-tone. Chroma
+is not subsampled, so colored text keeps sharp edges. The encoder is
+pdfboss's own, written from the JPEG specification, and costs about four
+times the default PNG encode per page.
+
 ```python
 ppm = page.render(scale=2.0, format="ppm")
 bmp, warnings = page.render_reporting(scale=2.0, format="bmp")
+jpg = page.render(scale=2.0, format="jpeg", quality=80)
 ```
 
 ## PNG compression

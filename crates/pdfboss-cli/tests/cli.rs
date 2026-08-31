@@ -178,15 +178,15 @@ fn render_smoke_writes_png() {
 }
 
 /// Renders page 1 of `hello.pdf` at half scale into a temp file with the
-/// given extension; returns the process output and the bytes written (if
-/// any), removing the file again.
-fn render_hello_to(extension: &str) -> (Output, Option<Vec<u8>>) {
+/// given extension, passing `extra` flags through; returns the process
+/// output and the bytes written (if any), removing the file again.
+fn render_hello_to(extension: &str, extra: &[&str]) -> (Output, Option<Vec<u8>>) {
     let file = fixture("hello.pdf");
     let out = std::env::temp_dir().join(format!(
-        "pdfboss-cli-render-{}.{extension}",
+        "pdfboss-cli-render-{}-{extension}.{extension}",
         std::process::id()
     ));
-    let output = pdfboss(&[
+    let mut args = vec![
         "render",
         file.to_str().unwrap(),
         "--page",
@@ -195,7 +195,9 @@ fn render_hello_to(extension: &str) -> (Output, Option<Vec<u8>>) {
         out.to_str().unwrap(),
         "--scale",
         "0.5",
-    ]);
+    ];
+    args.extend_from_slice(extra);
+    let output = pdfboss(&args);
     let bytes = std::fs::read(&out).ok();
     let _ = std::fs::remove_file(&out);
     (output, bytes)
@@ -203,7 +205,7 @@ fn render_hello_to(extension: &str) -> (Output, Option<Vec<u8>>) {
 
 #[test]
 fn render_writes_ppm_when_out_ends_in_ppm() {
-    let (output, bytes) = render_hello_to("ppm");
+    let (output, bytes) = render_hello_to("ppm", &[]);
     assert!(output.status.success(), "render failed: {output:?}");
     let bytes = bytes.expect("output PPM missing");
     assert!(bytes.starts_with(b"P6\n"), "output does not start with P6");
@@ -215,20 +217,48 @@ fn render_writes_ppm_when_out_ends_in_ppm() {
 
 #[test]
 fn render_writes_bmp_when_out_ends_in_bmp() {
-    let (output, bytes) = render_hello_to("bmp");
+    let (output, bytes) = render_hello_to("bmp", &[]);
     assert!(output.status.success(), "render failed: {output:?}");
     let bytes = bytes.expect("output BMP missing");
     assert!(bytes.starts_with(b"BM"), "output does not start with BM");
 }
 
 #[test]
+fn render_writes_jpeg_when_out_ends_in_jpg() {
+    let (output, bytes) = render_hello_to("jpg", &[]);
+    assert!(output.status.success(), "render failed: {output:?}");
+    let bytes = bytes.expect("output JPEG missing");
+    assert!(
+        bytes.starts_with(&[0xFF, 0xD8, 0xFF, 0xE0]),
+        "output does not start with SOI + APP0"
+    );
+    assert!(
+        bytes.ends_with(&[0xFF, 0xD9]),
+        "output does not end with EOI"
+    );
+}
+
+#[test]
+fn render_jpeg_quality_flag_shrinks_the_file() {
+    let (_, coarse) = render_hello_to("jpeg", &["--jpeg-quality", "20"]);
+    let (_, default) = render_hello_to("jpeg", &[]);
+    let (coarse, default) = (coarse.expect("coarse JPEG"), default.expect("default JPEG"));
+    assert!(
+        coarse.len() < default.len(),
+        "quality 20 ({}) is not smaller than the default ({})",
+        coarse.len(),
+        default.len()
+    );
+}
+
+#[test]
 fn render_rejects_an_unknown_output_extension() {
-    let (output, bytes) = render_hello_to("tiff");
+    let (output, bytes) = render_hello_to("tiff", &[]);
     assert_eq!(output.status.code(), Some(1));
     assert!(bytes.is_none(), "a file was written despite the error");
     let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        err.contains("unsupported output format \"tiff\": use .png, .ppm or .bmp"),
+        err.contains("unsupported output format \"tiff\": use .png, .ppm, .bmp or .jpg"),
         "unexpected stderr: {err}"
     );
 }

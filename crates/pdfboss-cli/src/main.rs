@@ -103,7 +103,7 @@ enum Command {
         #[arg(long)]
         page: Option<usize>,
     },
-    /// Render a page to PNG, PPM or BMP.
+    /// Render a page to PNG, PPM, BMP or JPEG.
     Render {
         /// Path to the PDF file.
         file: PathBuf,
@@ -113,8 +113,8 @@ enum Command {
         /// 1-based page number.
         #[arg(long)]
         page: usize,
-        /// Output file; its extension picks the format, .png, .ppm or .bmp
-        /// (default: page-N.png).
+        /// Output file; its extension picks the format, .png, .ppm, .bmp or
+        /// .jpg (default: page-N.png).
         #[arg(short, long)]
         out: Option<PathBuf>,
         /// Scale factor.
@@ -135,6 +135,9 @@ enum Command {
         /// (.ppm and .bmp are never compressed).
         #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
         png_compression: PngCompressionArg,
+        /// JPEG quality, 1 to 100 (.jpg and .jpeg only).
+        #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
+        jpeg_quality: u8,
     },
     /// Extract every image a page draws, each as a native-size PNG.
     Images {
@@ -345,6 +348,7 @@ fn main() {
             font_dir,
             password,
             png_compression,
+            jpeg_quality,
         } => cmd_render(
             &file,
             page,
@@ -354,6 +358,7 @@ fn main() {
             font_dir,
             &password,
             png_compression,
+            jpeg_quality,
         )
         .map_err(Failure::from),
         Command::Images {
@@ -649,12 +654,13 @@ fn cmd_render(
     font_dir: Option<PathBuf>,
     password: &str,
     png_compression: PngCompressionArg,
+    jpeg_quality: u8,
 ) -> Result<(), String> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
     }
     let out = out.unwrap_or_else(|| default_out(page));
-    let format = output_format(&out, png_compression)?;
+    let format = output_format(&out, png_compression, jpeg_quality)?;
     let fonts = fonts.unwrap_or_else(|| default_fonts(&font_dir));
     let substitutes = substitute_source(fonts, font_dir)?;
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
@@ -823,18 +829,22 @@ fn default_out(page: usize) -> PathBuf {
 }
 
 /// The image format `out`'s extension names, PNG carrying the requested
-/// compression level.
+/// compression level and JPEG the requested quality.
 fn output_format(
     out: &Path,
     png_compression: PngCompressionArg,
+    jpeg_quality: u8,
 ) -> Result<pdfboss_render::ImageFormat, String> {
     use pdfboss_render::ImageFormat;
     let extension = out.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ImageFormat::from_name(extension) {
         Some(ImageFormat::Png(_)) => Ok(ImageFormat::Png(png_compression.to_compression())),
+        Some(ImageFormat::Jpeg { .. }) => Ok(ImageFormat::Jpeg {
+            quality: jpeg_quality,
+        }),
         Some(format) => Ok(format),
         None => Err(format!(
-            "unsupported output format {extension:?}: use .png, .ppm or .bmp"
+            "unsupported output format {extension:?}: use .png, .ppm, .bmp or .jpg"
         )),
     }
 }
