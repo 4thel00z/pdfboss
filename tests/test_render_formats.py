@@ -100,8 +100,8 @@ def test_jpeg_is_a_jfif_stream_and_jpg_is_the_same_format(hello_pdf: Path) -> No
     assert page.render(scale=0.5, format="jpg") == jpeg
 
 
-def test_jpeg_quality_orders_file_size(hello_pdf: Path) -> None:
-    page = Document(hello_pdf)[0]
+def test_jpeg_quality_orders_file_size(fixtures_dir: Path) -> None:
+    page = Document(fixtures_dir / "shapes.pdf")[0]
     sizes = [len(page.render(scale=0.5, format="jpeg", quality=q)) for q in (20, 60, 95)]
     assert sizes == sorted(sizes) and len(set(sizes)) == 3, sizes
     assert page.render(scale=0.5, format="jpeg") == page.render(scale=0.5, format="jpeg", quality=90)
@@ -115,8 +115,8 @@ def test_jpeg_quality_outside_one_to_hundred_raises(hello_pdf: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_render_takes_jpeg_quality(hello_pdf: Path) -> None:
-    doc = await AsyncDocument.open(hello_pdf)
+async def test_async_render_takes_jpeg_quality(fixtures_dir: Path) -> None:
+    doc = await AsyncDocument.open(fixtures_dir / "shapes.pdf")
     small = await doc[0].render(scale=0.5, format="jpeg", quality=30)
     large = await doc[0].render(scale=0.5, format="jpeg", quality=95)
     assert small[:2] == b"\xff\xd8"
