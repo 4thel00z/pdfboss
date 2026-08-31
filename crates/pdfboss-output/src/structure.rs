@@ -502,15 +502,23 @@ fn half_points(size: f32) -> i32 {
 /// The document's size statistics, weighted by characters shown: a title
 /// carries a handful, body text carries thousands.
 fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
-    let mut weights: std::collections::BTreeMap<i32, usize> = std::collections::BTreeMap::new();
+    // A page holds a handful of distinct sizes, so a sorted vector beats a
+    // map; the weight counts scalar starts, which is the character count of
+    // valid UTF-8 without decoding it.
+    let mut weights: Vec<(i32, usize)> = Vec::new();
     for span in pages.iter().flat_map(|page| page.iter()) {
-        *weights.entry(half_points(span.size)).or_default() += span.text.chars().count();
+        let bucket = half_points(span.size);
+        let chars = span.text.bytes().filter(|b| (b & 0xC0) != 0x80).count();
+        match weights.binary_search_by_key(&bucket, |(b, _)| *b) {
+            Ok(index) => weights[index].1 += chars,
+            Err(index) => weights.insert(index, (bucket, chars)),
+        }
     }
     // Ties go to the smaller size: body text is what a document has most of
     // and, at equal weight, the likelier of the two to be it.
     let body = weights
         .iter()
-        .min_by_key(|(bucket, weight)| (std::cmp::Reverse(**weight), **bucket))
+        .min_by_key(|(bucket, weight)| (std::cmp::Reverse(*weight), *bucket))
         .map(|(bucket, _)| *bucket as f32 / 2.0);
     let Some(body) = body else {
         return SizeStats {
@@ -519,9 +527,9 @@ fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
         };
     };
     let ladder: Vec<f32> = weights
-        .keys()
+        .iter()
         .rev()
-        .map(|bucket| *bucket as f32 / 2.0)
+        .map(|(bucket, _)| *bucket as f32 / 2.0)
         .filter(|size| *size >= body + HEADING_MIN_DELTA)
         .collect();
     SizeStats { body, ladder }
@@ -1699,13 +1707,16 @@ fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
 /// [`WORD_GAP`] times the size becomes a space, and a change of
 /// `(bold, italic)` opens a new [`Inline`].
 fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
-    let mut inlines: Vec<Inline> = Vec::new();
+    // Most lines are one inline run; its text is sized once for every
+    // span's text and a space apiece rather than grown span by span.
+    let capacity = spans.iter().map(|span| span.text.len() + 1).sum();
+    let mut inlines: Vec<Inline> = Vec::with_capacity(1);
     let mut prev_end: Option<f32> = None;
     let mut prev_size = 0.0f32;
     let mut min_size = f32::INFINITY;
     for span in spans {
         let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
-        push_span(&mut inlines, span, spaced);
+        push_span(&mut inlines, span, spaced, capacity);
         prev_end = Some(span.end_x);
         prev_size = span.size;
         min_size = min_size.min(span.size);
@@ -1725,7 +1736,7 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 /// Extends the run the span continues, or opens one when its style differs.
 /// A `spaced` span puts its word-gap space at the end of the run before it,
 /// so the space is never lost at a style boundary.
-fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
+fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity: usize) {
     if let Some(last) = inlines.last_mut() {
         let already_spaced =
             last.text.ends_with(char::is_whitespace) || span.text.starts_with(char::is_whitespace);
@@ -1737,8 +1748,10 @@ fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool) {
             return;
         }
     }
+    let mut text = String::with_capacity(capacity);
+    text.push_str(&span.text);
     inlines.push(Inline {
-        text: span.text.clone(),
+        text,
         bold: span.bold,
         italic: span.italic,
     });
