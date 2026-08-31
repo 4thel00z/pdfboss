@@ -43,6 +43,8 @@ pip install pdfboss           # prebuilt abi3 wheels (CPython 3.12+), no toolcha
 cargo install pdfboss-cli     # the `pdfboss` binary
 ```
 
+Coding agents get a bundled [skill](skills/pdfboss/SKILL.md): `pdfboss skill install` writes it into the agent's skill directory, and `npx skills add 4thel00z/pdfboss` installs it from [skills.sh](https://skills.sh).
+
 ## Usage
 
 ```bash
