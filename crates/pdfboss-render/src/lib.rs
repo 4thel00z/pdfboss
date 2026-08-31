@@ -91,6 +91,33 @@ impl PngCompression {
     }
 }
 
+/// The file format [`Pixmap::encode`] writes. PNG keeps every channel and
+/// carries its compression level; PPM and BMP are a header plus one packing
+/// pass over the pixels, dropping alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    /// PNG, RGBA 8-bit, at the given compression level.
+    Png(PngCompression),
+    /// Binary PPM (`P6`): RGB rows, top-down, no padding.
+    Ppm,
+    /// Windows BMP: 24-bit BGR rows, bottom-up, padded to four bytes.
+    Bmp,
+}
+
+impl ImageFormat {
+    /// The format a file extension or a Python string names, case
+    /// insensitively: `png` (at the default compression level), `ppm` or
+    /// `bmp`.
+    pub fn from_name(name: &str) -> Option<ImageFormat> {
+        match name.to_ascii_lowercase().as_str() {
+            "png" => Some(ImageFormat::Png(PngCompression::default())),
+            "ppm" => Some(ImageFormat::Ppm),
+            "bmp" => Some(ImageFormat::Bmp),
+            _ => None,
+        }
+    }
+}
+
 impl Pixmap {
     /// Creates a fully transparent pixmap.
     pub fn new(w: u32, h: u32) -> Pixmap {
@@ -130,6 +157,15 @@ impl Pixmap {
         writer.write_image_data(&self.data).map_err(err)?;
         writer.finish().map_err(err)?;
         Ok(out)
+    }
+
+    /// Encodes the pixmap in `format`.
+    pub fn encode(&self, format: ImageFormat) -> Result<Vec<u8>> {
+        match format {
+            ImageFormat::Png(compression) => self.encode_png_with(compression),
+            ImageFormat::Ppm => Ok(encode::encode_ppm(self.width, self.height, &self.data)),
+            ImageFormat::Bmp => Ok(encode::encode_bmp(self.width, self.height, &self.data)),
+        }
     }
 
     /// Encodes the pixmap as PNG and writes it to `path`.
