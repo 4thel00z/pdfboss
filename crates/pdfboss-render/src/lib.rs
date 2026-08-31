@@ -34,6 +34,7 @@ mod executor;
 mod extract;
 mod glyph;
 mod image;
+mod jpeg;
 #[allow(dead_code)]
 mod path;
 #[allow(dead_code)]
@@ -93,7 +94,7 @@ impl PngCompression {
 
 /// The file format [`Pixmap::encode`] writes. PNG keeps every channel and
 /// carries its compression level; PPM and BMP are a header plus one packing
-/// pass over the pixels, dropping alpha.
+/// pass over the pixels, dropping alpha; JPEG is lossy at its quality.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
     /// PNG, RGBA 8-bit, at the given compression level.
@@ -102,17 +103,29 @@ pub enum ImageFormat {
     Ppm,
     /// Windows BMP: 24-bit BGR rows, bottom-up, padded to four bytes.
     Bmp,
+    /// Baseline JPEG, 4:4:4, at `quality` 1 to 100 (clamped); alpha dropped.
+    Jpeg {
+        /// The conventional quality knob: 50 uses the standard tables as
+        /// printed, 100 keeps every coefficient, lower values coarsen.
+        quality: u8,
+    },
 }
 
 impl ImageFormat {
+    /// The JPEG quality [`ImageFormat::from_name`] hands out.
+    pub const DEFAULT_JPEG_QUALITY: u8 = 90;
+
     /// The format a file extension or a Python string names, case
-    /// insensitively: `png` (at the default compression level), `ppm` or
-    /// `bmp`.
+    /// insensitively: `png` (at the default compression level), `ppm`,
+    /// `bmp`, or `jpeg` / `jpg` (at [`ImageFormat::DEFAULT_JPEG_QUALITY`]).
     pub fn from_name(name: &str) -> Option<ImageFormat> {
         match name.to_ascii_lowercase().as_str() {
             "png" => Some(ImageFormat::Png(PngCompression::default())),
             "ppm" => Some(ImageFormat::Ppm),
             "bmp" => Some(ImageFormat::Bmp),
+            "jpeg" | "jpg" => Some(ImageFormat::Jpeg {
+                quality: ImageFormat::DEFAULT_JPEG_QUALITY,
+            }),
             _ => None,
         }
     }
@@ -165,6 +178,9 @@ impl Pixmap {
             ImageFormat::Png(compression) => self.encode_png_with(compression),
             ImageFormat::Ppm => Ok(encode::encode_ppm(self.width, self.height, &self.data)),
             ImageFormat::Bmp => Ok(encode::encode_bmp(self.width, self.height, &self.data)),
+            ImageFormat::Jpeg { quality } => {
+                jpeg::encode_jpeg(self.width, self.height, &self.data, quality)
+            }
         }
     }
 

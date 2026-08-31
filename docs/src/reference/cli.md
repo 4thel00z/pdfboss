@@ -46,22 +46,24 @@ pdfboss md report.pdf > report.md
 
 ## render
 
-Render a page to PNG, PPM or BMP. See [Rendering pages](../guide/rendering.md).
+Render a page to PNG, PPM, BMP or JPEG. See [Rendering pages](../guide/rendering.md).
 
 ```text
 pdfboss render [OPTIONS] --page <PAGE> <FILE>
 ```
 
 - `--page <PAGE>`: 1-based page number (required)
-- `-o, --out <OUT>`: output file; its extension picks the format, `.png`, `.ppm` or `.bmp` (default: `page-N.png`)
+- `-o, --out <OUT>`: output file; its extension picks the format, `.png`, `.ppm`, `.bmp` or `.jpg` (default: `page-N.png`)
 - `--scale <SCALE>`: scale factor (default: 1)
 - `--fonts <FONTS>`: which fonts to paint, one of `embedded-only` (only embedded TrueType outlines, fastest), `all-embedded` (every embedded program), `full` (also substitute bundled faces for non-embedded fonts); the default resolves to `full` when substitute faces are available (the compiled-in OFL set or `--font-dir`), otherwise `all-embedded`
 - `--font-dir <FONT_DIR>`: directory of substitute faces for `--fonts full`; overrides the compiled-in OFL set
 - `--png-compression <PNG_COMPRESSION>`: `none`, `fast`, `default` or `best` (encode time against file size, same pixels; PNG only)
+- `--jpeg-quality <JPEG_QUALITY>`: 1 to 100 (default 90; JPEG only)
 
 ```bash
 pdfboss render --page 1 --scale 2 -o page-1.png report.pdf
 pdfboss render --page 1 --scale 2 -o page-1.ppm report.pdf
+pdfboss render --page 1 --scale 2 -o page-1.jpg --jpeg-quality 80 report.pdf
 ```
 
 ## images
