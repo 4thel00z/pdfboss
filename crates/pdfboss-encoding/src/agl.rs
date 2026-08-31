@@ -1,11 +1,11 @@
 //! The Adobe Glyph List: glyph name to the Unicode text it represents,
 //! sorted by name for binary search. Generated from glyphlist.txt (AGL 2.0,
-//! 2002-09-20, https://github.com/adobe-type-tools/agl-aglfn); do not edit.
+//! 2002-09-20, <https://github.com/adobe-type-tools/agl-aglfn>); do not edit.
 //!
 //! The list is redistributed under its own license, reproduced here:
 //!
 //! -----------------------------------------------------------
-//! Copyright 2002-2019 Adobe (http://www.adobe.com/).
+//! Copyright 2002-2019 Adobe (<http://www.adobe.com/>).
 //!
 //! Redistribution and use in source and binary forms, with or
 //! without modification, are permitted provided that the
@@ -41,7 +41,7 @@
 //! Name:          Adobe Glyph List
 //! Table version: 2.0
 //! Date:          September 20, 2002
-//! URL:           https://github.com/adobe-type-tools/agl-aglfn
+//! URL:           <https://github.com/adobe-type-tools/agl-aglfn>
 //!
 //! Format: two semicolon-delimited fields:
 //! (1) glyph name--upper/lowercase letters and digits
