@@ -11,32 +11,32 @@
   "repeat": 3,
   "libraries": {
     "pdfboss (fonts=full)": {
-      "time": 5.709729756024899,
+      "time": 5.484701874083839,
       "pages": 888,
       "ok": 38
     },
     "pdfboss (fonts=all-embedded)": {
-      "time": 3.96394091998809,
+      "time": 3.763136414170731,
       "pages": 888,
       "ok": 38
     },
     "pdfboss (fonts=embedded-only)": {
-      "time": 3.6406161269696895,
+      "time": 3.2428260830347426,
       "pages": 888,
       "ok": 38
     },
     "PyMuPDF": {
-      "time": 10.556600497948239,
+      "time": 9.935521749779582,
       "pages": 888,
       "ok": 38
     },
     "pypdfium2": {
-      "time": 7.589405957958661,
+      "time": 7.391386166680604,
       "pages": 888,
       "ok": 38
     },
     "pdfplumber": {
-      "time": 9.33511007897323,
+      "time": 8.842486500216182,
       "pages": 888,
       "ok": 38
     }
