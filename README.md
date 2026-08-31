@@ -22,6 +22,13 @@
 
 ---
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/assets/tui.png" alt="pdfboss tui: element tree, page preview, object inspector and hex view" width="100%">
+</p>
+<p align="center">
+  <sub><code>pdfboss tui</code> on a real-world PDF: the element tree, a live page preview drawn in half-blocks, and the selected object's bytes in the hex pane.</sub>
+</p>
+
 Reading a PDF should not require a C library. pdfboss is a clean-room reader built from the ISO 32000 specification: safe Rust, no C dependencies, no bindings to another engine, one core behind the CLI and the native Python extension. It is a **lenient reader**: real-world files are damaged, so it reconstructs broken cross-reference tables, tolerates wrong stream lengths, and skips garbage operators instead of refusing.
 
 ## Highlights
@@ -32,7 +39,7 @@ Reading a PDF should not require a C library. pdfboss is a clean-room reader bui
 - **Four render formats**: PNG through its own page-tuned encoder, PPM and BMP as the raw pixels behind a header (about 0.3 ms a page, for pipelines that consume the pixels right away), and JPEG from its own baseline encoder with a quality knob; picked by `format=` in Python and by the `-o` extension on the CLI ([guide](https://pdfboss.dev/docs/guide/rendering.html#output-formats)).
 - **Embedded-image extraction**: every image a page draws, at native size, alpha applied, from the CLI, Python and Rust ([example](#extract-embedded-images)).
 - **PDF creation**: document structs, a canvas painter and a COS writer with deterministic output; CommonMark+GFM composes into CSS-themed PDFs from the CLI, Python and Rust ([example](#create-pdfs)).
-- **Async, range-fetching I/O**: documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, never the whole file.
+- **Async, range-fetching I/O**: documents open over files or `http(s)://` URLs and fetch only the byte ranges they need, batched adaptively by access density ([remote documents](#remote-documents)).
 - **Lenient, and it says so**: broken cross-references are reconstructed and unreadable content is skipped, with every dropped or approximated item reported.
 - **Terminal explorer** (`pdfboss tui`): element tree, object inspector, hex view, page and Markdown previews.
 
@@ -100,6 +107,12 @@ pdfboss q       report.pdf '.header.version'  # jq-style queries over the JSON t
 pdfboss obj     report.pdf 5                  # pretty-print object 5
 ```
 
+`q` and `hex` address the same element tree, so a query's `_ref` answer feeds straight into a hexdump of that object's bytes:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/assets/explorer.png" alt="pdfboss q piping a page's fonts and object ref into pdfboss hex" width="100%">
+</p>
+
 ```python
 page = doc[0]
 print(page.width, page.height, page.rotation)
@@ -136,6 +149,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 </details>
+
+## Remote documents
+
+`tui`, `json`, `hex` and `q` take an `http(s)://` URL anywhere they take a path, and so do `AsyncDocument.open_url` in Python and `pdfboss-aio` in Rust. The document opens over ranged requests that fetch only the bytes the parser touches, batched adaptively: misses landing near each other double the batch, up to 8 MiB, and a far jump halves it, so a dense walk collapses into a few large requests while scattered access never over-fetches.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/assets/remote-open.gif" alt="pdfboss tui opening a 228 MiB PDF from archive.org over ranged requests" width="100%">
+</p>
+<p align="center">
+  <sub>Captured live, played back sped up: <code>pdfboss tui</code> opening a 6,610-page, 228 MiB book straight off archive.org. The caret marks the byte region being fetched, the map fills in as ranges arrive, and the explorer opens on the live document; a page preview or a query then reads through the same cache.</sub>
+</p>
+
+That coverage map is drawn on stderr whenever it is a terminal and erased once the document is open; piped stderr stays byte-for-byte empty. A server that ignores `Range` (`python3 -m http.server`, for one) costs one full download instead, reported with a notice and a progress bar and held in memory for the life of the document.
 
 ## Extract embedded images
 
@@ -216,10 +242,12 @@ pdfboss create images scan1.png photo.jpg -o scans.pdf
 And CommonMark+GFM composes straight into a themed, paginated PDF (headings, lists, tables, code blocks, clickable links and images), deterministically, from all three surfaces. A theme is a small CSS subset over element-type selectors, overlaid on the built-in default; the Helvetica, Times and Courier families are available, and characters outside them are replaced with `?` and reported:
 
 ```css
-body { font-family: times; font-size: 10.5pt; color: #222; }
-h1   { font-family: helvetica; font-size: 2.2em; color: #a33; }
-code { font-family: courier; background-color: #eee; }
-pre  { background-color: #eee; padding: 8pt; }
+body { font-family: helvetica; font-size: 10.5pt; color: #23241f; }
+h1   { font-family: times; font-size: 2.4em; color: #3a4a2a; }
+h2   { font-family: times; font-size: 1.5em; color: #55663d; }
+code { font-family: courier; background-color: #efeee8; }
+pre  { background-color: #efeee8; padding: 8pt; }
+th   { background-color: #e4e6da; }
 ```
 
 ```python
@@ -238,6 +266,12 @@ Path("notes.pdf").write_bytes(pdf)
 ```bash
 pdfboss create md notes.md -o notes.pdf --theme theme.css --size letter
 ```
+
+A page composed with the theme above and rendered back by `pdfboss render`: headings, a themed table, a code block and lists, all from plain Markdown:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/4thel00z/pdfboss/main/assets/create-md.png" alt="a Markdown report composed into a themed PDF page by pdfboss create md" width="70%">
+</p>
 
 In Rust, `pdfboss_markdown::to_pdf` returns the composed `Pdf` value plus a report of anything sanitized, ready for `save`/`to_bytes` or further canvas work.
 
