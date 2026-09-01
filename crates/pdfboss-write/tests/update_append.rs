@@ -5,7 +5,7 @@
 use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, XrefKind};
 use pdfboss_write::{
-    Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions,
+    Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions, Writer,
     XrefStyle,
 };
 
@@ -704,4 +704,86 @@ fn set_metadata_rewrites_xmp_when_catalog_has_it() {
     let text = String::from_utf8(stream.as_stream().unwrap().data.clone()).unwrap();
     assert!(text.contains("New"));
     assert!(!text.contains("Old"));
+}
+
+/// A base built directly through `Writer` (not `Pdf`, which always writes
+/// `/Info` fields as direct strings) whose `/Info /Title` is an indirect
+/// reference to its own string object, and whose catalog carries an XMP
+/// packet.
+fn writer_base_with_indirect_title() -> Vec<u8> {
+    let mut w = Writer::new(WriteOptions {
+        xref: XrefStyle::Table,
+        ..WriteOptions::default()
+    });
+    let pages_root = w.reserve();
+    let page = w.reserve();
+
+    let mut page_dict = Dict::new();
+    page_dict.insert(Name("Type".into()), Object::Name(Name("Page".into())));
+    page_dict.insert(Name("Parent".into()), Object::Ref(pages_root));
+    page_dict.insert(Name("Resources".into()), Object::Dict(Dict::new()));
+    page_dict.insert(
+        Name("MediaBox".into()),
+        Object::Array(vec![
+            Object::Int(0),
+            Object::Int(0),
+            Object::Int(612),
+            Object::Int(792),
+        ]),
+    );
+    w.fill(page, Object::Dict(page_dict)).unwrap();
+
+    let mut pages_dict = Dict::new();
+    pages_dict.insert(Name("Type".into()), Object::Name(Name("Pages".into())));
+    pages_dict.insert(Name("Kids".into()), Object::Array(vec![Object::Ref(page)]));
+    pages_dict.insert(Name("Count".into()), Object::Int(1));
+    w.fill(pages_root, Object::Dict(pages_dict)).unwrap();
+
+    let title_ref = w.put(Object::String(b"Indirect Title".to_vec()));
+    let mut info = Dict::new();
+    info.insert(Name("Title".into()), Object::Ref(title_ref));
+    let info_ref = w.put(Object::Dict(info));
+    w.set_info(info_ref);
+
+    let mut xmp_dict = Dict::new();
+    xmp_dict.insert(Name("Type".into()), Object::Name(Name("Metadata".into())));
+    xmp_dict.insert(Name("Subtype".into()), Object::Name(Name("XML".into())));
+    let xmp_ref = w.put_stream_raw(xmp_dict, b"<x:xmpmeta></x:xmpmeta>".to_vec());
+
+    let mut catalog = Dict::new();
+    catalog.insert(Name("Type".into()), Object::Name(Name("Catalog".into())));
+    catalog.insert(Name("Pages".into()), Object::Ref(pages_root));
+    catalog.insert(Name("Metadata".into()), Object::Ref(xmp_ref));
+    let root = w.put(Object::Dict(catalog));
+
+    w.finish(root).unwrap()
+}
+
+/// An `/Info /Title` stored as an indirect reference must still reach the
+/// rewritten XMP packet: `set_metadata` only touches `author`, so `Title`
+/// is a kept (`None`) field, and a kept indirect string must resolve
+/// rather than silently drop out of the merged `Metadata`.
+#[test]
+fn set_metadata_resolves_indirect_info_values_into_xmp() {
+    let base = writer_base_with_indirect_title();
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    update
+        .set_metadata(Metadata {
+            author: Some("New Author".to_string()),
+            ..Metadata::default()
+        })
+        .unwrap();
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    let root = reread.xref().trailer.get_ref("Root").unwrap();
+    let catalog = reread.get(root).unwrap();
+    let metadata_ref = catalog.as_dict().unwrap().get_ref("Metadata").unwrap();
+    let stream = reread.get(metadata_ref).unwrap();
+    let text = String::from_utf8(stream.as_stream().unwrap().data.clone()).unwrap();
+    assert!(
+        text.contains("Indirect Title"),
+        "a kept indirect /Info value must still reach the rewritten XMP packet: {text}"
+    );
 }

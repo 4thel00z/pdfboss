@@ -718,21 +718,38 @@ impl<'a> Update<'a> {
         &self.overlay
     }
 
-    /// Merges `meta` into the base document's `/Info` dictionary, read via
-    /// the overlay's own info ref when a prior call set one, else the
-    /// base's own, else built fresh; and, when the catalog already names
-    /// an XMP packet, rewrites it from the merged fields. See
-    /// [`set_metadata_with`] for the merge and rewrite rules. The
-    /// dictionary always comes from the base document, never from a prior
-    /// call's staged fields, so two calls on one `Update` do not compound.
+    /// Merges `meta` into the base document's `/Info` dictionary: the ref
+    /// comes from the overlay's own info ref when a prior call set one,
+    /// else the base's; the dictionary itself always comes from the base
+    /// document (never from a prior call's staged fields, so two calls on
+    /// one `Update` do not compound; on a base without `/Info`, a call
+    /// starts from a fresh dictionary). When the catalog already names an
+    /// XMP packet, it is rewritten from the merged fields. See
+    /// [`set_metadata_with`] for the merge and rewrite rules.
     pub fn set_metadata(&mut self, meta: Metadata) -> Result<()> {
         let info_ref = self.overlay.info.or(self.overlay.base.info);
         let existing_info = info_ref.and_then(|r| {
             let dict = self.doc.get(r).ok()?.as_dict()?.clone();
-            Some((r, dict))
+            Some((r, self.resolve_dict(&dict)))
         });
         let xmp_ref = self.catalog_metadata_ref();
         set_metadata_with(&mut self.overlay, existing_info, xmp_ref, meta)
+    }
+
+    /// `dict` with every value resolved against the base document: an
+    /// indirect value such as `/Title 12 0 R` becomes the string object it
+    /// points to, so a field kept by [`set_metadata_with`] (a `None` field
+    /// in the merge) still reads back as text rather than silently
+    /// vanishing from the rewritten XMP packet. A value whose reference
+    /// chain fails to resolve (an unreadable target, or a cycle) is kept
+    /// as given.
+    fn resolve_dict(&self, dict: &Dict) -> Dict {
+        let mut out = Dict::new();
+        for (key, value) in dict.iter() {
+            let resolved = self.doc.resolve(value).unwrap_or_else(|_| value.clone());
+            out.insert(key.clone(), resolved);
+        }
+        out
     }
 
     /// The catalog's `/Metadata` entry, when it is an indirect reference.
