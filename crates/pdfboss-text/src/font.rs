@@ -537,8 +537,13 @@ impl Font {
         // Text faces stay under ~110 glyph-space units and bold faces start
         // around 140, so a thick stem marks bold fonts whose descriptors
         // carry neither a weight nor a telling name (URW's -Medi faces).
+        // A name that states a non-bold weight outranks the stem: design
+        // tools export junk stem widths on faces named Regular.
+        let name_says_regular = ["Regular", "Light", "Thin", "Book", "Hairline"]
+            .iter()
+            .any(|marker| style.name.contains(marker));
         if let Some(stem) = rv(src, &descriptor, "StemV").await.and_then(|o| o.as_f64()) {
-            bold = bold || stem >= BOLD_STEM_WIDTH;
+            bold = bold || (stem >= BOLD_STEM_WIDTH && !name_says_regular);
         }
         if let Some(angle) = rv(src, &descriptor, "ItalicAngle")
             .await

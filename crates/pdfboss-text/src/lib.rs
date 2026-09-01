@@ -965,6 +965,53 @@ mod tests {
         assert!(!spans[1].bold, "StemV 85 is a regular stem");
     }
 
+    /// A face whose name says Regular (or Light, Thin, Book) is not bold,
+    /// whatever `/StemV` claims: design-tool exports write junk stem widths,
+    /// and an explicit weight name outranks a derived one. An explicit
+    /// `/FontWeight` still wins over the name.
+    #[test]
+    fn weight_name_vetoes_thick_stem() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (a) Tj /F2 12 Tf (b) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+NeueMachina-Regular \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /AAAAAA+NeueMachina-Regular /Flags 4 /StemV 172 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /BBBBBB+NeueMachina-Light \
+             /Encoding /WinAnsiEncoding /FontDescriptor 8 0 R >>",
+        );
+        b.object(
+            8,
+            "<< /Type /FontDescriptor /FontName /BBBBBB+NeueMachina-Light /Flags 4 \
+             /StemV 172 /FontWeight 700 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page).unwrap();
+        assert!(
+            !spans[0].bold,
+            "a Regular-named face is not bold, whatever StemV claims"
+        );
+        assert!(
+            spans[1].bold,
+            "an explicit FontWeight 700 outranks the Light name"
+        );
+    }
+
     /// BaseFont-name fallback when no descriptor exists, and ItalicAngle.
     #[test]
     fn basefont_name_and_italic_angle_fallbacks() {

@@ -70,7 +70,7 @@ const HEADING_MIN_DELTA: f32 = 1.0;
 const HEADING_MAX_LEVEL: u8 = 6;
 /// A wholly bold body-size line this short reads as a title; anything
 /// longer is a sentence that happens to be bold.
-const BOLD_HEADING_MAX_CHARS: usize = 60;
+const BOLD_HEADING_MAX_CHARS: usize = 72;
 /// A heading names a section, so it is short. Past this many characters the
 /// large type is a pull quote, a caption, or — on a page whose body size the
 /// character histogram read off a dense table — ordinary prose one bucket up.
@@ -562,12 +562,13 @@ fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
     SizeStats { body, ladder }
 }
 
-/// One assembled line and the smallest size that put a glyph on it. Heading
-/// classification measures a line by its smallest text, so a drop cap or an
-/// inline formula cannot promote a body line.
+/// One assembled line and the size heading classification measures it by:
+/// the smallest text that put a glyph on it, so a drop cap or an inline
+/// formula cannot promote a body line — except a small-caps line, all
+/// capitals in exactly two sizes, which measures by its capital size.
 struct Assembled {
     line: Line,
-    min_size: f32,
+    rank_size: f32,
 }
 
 /// Emits one segment's lines as blocks: a heading line closes the paragraph
@@ -639,10 +640,10 @@ fn heading_chars<'l>(lines: impl Iterator<Item = &'l Line>) -> usize {
 /// The heading level of a line: its size's ladder rank, or — for a line at
 /// body size — the bold-title rank.
 fn heading_level(line: &Assembled, stats: &SizeStats) -> Option<u8> {
-    if let Some(level) = stats.level(line.min_size) {
+    if let Some(level) = stats.level(line.rank_size) {
         return Some(level);
     }
-    if !stats.is_body(line.min_size) {
+    if !stats.is_body(line.rank_size) {
         return None;
     }
     if !is_bold_title(&line.line) {
@@ -657,7 +658,7 @@ fn continues_heading(prev: &Assembled, next: &Assembled, stats: &SizeStats, leve
     if heading_level(next, stats) != Some(level) {
         return false;
     }
-    if half_points(prev.min_size) != half_points(next.min_size) {
+    if half_points(prev.rank_size) != half_points(next.rank_size) {
         return false;
     }
     prev.line.y - next.line.y <= HEADING_MERGE_STEP * next.line.size
@@ -666,7 +667,20 @@ fn continues_heading(prev: &Assembled, next: &Assembled, stats: &SizeStats, leve
 /// True for a short, wholly bold line that does not end like a sentence —
 /// the run-in heading of a document that sets its headings in body size.
 fn is_bold_title(line: &Line) -> bool {
-    if line.inlines.is_empty() || !line.inlines.iter().all(|inline| inline.bold) {
+    // Whitespace-only inlines carry no visible weight: a regular-face space
+    // between bold words does not stop the line being a bold title.
+    let mut visible = line
+        .inlines
+        .iter()
+        .filter(|inline| !inline.text.trim().is_empty());
+    let mut any = false;
+    for inline in visible.by_ref() {
+        any = true;
+        if !inline.bold {
+            return false;
+        }
+    }
+    if !any {
         return false;
     }
     let text = line_text(line);
@@ -1740,14 +1754,45 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
     let mut inlines: Vec<Inline> = Vec::with_capacity(1);
     let mut prev_end: Option<f32> = None;
     let mut prev_size = 0.0f32;
-    let mut min_size = f32::INFINITY;
+    let mut max_size = f32::MIN;
+    let mut buckets: Vec<(i32, usize)> = Vec::new();
+    let mut lowercase = false;
     for span in spans {
         let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
         push_span(&mut inlines, span, spaced, capacity);
         prev_end = Some(span.end_x);
         prev_size = span.size;
-        min_size = min_size.min(span.size);
+        // A whitespace-only span has no visible size, so it has no vote in
+        // the line's size rank: a producer's stray body-size separator on a
+        // heading's baseline must not fold the heading into the paragraph.
+        if span.text.trim().is_empty() {
+            continue;
+        }
+        max_size = max_size.max(span.size);
+        lowercase = lowercase || span.text.chars().any(|c| c.is_lowercase());
+        let bucket = half_points(span.size);
+        let chars = span.text.bytes().filter(|b| (b & 0xC0) != 0x80).count();
+        match buckets.binary_search_by_key(&bucket, |(b, _)| *b) {
+            Ok(index) => buckets[index].1 += chars,
+            Err(index) => buckets.insert(index, (bucket, chars)),
+        }
     }
+    // A small-caps line — all capitals, exactly two sizes — measures by its
+    // capital size: the small caps are its lowercase, not a smaller text
+    // that should disqualify a heading. Anything else measures by the size
+    // that carries most of its characters (ties to the smaller), so a drop
+    // cap, an inline formula, or a trailing ornament cannot re-rank the
+    // line either way.
+    let rank_size = if buckets.len() == 2 && !lowercase {
+        max_size
+    } else if let Some((bucket, _)) = buckets
+        .iter()
+        .min_by_key(|(bucket, chars)| (std::cmp::Reverse(*chars), *bucket))
+    {
+        *bucket as f32 / 2.0
+    } else {
+        size
+    };
     Assembled {
         line: Line {
             inlines,
@@ -1756,7 +1801,7 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
             end_x: spans.last().map_or(0.0, |span| span.end_x),
             size,
         },
-        min_size: if min_size.is_finite() { min_size } else { size },
+        rank_size,
     }
 }
 

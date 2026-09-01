@@ -1555,6 +1555,60 @@ mod tests {
         assert!(!md.contains("pasteboard"), "markdown kept off-page text: {md:?}");
     }
 
+    /// A body-size space span drawn on the heading's baseline (a producer's
+    /// stray separator) must not drag the line's size rank down to body: a
+    /// space has no visible size, so it has no vote.
+    #[test]
+    fn stray_space_span_does_not_unrank_a_heading() {
+        let md = markdown_of(
+            "BT /F1 16 Tf 72 700 Td (Chapter One) Tj /F1 12 Tf ( ) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            md.contains("# Chapter One"),
+            "heading lost to a stray space span: {md:?}"
+        );
+    }
+
+    /// A small-caps heading sets word-initial capitals large and the rest
+    /// of the capitals below body size. The line is all capitals in exactly
+    /// two sizes — that is the small-caps signature — so it measures by its
+    /// capital size, not by the small caps that would otherwise disqualify
+    /// it.
+    #[test]
+    fn small_caps_heading_measures_by_its_capitals() {
+        let md = markdown_of(
+            "BT /F1 14 Tf 72 700 Td (R) Tj /F1 11 Tf (ECOLLECTION) Tj \
+             /F1 14 Tf ( N) Tj /F1 11 Tf (OTES) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            md.contains("# R"),
+            "small-caps heading lost its rank: {md:?}"
+        );
+    }
+
+    /// Three sizes on one all-caps line is not small caps: it ranks by its
+    /// smallest text like any other line (and must not panic, which the
+    /// first cut of the two-bucket scan did on exactly this shape).
+    #[test]
+    fn three_sizes_on_a_line_rank_by_the_smallest() {
+        let md = markdown_of(
+            "BT /F1 14 Tf 72 700 Td (A) Tj /F1 11 Tf (BC) Tj /F1 12 Tf (DE) Tj /F1 11 Tf (FG) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            !md.contains("# A"),
+            "a three-size line is not a small-caps heading: {md:?}"
+        );
+    }
+
     #[test]
     fn invisible_text_keeps_off_page_content() {
         let doc = pasteboard_doc();
