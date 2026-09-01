@@ -2358,7 +2358,36 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
         .filter(|(_, assigned)| assigned.is_none())
         .flat_map(|(flow, _)| flow.iter().copied())
         .collect();
-    let page_bands = (ordered.len() > 1 && loose.len() >= COLUMN_MIN_SPANS)
+    // The cheap pre-gate for the page pass: the final gate needs the
+    // stream to alternate across the gutter at least twice, and flows that
+    // never alternate across even the loose text's midline cannot. This
+    // skips the page-wide line grouping on every ordinary page.
+    let alternates = {
+        let (x_min, x_max) = x_bounds(&loose);
+        let mid = (x_min + x_max) / 2.0;
+        let mut lanes = raw_extents
+            .iter()
+            .filter_map(|(x0, x1)| {
+                if *x1 <= mid {
+                    Some(true)
+                } else if *x0 >= mid {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
+        let mut switches = 0usize;
+        if let Some(mut lane) = lanes.next() {
+            for next in lanes {
+                if next != lane {
+                    switches += 1;
+                    lane = next;
+                }
+            }
+        }
+        switches >= 2
+    };
+    let page_bands = (alternates && ordered.len() > 1 && loose.len() >= COLUMN_MIN_SPANS)
         .then(|| {
             let (x_min, x_max) = x_bounds(&loose);
             let width = x_max - x_min;
