@@ -446,36 +446,8 @@ impl Pdf {
             element::lower(content, &mut canvas, &mut links)?;
             let (width, height) = size.dimensions();
             let parts = canvas.into_parts();
-            let content_ref = w.put_stream(Dict::new(), serialize_ops(&parts.ops));
-            let mut fonts = Dict::new();
-            for (index, face) in parts.fonts.iter().enumerate() {
-                let font_ref = cached_font(&mut w, &mut font_cache, face);
-                fonts.insert(Name(format!("F{}", index + 1)), Object::Ref(font_ref));
-            }
-            let mut xobjects = Dict::new();
-            for (index, image) in parts.images.iter().enumerate() {
-                let image_ref = image.build_xobject(&mut w);
-                xobjects.insert(Name(format!("Im{}", index + 1)), Object::Ref(image_ref));
-            }
-            for (index, (group_parts, bbox)) in parts.groups.into_iter().enumerate() {
-                let group_ref = build_form(&mut w, group_parts, bbox, &mut font_cache)?;
-                xobjects.insert(Name(format!("Gp{}", index + 1)), Object::Ref(group_ref));
-            }
-            let mut ext_gstates = Dict::new();
-            for (index, state) in parts.gstates.iter().enumerate() {
-                let gstate_ref = w.put(Object::Dict(state.ext_gstate_dict()));
-                ext_gstates.insert(Name(format!("Gs{}", index + 1)), Object::Ref(gstate_ref));
-            }
-            let mut resources = Dict::new();
-            if !fonts.is_empty() {
-                resources.insert(name("Font"), Object::Dict(fonts));
-            }
-            if !xobjects.is_empty() {
-                resources.insert(name("XObject"), Object::Dict(xobjects));
-            }
-            if !ext_gstates.is_empty() {
-                resources.insert(name("ExtGState"), Object::Dict(ext_gstates));
-            }
+            let (content, resources) = lower_canvas(&mut w, parts, &mut font_cache)?;
+            let content_ref = w.put_stream(Dict::new(), content);
             let mut dict = Dict::new();
             dict.insert(name("Type"), Object::Name(name("Page")));
             dict.insert(name("Parent"), Object::Ref(pages_root));
@@ -953,17 +925,16 @@ fn cached_font(
     r
 }
 
-/// Builds one Form XObject from a registered group's parts: `/Type
-/// /XObject /Subtype /Form /BBox /Resources`, with the sub-canvas's
-/// operators as its content stream. Recurses for groups nested inside
-/// groups, and shares `font_cache` with the page loop so nested forms
-/// never duplicate a font already emitted elsewhere in the document.
-fn build_form(
+/// Serializes `parts`' operators and builds its resources dict: fonts,
+/// images, nested groups (recursing through `build_form`), and
+/// ext-gstates, each inserted as `/Font`, `/XObject`, `/ExtGState` only
+/// when non-empty. Shared by the page loop and `build_form`, whose page
+/// and Form XObject dicts differ but whose resource assembly is the same.
+fn lower_canvas(
     w: &mut Writer,
     parts: CanvasParts,
-    bbox: [f32; 4],
     font_cache: &mut Vec<(Standard14, ObjRef)>,
-) -> Result<ObjRef> {
+) -> Result<(Vec<u8>, Dict)> {
     let content = serialize_ops(&parts.ops);
     let mut fonts = Dict::new();
     for (index, face) in parts.fonts.iter().enumerate() {
@@ -994,6 +965,21 @@ fn build_form(
     if !ext_gstates.is_empty() {
         resources.insert(name("ExtGState"), Object::Dict(ext_gstates));
     }
+    Ok((content, resources))
+}
+
+/// Builds one Form XObject from a registered group's parts: `/Type
+/// /XObject /Subtype /Form /BBox /Resources`, with the sub-canvas's
+/// operators as its content stream. Recurses for groups nested inside
+/// groups, and shares `font_cache` with the page loop so nested forms
+/// never duplicate a font already emitted elsewhere in the document.
+fn build_form(
+    w: &mut Writer,
+    parts: CanvasParts,
+    bbox: [f32; 4],
+    font_cache: &mut Vec<(Standard14, ObjRef)>,
+) -> Result<ObjRef> {
+    let (content, resources) = lower_canvas(w, parts, font_cache)?;
     let mut dict = Dict::new();
     dict.insert(name("Type"), Object::Name(name("XObject")));
     dict.insert(name("Subtype"), Object::Name(name("Form")));
