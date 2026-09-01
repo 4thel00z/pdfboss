@@ -17,79 +17,80 @@ pub fn parse_ranges(s: &str, page_count: usize) -> Result<Vec<usize>, String> {
     for item in s.split(',') {
         let item = item.trim();
         if item.is_empty() {
-            continue;
+            return Err("not a page or range: \"\"".to_string());
         }
 
-        if let Some(dash_pos) = item.find('-') {
-            // Handle range: "N-M"
-            let start_str = &item[..dash_pos];
-            let end_str = &item[dash_pos + 1..];
-
-            let start: usize = start_str.parse().map_err(|_| {
-                format!(
-                    "page {} out of range (document has {page_count} page(s))",
-                    item
-                )
-            })?;
-            let end: usize = end_str.parse().map_err(|_| {
-                format!(
-                    "page {} out of range (document has {page_count} page(s))",
-                    item
-                )
-            })?;
-
-            if start == 0 {
-                return Err("page 0 does not exist".to_string());
-            }
-            if end == 0 {
-                return Err("page 0 does not exist".to_string());
-            }
-            if start > page_count {
-                return Err(format!(
-                    "page {start} out of range (document has {page_count} page{})",
-                    if page_count == 1 { "" } else { "s" }
-                ));
-            }
-            if end > page_count {
-                return Err(format!(
-                    "page {end} out of range (document has {page_count} page{})",
-                    if page_count == 1 { "" } else { "s" }
-                ));
-            }
-            if start > end {
-                return Err(format!(
-                    "page {} out of range (document has {page_count} page(s))",
-                    item
-                ));
-            }
-
-            for page in start..=end {
-                result.push(page - 1); // Convert to 0-based
-            }
+        if item.contains('-') {
+            let pages = parse_span(item, page_count)?;
+            result.extend(pages);
         } else {
-            // Handle single page: "N"
-            let page: usize = item.parse().map_err(|_| {
-                format!(
-                    "page {} out of range (document has {page_count} page(s))",
-                    item
-                )
-            })?;
-
-            if page == 0 {
-                return Err("page 0 does not exist".to_string());
-            }
-            if page > page_count {
-                return Err(format!(
-                    "page {page} out of range (document has {page_count} page{})",
-                    if page_count == 1 { "" } else { "s" }
-                ));
-            }
-
-            result.push(page - 1); // Convert to 0-based
+            let page = parse_single(item, page_count)?;
+            result.push(page);
         }
     }
 
     Ok(result)
+}
+
+fn parse_span(item: &str, page_count: usize) -> Result<Vec<usize>, String> {
+    if let Some(dash_pos) = item.find('-') {
+        let start_str = item[..dash_pos].trim();
+        let end_str = item[dash_pos + 1..].trim();
+
+        let start: usize = start_str
+            .parse()
+            .map_err(|_| format!("not a page or range: \"{}\"", item))?;
+        let end: usize = end_str
+            .parse()
+            .map_err(|_| format!("not a page or range: \"{}\"", item))?;
+
+        if start == 0 {
+            return Err("page 0 does not exist".to_string());
+        }
+        if end == 0 {
+            return Err("page 0 does not exist".to_string());
+        }
+        if start > page_count {
+            return Err(format!(
+                "page {start} out of range (document has {page_count} page{})",
+                if page_count == 1 { "" } else { "s" }
+            ));
+        }
+        if end > page_count {
+            return Err(format!(
+                "page {end} out of range (document has {page_count} page{})",
+                if page_count == 1 { "" } else { "s" }
+            ));
+        }
+        if start > end {
+            return Err(format!(
+                "not a page or range: \"{}\" reversed (ranges are low-high)",
+                item
+            ));
+        }
+
+        Ok((start..=end).map(|p| p - 1).collect())
+    } else {
+        Err(format!("not a page or range: \"{}\"", item))
+    }
+}
+
+fn parse_single(item: &str, page_count: usize) -> Result<usize, String> {
+    let page: usize = item
+        .parse()
+        .map_err(|_| format!("not a page or range: \"{}\"", item))?;
+
+    if page == 0 {
+        return Err("page 0 does not exist".to_string());
+    }
+    if page > page_count {
+        return Err(format!(
+            "page {page} out of range (document has {page_count} page{})",
+            if page_count == 1 { "" } else { "s" }
+        ));
+    }
+
+    Ok(page - 1)
 }
 
 /// Splits an input specification on the last colon when the tail matches
@@ -109,8 +110,6 @@ pub fn split_input_spec(spec: &str) -> (PathBuf, Option<String>) {
     (PathBuf::from(spec), None)
 }
 
-/// Checks if a string matches the range pattern: all digits, hyphens, and commas,
-/// and starts with a digit.
 fn is_range_pattern(s: &str) -> bool {
     if s.is_empty() {
         return false;
@@ -127,19 +126,18 @@ fn is_range_pattern(s: &str) -> bool {
 /// Replaces the first `%d` in a pattern with the given 1-based page number.
 /// Returns an error if the pattern contains no `%d`.
 pub fn pattern_path(pattern: &str, n: usize) -> Result<PathBuf, String> {
-    if let Some(pos) = pattern.find("%d") {
-        let result = format!("{}{}{}", &pattern[..pos], n, &pattern[pos + 2..]);
-        Ok(PathBuf::from(result))
-    } else {
-        Err(format!("pattern '{}' does not contain %d", pattern))
-    }
+    let pos = pattern
+        .find("%d")
+        .ok_or_else(|| format!("pattern '{}' does not contain %d", pattern))?;
+
+    let result = format!("{}{}{}", &pattern[..pos], n, &pattern[pos + 2..]);
+    Ok(PathBuf::from(result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // parse_ranges tests
     #[test]
     fn test_parse_plain_list() {
         let result = parse_ranges("2,4,12", 20).unwrap();
@@ -179,7 +177,16 @@ mod tests {
     #[test]
     fn test_parse_reversed_range() {
         let err = parse_ranges("9-2", 20).unwrap_err();
-        assert!(err.contains("out of range"));
+        assert_eq!(
+            err,
+            "not a page or range: \"9-2\" reversed (ranges are low-high)"
+        );
+    }
+
+    #[test]
+    fn test_parse_malformed_incomplete_trailing_dash() {
+        let err = parse_ranges("2-", 20).unwrap_err();
+        assert_eq!(err, "not a page or range: \"2-\"");
     }
 
     #[test]
@@ -200,7 +207,30 @@ mod tests {
         assert_eq!(err, "page 15 out of range (document has 10 pages)");
     }
 
-    // split_input_spec tests
+    #[test]
+    fn test_parse_empty_item() {
+        let err = parse_ranges("1,,2", 10).unwrap_err();
+        assert_eq!(err, "not a page or range: \"\"");
+    }
+
+    #[test]
+    fn test_parse_only_comma() {
+        let err = parse_ranges(",", 10).unwrap_err();
+        assert_eq!(err, "not a page or range: \"\"");
+    }
+
+    #[test]
+    fn test_parse_empty_string() {
+        let result = parse_ranges("", 10).unwrap();
+        assert_eq!(result, Vec::<usize>::new());
+    }
+
+    #[test]
+    fn test_parse_whitespace_padding() {
+        let result = parse_ranges(" 2 , 4 - 9 ", 20).unwrap();
+        assert_eq!(result, vec![1, 3, 4, 5, 6, 7, 8]);
+    }
+
     #[test]
     fn test_split_plain_path() {
         let (path, range) = split_input_spec("a.pdf");
@@ -243,7 +273,16 @@ mod tests {
         assert_eq!(range, Some("2-5".to_string()));
     }
 
-    // pattern_path tests
+    #[test]
+    fn test_parse_malformed_range_from_split() {
+        let (path, range) = split_input_spec("a.pdf:2-");
+        assert_eq!(path, PathBuf::from("a.pdf"));
+        assert_eq!(range, Some("2-".to_string()));
+
+        let err = parse_ranges("2-", 20).unwrap_err();
+        assert_eq!(err, "not a page or range: \"2-\"");
+    }
+
     #[test]
     fn test_pattern_simple() {
         let result = pattern_path("part-%d.pdf", 5).unwrap();
@@ -265,7 +304,6 @@ mod tests {
     #[test]
     fn test_pattern_multiple_placeholders() {
         let result = pattern_path("page-%d-out-%d.txt", 7).unwrap();
-        // Should replace only the first %d
         assert_eq!(result, PathBuf::from("page-7-out-%d.txt"));
     }
 
