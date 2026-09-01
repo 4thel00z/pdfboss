@@ -1288,9 +1288,11 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
 /// block, and without the extra column such a row fails [`table_row`]
 /// exactly as it always did.
 fn open_columns(groups: &[Group], grid: &RuledGrid) -> Vec<std::ops::Range<f32>> {
+    // Whitespace-only spans paint nothing; their extents open no column.
     let spans: Vec<&TextSpan> = groups
         .iter()
         .flat_map(|group| group.spans.iter().copied())
+        .filter(|span| !span.text.trim().is_empty())
         .collect();
     let (x_lo, x_hi) = x_bounds(&spans);
     let mut columns = grid.columns();
@@ -1688,6 +1690,11 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
     // contiguous stretch of `group.spans` — held as a range, never copied.
     let mut claimed: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
     for (position, &span) in group.spans.iter().enumerate() {
+        // A whitespace-only span paints nothing: a producer's padding
+        // running past the columns must not disqualify the row.
+        if span.text.trim().is_empty() {
+            continue;
+        }
         let lo = span.x.min(span.end_x);
         let hi = span.x.max(span.end_x);
         let start = columns.iter().rposition(|column| column.start <= lo)?;
@@ -2569,7 +2576,7 @@ pub(crate) mod tests {
         let path = std::env::var("PDFBOSS_PROBE_PDF").unwrap();
         let doc = Document::load(std::fs::read(&path).unwrap()).unwrap();
         let page = doc.page(0).unwrap();
-        let (_, rulings, report) =
+        let (spans, rulings, report) =
             pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page).unwrap();
         println!("rulings: {} (report complete: {})", rulings.len(), report.is_complete());
         for r in rulings.iter().take(20) {
@@ -2582,6 +2589,36 @@ pub(crate) mod tests {
         println!("grids: {}", grids.len());
         for grid in &grids {
             println!("  xs {:?} ys {} boxed {}", grid.xs, grid.ys.len(), grid.boxed);
+        }
+        for (index, segment) in segments_with_grids(&spans, &grids).into_iter().enumerate() {
+            let groups = segment.into_groups();
+            let claims = grid_claims(&groups, &grids);
+            println!("segment {index}: {} groups, {} claims", groups.len(), claims.len());
+            for grid in &grids {
+                let Some(lo) = groups.iter().position(|g| grid.holds(g.y)) else {
+                    continue;
+                };
+                let inside = groups[lo..].iter().take_while(|g| grid.holds(g.y)).count();
+                let hi = lo + inside;
+                let tail = groups[hi..].iter().filter(|g| grid.holds(g.y)).count();
+                println!(
+                    "  grid stretch {lo}..{hi} of {} ({} grid lines AFTER the stretch)",
+                    groups.len(),
+                    tail
+                );
+                let columns = open_columns(&groups[lo..hi], grid);
+                for (gi, group) in groups[lo..hi].iter().enumerate() {
+                    if table_row(group, &columns).is_none() {
+                        let text: String = group
+                            .spans
+                            .iter()
+                            .flat_map(|s| s.text.chars())
+                            .take(60)
+                            .collect();
+                        println!("  table_row fails at line {}: {:?}", lo + gi, text);
+                    }
+                }
+            }
         }
     }
 

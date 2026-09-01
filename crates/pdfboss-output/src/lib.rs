@@ -795,6 +795,23 @@ mod tests {
         );
     }
 
+    /// A trailing whitespace-only span running past the grid's right edge —
+    /// a producer's padding — paints nothing and must not disqualify the
+    /// row, and with it the whole grid's claim.
+    #[test]
+    fn trailing_space_span_does_not_fail_a_grid_row() {
+        let md = markdown_of_drawn(
+            "70 670 360 40 re S 250 670 m 250 710 l S 70 690 m 430 690 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 80 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj \
+             1 0 0 1 480 675 Tm (                    ) Tj ET",
+        );
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "the padded row still rows: {md:?}"
+        );
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
     #[test]
