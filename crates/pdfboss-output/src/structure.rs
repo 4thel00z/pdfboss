@@ -1980,6 +1980,13 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
             extent
         })
         .collect();
+    let movers = extents
+        .iter()
+        .filter(|e| e.chars >= VISUAL_ORDER_MIN_CHARS)
+        .count();
+    if movers < 2 {
+        return flows;
+    }
     let mut above: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut blockers = vec![0usize; n];
     for a in 0..n {
@@ -2019,6 +2026,9 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
     }
     if order.len() != n {
         // Degenerate boxes can relate two flows both ways; keep the stream.
+        return flows;
+    }
+    if order.iter().enumerate().all(|(position, &flow)| position == flow) {
         return flows;
     }
     // A page that is already essentially in reading order stays in the
