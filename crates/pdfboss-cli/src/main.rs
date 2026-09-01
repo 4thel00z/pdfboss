@@ -6,6 +6,7 @@ mod hexdump;
 mod input;
 mod json;
 mod manifest;
+mod meta;
 mod progress;
 mod q;
 mod skill;
@@ -71,6 +72,20 @@ enum Command {
     Create {
         #[command(subcommand)]
         command: create::CreateCommand,
+    },
+    /// Set document metadata by appending an update (original bytes preserved).
+    Meta {
+        /// Input PDF.
+        file: PathBuf,
+        /// Output PDF path.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Metadata assignment, repeatable: title, author, subject, keywords, creator, producer.
+        #[arg(long = "set", value_name = "KEY=VALUE", required = true)]
+        set: Vec<String>,
+        /// Password for encrypted PDFs.
+        #[arg(long, default_value = "")]
+        password: String,
     },
     /// Show version, page count, page sizes and metadata.
     Info {
@@ -328,6 +343,7 @@ fn main() {
     let result: Result<(), Failure> = match cli.command {
         Command::Create { command } => create::cmd_create(command).map_err(Failure::from),
         Command::Skill { command } => skill::cmd_skill(command).map_err(Failure::from),
+        Command::Meta { file, out, set, password } => meta::cmd_meta(&file, &out, &set, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,
