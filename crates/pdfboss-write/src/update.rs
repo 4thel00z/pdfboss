@@ -8,10 +8,12 @@ use std::io::Write;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use pdfboss_core::crypt::Sha256;
+use pdfboss_core::object::decode_text_string;
 use pdfboss_core::xref::{parse_section_at, startxref};
 use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
 
 use crate::error::{Error, Result};
+use crate::pdf::{text_string, Date, Metadata};
 use crate::ser::{serialize_dict, serialize_object};
 use crate::writer::{WriteOptions, Writer, XrefStyle};
 
@@ -571,6 +573,103 @@ impl Overlay {
     }
 }
 
+/// Merges `meta` into `existing_info`'s dictionary (or a fresh one, staged
+/// under a newly reserved number, when `existing_info` is `None`): a
+/// `Some` field overwrites its key (`Some(String::new())` writes an empty
+/// string), a `None` field leaves whatever key was already there. The
+/// merged dictionary is staged into `overlay` via `set` and `set_info`.
+///
+/// When `xmp_ref` is `Some`, the merged dictionary is read back into a
+/// [`Metadata`] (text fields via `decode_text_string`, dates via
+/// [`Date::parse_pdf`], an unparseable date simply dropping out) and
+/// staged under `xmp_ref` as a fresh, unfiltered `/Type /Metadata /Subtype
+/// /XML` stream of [`crate::xmp::packet`] over that merged value.
+///
+/// Shared by [`Update::set_metadata`] and its asynchronous counterpart.
+pub fn set_metadata_with(
+    overlay: &mut Overlay,
+    existing_info: Option<(ObjRef, Dict)>,
+    xmp_ref: Option<ObjRef>,
+    meta: Metadata,
+) -> Result<()> {
+    let (target, mut dict) = match existing_info {
+        Some((r, dict)) => (r, dict),
+        None => (overlay.reserve(), Dict::new()),
+    };
+    apply_metadata_fields(&mut dict, &meta);
+    let merged = metadata_from_info(&dict);
+    overlay.set(target, Object::Dict(dict));
+    overlay.set_info(target);
+    let Some(xmp_ref) = xmp_ref else {
+        return Ok(());
+    };
+    let mut xmp_dict = Dict::new();
+    xmp_dict.insert(name("Type"), Object::Name(name("Metadata")));
+    xmp_dict.insert(name("Subtype"), Object::Name(name("XML")));
+    overlay.set(
+        xmp_ref,
+        Object::Stream(Stream {
+            dict: xmp_dict,
+            data: crate::xmp::packet(&merged),
+        }),
+    );
+    Ok(())
+}
+
+/// Writes every `Some` field of `meta` into `dict` under its `/Info` key;
+/// a `None` field is left untouched.
+fn apply_metadata_fields(dict: &mut Dict, meta: &Metadata) {
+    let texts = [
+        ("Title", &meta.title),
+        ("Author", &meta.author),
+        ("Subject", &meta.subject),
+        ("Keywords", &meta.keywords),
+        ("Creator", &meta.creator),
+        ("Producer", &meta.producer),
+    ];
+    for (key, value) in texts {
+        if let Some(value) = value {
+            dict.insert(name(key), text_string(value));
+        }
+    }
+    let dates = [
+        ("CreationDate", meta.creation_date),
+        ("ModDate", meta.modification_date),
+    ];
+    for (key, value) in dates {
+        if let Some(date) = value {
+            dict.insert(name(key), Object::String(date.to_pdf_string().into_bytes()));
+        }
+    }
+}
+
+/// Reads an `/Info` dictionary back into a [`Metadata`]: text fields via
+/// `decode_text_string`, dates via [`Date::parse_pdf`]. A missing or
+/// unparseable field is simply `None`.
+fn metadata_from_info(dict: &Dict) -> Metadata {
+    Metadata {
+        title: info_text(dict, "Title"),
+        author: info_text(dict, "Author"),
+        subject: info_text(dict, "Subject"),
+        keywords: info_text(dict, "Keywords"),
+        creator: info_text(dict, "Creator"),
+        producer: info_text(dict, "Producer"),
+        creation_date: info_date(dict, "CreationDate"),
+        modification_date: info_date(dict, "ModDate"),
+    }
+}
+
+/// `dict[key]` decoded as a text string, when present and a string.
+fn info_text(dict: &Dict, key: &str) -> Option<String> {
+    Some(decode_text_string(dict.get(key)?.as_str_bytes()?))
+}
+
+/// `dict[key]` decoded and parsed as a PDF date, when present, a string,
+/// and a valid date.
+fn info_date(dict: &Dict, key: &str) -> Option<Date> {
+    Date::parse_pdf(&decode_text_string(dict.get(key)?.as_str_bytes()?))
+}
+
 /// The base's length as an update's write position, plus whether a pad
 /// newline must be inserted first: an object header may not follow
 /// directly after `%%EOF` unless the base already ends on a line
@@ -617,6 +716,34 @@ impl<'a> Update<'a> {
     /// The update section under construction.
     pub fn overlay(&self) -> &Overlay {
         &self.overlay
+    }
+
+    /// Merges `meta` into the base document's `/Info` dictionary, read via
+    /// the overlay's own info ref when a prior call set one, else the
+    /// base's own, else built fresh; and, when the catalog already names
+    /// an XMP packet, rewrites it from the merged fields. See
+    /// [`set_metadata_with`] for the merge and rewrite rules. The
+    /// dictionary always comes from the base document, never from a prior
+    /// call's staged fields, so two calls on one `Update` do not compound.
+    pub fn set_metadata(&mut self, meta: Metadata) -> Result<()> {
+        let info_ref = self.overlay.info.or(self.overlay.base.info);
+        let existing_info = info_ref.and_then(|r| {
+            let dict = self.doc.get(r).ok()?.as_dict()?.clone();
+            Some((r, dict))
+        });
+        let xmp_ref = self.catalog_metadata_ref();
+        set_metadata_with(&mut self.overlay, existing_info, xmp_ref, meta)
+    }
+
+    /// The catalog's `/Metadata` entry, when it is an indirect reference.
+    /// `None` for a catalog with no `/Metadata`, or one that reads as a
+    /// direct stream rather than a reference.
+    fn catalog_metadata_ref(&self) -> Option<ObjRef> {
+        let catalog = self.doc.get(self.overlay.base.root).ok()?;
+        match catalog.as_dict()?.get("Metadata")? {
+            Object::Ref(r) => Some(*r),
+            _ => None,
+        }
     }
 
     /// The base bytes, whether a pad newline goes before the appended

@@ -5,7 +5,8 @@
 use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, XrefKind};
 use pdfboss_write::{
-    Error, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions, XrefStyle,
+    Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions,
+    XrefStyle,
 };
 
 fn base_pdf(xref: XrefStyle) -> Vec<u8> {
@@ -605,4 +606,102 @@ fn index_stays_non_overlapping_with_duplicate_changes() {
             );
         }
     }
+}
+
+fn base_pdf_with_metadata(xref: XrefStyle, meta: Metadata) -> Vec<u8> {
+    let mut page = Page::new(PageSize::A4);
+    page.canvas
+        .text("Base page", 72.0, 700.0, Standard14::Helvetica, 14.0)
+        .unwrap();
+    Pdf {
+        pages: vec![page],
+        metadata: Some(meta),
+        options: WriteOptions {
+            xref,
+            ..WriteOptions::default()
+        },
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+/// Setting only `title` on a base that already carries `title` and `author`
+/// must keep `author` untouched: a `None` field never clears an existing
+/// key, only a `Some` field overwrites one.
+#[test]
+fn set_metadata_merges_existing_fields() {
+    let base = base_pdf_with_metadata(
+        XrefStyle::Table,
+        Metadata {
+            title: Some("Old".to_string()),
+            author: Some("Keep".to_string()),
+            ..Metadata::default()
+        },
+    );
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    update
+        .set_metadata(Metadata {
+            title: Some("New".to_string()),
+            ..Metadata::default()
+        })
+        .unwrap();
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    let meta = reread.metadata();
+    assert_eq!(meta.title.as_deref(), Some("New"));
+    assert_eq!(meta.author.as_deref(), Some("Keep"));
+}
+
+/// A base with no `/Info` at all still gets one on `set_metadata`: the
+/// merge target is a freshly reserved object rather than an existing ref.
+#[test]
+fn set_metadata_creates_info_when_absent() {
+    let base = classic_base();
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    update
+        .set_metadata(Metadata {
+            title: Some("Fresh".to_string()),
+            ..Metadata::default()
+        })
+        .unwrap();
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    assert_eq!(reread.metadata().title.as_deref(), Some("Fresh"));
+}
+
+/// A base whose catalog already carries `/Metadata` (every `Pdf` with
+/// metadata writes one) gets that packet rewritten from the merged fields:
+/// the reloaded stream carries the new title, not the old.
+#[test]
+fn set_metadata_rewrites_xmp_when_catalog_has_it() {
+    let base = base_pdf_with_metadata(
+        XrefStyle::Table,
+        Metadata {
+            title: Some("Old".to_string()),
+            ..Metadata::default()
+        },
+    );
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    update
+        .set_metadata(Metadata {
+            title: Some("New".to_string()),
+            ..Metadata::default()
+        })
+        .unwrap();
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    let root = reread.xref().trailer.get_ref("Root").unwrap();
+    let catalog = reread.get(root).unwrap();
+    let metadata_ref = catalog.as_dict().unwrap().get_ref("Metadata").unwrap();
+    let stream = reread.get(metadata_ref).unwrap();
+    let text = String::from_utf8(stream.as_stream().unwrap().data.clone()).unwrap();
+    assert!(text.contains("New"));
+    assert!(!text.contains("Old"));
 }

@@ -42,5 +42,7 @@ pub use pdf::{
     PageLabel, PageLayout, PageMode, PageSize, Pdf, Viewer,
 };
 pub use sink::{AsyncByteSink, Immediate};
-pub use update::{start_offset, watermark, watermark_with, Overlay, OverlayBase, Update};
+pub use update::{
+    set_metadata_with, start_offset, watermark, watermark_with, Overlay, OverlayBase, Update,
+};
 pub use writer::{WriteOptions, Writer, XrefStyle};

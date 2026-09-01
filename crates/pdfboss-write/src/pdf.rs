@@ -150,6 +150,80 @@ impl Date {
         ));
         out
     }
+
+    /// Parses a PDF date string (ISO 32000 §7.9.4): an optional `D:`
+    /// prefix, a required 4-digit year, then optional 2-digit month, day,
+    /// hour, minute and second (month and day default to 1, the rest to
+    /// 0), then an optional UTC offset as `Z` or `+`/`-HH'mm`. `None` when
+    /// the year is missing or any present field is not valid digits, or
+    /// the offset marker is neither `Z` nor a sign.
+    pub fn parse_pdf(s: &str) -> Option<Date> {
+        let bytes = s.strip_prefix("D:").unwrap_or(s).as_bytes();
+        let mut pos = 0;
+        let year = take_required_digits(bytes, &mut pos, 4)? as u16;
+        let month = take_optional_digits(bytes, &mut pos, 2)?.unwrap_or(1) as u8;
+        let day = take_optional_digits(bytes, &mut pos, 2)?.unwrap_or(1) as u8;
+        let hour = take_optional_digits(bytes, &mut pos, 2)?.unwrap_or(0) as u8;
+        let minute = take_optional_digits(bytes, &mut pos, 2)?.unwrap_or(0) as u8;
+        let second = take_optional_digits(bytes, &mut pos, 2)?.unwrap_or(0) as u8;
+        let utc_offset_minutes = parse_pdf_offset(bytes, pos)?;
+        Some(Date {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            utc_offset_minutes,
+        })
+    }
+}
+
+/// Reads exactly `width` ASCII digits at `bytes[*pos..]` as a decimal
+/// value, advancing `pos` past them. `None` when fewer than `width` bytes
+/// remain or one of them is not a digit.
+fn take_required_digits(bytes: &[u8], pos: &mut usize, width: usize) -> Option<u32> {
+    let end = *pos + width;
+    let digits = bytes.get(*pos..end)?;
+    if !digits.iter().all(|d| d.is_ascii_digit()) {
+        return None;
+    }
+    *pos = end;
+    Some(digits.iter().fold(0u32, |acc, &d| acc * 10 + u32::from(d - b'0')))
+}
+
+/// [`take_required_digits`], but a field with nothing left to read is
+/// absent (`Some(None)`) rather than malformed.
+fn take_optional_digits(bytes: &[u8], pos: &mut usize, width: usize) -> Option<Option<u32>> {
+    if *pos >= bytes.len() {
+        return Some(None);
+    }
+    take_required_digits(bytes, pos, width).map(Some)
+}
+
+/// Parses the UTC offset trailing a PDF date string's digits, in minutes:
+/// zero when nothing is left to read, zero for `Z`, or the signed
+/// magnitude of `+`/`-HH'mm` (the `'mm` half itself optional, defaulting
+/// to zero). `None` when what remains is neither.
+fn parse_pdf_offset(bytes: &[u8], pos: usize) -> Option<i16> {
+    if pos >= bytes.len() || bytes[pos] == b'Z' {
+        return Some(0);
+    }
+    let sign = match bytes[pos] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let mut cursor = pos + 1;
+    let hours = take_required_digits(bytes, &mut cursor, 2)?;
+    let minutes = if bytes.get(cursor) == Some(&b'\'') {
+        cursor += 1;
+        take_optional_digits(bytes, &mut cursor, 2)?.unwrap_or(0)
+    } else {
+        0
+    };
+    let magnitude = i16::try_from(hours * 60 + minutes).ok()?;
+    Some(sign * magnitude)
 }
 
 /// Document information written to the `/Info` dictionary. Every field is
@@ -994,7 +1068,7 @@ fn build_form(
 /// Encodes a text string (ISO 32000 §7.9.2.2): pure ASCII passes through
 /// as its own bytes, anything else becomes UTF-16BE with a `FE FF` byte
 /// order mark.
-fn text_string(value: &str) -> Object {
+pub(crate) fn text_string(value: &str) -> Object {
     if value.is_ascii() {
         return Object::String(value.as_bytes().to_vec());
     }
@@ -1150,6 +1224,42 @@ mod tests {
             utc_offset_minutes: -330,
         };
         assert_eq!(date.to_iso8601(), "1999-12-31T23:59:58-05:30");
+    }
+
+    #[test]
+    fn parse_pdf_full() {
+        assert!(Date::parse_pdf("D:20260901120000+02'00").is_some());
+    }
+
+    #[test]
+    fn parse_pdf_date_only_defaults_time() {
+        let date = Date::parse_pdf("D:20260901").expect("a date-only string parses");
+        assert_eq!(date.year, 2026);
+        assert_eq!(date.month, 9);
+        assert_eq!(date.day, 1);
+        assert_eq!(date.hour, 0);
+        assert_eq!(date.minute, 0);
+        assert_eq!(date.second, 0);
+        assert_eq!(date.utc_offset_minutes, 0);
+    }
+
+    #[test]
+    fn parse_pdf_rejects_garbage() {
+        assert!(Date::parse_pdf("yesterday").is_none());
+    }
+
+    #[test]
+    fn parse_roundtrips_to_pdf_string() {
+        let date = Date {
+            year: 2026,
+            month: 8,
+            day: 27,
+            hour: 12,
+            minute: 30,
+            second: 15,
+            utc_offset_minutes: -330,
+        };
+        assert_eq!(Date::parse_pdf(&date.to_pdf_string()), Some(date));
     }
 
     /// Two pages with text and an image — enough to exercise fonts,
