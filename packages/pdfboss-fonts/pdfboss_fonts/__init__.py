@@ -1,7 +1,7 @@
 """Bundled OFL 1.1 substitute fonts for ``pdfboss[full]`` (Croscore: Arimo, Tinos, Cousine)."""
 import os
 
-__version__ = "0.15.0"
+__version__ = "0.16.0"
 
 def font_dir() -> str:
     """Absolute path to the directory holding the bundled ``.ttf`` files.
