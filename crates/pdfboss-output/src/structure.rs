@@ -2322,7 +2322,6 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
             )
         })
         .collect();
-    let ordered = visual_flow_order(raw);
     let grid_of = |flow: &[&TextSpan]| -> Option<usize> {
         let x0 = flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min);
         let x1 = flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max);
@@ -2343,25 +2342,22 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(index, _)| index)
     };
-    let assignment: Vec<Option<usize>> = if grids.is_empty() {
-        vec![None; ordered.len()]
+    // The assignment is a fact about each flow, computed in stream order so
+    // the stream-order gates below can pair it with `raw_extents`; when the
+    // visual reorder moves the flows, it moves with them.
+    let stream_assignment: Vec<Option<usize>> = if grids.is_empty() {
+        vec![None; raw.len()]
     } else {
-        ordered.iter().map(|flow| grid_of(flow)).collect()
+        raw.iter().map(|flow| grid_of(flow)).collect()
     };
-    let mut merged: Vec<Vec<&TextSpan>> = vec![Vec::new(); grids.len()];
-    for (flow, assigned) in ordered.iter().zip(&assignment) {
-        if let Some(grid) = assigned {
-            merged[*grid].extend(flow.iter().copied());
-        }
-    }
     // The cheap pre-gate for the page pass: the final gate needs the
     // stream to alternate across the gutter at least twice, and flows that
     // never alternate across even the text's midline cannot. Everything
-    // here derives from the per-flow extents, so an ordinary page pays no
-    // allocation and no page-wide grouping.
-    let alternates = ordered.len() > 1 && {
+    // here derives from the per-flow extents in stream order, so an
+    // ordinary page pays no allocation and no page-wide grouping.
+    let alternates = raw.len() > 1 && {
         let (mut x_min, mut x_max) = (f32::MAX, f32::MIN);
-        for (extent, assigned) in raw_extents.iter().zip(&assignment) {
+        for (extent, assigned) in raw_extents.iter().zip(&stream_assignment) {
             if assigned.is_none() {
                 x_min = x_min.min(extent.0);
                 x_max = x_max.max(extent.1);
@@ -2370,7 +2366,7 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
         let mid = (x_min + x_max) / 2.0;
         let mut lanes = raw_extents
             .iter()
-            .zip(&assignment)
+            .zip(&stream_assignment)
             .filter(|(_, assigned)| assigned.is_none())
             .filter_map(|((x0, x1), _)| {
                 if *x1 <= mid {
@@ -2392,6 +2388,25 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
         }
         switches >= 2
     };
+    let (ordered, assignment) = match visual_flow_order(&raw) {
+        Some(order) => {
+            let mut slots: Vec<Option<Vec<&TextSpan>>> = raw.into_iter().map(Some).collect();
+            let ordered: Vec<Vec<&TextSpan>> = order
+                .iter()
+                .map(|&i| slots[i].take().expect("each flow placed once"))
+                .collect();
+            let assignment: Vec<Option<usize>> =
+                order.iter().map(|&i| stream_assignment[i]).collect();
+            (ordered, assignment)
+        }
+        None => (raw, stream_assignment),
+    };
+    let mut merged: Vec<Vec<&TextSpan>> = vec![Vec::new(); grids.len()];
+    for (flow, assigned) in ordered.iter().zip(&assignment) {
+        if let Some(grid) = assigned {
+            merged[*grid].extend(flow.iter().copied());
+        }
+    }
     // The page's loose text, all of it at once: a page with a true gutter
     // reads column-major across every flow — a report writing its columns
     // as interleaved paragraphs still reads left column first — while
@@ -2559,7 +2574,11 @@ const VISUAL_ORDER_MIN_DISORDER: f64 = 0.05;
 /// stream position, so a page already written in reading order comes out
 /// unchanged, and columns — whose flows never both overlap in x and clear
 /// in y — keep the order their producer wrote.
-fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
+///
+/// Returns the permutation for the caller to apply — the caller carries
+/// per-flow state (grid assignments) that must move with the flows — and
+/// `None` when the stream's order stands.
+fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
@@ -2573,7 +2592,7 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
 
     let n = flows.len();
     if n < 2 || n > VISUAL_ORDER_MAX_FLOWS {
-        return flows;
+        return None;
     }
     let extents: Vec<Extent> = flows
         .iter()
@@ -2600,7 +2619,7 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
         .filter(|e| e.chars >= VISUAL_ORDER_MIN_CHARS)
         .count();
     if movers < 2 {
-        return flows;
+        return None;
     }
     let mut above: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut blockers = vec![0usize; n];
@@ -2641,10 +2660,10 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
     }
     if order.len() != n {
         // Degenerate boxes can relate two flows both ways; keep the stream.
-        return flows;
+        return None;
     }
     if order.iter().enumerate().all(|(position, &flow)| position == flow) {
-        return flows;
+        return None;
     }
     // A page that is already essentially in reading order stays in the
     // stream's order: a couple of displaced chart-axis rows on an otherwise
@@ -2668,13 +2687,9 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
         }
     }
     if total == 0.0 || inverted / total < VISUAL_ORDER_MIN_DISORDER {
-        return flows;
+        return None;
     }
-    let mut slots: Vec<Option<Vec<&TextSpan>>> = flows.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .map(|i| slots[i].take().expect("each flow placed once"))
-        .collect()
+    Some(order)
 }
 
 /// The content stream's flows: runs of consecutive spans whose baselines
@@ -3243,6 +3258,37 @@ pub(crate) mod tests {
             grid_at,
             segments.len() - 1,
             "the bottom grid reads last, not hoisted above the title"
+        );
+    }
+
+    /// The interleaving gate reads the stream: each flow's extent pairs
+    /// with that same flow's grid assignment even after the visual reorder
+    /// has moved a grid's flow (here written first, sitting last). With
+    /// the pairing shifted, the last loose flow drops out of the lane
+    /// sequence and the page loses its column-major read.
+    #[test]
+    fn a_reordered_grid_flow_does_not_shift_the_lane_gate() {
+        let mut spans = Vec::new();
+        let grid = bottom_grid(&mut spans);
+        block("right one", 200.0, 288.0, 700.0, 10, &mut spans);
+        block("right two", 200.0, 288.0, 628.0, 10, &mut spans);
+        block("left one", 72.0, 160.0, 556.0, 16, &mut spans);
+        block("right three", 200.0, 288.0, 412.0, 10, &mut spans);
+        let segments = segments_with_grids(&spans, std::slice::from_ref(&grid));
+        let right_column = segments
+            .iter()
+            .find(|seg| {
+                seg.spans
+                    .iter()
+                    .any(|s| s.text.starts_with("right one body line 0"))
+            })
+            .expect("the right column is somewhere");
+        assert!(
+            right_column
+                .spans
+                .iter()
+                .any(|s| s.text.starts_with("right three")),
+            "the right column reads whole, top block to bottom block"
         );
     }
 
