@@ -71,6 +71,8 @@ guide then takes one task per chapter:
   native size.
 - [Creating PDFs](./guide/creating.md): canvas painting, composed elements
   and document slots from the CLI, Python and Rust.
+- [Editing PDFs](./guide/editing.md): incremental updates to an existing
+  file, starting with `meta`.
 - [Markdown to PDF](./guide/md-to-pdf.md): CommonMark+GFM composed into
   themed, paginated documents.
 - [Async and remote documents](./guide/async.md): range-fetching access to
