@@ -345,36 +345,59 @@ fn removed_object_is_gone_after_reload_stream() {
 
 /// The classic table's free chain always starts at entry 0: its row names
 /// the lowest freed number as the chain's head, so a reader following the
-/// chain from object 0 lands on the freed object first.
+/// chain from object 0 reaches the freed object first. Freeing two objects
+/// pins both ends of the chain: the head row names the lower number, that
+/// number's own row names the higher one, and the higher number's row
+/// closes the chain back to 0.
 #[test]
 fn free_chain_starts_at_entry_zero() {
     let base = classic_base();
     let doc1 = Document::load(base).unwrap();
     let mut update1 = Update::new(&doc1).unwrap();
-    let marker = update1.reserve();
-    let mut dict = Dict::new();
-    dict.insert(Name("Marker".into()), Object::Int(1));
-    update1.set(marker, Object::Dict(dict));
+    let marker_a = update1.reserve();
+    let marker_b = update1.reserve();
+    let mut dict_a = Dict::new();
+    dict_a.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker_a, Object::Dict(dict_a));
+    let mut dict_b = Dict::new();
+    dict_b.insert(Name("Marker".into()), Object::Int(2));
+    update1.set(marker_b, Object::Dict(dict_b));
     let once = update1.appended().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
-    update2.remove(marker);
+    update2.remove(marker_a);
+    update2.remove(marker_b);
     let out = update2.appended().unwrap();
 
     let off = startxref(&out).unwrap();
     let info = parse_section_at(&out, off).unwrap();
     assert_eq!(
-        info.xref.get(marker.num),
+        info.xref.get(marker_a.num),
         Some(XrefEntry::Free),
-        "the freed number's own entry reads back as free"
+        "the lower freed number's own entry reads back as free"
+    );
+    assert_eq!(
+        info.xref.get(marker_b.num),
+        Some(XrefEntry::Free),
+        "the higher freed number's own entry reads back as free"
     );
 
     let text = String::from_utf8_lossy(&out);
-    let head_row = format!("{:010} 65535 f \n", marker.num);
+    let head_row = format!("{:010} 65535 f \n", marker_a.num);
     assert!(
         text.contains(&head_row),
-        "the entry-0 subsection row names the freed number as the chain's head: {text}"
+        "the entry-0 subsection row names the lower freed number as the chain's head: {text}"
+    );
+    let middle_row = format!("{:010} 00001 f \n", marker_b.num);
+    assert!(
+        text.contains(&middle_row),
+        "the lower freed number's own row names the higher one next: {text}"
+    );
+    let tail_row = "0000000000 00001 f \n";
+    assert!(
+        text.contains(tail_row),
+        "the higher freed number's own row closes the chain back to 0: {text}"
     );
 }
 
@@ -462,4 +485,124 @@ fn index_pairs_coalesce_runs() {
         vec![1, 3, 6, 1, i64::from(base_size), 1],
         "the run 1..4 coalesces into one pair; 6 and the xref stream's own row stay isolated"
     );
+}
+
+/// A number recorded twice in one update, once by `set` and once by
+/// `remove`, keeps only its last-recorded change: the appended section
+/// carries exactly one row for that number (the free one), not one row
+/// per recorded change.
+#[test]
+fn set_then_remove_same_ref_emits_one_free_row() {
+    let base = classic_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.appended().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    let mut replacement = Dict::new();
+    replacement.insert(Name("Marker".into()), Object::Int(2));
+    update2.set(marker, Object::Dict(replacement));
+    update2.remove(marker);
+    let out = update2.appended().unwrap();
+
+    let reread = Document::load(out.clone()).unwrap();
+    assert!(matches!(
+        reread.get(marker),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
+
+    let off = startxref(&out).unwrap();
+    let text = String::from_utf8_lossy(&out[off..]);
+    let header = format!("\n{} 1\n", marker.num);
+    assert_eq!(
+        text.matches(&header).count(),
+        1,
+        "exactly one subsection row, in this update's own section, for the number set then removed: {text}"
+    );
+}
+
+/// Calling `remove` twice on the same reference records only one free row,
+/// not two entries chasing the same number through the chain.
+#[test]
+fn remove_twice_emits_one_free_row() {
+    let base = classic_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.appended().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    update2.remove(marker);
+    update2.remove(marker);
+    let out = update2.appended().unwrap();
+
+    let reread = Document::load(out.clone()).unwrap();
+    assert!(matches!(
+        reread.get(marker),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
+
+    let off = startxref(&out).unwrap();
+    let text = String::from_utf8_lossy(&out[off..]);
+    let header = format!("\n{} 1\n", marker.num);
+    assert_eq!(
+        text.matches(&header).count(),
+        1,
+        "exactly one subsection row, in this update's own section, for a number removed twice: {text}"
+    );
+}
+
+/// A number recorded more than once (two `set`s, then a `remove`) must
+/// still leave the xref stream's `/Index` non-overlapping: each object
+/// number appears in exactly one run, never split across two.
+#[test]
+fn index_stays_non_overlapping_with_duplicate_changes() {
+    let base = stream_base();
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    let target = ObjRef { num: 5, gen: 0 };
+    let mut first = Dict::new();
+    first.insert(Name("Marker".into()), Object::Int(1));
+    update.set(target, Object::Dict(first));
+    let mut second = Dict::new();
+    second.insert(Name("Marker".into()), Object::Int(2));
+    update.set(target, Object::Dict(second));
+    update.remove(target);
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out.clone()).unwrap();
+    assert!(matches!(
+        reread.get(target),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
+
+    let off = startxref(&out).unwrap();
+    let section = &out[off..];
+    let text = String::from_utf8_lossy(section);
+    let index_at = text.find("/Index").expect("the xref stream names /Index");
+    let array_start = text[index_at..].find('[').unwrap() + index_at;
+    let array_end = text[array_start..].find(']').unwrap() + array_start;
+    let numbers: Vec<i64> = text[array_start + 1..array_end]
+        .split_whitespace()
+        .map(|n| n.parse().unwrap())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for pair in numbers.chunks(2) {
+        let (run_start, count) = (pair[0], pair[1]);
+        for object_num in run_start..run_start + count {
+            assert!(
+                seen.insert(object_num),
+                "object {object_num} appears in more than one /Index run: {numbers:?}"
+            );
+        }
+    }
 }

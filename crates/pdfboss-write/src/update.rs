@@ -390,8 +390,13 @@ impl Overlay {
     /// it into entry 0's free list, in whichever style the base uses. Its
     /// generation for reuse is `r.gen` advanced by one (saturating at
     /// 65535, the field's own limit), per the classic table's convention
-    /// for a deleted entry's row.
+    /// for a deleted entry's row. A no-op for object number 0: it is
+    /// already the free list's own permanent head, represented by this
+    /// section's synthetic entry-0 row whenever any other object is freed.
     pub fn remove(&mut self, r: ObjRef) {
+        if r.num == 0 {
+            return;
+        }
         self.next = self.next.max(r.num.saturating_add(1));
         let gen = r.gen.saturating_add(1);
         self.objects
@@ -430,12 +435,19 @@ impl Overlay {
     /// The appended section alone: every set object at `start` plus its
     /// position within this section, then a cross-reference section in the
     /// base's style naming the base's section as `/Prev`. Refused when no
-    /// object has been set.
+    /// object has been set. A number recorded more than once (repeated
+    /// `set`, or `set` and `remove` on the same reference) keeps only its
+    /// last-recorded change, so the appended cross-reference data never
+    /// carries two rows for one number.
     pub fn section(&self, start: u64) -> Result<Vec<u8>> {
         if self.is_empty() {
             return Err(Error::EmptyUpdate);
         }
-        let mut changes = self.objects.clone();
+        let mut by_num: FastMap<u32, (ObjRef, Change)> = FastMap::default();
+        for (r, change) in &self.objects {
+            by_num.insert(r.num, (*r, change.clone()));
+        }
+        let mut changes: Vec<(ObjRef, Change)> = by_num.into_values().collect();
         changes.sort_by_key(|(r, _)| r.num);
         let mut out = Vec::new();
         let mut rows: Vec<Row> = Vec::with_capacity(changes.len() + 1);
