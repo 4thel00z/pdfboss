@@ -770,6 +770,31 @@ mod tests {
         extract_markdown(&doc, ReadingOrder::Content).unwrap()
     }
 
+    /// One drawn grid whose cell text arrives as two flows (the bottom rows
+    /// written before the top ones) is still one table: flows sharing a
+    /// grid merge before segmentation, so the grid cannot fragment into a
+    /// table per flow.
+    #[test]
+    fn a_grid_written_in_two_flows_is_one_table() {
+        let md = markdown_of_drawn(
+            "70 630 360 80 re S 250 630 m 250 710 l S \
+             70 690 m 430 690 l S 70 670 m 430 670 l S 70 650 m 430 650 l S \
+             BT /F1 10 Tf 1 0 0 1 80 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj \
+             1 0 0 1 80 635 Tm (a4) Tj 1 0 0 1 260 635 Tm (b4) Tj \
+             1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 80 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj ET",
+        );
+        assert_eq!(
+            md.matches("| --- | --- |").count(),
+            1,
+            "one grid must be one table: {md:?}"
+        );
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |\n| a3 | b3 |\n| a4 | b4 |"),
+            "rows read top to bottom in one table: {md:?}"
+        );
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
     #[test]

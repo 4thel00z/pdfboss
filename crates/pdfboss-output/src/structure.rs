@@ -406,7 +406,11 @@ fn page_layout_with_stats(
 ) -> PageLayout {
     let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
-    for segment in segments(spans, order) {
+    let parts = match order {
+        ReadingOrder::Content => segments_with_grids(spans, &grids),
+        _ => segments(spans, order),
+    };
+    for segment in parts {
         push_segment_blocks(segment, &grids, stats, order, &mut blocks);
     }
     PageLayout { blocks }
@@ -1920,11 +1924,54 @@ fn segments(spans: &[TextSpan], order: ReadingOrder) -> Vec<Segment<'_>> {
 /// by row, and takes over entirely when content order fragments into no
 /// order at all (see [`flows`]).
 fn content_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
-    visual_flow_order(flows(spans))
-        .into_iter()
-        .flat_map(gutter_split)
-        .filter(|segment| !segment.spans.is_empty())
-        .collect()
+    segments_with_grids(spans, &[])
+}
+
+/// [`content_segments`] with the page's ruled grids: flows whose boxes touch
+/// the same grid merge into one segment at the earliest one's position and
+/// skip the gutter split — the grid owns its region, and a table's cell text
+/// arriving as several flows (or laned at its column gap) must not fragment
+/// one drawn grid into a table per piece.
+fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Segment<'s>> {
+    let ordered = visual_flow_order(flows(spans));
+    if grids.is_empty() {
+        return ordered
+            .into_iter()
+            .flat_map(gutter_split)
+            .filter(|segment| !segment.spans.is_empty())
+            .collect();
+    }
+    let grid_of = |flow: &[&TextSpan]| -> Option<usize> {
+        let x0 = flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min);
+        let x1 = flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max);
+        let y0 = flow.iter().map(|s| s.bbox.y0).fold(f32::MAX, f32::min);
+        let y1 = flow.iter().map(|s| s.bbox.y1).fold(f32::MIN, f32::max);
+        grids.iter().position(|grid| {
+            let b = grid.bbox();
+            x1 >= b.x0 && x0 <= b.x1 && y1 >= b.y0 && y0 <= b.y1
+        })
+    };
+    let assignment: Vec<Option<usize>> = ordered.iter().map(|flow| grid_of(flow)).collect();
+    let mut merged: Vec<Vec<&TextSpan>> = vec![Vec::new(); grids.len()];
+    for (flow, assigned) in ordered.iter().zip(&assignment) {
+        if let Some(grid) = assigned {
+            merged[*grid].extend(flow.iter().copied());
+        }
+    }
+    let mut emitted = vec![false; grids.len()];
+    let mut out = Vec::new();
+    for (flow, assigned) in ordered.into_iter().zip(assignment) {
+        let Some(grid) = assigned else {
+            out.extend(gutter_split(flow));
+            continue;
+        };
+        if !emitted[grid] {
+            emitted[grid] = true;
+            out.push(Segment::ungrouped(std::mem::take(&mut merged[grid])));
+        }
+    }
+    out.retain(|segment| !segment.spans.is_empty());
+    out
 }
 
 /// Structure-tree order: one segment holding the spans as they came,
@@ -2512,6 +2559,31 @@ pub(crate) mod tests {
     use super::*;
     use pdfboss_core::Document;
     use pdfboss_testkit::doc_with_graphics;
+
+    /// Local prototyping rig, never run in CI: prints one page's rulings
+    /// and what the grid detector makes of them. PDFBOSS_PROBE_PDF names
+    /// the file.
+    #[test]
+    #[ignore]
+    fn ruling_probe() {
+        let path = std::env::var("PDFBOSS_PROBE_PDF").unwrap();
+        let doc = Document::load(std::fs::read(&path).unwrap()).unwrap();
+        let page = doc.page(0).unwrap();
+        let (_, rulings, report) =
+            pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+        println!("rulings: {} (report complete: {})", rulings.len(), report.is_complete());
+        for r in rulings.iter().take(20) {
+            println!(
+                "  ({:7.1},{:7.1}) -> ({:7.1},{:7.1}) w={:.2}",
+                r.start.x, r.start.y, r.end.x, r.end.y, r.width
+            );
+        }
+        let grids = ruled_grids(&rulings);
+        println!("grids: {}", grids.len());
+        for grid in &grids {
+            println!("  xs {:?} ys {} boxed {}", grid.xs, grid.ys.len(), grid.boxed);
+        }
+    }
 
     /// Local prototyping rig, never run in CI: dumps every page's flows —
     /// stream order, bbox, mass, text head — as JSONL for the reading-order
