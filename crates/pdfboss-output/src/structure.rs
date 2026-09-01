@@ -75,6 +75,16 @@ const BOLD_HEADING_MAX_CHARS: usize = 72;
 /// large type is a pull quote, a caption, or — on a page whose body size the
 /// character histogram read off a dense table — ordinary prose one bucket up.
 const HEADING_MAX_CHARS: usize = 120;
+/// A lone top line set in the body's own type still reads as the page's
+/// title when white space sets it apart: the gap under it must reach this
+/// multiple of the paragraph's own line pitch.
+const PAGE_TITLE_MIN_GAP: f32 = 1.5;
+/// ...and the line must stay narrower than this fraction of the page's
+/// text width — a full-measure line is prose, however isolated.
+const PAGE_TITLE_MAX_WIDTH: f32 = 0.7;
+/// Titles name, they do not explain: past this many words the line is a
+/// sentence set off for some other reason.
+const PAGE_TITLE_MAX_WORDS: usize = 10;
 /// A baseline step beyond this multiple of a run's median step is white
 /// space between paragraphs rather than leading inside one.
 const PARAGRAPH_GAP: f32 = 1.8;
@@ -168,7 +178,10 @@ pub fn page_layout_with_rulings(
     rulings: &[Ruling],
     order: ReadingOrder,
 ) -> PageLayout {
-    page_layout_with_stats(spans, rulings, &size_stats(&[spans]), order)
+    let stats = size_stats(&[spans]);
+    let mut layout = page_layout_with_stats(spans, rulings, &stats, order);
+    promote_page_title(&mut layout.blocks, &stats);
+    layout
 }
 
 /// Every page's spans as structure, ranking heading sizes against the whole
@@ -204,6 +217,9 @@ fn layouts_of(pages: &[(&[TextSpan], &[Ruling], ReadingOrder)]) -> Vec<PageLayou
         .map(|(spans, rulings, order)| page_layout_with_stats(spans, rulings, &stats, *order))
         .collect();
     tag_page_roles(&mut layouts);
+    for layout in &mut layouts {
+        promote_page_title(&mut layout.blocks, &stats);
+    }
     layouts
 }
 
@@ -446,6 +462,137 @@ fn demote_contents_entries(blocks: &mut [Block]) {
             role: Role::Body,
         };
     }
+}
+
+/// A block's bounding box, whichever kind it is.
+fn block_bbox(block: &Block) -> &BBox {
+    match block {
+        Block::Heading { bbox, .. }
+        | Block::Paragraph { bbox, .. }
+        | Block::List { bbox, .. }
+        | Block::Table { bbox, .. } => bbox,
+    }
+}
+
+/// Promotes an isolated top line to the page's title on a page whose type
+/// announced no heading at all: a lone line in exactly the body's type,
+/// standing [`PAGE_TITLE_MIN_GAP`] pitches above the paragraph under it,
+/// narrower than [`PAGE_TITLE_MAX_WIDTH`] of the page's text, short,
+/// starting uppercase, carrying no digit — a running header's usual tells
+/// all absent. The title may open a multi-line block: a page whose stray
+/// far-down lines skew the median step folds everything into one
+/// paragraph, and the title is carved out of it. Runs after page roles are
+/// tagged, so a repeated running header is already out of candidacy on
+/// documents long enough to tag one.
+fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats) {
+    if blocks.iter().any(|block| matches!(block, Block::Heading { .. })) {
+        return;
+    }
+    let is_edge = |block: &Block| {
+        matches!(
+            block,
+            Block::Paragraph {
+                role: Role::PageHeader | Role::PageFooter,
+                ..
+            }
+        )
+    };
+    let Some(start) = blocks.iter().position(|block| !is_edge(block)) else {
+        return;
+    };
+    let Block::Paragraph {
+        lines,
+        role: Role::Body,
+        ..
+    } = &blocks[start]
+    else {
+        return;
+    };
+    let Some(title) = lines.first() else { return };
+    // Exactly the body's type: smaller is a running header, and any larger
+    // size on a page the ladder left heading-free was already refused by
+    // the rank pass — a mixed line whose big glyph hides sub-body text.
+    if half_points(title.size) != half_points(stats.body) {
+        return;
+    }
+    let text = line_text(title);
+    let text = text.trim();
+    if !text.chars().next().is_some_and(char::is_uppercase) {
+        return;
+    }
+    if text.chars().any(|c| c.is_ascii_digit()) || text.ends_with([',', ';', ':']) {
+        return;
+    }
+    if text.chars().count() > BOLD_HEADING_MAX_CHARS
+        || text.split_whitespace().count() > PAGE_TITLE_MAX_WORDS
+    {
+        return;
+    }
+    // The paragraph under the title: the rest of its own block, or — for a
+    // lone-line block — the next body paragraph. Its first step is the
+    // pitch the title's gap is measured against.
+    let below: &[Line] = match lines.as_slice() {
+        [_only] => {
+            let Some(Block::Paragraph {
+                lines: next,
+                role: Role::Body,
+                ..
+            }) = blocks.get(start + 1)
+            else {
+                return;
+            };
+            next
+        }
+        [_title, rest @ ..] => rest,
+        [] => return,
+    };
+    let [first_below, second_below, ..] = below else {
+        return;
+    };
+    let pitch = first_below.y - second_below.y;
+    if pitch <= 0.0 {
+        return;
+    }
+    if title.y - first_below.y < PAGE_TITLE_MIN_GAP * pitch {
+        return;
+    }
+    let text_x0 = blocks[start..]
+        .iter()
+        .fold(f32::INFINITY, |x0, block| x0.min(block_bbox(block).x0));
+    let text_x1 = blocks[start..]
+        .iter()
+        .fold(f32::NEG_INFINITY, |x1, block| x1.max(block_bbox(block).x1));
+    if title.end_x - title.x > PAGE_TITLE_MAX_WIDTH * (text_x1 - text_x0) {
+        return;
+    }
+    let top = block_bbox(&blocks[start]).y1;
+    if blocks[start + 1..]
+        .iter()
+        .any(|block| block_bbox(block).y1 > top)
+    {
+        return;
+    }
+    let Block::Paragraph { lines, .. } = &mut blocks[start] else {
+        unreachable!("the candidate was matched as a paragraph");
+    };
+    let mut moved = std::mem::take(lines).into_iter();
+    let title = moved.next().expect("the candidate had a first line");
+    let remainder: Vec<Line> = moved.collect();
+    let heading = Block::Heading {
+        level: stats.bold_level(),
+        bbox: bbox(std::slice::from_ref(&title)),
+        lines: vec![title],
+    };
+    if remainder.is_empty() {
+        blocks[start] = heading;
+        return;
+    }
+    blocks[start] = Block::Paragraph {
+        bbox: bbox(&remainder),
+        lines: remainder,
+        role: Role::Body,
+    };
+    blocks.insert(start, heading);
 }
 
 /// More consecutive same-level heading blocks than this many is a list of
@@ -3289,6 +3436,163 @@ pub(crate) mod tests {
                 .iter()
                 .any(|s| s.text.starts_with("right three")),
             "the right column reads whole, top block to bottom block"
+        );
+    }
+
+    /// A lone top line set in the body's own type, standing well over a
+    /// pitch above a paragraph and far short of the measure, is the page's
+    /// title even though nothing in its type says so.
+    #[test]
+    fn an_isolated_body_size_top_line_becomes_the_page_title() {
+        let mut spans = vec![span("Print against Digital", 54.0, 140.0, 714.0, 11.5)];
+        for y in [682.0, 664.7, 647.4] {
+            spans.push(span(
+                "why readers pick one format over the other and stay with it",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        let layout = page_layout(&spans);
+        let Block::Heading { level, lines, .. } = &layout.blocks[0] else {
+            panic!("the isolated top line is the page's title, got {:?}", layout.blocks[0]);
+        };
+        assert_eq!(*level, 1);
+        assert_eq!(line_text(&lines[0]).trim(), "Print against Digital");
+    }
+
+    /// A page whose stray far-down lines (a widowed word, a footer) skew
+    /// the median step folds everything into one paragraph block; the
+    /// title is carved out of that block all the same.
+    #[test]
+    fn a_title_folded_into_the_page_block_still_promotes() {
+        let mut spans = vec![span("Print against Digital", 54.0, 140.0, 714.0, 11.5)];
+        for y in [682.0, 664.7] {
+            spans.push(span(
+                "why readers pick one format over the other and stay with it",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        spans.push(span("format.", 54.0, 96.0, 390.0, 11.5));
+        spans.push(span("Online Survey", 482.0, 558.0, 43.0, 8.0));
+        let layout = page_layout(&spans);
+        let Block::Heading { lines, .. } = &layout.blocks[0] else {
+            panic!("the folded title is carved out, got {:?}", layout.blocks[0]);
+        };
+        assert_eq!(line_text(&lines[0]).trim(), "Print against Digital");
+        let Block::Paragraph { lines, .. } = &layout.blocks[1] else {
+            panic!("the body stays a paragraph, got {:?}", layout.blocks[1]);
+        };
+        assert!(line_text(&lines[0]).starts_with("why readers"));
+    }
+
+    /// A top line set smaller than the body is a running header, however
+    /// isolated it stands.
+    #[test]
+    fn a_top_line_smaller_than_body_stays_a_running_header() {
+        let mut spans = vec![span("Print against Digital", 54.0, 140.0, 714.0, 8.0)];
+        for y in [682.0, 664.7, 647.4] {
+            spans.push(span(
+                "why readers pick one format over the other and stay with it",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        let layout = page_layout(&spans);
+        assert!(
+            !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+            "a sub-body top line never promotes"
+        );
+    }
+
+    /// An isolated top line carrying a digit is a folio or a running
+    /// header, not a title.
+    #[test]
+    fn a_top_line_with_a_digit_stays_prose() {
+        let mut spans = vec![span("16 Face Your World", 54.0, 140.0, 714.0, 11.5)];
+        for y in [682.0, 664.7, 647.4] {
+            spans.push(span(
+                "why readers pick one format over the other and stay with it",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        let layout = page_layout(&spans);
+        assert!(
+            !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+            "a numbered top line never promotes"
+        );
+    }
+
+    /// A full-measure top line is prose, however isolated: titles stop
+    /// short of the margin.
+    #[test]
+    fn a_full_measure_top_line_stays_prose() {
+        let mut spans = vec![span(
+            "As seen in this chart of responses we should adopt the format",
+            54.0,
+            558.0,
+            714.0,
+            11.5,
+        )];
+        for y in [682.0, 664.7, 647.4] {
+            spans.push(span(
+                "why readers pick one format over the other and stay with it",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        let layout = page_layout(&spans);
+        assert!(
+            !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+            "a full-measure top line never promotes"
+        );
+    }
+
+    /// A page whose type already announced a heading needs no promoted
+    /// title: typographic evidence outranks the structural read.
+    #[test]
+    fn a_page_with_a_sized_heading_promotes_nothing() {
+        let mut spans = vec![span("Print against Digital", 54.0, 140.0, 714.0, 11.5)];
+        for y in [682.0, 664.7, 647.4] {
+            spans.push(span(
+                "why readers pick one format over the other and stay with it",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        spans.push(span("Results", 54.0, 120.0, 600.0, 16.0));
+        for y in [566.0, 548.7] {
+            spans.push(span(
+                "what the numbers in the returned forms actually said",
+                54.0,
+                558.0,
+                y,
+                11.5,
+            ));
+        }
+        let layout = page_layout(&spans);
+        let headings: Vec<&Block> = layout
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Heading { .. }))
+            .collect();
+        assert_eq!(headings.len(), 1, "only the sized heading stands");
+        assert!(
+            matches!(&layout.blocks[0], Block::Paragraph { .. }),
+            "the top line stays prose beside real typographic headings"
         );
     }
 
