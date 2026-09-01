@@ -1962,12 +1962,22 @@ fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
     }
     let extents: Vec<Extent> = flows
         .iter()
-        .map(|flow| Extent {
-            left: flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min),
-            right: flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max),
-            bottom: flow.iter().map(|s| s.bbox.y0).fold(f32::MAX, f32::min),
-            top: flow.iter().map(|s| s.bbox.y1).fold(f32::MIN, f32::max),
-            chars: flow.iter().map(|s| s.text.chars().count()).sum(),
+        .map(|flow| {
+            let mut extent = Extent {
+                left: f32::MAX,
+                right: f32::MIN,
+                bottom: f32::MAX,
+                top: f32::MIN,
+                chars: 0,
+            };
+            for span in flow {
+                extent.left = extent.left.min(span.bbox.x0);
+                extent.right = extent.right.max(span.bbox.x1);
+                extent.bottom = extent.bottom.min(span.bbox.y0);
+                extent.top = extent.top.max(span.bbox.y1);
+                extent.chars += span.text.bytes().filter(|b| (b & 0xC0) != 0x80).count();
+            }
+            extent
         })
         .collect();
     let mut above: Vec<Vec<usize>> = vec![Vec::new(); n];
