@@ -326,7 +326,7 @@ impl OverlayBase {
     /// [`Error::MissingStartxref`] on this fallback path).
     pub fn from_document(doc: &Document) -> Result<OverlayBase> {
         let trailer = &doc.xref().trailer;
-        if trailer.get("Encrypt").is_some() {
+        if trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
             return Err(Error::EncryptedBase);
         }
         let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
@@ -400,8 +400,15 @@ impl Overlay {
     /// Sets an object under its own number, whether new or a replacement
     /// of one already in the base. Raises the next free number past `r`
     /// when `r` was not already reserved, so a later `reserve`/`put` never
-    /// collides with a caller-chosen number.
+    /// collides with a caller-chosen number. A no-op for object number 0:
+    /// it is already the free list's own permanent head, represented by
+    /// this section's synthetic entry-0 row whenever any other object is
+    /// freed, and a `set` row for it would collide with that row. Symmetric
+    /// with [`Overlay::remove`]'s guard.
     pub fn set(&mut self, r: ObjRef, obj: Object) {
+        if r.num == 0 {
+            return;
+        }
         self.next = self.next.max(r.num.saturating_add(1));
         self.objects.push((r, Change::Set(obj)));
     }
@@ -506,7 +513,7 @@ impl Overlay {
         if let Some(info) = self.info.or(self.base.info) {
             trailer.insert(name("Info"), Object::Ref(info));
         }
-        if let Some(id) = rotated_id(&self.base, &out) {
+        if let Some(id) = rotated_id(&self.base, &out, &freed) {
             trailer.insert(name("ID"), id);
         }
         trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
@@ -869,11 +876,14 @@ fn contiguous_runs(rows: &[Row]) -> Vec<(usize, usize)> {
 
 /// The appended trailer's `/ID`: the base's first half kept verbatim, the
 /// second half replaced by the first 16 bytes of a SHA-256 over the first
-/// half's bytes, the base's `/Prev` offset as little-endian bytes, and
-/// `body` (the section's serialized objects, built before its xref part).
-/// `None` when the base carries no `/ID` array with a string first
-/// element, in which case the appended trailer omits the key entirely.
-fn rotated_id(base: &OverlayBase, body: &[u8]) -> Option<Object> {
+/// half's bytes, the base's `/Prev` offset as little-endian bytes, `body`
+/// (the section's serialized objects, built before its xref part), and
+/// finally each of `freed`'s `(num, gen)` pairs in order (`num` then `gen`,
+/// both little-endian), so a frees-only update, whose `body` is empty,
+/// still rotates by what it freed rather than staying fixed. `None` when
+/// the base carries no `/ID` array with a string first element, in which
+/// case the appended trailer omits the key entirely.
+fn rotated_id(base: &OverlayBase, body: &[u8], freed: &[ObjRef]) -> Option<Object> {
     let Some(Object::Array(halves)) = &base.id else {
         return None;
     };
@@ -884,6 +894,10 @@ fn rotated_id(base: &OverlayBase, body: &[u8]) -> Option<Object> {
     hasher.update(first);
     hasher.update(&base.prev.to_le_bytes());
     hasher.update(body);
+    for r in freed {
+        hasher.update(&r.num.to_le_bytes());
+        hasher.update(&r.gen.to_le_bytes());
+    }
     let digest = hasher.finalize();
     Some(Object::Array(vec![
         Object::String(first.clone()),

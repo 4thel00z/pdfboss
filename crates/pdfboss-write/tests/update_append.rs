@@ -235,6 +235,24 @@ fn encrypted_base_is_refused() {
     assert!(matches!(Update::new(&doc), Err(Error::EncryptedBase)));
 }
 
+/// A literal `/Encrypt null` trailer entry is present but names no
+/// dictionary: `Document::load` already treats that as unencrypted (its own
+/// predicate is `is_some_and(|o| !o.is_null())`), so `Update::new` must
+/// accept the same base rather than refusing it as encrypted.
+#[test]
+fn encrypt_null_base_is_accepted() {
+    let mut builder = pdfboss_testkit::PdfBuilder::new().trailer_extra("/Encrypt null");
+    builder.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    builder.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    builder.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+    let bytes = builder.build(1);
+    let doc = Document::load(bytes).unwrap();
+    assert!(
+        Update::new(&doc).is_ok(),
+        "a literal /Encrypt null base is degenerate but loadable"
+    );
+}
+
 /// A hybrid base's newest section, per `startxref`, is its classic table
 /// (the `/XRefStm` stream is only ever named from that table's trailer),
 /// so the update must append in the classic style even though the merged
@@ -442,6 +460,63 @@ fn id_first_half_survives_second_rotates() {
     assert_ne!(second, base_second.as_slice(), "the second half rotates");
 }
 
+/// Two frees-only updates of the same base, freeing different objects, must
+/// rotate `/ID`'s second half differently: the digest folds each freed
+/// `(num, gen)` pair in, so a section with no set bodies at all (an empty
+/// `body`) still changes what it frees into a distinct second half. Running
+/// the same free twice over the same base stays deterministic.
+#[test]
+fn id_second_half_folds_freed_pairs() {
+    let base = classic_base();
+    let doc = Document::load(base).unwrap();
+
+    let mut seed = Update::new(&doc).unwrap();
+    let marker_a = seed.reserve();
+    let marker_b = seed.reserve();
+    let mut dict_a = Dict::new();
+    dict_a.insert(Name("Marker".into()), Object::Int(1));
+    seed.set(marker_a, Object::Dict(dict_a));
+    let mut dict_b = Dict::new();
+    dict_b.insert(Name("Marker".into()), Object::Int(2));
+    seed.set(marker_b, Object::Dict(dict_b));
+    let seeded = seed.bytes().unwrap();
+    let seeded_doc = Document::load(seeded).unwrap();
+
+    fn second_half(bytes: Vec<u8>) -> Vec<u8> {
+        let reread = Document::load(bytes).unwrap();
+        let id = reread
+            .xref()
+            .trailer
+            .get_array("ID")
+            .expect("the appended trailer carries an /ID array")
+            .to_vec();
+        id[1].as_str_bytes().unwrap().to_vec()
+    }
+
+    let mut update_a = Update::new(&seeded_doc).unwrap();
+    update_a.remove(marker_a);
+    let out_a = update_a.bytes().unwrap();
+
+    let mut update_b = Update::new(&seeded_doc).unwrap();
+    update_b.remove(marker_b);
+    let out_b = update_b.bytes().unwrap();
+
+    assert_ne!(
+        second_half(out_a.clone()),
+        second_half(out_b),
+        "freeing different objects rotates /ID's second half differently"
+    );
+
+    let mut update_a2 = Update::new(&seeded_doc).unwrap();
+    update_a2.remove(marker_a);
+    let out_a2 = update_a2.bytes().unwrap();
+    assert_eq!(
+        second_half(out_a),
+        second_half(out_a2),
+        "the same free, run twice over the same base, rotates /ID identically"
+    );
+}
+
 /// `/Index` groups sorted rows into maximal contiguous runs rather than one
 /// pair per object: objects 1-3 form one run, an isolated replacement and
 /// the xref stream's own row each stay isolated. The assertion inspects the
@@ -522,6 +597,45 @@ fn set_then_remove_same_ref_emits_one_free_row() {
         1,
         "exactly one subsection row, in this update's own section, for the number set then removed: {text}"
     );
+}
+
+/// `set` of object number 0 is a documented no-op, symmetric with
+/// `remove`'s existing guard: object 0 is the free-list head, already
+/// represented by the section's synthetic entry-0 row whenever anything
+/// else is freed, so a `set` row for it must never also appear.
+#[test]
+fn set_object_zero_is_a_no_op() {
+    let base = classic_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.bytes().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    let mut zero_dict = Dict::new();
+    zero_dict.insert(Name("Marker".into()), Object::Int(99));
+    update2.set(ObjRef { num: 0, gen: 0 }, Object::Dict(zero_dict));
+    update2.remove(marker);
+    let out = update2.bytes().unwrap();
+
+    let off = startxref(&out).unwrap();
+    let text = String::from_utf8_lossy(&out[off..]);
+    let header = "\n0 1\n";
+    assert_eq!(
+        text.matches(header).count(),
+        1,
+        "exactly one subsection row for object number 0: {text}"
+    );
+
+    let reread = Document::load(out).unwrap();
+    assert!(matches!(
+        reread.get(marker),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
 }
 
 /// Calling `remove` twice on the same reference records only one free row,
