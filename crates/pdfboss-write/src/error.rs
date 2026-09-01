@@ -35,6 +35,20 @@ pub enum Error {
     /// Image bytes could not be understood or are inconsistent.
     #[error("invalid image: {0}")]
     Image(String),
+    /// The base document carries an `/Encrypt` entry: its new strings and
+    /// streams would need encrypting too.
+    #[error("cannot update an encrypted document")]
+    EncryptedBase,
+    /// The base trailer names no `/Root` to build an update against.
+    #[error("trailer has no /Root")]
+    MissingRoot,
+    /// The base file carries no `startxref` to chain an appended section's
+    /// `/Prev` to.
+    #[error("no startxref in the base file")]
+    MissingStartxref,
+    /// An update section was asked for with no object set or put into it.
+    #[error("update has no changes")]
+    EmptyUpdate,
     /// Anything else.
     #[error("{0}")]
     Other(String),

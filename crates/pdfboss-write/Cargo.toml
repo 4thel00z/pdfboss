@@ -20,3 +20,4 @@ png = "0.18"
 pdfboss-render = { workspace = true }
 pdfboss-text = { workspace = true }
 pdfboss-output = { workspace = true }
+pdfboss-testkit = { path = "../pdfboss-testkit" }

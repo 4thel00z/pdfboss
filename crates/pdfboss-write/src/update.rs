@@ -7,12 +7,12 @@ use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use pdfboss_core::xref::startxref;
-use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream};
+use pdfboss_core::xref::{parse_section_at, startxref};
+use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
 
 use crate::error::{Error, Result};
 use crate::ser::{serialize_dict, serialize_object};
-use crate::writer::{WriteOptions, Writer};
+use crate::writer::{WriteOptions, Writer, XrefStyle};
 
 /// The resource name every page draws the overlay form under.
 const FORM_NAME: &str = "PdfbossWatermark";
@@ -29,13 +29,9 @@ pub fn watermark_with(
 ) -> Result<Vec<u8>> {
     let trailer = &base.xref().trailer;
     if trailer.get("Encrypt").is_some() {
-        return Err(Error::Other(
-            "an encrypted file cannot be rewritten".to_string(),
-        ));
+        return Err(Error::EncryptedBase);
     }
-    let root = trailer
-        .get_ref("Root")
-        .ok_or_else(|| Error::Other("the base file has no /Root".to_string()))?;
+    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
     let mut writer = Writer::new(options);
     let prefix = writer.put_stream_raw(Dict::new(), b"q\n".to_vec());
     let suffix = writer.put_stream_raw(
@@ -251,10 +247,12 @@ impl<'a> Rewrite<'a> {
 /// as they are. An encrypted base is refused: its new strings and streams
 /// would need encrypting too.
 pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
-    let mut update = Update::open(base)?;
-    let form = update.import_form(overlay)?;
-    let prefix = update.put(Object::Stream(plain_stream(b"q\n".to_vec())));
-    let suffix = update.put(Object::Stream(plain_stream(
+    let mut update = Update::new(base)?;
+    let form = update.overlay.import_form(overlay)?;
+    let prefix = update
+        .overlay
+        .put(Object::Stream(plain_stream(b"q\n".to_vec())));
+    let suffix = update.overlay.put(Object::Stream(plain_stream(
         format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
     )));
     for index in 0..base.page_count() {
@@ -287,59 +285,161 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
         }
         contents.push(Object::Ref(suffix));
         dict.insert(name("Contents"), Object::Array(contents));
-        update.replace(page_ref, Object::Dict(dict));
+        update.set(page_ref, Object::Dict(dict));
     }
-    update.finish()
+    update.appended()
 }
 
-/// One update section under construction: the objects it will hold, new
-/// ones numbered from the first number the base leaves free.
-struct Update<'a> {
-    base: &'a Document,
+/// The facts about a base document an update needs, read once from its
+/// trailer and its own newest cross-reference section: refuses an
+/// encrypted base or one missing `/Root` or a `startxref` to chain from.
+#[derive(Debug, Clone)]
+pub struct OverlayBase {
+    /// Byte offset of the base's own newest cross-reference section, named
+    /// as the appended section's `/Prev`.
+    pub prev: u64,
+    /// Style of that newest section, read from the section itself rather
+    /// than the merged trailer (a hybrid base's merged trailer carries
+    /// `/Type /XRef` inherited from its `/XRefStm`, even though its newest
+    /// section, per `startxref`, is the classic table).
+    pub kind: XrefStyle,
+    /// The next free object number: the base's declared `/Size`, raised to
+    /// one past its highest addressed object number.
+    pub size: u32,
+    /// The base's catalog.
+    pub root: ObjRef,
+    /// The base's document information dictionary, when present.
+    pub info: Option<ObjRef>,
+    /// The base trailer's `/ID` array, cloned.
+    pub id: Option<Object>,
+}
+
+impl OverlayBase {
+    /// Reads `doc`'s trailer and newest cross-reference section.
+    pub fn from_document(doc: &Document) -> Result<OverlayBase> {
+        let trailer = &doc.xref().trailer;
+        if trailer.get("Encrypt").is_some() {
+            return Err(Error::EncryptedBase);
+        }
+        let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
+        let prev = startxref(doc.bytes()).ok_or(Error::MissingStartxref)?;
+        let kind = match parse_section_at(doc.bytes(), prev)
+            .map_err(core_error)?
+            .kind
+        {
+            XrefKind::Table => XrefStyle::Table,
+            XrefKind::Stream => XrefStyle::Stream,
+        };
+        let highest = doc.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
+        let declared = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
+        Ok(OverlayBase {
+            prev: prev as u64,
+            kind,
+            size: declared.max(highest + 1),
+            root,
+            info: trailer.get_ref("Info"),
+            id: trailer.get("ID").cloned(),
+        })
+    }
+}
+
+/// An update section under construction over an [`OverlayBase`]: which
+/// objects it holds, new ones numbered from the base's first free number.
+#[derive(Debug, Clone)]
+pub struct Overlay {
+    base: OverlayBase,
     next: u32,
     objects: Vec<(ObjRef, Object)>,
     imported: FastMap<ObjRef, ObjRef>,
+    info: Option<ObjRef>,
 }
 
-impl<'a> Update<'a> {
-    fn open(base: &'a Document) -> Result<Update<'a>> {
-        let trailer = &base.xref().trailer;
-        if trailer.get("Encrypt").is_some() {
-            return Err(Error::Other(
-                "an encrypted file cannot be updated in place".to_string(),
-            ));
-        }
-        let highest = base.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
-        let size = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
-        Ok(Update {
+impl Overlay {
+    /// An empty update section over `base`, numbering new objects from its
+    /// first free number.
+    pub fn new(base: OverlayBase) -> Overlay {
+        let next = base.size;
+        Overlay {
             base,
-            next: size.max(highest + 1),
+            next,
             objects: Vec::new(),
             imported: FastMap::default(),
-        })
+            info: None,
+        }
     }
 
-    /// Adds a new object under the next free number.
-    fn put(&mut self, obj: Object) -> ObjRef {
+    /// Sets an object under its own number, whether new or a replacement
+    /// of one already in the base.
+    pub fn set(&mut self, r: ObjRef, obj: Object) {
+        self.objects.push((r, obj));
+    }
+
+    /// Allocates the next free object number without storing anything
+    /// under it yet.
+    pub fn reserve(&mut self) -> ObjRef {
         let r = ObjRef {
             num: self.next,
             gen: 0,
         };
         self.next += 1;
-        self.objects.push((r, obj));
         r
     }
 
-    /// Replaces an object of the base under its own number.
-    fn replace(&mut self, r: ObjRef, obj: Object) {
-        self.objects.push((r, obj));
+    /// Adds a new object under the next free number.
+    pub fn put(&mut self, obj: Object) -> ObjRef {
+        let r = self.reserve();
+        self.set(r, obj);
+        r
+    }
+
+    /// Registers the document information dictionary for the appended
+    /// section's trailer, overriding the base's own.
+    pub fn set_info(&mut self, r: ObjRef) {
+        self.info = Some(r);
+    }
+
+    /// Whether no object has been set yet.
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// The appended section alone: every set object at `start` plus its
+    /// position within this section, then a cross-reference section in the
+    /// base's style naming the base's section as `/Prev`. Refused when no
+    /// object has been set.
+    pub fn section(&self, start: u64) -> Result<Vec<u8>> {
+        if self.is_empty() {
+            return Err(Error::EmptyUpdate);
+        }
+        let mut objects = self.objects.clone();
+        objects.sort_by_key(|(r, _)| r.num);
+        let mut out = Vec::new();
+        let mut rows: Vec<(ObjRef, usize)> = Vec::with_capacity(objects.len() + 1);
+        for (r, obj) in &objects {
+            rows.push((*r, start as usize + out.len()));
+            write_indirect(&mut out, *r, obj)?;
+        }
+        let mut trailer = Dict::new();
+        trailer.insert(name("Root"), Object::Ref(self.base.root));
+        if let Some(info) = self.info.or(self.base.info) {
+            trailer.insert(name("Info"), Object::Ref(info));
+        }
+        if let Some(id) = &self.base.id {
+            trailer.insert(name("ID"), id.clone());
+        }
+        trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
+        match self.base.kind {
+            XrefStyle::Stream => finish_stream(&mut out, start, rows, trailer, self.next)?,
+            XrefStyle::Table => finish_table(&mut out, start, &rows, trailer, self.next)?,
+        }
+        Ok(out)
     }
 
     /// The overlay's first page as a form XObject in the base's object
     /// space: its media box as the form's bounding box, its decoded content
     /// as the form's stream, and its resource graph deep-copied and
     /// renumbered.
-    fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
+    pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
         let page = overlay.page(0).map_err(core_error)?;
         let content = page.content(overlay).map_err(core_error)?;
         let resources = self.import_object(overlay, &Object::Dict(page.resources.clone()))?;
@@ -369,17 +469,13 @@ impl<'a> Update<'a> {
     /// it reaches becomes a new object here, each source object copied once
     /// however many times it is referenced. Streams keep their encoded
     /// bytes and filters; their `/Length` is rewritten on emission.
-    fn import_object(&mut self, source: &Document, obj: &Object) -> Result<Object> {
+    pub(crate) fn import_object(&mut self, source: &Document, obj: &Object) -> Result<Object> {
         Ok(match obj {
             Object::Ref(r) => {
                 if let Some(copied) = self.imported.get(r) {
                     return Ok(Object::Ref(*copied));
                 }
-                let copied = ObjRef {
-                    num: self.next,
-                    gen: 0,
-                };
-                self.next += 1;
+                let copied = self.reserve();
                 self.imported.insert(*r, copied);
                 let body = source.get(*r).map_err(core_error)?;
                 let body = self.import_object(source, &body)?;
@@ -405,119 +501,147 @@ impl<'a> Update<'a> {
         })
     }
 
-    fn import_dict(&mut self, source: &Document, dict: &Dict) -> Result<Dict> {
+    pub(crate) fn import_dict(&mut self, source: &Document, dict: &Dict) -> Result<Dict> {
         let mut out = Dict::new();
         for (key, value) in dict.iter() {
             out.insert(key.clone(), self.import_object(source, value)?);
         }
         Ok(out)
     }
+}
 
-    /// The base bytes followed by the update section: every object, then a
-    /// cross-reference section in the base's style naming the base's
-    /// section as `/Prev`.
-    fn finish(mut self) -> Result<Vec<u8>> {
-        let base_bytes = self.base.bytes();
-        let prev = startxref(base_bytes)
-            .ok_or_else(|| Error::Other("the base file has no startxref".to_string()))?;
-        let mut out = base_bytes.to_vec();
-        if !out.ends_with(b"\n") {
-            out.push(b'\n');
-        }
-        self.objects.sort_by_key(|(r, _)| r.num);
-        let mut rows: Vec<(ObjRef, usize)> = Vec::with_capacity(self.objects.len() + 1);
-        for (r, obj) in &self.objects {
-            rows.push((*r, out.len()));
-            write_indirect(&mut out, *r, obj)?;
-        }
-        let trailer = &self.base.xref().trailer;
-        let mut section = Dict::new();
-        for key in ["Root", "Info", "ID"] {
-            if let Some(value) = trailer.get(key) {
-                section.insert(name(key), value.clone());
-            }
-        }
-        section.insert(name("Prev"), Object::Int(prev as i64));
-        let stream_style = trailer.get_name("Type").is_some_and(|n| n.0 == "XRef");
-        if stream_style {
-            self.finish_stream(&mut out, rows, section)?;
-        } else {
-            finish_table(&mut out, &rows, section, self.next)?;
-        }
-        Ok(out)
+/// The base's length as an update's write position, plus whether a pad
+/// newline must be inserted first: an object header may not follow
+/// directly after `%%EOF` unless the base already ends on a line
+/// terminator (`\n` or `\r`).
+pub fn start_offset(base: &[u8]) -> (u64, bool) {
+    let pad = !matches!(base.last(), Some(b'\n') | Some(b'\r'));
+    (base.len() as u64 + u64::from(pad), pad)
+}
+
+/// A base document plus the update section being built over it.
+pub struct Update<'a> {
+    doc: &'a Document,
+    overlay: Overlay,
+}
+
+impl<'a> Update<'a> {
+    /// Opens `doc` for an update: refuses an encrypted base or one missing
+    /// `/Root` or a `startxref` to chain the appended section's `/Prev` to.
+    pub fn new(doc: &'a Document) -> Result<Update<'a>> {
+        let base = OverlayBase::from_document(doc)?;
+        Ok(Update {
+            doc,
+            overlay: Overlay::new(base),
+        })
     }
 
-    /// A cross-reference stream as the section's last object, rows for
-    /// every object of the update and for the stream itself.
-    fn finish_stream(
-        &mut self,
-        out: &mut Vec<u8>,
-        mut rows: Vec<(ObjRef, usize)>,
-        mut section: Dict,
-    ) -> Result<()> {
-        let xref_ref = ObjRef {
-            num: self.next,
-            gen: 0,
-        };
-        self.next += 1;
-        let xref_offset = out.len();
-        rows.push((xref_ref, xref_offset));
-        let mut index = Vec::with_capacity(rows.len() * 2);
-        let mut data = Vec::with_capacity(rows.len() * 7);
-        for (r, offset) in &rows {
-            index.push(Object::Int(i64::from(r.num)));
-            index.push(Object::Int(1));
-            data.push(1);
-            data.extend_from_slice(&field_offset(*offset)?.to_be_bytes());
-            data.extend_from_slice(&r.gen.to_be_bytes());
+    /// Sets an object under its own number, whether new or a replacement
+    /// of one already in the base.
+    pub fn set(&mut self, r: ObjRef, obj: Object) {
+        self.overlay.set(r, obj);
+    }
+
+    /// Allocates the next free object number without storing anything
+    /// under it yet.
+    pub fn reserve(&mut self) -> ObjRef {
+        self.overlay.reserve()
+    }
+
+    /// The update section under construction.
+    pub fn overlay(&self) -> &Overlay {
+        &self.overlay
+    }
+
+    /// Writes the base bytes, a pad newline when the base needs one, and
+    /// the appended section into `out`.
+    pub fn append_into(&self, mut out: impl std::io::Write) -> Result<()> {
+        let base = self.doc.bytes();
+        let (start, pad) = start_offset(base);
+        out.write_all(base)?;
+        if pad {
+            out.write_all(b"\n")?;
         }
-        section.insert(name("Type"), Object::Name(name("XRef")));
-        section.insert(name("Size"), Object::Int(i64::from(self.next)));
-        section.insert(
-            name("W"),
-            Object::Array(vec![Object::Int(1), Object::Int(4), Object::Int(2)]),
-        );
-        section.insert(name("Index"), Object::Array(index));
-        write_indirect(
-            out,
-            xref_ref,
-            &Object::Stream(Stream {
-                dict: section,
-                data,
-            }),
-        )?;
-        out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+        out.write_all(&self.overlay.section(start)?)?;
         Ok(())
     }
+
+    /// [`Update::append_into`] to a new file at `path`.
+    pub fn save_appended(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let file = std::fs::File::create(path)?;
+        self.append_into(file)
+    }
+
+    /// The base bytes followed by the update section, as one buffer.
+    pub fn appended(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.append_into(&mut out)?;
+        Ok(out)
+    }
+}
+
+/// A cross-reference stream as the section's last object, rows for every
+/// object of the update and for the stream itself.
+fn finish_stream(
+    out: &mut Vec<u8>,
+    start: u64,
+    mut rows: Vec<(ObjRef, usize)>,
+    mut dict: Dict,
+    mut next: u32,
+) -> Result<()> {
+    let xref_ref = ObjRef { num: next, gen: 0 };
+    next += 1;
+    let xref_offset = start as usize + out.len();
+    rows.push((xref_ref, xref_offset));
+    let mut index = Vec::with_capacity(rows.len() * 2);
+    let mut data = Vec::with_capacity(rows.len() * 7);
+    for (r, offset) in &rows {
+        index.push(Object::Int(i64::from(r.num)));
+        index.push(Object::Int(1));
+        data.push(1);
+        data.extend_from_slice(&field_offset(*offset)?.to_be_bytes());
+        data.extend_from_slice(&r.gen.to_be_bytes());
+    }
+    dict.insert(name("Type"), Object::Name(name("XRef")));
+    dict.insert(name("Size"), Object::Int(i64::from(next)));
+    dict.insert(
+        name("W"),
+        Object::Array(vec![Object::Int(1), Object::Int(4), Object::Int(2)]),
+    );
+    dict.insert(name("Index"), Object::Array(index));
+    write_indirect(out, xref_ref, &Object::Stream(Stream { dict, data }))?;
+    out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    Ok(())
 }
 
 /// A classic `xref` table with one subsection per run of consecutive
 /// object numbers, then the `trailer` dictionary.
 fn finish_table(
     out: &mut Vec<u8>,
+    start: u64,
     rows: &[(ObjRef, usize)],
-    mut section: Dict,
+    mut dict: Dict,
     size: u32,
 ) -> Result<()> {
-    let xref_offset = out.len();
+    let xref_offset = start as usize + out.len();
     out.extend_from_slice(b"xref\n");
-    let mut start = 0;
-    while start < rows.len() {
-        let mut end = start + 1;
+    let mut begin = 0;
+    while begin < rows.len() {
+        let mut end = begin + 1;
         while end < rows.len() && rows[end].0.num == rows[end - 1].0.num + 1 {
             end += 1;
         }
-        out.extend_from_slice(format!("{} {}\n", rows[start].0.num, end - start).as_bytes());
-        for (r, offset) in &rows[start..end] {
+        out.extend_from_slice(format!("{} {}\n", rows[begin].0.num, end - begin).as_bytes());
+        for (r, offset) in &rows[begin..end] {
             out.extend_from_slice(
                 format!("{:010} {:05} n \n", table_offset(*offset)?, r.gen).as_bytes(),
             );
         }
-        start = end;
+        begin = end;
     }
-    section.insert(name("Size"), Object::Int(i64::from(size)));
+    dict.insert(name("Size"), Object::Int(i64::from(size)));
     out.extend_from_slice(b"trailer\n");
-    serialize_dict(&section, out)?;
+    serialize_dict(&dict, out)?;
     out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
 }
