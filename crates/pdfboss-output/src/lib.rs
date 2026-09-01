@@ -124,7 +124,9 @@ pub async fn extract_text_with<S: AsyncObjectSource>(
 /// [`ExtractReport`] whose entries name each skipped stream and why —
 /// unsupported filters (the passthrough image codecs included), undecodable
 /// bytes, unparseable content, missing resources, exhausted form limits.
-/// An empty text with an empty report really is an empty page.
+/// An empty text with an empty report is a page a viewer shows as empty —
+/// either truly empty, or holding only off-page content, which
+/// [`TextOptions::invisible_text`] recovers.
 pub fn extract_text_reporting(
     doc: &Document,
     page: &Page,

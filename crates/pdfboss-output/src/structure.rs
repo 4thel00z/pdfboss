@@ -425,7 +425,7 @@ fn page_layout_with_stats(
 /// it is set.
 fn demote_contents_entries(blocks: &mut [Block]) {
     let mut headings = blocks.iter_mut().filter_map(|block| match block {
-        Block::Heading { lines, .. } => Some(block),
+        Block::Heading { .. } => Some(block),
         _ => None,
     });
     let Some(Block::Heading { lines, .. }) = headings.next() else {
@@ -2591,7 +2591,7 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
     }
 
     let n = flows.len();
-    if n < 2 || n > VISUAL_ORDER_MAX_FLOWS {
+    if !(2..=VISUAL_ORDER_MAX_FLOWS).contains(&n) {
         return None;
     }
     let extents: Vec<Extent> = flows
