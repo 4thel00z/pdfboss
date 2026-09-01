@@ -32,7 +32,7 @@ pub mod update;
 pub mod writer;
 mod xmp;
 
-pub use assemble::merge_documents;
+pub use assemble::{merge_documents, split_document};
 pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
 pub use content::serialize_ops;

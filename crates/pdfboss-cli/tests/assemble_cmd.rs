@@ -1,5 +1,5 @@
-//! End-to-end tests for `pdfboss merge`, driving the binary and loading the
-//! results back through `pdfboss-core`.
+//! End-to-end tests for `pdfboss merge` and `pdfboss split`, driving the
+//! binary and loading the results back through `pdfboss-core`.
 
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -80,4 +80,61 @@ fn merge_names_the_path_of_an_encrypted_input() {
         "no input path in: {stderr}"
     );
     assert!(stderr.contains("encrypted"), "no cause in: {stderr}");
+}
+
+fn twenty_five_page_doc() -> Vec<u8> {
+    let labels: Vec<String> = (1..=25).map(|i| i.to_string()).collect();
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    pdfboss_testkit::multi_page_doc(&refs)
+}
+
+#[test]
+fn split_writes_one_part_per_chunk_named_by_pattern() {
+    let dir = tmp("split-parts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("big.pdf");
+    std::fs::write(&input, twenty_five_page_doc()).unwrap();
+    let pattern = dir.join("part-%d.pdf");
+
+    let output = pdfboss(&[
+        "split",
+        input.to_str().unwrap(),
+        "-o",
+        pattern.to_str().unwrap(),
+        "--every",
+        "10",
+    ]);
+    assert!(output.status.success(), "split failed: {output:?}");
+
+    let expected_counts = [10, 10, 5];
+    for (i, expected) in expected_counts.iter().enumerate() {
+        let part = dir.join(format!("part-{}.pdf", i + 1));
+        let doc = load(&part);
+        assert_eq!(doc.page_count(), *expected, "part {}", i + 1);
+    }
+    assert!(
+        !dir.join("part-4.pdf").exists(),
+        "no fourth part should be written"
+    );
+}
+
+#[test]
+fn split_rejects_a_missing_percent_d_before_opening_the_input() {
+    let missing_input = tmp("split-does-not-exist.pdf");
+
+    let output = pdfboss(&[
+        "split",
+        missing_input.to_str().unwrap(),
+        "-o",
+        "part.pdf",
+        "--every",
+        "10",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("%d"), "no %d complaint in: {stderr}");
+    assert!(
+        !stderr.contains("does-not-exist"),
+        "input was opened despite the bad pattern: {stderr}"
+    );
 }

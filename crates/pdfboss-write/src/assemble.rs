@@ -58,6 +58,21 @@ fn name(text: &str) -> Name {
     Name(text.to_string())
 }
 
+/// Consecutive chunks of `every` pages, each a fresh document. The last
+/// chunk carries whatever remains (never zero, since `every` is at least 1).
+pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Result<Vec<Vec<u8>>> {
+    let total = doc.page_count();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let end = (start + every).min(total);
+        let indices: Vec<usize> = (start..end).collect();
+        parts.push(merge_documents(&[(doc, Some(&indices))], options)?);
+        start = end;
+    }
+    Ok(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use pdfboss_output::extract_text;
@@ -103,5 +118,38 @@ mod tests {
         let doc = Document::load(encrypted_rc4_doc("secret")).expect("empty-password doc loads");
         let result = merge_documents(&[(&doc, None)], WriteOptions::default());
         assert!(matches!(result, Err(Error::EncryptedBase)));
+    }
+
+    #[test]
+    fn split_makes_parts_of_the_requested_size_and_a_shorter_last_part() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("doc loads");
+        let parts = split_document(&doc, 2, WriteOptions::default()).expect("split succeeds");
+        assert_eq!(parts.len(), 2);
+
+        let first = Document::load(parts[0].clone()).expect("first part loads");
+        assert_eq!(first.page_count(), 2);
+        let texts: Vec<String> = (0..2)
+            .map(|i| {
+                let page = first.page(i).expect("page exists");
+                extract_text(&first, &page).expect("text extracts")
+            })
+            .collect();
+        assert!(texts[0].contains("one"), "page 0: {:?}", texts[0]);
+        assert!(texts[1].contains("two"), "page 1: {:?}", texts[1]);
+
+        let second = Document::load(parts[1].clone()).expect("second part loads");
+        assert_eq!(second.page_count(), 1);
+        let page = second.page(0).expect("page exists");
+        let text = extract_text(&second, &page).expect("text extracts");
+        assert!(text.contains("three"), "page 0: {:?}", text);
+    }
+
+    #[test]
+    fn split_larger_than_the_page_count_makes_one_part() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("doc loads");
+        let parts = split_document(&doc, 10, WriteOptions::default()).expect("split succeeds");
+        assert_eq!(parts.len(), 1);
+        let only = Document::load(parts[0].clone()).expect("part loads");
+        assert_eq!(only.page_count(), 3);
     }
 }

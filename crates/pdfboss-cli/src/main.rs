@@ -101,6 +101,20 @@ enum Command {
         #[arg(long, default_value = "")]
         password: String,
     },
+    /// Cut a document into consecutive chunks of pages.
+    Split {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output pattern containing %d (1-based part number).
+        #[arg(short, long)]
+        out: String,
+        /// Pages per part.
+        #[arg(long, value_parser = parse_every)]
+        every: usize,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
     /// Show version, page count, page sizes and metadata.
     Info {
         /// Path to the PDF file.
@@ -291,6 +305,20 @@ enum Command {
     },
 }
 
+/// Parses `--every` as a positive page count. `usize` carries no
+/// `clap::value_parser!` range support (unlike the fixed-width integers),
+/// so the 1.. bound is checked by hand: 0 is rejected here rather than
+/// reaching `split_document` as an unrepresentable chunk size.
+fn parse_every(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("invalid value '{s}' for --every: not a number"))?;
+    if n == 0 {
+        return Err("invalid value '0' for --every: 0 is not in 1..".to_string());
+    }
+    Ok(n)
+}
+
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum FontsArg {
@@ -368,6 +396,12 @@ fn main() {
             out,
             password,
         } => assemble::cmd_merge(&inputs, &out, &password).map_err(Failure::from),
+        Command::Split {
+            file,
+            out,
+            every,
+            password,
+        } => assemble::cmd_split(&file, &out, every, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,
