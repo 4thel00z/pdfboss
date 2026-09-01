@@ -1856,7 +1856,7 @@ fn segments(spans: &[TextSpan], order: ReadingOrder) -> Vec<Segment<'_>> {
 /// by row, and takes over entirely when content order fragments into no
 /// order at all (see [`flows`]).
 fn content_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
-    flows(spans)
+    visual_flow_order(flows(spans))
         .into_iter()
         .flat_map(gutter_split)
         .filter(|segment| !segment.spans.is_empty())
@@ -1911,6 +1911,135 @@ fn sequential_groups(spans: &[TextSpan]) -> Vec<Group<'_>> {
         group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
     }
     groups
+}
+
+/// Pages with more flows than this keep stream order outright: the pairwise
+/// separation scan is quadratic, and a page fragmented into hundreds of
+/// flows is not one the reorder could read better anyway.
+const VISUAL_ORDER_MAX_FLOWS: usize = 256;
+
+/// Flows shorter than this never trade places: a figure's scattered labels
+/// and stray fragments read where the producer put them, exactly as
+/// [`merge_sparse_neighbours`] leaves them.
+const VISUAL_ORDER_MIN_CHARS: usize = 12;
+
+/// How much of the narrower flow's width two flows must share horizontally
+/// before one can read as above the other. Without this, the top of a right
+/// column clears the bottom of the left column and reorders across columns —
+/// a display equation splits a column into flows small enough for that.
+const VISUAL_ORDER_MIN_X_OVERLAP: f32 = 0.3;
+
+/// The char-weighted share of flow pairs the stream must have in the wrong
+/// vertical order before the page is rewritten. Below it the stream's order
+/// stands, chart-axis rows and all.
+const VISUAL_ORDER_MIN_DISORDER: f64 = 0.05;
+
+/// Flows fully separated vertically that share horizontal ground read top
+/// to bottom; everything else — side-by-side columns, a caption beside its
+/// figure — keeps the stream's order. A designed page often draws its
+/// footer or a late text box first, and a viewer's reader sees
+/// top-to-bottom regardless.
+///
+/// Kahn's algorithm over the "lies entirely above" relation, ties broken by
+/// stream position, so a page already written in reading order comes out
+/// unchanged, and columns — whose flows never both overlap in x and clear
+/// in y — keep the order their producer wrote.
+fn visual_flow_order(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    struct Extent {
+        left: f32,
+        right: f32,
+        bottom: f32,
+        top: f32,
+        chars: usize,
+    }
+
+    let n = flows.len();
+    if n < 2 || n > VISUAL_ORDER_MAX_FLOWS {
+        return flows;
+    }
+    let extents: Vec<Extent> = flows
+        .iter()
+        .map(|flow| Extent {
+            left: flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min),
+            right: flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max),
+            bottom: flow.iter().map(|s| s.bbox.y0).fold(f32::MAX, f32::min),
+            top: flow.iter().map(|s| s.bbox.y1).fold(f32::MIN, f32::max),
+            chars: flow.iter().map(|s| s.text.chars().count()).sum(),
+        })
+        .collect();
+    let mut above: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut blockers = vec![0usize; n];
+    for a in 0..n {
+        if extents[a].chars < VISUAL_ORDER_MIN_CHARS {
+            continue;
+        }
+        for b in 0..n {
+            if a == b || extents[b].chars < VISUAL_ORDER_MIN_CHARS {
+                continue;
+            }
+            let overlap = extents[a].right.min(extents[b].right)
+                - extents[a].left.max(extents[b].left);
+            let narrower = (extents[a].right - extents[a].left)
+                .min(extents[b].right - extents[b].left);
+            if narrower <= 0.0 || overlap < VISUAL_ORDER_MIN_X_OVERLAP * narrower {
+                continue;
+            }
+            if extents[a].bottom > extents[b].top {
+                above[a].push(b);
+                blockers[b] += 1;
+            }
+        }
+    }
+    let mut ready: BinaryHeap<Reverse<usize>> = (0..n)
+        .filter(|&i| blockers[i] == 0)
+        .map(Reverse)
+        .collect();
+    let mut order = Vec::with_capacity(n);
+    while let Some(Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &j in &above[i] {
+            blockers[j] -= 1;
+            if blockers[j] == 0 {
+                ready.push(Reverse(j));
+            }
+        }
+    }
+    if order.len() != n {
+        // Degenerate boxes can relate two flows both ways; keep the stream.
+        return flows;
+    }
+    // A page that is already essentially in reading order stays in the
+    // stream's order: a couple of displaced chart-axis rows on an otherwise
+    // ordered page are the producer's business, not disorder. Only a
+    // substantially scrambled page — a designed title page, an infographic
+    // — is worth rewriting, measured as the char-weighted share of flow
+    // pairs the stream has in the wrong vertical order.
+    let mut rank = vec![0usize; n];
+    for (position, &flow) in order.iter().enumerate() {
+        rank[flow] = position;
+    }
+    let mut inverted = 0.0f64;
+    let mut total = 0.0f64;
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let weight = extents[a].chars.min(extents[b].chars) as f64;
+            total += weight;
+            if rank[a] > rank[b] {
+                inverted += weight;
+            }
+        }
+    }
+    if total == 0.0 || inverted / total < VISUAL_ORDER_MIN_DISORDER {
+        return flows;
+    }
+    let mut slots: Vec<Option<Vec<&TextSpan>>> = flows.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each flow placed once"))
+        .collect()
 }
 
 /// The content stream's flows: runs of consecutive spans whose baselines
@@ -2300,6 +2429,72 @@ pub(crate) mod tests {
     use pdfboss_core::Document;
     use pdfboss_testkit::doc_with_graphics;
 
+    /// Local prototyping rig, never run in CI: dumps every page's flows —
+    /// stream order, bbox, mass, text head — as JSONL for the reading-order
+    /// policy prototype. Directories via PDFBOSS_FLOW_DUMP_DIR (PDFs) and
+    /// PDFBOSS_FLOW_DUMP_OUT (output file).
+    #[test]
+    #[ignore]
+    fn flow_dump() {
+        use std::fmt::Write as _;
+        let dir = std::env::var("PDFBOSS_FLOW_DUMP_DIR").unwrap();
+        let out_path = std::env::var("PDFBOSS_FLOW_DUMP_OUT").unwrap();
+        let mut out = String::new();
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(doc) = Document::load(std::fs::read(&path).unwrap()) else {
+                continue;
+            };
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            for index in 0..doc.page_count() {
+                let Ok(page) = doc.page(index) else { continue };
+                let Ok((mut spans, _)) = pdfboss_text::extract_spans_reporting(&doc, &page)
+                else {
+                    continue;
+                };
+                crate::retain_spans_on_page(&mut spans, &page);
+                let flows = flows(&spans);
+                let crop = page.crop_box;
+                write!(
+                    out,
+                    "{{\"doc\":{:?},\"page\":{},\"crop\":[{},{},{},{}],\"flows\":[",
+                    name, index, crop.x0, crop.y0, crop.x1, crop.y1
+                )
+                .unwrap();
+                for (i, flow) in flows.iter().enumerate() {
+                    let x0 = flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min);
+                    let x1 = flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max);
+                    let y0 = flow.iter().map(|s| s.bbox.y0).fold(f32::MAX, f32::min);
+                    let y1 = flow.iter().map(|s| s.bbox.y1).fold(f32::MIN, f32::max);
+                    let chars: usize = flow.iter().map(|s| s.text.chars().count()).sum();
+                    let mut head: String = flow
+                        .iter()
+                        .flat_map(|s| s.text.chars().chain(std::iter::once(' ')))
+                        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+                        .take(48)
+                        .collect();
+                    head = head.trim().to_string();
+                    let baselines = baseline_count(flow);
+                    let start_y = flow.first().map(|s| s.y).unwrap_or(0.0);
+                    write!(
+                        out,
+                        "{}{{\"bbox\":[{},{},{},{}],\"chars\":{},\"baselines\":{},\"start_y\":{},\"head\":{:?}}}",
+                        if i > 0 { "," } else { "" },
+                        x0, y0, x1, y1, chars, baselines, start_y, head
+                    )
+                    .unwrap();
+                }
+                out.push_str("]}\n");
+            }
+        }
+        std::fs::write(&out_path, out).unwrap();
+    }
+
     /// The content streams the crate's Text-adapter parity test replays:
     /// plain lines, both sides of the word-gap threshold, band separators,
     /// the shapes that must and must not split into columns, and a page whose
@@ -2591,6 +2786,34 @@ pub(crate) mod tests {
         assert_eq!(
             text_of("BT /F1 12 Tf 3 Tr 72 720 Td (ghost) Tj ET"),
             "ghost"
+        );
+    }
+
+    /// A stream that draws the page-bottom contact block first and the
+    /// title above it afterwards (a designed title page): flows fully
+    /// separated vertically read top to bottom, whatever order the
+    /// producer wrote them in.
+    #[test]
+    fn separated_flows_read_top_to_bottom() {
+        let text = text_of(
+            "BT /F1 12 Tf 72 40 Td (Contact us at the office) Tj \
+             72 720 Td (Annual Report) Tj 0 -20 Td (Prepared in June) Tj ET",
+        );
+        assert_eq!(text, "Annual Report\nPrepared in June\nContact us at the office");
+    }
+
+    /// Two side-by-side columns overlap vertically, so their stream order
+    /// is kept: the producer wrote left before right, and a reorder that
+    /// interleaved or swapped them would break column reading.
+    #[test]
+    fn overlapping_flows_keep_stream_order() {
+        let text = text_of(
+            "BT /F1 12 Tf 72 720 Td (Left head column text) Tj 0 -20 Td (Left foot column text) Tj ET \
+             BT /F1 12 Tf 300 740 Td (Right head column text) Tj 0 -20 Td (Right foot column text) Tj ET",
+        );
+        assert_eq!(
+            text,
+            "Left head column text\nLeft foot column text\nRight head column text\nRight foot column text"
         );
     }
 
