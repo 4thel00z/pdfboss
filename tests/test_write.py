@@ -356,6 +356,7 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
         "Pdf",
         "Standard14",
         "Text",
+        "Update",
         "Viewer",
         "watermark",
     ]
