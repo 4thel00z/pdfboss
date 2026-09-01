@@ -415,7 +415,50 @@ fn page_layout_with_stats(
     for segment in parts {
         push_segment_blocks(segment, &grids, stats, order, &mut blocks);
     }
+    demote_heading_runs(&mut blocks);
     PageLayout { blocks }
+}
+
+/// More consecutive same-level heading blocks than this many is a list of
+/// entries — a table of contents, an index — not document structure.
+const HEADING_RUN_MAX: usize = 3;
+
+/// Demotes runs of more than [`HEADING_RUN_MAX`] same-level, same-size
+/// heading blocks with nothing between them to paragraphs: a real section
+/// heading has a section under it, a contents page has another entry. The
+/// size is part of the key because ranks past the sixth clamp to one level
+/// while staying visibly distinct.
+fn demote_heading_runs(blocks: &mut [Block]) {
+    let level_of = |block: &Block| match block {
+        Block::Heading { level, lines, .. } => {
+            Some((*level, half_points(lines.first().map_or(0.0, |line| line.size))))
+        }
+        _ => None,
+    };
+    let mut index = 0;
+    while index < blocks.len() {
+        let Some(level) = level_of(&blocks[index]) else {
+            index += 1;
+            continue;
+        };
+        let mut end = index + 1;
+        while end < blocks.len() && level_of(&blocks[end]) == Some(level) {
+            end += 1;
+        }
+        if end - index > HEADING_RUN_MAX {
+            for block in &mut blocks[index..end] {
+                let Block::Heading { lines, bbox, .. } = block else {
+                    unreachable!("the run holds headings only");
+                };
+                *block = Block::Paragraph {
+                    lines: std::mem::take(lines),
+                    bbox: bbox.clone(),
+                    role: Role::Body,
+                };
+            }
+        }
+        index = end;
+    }
 }
 
 /// One segment's blocks. A segment no grid claims — every segment, when the
@@ -644,18 +687,36 @@ fn heading_chars<'l>(lines: impl Iterator<Item = &'l Line>) -> usize {
 }
 
 /// The heading level of a line: its size's ladder rank, or — for a line at
-/// body size — the bold-title rank.
+/// body size — the bold-title rank. A caption's lead never ranks: a figure
+/// caption set larger or bolder than body text is still a caption.
 fn heading_level(line: &Assembled, stats: &SizeStats) -> Option<u8> {
-    if let Some(level) = stats.level(line.rank_size) {
-        return Some(level);
-    }
-    if !stats.is_body(line.rank_size) {
+    let level = match stats.level(line.rank_size) {
+        Some(level) => level,
+        None => {
+            if !stats.is_body(line.rank_size) || !is_bold_title(&line.line) {
+                return None;
+            }
+            stats.bold_level()
+        }
+    };
+    if caption_lead(&line_text(&line.line)) {
         return None;
     }
-    if !is_bold_title(&line.line) {
-        return None;
-    }
-    Some(stats.bold_level())
+    Some(level)
+}
+
+/// True when the text opens like a caption: a marker word, then a number.
+fn caption_lead(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    ["Figure", "FIGURE", "Fig.", "FIG.", "Table", "TABLE", "Tab."]
+        .iter()
+        .filter_map(|marker| trimmed.strip_prefix(marker))
+        .any(|rest| {
+            rest.trim_start()
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
 }
 
 /// True when `next` is a wrapped continuation of the heading line `prev`:

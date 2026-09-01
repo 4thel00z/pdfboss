@@ -886,6 +886,52 @@ mod tests {
         );
     }
 
+    /// A figure caption set larger than body text is a caption, not a
+    /// heading: the marker word and number say so.
+    #[test]
+    fn a_large_figure_caption_is_not_a_heading() {
+        let md = markdown_of(
+            "BT /F1 13 Tf 72 700 Td (Figure 4.5. Breakdown of fuel by source) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            !md.contains("# Figure"),
+            "a caption stays a caption: {md:?}"
+        );
+        assert!(md.contains("Figure 4.5. Breakdown of fuel by source"));
+    }
+
+    /// A table of contents sets every entry in heading-sized type; a run of
+    /// same-level heading blocks with nothing between them is a list of
+    /// entries, not document structure, and reads as plain text.
+    #[test]
+    fn a_run_of_same_level_headings_is_not_structure() {
+        let entries: String = (1..=6)
+            .map(|i| {
+                format!(
+                    "BT /F1 14 Tf 72 {} Td (Part {i}: A chapter title entry) Tj ET ",
+                    720 - i * 40
+                )
+            })
+            .collect();
+        let body: String = (0..10)
+            .map(|i| {
+                format!(
+                    "BT /F1 10 Tf 72 {} Td (A good long body line of ordinary prose text number {i}) Tj ET ",
+                    440 - i * 12
+                )
+            })
+            .collect();
+        let md = markdown_of(&format!("{entries}{body}"));
+        assert!(
+            !md.contains("# Part 1"),
+            "TOC entries are not headings: {md:?}"
+        );
+        assert!(md.contains("Part 1: A chapter title entry"));
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
     #[test]
