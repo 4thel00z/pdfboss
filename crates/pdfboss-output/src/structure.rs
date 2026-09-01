@@ -1747,24 +1747,18 @@ fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
 /// One line from its spans in left-to-right order: a gap wider than
 /// [`WORD_GAP`] times the size becomes a space, and a change of
 /// `(bold, italic)` opens a new [`Inline`].
-fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
-    // Most lines are one inline run; its text is sized once for every
-    // span's text and a space apiece rather than grown span by span.
-    let capacity = spans.iter().map(|span| span.text.len() + 1).sum();
-    let mut inlines: Vec<Inline> = Vec::with_capacity(1);
-    let mut prev_end: Option<f32> = None;
-    let mut prev_size = 0.0f32;
-    let mut max_size = f32::MIN;
+/// The rank size of a line that mixes size buckets — the rare case, priced
+/// as a second pass so single-size lines never pay for it. A small-caps
+/// line — all capitals, exactly two sizes — measures by its capital size:
+/// the small caps are its lowercase, not a smaller text that should
+/// disqualify a heading. Anything else measures by the size that carries
+/// most of its characters (ties to the smaller), so a drop cap, an inline
+/// formula, or a trailing ornament cannot re-rank the line either way.
+fn mixed_rank_size(spans: &[&TextSpan]) -> f32 {
     let mut buckets: Vec<(i32, usize)> = Vec::new();
+    let mut max_size = f32::MIN;
     let mut lowercase = false;
     for span in spans {
-        let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
-        push_span(&mut inlines, span, spaced, capacity);
-        prev_end = Some(span.end_x);
-        prev_size = span.size;
-        // A whitespace-only span has no visible size, so it has no vote in
-        // the line's size rank: a producer's stray body-size separator on a
-        // heading's baseline must not fold the heading into the paragraph.
         if span.text.trim().is_empty() {
             continue;
         }
@@ -1777,21 +1771,46 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
             Err(index) => buckets.insert(index, (bucket, chars)),
         }
     }
-    // A small-caps line — all capitals, exactly two sizes — measures by its
-    // capital size: the small caps are its lowercase, not a smaller text
-    // that should disqualify a heading. Anything else measures by the size
-    // that carries most of its characters (ties to the smaller), so a drop
-    // cap, an inline formula, or a trailing ornament cannot re-rank the
-    // line either way.
-    let rank_size = if buckets.len() == 2 && !lowercase {
-        max_size
-    } else if let Some((bucket, _)) = buckets
+    if buckets.len() == 2 && !lowercase {
+        return max_size;
+    }
+    buckets
         .iter()
         .min_by_key(|(bucket, chars)| (std::cmp::Reverse(*chars), *bucket))
-    {
-        *bucket as f32 / 2.0
-    } else {
-        size
+        .map(|(bucket, _)| *bucket as f32 / 2.0)
+        .unwrap_or(max_size)
+}
+
+fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
+    // Most lines are one inline run; its text is sized once for every
+    // span's text and a space apiece rather than grown span by span.
+    let capacity = spans.iter().map(|span| span.text.len() + 1).sum();
+    let mut inlines: Vec<Inline> = Vec::with_capacity(1);
+    let mut prev_end: Option<f32> = None;
+    let mut prev_size = 0.0f32;
+    let mut first_bucket: Option<f32> = None;
+    let mut mixed = false;
+    for span in spans {
+        let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
+        push_span(&mut inlines, span, spaced, capacity);
+        prev_end = Some(span.end_x);
+        prev_size = span.size;
+        // A whitespace-only span has no visible size, so it has no vote in
+        // the line's size rank: a producer's stray body-size separator on a
+        // heading's baseline must not fold the heading into the paragraph.
+        if span.text.trim().is_empty() {
+            continue;
+        }
+        match first_bucket {
+            None => first_bucket = Some(span.size),
+            Some(first) if half_points(first) != half_points(span.size) => mixed = true,
+            _ => {}
+        }
+    }
+    let rank_size = match (first_bucket, mixed) {
+        (None, _) => size,
+        (Some(first), false) => first,
+        (Some(_), true) => mixed_rank_size(spans),
     };
     Assembled {
         line: Line {
