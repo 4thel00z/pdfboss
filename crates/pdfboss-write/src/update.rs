@@ -584,7 +584,7 @@ impl Overlay {
 /// [`Metadata`] (text fields via `decode_text_string`, dates via
 /// [`Date::parse_pdf`], an unparseable date simply dropping out) and
 /// staged under `xmp_ref` as a fresh, unfiltered `/Type /Metadata /Subtype
-/// /XML` stream of [`crate::xmp::packet`] over that merged value: any XMP
+/// /XML` stream of the crate's XMP packet over that merged value: any XMP
 /// property outside those eight fields is not carried into the new
 /// packet, though the original packet's bytes stay in the base.
 ///
