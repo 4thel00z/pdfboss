@@ -89,7 +89,7 @@ async fn async_append_matches_sync_bytes() {
             ..Metadata::default()
         })
         .unwrap();
-    let sync_bytes = sync_update.appended().unwrap();
+    let sync_bytes = sync_update.bytes().unwrap();
 
     let async_doc = AsyncDocument::open(&path).await.unwrap();
     std::fs::remove_file(&path).ok();
@@ -142,7 +142,7 @@ async fn pad_byte_matches_sync_and_async_over_a_truncated_base() {
             ..Metadata::default()
         })
         .unwrap();
-    let sync_bytes = sync_update.appended().unwrap();
+    let sync_bytes = sync_update.bytes().unwrap();
 
     let async_doc = AsyncDocument::open(&path).await.unwrap();
     std::fs::remove_file(&path).ok();

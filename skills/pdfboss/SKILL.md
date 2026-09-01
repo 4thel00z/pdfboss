@@ -82,7 +82,7 @@ data = (Pdf() | Metadata(title="Title") | page).to_bytes()
 # edit metadata on an existing file: appends an incremental update, base bytes untouched
 update = pdfboss.write.Update(doc)
 update.set_metadata(title="Q3 Report", author="Finance")   # kwarg per /Info field; repeated calls merge
-update.save_appended("out.pdf")                             # or update.to_bytes(); encrypted bases refused here
+update.save("out.pdf")                             # or update.to_bytes(); encrypted bases refused here
 
 # watermark an existing file: overlay's first page drawn over every page, as an
 # incremental update appended to the original bytes (rewrite=True writes a fresh, compressed file)

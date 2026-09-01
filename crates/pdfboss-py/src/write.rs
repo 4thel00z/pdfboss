@@ -1075,11 +1075,11 @@ impl WritePdf {
 /// are never rewritten, only appended to.
 ///
 /// Holds a [`DocumentSeed`] taken from the given [`Document`] at
-/// construction, not the document itself, so `save_appended`/`to_bytes`
+/// construction, not the document itself, so `save`/`to_bytes`
 /// rebuild a private core document and run under `py.allow_threads`
 /// without contending on the shared one. Construction never reads the
 /// base's `/Encrypt` entry: a document with an encrypted base is only
-/// refused once `save_appended`/`to_bytes` actually opens a
+/// refused once `save`/`to_bytes` actually opens a
 /// `pdfboss_write::Update` on it, raising `PdfError`.
 ///
 /// `set_metadata` may be called more than once before saving: each call
@@ -1107,7 +1107,7 @@ impl WriteUpdate {
     }
 
     /// Merges the given fields into the metadata staged for the next
-    /// `save_appended`/`to_bytes` call. A field left `None` keeps
+    /// `save`/`to_bytes` call. A field left `None` keeps
     /// whatever an earlier `set_metadata` call on this `Update` staged.
     #[pyo3(signature = (title=None, author=None, subject=None, keywords=None, creator=None, producer=None))]
     #[allow(clippy::too_many_arguments)]
@@ -1133,7 +1133,7 @@ impl WriteUpdate {
     /// section carrying the staged metadata, to a new file at `path`.
     /// Raises `PdfError` for an encrypted base, or one missing `/Root`
     /// or a `startxref` to chain the update against.
-    fn save_appended(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
         let seed = self.seed.clone();
         let meta = self
             .meta
@@ -1144,11 +1144,11 @@ impl WriteUpdate {
             let doc = CoreDocument::from_seed(seed);
             let mut update = CoreUpdate::new(&doc).map_err(pdf_err)?;
             update.set_metadata(meta).map_err(pdf_err)?;
-            update.save_appended(path).map_err(pdf_err)
+            update.save(path).map_err(pdf_err)
         })
     }
 
-    /// Like `save_appended`, but returns the full new file bytes (the
+    /// Like `save`, but returns the full new file bytes (the
     /// base's own bytes followed by the update section) instead of
     /// writing them to a path. May be called more than once.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
@@ -1162,7 +1162,7 @@ impl WriteUpdate {
             let doc = CoreDocument::from_seed(seed);
             let mut update = CoreUpdate::new(&doc).map_err(pdf_err)?;
             update.set_metadata(meta).map_err(pdf_err)?;
-            update.appended().map_err(pdf_err)
+            update.bytes().map_err(pdf_err)
         })?;
         Ok(PyBytes::new(py, &bytes))
     }

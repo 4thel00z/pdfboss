@@ -290,7 +290,7 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
         dict.insert(name("Contents"), Object::Array(contents));
         update.set(page_ref, Object::Dict(dict));
     }
-    update.appended()
+    update.bytes()
 }
 
 /// The facts about a base document an update needs, read once from its
@@ -794,7 +794,7 @@ impl<'a> Update<'a> {
     /// [`Update::append_into`] to a new file at `path`: the file is
     /// created only once the update is known to build, so a refused
     /// update leaves no file behind at all.
-    pub fn save_appended(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
         let (base, pad, section) = self.parts()?;
         let mut file = std::fs::File::create(path)?;
         file.write_all(base)?;
@@ -806,7 +806,7 @@ impl<'a> Update<'a> {
     }
 
     /// The base bytes followed by the update section, as one buffer.
-    pub fn appended(&self) -> Result<Vec<u8>> {
+    pub fn bytes(&self) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         self.append_into(&mut out)?;
         Ok(out)

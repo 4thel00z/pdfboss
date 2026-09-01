@@ -21,7 +21,7 @@ def test_update_appends_and_preserves_bytes(tmp_path: Path) -> None:
     update = Update(pdfboss.Document(str(src)))
     update.set_metadata(title="New")
     dst = tmp_path / "dst.pdf"
-    update.save_appended(str(dst))
+    update.save(str(dst))
 
     assert dst.read_bytes().startswith(src.read_bytes())
     reread = pdfboss.Document(str(dst))
@@ -37,6 +37,6 @@ def test_update_to_bytes_matches_saved_file(tmp_path: Path) -> None:
     update.set_metadata(title="New")
     data = update.to_bytes()
     dst = tmp_path / "dst.pdf"
-    update.save_appended(str(dst))
+    update.save(str(dst))
 
     assert data == dst.read_bytes()

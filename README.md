@@ -98,7 +98,7 @@ from pdfboss.write import Update
 
 update = Update(pdfboss.Document("report.pdf"))
 update.set_metadata(title="Q3 Report", author="Finance")
-update.save_appended("report-titled.pdf")
+update.save("report-titled.pdf")
 ```
 
 ```rust,no_run
@@ -113,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         author: Some("Finance".to_string()),
         ..Metadata::default()
     })?;
-    update.save_appended("report-titled.pdf")?;
+    update.save("report-titled.pdf")?;
     Ok(())
 }
 ```

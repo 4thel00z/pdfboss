@@ -11,7 +11,7 @@ pub fn cmd_meta(file: &Path, out: &Path, set: &[String], password: &str) -> Resu
     let doc = Document::open_with_password(file, password).map_err(|e| format!("parse: {e}"))?;
     let mut update = Update::new(&doc).map_err(|e| e.to_string())?;
     update.set_metadata(meta).map_err(|e| e.to_string())?;
-    update.save_appended(out).map_err(|e| e.to_string())
+    update.save(out).map_err(|e| e.to_string())
 }
 
 fn parse_assignments(set: &[String]) -> Result<Metadata, String> {

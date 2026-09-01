@@ -842,7 +842,7 @@ class write:
 
         Construction only captures a shareable seed of ``doc``; an
         encrypted base is not refused here, only at
-        ``save_appended``/``to_bytes`` time, raising ``PdfError``.
+        ``save``/``to_bytes`` time, raising ``PdfError``.
         """
 
         def __init__(self, doc: Document) -> None: ...
@@ -857,13 +857,13 @@ class write:
             producer: str | None = None,
         ) -> None:
             """Merges the given fields into the metadata staged for the
-            next ``save_appended``/``to_bytes`` call. A field left
+            next ``save``/``to_bytes`` call. A field left
             ``None`` keeps whatever an earlier call on this ``Update``
             staged; calling ``set_metadata`` more than once merges
             fields across calls, the latest non-``None`` value winning
             per field."""
 
-        def save_appended(self, path: str | os.PathLike[str]) -> None:
+        def save(self, path: str | os.PathLike[str]) -> None:
             """Writes the base document's bytes, then an incremental
             update section carrying the staged metadata, to a new file
             at ``path``. Raises ``PdfError`` for an encrypted base, or
@@ -871,7 +871,7 @@ class write:
             update against."""
 
         def to_bytes(self) -> bytes:
-            """Like ``save_appended``, but returns the full new file
+            """Like ``save``, but returns the full new file
             bytes instead of writing them to a path. May be called more
             than once."""
 

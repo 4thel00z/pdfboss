@@ -42,7 +42,7 @@ fn set_replaces_object_classic() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(7));
     update.set(ObjRef { num: 1, gen: 0 }, Object::Dict(dict));
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
     assert_eq!(&out[..base.len()], &base[..]);
     let reread = Document::load(out).unwrap();
     assert_eq!(
@@ -64,7 +64,7 @@ fn set_replaces_object_stream() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(7));
     update.set(ObjRef { num: 1, gen: 0 }, Object::Dict(dict));
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
     assert_eq!(&out[..base.len()], &base[..]);
     let reread = Document::load(out).unwrap();
     assert_eq!(
@@ -87,7 +87,7 @@ fn reserve_allocates_past_base_size() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(9));
     update.set(r, Object::Dict(dict));
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
     let reread = Document::load(out).unwrap();
     assert_eq!(
         reread.get(r).unwrap().as_dict().unwrap().get_int("Marker"),
@@ -103,7 +103,7 @@ fn two_appends_chain() {
     let mut first = Dict::new();
     first.insert(Name("First".into()), Object::Int(1));
     update1.set(ObjRef { num: 1, gen: 0 }, Object::Dict(first));
-    let once = update1.appended().unwrap();
+    let once = update1.bytes().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
@@ -111,7 +111,7 @@ fn two_appends_chain() {
     let mut second = Dict::new();
     second.insert(Name("Second".into()), Object::Int(2));
     update2.set(extra, Object::Dict(second));
-    let twice = update2.appended().unwrap();
+    let twice = update2.bytes().unwrap();
 
     let reread = Document::load(twice.clone()).unwrap();
     assert_eq!(
@@ -154,14 +154,14 @@ fn empty_update_is_refused() {
     let base = classic_base();
     let doc = Document::load(base).unwrap();
     let update = Update::new(&doc).unwrap();
-    assert!(matches!(update.appended(), Err(Error::EmptyUpdate)));
+    assert!(matches!(update.bytes(), Err(Error::EmptyUpdate)));
 }
 
 /// A refused update must fail before any byte reaches the destination:
-/// `save_appended` on an empty update must not leave a base-only (or
+/// `save` on an empty update must not leave a base-only (or
 /// otherwise partial) file behind.
 #[test]
-fn empty_update_save_appended_leaves_no_file() {
+fn empty_update_save_leaves_no_file() {
     let base = classic_base();
     let doc = Document::load(base).unwrap();
     let update = Update::new(&doc).unwrap();
@@ -170,10 +170,7 @@ fn empty_update_save_appended_leaves_no_file() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    assert!(matches!(
-        update.save_appended(&path),
-        Err(Error::EmptyUpdate)
-    ));
+    assert!(matches!(update.save(&path), Err(Error::EmptyUpdate)));
     assert!(
         !path.exists(),
         "a refused update must not create the destination file"
@@ -196,7 +193,7 @@ fn set_past_base_size_advances_next_on_stream_style() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(11));
     update.set(far, Object::Dict(dict));
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out.clone()).unwrap();
     assert_eq!(
@@ -253,7 +250,7 @@ fn hybrid_base_appends_a_classic_table() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(3));
     update.set(ObjRef { num: 5, gen: 0 }, Object::Dict(dict));
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let out_off = startxref(&out).unwrap();
     assert_eq!(
@@ -283,13 +280,13 @@ fn append_is_deterministic() {
     let mut dict_a = Dict::new();
     dict_a.insert(Name("Marker".into()), Object::Int(5));
     update_a.set(ObjRef { num: 1, gen: 0 }, Object::Dict(dict_a));
-    let a = update_a.appended().unwrap();
+    let a = update_a.bytes().unwrap();
 
     let mut update_b = Update::new(&doc).unwrap();
     let mut dict_b = Dict::new();
     dict_b.insert(Name("Marker".into()), Object::Int(5));
     update_b.set(ObjRef { num: 1, gen: 0 }, Object::Dict(dict_b));
-    let b = update_b.appended().unwrap();
+    let b = update_b.bytes().unwrap();
 
     assert_eq!(a, b);
 }
@@ -307,12 +304,12 @@ fn removed_object_is_gone_after_reload_classic() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(1));
     update1.set(marker, Object::Dict(dict));
-    let once = update1.appended().unwrap();
+    let once = update1.bytes().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
     update2.remove(marker);
-    let out = update2.appended().unwrap();
+    let out = update2.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     assert!(matches!(
@@ -330,12 +327,12 @@ fn removed_object_is_gone_after_reload_stream() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(1));
     update1.set(marker, Object::Dict(dict));
-    let once = update1.appended().unwrap();
+    let once = update1.bytes().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
     update2.remove(marker);
-    let out = update2.appended().unwrap();
+    let out = update2.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     assert!(matches!(
@@ -363,13 +360,13 @@ fn free_chain_starts_at_entry_zero() {
     let mut dict_b = Dict::new();
     dict_b.insert(Name("Marker".into()), Object::Int(2));
     update1.set(marker_b, Object::Dict(dict_b));
-    let once = update1.appended().unwrap();
+    let once = update1.bytes().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
     update2.remove(marker_a);
     update2.remove(marker_b);
-    let out = update2.appended().unwrap();
+    let out = update2.bytes().unwrap();
 
     let off = startxref(&out).unwrap();
     let info = parse_section_at(&out, off).unwrap();
@@ -427,7 +424,7 @@ fn id_first_half_survives_second_rotates() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(1));
     update.set(ObjRef { num: 1, gen: 0 }, Object::Dict(dict));
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     let id = reread
@@ -461,7 +458,7 @@ fn index_pairs_coalesce_runs() {
         dict.insert(Name("Marker".into()), Object::Int(i64::from(num)));
         update.set(ObjRef { num, gen: 0 }, Object::Dict(dict));
     }
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out.clone()).unwrap();
     for num in [1u32, 2, 3, 6] {
@@ -501,7 +498,7 @@ fn set_then_remove_same_ref_emits_one_free_row() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(1));
     update1.set(marker, Object::Dict(dict));
-    let once = update1.appended().unwrap();
+    let once = update1.bytes().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
@@ -509,7 +506,7 @@ fn set_then_remove_same_ref_emits_one_free_row() {
     replacement.insert(Name("Marker".into()), Object::Int(2));
     update2.set(marker, Object::Dict(replacement));
     update2.remove(marker);
-    let out = update2.appended().unwrap();
+    let out = update2.bytes().unwrap();
 
     let reread = Document::load(out.clone()).unwrap();
     assert!(matches!(
@@ -538,13 +535,13 @@ fn remove_twice_emits_one_free_row() {
     let mut dict = Dict::new();
     dict.insert(Name("Marker".into()), Object::Int(1));
     update1.set(marker, Object::Dict(dict));
-    let once = update1.appended().unwrap();
+    let once = update1.bytes().unwrap();
 
     let doc2 = Document::load(once).unwrap();
     let mut update2 = Update::new(&doc2).unwrap();
     update2.remove(marker);
     update2.remove(marker);
-    let out = update2.appended().unwrap();
+    let out = update2.bytes().unwrap();
 
     let reread = Document::load(out.clone()).unwrap();
     assert!(matches!(
@@ -578,7 +575,7 @@ fn index_stays_non_overlapping_with_duplicate_changes() {
     second.insert(Name("Marker".into()), Object::Int(2));
     update.set(target, Object::Dict(second));
     update.remove(target);
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out.clone()).unwrap();
     assert!(matches!(
@@ -647,7 +644,7 @@ fn set_metadata_merges_existing_fields() {
             ..Metadata::default()
         })
         .unwrap();
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     let meta = reread.metadata();
@@ -668,7 +665,7 @@ fn set_metadata_creates_info_when_absent() {
             ..Metadata::default()
         })
         .unwrap();
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     assert_eq!(reread.metadata().title.as_deref(), Some("Fresh"));
@@ -694,7 +691,7 @@ fn set_metadata_rewrites_xmp_when_catalog_has_it() {
             ..Metadata::default()
         })
         .unwrap();
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     let root = reread.xref().trailer.get_ref("Root").unwrap();
@@ -774,7 +771,7 @@ fn set_metadata_resolves_indirect_info_values_into_xmp() {
             ..Metadata::default()
         })
         .unwrap();
-    let out = update.appended().unwrap();
+    let out = update.bytes().unwrap();
 
     let reread = Document::load(out).unwrap();
     let root = reread.xref().trailer.get_ref("Root").unwrap();

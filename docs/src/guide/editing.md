@@ -26,7 +26,7 @@ from pdfboss.write import Update
 
 update = Update(pdfboss.Document("report.pdf"))
 update.set_metadata(title="Q3 Report", author="Finance")
-update.save_appended("report-titled.pdf")
+update.save("report-titled.pdf")
 ```
 
 `set_metadata` may be called more than once before saving: a field passed as `None` keeps whatever an earlier call staged, so calls compose. `to_bytes()` returns the same bytes without writing a file, and may be called more than once.
@@ -45,14 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         author: Some("Finance".to_string()),
         ..Metadata::default()
     })?;
-    update.save_appended("report-titled.pdf")?;
+    update.save("report-titled.pdf")?;
     Ok(())
 }
 ```
 
 Calling `set_metadata` more than once on the same `Update` does not compound the way the Python binding's own staging does: each call merges its fields against the base document's own `/Info`, never against an earlier call's, so the later call wins outright and any field it leaves `None` falls back to the base's original value rather than what an earlier call set.
 
-`append_into` writes to any `impl Write` and `appended()` returns the bytes directly; both build the update section before a byte reaches the output, so a refused or failing update leaves nothing behind. `set`, `remove` and `reserve` on `Update` stage arbitrary objects into the same appended section for edits beyond metadata.
+`append_into` writes to any `impl Write` and `bytes()` returns the bytes directly; both build the update section before a byte reaches the output, so a refused or failing update leaves nothing behind. `set`, `remove` and `reserve` on `Update` stage arbitrary objects into the same appended section for edits beyond metadata.
 
 ## Async
 
