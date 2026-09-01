@@ -1690,18 +1690,31 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
     // contiguous stretch of `group.spans` — held as a range, never copied.
     let mut claimed: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
     for (position, &span) in group.spans.iter().enumerate() {
-        // A whitespace-only span paints nothing: a producer's padding
-        // running past the columns must not disqualify the row.
-        if span.text.trim().is_empty() {
-            continue;
-        }
+        // A whitespace-only span that sits in the columns claims like any
+        // other, so a cell keeps its spacing; one running outside them —
+        // a producer's padding past the grid's edge — paints nothing and
+        // is skipped rather than disqualifying the whole row.
+        let whitespace = span.text.trim().is_empty();
         let lo = span.x.min(span.end_x);
         let hi = span.x.max(span.end_x);
-        let start = columns.iter().rposition(|column| column.start <= lo)?;
+        let Some(start) = columns.iter().rposition(|column| column.start <= lo) else {
+            if whitespace {
+                continue;
+            }
+            return None;
+        };
         if lo >= columns[start].end {
+            if whitespace {
+                continue;
+            }
             return None;
         }
-        let end = columns.iter().rposition(|column| column.start <= hi)?;
+        let Some(end) = columns.iter().rposition(|column| column.start <= hi) else {
+            if whitespace {
+                continue;
+            }
+            return None;
+        };
         match claimed.last_mut() {
             Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
