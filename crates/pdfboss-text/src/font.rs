@@ -538,10 +538,19 @@ impl Font {
         // around 140, so a thick stem marks bold fonts whose descriptors
         // carry neither a weight nor a telling name (URW's -Medi faces).
         // A name that states a non-bold weight outranks the stem: design
-        // tools export junk stem widths on faces named Regular.
+        // tools export junk stem widths on faces named Regular. The word
+        // must end where the match ends — a following lowercase letter
+        // means a family name (Bookman), not the weight.
         let name_says_regular = ["Regular", "Light", "Thin", "Book", "Hairline"]
             .iter()
-            .any(|marker| style.name.contains(marker));
+            .any(|marker| {
+                style.name.match_indices(marker).any(|(at, _)| {
+                    style.name[at + marker.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_lowercase())
+                })
+            });
         if let Some(stem) = rv(src, &descriptor, "StemV").await.and_then(|o| o.as_f64()) {
             bold = bold || (stem >= BOLD_STEM_WIDTH && !name_says_regular);
         }

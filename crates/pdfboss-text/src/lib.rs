@@ -1029,6 +1029,38 @@ mod tests {
         );
     }
 
+    /// The weight words match whole name parts, not substrings: Bookman is
+    /// a family name, not the Book weight, so a Demi face whose only bold
+    /// evidence is its thick stem keeps that evidence.
+    #[test]
+    fn family_name_containing_a_weight_word_is_not_a_veto() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (a) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Bookman-Demi \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Bookman-Demi /Flags 4 /StemV 167 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page).unwrap();
+        assert!(
+            spans[0].bold,
+            "Bookman-Demi's thick stem still marks it bold"
+        );
+    }
+
     /// BaseFont-name fallback when no descriptor exists, and ItalicAngle.
     #[test]
     fn basefont_name_and_italic_angle_fallbacks() {
