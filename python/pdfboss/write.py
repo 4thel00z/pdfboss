@@ -16,6 +16,7 @@ from pdfboss._pdfboss.write import (
     Pdf,
     Standard14,
     Text,
+    Update,
     Viewer,
     watermark,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "Pdf",
     "Standard14",
     "Text",
+    "Update",
     "Viewer",
     "watermark",
 ]

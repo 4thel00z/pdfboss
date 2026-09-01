@@ -760,10 +760,13 @@ class write:
             size: float = 11.0,
             leading: float | None = None,
             align: Literal["left", "center", "right", "justify"] = "left",
+            color: tuple[float, float, float] | None = None,
         ) -> None:
             """``leading`` defaults to a size-derived line height. Raises
             ``TypeError`` for an unknown ``align``, and ``PdfError`` at
-            lowering time if the wrapped text overflows ``rect``."""
+            lowering time if the wrapped text overflows ``rect``.
+            ``color`` is an ``(r, g, b)`` tuple in ``[0, 1]``, defaulting
+            to black."""
 
     class Metadata:
         """Document information written to the ``/Info`` dictionary. Dates
@@ -831,6 +834,46 @@ class write:
             start_at: int = 1,
         ) -> None:
             """Raises ``TypeError`` for an unknown ``style``."""
+
+    class Update:
+        """A metadata edit staged over an existing document, serialized
+        as an incremental update: the base document's own bytes are
+        never rewritten, only appended to.
+
+        Construction only captures a shareable seed of ``doc``; an
+        encrypted base is not refused here, only at
+        ``save``/``to_bytes`` time, raising ``PdfError``.
+        """
+
+        def __init__(self, doc: Document) -> None: ...
+
+        def set_metadata(
+            self,
+            title: str | None = None,
+            author: str | None = None,
+            subject: str | None = None,
+            keywords: str | None = None,
+            creator: str | None = None,
+            producer: str | None = None,
+        ) -> None:
+            """Merges the given fields into the metadata staged for the
+            next ``save``/``to_bytes`` call. A field left
+            ``None`` keeps whatever an earlier call on this ``Update``
+            staged; calling ``set_metadata`` more than once merges
+            fields across calls, the latest non-``None`` value winning
+            per field."""
+
+        def save(self, path: str | os.PathLike[str]) -> None:
+            """Writes the base document's bytes, then an incremental
+            update section carrying the staged metadata, to a new file
+            at ``path``. Raises ``PdfError`` for an encrypted base, or
+            one missing ``/Root`` or a ``startxref`` to chain the
+            update against."""
+
+        def to_bytes(self) -> bytes:
+            """Like ``save``, but returns the full new file
+            bytes instead of writing them to a path. May be called more
+            than once."""
 
     class Viewer:
         """Viewer preferences written to the catalog: initial layout,

@@ -54,6 +54,7 @@ pdfboss md      report.pdf                 # markdown: headings, lists, tables f
 pdfboss render  report.pdf --page 1 -o page.png --scale 2.0   # or .ppm / .bmp / .jpg
 pdfboss images  report.pdf                 # extract embedded images as native-size PNGs
 pdfboss tui     report.pdf                 # interactive terminal explorer
+pdfboss meta    report.pdf -o out.pdf --set title="Q3 Report"   # edit metadata, appended as an update
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
@@ -88,6 +89,36 @@ data = (Pdf() | Metadata(title="Q3 Report") | cover).to_bytes()
 An `Outline` of nested `Bookmark`s becomes the document's bookmark panel (`Pdf.outline`); `Attachment` objects embed arbitrary files inside the document (`Pdf.attachments`); `PageLabel` ranges control how page numbers render in viewer UI (`Pdf.page_labels`); and a `Viewer` sets the document's opening layout, mode, and page (`Pdf.viewer`). Each slots into `Pdf` with `|`, exactly like `Metadata`.
 
 Existing files are watermarked in place: `pdfboss.write.watermark(data, overlay)` returns `data` with the first page of `overlay` drawn over every page, as an incremental update appended to the original bytes, so the result grows by the overlay page's size and takes no longer than parsing the two files. `rewrite=True` writes a fresh, compressed file instead, which usually comes out smaller than the original.
+
+`pdfboss.write.Update` edits an existing file's metadata the same way, and `pdfboss meta` (above) is its CLI: staged `set_metadata` fields become an appended update, the base file's bytes untouched; an encrypted base is refused.
+
+```python
+import pdfboss
+from pdfboss.write import Update
+
+update = Update(pdfboss.Document("report.pdf"))
+update.set_metadata(title="Q3 Report", author="Finance")
+update.save("report-titled.pdf")
+```
+
+```rust,no_run
+use pdfboss_core::Document;
+use pdfboss_write::{Metadata, Update};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    let mut update = Update::new(&doc)?;
+    update.set_metadata(Metadata {
+        title: Some("Q3 Report".to_string()),
+        author: Some("Finance".to_string()),
+        ..Metadata::default()
+    })?;
+    update.save("report-titled.pdf")?;
+    Ok(())
+}
+```
+
+`merge`, `split`, `rotate`, `overlay` and `encrypt` follow in later PRs.
 
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>

@@ -1523,6 +1523,7 @@ dependencies = [
  "pdfboss-encoding",
  "pdfboss-output",
  "pdfboss-render",
+ "pdfboss-testkit",
  "pdfboss-text",
  "png",
  "thiserror",

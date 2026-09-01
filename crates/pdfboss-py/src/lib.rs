@@ -610,6 +610,16 @@ impl Document {
     }
 }
 
+impl Document {
+    /// The document's shareable core, for a caller (the `write`
+    /// submodule's `Update`) that needs to rebuild a private
+    /// `CoreDocument` of its own rather than going through this
+    /// document's lock.
+    pub(crate) fn seed(&self) -> DocumentSeed {
+        self.inner.lock().seed()
+    }
+}
+
 /// A single page of a document.
 /// One embedded image extracted from a page: PNG-encoded pixels at the
 /// image's own native dimensions, straight alpha, `/SMask` applied.

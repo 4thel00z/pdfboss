@@ -7,12 +7,15 @@ use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
-use pdfboss_core::xref::startxref;
-use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream};
+use pdfboss_core::crypt::Sha256;
+use pdfboss_core::object::decode_text_string;
+use pdfboss_core::xref::{parse_section_at, startxref};
+use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
 
 use crate::error::{Error, Result};
+use crate::pdf::{text_string, Date, Metadata};
 use crate::ser::{serialize_dict, serialize_object};
-use crate::writer::{WriteOptions, Writer};
+use crate::writer::{WriteOptions, Writer, XrefStyle};
 
 /// The resource name every page draws the overlay form under.
 const FORM_NAME: &str = "PdfbossWatermark";
@@ -29,13 +32,9 @@ pub fn watermark_with(
 ) -> Result<Vec<u8>> {
     let trailer = &base.xref().trailer;
     if trailer.get("Encrypt").is_some() {
-        return Err(Error::Other(
-            "an encrypted file cannot be rewritten".to_string(),
-        ));
+        return Err(Error::EncryptedBase);
     }
-    let root = trailer
-        .get_ref("Root")
-        .ok_or_else(|| Error::Other("the base file has no /Root".to_string()))?;
+    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
     let mut writer = Writer::new(options);
     let prefix = writer.put_stream_raw(Dict::new(), b"q\n".to_vec());
     let suffix = writer.put_stream_raw(
@@ -251,10 +250,12 @@ impl<'a> Rewrite<'a> {
 /// as they are. An encrypted base is refused: its new strings and streams
 /// would need encrypting too.
 pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
-    let mut update = Update::open(base)?;
-    let form = update.import_form(overlay)?;
-    let prefix = update.put(Object::Stream(plain_stream(b"q\n".to_vec())));
-    let suffix = update.put(Object::Stream(plain_stream(
+    let mut update = Update::new(base)?;
+    let form = update.overlay.import_form(overlay)?;
+    let prefix = update
+        .overlay
+        .put(Object::Stream(plain_stream(b"q\n".to_vec())));
+    let suffix = update.overlay.put(Object::Stream(plain_stream(
         format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
     )));
     for index in 0..base.page_count() {
@@ -287,59 +288,222 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
         }
         contents.push(Object::Ref(suffix));
         dict.insert(name("Contents"), Object::Array(contents));
-        update.replace(page_ref, Object::Dict(dict));
+        update.set(page_ref, Object::Dict(dict));
     }
-    update.finish()
+    update.bytes()
 }
 
-/// One update section under construction: the objects it will hold, new
-/// ones numbered from the first number the base leaves free.
-struct Update<'a> {
-    base: &'a Document,
-    next: u32,
-    objects: Vec<(ObjRef, Object)>,
-    imported: FastMap<ObjRef, ObjRef>,
+/// The facts about a base document an update needs, read once from its
+/// trailer and its own newest cross-reference section: refuses an
+/// encrypted base or one missing `/Root` or a `startxref` to chain from.
+#[derive(Debug, Clone)]
+pub struct OverlayBase {
+    /// Byte offset of the base's own newest cross-reference section, named
+    /// as the appended section's `/Prev`.
+    pub prev: u64,
+    /// Style of that newest section, read from the section itself rather
+    /// than the merged trailer (a hybrid base's merged trailer carries
+    /// `/Type /XRef` inherited from its `/XRefStm`, even though its newest
+    /// section, per `startxref`, is the classic table).
+    pub kind: XrefStyle,
+    /// The next free object number: the base's declared `/Size`, raised to
+    /// one past its highest addressed object number.
+    pub size: u32,
+    /// The base's catalog.
+    pub root: ObjRef,
+    /// The base's document information dictionary, when present.
+    pub info: Option<ObjRef>,
+    /// The base trailer's `/ID` array, cloned.
+    pub id: Option<Object>,
 }
 
-impl<'a> Update<'a> {
-    fn open(base: &'a Document) -> Result<Update<'a>> {
-        let trailer = &base.xref().trailer;
+impl OverlayBase {
+    /// Reads `doc`'s trailer and newest cross-reference section.
+    pub fn from_document(doc: &Document) -> Result<OverlayBase> {
+        let trailer = &doc.xref().trailer;
         if trailer.get("Encrypt").is_some() {
-            return Err(Error::Other(
-                "an encrypted file cannot be updated in place".to_string(),
-            ));
+            return Err(Error::EncryptedBase);
         }
-        let highest = base.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
-        let size = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
-        Ok(Update {
-            base,
-            next: size.max(highest + 1),
-            objects: Vec::new(),
-            imported: FastMap::default(),
+        let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
+        let prev = startxref(doc.bytes()).ok_or(Error::MissingStartxref)?;
+        let kind = match parse_section_at(doc.bytes(), prev)
+            .map_err(core_error)?
+            .kind
+        {
+            XrefKind::Table => XrefStyle::Table,
+            XrefKind::Stream => XrefStyle::Stream,
+        };
+        let highest = doc.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
+        let declared = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
+        Ok(OverlayBase {
+            prev: prev as u64,
+            kind,
+            size: declared.max(highest + 1),
+            root,
+            info: trailer.get_ref("Info"),
+            id: trailer.get("ID").cloned(),
         })
     }
+}
 
-    /// Adds a new object under the next free number.
-    fn put(&mut self, obj: Object) -> ObjRef {
+/// One recorded change against an object number: a new or replacement body
+/// from [`Overlay::set`], or a free marker from [`Overlay::remove`].
+#[derive(Debug, Clone)]
+enum Change {
+    Set(Object),
+    Free,
+}
+
+/// An update section under construction over an [`OverlayBase`]: which
+/// objects it holds, new ones numbered from the base's first free number.
+#[derive(Debug, Clone)]
+pub struct Overlay {
+    base: OverlayBase,
+    next: u32,
+    objects: Vec<(ObjRef, Change)>,
+    imported: FastMap<ObjRef, ObjRef>,
+    info: Option<ObjRef>,
+}
+
+impl Overlay {
+    /// An empty update section over `base`, numbering new objects from its
+    /// first free number.
+    pub fn new(base: OverlayBase) -> Overlay {
+        let next = base.size;
+        Overlay {
+            base,
+            next,
+            objects: Vec::new(),
+            imported: FastMap::default(),
+            info: None,
+        }
+    }
+
+    /// Sets an object under its own number, whether new or a replacement
+    /// of one already in the base. Raises the next free number past `r`
+    /// when `r` was not already reserved, so a later `reserve`/`put` never
+    /// collides with a caller-chosen number.
+    pub fn set(&mut self, r: ObjRef, obj: Object) {
+        self.next = self.next.max(r.num.saturating_add(1));
+        self.objects.push((r, Change::Set(obj)));
+    }
+
+    /// Marks `r` free: the appended section's cross-reference data chains
+    /// it into entry 0's free list, in whichever style the base uses. Its
+    /// generation for reuse is `r.gen` advanced by one (saturating at
+    /// 65535, the field's own limit), per the classic table's convention
+    /// for a deleted entry's row. A no-op for object number 0: it is
+    /// already the free list's own permanent head, represented by this
+    /// section's synthetic entry-0 row whenever any other object is freed.
+    pub fn remove(&mut self, r: ObjRef) {
+        if r.num == 0 {
+            return;
+        }
+        self.next = self.next.max(r.num.saturating_add(1));
+        let gen = r.gen.saturating_add(1);
+        self.objects
+            .push((ObjRef { num: r.num, gen }, Change::Free));
+    }
+
+    /// Allocates the next free object number without storing anything
+    /// under it yet.
+    pub fn reserve(&mut self) -> ObjRef {
         let r = ObjRef {
             num: self.next,
             gen: 0,
         };
         self.next += 1;
-        self.objects.push((r, obj));
         r
     }
 
-    /// Replaces an object of the base under its own number.
-    fn replace(&mut self, r: ObjRef, obj: Object) {
-        self.objects.push((r, obj));
+    /// Adds a new object under the next free number.
+    pub fn put(&mut self, obj: Object) -> ObjRef {
+        let r = self.reserve();
+        self.set(r, obj);
+        r
+    }
+
+    /// Registers the document information dictionary for the appended
+    /// section's trailer, overriding the base's own.
+    pub fn set_info(&mut self, r: ObjRef) {
+        self.info = Some(r);
+    }
+
+    /// Whether nothing has been set or removed yet.
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// The appended section alone: every set object at `start` plus its
+    /// position within this section, then a cross-reference section in the
+    /// base's style naming the base's section as `/Prev`. Refused when no
+    /// object has been set. A number recorded more than once (repeated
+    /// `set`, or `set` and `remove` on the same reference) keeps only its
+    /// last-recorded change, so the appended cross-reference data never
+    /// carries two rows for one number.
+    pub fn section(&self, start: u64) -> Result<Vec<u8>> {
+        if self.is_empty() {
+            return Err(Error::EmptyUpdate);
+        }
+        let mut last: FastMap<u32, usize> = FastMap::default();
+        for (index, (r, _)) in self.objects.iter().enumerate() {
+            last.insert(r.num, index);
+        }
+        let mut winners: Vec<usize> = last.into_values().collect();
+        winners.sort_by_key(|&index| self.objects[index].0.num);
+        let mut out = Vec::new();
+        let mut rows: Vec<Row> = Vec::with_capacity(winners.len() + 1);
+        let mut freed: Vec<ObjRef> = Vec::new();
+        for index in winners {
+            let (r, change) = &self.objects[index];
+            match change {
+                Change::Set(obj) => {
+                    rows.push(Row::InFile(*r, start as usize + out.len()));
+                    write_indirect(&mut out, *r, obj)?;
+                }
+                Change::Free => freed.push(*r),
+            }
+        }
+        if !freed.is_empty() {
+            freed.sort_by_key(|r| r.num);
+            let head = freed.first().map_or(0, |r| r.num);
+            rows.push(Row::Free {
+                num: 0,
+                gen: 65535,
+                next: head,
+            });
+            for (index, r) in freed.iter().enumerate() {
+                let next = freed.get(index + 1).map_or(0, |n| n.num);
+                rows.push(Row::Free {
+                    num: r.num,
+                    gen: r.gen,
+                    next,
+                });
+            }
+        }
+        rows.sort_by_key(Row::num);
+
+        let mut trailer = Dict::new();
+        trailer.insert(name("Root"), Object::Ref(self.base.root));
+        if let Some(info) = self.info.or(self.base.info) {
+            trailer.insert(name("Info"), Object::Ref(info));
+        }
+        if let Some(id) = rotated_id(&self.base, &out) {
+            trailer.insert(name("ID"), id);
+        }
+        trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
+        match self.base.kind {
+            XrefStyle::Stream => finish_stream(&mut out, start, rows, trailer, self.next)?,
+            XrefStyle::Table => finish_table(&mut out, start, &rows, trailer, self.next)?,
+        }
+        Ok(out)
     }
 
     /// The overlay's first page as a form XObject in the base's object
     /// space: its media box as the form's bounding box, its decoded content
     /// as the form's stream, and its resource graph deep-copied and
     /// renumbered.
-    fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
+    pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
         let page = overlay.page(0).map_err(core_error)?;
         let content = page.content(overlay).map_err(core_error)?;
         let resources = self.import_object(overlay, &Object::Dict(page.resources.clone()))?;
@@ -369,21 +533,17 @@ impl<'a> Update<'a> {
     /// it reaches becomes a new object here, each source object copied once
     /// however many times it is referenced. Streams keep their encoded
     /// bytes and filters; their `/Length` is rewritten on emission.
-    fn import_object(&mut self, source: &Document, obj: &Object) -> Result<Object> {
+    pub(crate) fn import_object(&mut self, source: &Document, obj: &Object) -> Result<Object> {
         Ok(match obj {
             Object::Ref(r) => {
                 if let Some(copied) = self.imported.get(r) {
                     return Ok(Object::Ref(*copied));
                 }
-                let copied = ObjRef {
-                    num: self.next,
-                    gen: 0,
-                };
-                self.next += 1;
+                let copied = self.reserve();
                 self.imported.insert(*r, copied);
                 let body = source.get(*r).map_err(core_error)?;
                 let body = self.import_object(source, &body)?;
-                self.objects.push((copied, body));
+                self.objects.push((copied, Change::Set(body)));
                 Object::Ref(copied)
             }
             Object::Dict(d) => Object::Dict(self.import_dict(source, d)?),
@@ -405,119 +565,395 @@ impl<'a> Update<'a> {
         })
     }
 
-    fn import_dict(&mut self, source: &Document, dict: &Dict) -> Result<Dict> {
+    pub(crate) fn import_dict(&mut self, source: &Document, dict: &Dict) -> Result<Dict> {
         let mut out = Dict::new();
         for (key, value) in dict.iter() {
             out.insert(key.clone(), self.import_object(source, value)?);
         }
         Ok(out)
     }
+}
 
-    /// The base bytes followed by the update section: every object, then a
-    /// cross-reference section in the base's style naming the base's
-    /// section as `/Prev`.
-    fn finish(mut self) -> Result<Vec<u8>> {
-        let base_bytes = self.base.bytes();
-        let prev = startxref(base_bytes)
-            .ok_or_else(|| Error::Other("the base file has no startxref".to_string()))?;
-        let mut out = base_bytes.to_vec();
-        if !out.ends_with(b"\n") {
-            out.push(b'\n');
+/// Merges `meta` into `existing_info`'s dictionary (or a fresh one, staged
+/// under a newly reserved number, when `existing_info` is `None`): a
+/// `Some` field overwrites its key (`Some(String::new())` writes an empty
+/// string), a `None` field leaves whatever key was already there. The
+/// merged dictionary is staged into `overlay` via `set` and `set_info`.
+///
+/// When `xmp_ref` is `Some`, the merged dictionary is read back into a
+/// [`Metadata`] (text fields via `decode_text_string`, dates via
+/// [`Date::parse_pdf`], an unparseable date simply dropping out) and
+/// staged under `xmp_ref` as a fresh, unfiltered `/Type /Metadata /Subtype
+/// /XML` stream of the crate's XMP packet over that merged value: any XMP
+/// property outside those eight fields is not carried into the new
+/// packet, though the original packet's bytes stay in the base.
+///
+/// Shared by [`Update::set_metadata`] and its asynchronous counterpart.
+pub fn set_metadata_with(
+    overlay: &mut Overlay,
+    existing_info: Option<(ObjRef, Dict)>,
+    xmp_ref: Option<ObjRef>,
+    meta: Metadata,
+) -> Result<()> {
+    let (target, mut dict) = match existing_info {
+        Some((r, dict)) => (r, dict),
+        None => (overlay.reserve(), Dict::new()),
+    };
+    apply_metadata_fields(&mut dict, &meta);
+    let merged = metadata_from_info(&dict);
+    overlay.set(target, Object::Dict(dict));
+    overlay.set_info(target);
+    let Some(xmp_ref) = xmp_ref else {
+        return Ok(());
+    };
+    let mut xmp_dict = Dict::new();
+    xmp_dict.insert(name("Type"), Object::Name(name("Metadata")));
+    xmp_dict.insert(name("Subtype"), Object::Name(name("XML")));
+    overlay.set(
+        xmp_ref,
+        Object::Stream(Stream {
+            dict: xmp_dict,
+            data: crate::xmp::packet(&merged),
+        }),
+    );
+    Ok(())
+}
+
+/// Writes every `Some` field of `meta` into `dict` under its `/Info` key;
+/// a `None` field is left untouched.
+fn apply_metadata_fields(dict: &mut Dict, meta: &Metadata) {
+    let texts = [
+        ("Title", &meta.title),
+        ("Author", &meta.author),
+        ("Subject", &meta.subject),
+        ("Keywords", &meta.keywords),
+        ("Creator", &meta.creator),
+        ("Producer", &meta.producer),
+    ];
+    for (key, value) in texts {
+        if let Some(value) = value {
+            dict.insert(name(key), text_string(value));
         }
-        self.objects.sort_by_key(|(r, _)| r.num);
-        let mut rows: Vec<(ObjRef, usize)> = Vec::with_capacity(self.objects.len() + 1);
-        for (r, obj) in &self.objects {
-            rows.push((*r, out.len()));
-            write_indirect(&mut out, *r, obj)?;
-        }
-        let trailer = &self.base.xref().trailer;
-        let mut section = Dict::new();
-        for key in ["Root", "Info", "ID"] {
-            if let Some(value) = trailer.get(key) {
-                section.insert(name(key), value.clone());
-            }
-        }
-        section.insert(name("Prev"), Object::Int(prev as i64));
-        let stream_style = trailer.get_name("Type").is_some_and(|n| n.0 == "XRef");
-        if stream_style {
-            self.finish_stream(&mut out, rows, section)?;
-        } else {
-            finish_table(&mut out, &rows, section, self.next)?;
-        }
-        Ok(out)
     }
-
-    /// A cross-reference stream as the section's last object, rows for
-    /// every object of the update and for the stream itself.
-    fn finish_stream(
-        &mut self,
-        out: &mut Vec<u8>,
-        mut rows: Vec<(ObjRef, usize)>,
-        mut section: Dict,
-    ) -> Result<()> {
-        let xref_ref = ObjRef {
-            num: self.next,
-            gen: 0,
-        };
-        self.next += 1;
-        let xref_offset = out.len();
-        rows.push((xref_ref, xref_offset));
-        let mut index = Vec::with_capacity(rows.len() * 2);
-        let mut data = Vec::with_capacity(rows.len() * 7);
-        for (r, offset) in &rows {
-            index.push(Object::Int(i64::from(r.num)));
-            index.push(Object::Int(1));
-            data.push(1);
-            data.extend_from_slice(&field_offset(*offset)?.to_be_bytes());
-            data.extend_from_slice(&r.gen.to_be_bytes());
+    let dates = [
+        ("CreationDate", meta.creation_date),
+        ("ModDate", meta.modification_date),
+    ];
+    for (key, value) in dates {
+        if let Some(date) = value {
+            dict.insert(name(key), Object::String(date.to_pdf_string().into_bytes()));
         }
-        section.insert(name("Type"), Object::Name(name("XRef")));
-        section.insert(name("Size"), Object::Int(i64::from(self.next)));
-        section.insert(
-            name("W"),
-            Object::Array(vec![Object::Int(1), Object::Int(4), Object::Int(2)]),
-        );
-        section.insert(name("Index"), Object::Array(index));
-        write_indirect(
-            out,
-            xref_ref,
-            &Object::Stream(Stream {
-                dict: section,
-                data,
-            }),
-        )?;
-        out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
-        Ok(())
     }
 }
 
-/// A classic `xref` table with one subsection per run of consecutive
-/// object numbers, then the `trailer` dictionary.
-fn finish_table(
-    out: &mut Vec<u8>,
-    rows: &[(ObjRef, usize)],
-    mut section: Dict,
-    size: u32,
-) -> Result<()> {
-    let xref_offset = out.len();
-    out.extend_from_slice(b"xref\n");
-    let mut start = 0;
-    while start < rows.len() {
-        let mut end = start + 1;
-        while end < rows.len() && rows[end].0.num == rows[end - 1].0.num + 1 {
+/// Reads an `/Info` dictionary back into a [`Metadata`]: text fields via
+/// `decode_text_string`, dates via [`Date::parse_pdf`]. A missing or
+/// unparseable field is simply `None`.
+fn metadata_from_info(dict: &Dict) -> Metadata {
+    Metadata {
+        title: info_text(dict, "Title"),
+        author: info_text(dict, "Author"),
+        subject: info_text(dict, "Subject"),
+        keywords: info_text(dict, "Keywords"),
+        creator: info_text(dict, "Creator"),
+        producer: info_text(dict, "Producer"),
+        creation_date: info_date(dict, "CreationDate"),
+        modification_date: info_date(dict, "ModDate"),
+    }
+}
+
+/// `dict[key]` decoded as a text string, when present and a string.
+fn info_text(dict: &Dict, key: &str) -> Option<String> {
+    Some(decode_text_string(dict.get(key)?.as_str_bytes()?))
+}
+
+/// `dict[key]` decoded and parsed as a PDF date, when present, a string,
+/// and a valid date.
+fn info_date(dict: &Dict, key: &str) -> Option<Date> {
+    Date::parse_pdf(&decode_text_string(dict.get(key)?.as_str_bytes()?))
+}
+
+/// The base's length as an update's write position, plus whether a pad
+/// newline must be inserted first: an object header may not follow
+/// directly after `%%EOF` unless the base already ends on a line
+/// terminator (`\n` or `\r`).
+pub fn start_offset(base: &[u8]) -> (u64, bool) {
+    let pad = !matches!(base.last(), Some(b'\n') | Some(b'\r'));
+    (base.len() as u64 + u64::from(pad), pad)
+}
+
+/// A base document plus the update section being built over it.
+pub struct Update<'a> {
+    doc: &'a Document,
+    overlay: Overlay,
+}
+
+impl<'a> Update<'a> {
+    /// Opens `doc` for an update: refuses an encrypted base or one missing
+    /// `/Root` or a `startxref` to chain the appended section's `/Prev` to.
+    pub fn new(doc: &'a Document) -> Result<Update<'a>> {
+        let base = OverlayBase::from_document(doc)?;
+        Ok(Update {
+            doc,
+            overlay: Overlay::new(base),
+        })
+    }
+
+    /// Sets an object under its own number, whether new or a replacement
+    /// of one already in the base.
+    pub fn set(&mut self, r: ObjRef, obj: Object) {
+        self.overlay.set(r, obj);
+    }
+
+    /// Marks `r` free in the appended section's cross-reference data.
+    pub fn remove(&mut self, r: ObjRef) {
+        self.overlay.remove(r);
+    }
+
+    /// Allocates the next free object number without storing anything
+    /// under it yet.
+    pub fn reserve(&mut self) -> ObjRef {
+        self.overlay.reserve()
+    }
+
+    /// The update section under construction.
+    pub fn overlay(&self) -> &Overlay {
+        &self.overlay
+    }
+
+    /// Merges `meta` into the base document's `/Info` dictionary: the ref
+    /// comes from the overlay's own info ref when a prior call set one,
+    /// else the base's; the dictionary itself always comes from the base
+    /// document (never from a prior call's staged fields, so two calls on
+    /// one `Update` do not compound; on a base without `/Info`, a call
+    /// starts from a fresh dictionary). When the catalog already names an
+    /// XMP packet, it is rewritten from the merged fields. See
+    /// [`set_metadata_with`] for the merge and rewrite rules.
+    pub fn set_metadata(&mut self, meta: Metadata) -> Result<()> {
+        let info_ref = self.overlay.info.or(self.overlay.base.info);
+        let existing_info = info_ref.and_then(|r| {
+            let dict = self.doc.get(r).ok()?.as_dict()?.clone();
+            Some((r, self.resolve_dict(&dict)))
+        });
+        let xmp_ref = self.catalog_metadata_ref();
+        set_metadata_with(&mut self.overlay, existing_info, xmp_ref, meta)
+    }
+
+    /// `dict` with every value resolved against the base document: an
+    /// indirect value such as `/Title 12 0 R` becomes the string object it
+    /// points to, so a field kept by [`set_metadata_with`] (a `None` field
+    /// in the merge) still reads back as text rather than silently
+    /// vanishing from the rewritten XMP packet. A value whose reference
+    /// chain fails to resolve (an unreadable target, or a cycle) is kept
+    /// as given.
+    fn resolve_dict(&self, dict: &Dict) -> Dict {
+        let mut out = Dict::new();
+        for (key, value) in dict.iter() {
+            let resolved = self.doc.resolve(value).unwrap_or_else(|_| value.clone());
+            out.insert(key.clone(), resolved);
+        }
+        out
+    }
+
+    /// The catalog's `/Metadata` entry, when it is an indirect reference.
+    /// `None` for a catalog with no `/Metadata`, or one that reads as a
+    /// direct stream rather than a reference.
+    fn catalog_metadata_ref(&self) -> Option<ObjRef> {
+        let catalog = self.doc.get(self.overlay.base.root).ok()?;
+        match catalog.as_dict()?.get("Metadata")? {
+            Object::Ref(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// The base bytes, whether a pad newline goes before the appended
+    /// section, and the section itself, computed together so a refused
+    /// update (or any other failure) is known before anything is written
+    /// anywhere.
+    fn parts(&self) -> Result<(&[u8], bool, Vec<u8>)> {
+        let base = self.doc.bytes();
+        let (start, pad) = start_offset(base);
+        let section = self.overlay.section(start)?;
+        Ok((base, pad, section))
+    }
+
+    /// Writes the base bytes, a pad newline when the base needs one, and
+    /// the appended section into `out`. The section is built before any
+    /// byte reaches `out`, so a refused update (or any other failure)
+    /// writes nothing at all.
+    pub fn append_into(&self, mut out: impl std::io::Write) -> Result<()> {
+        let (base, pad, section) = self.parts()?;
+        out.write_all(base)?;
+        if pad {
+            out.write_all(b"\n")?;
+        }
+        out.write_all(&section)?;
+        Ok(())
+    }
+
+    /// [`Update::append_into`] to a new file at `path`: the file is
+    /// created only once the update is known to build, so a refused
+    /// update leaves no file behind at all.
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        let (base, pad, section) = self.parts()?;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(base)?;
+        if pad {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(&section)?;
+        Ok(())
+    }
+
+    /// The base bytes followed by the update section, as one buffer.
+    pub fn bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.append_into(&mut out)?;
+        Ok(out)
+    }
+}
+
+/// One row of the appended section's cross-reference data: an object
+/// stored at a byte offset, or a freed number chained to the next free
+/// number in the section's own free list (entry 0 when it is the head).
+#[derive(Debug, Clone, Copy)]
+enum Row {
+    InFile(ObjRef, usize),
+    Free { num: u32, gen: u16, next: u32 },
+}
+
+impl Row {
+    fn num(&self) -> u32 {
+        match self {
+            Row::InFile(r, _) => r.num,
+            Row::Free { num, .. } => *num,
+        }
+    }
+}
+
+/// Splits `rows`, already sorted ascending by object number, into maximal
+/// runs of consecutive numbers, as `(run start index, run length)` pairs.
+/// Shared by the classic table's subsections and the xref stream's
+/// `/Index` pairs, so both group the same way.
+fn contiguous_runs(rows: &[Row]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut begin = 0;
+    while begin < rows.len() {
+        let mut end = begin + 1;
+        while end < rows.len() && rows[end].num() == rows[end - 1].num() + 1 {
             end += 1;
         }
-        out.extend_from_slice(format!("{} {}\n", rows[start].0.num, end - start).as_bytes());
-        for (r, offset) in &rows[start..end] {
-            out.extend_from_slice(
-                format!("{:010} {:05} n \n", table_offset(*offset)?, r.gen).as_bytes(),
-            );
-        }
-        start = end;
+        runs.push((begin, end - begin));
+        begin = end;
     }
-    section.insert(name("Size"), Object::Int(i64::from(size)));
+    runs
+}
+
+/// The appended trailer's `/ID`: the base's first half kept verbatim, the
+/// second half replaced by the first 16 bytes of a SHA-256 over the first
+/// half's bytes, the base's `/Prev` offset as little-endian bytes, and
+/// `body` (the section's serialized objects, built before its xref part).
+/// `None` when the base carries no `/ID` array with a string first
+/// element, in which case the appended trailer omits the key entirely.
+fn rotated_id(base: &OverlayBase, body: &[u8]) -> Option<Object> {
+    let Some(Object::Array(halves)) = &base.id else {
+        return None;
+    };
+    let Some(Object::String(first)) = halves.first() else {
+        return None;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(first);
+    hasher.update(&base.prev.to_le_bytes());
+    hasher.update(body);
+    let digest = hasher.finalize();
+    Some(Object::Array(vec![
+        Object::String(first.clone()),
+        Object::String(digest[..16].to_vec()),
+    ]))
+}
+
+/// A cross-reference stream as the section's last object: one row per
+/// object of the update (or per freed number) plus one for the stream
+/// itself, and `/Index` pairs one per contiguous run of object numbers.
+fn finish_stream(
+    out: &mut Vec<u8>,
+    start: u64,
+    mut rows: Vec<Row>,
+    mut dict: Dict,
+    mut next: u32,
+) -> Result<()> {
+    let xref_ref = ObjRef { num: next, gen: 0 };
+    next += 1;
+    let xref_offset = start as usize + out.len();
+    rows.push(Row::InFile(xref_ref, xref_offset));
+    rows.sort_by_key(Row::num);
+    let runs = contiguous_runs(&rows);
+    let mut index = Vec::with_capacity(runs.len() * 2);
+    for (begin, len) in runs {
+        index.push(Object::Int(i64::from(rows[begin].num())));
+        index.push(Object::Int(len as i64));
+    }
+    let mut data = Vec::with_capacity(rows.len() * 7);
+    for row in &rows {
+        match row {
+            Row::InFile(r, offset) => {
+                data.push(1);
+                data.extend_from_slice(&field_offset(*offset)?.to_be_bytes());
+                data.extend_from_slice(&r.gen.to_be_bytes());
+            }
+            Row::Free {
+                gen,
+                next: free_next,
+                ..
+            } => {
+                data.push(0);
+                data.extend_from_slice(&free_next.to_be_bytes());
+                data.extend_from_slice(&gen.to_be_bytes());
+            }
+        }
+    }
+    dict.insert(name("Type"), Object::Name(name("XRef")));
+    dict.insert(name("Size"), Object::Int(i64::from(next)));
+    dict.insert(
+        name("W"),
+        Object::Array(vec![Object::Int(1), Object::Int(4), Object::Int(2)]),
+    );
+    dict.insert(name("Index"), Object::Array(index));
+    write_indirect(out, xref_ref, &Object::Stream(Stream { dict, data }))?;
+    out.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    Ok(())
+}
+
+/// A classic `xref` table with one subsection per run of consecutive
+/// object numbers, then the `trailer` dictionary. A freed row uses `f` in
+/// place of `n`, its first field naming the next free number in the
+/// section's own chain rather than a byte offset.
+fn finish_table(
+    out: &mut Vec<u8>,
+    start: u64,
+    rows: &[Row],
+    mut dict: Dict,
+    size: u32,
+) -> Result<()> {
+    let xref_offset = start as usize + out.len();
+    out.extend_from_slice(b"xref\n");
+    for (begin, len) in contiguous_runs(rows) {
+        out.extend_from_slice(format!("{} {}\n", rows[begin].num(), len).as_bytes());
+        for row in &rows[begin..begin + len] {
+            match row {
+                Row::InFile(r, offset) => out.extend_from_slice(
+                    format!("{:010} {:05} n \n", table_offset(*offset)?, r.gen).as_bytes(),
+                ),
+                Row::Free { gen, next, .. } => {
+                    out.extend_from_slice(format!("{next:010} {gen:05} f \n").as_bytes())
+                }
+            }
+        }
+    }
+    dict.insert(name("Size"), Object::Int(i64::from(size)));
     out.extend_from_slice(b"trailer\n");
-    serialize_dict(&section, out)?;
+    serialize_dict(&dict, out)?;
     out.extend_from_slice(format!("\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes());
     Ok(())
 }

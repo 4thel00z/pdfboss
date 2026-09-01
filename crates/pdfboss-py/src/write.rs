@@ -27,17 +27,17 @@ use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 
-use pdfboss_core::Point;
+use pdfboss_core::{Document as CoreDocument, DocumentSeed, Point};
 use pdfboss_write::{
     Attachment as CoreAttachment, Bookmark as CoreBookmark, Canvas as CoreCanvas, Color,
     Content as CoreContent, Draw, Image as CoreImage, ImageData, LabelStyle, Link as CoreLink,
     LinkTarget as CoreLinkTarget, Metadata as CoreMetadata, Outline as CoreOutline,
     Page as CorePage, PageLabel as CorePageLabel, PageLayout, PageMode, Paragraph as CoreParagraph,
     ParagraphAlign, Pdf as CorePdf, Standard14 as CoreStandard14, Text as CoreText,
-    Viewer as CoreViewer,
+    Update as CoreUpdate, Viewer as CoreViewer,
 };
 
-use crate::{page_size_by_name, pdf_err, PdfError};
+use crate::{page_size_by_name, pdf_err, Document, PdfError};
 
 std::thread_local! {
     /// Holds a Python exception raised inside a draw-object's `draw()`
@@ -310,12 +310,13 @@ struct Paragraph {
     size: f32,
     leading: Option<f32>,
     align: ParagraphAlign,
+    color: Option<(f32, f32, f32)>,
 }
 
 #[pymethods]
 impl Paragraph {
     #[new]
-    #[pyo3(signature = (text, rect, font=Standard14::Helvetica, size=11.0, leading=None, align="left"))]
+    #[pyo3(signature = (text, rect, font=Standard14::Helvetica, size=11.0, leading=None, align="left", color=None))]
     fn new(
         text: String,
         rect: (f32, f32, f32, f32),
@@ -323,6 +324,7 @@ impl Paragraph {
         size: f32,
         leading: Option<f32>,
         align: &str,
+        color: Option<(f32, f32, f32)>,
     ) -> PyResult<Paragraph> {
         let align = parse_paragraph_align(align)?;
         Ok(Paragraph {
@@ -332,12 +334,17 @@ impl Paragraph {
             size,
             leading,
             align,
+            color,
         })
     }
 }
 
 impl Paragraph {
     fn lower(&self) -> CoreContent {
+        let color = match self.color {
+            Some((r, g, b)) => Color::Rgb(r, g, b),
+            None => Color::BLACK,
+        };
         CoreContent::Paragraph(CoreParagraph {
             text: self.text.clone(),
             rect: [self.rect.0, self.rect.1, self.rect.2, self.rect.3],
@@ -345,6 +352,7 @@ impl Paragraph {
             size: self.size,
             leading: self.leading,
             align: self.align,
+            color,
         })
     }
 }
@@ -1062,6 +1070,113 @@ impl WritePdf {
     }
 }
 
+/// A metadata edit staged over an existing document, serialized as an
+/// incremental update (ISO 32000-1 §7.5.6): the base document's own bytes
+/// are never rewritten, only appended to.
+///
+/// Holds a [`DocumentSeed`] taken from the given [`Document`] at
+/// construction, not the document itself, so `save`/`to_bytes`
+/// rebuild a private core document and run under `py.allow_threads`
+/// without contending on the shared one. Construction never reads the
+/// base's `/Encrypt` entry: a document with an encrypted base is only
+/// refused once `save`/`to_bytes` actually opens a
+/// `pdfboss_write::Update` on it, raising `PdfError`.
+///
+/// `set_metadata` may be called more than once before saving: each call
+/// merges its given fields into the metadata staged for this `Update`,
+/// a field passed as `None` keeping whatever an earlier call staged
+/// (the class as a whole, not just the base document's own `/Info`
+/// values). The Rust `Update::set_metadata` layer then merges that
+/// staged value against the base document's own `/Info` dictionary the
+/// same way: a field still `None` after every `set_metadata` call keeps
+/// the base's existing value rather than clearing it.
+#[pyclass(name = "Update", module = "pdfboss.write", frozen)]
+struct WriteUpdate {
+    seed: DocumentSeed,
+    meta: Mutex<CoreMetadata>,
+}
+
+#[pymethods]
+impl WriteUpdate {
+    #[new]
+    fn new(doc: PyRef<'_, Document>) -> WriteUpdate {
+        WriteUpdate {
+            seed: doc.seed(),
+            meta: Mutex::new(CoreMetadata::default()),
+        }
+    }
+
+    /// Merges the given fields into the metadata staged for the next
+    /// `save`/`to_bytes` call. A field left `None` keeps
+    /// whatever an earlier `set_metadata` call on this `Update` staged.
+    #[pyo3(signature = (title=None, author=None, subject=None, keywords=None, creator=None, producer=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn set_metadata(
+        &self,
+        title: Option<String>,
+        author: Option<String>,
+        subject: Option<String>,
+        keywords: Option<String>,
+        creator: Option<String>,
+        producer: Option<String>,
+    ) {
+        let mut meta = self.meta.lock().unwrap_or_else(PoisonError::into_inner);
+        merge_metadata_field(&mut meta.title, title);
+        merge_metadata_field(&mut meta.author, author);
+        merge_metadata_field(&mut meta.subject, subject);
+        merge_metadata_field(&mut meta.keywords, keywords);
+        merge_metadata_field(&mut meta.creator, creator);
+        merge_metadata_field(&mut meta.producer, producer);
+    }
+
+    /// Writes the base document's bytes, then an incremental update
+    /// section carrying the staged metadata, to a new file at `path`.
+    /// Raises `PdfError` for an encrypted base, or one missing `/Root`
+    /// or a `startxref` to chain the update against.
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        let seed = self.seed.clone();
+        let meta = self
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        py.allow_threads(move || {
+            let doc = CoreDocument::from_seed(seed);
+            let mut update = CoreUpdate::new(&doc).map_err(pdf_err)?;
+            update.set_metadata(meta).map_err(pdf_err)?;
+            update.save(path).map_err(pdf_err)
+        })
+    }
+
+    /// Like `save`, but returns the full new file bytes (the
+    /// base's own bytes followed by the update section) instead of
+    /// writing them to a path. May be called more than once.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let seed = self.seed.clone();
+        let meta = self
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let bytes = py.allow_threads(move || {
+            let doc = CoreDocument::from_seed(seed);
+            let mut update = CoreUpdate::new(&doc).map_err(pdf_err)?;
+            update.set_metadata(meta).map_err(pdf_err)?;
+            update.bytes().map_err(pdf_err)
+        })?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+}
+
+/// Overwrites `field` with `value` when `value` is `Some`; leaves it
+/// untouched otherwise. The merge rule behind `WriteUpdate::set_metadata`:
+/// later `Some` wins, per field, across every call on one `Update`.
+fn merge_metadata_field(field: &mut Option<String>, value: Option<String>) {
+    if value.is_some() {
+        *field = value;
+    }
+}
+
 /// Builds the `write` submodule, registers its classes, and makes it
 /// importable as `pdfboss._pdfboss.write`.
 ///
@@ -1119,6 +1234,7 @@ pub(crate) fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult
     module.add_class::<WriteMetadata>()?;
     module.add_class::<WritePage>()?;
     module.add_class::<WritePdf>()?;
+    module.add_class::<WriteUpdate>()?;
     parent.add_submodule(&module)?;
     py.import("sys")?
         .getattr("modules")?

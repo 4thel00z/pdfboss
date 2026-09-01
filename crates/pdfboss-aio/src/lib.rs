@@ -12,6 +12,8 @@ pub mod error;
 #[cfg(feature = "write")]
 pub mod sink;
 pub mod stream;
+#[cfg(feature = "write")]
+pub mod update;
 
 #[cfg(feature = "http")]
 pub use backend::HttpBackend;
@@ -22,3 +24,5 @@ pub use error::{Error, Result};
 #[cfg(feature = "write")]
 pub use sink::TokioSink;
 pub use stream::ElementStream;
+#[cfg(feature = "write")]
+pub use update::{append_overlay, overlay_base};

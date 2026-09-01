@@ -44,8 +44,10 @@ pages:     1
 ## CLI
 
 Every subcommand that reads a PDF (`info`, `text`, `md`,
-`render`, `images`, `obj`, `tui`, `json`, `hex` and `q`) takes `--password`,
-accepted as either the user or the owner password:
+`render`, `images`, `obj`, `tui`, `json`, `hex`, `meta` and `q`) takes
+`--password`, accepted as either the user or the owner password; for
+`meta` it only unlocks the base for reading, since writing an update
+against an encrypted base stays refused until a later PR:
 
 ```bash
 pdfboss text --password hunter2 locked.pdf
