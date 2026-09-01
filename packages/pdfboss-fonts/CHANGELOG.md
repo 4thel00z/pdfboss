@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/4thel00z/pdfboss/compare/pdfboss-fonts-v0.15.0...pdfboss-fonts-v0.16.0) (2026-09-01)
+
+
+### Features
+
+* **render:** paint bold sans substitutes with static Arimo bold faces ([#150](https://github.com/4thel00z/pdfboss/issues/150)) ([5685da3](https://github.com/4thel00z/pdfboss/commit/5685da3f2bf6e411a6e9f440586d823dfac750ac))
+
 ## [0.15.0](https://github.com/4thel00z/pdfboss/compare/pdfboss-fonts-v0.3.0...pdfboss-fonts-v0.15.0) (2026-08-11)
 
 
