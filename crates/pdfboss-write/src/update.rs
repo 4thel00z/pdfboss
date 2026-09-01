@@ -445,16 +445,17 @@ impl Overlay {
         if self.is_empty() {
             return Err(Error::EmptyUpdate);
         }
-        let mut by_num: FastMap<u32, (ObjRef, Change)> = FastMap::default();
-        for (r, change) in &self.objects {
-            by_num.insert(r.num, (*r, change.clone()));
+        let mut last: FastMap<u32, usize> = FastMap::default();
+        for (index, (r, _)) in self.objects.iter().enumerate() {
+            last.insert(r.num, index);
         }
-        let mut changes: Vec<(ObjRef, Change)> = by_num.into_values().collect();
-        changes.sort_by_key(|(r, _)| r.num);
+        let mut winners: Vec<usize> = last.into_values().collect();
+        winners.sort_by_key(|&index| self.objects[index].0.num);
         let mut out = Vec::new();
-        let mut rows: Vec<Row> = Vec::with_capacity(changes.len() + 1);
+        let mut rows: Vec<Row> = Vec::with_capacity(winners.len() + 1);
         let mut freed: Vec<ObjRef> = Vec::new();
-        for (r, change) in &changes {
+        for index in winners {
+            let (r, change) = &self.objects[index];
             match change {
                 Change::Set(obj) => {
                     rows.push(Row::InFile(*r, start as usize + out.len()));
