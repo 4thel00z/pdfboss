@@ -5,10 +5,10 @@
 #![cfg(feature = "write")]
 
 use pdfboss_aio::{append_overlay, overlay_base, AsyncDocument};
-use pdfboss_core::{Dict, Document, ObjRef, Object};
+use pdfboss_core::{Dict, Document, Name, ObjRef, Object};
 use pdfboss_write::{
-    set_metadata_with, Error, Metadata, Overlay, Page, PageSize, Pdf, Standard14, Update,
-    WriteOptions, XrefStyle,
+    set_metadata_with, Error, Immediate, Metadata, Overlay, Page, PageSize, Pdf, Standard14,
+    Update, WriteOptions, XrefStyle,
 };
 
 /// A classic-table base document with an existing `/Info /Title` and a
@@ -116,6 +116,55 @@ async fn async_append_matches_sync_bytes() {
         .unwrap();
 
     assert_eq!(sync_bytes, async_bytes);
+}
+
+/// A writer that shares its buffer through `Rc`, wrapped in `Immediate` so
+/// it satisfies `AsyncByteSink`: `append_overlay` only returns its sink
+/// argument on success, so a test that must inspect what reached the sink
+/// after an error needs a handle that survives the dropped argument.
+#[derive(Debug)]
+struct SharedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A name containing NUL has no legal escape (`pdfboss_write::ser` rejects
+/// `#00`), so building the appended section must fail; that failure must
+/// happen before any byte reaches the sink, not partway through streaming
+/// the base.
+#[tokio::test]
+async fn section_build_failure_leaves_sink_empty() {
+    let base = classic_base_with_title("Old");
+    let path = temp_path("nul-name");
+    std::fs::write(&path, &base).unwrap();
+    let doc = AsyncDocument::open(&path).await.unwrap();
+    std::fs::remove_file(&path).ok();
+
+    let base_info = overlay_base(&doc).await.unwrap();
+    let mut overlay = Overlay::new(base_info);
+    overlay.put(Object::Name(Name("bad\0name".to_string())));
+
+    let shared = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = Immediate(SharedWriter(std::rc::Rc::clone(&shared)));
+
+    let result = append_overlay(&doc, &overlay, sink).await;
+
+    assert!(
+        matches!(result, Err(Error::Other(_))),
+        "a name containing NUL must fail to serialize: {result:?}"
+    );
+    assert!(
+        shared.borrow().is_empty(),
+        "the sink must receive nothing when the section fails to build"
+    );
 }
 
 #[tokio::test]
