@@ -110,8 +110,8 @@ fn build_inner(manifest_path: &Path) -> Result<Pdf, String> {
     let base_dir = manifest_path.parent().unwrap_or(Path::new("."));
     let metadata = manifest.meta.map(to_metadata);
     let mut pages = Vec::with_capacity(manifest.pages.len());
-    for page in manifest.pages {
-        pages.push(to_page(page, base_dir)?);
+    for (index, page) in manifest.pages.into_iter().enumerate() {
+        pages.push(to_page(page, base_dir).map_err(|e| format!("page {}: {e}", index + 1))?);
     }
     Ok(Pdf {
         metadata,
@@ -479,6 +479,20 @@ size = "a4"
         std::fs::write(&manifest_path, "[[page]]\n").unwrap();
         let pdf = build(&manifest_path).unwrap();
         assert_eq!(pdf.pages[0].size, PageSize::A4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn per_page_error_names_the_page_number() {
+        let dir = scratch_dir("page-error");
+        let manifest_path = dir.join("page-error.toml");
+        std::fs::write(
+            &manifest_path,
+            "[[page]]\n  [[page.text]]\n  value = \"hi\"\n  at = [0, 0]\n[[page]]\n  [[page.text]]\n  value = \"second\"\n  at = [0, 0]\n  font = \"UnknownFont\"\n",
+        )
+        .unwrap();
+        let err = build(&manifest_path).unwrap_err();
+        assert!(err.contains("page 2:"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
