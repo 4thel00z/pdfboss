@@ -453,6 +453,23 @@ mod tests {
         assert!(report.is_complete());
     }
 
+    /// A table border drawn as a thin filled bar with beveled (mitered)
+    /// ends: two axis-aligned long edges, two slanted short ones. The bar's
+    /// box is thin, so it reads as a ruling along its centerline exactly
+    /// like a rectangular one.
+    #[test]
+    fn beveled_filled_bar_reads_as_a_ruling() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "70.87 594.07 m 541.13 594.07 l 540.38 593.32 l 71.62 593.32 l h f",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let (_, rulings, _) = extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+        assert_eq!(rulings.len(), 1, "the beveled bar is one ruling");
+        assert!((rulings[0].start.y - 593.7).abs() < 0.5);
+        assert!((rulings[0].end.x - rulings[0].start.x - 470.0).abs() < 2.0);
+    }
+
     #[test]
     fn extract_spans_ordering_multi_line() {
         let doc = Document::load(pdfboss_testkit::doc_with_graphics(

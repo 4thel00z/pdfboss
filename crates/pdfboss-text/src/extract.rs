@@ -565,10 +565,14 @@ fn ruling_from_segment(a: Point, b: Point, width: f32) -> Option<Ruling> {
     None
 }
 
-/// The centerline of a thin filled rectangle: a closed 4-vertex subpath in
-/// device space whose edges are all axis-aligned, with a thin dimension at
-/// most [`RULING_MAX_FILL_THICKNESS`] and a long dimension at least
-/// [`RULING_MIN_LENGTH`]. Width is 0.0 — a fill has no stroke width.
+/// The centerline of a thin filled bar: a closed 4-vertex subpath in device
+/// space whose bounding box has a thin dimension at most
+/// [`RULING_MAX_FILL_THICKNESS`] and a long dimension at least
+/// [`RULING_MIN_LENGTH`]. The box being thin is the whole test: a rectangle
+/// qualifies, and so does the mitered bar some producers draw table borders
+/// as — axis-aligned long edges, beveled ends — while a diagonal sliver's
+/// box is fat in both dimensions and never qualifies. Width is 0.0 — a fill
+/// has no stroke width.
 fn filled_rect_ruling(device: &[Point]) -> Option<Ruling> {
     let corners = match device {
         [a, b, c, d] => [*a, *b, *c, *d],
@@ -582,14 +586,6 @@ fn filled_rect_ruling(device: &[Point]) -> Option<Ruling> {
     };
     if corners.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
         return None;
-    }
-    let axis_aligned = |a: Point, b: Point| {
-        (b.x - a.x).abs() <= RULING_AXIS_EPSILON || (b.y - a.y).abs() <= RULING_AXIS_EPSILON
-    };
-    for i in 0..4 {
-        if !axis_aligned(corners[i], corners[(i + 1) % 4]) {
-            return None;
-        }
     }
     let x0 = corners.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
     let x1 = corners
