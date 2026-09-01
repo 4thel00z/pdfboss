@@ -2346,28 +2346,25 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
             merged[*grid].extend(flow.iter().copied());
         }
     }
-    // The page's loose text, all of it at once: a page with a true gutter
-    // reads column-major across every flow — a report writing its columns
-    // as interleaved paragraphs still reads left column first — while
-    // stream order survives inside each lane. Without a page gutter each
-    // flow splits on its own, which is what keeps a designed page's
-    // side-by-side blocks apart.
-    let loose: Vec<&TextSpan> = ordered
-        .iter()
-        .zip(&assignment)
-        .filter(|(_, assigned)| assigned.is_none())
-        .flat_map(|(flow, _)| flow.iter().copied())
-        .collect();
     // The cheap pre-gate for the page pass: the final gate needs the
     // stream to alternate across the gutter at least twice, and flows that
-    // never alternate across even the loose text's midline cannot. This
-    // skips the page-wide line grouping on every ordinary page.
-    let alternates = {
-        let (x_min, x_max) = x_bounds(&loose);
+    // never alternate across even the text's midline cannot. Everything
+    // here derives from the per-flow extents, so an ordinary page pays no
+    // allocation and no page-wide grouping.
+    let alternates = ordered.len() > 1 && {
+        let (mut x_min, mut x_max) = (f32::MAX, f32::MIN);
+        for (extent, assigned) in raw_extents.iter().zip(&assignment) {
+            if assigned.is_none() {
+                x_min = x_min.min(extent.0);
+                x_max = x_max.max(extent.1);
+            }
+        }
         let mid = (x_min + x_max) / 2.0;
         let mut lanes = raw_extents
             .iter()
-            .filter_map(|(x0, x1)| {
+            .zip(&assignment)
+            .filter(|(_, assigned)| assigned.is_none())
+            .filter_map(|((x0, x1), _)| {
                 if *x1 <= mid {
                     Some(true)
                 } else if *x0 >= mid {
@@ -2387,7 +2384,23 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
         }
         switches >= 2
     };
-    let page_bands = (alternates && ordered.len() > 1 && loose.len() >= COLUMN_MIN_SPANS)
+    // The page's loose text, all of it at once: a page with a true gutter
+    // reads column-major across every flow — a report writing its columns
+    // as interleaved paragraphs still reads left column first — while
+    // stream order survives inside each lane. Without a page gutter each
+    // flow splits on its own, which is what keeps a designed page's
+    // side-by-side blocks apart.
+    let loose: Vec<&TextSpan> = if alternates {
+        ordered
+            .iter()
+            .zip(&assignment)
+            .filter(|(_, assigned)| assigned.is_none())
+            .flat_map(|(flow, _)| flow.iter().copied())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let page_bands = (alternates && loose.len() >= COLUMN_MIN_SPANS)
         .then(|| {
             let (x_min, x_max) = x_bounds(&loose);
             let width = x_max - x_min;
