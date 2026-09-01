@@ -118,6 +118,67 @@ async fn async_append_matches_sync_bytes() {
     assert_eq!(sync_bytes, async_bytes);
 }
 
+/// `start_offset`'s pad rule: an object header may not directly follow a
+/// base that does not already end on a line terminator, so a `\n` goes in
+/// first. `Writer::finish` never ends a file on one (bases end on
+/// `%%EOF`, per `writer::tests::table_mode_minimal_document_loads`), and
+/// popping one more byte off only trims that non-terminator further, so
+/// the base still needs the pad and still loads (`startxref` is found by
+/// its own keyword, not by scanning for `%%EOF`). The pad must land at the
+/// same offset, `base.len()`, whether the base is opened synchronously or
+/// asynchronously.
+#[tokio::test]
+async fn pad_byte_matches_sync_and_async_over_a_truncated_base() {
+    let mut base = classic_base_with_title("Old");
+    base.pop();
+    let path = temp_path("pad-rule");
+    std::fs::write(&path, &base).unwrap();
+
+    let sync_doc = Document::load(base.clone()).unwrap();
+    let mut sync_update = Update::new(&sync_doc).unwrap();
+    sync_update
+        .set_metadata(Metadata {
+            title: Some("Renamed".to_string()),
+            ..Metadata::default()
+        })
+        .unwrap();
+    let sync_bytes = sync_update.appended().unwrap();
+
+    let async_doc = AsyncDocument::open(&path).await.unwrap();
+    std::fs::remove_file(&path).ok();
+    let base_info = overlay_base(&async_doc).await.unwrap();
+    let info_ref = base_info.info;
+    let root = base_info.root;
+
+    let mut overlay = Overlay::new(base_info);
+    let existing_info = existing_info(&async_doc, info_ref).await;
+    let xmp_ref = catalog_metadata_ref(&async_doc, root).await;
+    set_metadata_with(
+        &mut overlay,
+        existing_info,
+        xmp_ref,
+        Metadata {
+            title: Some("Renamed".to_string()),
+            ..Metadata::default()
+        },
+    )
+    .unwrap();
+
+    let async_bytes = append_overlay(&async_doc, &overlay, Vec::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sync_bytes, async_bytes,
+        "sync and async agree on the padded, appended bytes over a truncated base"
+    );
+    assert_eq!(
+        sync_bytes[base.len()],
+        b'\n',
+        "the pad byte lands right after the truncated base, before the appended section"
+    );
+}
+
 /// A writer that shares its buffer through `Rc`, wrapped in `Immediate` so
 /// it satisfies `AsyncByteSink`: `append_overlay` only returns its sink
 /// argument on success, so a test that must inspect what reached the sink

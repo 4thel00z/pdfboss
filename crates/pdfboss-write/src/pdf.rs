@@ -189,7 +189,11 @@ fn take_required_digits(bytes: &[u8], pos: &mut usize, width: usize) -> Option<u
         return None;
     }
     *pos = end;
-    Some(digits.iter().fold(0u32, |acc, &d| acc * 10 + u32::from(d - b'0')))
+    Some(
+        digits
+            .iter()
+            .fold(0u32, |acc, &d| acc * 10 + u32::from(d - b'0')),
+    )
 }
 
 /// [`take_required_digits`], but a field with nothing left to read is

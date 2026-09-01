@@ -8,11 +8,10 @@ use pdfboss_write::{Metadata, Update};
 
 pub fn cmd_meta(file: &Path, out: &Path, set: &[String], password: &str) -> Result<(), String> {
     let meta = parse_assignments(set)?;
-    let doc = Document::open_with_password(file, password)
-        .map_err(|e| format!("parse: {e}"))?;
+    let doc = Document::open_with_password(file, password).map_err(|e| format!("parse: {e}"))?;
     let mut update = Update::new(&doc).map_err(|e| e.to_string())?;
     update.set_metadata(meta).map_err(|e| e.to_string())?;
-    update.save_appended(out).map_err(|e| format!("io: {e}"))
+    update.save_appended(out).map_err(|e| e.to_string())
 }
 
 fn parse_assignments(set: &[String]) -> Result<Metadata, String> {

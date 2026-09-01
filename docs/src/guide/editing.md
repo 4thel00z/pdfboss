@@ -6,6 +6,8 @@ An encrypted base is refused outright. `Update::new` checks the trailer for an `
 
 This chapter covers `meta`, the first editing verb. `merge`, `split`, `rotate`, `overlay` and `encrypt` follow in later PRs. Existing files can already be drawn on with [`watermark`](./creating.md#watermarking-an-existing-file), built on the same incremental-append machinery.
 
+When the catalog already names an XMP packet, `set_metadata` rebuilds it from the eight modeled `Metadata` fields alone: any other XMP property the original packet carried (a PDF/A identifier, a rights statement, edit history, a custom schema) is not carried into the new packet, though the original packet's bytes stay physically present in the base, superseded only by the appended section's newer entry for that object number.
+
 ## CLI
 
 `pdfboss meta` sets one or more `/Info` fields and writes the result as an appended update:
@@ -48,8 +50,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Calling `set_metadata` more than once on the same `Update` does not compound the way the Python binding's own staging does: each call merges its fields against the base document's own `/Info`, never against an earlier call's, so the later call wins outright and any field it leaves `None` falls back to the base's original value rather than what an earlier call set.
+
 `append_into` writes to any `impl Write` and `appended()` returns the bytes directly; both build the update section before a byte reaches the output, so a refused or failing update leaves nothing behind. `set`, `remove` and `reserve` on `Update` stage arbitrary objects into the same appended section for edits beyond metadata.
 
 ## Async
 
-`pdfboss-aio`'s `write` feature carries the same append over an `AsyncDocument`, without holding the whole base in memory: `overlay_base(&doc)` reads its trailer and newest cross-reference section into an `OverlayBase`, and `append_overlay(&doc, &overlay, sink)` streams the base's bytes through any `AsyncByteSink` in 64 KiB chunks, then writes the built section in one call. `Update` itself stays synchronous; `Overlay`, `OverlayBase`, `start_offset` and `set_metadata_with` are the pieces both sides are built from.
+`pdfboss-aio`'s `write` feature carries the same append over an `AsyncDocument`, without holding the whole base in memory: `overlay_base(&doc)` reads its trailer and newest cross-reference section into an `OverlayBase`, and `append_overlay(&doc, &overlay, sink)` streams the base's bytes through any `AsyncByteSink` in 64 KiB chunks, then writes the built section in one call. `Update` itself stays synchronous; `Overlay`, `OverlayBase` and `set_metadata_with` are the pieces both sides are built from, but not `start_offset`, since `append_overlay` reads the base's own last byte to compute its pad instead of calling it.

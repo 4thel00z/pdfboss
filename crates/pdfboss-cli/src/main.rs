@@ -343,7 +343,12 @@ fn main() {
     let result: Result<(), Failure> = match cli.command {
         Command::Create { command } => create::cmd_create(command).map_err(Failure::from),
         Command::Skill { command } => skill::cmd_skill(command).map_err(Failure::from),
-        Command::Meta { file, out, set, password } => meta::cmd_meta(&file, &out, &set, &password).map_err(Failure::from),
+        Command::Meta {
+            file,
+            out,
+            set,
+            password,
+        } => meta::cmd_meta(&file, &out, &set, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,

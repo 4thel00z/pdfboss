@@ -1,6 +1,6 @@
 ---
 name: pdfboss
-description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
+description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, editing or updating PDF metadata without rewriting the file, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
 ---
 
 # pdfboss
@@ -25,6 +25,7 @@ pdfboss text    doc.pdf --page 2            # omit --page for all pages
 pdfboss md      doc.pdf                     # Markdown: headings, lists, tables from layout, pages read in content order
 pdfboss render  doc.pdf --page 1 -o p.png --scale 2.0   # -o extension picks .png/.ppm/.bmp/.jpg; --jpeg-quality 1-100
 pdfboss images  doc.pdf -o out/             # embedded images as native-size PNGs
+pdfboss meta    doc.pdf -o out.pdf --set title=X --set author=Y   # /Info fields (repeatable --set): title, author, subject, keywords, creator, producer; appends an update, base bytes untouched
 pdfboss tui     doc.pdf                     # interactive terminal explorer
 ```
 
@@ -77,6 +78,11 @@ page = (
     | Paragraph("Body text.", rect=(72, 100, 451, 640))
 )
 data = (Pdf() | Metadata(title="Title") | page).to_bytes()
+
+# edit metadata on an existing file: appends an incremental update, base bytes untouched
+update = pdfboss.write.Update(doc)
+update.set_metadata(title="Q3 Report", author="Finance")   # kwarg per /Info field; repeated calls merge
+update.save_appended("out.pdf")                             # or update.to_bytes(); encrypted bases refused here
 
 # watermark an existing file: overlay's first page drawn over every page, as an
 # incremental update appended to the original bytes (rewrite=True writes a fresh, compressed file)

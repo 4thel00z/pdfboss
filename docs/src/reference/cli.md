@@ -292,6 +292,7 @@ pdfboss meta [OPTIONS] --out <OUT> --set <SET> <FILE>
 
 - `-o, --out <OUT>`: output file (required)
 - `--set <KEY=VALUE>`: metadata assignment, repeatable and required at least once; `KEY` is one of `title`, `author`, `subject`, `keywords`, `creator`, `producer`
+- `--password <PASSWORD>`: opens an encrypted input for reading; an encrypted base is still refused at write time, until encryption support arrives in a later PR
 
 ```bash
 pdfboss meta report.pdf -o report-titled.pdf --set title="Q3 Report" --set author="Finance"

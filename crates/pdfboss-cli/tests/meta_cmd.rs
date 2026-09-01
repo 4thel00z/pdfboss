@@ -129,11 +129,10 @@ fn meta_requires_set() {
     let input = common::fixture("hello.pdf");
     let out = tmp("meta-no-set.pdf");
 
-    let output = pdfboss(&[
-        "meta",
-        input.to_str().unwrap(),
-        "-o",
-        out.to_str().unwrap(),
-    ]);
-    assert_eq!(output.status.code(), Some(2), "expected usage error exit code 2");
+    let output = pdfboss(&["meta", input.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "expected usage error exit code 2"
+    );
 }
