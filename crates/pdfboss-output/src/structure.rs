@@ -1183,6 +1183,11 @@ const OPEN_RULED_MAX_HEIGHT: f32 = 20.0;
 /// low, because it applies only inside a region the rules already vouch
 /// for, and a boundary must additionally never be crossed by any line.
 const OPEN_RULED_COLUMN_GAP: f32 = 0.6;
+/// Pages with more free horizontal rules than this skip open-ruled
+/// detection outright: hundreds of stacked rules are graph paper or a
+/// form's writing lines, not tables, and the gap-splitting recursion runs
+/// one frame per rule in a cluster.
+const OPEN_RULED_MAX_RULES: usize = 256;
 
 /// Tables ruled only horizontally: stacked rules sharing one x-extent
 /// bracket text whose lines share column gaps. Most printed tables rule
@@ -1210,6 +1215,9 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
             })
         })
         .collect();
+    if horizontals.len() > OPEN_RULED_MAX_RULES {
+        return Vec::new();
+    }
     horizontals.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let mut grids: Vec<RuledGrid> = Vec::new();
@@ -3099,6 +3107,75 @@ pub(crate) mod tests {
     use super::*;
     use pdfboss_core::Document;
     use pdfboss_testkit::doc_with_graphics;
+
+    /// A synthetic span for driving the segmentation machinery directly,
+    /// where a content-stream fixture would be hostage to every upstream
+    /// heuristic at once.
+    fn span(text: &str, x: f32, end_x: f32, y: f32, size: f32) -> TextSpan {
+        TextSpan {
+            text: text.to_string(),
+            x,
+            y,
+            end_x,
+            size,
+            font: "F1".to_string(),
+            font_name: String::new(),
+            page: 0,
+            bbox: pdfboss_core::Rect {
+                x0: x,
+                y0: y - 2.0,
+                x1: end_x,
+                y1: y + 8.0,
+            },
+            bold: false,
+            italic: false,
+            monospace: false,
+            serif: false,
+            rise: 0.0,
+            vertical: false,
+            invisible: false,
+            color: None,
+            underline: false,
+            strikethrough: false,
+        }
+    }
+
+    /// A synthetic horizontal ruling.
+    fn hrule(y: f32, x0: f32, x1: f32) -> Ruling {
+        Ruling {
+            start: pdfboss_core::Point { x: x0, y },
+            end: pdfboss_core::Point { x: x1, y },
+            width: 0.5,
+        }
+    }
+
+    /// A page buried in stacked aligned rules — graph paper, a form's
+    /// writing lines — skips open-ruled detection outright: no cluster of
+    /// hundreds of rules is a table, and chewing through one costs a
+    /// recursion per rule.
+    #[test]
+    fn a_rule_stack_past_the_cap_skips_open_ruled_detection() {
+        let mut rulings: Vec<Ruling> = (0..597)
+            .map(|i| hrule(100.0 + 0.5 * i as f32, 70.0, 430.0))
+            .collect();
+        rulings.extend([
+            hrule(610.0, 70.0, 430.0),
+            hrule(688.0, 70.0, 430.0),
+            hrule(710.0, 70.0, 430.0),
+        ]);
+        let mut spans = vec![
+            span("Added cation", 72.0, 150.0, 700.0, 10.0),
+            span("Relative rates", 260.0, 340.0, 700.0, 10.0),
+        ];
+        for (row, y) in [676.0, 656.0, 636.0, 616.0].into_iter().enumerate() {
+            spans.push(span(&format!("K{row}+"), 72.0, 110.0, y, 10.0));
+            spans.push(span("slow", 260.0, 300.0, y, 10.0));
+        }
+        assert!(
+            open_ruled_grids(&spans, &rulings, &[]).is_empty(),
+            "a 600-rule stack is not table territory"
+        );
+    }
 
     /// Local prototyping rig, never run in CI: dumps per page the
     /// horizontal rulings, the detected lattice grids' boxes, and compact
