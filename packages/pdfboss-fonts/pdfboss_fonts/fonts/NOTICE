@@ -1,8 +1,14 @@
-This directory bundles the following font files, unmodified, from the
-Google Fonts OFL collection (google/fonts, ofl/{arimo,tinos,cousine}):
+This directory bundles the following font files, unmodified. The variable
+Arimo files, Tinos and Cousine come from the Google Fonts OFL collection
+(google/fonts, ofl/{arimo,tinos,cousine}); the two static Arimo bold
+instances come from the Arimo upstream repository (googlefonts/arimo,
+fonts/ttf, commit 4a6255f269916ae7ad3fc2706b0935e7621396b8), which does not
+publish them through google/fonts:
 
   - Arimo[wght].ttf
   - Arimo-Italic[wght].ttf
+  - Arimo-Bold.ttf
+  - Arimo-BoldItalic.ttf
     Arimo -- Copyright 2020 The Arimo Project Authors
     (https://github.com/googlefonts/arimo)
 

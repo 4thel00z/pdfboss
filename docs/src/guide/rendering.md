@@ -69,7 +69,7 @@ holds one file per face, looked up by these exact names:
 
 | Family | Files |
 |---|---|
-| Sans (Arimo) | `Arimo[wght].ttf`, `Arimo-Italic[wght].ttf` (weight rides the variable-font `[wght]` axis) |
+| Sans (Arimo) | `Arimo[wght].ttf`, `Arimo-Italic[wght].ttf` (variable files, rendered at their default instance), `Arimo-Bold.ttf`, `Arimo-BoldItalic.ttf` (static bold instances) |
 | Serif (Tinos) | `Tinos-Regular.ttf`, `Tinos-Bold.ttf`, `Tinos-Italic.ttf`, `Tinos-BoldItalic.ttf` |
 | Mono (Cousine) | `Cousine-Regular.ttf`, `Cousine-Bold.ttf`, `Cousine-Italic.ttf`, `Cousine-BoldItalic.ttf` |
 
