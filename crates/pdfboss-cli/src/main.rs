@@ -7,6 +7,7 @@ mod input;
 mod json;
 mod manifest;
 mod meta;
+mod pages;
 mod progress;
 mod q;
 mod skill;
