@@ -404,7 +404,9 @@ fn page_layout_with_stats(
     stats: &SizeStats,
     order: ReadingOrder,
 ) -> PageLayout {
-    let grids = ruled_grids(rulings);
+    let mut grids = ruled_grids(rulings);
+    grids.extend(open_ruled_grids(spans, rulings, &grids));
+    grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
     let mut blocks = Vec::new();
     let parts = match order {
         ReadingOrder::Content => segments_with_grids(spans, &grids),
@@ -975,6 +977,11 @@ struct RuledGrid {
     ys: Vec<f32>,
     /// Whether all four outer borders are drawn end to end.
     boxed: bool,
+    /// Whether the verticals are inferred from the text rather than drawn:
+    /// an open-ruled table's bands are coarse — often one rule under the
+    /// header and one closing rule — so its row inference runs on bands a
+    /// lattice's would consider too thin.
+    open: bool,
 }
 
 impl RuledGrid {
@@ -1068,6 +1075,214 @@ fn ruled_grids(rulings: &[Ruling]) -> Vec<RuledGrid> {
         .collect();
     grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
     grids
+}
+
+/// How closely two horizontal rules must agree at both ends to belong to
+/// one open-ruled table.
+const OPEN_RULED_ALIGN: f32 = 6.0;
+/// The top rule may sit at most this many median sizes above the first
+/// line, and the bottom rule at most [`OPEN_RULED_HUG_BOTTOM`] below the
+/// last: a table's rules hug its text, a page's header and footer rules do
+/// not.
+const OPEN_RULED_HUG_TOP: f32 = 1.5;
+const OPEN_RULED_HUG_BOTTOM: f32 = 1.0;
+/// A bracketed region taller than this many median sizes is a page stripe,
+/// not a table.
+const OPEN_RULED_MAX_HEIGHT: f32 = 20.0;
+/// A gap wider than this many sizes inside a line separates two columns —
+/// low, because it applies only inside a region the rules already vouch
+/// for, and a boundary must additionally never be crossed by any line.
+const OPEN_RULED_COLUMN_GAP: f32 = 0.6;
+
+/// Tables ruled only horizontally: stacked rules sharing one x-extent
+/// bracket text whose lines share column gaps. Most printed tables rule
+/// this way — a top rule, one under the header, a closing rule, no
+/// verticals — and the text's own gaps stand in for the verticals a
+/// lattice would have. The result is an ordinary [`RuledGrid`], so the
+/// claim, banding, and row inference downstream apply unchanged.
+///
+/// A cluster that fails the hug or height gates splits at its largest rule
+/// gap and each half tries again: two stacked tables share their x-extent,
+/// and only splitting tells them apart. Rules inside a drawn lattice are
+/// the lattice's own and never seed a cluster.
+fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid]) -> Vec<RuledGrid> {
+    let mut horizontals: Vec<(f32, f32, f32)> = rulings
+        .iter()
+        .filter(|r| (r.end.x - r.start.x).abs() >= (r.end.y - r.start.y).abs())
+        .map(|r| (r.start.y, r.start.x.min(r.end.x), r.start.x.max(r.end.x)))
+        .filter(|(y, x0, x1)| {
+            !taken.iter().any(|grid| {
+                let b = grid.bbox();
+                *x1 >= b.x0 - OPEN_RULED_ALIGN
+                    && *x0 <= b.x1 + OPEN_RULED_ALIGN
+                    && *y >= b.y0 - OPEN_RULED_ALIGN
+                    && *y <= b.y1 + OPEN_RULED_ALIGN
+            })
+        })
+        .collect();
+    horizontals.sort_by(|a, b| a.0.total_cmp(&b.0));
+
+    let mut grids: Vec<RuledGrid> = Vec::new();
+    let mut used = vec![false; horizontals.len()];
+    for seed in 0..horizontals.len() {
+        if used[seed] {
+            continue;
+        }
+        let (_, seed_x0, seed_x1) = horizontals[seed];
+        let cluster: Vec<usize> = (seed..horizontals.len())
+            .filter(|&i| {
+                !used[i]
+                    && (horizontals[i].1 - seed_x0).abs() <= OPEN_RULED_ALIGN
+                    && (horizontals[i].2 - seed_x1).abs() <= OPEN_RULED_ALIGN
+            })
+            .collect();
+        if cluster.len() < 2 {
+            continue;
+        }
+        for &i in &cluster {
+            used[i] = true;
+        }
+        let ys: Vec<f32> = cluster.iter().map(|&i| horizontals[i].0).collect();
+        open_ruled_split(spans, &ys, seed_x0, seed_x1, taken, &mut grids);
+    }
+    grids
+}
+
+/// One rule cluster as a table candidate, splitting at the largest rule
+/// gap when the gates reject it whole.
+fn open_ruled_split(
+    spans: &[TextSpan],
+    ys: &[f32],
+    x0: f32,
+    x1: f32,
+    taken: &[RuledGrid],
+    out: &mut Vec<RuledGrid>,
+) {
+    if ys.len() < 2 {
+        return;
+    }
+    if let Some(grid) = open_ruled_candidate(spans, ys, x0, x1, taken) {
+        out.push(grid);
+        return;
+    }
+    let widest = (1..ys.len())
+        .max_by(|&a, &b| (ys[a] - ys[a - 1]).total_cmp(&(ys[b] - ys[b - 1])))
+        .expect("two rules have a gap");
+    open_ruled_split(spans, &ys[..widest], x0, x1, taken, out);
+    open_ruled_split(spans, &ys[widest..], x0, x1, taken, out);
+}
+
+/// The gates and column inference for one bracketed region; `None` sends
+/// the cluster to the split.
+fn open_ruled_candidate(
+    spans: &[TextSpan],
+    ys: &[f32],
+    x0: f32,
+    x1: f32,
+    taken: &[RuledGrid],
+) -> Option<RuledGrid> {
+    let (y_lo, y_hi) = (ys[0], ys[ys.len() - 1]);
+    let region: Vec<&TextSpan> = spans
+        .iter()
+        .filter(|s| !s.text.trim().is_empty())
+        .filter(|s| s.y >= y_lo && s.y < y_hi)
+        .filter(|s| s.bbox.x1 >= x0 - OPEN_RULED_ALIGN && s.bbox.x0 <= x1 + OPEN_RULED_ALIGN)
+        .collect();
+    if region.is_empty() {
+        return None;
+    }
+    let mut sizes: Vec<f32> = region.iter().map(|s| s.size).collect();
+    sizes.sort_by(f32::total_cmp);
+    let median = sizes[sizes.len() / 2];
+    if (y_hi - y_lo) / median > OPEN_RULED_MAX_HEIGHT {
+        return None;
+    }
+    let mut by_y = region.clone();
+    by_y.sort_by(|a, b| b.y.total_cmp(&a.y));
+    let mut lines: Vec<Vec<&TextSpan>> = Vec::new();
+    for span in by_y {
+        match lines.last_mut() {
+            Some(line)
+                if (line[0].y - span.y).abs() <= 0.5 * line[0].size.max(span.size) =>
+            {
+                line.push(span)
+            }
+            _ => lines.push(vec![span]),
+        }
+    }
+    if lines.len() < 2 {
+        return None;
+    }
+    let top_line = lines[0][0].y;
+    let bottom_line = lines[lines.len() - 1][0].y;
+    if (y_hi - top_line) / median > OPEN_RULED_HUG_TOP
+        || (bottom_line - y_lo) / median > OPEN_RULED_HUG_BOTTOM
+    {
+        return None;
+    }
+    // Column boundaries: per-line gaps collected as intervals, overlapping
+    // intervals intersected into one boundary — every straddling line must
+    // agree on where the column break can be — and no line may cross it.
+    let mut gaps: Vec<(f32, f32)> = Vec::new();
+    for line in &lines {
+        let mut row: Vec<&&TextSpan> = line.iter().collect();
+        row.sort_by(|a, b| a.bbox.x0.total_cmp(&b.bbox.x0));
+        let mut cover = row[0].bbox.x1;
+        for span in &row[1..] {
+            if span.bbox.x0 - cover > OPEN_RULED_COLUMN_GAP * span.size {
+                gaps.push((cover, span.bbox.x0));
+            }
+            cover = cover.max(span.bbox.x1);
+        }
+    }
+    if gaps.is_empty() {
+        return None;
+    }
+    gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut boundaries: Vec<f32> = Vec::new();
+    let (mut lo, mut hi) = gaps[0];
+    for &(gap_lo, gap_hi) in &gaps[1..] {
+        if gap_lo < hi {
+            lo = lo.max(gap_lo);
+            hi = hi.min(gap_hi);
+            continue;
+        }
+        boundaries.push((lo + hi) / 2.0);
+        (lo, hi) = (gap_lo, gap_hi);
+    }
+    boundaries.push((lo + hi) / 2.0);
+    boundaries.retain(|mid| {
+        !lines
+            .iter()
+            .flatten()
+            .any(|s| s.bbox.x0 < *mid && *mid < s.bbox.x1)
+    });
+    if boundaries.is_empty() {
+        return None;
+    }
+    let text_lo = region.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min);
+    let text_hi = region.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max);
+    let mut xs = Vec::with_capacity(boundaries.len() + 2);
+    xs.push(x0.min(text_lo) - 1.0);
+    xs.extend(boundaries);
+    xs.push(x1.max(text_hi) + 1.0);
+    let grid = RuledGrid {
+        xs,
+        ys: ys.to_vec(),
+        boxed: false,
+        open: true,
+    };
+    // A candidate that reaches into a drawn lattice would steal its flows;
+    // the lattice was there first.
+    let own = grid.bbox();
+    let overlaps_taken = taken.iter().any(|other| {
+        let b = other.bbox();
+        own.x1 >= b.x0 && own.x0 <= b.x1 && own.y1 >= b.y0 && own.y0 <= b.y1
+    });
+    if overlaps_taken {
+        return None;
+    }
+    Some(grid)
 }
 
 /// Rulings on one axis as drawn lines: grouped by their constant coordinate
@@ -1175,7 +1390,12 @@ fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGr
     if ys.len() < RULED_GRID_MIN_HORIZONTALS {
         return None;
     }
-    Some(RuledGrid { xs, ys, boxed })
+    Some(RuledGrid {
+        xs,
+        ys,
+        boxed,
+        open: false,
+    })
 }
 
 /// The lines' positions, ascending, neighbours within
@@ -1265,7 +1485,8 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         for group in band {
             lines.push(table_row(group, &columns)?);
         }
-        if lines.len() >= BAND_INFER_MIN_LINES && 2 * lines.len() > hi - lo {
+        let infer_floor = if grid.open { 2 } else { BAND_INFER_MIN_LINES };
+        if lines.len() >= infer_floor && 2 * lines.len() > hi - lo {
             rows.append(&mut anchored_rows(lines, columns.len()));
             continue;
         }
@@ -1966,10 +2187,20 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
         let x1 = flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max);
         let y0 = flow.iter().map(|s| s.bbox.y0).fold(f32::MAX, f32::min);
         let y1 = flow.iter().map(|s| s.bbox.y1).fold(f32::MIN, f32::max);
-        grids.iter().position(|grid| {
-            let b = grid.bbox();
-            x1 >= b.x0 && x0 <= b.x1 && y1 >= b.y0 && y0 <= b.y1
-        })
+        // The grid sharing the most area with the flow, so a caption
+        // brushing one grid's edge cannot steal a flow whose body sits in
+        // another.
+        grids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, grid)| {
+                let b = grid.bbox();
+                let ox = x1.min(b.x1) - x0.max(b.x0);
+                let oy = y1.min(b.y1) - y0.max(b.y0);
+                (ox > 0.0 && oy > 0.0).then_some((index, ox * oy))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(index, _)| index)
     };
     let assignment: Vec<Option<usize>> = ordered.iter().map(|flow| grid_of(flow)).collect();
     let mut merged: Vec<Vec<&TextSpan>> = vec![Vec::new(); grids.len()];
@@ -2580,6 +2811,99 @@ pub(crate) mod tests {
     use pdfboss_core::Document;
     use pdfboss_testkit::doc_with_graphics;
 
+    /// Local prototyping rig, never run in CI: dumps per page the
+    /// horizontal rulings, the detected lattice grids' boxes, and compact
+    /// span records as JSONL, for offline table-detection work.
+    /// PDFBOSS_TABLE_DUMP_DIR names the PDF directory,
+    /// PDFBOSS_TABLE_DUMP_OUT the output file.
+    #[test]
+    #[ignore]
+    fn table_dump() {
+        use std::fmt::Write as _;
+        let dir = std::env::var("PDFBOSS_TABLE_DUMP_DIR").unwrap();
+        let out_path = std::env::var("PDFBOSS_TABLE_DUMP_OUT").unwrap();
+        let mut out = String::new();
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "pdf"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let Ok(doc) = Document::load(std::fs::read(&path).unwrap()) else {
+                continue;
+            };
+            let name = path.file_stem().unwrap().to_string_lossy().to_string();
+            for index in 0..doc.page_count() {
+                let Ok(page) = doc.page(index) else { continue };
+                let Ok((mut spans, rulings, _)) =
+                    pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page)
+                else {
+                    continue;
+                };
+                crate::retain_spans_on_page(&mut spans, &page);
+                let crop = page.crop_box;
+                let grids = ruled_grids(&rulings);
+                write!(
+                    out,
+                    "{{\"doc\":{:?},\"page\":{},\"crop\":[{},{},{},{}],\"grids\":[",
+                    name, index, crop.x0, crop.y0, crop.x1, crop.y1
+                )
+                .unwrap();
+                for (i, grid) in grids.iter().enumerate() {
+                    let b = grid.bbox();
+                    write!(
+                        out,
+                        "{}[{},{},{},{}]",
+                        if i > 0 { "," } else { "" },
+                        b.x0, b.y0, b.x1, b.y1
+                    )
+                    .unwrap();
+                }
+                out.push_str("],\"hrules\":[");
+                let mut first = true;
+                for r in &rulings {
+                    if (r.end.x - r.start.x).abs() < (r.end.y - r.start.y).abs() {
+                        continue;
+                    }
+                    write!(
+                        out,
+                        "{}[{},{},{}]",
+                        if first { "" } else { "," },
+                        r.start.y,
+                        r.start.x.min(r.end.x),
+                        r.start.x.max(r.end.x)
+                    )
+                    .unwrap();
+                    first = false;
+                }
+                out.push_str("],\"spans\":[");
+                for (i, s) in spans.iter().enumerate() {
+                    let head: String = s
+                        .text
+                        .chars()
+                        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+                        .take(12)
+                        .collect();
+                    write!(
+                        out,
+                        "{}[{},{},{},{},{},{:?}]",
+                        if i > 0 { "," } else { "" },
+                        s.bbox.x0,
+                        s.bbox.x1,
+                        s.y,
+                        s.size,
+                        usize::from(!s.text.trim().is_empty()),
+                        head
+                    )
+                    .unwrap();
+                }
+                out.push_str("]}\n");
+            }
+        }
+        std::fs::write(&out_path, out).unwrap();
+    }
+
     /// Local prototyping rig, never run in CI: prints one page's rulings
     /// and what the grid detector makes of them. PDFBOSS_PROBE_PDF names
     /// the file.
@@ -2602,6 +2926,11 @@ pub(crate) mod tests {
         println!("grids: {}", grids.len());
         for grid in &grids {
             println!("  xs {:?} ys {} boxed {}", grid.xs, grid.ys.len(), grid.boxed);
+        }
+        let open = open_ruled_grids(&spans, &rulings, &grids);
+        println!("open grids: {}", open.len());
+        for grid in &open {
+            println!("  xs {:?} ys {:?}", grid.xs, grid.ys);
         }
         for (index, segment) in segments_with_grids(&spans, &grids).into_iter().enumerate() {
             let groups = segment.into_groups();

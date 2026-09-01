@@ -812,6 +812,55 @@ mod tests {
         );
     }
 
+    /// A table ruled only horizontally — top rule, one under the header,
+    /// bottom rule, no verticals — with its columns readable from the text:
+    /// the open-ruled species most tables in print actually are.
+    #[test]
+    fn a_horizontally_ruled_table_becomes_a_table() {
+        let md = markdown_of_drawn(
+            "70 710 m 430 710 l S 70 688 m 430 688 l S 70 610 m 430 610 l S \
+             BT /F1 10 Tf 1 0 0 1 72 700 Tm (Added cation) Tj 1 0 0 1 260 700 Tm (Relative rates) Tj \
+             1 0 0 1 72 676 Tm (K+) Tj 1 0 0 1 260 676 Tm (slow) Tj \
+             1 0 0 1 72 656 Tm (Na+) Tj 1 0 0 1 260 656 Tm (medium) Tj \
+             1 0 0 1 72 636 Tm (Ca2+) Tj 1 0 0 1 260 636 Tm (fast) Tj \
+             1 0 0 1 72 616 Tm (Check) Tj 1 0 0 1 260 616 Tm (none) Tj ET",
+        );
+        assert!(
+            md.contains("| Added cation | Relative rates |"),
+            "the header row rows: {md:?}"
+        );
+        assert!(
+            md.contains("| K+ | slow |") && md.contains("| Check | none |"),
+            "body rows read as rows: {md:?}"
+        );
+    }
+
+    /// Two stacked open-ruled tables share their x-extent; the cluster
+    /// splits at the largest rule gap and each table comes out whole.
+    #[test]
+    fn stacked_open_ruled_tables_split_apart() {
+        let md = markdown_of_drawn(
+            "70 710 m 430 710 l S 70 688 m 430 688 l S 70 648 m 430 648 l S \
+             70 470 m 430 470 l S 70 448 m 430 448 l S 70 408 m 430 408 l S \
+             BT /F1 10 Tf 1 0 0 1 72 700 Tm (Name) Tj 1 0 0 1 260 700 Tm (Kind) Tj \
+             1 0 0 1 72 676 Tm (Pupfish) Tj 1 0 0 1 260 676 Tm (alvarezi) Tj \
+             1 0 0 1 72 656 Tm (Skiffia) Tj 1 0 0 1 260 656 Tm (francesae) Tj \
+             1 0 0 1 72 560 Tm (Prose between the two tables sits here) Tj \
+             1 0 0 1 72 460 Tm (Year) Tj 1 0 0 1 260 460 Tm (Event) Tj \
+             1 0 0 1 72 436 Tm (2019) Tj 1 0 0 1 260 436 Tm (survey) Tj \
+             1 0 0 1 72 416 Tm (2020) Tj 1 0 0 1 260 416 Tm (recovery) Tj ET",
+        );
+        assert!(
+            md.contains("| Name | Kind |") && md.contains("| Year | Event |"),
+            "both stacked tables detected: {md:?}"
+        );
+        assert!(
+            md.contains("Prose between the two tables sits here")
+                && !md.contains("| Prose"),
+            "the prose between them stays prose: {md:?}"
+        );
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
     #[test]
