@@ -14,7 +14,7 @@
 //! hands out faces bundled into the binary via `include_bytes!`, compiled
 //! in only behind the `substitute-fonts` Cargo feature (see
 //! [`crate::builtin_fonts_available`]) so the default build stays free of
-//! the ~4 MB of font data.
+//! the ~5 MB of font data.
 //!
 //! The bundled set is the OFL 1.1 Croscore family -- Arimo (sans), Tinos
 //! (serif) and Cousine (mono), metric-compatible substitutes for
@@ -25,15 +25,19 @@
 //! `hmtx`, behind only the PDF's own `/Widths` -- see `glyph.rs`'s
 //! `GlyphFont::advance` for the full three-tier order.
 //!
-//! v1 limitations, none of which are guessed around: `FaceRequest::
-//! from_font_dict` returns `None` for `/Symbol` and `/ZapfDingbats`, which
-//! have no license-clean substitute in the bundled set, so that text stays
+//! v1 limitation, not guessed around: `FaceRequest::from_font_dict`
+//! returns `None` for `/Symbol` and `/ZapfDingbats`, which have no
+//! license-clean substitute in the bundled set, so that text stays
 //! unpainted at every tier rather than borrowing an unrelated face's
-//! glyphs (it still advances, via `glyph.rs`'s metrics-only loader); and a
-//! "bold" *sans* request is not visually distinct from the regular weight,
-//! because Arimo ships only as a `[wght]` variable font and is rendered at
-//! its default (Regular) instance -- only italic varies, via a separate
-//! static face.
+//! glyphs (it still advances, via `glyph.rs`'s metrics-only loader).
+//!
+//! Sans faces are a mixed set for compatibility: regular and italic keep
+//! the original variable-font filenames (`Arimo[wght].ttf`,
+//! `Arimo-Italic[wght].ttf`, each rendered at its default instance), while
+//! bold and bold-italic map to static instances (`Arimo-Bold.ttf`,
+//! `Arimo-BoldItalic.ttf`) -- the variable files rendered at the default
+//! Regular weight cannot paint bold, and the filenames are the lookup key
+//! for [`DirProvider`] directories in the wild, so the existing two stay.
 
 use pdfboss_core::{AsyncObjectSource, Dict};
 
@@ -169,18 +173,18 @@ impl FaceRequest {
 
 /// The bundled-substitute filename for `req`: Arimo (sans), Tinos (serif) or
 /// Cousine (mono) -- the metric-compatible Liberation-family faces used as
-/// the standard substitute set. Sans only varies by italic (weight rides the
-/// variable-font axis, `[wght]`); serif and mono pick one of the four static
-/// styles.
+/// the standard substitute set. Serif and mono pick one of four static
+/// styles; sans keeps the variable-font filenames for regular and italic
+/// (rendered at the default instance) and picks static instances for the
+/// two bold styles.
 pub(crate) fn face_filename(req: &FaceRequest) -> &'static str {
     match req.family {
-        Family::Sans => {
-            if req.italic {
-                "Arimo-Italic[wght].ttf"
-            } else {
-                "Arimo[wght].ttf"
-            }
-        }
+        Family::Sans => match (req.bold, req.italic) {
+            (false, false) => "Arimo[wght].ttf",
+            (true, false) => "Arimo-Bold.ttf",
+            (false, true) => "Arimo-Italic[wght].ttf",
+            (true, true) => "Arimo-BoldItalic.ttf",
+        },
         Family::Serif => match (req.bold, req.italic) {
             (false, false) => "Tinos-Regular.ttf",
             (true, false) => "Tinos-Bold.ttf",
@@ -211,7 +215,7 @@ impl SubstituteProvider for DirProvider {
 /// Compiled-in substitute faces: the OFL Croscore set (Arimo/Tinos/Cousine,
 /// metric-compatible with Helvetica/Times/Courier) bundled via
 /// `include_bytes!` under `assets/fonts/`. Gated behind the `substitute-fonts`
-/// feature so the default build stays free of the ~4 MB of font data; see
+/// feature so the default build stays free of the ~5 MB of font data; see
 /// `assets/fonts/NOTICE` and `OFL.txt` for licensing.
 #[cfg(feature = "substitute-fonts")]
 pub(crate) struct BuiltinProvider;
@@ -221,7 +225,9 @@ impl SubstituteProvider for BuiltinProvider {
     fn face(&self, req: &FaceRequest) -> Option<Vec<u8>> {
         let bytes: &[u8] = match face_filename(req) {
             "Arimo[wght].ttf" => include_bytes!("../assets/fonts/Arimo[wght].ttf"),
+            "Arimo-Bold.ttf" => include_bytes!("../assets/fonts/Arimo-Bold.ttf"),
             "Arimo-Italic[wght].ttf" => include_bytes!("../assets/fonts/Arimo-Italic[wght].ttf"),
+            "Arimo-BoldItalic.ttf" => include_bytes!("../assets/fonts/Arimo-BoldItalic.ttf"),
             "Tinos-Regular.ttf" => include_bytes!("../assets/fonts/Tinos-Regular.ttf"),
             "Tinos-Bold.ttf" => include_bytes!("../assets/fonts/Tinos-Bold.ttf"),
             "Tinos-Italic.ttf" => include_bytes!("../assets/fonts/Tinos-Italic.ttf"),
@@ -371,14 +377,14 @@ mod tests {
     }
 
     #[test]
-    fn face_filename_sans_ignores_bold_varies_by_italic() {
+    fn face_filename_sans_every_style() {
         assert_eq!(
             face_filename(&req(Family::Sans, false, false)),
             "Arimo[wght].ttf"
         );
         assert_eq!(
             face_filename(&req(Family::Sans, true, false)),
-            "Arimo[wght].ttf"
+            "Arimo-Bold.ttf"
         );
         assert_eq!(
             face_filename(&req(Family::Sans, false, true)),
@@ -386,7 +392,7 @@ mod tests {
         );
         assert_eq!(
             face_filename(&req(Family::Sans, true, true)),
-            "Arimo-Italic[wght].ttf"
+            "Arimo-BoldItalic.ttf"
         );
     }
 

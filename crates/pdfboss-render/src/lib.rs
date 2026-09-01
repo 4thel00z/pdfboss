@@ -16,13 +16,10 @@
 //! (`pdfboss_encoding::standard_14_width`) ahead of the substitute's own
 //! `hmtx`, behind only the PDF's own `/Widths`.
 //!
-//! v1 limitations: `/Symbol` and `/ZapfDingbats` have no license-clean
+//! v1 limitation: `/Symbol` and `/ZapfDingbats` have no license-clean
 //! substitute, so they stay unpainted at every tier rather than borrowing
 //! an unrelated face's glyphs (their text still advances, via the
-//! metrics-only loader in `crate::glyph`); and a "bold" *sans* substitute
-//! request is not visually distinct from regular weight (Arimo is a
-//! `[wght]` variable font, rendered at its Regular instance -- only italic
-//! varies, via a separate static face).
+//! metrics-only loader in `crate::glyph`).
 
 // The rasterizer modules are consumed by the content-stream executor; the
 // `dead_code` allowances below disappear once it is wired up.
