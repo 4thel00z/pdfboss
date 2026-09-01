@@ -2818,8 +2818,39 @@ fn split_at_gutter<'s>(
         .iter()
         .flat_map(|line| line.spans.iter().copied())
         .collect();
-    let (left, right): (Vec<&TextSpan>, Vec<&TextSpan>) =
-        body.iter().partition(|s| s.x.max(s.end_x) <= cut);
+    // Each line splits once at the cut and both halves keep their baseline
+    // identity, so the bands below carry prebuilt groups and no segment
+    // regroups its spans.
+    let mut left_groups: Vec<Group<'s>> = Vec::new();
+    let mut right_groups: Vec<Group<'s>> = Vec::new();
+    for line in &columns {
+        let (l, r): (Vec<&TextSpan>, Vec<&TextSpan>) = line
+            .spans
+            .iter()
+            .partition(|s| s.x.max(s.end_x) <= cut);
+        if !l.is_empty() {
+            left_groups.push(Group {
+                y: line.y,
+                size: line.size,
+                spans: l,
+            });
+        }
+        if !r.is_empty() {
+            right_groups.push(Group {
+                y: line.y,
+                size: line.size,
+                spans: r,
+            });
+        }
+    }
+    let left: Vec<&TextSpan> = left_groups
+        .iter()
+        .flat_map(|g| g.spans.iter().copied())
+        .collect();
+    let right: Vec<&TextSpan> = right_groups
+        .iter()
+        .flat_map(|g| g.spans.iter().copied())
+        .collect();
     // Two-column flow lives on portrait-shaped text blocks. A block wider
     // than it is tall is a slide or a table sheet, where a lone lane is a
     // cell boundary, not a gutter — unless it is a 2-up sheet: a gutter no
@@ -2858,7 +2889,7 @@ fn split_at_gutter<'s>(
     let mut out: Vec<Segment<'s>> = Vec::new();
     let mut top = f32::INFINITY;
     for &sep_y in &cuts {
-        push_band(&left, &right, top, sep_y, &mut out);
+        push_band(&left_groups, &right_groups, top, sep_y, &mut out);
         out.push(Segment::ungrouped(
             crossing
                 .iter()
@@ -2868,7 +2899,7 @@ fn split_at_gutter<'s>(
         ));
         top = sep_y;
     }
-    push_band(&left, &right, top, f32::NEG_INFINITY, &mut out);
+    push_band(&left_groups, &right_groups, top, f32::NEG_INFINITY, &mut out);
     Some((out, cut))
 }
 
@@ -2876,19 +2907,30 @@ fn split_at_gutter<'s>(
 /// left side first. A column half is prose: its one gutter lane belongs to
 /// the page, not to anything inside the column.
 fn push_band<'s>(
-    left: &[&'s TextSpan],
-    right: &[&'s TextSpan],
+    left: &[Group<'s>],
+    right: &[Group<'s>],
     top: f32,
     bottom: f32,
     out: &mut Vec<Segment<'s>>,
 ) {
     for side in [left, right] {
-        out.push(Segment::ungrouped(
-            side.iter()
-                .filter(|s| s.y <= top && s.y > bottom)
-                .copied()
-                .collect(),
-        ));
+        let groups: Vec<Group<'s>> = side
+            .iter()
+            .filter(|group| group.y <= top && group.y > bottom)
+            .map(|group| Group {
+                y: group.y,
+                size: group.size,
+                spans: group.spans.clone(),
+            })
+            .collect();
+        let spans: Vec<&TextSpan> = groups
+            .iter()
+            .flat_map(|group| group.spans.iter().copied())
+            .collect();
+        out.push(Segment {
+            spans,
+            groups: Some(groups),
+        });
     }
 }
 
