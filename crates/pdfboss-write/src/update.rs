@@ -318,31 +318,49 @@ pub struct OverlayBase {
 }
 
 impl OverlayBase {
-    /// Reads `doc`'s trailer and newest cross-reference section.
+    /// Reads `doc`'s trailer and newest cross-reference section: the
+    /// section's offset and kind come from `doc.xref().newest_section()`,
+    /// already recorded while core loaded the file, falling back to
+    /// re-deriving them from `startxref` and `parse_section_at` when the
+    /// document has none (a recovery-scan base refuses with
+    /// [`Error::MissingStartxref`] on this fallback path).
     pub fn from_document(doc: &Document) -> Result<OverlayBase> {
         let trailer = &doc.xref().trailer;
         if trailer.get("Encrypt").is_some() {
             return Err(Error::EncryptedBase);
         }
         let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
-        let prev = startxref(doc.bytes()).ok_or(Error::MissingStartxref)?;
-        let kind = match parse_section_at(doc.bytes(), prev)
-            .map_err(core_error)?
-            .kind
-        {
-            XrefKind::Table => XrefStyle::Table,
-            XrefKind::Stream => XrefStyle::Stream,
+        let (prev, kind) = match doc.xref().newest_section() {
+            Some(section) => (section.offset, xref_style(section.kind)),
+            None => {
+                let offset = startxref(doc.bytes()).ok_or(Error::MissingStartxref)?;
+                let kind = xref_style(
+                    parse_section_at(doc.bytes(), offset)
+                        .map_err(core_error)?
+                        .kind,
+                );
+                (offset as u64, kind)
+            }
         };
         let highest = doc.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
         let declared = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
         Ok(OverlayBase {
-            prev: prev as u64,
+            prev,
             kind,
             size: declared.max(highest + 1),
             root,
             info: trailer.get_ref("Info"),
             id: trailer.get("ID").cloned(),
         })
+    }
+}
+
+/// The [`XrefStyle`] an appended section should copy for a base whose
+/// newest section is `kind`.
+fn xref_style(kind: XrefKind) -> XrefStyle {
+    match kind {
+        XrefKind::Table => XrefStyle::Table,
+        XrefKind::Stream => XrefStyle::Stream,
     }
 }
 

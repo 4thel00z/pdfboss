@@ -22,18 +22,39 @@ pub enum XrefEntry {
     InStream { stream_num: u32, index: u32 },
 }
 
+/// A file's newest cross-reference section: its byte offset and kind, as
+/// the trailing `startxref` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewestSection {
+    /// Byte offset of the section within the file.
+    pub offset: u64,
+    /// Whether the section is a classic table or a cross-reference stream.
+    pub kind: XrefKind,
+}
+
 /// The merged cross-reference table plus the (merged) trailer dictionary.
 #[derive(Debug, Clone, Default)]
 pub struct Xref {
     map: FastMap<u32, XrefEntry>,
     /// Merged trailer dictionary; keys from newer sections win.
     pub trailer: Dict,
+    /// The file's newest cross-reference section, recorded by `load_chain`
+    /// at the section `startxref` names; `None` after a recovery scan.
+    newest: Option<NewestSection>,
 }
 
 impl Xref {
     /// Looks up the entry for object number `num`.
     pub fn get(&self, num: u32) -> Option<XrefEntry> {
         self.map.get(&num).copied()
+    }
+
+    /// The file's newest cross-reference section: its offset and kind, as
+    /// recorded while the section chain was walked. `None` when the file
+    /// was loaded by a whole-file recovery scan, which has no single
+    /// section to point to.
+    pub fn newest_section(&self) -> Option<NewestSection> {
+        self.newest
     }
 
     /// Inserts `entry` for `num` unless an entry is already present.
@@ -43,7 +64,7 @@ impl Xref {
 
     /// Merges an older section into this one. Entries already present win
     /// (sections are walked newest to oldest, first-seen wins); trailer
-    /// keys already present are kept.
+    /// keys and the newest-section record already present are kept.
     pub fn merge(&mut self, older: Xref) {
         for (num, entry) in older.map {
             self.map.entry(num).or_insert(entry);
@@ -52,6 +73,9 @@ impl Xref {
             if self.trailer.get(&key.0).is_none() {
                 self.trailer.insert(key.clone(), value.clone());
             }
+        }
+        if self.newest.is_none() {
+            self.newest = older.newest;
         }
     }
 
@@ -126,11 +150,19 @@ fn load_chain(data: &[u8], start: usize) -> Result<Xref> {
     let mut acc = Xref::default();
     let mut visited: FastSet<usize> = FastSet::default();
     let mut next = Some(start);
+    let mut first = true;
     while let Some(off) = next {
         if !visited.insert(off) {
             break;
         }
         let info = parse_section_at(data, off)?;
+        if first {
+            acc.newest = Some(NewestSection {
+                offset: off as u64,
+                kind: info.kind,
+            });
+            first = false;
+        }
         if let Some(xs) = info.xrefstm.and_then(|v| to_offset(v, data)) {
             if visited.insert(xs) {
                 // Lenient: a broken hybrid stream leaves the table alone.
@@ -855,6 +887,108 @@ mod tests {
             info.xref.trailer.get("Root")
         );
         assert!(tspan.end as usize <= data.len());
+    }
+
+    #[test]
+    fn newest_section_reports_table_offset_and_kind() {
+        let data = simple_doc("newest section");
+        let off = startxref(&data).unwrap() as u64;
+        let xref = load_xref(&data).unwrap();
+        assert_eq!(
+            xref.newest_section(),
+            Some(NewestSection {
+                offset: off,
+                kind: XrefKind::Table
+            })
+        );
+    }
+
+    #[test]
+    fn newest_section_reports_stream_offset_and_kind() {
+        let (dict, payload) = objstm_payload(&[
+            (1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            (2, "<< /Type /Pages /Kids [] /Count 0 >>"),
+        ]);
+        let mut b = PdfBuilder::new();
+        b.stream(5, &dict, &payload);
+        let data = b.build_xref_stream(1);
+        let off = startxref(&data).unwrap() as u64;
+        let xref = load_xref(&data).unwrap();
+        assert_eq!(
+            xref.newest_section(),
+            Some(NewestSection {
+                offset: off,
+                kind: XrefKind::Stream
+            })
+        );
+    }
+
+    #[test]
+    fn newest_section_hybrid_reports_table_at_table_offset() {
+        let data = pdfboss_testkit::hybrid_doc();
+        let off = startxref(&data).unwrap() as u64;
+        let xref = load_xref(&data).unwrap();
+        assert_eq!(
+            xref.newest_section(),
+            Some(NewestSection {
+                offset: off,
+                kind: XrefKind::Table
+            }),
+            "a hybrid base's newest section is its table, not the /XRefStm"
+        );
+    }
+
+    #[test]
+    fn newest_section_is_none_after_recovery_scan() {
+        let mut data = simple_doc("recovered");
+        corrupt_startxref(&mut data);
+        let xref = load_xref(&data).unwrap();
+        assert_eq!(xref.newest_section(), None);
+    }
+
+    #[test]
+    fn merge_keeps_the_newer_sides_newest_section() {
+        let mut newer = Xref {
+            newest: Some(NewestSection {
+                offset: 10,
+                kind: XrefKind::Stream,
+            }),
+            ..Xref::default()
+        };
+        let older = Xref {
+            newest: Some(NewestSection {
+                offset: 1,
+                kind: XrefKind::Table,
+            }),
+            ..Xref::default()
+        };
+        newer.merge(older);
+        assert_eq!(
+            newer.newest_section(),
+            Some(NewestSection {
+                offset: 10,
+                kind: XrefKind::Stream
+            }),
+            "first-write-wins, like trailer keys"
+        );
+
+        let mut newer_without = Xref::default();
+        let older_with = Xref {
+            newest: Some(NewestSection {
+                offset: 1,
+                kind: XrefKind::Table,
+            }),
+            ..Xref::default()
+        };
+        newer_without.merge(older_with);
+        assert_eq!(
+            newer_without.newest_section(),
+            Some(NewestSection {
+                offset: 1,
+                kind: XrefKind::Table
+            }),
+            "older's value adopted when the newer side has none"
+        );
     }
 
     #[test]
