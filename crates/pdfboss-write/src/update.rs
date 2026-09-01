@@ -25,7 +25,9 @@ const FORM_NAME: &str = "PdfbossWatermark";
 /// `options` instead of appending an update: every object the base's
 /// catalog reaches is copied over, uncompressed streams are compressed when
 /// `options.compress` is set, and unreachable objects and earlier sections
-/// are left behind, so the result is usually smaller than the base.
+/// are left behind, so the result is usually smaller than the base. Both
+/// `base` and `overlay` are refused when encrypted, through
+/// [`crate::importer::Importer::new`].
 pub fn watermark_with(
     base: &Document,
     overlay: &Document,
@@ -145,8 +147,10 @@ fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
 /// and each page's dictionary rewritten with that form in its resources
 /// and its content wrapped in `q … Q` before the form is drawn. Pages
 /// inlined directly into `/Kids`, having no object of their own, are left
-/// as they are. An encrypted base is refused: its new strings and streams
-/// would need encrypting too.
+/// as they are. An encrypted `base` is refused: its new strings and
+/// streams would need encrypting too. An encrypted `overlay` is refused
+/// as well: its decrypted content would otherwise copy across into the
+/// plain update section.
 pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
     let mut update = Update::new(base)?;
     let form = update.overlay.import_form(overlay)?;
@@ -425,8 +429,19 @@ impl Overlay {
     /// The overlay's first page as a form XObject in the base's object
     /// space: its media box as the form's bounding box, its decoded content
     /// as the form's stream, and its resource graph deep-copied and
-    /// renumbered.
+    /// renumbered. Refuses an encrypted `overlay`, for the same reason
+    /// [`crate::importer::Importer::new`] refuses an encrypted source:
+    /// copying its decrypted content across would silently strip its
+    /// protection.
     pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
+        if overlay
+            .xref()
+            .trailer
+            .get("Encrypt")
+            .is_some_and(|o| !o.is_null())
+        {
+            return Err(Error::EncryptedBase);
+        }
         let page = overlay.page(0).map_err(core_error)?;
         let content = page.content(overlay).map_err(core_error)?;
         let resources = self.import_object(overlay, &Object::Dict(page.resources.clone()))?;

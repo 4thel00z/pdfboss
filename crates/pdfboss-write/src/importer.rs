@@ -26,9 +26,11 @@ pub struct Importer<'w, 's> {
 
 impl<'w, 's> Importer<'w, 's> {
     /// Opens `source` for import into `writer`. Refuses an encrypted
-    /// source (ISO 32000 §7.6): its strings and streams are unreadable
-    /// without decryption, and copying them across verbatim would carry
-    /// the encrypted bytes into a document with no matching `/Encrypt`.
+    /// source: `Document::get` decrypts transparently, so copying from
+    /// an encrypted source would silently strip its protection into a
+    /// plain target with no `/Encrypt` of its own. pdfboss refuses that
+    /// silent downgrade; writing an encrypted target is a separate,
+    /// not yet implemented feature.
     pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
         if source
             .xref()
@@ -107,6 +109,11 @@ impl<'w, 's> Importer<'w, 's> {
     /// renumbering: the caller translates any source refs into it via
     /// `reference`/`copy` first, and may use refs of objects already
     /// in the writer directly.
+    ///
+    /// Must be called before `finish` drains `r`: once `r` is popped off
+    /// the pending queue and filled, a later `substitute` for it has no
+    /// effect. `page` cannot trigger this hazard: it only substitutes a
+    /// reference it has itself just queued for the first time.
     pub fn substitute(&mut self, r: ObjRef, body: Object) {
         self.substitutions.insert(r, body);
     }
@@ -146,11 +153,24 @@ impl<'w, 's> Importer<'w, 's> {
     /// (target-space): old `/Parent` replaced with `parent`, effective
     /// `/Resources` and `/MediaBox` materialized, `/Rotate` when non-zero,
     /// `/CropBox` when it differs from the media box. Returns the page's
-    /// new ref. Pages inlined into `/Kids` (no object of their own) get
-    /// a fresh object.
+    /// new ref. The source `/Parent` is dropped before translation, so
+    /// none of the source's page tree (siblings, ancestors) rides along
+    /// as unreachable objects in the target.
+    ///
+    /// ISO 32000 gives a page exactly one parent, so every call gets its
+    /// own page object: importing the same source index again (for a
+    /// second parent, or a repeat in an assembled document) never reuses
+    /// an earlier call's object, even though the resources and content
+    /// beneath keep deduping through this `Importer`'s map. The one
+    /// exception is the very first time a given indirect source page is
+    /// seen: that call keeps the page's source-graph identity (so an
+    /// `/Annots` `/P` back-reference elsewhere in the graph resolves to
+    /// this same object rather than a duplicate). Pages inlined into
+    /// `/Kids` (no object of their own) always get a fresh object.
     pub fn page(&mut self, index: usize, parent: ObjRef) -> Result<ObjRef> {
         let page = self.source.page(index).map_err(core_error)?;
         let mut dict = page.dict().clone();
+        dict.remove("Parent");
         dict.insert(name("Resources"), Object::Dict(page.resources.clone()));
         dict.insert(name("MediaBox"), rect_array(page.media_box));
         if page.rotate != 0 {
@@ -162,12 +182,12 @@ impl<'w, 's> Importer<'w, 's> {
         let mut translated = self.copy_dict(&dict)?;
         translated.insert(name("Parent"), Object::Ref(parent));
         let target = match page.object_ref() {
-            Some(r) => {
+            Some(r) if !self.map.contains_key(&r) => {
                 let target = self.reference(r);
                 self.substitute(r, Object::Dict(translated));
                 target
             }
-            None => {
+            _ => {
                 let target = self.writer.reserve();
                 self.writer.fill(target, Object::Dict(translated))?;
                 target
@@ -183,11 +203,49 @@ pub(crate) fn rect_array(rect: Rect) -> Object {
     Object::Array(
         [rect.x0, rect.y0, rect.x1, rect.y1]
             .iter()
-            .map(|v| Object::Real(f64::from(*v)))
+            .map(|v| Object::Real(widen(*v)))
             .collect(),
     )
 }
 
+/// `value` widened to `f64` through its own shortest round-trip decimal,
+/// rather than a raw bit widening: a plain `f64::from(f32)` keeps every
+/// bit of the `f32`'s binary value, which usually needs far more decimal
+/// digits to print than the `f32` itself means (`0.1_f32` widens to
+/// `0.10000000149011612`, not `0.1`). Formatting the `f32` first and
+/// reparsing produces the `f64` an `Object::Real` should hold: the one
+/// whose decimal digits match what the source number meant.
+fn widen(value: f32) -> f64 {
+    value
+        .to_string()
+        .parse()
+        .expect("a float's own Display output parses back as a float")
+}
+
 fn name(text: &str) -> Name {
     Name(text.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use pdfboss_core::Rect;
+
+    use super::*;
+    use crate::ser::serialize_object;
+
+    fn real_at(array: &Object, index: usize) -> String {
+        let Object::Array(items) = array else {
+            panic!("expected an array, got {array:?}");
+        };
+        let mut out = Vec::new();
+        serialize_object(&items[index], &mut out).expect("a real serializes");
+        String::from_utf8(out).expect("real syntax is ASCII")
+    }
+
+    #[test]
+    fn rect_array_keeps_the_f32_shortest_decimal() {
+        let rect = Rect::new(0.1, 0.0, 300.0, 400.0);
+        let array = rect_array(rect);
+        assert_eq!(real_at(&array, 0), "0.1");
+    }
 }

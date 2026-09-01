@@ -143,8 +143,7 @@ impl Writer {
         self.info = Some(info);
     }
 
-    /// Whether a stream filled through this writer without a filter of its
-    /// own is Flate-compressed, per [`WriteOptions::compress`].
+    /// The [`WriteOptions::compress`] value this writer was created with.
     pub fn compress(&self) -> bool {
         self.options.compress
     }
