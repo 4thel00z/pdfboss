@@ -1673,6 +1673,16 @@ fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize, open: bool) -> Vec<Vec<C
     if !lines.first().is_some_and(opens) {
         return vec![logical_row(lines, columns)];
     }
+    // In a band of top-aligned records, every line that draws in the
+    // anchor column opens one. An anchor line that is not a record — a
+    // group label filling only the anchor — says the band is not records
+    // at all, and it merges whole.
+    if lines
+        .iter()
+        .any(|line| populates(line, anchor) && !opens(line))
+    {
+        return vec![logical_row(lines, columns)];
+    }
     let mut rows = Vec::new();
     let mut group: Vec<Vec<Cell>> = Vec::new();
     for line in lines {
