@@ -16,6 +16,7 @@
 //! output. The crate never reads clocks or randomness — dates appear only
 //! when callers supply them.
 
+pub mod assemble;
 pub mod canvas;
 pub mod color;
 pub mod content;
@@ -31,6 +32,7 @@ pub mod update;
 pub mod writer;
 mod xmp;
 
+pub use assemble::merge_documents;
 pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
 pub use content::serialize_ops;

@@ -1,6 +1,7 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
+mod assemble;
 mod create;
 mod hexdump;
 mod input;
@@ -85,6 +86,18 @@ enum Command {
         #[arg(long = "set", value_name = "KEY=VALUE", required = true)]
         set: Vec<String>,
         /// Password for encrypted PDFs.
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Combine selected pages from several inputs into one fresh document.
+    Merge {
+        /// Inputs, each optionally FILE:RANGE (1-based, e.g. report.pdf:2-9).
+        #[arg(required = true)]
+        inputs: Vec<String>,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// One password tried for every encrypted input.
         #[arg(long, default_value = "")]
         password: String,
     },
@@ -350,6 +363,11 @@ fn main() {
             set,
             password,
         } => meta::cmd_meta(&file, &out, &set, &password).map_err(Failure::from),
+        Command::Merge {
+            inputs,
+            out,
+            password,
+        } => assemble::cmd_merge(&inputs, &out, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,
