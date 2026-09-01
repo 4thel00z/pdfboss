@@ -2,7 +2,7 @@
 //! an existing document, exercised directly rather than through
 //! `watermark`.
 
-use pdfboss_core::xref::{parse_section_at, startxref};
+use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, XrefKind};
 use pdfboss_write::{
     Error, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions, XrefStyle,
@@ -124,7 +124,12 @@ fn two_appends_chain() {
         "the first update's change is still visible"
     );
     assert_eq!(
-        reread.get(extra).unwrap().as_dict().unwrap().get_int("Second"),
+        reread
+            .get(extra)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_int("Second"),
         Some(2),
         "the second update's change is visible"
     );
@@ -135,9 +140,7 @@ fn two_appends_chain() {
         .prev
         .expect("the newest section chains to the first update") as usize;
     let info_b = parse_section_at(&twice, off_b).unwrap();
-    let off_c = info_b
-        .prev
-        .expect("the first update chains to the base") as usize;
+    let off_c = info_b.prev.expect("the first update chains to the base") as usize;
     let info_c = parse_section_at(&twice, off_c).unwrap();
     assert!(
         info_c.prev.is_none(),
@@ -196,7 +199,12 @@ fn set_past_base_size_advances_next_on_stream_style() {
 
     let reread = Document::load(out.clone()).unwrap();
     assert_eq!(
-        reread.get(far).unwrap().as_dict().unwrap().get_int("Marker"),
+        reread
+            .get(far)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_int("Marker"),
         Some(11),
         "the object set well past the base's size resolves"
     );
@@ -283,4 +291,175 @@ fn append_is_deterministic() {
     let b = update_b.appended().unwrap();
 
     assert_eq!(a, b);
+}
+
+/// `remove` marks the number free in both xref styles: a reader must not
+/// resolve it after reload. The marker is added by a first update (so it
+/// exists in the base but nothing else references it) and freed by a
+/// second, with two updates chained just as `two_appends_chain` does.
+#[test]
+fn removed_object_is_gone_after_reload_classic() {
+    let base = classic_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.appended().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    update2.remove(marker);
+    let out = update2.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    assert!(matches!(
+        reread.get(marker),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
+}
+
+#[test]
+fn removed_object_is_gone_after_reload_stream() {
+    let base = stream_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.appended().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    update2.remove(marker);
+    let out = update2.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    assert!(matches!(
+        reread.get(marker),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
+}
+
+/// The classic table's free chain always starts at entry 0: its row names
+/// the lowest freed number as the chain's head, so a reader following the
+/// chain from object 0 lands on the freed object first.
+#[test]
+fn free_chain_starts_at_entry_zero() {
+    let base = classic_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.appended().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    update2.remove(marker);
+    let out = update2.appended().unwrap();
+
+    let off = startxref(&out).unwrap();
+    let info = parse_section_at(&out, off).unwrap();
+    assert_eq!(
+        info.xref.get(marker.num),
+        Some(XrefEntry::Free),
+        "the freed number's own entry reads back as free"
+    );
+
+    let text = String::from_utf8_lossy(&out);
+    let head_row = format!("{:010} 65535 f \n", marker.num);
+    assert!(
+        text.contains(&head_row),
+        "the entry-0 subsection row names the freed number as the chain's head: {text}"
+    );
+}
+
+/// The base's own `/ID` half is copied verbatim into the appended trailer;
+/// the second half is replaced, not copied, so it differs from the base's.
+#[test]
+fn id_first_half_survives_second_rotates() {
+    let base = classic_base();
+    let doc = Document::load(base).unwrap();
+    let base_id = doc
+        .xref()
+        .trailer
+        .get_array("ID")
+        .expect("the base carries an /ID array")
+        .to_vec();
+    let base_first = base_id[0]
+        .as_str_bytes()
+        .expect("the first half is a string")
+        .to_vec();
+    let base_second = base_id[1]
+        .as_str_bytes()
+        .expect("the second half is a string")
+        .to_vec();
+
+    let mut update = Update::new(&doc).unwrap();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update.set(ObjRef { num: 1, gen: 0 }, Object::Dict(dict));
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    let id = reread
+        .xref()
+        .trailer
+        .get_array("ID")
+        .expect("the appended trailer carries an /ID array");
+    let first = id[0].as_str_bytes().expect("the first half is a string");
+    let second = id[1].as_str_bytes().expect("the second half is a string");
+    assert_eq!(
+        first,
+        base_first.as_slice(),
+        "the first half survives untouched"
+    );
+    assert_ne!(second, base_second.as_slice(), "the second half rotates");
+}
+
+/// `/Index` groups sorted rows into maximal contiguous runs rather than one
+/// pair per object: objects 1-3 form one run, an isolated replacement and
+/// the xref stream's own row each stay isolated. The assertion inspects the
+/// section bytes directly, since resolving all four objects after reload
+/// would pass even without coalescing.
+#[test]
+fn index_pairs_coalesce_runs() {
+    let base = stream_base();
+    let doc = Document::load(base).unwrap();
+    let base_size = OverlayBase::from_document(&doc).unwrap().size;
+    let mut update = Update::new(&doc).unwrap();
+    for num in [1u32, 2, 3, 6] {
+        let mut dict = Dict::new();
+        dict.insert(Name("Marker".into()), Object::Int(i64::from(num)));
+        update.set(ObjRef { num, gen: 0 }, Object::Dict(dict));
+    }
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out.clone()).unwrap();
+    for num in [1u32, 2, 3, 6] {
+        assert!(
+            reread.get(ObjRef { num, gen: 0 }).is_ok(),
+            "object {num} resolves after reload"
+        );
+    }
+
+    let off = startxref(&out).unwrap();
+    let section = &out[off..];
+    let text = String::from_utf8_lossy(section);
+    let index_at = text.find("/Index").expect("the xref stream names /Index");
+    let array_start = text[index_at..].find('[').unwrap() + index_at;
+    let array_end = text[array_start..].find(']').unwrap() + array_start;
+    let numbers: Vec<i64> = text[array_start + 1..array_end]
+        .split_whitespace()
+        .map(|n| n.parse().unwrap())
+        .collect();
+    assert_eq!(
+        numbers,
+        vec![1, 3, 6, 1, i64::from(base_size), 1],
+        "the run 1..4 coalesces into one pair; 6 and the xref stream's own row stay isolated"
+    );
 }

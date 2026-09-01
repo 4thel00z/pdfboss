@@ -7,6 +7,7 @@ use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use pdfboss_core::crypt::Sha256;
 use pdfboss_core::xref::{parse_section_at, startxref};
 use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
 
@@ -343,13 +344,21 @@ impl OverlayBase {
     }
 }
 
+/// One recorded change against an object number: a new or replacement body
+/// from [`Overlay::set`], or a free marker from [`Overlay::remove`].
+#[derive(Debug, Clone)]
+enum Change {
+    Set(Object),
+    Free,
+}
+
 /// An update section under construction over an [`OverlayBase`]: which
 /// objects it holds, new ones numbered from the base's first free number.
 #[derive(Debug, Clone)]
 pub struct Overlay {
     base: OverlayBase,
     next: u32,
-    objects: Vec<(ObjRef, Object)>,
+    objects: Vec<(ObjRef, Change)>,
     imported: FastMap<ObjRef, ObjRef>,
     info: Option<ObjRef>,
 }
@@ -374,7 +383,19 @@ impl Overlay {
     /// collides with a caller-chosen number.
     pub fn set(&mut self, r: ObjRef, obj: Object) {
         self.next = self.next.max(r.num.saturating_add(1));
-        self.objects.push((r, obj));
+        self.objects.push((r, Change::Set(obj)));
+    }
+
+    /// Marks `r` free: the appended section's cross-reference data chains
+    /// it into entry 0's free list, in whichever style the base uses. Its
+    /// generation for reuse is `r.gen` advanced by one (saturating at
+    /// 65535, the field's own limit), per the classic table's convention
+    /// for a deleted entry's row.
+    pub fn remove(&mut self, r: ObjRef) {
+        self.next = self.next.max(r.num.saturating_add(1));
+        let gen = r.gen.saturating_add(1);
+        self.objects
+            .push((ObjRef { num: r.num, gen }, Change::Free));
     }
 
     /// Allocates the next free object number without storing anything
@@ -401,7 +422,7 @@ impl Overlay {
         self.info = Some(r);
     }
 
-    /// Whether no object has been set yet.
+    /// Whether nothing has been set or removed yet.
     pub fn is_empty(&self) -> bool {
         self.objects.is_empty()
     }
@@ -414,21 +435,46 @@ impl Overlay {
         if self.is_empty() {
             return Err(Error::EmptyUpdate);
         }
-        let mut objects = self.objects.clone();
-        objects.sort_by_key(|(r, _)| r.num);
+        let mut changes = self.objects.clone();
+        changes.sort_by_key(|(r, _)| r.num);
         let mut out = Vec::new();
-        let mut rows: Vec<(ObjRef, usize)> = Vec::with_capacity(objects.len() + 1);
-        for (r, obj) in &objects {
-            rows.push((*r, start as usize + out.len()));
-            write_indirect(&mut out, *r, obj)?;
+        let mut rows: Vec<Row> = Vec::with_capacity(changes.len() + 1);
+        let mut freed: Vec<ObjRef> = Vec::new();
+        for (r, change) in &changes {
+            match change {
+                Change::Set(obj) => {
+                    rows.push(Row::InFile(*r, start as usize + out.len()));
+                    write_indirect(&mut out, *r, obj)?;
+                }
+                Change::Free => freed.push(*r),
+            }
         }
+        if !freed.is_empty() {
+            freed.sort_by_key(|r| r.num);
+            let head = freed.first().map_or(0, |r| r.num);
+            rows.push(Row::Free {
+                num: 0,
+                gen: 65535,
+                next: head,
+            });
+            for (index, r) in freed.iter().enumerate() {
+                let next = freed.get(index + 1).map_or(0, |n| n.num);
+                rows.push(Row::Free {
+                    num: r.num,
+                    gen: r.gen,
+                    next,
+                });
+            }
+        }
+        rows.sort_by_key(Row::num);
+
         let mut trailer = Dict::new();
         trailer.insert(name("Root"), Object::Ref(self.base.root));
         if let Some(info) = self.info.or(self.base.info) {
             trailer.insert(name("Info"), Object::Ref(info));
         }
-        if let Some(id) = &self.base.id {
-            trailer.insert(name("ID"), id.clone());
+        if let Some(id) = rotated_id(&self.base, &out) {
+            trailer.insert(name("ID"), id);
         }
         trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
         match self.base.kind {
@@ -482,7 +528,7 @@ impl Overlay {
                 self.imported.insert(*r, copied);
                 let body = source.get(*r).map_err(core_error)?;
                 let body = self.import_object(source, &body)?;
-                self.objects.push((copied, body));
+                self.objects.push((copied, Change::Set(body)));
                 Object::Ref(copied)
             }
             Object::Dict(d) => Object::Dict(self.import_dict(source, d)?),
@@ -545,6 +591,11 @@ impl<'a> Update<'a> {
         self.overlay.set(r, obj);
     }
 
+    /// Marks `r` free in the appended section's cross-reference data.
+    pub fn remove(&mut self, r: ObjRef) {
+        self.overlay.remove(r);
+    }
+
     /// Allocates the next free object number without storing anything
     /// under it yet.
     pub fn reserve(&mut self) -> ObjRef {
@@ -603,27 +654,105 @@ impl<'a> Update<'a> {
     }
 }
 
-/// A cross-reference stream as the section's last object, rows for every
-/// object of the update and for the stream itself.
+/// One row of the appended section's cross-reference data: an object
+/// stored at a byte offset, or a freed number chained to the next free
+/// number in the section's own free list (entry 0 when it is the head).
+#[derive(Debug, Clone, Copy)]
+enum Row {
+    InFile(ObjRef, usize),
+    Free { num: u32, gen: u16, next: u32 },
+}
+
+impl Row {
+    fn num(&self) -> u32 {
+        match self {
+            Row::InFile(r, _) => r.num,
+            Row::Free { num, .. } => *num,
+        }
+    }
+}
+
+/// Splits `rows`, already sorted ascending by object number, into maximal
+/// runs of consecutive numbers, as `(run start index, run length)` pairs.
+/// Shared by the classic table's subsections and the xref stream's
+/// `/Index` pairs, so both group the same way.
+fn contiguous_runs(rows: &[Row]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut begin = 0;
+    while begin < rows.len() {
+        let mut end = begin + 1;
+        while end < rows.len() && rows[end].num() == rows[end - 1].num() + 1 {
+            end += 1;
+        }
+        runs.push((begin, end - begin));
+        begin = end;
+    }
+    runs
+}
+
+/// The appended trailer's `/ID`: the base's first half kept verbatim, the
+/// second half replaced by the first 16 bytes of a SHA-256 over the first
+/// half's bytes, the base's `/Prev` offset as little-endian bytes, and
+/// `body` (the section's serialized objects, built before its xref part).
+/// `None` when the base carries no `/ID` array with a string first
+/// element, in which case the appended trailer omits the key entirely.
+fn rotated_id(base: &OverlayBase, body: &[u8]) -> Option<Object> {
+    let Some(Object::Array(halves)) = &base.id else {
+        return None;
+    };
+    let Some(Object::String(first)) = halves.first() else {
+        return None;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(first);
+    hasher.update(&base.prev.to_le_bytes());
+    hasher.update(body);
+    let digest = hasher.finalize();
+    Some(Object::Array(vec![
+        Object::String(first.clone()),
+        Object::String(digest[..16].to_vec()),
+    ]))
+}
+
+/// A cross-reference stream as the section's last object: one row per
+/// object of the update (or per freed number) plus one for the stream
+/// itself, and `/Index` pairs one per contiguous run of object numbers.
 fn finish_stream(
     out: &mut Vec<u8>,
     start: u64,
-    mut rows: Vec<(ObjRef, usize)>,
+    mut rows: Vec<Row>,
     mut dict: Dict,
     mut next: u32,
 ) -> Result<()> {
     let xref_ref = ObjRef { num: next, gen: 0 };
     next += 1;
     let xref_offset = start as usize + out.len();
-    rows.push((xref_ref, xref_offset));
-    let mut index = Vec::with_capacity(rows.len() * 2);
+    rows.push(Row::InFile(xref_ref, xref_offset));
+    rows.sort_by_key(Row::num);
+    let runs = contiguous_runs(&rows);
+    let mut index = Vec::with_capacity(runs.len() * 2);
+    for (begin, len) in runs {
+        index.push(Object::Int(i64::from(rows[begin].num())));
+        index.push(Object::Int(len as i64));
+    }
     let mut data = Vec::with_capacity(rows.len() * 7);
-    for (r, offset) in &rows {
-        index.push(Object::Int(i64::from(r.num)));
-        index.push(Object::Int(1));
-        data.push(1);
-        data.extend_from_slice(&field_offset(*offset)?.to_be_bytes());
-        data.extend_from_slice(&r.gen.to_be_bytes());
+    for row in &rows {
+        match row {
+            Row::InFile(r, offset) => {
+                data.push(1);
+                data.extend_from_slice(&field_offset(*offset)?.to_be_bytes());
+                data.extend_from_slice(&r.gen.to_be_bytes());
+            }
+            Row::Free {
+                gen,
+                next: free_next,
+                ..
+            } => {
+                data.push(0);
+                data.extend_from_slice(&free_next.to_be_bytes());
+                data.extend_from_slice(&gen.to_be_bytes());
+            }
+        }
     }
     dict.insert(name("Type"), Object::Name(name("XRef")));
     dict.insert(name("Size"), Object::Int(i64::from(next)));
@@ -638,29 +767,30 @@ fn finish_stream(
 }
 
 /// A classic `xref` table with one subsection per run of consecutive
-/// object numbers, then the `trailer` dictionary.
+/// object numbers, then the `trailer` dictionary. A freed row uses `f` in
+/// place of `n`, its first field naming the next free number in the
+/// section's own chain rather than a byte offset.
 fn finish_table(
     out: &mut Vec<u8>,
     start: u64,
-    rows: &[(ObjRef, usize)],
+    rows: &[Row],
     mut dict: Dict,
     size: u32,
 ) -> Result<()> {
     let xref_offset = start as usize + out.len();
     out.extend_from_slice(b"xref\n");
-    let mut begin = 0;
-    while begin < rows.len() {
-        let mut end = begin + 1;
-        while end < rows.len() && rows[end].0.num == rows[end - 1].0.num + 1 {
-            end += 1;
+    for (begin, len) in contiguous_runs(rows) {
+        out.extend_from_slice(format!("{} {}\n", rows[begin].num(), len).as_bytes());
+        for row in &rows[begin..begin + len] {
+            match row {
+                Row::InFile(r, offset) => out.extend_from_slice(
+                    format!("{:010} {:05} n \n", table_offset(*offset)?, r.gen).as_bytes(),
+                ),
+                Row::Free { gen, next, .. } => {
+                    out.extend_from_slice(format!("{next:010} {gen:05} f \n").as_bytes())
+                }
+            }
         }
-        out.extend_from_slice(format!("{} {}\n", rows[begin].0.num, end - begin).as_bytes());
-        for (r, offset) in &rows[begin..end] {
-            out.extend_from_slice(
-                format!("{:010} {:05} n \n", table_offset(*offset)?, r.gen).as_bytes(),
-            );
-        }
-        begin = end;
     }
     dict.insert(name("Size"), Object::Int(i64::from(size)));
     out.extend_from_slice(b"trailer\n");
