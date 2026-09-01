@@ -1487,12 +1487,14 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         }
         let infer_floor = if grid.open { 2 } else { BAND_INFER_MIN_LINES };
         if lines.len() >= infer_floor && 2 * lines.len() > hi - lo {
-            rows.append(&mut anchored_rows(lines, columns.len()));
+            rows.append(&mut anchored_rows(lines, columns.len(), grid.open));
             continue;
         }
         rows.push(logical_row(lines, columns.len()));
     }
-    if rows.len() < TABLE_MIN_ROWS && !(grid.boxed && rows.len() >= RULED_BOXED_MIN_ROWS) {
+    if rows.len() < TABLE_MIN_ROWS
+        && !((grid.boxed || grid.open) && rows.len() >= RULED_BOXED_MIN_ROWS)
+    {
         return None;
     }
     Some(GridClaim {
@@ -1542,15 +1544,20 @@ fn open_columns(groups: &[Group], grid: &RuledGrid) -> Vec<std::ops::Range<f32>>
 /// center their cells vertically, or it is one wrapped record whose long
 /// first column touches every line. There the anchor says nothing, and the
 /// band merges whole, exactly as a wrapped row always has.
-fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize) -> Vec<Vec<Cell>> {
+fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize, open: bool) -> Vec<Vec<Cell>> {
     let Some(anchor) =
         (0..columns).find(|column| lines.iter().any(|line| populates(line, *column)))
     else {
         return vec![logical_row(lines, columns)];
     };
+    // An open-ruled table's lines are its rows: a fill-in table populates
+    // only its first column, and each such line still opens a record. A
+    // lattice keeps the two-cell demand, which is what stops a wrapped
+    // first column splitting into a row per line.
+    let cells_to_open = if open { 1 } else { TABLE_MIN_ROW_CELLS };
     let opens = |line: &Vec<Cell>| {
         populates(line, anchor)
-            && line.iter().filter(|cell| cell.line.is_some()).count() >= TABLE_MIN_ROW_CELLS
+            && line.iter().filter(|cell| cell.line.is_some()).count() >= cells_to_open
     };
     if !lines.first().is_some_and(opens) {
         return vec![logical_row(lines, columns)];
