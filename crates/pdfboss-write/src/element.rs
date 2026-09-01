@@ -142,6 +142,8 @@ pub struct Paragraph {
     pub leading: Option<f32>,
     /// Horizontal alignment within the rect.
     pub align: ParagraphAlign,
+    /// Fill color.
+    pub color: Color,
 }
 
 impl Default for Paragraph {
@@ -153,6 +155,7 @@ impl Default for Paragraph {
             size: 11.0,
             leading: None,
             align: ParagraphAlign::Left,
+            color: Color::BLACK,
         }
     }
 }
@@ -211,6 +214,7 @@ fn lines_that_fit(y0: f32, y1: f32, size: f32, leading: f32) -> usize {
 /// the very end.
 impl Draw for Paragraph {
     fn draw(&self, canvas: &mut Canvas) -> Result<()> {
+        canvas.set_fill(self.color);
         let [x0, y0, x1, y1] = self.rect;
         let width = x1 - x0;
         let leading = self.leading.unwrap_or(1.2 * self.size);
@@ -511,6 +515,21 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_sets_its_own_fill() {
+        let mut canvas = Canvas::new();
+        let paragraph = Paragraph {
+            text: "hi".into(),
+            rect: [0.0, 0.0, 100.0, 100.0],
+            font: Standard14::Helvetica,
+            size: 10.0,
+            color: Color::Rgb(0.0, 0.5, 0.0),
+            ..Paragraph::default()
+        };
+        paragraph.draw(&mut canvas).unwrap();
+        assert!(matches!(canvas.ops()[0], Op::SetFillRGB(0.0, 0.5, 0.0)));
+    }
+
+    #[test]
     fn paragraph_wraps_at_word_boundaries_courier_metrics() {
         let mut canvas = Canvas::new();
         let mut links = Vec::new();
@@ -525,6 +544,7 @@ mod tests {
         assert_eq!(
             canvas.ops(),
             [
+                Op::SetFillGray(0.0),
                 Op::BeginText,
                 Op::SetFont(Name("F1".into()), 10.0),
                 Op::TextMove(0.0, 90.0),
@@ -575,6 +595,7 @@ mod tests {
         assert_eq!(
             canvas.ops(),
             [
+                Op::SetFillGray(0.0),
                 Op::SetWordSpacing(30.0),
                 Op::BeginText,
                 Op::SetFont(Name("F1".into()), 10.0),
@@ -619,6 +640,7 @@ mod tests {
         };
         lower(vec![paragraph.into()], &mut canvas, &mut links).unwrap();
         let expected = [
+            Op::SetFillGray(0.0),
             Op::SetWordSpacing(30.0),
             Op::BeginText,
             Op::SetFont(Name("F1".into()), 10.0),
@@ -683,6 +705,7 @@ mod tests {
         assert_eq!(
             canvas.ops(),
             [
+                Op::SetFillGray(0.0),
                 Op::SetWordSpacing(30.0),
                 Op::BeginText,
                 Op::SetFont(Name("F1".into()), 10.0),
@@ -762,7 +785,7 @@ mod tests {
             &mut links,
         )
         .unwrap();
-        assert_eq!(center_canvas.ops()[2], Op::TextMove(33.0, 40.0));
+        assert_eq!(center_canvas.ops()[3], Op::TextMove(33.0, 40.0));
 
         let mut right_canvas = Canvas::new();
         lower(
@@ -775,7 +798,7 @@ mod tests {
             &mut links,
         )
         .unwrap();
-        assert_eq!(right_canvas.ops()[2], Op::TextMove(66.0, 40.0));
+        assert_eq!(right_canvas.ops()[3], Op::TextMove(66.0, 40.0));
     }
 
     #[test]

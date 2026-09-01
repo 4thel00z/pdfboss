@@ -760,10 +760,13 @@ class write:
             size: float = 11.0,
             leading: float | None = None,
             align: Literal["left", "center", "right", "justify"] = "left",
+            color: tuple[float, float, float] | None = None,
         ) -> None:
             """``leading`` defaults to a size-derived line height. Raises
             ``TypeError`` for an unknown ``align``, and ``PdfError`` at
-            lowering time if the wrapped text overflows ``rect``."""
+            lowering time if the wrapped text overflows ``rect``.
+            ``color`` is an ``(r, g, b)`` tuple in ``[0, 1]``, defaulting
+            to black."""
 
     class Metadata:
         """Document information written to the ``/Info`` dictionary. Dates

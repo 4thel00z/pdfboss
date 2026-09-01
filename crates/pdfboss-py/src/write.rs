@@ -310,12 +310,13 @@ struct Paragraph {
     size: f32,
     leading: Option<f32>,
     align: ParagraphAlign,
+    color: Option<(f32, f32, f32)>,
 }
 
 #[pymethods]
 impl Paragraph {
     #[new]
-    #[pyo3(signature = (text, rect, font=Standard14::Helvetica, size=11.0, leading=None, align="left"))]
+    #[pyo3(signature = (text, rect, font=Standard14::Helvetica, size=11.0, leading=None, align="left", color=None))]
     fn new(
         text: String,
         rect: (f32, f32, f32, f32),
@@ -323,6 +324,7 @@ impl Paragraph {
         size: f32,
         leading: Option<f32>,
         align: &str,
+        color: Option<(f32, f32, f32)>,
     ) -> PyResult<Paragraph> {
         let align = parse_paragraph_align(align)?;
         Ok(Paragraph {
@@ -332,12 +334,17 @@ impl Paragraph {
             size,
             leading,
             align,
+            color,
         })
     }
 }
 
 impl Paragraph {
     fn lower(&self) -> CoreContent {
+        let color = match self.color {
+            Some((r, g, b)) => Color::Rgb(r, g, b),
+            None => Color::BLACK,
+        };
         CoreContent::Paragraph(CoreParagraph {
             text: self.text.clone(),
             rect: [self.rect.0, self.rect.1, self.rect.2, self.rect.3],
@@ -345,6 +352,7 @@ impl Paragraph {
             size: self.size,
             leading: self.leading,
             align: self.align,
+            color,
         })
     }
 }
