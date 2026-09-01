@@ -1251,11 +1251,15 @@ fn open_ruled_candidate(
         (lo, hi) = (gap_lo, gap_hi);
     }
     boundaries.push((lo + hi) / 2.0);
+    // A banner or title row spanning the whole table crosses every column
+    // boundary and is a colspan row, not a veto; text that is not a table
+    // crosses on most of its lines. A quarter of the lines is the cut.
     boundaries.retain(|mid| {
-        !lines
+        let crossing = lines
             .iter()
-            .flatten()
-            .any(|s| s.bbox.x0 < *mid && *mid < s.bbox.x1)
+            .filter(|line| line.iter().any(|s| s.bbox.x0 < *mid && *mid < s.bbox.x1))
+            .count();
+        4 * crossing <= lines.len()
     });
     if boundaries.is_empty() {
         return None;
