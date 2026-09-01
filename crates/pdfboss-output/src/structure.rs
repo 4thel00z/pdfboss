@@ -2292,14 +2292,19 @@ fn content_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
 /// arriving as several flows (or laned at its column gap) must not fragment
 /// one drawn grid into a table per piece.
 fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Segment<'s>> {
-    let ordered = visual_flow_order(flows(spans));
-    if grids.is_empty() {
-        return ordered
-            .into_iter()
-            .flat_map(gutter_split)
-            .filter(|segment| !segment.spans.is_empty())
-            .collect();
-    }
+    let raw = flows(spans);
+    // The stream's own flow extents, kept before any reordering: whether
+    // the producer interleaved the columns is a question about the stream.
+    let raw_extents: Vec<(f32, f32)> = raw
+        .iter()
+        .map(|flow| {
+            (
+                flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min),
+                flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max),
+            )
+        })
+        .collect();
+    let ordered = visual_flow_order(raw);
     let grid_of = |flow: &[&TextSpan]| -> Option<usize> {
         let x0 = flow.iter().map(|s| s.bbox.x0).fold(f32::MAX, f32::min);
         let x1 = flow.iter().map(|s| s.bbox.x1).fold(f32::MIN, f32::max);
@@ -2320,15 +2325,83 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(index, _)| index)
     };
-    let assignment: Vec<Option<usize>> = ordered.iter().map(|flow| grid_of(flow)).collect();
+    let assignment: Vec<Option<usize>> = if grids.is_empty() {
+        vec![None; ordered.len()]
+    } else {
+        ordered.iter().map(|flow| grid_of(flow)).collect()
+    };
     let mut merged: Vec<Vec<&TextSpan>> = vec![Vec::new(); grids.len()];
     for (flow, assigned) in ordered.iter().zip(&assignment) {
         if let Some(grid) = assigned {
             merged[*grid].extend(flow.iter().copied());
         }
     }
-    let mut emitted = vec![false; grids.len()];
+    // The page's loose text, all of it at once: a page with a true gutter
+    // reads column-major across every flow — a report writing its columns
+    // as interleaved paragraphs still reads left column first — while
+    // stream order survives inside each lane. Without a page gutter each
+    // flow splits on its own, which is what keeps a designed page's
+    // side-by-side blocks apart.
+    let loose: Vec<&TextSpan> = ordered
+        .iter()
+        .zip(&assignment)
+        .filter(|(_, assigned)| assigned.is_none())
+        .flat_map(|(flow, _)| flow.iter().copied())
+        .collect();
+    let page_bands = (ordered.len() > 1 && loose.len() >= COLUMN_MIN_SPANS)
+        .then(|| {
+            let (x_min, x_max) = x_bounds(&loose);
+            let width = x_max - x_min;
+            if !width.is_finite() || width <= 0.0 {
+                return None;
+            }
+            let lines = line_groups(&loose);
+            let (bands, cut) = split_at_gutter(&lines, x_min, width)?;
+            // An ordered stream writes its left column whole and crosses
+            // the gutter once; only flows that alternate across it need
+            // the page's lanes imposed. One switch is order, several are
+            // interleaving.
+            let mut lanes: Vec<bool> = Vec::new();
+            for (x0, x1) in &raw_extents {
+                if *x1 <= cut {
+                    lanes.push(true);
+                } else if *x0 >= cut {
+                    lanes.push(false);
+                }
+            }
+            let switches = lanes.windows(2).filter(|pair| pair[0] != pair[1]).count();
+            (switches >= 2).then_some(bands)
+        })
+        .flatten();
+
     let mut out = Vec::new();
+    if let Some(bands) = page_bands {
+        out.extend(bands);
+        // Each grid's segment slots in by height: before the first band
+        // that starts below the grid's top.
+        for spans in merged {
+            if spans.is_empty() {
+                continue;
+            }
+            let top = spans.iter().map(|s| s.bbox.y1).fold(f32::MIN, f32::max);
+            let position = out
+                .iter()
+                .position(|segment: &Segment| {
+                    segment
+                        .spans
+                        .iter()
+                        .map(|s| s.bbox.y1)
+                        .fold(f32::MIN, f32::max)
+                        < top
+                })
+                .unwrap_or(out.len());
+            out.insert(position, Segment::ungrouped(spans));
+        }
+        out.retain(|segment| !segment.spans.is_empty());
+        return out;
+    }
+
+    let mut emitted = vec![false; grids.len()];
     for (flow, assigned) in ordered.into_iter().zip(assignment) {
         let Some(grid) = assigned else {
             out.extend(gutter_split(flow));
@@ -2645,7 +2718,7 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Segment<'_>> {
     }
     let lines = line_groups(&spans);
     match split_at_gutter(&lines, x_min, width) {
-        Some(bands) => bands,
+        Some((bands, _)) => bands,
         None => vec![Segment {
             spans,
             groups: Some(lines),
@@ -2656,7 +2729,11 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Segment<'_>> {
 /// The bands of a flow that has a gutter, or `None` when it has none and
 /// reads whole. `lines` are the flow's line groups, which the caller keeps
 /// for the block pass when the flow stays whole.
-fn split_at_gutter<'s>(lines: &[Group<'s>], x_min: f32, width: f32) -> Option<Vec<Segment<'s>>> {
+fn split_at_gutter<'s>(
+    lines: &[Group<'s>],
+    x_min: f32,
+    width: f32,
+) -> Option<(Vec<Segment<'s>>, f32)> {
     let scale = GUTTER_BINS as f32 / width;
     let mut coverage = [0usize; GUTTER_BINS];
     for line in lines {
@@ -2740,7 +2817,7 @@ fn split_at_gutter<'s>(lines: &[Group<'s>], x_min: f32, width: f32) -> Option<Ve
         top = sep_y;
     }
     push_band(&left, &right, top, f32::NEG_INFINITY, &mut out);
-    Some(out)
+    Some((out, cut))
 }
 
 /// Pushes one band's columns — the spans with baseline in `(bottom, top]` —
@@ -3050,10 +3127,81 @@ pub(crate) mod tests {
         for grid in &open {
             println!("  xs {:?} ys {:?}", grid.xs, grid.ys);
         }
+        {
+            let all: Vec<&TextSpan> = spans.iter().collect();
+            let (x_min, x_max) = x_bounds(&all);
+            let width = x_max - x_min;
+            let lines = line_groups(&all);
+            let scale = GUTTER_BINS as f32 / width;
+            let mut coverage = [0usize; GUTTER_BINS];
+            for line in &lines {
+                let mut covered = [false; GUTTER_BINS];
+                fill_bins(&mut covered, &line.spans, x_min, scale);
+                for (count, hit) in coverage.iter_mut().zip(covered) {
+                    *count += usize::from(hit);
+                }
+            }
+            let allowed = (GUTTER_MAX_CROSSING * lines.len() as f32) as usize;
+            let occupied: [bool; GUTTER_BINS] =
+                std::array::from_fn(|bin| coverage[bin] > allowed);
+            let gaps = wide_gaps(&occupied, scale);
+            println!(
+                "page-level: {} lines, allowed {}, gaps {:?} (band {:?})",
+                lines.len(),
+                allowed,
+                gaps.iter()
+                    .map(|g| {
+                        let center = (g.start + g.end) as f32 / 2.0 / GUTTER_BINS as f32;
+                        (g.start, g.end, (center * 100.0) as i32)
+                    })
+                    .collect::<Vec<_>>(),
+                GUTTER_BAND
+            );
+            if let [gutter] = gaps.as_slice() {
+                let cut = x_min + (gutter.start + gutter.end) as f32 / 2.0 / scale;
+                let (crossing, columns): (Vec<&Group>, Vec<&Group>) =
+                    lines.iter().partition(|line| {
+                        let mut covered = [false; GUTTER_BINS];
+                        fill_bins(&mut covered, &line.spans, x_min, scale);
+                        covered[gutter.clone()].iter().any(|hit| *hit)
+                    });
+                let body: Vec<&TextSpan> = columns
+                    .iter()
+                    .flat_map(|line| line.spans.iter().copied())
+                    .collect();
+                let (left, right): (Vec<&TextSpan>, Vec<&TextSpan>) =
+                    body.iter().partition(|s| s.x.max(s.end_x) <= cut);
+                println!(
+                    "  crossing {} columns {}; left shaped {} span {:.2} right shaped {} span {:.2}",
+                    crossing.len(),
+                    columns.len(),
+                    column_shaped(&left),
+                    x_span(&left) / width,
+                    column_shaped(&right),
+                    x_span(&right) / width,
+                );
+                let (left_lo, left_hi) = y_extent(&left);
+                let (right_lo, right_hi) = y_extent(&right);
+                let height = left_hi.max(right_hi) - left_lo.min(right_lo);
+                println!(
+                    "  heights: left {:.2} right {:.2} (min {})",
+                    (left_hi - left_lo) / height,
+                    (right_hi - right_lo) / height,
+                    COLUMN_MIN_HEIGHT
+                );
+            }
+        }
         for (index, segment) in segments_with_grids(&spans, &grids).into_iter().enumerate() {
+            let (x_lo, x_hi) = x_bounds(&segment.spans);
+            let y_hi = segment.spans.iter().map(|s| s.y).fold(f32::MIN, f32::max);
+            let y_lo = segment.spans.iter().map(|s| s.y).fold(f32::MAX, f32::min);
             let groups = segment.into_groups();
             let claims = grid_claims(&groups, &grids);
-            println!("segment {index}: {} groups, {} claims", groups.len(), claims.len());
+            println!(
+                "segment {index}: {} groups, {} claims, x {x_lo:.0}..{x_hi:.0}, y {y_lo:.0}..{y_hi:.0}",
+                groups.len(),
+                claims.len()
+            );
             for grid in &grids {
                 let Some(lo) = groups.iter().position(|g| grid.holds(g.y)) else {
                     continue;
