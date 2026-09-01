@@ -932,6 +932,30 @@ mod tests {
         assert!(md.contains("Part 1: A chapter title entry"));
     }
 
+    /// A page whose first heading announces a table of contents keeps that
+    /// one heading; the part titles below it are entries, however large
+    /// they are set, even with numbered chapter lists between them.
+    #[test]
+    fn contents_page_part_titles_are_entries() {
+        let md = markdown_of(
+            "BT /F1 22 Tf 72 740 Td (Table of contents) Tj ET \
+             BT /F1 14 Tf 72 700 Td (Part I: Different Toys 21) Tj ET \
+             BT /F1 10 Tf 72 676 Td (3. The Child as Consumer 26) Tj \
+             0 -14 Td (4. Domesticating Play 30) Tj 0 -14 Td (5. The Child in the City 35) Tj ET \
+             BT /F1 14 Tf 72 600 Td (Part II: Networked Play 45) Tj ET \
+             BT /F1 10 Tf 72 576 Td (7. LEGO Toys: from Blocks to Bricks 50) Tj \
+             0 -14 Td (8. Brand Extension 58) Tj 0 -14 Td (9. Bringing the Fans in 62) Tj ET",
+        );
+        assert!(
+            md.contains("# Table of contents"),
+            "the page title stays a heading: {md:?}"
+        );
+        assert!(
+            !md.contains("# Part I") && !md.contains("# Part II"),
+            "entries are not headings: {md:?}"
+        );
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
     #[test]

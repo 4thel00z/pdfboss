@@ -416,7 +416,36 @@ fn page_layout_with_stats(
         push_segment_blocks(segment, &grids, stats, order, &mut blocks);
     }
     demote_heading_runs(&mut blocks);
+    demote_contents_entries(&mut blocks);
     PageLayout { blocks }
+}
+
+/// A page whose first heading announces a table of contents keeps that one
+/// heading; every heading after it on the page is an entry, however large
+/// it is set.
+fn demote_contents_entries(blocks: &mut [Block]) {
+    let mut headings = blocks.iter_mut().filter_map(|block| match block {
+        Block::Heading { lines, .. } => Some(block),
+        _ => None,
+    });
+    let Some(Block::Heading { lines, .. }) = headings.next() else {
+        return;
+    };
+    let title: String = lines.iter().map(line_text).collect::<Vec<_>>().join(" ");
+    let title = title.trim().to_ascii_lowercase();
+    if !matches!(title.as_str(), "contents" | "table of contents" | "index") {
+        return;
+    }
+    for block in headings {
+        let Block::Heading { lines, bbox, .. } = block else {
+            unreachable!("the filter passes headings only");
+        };
+        *block = Block::Paragraph {
+            lines: std::mem::take(lines),
+            bbox: bbox.clone(),
+            role: Role::Body,
+        };
+    }
 }
 
 /// More consecutive same-level heading blocks than this many is a list of
