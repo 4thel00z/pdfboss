@@ -13,6 +13,7 @@ use pdfboss_core::xref::{parse_section_at, startxref};
 use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
 
 use crate::error::{Error, Result};
+use crate::importer::{rect_array, Importer};
 use crate::pdf::{text_string, Date, Metadata};
 use crate::ser::{serialize_dict, serialize_object};
 use crate::writer::{WriteOptions, Writer, XrefStyle};
@@ -30,215 +31,112 @@ pub fn watermark_with(
     overlay: &Document,
     options: WriteOptions,
 ) -> Result<Vec<u8>> {
-    let trailer = &base.xref().trailer;
-    if trailer.get("Encrypt").is_some() {
-        return Err(Error::EncryptedBase);
-    }
-    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
     let mut writer = Writer::new(options);
     let prefix = writer.put_stream_raw(Dict::new(), b"q\n".to_vec());
     let suffix = writer.put_stream_raw(
         Dict::new(),
         format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
     );
-    let mut overlay_copy = Rewrite::new(overlay, options.compress);
-    let form = overlay_copy.form(&mut writer)?;
-    overlay_copy.drain(&mut writer, None)?;
+    let form = overlay_form(&mut writer, overlay)?;
 
-    let pages: FastMap<ObjRef, usize> = (0..base.page_count())
-        .filter_map(|index| {
-            let page = base.page(index).ok()?;
-            page.object_ref().map(|r| (r, index))
-        })
-        .collect();
-    let stamp = Stamp {
-        form,
-        prefix,
-        suffix,
-        pages,
-    };
-    let mut base_copy = Rewrite::new(base, options.compress);
-    let new_root = base_copy.reference(&mut writer, root);
-    if let Some(info) = trailer.get_ref("Info") {
-        let new_info = base_copy.reference(&mut writer, info);
+    let trailer = &base.xref().trailer;
+    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
+    let mut importer = Importer::new(&mut writer, base)?;
+    let new_root = importer.reference(root);
+    let new_info = trailer.get_ref("Info").map(|info| importer.reference(info));
+    for index in 0..base.page_count() {
+        let page = base.page(index).map_err(core_error)?;
+        let Some(page_ref) = page.object_ref() else {
+            continue;
+        };
+        let dict = marked_page_dict(&mut importer, base, index, form, prefix, suffix)?;
+        importer.substitute(page_ref, dict);
+    }
+    importer.finish()?;
+    if let Some(new_info) = new_info {
         writer.set_info(new_info);
     }
-    base_copy.drain(&mut writer, Some(&stamp))?;
     writer.finish(new_root)
 }
 
-/// What every stamped page draws: the overlay form and the two content
-/// streams wrapped around the page's own, plus which objects are pages.
-struct Stamp {
+/// The marked dictionary for source page `index`: its own dictionary
+/// translated into the target, its effective resources gaining the overlay
+/// form under [`FORM_NAME`], and its content wrapped in `prefix` and
+/// `suffix`.
+fn marked_page_dict(
+    importer: &mut Importer,
+    base: &Document,
+    index: usize,
     form: ObjRef,
     prefix: ObjRef,
     suffix: ObjRef,
-    pages: FastMap<ObjRef, usize>,
-}
-
-/// Copies one document's object graph into a [`Writer`]: every reference
-/// met is reserved a number once and queued, and the queue is drained
-/// iteratively, so a long chain of references costs no stack.
-struct Rewrite<'a> {
-    source: &'a Document,
-    map: FastMap<ObjRef, ObjRef>,
-    pending: Vec<ObjRef>,
-    compress: bool,
-}
-
-impl<'a> Rewrite<'a> {
-    fn new(source: &'a Document, compress: bool) -> Rewrite<'a> {
-        Rewrite {
-            source,
-            map: FastMap::default(),
-            pending: Vec::new(),
-            compress,
+) -> Result<Object> {
+    let page = base.page(index).map_err(core_error)?;
+    let mut dict = importer.copy_dict(page.dict())?;
+    let mut resources = importer.copy_dict(&page.resources)?;
+    let mut xobjects = match page.resources.get("XObject") {
+        Some(existing) => {
+            let existing = base.resolve(existing).map_err(core_error)?;
+            match existing.as_dict() {
+                Some(d) => importer.copy_dict(d)?,
+                None => Dict::new(),
+            }
         }
-    }
-
-    /// The target number for source reference `r`, reserved and queued on
-    /// first sight.
-    fn reference(&mut self, writer: &mut Writer, r: ObjRef) -> ObjRef {
-        if let Some(copied) = self.map.get(&r) {
-            return *copied;
+        None => Dict::new(),
+    };
+    xobjects.insert(name(FORM_NAME), Object::Ref(form));
+    resources.insert(name("XObject"), Object::Dict(xobjects));
+    dict.insert(name("Resources"), Object::Dict(resources));
+    let mut contents = vec![Object::Ref(prefix)];
+    match page.dict().get("Contents") {
+        Some(Object::Array(items)) => {
+            for item in items {
+                contents.push(importer.copy(item)?);
+            }
         }
-        let copied = writer.reserve();
-        self.map.insert(r, copied);
-        self.pending.push(r);
-        copied
-    }
-
-    /// A copy of `obj`'s direct structure with every reference mapped.
-    fn copy(&mut self, writer: &mut Writer, obj: &Object) -> Result<Object> {
-        Ok(match obj {
-            Object::Ref(r) => Object::Ref(self.reference(writer, *r)),
-            Object::Dict(d) => Object::Dict(self.copy_dict(writer, d)?),
-            Object::Array(items) => Object::Array(
-                items
-                    .iter()
-                    .map(|item| self.copy(writer, item))
-                    .collect::<Result<Vec<Object>>>()?,
-            ),
-            Object::Stream(_) => return Err(Error::NestedStream),
-            other => other.clone(),
-        })
-    }
-
-    fn copy_dict(&mut self, writer: &mut Writer, dict: &Dict) -> Result<Dict> {
-        let mut out = Dict::new();
-        for (key, value) in dict.iter() {
-            out.insert(key.clone(), self.copy(writer, value)?);
-        }
-        Ok(out)
-    }
-
-    /// A stream body: its dictionary copied without `/Length` (the writer
-    /// sets it), its data compressed when asked and not already filtered.
-    fn copy_stream(&mut self, writer: &mut Writer, stream: &Stream) -> Result<Object> {
-        let mut dict = stream.dict.clone();
-        dict.remove("Length");
-        let mut dict = self.copy_dict(writer, &dict)?;
-        let data = if self.compress && dict.get("Filter").is_none() {
-            dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
-            deflate(&stream.data)
-        } else {
-            stream.data.clone()
-        };
-        Ok(Object::Stream(Stream { dict, data }))
-    }
-
-    /// Fills every queued object, stamping the pages `stamp` names.
-    fn drain(&mut self, writer: &mut Writer, stamp: Option<&Stamp>) -> Result<()> {
-        while let Some(r) = self.pending.pop() {
-            let target = self.map[&r];
-            let stamped = stamp.and_then(|s| s.pages.get(&r).map(|index| (s, *index)));
-            let body = match stamped {
-                Some((s, index)) => self.stamped_page(writer, index, s)?,
-                None => match self.source.get(r).map_err(core_error)? {
-                    Object::Stream(s) => self.copy_stream(writer, &s)?,
-                    other => self.copy(writer, &other)?,
-                },
-            };
-            writer.fill(target, body)?;
-        }
-        Ok(())
-    }
-
-    /// Page `index`'s dictionary copied with the stamp applied: its
-    /// effective resources gain the form, its content is wrapped in the
-    /// prefix and suffix streams.
-    fn stamped_page(&mut self, writer: &mut Writer, index: usize, stamp: &Stamp) -> Result<Object> {
-        let page = self.source.page(index).map_err(core_error)?;
-        let mut dict = self.copy_dict(writer, page.dict())?;
-        let mut resources = self.copy_dict(writer, &page.resources)?;
-        let mut xobjects = match page.resources.get("XObject") {
-            Some(existing) => {
-                let existing = self.source.resolve(existing).map_err(core_error)?;
-                match existing.as_dict() {
-                    Some(d) => self.copy_dict(writer, d)?,
-                    None => Dict::new(),
+        Some(Object::Ref(r)) => match base.get(*r).map_err(core_error)? {
+            Object::Array(items) => {
+                for item in &items {
+                    contents.push(importer.copy(item)?);
                 }
             }
-            None => Dict::new(),
-        };
-        xobjects.insert(name(FORM_NAME), Object::Ref(stamp.form));
-        resources.insert(name("XObject"), Object::Dict(xobjects));
-        dict.insert(name("Resources"), Object::Dict(resources));
-        let mut contents = vec![Object::Ref(stamp.prefix)];
-        match page.dict().get("Contents") {
-            Some(Object::Array(items)) => {
-                for item in items {
-                    contents.push(self.copy(writer, item)?);
-                }
-            }
-            Some(Object::Ref(r)) => match self.source.get(*r).map_err(core_error)? {
-                Object::Array(items) => {
-                    for item in &items {
-                        contents.push(self.copy(writer, item)?);
-                    }
-                }
-                _ => contents.push(Object::Ref(self.reference(writer, *r))),
-            },
-            _ => {}
-        }
-        contents.push(Object::Ref(stamp.suffix));
-        dict.insert(name("Contents"), Object::Array(contents));
-        Ok(Object::Dict(dict))
+            _ => contents.push(Object::Ref(importer.reference(*r))),
+        },
+        _ => {}
     }
+    contents.push(Object::Ref(suffix));
+    dict.insert(name("Contents"), Object::Array(contents));
+    Ok(Object::Dict(dict))
+}
 
-    /// The source's first page as a form XObject, filled into the writer:
-    /// its media box as the bounding box, its decoded content deflated, its
-    /// resources copied.
-    fn form(&mut self, writer: &mut Writer) -> Result<ObjRef> {
-        let page = self.source.page(0).map_err(core_error)?;
-        let content = page.content(self.source).map_err(core_error)?;
-        let resources = self.copy_dict(writer, &page.resources)?;
-        let bbox = page.media_box;
-        let mut dict = Dict::new();
-        dict.insert(name("Type"), Object::Name(name("XObject")));
-        dict.insert(name("Subtype"), Object::Name(name("Form")));
-        dict.insert(name("FormType"), Object::Int(1));
-        dict.insert(
-            name("BBox"),
-            Object::Array(
-                [bbox.x0, bbox.y0, bbox.x1, bbox.y1]
-                    .iter()
-                    .map(|v| Object::Real(f64::from(*v)))
-                    .collect(),
-            ),
-        );
-        dict.insert(name("Resources"), Object::Dict(resources));
-        dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
-        let form = writer.reserve();
-        writer.fill(
-            form,
-            Object::Stream(Stream {
-                dict,
-                data: deflate(&content),
-            }),
-        )?;
-        Ok(form)
-    }
+/// The overlay's first page as a form XObject, filled directly into
+/// `writer`: its media box as the bounding box, its decoded content
+/// deflated, its resources imported from `overlay`.
+fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
+    let page = overlay.page(0).map_err(core_error)?;
+    let content = page.content(overlay).map_err(core_error)?;
+    let resources = {
+        let mut importer = Importer::new(writer, overlay)?;
+        let resources = importer.copy_dict(&page.resources)?;
+        importer.finish()?;
+        resources
+    };
+    let mut dict = Dict::new();
+    dict.insert(name("Type"), Object::Name(name("XObject")));
+    dict.insert(name("Subtype"), Object::Name(name("Form")));
+    dict.insert(name("FormType"), Object::Int(1));
+    dict.insert(name("BBox"), rect_array(page.media_box));
+    dict.insert(name("Resources"), Object::Dict(resources));
+    dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
+    let form = writer.reserve();
+    writer.fill(
+        form,
+        Object::Stream(Stream {
+            dict,
+            data: deflate(&content),
+        }),
+    )?;
+    Ok(form)
 }
 
 /// Draws the first page of `overlay` over every page of `base`, returning
@@ -1019,7 +917,7 @@ fn plain_stream(data: Vec<u8>) -> Stream {
     }
 }
 
-fn deflate(data: &[u8]) -> Vec<u8> {
+pub(crate) fn deflate(data: &[u8]) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(data)
@@ -1049,6 +947,6 @@ fn name(text: &str) -> Name {
     Name(text.to_string())
 }
 
-fn core_error(error: pdfboss_core::Error) -> Error {
+pub(crate) fn core_error(error: pdfboss_core::Error) -> Error {
     Error::Other(error.to_string())
 }

@@ -143,6 +143,12 @@ impl Writer {
         self.info = Some(info);
     }
 
+    /// Whether a stream filled through this writer without a filter of its
+    /// own is Flate-compressed, per [`WriteOptions::compress`].
+    pub fn compress(&self) -> bool {
+        self.options.compress
+    }
+
     /// Serializes everything into a complete PDF file: header with binary
     /// comment, all objects (packed into object streams where options
     /// allow), the cross-reference, and the trailer with `root`, the

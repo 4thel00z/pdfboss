@@ -23,6 +23,7 @@ pub mod element;
 pub mod error;
 pub mod font;
 pub mod image;
+pub mod importer;
 pub mod pdf;
 pub mod ser;
 pub mod sink;
@@ -37,6 +38,7 @@ pub use element::{Content, Draw, Image, Link, Paragraph, ParagraphAlign, Text};
 pub use error::{Error, Result};
 pub use font::Standard14;
 pub use image::ImageData;
+pub use importer::Importer;
 pub use pdf::{
     Attachment, Bookmark, Date, LabelStyle, LinkAnnotation, LinkTarget, Metadata, Outline, Page,
     PageLabel, PageLayout, PageMode, PageSize, Pdf, Viewer,
