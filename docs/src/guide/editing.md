@@ -52,4 +52,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Async
 
-`pdfboss-aio`'s `write` feature carries the same append over an `AsyncDocument`, without holding the whole base in memory: `overlay_base(&doc)` reads its trailer and newest cross-reference section into an `OverlayBase`, and `append_overlay(&doc, &overlay, sink)` streams the base's bytes and the built section through any `AsyncByteSink` in 64 KiB chunks. `Update` itself stays synchronous; `Overlay`, `OverlayBase`, `start_offset` and `set_metadata_with` are the pieces both sides are built from.
+`pdfboss-aio`'s `write` feature carries the same append over an `AsyncDocument`, without holding the whole base in memory: `overlay_base(&doc)` reads its trailer and newest cross-reference section into an `OverlayBase`, and `append_overlay(&doc, &overlay, sink)` streams the base's bytes through any `AsyncByteSink` in 64 KiB chunks, then writes the built section in one call. `Update` itself stays synchronous; `Overlay`, `OverlayBase`, `start_offset` and `set_metadata_with` are the pieces both sides are built from.
