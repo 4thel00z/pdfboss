@@ -369,8 +369,11 @@ impl Overlay {
     }
 
     /// Sets an object under its own number, whether new or a replacement
-    /// of one already in the base.
+    /// of one already in the base. Raises the next free number past `r`
+    /// when `r` was not already reserved, so a later `reserve`/`put` never
+    /// collides with a caller-chosen number.
     pub fn set(&mut self, r: ObjRef, obj: Object) {
+        self.next = self.next.max(r.num.saturating_add(1));
         self.objects.push((r, obj));
     }
 
@@ -553,23 +556,43 @@ impl<'a> Update<'a> {
         &self.overlay
     }
 
-    /// Writes the base bytes, a pad newline when the base needs one, and
-    /// the appended section into `out`.
-    pub fn append_into(&self, mut out: impl std::io::Write) -> Result<()> {
+    /// The base bytes, whether a pad newline goes before the appended
+    /// section, and the section itself, computed together so a refused
+    /// update (or any other failure) is known before anything is written
+    /// anywhere.
+    fn parts(&self) -> Result<(&[u8], bool, Vec<u8>)> {
         let base = self.doc.bytes();
         let (start, pad) = start_offset(base);
+        let section = self.overlay.section(start)?;
+        Ok((base, pad, section))
+    }
+
+    /// Writes the base bytes, a pad newline when the base needs one, and
+    /// the appended section into `out`. The section is built before any
+    /// byte reaches `out`, so a refused update (or any other failure)
+    /// writes nothing at all.
+    pub fn append_into(&self, mut out: impl std::io::Write) -> Result<()> {
+        let (base, pad, section) = self.parts()?;
         out.write_all(base)?;
         if pad {
             out.write_all(b"\n")?;
         }
-        out.write_all(&self.overlay.section(start)?)?;
+        out.write_all(&section)?;
         Ok(())
     }
 
-    /// [`Update::append_into`] to a new file at `path`.
+    /// [`Update::append_into`] to a new file at `path`: the file is
+    /// created only once the update is known to build, so a refused
+    /// update leaves no file behind at all.
     pub fn save_appended(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        let file = std::fs::File::create(path)?;
-        self.append_into(file)
+        let (base, pad, section) = self.parts()?;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(base)?;
+        if pad {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(&section)?;
+        Ok(())
     }
 
     /// The base bytes followed by the update section, as one buffer.

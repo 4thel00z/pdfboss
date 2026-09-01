@@ -3,7 +3,7 @@
 //! `watermark`.
 
 use pdfboss_core::xref::{parse_section_at, startxref};
-use pdfboss_core::{Dict, Document, Name, ObjRef, Object};
+use pdfboss_core::{Dict, Document, Name, ObjRef, Object, XrefKind};
 use pdfboss_write::{
     Error, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions, XrefStyle,
 };
@@ -153,6 +153,75 @@ fn empty_update_is_refused() {
     assert!(matches!(update.appended(), Err(Error::EmptyUpdate)));
 }
 
+/// A refused update must fail before any byte reaches the destination:
+/// `save_appended` on an empty update must not leave a base-only (or
+/// otherwise partial) file behind.
+#[test]
+fn empty_update_save_appended_leaves_no_file() {
+    let base = classic_base();
+    let doc = Document::load(base).unwrap();
+    let update = Update::new(&doc).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "pdfboss-update-append-empty-{}.pdf",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    assert!(matches!(
+        update.save_appended(&path),
+        Err(Error::EmptyUpdate)
+    ));
+    assert!(
+        !path.exists(),
+        "a refused update must not create the destination file"
+    );
+}
+
+/// `set` with a caller-chosen number past the base's declared size must
+/// raise the next free number past it, so the appended section's own
+/// cross-reference stream never collides with it and the section's
+/// declared `/Size` still covers it.
+#[test]
+fn set_past_base_size_advances_next_on_stream_style() {
+    let base = stream_base();
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    let far = ObjRef {
+        num: 10_000,
+        gen: 0,
+    };
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(11));
+    update.set(far, Object::Dict(dict));
+    let out = update.appended().unwrap();
+
+    let reread = Document::load(out.clone()).unwrap();
+    assert_eq!(
+        reread.get(far).unwrap().as_dict().unwrap().get_int("Marker"),
+        Some(11),
+        "the object set well past the base's size resolves"
+    );
+
+    let off = startxref(&out).unwrap();
+    let info = parse_section_at(&out, off).unwrap();
+    let xref_num = info
+        .xref
+        .iter()
+        .map(|(num, _)| num)
+        .max()
+        .expect("the appended section carries at least one entry");
+    assert_ne!(
+        xref_num, far.num,
+        "the xref stream got a number distinct from the object set past the base's size"
+    );
+
+    let size = reread.xref().trailer.get_int("Size").unwrap();
+    assert!(
+        size > far.num as i64,
+        "the reloaded trailer's /Size ({size}) exceeds the set object's number ({})",
+        far.num
+    );
+}
+
 #[test]
 fn encrypted_base_is_refused() {
     let bytes = pdfboss_testkit::encrypted_rc4_doc("secret");
@@ -176,6 +245,14 @@ fn hybrid_base_appends_a_classic_table() {
     dict.insert(Name("Marker".into()), Object::Int(3));
     update.set(ObjRef { num: 5, gen: 0 }, Object::Dict(dict));
     let out = update.appended().unwrap();
+
+    let out_off = startxref(&out).unwrap();
+    assert_eq!(
+        parse_section_at(&out, out_off).unwrap().kind,
+        XrefKind::Table,
+        "the appended section itself is emitted in the classic style"
+    );
+
     let reread = Document::load(out).unwrap();
     assert_eq!(
         reread
