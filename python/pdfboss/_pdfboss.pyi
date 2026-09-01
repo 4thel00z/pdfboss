@@ -253,10 +253,14 @@ class Document:
         given) to image bytes (PNG unless ``format`` says otherwise), fanned
         out across the machine's cores."""
 
-    def extract_text(self, *, reading_order: str = "content") -> str:
+    def extract_text(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``)."""
 
-    def extract_markdown(self, *, reading_order: str = "content") -> str:
+    def extract_markdown(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Whole-document markdown: headings, lists and tables inferred from
         layout; heading sizes judged across the document."""
 
@@ -331,10 +335,14 @@ class Page:
         """The art box, clipped to the media box; defaults to the crop
         box."""
 
-    def extract_text(self, *, reading_order: str = "content") -> str:
+    def extract_text(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Extracts the page's text."""
 
-    def extract_markdown(self, *, reading_order: str = "content") -> str:
+    def extract_markdown(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Page markdown, ranking heading sizes against that page alone.
         ``Document.extract_markdown`` is the better answer whenever the
         whole document is at hand."""
@@ -483,13 +491,17 @@ class AsyncDocument:
         attributes were resolved at open. Negative indexes are NOT
         accepted here; use subscription, ``doc[-1]``, for those."""
 
-    async def extract_text(self, *, reading_order: str = "content") -> str:
+    async def extract_text(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``) —
         the async twin of ``Document.extract_text``. Per-page lenient: a
         page whose content will not read contributes an empty string, and
         an error means the document itself could not be read."""
 
-    async def extract_markdown(self, *, reading_order: str = "content") -> str:
+    async def extract_markdown(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Whole-document markdown — the async twin of
         ``Document.extract_markdown``: headings, lists and tables inferred
         from layout, heading sizes judged across the document."""
@@ -589,11 +601,15 @@ class AsyncPage:
         """The art box, clipped to the media box; defaults to the crop
         box."""
 
-    async def extract_text(self, *, reading_order: str = "content") -> str:
+    async def extract_text(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Extracts the page's text — the async twin of
         ``Page.extract_text``."""
 
-    async def extract_markdown(self, *, reading_order: str = "content") -> str:
+    async def extract_markdown(
+        self, *, reading_order: str = "content", invisible_text: bool = False
+    ) -> str:
         """Page markdown, ranking heading sizes against that page alone —
         the async twin of ``Page.extract_markdown``.
         ``AsyncDocument.extract_markdown`` is the better answer whenever

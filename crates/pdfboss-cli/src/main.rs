@@ -222,6 +222,10 @@ enum Command {
         /// The order lines are read in.
         #[arg(long, value_enum, default_value_t = ReadingOrderArg::Content)]
         reading_order: ReadingOrderArg,
+        /// Keep content outside the page box — pasteboard text a cropped
+        /// export leaves in the stream, which no viewer shows.
+        #[arg(long)]
+        invisible_text: bool,
     },
     /// Extract markdown (headings, lists, tables inferred from layout).
     Md {
@@ -237,6 +241,10 @@ enum Command {
         /// The order lines are read in.
         #[arg(long, value_enum, default_value_t = ReadingOrderArg::Content)]
         reading_order: ReadingOrderArg,
+        /// Keep content outside the page box — pasteboard text a cropped
+        /// export leaves in the stream, which no viewer shows.
+        #[arg(long)]
+        invisible_text: bool,
     },
     /// Render a page to PNG, PPM, BMP or JPEG.
     Render {
@@ -568,13 +576,17 @@ fn main() {
             page,
             password,
             reading_order,
-        } => cmd_text(&file, page, &password, reading_order.to_order()).map_err(Failure::from),
+            invisible_text,
+        } => cmd_text(&file, page, &password, reading_order.to_order(), invisible_text)
+            .map_err(Failure::from),
         Command::Md {
             file,
             page,
             password,
             reading_order,
-        } => cmd_md(&file, page, &password, reading_order.to_order()).map_err(Failure::from),
+            invisible_text,
+        } => cmd_md(&file, page, &password, reading_order.to_order(), invisible_text)
+            .map_err(Failure::from),
         Command::Render {
             file,
             page,
@@ -775,14 +787,17 @@ fn cmd_text(
     page: Option<usize>,
     password: &str,
     order: pdfboss_output::ReadingOrder,
+    invisible_text: bool,
 ) -> Result<(), String> {
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
+    let opts = pdfboss_output::TextOptions { invisible_text };
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
-            let (text, report) = pdfboss_output::extract_text_reporting(&doc, &page, order)
-                .map_err(|e| e.to_string())?;
+            let (text, report) =
+                pdfboss_output::extract_text_reporting_opts(&doc, &page, order, opts)
+                    .map_err(|e| e.to_string())?;
             warn_skips(n, &report);
             text
         }
@@ -795,7 +810,7 @@ fn cmd_text(
             // loads once per document rather than once per page.
             let fonts = pdfboss_output::FontCache::default();
             let parts = pdfboss_core::map_pages(&doc, |doc, page| {
-                pdfboss_output::extract_text_reporting_cached(doc, page, &fonts, order)
+                pdfboss_output::extract_text_reporting_cached_opts(doc, page, &fonts, order, opts)
             })
             .into_iter()
             .enumerate()
@@ -821,15 +836,21 @@ fn cmd_md(
     page: Option<usize>,
     password: &str,
     order: pdfboss_output::ReadingOrder,
+    invisible_text: bool,
 ) -> Result<(), String> {
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
+    let opts = pdfboss_output::TextOptions { invisible_text };
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
-            let (spans, rulings, report) =
+            let (mut spans, mut rulings, report) =
                 pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, order)
                     .map_err(|e| e.to_string())?;
+            if !invisible_text {
+                pdfboss_output::retain_spans_on_page(&mut spans, &page);
+                pdfboss_output::retain_rulings_on_page(&mut rulings, &page);
+            }
             warn_skips(n, &report);
             pdfboss_output::Markdown.render(&[pdfboss_output::page_layout_with_rulings(
                 &spans,
@@ -838,7 +859,7 @@ fn cmd_md(
             )])
         }
         None => {
-            let (md, reports) = pdfboss_output::extract_markdown_reporting(&doc, order)
+            let (md, reports) = pdfboss_output::extract_markdown_reporting_opts(&doc, order, opts)
                 .map_err(|e| e.to_string())?;
             for (index, report) in reports.iter().enumerate() {
                 warn_skips(index + 1, report);

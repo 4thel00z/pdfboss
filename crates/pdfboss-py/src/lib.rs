@@ -450,11 +450,20 @@ impl Document {
     /// failing the whole document. An error here means the document
     /// itself could not be read. `reading_order` is `"content"` (the
     /// default), `"structure-tree"` or `"geometric"`.
-    #[pyo3(signature = (*, reading_order = "content"))]
-    fn extract_text(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
+    /// `invisible_text=True` keeps content outside the page box — the
+    /// pasteboard text a cropped export leaves in the stream, which no
+    /// viewer shows.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
+    fn extract_text(
+        &self,
+        py: Python<'_>,
+        reading_order: &str,
+        invisible_text: bool,
+    ) -> PyResult<String> {
         let inner = &self.inner;
         let fonts = Arc::clone(&self.text_cache);
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         py.allow_threads(move || {
             // The lock is held only long enough to seed; the fan-out runs
             // on a private materialization.
@@ -465,8 +474,9 @@ impl Document {
             // document's font cache serves every worker, so a font loads
             // once per document rather than once per page.
             let texts = pdfboss_core::map_pages(&doc, |doc, page| {
-                let (text, _) =
-                    pdfboss_output::extract_text_reporting_cached(doc, page, &fonts, order)?;
+                let (text, _) = pdfboss_output::extract_text_reporting_cached_opts(
+                    doc, page, &fonts, order, opts,
+                )?;
                 Ok(text)
             });
             let mut out = String::new();
@@ -484,13 +494,21 @@ impl Document {
     /// inferred from layout, with font sizes judged across the document.
     /// Same fan-out, per-page leniency and `reading_order` as
     /// `extract_text`.
-    #[pyo3(signature = (*, reading_order = "content"))]
-    fn extract_markdown(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
+    /// `invisible_text=True` keeps content outside each page's box, like
+    /// `extract_text`.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
+    fn extract_markdown(
+        &self,
+        py: Python<'_>,
+        reading_order: &str,
+        invisible_text: bool,
+    ) -> PyResult<String> {
         let inner = &self.inner;
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         py.allow_threads(move || {
             let doc = CoreDocument::from_seed(inner.lock().seed());
-            pdfboss_output::extract_markdown(&doc, order).map_err(pdf_err)
+            pdfboss_output::extract_markdown_opts(&doc, order, opts).map_err(pdf_err)
         })
     }
 
@@ -800,16 +818,26 @@ impl Page {
     /// proceed in parallel when called from multiple Python threads.
     /// `reading_order` is `"content"` (the default), `"structure-tree"` or
     /// `"geometric"`.
-    #[pyo3(signature = (*, reading_order = "content"))]
-    fn extract_text(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
+    /// `invisible_text=True` keeps content outside the page box — the
+    /// pasteboard text a cropped export leaves in the stream, which no
+    /// viewer shows.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
+    fn extract_text(
+        &self,
+        py: Python<'_>,
+        reading_order: &str,
+        invisible_text: bool,
+    ) -> PyResult<String> {
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            let (text, _) = pdfboss_output::extract_text_reporting_cached(
+            let (text, _) = pdfboss_output::extract_text_reporting_cached_opts(
                 &doc,
                 &self.page,
                 &self.text_cache,
                 order,
+                opts,
             )
             .map_err(pdf_err)?;
             Ok(text)
@@ -819,12 +847,21 @@ impl Page {
     /// Extracts the page's markdown, ranking heading sizes against that page
     /// alone. `Document.extract_markdown` is the better answer whenever the
     /// whole document is at hand. Same `reading_order` as `extract_text`.
-    #[pyo3(signature = (*, reading_order = "content"))]
-    fn extract_markdown(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
+    /// `invisible_text=True` keeps content outside the page box, like
+    /// `extract_text`.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
+    fn extract_markdown(
+        &self,
+        py: Python<'_>,
+        reading_order: &str,
+        invisible_text: bool,
+    ) -> PyResult<String> {
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            pdfboss_output::extract_page_markdown(&doc, &self.page, order).map_err(pdf_err)
+            pdfboss_output::extract_page_markdown_opts(&doc, &self.page, order, opts)
+                .map_err(pdf_err)
         })
     }
 
@@ -1453,14 +1490,18 @@ impl AsyncDocument {
     /// the extraction runs on the tokio runtime, so the asyncio loop is
     /// never blocked. `reading_order` is `"content"` (the default),
     /// `"structure-tree"` or `"geometric"`.
-    #[pyo3(signature = (*, reading_order = "content"))]
+    /// `invisible_text=True` keeps content outside each page's box, like
+    /// the sync method.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
     fn extract_text<'py>(
         &self,
         py: Python<'py>,
         reading_order: &str,
+        invisible_text: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = inner.oc_state().await;
             let structure = structure_for(&inner, order).await;
@@ -1470,12 +1511,13 @@ impl AsyncDocument {
                     out.push('\u{c}');
                 }
                 let page = inner.page(i).map_err(aio_err)?;
-                let text = pdfboss_output::extract_text_with(
+                let (text, _) = pdfboss_output::extract_text_reporting_with_opts(
                     inner.clone(),
                     &page,
                     oc.as_ref(),
                     structure.as_ref(),
                     order,
+                    opts,
                 )
                 .await
                 .map_err(pdf_err)?;
@@ -1490,11 +1532,14 @@ impl AsyncDocument {
     /// from layout, font sizes judged across the document. Coroutine; runs
     /// on the tokio runtime, so the asyncio loop is never blocked. Same
     /// `reading_order` as `extract_text`.
-    #[pyo3(signature = (*, reading_order = "content"))]
+    /// `invisible_text=True` keeps content outside each page's box, like
+    /// the sync method.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
     fn extract_markdown<'py>(
         &self,
         py: Python<'py>,
         reading_order: &str,
+        invisible_text: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let order = reading_order_from_str(reading_order)?;
@@ -1504,7 +1549,7 @@ impl AsyncDocument {
             let mut pages = Vec::new();
             for i in 0..inner.page_count() {
                 let page = inner.page(i).map_err(aio_err)?;
-                let (spans, rulings, report) =
+                let (mut spans, mut rulings, report) =
                     pdfboss_text::extract_spans_and_rulings_reporting_with(
                         inner.clone(),
                         &page,
@@ -1514,6 +1559,10 @@ impl AsyncDocument {
                     )
                     .await
                     .map_err(pdf_err)?;
+                if !invisible_text {
+                    pdfboss_output::retain_spans_on_page(&mut spans, &page);
+                    pdfboss_output::retain_rulings_on_page(&mut rulings, &page);
+                }
                 pages.push((spans, rulings, report.order));
             }
             Ok(pdfboss_output::Markdown
@@ -1760,45 +1809,60 @@ impl AsyncPage {
 
     /// Extracts the page's text in the `reading_order` given (`"content"`,
     /// `"structure-tree"` or `"geometric"`). Coroutine resolving to str.
-    #[pyo3(signature = (*, reading_order = "content"))]
+    /// `invisible_text=True` keeps content outside the page box.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
     fn extract_text<'py>(
         &self,
         py: Python<'py>,
         reading_order: &str,
+        invisible_text: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.doc.clone();
         let page = self.page.clone();
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = doc.oc_state().await;
             let structure = structure_for(&doc, order).await;
-            pdfboss_output::extract_text_with(&doc, &page, oc.as_ref(), structure.as_ref(), order)
-                .await
-                .map_err(pdf_err)
+            let (text, _) = pdfboss_output::extract_text_reporting_with_opts(
+                &doc,
+                &page,
+                oc.as_ref(),
+                structure.as_ref(),
+                order,
+                opts,
+            )
+            .await
+            .map_err(pdf_err)?;
+            Ok(text)
         })
     }
 
     /// Extracts the page's markdown, like the sync `Page.extract_markdown`,
     /// ranking heading sizes against that page alone. Same `reading_order`
     /// as `extract_text`. Coroutine.
-    #[pyo3(signature = (*, reading_order = "content"))]
+    /// `invisible_text=True` keeps content outside the page box.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false))]
     fn extract_markdown<'py>(
         &self,
         py: Python<'py>,
         reading_order: &str,
+        invisible_text: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.doc.clone();
         let page = self.page.clone();
         let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = doc.oc_state().await;
             let structure = structure_for(&doc, order).await;
-            pdfboss_output::extract_page_markdown_with(
+            pdfboss_output::extract_page_markdown_with_opts(
                 &doc,
                 &page,
                 oc.as_ref(),
                 structure.as_ref(),
                 order,
+                opts,
             )
             .await
             .map_err(pdf_err)

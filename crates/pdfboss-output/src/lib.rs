@@ -19,6 +19,63 @@ pub use structure::{
     document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
 };
 
+/// What extraction keeps beyond the visible page.
+///
+/// By default the `extract_*` entries read what a viewer shows: spans and
+/// rulings lying entirely outside the page's crop box are dropped before
+/// layout. A page cropped out of a larger document often keeps its
+/// neighbors' content in the stream — pasteboard text no viewer renders —
+/// and `invisible_text: true` extracts it too.
+///
+/// Text drawn with render mode 3 (an OCR layer over a scan) is on the page,
+/// selectable in a viewer, and always extracted; this option is only about
+/// content outside the page box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextOptions {
+    /// Keep content outside the page's crop box.
+    pub invisible_text: bool,
+}
+
+/// The overlap window of `page`'s crop box, one point of tolerance to each
+/// side so a glyph overhanging the margin stays on the page.
+fn page_window(page: &Page) -> (f32, f32, f32, f32) {
+    const TOLERANCE: f32 = 1.0;
+    let crop = page.crop_box;
+    (
+        crop.x0.min(crop.x1) - TOLERANCE,
+        crop.x0.max(crop.x1) + TOLERANCE,
+        crop.y0.min(crop.y1) - TOLERANCE,
+        crop.y0.max(crop.y1) + TOLERANCE,
+    )
+}
+
+/// Drops the spans that lie entirely outside `page`'s crop box (overlap
+/// test, a point of tolerance). This is what the `extract_*` entries apply
+/// by default; a caller composing an extraction from raw spans — the
+/// document-level asynchronous Markdown path — applies it to match them.
+pub fn retain_spans_on_page(spans: &mut Vec<TextSpan>, page: &Page) {
+    let (x0, x1, y0, y1) = page_window(page);
+    spans.retain(|s| {
+        s.bbox.x1.max(s.bbox.x0) >= x0
+            && s.bbox.x0.min(s.bbox.x1) <= x1
+            && s.bbox.y1.max(s.bbox.y0) >= y0
+            && s.bbox.y0.min(s.bbox.y1) <= y1
+    });
+}
+
+/// [`retain_spans_on_page`] for rulings: drops the segments that lie
+/// entirely outside `page`'s crop box, so an off-page grid cannot become a
+/// table.
+pub fn retain_rulings_on_page(rulings: &mut Vec<Ruling>, page: &Page) {
+    let (x0, x1, y0, y1) = page_window(page);
+    rulings.retain(|r| {
+        r.start.x.max(r.end.x) >= x0
+            && r.start.x.min(r.end.x) <= x1
+            && r.start.y.max(r.end.y) >= y0
+            && r.start.y.min(r.end.y) <= y1
+    });
+}
+
 /// Extracts the page's text with layout applied: spans grouped into lines,
 /// lines in the [`ReadingOrder`] given and joined with `\n`, spaces
 /// inserted at horizontal gaps. [`ReadingOrder::Content`] is the default
@@ -73,7 +130,21 @@ pub fn extract_text_reporting(
     page: &Page,
     order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting(doc, page, order)?;
+    extract_text_reporting_opts(doc, page, order, TextOptions::default())
+}
+
+/// [`extract_text_reporting`] with [`TextOptions`]: `invisible_text` keeps
+/// the content outside the page box that the default drops.
+pub fn extract_text_reporting_opts(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) = pdfboss_text::extract_spans_reporting(doc, page, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
     Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
@@ -86,8 +157,24 @@ pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     structure: Option<&StructureTree>,
     order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) =
+    extract_text_reporting_with_opts(src, page, oc, structure, order, TextOptions::default()).await
+}
+
+/// [`extract_text_reporting_with`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside the page box that the default drops.
+pub async fn extract_text_reporting_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) =
         pdfboss_text::extract_spans_reporting_with(src, page, oc, structure, order).await?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
     Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
@@ -105,7 +192,23 @@ pub fn extract_text_reporting_cached(
     fonts: &FontCache,
     order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting_cached(doc, page, fonts, order)?;
+    extract_text_reporting_cached_opts(doc, page, fonts, order, TextOptions::default())
+}
+
+/// [`extract_text_reporting_cached`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside the page box that the default drops.
+pub fn extract_text_reporting_cached_opts(
+    doc: &Document,
+    page: &Page,
+    fonts: &FontCache,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) =
+        pdfboss_text::extract_spans_reporting_cached(doc, page, fonts, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
     Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
@@ -124,6 +227,17 @@ pub fn extract_markdown(doc: &Document, order: ReadingOrder) -> Result<String> {
     Ok(markdown)
 }
 
+/// [`extract_markdown`] with [`TextOptions`]: `invisible_text` keeps the
+/// content outside each page's box that the default drops.
+pub fn extract_markdown_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<String> {
+    let (markdown, _) = extract_markdown_reporting_opts(doc, order, opts)?;
+    Ok(markdown)
+}
+
 /// [`extract_markdown`] with one [`ExtractReport`] per page, in page order.
 ///
 /// Each page's rulings ride along with its spans: a table whose structure is
@@ -132,9 +246,25 @@ pub fn extract_markdown_reporting(
     doc: &Document,
     order: ReadingOrder,
 ) -> Result<(String, Vec<ExtractReport>)> {
+    extract_markdown_reporting_opts(doc, order, TextOptions::default())
+}
+
+/// [`extract_markdown_reporting`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside each page's box that the default drops.
+pub fn extract_markdown_reporting_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
     let per_page = pdfboss_core::map_pages(doc, |doc: &Document, page: &Page| {
-        pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts, order)
+        let (mut spans, mut rulings, report) =
+            pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts, order)?;
+        if !opts.invisible_text {
+            retain_spans_on_page(&mut spans, page);
+            retain_rulings_on_page(&mut rulings, page);
+        }
+        Ok((spans, rulings, report))
     });
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
@@ -153,8 +283,23 @@ pub fn extract_markdown_reporting(
 /// [`extract_markdown`] is the better answer whenever the document is at
 /// hand — a page whose text is all one size has no heading to find.
 pub fn extract_page_markdown(doc: &Document, page: &Page, order: ReadingOrder) -> Result<String> {
-    let (spans, rulings, report) =
+    extract_page_markdown_opts(doc, page, order, TextOptions::default())
+}
+
+/// [`extract_page_markdown`] with [`TextOptions`]: `invisible_text` keeps
+/// the content outside the page box that the default drops.
+pub fn extract_page_markdown_opts(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<String> {
+    let (mut spans, mut rulings, report) =
         pdfboss_text::extract_spans_and_rulings_reporting(doc, page, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
 }
 
@@ -173,9 +318,26 @@ pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
     structure: Option<&StructureTree>,
     order: ReadingOrder,
 ) -> Result<String> {
-    let (spans, rulings, report) =
+    extract_page_markdown_with_opts(src, page, oc, structure, order, TextOptions::default()).await
+}
+
+/// [`extract_page_markdown_with`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside the page box that the default drops.
+pub async fn extract_page_markdown_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<String> {
+    let (mut spans, mut rulings, report) =
         pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc, structure, order)
             .await?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
 }
 
@@ -1358,5 +1520,52 @@ mod tests {
         let xs = std::fs::read(format!("{dir}/xref-stream.pdf")).unwrap();
         let doc = Document::load(xs).unwrap();
         assert_eq!(page_text(&doc, 0), "Hello, world!");
+    }
+
+    /// A 300 by 200 page whose content stream also draws text far to the
+    /// right of the page box — the pasteboard leftovers a cropped export
+    /// keeps. `(inside)` sits on the page; `(pasteboard)` starts at x=650.
+    fn pasteboard_doc() -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf 50 100 Td (inside) Tj 600 0 Td (pasteboard) Tj ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        );
+        Document::load(b.build(1)).unwrap()
+    }
+
+    #[test]
+    fn extraction_clips_to_the_page_box() {
+        let doc = pasteboard_doc();
+        assert_eq!(page_text(&doc, 0), "inside");
+        let md = extract_markdown(&doc, ReadingOrder::Content).unwrap();
+        assert!(md.contains("inside"), "markdown lost page text: {md:?}");
+        assert!(!md.contains("pasteboard"), "markdown kept off-page text: {md:?}");
+    }
+
+    #[test]
+    fn invisible_text_keeps_off_page_content() {
+        let doc = pasteboard_doc();
+        let page = doc.page(0).unwrap();
+        let opts = TextOptions {
+            invisible_text: true,
+        };
+        let (text, _) =
+            extract_text_reporting_opts(&doc, &page, ReadingOrder::Content, opts).unwrap();
+        assert_eq!(text, "inside pasteboard");
+        let md = extract_markdown_opts(&doc, ReadingOrder::Content, opts).unwrap();
+        assert!(md.contains("pasteboard"), "flag dropped off-page text: {md:?}");
     }
 }
