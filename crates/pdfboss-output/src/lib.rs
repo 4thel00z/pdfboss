@@ -861,6 +861,31 @@ mod tests {
         );
     }
 
+    /// A lattice whose outer frame never made it into the rulings — only
+    /// the interior verticals and the row rules are there. The rules'
+    /// extents say where the frame was: the horizontals span the table's
+    /// width, the verticals its height, and the outer columns and bands
+    /// they imply hold the outer cells.
+    #[test]
+    fn interior_lattice_infers_its_outer_edges() {
+        let md = markdown_of_drawn(
+            "180 610 m 180 710 l S 258 610 m 258 710 l S \
+             70 688 m 540 688 l S 70 648 m 540 648 l S \
+             BT /F1 10 Tf 1 0 0 1 74 696 Tm (Channel) Tj 1 0 0 1 186 696 Tm (Medium) Tj 1 0 0 1 264 696 Tm (Examples) Tj \
+             1 0 0 1 74 664 Tm (Direct) Tj 1 0 0 1 186 664 Tm (Physical) Tj 1 0 0 1 264 664 Tm (meetings) Tj \
+             1 0 0 1 74 624 Tm (Indirect) Tj 1 0 0 1 186 624 Tm (Digital) Tj 1 0 0 1 264 624 Tm (websites) Tj ET",
+        );
+        assert!(
+            md.contains("| Channel | Medium | Examples |"),
+            "outer cells sit in inferred outer columns: {md:?}"
+        );
+        assert!(
+            md.contains("| Direct | Physical | meetings |")
+                && md.contains("| Indirect | Digital | websites |"),
+            "all three bands row: {md:?}"
+        );
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
     #[test]

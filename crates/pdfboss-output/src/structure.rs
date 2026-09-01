@@ -1362,7 +1362,7 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 /// Where they reach beyond it, a synthetic boundary at their far end adds
 /// that band, so the rows it holds stay rows of this grid.
 fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGrid> {
-    let xs = distinct_positions(verticals);
+    let mut xs = distinct_positions(verticals);
     let mut ys = distinct_positions(horizontals);
     if xs.len() < RULED_GRID_MIN_VERTICALS || ys.is_empty() {
         return None;
@@ -1386,6 +1386,23 @@ fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGr
     }
     if reach_hi > y_hi + RULING_SNAP_TOLERANCE {
         ys.push(reach_hi);
+    }
+    // The mirror for columns: a frame that never reached the rulings (a
+    // rounded or decorated border) leaves its row rules running past the
+    // outermost verticals, and their reach is where its edges were.
+    let across_lo = horizontals
+        .iter()
+        .map(|line| line.extent.start)
+        .fold(f32::INFINITY, f32::min);
+    let across_hi = horizontals
+        .iter()
+        .map(|line| line.extent.end)
+        .fold(f32::NEG_INFINITY, f32::max);
+    if across_lo < x_lo - RULING_SNAP_TOLERANCE {
+        xs.insert(0, across_lo);
+    }
+    if across_hi > x_hi + RULING_SNAP_TOLERANCE {
+        xs.push(across_hi);
     }
     if ys.len() < RULED_GRID_MIN_HORIZONTALS {
         return None;
