@@ -2437,6 +2437,9 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
     let mut out = Vec::new();
     if let Some(bands) = page_bands {
         out.extend(bands);
+        // A band's empty sides go before the grids slot in by height: an
+        // empty segment has no height and would match any grid's top.
+        out.retain(|segment| !segment.spans.is_empty());
         // Each grid's segment slots in by height: before the first band
         // that starts below the grid's top.
         for spans in merged {
@@ -2457,7 +2460,6 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
                 .unwrap_or(out.len());
             out.insert(position, Segment::ungrouped(spans));
         }
-        out.retain(|segment| !segment.spans.is_empty());
         return out;
     }
 
@@ -3174,6 +3176,73 @@ pub(crate) mod tests {
         assert!(
             open_ruled_grids(&spans, &rulings, &[]).is_empty(),
             "a 600-rule stack is not table territory"
+        );
+    }
+
+    /// One block of single-span lines, top line at `top`, stepping down 12.
+    fn block(prefix: &str, x: f32, end_x: f32, top: f32, lines: usize, spans: &mut Vec<TextSpan>) {
+        for i in 0..lines {
+            let text = format!("{prefix} body line {i} of text");
+            spans.push(span(&text, x, end_x, top - 12.0 * i as f32, 10.0));
+        }
+    }
+
+    /// A two-by-two drawn grid at the page bottom and its four cell spans.
+    fn bottom_grid(spans: &mut Vec<TextSpan>) -> RuledGrid {
+        for (text, x, end_x, y) in [
+            ("cell a1", 80.0, 170.0, 240.0),
+            ("cell b1", 190.0, 280.0, 240.0),
+            ("cell a2", 80.0, 170.0, 220.0),
+            ("cell b2", 190.0, 280.0, 220.0),
+        ] {
+            spans.push(span(text, x, end_x, y, 10.0));
+        }
+        RuledGrid {
+            xs: vec![76.0, 180.0, 284.0],
+            ys: vec![186.0, 254.0],
+            boxed: true,
+            open: false,
+        }
+    }
+
+    /// A page whose columns interleave across the gutter (the page-lane
+    /// path), with a full-width title above them and a drawn grid at the
+    /// bottom, its cell text written first in the stream. The title's band
+    /// stripe leaves empty column segments above it, and the grid must
+    /// still slot in at the bottom — below the title and both columns —
+    /// not before them.
+    #[test]
+    fn a_bottom_grid_slots_below_the_title_band() {
+        let mut spans = Vec::new();
+        let grid = bottom_grid(&mut spans);
+        spans.push(span(
+            "The annual report of the society",
+            72.0,
+            288.0,
+            740.0,
+            10.0,
+        ));
+        block("left one", 72.0, 160.0, 700.0, 10, &mut spans);
+        block("right one", 200.0, 288.0, 628.0, 10, &mut spans);
+        block("left two", 72.0, 160.0, 556.0, 10, &mut spans);
+        block("right two", 200.0, 288.0, 484.0, 10, &mut spans);
+        block("left three", 72.0, 160.0, 412.0, 10, &mut spans);
+        let segments = segments_with_grids(&spans, std::slice::from_ref(&grid));
+        assert!(
+            segments[0]
+                .spans
+                .iter()
+                .any(|s| s.text.starts_with("The annual report")),
+            "the title reads first"
+        );
+        let grid_at = segments
+            .iter()
+            .position(|seg| seg.spans.iter().any(|s| s.text == "cell a1"))
+            .expect("the grid's text is somewhere");
+        assert_eq!(
+            grid_at,
+            segments.len() - 1,
+            "the bottom grid reads last, not hoisted above the title"
         );
     }
 
