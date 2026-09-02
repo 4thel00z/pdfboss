@@ -285,7 +285,7 @@ The canvas is only usable inside the call: any method raises `PdfError` once `dr
 
 `Metadata` fills the document information dictionary: `title`, `author`, `subject`, `keywords`, `creator`, `producer`, `creation_date`, `modification_date`. Every field is an `Option`, and an all-`None` value writes no `/Info` dictionary at all. Dates are explicit `Date { year, month, day, hour, minute, second, utc_offset_minutes }` values; the writer never reads a clock, so dates appear in output only when supplied.
 
-Any `Some` metadata, all-`None` included, also writes an XMP metadata stream wired into the catalog as `/Metadata`, built from the same value so the two never drift: `title` becomes `dc:title`, `author` `dc:creator`, `subject` `dc:description`, `keywords` `pdf:Keywords`, `producer` `pdf:Producer`, `creator` `xmp:CreatorTool`, and the dates `xmp:CreateDate`/`xmp:ModifyDate` in ISO-8601. The packet carries no `xmpMM:InstanceID`, no `xmpMM:DocumentID` and no generated timestamps. Nothing in the crate reads clocks or randomness, and the file identifier derives from a hash of the emitted body, so the same input produces byte-identical output.
+Any `Some` metadata, all-`None` included, also writes an XMP metadata stream referenced from the catalog as `/Metadata`, built from the same value so the two always match: `title` becomes `dc:title`, `author` `dc:creator`, `subject` `dc:description`, `keywords` `pdf:Keywords`, `producer` `pdf:Producer`, `creator` `xmp:CreatorTool`, and the dates `xmp:CreateDate`/`xmp:ModifyDate` in ISO-8601. The packet carries no `xmpMM:InstanceID`, no `xmpMM:DocumentID` and no generated timestamps. Nothing in the crate reads clocks or randomness, and the file identifier derives from a hash of the emitted body, so the same input produces identical output bytes.
 
 ## Writing the file
 
@@ -434,9 +434,9 @@ use pdfboss_core::Document;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = Document::open("report.pdf")?;
-    let overlay = Document::open("draft-stamp.pdf")?;
+    let overlay = Document::open("draft.pdf")?;
     let bytes = pdfboss_write::watermark(&base, &overlay)?;
-    std::fs::write("report-stamped.pdf", bytes)?;
+    std::fs::write("report-watermarked.pdf", bytes)?;
     Ok(())
 }
 ```
@@ -448,6 +448,8 @@ From Python, `pdfboss.write.watermark(data, overlay)` takes and returns bytes; `
 ```python
 import pdfboss
 
-stamped = pdfboss.write.watermark(open("report.pdf", "rb").read(), open("draft-stamp.pdf", "rb").read())
-open("report-stamped.pdf", "wb").write(stamped)
+marked = pdfboss.write.watermark(open("report.pdf", "rb").read(), open("draft.pdf", "rb").read())
+open("report-watermarked.pdf", "wb").write(marked)
 ```
+
+`watermark_under(&base, &overlay)` in Rust and `pdfboss.write.watermark(data, overlay, under=True)` in Python draw the overlay beneath the page's own content instead of on top of it, so the page's own content paints over it.
