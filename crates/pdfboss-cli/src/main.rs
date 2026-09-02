@@ -115,6 +115,26 @@ enum Command {
         #[arg(long, default_value = "")]
         password: String,
     },
+    /// Rotate selected pages by a quarter-turn multiple, clockwise.
+    Rotate {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// 1-based pages, e.g. 2,4-9; every page when omitted.
+        #[arg(long)]
+        pages: Option<String>,
+        /// Quarter turns clockwise: 90, 180 or 270.
+        #[arg(long, value_parser = ["90", "180", "270"])]
+        by: String,
+        /// Full rewrite instead of an incremental append.
+        #[arg(long)]
+        rewrite: bool,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
     /// Show version, page count, page sizes and metadata.
     Info {
         /// Path to the PDF file.
@@ -402,6 +422,15 @@ fn main() {
             every,
             password,
         } => assemble::cmd_split(&file, &out, every, &password).map_err(Failure::from),
+        Command::Rotate {
+            file,
+            out,
+            pages,
+            by,
+            rewrite,
+            password,
+        } => assemble::cmd_rotate(&file, &out, pages.as_deref(), &by, rewrite, &password)
+            .map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,

@@ -32,7 +32,7 @@ pub mod update;
 pub mod writer;
 mod xmp;
 
-pub use assemble::{merge_documents, split_document};
+pub use assemble::{merge_documents, rotate_rewrite, split_document};
 pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
 pub use content::serialize_ops;
@@ -47,6 +47,7 @@ pub use pdf::{
 };
 pub use sink::{AsyncByteSink, Immediate};
 pub use update::{
-    set_metadata_with, start_offset, watermark, watermark_with, Overlay, OverlayBase, Update,
+    rotate_pages, set_metadata_with, start_offset, watermark, watermark_with, Overlay, OverlayBase,
+    Update,
 };
 pub use writer::{WriteOptions, Writer, XrefStyle};

@@ -195,6 +195,31 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
     update.bytes()
 }
 
+/// Stages `by` degrees of rotation, clockwise, on each of `pages` (0-based
+/// indices) into `update`: a clone of the page's own leaf dictionary, its
+/// `/Rotate` set to its current effective rotation plus `by`, normalized
+/// with `rem_euclid(360)`. The staged dictionary is untranslated: it
+/// keeps its own `/Parent`, so it stays exactly where it was in the page
+/// tree. A page with no object of its own (inlined directly into
+/// `/Kids`) cannot be staged this way: refused, naming its 1-based page
+/// number and pointing at `--rewrite`.
+pub fn rotate_pages(update: &mut Update, pages: &[usize], by: i32) -> Result<()> {
+    for &index in pages {
+        let page = update.doc.page(index).map_err(core_error)?;
+        let Some(page_ref) = page.object_ref() else {
+            return Err(Error::Other(format!(
+                "page {} has no object of its own (inlined into /Kids); use --rewrite instead",
+                index + 1
+            )));
+        };
+        let mut dict = page.dict().clone();
+        let rotate = (page.rotate + by).rem_euclid(360);
+        dict.insert(name("Rotate"), Object::Int(i64::from(rotate)));
+        update.set(page_ref, Object::Dict(dict));
+    }
+    Ok(())
+}
+
 /// The facts about a base document an update needs, read once from its
 /// trailer and its own newest cross-reference section: refuses an
 /// encrypted base or one missing `/Root` or a `startxref` to chain from.

@@ -150,3 +150,91 @@ fn split_rejects_every_zero_at_the_clap_level() {
     );
     assert!(stderr.contains('0'), "no offending value in: {stderr}");
 }
+
+#[test]
+fn rotate_appends_by_default_and_keeps_the_prefix() {
+    let input = tmp("rotate-append-in.pdf");
+    let base = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
+    std::fs::write(&input, &base).unwrap();
+    let out = tmp("rotate-append-out.pdf");
+
+    let output = pdfboss(&[
+        "rotate",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--by",
+        "90",
+    ]);
+    assert!(output.status.success(), "rotate failed: {output:?}");
+
+    let out_bytes = std::fs::read(&out).unwrap();
+    assert_eq!(
+        &out_bytes[..base.len()],
+        &base[..],
+        "an append keeps the base bytes in place"
+    );
+
+    let doc = load(&out);
+    for index in 0..3 {
+        let page = doc.page(index).unwrap();
+        assert_eq!(page.rotate, 90, "page {index}");
+    }
+}
+
+#[test]
+fn rotate_pages_flag_selects_a_range() {
+    let input = tmp("rotate-range-in.pdf");
+    std::fs::write(
+        &input,
+        pdfboss_testkit::multi_page_doc(&["one", "two", "three"]),
+    )
+    .unwrap();
+    let out = tmp("rotate-range-out.pdf");
+
+    let output = pdfboss(&[
+        "rotate",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--pages",
+        "2-3",
+        "--by",
+        "180",
+    ]);
+    assert!(output.status.success(), "rotate failed: {output:?}");
+
+    let doc = load(&out);
+    for (index, expected) in [0, 180, 180].iter().enumerate() {
+        let page = doc.page(index).unwrap();
+        assert_eq!(page.rotate, *expected, "page {index}");
+    }
+}
+
+#[test]
+fn rotate_rewrite_flag_writes_a_full_rewrite() {
+    let input = tmp("rotate-rewrite-in.pdf");
+    std::fs::write(
+        &input,
+        pdfboss_testkit::multi_page_doc(&["one", "two", "three"]),
+    )
+    .unwrap();
+    let out = tmp("rotate-rewrite-out.pdf");
+
+    let output = pdfboss(&[
+        "rotate",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--by",
+        "270",
+        "--rewrite",
+    ]);
+    assert!(output.status.success(), "rotate failed: {output:?}");
+
+    let doc = load(&out);
+    for index in 0..3 {
+        let page = doc.page(index).unwrap();
+        assert_eq!(page.rotate, 270, "page {index}");
+    }
+}

@@ -1,11 +1,16 @@
 //! `pdfboss merge` and `pdfboss split`: combining selected pages from
 //! several input files into one fresh document, or cutting one document
-//! into consecutive-page parts.
+//! into consecutive-page parts. Also `pdfboss rotate`: turning selected
+//! pages by a quarter-turn multiple, by appending an incremental update
+//! or writing a full rewrite.
 
 use std::path::Path;
 
 use pdfboss_core::Document;
-use pdfboss_write::{merge_documents, split_document, Error as WriteError, WriteOptions};
+use pdfboss_write::{
+    merge_documents, rotate_pages, rotate_rewrite, split_document, Error as WriteError, Update,
+    WriteOptions,
+};
 
 use crate::pages::{parse_ranges, pattern_path, split_input_spec};
 
@@ -66,9 +71,52 @@ pub fn cmd_split(file: &Path, out: &str, every: usize, password: &str) -> Result
     Ok(())
 }
 
+/// Runs `pdfboss rotate`: rotates `pages` (1-based, e.g. `2,4-9`; every
+/// page when omitted) of `file` by `by` degrees clockwise (`"90"`,
+/// `"180"` or `"270"`, already validated by clap's `--by` choices), and
+/// writes the result to `out`. Appends an incremental update by default;
+/// `rewrite` asks for a full rewrite instead, the only way to rotate a
+/// page inlined directly into `/Kids` with no object of its own.
+pub fn cmd_rotate(
+    file: &Path,
+    out: &Path,
+    pages: Option<&str>,
+    by: &str,
+    rewrite: bool,
+    password: &str,
+) -> Result<(), String> {
+    let by: i32 = by
+        .parse()
+        .map_err(|_| format!("invalid --by value: {by}"))?;
+    let doc = Document::open_with_password(file, password)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    reject_encrypted(&doc, file)?;
+    let indices = match pages {
+        Some(text) => {
+            parse_ranges(text, doc.page_count()).map_err(|e| format!("{}: {e}", file.display()))?
+        }
+        None => (0..doc.page_count()).collect(),
+    };
+    let count = indices.len();
+    if rewrite {
+        let bytes = rotate_rewrite(&doc, &indices, by, WriteOptions::default())
+            .map_err(|e| e.to_string())?;
+        std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    } else {
+        let mut update = Update::new(&doc).map_err(|e| e.to_string())?;
+        rotate_pages(&mut update, &indices, by).map_err(|e| e.to_string())?;
+        update
+            .save(out)
+            .map_err(|e| format!("{}: {e}", out.display()))?;
+    }
+    let plural = if count == 1 { "" } else { "s" };
+    println!("wrote {} ({count} page{plural} rotated)", out.display());
+    Ok(())
+}
+
 /// Refuses a document carrying an `/Encrypt` entry, naming `path` in the
-/// error. Shared by `cmd_merge` and `cmd_split`: neither copies encrypted
-/// content into a fresh output.
+/// error. Shared by `cmd_merge`, `cmd_split` and `cmd_rotate`: none of
+/// them copies encrypted content into a fresh output.
 fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
     if doc
         .xref()

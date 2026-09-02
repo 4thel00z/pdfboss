@@ -6,6 +6,7 @@ use pdfboss_core::{Dict, Document, Name, Object};
 
 use crate::error::{Error, Result};
 use crate::importer::Importer;
+use crate::update::core_error;
 use crate::writer::{WriteOptions, Writer};
 
 /// Assembles `inputs` into one document: each source's selected pages
@@ -58,6 +59,48 @@ fn name(text: &str) -> Name {
     Name(text.to_string())
 }
 
+/// Rewrites `doc` fresh, like [`merge_documents`] but keeping the whole
+/// document rather than assembling selected pages into a new tree: every
+/// object the catalog and `/Info` reach is copied over, and each of
+/// `pages` (0-based indices) gets its own leaf dictionary substituted with
+/// `/Rotate` set to its current effective rotation plus `by`, normalized
+/// with `rem_euclid(360)`. A selected page with no object of its own
+/// (inlined directly into `/Kids`) has no reference to substitute a
+/// rewritten body onto: refused, naming its 1-based page number.
+pub fn rotate_rewrite(
+    doc: &Document,
+    pages: &[usize],
+    by: i32,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    let mut writer = Writer::new(options);
+    let mut importer = Importer::new(&mut writer, doc)?;
+    let new_info = doc
+        .xref()
+        .trailer
+        .get_ref("Info")
+        .map(|info| importer.reference(info));
+    for &index in pages {
+        let page = doc.page(index).map_err(core_error)?;
+        let Some(page_ref) = page.object_ref() else {
+            return Err(Error::Other(format!(
+                "page {} has no object of its own (inlined into /Kids)",
+                index + 1
+            )));
+        };
+        let mut dict = page.dict().clone();
+        let rotate = (page.rotate + by).rem_euclid(360);
+        dict.insert(name("Rotate"), Object::Int(i64::from(rotate)));
+        let body = importer.copy(&Object::Dict(dict))?;
+        importer.substitute(page_ref, body);
+    }
+    let new_root = importer.document()?;
+    if let Some(new_info) = new_info {
+        writer.set_info(new_info);
+    }
+    writer.finish(new_root)
+}
+
 /// Consecutive chunks of `every` pages, each a fresh document. `every` must
 /// be at least 1; the last chunk carries whatever remains, so no chunk is
 /// ever empty.
@@ -82,7 +125,7 @@ pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Re
 #[cfg(test)]
 mod tests {
     use pdfboss_output::extract_text;
-    use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc};
+    use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, PdfBuilder};
 
     use super::*;
 
@@ -167,5 +210,43 @@ mod tests {
             panic!("expected Error::Other, got {result:?}");
         };
         assert!(message.contains("every"), "message: {message}");
+    }
+
+    /// Rotating pages 1 and 3 of a three-page document by 90 degrees
+    /// clockwise substitutes each page's own object with its effective
+    /// rotation plus 90, leaving the untouched page at 0. Unlike the
+    /// append path, the whole document is copied fresh.
+    #[test]
+    fn rotate_rewrite_rotates_the_selected_pages() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("doc loads");
+        let bytes =
+            rotate_rewrite(&doc, &[0, 2], 90, WriteOptions::default()).expect("rotate succeeds");
+        let rotated = Document::load(bytes).expect("rotated document loads");
+        for (index, expected) in [90, 0, 90].iter().enumerate() {
+            let page = rotated.page(index).expect("page exists");
+            assert_eq!(page.rotate, *expected, "page {index}");
+        }
+    }
+
+    /// A page inlined directly into `/Kids`, with no object of its own, has
+    /// no reference to substitute a rewritten body onto: `rotate_rewrite`
+    /// refuses it, naming its 1-based page number, rather than silently
+    /// leaving it unrotated.
+    #[test]
+    fn rotate_rewrite_refuses_an_inline_page() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(
+            2,
+            "<< /Type /Pages /Count 1 /Kids [ << /Type /Page /Parent 2 0 R \
+             /MediaBox [0 0 612 792] >> ] >>",
+        );
+        let doc = Document::load(b.build(1)).expect("doc loads");
+
+        let result = rotate_rewrite(&doc, &[0], 90, WriteOptions::default());
+        let Err(Error::Other(message)) = result else {
+            panic!("expected Error::Other, got {result:?}");
+        };
+        assert!(message.contains("page 1"), "message: {message}");
     }
 }

@@ -5,8 +5,8 @@
 use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, XrefKind};
 use pdfboss_write::{
-    Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions, Writer,
-    XrefStyle,
+    rotate_pages, Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update,
+    WriteOptions, Writer, XrefStyle,
 };
 
 fn base_pdf(xref: XrefStyle) -> Vec<u8> {
@@ -897,4 +897,52 @@ fn set_metadata_resolves_indirect_info_values_into_xmp() {
         text.contains("Indirect Title"),
         "a kept indirect /Info value must still reach the rewritten XMP packet: {text}"
     );
+}
+
+/// Rotating pages 1 and 3 of a three-page document by 90 degrees clockwise
+/// stages each page's own object with its effective rotation plus 90,
+/// leaving the untouched page at 0. The base bytes stay in place at the
+/// front of the output, since this is an incremental update.
+#[test]
+fn rotate_pages_marks_selected_pages_and_keeps_the_prefix() {
+    let base = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base.clone()).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    rotate_pages(&mut update, &[0, 2], 90).unwrap();
+    let out = update.bytes().unwrap();
+    assert_eq!(
+        &out[..base.len()],
+        &base[..],
+        "an update keeps the base bytes in place"
+    );
+
+    let reread = Document::load(out).unwrap();
+    for (index, expected) in [90, 0, 90].iter().enumerate() {
+        let page = reread.page(index).unwrap();
+        assert_eq!(page.rotate, *expected, "page {index}");
+    }
+}
+
+/// A page inlined directly into `/Kids`, with no object of its own, cannot
+/// be staged as a replacement object: `rotate_pages` refuses it, naming
+/// its 1-based page number and pointing at `--rewrite`.
+#[test]
+fn rotate_pages_refuses_an_inline_page() {
+    let mut b = pdfboss_testkit::PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Count 1 /Kids [ << /Type /Page /Parent 2 0 R \
+         /MediaBox [0 0 612 792] >> ] >>",
+    );
+    let base = b.build(1);
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+
+    let result = rotate_pages(&mut update, &[0], 90);
+    let Err(Error::Other(message)) = result else {
+        panic!("expected Error::Other, got {result:?}");
+    };
+    assert!(message.contains("page 1"), "message: {message}");
+    assert!(message.contains("--rewrite"), "message: {message}");
 }
