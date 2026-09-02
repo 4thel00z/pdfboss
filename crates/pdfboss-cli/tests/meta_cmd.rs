@@ -163,3 +163,70 @@ fn meta_rewrite_flag_writes_a_fresh_file_with_the_set_fields() {
     let doc = load(&out);
     assert_eq!(doc.metadata().title.as_deref(), Some("Rewritten"));
 }
+
+/// `meta` refuses an encrypted input in both modes, the same way every
+/// other assembly command does, even once the correct password has opened
+/// it: `decrypt` is the one command that deliberately strips encryption.
+#[test]
+fn meta_refuses_an_encrypted_input_in_either_mode() {
+    let input = tmp("meta-encrypted-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["one"])).unwrap();
+    let encrypted = tmp("meta-encrypted.pdf");
+    let encrypt_output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        encrypted.to_str().unwrap(),
+        "--user-password",
+        "secret",
+    ]);
+    assert!(
+        encrypt_output.status.success(),
+        "encrypt failed: {encrypt_output:?}"
+    );
+
+    let rewrite_out = tmp("meta-encrypted-rewrite-out.pdf");
+    let rewrite_output = pdfboss(&[
+        "meta",
+        encrypted.to_str().unwrap(),
+        "-o",
+        rewrite_out.to_str().unwrap(),
+        "--set",
+        "title=Nope",
+        "--rewrite",
+        "--password",
+        "secret",
+    ]);
+    assert_eq!(
+        rewrite_output.status.code(),
+        Some(1),
+        "meta --rewrite on an encrypted input should exit nonzero: {rewrite_output:?}"
+    );
+    let rewrite_stderr = String::from_utf8_lossy(&rewrite_output.stderr).into_owned();
+    assert!(
+        rewrite_stderr.contains("meta-encrypted.pdf"),
+        "no input path in: {rewrite_stderr}"
+    );
+
+    let append_out = tmp("meta-encrypted-append-out.pdf");
+    let append_output = pdfboss(&[
+        "meta",
+        encrypted.to_str().unwrap(),
+        "-o",
+        append_out.to_str().unwrap(),
+        "--set",
+        "title=Nope",
+        "--password",
+        "secret",
+    ]);
+    assert_eq!(
+        append_output.status.code(),
+        Some(1),
+        "meta (append mode) on an encrypted input should exit nonzero: {append_output:?}"
+    );
+    let append_stderr = String::from_utf8_lossy(&append_output.stderr).into_owned();
+    assert!(
+        append_stderr.contains("meta-encrypted.pdf"),
+        "no input path in: {append_stderr}"
+    );
+}

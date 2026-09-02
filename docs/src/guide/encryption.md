@@ -46,11 +46,10 @@ pages:     1
 Every subcommand that reads a PDF (`info`, `text`, `md`,
 `render`, `images`, `obj`, `tui`, `json`, `hex`, `meta` and `q`) takes
 `--password`, accepted as either the user or the owner password. For
-`meta` it only unlocks the base for reading: the incremental update it
-appends by default still refuses any encrypted base outright, whether
-or not the password opened it, the same refusal `rotate`'s and
-`overlay`'s own default append raise, and `pdfboss_write::Update`
-raises directly:
+`meta` it only unlocks the base for reading: every assembly command,
+`meta` included, refuses an encrypted input at write time regardless of
+password; `decrypt` is the one command that removes encryption instead
+of refusing it:
 
 ```bash
 pdfboss text --password hunter2 locked.pdf
@@ -219,10 +218,10 @@ encrypted base (the default mode of `meta`, `rotate` and `overlay`, and
 `pdfboss_write::Update` directly) still refuses the base outright,
 whether or not it opens under a password. `encrypt` and `decrypt` are
 the only commands that take a password-opened encrypted input
-directly; `merge`, `split`, `rewrite` and the `--rewrite` forms of
-`rotate`/`overlay` refuse every encrypted input at the CLI regardless
-of password, even though the `pdfboss_write` functions behind them
-would accept an already-opened one and carry its content across as
-plaintext. The `/Info` metadata stream (the XMP packet), like every
+directly; `merge`, `split`, `rewrite`, `meta --rewrite` and the
+`--rewrite` forms of `rotate`/`overlay` refuse every encrypted input at
+the CLI regardless of password, even though the `pdfboss_write`
+functions behind them would accept an already-opened one and carry its
+content across as plaintext. The `/Info` metadata stream (the XMP packet), like every
 other string and stream in the file, is always encrypted along with
 the rest of the content.

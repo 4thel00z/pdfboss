@@ -266,14 +266,14 @@ pub fn cmd_overlay(
 }
 
 /// Refuses a document carrying an `/Encrypt` entry, naming `path` in the
-/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate`, `cmd_rewrite`
-/// and `cmd_overlay`: the CLI refuses every encrypted input on every
-/// assembly command, password-opened or not, regardless of the library's
-/// own finer predicate underneath (some library entry points now accept a
-/// password-opened source; this gate runs first and stays coarser on
-/// purpose). `cmd_overlay` calls this once per input rather than relying
-/// on a library check, so each refusal names its own file.
-fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
+/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate`, `cmd_rewrite`,
+/// `cmd_overlay` and `cmd_meta`: the CLI refuses every encrypted input on
+/// every assembly command, password-opened or not, regardless of the
+/// library's own finer predicate underneath (some library entry points now
+/// accept a password-opened source; this gate runs first and stays coarser
+/// on purpose). `cmd_overlay` calls this once per input rather than
+/// relying on a library check, so each refusal names its own file.
+pub fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
     if doc.is_encrypted() {
         return Err(format!("{}: {}", path.display(), WriteError::EncryptedBase));
     }

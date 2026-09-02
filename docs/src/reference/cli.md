@@ -293,7 +293,7 @@ pdfboss meta [OPTIONS] --out <OUT> --set <SET> <FILE>
 - `-o, --out <OUT>`: output file (required)
 - `--set <KEY=VALUE>`: metadata assignment, repeatable and required at least once; `KEY` is one of `title`, `author`, `subject`, `keywords`, `creator`, `producer`
 - `--rewrite`: full rewrite instead of an incremental append
-- `--password <PASSWORD>`: opens an encrypted input for reading; the default incremental append still refuses any encrypted base
+- `--password <PASSWORD>`: opens an encrypted input for reading; an encrypted input is still refused at write time, in either mode
 
 ```bash
 pdfboss meta report.pdf -o report-titled.pdf --set title="Q3 Report" --set author="Finance"
@@ -309,7 +309,7 @@ pdfboss merge [OPTIONS] --out <OUT> <INPUTS>...
 
 - `<INPUTS>...`: one or more inputs, each optionally `FILE:RANGE` (1-based, e.g. `report.pdf:2-9`); a bare path takes every page
 - `-o, --out <OUT>`: output file (required)
-- `--password <PASSWORD>`: one password tried against every encrypted input; an encrypted input is still refused at write time, until encryption support arrives in a later PR
+- `--password <PASSWORD>`: one password tried against every encrypted input; an encrypted input is still refused at write time
 
 ```bash
 pdfboss merge report.pdf:2-9 appendix.pdf -o combined.pdf
