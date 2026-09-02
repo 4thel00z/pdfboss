@@ -1548,7 +1548,10 @@ impl Encryptor {
     /// exact inverse of [`Decryptor::decrypt_object`]: every string and
     /// stream body gets a fresh random IV and PKCS#7 padding before
     /// AES-256-CBC under the file key. AESV3 applies the same key to every
-    /// object, so `num` and `gen` only mirror that method's signature.
+    /// object, so `num` and `gen` are accepted and ignored here, purely for
+    /// signature symmetry with `decrypt_object`; a future per-object write
+    /// cipher (an AESV2 write path, say) would need to start deriving its
+    /// key from them instead of discarding them.
     pub fn encrypt_object(&mut self, obj: &mut Object, num: u32, gen: u16) {
         let _ = (num, gen);
         encrypt_in_place(obj, &self.file_key, &mut *self.rng);
