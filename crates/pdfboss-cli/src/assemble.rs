@@ -19,14 +19,7 @@ pub fn cmd_merge(inputs: &[String], out: &Path, password: &str) -> Result<(), St
         let (path, range) = split_input_spec(spec);
         let doc = Document::open_with_password(&path, password)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        if doc
-            .xref()
-            .trailer
-            .get("Encrypt")
-            .is_some_and(|o| !o.is_null())
-        {
-            return Err(format!("{}: {}", path.display(), WriteError::EncryptedBase));
-        }
+        reject_encrypted(&doc, &path)?;
         let indices = match range {
             Some(text) => Some(
                 parse_ranges(&text, doc.page_count())
@@ -59,14 +52,7 @@ pub fn cmd_split(file: &Path, out: &str, every: usize, password: &str) -> Result
     pattern_path(out, 1)?;
     let doc = Document::open_with_password(file, password)
         .map_err(|e| format!("{}: {e}", file.display()))?;
-    if doc
-        .xref()
-        .trailer
-        .get("Encrypt")
-        .is_some_and(|o| !o.is_null())
-    {
-        return Err(format!("{}: {}", file.display(), WriteError::EncryptedBase));
-    }
+    reject_encrypted(&doc, file)?;
     let total = doc.page_count();
     let parts = split_document(&doc, every, WriteOptions::default()).map_err(|e| e.to_string())?;
     for (i, bytes) in parts.iter().enumerate() {
@@ -76,6 +62,21 @@ pub fn cmd_split(file: &Path, out: &str, every: usize, password: &str) -> Result
         let count = (start + every).min(total) - start;
         let plural = if count == 1 { "" } else { "s" };
         println!("wrote {} ({count} page{plural})", path.display());
+    }
+    Ok(())
+}
+
+/// Refuses a document carrying an `/Encrypt` entry, naming `path` in the
+/// error. Shared by `cmd_merge` and `cmd_split`: neither copies encrypted
+/// content into a fresh output.
+fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
+    if doc
+        .xref()
+        .trailer
+        .get("Encrypt")
+        .is_some_and(|o| !o.is_null())
+    {
+        return Err(format!("{}: {}", path.display(), WriteError::EncryptedBase));
     }
     Ok(())
 }

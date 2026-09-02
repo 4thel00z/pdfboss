@@ -138,3 +138,15 @@ fn split_rejects_a_missing_percent_d_before_opening_the_input() {
         "input was opened despite the bad pattern: {stderr}"
     );
 }
+
+#[test]
+fn split_rejects_every_zero_at_the_clap_level() {
+    let output = pdfboss(&["split", "in.pdf", "-o", "part-%d.pdf", "--every", "0"]);
+    assert_eq!(output.status.code(), Some(2), "output: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("--every"),
+        "no --every mention in: {stderr}"
+    );
+    assert!(stderr.contains('0'), "no offending value in: {stderr}");
+}

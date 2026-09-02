@@ -58,9 +58,15 @@ fn name(text: &str) -> Name {
     Name(text.to_string())
 }
 
-/// Consecutive chunks of `every` pages, each a fresh document. The last
-/// chunk carries whatever remains (never zero, since `every` is at least 1).
+/// Consecutive chunks of `every` pages, each a fresh document. `every` must
+/// be at least 1; the last chunk carries whatever remains, so no chunk is
+/// ever empty.
 pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Result<Vec<Vec<u8>>> {
+    if every == 0 {
+        return Err(Error::Other(
+            "every must be at least 1 page per part".to_string(),
+        ));
+    }
     let total = doc.page_count();
     let mut parts = Vec::new();
     let mut start = 0;
@@ -151,5 +157,15 @@ mod tests {
         assert_eq!(parts.len(), 1);
         let only = Document::load(parts[0].clone()).expect("part loads");
         assert_eq!(only.page_count(), 3);
+    }
+
+    #[test]
+    fn split_rejects_zero_pages_per_part_with_an_honest_message() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("doc loads");
+        let result = split_document(&doc, 0, WriteOptions::default());
+        let Err(Error::Other(message)) = result else {
+            panic!("expected Error::Other, got {result:?}");
+        };
+        assert!(message.contains("every"), "message: {message}");
     }
 }
