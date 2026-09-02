@@ -408,3 +408,249 @@ fn overlay_names_the_path_of_an_encrypted_overlay() {
     );
     assert!(stderr.contains("encrypted"), "no cause in: {stderr}");
 }
+
+#[test]
+fn encrypt_then_text_with_password_reads_it() {
+    let input = tmp("encrypt-read-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["one", "two"])).unwrap();
+    let out = tmp("encrypt-read-out.pdf");
+
+    let output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--user-password",
+        "secret",
+    ]);
+    assert!(output.status.success(), "encrypt failed: {output:?}");
+
+    let doc =
+        Document::open_with_password(&out, "secret").expect("output opens with the user password");
+    assert!(doc.is_encrypted(), "encrypted output reports unencrypted");
+
+    let text_output = pdfboss(&["text", out.to_str().unwrap(), "--password", "secret"]);
+    assert!(text_output.status.success(), "text failed: {text_output:?}");
+    let stdout = String::from_utf8_lossy(&text_output.stdout).into_owned();
+    assert!(stdout.contains("one"), "page 1 missing: {stdout:?}");
+    assert!(stdout.contains("two"), "page 2 missing: {stdout:?}");
+}
+
+#[test]
+fn encrypt_re_encrypts_an_already_encrypted_input_under_new_passwords() {
+    let input = tmp("encrypt-re-encrypt-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["once"])).unwrap();
+    let first = tmp("encrypt-re-encrypt-first.pdf");
+    let first_output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        first.to_str().unwrap(),
+        "--user-password",
+        "old",
+    ]);
+    assert!(
+        first_output.status.success(),
+        "first encrypt failed: {first_output:?}"
+    );
+
+    let second = tmp("encrypt-re-encrypt-second.pdf");
+    let second_output = pdfboss(&[
+        "encrypt",
+        first.to_str().unwrap(),
+        "-o",
+        second.to_str().unwrap(),
+        "--password",
+        "old",
+        "--user-password",
+        "new",
+    ]);
+    assert!(
+        second_output.status.success(),
+        "re-encrypt failed: {second_output:?}"
+    );
+
+    // The old password no longer opens the re-encrypted output.
+    assert!(Document::open_with_password(&second, "old").is_err());
+
+    let text_output = pdfboss(&["text", second.to_str().unwrap(), "--password", "new"]);
+    assert!(text_output.status.success(), "text failed: {text_output:?}");
+    assert!(String::from_utf8_lossy(&text_output.stdout).contains("once"));
+}
+
+#[test]
+fn decrypt_of_encrypted_output_opens_with_plain_text() {
+    let input = tmp("decrypt-read-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["alpha", "beta"])).unwrap();
+    let encrypted = tmp("decrypt-read-encrypted.pdf");
+    let encrypt_output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        encrypted.to_str().unwrap(),
+        "--user-password",
+        "opensesame",
+    ]);
+    assert!(
+        encrypt_output.status.success(),
+        "encrypt failed: {encrypt_output:?}"
+    );
+
+    let out = tmp("decrypt-read-out.pdf");
+    let decrypt_output = pdfboss(&[
+        "decrypt",
+        encrypted.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--password",
+        "opensesame",
+    ]);
+    assert!(
+        decrypt_output.status.success(),
+        "decrypt failed: {decrypt_output:?}"
+    );
+
+    let doc = load(&out);
+    assert!(!doc.is_encrypted(), "decrypted output still encrypted");
+
+    let text_output = pdfboss(&["text", out.to_str().unwrap()]);
+    assert!(text_output.status.success(), "text failed: {text_output:?}");
+    let stdout = String::from_utf8_lossy(&text_output.stdout).into_owned();
+    assert!(stdout.contains("alpha"), "page 1 missing: {stdout:?}");
+    assert!(stdout.contains("beta"), "page 2 missing: {stdout:?}");
+}
+
+#[test]
+fn decrypt_wrong_or_missing_password_exits_nonzero_naming_the_file() {
+    let input = tmp("decrypt-wrong-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["one"])).unwrap();
+    let encrypted = tmp("decrypt-wrong-encrypted.pdf");
+    let encrypt_output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        encrypted.to_str().unwrap(),
+        "--user-password",
+        "correct",
+    ]);
+    assert!(
+        encrypt_output.status.success(),
+        "encrypt failed: {encrypt_output:?}"
+    );
+
+    let out = tmp("decrypt-wrong-out.pdf");
+    let wrong_password = pdfboss(&[
+        "decrypt",
+        encrypted.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--password",
+        "wrong",
+    ]);
+    assert_ne!(wrong_password.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&wrong_password.stderr).into_owned();
+    assert!(
+        stderr.contains("decrypt-wrong-encrypted.pdf"),
+        "no input path in: {stderr}"
+    );
+    assert!(!out.exists(), "no output should be written on a bad open");
+
+    let missing_password = pdfboss(&[
+        "decrypt",
+        encrypted.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_ne!(missing_password.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&missing_password.stderr).into_owned();
+    assert!(
+        stderr.contains("decrypt-wrong-encrypted.pdf"),
+        "no input path in: {stderr}"
+    );
+}
+
+#[test]
+fn encrypt_bad_allow_value_exits_2() {
+    let input = tmp("encrypt-bad-allow-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["one"])).unwrap();
+    let out = tmp("encrypt-bad-allow-out.pdf");
+
+    let output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--user-password",
+        "secret",
+        "--allow",
+        "print,bogus",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "output: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("bogus"), "no offending value in: {stderr}");
+    for name in [
+        "print",
+        "modify",
+        "copy",
+        "annotate",
+        "fill-forms",
+        "accessibility",
+        "assemble",
+        "print-hires",
+    ] {
+        assert!(stderr.contains(name), "{name} missing from list: {stderr}");
+    }
+}
+
+#[test]
+fn encrypt_requires_at_least_one_non_empty_password() {
+    let input = tmp("encrypt-no-password-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["one"])).unwrap();
+    let out = tmp("encrypt-no-password-out.pdf");
+
+    let output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "output: {output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("--user-password") || stderr.contains("--owner-password"),
+        "no flag named in: {stderr}"
+    );
+}
+
+#[test]
+fn encrypt_with_only_owner_password_opens_with_owner_and_empty_user_password() {
+    let input = tmp("encrypt-owner-only-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["secretpage"])).unwrap();
+    let out = tmp("encrypt-owner-only-out.pdf");
+
+    let output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--owner-password",
+        "ownersecret",
+    ]);
+    assert!(output.status.success(), "encrypt failed: {output:?}");
+
+    // Opens with the owner password.
+    let owner_text = pdfboss(&["text", out.to_str().unwrap(), "--password", "ownersecret"]);
+    assert!(
+        owner_text.status.success(),
+        "owner-password open failed: {owner_text:?}"
+    );
+    assert!(String::from_utf8_lossy(&owner_text.stdout).contains("secretpage"));
+
+    // ISO empty-user-password case: also opens with no password supplied.
+    let empty_user_text = pdfboss(&["text", out.to_str().unwrap()]);
+    assert!(
+        empty_user_text.status.success(),
+        "empty-user-password open failed: {empty_user_text:?}"
+    );
+    assert!(String::from_utf8_lossy(&empty_user_text.stdout).contains("secretpage"));
+}

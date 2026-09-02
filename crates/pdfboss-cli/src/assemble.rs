@@ -5,18 +5,21 @@
 //! or writing a full rewrite. Also `pdfboss rewrite`: writing a whole
 //! document fresh on its own, with no page change. Also `pdfboss overlay`:
 //! drawing one file's first page onto every page of another, over or under
-//! the content.
+//! the content. Also `pdfboss encrypt` and `pdfboss decrypt`: writing a
+//! fresh AES-256 protected copy of a document, or a fresh plain copy of one
+//! that was encrypted.
 
 use std::path::Path;
 
-use pdfboss_core::Document;
+use pdfboss_core::{Document, Permissions};
 use pdfboss_write::{
-    merge_documents, rewrite_document, rotate_pages, rotate_rewrite, split_document, watermark,
-    watermark_under, watermark_under_with, watermark_with, Error as WriteError, Update,
-    WriteOptions,
+    decrypt_document, encrypt_document, merge_documents, rewrite_document, rotate_pages,
+    rotate_rewrite, split_document, watermark, watermark_under, watermark_under_with,
+    watermark_with, Error as WriteError, Update, WriteOptions,
 };
 
 use crate::pages::{parse_ranges, pattern_path, split_input_spec};
+use crate::Failure;
 
 /// Runs `pdfboss merge`: opens every input (splitting an optional
 /// `FILE:RANGE` suffix), resolves each range against its own page count,
@@ -130,6 +133,105 @@ pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String
     std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("wrote {}", out.display());
     Ok(())
+}
+
+/// Runs `pdfboss encrypt`: AES-256 protects `file` under `user_password`
+/// and/or `owner_password` (ISO 32000-2 §7.6.4.3) and writes a fresh output
+/// to `out`, restricted by `allow`. `password` opens `file` first, so an
+/// already-encrypted input is re-encrypted under the new passwords once its
+/// content reads as plaintext. At least one of `user_password`/
+/// `owner_password` must be non-empty; that refusal is raised here, with
+/// its own message, ahead of the library's own coarser one.
+pub fn cmd_encrypt(
+    file: &Path,
+    out: &Path,
+    user_password: &str,
+    owner_password: &str,
+    allow: Option<Vec<String>>,
+    password: &str,
+) -> Result<(), Failure> {
+    if user_password.is_empty() && owner_password.is_empty() {
+        return Err(Failure::new(
+            "at least one of --user-password or --owner-password must be set",
+        ));
+    }
+    let permissions = parse_allow(allow)?;
+    let doc = Document::open_with_password(file, password)
+        .map_err(|e| Failure::new(format!("{}: {e}", file.display())))?;
+    let bytes = encrypt_document(
+        &doc,
+        user_password,
+        owner_password,
+        permissions,
+        WriteOptions::default(),
+    )
+    .map_err(|e| Failure::new(e.to_string()))?;
+    std::fs::write(out, bytes).map_err(|e| Failure::new(format!("{}: {e}", out.display())))?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Runs `pdfboss decrypt`: opens `file` under `password` (user or owner)
+/// and writes a fresh, unencrypted output to `out`. A wrong or missing
+/// password fails with the open error, naming `file` (the same error
+/// format every other command in this file uses).
+pub fn cmd_decrypt(file: &Path, out: &Path, password: &str) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    let bytes = decrypt_document(&doc, WriteOptions::default()).map_err(|e| e.to_string())?;
+    std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// The full list of `--allow` values, in the order named in its help text.
+const ALLOW_VALUES: [&str; 8] = [
+    "print",
+    "modify",
+    "copy",
+    "annotate",
+    "fill-forms",
+    "accessibility",
+    "assemble",
+    "print-hires",
+];
+
+/// Parses `--allow` into a [`Permissions`]: every permission when `values`
+/// is `None`, otherwise only the named ones. An unknown value fails with
+/// exit code 2, naming both the offending value and the full accepted list.
+fn parse_allow(values: Option<Vec<String>>) -> Result<Permissions, Failure> {
+    let Some(values) = values else {
+        return Ok(Permissions::all());
+    };
+    let mut permissions = Permissions {
+        print: false,
+        modify: false,
+        copy: false,
+        annotate: false,
+        fill_forms: false,
+        accessibility: false,
+        assemble: false,
+        print_hires: false,
+    };
+    for value in values {
+        match value.as_str() {
+            "print" => permissions.print = true,
+            "modify" => permissions.modify = true,
+            "copy" => permissions.copy = true,
+            "annotate" => permissions.annotate = true,
+            "fill-forms" => permissions.fill_forms = true,
+            "accessibility" => permissions.accessibility = true,
+            "assemble" => permissions.assemble = true,
+            "print-hires" => permissions.print_hires = true,
+            other => {
+                return Err(Failure::program(format!(
+                    "invalid value '{other}' for --allow: expected one of {}",
+                    ALLOW_VALUES.join(", ")
+                )))
+            }
+        }
+    }
+    Ok(permissions)
 }
 
 /// Runs `pdfboss overlay`: draws the first page of `overlay` onto every
