@@ -351,6 +351,23 @@ Either mode refuses a page inlined directly into `/Kids` with no object of its o
 pdfboss rotate report.pdf -o rotated.pdf --pages 2,4-9 --by 90
 ```
 
+## overlay
+
+Draw the first page of `<OVERLAY>` onto every page of `<FILE>`, on top by default or beneath with `--under`. See [Editing PDFs](../guide/editing.md).
+
+```text
+pdfboss overlay [OPTIONS] --out <OUT> <FILE> <OVERLAY>
+```
+
+- `-o, --out <OUT>`: output file (required)
+- `--under`: draw beneath the page content instead of on top of it
+- `--rewrite`: full rewrite instead of an incremental append
+- `--password <PASSWORD>`: password for an encrypted file (user or owner password), tried against both `<FILE>` and `<OVERLAY>`; either encrypted input is still refused at write time
+
+```bash
+pdfboss overlay report.pdf draft.pdf -o out.pdf --under
+```
+
 ## rewrite
 
 Rewrite a document fresh: recompressed, unreachable objects and earlier update sections left behind, with no page change. See [Assembling documents](../guide/assembling.md).
