@@ -1335,6 +1335,15 @@ const OPEN_RULED_COLUMN_GAP: f32 = 0.6;
 /// form's writing lines, not tables, and the gap-splitting recursion runs
 /// one frame per rule in a cluster.
 const OPEN_RULED_MAX_RULES: usize = 256;
+/// A cluster of at least this many rules whose gaps all agree within
+/// [`OPEN_RULED_EVEN_STACK_RATIO`] is a chart's plot grid or ruled paper —
+/// identical bands drawn as guides. A table's row heights follow its rows'
+/// content and never come out this uniform over so many rules, so the
+/// whole cluster stands down; splitting it would only mine the corner its
+/// labels hug. Rules inside a drawn lattice never reach here, so a fully
+/// boxed zebra table keeps its evenly ruled rows.
+const OPEN_RULED_EVEN_STACK: usize = 5;
+const OPEN_RULED_EVEN_STACK_RATIO: f32 = 1.15;
 
 /// Tables ruled only horizontally: stacked rules sharing one x-extent
 /// bracket text whose lines share column gaps. Most printed tables rule
@@ -1388,9 +1397,24 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
             used[i] = true;
         }
         let ys: Vec<f32> = cluster.iter().map(|&i| horizontals[i].0).collect();
+        if even_stack(&ys) {
+            continue;
+        }
         open_ruled_split(spans, &ys, seed_x0, seed_x1, taken, &mut grids);
     }
     grids
+}
+
+/// True for [`OPEN_RULED_EVEN_STACK`] or more rules at near-identical gaps:
+/// a plot grid or ruled paper, never a table.
+fn even_stack(ys: &[f32]) -> bool {
+    if ys.len() < OPEN_RULED_EVEN_STACK {
+        return false;
+    }
+    let gaps = ys.windows(2).map(|pair| pair[1] - pair[0]);
+    let smallest = gaps.clone().fold(f32::INFINITY, f32::min);
+    let largest = gaps.fold(f32::NEG_INFINITY, f32::max);
+    smallest > 0.0 && largest <= OPEN_RULED_EVEN_STACK_RATIO * smallest
 }
 
 /// One rule cluster as a table candidate, splitting at the largest rule
@@ -3341,6 +3365,30 @@ pub(crate) mod tests {
         );
     }
 
+    /// A chart's plot grid: many aligned rules at near-identical gaps with
+    /// data labels hugging some of them. No corner of it is a table, however
+    /// well a subcluster's rules hug the labels.
+    #[test]
+    fn an_even_rule_stack_reads_as_a_plot_grid_not_a_table() {
+        let ys = [582.6, 602.0, 622.3, 641.7, 662.0, 681.4, 701.7, 722.0, 741.4];
+        let rulings: Vec<Ruling> = ys.iter().map(|&y| hrule(y, 125.4, 488.8)).collect();
+        let mut spans = Vec::new();
+        for (y, xs) in [
+            (735.0, [180.0, 280.0, 380.0]),
+            (712.0, [160.0, 260.0, 360.0]),
+            (676.0, [200.0, 300.0, 400.0]),
+            (668.0, [220.0, 320.0, 420.0]),
+        ] {
+            for x in xs {
+                spans.push(span("68", x, x + 14.0, y, 8.0));
+            }
+        }
+        assert!(
+            open_ruled_grids(&spans, &rulings, &[]).is_empty(),
+            "identical bands are drawn guides, not rows"
+        );
+    }
+
     /// One block of single-span lines, top line at `top`, stepping down 12.
     fn block(prefix: &str, x: f32, end_x: f32, top: f32, lines: usize, spans: &mut Vec<TextSpan>) {
         for i in 0..lines {
@@ -3701,7 +3749,7 @@ pub(crate) mod tests {
         let (spans, rulings, report) =
             pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page).unwrap();
         println!("rulings: {} (report complete: {})", rulings.len(), report.is_complete());
-        for r in rulings.iter().take(20) {
+        for r in rulings.iter().take(60) {
             println!(
                 "  ({:7.1},{:7.1}) -> ({:7.1},{:7.1}) w={:.2}",
                 r.start.x, r.start.y, r.end.x, r.end.y, r.width
