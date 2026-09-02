@@ -15,6 +15,9 @@ thiserror = "2"
 # backend and still C-free (keeps the dependency tree free of native code).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 memchr = "2"
+# OS random source for the R6 encryption key material (file key, salts,
+# /Perms padding).
+getrandom = "0.4"
 
 [features]
 # Compiles in Adobe's predefined CJK CMap set (ISO 32000-1 Table 118;

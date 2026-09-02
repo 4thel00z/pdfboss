@@ -1180,6 +1180,83 @@ fn hash_2b(r: i64, password: &[u8], salt: &[u8], udata: &[u8]) -> Vec<u8> {
     k
 }
 
+/// Freshly generated key material for a revision-6 `/Encrypt` dictionary:
+/// the random file key plus `/U`, `/UE`, `/O`, `/OE` and `/Perms` derived
+/// from it (ISO 32000-2 §7.6.4.3.4-3.6, Algorithms 8, 9 and 10).
+#[allow(dead_code, reason = "consumed by the write-side Encryptor, added next")]
+pub(crate) struct KeyMaterial {
+    file_key: [u8; 32],
+    u: Vec<u8>,
+    ue: Vec<u8>,
+    o: Vec<u8>,
+    oe: Vec<u8>,
+    perms: Vec<u8>,
+}
+
+/// Builds a [`KeyMaterial`] for `user_pw`/`owner_pw` at permission bits `p`
+/// (ISO 32000-2 §7.6.4.2, Table 22), recording whether metadata is left
+/// unencrypted. `rng` fills the random bytes Algorithms 8-10 call for: the
+/// 32-byte file key, the user and owner validation/key salts, and the
+/// 4-byte `/Perms` pad. Passwords longer than the 127 UTF-8 bytes the
+/// algorithm defines are truncated, matching the validation side.
+#[allow(dead_code, reason = "consumed by the write-side Encryptor, added next")]
+pub(crate) fn r6_key_material(
+    user_pw: &[u8],
+    owner_pw: &[u8],
+    p: i32,
+    encrypt_metadata: bool,
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> KeyMaterial {
+    let user_pw = &user_pw[..user_pw.len().min(127)];
+    let owner_pw = &owner_pw[..owner_pw.len().min(127)];
+
+    let mut file_key = [0u8; 32];
+    rng(&mut file_key);
+
+    // Algorithm 8: /U and /UE from a 16-byte random pad, the first 8
+    // bytes the validation salt and the last 8 the key salt.
+    let mut user_salt = [0u8; 16];
+    rng(&mut user_salt);
+    let mut u = hash_2b(6, user_pw, &user_salt[..8], &[]);
+    u.extend_from_slice(&user_salt);
+    let user_intermediate = hash_2b(6, user_pw, &user_salt[8..], &[]);
+    let ue = aes_cbc_encrypt_blocks(&user_intermediate, &[0u8; 16], &file_key);
+
+    // Algorithm 9: /O and /OE, the same derivation but hashing in the
+    // first 48 bytes of /U as well.
+    let mut owner_salt = [0u8; 16];
+    rng(&mut owner_salt);
+    let mut o = hash_2b(6, owner_pw, &owner_salt[..8], &u[..48]);
+    o.extend_from_slice(&owner_salt);
+    let owner_intermediate = hash_2b(6, owner_pw, &owner_salt[8..], &u[..48]);
+    let oe = aes_cbc_encrypt_blocks(&owner_intermediate, &[0u8; 16], &file_key);
+
+    // Algorithm 10: /Perms, the file key applied to a single AES-256 ECB
+    // block (not CBC).
+    let mut perms_block = [0u8; 16];
+    perms_block[..4].copy_from_slice(&p.to_le_bytes());
+    perms_block[4..8].copy_from_slice(&[0xff; 4]);
+    perms_block[8] = if encrypt_metadata { b'T' } else { b'F' };
+    perms_block[9..12].copy_from_slice(b"adb");
+    rng(&mut perms_block[12..]);
+    aes_encrypt_block(&mut perms_block, &aes_expand_key(&file_key));
+
+    KeyMaterial {
+        file_key,
+        u,
+        ue,
+        o,
+        oe,
+        perms: perms_block.to_vec(),
+    }
+}
+
+/// Fills `buf` with operating-system random bytes.
+#[allow(dead_code, reason = "consumed by the write-side Encryptor, added next")]
+pub(crate) fn fill_os_random(buf: &mut [u8]) {
+    getrandom::fill(buf).expect("OS random number generator unavailable");
+}
+
 /// Per-round left-rotation amounts (RFC 1321).
 #[rustfmt::skip]
 const MD5_S: [u32; 64] = [
@@ -1844,5 +1921,77 @@ mod tests {
     #[test]
     fn document_load_decrypts_aesv3_r6() {
         assert_aesv3_decrypts(6); // exercises the iterated Algorithm 2.B hash
+    }
+
+    // --- R6 key material (write side): the existing validation code above
+    // is the oracle everything generated here must open under. ---
+
+    /// The `/Encrypt` dict layout `encrypted_fixture_aesv3_with` builds by
+    /// hand, but with `/U`/`/UE`/`/O`/`/OE`/`/Perms` taken from generated
+    /// key material instead.
+    fn r6_encrypt_dict(material: &KeyMaterial, p: i32) -> Dict {
+        let mut stdcf = Dict::new();
+        stdcf.insert(
+            Name("CFM".to_string()),
+            Object::Name(Name("AESV3".to_string())),
+        );
+        stdcf.insert(Name("Length".to_string()), Object::Int(32));
+        let mut cf = Dict::new();
+        cf.insert(Name("StdCF".to_string()), Object::Dict(stdcf));
+
+        let mut d = Dict::new();
+        d.insert(
+            Name("Filter".to_string()),
+            Object::Name(Name("Standard".to_string())),
+        );
+        d.insert(Name("V".to_string()), Object::Int(5));
+        d.insert(Name("R".to_string()), Object::Int(6));
+        d.insert(Name("Length".to_string()), Object::Int(256));
+        d.insert(Name("CF".to_string()), Object::Dict(cf));
+        d.insert(
+            Name("StmF".to_string()),
+            Object::Name(Name("StdCF".to_string())),
+        );
+        d.insert(
+            Name("StrF".to_string()),
+            Object::Name(Name("StdCF".to_string())),
+        );
+        d.insert(Name("P".to_string()), Object::Int(i64::from(p)));
+        d.insert(Name("U".to_string()), Object::String(material.u.clone()));
+        d.insert(Name("UE".to_string()), Object::String(material.ue.clone()));
+        d.insert(Name("O".to_string()), Object::String(material.o.clone()));
+        d.insert(Name("OE".to_string()), Object::String(material.oe.clone()));
+        d.insert(
+            Name("Perms".to_string()),
+            Object::String(material.perms.clone()),
+        );
+        d
+    }
+
+    /// Generated key material must open through the same `aesv3_key`
+    /// validation a real reader runs, for both passwords, and reject a
+    /// wrong one; the embedded `/Perms` must decrypt to its marker under
+    /// the generated file key.
+    #[test]
+    fn r6_key_material_opens_under_aesv3_key() {
+        let mut c = 0u8;
+        let mut rng = |b: &mut [u8]| {
+            for x in b {
+                c = c.wrapping_add(1);
+                *x = c;
+            }
+        };
+        let material = r6_key_material(b"user-pw", b"owner-pw", P, true, &mut rng);
+        let dict = r6_encrypt_dict(&material, P);
+
+        let user_key = aesv3_key(&dict, 6, b"user-pw").expect("user password opens");
+        assert_eq!(user_key, material.file_key.to_vec());
+
+        let owner_key = aesv3_key(&dict, 6, b"owner-pw").expect("owner password opens");
+        assert_eq!(owner_key, material.file_key.to_vec());
+
+        assert!(aesv3_key(&dict, 6, b"wrong-pw").is_none());
+
+        assert!(perms_marker_valid(&material.file_key, &material.perms));
     }
 }
