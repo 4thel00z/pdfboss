@@ -553,6 +553,10 @@ fn decrypt_wrong_or_missing_password_exits_nonzero_naming_the_file() {
         stderr.contains("decrypt-wrong-encrypted.pdf"),
         "no input path in: {stderr}"
     );
+    assert!(
+        stderr.contains("wrong or missing password"),
+        "decrypt must name a bad password as such, not as an unsupported input: {stderr}"
+    );
     assert!(!out.exists(), "no output should be written on a bad open");
 
     let missing_password = pdfboss(&[
@@ -567,6 +571,52 @@ fn decrypt_wrong_or_missing_password_exits_nonzero_naming_the_file() {
         stderr.contains("decrypt-wrong-encrypted.pdf"),
         "no input path in: {stderr}"
     );
+    assert!(
+        stderr.contains("wrong or missing password"),
+        "decrypt must name a bad password as such, not as an unsupported input: {stderr}"
+    );
+}
+
+#[test]
+fn encrypt_wrong_or_missing_password_names_it_as_such() {
+    let input = tmp("encrypt-wrong-in.pdf");
+    std::fs::write(&input, pdfboss_testkit::multi_page_doc(&["one"])).unwrap();
+    let encrypted = tmp("encrypt-wrong-encrypted.pdf");
+    let encrypt_output = pdfboss(&[
+        "encrypt",
+        input.to_str().unwrap(),
+        "-o",
+        encrypted.to_str().unwrap(),
+        "--user-password",
+        "correct",
+    ]);
+    assert!(
+        encrypt_output.status.success(),
+        "encrypt failed: {encrypt_output:?}"
+    );
+
+    let out = tmp("encrypt-wrong-out.pdf");
+    let wrong_password = pdfboss(&[
+        "encrypt",
+        encrypted.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--password",
+        "wrong",
+        "--user-password",
+        "new",
+    ]);
+    assert_ne!(wrong_password.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&wrong_password.stderr).into_owned();
+    assert!(
+        stderr.contains("encrypt-wrong-encrypted.pdf"),
+        "no input path in: {stderr}"
+    );
+    assert!(
+        stderr.contains("wrong or missing password"),
+        "encrypt must name a bad password as such, not as an unsupported input: {stderr}"
+    );
+    assert!(!out.exists(), "no output should be written on a bad open");
 }
 
 #[test]

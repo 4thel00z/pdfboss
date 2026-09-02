@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use pdfboss_core::{Document, Permissions};
+use pdfboss_core::{Document, Error as CoreError, Permissions};
 use pdfboss_write::{
     decrypt_document, encrypt_document, merge_documents, rewrite_document, rotate_pages,
     rotate_rewrite, split_document, watermark, watermark_under, watermark_under_with,
@@ -141,7 +141,9 @@ pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String
 /// already-encrypted input is re-encrypted under the new passwords once its
 /// content reads as plaintext. At least one of `user_password`/
 /// `owner_password` must be non-empty; that refusal is raised here, with
-/// its own message, ahead of the library's own coarser one.
+/// its own message, ahead of the library's own coarser one. A wrong or
+/// missing `password` names itself as such rather than as an unsupported
+/// input: `encrypt` exists specifically to work with encrypted files.
 pub fn cmd_encrypt(
     file: &Path,
     out: &Path,
@@ -156,8 +158,12 @@ pub fn cmd_encrypt(
         ));
     }
     let permissions = parse_allow(allow)?;
-    let doc = Document::open_with_password(file, password)
-        .map_err(|e| Failure::new(format!("{}: {e}", file.display())))?;
+    let doc = Document::open_with_password(file, password).map_err(|e| match e {
+        CoreError::Encrypted => {
+            Failure::new(format!("{}: wrong or missing password", file.display()))
+        }
+        other => Failure::new(format!("{}: {other}", file.display())),
+    })?;
     let bytes = encrypt_document(
         &doc,
         user_password,
@@ -173,11 +179,14 @@ pub fn cmd_encrypt(
 
 /// Runs `pdfboss decrypt`: opens `file` under `password` (user or owner)
 /// and writes a fresh, unencrypted output to `out`. A wrong or missing
-/// password fails with the open error, naming `file` (the same error
-/// format every other command in this file uses).
+/// password names itself as such, naming `file`, rather than reporting the
+/// input as unsupported: `decrypt` exists specifically to work with
+/// encrypted files.
 pub fn cmd_decrypt(file: &Path, out: &Path, password: &str) -> Result<(), String> {
-    let doc = Document::open_with_password(file, password)
-        .map_err(|e| format!("{}: {e}", file.display()))?;
+    let doc = Document::open_with_password(file, password).map_err(|e| match e {
+        CoreError::Encrypted => format!("{}: wrong or missing password", file.display()),
+        other => format!("{}: {other}", file.display()),
+    })?;
     let bytes = decrypt_document(&doc, WriteOptions::default()).map_err(|e| e.to_string())?;
     std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("wrote {}", out.display());
