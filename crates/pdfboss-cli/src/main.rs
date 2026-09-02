@@ -85,6 +85,9 @@ enum Command {
         /// Metadata assignment, repeatable: title, author, subject, keywords, creator, producer.
         #[arg(long = "set", value_name = "KEY=VALUE", required = true)]
         set: Vec<String>,
+        /// Full rewrite instead of an incremental append.
+        #[arg(long)]
+        rewrite: bool,
         /// Password for encrypted PDFs.
         #[arg(long, default_value = "")]
         password: String,
@@ -131,6 +134,18 @@ enum Command {
         /// Full rewrite instead of an incremental append.
         #[arg(long)]
         rewrite: bool,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Rewrite a document fresh: recompressed, unreachable objects and
+    /// earlier update sections left behind.
+    Rewrite {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
         /// Password for an encrypted file (user or owner password).
         #[arg(long, default_value = "")]
         password: String,
@@ -409,8 +424,9 @@ fn main() {
             file,
             out,
             set,
+            rewrite,
             password,
-        } => meta::cmd_meta(&file, &out, &set, &password).map_err(Failure::from),
+        } => meta::cmd_meta(&file, &out, &set, rewrite, &password).map_err(Failure::from),
         Command::Merge {
             inputs,
             out,
@@ -431,6 +447,11 @@ fn main() {
             password,
         } => assemble::cmd_rotate(&file, &out, pages.as_deref(), &by, rewrite, &password)
             .map_err(Failure::from),
+        Command::Rewrite {
+            file,
+            out,
+            password,
+        } => assemble::cmd_rewrite(&file, &out, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,

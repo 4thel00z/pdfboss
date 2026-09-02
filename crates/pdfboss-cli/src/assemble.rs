@@ -2,14 +2,15 @@
 //! several input files into one fresh document, or cutting one document
 //! into consecutive-page parts. Also `pdfboss rotate`: turning selected
 //! pages by a quarter-turn multiple, by appending an incremental update
-//! or writing a full rewrite.
+//! or writing a full rewrite. Also `pdfboss rewrite`: writing a whole
+//! document fresh on its own, with no page change.
 
 use std::path::Path;
 
 use pdfboss_core::Document;
 use pdfboss_write::{
-    merge_documents, rotate_pages, rotate_rewrite, split_document, Error as WriteError, Update,
-    WriteOptions,
+    merge_documents, rewrite_document, rotate_pages, rotate_rewrite, split_document,
+    Error as WriteError, Update, WriteOptions,
 };
 
 use crate::pages::{parse_ranges, pattern_path, split_input_spec};
@@ -111,6 +112,19 @@ pub fn cmd_rotate(
     }
     let plural = if count == 1 { "" } else { "s" };
     println!("wrote {} ({count} page{plural} rotated)", out.display());
+    Ok(())
+}
+
+/// Runs `pdfboss rewrite`: rewrites `file` fresh through the `Writer`,
+/// recompressing streams and dropping unreachable objects and earlier
+/// update sections, and writes the result to `out`.
+pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    reject_encrypted(&doc, file)?;
+    let bytes = rewrite_document(&doc, WriteOptions::default()).map_err(|e| e.to_string())?;
+    std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("wrote {}", out.display());
     Ok(())
 }
 

@@ -6,7 +6,10 @@ use pdfboss_core::{Dict, Document, Name, Object};
 
 use crate::error::{Error, Result};
 use crate::importer::Importer;
-use crate::update::core_error;
+use crate::pdf::Metadata;
+use crate::update::{
+    catalog_metadata_ref, core_error, merge_metadata, resolve_dict, xmp_metadata_stream,
+};
 use crate::writer::{WriteOptions, Writer};
 
 /// Assembles `inputs` into one document: each source's selected pages
@@ -104,6 +107,73 @@ pub fn rotate_rewrite(
     writer.finish(new_root)
 }
 
+/// The whole document through the [`Writer`]: recompressed, object streams
+/// per `options`, unreachable objects and earlier update sections left
+/// behind. Carries `/Info` along the same way [`rotate_rewrite`] does: it
+/// is a trailer key `Importer::document` alone can never reach, since
+/// nothing in the catalog's own graph points at it.
+pub fn rewrite_document(doc: &Document, options: WriteOptions) -> Result<Vec<u8>> {
+    let mut writer = Writer::new(options);
+    let mut importer = Importer::new(&mut writer, doc)?;
+    let new_info = doc
+        .xref()
+        .trailer
+        .get_ref("Info")
+        .map(|info| importer.reference(info));
+    let new_root = importer.document()?;
+    if let Some(new_info) = new_info {
+        writer.set_info(new_info);
+    }
+    writer.finish(new_root)
+}
+
+/// [`rewrite_document`], first replacing `/Info` (and, when the catalog
+/// names one, the XMP packet) with `meta` merged over whatever the base
+/// already carried: the same merge [`crate::update::set_metadata_with`]
+/// performs for an appended update, applied here as substitutions into the
+/// copied graph instead. An existing `/Info` or `/Metadata` object is
+/// substituted in place; a base with no `/Info` gets a fresh one put
+/// directly into the writer, since there is no source object to
+/// substitute into.
+pub fn rewrite_with_metadata(
+    doc: &Document,
+    meta: Metadata,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    let mut writer = Writer::new(options);
+    let mut importer = Importer::new(&mut writer, doc)?;
+    let trailer = &doc.xref().trailer;
+    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
+    let info_ref = trailer.get_ref("Info");
+    let existing_dict = info_ref.and_then(|r| {
+        let dict = doc.get(r).ok()?.as_dict()?.clone();
+        Some(resolve_dict(doc, &dict))
+    });
+    let xmp_ref = catalog_metadata_ref(doc, root);
+    let (dict, merged) = merge_metadata(existing_dict, &meta);
+
+    let new_info_target = info_ref.map(|r| importer.reference(r));
+    let mut fresh_info = Some(Object::Dict(dict));
+    if let Some(r) = info_ref {
+        importer.substitute(r, fresh_info.take().expect("just built above"));
+    }
+    if let Some(r) = xmp_ref {
+        importer.substitute(r, xmp_metadata_stream(&merged));
+    }
+
+    let new_root = importer.document()?;
+    let new_info = match new_info_target {
+        Some(target) => target,
+        None => writer.put(
+            fresh_info
+                .take()
+                .expect("no source /Info to substitute into"),
+        ),
+    };
+    writer.set_info(new_info);
+    writer.finish(new_root)
+}
+
 /// Consecutive chunks of `every` pages, each a fresh document. `every` must
 /// be at least 1; the last chunk carries whatever remains, so no chunk is
 /// ever empty.
@@ -127,10 +197,13 @@ pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Re
 
 #[cfg(test)]
 mod tests {
+    use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
     use pdfboss_output::extract_text;
     use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, PdfBuilder};
 
     use crate::pdf::{Metadata, Page, PageSize, Pdf};
+    use crate::update::Update;
+    use crate::writer::XrefStyle;
 
     use super::*;
 
@@ -292,5 +365,191 @@ mod tests {
             "the rewritten trailer still names an /Info dictionary"
         );
         assert_eq!(rotated.metadata().title.as_deref(), Some("Rotated Title"));
+    }
+
+    /// Counts non-free cross-reference entries: the objects a document
+    /// actually carries, whether stored directly or packed into an object
+    /// stream.
+    fn live_count(doc: &Document) -> usize {
+        doc.xref()
+            .iter()
+            .filter(|(_, entry)| !matches!(entry, XrefEntry::Free))
+            .count()
+    }
+
+    /// A rewrite carries `/Info` along, the same way [`rotate_rewrite`]
+    /// does: the reloaded trailer still resolves an `/Info` dictionary, and
+    /// its `/Title` still reads the base document's title.
+    #[test]
+    fn rewrite_document_carries_info_along() {
+        let base = Pdf {
+            pages: vec![Page::new(PageSize::A4)],
+            metadata: Some(Metadata {
+                title: Some("Rewritten Title".to_string()),
+                ..Metadata::default()
+            }),
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .expect("base builds");
+        let doc = Document::load(base).expect("base loads");
+        assert!(
+            doc.xref().trailer.get_ref("Info").is_some(),
+            "the base's trailer must carry /Info for this test to exercise the carry"
+        );
+
+        let bytes = rewrite_document(&doc, WriteOptions::default()).expect("rewrite succeeds");
+        let rewritten = Document::load(bytes).expect("rewritten document loads");
+        assert!(
+            rewritten.xref().trailer.get_ref("Info").is_some(),
+            "the rewritten trailer still names an /Info dictionary"
+        );
+        assert_eq!(
+            rewritten.metadata().title.as_deref(),
+            Some("Rewritten Title")
+        );
+    }
+
+    /// A rewrite recomputes the whole object graph from the catalog and
+    /// `/Info` alone: an object neither one reaches is dropped, even though
+    /// the base carried it, and the pages that remain still read back.
+    #[test]
+    fn rewrite_document_drops_an_unreferenced_object_and_keeps_text() {
+        let options = WriteOptions {
+            xref: XrefStyle::Table,
+            compress: false,
+            object_streams: false,
+            version: (1, 7),
+        };
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (hello) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(6, "<< /Extra (unreferenced) >>");
+        let doc = Document::load(b.build(1)).expect("doc loads");
+        assert_eq!(
+            live_count(&doc),
+            6,
+            "the fixture carries the extra object alongside the reachable five"
+        );
+
+        let bytes = rewrite_document(&doc, options).expect("rewrite succeeds");
+        let rewritten = Document::load(bytes).expect("rewritten document loads");
+        assert_eq!(
+            live_count(&rewritten),
+            5,
+            "the unreferenced object must not survive the rewrite"
+        );
+
+        let page = rewritten.page(0).expect("page exists");
+        let text = extract_text(&rewritten, &page).expect("text extracts");
+        assert!(text.contains("hello"), "text: {text:?}");
+    }
+
+    /// A base already carrying an appended update section (two
+    /// cross-reference sections chained by `/Prev`) collapses to one fresh
+    /// section: a rewrite always builds a whole new graph, never an append
+    /// of its own.
+    #[test]
+    fn rewrite_document_collapses_an_appended_update_into_one_section() {
+        let base = Pdf {
+            pages: vec![Page::new(PageSize::A4)],
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .expect("base builds");
+        let base_doc = Document::load(base).expect("base loads");
+        let mut update = Update::new(&base_doc).expect("update opens");
+        let extra = update.reserve();
+        let mut dict = Dict::new();
+        dict.insert(name("Marker"), Object::Int(1));
+        update.set(extra, Object::Dict(dict));
+        let appended = update.bytes().expect("update appends");
+
+        let appended_doc = Document::load(appended).expect("appended document loads");
+        let bytes =
+            rewrite_document(&appended_doc, WriteOptions::default()).expect("rewrite succeeds");
+
+        let offset = startxref(&bytes).expect("startxref present");
+        let section = parse_section_at(&bytes, offset).expect("section parses");
+        assert!(
+            section.prev.is_none(),
+            "the rewrite must collapse the update chain into one section"
+        );
+    }
+
+    /// Rewriting with metadata merges `meta`'s `Some` fields over whatever
+    /// the base already carried, the same as an appended `set_metadata`,
+    /// but into a whole fresh file: the output cannot start with the
+    /// base's own bytes, since there is no append to preserve a prefix of.
+    #[test]
+    fn rewrite_with_metadata_merges_fields_into_a_fresh_file() {
+        let base = Pdf {
+            pages: vec![Page::new(PageSize::A4)],
+            metadata: Some(Metadata {
+                title: Some("Old".to_string()),
+                author: Some("Keep".to_string()),
+                ..Metadata::default()
+            }),
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .expect("base builds");
+        let doc = Document::load(base.clone()).expect("base loads");
+
+        let bytes = rewrite_with_metadata(
+            &doc,
+            Metadata {
+                title: Some("New".to_string()),
+                ..Metadata::default()
+            },
+            WriteOptions::default(),
+        )
+        .expect("rewrite succeeds");
+        assert!(
+            !bytes.starts_with(&base[..]),
+            "a metadata rewrite must not merely append an update onto the base"
+        );
+
+        let rewritten = Document::load(bytes).expect("rewritten document loads");
+        let meta = rewritten.metadata();
+        assert_eq!(meta.title.as_deref(), Some("New"));
+        assert_eq!(meta.author.as_deref(), Some("Keep"));
+    }
+
+    /// A base with no `/Info` at all still gets one from
+    /// `rewrite_with_metadata`: the merge target is a fresh object put
+    /// directly into the writer, never an `Importer` substitution.
+    #[test]
+    fn rewrite_with_metadata_creates_info_when_absent() {
+        let base = Pdf {
+            pages: vec![Page::new(PageSize::A4)],
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .expect("base builds");
+        let doc = Document::load(base).expect("base loads");
+
+        let bytes = rewrite_with_metadata(
+            &doc,
+            Metadata {
+                title: Some("Fresh".to_string()),
+                ..Metadata::default()
+            },
+            WriteOptions::default(),
+        )
+        .expect("rewrite succeeds");
+
+        let rewritten = Document::load(bytes).expect("rewritten document loads");
+        assert_eq!(rewritten.metadata().title.as_deref(), Some("Fresh"));
     }
 }

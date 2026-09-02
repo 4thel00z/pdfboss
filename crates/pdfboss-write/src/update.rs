@@ -558,28 +558,74 @@ pub fn set_metadata_with(
     xmp_ref: Option<ObjRef>,
     meta: Metadata,
 ) -> Result<()> {
-    let (target, mut dict) = match existing_info {
-        Some((r, dict)) => (r, dict),
-        None => (overlay.reserve(), Dict::new()),
+    let (target, existing_dict) = match existing_info {
+        Some((r, dict)) => (r, Some(dict)),
+        None => (overlay.reserve(), None),
     };
-    apply_metadata_fields(&mut dict, &meta);
-    let merged = metadata_from_info(&dict);
+    let (dict, merged) = merge_metadata(existing_dict, &meta);
     overlay.set(target, Object::Dict(dict));
     overlay.set_info(target);
     let Some(xmp_ref) = xmp_ref else {
         return Ok(());
     };
+    overlay.set(xmp_ref, xmp_metadata_stream(&merged));
+    Ok(())
+}
+
+/// `existing` (`None` starts from an empty dictionary) with every `Some`
+/// field of `meta` applied: a `Some` field overwrites its key
+/// (`Some(String::new())` writes an empty string), a `None` field leaves
+/// whatever key was already there. Also returns that merged dictionary read
+/// back into a [`Metadata`] (text fields via `decode_text_string`, dates via
+/// [`Date::parse_pdf`], an unparseable date simply dropping out), for
+/// [`xmp_metadata_stream`]: any XMP property outside those eight fields is
+/// not carried into a rebuilt packet.
+///
+/// Shared by [`set_metadata_with`] and [`crate::assemble::rewrite_with_metadata`].
+pub(crate) fn merge_metadata(existing: Option<Dict>, meta: &Metadata) -> (Dict, Metadata) {
+    let mut dict = existing.unwrap_or_default();
+    apply_metadata_fields(&mut dict, meta);
+    let merged = metadata_from_info(&dict);
+    (dict, merged)
+}
+
+/// A fresh, unfiltered `/Type /Metadata /Subtype /XML` stream over `meta`'s
+/// XMP packet, ready to stage into an [`Overlay`] or substitute into an
+/// import.
+pub(crate) fn xmp_metadata_stream(meta: &Metadata) -> Object {
     let mut xmp_dict = Dict::new();
     xmp_dict.insert(name("Type"), Object::Name(name("Metadata")));
     xmp_dict.insert(name("Subtype"), Object::Name(name("XML")));
-    overlay.set(
-        xmp_ref,
-        Object::Stream(Stream {
-            dict: xmp_dict,
-            data: crate::xmp::packet(&merged),
-        }),
-    );
-    Ok(())
+    Object::Stream(Stream {
+        dict: xmp_dict,
+        data: crate::xmp::packet(meta),
+    })
+}
+
+/// `dict` with every value resolved against `doc`: an indirect value such
+/// as `/Title 12 0 R` becomes the string object it points to, so a field
+/// [`merge_metadata`] keeps (a `None` field in the merge) still reads back
+/// as text rather than silently vanishing from a rebuilt XMP packet. A
+/// value whose reference chain fails to resolve (an unreadable target, or
+/// a cycle) is kept as given.
+pub(crate) fn resolve_dict(doc: &Document, dict: &Dict) -> Dict {
+    let mut out = Dict::new();
+    for (key, value) in dict.iter() {
+        let resolved = doc.resolve(value).unwrap_or_else(|_| value.clone());
+        out.insert(key.clone(), resolved);
+    }
+    out
+}
+
+/// `doc`'s catalog's `/Metadata` entry, when it is an indirect reference.
+/// `None` for a catalog with no `/Metadata`, or one that reads as a direct
+/// stream rather than a reference.
+pub(crate) fn catalog_metadata_ref(doc: &Document, root: ObjRef) -> Option<ObjRef> {
+    let catalog = doc.get(root).ok()?;
+    match catalog.as_dict()?.get("Metadata")? {
+        Object::Ref(r) => Some(*r),
+        _ => None,
+    }
 }
 
 /// Writes every `Some` field of `meta` into `dict` under its `/Info` key;
@@ -696,37 +742,10 @@ impl<'a> Update<'a> {
         let info_ref = self.overlay.info.or(self.overlay.base.info);
         let existing_info = info_ref.and_then(|r| {
             let dict = self.doc.get(r).ok()?.as_dict()?.clone();
-            Some((r, self.resolve_dict(&dict)))
+            Some((r, resolve_dict(self.doc, &dict)))
         });
-        let xmp_ref = self.catalog_metadata_ref();
+        let xmp_ref = catalog_metadata_ref(self.doc, self.overlay.base.root);
         set_metadata_with(&mut self.overlay, existing_info, xmp_ref, meta)
-    }
-
-    /// `dict` with every value resolved against the base document: an
-    /// indirect value such as `/Title 12 0 R` becomes the string object it
-    /// points to, so a field kept by [`set_metadata_with`] (a `None` field
-    /// in the merge) still reads back as text rather than silently
-    /// vanishing from the rewritten XMP packet. A value whose reference
-    /// chain fails to resolve (an unreadable target, or a cycle) is kept
-    /// as given.
-    fn resolve_dict(&self, dict: &Dict) -> Dict {
-        let mut out = Dict::new();
-        for (key, value) in dict.iter() {
-            let resolved = self.doc.resolve(value).unwrap_or_else(|_| value.clone());
-            out.insert(key.clone(), resolved);
-        }
-        out
-    }
-
-    /// The catalog's `/Metadata` entry, when it is an indirect reference.
-    /// `None` for a catalog with no `/Metadata`, or one that reads as a
-    /// direct stream rather than a reference.
-    fn catalog_metadata_ref(&self) -> Option<ObjRef> {
-        let catalog = self.doc.get(self.overlay.base.root).ok()?;
-        match catalog.as_dict()?.get("Metadata")? {
-            Object::Ref(r) => Some(*r),
-            _ => None,
-        }
     }
 
     /// The base bytes, whether a pad newline goes before the appended

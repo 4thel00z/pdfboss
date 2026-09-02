@@ -238,3 +238,50 @@ fn rotate_rewrite_flag_writes_a_full_rewrite() {
         assert_eq!(page.rotate, 270, "page {index}");
     }
 }
+
+#[test]
+fn rewrite_writes_a_fresh_file_preserving_pages() {
+    let input = tmp("rewrite-in.pdf");
+    std::fs::write(
+        &input,
+        pdfboss_testkit::multi_page_doc(&["one", "two", "three"]),
+    )
+    .unwrap();
+    let out = tmp("rewrite-out.pdf");
+
+    let output = pdfboss(&[
+        "rewrite",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "rewrite failed: {output:?}");
+
+    let doc = load(&out);
+    assert_eq!(doc.page_count(), 3);
+    let texts: Vec<String> = (0..3)
+        .map(|i| {
+            let page = doc.page(i).unwrap();
+            pdfboss_output::extract_text(&doc, &page).unwrap()
+        })
+        .collect();
+    assert!(texts[0].contains("one"), "page 0: {:?}", texts[0]);
+    assert!(texts[1].contains("two"), "page 1: {:?}", texts[1]);
+    assert!(texts[2].contains("three"), "page 2: {:?}", texts[2]);
+}
+
+#[test]
+fn rewrite_names_the_path_of_an_encrypted_input() {
+    let a = tmp("rewrite-encrypted.pdf");
+    std::fs::write(&a, pdfboss_testkit::encrypted_rc4_doc("secret")).unwrap();
+    let out = tmp("rewrite-encrypted-out.pdf");
+
+    let output = pdfboss(&["rewrite", a.to_str().unwrap(), "-o", out.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("rewrite-encrypted.pdf"),
+        "no input path in: {stderr}"
+    );
+    assert!(stderr.contains("encrypted"), "no cause in: {stderr}");
+}
