@@ -676,13 +676,19 @@ class write:
         """Assembles ``inputs`` into one fresh document: each item is
         either raw bytes (every page) or a ``(bytes, list[int])`` tuple
         selecting specific 0-based pages, gathered in argument order
-        under a fresh page tree. An encrypted input raises ``PdfError``."""
+        under a fresh page tree. An input that cannot be opened at all
+        (encrypted with no working password) raises ``PdfError``; one
+        that opens under its password, including the empty user
+        password, copies across as plain, unencrypted bytes."""
 
     @staticmethod
     def split(data: bytes, every: int) -> list[bytes]:
         """Cuts ``data`` into consecutive parts of ``every`` pages each,
-        the last part carrying whatever remains. An encrypted ``data``
-        raises ``PdfError``."""
+        the last part carrying whatever remains. A ``data`` that cannot
+        be opened at all (encrypted with no working password) raises
+        ``PdfError``; one that opens under its password, including the
+        empty user password, copies across as plain, unencrypted
+        bytes."""
 
     @staticmethod
     def rotate(
@@ -694,13 +700,23 @@ class write:
         default; ``rewrite=True`` writes the whole file fresh instead.
         Either mode refuses a page inlined directly into ``/Kids`` with
         no object of its own: pdfboss does not yet restructure such a
-        page to rotate it. An encrypted ``data`` raises ``PdfError``."""
+        page to rotate it. By default (``rewrite=False``) any encrypted
+        ``data`` raises ``PdfError``, whether or not it opens; with
+        ``rewrite=True`` only a ``data`` that cannot be opened at all
+        raises ``PdfError``. A ``data`` that opens under its password,
+        including the empty user password, copies across as plain,
+        unencrypted bytes instead."""
 
     @staticmethod
     def rewrite(data: bytes) -> bytes:
         """Rewrites ``data`` fresh: recompressed, object streams per the
         default options, unreachable objects and earlier update sections
-        left behind. An encrypted ``data`` raises ``PdfError``."""
+        left behind. A ``data`` that cannot be opened at all (encrypted
+        with no working password) raises ``PdfError``; one that opens
+        under its password, including the empty user password, copies
+        across as plain, unencrypted bytes. An owner-password-only
+        file loses its ``/P`` restrictions this way, since the fresh
+        output carries no encryption at all."""
 
     @staticmethod
     def encrypt(
@@ -735,8 +751,13 @@ class write:
         ``rewrite=True`` the whole file is written afresh with compression
         and object streams, dropping unreachable objects, which usually
         comes out smaller than ``data``. With ``under=True`` the overlay is
-        drawn beneath each page's own content instead of on top of it. An
-        encrypted ``data`` or ``overlay`` raises ``PdfError``."""
+        drawn beneath each page's own content instead of on top of it. By
+        default (``rewrite=False``) an encrypted ``data`` or ``overlay``
+        raises ``PdfError``, whether or not it opens; with ``rewrite=True``
+        only a ``data`` or ``overlay`` that cannot be opened at all raises
+        ``PdfError``. One that opens under its password, including the
+        empty user password, copies across as plain, unencrypted bytes
+        instead."""
 
     class Standard14:
         """One of the fourteen standard fonts every PDF consumer
