@@ -128,7 +128,7 @@ Library crates on crates.io: `pdfboss-core` (the reader), `pdfboss-text`, `pdfbo
 - Scanned PDFs (JBIG2, CCITT) carry no text layer: `text` and `md` return little or nothing there; render the pages instead.
 - `extract_markdown` drops repeated page headers and footers by design.
 - A whole-document Rust render walk should share one `RenderCache` through `RenderOptions::cache` so fonts and ICC profiles load once.
-- Encrypted output (`encrypt`) is never byte-identical run to run: the file key, salts and IVs are fresh random each time. An incremental update (`meta`, `rotate`, `overlay` defaults, `Update`) still refuses any encrypted base outright, password-opened or not.
+- Encrypted output (`encrypt`) differs on every run: the file key, salts and IVs are fresh random each time. An incremental update (`meta`, `rotate`, `overlay` defaults, `Update`) still refuses any encrypted base outright, password-opened or not.
 
 ## Links
 

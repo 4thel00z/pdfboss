@@ -1,6 +1,6 @@
 ---
 name: pdfboss
-description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF or overlaying one PDF's first page onto every page of another, editing or updating PDF metadata without rewriting the file, merging, splitting or rotating pages, rewriting a document fresh, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
+description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF or overlaying one PDF's first page onto every page of another, editing or updating PDF metadata without rewriting the file, merging, splitting or rotating pages, rewriting a document fresh, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening, encrypting or decrypting PDFs.
 ---
 
 # pdfboss
@@ -31,6 +31,8 @@ pdfboss merge   a.pdf:2-9 b.pdf -o out.pdf              # combine selected pages
 pdfboss split   doc.pdf -o 'part-%d.pdf' --every 10     # cut into consecutive chunks of pages
 pdfboss rotate  doc.pdf -o out.pdf --pages 2,4-9 --by 90   # quarter turns clockwise; appends an update, --rewrite for a fresh file instead
 pdfboss overlay doc.pdf mark.pdf -o out.pdf --under        # mark.pdf's first page onto every page, on top by default (--under for beneath); appends an update, --rewrite for a fresh file instead
+pdfboss encrypt doc.pdf -o out.pdf --user-password X --allow print,copy   # AES-256 (R6); --owner-password falls back to the user password; --password re-opens an encrypted input to re-encrypt it
+pdfboss decrypt doc.pdf -o out.pdf --password X             # remove protection, a fresh plain file
 pdfboss rewrite doc.pdf -o out.pdf                      # whole document fresh: recompressed, unreachable objects and old update sections dropped
 pdfboss tui     doc.pdf                     # interactive terminal explorer
 ```
@@ -104,6 +106,11 @@ parts    = split(doc_bytes, every=10)            # consecutive chunks, last one 
 rotated  = rotate(doc_bytes, 90, pages=[0])
 clean    = rewrite(doc_bytes)                    # recompressed, unreachable objects and old update sections dropped
 
+# encrypt/decrypt: AES-256 (R6); owner_password defaults to user_password, both empty raises ValueError
+from pdfboss.write import encrypt, decrypt
+locked = encrypt(doc_bytes, user_password="X", allow=["print", "copy"])   # allow omitted grants everything
+plain  = decrypt(locked, password="X")
+
 # markdown to PDF: returns the file bytes
 data = pdfboss.md.to_pdf("# Hello\n\nWorld", theme=None, size="a4")
 ```
@@ -121,6 +128,7 @@ Library crates on crates.io: `pdfboss-core` (the reader), `pdfboss-text`, `pdfbo
 - Scanned PDFs (JBIG2, CCITT) carry no text layer: `text` and `md` return little or nothing there; render the pages instead.
 - `extract_markdown` drops repeated page headers and footers by design.
 - A whole-document Rust render walk should share one `RenderCache` through `RenderOptions::cache` so fonts and ICC profiles load once.
+- Encrypted output (`encrypt`) differs on every run: the file key, salts and IVs are fresh random each time. An incremental update (`meta`, `rotate`, `overlay` defaults, `Update`) still refuses any encrypted base outright, password-opened or not.
 
 ## Links
 
