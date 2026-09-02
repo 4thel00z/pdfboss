@@ -3,14 +3,17 @@
 //! into consecutive-page parts. Also `pdfboss rotate`: turning selected
 //! pages by a quarter-turn multiple, by appending an incremental update
 //! or writing a full rewrite. Also `pdfboss rewrite`: writing a whole
-//! document fresh on its own, with no page change.
+//! document fresh on its own, with no page change. Also `pdfboss overlay`:
+//! drawing one file's first page onto every page of another, over or under
+//! the content.
 
 use std::path::Path;
 
 use pdfboss_core::Document;
 use pdfboss_write::{
-    merge_documents, rewrite_document, rotate_pages, rotate_rewrite, split_document,
-    Error as WriteError, Update, WriteOptions,
+    merge_documents, rewrite_document, rotate_pages, rotate_rewrite, split_document, watermark,
+    watermark_under, watermark_under_with, watermark_with, Error as WriteError, Update,
+    WriteOptions,
 };
 
 use crate::pages::{parse_ranges, pattern_path, split_input_spec};
@@ -129,10 +132,44 @@ pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String
     Ok(())
 }
 
+/// Runs `pdfboss overlay`: draws the first page of `overlay` onto every
+/// page of `file` and writes the result to `out`. On top of the content
+/// by default; `under` draws beneath it instead. Appends an incremental
+/// update by default; `rewrite` asks for a full rewrite. Both inputs are
+/// refused when encrypted, each error naming its own file.
+pub fn cmd_overlay(
+    file: &Path,
+    overlay: &Path,
+    out: &Path,
+    under: bool,
+    rewrite: bool,
+    password: &str,
+) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    reject_encrypted(&doc, file)?;
+    let mark = Document::open_with_password(overlay, password)
+        .map_err(|e| format!("{}: {e}", overlay.display()))?;
+    reject_encrypted(&mark, overlay)?;
+    let bytes = match (under, rewrite) {
+        (false, false) => watermark(&doc, &mark),
+        (true, false) => watermark_under(&doc, &mark),
+        (false, true) => watermark_with(&doc, &mark, WriteOptions::default()),
+        (true, true) => watermark_under_with(&doc, &mark, WriteOptions::default()),
+    }
+    .map_err(|e| e.to_string())?;
+    std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
 /// Refuses a document carrying an `/Encrypt` entry, naming `path` in the
-/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate` and
-/// `cmd_rewrite`: none of them copies encrypted content into a fresh
-/// output.
+/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate`, `cmd_rewrite`
+/// and `cmd_overlay`: none of them copies encrypted content into a fresh
+/// output. `cmd_overlay` calls this once per input rather than relying on
+/// the library's own check, so each refusal names its own file: the
+/// library would refuse an encrypted overlay too, but its error would not
+/// say which file was encrypted.
 fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
     if doc.is_encrypted() {
         return Err(format!("{}: {}", path.display(), WriteError::EncryptedBase));

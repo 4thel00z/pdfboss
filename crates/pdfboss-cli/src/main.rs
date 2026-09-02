@@ -138,6 +138,25 @@ enum Command {
         #[arg(long, default_value = "")]
         password: String,
     },
+    /// Draw the first page of another PDF onto every page.
+    Overlay {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// PDF whose first page is drawn onto every page.
+        overlay: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Draw beneath the page content instead of on top of it.
+        #[arg(long)]
+        under: bool,
+        /// Full rewrite instead of an incremental append.
+        #[arg(long)]
+        rewrite: bool,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
     /// Rewrite a document fresh: recompressed, unreachable objects and
     /// earlier update sections left behind.
     Rewrite {
@@ -476,6 +495,15 @@ fn main() {
             rewrite,
             password,
         } => assemble::cmd_rotate(&file, &out, pages.as_deref(), &by, rewrite, &password)
+            .map_err(Failure::from),
+        Command::Overlay {
+            file,
+            overlay,
+            out,
+            under,
+            rewrite,
+            password,
+        } => assemble::cmd_overlay(&file, &overlay, &out, under, rewrite, &password)
             .map_err(Failure::from),
         Command::Rewrite {
             file,
