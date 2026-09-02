@@ -1,14 +1,30 @@
-//! `pdfboss meta`: update document metadata by appending an incremental update
-//! to preserve the original PDF bytes.
+//! `pdfboss meta`: update document metadata, by appending an incremental
+//! update that preserves the original PDF bytes, or, with `--rewrite`, by
+//! writing the whole document fresh.
 
 use std::path::Path;
 
 use pdfboss_core::Document;
-use pdfboss_write::{Metadata, Update};
+use pdfboss_write::{rewrite_with_metadata, Metadata, Update, WriteOptions};
 
-pub fn cmd_meta(file: &Path, out: &Path, set: &[String], password: &str) -> Result<(), String> {
+/// Runs `pdfboss meta`: sets `set`'s assignments on `file`'s metadata and
+/// writes the result to `out`. Appends an incremental update by default;
+/// `rewrite` writes the whole document fresh instead, through
+/// [`rewrite_with_metadata`].
+pub fn cmd_meta(
+    file: &Path,
+    out: &Path,
+    set: &[String],
+    rewrite: bool,
+    password: &str,
+) -> Result<(), String> {
     let meta = parse_assignments(set)?;
     let doc = Document::open_with_password(file, password).map_err(|e| format!("parse: {e}"))?;
+    if rewrite {
+        let bytes = rewrite_with_metadata(&doc, meta, WriteOptions::default())
+            .map_err(|e| e.to_string())?;
+        return std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()));
+    }
     let mut update = Update::new(&doc).map_err(|e| e.to_string())?;
     update.set_metadata(meta).map_err(|e| e.to_string())?;
     update.save(out).map_err(|e| e.to_string())

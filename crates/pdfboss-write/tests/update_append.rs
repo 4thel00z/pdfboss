@@ -5,8 +5,8 @@
 use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, XrefKind};
 use pdfboss_write::{
-    Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update, WriteOptions, Writer,
-    XrefStyle,
+    rotate_pages, Error, Metadata, OverlayBase, Page, PageSize, Pdf, Standard14, Update,
+    WriteOptions, Writer, XrefStyle,
 };
 
 fn base_pdf(xref: XrefStyle) -> Vec<u8> {
@@ -235,6 +235,24 @@ fn encrypted_base_is_refused() {
     assert!(matches!(Update::new(&doc), Err(Error::EncryptedBase)));
 }
 
+/// A literal `/Encrypt null` trailer entry is present but names no
+/// dictionary: `Document::load` already treats that as unencrypted (its own
+/// predicate is `is_some_and(|o| !o.is_null())`), so `Update::new` must
+/// accept the same base rather than refusing it as encrypted.
+#[test]
+fn encrypt_null_base_is_accepted() {
+    let mut builder = pdfboss_testkit::PdfBuilder::new().trailer_extra("/Encrypt null");
+    builder.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    builder.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    builder.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+    let bytes = builder.build(1);
+    let doc = Document::load(bytes).unwrap();
+    assert!(
+        Update::new(&doc).is_ok(),
+        "a literal /Encrypt null base is degenerate but loadable"
+    );
+}
+
 /// A hybrid base's newest section, per `startxref`, is its classic table
 /// (the `/XRefStm` stream is only ever named from that table's trailer),
 /// so the update must append in the classic style even though the merged
@@ -442,6 +460,63 @@ fn id_first_half_survives_second_rotates() {
     assert_ne!(second, base_second.as_slice(), "the second half rotates");
 }
 
+/// Two frees-only updates of the same base, freeing different objects, must
+/// rotate `/ID`'s second half differently: the digest folds each freed
+/// `(num, gen)` pair in, so a section with no set bodies at all (an empty
+/// `body`) still changes what it frees into a distinct second half. Running
+/// the same free twice over the same base stays deterministic.
+#[test]
+fn id_second_half_folds_freed_pairs() {
+    let base = classic_base();
+    let doc = Document::load(base).unwrap();
+
+    let mut seed = Update::new(&doc).unwrap();
+    let marker_a = seed.reserve();
+    let marker_b = seed.reserve();
+    let mut dict_a = Dict::new();
+    dict_a.insert(Name("Marker".into()), Object::Int(1));
+    seed.set(marker_a, Object::Dict(dict_a));
+    let mut dict_b = Dict::new();
+    dict_b.insert(Name("Marker".into()), Object::Int(2));
+    seed.set(marker_b, Object::Dict(dict_b));
+    let seeded = seed.bytes().unwrap();
+    let seeded_doc = Document::load(seeded).unwrap();
+
+    fn second_half(bytes: Vec<u8>) -> Vec<u8> {
+        let reread = Document::load(bytes).unwrap();
+        let id = reread
+            .xref()
+            .trailer
+            .get_array("ID")
+            .expect("the appended trailer carries an /ID array")
+            .to_vec();
+        id[1].as_str_bytes().unwrap().to_vec()
+    }
+
+    let mut update_a = Update::new(&seeded_doc).unwrap();
+    update_a.remove(marker_a);
+    let out_a = update_a.bytes().unwrap();
+
+    let mut update_b = Update::new(&seeded_doc).unwrap();
+    update_b.remove(marker_b);
+    let out_b = update_b.bytes().unwrap();
+
+    assert_ne!(
+        second_half(out_a.clone()),
+        second_half(out_b),
+        "freeing different objects rotates /ID's second half differently"
+    );
+
+    let mut update_a2 = Update::new(&seeded_doc).unwrap();
+    update_a2.remove(marker_a);
+    let out_a2 = update_a2.bytes().unwrap();
+    assert_eq!(
+        second_half(out_a),
+        second_half(out_a2),
+        "the same free, run twice over the same base, rotates /ID identically"
+    );
+}
+
 /// `/Index` groups sorted rows into maximal contiguous runs rather than one
 /// pair per object: objects 1-3 form one run, an isolated replacement and
 /// the xref stream's own row each stay isolated. The assertion inspects the
@@ -522,6 +597,45 @@ fn set_then_remove_same_ref_emits_one_free_row() {
         1,
         "exactly one subsection row, in this update's own section, for the number set then removed: {text}"
     );
+}
+
+/// `set` of object number 0 is a documented no-op, symmetric with
+/// `remove`'s existing guard: object 0 is the free-list head, already
+/// represented by the section's synthetic entry-0 row whenever anything
+/// else is freed, so a `set` row for it must never also appear.
+#[test]
+fn set_object_zero_is_a_no_op() {
+    let base = classic_base();
+    let doc1 = Document::load(base).unwrap();
+    let mut update1 = Update::new(&doc1).unwrap();
+    let marker = update1.reserve();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(1));
+    update1.set(marker, Object::Dict(dict));
+    let once = update1.bytes().unwrap();
+
+    let doc2 = Document::load(once).unwrap();
+    let mut update2 = Update::new(&doc2).unwrap();
+    let mut zero_dict = Dict::new();
+    zero_dict.insert(Name("Marker".into()), Object::Int(99));
+    update2.set(ObjRef { num: 0, gen: 0 }, Object::Dict(zero_dict));
+    update2.remove(marker);
+    let out = update2.bytes().unwrap();
+
+    let off = startxref(&out).unwrap();
+    let text = String::from_utf8_lossy(&out[off..]);
+    let header = "\n0 1\n";
+    assert_eq!(
+        text.matches(header).count(),
+        1,
+        "exactly one subsection row for object number 0: {text}"
+    );
+
+    let reread = Document::load(out).unwrap();
+    assert!(matches!(
+        reread.get(marker),
+        Err(pdfboss_core::Error::ObjectNotFound(..))
+    ));
 }
 
 /// Calling `remove` twice on the same reference records only one free row,
@@ -783,4 +897,121 @@ fn set_metadata_resolves_indirect_info_values_into_xmp() {
         text.contains("Indirect Title"),
         "a kept indirect /Info value must still reach the rewritten XMP packet: {text}"
     );
+}
+
+/// A three-page document, one page per entry in `texts`, in `xref`'s
+/// style. Every page gets its own indirect object, so [`Page::object_ref`]
+/// is always `Some`.
+fn multi_page_pdf(xref: XrefStyle, texts: &[&str]) -> Vec<u8> {
+    let pages: Vec<Page> = texts
+        .iter()
+        .map(|text| {
+            let mut page = Page::new(PageSize::A4);
+            page.canvas
+                .text(text, 72.0, 700.0, Standard14::Helvetica, 14.0)
+                .unwrap();
+            page
+        })
+        .collect();
+    Pdf {
+        pages,
+        options: WriteOptions {
+            xref,
+            ..WriteOptions::default()
+        },
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+/// Rotating pages 1 and 3 of a three-page document by 90 degrees clockwise
+/// stages each page's own object with its effective rotation plus 90,
+/// leaving the untouched page at 0. The base bytes stay in place at the
+/// front of the output, since this is an incremental update.
+fn assert_rotate_pages_marks_selected_pages_and_keeps_the_prefix(xref: XrefStyle) {
+    let base = multi_page_pdf(xref, &["one", "two", "three"]);
+    let doc = Document::load(base.clone()).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    rotate_pages(&mut update, &[0, 2], 90).unwrap();
+    let out = update.bytes().unwrap();
+    assert_eq!(
+        &out[..base.len()],
+        &base[..],
+        "an update keeps the base bytes in place"
+    );
+
+    let reread = Document::load(out).unwrap();
+    for (index, expected) in [90, 0, 90].iter().enumerate() {
+        let page = reread.page(index).unwrap();
+        assert_eq!(page.rotate, *expected, "page {index}");
+    }
+}
+
+#[test]
+fn rotate_pages_marks_selected_pages_and_keeps_the_prefix_classic() {
+    assert_rotate_pages_marks_selected_pages_and_keeps_the_prefix(XrefStyle::Table);
+}
+
+#[test]
+fn rotate_pages_marks_selected_pages_and_keeps_the_prefix_stream() {
+    assert_rotate_pages_marks_selected_pages_and_keeps_the_prefix(XrefStyle::Stream);
+}
+
+/// A page inlined directly into `/Kids`, with no object of its own, cannot
+/// be staged as a replacement object: `rotate_pages` refuses it, naming
+/// its 1-based page number and that it cannot be edited in place.
+#[test]
+fn rotate_pages_refuses_an_inline_page() {
+    let mut b = pdfboss_testkit::PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Count 1 /Kids [ << /Type /Page /Parent 2 0 R \
+         /MediaBox [0 0 612 792] >> ] >>",
+    );
+    let base = b.build(1);
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+
+    let result = rotate_pages(&mut update, &[0], 90);
+    let Err(Error::Other(message)) = result else {
+        panic!("expected Error::Other, got {result:?}");
+    };
+    assert!(message.contains("page 1"), "message: {message}");
+    assert!(
+        message.contains("cannot be edited in place"),
+        "message: {message}"
+    );
+}
+
+/// A `by` that is not a multiple of 90 is refused before any page is
+/// staged, rather than silently truncated or wrapped into a confusing
+/// rotation.
+#[test]
+fn rotate_pages_refuses_a_non_multiple_of_90() {
+    let base = multi_page_pdf(XrefStyle::Table, &["one"]);
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+
+    let result = rotate_pages(&mut update, &[0], 45);
+    let Err(Error::Other(message)) = result else {
+        panic!("expected Error::Other, got {result:?}");
+    };
+    assert!(message.contains("multiple of 90"), "message: {message}");
+}
+
+/// A negative multiple of 90 stays legal: `rem_euclid(360)` normalizes it
+/// into the usual 0..360 range instead of refusing it.
+#[test]
+fn rotate_pages_accepts_a_negative_multiple_of_90() {
+    let base = multi_page_pdf(XrefStyle::Table, &["one"]);
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    rotate_pages(&mut update, &[0], -90).unwrap();
+    let out = update.bytes().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    let page = reread.page(0).unwrap();
+    assert_eq!(page.rotate, 270);
 }

@@ -143,6 +143,11 @@ impl Writer {
         self.info = Some(info);
     }
 
+    /// The [`WriteOptions::compress`] value this writer was created with.
+    pub fn compress(&self) -> bool {
+        self.options.compress
+    }
+
     /// Serializes everything into a complete PDF file: header with binary
     /// comment, all objects (packed into object streams where options
     /// allow), the cross-reference, and the trailer with `root`, the

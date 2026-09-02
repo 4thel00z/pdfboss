@@ -1,0 +1,451 @@
+//! The public `Importer`: per-source object-graph transplant into a
+//! [`Writer`], exercised directly rather than through `watermark_with`.
+
+use pdfboss_core::{Dict, Document, Name, ObjRef, Object, Rect, Stream};
+use pdfboss_output::extract_text;
+use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, simple_doc, PdfBuilder};
+use pdfboss_write::{watermark, watermark_with, Error, Importer, WriteOptions, Writer, XrefStyle};
+
+fn name(text: &str) -> Name {
+    Name(text.to_string())
+}
+
+/// Wraps `page_refs` in a one-level `/Pages` tree at `pages_ref`, builds a
+/// catalog over it, and finishes `writer` into file bytes.
+fn finish_with_tree(mut writer: Writer, pages_ref: ObjRef, page_refs: &[ObjRef]) -> Vec<u8> {
+    let mut tree = Dict::new();
+    tree.insert(name("Type"), Object::Name(name("Pages")));
+    tree.insert(
+        name("Kids"),
+        Object::Array(page_refs.iter().map(|r| Object::Ref(*r)).collect()),
+    );
+    tree.insert(name("Count"), Object::Int(page_refs.len() as i64));
+    writer
+        .fill(pages_ref, Object::Dict(tree))
+        .expect("the reserved /Pages ref is fillable");
+    let mut catalog = Dict::new();
+    catalog.insert(name("Type"), Object::Name(name("Catalog")));
+    catalog.insert(name("Pages"), Object::Ref(pages_ref));
+    let root = writer.put(Object::Dict(catalog));
+    writer
+        .finish(root)
+        .expect("the assembled document finishes")
+}
+
+/// Raw, uncompressed, no-object-streams options: output stays literal text
+/// so a test can grep for a substring.
+fn plain_table_options() -> WriteOptions {
+    WriteOptions {
+        xref: XrefStyle::Table,
+        compress: false,
+        object_streams: false,
+        version: (1, 7),
+    }
+}
+
+fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+#[test]
+fn imported_page_is_self_contained() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+    let mut writer = Writer::new(WriteOptions::default());
+    let pages_ref = writer.reserve();
+    let page_ref = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.page(1, pages_ref).expect("page 1 imports")
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page_ref]);
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert_eq!(reloaded.page_count(), 1);
+    let page = reloaded.page(0).expect("the one page exists");
+    let text = extract_text(&reloaded, &page).expect("text extracts");
+    assert!(text.contains("two"), "unexpected text: {text:?}");
+    assert!(page.dict().get("Resources").is_some());
+    assert!(page.dict().get("MediaBox").is_some());
+    assert_eq!(page.dict().get_ref("Parent"), Some(pages_ref));
+}
+
+/// Holds only for an annotation-free source: see
+/// `page_import_of_a_linked_source_carries_the_linked_page_along` for the
+/// case where a page's own `/Annots` points elsewhere.
+#[test]
+fn page_import_pulls_in_no_sibling_content_without_links() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+    let mut writer = Writer::new(plain_table_options());
+    let pages_ref = writer.reserve();
+    let page_ref = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.page(1, pages_ref).expect("page 1 imports")
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page_ref]);
+
+    assert_eq!(
+        count_occurrences(&bytes, b"(one)"),
+        0,
+        "sibling page 0's content must not ride along"
+    );
+    assert_eq!(
+        count_occurrences(&bytes, b"(three)"),
+        0,
+        "sibling page 2's content must not ride along"
+    );
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    let page = reloaded.page(0).expect("the one page exists");
+    let text = extract_text(&reloaded, &page).expect("text extracts");
+    assert!(text.contains("two"), "unexpected text: {text:?}");
+}
+
+/// Pins a current limitation rather than a guarantee: a page's `/Annots`
+/// array is part of its own dict, so importing the page copies whatever
+/// it references. Here page 1 carries a link whose `/GoTo` destination
+/// names page 2's object; importing page 1 alone still drags page 2's
+/// object (and its content stream) into the output as an orphan, outside
+/// the new `/Kids` tree, even though page 2 was never itself imported.
+/// Link-preserving import (rewriting the destination onto whichever
+/// imported page it should now point at, or dropping it) is not yet
+/// implemented; see the limitation noted in
+/// `docs/src/guide/assembling.md`.
+#[test]
+fn page_import_of_a_linked_source_carries_the_linked_page_along() {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+    );
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [5 0 R] >>",
+    );
+    b.stream(4, "", b"(page-one-marker)");
+    b.object(
+        5,
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] \
+         /A << /S /GoTo /D [6 0 R /Fit] >> >>",
+    );
+    b.object(6, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>");
+    b.stream(7, "", b"(page-two-marker)");
+    let doc = Document::load(b.build(1)).expect("base document loads");
+
+    let mut writer = Writer::new(plain_table_options());
+    let pages_ref = writer.reserve();
+    let page_ref = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.page(0, pages_ref).expect("page 1 imports")
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page_ref]);
+
+    assert!(
+        count_occurrences(&bytes, b"(page-two-marker)") > 0,
+        "the linked page's content is carried into the output even though only page 1 was imported"
+    );
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert_eq!(
+        reloaded.page_count(),
+        1,
+        "the carried copy of page 2 sits outside the new /Kids tree"
+    );
+}
+
+#[test]
+fn inherited_attributes_survive_the_transplant() {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] \
+         /Resources << /Font << /F1 5 0 R >> >> >>",
+    );
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /Rotate 90 /Contents 4 0 R >>",
+    );
+    b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (leaf) Tj ET");
+    b.object(
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    );
+    let base = b.build(1);
+    let doc = Document::load(base).expect("base document loads");
+
+    let mut writer = Writer::new(WriteOptions::default());
+    let pages_ref = writer.reserve();
+    let page_ref = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.page(0, pages_ref).expect("the leaf page imports")
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page_ref]);
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    let page = reloaded.page(0).expect("the one page exists");
+    assert_eq!(page.media_box, Rect::new(0.0, 0.0, 300.0, 400.0));
+    assert_eq!(page.rotate, 90);
+}
+
+#[test]
+fn shared_resources_dedup_across_pages() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+    let mut writer = Writer::new(plain_table_options());
+    let pages_ref = writer.reserve();
+    let (page0, page2) = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        let page0 = importer.page(0, pages_ref).expect("page 0 imports");
+        let page2 = importer.page(2, pages_ref).expect("page 2 imports");
+        (page0, page2)
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page0, page2]);
+
+    let count = count_occurrences(&bytes, b"/Type /Font");
+    assert_eq!(count, 1, "the shared font must appear exactly once");
+}
+
+#[test]
+fn later_page_import_stays_self_contained() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+    let mut writer = Writer::new(WriteOptions::default());
+    let pages_ref = writer.reserve();
+    let (page0, page2) = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        let page0 = importer.page(0, pages_ref).expect("page 0 imports");
+        let page2 = importer.page(2, pages_ref).expect("page 2 imports");
+        (page0, page2)
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page0, page2]);
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    let page2_dict = reloaded.get(page2).expect("page 2's object resolves");
+    let dict = page2_dict.as_dict().expect("page 2 is a dict");
+    assert!(
+        dict.get("Resources").is_some(),
+        "page 2 must keep its own /Resources"
+    );
+    assert!(
+        dict.get("MediaBox").is_some(),
+        "page 2 must keep its own /MediaBox"
+    );
+    assert_eq!(
+        dict.get_ref("Parent"),
+        Some(pages_ref),
+        "page 2 must point at the new tree, not a leftover from page 0's import"
+    );
+}
+
+#[test]
+fn repeated_page_import_yields_distinct_objects() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+    let mut writer = Writer::new(plain_table_options());
+    let tree_ref = writer.reserve();
+    let parent_a = writer.reserve();
+    let parent_b = writer.reserve();
+    let (ref_a, ref_b) = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        let ref_a = importer.page(1, parent_a).expect("first import of page 1");
+        let ref_b = importer.page(1, parent_b).expect("second import of page 1");
+        (ref_a, ref_b)
+    };
+    assert_ne!(ref_a, ref_b, "each page() call must yield its own object");
+    writer
+        .fill(parent_a, Object::Dict(Dict::new()))
+        .expect("parent_a is fillable");
+    writer
+        .fill(parent_b, Object::Dict(Dict::new()))
+        .expect("parent_b is fillable");
+    let bytes = finish_with_tree(writer, tree_ref, &[ref_a, ref_b]);
+    let count = count_occurrences(&bytes, b"/Type /Font");
+    assert_eq!(count, 1, "the shared font must still appear exactly once");
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert_eq!(reloaded.page_count(), 2);
+    let dict_a = reloaded
+        .get(ref_a)
+        .expect("the first object resolves")
+        .as_dict()
+        .expect("a dict")
+        .clone();
+    let dict_b = reloaded
+        .get(ref_b)
+        .expect("the second object resolves")
+        .as_dict()
+        .expect("a dict")
+        .clone();
+    assert_eq!(dict_a.get_ref("Parent"), Some(parent_a));
+    assert_eq!(dict_b.get_ref("Parent"), Some(parent_b));
+}
+
+#[test]
+fn substitute_swaps_a_body_verbatim() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+    let content_ref = match doc.page(1).expect("page 1 exists").dict().get("Contents") {
+        Some(Object::Ref(r)) => *r,
+        other => panic!("expected an indirect /Contents, got {other:?}"),
+    };
+
+    let mut writer = Writer::new(WriteOptions::default());
+    let root = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.substitute(
+            content_ref,
+            Object::Stream(Stream {
+                dict: Dict::new(),
+                data: b"BT /F1 12 Tf 72 720 Td (SWAPPED) Tj ET".to_vec(),
+            }),
+        );
+        importer.document().expect("the whole graph imports")
+    };
+    let bytes = writer
+        .finish(root)
+        .expect("the assembled document finishes");
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert_eq!(reloaded.page_count(), 3);
+    let texts: Vec<String> = (0..3)
+        .map(|i| {
+            let page = reloaded.page(i).expect("page exists");
+            extract_text(&reloaded, &page).expect("text extracts")
+        })
+        .collect();
+    assert!(texts[0].contains("one"), "page 0: {:?}", texts[0]);
+    assert!(texts[1].contains("SWAPPED"), "page 1: {:?}", texts[1]);
+    assert!(!texts[1].contains("two"), "page 1: {:?}", texts[1]);
+    assert!(texts[2].contains("three"), "page 2: {:?}", texts[2]);
+}
+
+#[test]
+fn copy_translates_source_refs_into_the_target() {
+    let base = multi_page_doc(&["one"]);
+    let doc = Document::load(base).expect("base document loads");
+    let font_ref = ObjRef { num: 3, gen: 0 };
+
+    let mut writer = Writer::new(WriteOptions::default());
+    let (new_font_ref, root) = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        let mut source = Dict::new();
+        source.insert(name("Font"), Object::Ref(font_ref));
+        let copied = importer
+            .copy(&Object::Dict(source))
+            .expect("copy translates the dict");
+        let new_font_ref = match copied {
+            Object::Dict(d) => d.get_ref("Font").expect("the Font entry survives"),
+            other => panic!("expected a dict, got {other:?}"),
+        };
+        assert_ne!(new_font_ref.num, font_ref.num);
+        let root = importer.document().expect("the whole graph imports");
+        (new_font_ref, root)
+    };
+    let bytes = writer
+        .finish(root)
+        .expect("the assembled document finishes");
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    let font = reloaded.get(new_font_ref).expect("the font resolves");
+    assert_eq!(
+        font.as_dict().expect("font is a dict").get_name("Type"),
+        Some(&Name("Font".to_string()))
+    );
+}
+
+#[test]
+fn document_import_reaches_the_whole_graph() {
+    let base = multi_page_doc(&["one", "two", "three"]);
+    let doc = Document::load(base).expect("base document loads");
+
+    let mut writer = Writer::new(WriteOptions::default());
+    let root = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.document().expect("the whole graph imports")
+    };
+    let bytes = writer
+        .finish(root)
+        .expect("the assembled document finishes");
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert_eq!(reloaded.page_count(), 3);
+    for (index, expected) in ["one", "two", "three"].iter().enumerate() {
+        let page = reloaded.page(index).expect("page exists");
+        let text = extract_text(&reloaded, &page).expect("text extracts");
+        assert!(text.contains(expected), "page {index}: {text:?}");
+    }
+}
+
+#[test]
+fn encrypted_source_is_refused() {
+    let base = encrypted_rc4_doc("secret message");
+    let doc = Document::load(base).expect("empty-password RC4 document loads");
+    let mut writer = Writer::new(WriteOptions::default());
+    let result = Importer::new(&mut writer, &doc);
+    assert!(matches!(result, Err(Error::EncryptedBase)));
+}
+
+#[test]
+fn inline_page_gets_its_own_object() {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Count 1 /Kids [ << /Type /Page /Parent 2 0 R \
+         /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> \
+         /Contents 4 0 R >> ] >>",
+    );
+    b.object(
+        3,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    );
+    b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (inline) Tj ET");
+    let base = b.build(1);
+    let doc = Document::load(base).expect("base document loads");
+    assert_eq!(
+        doc.page(0).expect("page exists").object_ref(),
+        None,
+        "the fixture page must start inlined into /Kids"
+    );
+
+    let mut writer = Writer::new(WriteOptions::default());
+    let pages_ref = writer.reserve();
+    let page_ref = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer
+            .page(0, pages_ref)
+            .expect("the inline page imports")
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page_ref]);
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    let page = reloaded.page(0).expect("the one page exists");
+    assert_eq!(
+        page.object_ref(),
+        Some(page_ref),
+        "the imported page must now be an indirect object"
+    );
+    let text = extract_text(&reloaded, &page).expect("text extracts");
+    assert!(text.contains("inline"), "unexpected text: {text:?}");
+}
+
+#[test]
+fn watermark_refuses_an_encrypted_overlay() {
+    let base_doc = Document::load(simple_doc("Base")).expect("plain base loads");
+    let overlay_doc =
+        Document::load(encrypted_rc4_doc("secret")).expect("empty-password RC4 overlay loads");
+    let result = watermark(&base_doc, &overlay_doc);
+    assert!(matches!(result, Err(Error::EncryptedBase)));
+}
+
+#[test]
+fn watermark_with_refuses_an_encrypted_overlay() {
+    let base_doc = Document::load(simple_doc("Base")).expect("plain base loads");
+    let overlay_doc =
+        Document::load(encrypted_rc4_doc("secret")).expect("empty-password RC4 overlay loads");
+    let result = watermark_with(&base_doc, &overlay_doc, WriteOptions::default());
+    assert!(matches!(result, Err(Error::EncryptedBase)));
+}

@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
-use pyo3::exceptions::PyTypeError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 
@@ -1217,9 +1217,128 @@ fn watermark<'py>(
     Ok(PyBytes::new(py, &bytes))
 }
 
+/// Extracts one `merge` input: raw bytes selecting every page, or a
+/// `(bytes, list[int])` tuple selecting specific 0-based pages.
+fn extract_merge_input(item: &Bound<'_, PyAny>) -> PyResult<(Vec<u8>, Option<Vec<usize>>)> {
+    if let Ok(data) = item.extract::<Vec<u8>>() {
+        return Ok((data, None));
+    }
+    if let Ok((data, pages)) = item.extract::<(Vec<u8>, Vec<i64>)>() {
+        if let Some(bad) = pages.iter().find(|&&p| usize::try_from(p).is_err()) {
+            return Err(PyValueError::new_err(format!(
+                "merge page indices must be non-negative, got {bad}"
+            )));
+        }
+        return Ok((data, Some(pages.into_iter().map(|p| p as usize).collect())));
+    }
+    Err(PyTypeError::new_err(format!(
+        "merge input must be bytes or (bytes, list[int]), got {}",
+        item.get_type().name()?
+    )))
+}
+
+/// Assembles `inputs` into one fresh document: each item is either raw
+/// bytes (every page) or a `(bytes, list[int])` tuple selecting specific
+/// 0-based pages, gathered in argument order under a fresh page tree.
+/// Releases the GIL while every input is parsed and the result is built.
+#[pyfunction]
+fn merge<'py>(py: Python<'py>, inputs: Vec<Py<PyAny>>) -> PyResult<Bound<'py, PyBytes>> {
+    let mut parsed = Vec::with_capacity(inputs.len());
+    for item in &inputs {
+        parsed.push(extract_merge_input(item.bind(py))?);
+    }
+    let bytes = py.allow_threads(move || {
+        let mut loaded = Vec::with_capacity(parsed.len());
+        for (data, pages) in parsed {
+            let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
+            loaded.push((doc, pages));
+        }
+        let selection: Vec<(&pdfboss_core::Document, Option<&[usize]>)> = loaded
+            .iter()
+            .map(|(doc, pages)| (doc, pages.as_deref()))
+            .collect();
+        pdfboss_write::merge_documents(&selection, pdfboss_write::WriteOptions::default())
+            .map_err(pdf_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
+/// Cuts `data` into consecutive parts of `every` pages each, the last part
+/// carrying whatever remains. Releases the GIL while the input is parsed
+/// and the parts are built.
+#[pyfunction]
+fn split<'py>(py: Python<'py>, data: Vec<u8>, every: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let parts = py.allow_threads(|| {
+        let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
+        pdfboss_write::split_document(&doc, every, pdfboss_write::WriteOptions::default())
+            .map_err(pdf_err)
+    })?;
+    Ok(parts
+        .into_iter()
+        .map(|part| PyBytes::new(py, &part))
+        .collect())
+}
+
+/// Rotates `pages` (0-based; every page when omitted) of `data` by `by`
+/// degrees clockwise, restricted to 90, 180 or 270, else `ValueError`.
+/// Appends an incremental update by default; `rewrite=True` writes the
+/// whole file fresh instead. Either mode refuses a page inlined directly
+/// into `/Kids` with no object of its own: pdfboss does not yet
+/// restructure such a page to rotate it. Releases the GIL while the
+/// input is parsed and the result is built.
+#[pyfunction]
+#[pyo3(signature = (data, by, pages=None, rewrite=false))]
+fn rotate<'py>(
+    py: Python<'py>,
+    data: Vec<u8>,
+    by: i32,
+    pages: Option<Vec<usize>>,
+    rewrite: bool,
+) -> PyResult<Bound<'py, PyBytes>> {
+    if !matches!(by, 90 | 180 | 270) {
+        return Err(PyValueError::new_err(format!(
+            "by must be 90, 180 or 270, got {by}"
+        )));
+    }
+    let bytes = py.allow_threads(|| {
+        let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
+        let indices = pages.unwrap_or_else(|| (0..doc.page_count()).collect());
+        if rewrite {
+            return pdfboss_write::rotate_rewrite(
+                &doc,
+                &indices,
+                by,
+                pdfboss_write::WriteOptions::default(),
+            )
+            .map_err(pdf_err);
+        }
+        let mut update = CoreUpdate::new(&doc).map_err(pdf_err)?;
+        pdfboss_write::rotate_pages(&mut update, &indices, by).map_err(pdf_err)?;
+        update.bytes().map_err(pdf_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
+/// Rewrites `data` fresh: recompressed, object streams per the default
+/// options, unreachable objects and earlier update sections left behind.
+/// Releases the GIL while the input is parsed and the result is built.
+#[pyfunction]
+fn rewrite<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = py.allow_threads(|| {
+        let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
+        pdfboss_write::rewrite_document(&doc, pdfboss_write::WriteOptions::default())
+            .map_err(pdf_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
 pub(crate) fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let module = PyModule::new(py, "write")?;
     module.add_function(wrap_pyfunction!(watermark, &module)?)?;
+    module.add_function(wrap_pyfunction!(merge, &module)?)?;
+    module.add_function(wrap_pyfunction!(split, &module)?)?;
+    module.add_function(wrap_pyfunction!(rotate, &module)?)?;
+    module.add_function(wrap_pyfunction!(rewrite, &module)?)?;
     module.add_class::<Standard14>()?;
     module.add_class::<Text>()?;
     module.add_class::<Image>()?;

@@ -136,3 +136,30 @@ fn meta_requires_set() {
         "expected usage error exit code 2"
     );
 }
+
+#[test]
+fn meta_rewrite_flag_writes_a_fresh_file_with_the_set_fields() {
+    let input = common::fixture("hello.pdf");
+    let out = tmp("meta-rewrite.pdf");
+
+    let output = pdfboss(&[
+        "meta",
+        input.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--set",
+        "title=Rewritten",
+        "--rewrite",
+    ]);
+    assert!(output.status.success(), "meta --rewrite failed: {output:?}");
+
+    let input_bytes = std::fs::read(&input).unwrap();
+    let output_bytes = std::fs::read(&out).unwrap();
+    assert!(
+        !output_bytes.starts_with(&input_bytes[..]),
+        "--rewrite must not merely append an update onto the input"
+    );
+
+    let doc = load(&out);
+    assert_eq!(doc.metadata().title.as_deref(), Some("Rewritten"));
+}

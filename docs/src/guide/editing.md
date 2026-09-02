@@ -2,9 +2,9 @@
 
 `pdfboss_write::Update` edits an existing document without rewriting it. It appends an incremental update (ISO 32000-1 §7.5.6): a cross-reference section holding only the changed and new objects, chained to the base document's own newest section by `/Prev`. The base's bytes never move; a conforming reader parses the newest cross-reference section first and falls back to `/Prev` only for object numbers that section does not cover, so an edit takes effect over the whole file without touching a byte of what came before it.
 
-An encrypted base is refused outright. `Update::new` checks the trailer for an `/Encrypt` entry before reading or writing anything and returns `Error::EncryptedBase` (`cannot update an encrypted document`) if one is there, whether or not the document was opened with the correct password: the check is for the entry, not for whether decryption succeeded, because the new strings and streams an update writes would need encrypting too.
+An encrypted base is refused outright. `Update::new` checks the trailer for an `/Encrypt` entry before reading or writing anything and returns `Error::EncryptedBase` (`cannot update or copy from an encrypted document`) if one is there, whether or not the document was opened with the correct password: the check is for the entry, not for whether decryption succeeded, because the new strings and streams an update writes would need encrypting too.
 
-This chapter covers `meta`, the first editing verb. `merge`, `split`, `rotate`, `overlay` and `encrypt` follow in later PRs. Existing files can already be drawn on with [`watermark`](./creating.md#watermarking-an-existing-file), built on the same incremental-append machinery.
+This chapter covers `meta`. `merge`, `split`, `rotate` and the whole-document `rewrite` are in [Assembling documents](./assembling.md); `overlay` and `encrypt` follow in later PRs. Existing files can already be drawn on with [`watermark`](./creating.md#watermarking-an-existing-file), built on the same incremental-append machinery.
 
 When the catalog already names an XMP packet, `set_metadata` rebuilds it from the eight modeled `Metadata` fields alone: any other XMP property the original packet carried (a PDF/A identifier, a rights statement, edit history, a custom schema) is not carried into the new packet, though the original packet's bytes stay physically present in the base, superseded only by the appended section's newer entry for that object number.
 
@@ -16,7 +16,7 @@ When the catalog already names an XMP packet, `set_metadata` rebuilds it from th
 pdfboss meta report.pdf -o report-titled.pdf --set title="Q3 Report" --set author="Finance"
 ```
 
-`--set KEY=VALUE` repeats, one per field: `title`, `author`, `subject`, `keywords`, `creator`, `producer`. `--password` opens an encrypted input for reading; the write step still refuses it, for the reason above.
+`--set KEY=VALUE` repeats, one per field: `title`, `author`, `subject`, `keywords`, `creator`, `producer`. `--password` opens an encrypted input for reading; the write step still refuses it, for the reason above. `--rewrite` writes the whole document fresh instead of appending: the same [`rewrite`](./assembling.md#rewriting) operation, with the metadata merged in along the way.
 
 ## Python
 

@@ -13,6 +13,7 @@ use pdfboss_core::xref::{parse_section_at, startxref};
 use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
 
 use crate::error::{Error, Result};
+use crate::importer::{rect_array, Importer};
 use crate::pdf::{text_string, Date, Metadata};
 use crate::ser::{serialize_dict, serialize_object};
 use crate::writer::{WriteOptions, Writer, XrefStyle};
@@ -24,221 +25,120 @@ const FORM_NAME: &str = "PdfbossWatermark";
 /// `options` instead of appending an update: every object the base's
 /// catalog reaches is copied over, uncompressed streams are compressed when
 /// `options.compress` is set, and unreachable objects and earlier sections
-/// are left behind, so the result is usually smaller than the base.
+/// are left behind, so the result is usually smaller than the base. Both
+/// `base` and `overlay` are refused when encrypted, through
+/// [`crate::importer::Importer::new`].
 pub fn watermark_with(
     base: &Document,
     overlay: &Document,
     options: WriteOptions,
 ) -> Result<Vec<u8>> {
-    let trailer = &base.xref().trailer;
-    if trailer.get("Encrypt").is_some() {
-        return Err(Error::EncryptedBase);
-    }
-    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
     let mut writer = Writer::new(options);
     let prefix = writer.put_stream_raw(Dict::new(), b"q\n".to_vec());
     let suffix = writer.put_stream_raw(
         Dict::new(),
         format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
     );
-    let mut overlay_copy = Rewrite::new(overlay, options.compress);
-    let form = overlay_copy.form(&mut writer)?;
-    overlay_copy.drain(&mut writer, None)?;
+    let form = overlay_form(&mut writer, overlay)?;
 
-    let pages: FastMap<ObjRef, usize> = (0..base.page_count())
-        .filter_map(|index| {
-            let page = base.page(index).ok()?;
-            page.object_ref().map(|r| (r, index))
-        })
-        .collect();
-    let stamp = Stamp {
-        form,
-        prefix,
-        suffix,
-        pages,
-    };
-    let mut base_copy = Rewrite::new(base, options.compress);
-    let new_root = base_copy.reference(&mut writer, root);
-    if let Some(info) = trailer.get_ref("Info") {
-        let new_info = base_copy.reference(&mut writer, info);
+    let trailer = &base.xref().trailer;
+    let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
+    let mut importer = Importer::new(&mut writer, base)?;
+    let new_root = importer.reference(root);
+    let new_info = trailer.get_ref("Info").map(|info| importer.reference(info));
+    for index in 0..base.page_count() {
+        let page = base.page(index).map_err(core_error)?;
+        let Some(page_ref) = page.object_ref() else {
+            continue;
+        };
+        let dict = marked_page_dict(&mut importer, base, index, form, prefix, suffix)?;
+        importer.substitute(page_ref, dict);
+    }
+    importer.finish()?;
+    if let Some(new_info) = new_info {
         writer.set_info(new_info);
     }
-    base_copy.drain(&mut writer, Some(&stamp))?;
     writer.finish(new_root)
 }
 
-/// What every stamped page draws: the overlay form and the two content
-/// streams wrapped around the page's own, plus which objects are pages.
-struct Stamp {
+/// The marked dictionary for source page `index`: its own dictionary
+/// translated into the target, its effective resources gaining the overlay
+/// form under [`FORM_NAME`], and its content wrapped in `prefix` and
+/// `suffix`.
+fn marked_page_dict(
+    importer: &mut Importer,
+    base: &Document,
+    index: usize,
     form: ObjRef,
     prefix: ObjRef,
     suffix: ObjRef,
-    pages: FastMap<ObjRef, usize>,
-}
-
-/// Copies one document's object graph into a [`Writer`]: every reference
-/// met is reserved a number once and queued, and the queue is drained
-/// iteratively, so a long chain of references costs no stack.
-struct Rewrite<'a> {
-    source: &'a Document,
-    map: FastMap<ObjRef, ObjRef>,
-    pending: Vec<ObjRef>,
-    compress: bool,
-}
-
-impl<'a> Rewrite<'a> {
-    fn new(source: &'a Document, compress: bool) -> Rewrite<'a> {
-        Rewrite {
-            source,
-            map: FastMap::default(),
-            pending: Vec::new(),
-            compress,
+) -> Result<Object> {
+    let page = base.page(index).map_err(core_error)?;
+    let mut dict = importer.copy_dict(page.dict())?;
+    let mut resources = importer.copy_dict(&page.resources)?;
+    let mut xobjects = match page.resources.get("XObject") {
+        Some(existing) => {
+            let existing = base.resolve(existing).map_err(core_error)?;
+            match existing.as_dict() {
+                Some(d) => importer.copy_dict(d)?,
+                None => Dict::new(),
+            }
         }
-    }
-
-    /// The target number for source reference `r`, reserved and queued on
-    /// first sight.
-    fn reference(&mut self, writer: &mut Writer, r: ObjRef) -> ObjRef {
-        if let Some(copied) = self.map.get(&r) {
-            return *copied;
+        None => Dict::new(),
+    };
+    xobjects.insert(name(FORM_NAME), Object::Ref(form));
+    resources.insert(name("XObject"), Object::Dict(xobjects));
+    dict.insert(name("Resources"), Object::Dict(resources));
+    let mut contents = vec![Object::Ref(prefix)];
+    match page.dict().get("Contents") {
+        Some(Object::Array(items)) => {
+            for item in items {
+                contents.push(importer.copy(item)?);
+            }
         }
-        let copied = writer.reserve();
-        self.map.insert(r, copied);
-        self.pending.push(r);
-        copied
-    }
-
-    /// A copy of `obj`'s direct structure with every reference mapped.
-    fn copy(&mut self, writer: &mut Writer, obj: &Object) -> Result<Object> {
-        Ok(match obj {
-            Object::Ref(r) => Object::Ref(self.reference(writer, *r)),
-            Object::Dict(d) => Object::Dict(self.copy_dict(writer, d)?),
-            Object::Array(items) => Object::Array(
-                items
-                    .iter()
-                    .map(|item| self.copy(writer, item))
-                    .collect::<Result<Vec<Object>>>()?,
-            ),
-            Object::Stream(_) => return Err(Error::NestedStream),
-            other => other.clone(),
-        })
-    }
-
-    fn copy_dict(&mut self, writer: &mut Writer, dict: &Dict) -> Result<Dict> {
-        let mut out = Dict::new();
-        for (key, value) in dict.iter() {
-            out.insert(key.clone(), self.copy(writer, value)?);
-        }
-        Ok(out)
-    }
-
-    /// A stream body: its dictionary copied without `/Length` (the writer
-    /// sets it), its data compressed when asked and not already filtered.
-    fn copy_stream(&mut self, writer: &mut Writer, stream: &Stream) -> Result<Object> {
-        let mut dict = stream.dict.clone();
-        dict.remove("Length");
-        let mut dict = self.copy_dict(writer, &dict)?;
-        let data = if self.compress && dict.get("Filter").is_none() {
-            dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
-            deflate(&stream.data)
-        } else {
-            stream.data.clone()
-        };
-        Ok(Object::Stream(Stream { dict, data }))
-    }
-
-    /// Fills every queued object, stamping the pages `stamp` names.
-    fn drain(&mut self, writer: &mut Writer, stamp: Option<&Stamp>) -> Result<()> {
-        while let Some(r) = self.pending.pop() {
-            let target = self.map[&r];
-            let stamped = stamp.and_then(|s| s.pages.get(&r).map(|index| (s, *index)));
-            let body = match stamped {
-                Some((s, index)) => self.stamped_page(writer, index, s)?,
-                None => match self.source.get(r).map_err(core_error)? {
-                    Object::Stream(s) => self.copy_stream(writer, &s)?,
-                    other => self.copy(writer, &other)?,
-                },
-            };
-            writer.fill(target, body)?;
-        }
-        Ok(())
-    }
-
-    /// Page `index`'s dictionary copied with the stamp applied: its
-    /// effective resources gain the form, its content is wrapped in the
-    /// prefix and suffix streams.
-    fn stamped_page(&mut self, writer: &mut Writer, index: usize, stamp: &Stamp) -> Result<Object> {
-        let page = self.source.page(index).map_err(core_error)?;
-        let mut dict = self.copy_dict(writer, page.dict())?;
-        let mut resources = self.copy_dict(writer, &page.resources)?;
-        let mut xobjects = match page.resources.get("XObject") {
-            Some(existing) => {
-                let existing = self.source.resolve(existing).map_err(core_error)?;
-                match existing.as_dict() {
-                    Some(d) => self.copy_dict(writer, d)?,
-                    None => Dict::new(),
+        Some(Object::Ref(r)) => match base.get(*r).map_err(core_error)? {
+            Object::Array(items) => {
+                for item in &items {
+                    contents.push(importer.copy(item)?);
                 }
             }
-            None => Dict::new(),
-        };
-        xobjects.insert(name(FORM_NAME), Object::Ref(stamp.form));
-        resources.insert(name("XObject"), Object::Dict(xobjects));
-        dict.insert(name("Resources"), Object::Dict(resources));
-        let mut contents = vec![Object::Ref(stamp.prefix)];
-        match page.dict().get("Contents") {
-            Some(Object::Array(items)) => {
-                for item in items {
-                    contents.push(self.copy(writer, item)?);
-                }
-            }
-            Some(Object::Ref(r)) => match self.source.get(*r).map_err(core_error)? {
-                Object::Array(items) => {
-                    for item in &items {
-                        contents.push(self.copy(writer, item)?);
-                    }
-                }
-                _ => contents.push(Object::Ref(self.reference(writer, *r))),
-            },
-            _ => {}
-        }
-        contents.push(Object::Ref(stamp.suffix));
-        dict.insert(name("Contents"), Object::Array(contents));
-        Ok(Object::Dict(dict))
+            _ => contents.push(Object::Ref(importer.reference(*r))),
+        },
+        _ => {}
     }
+    contents.push(Object::Ref(suffix));
+    dict.insert(name("Contents"), Object::Array(contents));
+    Ok(Object::Dict(dict))
+}
 
-    /// The source's first page as a form XObject, filled into the writer:
-    /// its media box as the bounding box, its decoded content deflated, its
-    /// resources copied.
-    fn form(&mut self, writer: &mut Writer) -> Result<ObjRef> {
-        let page = self.source.page(0).map_err(core_error)?;
-        let content = page.content(self.source).map_err(core_error)?;
-        let resources = self.copy_dict(writer, &page.resources)?;
-        let bbox = page.media_box;
-        let mut dict = Dict::new();
-        dict.insert(name("Type"), Object::Name(name("XObject")));
-        dict.insert(name("Subtype"), Object::Name(name("Form")));
-        dict.insert(name("FormType"), Object::Int(1));
-        dict.insert(
-            name("BBox"),
-            Object::Array(
-                [bbox.x0, bbox.y0, bbox.x1, bbox.y1]
-                    .iter()
-                    .map(|v| Object::Real(f64::from(*v)))
-                    .collect(),
-            ),
-        );
-        dict.insert(name("Resources"), Object::Dict(resources));
-        dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
-        let form = writer.reserve();
-        writer.fill(
-            form,
-            Object::Stream(Stream {
-                dict,
-                data: deflate(&content),
-            }),
-        )?;
-        Ok(form)
-    }
+/// The overlay's first page as a form XObject, filled directly into
+/// `writer`: its media box as the bounding box, its decoded content
+/// deflated, its resources imported from `overlay`.
+fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
+    let page = overlay.page(0).map_err(core_error)?;
+    let content = page.content(overlay).map_err(core_error)?;
+    let resources = {
+        let mut importer = Importer::new(writer, overlay)?;
+        let resources = importer.copy_dict(&page.resources)?;
+        importer.finish()?;
+        resources
+    };
+    let mut dict = Dict::new();
+    dict.insert(name("Type"), Object::Name(name("XObject")));
+    dict.insert(name("Subtype"), Object::Name(name("Form")));
+    dict.insert(name("FormType"), Object::Int(1));
+    dict.insert(name("BBox"), rect_array(page.media_box));
+    dict.insert(name("Resources"), Object::Dict(resources));
+    dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
+    let form = writer.reserve();
+    writer.fill(
+        form,
+        Object::Stream(Stream {
+            dict,
+            data: deflate(&content),
+        }),
+    )?;
+    Ok(form)
 }
 
 /// Draws the first page of `overlay` over every page of `base`, returning
@@ -247,8 +147,10 @@ impl<'a> Rewrite<'a> {
 /// and each page's dictionary rewritten with that form in its resources
 /// and its content wrapped in `q … Q` before the form is drawn. Pages
 /// inlined directly into `/Kids`, having no object of their own, are left
-/// as they are. An encrypted base is refused: its new strings and streams
-/// would need encrypting too.
+/// as they are. An encrypted `base` is refused: its new strings and
+/// streams would need encrypting too. An encrypted `overlay` is refused
+/// as well: its decrypted content would otherwise copy across into the
+/// plain update section.
 pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
     let mut update = Update::new(base)?;
     let form = update.overlay.import_form(overlay)?;
@@ -293,6 +195,37 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
     update.bytes()
 }
 
+/// Stages `by` degrees of rotation, clockwise, on each of `pages` (0-based
+/// indices) into `update`: a clone of the page's own leaf dictionary, its
+/// `/Rotate` set to its current effective rotation plus `by`, normalized
+/// with `rem_euclid(360)`. The staged dictionary is untranslated: it
+/// keeps its own `/Parent`, so it stays exactly where it was in the page
+/// tree. A page with no object of its own (inlined directly into
+/// `/Kids`) cannot be staged this way: refused, naming its 1-based page
+/// number. `by` must be a multiple of 90; anything else is refused before
+/// any page is touched.
+pub fn rotate_pages(update: &mut Update, pages: &[usize], by: i32) -> Result<()> {
+    if by % 90 != 0 {
+        return Err(Error::Other(
+            "rotation must be a multiple of 90 degrees".to_string(),
+        ));
+    }
+    for &index in pages {
+        let page = update.doc.page(index).map_err(core_error)?;
+        let Some(page_ref) = page.object_ref() else {
+            return Err(Error::Other(format!(
+                "page {} is inlined into /Kids and cannot be edited in place",
+                index + 1
+            )));
+        };
+        let mut dict = page.dict().clone();
+        let rotate = (page.rotate + by).rem_euclid(360);
+        dict.insert(name("Rotate"), Object::Int(i64::from(rotate)));
+        update.set(page_ref, Object::Dict(dict));
+    }
+    Ok(())
+}
+
 /// The facts about a base document an update needs, read once from its
 /// trailer and its own newest cross-reference section: refuses an
 /// encrypted base or one missing `/Root` or a `startxref` to chain from.
@@ -318,31 +251,49 @@ pub struct OverlayBase {
 }
 
 impl OverlayBase {
-    /// Reads `doc`'s trailer and newest cross-reference section.
+    /// Reads `doc`'s trailer and newest cross-reference section: the
+    /// section's offset and kind come from `doc.xref().newest_section()`,
+    /// already recorded while core loaded the file, falling back to
+    /// re-deriving them from `startxref` and `parse_section_at` when the
+    /// document has none (a recovery-scan base refuses with
+    /// [`Error::MissingStartxref`] on this fallback path).
     pub fn from_document(doc: &Document) -> Result<OverlayBase> {
         let trailer = &doc.xref().trailer;
-        if trailer.get("Encrypt").is_some() {
+        if trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
             return Err(Error::EncryptedBase);
         }
         let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
-        let prev = startxref(doc.bytes()).ok_or(Error::MissingStartxref)?;
-        let kind = match parse_section_at(doc.bytes(), prev)
-            .map_err(core_error)?
-            .kind
-        {
-            XrefKind::Table => XrefStyle::Table,
-            XrefKind::Stream => XrefStyle::Stream,
+        let (prev, kind) = match doc.xref().newest_section() {
+            Some(section) => (section.offset, xref_style(section.kind)),
+            None => {
+                let offset = startxref(doc.bytes()).ok_or(Error::MissingStartxref)?;
+                let kind = xref_style(
+                    parse_section_at(doc.bytes(), offset)
+                        .map_err(core_error)?
+                        .kind,
+                );
+                (offset as u64, kind)
+            }
         };
         let highest = doc.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
         let declared = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
         Ok(OverlayBase {
-            prev: prev as u64,
+            prev,
             kind,
             size: declared.max(highest + 1),
             root,
             info: trailer.get_ref("Info"),
             id: trailer.get("ID").cloned(),
         })
+    }
+}
+
+/// The [`XrefStyle`] an appended section should copy for a base whose
+/// newest section is `kind`.
+fn xref_style(kind: XrefKind) -> XrefStyle {
+    match kind {
+        XrefKind::Table => XrefStyle::Table,
+        XrefKind::Stream => XrefStyle::Stream,
     }
 }
 
@@ -382,8 +333,15 @@ impl Overlay {
     /// Sets an object under its own number, whether new or a replacement
     /// of one already in the base. Raises the next free number past `r`
     /// when `r` was not already reserved, so a later `reserve`/`put` never
-    /// collides with a caller-chosen number.
+    /// collides with a caller-chosen number. A no-op for object number 0:
+    /// it is already the free list's own permanent head, represented by
+    /// this section's synthetic entry-0 row whenever any other object is
+    /// freed, and a `set` row for it would collide with that row. Symmetric
+    /// with [`Overlay::remove`]'s guard.
     pub fn set(&mut self, r: ObjRef, obj: Object) {
+        if r.num == 0 {
+            return;
+        }
         self.next = self.next.max(r.num.saturating_add(1));
         self.objects.push((r, Change::Set(obj)));
     }
@@ -488,7 +446,7 @@ impl Overlay {
         if let Some(info) = self.info.or(self.base.info) {
             trailer.insert(name("Info"), Object::Ref(info));
         }
-        if let Some(id) = rotated_id(&self.base, &out) {
+        if let Some(id) = rotated_id(&self.base, &out, &freed) {
             trailer.insert(name("ID"), id);
         }
         trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
@@ -502,8 +460,19 @@ impl Overlay {
     /// The overlay's first page as a form XObject in the base's object
     /// space: its media box as the form's bounding box, its decoded content
     /// as the form's stream, and its resource graph deep-copied and
-    /// renumbered.
+    /// renumbered. Refuses an encrypted `overlay`, for the same reason
+    /// [`crate::importer::Importer::new`] refuses an encrypted source:
+    /// copying its decrypted content across would silently strip its
+    /// protection.
     pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
+        if overlay
+            .xref()
+            .trailer
+            .get("Encrypt")
+            .is_some_and(|o| !o.is_null())
+        {
+            return Err(Error::EncryptedBase);
+        }
         let page = overlay.page(0).map_err(core_error)?;
         let content = page.content(overlay).map_err(core_error)?;
         let resources = self.import_object(overlay, &Object::Dict(page.resources.clone()))?;
@@ -595,28 +564,74 @@ pub fn set_metadata_with(
     xmp_ref: Option<ObjRef>,
     meta: Metadata,
 ) -> Result<()> {
-    let (target, mut dict) = match existing_info {
-        Some((r, dict)) => (r, dict),
-        None => (overlay.reserve(), Dict::new()),
+    let (target, existing_dict) = match existing_info {
+        Some((r, dict)) => (r, Some(dict)),
+        None => (overlay.reserve(), None),
     };
-    apply_metadata_fields(&mut dict, &meta);
-    let merged = metadata_from_info(&dict);
+    let (dict, merged) = merge_metadata(existing_dict, &meta);
     overlay.set(target, Object::Dict(dict));
     overlay.set_info(target);
     let Some(xmp_ref) = xmp_ref else {
         return Ok(());
     };
+    overlay.set(xmp_ref, xmp_metadata_stream(&merged));
+    Ok(())
+}
+
+/// `existing` (`None` starts from an empty dictionary) with every `Some`
+/// field of `meta` applied: a `Some` field overwrites its key
+/// (`Some(String::new())` writes an empty string), a `None` field leaves
+/// whatever key was already there. Also returns that merged dictionary read
+/// back into a [`Metadata`] (text fields via `decode_text_string`, dates via
+/// [`Date::parse_pdf`], an unparseable date simply dropping out), for
+/// [`xmp_metadata_stream`]: any XMP property outside those eight fields is
+/// not carried into a rebuilt packet.
+///
+/// Shared by [`set_metadata_with`] and [`crate::assemble::rewrite_with_metadata`].
+pub(crate) fn merge_metadata(existing: Option<Dict>, meta: &Metadata) -> (Dict, Metadata) {
+    let mut dict = existing.unwrap_or_default();
+    apply_metadata_fields(&mut dict, meta);
+    let merged = metadata_from_info(&dict);
+    (dict, merged)
+}
+
+/// A fresh, unfiltered `/Type /Metadata /Subtype /XML` stream over `meta`'s
+/// XMP packet, ready to stage into an [`Overlay`] or substitute into an
+/// import.
+pub(crate) fn xmp_metadata_stream(meta: &Metadata) -> Object {
     let mut xmp_dict = Dict::new();
     xmp_dict.insert(name("Type"), Object::Name(name("Metadata")));
     xmp_dict.insert(name("Subtype"), Object::Name(name("XML")));
-    overlay.set(
-        xmp_ref,
-        Object::Stream(Stream {
-            dict: xmp_dict,
-            data: crate::xmp::packet(&merged),
-        }),
-    );
-    Ok(())
+    Object::Stream(Stream {
+        dict: xmp_dict,
+        data: crate::xmp::packet(meta),
+    })
+}
+
+/// `dict` with every value resolved against `doc`: an indirect value such
+/// as `/Title 12 0 R` becomes the string object it points to, so a field
+/// [`merge_metadata`] keeps (a `None` field in the merge) still reads back
+/// as text rather than silently vanishing from a rebuilt XMP packet. A
+/// value whose reference chain fails to resolve (an unreadable target, or
+/// a cycle) is kept as given.
+pub(crate) fn resolve_dict(doc: &Document, dict: &Dict) -> Dict {
+    let mut out = Dict::new();
+    for (key, value) in dict.iter() {
+        let resolved = doc.resolve(value).unwrap_or_else(|_| value.clone());
+        out.insert(key.clone(), resolved);
+    }
+    out
+}
+
+/// `doc`'s catalog's `/Metadata` entry, when it is an indirect reference.
+/// `None` for a catalog with no `/Metadata`, or one that reads as a direct
+/// stream rather than a reference.
+pub(crate) fn catalog_metadata_ref(doc: &Document, root: ObjRef) -> Option<ObjRef> {
+    let catalog = doc.get(root).ok()?;
+    match catalog.as_dict()?.get("Metadata")? {
+        Object::Ref(r) => Some(*r),
+        _ => None,
+    }
 }
 
 /// Writes every `Some` field of `meta` into `dict` under its `/Info` key;
@@ -733,37 +748,10 @@ impl<'a> Update<'a> {
         let info_ref = self.overlay.info.or(self.overlay.base.info);
         let existing_info = info_ref.and_then(|r| {
             let dict = self.doc.get(r).ok()?.as_dict()?.clone();
-            Some((r, self.resolve_dict(&dict)))
+            Some((r, resolve_dict(self.doc, &dict)))
         });
-        let xmp_ref = self.catalog_metadata_ref();
+        let xmp_ref = catalog_metadata_ref(self.doc, self.overlay.base.root);
         set_metadata_with(&mut self.overlay, existing_info, xmp_ref, meta)
-    }
-
-    /// `dict` with every value resolved against the base document: an
-    /// indirect value such as `/Title 12 0 R` becomes the string object it
-    /// points to, so a field kept by [`set_metadata_with`] (a `None` field
-    /// in the merge) still reads back as text rather than silently
-    /// vanishing from the rewritten XMP packet. A value whose reference
-    /// chain fails to resolve (an unreadable target, or a cycle) is kept
-    /// as given.
-    fn resolve_dict(&self, dict: &Dict) -> Dict {
-        let mut out = Dict::new();
-        for (key, value) in dict.iter() {
-            let resolved = self.doc.resolve(value).unwrap_or_else(|_| value.clone());
-            out.insert(key.clone(), resolved);
-        }
-        out
-    }
-
-    /// The catalog's `/Metadata` entry, when it is an indirect reference.
-    /// `None` for a catalog with no `/Metadata`, or one that reads as a
-    /// direct stream rather than a reference.
-    fn catalog_metadata_ref(&self) -> Option<ObjRef> {
-        let catalog = self.doc.get(self.overlay.base.root).ok()?;
-        match catalog.as_dict()?.get("Metadata")? {
-            Object::Ref(r) => Some(*r),
-            _ => None,
-        }
     }
 
     /// The base bytes, whether a pad newline goes before the appended
@@ -851,11 +839,14 @@ fn contiguous_runs(rows: &[Row]) -> Vec<(usize, usize)> {
 
 /// The appended trailer's `/ID`: the base's first half kept verbatim, the
 /// second half replaced by the first 16 bytes of a SHA-256 over the first
-/// half's bytes, the base's `/Prev` offset as little-endian bytes, and
-/// `body` (the section's serialized objects, built before its xref part).
-/// `None` when the base carries no `/ID` array with a string first
-/// element, in which case the appended trailer omits the key entirely.
-fn rotated_id(base: &OverlayBase, body: &[u8]) -> Option<Object> {
+/// half's bytes, the base's `/Prev` offset as little-endian bytes, `body`
+/// (the section's serialized objects, built before its xref part), and
+/// finally each of `freed`'s `(num, gen)` pairs in order (`num` then `gen`,
+/// both little-endian), so a frees-only update, whose `body` is empty,
+/// still rotates by what it freed rather than staying fixed. `None` when
+/// the base carries no `/ID` array with a string first element, in which
+/// case the appended trailer omits the key entirely.
+fn rotated_id(base: &OverlayBase, body: &[u8], freed: &[ObjRef]) -> Option<Object> {
     let Some(Object::Array(halves)) = &base.id else {
         return None;
     };
@@ -866,6 +857,10 @@ fn rotated_id(base: &OverlayBase, body: &[u8]) -> Option<Object> {
     hasher.update(first);
     hasher.update(&base.prev.to_le_bytes());
     hasher.update(body);
+    for r in freed {
+        hasher.update(&r.num.to_le_bytes());
+        hasher.update(&r.gen.to_le_bytes());
+    }
     let digest = hasher.finalize();
     Some(Object::Array(vec![
         Object::String(first.clone()),
@@ -987,7 +982,7 @@ fn plain_stream(data: Vec<u8>) -> Stream {
     }
 }
 
-fn deflate(data: &[u8]) -> Vec<u8> {
+pub(crate) fn deflate(data: &[u8]) -> Vec<u8> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder
         .write_all(data)
@@ -1017,6 +1012,6 @@ fn name(text: &str) -> Name {
     Name(text.to_string())
 }
 
-fn core_error(error: pdfboss_core::Error) -> Error {
+pub(crate) fn core_error(error: pdfboss_core::Error) -> Error {
     Error::Other(error.to_string())
 }

@@ -1,12 +1,14 @@
 //! The `pdfboss` command-line tool: document info, text extraction, page
 //! rendering and object inspection.
 
+mod assemble;
 mod create;
 mod hexdump;
 mod input;
 mod json;
 mod manifest;
 mod meta;
+mod pages;
 mod progress;
 mod q;
 mod skill;
@@ -83,7 +85,68 @@ enum Command {
         /// Metadata assignment, repeatable: title, author, subject, keywords, creator, producer.
         #[arg(long = "set", value_name = "KEY=VALUE", required = true)]
         set: Vec<String>,
+        /// Full rewrite instead of an incremental append.
+        #[arg(long)]
+        rewrite: bool,
         /// Password for encrypted PDFs.
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Combine selected pages from several inputs into one fresh document.
+    Merge {
+        /// Inputs, each optionally FILE:RANGE (1-based, e.g. report.pdf:2-9).
+        #[arg(required = true)]
+        inputs: Vec<String>,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// One password tried for every encrypted input.
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Cut a document into consecutive chunks of pages.
+    Split {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output pattern containing %d (1-based part number).
+        #[arg(short, long)]
+        out: String,
+        /// Pages per part.
+        #[arg(long, value_parser = parse_every)]
+        every: usize,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Rotate selected pages by a quarter-turn multiple, clockwise.
+    Rotate {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// 1-based pages, e.g. 2,4-9; every page when omitted.
+        #[arg(long)]
+        pages: Option<String>,
+        /// Quarter turns clockwise: 90, 180 or 270.
+        #[arg(long, value_parser = ["90", "180", "270"])]
+        by: String,
+        /// Full rewrite instead of an incremental append.
+        #[arg(long)]
+        rewrite: bool,
+        /// Password for an encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Rewrite a document fresh: recompressed, unreachable objects and
+    /// earlier update sections left behind.
+    Rewrite {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Password for an encrypted file (user or owner password).
         #[arg(long, default_value = "")]
         password: String,
     },
@@ -277,6 +340,20 @@ enum Command {
     },
 }
 
+/// Parses `--every` as a positive page count. `usize` carries no
+/// `clap::value_parser!` range support (unlike the fixed-width integers),
+/// so the 1.. bound is checked by hand: 0 is rejected here rather than
+/// reaching `split_document` as an unrepresentable chunk size.
+fn parse_every(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("invalid value '{s}' for --every: not a number"))?;
+    if n == 0 {
+        return Err("invalid value '0' for --every: 0 is not in 1..".to_string());
+    }
+    Ok(n)
+}
+
 /// `--fonts` choices for `render`, mapping to `pdfboss_render::GlyphPainting`.
 #[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
 enum FontsArg {
@@ -347,8 +424,34 @@ fn main() {
             file,
             out,
             set,
+            rewrite,
             password,
-        } => meta::cmd_meta(&file, &out, &set, &password).map_err(Failure::from),
+        } => meta::cmd_meta(&file, &out, &set, rewrite, &password).map_err(Failure::from),
+        Command::Merge {
+            inputs,
+            out,
+            password,
+        } => assemble::cmd_merge(&inputs, &out, &password).map_err(Failure::from),
+        Command::Split {
+            file,
+            out,
+            every,
+            password,
+        } => assemble::cmd_split(&file, &out, every, &password).map_err(Failure::from),
+        Command::Rotate {
+            file,
+            out,
+            pages,
+            by,
+            rewrite,
+            password,
+        } => assemble::cmd_rotate(&file, &out, pages.as_deref(), &by, rewrite, &password)
+            .map_err(Failure::from),
+        Command::Rewrite {
+            file,
+            out,
+            password,
+        } => assemble::cmd_rewrite(&file, &out, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,

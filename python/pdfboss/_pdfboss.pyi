@@ -668,6 +668,37 @@ class write:
     """
 
     @staticmethod
+    def merge(inputs: list[bytes | tuple[bytes, list[int]]]) -> bytes:
+        """Assembles ``inputs`` into one fresh document: each item is
+        either raw bytes (every page) or a ``(bytes, list[int])`` tuple
+        selecting specific 0-based pages, gathered in argument order
+        under a fresh page tree. An encrypted input raises ``PdfError``."""
+
+    @staticmethod
+    def split(data: bytes, every: int) -> list[bytes]:
+        """Cuts ``data`` into consecutive parts of ``every`` pages each,
+        the last part carrying whatever remains. An encrypted ``data``
+        raises ``PdfError``."""
+
+    @staticmethod
+    def rotate(
+        data: bytes, by: int, pages: list[int] | None = None, rewrite: bool = False
+    ) -> bytes:
+        """Rotates ``pages`` (0-based; every page when omitted) of
+        ``data`` by ``by`` degrees clockwise, restricted to 90, 180 or
+        270, else ``ValueError``. Appends an incremental update by
+        default; ``rewrite=True`` writes the whole file fresh instead.
+        Either mode refuses a page inlined directly into ``/Kids`` with
+        no object of its own: pdfboss does not yet restructure such a
+        page to rotate it. An encrypted ``data`` raises ``PdfError``."""
+
+    @staticmethod
+    def rewrite(data: bytes) -> bytes:
+        """Rewrites ``data`` fresh: recompressed, object streams per the
+        default options, unreachable objects and earlier update sections
+        left behind. An encrypted ``data`` raises ``PdfError``."""
+
+    @staticmethod
     def watermark(data: bytes, overlay: bytes, *, rewrite: bool = False) -> bytes:
         """Draws the first page of ``overlay`` over every page of ``data``
         and returns the watermarked file. By default that is ``data``'s

@@ -16,6 +16,7 @@
 - [Extracting images from PDFs](guide/images.md)
 - [Creating PDFs](guide/creating.md)
 - [Editing PDFs](guide/editing.md)
+- [Assembling documents](guide/assembling.md)
 - [Markdown to PDF](guide/md-to-pdf.md)
 - [Async and remote PDFs over HTTP](guide/async.md)
 - [Exploring PDF internals](guide/explorer.md)

@@ -1,5 +1,6 @@
-"""Composing new PDFs: pages, elements and document slots joined with |, and
-watermarking existing ones in place."""
+"""Composing new PDFs: pages, elements and document slots joined with |,
+watermarking existing ones in place, and merging, splitting, rotating or
+rewriting existing ones."""
 
 import pdfboss._pdfboss  # noqa: F401  registers pdfboss._pdfboss.write in sys.modules
 from pdfboss._pdfboss.write import (
@@ -18,6 +19,10 @@ from pdfboss._pdfboss.write import (
     Text,
     Update,
     Viewer,
+    merge,
+    rewrite,
+    rotate,
+    split,
     watermark,
 )
 
@@ -37,5 +42,9 @@ __all__ = [
     "Text",
     "Update",
     "Viewer",
+    "merge",
+    "rewrite",
+    "rotate",
+    "split",
     "watermark",
 ]

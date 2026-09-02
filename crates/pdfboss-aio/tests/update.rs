@@ -42,10 +42,10 @@ fn temp_path(name: &str) -> std::path::PathBuf {
     ))
 }
 
-/// `dict` with every value resolved against `doc`, mirroring
-/// `pdfboss_write::Update`'s own `resolve_dict`: an indirect value reads
-/// back as the object it points to, so a field the merge keeps still
-/// carries text rather than a bare reference.
+/// `dict` with every value resolved against `doc`, mirroring the
+/// crate-private `resolve_dict` free function in `pdfboss_write::update`:
+/// an indirect value reads back as the object it points to, so a field the
+/// merge keeps still carries text rather than a bare reference.
 async fn resolve_dict(doc: &AsyncDocument, dict: &Dict) -> Dict {
     let mut out = Dict::new();
     for (key, value) in dict.iter() {
@@ -66,7 +66,8 @@ async fn existing_info(doc: &AsyncDocument, info: Option<ObjRef>) -> Option<(Obj
 }
 
 /// The catalog's `/Metadata` entry, when it is an indirect reference,
-/// mirroring `pdfboss_write::Update::catalog_metadata_ref`.
+/// mirroring the crate-private `catalog_metadata_ref` free function in
+/// `pdfboss_write::update`.
 async fn catalog_metadata_ref(doc: &AsyncDocument, root: ObjRef) -> Option<ObjRef> {
     let catalog = doc.get_object(root).await.ok()?;
     match catalog.as_dict()?.get("Metadata")? {
