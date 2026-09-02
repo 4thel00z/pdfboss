@@ -44,7 +44,8 @@ fn merge_combines_a_whole_file_and_a_selected_page() {
     let texts: Vec<String> = (0..3)
         .map(|i| {
             let page = doc.page(i).unwrap();
-            pdfboss_output::extract_text(&doc, &page).unwrap()
+            pdfboss_output::extract_text(&doc, &page, pdfboss_output::ReadingOrder::Content)
+                .unwrap()
         })
         .collect();
     assert!(texts[0].contains("a1"), "page 0: {:?}", texts[0]);
@@ -262,7 +263,8 @@ fn rewrite_writes_a_fresh_file_preserving_pages() {
     let texts: Vec<String> = (0..3)
         .map(|i| {
             let page = doc.page(i).unwrap();
-            pdfboss_output::extract_text(&doc, &page).unwrap()
+            pdfboss_output::extract_text(&doc, &page, pdfboss_output::ReadingOrder::Content)
+                .unwrap()
         })
         .collect();
     assert!(texts[0].contains("one"), "page 0: {:?}", texts[0]);

@@ -2,7 +2,7 @@
 //! [`Writer`], exercised directly rather than through `watermark_with`.
 
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, Rect, Stream};
-use pdfboss_output::extract_text;
+use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, simple_doc, PdfBuilder};
 use pdfboss_write::{watermark, watermark_with, Error, Importer, WriteOptions, Writer, XrefStyle};
 
@@ -65,7 +65,7 @@ fn imported_page_is_self_contained() {
     let reloaded = Document::load(bytes).expect("assembled document loads");
     assert_eq!(reloaded.page_count(), 1);
     let page = reloaded.page(0).expect("the one page exists");
-    let text = extract_text(&reloaded, &page).expect("text extracts");
+    let text = extract_text(&reloaded, &page, ReadingOrder::Content).expect("text extracts");
     assert!(text.contains("two"), "unexpected text: {text:?}");
     assert!(page.dict().get("Resources").is_some());
     assert!(page.dict().get("MediaBox").is_some());
@@ -99,7 +99,7 @@ fn page_import_pulls_in_no_sibling_content_without_links() {
     );
     let reloaded = Document::load(bytes).expect("assembled document loads");
     let page = reloaded.page(0).expect("the one page exists");
-    let text = extract_text(&reloaded, &page).expect("text extracts");
+    let text = extract_text(&reloaded, &page, ReadingOrder::Content).expect("text extracts");
     assert!(text.contains("two"), "unexpected text: {text:?}");
 }
 
@@ -313,7 +313,7 @@ fn substitute_swaps_a_body_verbatim() {
     let texts: Vec<String> = (0..3)
         .map(|i| {
             let page = reloaded.page(i).expect("page exists");
-            extract_text(&reloaded, &page).expect("text extracts")
+            extract_text(&reloaded, &page, ReadingOrder::Content).expect("text extracts")
         })
         .collect();
     assert!(texts[0].contains("one"), "page 0: {:?}", texts[0]);
@@ -374,7 +374,7 @@ fn document_import_reaches_the_whole_graph() {
     assert_eq!(reloaded.page_count(), 3);
     for (index, expected) in ["one", "two", "three"].iter().enumerate() {
         let page = reloaded.page(index).expect("page exists");
-        let text = extract_text(&reloaded, &page).expect("text extracts");
+        let text = extract_text(&reloaded, &page, ReadingOrder::Content).expect("text extracts");
         assert!(text.contains(expected), "page {index}: {text:?}");
     }
 }
@@ -428,7 +428,7 @@ fn inline_page_gets_its_own_object() {
         Some(page_ref),
         "the imported page must now be an indirect object"
     );
-    let text = extract_text(&reloaded, &page).expect("text extracts");
+    let text = extract_text(&reloaded, &page, ReadingOrder::Content).expect("text extracts");
     assert!(text.contains("inline"), "unexpected text: {text:?}");
 }
 
