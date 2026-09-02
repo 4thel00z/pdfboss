@@ -1274,7 +1274,10 @@ pub(crate) fn r6_key_material(
     }
 }
 
-/// Fills `buf` with operating-system random bytes.
+/// Fills `buf` with operating-system random bytes. Not available on
+/// `wasm32-unknown-unknown`, where `getrandom` is not a dependency at all;
+/// use [`Encryptor::aes256_with_rng`] there with a caller-supplied source.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn fill_os_random(buf: &mut [u8]) {
     getrandom::fill(buf).expect("OS random number generator unavailable");
 }
@@ -1420,6 +1423,12 @@ impl Encryptor {
     /// random source (ISO 32000-2 §7.6.4.3). Returns the encryptor plus the
     /// complete `/Encrypt` dictionary to place in the trailer. Passwords
     /// encode as UTF-8 and are truncated to 127 bytes, matching the reader.
+    ///
+    /// Not available on `wasm32-unknown-unknown`: there is no operating
+    /// system random source to draw from there. Use
+    /// [`Encryptor::aes256_with_rng`] instead, with caller-supplied
+    /// randomness (for example from the host's `crypto.getRandomValues`).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn aes256(
         user_password: &str,
         owner_password: &str,

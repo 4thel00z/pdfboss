@@ -15,8 +15,12 @@ thiserror = "2"
 # backend and still C-free (keeps the dependency tree free of native code).
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 memchr = "2"
+
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 # OS random source for the R6 encryption key material (file key, salts,
-# /Perms padding).
+# /Perms padding). Unavailable on wasm32-unknown-unknown without the
+# wasm_js feature and a JS host; `Encryptor::aes256` is gated the same
+# way, so wasm callers use `Encryptor::aes256_with_rng` instead.
 getrandom = "0.4"
 
 [features]
