@@ -168,6 +168,9 @@ enum Command {
         /// 1-based page number.
         #[arg(long)]
         page: Option<usize>,
+        /// The order lines are read in.
+        #[arg(long, value_enum, default_value_t = ReadingOrderArg::Content)]
+        reading_order: ReadingOrderArg,
     },
     /// Extract markdown (headings, lists, tables inferred from layout).
     Md {
@@ -180,6 +183,9 @@ enum Command {
         /// not across the document).
         #[arg(long)]
         page: Option<usize>,
+        /// The order lines are read in.
+        #[arg(long, value_enum, default_value_t = ReadingOrderArg::Content)]
+        reading_order: ReadingOrderArg,
     },
     /// Render a page to PNG, PPM, BMP or JPEG.
     Render {
@@ -415,6 +421,30 @@ impl PngCompressionArg {
     }
 }
 
+/// `--reading-order` values for `text` and `md`, mapped onto
+/// `pdfboss_output::ReadingOrder`.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum ReadingOrderArg {
+    /// The content stream's order, corrected by geometry (default).
+    #[default]
+    Content,
+    /// The structure tree's order on tagged pages, content order elsewhere.
+    StructureTree,
+    /// Position alone: lines top to bottom, left to right.
+    Geometric,
+}
+
+impl ReadingOrderArg {
+    fn to_order(self) -> pdfboss_output::ReadingOrder {
+        use pdfboss_output::ReadingOrder;
+        match self {
+            ReadingOrderArg::Content => ReadingOrder::Content,
+            ReadingOrderArg::StructureTree => ReadingOrder::StructureTree,
+            ReadingOrderArg::Geometric => ReadingOrder::Geometric,
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let result: Result<(), Failure> = match cli.command {
@@ -457,12 +487,14 @@ fn main() {
             file,
             page,
             password,
-        } => cmd_text(&file, page, &password).map_err(Failure::from),
+            reading_order,
+        } => cmd_text(&file, page, &password, reading_order.to_order()).map_err(Failure::from),
         Command::Md {
             file,
             page,
             password,
-        } => cmd_md(&file, page, &password).map_err(Failure::from),
+            reading_order,
+        } => cmd_md(&file, page, &password, reading_order.to_order()).map_err(Failure::from),
         Command::Render {
             file,
             page,
@@ -658,14 +690,19 @@ fn scan_version(data: &[u8]) -> Option<(u8, u8)> {
 /// form feed. Extraction is lenient — content that will not read yields
 /// no text rather than an error — so anything skipped is surfaced as a
 /// stderr warning instead of vanishing.
-fn cmd_text(file: &Path, page: Option<usize>, password: &str) -> Result<(), String> {
+fn cmd_text(
+    file: &Path,
+    page: Option<usize>,
+    password: &str,
+    order: pdfboss_output::ReadingOrder,
+) -> Result<(), String> {
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
-            let (text, report) =
-                pdfboss_output::extract_text_reporting(&doc, &page).map_err(|e| e.to_string())?;
+            let (text, report) = pdfboss_output::extract_text_reporting(&doc, &page, order)
+                .map_err(|e| e.to_string())?;
             warn_skips(n, &report);
             text
         }
@@ -678,7 +715,7 @@ fn cmd_text(file: &Path, page: Option<usize>, password: &str) -> Result<(), Stri
             // loads once per document rather than once per page.
             let fonts = pdfboss_output::FontCache::default();
             let parts = pdfboss_core::map_pages(&doc, |doc, page| {
-                pdfboss_output::extract_text_reporting_cached(doc, page, &fonts)
+                pdfboss_output::extract_text_reporting_cached(doc, page, &fonts, order)
             })
             .into_iter()
             .enumerate()
@@ -699,22 +736,30 @@ fn cmd_text(file: &Path, page: Option<usize>, password: &str) -> Result<(), Stri
 /// Markdown -- headings, lists and pipe/HTML tables inferred from layout.
 /// Heading sizes rank against the whole document unless `--page` narrows to
 /// one page, whose sizes are then judged only against themselves.
-fn cmd_md(file: &Path, page: Option<usize>, password: &str) -> Result<(), String> {
+fn cmd_md(
+    file: &Path,
+    page: Option<usize>,
+    password: &str,
+    order: pdfboss_output::ReadingOrder,
+) -> Result<(), String> {
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let text = match page {
         Some(n) => {
             let index = page_index(n, doc.page_count())?;
             let page = doc.page(index).map_err(|e| e.to_string())?;
             let (spans, rulings, report) =
-                pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page)
+                pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, order)
                     .map_err(|e| e.to_string())?;
             warn_skips(n, &report);
-            pdfboss_output::Markdown
-                .render(&[pdfboss_output::page_layout_with_rulings(&spans, &rulings)])
+            pdfboss_output::Markdown.render(&[pdfboss_output::page_layout_with_rulings(
+                &spans,
+                &rulings,
+                report.order,
+            )])
         }
         None => {
-            let (md, reports) =
-                pdfboss_output::extract_markdown_reporting(&doc).map_err(|e| e.to_string())?;
+            let (md, reports) = pdfboss_output::extract_markdown_reporting(&doc, order)
+                .map_err(|e| e.to_string())?;
             for (index, report) in reports.iter().enumerate() {
                 warn_skips(index + 1, report);
             }

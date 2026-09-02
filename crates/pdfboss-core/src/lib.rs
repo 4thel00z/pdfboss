@@ -19,6 +19,7 @@ pub mod oc;
 pub mod parser;
 pub mod pretty;
 pub mod source;
+pub mod structure;
 pub mod xref;
 
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
@@ -37,3 +38,4 @@ pub use source::{
     block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
     ObjectSource, MAX_RESOLVE_DEPTH,
 };
+pub use structure::{MarkedContentId, StructureTree};

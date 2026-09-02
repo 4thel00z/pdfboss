@@ -4,7 +4,7 @@
 //! both texts on every page.
 
 use pdfboss_core::Document;
-use pdfboss_output::extract_text;
+use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
     watermark, watermark_with, Page, PageSize, Pdf, Standard14, WriteOptions, XrefStyle,
@@ -68,7 +68,7 @@ fn assert_watermarked(base: Vec<u8>) {
     assert_eq!(doc.page_count(), 2);
     for (index, expected) in ["Base page one", "Base page two"].iter().enumerate() {
         let page = doc.page(index).unwrap();
-        let text = extract_text(&doc, &page).unwrap();
+        let text = extract_text(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(text.contains(expected), "page {index}: {text:?}");
         assert!(text.contains("DRAFT"), "page {index}: {text:?}");
         let (_, report) =
@@ -149,7 +149,7 @@ fn watermark_with_rewrites_the_file_compressed() {
     assert_eq!(doc.page_count(), 2);
     for (index, expected) in ["Base page one", "Base page two"].iter().enumerate() {
         let page = doc.page(index).unwrap();
-        let text = extract_text(&doc, &page).unwrap();
+        let text = extract_text(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(text.contains(expected), "page {index}: {text:?}");
         assert!(text.contains("DRAFT"), "page {index}: {text:?}");
     }

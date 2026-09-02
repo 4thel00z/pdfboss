@@ -18,7 +18,9 @@ The analysis infers:
   Tables render as pipe tables while every cell stands in one column, and as HTML
   tables as soon as a cell spans several.
 - **Two-column pages**: read column-major: the left column top to bottom, then the
-  right.
+  right. The `reading_order` keyword (CLI `--reading-order`) selects content order,
+  the structure tree of a tagged PDF, or geometric position; see
+  [Reading order](./text.md#reading-order).
 - **Page headers, footers and page numbers**: a page's first or last line,
   repeated near-verbatim at the same height on at least half the pages (three at
   minimum), is tagged

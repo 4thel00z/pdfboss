@@ -24,7 +24,7 @@ A further workspace member, `pdfboss-testkit`, is an internal PDF fixture builde
 ## Where to start
 
 - Reading a document: `pdfboss_core::Document` (`open`, `load`, and their `_with_password` twins), then `page`, `page_count`, `metadata`, `version`.
-- Text and markdown: `pdfboss_output::{extract_text, extract_markdown}`; positioned styled spans via `pdfboss_text::extract_spans`.
+- Text and markdown: `pdfboss_output::{extract_text, extract_markdown}`, each taking a `ReadingOrder` (`Content`, `StructureTree`, `Geometric`); positioned styled spans via `pdfboss_text::extract_spans`.
 - Rasterizing: `pdfboss_render::{render_page, render_page_with_options, render_page_reporting}` and `Pixmap::save_png`; embedded images via `extract_page_images`.
 - Creating: `pdfboss_write::{Pdf, Page, Canvas, Content}`; see [Creating PDFs](../guide/creating.md).
 - Composing Markdown: `pdfboss_markdown::to_pdf` with a `pdfboss_style::Theme`; see [Markdown to PDF](../guide/md-to-pdf.md).

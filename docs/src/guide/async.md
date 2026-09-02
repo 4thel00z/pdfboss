@@ -104,7 +104,7 @@ The extraction and rendering crates are written sans-I/O. Each entry point is im
 
 ```rust,no_run
 use pdfboss_aio::AsyncDocument;
-use pdfboss_output::extract_text_with;
+use pdfboss_output::{extract_text_with, ReadingOrder};
 use pdfboss_render::extract_page_images_with;
 
 #[tokio::main]
@@ -114,7 +114,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let page = doc.page(0)?;
     let oc = doc.oc_state().await;
-    let text = extract_text_with(doc.clone(), &page, oc.as_ref()).await?;
+    let text = extract_text_with(doc.clone(), &page, oc.as_ref(), None, ReadingOrder::Content)
+        .await?;
     println!("{text}");
 
     let images = extract_page_images_with(doc.clone(), &page).await?;
@@ -125,4 +126,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The `oc` parameter carries the document's optional-content visibility (`doc.oc_state().await`); text and markdown extraction use it to exclude layers the document's default configuration turns off, exactly as the sync entry points do. Rendering takes the same state through `RenderOptions::oc`: set `opts.oc = doc.oc_state().await.map(Arc::new);` before calling `render_page_reporting_with`. Leaving it `None` renders every layer; only the sync entry points fill it from the document. What the extracted images contain (drawing order, native size, `/SMask` alpha) is described in [Extracting images](./images.md); the sync Rust and Python surfaces are in [Rust crates](../reference/rust.md) and [Python API](../reference/python.md).
+The `oc` parameter carries the document's optional-content visibility (`doc.oc_state().await`); text and markdown extraction use it to exclude layers the document's default configuration turns off, exactly as the sync entry points do. The `structure` parameter next to it is the document's structure tree (`doc.structure_tree().await`), read only under `ReadingOrder::StructureTree`; pass `None` for the other orders. See [Reading order](./text.md#reading-order). Rendering takes the same state through `RenderOptions::oc`: set `opts.oc = doc.oc_state().await.map(Arc::new);` before calling `render_page_reporting_with`. Leaving it `None` renders every layer; only the sync entry points fill it from the document. What the extracted images contain (drawing order, native size, `/SMask` alpha) is described in [Extracting images](./images.md); the sync Rust and Python surfaces are in [Rust crates](../reference/rust.md) and [Python API](../reference/python.md).

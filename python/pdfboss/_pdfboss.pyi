@@ -253,10 +253,10 @@ class Document:
         given) to image bytes (PNG unless ``format`` says otherwise), fanned
         out across the machine's cores."""
 
-    def extract_text(self) -> str:
+    def extract_text(self, *, reading_order: str = "content") -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``)."""
 
-    def extract_markdown(self) -> str:
+    def extract_markdown(self, *, reading_order: str = "content") -> str:
         """Whole-document markdown: headings, lists and tables inferred from
         layout; heading sizes judged across the document."""
 
@@ -274,7 +274,9 @@ class Document:
         yielded; each step releases the GIL while parsing.
         """
 
-    def spans(self, pages: list[int] | None = None) -> Iterator[Span]:
+    def spans(
+        self, pages: list[int] | None = None, *, reading_order: str = "content"
+    ) -> Iterator[Span]:
         """Lazily iterates the document's styled text spans, page by
         page: every page's, or the 0-based ``pages`` given, in the order
         given. Each step releases the GIL and shares one font cache
@@ -329,15 +331,15 @@ class Page:
         """The art box, clipped to the media box; defaults to the crop
         box."""
 
-    def extract_text(self) -> str:
+    def extract_text(self, *, reading_order: str = "content") -> str:
         """Extracts the page's text."""
 
-    def extract_markdown(self) -> str:
+    def extract_markdown(self, *, reading_order: str = "content") -> str:
         """Page markdown, ranking heading sizes against that page alone.
         ``Document.extract_markdown`` is the better answer whenever the
         whole document is at hand."""
 
-    def spans(self) -> list[Span]:
+    def spans(self, *, reading_order: str = "content") -> list[Span]:
         """The page's styled text spans, in emission order. Releases the
         GIL like ``extract_text``, and is lenient the same way:
         unreadable content yields no spans rather than raising."""
@@ -481,13 +483,13 @@ class AsyncDocument:
         attributes were resolved at open. Negative indexes are NOT
         accepted here; use subscription, ``doc[-1]``, for those."""
 
-    async def extract_text(self) -> str:
+    async def extract_text(self, *, reading_order: str = "content") -> str:
         """Extracts text from all pages, joined by form feed (``"\\f"``) —
         the async twin of ``Document.extract_text``. Per-page lenient: a
         page whose content will not read contributes an empty string, and
         an error means the document itself could not be read."""
 
-    async def extract_markdown(self) -> str:
+    async def extract_markdown(self, *, reading_order: str = "content") -> str:
         """Whole-document markdown — the async twin of
         ``Document.extract_markdown``: headings, lists and tables inferred
         from layout, heading sizes judged across the document."""
@@ -529,7 +531,9 @@ class AsyncDocument:
         ordering and salvage semantics as ``Document.elements``.
         """
 
-    def spans(self, pages: list[int] | None = None) -> AsyncIterator[Span]:
+    def spans(
+        self, pages: list[int] | None = None, *, reading_order: str = "content"
+    ) -> AsyncIterator[Span]:
         """Streams the document's styled text spans page by page — the
         async twin of ``Document.spans``, over range-fetching reads; use
         with ``async for``."""
@@ -585,17 +589,17 @@ class AsyncPage:
         """The art box, clipped to the media box; defaults to the crop
         box."""
 
-    async def extract_text(self) -> str:
+    async def extract_text(self, *, reading_order: str = "content") -> str:
         """Extracts the page's text — the async twin of
         ``Page.extract_text``."""
 
-    async def extract_markdown(self) -> str:
+    async def extract_markdown(self, *, reading_order: str = "content") -> str:
         """Page markdown, ranking heading sizes against that page alone —
         the async twin of ``Page.extract_markdown``.
         ``AsyncDocument.extract_markdown`` is the better answer whenever
         the whole document is at hand."""
 
-    async def spans(self) -> list[Span]:
+    async def spans(self, *, reading_order: str = "content") -> list[Span]:
         """The page's styled text spans — the async twin of
         ``Page.spans``."""
 

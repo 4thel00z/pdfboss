@@ -8,7 +8,7 @@ use futures_core::Stream as _;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::{Element, ElementOpts, Span};
 use pdfboss_core::{Document, Stream};
-use pdfboss_text::{Ruling, TextSpan};
+use pdfboss_text::{ReadingOrder, Ruling, TextSpan};
 
 /// Whether stdout should carry ANSI colors: only on a tty, and never when
 /// `NO_COLOR` is set (any value, per the NO_COLOR convention).
@@ -110,9 +110,12 @@ impl Input {
         match self {
             Input::Local { doc } => {
                 let page = doc.page(index).map_err(|e| e.to_string())?;
-                let (spans, rulings, _) =
-                    pdfboss_text::extract_spans_and_rulings_reporting(doc, &page)
-                        .map_err(|e| e.to_string())?;
+                let (spans, rulings, _) = pdfboss_text::extract_spans_and_rulings_reporting(
+                    doc,
+                    &page,
+                    ReadingOrder::Content,
+                )
+                .map_err(|e| e.to_string())?;
                 Ok((spans, rulings))
             }
             Input::Remote { rt, doc } => {
@@ -124,6 +127,8 @@ impl Input {
                             doc.clone(),
                             &page,
                             oc.as_ref(),
+                            None,
+                            ReadingOrder::Content,
                         )
                         .await
                     })

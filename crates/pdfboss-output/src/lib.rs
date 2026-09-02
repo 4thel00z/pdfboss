@@ -6,21 +6,25 @@ mod markdown;
 mod output;
 mod structure;
 
-use pdfboss_core::{AsyncObjectSource, Document, OcState, Page, Result};
+use pdfboss_core::{AsyncObjectSource, Document, OcState, Page, Result, StructureTree};
 
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 pub use markdown::Markdown;
 pub use output::{Output, Text};
 pub use pdfboss_text::{
-    ExtractReport, FontCache, Ruling, SkipCause, SkippedText, SkippedTextKind, TextSpan,
+    ExtractReport, FontCache, MarkedContentId, ReadingOrder, Ruling, SkipCause, SkippedText,
+    SkippedTextKind, TextSpan,
 };
 pub use structure::{
     document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
 };
 
-/// Extracts the page's text with positional layout applied: spans grouped
-/// into lines, lines ordered top to bottom and joined with `\n`, spaces
-/// inserted at horizontal gaps.
+/// Extracts the page's text with layout applied: spans grouped into lines,
+/// lines in the [`ReadingOrder`] given and joined with `\n`, spaces
+/// inserted at horizontal gaps. [`ReadingOrder::Content`] is the default
+/// order; [`ReadingOrder::StructureTree`] reads a tagged page as its
+/// structure tree does and every other page in content order;
+/// [`ReadingOrder::Geometric`] reads by position alone.
 ///
 /// Lenient the way rendering is: content that will not fetch, decode, or
 /// parse yields no text rather than an error, so one unreadable stream
@@ -31,15 +35,17 @@ pub use structure::{
 /// are excluded, exactly as `pdfboss_text`'s document-level entries exclude
 /// them; the source-generic `_with` twins have no document to read that
 /// configuration from and extract every layer.
-pub fn extract_text(doc: &Document, page: &Page) -> Result<String> {
-    let (text, _) = extract_text_reporting(doc, page)?;
+pub fn extract_text(doc: &Document, page: &Page, order: ReadingOrder) -> Result<String> {
+    let (text, _) = extract_text_reporting(doc, page, order)?;
     Ok(text)
 }
 
 /// [`extract_text`] against any object source, awaiting whatever I/O the
 /// source needs to read the page — the same span extraction and layout.
 /// `oc` is the document's optional-content visibility (the async document's
-/// `oc_state()`); `None` extracts every layer.
+/// `oc_state()`); `None` extracts every layer. `structure` is its structure
+/// tree (the async document's `structure_tree()`), read only under
+/// [`ReadingOrder::StructureTree`]; `None` there reads content order.
 ///
 /// The source is taken by value and the page by reference. That combination is
 /// what a consumer needs to spawn the result: the future is `Send` over a source
@@ -50,8 +56,10 @@ pub async fn extract_text_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<String> {
-    let (text, _) = extract_text_reporting_with(src, page, oc).await?;
+    let (text, _) = extract_text_reporting_with(src, page, oc, structure, order).await?;
     Ok(text)
 }
 
@@ -60,9 +68,13 @@ pub async fn extract_text_with<S: AsyncObjectSource>(
 /// unsupported filters (the passthrough image codecs included), undecodable
 /// bytes, unparseable content, missing resources, exhausted form limits.
 /// An empty text with an empty report really is an empty page.
-pub fn extract_text_reporting(doc: &Document, page: &Page) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting(doc, page)?;
-    Ok((Text.render(&[page_layout(&spans)]), report))
+pub fn extract_text_reporting(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+) -> Result<(String, ExtractReport)> {
+    let (spans, report) = pdfboss_text::extract_spans_reporting(doc, page, order)?;
+    Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
 /// [`extract_text_reporting`] against any object source. Signed like
@@ -71,9 +83,12 @@ pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting_with(src, page, oc).await?;
-    Ok((Text.render(&[page_layout(&spans)]), report))
+    let (spans, report) =
+        pdfboss_text::extract_spans_reporting_with(src, page, oc, structure, order).await?;
+    Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
 /// [`extract_text_reporting`] with fonts cached across pages: a caller
@@ -88,9 +103,10 @@ pub fn extract_text_reporting_cached(
     doc: &Document,
     page: &Page,
     fonts: &FontCache,
+    order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting_cached(doc, page, fonts)?;
-    Ok((Text.render(&[page_layout(&spans)]), report))
+    let (spans, report) = pdfboss_text::extract_spans_reporting_cached(doc, page, fonts, order)?;
+    Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
 /// Extracts the whole document as Markdown: ATX headings, paragraphs, and
@@ -103,8 +119,8 @@ pub fn extract_text_reporting_cached(
 /// Lenient like [`extract_text`]: unreadable content costs its own text and
 /// nothing else. Use [`extract_markdown_reporting`] to see what was left
 /// out.
-pub fn extract_markdown(doc: &Document) -> Result<String> {
-    let (markdown, _) = extract_markdown_reporting(doc)?;
+pub fn extract_markdown(doc: &Document, order: ReadingOrder) -> Result<String> {
+    let (markdown, _) = extract_markdown_reporting(doc, order)?;
     Ok(markdown)
 }
 
@@ -112,16 +128,19 @@ pub fn extract_markdown(doc: &Document) -> Result<String> {
 ///
 /// Each page's rulings ride along with its spans: a table whose structure is
 /// drawn as borders is read from them ahead of lane occupancy.
-pub fn extract_markdown_reporting(doc: &Document) -> Result<(String, Vec<ExtractReport>)> {
+pub fn extract_markdown_reporting(
+    doc: &Document,
+    order: ReadingOrder,
+) -> Result<(String, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
     let per_page = pdfboss_core::map_pages(doc, |doc: &Document, page: &Page| {
-        pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts)
+        pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts, order)
     });
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
     for outcome in per_page {
         let (spans, rulings, report) = outcome?;
-        pages.push((spans, rulings));
+        pages.push((spans, rulings, report.order));
         reports.push(report);
     }
     Ok((
@@ -133,9 +152,10 @@ pub fn extract_markdown_reporting(doc: &Document) -> Result<(String, Vec<Extract
 /// One page as Markdown, ranking heading sizes against that page alone.
 /// [`extract_markdown`] is the better answer whenever the document is at
 /// hand — a page whose text is all one size has no heading to find.
-pub fn extract_page_markdown(doc: &Document, page: &Page) -> Result<String> {
-    let (spans, rulings, _) = pdfboss_text::extract_spans_and_rulings_reporting(doc, page)?;
-    Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings)]))
+pub fn extract_page_markdown(doc: &Document, page: &Page, order: ReadingOrder) -> Result<String> {
+    let (spans, rulings, report) =
+        pdfboss_text::extract_spans_and_rulings_reporting(doc, page, order)?;
+    Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
 }
 
 /// [`extract_page_markdown`] against any object source. Signed like
@@ -150,22 +170,113 @@ pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<String> {
-    let (spans, rulings, _) =
-        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc).await?;
-    Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings)]))
+    let (spans, rulings, report) =
+        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc, structure, order)
+            .await?;
+    Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use pdfboss_core::{block_on, resolve_with, BoxFuture, ObjRef, Object, Stream};
-    use pdfboss_testkit::{doc_with_graphics, multi_page_doc, simple_doc, PdfBuilder};
+    use pdfboss_testkit::{
+        doc_with_graphics, multi_page_doc, simple_doc, tagged_two_column_doc, PdfBuilder,
+    };
     use std::future::Future;
 
     fn page_text(doc: &Document, index: usize) -> String {
         let page = doc.page(index).unwrap();
-        extract_text(doc, &page).unwrap()
+        extract_text(doc, &page, ReadingOrder::Content).unwrap()
+    }
+
+    /// The tagged two-column fixture read three ways: the stream as
+    /// written, the page by position, the page as its structure tree says.
+    #[test]
+    fn three_reading_orders_read_the_tagged_page_three_ways() {
+        let doc = Document::load(tagged_two_column_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let text = |order: ReadingOrder| extract_text(&doc, &page, order).unwrap();
+        assert_eq!(text(ReadingOrder::Content), "L3 R3\nL4 R4\nL1 R1\nL2 R2");
+        assert_eq!(text(ReadingOrder::Geometric), "L1 R1\nL2 R2\nL3 R3\nL4 R4");
+        assert_eq!(
+            text(ReadingOrder::StructureTree),
+            "L1\nL2\nL3\nL4\nR1\nR2\nR3\nR4"
+        );
+    }
+
+    /// The `L`/`R` labels of a markdown rendering, in the order written.
+    fn labels(md: &str) -> Vec<&str> {
+        md.split_whitespace()
+            .filter(|token| token.starts_with('L') || token.starts_with('R'))
+            .collect()
+    }
+
+    /// Markdown reads by the same order as text, page by page and
+    /// document-wide.
+    #[test]
+    fn markdown_follows_the_reading_order() {
+        let doc = Document::load(tagged_two_column_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let tree = ["L1", "L2", "L3", "L4", "R1", "R2", "R3", "R4"];
+        let by_page = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(labels(&by_page), tree, "page md: {by_page}");
+        let whole = extract_markdown(&doc, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(labels(&whole), tree, "document md: {whole}");
+        let geometric = extract_markdown(&doc, ReadingOrder::Geometric).unwrap();
+        assert_eq!(
+            labels(&geometric),
+            ["L1", "R1", "L2", "R2", "L3", "R3", "L4", "R4"],
+            "geometric md: {geometric}"
+        );
+    }
+
+    /// An untagged document asked for structure-tree order reads exactly as
+    /// it does in content order, and its report says so.
+    #[test]
+    fn structure_tree_order_on_an_untagged_document_is_content_order() {
+        let doc = Document::load(multi_page_doc(&["alpha", "beta"])).unwrap();
+        for index in 0..2 {
+            let page = doc.page(index).unwrap();
+            let (tree, report) =
+                extract_text_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+            let (content, _) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+            assert_eq!(tree, content);
+            assert_eq!(report.order, ReadingOrder::Content);
+        }
+    }
+
+    /// A document's pages each keep their own order: a tagged page reads by
+    /// its tree while an untagged neighbour reads its stream, in one layout.
+    #[test]
+    fn document_layout_orders_each_page_by_its_own_order() {
+        let tagged = Document::load(tagged_two_column_doc()).unwrap();
+        let tagged_page = tagged.page(0).unwrap();
+        let (tree_spans, report) = pdfboss_text::extract_spans_reporting(
+            &tagged,
+            &tagged_page,
+            ReadingOrder::StructureTree,
+        )
+        .unwrap();
+        let plain = Document::load(doc_with_graphics(
+            "BT /F1 12 Tf 1 0 0 1 72 680 Tm (second) Tj 1 0 0 1 72 700 Tm (first) Tj ET",
+        ))
+        .unwrap();
+        let plain_page = plain.page(0).unwrap();
+        let (plain_spans, _) =
+            pdfboss_text::extract_spans_reporting(&plain, &plain_page, ReadingOrder::Content)
+                .unwrap();
+        let layouts = document_layout(&[
+            (tree_spans, report.order),
+            (plain_spans, ReadingOrder::Content),
+        ]);
+        assert_eq!(
+            Text.render(&layouts),
+            "L1\nL2\nL3\nL4\nR1\nR2\nR3\nR4\u{c}first\nsecond"
+        );
     }
 
     /// Non-whitespace token runs, counted — the content-preservation
@@ -196,10 +307,14 @@ mod tests {
         for content in structure::tests::fixture_contents() {
             let doc = Document::load(doc_with_graphics(&content)).unwrap();
             let page = doc.page(0).unwrap();
-            let (spans, rulings, report) =
-                pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+            let (spans, rulings, report) = pdfboss_text::extract_spans_and_rulings_reporting(
+                &doc,
+                &page,
+                ReadingOrder::Content,
+            )
+            .unwrap();
             assert!(report.is_complete(), "unexpected skips: {report:?}");
-            let layout = page_layout_with_rulings(&spans, &rulings);
+            let layout = page_layout_with_rulings(&spans, &rulings, ReadingOrder::Content);
             headings += layout
                 .blocks
                 .iter()
@@ -221,7 +336,7 @@ mod tests {
                 ruled_tables += fixture_tables;
             }
             let via_ir = Text.render(&[layout]);
-            let flat = structure::layout_reference(&spans);
+            let flat = structure::layout_reference(&spans, ReadingOrder::Content);
             if rulings.is_empty() {
                 assert_eq!(via_ir, flat, "content: {content}");
             } else {
@@ -245,9 +360,10 @@ mod tests {
     fn markdown_of(content: &str) -> String {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
-        let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+        let (spans, report) =
+            pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(report.is_complete(), "unexpected skips: {report:?}");
-        Markdown.render(&document_layout(&[spans]))
+        Markdown.render(&document_layout(&[(spans, ReadingOrder::Content)]))
     }
 
     /// [`markdown_of`] on a page whose resources carry `/F1` Helvetica and
@@ -274,9 +390,10 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+        let (spans, report) =
+            pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(report.is_complete(), "unexpected skips: {report:?}");
-        Markdown.render(&document_layout(&[spans]))
+        Markdown.render(&document_layout(&[(spans, ReadingOrder::Content)]))
     }
 
     /// Sizes rank into levels; body text stays a paragraph. 24pt > 16pt > 12pt
@@ -488,7 +605,7 @@ mod tests {
     /// through the real document entry point, which threads them.
     fn markdown_of_drawn(content: &str) -> String {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
-        extract_markdown(&doc).unwrap()
+        extract_markdown(&doc, ReadingOrder::Content).unwrap()
     }
 
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
@@ -634,9 +751,10 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let (spans, report) = pdfboss_text::extract_spans_reporting(&doc, &page).unwrap();
+        let (spans, report) =
+            pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(report.is_complete(), "unexpected skips: {report:?}");
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
             layout
                 .blocks
@@ -677,12 +795,13 @@ mod tests {
              /Encoding /WinAnsiEncoding >>",
         );
         let doc = Document::load(b.build(1)).unwrap();
-        let pages: Vec<Vec<TextSpan>> = (0..2)
+        let pages: Vec<(Vec<TextSpan>, ReadingOrder)> = (0..2)
             .map(|i| {
                 let page = doc.page(i).unwrap();
-                pdfboss_text::extract_spans_reporting(&doc, &page)
-                    .unwrap()
-                    .0
+                let (spans, _) =
+                    pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content)
+                        .unwrap();
+                (spans, ReadingOrder::Content)
             })
             .collect();
         let md = Markdown.render(&document_layout(&pages));
@@ -690,7 +809,7 @@ mod tests {
             md.contains("# Chapter Two"),
             "doc stats make it a heading: {md}"
         );
-        let alone = Markdown.render(&[page_layout(&pages[1])]);
+        let alone = Markdown.render(&[page_layout(&pages[1].0, ReadingOrder::Content)]);
         assert!(
             !alone.contains("# "),
             "page stats alone see 24pt as body: {alone}"
@@ -732,12 +851,13 @@ mod tests {
              /Encoding /WinAnsiEncoding >>",
         );
         let doc = Document::load(b.build(1)).unwrap();
-        let pages: Vec<Vec<TextSpan>> = (0..3)
+        let pages: Vec<(Vec<TextSpan>, ReadingOrder)> = (0..3)
             .map(|i| {
                 let page = doc.page(i).unwrap();
-                pdfboss_text::extract_spans_reporting(&doc, &page)
-                    .unwrap()
-                    .0
+                let (spans, _) =
+                    pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content)
+                        .unwrap();
+                (spans, ReadingOrder::Content)
             })
             .collect();
         let layouts = document_layout(&pages);
@@ -927,7 +1047,7 @@ mod tests {
             b"BT /F1 12 Tf 72 720 Td (ghost) Tj ET",
         );
         let page = doc.page(0).unwrap();
-        let (text, report) = extract_text_reporting(&doc, &page).unwrap();
+        let (text, report) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(text, "", "the passthrough bytes must not be parsed");
         assert_eq!(
             report.skipped,
@@ -937,7 +1057,10 @@ mod tests {
             }],
         );
         // The plain entry point is the same leniency without the report.
-        assert_eq!(extract_text(&doc, &page).unwrap(), "");
+        assert_eq!(
+            extract_text(&doc, &page, ReadingOrder::Content).unwrap(),
+            ""
+        );
     }
 
     /// The inverse: a benign trailing filter the decoder can run must keep
@@ -950,7 +1073,7 @@ mod tests {
             &hex(b"BT /F1 12 Tf 72 720 Td (plain sight) Tj ET"),
         );
         let page = doc.page(0).unwrap();
-        let (text, report) = extract_text_reporting(&doc, &page).unwrap();
+        let (text, report) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(text, "plain sight");
         assert!(report.is_complete(), "nothing was skipped: {report:?}");
     }
@@ -983,7 +1106,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let (text, report) = extract_text_reporting(&doc, &page).unwrap();
+        let (text, report) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(text, "kept", "the page's own text survives the refusal");
         assert_eq!(
             report.skipped,
@@ -1020,7 +1143,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let (text, report) = extract_text_reporting(&doc, &page).unwrap();
+        let (text, report) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(text, "decoded");
         assert!(report.is_complete(), "nothing was skipped: {report:?}");
     }
@@ -1053,7 +1176,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let (text, report) = extract_text_reporting(&doc, &page).unwrap();
+        let (text, report) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(!text.is_empty(), "the levels above the cap still extract");
         assert_eq!(
             report.skipped,
@@ -1070,7 +1193,7 @@ mod tests {
     fn a_missing_xobject_is_reported() {
         let doc = contents_doc("", b"BT /F1 12 Tf 72 720 Td (here) Tj ET /Nope Do");
         let page = doc.page(0).unwrap();
-        let (text, report) = extract_text_reporting(&doc, &page).unwrap();
+        let (text, report) = extract_text_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(text, "here");
         assert_eq!(
             report.skipped,
@@ -1206,6 +1329,8 @@ mod tests {
                 },
                 &text_page,
                 None,
+                None,
+                ReadingOrder::Content,
             )
             .await
         };

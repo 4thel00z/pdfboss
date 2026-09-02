@@ -374,7 +374,7 @@ mod tests {
         .unwrap();
         let doc = Document::load(bytes).unwrap();
         let loaded = doc.page(0).unwrap();
-        let text = extract_text(&doc, &loaded).unwrap();
+        let text = extract_text(&doc, &loaded, pdfboss_output::ReadingOrder::Content).unwrap();
         assert!(text.contains("under") && text.contains("over"));
         assert!(ops_before > 0);
 
@@ -423,7 +423,7 @@ mod tests {
         .unwrap();
         let doc = Document::load(bytes).unwrap();
         let loaded = doc.page(0).unwrap();
-        let text = extract_text(&doc, &loaded).unwrap();
+        let text = extract_text(&doc, &loaded, pdfboss_output::ReadingOrder::Content).unwrap();
         assert!(text.contains("ACME GmbH"));
     }
 

@@ -282,6 +282,66 @@ pub fn multi_page_doc(pages: &[&str]) -> Vec<u8> {
     b.build(1)
 }
 
+/// A one-page tagged document whose three reading orders disagree: two
+/// columns of four lines, written row by row with the lower half first.
+/// The content stream says `L3 R3 / L4 R4 / L1 R1 / L2 R2` (two flows of
+/// two lines each, so neither reads as fragmented), geometry says `L1 R1`
+/// down to `L4 R4`, and the structure tree says `L1 L2 L3 L4 R1 R2 R3 R4`:
+/// two paragraphs, the left holding marked content 4 6 0 2 (L1 to L4), the
+/// right 5 7 1 3 (R1 to R4). The catalog names a `/StructTreeRoot` and no
+/// `/MarkInfo`; the page carries `/StructParents 0`.
+pub fn tagged_two_column_doc() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.object(
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+    );
+    b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+         /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+    );
+    b.stream(
+        4,
+        "",
+        b"BT /F1 12 Tf \
+          /P << /MCID 0 >> BDC 1 0 0 1 72 660 Tm (L3) Tj EMC \
+          /P << /MCID 1 >> BDC 1 0 0 1 300 660 Tm (R3) Tj EMC \
+          /P << /MCID 2 >> BDC 1 0 0 1 72 640 Tm (L4) Tj EMC \
+          /P << /MCID 3 >> BDC 1 0 0 1 300 640 Tm (R4) Tj EMC \
+          /P << /MCID 4 >> BDC 1 0 0 1 72 700 Tm (L1) Tj EMC \
+          /P << /MCID 5 >> BDC 1 0 0 1 300 700 Tm (R1) Tj EMC \
+          /P << /MCID 6 >> BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+          /P << /MCID 7 >> BDC 1 0 0 1 300 680 Tm (R2) Tj EMC ET",
+    );
+    b.object(
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    );
+    b.object(
+        10,
+        "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+    );
+    b.object(
+        11,
+        "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 14 0 R] >>",
+    );
+    b.object(
+        12,
+        "<< /Nums [0 [13 0 R 14 0 R 13 0 R 14 0 R 13 0 R 14 0 R 13 0 R 14 0 R]] >>",
+    );
+    b.object(
+        13,
+        "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [4 6 0 2] >>",
+    );
+    b.object(
+        14,
+        "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [5 7 1 3] >>",
+    );
+    b.build(1)
+}
+
 /// One-call fixture: a single page whose content stream is `content`
 /// verbatim (raw operators). The page still carries the `/F1` Helvetica
 /// resource so text operators work too.

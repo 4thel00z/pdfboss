@@ -9,9 +9,13 @@ STUB = Path(__file__).parent.parent / "python" / "pdfboss" / "_pdfboss.pyi"
 
 
 def test_stub_declares_every_exported_class() -> None:
+    """Every class the extension module exports has a stub. A class defined
+    in Python (``ReadingOrder``) is its own declaration and needs none."""
     stub = STUB.read_text()
     for name in pdfboss.__all__:
         if not inspect.isclass(getattr(pdfboss, name)):
+            continue
+        if not hasattr(pdfboss._pdfboss, name):
             continue
         assert f"class {name}" in stub, f"missing stub for {name}"
 

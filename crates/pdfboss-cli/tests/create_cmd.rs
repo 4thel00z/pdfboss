@@ -294,7 +294,8 @@ fn manifest_maps_toml_through_the_compose_layer() {
     assert_eq!(doc.metadata().author.as_deref(), Some("Mo"));
 
     let page = doc.page(0).unwrap();
-    let text = pdfboss_output::extract_text(&doc, &page).unwrap();
+    let text =
+        pdfboss_output::extract_text(&doc, &page, pdfboss_output::ReadingOrder::Content).unwrap();
     assert!(text.contains("Q3 Report"), "text was: {text}");
 
     let annots = page.dict().get_array("Annots").unwrap_or(&[]);

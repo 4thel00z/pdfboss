@@ -4,7 +4,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
 use pdfboss_core::Document;
-use pdfboss_output::extract_text;
+use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_testkit::doc_with_graphics;
 
 /// A single page whose content stream shows `lines` lines of text.
@@ -37,7 +37,7 @@ fn bench_extract(c: &mut Criterion) {
     let dense = Document::load(dense_doc(60, 40)).unwrap();
     let dense_page = dense.page(0).unwrap();
     c.bench_function("extract_text_warm_dense_60x40", |b| {
-        b.iter(|| black_box(extract_text(&dense, &dense_page).unwrap()));
+        b.iter(|| black_box(extract_text(&dense, &dense_page, ReadingOrder::Content).unwrap()));
     });
 
     let bytes = text_doc(500);
@@ -47,7 +47,7 @@ fn bench_extract(c: &mut Criterion) {
     let doc = Document::load(bytes.clone()).unwrap();
     let page = doc.page(0).unwrap();
     c.bench_function("extract_text_warm_500_lines", |b| {
-        b.iter(|| black_box(extract_text(&doc, &page).unwrap()));
+        b.iter(|| black_box(extract_text(&doc, &page, ReadingOrder::Content).unwrap()));
     });
 
     // Cold: fresh document every iteration; captures load + decode + extract.
@@ -57,7 +57,7 @@ fn bench_extract(c: &mut Criterion) {
             |data| {
                 let doc = Document::load(data).unwrap();
                 let page = doc.page(0).unwrap();
-                black_box(extract_text(&doc, &page).unwrap())
+                black_box(extract_text(&doc, &page, ReadingOrder::Content).unwrap())
             },
             BatchSize::SmallInput,
         );

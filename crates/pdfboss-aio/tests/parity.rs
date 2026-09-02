@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::ElementOpts;
 use pdfboss_core::{Document, ObjRef};
+use pdfboss_output::ReadingOrder;
 use pdfboss_testkit::{hybrid_doc, multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
 use std::io::Write;
 
@@ -343,7 +344,9 @@ async fn shared_algorithms_run_over_the_async_document() {
 
     for i in 0..sync_doc.page_count() {
         let sync_page = sync_doc.page(i).expect("sync page");
-        let expected_text = pdfboss_output::extract_text(&sync_doc, &sync_page).expect("sync text");
+        let expected_text =
+            pdfboss_output::extract_text(&sync_doc, &sync_page, ReadingOrder::Content)
+                .expect("sync text");
         let (expected_pix, _) = pdfboss_render::render_page_reporting(
             &sync_doc,
             &sync_page,
@@ -356,9 +359,15 @@ async fn shared_algorithms_run_over_the_async_document() {
         let handle = tokio::spawn(async move {
             let page = doc.page(i).expect("async page");
             let oc = doc.oc_state().await;
-            let text = pdfboss_output::extract_text_with(doc.clone(), &page, oc.as_ref())
-                .await
-                .expect("async text");
+            let text = pdfboss_output::extract_text_with(
+                doc.clone(),
+                &page,
+                oc.as_ref(),
+                None,
+                ReadingOrder::Content,
+            )
+            .await
+            .expect("async text");
             let opts = pdfboss_render::RenderOptions {
                 oc: doc.oc_state().await.map(std::sync::Arc::new),
                 ..Default::default()
@@ -468,11 +477,18 @@ async fn encrypted_documents_decrypt_identically() {
     // The encrypted content stream decrypts, so text extraction agrees.
     let sync_page = sync_doc.page(0).expect("sync page");
     let async_page = async_doc.page(0).expect("async page");
-    let sync_text = pdfboss_output::extract_text(&sync_doc, &sync_page).expect("sync text");
+    let sync_text = pdfboss_output::extract_text(&sync_doc, &sync_page, ReadingOrder::Content)
+        .expect("sync text");
     let oc = async_doc.oc_state().await;
-    let async_text = pdfboss_output::extract_text_with(async_doc.clone(), &async_page, oc.as_ref())
-        .await
-        .expect("async text");
+    let async_text = pdfboss_output::extract_text_with(
+        async_doc.clone(),
+        &async_page,
+        oc.as_ref(),
+        None,
+        ReadingOrder::Content,
+    )
+    .await
+    .expect("async text");
     assert_eq!(sync_text, "Top secret message");
     assert_eq!(
         sync_text, async_text,
@@ -480,10 +496,17 @@ async fn encrypted_documents_decrypt_identically() {
     );
 
     // Markdown extraction over the same encrypted content agrees too.
-    let sync_md = pdfboss_output::extract_page_markdown(&sync_doc, &sync_page).expect("sync md");
-    let async_md =
-        pdfboss_output::extract_page_markdown_with(async_doc.clone(), &async_page, oc.as_ref())
-            .await
-            .expect("async md");
+    let sync_md =
+        pdfboss_output::extract_page_markdown(&sync_doc, &sync_page, ReadingOrder::Content)
+            .expect("sync md");
+    let async_md = pdfboss_output::extract_page_markdown_with(
+        async_doc.clone(),
+        &async_page,
+        oc.as_ref(),
+        None,
+        ReadingOrder::Content,
+    )
+    .await
+    .expect("async md");
     assert_eq!(sync_md, async_md, "markdown agrees on encrypted files");
 }
