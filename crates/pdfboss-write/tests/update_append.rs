@@ -899,13 +899,38 @@ fn set_metadata_resolves_indirect_info_values_into_xmp() {
     );
 }
 
+/// A three-page document, one page per entry in `texts`, in `xref`'s
+/// style. Every page gets its own indirect object, so [`Page::object_ref`]
+/// is always `Some`.
+fn multi_page_pdf(xref: XrefStyle, texts: &[&str]) -> Vec<u8> {
+    let pages: Vec<Page> = texts
+        .iter()
+        .map(|text| {
+            let mut page = Page::new(PageSize::A4);
+            page.canvas
+                .text(text, 72.0, 700.0, Standard14::Helvetica, 14.0)
+                .unwrap();
+            page
+        })
+        .collect();
+    Pdf {
+        pages,
+        options: WriteOptions {
+            xref,
+            ..WriteOptions::default()
+        },
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap()
+}
+
 /// Rotating pages 1 and 3 of a three-page document by 90 degrees clockwise
 /// stages each page's own object with its effective rotation plus 90,
 /// leaving the untouched page at 0. The base bytes stay in place at the
 /// front of the output, since this is an incremental update.
-#[test]
-fn rotate_pages_marks_selected_pages_and_keeps_the_prefix() {
-    let base = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
+fn assert_rotate_pages_marks_selected_pages_and_keeps_the_prefix(xref: XrefStyle) {
+    let base = multi_page_pdf(xref, &["one", "two", "three"]);
     let doc = Document::load(base.clone()).unwrap();
     let mut update = Update::new(&doc).unwrap();
     rotate_pages(&mut update, &[0, 2], 90).unwrap();
@@ -921,6 +946,16 @@ fn rotate_pages_marks_selected_pages_and_keeps_the_prefix() {
         let page = reread.page(index).unwrap();
         assert_eq!(page.rotate, *expected, "page {index}");
     }
+}
+
+#[test]
+fn rotate_pages_marks_selected_pages_and_keeps_the_prefix_classic() {
+    assert_rotate_pages_marks_selected_pages_and_keeps_the_prefix(XrefStyle::Table);
+}
+
+#[test]
+fn rotate_pages_marks_selected_pages_and_keeps_the_prefix_stream() {
+    assert_rotate_pages_marks_selected_pages_and_keeps_the_prefix(XrefStyle::Stream);
 }
 
 /// A page inlined directly into `/Kids`, with no object of its own, cannot
