@@ -7,7 +7,7 @@
 //! produces byte-identical output; the `/ID` derives from a SHA-256 of the
 //! emitted body. Unencrypted output reads no clock or RNG. Encrypted
 //! output is deterministic too, but only under a caller-supplied
-//! deterministic RNG — [`Encryptor::aes256`] draws from the operating
+//! deterministic RNG. [`Encryptor::aes256`] draws from the operating
 //! system's random source instead, exactly like every other real-world
 //! encryption key.
 
@@ -109,7 +109,7 @@ impl Writer {
     /// trailer strings, and the `/Type /XRef` cross-reference stream
     /// (ISO 32000-2 §7.6.2, which never encrypts the handshake objects a
     /// reader needs before it has a file key). `encrypt_dict` is the
-    /// complete `/Encrypt` dictionary to place in the trailer — both
+    /// complete `/Encrypt` dictionary to place in the trailer; both
     /// values come from [`Encryptor::aes256`] or
     /// [`Encryptor::aes256_with_rng`]. `finish` reserves one extra object
     /// number for `encrypt_dict` and adds the trailer's `/Encrypt` entry;

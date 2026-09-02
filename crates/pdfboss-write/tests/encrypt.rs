@@ -1,6 +1,6 @@
 //! Encrypted emission through the `Writer`: `new_encrypted`, the
 //! `/Encrypt` object and trailer entry, and each exemption the spec
-//! requires — the `/Encrypt` dictionary itself, the trailer's `/ID`
+//! requires: the `/Encrypt` dictionary itself, the trailer's `/ID`
 //! strings, the `/Type /XRef` cross-reference stream, and object-stream
 //! member strings (encrypted only at the container level).
 //!
@@ -88,7 +88,7 @@ fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
 }
 
 /// Parses one indirect object directly out of raw file bytes, with no
-/// decryption applied at all — the same low-level parse
+/// decryption applied at all: the same low-level parse
 /// `Document::load_with_password` itself uses to read `/Encrypt` before a
 /// decryptor exists. Only valid for an object with no nested indirect
 /// references (`NoResolve` never resolves any).
@@ -149,7 +149,7 @@ fn wrong_password_fails_to_open() {
 
 /// Exemption: the `/Encrypt` dictionary itself is never encrypted. Its
 /// `/U`, `/UE`, `/O` and `/OE` strings must equal the dict handed to
-/// `new_encrypted`, verified from a raw, undecrypted parse — running them
+/// `new_encrypted`, verified from a raw, undecrypted parse. Running them
 /// back through the normal decrypting read path would treat already-plain
 /// bytes as ciphertext and corrupt them, which is exactly what emitting
 /// this object unencrypted must avoid.
@@ -282,8 +282,8 @@ fn object_stream_members_are_readable_after_a_password_load() {
 }
 
 /// The same document round-trips under the classic `xref` table flavor,
-/// which has no object streams and no cross-reference stream to exempt —
-/// only the `/Encrypt` dictionary and the `/ID` strings.
+/// which has no object streams and no cross-reference stream to exempt:
+/// only the `/Encrypt` dictionary and the `/ID` strings apply.
 #[test]
 fn table_mode_round_trips_encrypted() {
     let (encryptor, dict) = encryptor();
