@@ -706,6 +706,16 @@ impl AsyncDocument {
         AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend)), password).await
     }
 
+    /// True when the trailer carries a non-null `/Encrypt` entry: the file
+    /// declares encryption, whether or not this handle decrypted it.
+    pub fn is_encrypted(&self) -> bool {
+        self.inner
+            .xref
+            .trailer
+            .get("Encrypt")
+            .is_some_and(|o| !o.is_null())
+    }
+
     /// The open flow: header window → tail scan → xref chain → indexes.
     async fn from_arc(backend: Arc<dyn Backend>, password: &str) -> Result<AsyncDocument> {
         let file_len = backend.len().await.map_err(Error::from)?;
@@ -718,7 +728,6 @@ impl AsyncDocument {
         let header_span = header_span_in(&head);
         let (startxref, eof_span) = find_tail(&fetcher).await?;
         let (xref, sections) = load_xref_chain(&fetcher, startxref.offset).await?;
-        let encrypted = xref.trailer.get("Encrypt").is_some_and(|o| !o.is_null());
         let inner = DocumentInner {
             backend,
             file_len,
@@ -736,7 +745,7 @@ impl AsyncDocument {
         let doc = AsyncDocument {
             inner: Arc::new(inner),
         };
-        if encrypted {
+        if doc.is_encrypted() {
             doc.setup_decryption(password).await?;
         }
         let pages = doc.flatten_pages().await;

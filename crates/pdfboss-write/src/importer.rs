@@ -32,12 +32,7 @@ impl<'w, 's> Importer<'w, 's> {
     /// silent downgrade; writing an encrypted target is a separate,
     /// not yet implemented feature.
     pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
-        if source
-            .xref()
-            .trailer
-            .get("Encrypt")
-            .is_some_and(|o| !o.is_null())
-        {
+        if source.is_encrypted() {
             return Err(Error::EncryptedBase);
         }
         let compress = writer.compress();

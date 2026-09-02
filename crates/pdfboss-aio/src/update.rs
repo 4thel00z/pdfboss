@@ -27,10 +27,10 @@ const CHUNK: u64 = 64 * 1024;
 /// walk (an empty result there is `InvalidXref` before opening finishes),
 /// so the section lookup below cannot fail.
 pub async fn overlay_base(doc: &AsyncDocument) -> Result<OverlayBase> {
-    let (trailer, _) = doc.merged_trailer();
-    if trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
+    if doc.is_encrypted() {
         return Err(Error::EncryptedBase);
     }
+    let (trailer, _) = doc.merged_trailer();
     let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
     let newest = doc
         .sections()

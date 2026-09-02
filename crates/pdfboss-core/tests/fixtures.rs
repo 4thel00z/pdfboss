@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use pdfboss_core::Document;
+use pdfboss_testkit::PdfBuilder;
 
 /// Absolute path to a committed fixture file.
 fn fixture(name: &str) -> PathBuf {
@@ -56,4 +57,32 @@ fn open_shapes_fixture() {
     let content = page.content(&doc).expect("content should decode");
     let text = String::from_utf8_lossy(&content);
     assert!(text.contains("re f"), "content was: {text}");
+}
+
+#[test]
+fn is_encrypted_is_false_for_a_document_built_from_plain_bytes() {
+    let doc = Document::load(pdfboss_testkit::simple_doc("no encryption here"))
+        .expect("plain document should load");
+    assert!(!doc.is_encrypted());
+}
+
+#[test]
+fn is_encrypted_is_false_when_the_trailer_encrypt_entry_is_null() {
+    let mut b = PdfBuilder::new().trailer_extra("/Encrypt null");
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+    let doc = Document::load(b.build(1)).expect("document with a null /Encrypt should load");
+    assert!(!doc.is_encrypted());
+}
+
+#[test]
+fn is_encrypted_is_true_for_an_encrypted_document() {
+    // `encrypted_rc4_doc` is the same fixture
+    // `pdfboss_cli` merge/rewrite use to pin their "refuses an encrypted
+    // input" behavior (crates/pdfboss-cli/tests/assemble_cmd.rs). It is a
+    // real RC4 (V2/R3) `/Encrypt` dictionary for the empty user password, so
+    // it opens transparently while still declaring encryption.
+    let doc = Document::load(pdfboss_testkit::encrypted_rc4_doc("secret"))
+        .expect("empty-user-password RC4 fixture should open transparently");
+    assert!(doc.is_encrypted());
 }

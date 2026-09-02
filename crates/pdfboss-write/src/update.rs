@@ -258,10 +258,10 @@ impl OverlayBase {
     /// document has none (a recovery-scan base refuses with
     /// [`Error::MissingStartxref`] on this fallback path).
     pub fn from_document(doc: &Document) -> Result<OverlayBase> {
-        let trailer = &doc.xref().trailer;
-        if trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
+        if doc.is_encrypted() {
             return Err(Error::EncryptedBase);
         }
+        let trailer = &doc.xref().trailer;
         let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
         let (prev, kind) = match doc.xref().newest_section() {
             Some(section) => (section.offset, xref_style(section.kind)),
@@ -465,12 +465,7 @@ impl Overlay {
     /// copying its decrypted content across would silently strip its
     /// protection.
     pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
-        if overlay
-            .xref()
-            .trailer
-            .get("Encrypt")
-            .is_some_and(|o| !o.is_null())
-        {
+        if overlay.is_encrypted() {
             return Err(Error::EncryptedBase);
         }
         let page = overlay.page(0).map_err(core_error)?;

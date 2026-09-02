@@ -134,12 +134,7 @@ pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String
 /// `cmd_rewrite`: none of them copies encrypted content into a fresh
 /// output.
 fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
-    if doc
-        .xref()
-        .trailer
-        .get("Encrypt")
-        .is_some_and(|o| !o.is_null())
-    {
+    if doc.is_encrypted() {
         return Err(format!("{}: {}", path.display(), WriteError::EncryptedBase));
     }
     Ok(())
