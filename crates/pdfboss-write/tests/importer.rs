@@ -480,6 +480,10 @@ fn watermark_with_accepts_a_password_opened_encrypted_overlay() {
         !watermarked.is_encrypted(),
         "the watermarked output carries no /Encrypt"
     );
+    let page = watermarked.page(0).expect("page 0 exists");
+    let text = extract_text(&watermarked, &page, ReadingOrder::Content).expect("text extracts");
+    assert!(text.contains("Base"), "{text:?}");
+    assert!(text.contains("secret"), "{text:?}");
 }
 
 /// A source page dictionary missing `/Type` entirely (legal but sloppy:

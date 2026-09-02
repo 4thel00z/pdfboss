@@ -35,11 +35,14 @@ pub enum Error {
     /// Image bytes could not be understood or are inconsistent.
     #[error("invalid image: {0}")]
     Image(String),
-    /// A document carries an `/Encrypt` entry: an update would need to
-    /// encrypt its new strings and streams, and a copy would otherwise
-    /// silently strip the source's protection into a plain output. Neither
-    /// is implemented, so both an encrypted base and an encrypted import
-    /// source are refused.
+    /// A locked import source (encrypted, with no working decryptor) is
+    /// refused: a copy would otherwise emit raw ciphertext into a plain
+    /// output with no `/Encrypt` of its own. A password-opened encrypted
+    /// source copies fine, since its content already reads as plaintext.
+    /// An append base is refused whenever it carries an `/Encrypt` entry at
+    /// all, password-opened or not: an appended update would need to
+    /// encrypt its own new strings and streams too, which is not yet
+    /// implemented.
     #[error("cannot update or copy from an encrypted document")]
     EncryptedBase,
     /// The base trailer names no `/Root` to build an update against.

@@ -371,6 +371,42 @@ fn encrypt_document_round_trips_with_the_user_and_owner_password() {
     }
 }
 
+/// An empty `owner_password` falls back to `user_password`: `/O` and `/OE`
+/// end up derived from `"user-pw"` too, so it opens the file whether a
+/// reader tries it as the user or the owner password (the two checks are
+/// indistinguishable here since both stored passwords are now the same
+/// string). Critically, `Document::load` with NO password at all must
+/// still fail: a regression that let the fallback lapse (leaving `/O`
+/// derived from the literal empty string) would make the empty password
+/// itself open the file, since a no-password load tries `""` against both
+/// the user and the recovered owner check.
+#[test]
+fn encrypt_document_falls_back_to_the_user_password_for_an_empty_owner_password() {
+    let mut w = Writer::new(WriteOptions::default());
+    let root = build(&mut w);
+    let plain_bytes = w.finish(root).expect("plain document finishes");
+    let plain = Document::load(plain_bytes).expect("plain document loads");
+
+    let bytes = encrypt_document(
+        &plain,
+        "user-pw",
+        "",
+        Permissions::all(),
+        WriteOptions::default(),
+    )
+    .expect("an empty owner password falls back to the user password");
+
+    let doc = Document::load_with_password(bytes.clone(), "user-pw")
+        .expect("user-pw opens, whether matched as the user or the fallen-back owner password");
+    assert_eq!(doc.page_count(), 1);
+
+    assert!(
+        matches!(Document::load(bytes), Err(Error::Encrypted)),
+        "no password must not open the file: an un-fallen-back empty owner \
+         password would let the empty user password open it too"
+    );
+}
+
 /// `encrypt_document` refuses to build a file neither password would
 /// protect: reusing `Error::Other`, the same generic invalid-argument
 /// variant `rotate_rewrite` uses for a bad `by`, rather than a new

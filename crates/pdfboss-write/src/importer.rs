@@ -34,6 +34,9 @@ impl<'w, 's> Importer<'w, 's> {
     /// what [`crate::encrypt_document`] relies on to re-encrypt it under
     /// new passwords.
     pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
+        // The public load path already refuses a wrong or missing password
+        // before any `Document` exists; this check is a second safeguard,
+        // for a `Document` constructed some other way.
         if source.is_locked() {
             return Err(Error::EncryptedBase);
         }

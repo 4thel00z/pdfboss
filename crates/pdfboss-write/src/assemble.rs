@@ -120,7 +120,14 @@ pub fn rotate_rewrite(
 /// is a trailer key `Importer::document` alone can never reach, since
 /// nothing in the catalog's own graph points at it.
 pub fn rewrite_document(doc: &Document, options: WriteOptions) -> Result<Vec<u8>> {
-    let mut writer = Writer::new(options);
+    rewrite_into(Writer::new(options), doc)
+}
+
+/// Shared by [`rewrite_document`] and [`encrypt_document`]: the whole
+/// reachable graph from `doc`'s catalog copied into `writer`, already
+/// constructed plain or encrypting, carrying `/Info` along the same way
+/// [`rotate_rewrite`] does.
+fn rewrite_into(mut writer: Writer, doc: &Document) -> Result<Vec<u8>> {
     let mut importer = Importer::new(&mut writer, doc)?;
     let new_info = doc
         .xref()
@@ -164,18 +171,7 @@ pub fn encrypt_document(
         owner_password
     };
     let (encryptor, encrypt_dict) = Encryptor::aes256(user_password, owner_password, permissions);
-    let mut writer = Writer::new_encrypted(options, encryptor, encrypt_dict);
-    let mut importer = Importer::new(&mut writer, doc)?;
-    let new_info = doc
-        .xref()
-        .trailer
-        .get_ref("Info")
-        .map(|info| importer.reference(info));
-    let new_root = importer.document()?;
-    if let Some(new_info) = new_info {
-        writer.set_info(new_info);
-    }
-    writer.finish(new_root)
+    rewrite_into(Writer::new_encrypted(options, encryptor, encrypt_dict), doc)
 }
 
 /// [`rewrite_document`], named for the decryption it performs when `doc`
