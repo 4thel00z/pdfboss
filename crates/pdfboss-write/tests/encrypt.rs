@@ -13,7 +13,9 @@ use pdfboss_core::xref::{load_xref, XrefEntry};
 use pdfboss_core::{Dict, Document, Encryptor, Error, Name, ObjRef, Object, Permissions};
 use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_testkit::PdfBuilder;
-use pdfboss_write::{decrypt_document, encrypt_document, rewrite_document, WriteOptions, Writer, XrefStyle};
+use pdfboss_write::{
+    decrypt_document, encrypt_document, rewrite_document, WriteOptions, Writer, XrefStyle,
+};
 
 const CONTENT: &[u8] = b"BT /F1 12 Tf 72 720 Td (Hello, encrypted) Tj ET";
 const USER_PW: &str = "user-pw";
@@ -637,11 +639,7 @@ fn rewrite_document_carries_an_encrypt_metadata_false_stream_through_unchanged()
     let rewritten =
         rewrite_document(&doc, WriteOptions::default()).expect("rewrite_document succeeds");
     let plain = Document::load(rewritten).expect("rewritten output carries no /Encrypt");
-    let root = plain
-        .xref()
-        .trailer
-        .get_ref("Root")
-        .expect("/Root present");
+    let root = plain.xref().trailer.get_ref("Root").expect("/Root present");
     let catalog = plain.get(root).expect("catalog resolves");
     let metadata_ref = catalog
         .as_dict()
