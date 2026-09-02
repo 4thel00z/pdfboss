@@ -208,7 +208,7 @@ pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Re
 #[cfg(test)]
 mod tests {
     use pdfboss_core::xref::{parse_section_at, startxref, XrefEntry};
-    use pdfboss_output::extract_text;
+    use pdfboss_output::{extract_text, ReadingOrder};
     use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, PdfBuilder};
 
     use crate::pdf::{Metadata, Page, PageSize, Pdf};
@@ -228,7 +228,7 @@ mod tests {
         let texts: Vec<String> = (0..4)
             .map(|i| {
                 let page = merged.page(i).expect("page exists");
-                extract_text(&merged, &page).expect("text extracts")
+                extract_text(&merged, &page, ReadingOrder::Content).expect("text extracts")
             })
             .collect();
         assert!(texts[0].contains("a1"), "page 0: {:?}", texts[0]);
@@ -246,8 +246,12 @@ mod tests {
         assert_eq!(merged.page_count(), 2);
         let first = merged.page(0).expect("first page exists");
         let second = merged.page(1).expect("second page exists");
-        assert!(extract_text(&merged, &first).unwrap().contains("three"));
-        assert!(extract_text(&merged, &second).unwrap().contains("one"));
+        assert!(extract_text(&merged, &first, ReadingOrder::Content)
+            .unwrap()
+            .contains("three"));
+        assert!(extract_text(&merged, &second, ReadingOrder::Content)
+            .unwrap()
+            .contains("one"));
     }
 
     #[test]
@@ -268,7 +272,7 @@ mod tests {
         let texts: Vec<String> = (0..2)
             .map(|i| {
                 let page = first.page(i).expect("page exists");
-                extract_text(&first, &page).expect("text extracts")
+                extract_text(&first, &page, ReadingOrder::Content).expect("text extracts")
             })
             .collect();
         assert!(texts[0].contains("one"), "page 0: {:?}", texts[0]);
@@ -277,7 +281,7 @@ mod tests {
         let second = Document::load(parts[1].clone()).expect("second part loads");
         assert_eq!(second.page_count(), 1);
         let page = second.page(0).expect("page exists");
-        let text = extract_text(&second, &page).expect("text extracts");
+        let text = extract_text(&second, &page, ReadingOrder::Content).expect("text extracts");
         assert!(text.contains("three"), "page 0: {:?}", text);
     }
 
@@ -486,7 +490,7 @@ mod tests {
         );
 
         let page = rewritten.page(0).expect("page exists");
-        let text = extract_text(&rewritten, &page).expect("text extracts");
+        let text = extract_text(&rewritten, &page, ReadingOrder::Content).expect("text extracts");
         assert!(text.contains("hello"), "text: {text:?}");
     }
 
