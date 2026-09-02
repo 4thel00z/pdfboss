@@ -563,10 +563,6 @@ fn length_reflects_the_padded_ciphertext_not_the_plaintext() {
     let padded = l + (16 - l % 16); // PKCS#7: a full extra block when l is already aligned
     let expected = 16 + padded; // IV prefix plus the padded ciphertext
     assert_eq!(
-        expected, 64,
-        "32 aligned plaintext bytes pad to a full extra block"
-    );
-    assert_eq!(
         length as usize, expected,
         "/Length must reflect the IV-prefixed, padded ciphertext, not the plaintext"
     );

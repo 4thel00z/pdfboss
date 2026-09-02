@@ -43,7 +43,7 @@ pub enum Error {
     /// all, password-opened or not: an appended update would need to
     /// encrypt its own new strings and streams too, which is not yet
     /// implemented.
-    #[error("cannot update or copy from an encrypted document")]
+    #[error("cannot update an encrypted document, or copy from an encrypted document not opened with its password")]
     EncryptedBase,
     /// The base trailer names no `/Root` to build an update against.
     #[error("trailer has no /Root")]
