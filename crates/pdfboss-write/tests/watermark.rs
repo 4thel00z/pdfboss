@@ -35,9 +35,13 @@ fn base_pdf(xref: XrefStyle) -> Vec<u8> {
 }
 
 fn overlay_pdf() -> Vec<u8> {
+    overlay_pdf_with_text("DRAFT")
+}
+
+fn overlay_pdf_with_text(text: &str) -> Vec<u8> {
     let mut page = Page::new(PageSize::A4);
     page.canvas
-        .text("DRAFT", 200.0, 400.0, Standard14::HelveticaBold, 48.0)
+        .text(text, 200.0, 400.0, Standard14::HelveticaBold, 48.0)
         .unwrap();
     Pdf {
         pages: vec![page],
@@ -240,4 +244,35 @@ fn under_text_survives() {
         assert!(text.contains(expected), "page {index}: {text:?}");
         assert!(text.contains("DRAFT"), "page {index}: {text:?}");
     }
+}
+
+/// A second overlay on an already-marked file draws under its own free
+/// name (`PdfbossWatermark2`) instead of replacing the first mark's
+/// `/XObject` entry, so both draw operators survive and each fires once.
+#[test]
+fn overlaying_twice_keeps_both_marks() {
+    let base_doc = Document::load(base_pdf(XrefStyle::Table)).unwrap();
+    let first_overlay = Document::load(overlay_pdf_with_text("MARKONE")).unwrap();
+    let once = watermark(&base_doc, &first_overlay).unwrap();
+
+    let once_doc = Document::load(once).unwrap();
+    let second_overlay = Document::load(overlay_pdf_with_text("MARKTWO")).unwrap();
+    let twice = watermark(&once_doc, &second_overlay).unwrap();
+
+    let content = page0_content_text(&twice);
+    assert_eq!(
+        content.matches("/PdfbossWatermark Do").count(),
+        1,
+        "first mark's draw operator fires exactly once: {content:?}"
+    );
+    assert_eq!(
+        content.matches("/PdfbossWatermark2 Do").count(),
+        1,
+        "second mark's draw operator fires exactly once: {content:?}"
+    );
+
+    let doc = Document::load(twice).unwrap();
+    let page = doc.page(0).unwrap();
+    let text = extract_text(&doc, &page, ReadingOrder::Content).unwrap();
+    assert!(text.contains("Base page one"), "page 0: {text:?}");
 }
