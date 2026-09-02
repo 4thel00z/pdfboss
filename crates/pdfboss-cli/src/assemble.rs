@@ -129,8 +129,9 @@ pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String
 }
 
 /// Refuses a document carrying an `/Encrypt` entry, naming `path` in the
-/// error. Shared by `cmd_merge`, `cmd_split` and `cmd_rotate`: none of
-/// them copies encrypted content into a fresh output.
+/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate` and
+/// `cmd_rewrite`: none of them copies encrypted content into a fresh
+/// output.
 fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
     if doc
         .xref()

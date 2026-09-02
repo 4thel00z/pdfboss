@@ -131,10 +131,14 @@ pub fn rewrite_document(doc: &Document, options: WriteOptions) -> Result<Vec<u8>
 /// names one, the XMP packet) with `meta` merged over whatever the base
 /// already carried: the same merge [`crate::update::set_metadata_with`]
 /// performs for an appended update, applied here as substitutions into the
-/// copied graph instead. An existing `/Info` or `/Metadata` object is
-/// substituted in place; a base with no `/Info` gets a fresh one put
-/// directly into the writer, since there is no source object to
-/// substitute into.
+/// copied graph instead. An existing `/Info` object is translated into the
+/// target's own numbering via [`Importer::copy`] before the substitution
+/// (`resolve_dict` only chases a value's own top-level reference, so a
+/// nested or unresolvable one still names a source object; `copy`
+/// translates it correctly, the same pattern [`rotate_rewrite`] uses for a
+/// page body). A base with no `/Info` gets a fresh one put directly into
+/// the writer, since there is no source object to substitute into and
+/// nothing in a freshly built dict can name one.
 pub fn rewrite_with_metadata(
     doc: &Document,
     meta: Metadata,
@@ -152,11 +156,15 @@ pub fn rewrite_with_metadata(
     let xmp_ref = catalog_metadata_ref(doc, root);
     let (dict, merged) = merge_metadata(existing_dict, &meta);
 
-    let new_info_target = info_ref.map(|r| importer.reference(r));
-    let mut fresh_info = Some(Object::Dict(dict));
-    if let Some(r) = info_ref {
-        importer.substitute(r, fresh_info.take().expect("just built above"));
-    }
+    let new_info_target = match info_ref {
+        Some(r) => {
+            let target = importer.reference(r);
+            let body = importer.copy(&Object::Dict(dict.clone()))?;
+            importer.substitute(r, body);
+            Some(target)
+        }
+        None => None,
+    };
     if let Some(r) = xmp_ref {
         importer.substitute(r, xmp_metadata_stream(&merged));
     }
@@ -164,11 +172,7 @@ pub fn rewrite_with_metadata(
     let new_root = importer.document()?;
     let new_info = match new_info_target {
         Some(target) => target,
-        None => writer.put(
-            fresh_info
-                .take()
-                .expect("no source /Info to substitute into"),
-        ),
+        None => writer.put(Object::Dict(dict)),
     };
     writer.set_info(new_info);
     writer.finish(new_root)
@@ -475,6 +479,14 @@ mod tests {
         update.set(extra, Object::Dict(dict));
         let appended = update.bytes().expect("update appends");
 
+        let control_offset = startxref(&appended).expect("startxref present in the input");
+        let control_section =
+            parse_section_at(&appended, control_offset).expect("input section parses");
+        assert!(
+            control_section.prev.is_some(),
+            "the input must really carry a /Prev chain for this test to exercise the collapse"
+        );
+
         let appended_doc = Document::load(appended).expect("appended document loads");
         let bytes =
             rewrite_document(&appended_doc, WriteOptions::default()).expect("rewrite succeeds");
@@ -524,11 +536,40 @@ mod tests {
         let meta = rewritten.metadata();
         assert_eq!(meta.title.as_deref(), Some("New"));
         assert_eq!(meta.author.as_deref(), Some("Keep"));
+
+        let new_root = rewritten
+            .xref()
+            .trailer
+            .get_ref("Root")
+            .expect("rewritten trailer names /Root");
+        let catalog = rewritten.get(new_root).expect("catalog resolves");
+        let metadata_ref = catalog
+            .as_dict()
+            .expect("catalog is a dictionary")
+            .get_ref("Metadata")
+            .expect("the base's XMP packet must still be named");
+        let stream = rewritten
+            .get(metadata_ref)
+            .expect("metadata stream resolves");
+        let text = String::from_utf8(
+            stream
+                .as_stream()
+                .expect("metadata is a stream")
+                .data
+                .clone(),
+        )
+        .expect("packet is utf-8");
+        assert!(text.contains("New"), "packet: {text}");
+        assert!(text.contains("Keep"), "packet: {text}");
+        assert!(!text.contains("Old"), "packet: {text}");
     }
 
     /// A base with no `/Info` at all still gets one from
     /// `rewrite_with_metadata`: the merge target is a fresh object put
-    /// directly into the writer, never an `Importer` substitution.
+    /// directly into the writer, never an `Importer` substitution. A base
+    /// with no XMP packet either must not gain one: `set_metadata_with`'s
+    /// own rule (never build a fresh packet where none existed) applies
+    /// here too.
     #[test]
     fn rewrite_with_metadata_creates_info_when_absent() {
         let base = Pdf {
@@ -551,5 +592,199 @@ mod tests {
 
         let rewritten = Document::load(bytes).expect("rewritten document loads");
         assert_eq!(rewritten.metadata().title.as_deref(), Some("Fresh"));
+
+        let new_root = rewritten
+            .xref()
+            .trailer
+            .get_ref("Root")
+            .expect("rewritten trailer names /Root");
+        let catalog = rewritten.get(new_root).expect("catalog resolves");
+        assert!(
+            catalog
+                .as_dict()
+                .expect("catalog is a dictionary")
+                .get("Metadata")
+                .is_none(),
+            "a base with no XMP packet must not gain one from a metadata rewrite"
+        );
+    }
+
+    /// A kept `/Info` value stored as an indirect reference must be
+    /// translated into the target's own numbering, not carried verbatim:
+    /// `resolve_dict` only chases a value's own top-level reference chain,
+    /// so the merged dict still names the source object directly, and
+    /// `Importer::substitute` fills bodies verbatim with no renumbering of
+    /// its own. Left untranslated, the raw source number would alias
+    /// whatever the target happens to number the same in the rewritten
+    /// file.
+    #[test]
+    fn rewrite_with_metadata_translates_a_kept_indirect_info_value() {
+        let mut w = Writer::new(WriteOptions {
+            xref: XrefStyle::Table,
+            ..WriteOptions::default()
+        });
+        let pages_root = w.reserve();
+        let page = w.reserve();
+
+        let mut page_dict = Dict::new();
+        page_dict.insert(name("Type"), Object::Name(name("Page")));
+        page_dict.insert(name("Parent"), Object::Ref(pages_root));
+        page_dict.insert(name("Resources"), Object::Dict(Dict::new()));
+        page_dict.insert(
+            name("MediaBox"),
+            Object::Array(vec![
+                Object::Int(0),
+                Object::Int(0),
+                Object::Int(612),
+                Object::Int(792),
+            ]),
+        );
+        w.fill(page, Object::Dict(page_dict))
+            .expect("page slot fills");
+
+        let mut pages_dict = Dict::new();
+        pages_dict.insert(name("Type"), Object::Name(name("Pages")));
+        pages_dict.insert(name("Kids"), Object::Array(vec![Object::Ref(page)]));
+        pages_dict.insert(name("Count"), Object::Int(1));
+        w.fill(pages_root, Object::Dict(pages_dict))
+            .expect("pages slot fills");
+
+        let title_ref = w.put(Object::String(b"Indirect Title".to_vec()));
+        let mut info = Dict::new();
+        info.insert(name("Title"), Object::Ref(title_ref));
+        let info_ref = w.put(Object::Dict(info));
+        w.set_info(info_ref);
+
+        let mut catalog = Dict::new();
+        catalog.insert(name("Type"), Object::Name(name("Catalog")));
+        catalog.insert(name("Pages"), Object::Ref(pages_root));
+        let root = w.put(Object::Dict(catalog));
+        let base = w.finish(root).expect("base finishes");
+        let doc = Document::load(base).expect("base loads");
+
+        let bytes = rewrite_with_metadata(
+            &doc,
+            Metadata {
+                author: Some("New Author".to_string()),
+                ..Metadata::default()
+            },
+            WriteOptions::default(),
+        )
+        .expect("rewrite succeeds");
+
+        let rewritten = Document::load(bytes).expect("rewritten document loads");
+        let meta = rewritten.metadata();
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("Indirect Title"),
+            "a kept indirect /Info value must translate rather than alias"
+        );
+        assert_eq!(meta.author.as_deref(), Some("New Author"));
+
+        let page = rewritten.page(0).expect("page still resolves");
+        assert_eq!(
+            page.dict().get_name("Type"),
+            Some(&Name("Page".to_string())),
+            "the page object must not have been aliased by an untranslated /Info reference"
+        );
+    }
+
+    /// `resolve_dict` resolves a key's own top-level reference chain, but
+    /// never recurses into a value that is itself an array or a nested
+    /// dictionary: a reference held inside one survives the merge
+    /// untouched, still naming a source object. `rewrite_with_metadata`
+    /// must translate it into the target's own numbering rather than
+    /// substituting it verbatim, or the raw source number would alias
+    /// whatever the rewrite happens to number the same.
+    #[test]
+    fn rewrite_with_metadata_translates_a_reference_nested_in_an_info_value() {
+        let mut w = Writer::new(WriteOptions {
+            xref: XrefStyle::Table,
+            ..WriteOptions::default()
+        });
+        let pages_root = w.reserve();
+        let page = w.reserve();
+
+        let mut page_dict = Dict::new();
+        page_dict.insert(name("Type"), Object::Name(name("Page")));
+        page_dict.insert(name("Parent"), Object::Ref(pages_root));
+        page_dict.insert(name("Resources"), Object::Dict(Dict::new()));
+        page_dict.insert(
+            name("MediaBox"),
+            Object::Array(vec![
+                Object::Int(0),
+                Object::Int(0),
+                Object::Int(612),
+                Object::Int(792),
+            ]),
+        );
+        w.fill(page, Object::Dict(page_dict))
+            .expect("page slot fills");
+
+        let mut pages_dict = Dict::new();
+        pages_dict.insert(name("Type"), Object::Name(name("Pages")));
+        pages_dict.insert(name("Kids"), Object::Array(vec![Object::Ref(page)]));
+        pages_dict.insert(name("Count"), Object::Int(1));
+        w.fill(pages_root, Object::Dict(pages_dict))
+            .expect("pages slot fills");
+
+        let witness = w.put(Object::String(b"Witness".to_vec()));
+        let mut info = Dict::new();
+        info.insert(name("Title"), Object::String(b"Plain Title".to_vec()));
+        info.insert(
+            name("CustomRefs"),
+            Object::Array(vec![Object::Ref(witness)]),
+        );
+        let info_ref = w.put(Object::Dict(info));
+        w.set_info(info_ref);
+
+        let mut catalog = Dict::new();
+        catalog.insert(name("Type"), Object::Name(name("Catalog")));
+        catalog.insert(name("Pages"), Object::Ref(pages_root));
+        let root = w.put(Object::Dict(catalog));
+        let base = w.finish(root).expect("base finishes");
+        let doc = Document::load(base).expect("base loads");
+
+        let bytes = rewrite_with_metadata(
+            &doc,
+            Metadata {
+                author: Some("New Author".to_string()),
+                ..Metadata::default()
+            },
+            WriteOptions::default(),
+        )
+        .expect("rewrite succeeds");
+
+        let rewritten = Document::load(bytes).expect("rewritten document loads");
+        let new_info_ref = rewritten
+            .xref()
+            .trailer
+            .get_ref("Info")
+            .expect("rewritten trailer names /Info");
+        let info_dict = rewritten.get(new_info_ref).expect("info resolves");
+        let custom = info_dict
+            .as_dict()
+            .expect("info is a dictionary")
+            .get("CustomRefs")
+            .expect("CustomRefs survives the merge, untouched by the recognized fields");
+        let Object::Array(items) = custom else {
+            panic!("CustomRefs must still be an array, got {custom:?}");
+        };
+        let Object::Ref(witness_target) = items[0] else {
+            panic!(
+                "CustomRefs[0] must still be a reference, got {:?}",
+                items[0]
+            );
+        };
+        let resolved = rewritten
+            .get(witness_target)
+            .expect("the translated reference must resolve to a real object");
+        assert_eq!(
+            resolved.as_str_bytes(),
+            Some(&b"Witness"[..]),
+            "a reference nested inside an /Info value must translate into the \
+             target's own numbering, not alias whatever the rewrite happens to \
+             number the same"
+        );
     }
 }
