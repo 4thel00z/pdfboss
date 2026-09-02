@@ -1191,28 +1191,29 @@ fn merge_metadata_field(field: &mut Option<String>, value: Option<String>) {
 /// each page to draw it; with `rewrite=True` the whole file is written
 /// afresh through the writer with compression and object streams, which
 /// leaves unreachable objects behind and usually comes out smaller than
-/// `data`. Releases the GIL while both files are parsed and the result is
-/// built.
+/// `data`. With `under=True` the overlay is drawn beneath each page's own
+/// content instead of on top of it. Releases the GIL while both files are
+/// parsed and the result is built.
 #[pyfunction]
-#[pyo3(signature = (data, overlay, *, rewrite=false))]
+#[pyo3(signature = (data, overlay, *, rewrite=false, under=false))]
 fn watermark<'py>(
     py: Python<'py>,
     data: Vec<u8>,
     overlay: Vec<u8>,
     rewrite: bool,
+    under: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let bytes = py.allow_threads(|| {
         let base = pdfboss_core::Document::load(data).map_err(crate::pdf_err)?;
-        let overlay = pdfboss_core::Document::load(overlay).map_err(crate::pdf_err)?;
-        if rewrite {
-            return pdfboss_write::watermark_with(
-                &base,
-                &overlay,
-                pdfboss_write::WriteOptions::default(),
-            )
-            .map_err(crate::pdf_err);
+        let mark = pdfboss_core::Document::load(overlay).map_err(crate::pdf_err)?;
+        let options = pdfboss_write::WriteOptions::default();
+        match (under, rewrite) {
+            (false, false) => pdfboss_write::watermark(&base, &mark),
+            (true, false) => pdfboss_write::watermark_under(&base, &mark),
+            (false, true) => pdfboss_write::watermark_with(&base, &mark, options),
+            (true, true) => pdfboss_write::watermark_under_with(&base, &mark, options),
         }
-        pdfboss_write::watermark(&base, &overlay).map_err(crate::pdf_err)
+        .map_err(crate::pdf_err)
     })?;
     Ok(PyBytes::new(py, &bytes))
 }
