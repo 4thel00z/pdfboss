@@ -984,3 +984,34 @@ fn rotate_pages_refuses_an_inline_page() {
         "message: {message}"
     );
 }
+
+/// A `by` that is not a multiple of 90 is refused before any page is
+/// staged, rather than silently truncated or wrapped into a confusing
+/// rotation.
+#[test]
+fn rotate_pages_refuses_a_non_multiple_of_90() {
+    let base = multi_page_pdf(XrefStyle::Table, &["one"]);
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+
+    let result = rotate_pages(&mut update, &[0], 45);
+    let Err(Error::Other(message)) = result else {
+        panic!("expected Error::Other, got {result:?}");
+    };
+    assert!(message.contains("multiple of 90"), "message: {message}");
+}
+
+/// A negative multiple of 90 stays legal: `rem_euclid(360)` normalizes it
+/// into the usual 0..360 range instead of refusing it.
+#[test]
+fn rotate_pages_accepts_a_negative_multiple_of_90() {
+    let base = multi_page_pdf(XrefStyle::Table, &["one"]);
+    let doc = Document::load(base).unwrap();
+    let mut update = Update::new(&doc).unwrap();
+    rotate_pages(&mut update, &[0], -90).unwrap();
+    let out = update.bytes().unwrap();
+
+    let reread = Document::load(out).unwrap();
+    let page = reread.page(0).unwrap();
+    assert_eq!(page.rotate, 270);
+}

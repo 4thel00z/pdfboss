@@ -1,7 +1,5 @@
 //! CLI page-range parsing and input/output pattern utilities.
 
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 /// Parses a comma-separated list of 1-based page numbers and ranges into
@@ -33,46 +31,45 @@ pub fn parse_ranges(s: &str, page_count: usize) -> Result<Vec<usize>, String> {
 }
 
 fn parse_span(item: &str, page_count: usize) -> Result<Vec<usize>, String> {
-    if let Some(dash_pos) = item.find('-') {
-        let start_str = item[..dash_pos].trim();
-        let end_str = item[dash_pos + 1..].trim();
+    let Some(dash_pos) = item.find('-') else {
+        return Err(format!("not a page or range: \"{}\"", item));
+    };
+    let start_str = item[..dash_pos].trim();
+    let end_str = item[dash_pos + 1..].trim();
 
-        let start: usize = start_str
-            .parse()
-            .map_err(|_| format!("not a page or range: \"{}\"", item))?;
-        let end: usize = end_str
-            .parse()
-            .map_err(|_| format!("not a page or range: \"{}\"", item))?;
+    let start: usize = start_str
+        .parse()
+        .map_err(|_| format!("not a page or range: \"{}\"", item))?;
+    let end: usize = end_str
+        .parse()
+        .map_err(|_| format!("not a page or range: \"{}\"", item))?;
 
-        if start == 0 {
-            return Err("page 0 does not exist".to_string());
-        }
-        if end == 0 {
-            return Err("page 0 does not exist".to_string());
-        }
-        if start > page_count {
-            return Err(format!(
-                "page {start} out of range (document has {page_count} page{})",
-                if page_count == 1 { "" } else { "s" }
-            ));
-        }
-        if end > page_count {
-            return Err(format!(
-                "page {end} out of range (document has {page_count} page{})",
-                if page_count == 1 { "" } else { "s" }
-            ));
-        }
-        if start > end {
-            return Err(format!(
-                "not a page or range: \"{}\" reversed (ranges are low-high)",
-                item
-            ));
-        }
-
-        Ok((start..=end).map(|p| p - 1).collect())
-    } else {
-        Err(format!("not a page or range: \"{}\"", item))
+    if start == 0 {
+        return Err("page 0 does not exist".to_string());
     }
+    if end == 0 {
+        return Err("page 0 does not exist".to_string());
+    }
+    if start > page_count {
+        return Err(format!(
+            "page {start} out of range (document has {page_count} page{})",
+            if page_count == 1 { "" } else { "s" }
+        ));
+    }
+    if end > page_count {
+        return Err(format!(
+            "page {end} out of range (document has {page_count} page{})",
+            if page_count == 1 { "" } else { "s" }
+        ));
+    }
+    if start > end {
+        return Err(format!(
+            "not a page or range: \"{}\" reversed (ranges are low-high)",
+            item
+        ));
+    }
+
+    Ok((start..=end).map(|p| p - 1).collect())
 }
 
 fn parse_single(item: &str, page_count: usize) -> Result<usize, String> {

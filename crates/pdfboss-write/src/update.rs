@@ -202,8 +202,14 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
 /// keeps its own `/Parent`, so it stays exactly where it was in the page
 /// tree. A page with no object of its own (inlined directly into
 /// `/Kids`) cannot be staged this way: refused, naming its 1-based page
-/// number.
+/// number. `by` must be a multiple of 90; anything else is refused before
+/// any page is touched.
 pub fn rotate_pages(update: &mut Update, pages: &[usize], by: i32) -> Result<()> {
+    if by % 90 != 0 {
+        return Err(Error::Other(
+            "rotation must be a multiple of 90 degrees".to_string(),
+        ));
+    }
     for &index in pages {
         let page = update.doc.page(index).map_err(core_error)?;
         let Some(page_ref) = page.object_ref() else {

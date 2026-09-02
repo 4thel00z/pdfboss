@@ -71,13 +71,19 @@ fn name(text: &str) -> Name {
 /// reference, so a selected page with no object of its own (inlined
 /// directly into `/Kids`) is refused, naming its 1-based page number:
 /// pdfboss does not yet restructure such a page into one with its own
-/// object.
+/// object. `by` must be a multiple of 90; anything else is refused before
+/// any object is copied.
 pub fn rotate_rewrite(
     doc: &Document,
     pages: &[usize],
     by: i32,
     options: WriteOptions,
 ) -> Result<Vec<u8>> {
+    if by % 90 != 0 {
+        return Err(Error::Other(
+            "rotation must be a multiple of 90 degrees".to_string(),
+        ));
+    }
     let mut writer = Writer::new(options);
     let mut importer = Importer::new(&mut writer, doc)?;
     let new_info = doc
@@ -338,6 +344,31 @@ mod tests {
             message.contains("does not yet restructure"),
             "message: {message}"
         );
+    }
+
+    /// A `by` that is not a multiple of 90 is refused before any object is
+    /// copied, rather than silently truncated or wrapped into a confusing
+    /// rotation.
+    #[test]
+    fn rotate_rewrite_refuses_a_non_multiple_of_90() {
+        let doc = Document::load(multi_page_doc(&["one"])).expect("doc loads");
+        let result = rotate_rewrite(&doc, &[0], 45, WriteOptions::default());
+        let Err(Error::Other(message)) = result else {
+            panic!("expected Error::Other, got {result:?}");
+        };
+        assert!(message.contains("multiple of 90"), "message: {message}");
+    }
+
+    /// A negative multiple of 90 stays legal: `rem_euclid(360)` normalizes
+    /// it into the usual 0..360 range instead of refusing it.
+    #[test]
+    fn rotate_rewrite_accepts_a_negative_multiple_of_90() {
+        let doc = Document::load(multi_page_doc(&["one"])).expect("doc loads");
+        let bytes =
+            rotate_rewrite(&doc, &[0], -90, WriteOptions::default()).expect("rotate succeeds");
+        let rotated = Document::load(bytes).expect("rotated document loads");
+        let page = rotated.page(0).expect("page exists");
+        assert_eq!(page.rotate, 270);
     }
 
     /// A rewrite carries `/Info` along: the reloaded catalog's trailer

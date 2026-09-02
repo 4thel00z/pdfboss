@@ -25,7 +25,7 @@ pdfboss text    doc.pdf --page 2            # omit --page for all pages
 pdfboss md      doc.pdf                     # Markdown: headings, lists, tables from layout, pages read in content order
 pdfboss render  doc.pdf --page 1 -o p.png --scale 2.0   # -o extension picks .png/.ppm/.bmp/.jpg; --jpeg-quality 1-100
 pdfboss images  doc.pdf -o out/             # embedded images as native-size PNGs
-pdfboss meta    doc.pdf -o out.pdf --set title=X --set author=Y   # /Info fields (repeatable --set): title, author, subject, keywords, creator, producer; appends an update, base bytes untouched
+pdfboss meta    doc.pdf -o out.pdf --set title=X --set author=Y   # /Info fields (repeatable --set): title, author, subject, keywords, creator, producer; appends an update, --rewrite for a fresh file instead
 pdfboss merge   a.pdf:2-9 b.pdf -o out.pdf              # combine selected pages from several inputs into one fresh document
 pdfboss split   doc.pdf -o 'part-%d.pdf' --every 10     # cut into consecutive chunks of pages
 pdfboss rotate  doc.pdf -o out.pdf --pages 2,4-9 --by 90   # quarter turns clockwise; appends an update, --rewrite for a fresh file instead

@@ -124,10 +124,10 @@ Four more verbs assemble documents out of existing ones, each also available fro
 |---|---|---|---|
 | `pdfboss merge` | Combine selected pages from several inputs into one fresh document, in argument order | always a fresh document | (its only mode) |
 | `pdfboss split` | Cut a document into consecutive chunks of pages | always fresh documents | (its only mode) |
-| `pdfboss rotate` | Rotate selected pages by a quarter turn, clockwise | appends an incremental update | `--rewrite` |
+| `pdfboss rotate` | Rotate selected pages by a quarter-turn multiple, clockwise | appends an incremental update | `--rewrite` |
 | `pdfboss rewrite` | Rewrite a document fresh, with no page change | always a fresh document | (its only mode) |
 
-Every one of the four runs on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; a merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. An encrypted input is refused everywhere, the same as `meta` above. `overlay` and `encrypt` follow in later PRs.
+`merge`, `split` and `rewrite` always run on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; `rotate`'s `--rewrite` mode does too, but its default instead appends through `Update`, the same way `meta` does. A merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. An encrypted input is refused everywhere, the same as `meta` above. `overlay` and `encrypt` follow in later PRs.
 
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>

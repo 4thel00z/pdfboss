@@ -72,8 +72,11 @@ fn imported_page_is_self_contained() {
     assert_eq!(page.dict().get_ref("Parent"), Some(pages_ref));
 }
 
+/// Holds only for an annotation-free source: see
+/// `page_import_of_a_linked_source_carries_the_linked_page_along` for the
+/// case where a page's own `/Annots` points elsewhere.
 #[test]
-fn page_import_pulls_in_no_sibling_content() {
+fn page_import_pulls_in_no_sibling_content_without_links() {
     let base = multi_page_doc(&["one", "two", "three"]);
     let doc = Document::load(base).expect("base document loads");
     let mut writer = Writer::new(plain_table_options());
@@ -98,6 +101,58 @@ fn page_import_pulls_in_no_sibling_content() {
     let page = reloaded.page(0).expect("the one page exists");
     let text = extract_text(&reloaded, &page).expect("text extracts");
     assert!(text.contains("two"), "unexpected text: {text:?}");
+}
+
+/// Pins a current limitation rather than a guarantee: a page's `/Annots`
+/// array is part of its own dict, so importing the page copies whatever
+/// it references. Here page 1 carries a link whose `/GoTo` destination
+/// names page 2's object; importing page 1 alone still drags page 2's
+/// object (and its content stream) into the output as an orphan, outside
+/// the new `/Kids` tree, even though page 2 was never itself imported.
+/// Link-preserving import (rewriting the destination onto whichever
+/// imported page it should now point at, or dropping it) is not yet
+/// implemented; see the limitation noted in
+/// `docs/src/guide/assembling.md`.
+#[test]
+fn page_import_of_a_linked_source_carries_the_linked_page_along() {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 /MediaBox [0 0 612 792] >>",
+    );
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [5 0 R] >>",
+    );
+    b.stream(4, "", b"(page-one-marker)");
+    b.object(
+        5,
+        "<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] \
+         /A << /S /GoTo /D [6 0 R /Fit] >> >>",
+    );
+    b.object(6, "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>");
+    b.stream(7, "", b"(page-two-marker)");
+    let doc = Document::load(b.build(1)).expect("base document loads");
+
+    let mut writer = Writer::new(plain_table_options());
+    let pages_ref = writer.reserve();
+    let page_ref = {
+        let mut importer = Importer::new(&mut writer, &doc).expect("an unencrypted source opens");
+        importer.page(0, pages_ref).expect("page 1 imports")
+    };
+    let bytes = finish_with_tree(writer, pages_ref, &[page_ref]);
+
+    assert!(
+        count_occurrences(&bytes, b"(page-two-marker)") > 0,
+        "the linked page's content is carried into the output even though only page 1 was imported"
+    );
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert_eq!(
+        reloaded.page_count(),
+        1,
+        "the carried copy of page 2 sits outside the new /Kids tree"
+    );
 }
 
 #[test]

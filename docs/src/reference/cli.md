@@ -324,7 +324,7 @@ pdfboss split [OPTIONS] --out <OUT> --every <EVERY> <FILE>
 ```
 
 - `-o, --out <OUT>`: output pattern containing `%d`, substituted with the 1-based part number (required)
-- `--every <EVERY>`: pages per part; the last part carries whatever remains
+- `--every <EVERY>`: pages per part (required); the last part carries whatever remains
 - `--password <PASSWORD>`: password for an encrypted file (user or owner password); an encrypted input is still refused at write time
 
 ```bash
@@ -341,7 +341,7 @@ pdfboss rotate [OPTIONS] --out <OUT> --by <BY> <FILE>
 
 - `-o, --out <OUT>`: output file (required)
 - `--pages <PAGES>`: 1-based pages, e.g. `2,4-9`; every page when omitted
-- `--by <BY>`: quarter turns clockwise, one of `90`, `180`, `270`
+- `--by <BY>`: quarter turns clockwise, one of `90`, `180`, `270` (required)
 - `--rewrite`: full rewrite instead of an incremental append
 - `--password <PASSWORD>`: password for an encrypted file (user or owner password); an encrypted input is still refused at write time
 

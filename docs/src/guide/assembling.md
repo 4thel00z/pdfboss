@@ -1,6 +1,6 @@
 # Assembling documents
 
-`pdfboss_write::assemble` builds new documents out of existing ones: `merge_documents` gathers selected pages from several sources under a fresh page tree (ISO 32000-1 §7.7.3), `split_document` cuts one document into consecutive-page parts, `rotate_rewrite` turns selected pages by a quarter-turn multiple in a whole fresh copy, and `rewrite_document`/`rewrite_with_metadata` write a document fresh with no page change. All four, plus the appended form of rotation, route through [`Importer`](#the-importer), which renumbers every object reference it meets once and copies it into the output.
+`pdfboss_write::assemble` builds new documents out of existing ones: `merge_documents` gathers selected pages from several sources under a fresh page tree (ISO 32000-1 §7.7.3), `split_document` cuts one document into consecutive-page parts, `rotate_rewrite` turns selected pages by a quarter-turn multiple in a whole fresh copy, and `rewrite_document`/`rewrite_with_metadata` write a document fresh with no page change. `merge_documents`, `split_document`, `rewrite_document`/`rewrite_with_metadata`, and `rotate_rewrite` all route through [`Importer`](#the-importer), which renumbers every object reference it meets once and copies it into the output; rotate's default append mode instead stages its change through [`Update`](./editing.md), the same way `meta` does.
 
 An encrypted input is refused everywhere, the same way [`Update`](./editing.md) refuses one: the check is for the `/Encrypt` entry itself, not for whether the password opened it, since a plain target has no encryption of its own to carry the content into.
 
@@ -21,6 +21,8 @@ combined = merge([(report_bytes, [1, 2, 3, 4, 5, 6, 7, 8]), appendix_bytes])
 ```
 
 Only the pages themselves are imported: document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the merged output.
+
+Link annotations are not yet rewritten for the new page tree. When a merged or split page carries a link annotation pointing at another page of its source, that referenced page's objects ride along in the output outside the new page tree, unreferenced by any `/Kids` array (a larger file than the selection alone would need), and the link still resolves to those carried objects rather than to whichever imported page they came from.
 
 ## Splitting
 
