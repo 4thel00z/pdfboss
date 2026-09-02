@@ -1,6 +1,6 @@
 ---
 name: pdfboss
-description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, editing or updating PDF metadata without rewriting the file, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
+description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, editing or updating PDF metadata without rewriting the file, merging, splitting or rotating pages, rewriting a document fresh, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
 ---
 
 # pdfboss
@@ -26,6 +26,10 @@ pdfboss md      doc.pdf                     # Markdown: headings, lists, tables 
 pdfboss render  doc.pdf --page 1 -o p.png --scale 2.0   # -o extension picks .png/.ppm/.bmp/.jpg; --jpeg-quality 1-100
 pdfboss images  doc.pdf -o out/             # embedded images as native-size PNGs
 pdfboss meta    doc.pdf -o out.pdf --set title=X --set author=Y   # /Info fields (repeatable --set): title, author, subject, keywords, creator, producer; appends an update, base bytes untouched
+pdfboss merge   a.pdf:2-9 b.pdf -o out.pdf              # combine selected pages from several inputs into one fresh document
+pdfboss split   doc.pdf -o 'part-%d.pdf' --every 10     # cut into consecutive chunks of pages
+pdfboss rotate  doc.pdf -o out.pdf --pages 2,4-9 --by 90   # quarter turns clockwise; appends an update, --rewrite for a fresh file instead
+pdfboss rewrite doc.pdf -o out.pdf                      # whole document fresh: recompressed, unreachable objects and old update sections dropped
 pdfboss tui     doc.pdf                     # interactive terminal explorer
 ```
 
@@ -87,6 +91,14 @@ update.save("out.pdf")                             # or update.to_bytes(); encry
 # watermark an existing file: overlay's first page drawn over every page, as an
 # incremental update appended to the original bytes (rewrite=True writes a fresh, compressed file)
 stamped = pdfboss.write.watermark(original_bytes, overlay_bytes)
+
+# assemble documents: 0-based page lists throughout; merge/split/rewrite always build a fresh file,
+# rotate appends an incremental update by default (rewrite=True writes a fresh file instead)
+from pdfboss.write import merge, split, rotate, rewrite
+combined = merge([a_bytes, (b_bytes, [1, 0])])   # bytes for every page, or (bytes, list[int]) to select/reorder
+parts    = split(doc_bytes, every=10)            # consecutive chunks, last one carries the remainder
+rotated  = rotate(doc_bytes, 90, pages=[0])
+clean    = rewrite(doc_bytes)                    # recompressed, unreachable objects and old update sections dropped
 
 # markdown to PDF: returns the file bytes
 data = pdfboss.md.to_pdf("# Hello\n\nWorld", theme=None, size="a4")

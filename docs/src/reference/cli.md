@@ -284,7 +284,7 @@ pdfboss create manifest q3.toml -o q3.pdf
 
 ## meta
 
-Set one or more `/Info` fields by appending an incremental update; the input file's own bytes are not rewritten. See [Editing PDFs](../guide/editing.md).
+Set one or more `/Info` fields, appending an incremental update by default (the input file's own bytes untouched) or, with `--rewrite`, writing the whole document fresh. See [Editing PDFs](../guide/editing.md).
 
 ```text
 pdfboss meta [OPTIONS] --out <OUT> --set <SET> <FILE>
@@ -292,8 +292,76 @@ pdfboss meta [OPTIONS] --out <OUT> --set <SET> <FILE>
 
 - `-o, --out <OUT>`: output file (required)
 - `--set <KEY=VALUE>`: metadata assignment, repeatable and required at least once; `KEY` is one of `title`, `author`, `subject`, `keywords`, `creator`, `producer`
+- `--rewrite`: full rewrite instead of an incremental append
 - `--password <PASSWORD>`: opens an encrypted input for reading; an encrypted base is still refused at write time, until encryption support arrives in a later PR
 
 ```bash
 pdfboss meta report.pdf -o report-titled.pdf --set title="Q3 Report" --set author="Finance"
+```
+
+## merge
+
+Combine selected pages from several inputs into one fresh document. See [Assembling documents](../guide/assembling.md).
+
+```text
+pdfboss merge [OPTIONS] --out <OUT> <INPUTS>...
+```
+
+- `<INPUTS>...`: one or more inputs, each optionally `FILE:RANGE` (1-based, e.g. `report.pdf:2-9`); a bare path takes every page
+- `-o, --out <OUT>`: output file (required)
+- `--password <PASSWORD>`: one password tried against every encrypted input; an encrypted input is still refused at write time, until encryption support arrives in a later PR
+
+```bash
+pdfboss merge report.pdf:2-9 appendix.pdf -o combined.pdf
+```
+
+## split
+
+Cut a document into consecutive chunks of pages. See [Assembling documents](../guide/assembling.md).
+
+```text
+pdfboss split [OPTIONS] --out <OUT> --every <EVERY> <FILE>
+```
+
+- `-o, --out <OUT>`: output pattern containing `%d`, substituted with the 1-based part number (required)
+- `--every <EVERY>`: pages per part; the last part carries whatever remains
+- `--password <PASSWORD>`: password for an encrypted file (user or owner password); an encrypted input is still refused at write time
+
+```bash
+pdfboss split report.pdf -o 'part-%d.pdf' --every 10
+```
+
+## rotate
+
+Rotate selected pages by a quarter-turn multiple, clockwise. See [Assembling documents](../guide/assembling.md).
+
+```text
+pdfboss rotate [OPTIONS] --out <OUT> --by <BY> <FILE>
+```
+
+- `-o, --out <OUT>`: output file (required)
+- `--pages <PAGES>`: 1-based pages, e.g. `2,4-9`; every page when omitted
+- `--by <BY>`: quarter turns clockwise, one of `90`, `180`, `270`
+- `--rewrite`: full rewrite instead of an incremental append
+- `--password <PASSWORD>`: password for an encrypted file (user or owner password); an encrypted input is still refused at write time
+
+Either mode refuses a page inlined directly into `/Kids` with no object of its own: pdfboss does not yet restructure such a page to rotate it.
+
+```bash
+pdfboss rotate report.pdf -o rotated.pdf --pages 2,4-9 --by 90
+```
+
+## rewrite
+
+Rewrite a document fresh: recompressed, unreachable objects and earlier update sections left behind, with no page change. See [Assembling documents](../guide/assembling.md).
+
+```text
+pdfboss rewrite [OPTIONS] --out <OUT> <FILE>
+```
+
+- `-o, --out <OUT>`: output file (required)
+- `--password <PASSWORD>`: password for an encrypted file (user or owner password); an encrypted input is still refused at write time
+
+```bash
+pdfboss rewrite report.pdf -o rewritten.pdf
 ```
