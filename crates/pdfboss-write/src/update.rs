@@ -10,7 +10,7 @@ use flate2::Compression;
 use pdfboss_core::crypt::Sha256;
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::xref::{parse_section_at, startxref};
-use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
+use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Page, Stream, XrefKind};
 
 use crate::error::{Error, Result};
 use crate::importer::{rect_array, Importer};
@@ -24,27 +24,36 @@ use crate::writer::{WriteOptions, Writer, XrefStyle};
 const FORM_NAME: &str = "PdfbossWatermark";
 
 /// The first name in the series `PdfbossWatermark`, `PdfbossWatermark2`,
-/// ... whose `/XObject` entry is free in every page of `base`. Overlaying
-/// a file that already carries a mark under an earlier name in the series
-/// draws its own form under the next free one instead of replacing the
-/// earlier entry and leaving its `Do` operators pointing at the new form.
-fn free_form_name(base: &Document) -> Result<String> {
+/// ... whose `/XObject` entry is free in every marked page of `pages`.
+/// Overlaying a file that already carries a mark under an earlier name in
+/// the series draws its own form under the next free one instead of
+/// replacing the earlier entry and leaving its `Do` operators pointing at
+/// the new form. `pages` is fetched once by the caller and reused for the
+/// mark loop that follows: [`Document::page`] materializes a page's
+/// effective resources on every call, so probing by re-fetching would
+/// double that cost across the whole document.
+fn free_form_name(base: &Document, pages: &[Page]) -> Result<String> {
     let mut candidate = FORM_NAME.to_string();
     let mut next = 2;
-    while xobject_name_taken(base, &candidate)? {
+    while xobject_name_taken(base, pages, &candidate)? {
         candidate = format!("{FORM_NAME}{next}");
         next += 1;
     }
     Ok(candidate)
 }
 
-/// Whether any page of `base` already carries an `/XObject` resource
-/// named `candidate`, resolving each page's effective resources the same
-/// way [`marked_page_dict`] and [`watermark_placed`] do before adding
-/// their own entry.
-fn xobject_name_taken(base: &Document, candidate: &str) -> Result<bool> {
-    for index in 0..base.page_count() {
-        let page = base.page(index).map_err(core_error)?;
+/// Whether any page in `pages` that is marked (has an [`ObjRef`] of its
+/// own) already carries an `/XObject` resource named `candidate`,
+/// resolving each page's effective resources the same way
+/// [`marked_page_dict`] and [`watermark_placed`] do before adding their
+/// own entry. A page inlined into `/Kids`, having no object of its own,
+/// is never marked, so it is skipped: only a marked page's `/XObject`
+/// dictionary can ever collide with the name this picks.
+fn xobject_name_taken(base: &Document, pages: &[Page], candidate: &str) -> Result<bool> {
+    for page in pages {
+        if page.object_ref().is_none() {
+            continue;
+        }
         let Some(existing) = page.resources.get("XObject") else {
             continue;
         };
@@ -57,6 +66,16 @@ fn xobject_name_taken(base: &Document, candidate: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Every page of `base`, in order, fetched once: shared by the name probe
+/// and the mark loop that follows it, so [`Document::page`] materializes
+/// each page's effective resources only once per watermark construction
+/// rather than once for the probe and again for marking.
+fn fetch_pages(base: &Document) -> Result<Vec<Page>> {
+    (0..base.page_count())
+        .map(|index| base.page(index).map_err(core_error))
+        .collect()
 }
 
 /// The content wrappers for one marked page: what precedes the page's own
@@ -84,7 +103,8 @@ fn watermark_rewrite_placed(
     options: WriteOptions,
     under: bool,
 ) -> Result<Vec<u8>> {
-    let form_name = free_form_name(base)?;
+    let pages = fetch_pages(base)?;
+    let form_name = free_form_name(base, &pages)?;
     let mut writer = Writer::new(options);
     let (prefix_bytes, suffix_bytes) = wrapper_streams(&form_name, under);
     let prefix = writer.put_stream_raw(Dict::new(), prefix_bytes);
@@ -96,12 +116,11 @@ fn watermark_rewrite_placed(
     let mut importer = Importer::new(&mut writer, base)?;
     let new_root = importer.reference(root);
     let new_info = trailer.get_ref("Info").map(|info| importer.reference(info));
-    for index in 0..base.page_count() {
-        let page = base.page(index).map_err(core_error)?;
+    for page in &pages {
         let Some(page_ref) = page.object_ref() else {
             continue;
         };
-        let dict = marked_page_dict(&mut importer, base, index, form, prefix, suffix, &form_name)?;
+        let dict = marked_page_dict(&mut importer, base, page, form, prefix, suffix, &form_name)?;
         importer.substitute(page_ref, dict);
     }
     importer.finish()?;
@@ -147,20 +166,19 @@ pub fn watermark_under_with(
     watermark_rewrite_placed(base, overlay, options, true)
 }
 
-/// The marked dictionary for source page `index`: its own dictionary
-/// translated into the target with `/Type /Page` guaranteed, its
-/// effective resources gaining the overlay form under `form_name`, and
-/// its content wrapped in `prefix` and `suffix`.
+/// The marked dictionary for `page`, already fetched from `base` by the
+/// caller: its own dictionary translated into the target with `/Type
+/// /Page` guaranteed, its effective resources gaining the overlay form
+/// under `form_name`, and its content wrapped in `prefix` and `suffix`.
 fn marked_page_dict(
     importer: &mut Importer,
     base: &Document,
-    index: usize,
+    page: &Page,
     form: ObjRef,
     prefix: ObjRef,
     suffix: ObjRef,
     form_name: &str,
 ) -> Result<Object> {
-    let page = base.page(index).map_err(core_error)?;
     let mut dict = importer.copy_dict(page.dict())?;
     let mut resources = importer.copy_dict(&page.resources)?;
     let mut xobjects = match page.resources.get("XObject") {
@@ -242,7 +260,8 @@ fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
 /// decrypted content would otherwise copy across into the plain update
 /// section.
 fn watermark_placed(base: &Document, overlay: &Document, under: bool) -> Result<Vec<u8>> {
-    let form_name = free_form_name(base)?;
+    let pages = fetch_pages(base)?;
+    let form_name = free_form_name(base, &pages)?;
     let mut update = Update::new(base)?;
     let form = update.overlay.import_form(overlay)?;
     let (prefix_bytes, suffix_bytes) = wrapper_streams(&form_name, under);
@@ -252,8 +271,7 @@ fn watermark_placed(base: &Document, overlay: &Document, under: bool) -> Result<
     let suffix = update
         .overlay
         .put(Object::Stream(plain_stream(suffix_bytes)));
-    for index in 0..base.page_count() {
-        let page = base.page(index).map_err(core_error)?;
+    for page in &pages {
         let Some(page_ref) = page.object_ref() else {
             continue;
         };
