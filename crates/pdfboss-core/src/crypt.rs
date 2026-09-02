@@ -1408,11 +1408,11 @@ fn aes256_encrypt_dict(material: &KeyMaterial, p: i32) -> Dict {
 /// `/Encrypt` dictionary for the trailer.
 #[allow(
     clippy::type_complexity,
-    reason = "Box<dyn FnMut(&mut [u8])> names the one random-byte source the write path takes; a type alias would only rename it"
+    reason = "Box<dyn FnMut(&mut [u8]) + Send> names the one random-byte source the write path takes; a type alias would only rename it"
 )]
 pub struct Encryptor {
     file_key: [u8; 32],
-    rng: Box<dyn FnMut(&mut [u8])>,
+    rng: Box<dyn FnMut(&mut [u8]) + Send>,
 }
 
 impl Encryptor {
@@ -1440,7 +1440,7 @@ impl Encryptor {
         user_password: &str,
         owner_password: &str,
         permissions: Permissions,
-        rng: Box<dyn FnMut(&mut [u8])>,
+        rng: Box<dyn FnMut(&mut [u8]) + Send>,
     ) -> (Encryptor, Dict) {
         let mut rng = rng;
         let p = permissions.p_value();
@@ -2287,7 +2287,7 @@ mod tests {
     /// so key material and IVs are reproducible without touching the OS
     /// random source.
     #[allow(clippy::type_complexity, reason = "see Encryptor's rng field")]
-    fn counter_rng() -> Box<dyn FnMut(&mut [u8])> {
+    fn counter_rng() -> Box<dyn FnMut(&mut [u8]) + Send> {
         let mut c = 0u8;
         Box::new(move |buf: &mut [u8]| {
             for b in buf {
