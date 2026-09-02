@@ -1277,9 +1277,10 @@ fn split<'py>(py: Python<'py>, data: Vec<u8>, every: usize) -> PyResult<Vec<Boun
 /// Rotates `pages` (0-based; every page when omitted) of `data` by `by`
 /// degrees clockwise, restricted to 90, 180 or 270, else `ValueError`.
 /// Appends an incremental update by default; `rewrite=True` writes the
-/// whole file fresh instead, the only way to rotate a page inlined
-/// directly into `/Kids` with no object of its own. Releases the GIL
-/// while the input is parsed and the result is built.
+/// whole file fresh instead. Either mode refuses a page inlined directly
+/// into `/Kids` with no object of its own: pdfboss does not yet
+/// restructure such a page to rotate it. Releases the GIL while the
+/// input is parsed and the result is built.
 #[pyfunction]
 #[pyo3(signature = (data, by, pages=None, rewrite=false))]
 fn rotate<'py>(

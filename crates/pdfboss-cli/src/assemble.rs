@@ -76,8 +76,9 @@ pub fn cmd_split(file: &Path, out: &str, every: usize, password: &str) -> Result
 /// page when omitted) of `file` by `by` degrees clockwise (`"90"`,
 /// `"180"` or `"270"`, already validated by clap's `--by` choices), and
 /// writes the result to `out`. Appends an incremental update by default;
-/// `rewrite` asks for a full rewrite instead, the only way to rotate a
-/// page inlined directly into `/Kids` with no object of its own.
+/// `rewrite` asks for a full rewrite instead. Either mode refuses a page
+/// inlined directly into `/Kids` with no object of its own: pdfboss does
+/// not yet restructure such a page to rotate it.
 pub fn cmd_rotate(
     file: &Path,
     out: &Path,

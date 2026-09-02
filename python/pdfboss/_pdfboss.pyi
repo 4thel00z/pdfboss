@@ -687,10 +687,10 @@ class write:
         """Rotates ``pages`` (0-based; every page when omitted) of
         ``data`` by ``by`` degrees clockwise, restricted to 90, 180 or
         270, else ``ValueError``. Appends an incremental update by
-        default; ``rewrite=True`` writes the whole file fresh instead,
-        the only way to rotate a page inlined directly into ``/Kids``
-        with no object of its own. An encrypted ``data`` raises
-        ``PdfError``."""
+        default; ``rewrite=True`` writes the whole file fresh instead.
+        Either mode refuses a page inlined directly into ``/Kids`` with
+        no object of its own: pdfboss does not yet restructure such a
+        page to rotate it. An encrypted ``data`` raises ``PdfError``."""
 
     @staticmethod
     def rewrite(data: bytes) -> bytes:
