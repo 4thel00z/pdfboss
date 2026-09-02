@@ -12,7 +12,7 @@ use pdfboss_core::parser::{NoResolve, Parser};
 use pdfboss_core::xref::{load_xref, XrefEntry};
 use pdfboss_core::{Dict, Document, Encryptor, Error, Name, ObjRef, Object, Permissions};
 use pdfboss_output::{extract_text, ReadingOrder};
-use pdfboss_write::{WriteOptions, Writer, XrefStyle};
+use pdfboss_write::{decrypt_document, encrypt_document, WriteOptions, Writer, XrefStyle};
 
 const CONTENT: &[u8] = b"BT /F1 12 Tf 72 720 Td (Hello, encrypted) Tj ET";
 const USER_PW: &str = "user-pw";
@@ -311,4 +311,210 @@ fn table_mode_round_trips_encrypted() {
     let page = doc.page(0).expect("page 0 exists");
     let text = extract_text(&doc, &page, ReadingOrder::Content).expect("text extracts");
     assert!(text.contains("Hello, encrypted"), "{text:?}");
+}
+
+/// A locked `Document` (encrypted, no working decryptor) cannot come into
+/// being through the public sync load path: a wrong or missing password
+/// fails inside `load_with_password` itself, before any `Document` value
+/// exists. This pins that load-time refusal and its exact message.
+/// `Importer::new`'s own `is_locked` refusal, and so `encrypt_document`'s
+/// and `decrypt_document`'s, is a second safeguard behind it that this
+/// crate's public API can never actually reach on its own.
+#[test]
+fn loading_an_encrypted_fixture_without_a_password_fails_at_load() {
+    let (encryptor, dict) = encryptor();
+    let mut w = Writer::new_encrypted(WriteOptions::default(), encryptor, dict);
+    let root = build(&mut w);
+    let bytes = w.finish(root).expect("encrypted document finishes");
+
+    let Err(err) = Document::load(bytes) else {
+        panic!("no password must not open an encrypted file");
+    };
+    assert_eq!(err.to_string(), "encrypted documents are not supported");
+}
+
+/// A plain, unencrypted document encrypts under both a user and an owner
+/// password: each opens the result, a wrong password does not, and the
+/// text extracted from the encrypted output still matches the original.
+#[test]
+fn encrypt_document_round_trips_with_the_user_and_owner_password() {
+    let mut w = Writer::new(WriteOptions::default());
+    let root = build(&mut w);
+    let plain_bytes = w.finish(root).expect("plain document finishes");
+    let plain = Document::load(plain_bytes).expect("plain document loads");
+
+    let bytes = encrypt_document(
+        &plain,
+        USER_PW,
+        OWNER_PW,
+        Permissions::all(),
+        WriteOptions::default(),
+    )
+    .expect("encrypt_document succeeds");
+
+    assert!(
+        matches!(Document::load(bytes.clone()), Err(Error::Encrypted)),
+        "no password must not open the encrypted output"
+    );
+    assert!(matches!(
+        Document::load_with_password(bytes.clone(), "not-it"),
+        Err(Error::Encrypted)
+    ));
+
+    for password in [USER_PW, OWNER_PW] {
+        let doc = Document::load_with_password(bytes.clone(), password)
+            .unwrap_or_else(|err| panic!("password {password:?} opens: {err}"));
+        assert_eq!(doc.page_count(), 1);
+        let page = doc.page(0).expect("page 0 exists");
+        let text = extract_text(&doc, &page, ReadingOrder::Content).expect("text extracts");
+        assert!(text.contains("Hello, encrypted"), "{text:?}");
+    }
+}
+
+/// `encrypt_document` refuses to build a file neither password would
+/// protect: reusing `Error::Other`, the same generic invalid-argument
+/// variant `rotate_rewrite` uses for a bad `by`, rather than a new
+/// variant.
+#[test]
+fn encrypt_document_refuses_when_both_passwords_are_empty() {
+    let mut w = Writer::new(WriteOptions::default());
+    let root = build(&mut w);
+    let plain_bytes = w.finish(root).expect("plain document finishes");
+    let plain = Document::load(plain_bytes).expect("plain document loads");
+
+    let result = encrypt_document(&plain, "", "", Permissions::all(), WriteOptions::default());
+    let Err(pdfboss_write::Error::Other(message)) = result else {
+        panic!("expected Error::Other, got {result:?}");
+    };
+    assert!(
+        message.contains("cannot both be empty"),
+        "message: {message}"
+    );
+}
+
+/// The encrypted bytes, opened with the user password, decrypt back to a
+/// plain file: `Document::load` (no password at all) opens it, it carries
+/// no `/Encrypt`, and the text still matches the original.
+#[test]
+fn decrypt_document_produces_a_plain_file_with_matching_text() {
+    let (encryptor, dict) = encryptor();
+    let mut w = Writer::new_encrypted(WriteOptions::default(), encryptor, dict);
+    let root = build(&mut w);
+    let encrypted_bytes = w.finish(root).expect("encrypted document finishes");
+
+    let opened =
+        Document::load_with_password(encrypted_bytes, USER_PW).expect("user password opens");
+
+    let plain_bytes =
+        decrypt_document(&opened, WriteOptions::default()).expect("decrypt_document succeeds");
+
+    let plain = Document::load(plain_bytes).expect("plain load succeeds with no password");
+    assert!(
+        !plain.is_encrypted(),
+        "the decrypted output carries no /Encrypt"
+    );
+    assert_eq!(plain.page_count(), 1);
+    let page = plain.page(0).expect("page 0 exists");
+    let text = extract_text(&plain, &page, ReadingOrder::Content).expect("text extracts");
+    assert!(text.contains("Hello, encrypted"), "{text:?}");
+}
+
+/// A document already opened under a password re-encrypts under new
+/// passwords: its plaintext content copies across (the `is_locked` change
+/// from refusing `is_encrypted`), the result opens under both new
+/// passwords, and neither old password still works.
+#[test]
+fn encrypt_document_re_encrypts_a_password_opened_source_under_new_passwords() {
+    let (encryptor, dict) = encryptor();
+    let mut w = Writer::new_encrypted(WriteOptions::default(), encryptor, dict);
+    let root = build(&mut w);
+    let original_bytes = w.finish(root).expect("encrypted document finishes");
+
+    let opened = Document::load_with_password(original_bytes, USER_PW)
+        .expect("original user password opens");
+
+    let new_user = "new-user-pw";
+    let new_owner = "new-owner-pw";
+    let re_encrypted = encrypt_document(
+        &opened,
+        new_user,
+        new_owner,
+        Permissions::all(),
+        WriteOptions::default(),
+    )
+    .expect("re-encrypting a password-opened source succeeds");
+
+    for old_password in [USER_PW, OWNER_PW] {
+        assert!(
+            matches!(
+                Document::load_with_password(re_encrypted.clone(), old_password),
+                Err(Error::Encrypted)
+            ),
+            "the old password {old_password:?} must no longer open the re-encrypted file"
+        );
+    }
+
+    for new_password in [new_user, new_owner] {
+        let reopened = Document::load_with_password(re_encrypted.clone(), new_password)
+            .unwrap_or_else(|err| panic!("new password {new_password:?} opens: {err}"));
+        assert_eq!(reopened.page_count(), 1);
+        let page = reopened.page(0).expect("page 0 exists");
+        let text = extract_text(&reopened, &page, ReadingOrder::Content).expect("text extracts");
+        assert!(text.contains("Hello, encrypted"), "{text:?}");
+    }
+}
+
+/// `/Length` is set from the object's serialized body, computed after
+/// encryption: for a stream written raw (no compression) at a known
+/// plaintext length `L`, the emitted `/Length` must equal the IV (16
+/// bytes) plus the PKCS#7-padded ciphertext, never the plaintext length
+/// itself. `L` here is already a multiple of 16, so padding must add a
+/// full extra block rather than nothing.
+#[test]
+fn length_reflects_the_padded_ciphertext_not_the_plaintext() {
+    let (encryptor, dict) = encryptor();
+    let options = WriteOptions {
+        xref: XrefStyle::Table,
+        compress: false,
+        object_streams: false,
+        version: (1, 7),
+    };
+    let mut w = Writer::new_encrypted(options, encryptor, dict);
+    let root = build(&mut w);
+    let plaintext = vec![0x41u8; 32];
+    assert_eq!(plaintext.len() % 16, 0, "the fixture must be block-aligned");
+    let marker_ref = w.put_stream_raw(Dict::new(), plaintext.clone());
+    let bytes = w.finish(root).expect("encrypted document finishes");
+
+    let raw = parse_raw_object(&bytes, marker_ref);
+    let raw_stream = raw.as_stream().expect("marker object is a stream");
+    let length = raw_stream
+        .dict
+        .get_int("Length")
+        .expect("stream carries a direct /Length");
+
+    let l = plaintext.len();
+    let padded = l + (16 - l % 16); // PKCS#7: a full extra block when l is already aligned
+    let expected = 16 + padded; // IV prefix plus the padded ciphertext
+    assert_eq!(
+        expected, 64,
+        "32 aligned plaintext bytes pad to a full extra block"
+    );
+    assert_eq!(
+        length as usize, expected,
+        "/Length must reflect the IV-prefixed, padded ciphertext, not the plaintext"
+    );
+
+    let doc = Document::load_with_password(bytes, USER_PW).expect("user password opens");
+    let resolved = doc
+        .resolve(&Object::Ref(marker_ref))
+        .expect("marker object resolves");
+    assert_eq!(
+        resolved
+            .as_stream()
+            .expect("resolved marker is a stream")
+            .data,
+        plaintext,
+        "the decrypted content must still equal the original plaintext"
+    );
 }

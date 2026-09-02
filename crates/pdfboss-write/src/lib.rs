@@ -13,8 +13,12 @@
 //!   and a deterministic `/ID`.
 //!
 //! Determinism is a feature: the same input produces byte-identical
-//! output. The crate never reads clocks or randomness — dates appear only
-//! when callers supply them.
+//! output, with one exception. The crate never reads clocks. Randomness is
+//! read only when encrypting: `encrypt_document` and `Writer::new_encrypted`
+//! draw key material and IVs from the operating system's random source by
+//! default (a caller can supply its own deterministic source through
+//! `Encryptor::aes256_with_rng`), so two encrypted runs need not match
+//! byte-for-byte. Otherwise, dates appear only when callers supply them.
 
 pub mod assemble;
 pub mod canvas;
@@ -33,7 +37,8 @@ pub mod writer;
 mod xmp;
 
 pub use assemble::{
-    merge_documents, rewrite_document, rewrite_with_metadata, rotate_rewrite, split_document,
+    decrypt_document, encrypt_document, merge_documents, rewrite_document, rewrite_with_metadata,
+    rotate_rewrite, split_document,
 };
 pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;

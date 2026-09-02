@@ -2,7 +2,7 @@
 //! selected pages from each source, gathered in argument order under a
 //! single new `/Pages` node.
 
-use pdfboss_core::{Dict, Document, Name, Object};
+use pdfboss_core::{Dict, Document, Encryptor, Name, Object, Permissions};
 
 use crate::error::{Error, Result};
 use crate::importer::Importer;
@@ -18,8 +18,9 @@ use crate::writer::{WriteOptions, Writer};
 /// no `/ID` is inherited (the writer derives its own from the emitted
 /// content). Document-level trees of the inputs -- outlines, names,
 /// optional content -- are not carried, since only individual pages are
-/// imported. An encrypted input is refused, the same way a lone import
-/// would be.
+/// imported. A locked input is refused, the same way a lone import would
+/// be; an already password-opened encrypted input copies its plaintext
+/// content across like any unencrypted source.
 pub fn merge_documents(
     inputs: &[(&Document, Option<&[usize]>)],
     options: WriteOptions,
@@ -131,6 +132,64 @@ pub fn rewrite_document(doc: &Document, options: WriteOptions) -> Result<Vec<u8>
         writer.set_info(new_info);
     }
     writer.finish(new_root)
+}
+
+/// [`rewrite_document`], writing through an encrypting [`Writer`] instead
+/// of a plain one: every copied string and stream is AES-256 protected
+/// under `user_password` and `owner_password` (ISO 32000-2 §7.6.4.3), with
+/// `permissions` as the restrictions a reader opening under the user
+/// password is granted. An empty `owner_password` falls back to
+/// `user_password`; both empty is refused, since neither password would
+/// then protect the file at all. `doc` is refused when
+/// [`Document::is_locked`], the same refusal [`Importer::new`] already
+/// raises. An already password-opened encrypted `doc` is fine: its
+/// content already reads as plaintext through `Document::get`, so it
+/// copies across like any unencrypted source and gets encrypted afresh
+/// under the new passwords.
+pub fn encrypt_document(
+    doc: &Document,
+    user_password: &str,
+    owner_password: &str,
+    permissions: Permissions,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    if user_password.is_empty() && owner_password.is_empty() {
+        return Err(Error::Other(
+            "user_password and owner_password cannot both be empty".to_string(),
+        ));
+    }
+    let owner_password = if owner_password.is_empty() {
+        user_password
+    } else {
+        owner_password
+    };
+    let (encryptor, encrypt_dict) = Encryptor::aes256(user_password, owner_password, permissions);
+    let mut writer = Writer::new_encrypted(options, encryptor, encrypt_dict);
+    let mut importer = Importer::new(&mut writer, doc)?;
+    let new_info = doc
+        .xref()
+        .trailer
+        .get_ref("Info")
+        .map(|info| importer.reference(info));
+    let new_root = importer.document()?;
+    if let Some(new_info) = new_info {
+        writer.set_info(new_info);
+    }
+    writer.finish(new_root)
+}
+
+/// [`rewrite_document`], named for the decryption it performs when `doc`
+/// was opened under a password: its content already reads as plaintext
+/// through `Document::get`, and the fresh [`Writer`] this builds carries
+/// no `/Encrypt` of its own, so the output is plainly unencrypted no
+/// matter what protected the input. Refuses a [`Document::is_locked`]
+/// `doc` exactly as [`Importer::new`] does, a second safeguard behind
+/// `Document::load_with_password`'s own refusal of a wrong or missing
+/// password: that refusal happens before a `Document` exists, so a locked
+/// one never reaches this function through the public load path in the
+/// first place.
+pub fn decrypt_document(doc: &Document, options: WriteOptions) -> Result<Vec<u8>> {
+    rewrite_document(doc, options)
 }
 
 /// [`rewrite_document`], first replacing `/Info` (and, when the catalog
@@ -254,11 +313,24 @@ mod tests {
             .contains("one"));
     }
 
+    /// The fixture's empty user password opens transparently, so `doc`
+    /// carries a working decryptor and is not locked: `merge_documents`
+    /// now accepts it, copying its already-decrypted content across like
+    /// any unencrypted source, and the copied page's text still reads
+    /// correctly in the plain output.
     #[test]
-    fn encrypted_input_is_refused() {
+    fn merge_documents_accepts_a_password_opened_encrypted_source() {
         let doc = Document::load(encrypted_rc4_doc("secret")).expect("empty-password doc loads");
-        let result = merge_documents(&[(&doc, None)], WriteOptions::default());
-        assert!(matches!(result, Err(Error::EncryptedBase)));
+        let bytes = merge_documents(&[(&doc, None)], WriteOptions::default())
+            .expect("a password-opened encrypted source is not locked, so merge succeeds");
+        let merged = Document::load(bytes).expect("merged document loads");
+        assert!(
+            !merged.is_encrypted(),
+            "the merged output carries no /Encrypt"
+        );
+        let page = merged.page(0).expect("page 0 exists");
+        let text = extract_text(&merged, &page, ReadingOrder::Content).expect("text extracts");
+        assert!(text.contains("secret"), "{text:?}");
     }
 
     #[test]

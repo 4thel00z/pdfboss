@@ -25,14 +25,16 @@ pub struct Importer<'w, 's> {
 }
 
 impl<'w, 's> Importer<'w, 's> {
-    /// Opens `source` for import into `writer`. Refuses an encrypted
-    /// source: `Document::get` decrypts transparently, so copying from
-    /// an encrypted source would silently strip its protection into a
-    /// plain target with no `/Encrypt` of its own. pdfboss refuses that
-    /// silent downgrade; writing an encrypted target is a separate,
-    /// not yet implemented feature.
+    /// Opens `source` for import into `writer`. Refuses a locked source:
+    /// `Document::get` only decrypts transparently once a working
+    /// password configured a decryptor, so copying from a locked source
+    /// would emit raw ciphertext into a plain target with no `/Encrypt`
+    /// of its own. A password-opened encrypted document copies fine: its
+    /// content already reads as plaintext through `Document::get`, exactly
+    /// what [`crate::encrypt_document`] relies on to re-encrypt it under
+    /// new passwords.
     pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
-        if source.is_encrypted() {
+        if source.is_locked() {
             return Err(Error::EncryptedBase);
         }
         let compress = writer.compress();
