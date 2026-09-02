@@ -23,6 +23,7 @@ Coding agents can install this skill with `pdfboss skill install` (writes it int
 pdfboss info    doc.pdf                     # version, page count, sizes, metadata
 pdfboss text    doc.pdf --page 2            # omit --page for all pages
 pdfboss md      doc.pdf                     # Markdown: headings, lists, tables from layout, pages read in content order
+pdfboss text    doc.pdf --reading-order structure-tree   # or geometric; content is the default (text and md)
 pdfboss render  doc.pdf --page 1 -o p.png --scale 2.0   # -o extension picks .png/.ppm/.bmp/.jpg; --jpeg-quality 1-100
 pdfboss images  doc.pdf -o out/             # embedded images as native-size PNGs
 pdfboss meta    doc.pdf -o out.pdf --set title=X --set author=Y   # /Info fields (repeatable --set): title, author, subject, keywords, creator, producer; appends an update, base bytes untouched
@@ -62,6 +63,7 @@ import pdfboss
 doc  = pdfboss.Document("doc.pdf")            # or Document(data=raw_bytes), password=""
 text = doc.extract_text()                     # pages fan out across cores
 md   = doc.extract_markdown()
+tree = doc.extract_text(reading_order=pdfboss.ReadingOrder.STRUCTURE_TREE)   # or "geometric"; default "content"
 png  = doc[0].render(scale=2.0)               # PNG bytes; format="ppm"/"bmp" for raw RGB pixels, "jpeg" (quality=90) for lossy
 png, warnings = doc[0].render_reporting()     # warnings list every drop or approximation
 images = doc[0].extract_images()              # each: .data (PNG bytes), .width, .height

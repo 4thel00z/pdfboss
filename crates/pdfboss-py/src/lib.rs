@@ -191,6 +191,26 @@ fn glyph_painting_from_str(s: &str) -> PyResult<pdfboss_render::GlyphPainting> {
     }
 }
 
+/// Maps the Python `reading_order=` string to a
+/// [`pdfboss_output::ReadingOrder`]: `"content"`, `"structure-tree"` or
+/// `"geometric"`.
+fn reading_order_from_str(s: &str) -> PyResult<pdfboss_output::ReadingOrder> {
+    s.parse()
+        .map_err(|e: pdfboss_core::Error| PyValueError::new_err(e.to_string()))
+}
+
+/// The async document's structure tree, loaded only when `order` reads by
+/// it.
+async fn structure_for(
+    doc: &AioDocument,
+    order: pdfboss_output::ReadingOrder,
+) -> Option<pdfboss_core::StructureTree> {
+    match order {
+        pdfboss_output::ReadingOrder::StructureTree => doc.structure_tree().await,
+        _ => None,
+    }
+}
+
 /// Maps the Python `compression=` string to a
 /// [`pdfboss_render::PngCompression`] level.
 fn png_compression_from_str(s: &str) -> PyResult<pdfboss_render::PngCompression> {
@@ -428,10 +448,13 @@ impl Document {
     /// Per-page lenient like rendering: a page whose content will not
     /// fetch, decode, or parse contributes an empty string rather than
     /// failing the whole document. An error here means the document
-    /// itself could not be read.
-    fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
+    /// itself could not be read. `reading_order` is `"content"` (the
+    /// default), `"structure-tree"` or `"geometric"`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_text(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
         let inner = &self.inner;
         let fonts = Arc::clone(&self.text_cache);
+        let order = reading_order_from_str(reading_order)?;
         py.allow_threads(move || {
             // The lock is held only long enough to seed; the fan-out runs
             // on a private materialization.
@@ -442,7 +465,8 @@ impl Document {
             // document's font cache serves every worker, so a font loads
             // once per document rather than once per page.
             let texts = pdfboss_core::map_pages(&doc, |doc, page| {
-                let (text, _) = pdfboss_output::extract_text_reporting_cached(doc, page, &fonts)?;
+                let (text, _) =
+                    pdfboss_output::extract_text_reporting_cached(doc, page, &fonts, order)?;
                 Ok(text)
             });
             let mut out = String::new();
@@ -458,12 +482,15 @@ impl Document {
 
     /// Extracts the whole document as markdown: headings, lists and tables
     /// inferred from layout, with font sizes judged across the document.
-    /// Same fan-out and per-page leniency as `extract_text`.
-    fn extract_markdown(&self, py: Python<'_>) -> PyResult<String> {
+    /// Same fan-out, per-page leniency and `reading_order` as
+    /// `extract_text`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_markdown(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
         let inner = &self.inner;
+        let order = reading_order_from_str(reading_order)?;
         py.allow_threads(move || {
             let doc = CoreDocument::from_seed(inner.lock().seed());
-            pdfboss_output::extract_markdown(&doc).map_err(pdf_err)
+            pdfboss_output::extract_markdown(&doc, order).map_err(pdf_err)
         })
     }
 
@@ -591,22 +618,25 @@ impl Document {
     /// every page's, or the 0-based `pages` given, in the order given.
     /// Each step releases the GIL, runs on a private materialization of
     /// the document, and shares one font cache across the walk, so a font
-    /// loads once for the document.
-    #[pyo3(signature = (pages=None))]
-    fn spans(&self, pages: Option<Vec<usize>>) -> SpanIter {
+    /// loads once for the document. Each page's spans come in the
+    /// `reading_order` given, as `extract_text` reads them.
+    #[pyo3(signature = (pages=None, *, reading_order = "content"))]
+    fn spans(&self, pages: Option<Vec<usize>>, reading_order: &str) -> PyResult<SpanIter> {
+        let order = reading_order_from_str(reading_order)?;
         let (seed, count) = {
             let doc = self.inner.lock();
             (doc.seed(), doc.page_count())
         };
         let pages = pages.unwrap_or_else(|| (0..count).collect());
-        SpanIter {
+        Ok(SpanIter {
             state: Mutex::new(SpanIterState {
                 seed,
                 fonts: FontCache::default(),
+                order,
                 pages: pages.into_iter(),
                 buffer: Vec::new().into_iter(),
             }),
-        }
+        })
     }
 }
 
@@ -768,36 +798,53 @@ impl Page {
     /// Extracts the page's text. Releases the GIL and runs on a private
     /// materialization of the document, so extractions of different pages
     /// proceed in parallel when called from multiple Python threads.
-    fn extract_text(&self, py: Python<'_>) -> PyResult<String> {
+    /// `reading_order` is `"content"` (the default), `"structure-tree"` or
+    /// `"geometric"`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_text(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
+        let order = reading_order_from_str(reading_order)?;
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            let (text, _) =
-                pdfboss_output::extract_text_reporting_cached(&doc, &self.page, &self.text_cache)
-                    .map_err(pdf_err)?;
+            let (text, _) = pdfboss_output::extract_text_reporting_cached(
+                &doc,
+                &self.page,
+                &self.text_cache,
+                order,
+            )
+            .map_err(pdf_err)?;
             Ok(text)
         })
     }
 
     /// Extracts the page's markdown, ranking heading sizes against that page
     /// alone. `Document.extract_markdown` is the better answer whenever the
-    /// whole document is at hand.
-    fn extract_markdown(&self, py: Python<'_>) -> PyResult<String> {
+    /// whole document is at hand. Same `reading_order` as `extract_text`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_markdown(&self, py: Python<'_>, reading_order: &str) -> PyResult<String> {
+        let order = reading_order_from_str(reading_order)?;
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            pdfboss_output::extract_page_markdown(&doc, &self.page).map_err(pdf_err)
+            pdfboss_output::extract_page_markdown(&doc, &self.page, order).map_err(pdf_err)
         })
     }
 
-    /// The page's styled text spans, in emission order. Releases the GIL
-    /// and runs on a private materialization of the document, like
+    /// The page's styled text spans, in the `reading_order` given (the
+    /// content stream's emission order by default). Releases the GIL and
+    /// runs on a private materialization of the document, like
     /// `extract_text`. Lenient the same way: unreadable content yields no
     /// spans rather than raising.
-    fn spans(&self, py: Python<'_>) -> PyResult<Vec<Span>> {
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn spans(&self, py: Python<'_>, reading_order: &str) -> PyResult<Vec<Span>> {
+        let order = reading_order_from_str(reading_order)?;
         py.allow_threads(|| {
             let doc = CoreDocument::from_seed(self.seed.clone());
-            let (spans, _) =
-                pdfboss_text::extract_spans_reporting_cached(&doc, &self.page, &self.text_cache)
-                    .map_err(pdf_err)?;
+            let (spans, _) = pdfboss_text::extract_spans_reporting_cached(
+                &doc,
+                &self.page,
+                &self.text_cache,
+                order,
+            )
+            .map_err(pdf_err)?;
             Ok(spans.into_iter().map(|inner| Span { inner }).collect())
         })
     }
@@ -1062,6 +1109,7 @@ struct SpanIter {
 struct SpanIterState {
     seed: DocumentSeed,
     fonts: FontCache,
+    order: pdfboss_output::ReadingOrder,
     pages: std::vec::IntoIter<usize>,
     buffer: std::vec::IntoIter<TextSpan>,
 }
@@ -1085,9 +1133,13 @@ impl SpanIter {
                 };
                 let doc = CoreDocument::from_seed(state.seed.clone());
                 let page = doc.page(index).map_err(pdf_err)?;
-                let (spans, _) =
-                    pdfboss_text::extract_spans_reporting_cached(&doc, &page, &state.fonts)
-                        .map_err(pdf_err)?;
+                let (spans, _) = pdfboss_text::extract_spans_reporting_cached(
+                    &doc,
+                    &page,
+                    &state.fonts,
+                    state.order,
+                )
+                .map_err(pdf_err)?;
                 state.buffer = spans.into_iter();
             }
         })
@@ -1399,20 +1451,34 @@ impl AsyncDocument {
     /// page whose content will not read contributes an empty string, and
     /// an error means the document itself could not be read. Coroutine;
     /// the extraction runs on the tokio runtime, so the asyncio loop is
-    /// never blocked.
-    fn extract_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// never blocked. `reading_order` is `"content"` (the default),
+    /// `"structure-tree"` or `"geometric"`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_text<'py>(
+        &self,
+        py: Python<'py>,
+        reading_order: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let order = reading_order_from_str(reading_order)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = inner.oc_state().await;
+            let structure = structure_for(&inner, order).await;
             let mut out = String::new();
             for i in 0..inner.page_count() {
                 if i > 0 {
                     out.push('\u{c}');
                 }
                 let page = inner.page(i).map_err(aio_err)?;
-                let text = pdfboss_output::extract_text_with(inner.clone(), &page, oc.as_ref())
-                    .await
-                    .map_err(pdf_err)?;
+                let text = pdfboss_output::extract_text_with(
+                    inner.clone(),
+                    &page,
+                    oc.as_ref(),
+                    structure.as_ref(),
+                    order,
+                )
+                .await
+                .map_err(pdf_err)?;
                 out.push_str(&text);
             }
             Ok(out)
@@ -1422,22 +1488,33 @@ impl AsyncDocument {
     /// Extracts the whole document as markdown, like the sync
     /// `Document.extract_markdown` — headings, lists and tables inferred
     /// from layout, font sizes judged across the document. Coroutine; runs
-    /// on the tokio runtime, so the asyncio loop is never blocked.
-    fn extract_markdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// on the tokio runtime, so the asyncio loop is never blocked. Same
+    /// `reading_order` as `extract_text`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_markdown<'py>(
+        &self,
+        py: Python<'py>,
+        reading_order: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let order = reading_order_from_str(reading_order)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = inner.oc_state().await;
+            let structure = structure_for(&inner, order).await;
             let mut pages = Vec::new();
             for i in 0..inner.page_count() {
                 let page = inner.page(i).map_err(aio_err)?;
-                let (spans, rulings, _) = pdfboss_text::extract_spans_and_rulings_reporting_with(
-                    inner.clone(),
-                    &page,
-                    oc.as_ref(),
-                )
-                .await
-                .map_err(pdf_err)?;
-                pages.push((spans, rulings));
+                let (spans, rulings, report) =
+                    pdfboss_text::extract_spans_and_rulings_reporting_with(
+                        inner.clone(),
+                        &page,
+                        oc.as_ref(),
+                        structure.as_ref(),
+                        order,
+                    )
+                    .await
+                    .map_err(pdf_err)?;
+                pages.push((spans, rulings, report.order));
             }
             Ok(pdfboss_output::Markdown
                 .render(&pdfboss_output::document_layout_with_rulings(&pages)))
@@ -1591,21 +1668,25 @@ impl AsyncDocument {
     /// Streams the document's styled text spans page by page — the async
     /// twin of `Document.spans`, over range-fetching reads; use with
     /// `async for`. Every page's, or the 0-based `pages` given, in the
-    /// order given, with one font cache shared across the walk.
-    #[pyo3(signature = (pages=None))]
-    fn spans(&self, pages: Option<Vec<usize>>) -> AsyncSpanIter {
+    /// order given, with one font cache shared across the walk, each
+    /// page's spans in the `reading_order` given.
+    #[pyo3(signature = (pages=None, *, reading_order = "content"))]
+    fn spans(&self, pages: Option<Vec<usize>>, reading_order: &str) -> PyResult<AsyncSpanIter> {
+        let order = reading_order_from_str(reading_order)?;
         let doc = self.inner.clone();
         let pages = pages.unwrap_or_else(|| (0..doc.page_count()).collect());
-        AsyncSpanIter {
+        Ok(AsyncSpanIter {
             state: Arc::new(tokio::sync::Mutex::new(AsyncSpanIterState {
                 doc,
                 fonts: FontCache::default(),
+                order,
                 oc: None,
+                structure: None,
                 oc_loaded: false,
                 pages: pages.into_iter(),
                 buffer: Vec::new().into_iter(),
             })),
-        }
+        })
     }
 }
 
@@ -1677,41 +1758,72 @@ impl AsyncPage {
         rect_tuple(self.page.art_box)
     }
 
-    /// Extracts the page's text. Coroutine resolving to str.
-    fn extract_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Extracts the page's text in the `reading_order` given (`"content"`,
+    /// `"structure-tree"` or `"geometric"`). Coroutine resolving to str.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_text<'py>(
+        &self,
+        py: Python<'py>,
+        reading_order: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.doc.clone();
         let page = self.page.clone();
+        let order = reading_order_from_str(reading_order)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = doc.oc_state().await;
-            pdfboss_output::extract_text_with(&doc, &page, oc.as_ref())
+            let structure = structure_for(&doc, order).await;
+            pdfboss_output::extract_text_with(&doc, &page, oc.as_ref(), structure.as_ref(), order)
                 .await
                 .map_err(pdf_err)
         })
     }
 
     /// Extracts the page's markdown, like the sync `Page.extract_markdown`,
-    /// ranking heading sizes against that page alone. Coroutine.
-    fn extract_markdown<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// ranking heading sizes against that page alone. Same `reading_order`
+    /// as `extract_text`. Coroutine.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn extract_markdown<'py>(
+        &self,
+        py: Python<'py>,
+        reading_order: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.doc.clone();
         let page = self.page.clone();
+        let order = reading_order_from_str(reading_order)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = doc.oc_state().await;
-            pdfboss_output::extract_page_markdown_with(&doc, &page, oc.as_ref())
-                .await
-                .map_err(pdf_err)
+            let structure = structure_for(&doc, order).await;
+            pdfboss_output::extract_page_markdown_with(
+                &doc,
+                &page,
+                oc.as_ref(),
+                structure.as_ref(),
+                order,
+            )
+            .await
+            .map_err(pdf_err)
         })
     }
 
-    /// The page's styled text spans — the async twin of `Page.spans`.
-    /// Coroutine resolving to a list of `Span`.
-    fn spans<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// The page's styled text spans, the async twin of `Page.spans`, same
+    /// `reading_order`. Coroutine resolving to a list of `Span`.
+    #[pyo3(signature = (*, reading_order = "content"))]
+    fn spans<'py>(&self, py: Python<'py>, reading_order: &str) -> PyResult<Bound<'py, PyAny>> {
         let doc = self.doc.clone();
         let page = self.page.clone();
+        let order = reading_order_from_str(reading_order)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let oc = doc.oc_state().await;
-            let spans = pdfboss_text::extract_spans_with(&doc, &page, oc.as_ref())
-                .await
-                .map_err(pdf_err)?;
+            let structure = structure_for(&doc, order).await;
+            let spans = pdfboss_text::extract_spans_with(
+                &doc,
+                &page,
+                oc.as_ref(),
+                structure.as_ref(),
+                order,
+            )
+            .await
+            .map_err(pdf_err)?;
             Ok(spans
                 .into_iter()
                 .map(|inner| Span { inner })
@@ -1854,7 +1966,9 @@ struct AsyncSpanIter {
 struct AsyncSpanIterState {
     doc: AioDocument,
     fonts: FontCache,
+    order: pdfboss_output::ReadingOrder,
     oc: Option<OcState>,
+    structure: Option<pdfboss_core::StructureTree>,
     oc_loaded: bool,
     pages: std::vec::IntoIter<usize>,
     buffer: std::vec::IntoIter<TextSpan>,
@@ -1874,6 +1988,7 @@ impl AsyncSpanIter {
             let mut state = state.lock().await;
             if !state.oc_loaded {
                 state.oc = state.doc.oc_state().await;
+                state.structure = structure_for(&state.doc, state.order).await;
                 state.oc_loaded = true;
             }
             loop {
@@ -1889,6 +2004,8 @@ impl AsyncSpanIter {
                     &page,
                     &state.fonts,
                     state.oc.as_ref(),
+                    state.structure.as_ref(),
+                    state.order,
                 )
                 .await
                 .map_err(pdf_err)?;

@@ -5,7 +5,7 @@
 
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::{Dict, Document, Matrix, Name, Object, Rect, Stream};
-use pdfboss_output::extract_text;
+use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_render::{render_page_reporting, RenderOptions};
 use pdfboss_write::{
     Attachment, BlendMode, Bookmark, Canvas, Color, Content, Date, Error, ImageData, LabelStyle,
@@ -35,7 +35,7 @@ fn hello_single_page_round_trips() {
     assert_eq!(doc.page_count(), 1);
     let loaded = doc.page(0).unwrap();
     assert_eq!(loaded.media_box, Rect::new(0.0, 0.0, 595.28, 841.89));
-    let text = extract_text(&doc, &loaded).unwrap();
+    let text = extract_text(&doc, &loaded, ReadingOrder::Content).unwrap();
     assert!(text.contains("Hello, world!"), "extracted: {text:?}");
 }
 
@@ -238,7 +238,7 @@ fn draw_group_paints_the_registered_subcanvas() {
     .unwrap();
     let doc = Document::load(bytes).unwrap();
     let loaded = doc.page(0).unwrap();
-    let text = extract_text(&doc, &loaded).unwrap();
+    let text = extract_text(&doc, &loaded, ReadingOrder::Content).unwrap();
     assert!(text.contains("Letterhead"), "extracted: {text:?}");
     let form = resolve_form(&doc, &loaded.resources, "Gp1");
     assert_eq!(form.dict.get_name("Type"), Some(&Name("XObject".into())));
@@ -285,8 +285,12 @@ fn letterhead_group_on_two_pages_yields_structurally_equal_forms() {
     let doc = Document::load(bytes).unwrap();
     let page0 = doc.page(0).unwrap();
     let page1 = doc.page(1).unwrap();
-    assert!(extract_text(&doc, &page0).unwrap().contains("Letterhead"));
-    assert!(extract_text(&doc, &page1).unwrap().contains("Letterhead"));
+    assert!(extract_text(&doc, &page0, ReadingOrder::Content)
+        .unwrap()
+        .contains("Letterhead"));
+    assert!(extract_text(&doc, &page1, ReadingOrder::Content)
+        .unwrap()
+        .contains("Letterhead"));
 
     let form0 = resolve_form(&doc, &page0.resources, "Gp1");
     let form1 = resolve_form(&doc, &page1.resources, "Gp1");
@@ -355,7 +359,7 @@ fn drawing_one_group_twice_shares_the_same_form_xobject() {
         1,
         "two draw_group calls on one handle must reference one form"
     );
-    let text = extract_text(&doc, &loaded).unwrap();
+    let text = extract_text(&doc, &loaded, ReadingOrder::Content).unwrap();
     assert_eq!(
         text.matches("Letterhead").count(),
         2,
@@ -384,7 +388,7 @@ fn nested_groups_recurse_through_extraction() {
     .unwrap();
     let doc = Document::load(bytes).unwrap();
     let loaded = doc.page(0).unwrap();
-    let text = extract_text(&doc, &loaded).unwrap();
+    let text = extract_text(&doc, &loaded, ReadingOrder::Content).unwrap();
     assert!(text.contains("Inner"), "extracted: {text:?}");
 }
 
@@ -513,7 +517,9 @@ fn both_xref_styles_load() {
         let doc = Document::load(bytes).unwrap();
         assert_eq!(doc.page_count(), 1);
         let loaded = doc.page(0).unwrap();
-        assert!(extract_text(&doc, &loaded).unwrap().contains("Xref"));
+        assert!(extract_text(&doc, &loaded, ReadingOrder::Content)
+            .unwrap()
+            .contains("Xref"));
     }
 }
 
@@ -628,7 +634,7 @@ fn paragraph_wraps_and_extracts_across_lines() {
     .unwrap();
     let doc = Document::load(bytes).unwrap();
     let loaded = doc.page(0).unwrap();
-    let text = extract_text(&doc, &loaded).unwrap();
+    let text = extract_text(&doc, &loaded, ReadingOrder::Content).unwrap();
     assert!(
         text.contains("aaaaaaaaa bbbbbbbbbb"),
         "expected the first wrapped line intact, got {text:?}"

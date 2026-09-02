@@ -3,7 +3,7 @@
 
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
-use pdfboss_text::{Ruling, TextSpan};
+use pdfboss_text::{ReadingOrder, Ruling, TextSpan};
 
 /// Fraction of the device font size a horizontal gap must exceed to read
 /// as a word break. The ceiling is justified LaTeX's shrunk inter-word
@@ -137,57 +137,71 @@ const HEADER_FOOTER_MIN_PAGES: usize = 3;
 /// line rather than two different ones that happen to match text.
 const HEADER_FOOTER_Y_TOLERANCE: f32 = 2.0;
 
-/// Groups spans into lines (baselines within `0.5 · size`), orders lines
-/// top to bottom and spans left to right, inserts a space at horizontal
-/// gaps wider than `WORD_GAP` times the size, and joins lines with `\n`.
-/// A page with a clear two-column gutter reads column-major: full-width
-/// separators split it into bands, and within each band the left column
-/// flows before the right.
-pub fn layout(spans: &[TextSpan]) -> String {
-    Text.render(&[page_layout(spans)])
+/// Groups spans into lines (baselines within `0.5 · size`), inserts a space
+/// at horizontal gaps wider than `WORD_GAP` times the size, and joins lines
+/// with `\n`, the lines in the [`ReadingOrder`] given: the content stream's
+/// flows corrected by geometry, the structure tree's order as the extractor
+/// settled it, or position alone. A page with a clear two-column gutter
+/// reads column-major under the first and the last: full-width separators
+/// split it into bands, and within each band the left column flows before
+/// the right.
+pub fn layout(spans: &[TextSpan], order: ReadingOrder) -> String {
+    Text.render(&[page_layout(spans, order)])
 }
 
 /// The page's spans as structure, ranking heading sizes against this page
 /// alone. Prefer [`document_layout`] whenever the whole document is at
 /// hand: a page of nothing but large type has no body size of its own.
-pub fn page_layout(spans: &[TextSpan]) -> PageLayout {
-    page_layout_with_rulings(spans, &[])
+///
+/// `order` is the order the spans are in: the extraction report's, for a
+/// [`ReadingOrder::StructureTree`] request that fell back to content order
+/// on a page the tree does not reach.
+pub fn page_layout(spans: &[TextSpan], order: ReadingOrder) -> PageLayout {
+    page_layout_with_rulings(spans, &[], order)
 }
 
 /// [`page_layout`] with the page's rulings: a lattice of drawn borders is
 /// read as a table ahead of lane occupancy. With no rulings the two are the
 /// same function.
-pub fn page_layout_with_rulings(spans: &[TextSpan], rulings: &[Ruling]) -> PageLayout {
-    page_layout_with_stats(spans, rulings, &size_stats(&[spans]))
+pub fn page_layout_with_rulings(
+    spans: &[TextSpan],
+    rulings: &[Ruling],
+    order: ReadingOrder,
+) -> PageLayout {
+    page_layout_with_stats(spans, rulings, &size_stats(&[spans]), order)
 }
 
 /// Every page's spans as structure, ranking heading sizes against the whole
-/// document, so one oversized page cannot redefine what body text is.
-pub fn document_layout(pages: &[Vec<TextSpan>]) -> Vec<PageLayout> {
-    let paired: Vec<(&[TextSpan], &[Ruling])> = pages
+/// document, so one oversized page cannot redefine what body text is. Each
+/// page carries its own order, since a tagged document's untagged pages
+/// come out in content order beside their tagged neighbours.
+pub fn document_layout(pages: &[(Vec<TextSpan>, ReadingOrder)]) -> Vec<PageLayout> {
+    let paired: Vec<(&[TextSpan], &[Ruling], ReadingOrder)> = pages
         .iter()
-        .map(|spans| (spans.as_slice(), &[][..]))
+        .map(|(spans, order)| (spans.as_slice(), &[][..], *order))
         .collect();
     layouts_of(&paired)
 }
 
 /// [`document_layout`] with each page's rulings, so drawn grids become
 /// tables document-wide. With no rulings the two are the same function.
-pub fn document_layout_with_rulings(pages: &[(Vec<TextSpan>, Vec<Ruling>)]) -> Vec<PageLayout> {
-    let paired: Vec<(&[TextSpan], &[Ruling])> = pages
+pub fn document_layout_with_rulings(
+    pages: &[(Vec<TextSpan>, Vec<Ruling>, ReadingOrder)],
+) -> Vec<PageLayout> {
+    let paired: Vec<(&[TextSpan], &[Ruling], ReadingOrder)> = pages
         .iter()
-        .map(|(spans, rulings)| (spans.as_slice(), rulings.as_slice()))
+        .map(|(spans, rulings, order)| (spans.as_slice(), rulings.as_slice(), *order))
         .collect();
     layouts_of(&paired)
 }
 
 /// Every page's layout over shared document-wide size statistics.
-fn layouts_of(pages: &[(&[TextSpan], &[Ruling])]) -> Vec<PageLayout> {
-    let borrowed: Vec<&[TextSpan]> = pages.iter().map(|(spans, _)| *spans).collect();
+fn layouts_of(pages: &[(&[TextSpan], &[Ruling], ReadingOrder)]) -> Vec<PageLayout> {
+    let borrowed: Vec<&[TextSpan]> = pages.iter().map(|(spans, _, _)| *spans).collect();
     let stats = size_stats(&borrowed);
     let mut layouts: Vec<PageLayout> = pages
         .iter()
-        .map(|(spans, rulings)| page_layout_with_stats(spans, rulings, &stats))
+        .map(|(spans, rulings, order)| page_layout_with_stats(spans, rulings, &stats, *order))
         .collect();
     tag_page_roles(&mut layouts);
     layouts
@@ -384,11 +398,16 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
 /// dropped — which is what keeps the [`Text`] adapter byte-equal to
 /// positional extraction. A drawn grid's bands merge into logical rows,
 /// which preserves every token but reads cell-major.
-fn page_layout_with_stats(spans: &[TextSpan], rulings: &[Ruling], stats: &SizeStats) -> PageLayout {
+fn page_layout_with_stats(
+    spans: &[TextSpan],
+    rulings: &[Ruling],
+    stats: &SizeStats,
+    order: ReadingOrder,
+) -> PageLayout {
     let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
-    for segment in segments(spans) {
-        push_segment_blocks(segment, &grids, stats, &mut blocks);
+    for segment in segments(spans, order) {
+        push_segment_blocks(segment, &grids, stats, order, &mut blocks);
     }
     PageLayout { blocks }
 }
@@ -402,6 +421,7 @@ fn push_segment_blocks(
     segment: Segment<'_>,
     grids: &[RuledGrid],
     stats: &SizeStats,
+    order: ReadingOrder,
     out: &mut Vec<Block>,
 ) {
     let groups = segment.into_groups();
@@ -416,14 +436,14 @@ fn push_segment_blocks(
     }
     let mut next = 0usize;
     for claim in claims {
-        push_stretch(&groups[next..claim.range.start], stats, out);
+        push_stretch(&groups[next..claim.range.start], stats, order, out);
         out.push(Block::Table {
             bbox: claim.bbox,
             rows: claim.rows,
         });
         next = claim.range.end;
     }
-    push_stretch(&groups[next..], stats, out);
+    push_stretch(&groups[next..], stats, order, out);
 }
 
 /// The lane path: one [`table_band`] attempt over the segment's line
@@ -441,10 +461,17 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     push_blocks(band.below, stats, out);
 }
 
-/// A remainder stretch between grid claims, back as spans and regrouped,
-/// through the same lane attempt a whole segment gets.
-fn push_stretch(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+/// A remainder stretch between grid claims, through the same lane attempt
+/// a whole segment gets. Under the two orders that group lines by position
+/// the stretch goes back to spans and is regrouped, so lines the grid's
+/// rows once kept apart may join; under structure-tree order the groups
+/// stay the segment's own, so the lines stay where the tree put them.
+fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &mut Vec<Block>) {
     if groups.is_empty() {
+        return;
+    }
+    if order == ReadingOrder::StructureTree {
+        push_lane_blocks(groups, stats, out);
         return;
     }
     let spans: Vec<&TextSpan> = groups
@@ -1805,24 +1832,85 @@ impl<'s> Segment<'s> {
     }
 }
 
-/// The page's spans in reading order, cut into segments: the content
-/// stream's flows first, each then split at its gutter when it has one.
+/// The page's spans in reading order, cut into segments, by one of three
+/// builders chosen once per page: [`content_segments`],
+/// [`structure_segments`] or [`geometric_segments`].
+///
+/// Lanes are not carried out: a table is looked for inside a segment, over
+/// its own rows, because a page's lanes are whatever every line on it leaves
+/// clear together, which is nothing as soon as one line runs the full width.
+fn segments(spans: &[TextSpan], order: ReadingOrder) -> Vec<Segment<'_>> {
+    match order {
+        ReadingOrder::Content => content_segments(spans),
+        ReadingOrder::StructureTree => structure_segments(spans),
+        ReadingOrder::Geometric => geometric_segments(spans),
+    }
+}
+
+/// Content order: the content stream's flows first, each then split at its
+/// gutter when it has one.
 ///
 /// Content order is the order the producer wrote and, in a typeset
 /// document, the order it meant: a column is emitted whole before the next
 /// begins. Geometry corrects the streams that write across two columns row
 /// by row, and takes over entirely when content order fragments into no
 /// order at all (see [`flows`]).
-///
-/// Lanes are not carried out: a table is looked for inside a segment, over
-/// its own rows, because a page's lanes are whatever every line on it leaves
-/// clear together, which is nothing as soon as one line runs the full width.
-fn segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
+fn content_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
     flows(spans)
         .into_iter()
         .flat_map(gutter_split)
         .filter(|segment| !segment.spans.is_empty())
         .collect()
+}
+
+/// Structure-tree order: one segment holding the spans as they came,
+/// grouped into lines as they come (see [`sequential_groups`]). The
+/// extractor already put them in the tree's order; nothing here moves a
+/// line, so a column the tree reads whole stays whole however the page
+/// looks.
+fn structure_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    vec![Segment {
+        spans: spans.iter().collect(),
+        groups: Some(sequential_groups(spans)),
+    }]
+}
+
+/// Geometric order: the whole page as one flow split at its gutter, lines
+/// top to bottom inside each band: position alone, the order a content
+/// stream written in no order at all falls back to.
+fn geometric_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
+    gutter_split(spans.iter().collect())
+        .into_iter()
+        .filter(|segment| !segment.spans.is_empty())
+        .collect()
+}
+
+/// Lines from spans in a settled order: a span joins the line before it
+/// when it sits on that line (see [`same_line`]) and opens a new one
+/// otherwise, so lines stay in the order their first spans came. Spans
+/// sort left to right inside each line, as [`line_groups`] sorts them.
+fn sequential_groups(spans: &[TextSpan]) -> Vec<Group<'_>> {
+    let mut groups: Vec<Group> = Vec::new();
+    for span in spans {
+        match groups.last_mut() {
+            Some(line) if same_line(line.y, line.size, span) => {
+                line.size = line.size.max(span.size);
+                line.spans.push(span);
+            }
+            _ => groups.push(Group {
+                y: span.y,
+                size: span.size,
+                spans: vec![span],
+            }),
+        }
+    }
+    for group in &mut groups {
+        group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+    }
+    groups
 }
 
 /// The content stream's flows: runs of consecutive spans whose baselines
@@ -2136,30 +2224,40 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
 /// between — lanes and tables included, which it knows nothing about. Any
 /// divergence is a parity bug in the IR or the [`Text`] adapter.
 #[cfg(test)]
-pub(crate) fn layout_reference(spans: &[TextSpan]) -> String {
+pub(crate) fn layout_reference(spans: &[TextSpan], order: ReadingOrder) -> String {
     let mut out = String::new();
-    for segment in segments(spans) {
+    for segment in segments(spans, order) {
         if !out.is_empty() {
             out.push('\n');
         }
-        flow(&segment.spans, &mut out);
+        flow(&segment.spans, order, &mut out);
     }
     out
 }
 
-/// Lays one reading-order segment out into lines, appending to `out`.
+/// Lays one reading-order segment out into lines, appending to `out`: any
+/// span joins any line it sits on and lines sort top of page first, except
+/// under structure-tree order, where a span joins only the line before it
+/// and lines stay as they came.
 #[cfg(test)]
-fn flow(spans: &[&TextSpan], out: &mut String) {
+fn flow(spans: &[&TextSpan], order: ReadingOrder, out: &mut String) {
     struct Group<'s> {
         y: f32,
         size: f32,
         spans: Vec<&'s TextSpan>,
     }
+    let sequential = order == ReadingOrder::StructureTree;
     let mut lines: Vec<Group> = Vec::new();
     for &span in spans {
-        let found = lines
-            .iter_mut()
-            .find(|line| same_line(line.y, line.size, span));
+        let found = if sequential {
+            lines
+                .last_mut()
+                .filter(|line| same_line(line.y, line.size, span))
+        } else {
+            lines
+                .iter_mut()
+                .find(|line| same_line(line.y, line.size, span))
+        };
         match found {
             Some(line) => {
                 line.size = line.size.max(span.size);
@@ -2172,7 +2270,9 @@ fn flow(spans: &[&TextSpan], out: &mut String) {
             }),
         }
     }
-    lines.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
+    if !sequential {
+        lines.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
+    }
     for (i, line) in lines.iter_mut().enumerate() {
         if i > 0 {
             out.push('\n');
@@ -2445,7 +2545,8 @@ pub(crate) mod tests {
     /// The page's spans, asserting the extraction report is complete: no
     /// test here expects to lose content.
     fn page_spans(doc: &Document, page: &pdfboss_core::Page) -> Vec<TextSpan> {
-        let (spans, report) = pdfboss_text::extract_spans_reporting(doc, page).unwrap();
+        let (spans, report) =
+            pdfboss_text::extract_spans_reporting(doc, page, ReadingOrder::Content).unwrap();
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         spans
     }
@@ -2455,7 +2556,7 @@ pub(crate) mod tests {
     fn text_of(content: &str) -> String {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
-        layout(&page_spans(&doc, &page))
+        layout(&page_spans(&doc, &page), ReadingOrder::Content)
     }
 
     #[test]

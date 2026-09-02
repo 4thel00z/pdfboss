@@ -2,11 +2,11 @@
 //! Ts), glyph advances, and form XObject recursion.
 
 use crate::font::Font;
-use crate::{Ruling, TextSpan};
+use crate::{ReadingOrder, Ruling, TextSpan};
 use pdfboss_core::content::{ContentOps, Op, TextItem};
 use pdfboss_core::{
-    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, Matrix, Name,
-    ObjRef, Object, OcState, Page, Point, Rect,
+    content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, MarkedContentId,
+    Matrix, Name, ObjRef, Object, OcState, Page, Point, Rect, StructureTree,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,12 @@ pub struct ExtractReport {
     /// cannot balloon `skipped`. Configured behavior, not a loss:
     /// [`ExtractReport::is_complete`] ignores it.
     pub hidden: u64,
+    /// The order the spans came out in: the order requested, except that
+    /// [`ReadingOrder::StructureTree`] falls back to
+    /// [`ReadingOrder::Content`] on a page the structure tree does not reach
+    /// (no tree, no parent-tree entry, no marked content), so the two read
+    /// the same there.
+    pub order: ReadingOrder,
 }
 
 impl ExtractReport {
@@ -187,9 +193,82 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
     page: &Page,
     fonts: Option<&FontCache>,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
-    let mut report = ExtractReport::default();
-    let content = match page_content_with(&src, page).await {
+    match order {
+        ReadingOrder::Content => content_order_with(src, page, fonts, oc).await,
+        ReadingOrder::StructureTree => {
+            structure_tree_order_with(src, page, fonts, oc, structure).await
+        }
+        ReadingOrder::Geometric => geometric_order_with(src, page, fonts, oc).await,
+    }
+}
+
+/// The page's spans as the content stream emits them: the walk with no
+/// marked-content recording compiled in.
+async fn content_order_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: Option<&FontCache>,
+    oc: Option<&OcState>,
+) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
+    let (spans, rulings, report, Ignored) =
+        walk_with::<S, Ignored>(&src, page, fonts, oc, ReadingOrder::Content).await;
+    (spans, rulings, report)
+}
+
+/// The same spans as [`content_order_with`], tagged for geometric layout:
+/// ordering by position is the layout stage's work, the extraction is the
+/// content-order walk.
+async fn geometric_order_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: Option<&FontCache>,
+    oc: Option<&OcState>,
+) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
+    let (spans, rulings, report, Ignored) =
+        walk_with::<S, Ignored>(&src, page, fonts, oc, ReadingOrder::Geometric).await;
+    (spans, rulings, report)
+}
+
+/// The page's spans in structure-tree order: the walk that records each
+/// span's marked-content sequence, then the reorder by the tree's ranks.
+/// With no tree, or a page the tree does not reach, the spans stay in
+/// content order and the report says so.
+async fn structure_tree_order_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: Option<&FontCache>,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
+    let Some(tree) = structure else {
+        return content_order_with(src, page, fonts, oc).await;
+    };
+    let (mut spans, rulings, mut report, recorded) =
+        walk_with::<S, Recorded>(&src, page, fonts, oc, ReadingOrder::Content).await;
+    if structure_order(&src, tree, page, &mut spans, &recorded.ids).await {
+        report.order = ReadingOrder::StructureTree;
+    }
+    (spans, rulings, report)
+}
+
+/// One page walk, compiled once per [`MarkedContent`] strategy: the
+/// executor over the page's content and every form it invokes, then the
+/// underline and strikethrough pass over the rulings it drew.
+async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
+    src: &S,
+    page: &Page,
+    fonts: Option<&FontCache>,
+    oc: Option<&OcState>,
+    order: ReadingOrder,
+) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport, M) {
+    let mut report = ExtractReport {
+        order,
+        ..ExtractReport::default()
+    };
+    let content = match page_content_with(src, page).await {
         Ok(content) => content,
         Err(e) => {
             report.record(SkippedTextKind::PageContents, cause_for(&e));
@@ -197,7 +276,7 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         }
     };
     let mut exec = Executor {
-        src: &src,
+        src,
         spans: Vec::new(),
         rulings: Vec::new(),
         fallback: Arc::new(Font::fallback()),
@@ -207,6 +286,7 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         shared: fonts,
         oc,
         categories: FastMap::default(),
+        marks: M::default(),
     };
     let root = Frame::new(
         Arc::new(content),
@@ -214,6 +294,7 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         GState::new(),
         0,
         (0, 0),
+        M::parents_of(page.dict()),
     );
     exec.run(root).await;
     let mut spans = exec.spans;
@@ -236,7 +317,96 @@ pub async fn page_spans_and_rulings_with<S: AsyncObjectSource>(
         }
     }
     drop(horizontals);
-    (spans, exec.rulings, exec.report)
+    (spans, exec.rulings, exec.report, exec.marks)
+}
+
+/// What a page walk does with marked content, fixed when the walk is
+/// compiled: the content-order walk ignores it and pays nothing per
+/// operator, the structure-tree walk records each span's sequence.
+trait MarkedContent: Default {
+    /// Whether `BDC` reads its `/MCID`. A constant, so the operator loop
+    /// carries no check at run time.
+    const READS_MCID: bool;
+    /// The `/StructParents` key a content stream files its sequences under.
+    fn parents_of(dict: &Dict) -> Option<u32>;
+    /// Notes the sequence the span just emitted came from.
+    fn record(&mut self, frame: &Frame);
+    /// Drops the notes for the spans a failed stream took back.
+    fn truncate(&mut self, len: usize);
+}
+
+/// Marked content ignored: the content-order walk.
+#[derive(Default)]
+struct Ignored;
+
+impl MarkedContent for Ignored {
+    const READS_MCID: bool = false;
+
+    fn parents_of(_: &Dict) -> Option<u32> {
+        None
+    }
+
+    fn record(&mut self, _: &Frame) {}
+
+    fn truncate(&mut self, _: usize) {}
+}
+
+/// Each emitted span's marked-content sequence, parallel to the executor's
+/// spans: the structure-tree walk.
+#[derive(Default)]
+struct Recorded {
+    ids: Vec<Option<MarkedContentId>>,
+}
+
+impl MarkedContent for Recorded {
+    const READS_MCID: bool = true;
+
+    fn parents_of(dict: &Dict) -> Option<u32> {
+        u32::try_from(dict.get_int("StructParents")?).ok()
+    }
+
+    fn record(&mut self, frame: &Frame) {
+        self.ids.push(frame.marked_content());
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.ids.truncate(len);
+    }
+}
+
+/// Reorders `spans` into structure-tree order, `marks` being each span's
+/// marked-content sequence: a tagged span sorts by its sequence's rank in
+/// the tree, an untagged one keeps its place after the last tagged span
+/// before it (a running header written first stays first, an artifact
+/// written between two paragraphs stays between them). Stable, so spans
+/// within one sequence keep content order. `false` when the tree reaches
+/// none of the page's marked content, leaving the spans as they were.
+async fn structure_order<S: AsyncObjectSource>(
+    src: &S,
+    tree: &StructureTree,
+    page: &Page,
+    spans: &mut Vec<TextSpan>,
+    marks: &[Option<MarkedContentId>],
+) -> bool {
+    let ids: Vec<MarkedContentId> = marks.iter().flatten().copied().collect();
+    if ids.is_empty() {
+        return false;
+    }
+    let ranks = tree.ranks_with(src, page, &ids).await;
+    if ranks.is_empty() {
+        return false;
+    }
+    let mut keyed: Vec<(i64, TextSpan)> = Vec::with_capacity(spans.len());
+    let mut current: i64 = -1;
+    for (span, mark) in spans.drain(..).zip(marks) {
+        if let Some(rank) = mark.and_then(|id| ranks.get(&id)) {
+            current = i64::from(*rank);
+        }
+        keyed.push((current, span));
+    }
+    keyed.sort_by_key(|(key, _)| *key);
+    spans.extend(keyed.into_iter().map(|(_, span)| span));
+    true
 }
 
 /// How far below the baseline (in fractions of the effective size) an
@@ -506,11 +676,22 @@ struct Frame {
     /// Loaded fonts, per operator stream: every form invocation starts with an
     /// empty cache, as it did when each invocation was its own `run` call.
     fonts: HashMap<String, Arc<Font>>,
-    /// The marked-content stack: one entry per open `BMC`/`BDC`, `true` for
-    /// a `BDC /OC` span the optional-content configuration hides. Per frame
+    /// The marked-content stack: one entry per open `BMC`/`BDC`. Per frame
     /// like `tm`/`tlm` — `BMC`/`EMC` nesting is not `q`/`Q` scoped and never
     /// crosses a stream boundary. A stray `EMC` pops nothing.
-    marks: Vec<bool>,
+    marks: Vec<Mark>,
+    /// The `/StructParents` key of this content stream: the page's, or a
+    /// form XObject's own when it declares one, else its caller's.
+    parents: Option<u32>,
+}
+
+/// One open marked-content sequence: whether a `BDC /OC` span the
+/// optional-content configuration hides, and its `/MCID` when the walk is
+/// tracking marked content for the structure tree.
+#[derive(Clone, Copy)]
+struct Mark {
+    hidden: bool,
+    mcid: Option<u32>,
 }
 
 impl Frame {
@@ -520,6 +701,7 @@ impl Frame {
         gs: GState,
         depth: usize,
         (spans_mark, rulings_mark): (usize, usize),
+        parents: Option<u32>,
     ) -> Frame {
         Frame {
             content,
@@ -535,6 +717,7 @@ impl Frame {
             subpaths: Vec::new(),
             fonts: HashMap::new(),
             marks: Vec::new(),
+            parents,
         }
     }
 
@@ -542,7 +725,17 @@ impl Frame {
     /// optional-content configuration hides: state still executes, but the
     /// span's text and rulings are excluded from the result.
     fn suppressed(&self) -> bool {
-        self.marks.iter().any(|hidden| *hidden)
+        self.marks.iter().any(|mark| mark.hidden)
+    }
+
+    /// The marked-content sequence the frame is inside: the innermost open
+    /// mark carrying an `/MCID`, under this stream's `/StructParents` key.
+    /// `None` outside any sequence, or when the stream has no key to file
+    /// the sequence under.
+    fn marked_content(&self) -> Option<MarkedContentId> {
+        let parents = self.parents?;
+        let mcid = self.marks.iter().rev().find_map(|mark| mark.mcid)?;
+        Some(MarkedContentId { parents, mcid })
     }
 
     fn move_to(&mut self, x: f32, y: f32) {
@@ -601,7 +794,7 @@ impl Frame {
     }
 }
 
-struct Executor<'a, S> {
+struct Executor<'a, S, M> {
     src: &'a S,
     spans: Vec<TextSpan>,
     rulings: Vec<Ruling>,
@@ -631,6 +824,8 @@ struct Executor<'a, S> {
     /// the resource dictionary's allocation alive, so the address cannot be
     /// reused while its entry exists. See [`MAX_CATEGORY_CACHE`].
     categories: FastMap<(usize, u8), ResolvedCategory>,
+    /// The walk's marked-content strategy (see [`MarkedContent`]).
+    marks: M,
 }
 
 /// One memoized resource category: the resource dictionary whose allocation
@@ -653,7 +848,7 @@ fn category_slot(category: &str) -> Option<u8> {
     }
 }
 
-impl<S: AsyncObjectSource> Executor<'_, S> {
+impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// Looks up `/category/name` in the resource chain, innermost dictionary
     /// first (ISO 32000 §7.8.3).
     ///
@@ -822,6 +1017,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         // nothing, exactly as it contributed nothing when
                         // the whole stream was parsed up front.
                         self.spans.truncate(frame.spans_mark);
+                        self.marks.truncate(frame.spans_mark);
                         self.rulings.truncate(frame.rulings_mark);
                         let kind = if frame.depth == 0 {
                             SkippedTextKind::PageContents
@@ -851,7 +1047,13 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                             continue;
                         }
                         let entered = self
-                            .form_frame(&name.0, &frame.chain, &frame.gs, frame.depth)
+                            .form_frame(
+                                &name.0,
+                                &frame.chain,
+                                &frame.gs,
+                                frame.depth,
+                                frame.parents,
+                            )
                             .await;
                         if let Some(child) = entered {
                             // The caller goes back underneath its form: the form
@@ -869,7 +1071,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         if hidden {
                             self.report.hidden += 1;
                         }
-                        frame.marks.push(hidden);
+                        let mcid = if M::READS_MCID {
+                            self.marked_mcid(props, &frame.chain).await
+                        } else {
+                            None
+                        };
+                        frame.marks.push(Mark { hidden, mcid });
                     }
                     op => self.step(&mut frame, op),
                 }
@@ -1009,7 +1216,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             Op::EndPath => frame.subpaths.clear(),
             // Marked content: every open is pushed (hidden or not) so `EMC`
             // stays balanced; `BDC` needs I/O and is handled in `run`.
-            Op::BeginMarkedContent(_) => frame.marks.push(false),
+            Op::BeginMarkedContent(_) => frame.marks.push(Mark {
+                hidden: false,
+                mcid: None,
+            }),
             Op::EndMarkedContent => {
                 frame.marks.pop();
             }
@@ -1033,6 +1243,21 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             return false;
         }
         !oc.props_visible_with(self.src, chain, props).await
+    }
+
+    /// The `/MCID` a `BDC` opens: read from an inline property dictionary,
+    /// or from the named one in the resource chain's `/Properties`.
+    async fn marked_mcid(&mut self, props: &Object, chain: &[Arc<Dict>]) -> Option<u32> {
+        let named;
+        let dict = match props {
+            Object::Dict(dict) => dict,
+            Object::Name(name) => {
+                named = self.find_res(chain, "Properties", &name.0).await?;
+                named.as_dict()?
+            }
+            _ => return None,
+        };
+        u32::try_from(dict.get_int("MCID")?).ok()
     }
 
     /// Commits the accumulated path on a painting operator and clears it.
@@ -1080,6 +1305,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(span) = self.show(&frame.gs, &mut frame.tm, bytes) {
             if !suppressed {
                 self.spans.push(span);
+                self.marks.record(frame);
             }
         }
     }
@@ -1186,6 +1412,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         chain: &[Arc<Dict>],
         gs: &GState,
         depth: usize,
+        parents: Option<u32>,
     ) -> Option<Frame> {
         if depth >= MAX_FORM_DEPTH || self.forms >= MAX_FORM_INVOCATIONS {
             self.report
@@ -1253,12 +1480,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if let Some(m) = self.form_matrix(&stream.dict).await {
             inner.ctm = m.concat(inner.ctm);
         }
+        // A form declaring its own `/StructParents` files its marked content
+        // under that key (ISO 32000-1 §14.7.4.4); one without inherits its
+        // caller's.
         Some(Frame::new(
             Arc::new(data),
             inner_chain,
             inner,
             depth + 1,
             (self.spans.len(), self.rulings.len()),
+            M::parents_of(&stream.dict).or(parents),
         ))
     }
 
@@ -1324,6 +1555,8 @@ mod tests {
             page,
             None,
             oc.as_ref(),
+            None,
+            ReadingOrder::Content,
         ))
     }
 
@@ -1579,6 +1812,8 @@ mod tests {
             &page,
             None,
             None,
+            None,
+            ReadingOrder::Content,
         ));
         assert!(!spans.is_empty()); // nested forms still extract text
         assert!(

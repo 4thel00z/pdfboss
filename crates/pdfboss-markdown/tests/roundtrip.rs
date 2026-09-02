@@ -19,7 +19,9 @@ fn structure_survives_the_round_trip() {
     assert!(report.is_empty(), "{}", report.summary());
     let bytes = pdf.to_bytes().unwrap();
     let doc = Document::load(bytes).unwrap();
-    let (md, _) = pdfboss_output::extract_markdown_reporting(&doc).unwrap();
+    let (md, _) =
+        pdfboss_output::extract_markdown_reporting(&doc, pdfboss_output::ReadingOrder::Content)
+            .unwrap();
     assert!(md.contains("Title"));
     assert!(md.contains("bold"));
     assert!(md.contains("let x = 1;"));

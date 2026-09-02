@@ -1387,6 +1387,14 @@ impl AsyncDocument {
         pdfboss_core::OcState::load_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The document's structure tree (ISO 32000-1 §14.7), or `None` when the
+    /// catalog names no `/StructTreeRoot`: the async twin of the sync
+    /// document's `structure_tree()`, read over range fetches. Pass it to
+    /// the `_with` extraction entry points for structure-tree reading order.
+    pub async fn structure_tree(&self) -> Option<pdfboss_core::StructureTree> {
+        pdfboss_core::StructureTree::load_with(self, &self.inner.xref.trailer).await
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.
@@ -1401,7 +1409,7 @@ impl AsyncDocument {
     /// because everything it needs is already resolved.
     ///
     /// With a `Page` in hand, every shared algorithm runs over this
-    /// document directly: `extract_text_with(doc.clone(), &page)`,
+    /// document directly: `extract_text_with(doc.clone(), &page, ..)`,
     /// `render_page_reporting_with(doc.clone(), &page, ..)`, and
     /// `page_content_with(&doc, &page)` — the document is an `Arc` handle,
     /// so the clone is two atomic increments.

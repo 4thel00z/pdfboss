@@ -6,10 +6,80 @@ mod extract;
 mod font;
 mod sfnt;
 
-use pdfboss_core::{block_on, AsyncObjectSource, Document, Immediate, OcState, Page, Result};
+use pdfboss_core::{
+    block_on, AsyncObjectSource, Document, Error, Immediate, OcState, Page, Result, StructureTree,
+};
 
 pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
-pub use pdfboss_core::{Point, Rect};
+pub use pdfboss_core::{MarkedContentId, Point, Rect};
+
+/// The order a page's text is read in. Every extraction entry point takes
+/// one; [`ReadingOrder::Content`] is the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ReadingOrder {
+    /// The content stream's order: what the producer wrote, which in a
+    /// typeset document is the order it meant, each column whole before
+    /// the next. Layout corrects the streams that write across two columns
+    /// row by row and takes over on a page not written in any order.
+    #[default]
+    Content,
+    /// The structure tree's order (ISO 32000-1 §14.7) on a tagged page: the
+    /// reading order the author declared, `/MarkInfo` notwithstanding. A
+    /// page the tree does not reach reads in content order.
+    StructureTree,
+    /// Position on the page: lines top to bottom, spans left to right, a
+    /// page with a clear gutter column by column. Interleaves the columns
+    /// of a two-column page the gutter search does not find; opt in only.
+    Geometric,
+}
+
+impl ReadingOrder {
+    /// Every order, in the order they are documented.
+    pub const ALL: [ReadingOrder; 3] = [
+        ReadingOrder::Content,
+        ReadingOrder::StructureTree,
+        ReadingOrder::Geometric,
+    ];
+
+    /// The order's name, `content`, `structure-tree` or `geometric`: what
+    /// [`FromStr`](std::str::FromStr) accepts and [`Display`](std::fmt::Display) prints.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReadingOrder::Content => "content",
+            ReadingOrder::StructureTree => "structure-tree",
+            ReadingOrder::Geometric => "geometric",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadingOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReadingOrder {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<ReadingOrder> {
+        ReadingOrder::ALL
+            .into_iter()
+            .find(|order| order.as_str() == s)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "unknown reading order {s:?}: expected 'content', 'structure-tree' or 'geometric'"
+                ))
+            })
+    }
+}
+
+/// The structure tree, loaded only when `order` reads by it.
+fn structure_for(doc: &Document, order: ReadingOrder) -> Option<StructureTree> {
+    match order {
+        ReadingOrder::StructureTree => doc.structure_tree(),
+        _ => None,
+    }
+}
 
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
@@ -91,7 +161,11 @@ pub struct Ruling {
     pub width: f32,
 }
 
-/// Extracts the page's raw text spans (position, size and font per span).
+/// Extracts the page's raw text spans (position, size and font per span) in
+/// the given [`ReadingOrder`]: as the content stream emits them for
+/// [`ReadingOrder::Content`] and [`ReadingOrder::Geometric`] (position
+/// sorting is the layout stage's work), by the structure tree for
+/// [`ReadingOrder::StructureTree`] on a tagged page.
 ///
 /// Lenient the way rendering is: content that will not fetch, decode, or
 /// parse yields no spans rather than an error, so one unreadable stream
@@ -103,13 +177,16 @@ pub struct Ruling {
 /// [`ExtractReport::hidden`]. The document-level entry points here read
 /// that configuration themselves; the source-generic `_with` twins take it
 /// as their `oc` parameter (`None` extracts every layer).
-pub fn extract_spans(doc: &Document, page: &Page) -> Result<Vec<TextSpan>> {
+pub fn extract_spans(doc: &Document, page: &Page, order: ReadingOrder) -> Result<Vec<TextSpan>> {
     let oc = doc.oc_state();
+    let structure = structure_for(doc, order);
     let (spans, _, _) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
         None,
         oc.as_ref(),
+        structure.as_ref(),
+        order,
     ));
     Ok(spans)
 }
@@ -122,7 +199,10 @@ pub fn extract_spans(doc: &Document, page: &Page) -> Result<Vec<TextSpan>> {
 /// optional-content visibility — `Document::oc_state` sync, the async
 /// document's `oc_state()` over a range-fetching source — and gates hidden
 /// layers exactly as the document-level entry does; `None` extracts every
-/// layer.
+/// layer. `structure` is the document's structure tree
+/// (`Document::structure_tree`, or the async document's
+/// `structure_tree()`), read only under [`ReadingOrder::StructureTree`];
+/// `None` there reads every page in content order.
 ///
 /// The source is taken by value and the page by reference. That combination is
 /// what a consumer needs to spawn the result: the future is `Send` over a source
@@ -133,8 +213,11 @@ pub async fn extract_spans_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<Vec<TextSpan>> {
-    let (spans, _, _) = extract::page_spans_and_rulings_with(src, page, None, oc).await;
+    let (spans, _, _) =
+        extract::page_spans_and_rulings_with(src, page, None, oc, structure, order).await;
     Ok(spans)
 }
 
@@ -146,13 +229,17 @@ pub async fn extract_spans_with<S: AsyncObjectSource>(
 pub fn extract_spans_reporting(
     doc: &Document,
     page: &Page,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
     let oc = doc.oc_state();
+    let structure = structure_for(doc, order);
     let (spans, _, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
         None,
         oc.as_ref(),
+        structure.as_ref(),
+        order,
     ));
     Ok((spans, report))
 }
@@ -163,8 +250,11 @@ pub async fn extract_spans_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, None, oc).await;
+    let (spans, _, report) =
+        extract::page_spans_and_rulings_with(src, page, None, oc, structure, order).await;
     Ok((spans, report))
 }
 
@@ -182,13 +272,17 @@ pub fn extract_spans_reporting_cached(
     doc: &Document,
     page: &Page,
     fonts: &FontCache,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
     let oc = doc.oc_state();
+    let structure = structure_for(doc, order);
     let (spans, _, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
         Some(fonts),
         oc.as_ref(),
+        structure.as_ref(),
+        order,
     ));
     Ok((spans, report))
 }
@@ -200,8 +294,11 @@ pub async fn extract_spans_reporting_cached_with<S: AsyncObjectSource>(
     page: &Page,
     fonts: &FontCache,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, ExtractReport)> {
-    let (spans, _, report) = extract::page_spans_and_rulings_with(src, page, Some(fonts), oc).await;
+    let (spans, _, report) =
+        extract::page_spans_and_rulings_with(src, page, Some(fonts), oc, structure, order).await;
     Ok((spans, report))
 }
 
@@ -212,13 +309,17 @@ pub async fn extract_spans_reporting_cached_with<S: AsyncObjectSource>(
 pub fn extract_spans_and_rulings_reporting(
     doc: &Document,
     page: &Page,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
     let oc = doc.oc_state();
+    let structure = structure_for(doc, order);
     let (spans, rulings, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
         None,
         oc.as_ref(),
+        structure.as_ref(),
+        order,
     ));
     Ok((spans, rulings, report))
 }
@@ -229,8 +330,11 @@ pub async fn extract_spans_and_rulings_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
-    let (spans, rulings, report) = extract::page_spans_and_rulings_with(src, page, None, oc).await;
+    let (spans, rulings, report) =
+        extract::page_spans_and_rulings_with(src, page, None, oc, structure, order).await;
     Ok((spans, rulings, report))
 }
 
@@ -244,13 +348,17 @@ pub fn extract_spans_and_rulings_reporting_cached(
     doc: &Document,
     page: &Page,
     fonts: &FontCache,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
     let oc = doc.oc_state();
+    let structure = structure_for(doc, order);
     let (spans, rulings, report) = block_on(extract::page_spans_and_rulings_with(
         Immediate(doc),
         page,
         Some(fonts),
         oc.as_ref(),
+        structure.as_ref(),
+        order,
     ));
     Ok((spans, rulings, report))
 }
@@ -263,9 +371,11 @@ pub async fn extract_spans_and_rulings_reporting_cached_with<S: AsyncObjectSourc
     page: &Page,
     fonts: &FontCache,
     oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
 ) -> Result<(Vec<TextSpan>, Vec<Ruling>, ExtractReport)> {
     let (spans, rulings, report) =
-        extract::page_spans_and_rulings_with(src, page, Some(fonts), oc).await;
+        extract::page_spans_and_rulings_with(src, page, Some(fonts), oc, structure, order).await;
     Ok((spans, rulings, report))
 }
 
@@ -306,7 +416,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans.len(), 2);
         assert!((spans[1].y - 700.0).abs() < 1e-3); // form matrix applied
     }
@@ -315,7 +425,7 @@ mod tests {
     fn extract_spans_sane_positions() {
         let doc = Document::load(simple_doc("Hi")).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans.len(), 1);
         let s = &spans[0];
         assert_eq!(s.text, "Hi");
@@ -334,7 +444,8 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let (spans, rulings, report) = extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+        let (spans, rulings, report) =
+            extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].text, "Hi");
         assert_eq!(rulings.len(), 1);
@@ -349,7 +460,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans.len(), 2);
         assert!(spans[0].y > spans[1].y);
         assert_eq!(spans[0].text, "top");
@@ -377,7 +488,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].font_name, "ABCDEF+Times-Roman");
         assert_eq!(spans[0].font, "F1");
     }
@@ -408,7 +519,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].font_name, "Nameless-Face");
         assert_eq!(spans[1].font_name, "");
     }
@@ -439,7 +550,7 @@ mod tests {
         let doc = Document::load(b.build(1)).unwrap();
         for index in 0..2 {
             let page = doc.page(index).unwrap();
-            let spans = extract_spans(&doc, &page).unwrap();
+            let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
             assert_eq!(spans[0].page, index, "page {index}");
         }
     }
@@ -469,7 +580,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         let s = &spans[0];
         assert!((s.bbox.x0 - s.x).abs() < 1e-3);
         assert!((s.bbox.x1 - s.end_x).abs() < 1e-3);
@@ -483,7 +594,7 @@ mod tests {
     fn span_bbox_defaults_to_em_fractions() {
         let doc = Document::load(simple_doc("Hi")).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         let s = &spans[0];
         assert!((s.bbox.y0 - (720.0 - 0.2 * 12.0)).abs() < 1e-3);
         assert!((s.bbox.y1 - (720.0 + 0.8 * 12.0)).abs() < 1e-3);
@@ -513,7 +624,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!((spans[0].bbox.y1 - (720.0 + 0.7 * 12.0)).abs() < 1e-3);
         assert!((spans[0].bbox.y0 - (720.0 - 0.2 * 12.0)).abs() < 1e-3);
     }
@@ -556,7 +667,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        extract_spans(&doc, &page).unwrap()
+        extract_spans(&doc, &page, ReadingOrder::Content).unwrap()
     }
 
     /// The span records the text rise (`Ts`) it was shown under.
@@ -567,7 +678,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].rise, 0.0);
         assert_eq!(spans[1].rise, 5.0);
     }
@@ -601,7 +712,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].vertical);
     }
 
@@ -615,7 +726,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         let invisible: Vec<bool> = spans.iter().map(|s| s.invisible).collect();
         assert_eq!(invisible, [false, true, true, false]);
     }
@@ -625,7 +736,7 @@ mod tests {
     fn span_color_defaults_to_black() {
         let doc = Document::load(simple_doc("Hi")).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].color, Some((0.0, 0.0, 0.0)));
     }
 
@@ -638,7 +749,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].color, Some((1.0, 0.0, 0.0)));
         assert_eq!(spans[1].color, Some((0.5, 0.5, 0.5)));
         assert_eq!(spans[2].color, Some((0.0, 1.0, 1.0)));
@@ -655,7 +766,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].color, Some((0.0, 1.0, 0.0)));
         assert_eq!(spans[1].color, Some((0.25, 0.25, 0.25)));
     }
@@ -669,7 +780,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans[0].color, None);
     }
 
@@ -682,7 +793,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].underline);
         assert!(!spans[0].strikethrough);
     }
@@ -695,7 +806,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].strikethrough);
         assert!(!spans[0].underline);
     }
@@ -709,7 +820,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(!spans[0].underline);
         assert!(!spans[0].strikethrough);
     }
@@ -724,7 +835,7 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(!spans[0].underline);
     }
 
@@ -762,10 +873,24 @@ mod tests {
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
         let oc = doc.oc_state();
-        let gated = block_on(extract_spans_with(Immediate(&doc), &page, oc.as_ref())).unwrap();
+        let gated = block_on(extract_spans_with(
+            Immediate(&doc),
+            &page,
+            oc.as_ref(),
+            None,
+            ReadingOrder::Content,
+        ))
+        .unwrap();
         let texts: Vec<&str> = gated.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["kept"]);
-        let all = block_on(extract_spans_with(Immediate(&doc), &page, None)).unwrap();
+        let all = block_on(extract_spans_with(
+            Immediate(&doc),
+            &page,
+            None,
+            None,
+            ReadingOrder::Content,
+        ))
+        .unwrap();
         let texts: Vec<&str> = all.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["hidden", "kept"]);
     }
@@ -796,7 +921,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].italic, "Flags bit 7 (mask 64) is Italic");
         assert!(spans[0].bold, "FontWeight 700 >= 600 is bold");
     }
@@ -835,7 +960,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].bold, "StemV 140 is a bold stem");
         assert!(!spans[1].bold, "StemV 85 is a regular stem");
     }
@@ -868,7 +993,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(
             spans[0].bold && spans[0].italic,
             "BaseFont substrings Bold+Oblique"
@@ -910,7 +1035,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].bold && spans[0].italic);
     }
 
@@ -981,8 +1106,14 @@ mod tests {
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
         let counting = Counting::new(&doc);
-        let (spans, report) =
-            block_on(extract_spans_reporting_with(&counting, &page, None)).unwrap();
+        let (spans, report) = block_on(extract_spans_reporting_with(
+            &counting,
+            &page,
+            None,
+            None,
+            ReadingOrder::Content,
+        ))
+        .unwrap();
         assert!(report.is_complete(), "unexpected skips: {report:?}");
         assert_eq!(spans.len(), 2, "both form invocations must show text");
         assert_eq!(
@@ -1019,7 +1150,11 @@ mod tests {
         let page = doc.page(0).unwrap();
         let counting = Counting::new(&doc);
         let (_, rulings, report) = block_on(extract_spans_and_rulings_reporting_with(
-            &counting, &page, None,
+            &counting,
+            &page,
+            None,
+            None,
+            ReadingOrder::Content,
         ))
         .unwrap();
         assert!(report.is_complete(), "unexpected skips: {report:?}");
@@ -1063,7 +1198,12 @@ mod tests {
         for index in 0..2 {
             let page = doc.page(index).unwrap();
             let (spans, report) = block_on(extract_spans_reporting_cached_with(
-                &counting, &page, &fonts, None,
+                &counting,
+                &page,
+                &fonts,
+                None,
+                None,
+                ReadingOrder::Content,
             ))
             .unwrap();
             assert!(report.is_complete(), "unexpected skips: {report:?}");
@@ -1076,7 +1216,9 @@ mod tests {
         );
         for (index, spans) in cached.iter().enumerate() {
             let page = doc.page(index).unwrap();
-            let plain = extract_spans_reporting(&doc, &page).unwrap().0;
+            let plain = extract_spans_reporting(&doc, &page, ReadingOrder::Content)
+                .unwrap()
+                .0;
             assert_eq!(spans, &plain, "page {index} must extract identically");
         }
     }
@@ -1117,7 +1259,8 @@ mod tests {
         let mut advances = Vec::new();
         for index in 0..2 {
             let page = doc.page(index).unwrap();
-            let (spans, _) = extract_spans_reporting_cached(&doc, &page, &fonts).unwrap();
+            let (spans, _) =
+                extract_spans_reporting_cached(&doc, &page, &fonts, ReadingOrder::Content).unwrap();
             assert_eq!(spans.len(), 1);
             advances.push(spans[0].end_x - spans[0].x);
         }
@@ -1190,6 +1333,8 @@ mod tests {
                 },
                 &spans_page,
                 None,
+                None,
+                ReadingOrder::Content,
             )
             .await
         };
@@ -1198,5 +1343,186 @@ mod tests {
         // A source that resolves everything to null yields a page with no
         // contents, so driving this only proves the wiring is reachable.
         assert!(block_on(spans).unwrap().is_empty());
+    }
+
+    /// A one-page tagged document: the catalog names object 10 as the
+    /// structure tree root, object 12 is the parent tree, and the page
+    /// (object 3, `/StructParents 0`) shows `content` with `/F1` Helvetica.
+    /// Objects 13 and 14 are two paragraphs, the left one holding marked
+    /// content 0 and 2, the right one 1 and 3: tree order is 0, 2, 1, 3.
+    fn tagged_doc(
+        content: &[u8],
+        page_extra: &str,
+        extra: impl FnOnce(&mut PdfBuilder),
+    ) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+                 /Resources << /Font << /F1 5 0 R >> {page_extra} >> /Contents 4 0 R >>"
+            ),
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 14 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [13 0 R 14 0 R 13 0 R 14 0 R]] >>");
+        b.object(
+            13,
+            "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0 2] >>",
+        );
+        b.object(
+            14,
+            "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [1 3] >>",
+        );
+        extra(&mut b);
+        Document::load(b.build(1)).unwrap()
+    }
+
+    /// Two columns written bottom row first: stream order L2 R2 L1 R1,
+    /// geometry L1 R1 / L2 R2, tree L1 L2 R1 R2: three orders, three
+    /// different answers.
+    const TWO_COLUMNS: &[u8] = b"BT /F1 12 Tf \
+        /P << /MCID 2 >> BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+        /P << /MCID 3 >> BDC 1 0 0 1 300 680 Tm (R2) Tj EMC \
+        /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (L1) Tj EMC \
+        /P << /MCID 1 >> BDC 1 0 0 1 300 700 Tm (R1) Tj EMC ET";
+
+    fn texts(spans: &[TextSpan]) -> Vec<&str> {
+        spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn ordered(doc: &Document, order: ReadingOrder) -> (Vec<String>, ReadingOrder) {
+        let page = doc.page(0).unwrap();
+        let (spans, report) = extract_spans_reporting(doc, &page, order).unwrap();
+        (spans.into_iter().map(|s| s.text).collect(), report.order)
+    }
+
+    #[test]
+    fn reading_order_names_round_trip() {
+        for order in ReadingOrder::ALL {
+            assert_eq!(order.as_str().parse::<ReadingOrder>().unwrap(), order);
+            assert_eq!(order.to_string(), order.as_str());
+        }
+        assert_eq!(ReadingOrder::default(), ReadingOrder::Content);
+        assert!("bogus".parse::<ReadingOrder>().is_err());
+    }
+
+    #[test]
+    fn content_order_is_the_stream_as_written() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |_| {});
+        let (spans, order) = ordered(&doc, ReadingOrder::Content);
+        assert_eq!(spans, ["L2", "R2", "L1", "R1"]);
+        assert_eq!(order, ReadingOrder::Content);
+    }
+
+    #[test]
+    fn geometric_order_extracts_the_stream_and_tags_the_report() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |_| {});
+        let (spans, order) = ordered(&doc, ReadingOrder::Geometric);
+        assert_eq!(spans, ["L2", "R2", "L1", "R1"]);
+        assert_eq!(order, ReadingOrder::Geometric);
+    }
+
+    #[test]
+    fn structure_tree_order_follows_the_tree() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |_| {});
+        let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
+        assert_eq!(spans, ["L1", "L2", "R1", "R2"]);
+        assert_eq!(order, ReadingOrder::StructureTree);
+    }
+
+    #[test]
+    fn structure_tree_order_reads_an_untagged_document_in_content_order() {
+        let doc = Document::load(pdfboss_testkit::multi_page_doc(&["one", "two"])).unwrap();
+        let page = doc.page(1).unwrap();
+        let (spans, report) =
+            extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["two"]);
+        assert_eq!(report.order, ReadingOrder::Content);
+    }
+
+    #[test]
+    fn a_page_the_tree_does_not_reach_reads_in_content_order() {
+        // Marked content on the page, but the parent tree keys 0 to nothing.
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(12, "<< /Nums [7 [13 0 R]] >>");
+        });
+        let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
+        assert_eq!(spans, ["L2", "R2", "L1", "R1"]);
+        assert_eq!(order, ReadingOrder::Content);
+    }
+
+    #[test]
+    fn untagged_content_keeps_its_place_after_the_tagged_content_before_it() {
+        let content = b"BT /F1 12 Tf \
+            /P << /MCID 2 >> BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+            /Artifact BMC 1 0 0 1 72 40 Tm (footer) Tj EMC \
+            /P << /MCID 3 >> BDC 1 0 0 1 300 680 Tm (R2) Tj EMC \
+            /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (L1) Tj EMC \
+            /P << /MCID 1 >> BDC 1 0 0 1 300 700 Tm (R1) Tj EMC ET";
+        let doc = tagged_doc(content, "", |_| {});
+        let (spans, _) = ordered(&doc, ReadingOrder::StructureTree);
+        assert_eq!(spans, ["L1", "L2", "footer", "R1", "R2"]);
+    }
+
+    #[test]
+    fn named_marked_content_properties_are_read() {
+        let content = b"BT /F1 12 Tf \
+            /P /M2 BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+            /P /M3 BDC 1 0 0 1 300 680 Tm (R2) Tj EMC \
+            /P /M0 BDC 1 0 0 1 72 700 Tm (L1) Tj EMC \
+            /P /M1 BDC 1 0 0 1 300 700 Tm (R1) Tj EMC ET";
+        let props = "/Properties << /M0 << /MCID 0 >> /M1 << /MCID 1 >> \
+                     /M2 << /MCID 2 >> /M3 << /MCID 3 >> >>";
+        let doc = tagged_doc(content, props, |_| {});
+        let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
+        assert_eq!(spans, ["L1", "L2", "R1", "R2"]);
+        assert_eq!(order, ReadingOrder::StructureTree);
+    }
+
+    #[test]
+    fn a_form_files_its_marked_content_under_its_own_parents_key() {
+        // The page holds the right column (key 0, ids 1 and 3 in element
+        // 14); a form with `/StructParents 1` holds the left column, its
+        // ids 0 and 1 in element 13.
+        let content = b"BT /F1 12 Tf \
+            /P << /MCID 3 >> BDC 1 0 0 1 300 680 Tm (R2) Tj EMC \
+            /P << /MCID 1 >> BDC 1 0 0 1 300 700 Tm (R1) Tj EMC ET /Fx Do";
+        let doc = tagged_doc(content, "/XObject << /Fx 6 0 R >>", |b| {
+            b.stream(
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 612 792] /StructParents 1",
+                b"BT /F1 12 Tf \
+                  /P << /MCID 1 >> BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+                  /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (L1) Tj EMC ET",
+            );
+            b.object(
+                12,
+                "<< /Nums [0 [null 14 0 R null 14 0 R] 1 [13 0 R 13 0 R]] >>",
+            );
+            b.object(
+                13,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0 1] >>",
+            );
+        });
+        let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
+        assert_eq!(spans, ["L1", "L2", "R1", "R2"]);
+        assert_eq!(order, ReadingOrder::StructureTree);
     }
 }

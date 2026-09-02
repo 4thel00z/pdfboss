@@ -60,14 +60,19 @@ fn layout_value(input: &Input, pages: &Option<Vec<usize>>) -> Result<Value, Stri
             let mut layouts = Vec::with_capacity(numbers.len());
             for n in numbers {
                 let (spans, rulings) = input.page_spans_and_rulings(n - 1)?;
-                layouts.push(pdfboss_output::page_layout_with_rulings(&spans, &rulings));
+                layouts.push(pdfboss_output::page_layout_with_rulings(
+                    &spans,
+                    &rulings,
+                    pdfboss_output::ReadingOrder::Content,
+                ));
             }
             layouts
         }
         None => {
             let mut pages = Vec::with_capacity(count);
             for index in 0..count {
-                pages.push(input.page_spans_and_rulings(index)?);
+                let (spans, rulings) = input.page_spans_and_rulings(index)?;
+                pages.push((spans, rulings, pdfboss_output::ReadingOrder::Content));
             }
             pdfboss_output::document_layout_with_rulings(&pages)
         }

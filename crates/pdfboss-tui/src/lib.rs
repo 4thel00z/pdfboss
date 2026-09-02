@@ -580,9 +580,15 @@ async fn extract_markdown(
 async fn page_markdown(doc: &AsyncDocument, page: usize) -> Result<String, String> {
     let page_object = doc.page(page).map_err(|error| error.to_string())?;
     let oc = doc.oc_state().await;
-    pdfboss_output::extract_page_markdown_with(doc, &page_object, oc.as_ref())
-        .await
-        .map_err(|error| error.to_string())
+    pdfboss_output::extract_page_markdown_with(
+        doc,
+        &page_object,
+        oc.as_ref(),
+        None,
+        pdfboss_output::ReadingOrder::Content,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Fetches the entire file via one `read_span` over
