@@ -960,7 +960,7 @@ fn rotate_pages_marks_selected_pages_and_keeps_the_prefix_stream() {
 
 /// A page inlined directly into `/Kids`, with no object of its own, cannot
 /// be staged as a replacement object: `rotate_pages` refuses it, naming
-/// its 1-based page number and pointing at `--rewrite`.
+/// its 1-based page number and that it cannot be edited in place.
 #[test]
 fn rotate_pages_refuses_an_inline_page() {
     let mut b = pdfboss_testkit::PdfBuilder::new();
@@ -979,5 +979,8 @@ fn rotate_pages_refuses_an_inline_page() {
         panic!("expected Error::Other, got {result:?}");
     };
     assert!(message.contains("page 1"), "message: {message}");
-    assert!(message.contains("--rewrite"), "message: {message}");
+    assert!(
+        message.contains("cannot be edited in place"),
+        "message: {message}"
+    );
 }

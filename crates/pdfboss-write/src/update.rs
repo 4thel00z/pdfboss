@@ -202,13 +202,13 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
 /// keeps its own `/Parent`, so it stays exactly where it was in the page
 /// tree. A page with no object of its own (inlined directly into
 /// `/Kids`) cannot be staged this way: refused, naming its 1-based page
-/// number and pointing at `--rewrite`.
+/// number.
 pub fn rotate_pages(update: &mut Update, pages: &[usize], by: i32) -> Result<()> {
     for &index in pages {
         let page = update.doc.page(index).map_err(core_error)?;
         let Some(page_ref) = page.object_ref() else {
             return Err(Error::Other(format!(
-                "page {} has no object of its own (inlined into /Kids); use --rewrite instead",
+                "page {} is inlined into /Kids and cannot be edited in place",
                 index + 1
             )));
         };

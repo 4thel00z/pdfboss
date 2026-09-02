@@ -64,9 +64,11 @@ fn name(text: &str) -> Name {
 /// object the catalog and `/Info` reach is copied over, and each of
 /// `pages` (0-based indices) gets its own leaf dictionary substituted with
 /// `/Rotate` set to its current effective rotation plus `by`, normalized
-/// with `rem_euclid(360)`. A selected page with no object of its own
-/// (inlined directly into `/Kids`) has no reference to substitute a
-/// rewritten body onto: refused, naming its 1-based page number.
+/// with `rem_euclid(360)`. Substitution keys by the source object
+/// reference, so a selected page with no object of its own (inlined
+/// directly into `/Kids`) is refused, naming its 1-based page number:
+/// pdfboss does not yet restructure such a page into one with its own
+/// object.
 pub fn rotate_rewrite(
     doc: &Document,
     pages: &[usize],
@@ -84,7 +86,8 @@ pub fn rotate_rewrite(
         let page = doc.page(index).map_err(core_error)?;
         let Some(page_ref) = page.object_ref() else {
             return Err(Error::Other(format!(
-                "page {} has no object of its own (inlined into /Kids)",
+                "page {} is inlined into /Kids and cannot be edited in place; \
+                 pdfboss does not yet restructure such pages to rotate them",
                 index + 1
             )));
         };
@@ -126,6 +129,8 @@ pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Re
 mod tests {
     use pdfboss_output::extract_text;
     use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, PdfBuilder};
+
+    use crate::pdf::{Metadata, Page, PageSize, Pdf};
 
     use super::*;
 
@@ -248,5 +253,44 @@ mod tests {
             panic!("expected Error::Other, got {result:?}");
         };
         assert!(message.contains("page 1"), "message: {message}");
+        assert!(
+            message.contains("cannot be edited in place"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("does not yet restructure"),
+            "message: {message}"
+        );
+    }
+
+    /// A rewrite carries `/Info` along: the reloaded catalog's trailer
+    /// still resolves an `/Info` dictionary, and its `/Title` still reads
+    /// the base document's title after rotation.
+    #[test]
+    fn rotate_rewrite_carries_info_along() {
+        let base = Pdf {
+            pages: vec![Page::new(PageSize::A4)],
+            metadata: Some(Metadata {
+                title: Some("Rotated Title".to_string()),
+                ..Metadata::default()
+            }),
+            ..Pdf::default()
+        }
+        .to_bytes()
+        .expect("base builds");
+        let doc = Document::load(base).expect("base loads");
+        assert!(
+            doc.xref().trailer.get_ref("Info").is_some(),
+            "the base's trailer must carry /Info for this test to exercise the carry"
+        );
+
+        let bytes =
+            rotate_rewrite(&doc, &[0], 90, WriteOptions::default()).expect("rotate succeeds");
+        let rotated = Document::load(bytes).expect("rotated document loads");
+        assert!(
+            rotated.xref().trailer.get_ref("Info").is_some(),
+            "the rewritten trailer still names an /Info dictionary"
+        );
+        assert_eq!(rotated.metadata().title.as_deref(), Some("Rotated Title"));
     }
 }
