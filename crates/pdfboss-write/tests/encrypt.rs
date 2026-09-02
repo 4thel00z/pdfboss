@@ -12,7 +12,8 @@ use pdfboss_core::parser::{NoResolve, Parser};
 use pdfboss_core::xref::{load_xref, XrefEntry};
 use pdfboss_core::{Dict, Document, Encryptor, Error, Name, ObjRef, Object, Permissions};
 use pdfboss_output::{extract_text, ReadingOrder};
-use pdfboss_write::{decrypt_document, encrypt_document, WriteOptions, Writer, XrefStyle};
+use pdfboss_testkit::PdfBuilder;
+use pdfboss_write::{decrypt_document, encrypt_document, rewrite_document, WriteOptions, Writer, XrefStyle};
 
 const CONTENT: &[u8] = b"BT /F1 12 Tf 72 720 Td (Hello, encrypted) Tj ET";
 const USER_PW: &str = "user-pw";
@@ -102,6 +103,35 @@ fn parse_raw_object(bytes: &[u8], r: ObjRef) -> Object {
         .parse_indirect(&NoResolve)
         .expect("object parses");
     obj
+}
+
+fn hexstr(b: &[u8]) -> String {
+    let mut s = String::from("<");
+    for x in b {
+        s.push_str(&format!("{x:02x}"));
+    }
+    s.push('>');
+    s
+}
+
+/// A hand-built `/Encrypt` dict body for a source PDF assembled directly
+/// through `PdfBuilder`, not through this crate's own `Writer`: the write
+/// side never emits `/EncryptMetadata false` (`Encryptor::aes256_with_rng`
+/// always leaves it absent, meaning true), so a fixture with it set has to
+/// be assembled by hand, the way a third-party writer like Acrobat would.
+fn encrypt_dict_body(dict: &Dict) -> String {
+    let field = |key: &str| hexstr(dict.get(key).and_then(Object::as_str_bytes).unwrap());
+    format!(
+        "<< /Filter /Standard /V 5 /R 6 /Length 256 /P {} /U {} /UE {} /O {} /OE {} /Perms {} \
+         /EncryptMetadata false /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> \
+         /StmF /StdCF /StrF /StdCF >>",
+        dict.get_int("P").unwrap(),
+        field("U"),
+        field("UE"),
+        field("O"),
+        field("OE"),
+        field("Perms"),
+    )
 }
 
 #[test]
@@ -552,5 +582,82 @@ fn length_reflects_the_padded_ciphertext_not_the_plaintext() {
             .data,
         plaintext,
         "the decrypted content must still equal the original plaintext"
+    );
+}
+
+/// A source PDF whose `/Encrypt` dict carries `/EncryptMetadata false` and
+/// whose metadata stream was stored in plaintext, the way a real writer
+/// like Acrobat leaves it, assembled by hand since this crate's own
+/// `Encryptor` never emits that entry. `rewrite_document` must carry the
+/// metadata bytes through unchanged rather than corrupting them, the same
+/// gap `pdfboss_core`'s decryptor now closes for a plain password load.
+#[test]
+fn rewrite_document_carries_an_encrypt_metadata_false_stream_through_unchanged() {
+    const XMP: &[u8] =
+        b"<?xpacket begin=''?><x:xmpmeta><dc:title>XMP Secret Title</dc:title></x:xmpmeta>\
+          <?xpacket end='w'?>";
+
+    let (mut enc, dict) =
+        Encryptor::aes256_with_rng(USER_PW, OWNER_PW, Permissions::all(), counter_rng());
+
+    let mut msg = Object::Dict({
+        let mut d = Dict::new();
+        d.insert(name("Msg"), Object::String(b"ordinary secret".to_vec()));
+        d
+    });
+    enc.encrypt_object(&mut msg, 3, 0);
+    let msg_bytes = msg
+        .as_dict()
+        .unwrap()
+        .get("Msg")
+        .and_then(Object::as_str_bytes)
+        .unwrap();
+
+    let mut b = PdfBuilder::new().version(1, 7);
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+    b.object(3, &format!("<< /Msg {} >>", hexstr(msg_bytes)));
+    b.stream(5, "<< /Type /Metadata /Subtype /XML >>", XMP);
+    b.object(9, &encrypt_dict_body(&dict));
+    let bytes = b.trailer_extra("/Encrypt 9 0 R").build(1);
+
+    let doc = Document::load_with_password(bytes, USER_PW).expect("user password opens");
+    let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+    assert_eq!(
+        obj3.as_dict()
+            .unwrap()
+            .get("Msg")
+            .and_then(Object::as_str_bytes),
+        Some(&b"ordinary secret"[..]),
+        "an ordinary encrypted string still decrypts"
+    );
+    let obj5 = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
+    assert_eq!(
+        doc.stream_data(obj5.as_stream().unwrap()).unwrap(),
+        XMP,
+        "the metadata stream is plaintext before any rewrite"
+    );
+
+    let rewritten =
+        rewrite_document(&doc, WriteOptions::default()).expect("rewrite_document succeeds");
+    let plain = Document::load(rewritten).expect("rewritten output carries no /Encrypt");
+    let root = plain
+        .xref()
+        .trailer
+        .get_ref("Root")
+        .expect("/Root present");
+    let catalog = plain.get(root).expect("catalog resolves");
+    let metadata_ref = catalog
+        .as_dict()
+        .unwrap()
+        .get_ref("Metadata")
+        .expect("/Metadata present on the rewritten catalog");
+    let metadata_obj = plain.get(metadata_ref).expect("metadata object resolves");
+    let metadata = plain
+        .stream_data(metadata_obj.as_stream().expect("metadata is a stream"))
+        .expect("metadata stream decodes");
+    assert_eq!(
+        metadata, XMP,
+        "rewrite_document must carry the metadata bytes through unchanged"
     );
 }

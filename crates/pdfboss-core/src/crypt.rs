@@ -43,6 +43,18 @@ pub struct Decryptor {
     /// The file key (`n` bytes for RC4/AESV2, 32 for AESV3).
     key: Vec<u8>,
     cipher: Cipher,
+    /// The `/Encrypt` dictionary's `/EncryptMetadata` value (default true
+    /// when absent): when false, a stream whose own dictionary says
+    /// `/Type /Metadata` was stored in plaintext and must not be decrypted.
+    encrypt_metadata: bool,
+}
+
+/// The `/Encrypt` dictionary's `/EncryptMetadata` flag, true when absent
+/// (ISO 32000-2 §7.6.4.2, Table 20).
+fn encrypt_metadata_flag(enc: &Dict) -> bool {
+    enc.get("EncryptMetadata")
+        .and_then(Object::as_bool)
+        .unwrap_or(true)
 }
 
 impl Decryptor {
@@ -97,6 +109,7 @@ impl Decryptor {
         }
         let v = enc.get_int("V").unwrap_or(0);
         let r = enc.get_int("R").unwrap_or(0);
+        let encrypt_metadata = encrypt_metadata_flag(enc);
         match (v, r) {
             // RC4: V1 (40-bit) and V2 (up to 128-bit).
             (1 | 2, 2 | 3) => {
@@ -109,6 +122,7 @@ impl Decryptor {
                 Some(Decryptor {
                     key,
                     cipher: Cipher::Rc4,
+                    encrypt_metadata,
                 })
             }
             // V4: 128-bit key, cipher chosen by the standard crypt filter.
@@ -119,12 +133,17 @@ impl Decryptor {
                     "V2" => Cipher::Rc4,
                     _ => return None, // Identity or unknown
                 };
-                Some(Decryptor { key, cipher })
+                Some(Decryptor {
+                    key,
+                    cipher,
+                    encrypt_metadata,
+                })
             }
             // V5: AES-256 with SHA-2-based key derivation.
             (5, 5 | 6) => aesv3_key(enc, r, password).map(|key| Decryptor {
                 key,
                 cipher: Cipher::Aesv3,
+                encrypt_metadata,
             }),
             _ => None,
         }
@@ -151,7 +170,7 @@ impl Decryptor {
             Cipher::Aesv3 => self.key.clone(), // one file key for every object
             Cipher::Rc4 | Cipher::Aesv2 => self.object_key(num, gen),
         };
-        decrypt_in_place(obj, &key, self.cipher);
+        decrypt_in_place(obj, &key, self.cipher, self.encrypt_metadata);
     }
 
     /// Per-object key: `MD5(filekey ++ num[0..3] ++ gen[0..2] [++ "sAlT"])`
@@ -172,25 +191,36 @@ impl Decryptor {
 }
 
 /// Recursively decrypts every string and stream body reachable from `obj` with
-/// the per-object `key` under `cipher`.
-fn decrypt_in_place(obj: &mut Object, key: &[u8], cipher: Cipher) {
+/// the per-object `key` under `cipher`. When `encrypt_metadata` is false, a
+/// stream whose own dictionary says `/Type /Metadata` was stored in
+/// plaintext (ISO 32000-2 §7.6.4.2, Table 20) and its data is left alone;
+/// the dictionary's own values still walk normally.
+fn decrypt_in_place(obj: &mut Object, key: &[u8], cipher: Cipher, encrypt_metadata: bool) {
     match obj {
         Object::String(bytes) => *bytes = decrypt_bytes(cipher, key, bytes),
         Object::Array(items) => items
             .iter_mut()
-            .for_each(|it| decrypt_in_place(it, key, cipher)),
+            .for_each(|it| decrypt_in_place(it, key, cipher, encrypt_metadata)),
         Object::Dict(dict) => dict
             .values_mut()
-            .for_each(|v| decrypt_in_place(v, key, cipher)),
+            .for_each(|v| decrypt_in_place(v, key, cipher, encrypt_metadata)),
         Object::Stream(stream) => {
             stream
                 .dict
                 .values_mut()
-                .for_each(|v| decrypt_in_place(v, key, cipher));
+                .for_each(|v| decrypt_in_place(v, key, cipher, encrypt_metadata));
+            if !encrypt_metadata && is_metadata_stream(&stream.dict) {
+                return;
+            }
             stream.data = decrypt_bytes(cipher, key, &stream.data);
         }
         _ => {}
     }
+}
+
+/// Whether `dict` names `/Type /Metadata`.
+fn is_metadata_stream(dict: &Dict) -> bool {
+    dict.get_name("Type").map(|n| n.0.as_str()) == Some("Metadata")
 }
 
 /// Applies `cipher` to one string or stream body with the given `key`.
@@ -276,7 +306,7 @@ fn md5_file_key(enc: &Dict, id0: &[u8], r: i64, n: usize, padded: &[u8; 32]) -> 
     input.extend_from_slice(&(p as i32 as u32).to_le_bytes()); // /P low 32 bits, LE
     input.extend_from_slice(id0);
     // Revision 4 with /EncryptMetadata false hashes an extra 0xFFFFFFFF.
-    if r >= 4 && enc.get("EncryptMetadata").and_then(Object::as_bool) == Some(false) {
+    if r >= 4 && !encrypt_metadata_flag(enc) {
         input.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
     }
     let mut digest = md5(&input);
@@ -2092,6 +2122,21 @@ mod tests {
     }
 
     fn encrypted_fixture_aesv3_with(r: i64, user_pw: &[u8], owner_pw: &[u8]) -> Vec<u8> {
+        encrypted_fixture_aesv3_with_metadata(r, user_pw, owner_pw, true, None)
+    }
+
+    /// [`encrypted_fixture_aesv3_with`], plus an `/EncryptMetadata` entry
+    /// and, when `metadata` is given, object 5 as a `/Type /Metadata`
+    /// stream holding its bytes verbatim (never encrypted here, since a
+    /// real writer with `encrypt_metadata` false stores it in plaintext
+    /// too): the fixture a reader must not corrupt.
+    fn encrypted_fixture_aesv3_with_metadata(
+        r: i64,
+        user_pw: &[u8],
+        owner_pw: &[u8],
+        encrypt_metadata: bool,
+        metadata: Option<&[u8]>,
+    ) -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
         let key: Vec<u8> = (0u8..32).map(|i| i ^ 0x5a).collect(); // arbitrary 256-bit file key
         let vsalt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -2114,15 +2159,27 @@ mod tests {
         let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &iv);
 
         let mut b = PdfBuilder::new().version(1, 7);
-        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let catalog = match metadata {
+            Some(_) => "<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>",
+            None => "<< /Type /Catalog /Pages 2 0 R >>",
+        };
+        b.object(1, catalog);
         b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
         b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
         b.stream(4, "", &stream);
+        if let Some(metadata) = metadata {
+            b.stream(5, "<< /Type /Metadata /Subtype /XML >>", metadata);
+        }
+        let encrypt_metadata_entry = if encrypt_metadata {
+            ""
+        } else {
+            " /EncryptMetadata false"
+        };
         b.object(
             9,
             &format!(
                 "<< /Filter /Standard /V 5 /R {r} /Length 256 /P {P} /U {} /UE {} \
-                 /O {} /OE {} \
+                 /O {} /OE {}{encrypt_metadata_entry} \
                  /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>",
                 hexstr(&u),
                 hexstr(&ue),
@@ -2163,6 +2220,37 @@ mod tests {
     #[test]
     fn document_load_decrypts_aesv3_r6() {
         assert_aesv3_decrypts(6); // exercises the iterated Algorithm 2.B hash
+    }
+
+    #[test]
+    fn encrypt_metadata_false_leaves_the_metadata_stream_plaintext() {
+        use crate::object::ObjRef;
+        use crate::Document;
+
+        const XMP: &[u8] = b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>\
+            <x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF \
+            xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description \
+            xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:title>XMP Secret \
+            Title</dc:title></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='w'?>";
+
+        let bytes =
+            encrypted_fixture_aesv3_with_metadata(6, b"user-pw", b"owner-pw", false, Some(XMP));
+        let doc = Document::load_with_password(bytes, "user-pw").expect("user password opens");
+
+        let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+        let msg = obj3.as_dict().unwrap().get("Msg").unwrap();
+        assert_eq!(
+            msg.as_str_bytes().unwrap(),
+            b"AES-256 secret",
+            "an ordinary string still decrypts under EncryptMetadata false"
+        );
+
+        let obj5 = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
+        let metadata = doc.stream_data(obj5.as_stream().unwrap()).unwrap();
+        assert_eq!(
+            metadata, XMP,
+            "the metadata stream was stored in plaintext and must not be decrypted"
+        );
     }
 
     // --- R6 key material (write side): the existing validation code above
@@ -2315,6 +2403,7 @@ mod tests {
         Decryptor {
             key,
             cipher: Cipher::Aesv3,
+            encrypt_metadata: true,
         }
     }
 
