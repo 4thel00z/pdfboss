@@ -57,6 +57,17 @@ def test_merge_mixes_whole_and_selected_inputs() -> None:
     assert "three" in texts[1]
 
 
+def test_merge_rejects_a_negative_page_index_by_value() -> None:
+    a = build_pdf("one", "two")
+    with pytest.raises(ValueError, match="non-negative, got -1"):
+        merge([(a, [0, -1])])
+
+
+def test_merge_rejects_a_wrong_typed_input_by_type() -> None:
+    with pytest.raises(TypeError, match=r"bytes or \(bytes, list\[int\]\), got int"):
+        merge([7])
+
+
 def test_split_round_trips_page_counts() -> None:
     data = build_pdf("one", "two", "three")
     parts = split(data, 2)

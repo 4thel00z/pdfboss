@@ -1223,8 +1223,13 @@ fn extract_merge_input(item: &Bound<'_, PyAny>) -> PyResult<(Vec<u8>, Option<Vec
     if let Ok(data) = item.extract::<Vec<u8>>() {
         return Ok((data, None));
     }
-    if let Ok((data, pages)) = item.extract::<(Vec<u8>, Vec<usize>)>() {
-        return Ok((data, Some(pages)));
+    if let Ok((data, pages)) = item.extract::<(Vec<u8>, Vec<i64>)>() {
+        if let Some(bad) = pages.iter().find(|&&p| usize::try_from(p).is_err()) {
+            return Err(PyValueError::new_err(format!(
+                "merge page indices must be non-negative, got {bad}"
+            )));
+        }
+        return Ok((data, Some(pages.into_iter().map(|p| p as usize).collect())));
     }
     Err(PyTypeError::new_err(format!(
         "merge input must be bytes or (bytes, list[int]), got {}",
