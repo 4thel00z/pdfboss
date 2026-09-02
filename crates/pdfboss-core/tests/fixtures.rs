@@ -75,13 +75,13 @@ fn is_encrypted_is_false_when_the_trailer_encrypt_entry_is_null() {
     assert!(!doc.is_encrypted());
 }
 
+/// `encrypted_rc4_doc` is the same fixture `pdfboss_cli` merge/rewrite use
+/// to pin their "refuses an encrypted input" behavior
+/// (`crates/pdfboss-cli/tests/assemble_cmd.rs`). It is a real RC4 (V2/R3)
+/// `/Encrypt` dictionary for the empty user password, so it opens
+/// transparently while still declaring encryption.
 #[test]
 fn is_encrypted_is_true_for_an_encrypted_document() {
-    // `encrypted_rc4_doc` is the same fixture
-    // `pdfboss_cli` merge/rewrite use to pin their "refuses an encrypted
-    // input" behavior (crates/pdfboss-cli/tests/assemble_cmd.rs). It is a
-    // real RC4 (V2/R3) `/Encrypt` dictionary for the empty user password, so
-    // it opens transparently while still declaring encryption.
     let doc = Document::load(pdfboss_testkit::encrypted_rc4_doc("secret"))
         .expect("empty-user-password RC4 fixture should open transparently");
     assert!(doc.is_encrypted());
