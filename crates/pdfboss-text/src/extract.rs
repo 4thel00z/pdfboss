@@ -30,6 +30,12 @@ const RULING_MIN_LENGTH: f32 = 8.0;
 /// Maximum thin dimension of a filled rectangle that reads as a drawn line;
 /// anything fatter is a shaded box, not a ruling.
 const RULING_MAX_FILL_THICKNESS: f32 = 3.0;
+/// A closed stroked box at most this big in BOTH dimensions is a legend
+/// marker, a checkbox, a data-point square — drawn ink, never table
+/// structure. Welded into a lattice its edges invent columns a chart never
+/// had. A box small in one dimension only is a drawn cell and keeps its
+/// edges.
+const RULING_MAX_ICON_EXTENT: f32 = 24.0;
 
 /// What extraction could not read. Extraction is lenient the way rendering
 /// is — content that will not fetch, decode, or parse yields no text rather
@@ -563,6 +569,30 @@ fn ruling_from_segment(a: Point, b: Point, width: f32) -> Option<Ruling> {
         });
     }
     None
+}
+
+/// True for a closed box at most [`RULING_MAX_ICON_EXTENT`] in both
+/// dimensions: 4 corners closed, or 5 points returning to the start.
+fn icon_box(device: &[Point], closed: bool) -> bool {
+    let ring = match device {
+        [_, _, _, _] if closed => device,
+        [a, .., e]
+            if device.len() == 5
+                && (e.x - a.x).abs() <= RULING_AXIS_EPSILON
+                && (e.y - a.y).abs() <= RULING_AXIS_EPSILON =>
+        {
+            device
+        }
+        _ => return false,
+    };
+    if ring.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return false;
+    }
+    let x0 = ring.iter().map(|p| p.x).fold(f32::INFINITY, f32::min);
+    let x1 = ring.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max);
+    let y0 = ring.iter().map(|p| p.y).fold(f32::INFINITY, f32::min);
+    let y1 = ring.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max);
+    x1 - x0 <= RULING_MAX_ICON_EXTENT && y1 - y0 <= RULING_MAX_ICON_EXTENT
 }
 
 /// The centerline of a thin filled bar: a closed 4-vertex subpath in device
@@ -1274,7 +1304,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 continue;
             }
             let device: Vec<Point> = sub.points.iter().map(|p| ctm.apply(*p)).collect();
-            if stroke {
+            if stroke && !icon_box(&device, sub.closed) {
                 let segments = device.windows(2).map(|pair| (pair[0], pair[1]));
                 // A closed 2-point subpath draws one doubled edge, not two.
                 let closing =
@@ -1966,6 +1996,23 @@ mod tests {
         assert_ruling(&rulings[4], 172.0, 600.0, 172.0, 700.0);
         assert_ruling(&rulings[5], 72.0, 650.0, 272.0, 650.0);
         assert!(rulings.iter().all(|r| (r.width - 1.0).abs() < 1e-3));
+    }
+
+    /// A tiny closed stroked box is a legend marker, a checkbox, a
+    /// data-point square: drawn ink, but never table structure. Welded
+    /// into a lattice its edges invent columns a chart never had.
+    #[test]
+    fn a_tiny_closed_stroked_box_yields_no_rulings() {
+        let rulings = rulings_of("142 650 18 16 re S");
+        assert!(rulings.is_empty(), "{rulings:?}");
+    }
+
+    /// A closed box small in one dimension only is a drawn cell, and its
+    /// edges stay rulings.
+    #[test]
+    fn a_squat_wide_box_keeps_its_rulings() {
+        let rulings = rulings_of("72 650 120 16 re S");
+        assert_eq!(rulings.len(), 4, "{rulings:?}");
     }
 
     #[test]
