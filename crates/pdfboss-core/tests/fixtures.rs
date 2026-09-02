@@ -86,3 +86,20 @@ fn is_encrypted_is_true_for_an_encrypted_document() {
         .expect("empty-user-password RC4 fixture should open transparently");
     assert!(doc.is_encrypted());
 }
+
+#[test]
+fn is_locked_is_false_for_a_document_built_from_plain_bytes() {
+    let doc = Document::load(pdfboss_testkit::simple_doc("no encryption here"))
+        .expect("plain document should load");
+    assert!(!doc.is_locked());
+}
+
+#[test]
+fn is_locked_is_false_once_a_working_password_opens_the_file() {
+    let doc = Document::load(pdfboss_testkit::encrypted_rc4_doc("secret"))
+        .expect("empty-user-password RC4 fixture should open transparently");
+    assert!(
+        !doc.is_locked(),
+        "a working decryptor means the document isn't locked"
+    );
+}
