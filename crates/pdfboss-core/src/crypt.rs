@@ -1993,5 +1993,20 @@ mod tests {
         assert!(aesv3_key(&dict, 6, b"wrong-pw").is_none());
 
         assert!(perms_marker_valid(&material.file_key, &material.perms));
+
+        // With /Perms absent, aesv3_key skips the fast path and falls
+        // through to comparing the /U and /O validation hashes directly,
+        // proving those 32 bytes (not just the key-salt derivation the
+        // fast path above exercised) are correct too.
+        let mut without_perms = dict.clone();
+        without_perms.remove("Perms");
+        assert_eq!(
+            aesv3_key(&without_perms, 6, b"user-pw"),
+            Some(material.file_key.to_vec())
+        );
+        assert_eq!(
+            aesv3_key(&without_perms, 6, b"owner-pw"),
+            Some(material.file_key.to_vec())
+        );
     }
 }
