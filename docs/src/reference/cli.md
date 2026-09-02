@@ -293,7 +293,7 @@ pdfboss meta [OPTIONS] --out <OUT> --set <SET> <FILE>
 - `-o, --out <OUT>`: output file (required)
 - `--set <KEY=VALUE>`: metadata assignment, repeatable and required at least once; `KEY` is one of `title`, `author`, `subject`, `keywords`, `creator`, `producer`
 - `--rewrite`: full rewrite instead of an incremental append
-- `--password <PASSWORD>`: opens an encrypted input for reading; an encrypted base is still refused at write time, until encryption support arrives in a later PR
+- `--password <PASSWORD>`: opens an encrypted input for reading; the default incremental append still refuses any encrypted base
 
 ```bash
 pdfboss meta report.pdf -o report-titled.pdf --set title="Q3 Report" --set author="Finance"
@@ -381,4 +381,39 @@ pdfboss rewrite [OPTIONS] --out <OUT> <FILE>
 
 ```bash
 pdfboss rewrite report.pdf -o rewritten.pdf
+```
+
+## encrypt
+
+Encrypt a document with AES-256, revision 6, writing a fresh output. See [Encrypting a file](../guide/encryption.md#encrypting-a-file).
+
+```text
+pdfboss encrypt [OPTIONS] --out <OUT> <FILE>
+```
+
+- `-o, --out <OUT>`: output file (required)
+- `--user-password <PASSWORD>`: password readers must supply to open the file
+- `--owner-password <PASSWORD>`: owner password; falls back to `--user-password` when omitted
+- `--allow <VALUES>`: comma-separated permissions granted to a reader opening under the user password; one or more of `print`, `modify`, `copy`, `annotate`, `fill-forms`, `accessibility`, `assemble`, `print-hires`; every permission when omitted
+- `--password <PASSWORD>`: opens an input that is itself encrypted, so it re-encrypts under the new passwords instead of refusing
+
+At least one of `--user-password`/`--owner-password` must be set; both empty is refused.
+
+```bash
+pdfboss encrypt report.pdf -o locked.pdf --user-password hunter2 --allow print,copy
+```
+
+## decrypt
+
+Remove encryption from a document, writing a fresh plain output. See [Removing encryption](../guide/encryption.md#removing-encryption).
+
+```text
+pdfboss decrypt [OPTIONS] --out <OUT> <FILE>
+```
+
+- `-o, --out <OUT>`: output file (required)
+- `--password <PASSWORD>`: password for the encrypted file (user or owner password)
+
+```bash
+pdfboss decrypt locked.pdf -o report.pdf --password hunter2
 ```

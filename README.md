@@ -55,6 +55,8 @@ pdfboss render  report.pdf --page 1 -o page.png --scale 2.0   # or .ppm / .bmp /
 pdfboss images  report.pdf                 # extract embedded images as native-size PNGs
 pdfboss tui     report.pdf                 # interactive terminal explorer
 pdfboss meta    report.pdf -o out.pdf --set title="Q3 Report"   # edit metadata, appended as an update
+pdfboss encrypt report.pdf -o locked.pdf --user-password hunter2   # AES-256 protect a fresh copy
+pdfboss decrypt locked.pdf -o report.pdf --password hunter2        # remove protection, a fresh plain copy
 pdfboss create blank  -o out.pdf --pages 3    # new PDF: empty pages
 pdfboss create text   notes.txt -o out.pdf    # new PDF: word-wrapped text
 pdfboss create images a.png b.jpg -o out.pdf  # new PDF: one page per image
@@ -118,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Five more commands assemble documents out of existing ones, each also available from `pdfboss.write` and `pdfboss_write` directly:
+Seven more commands assemble or protect documents out of existing ones, each also available from `pdfboss.write` and `pdfboss_write` directly:
 
 | Command | What it does | Default | Full rewrite |
 |---|---|---|---|
@@ -127,8 +129,10 @@ Five more commands assemble documents out of existing ones, each also available 
 | `pdfboss rotate` | Rotate selected pages by a quarter-turn multiple, clockwise | appends an incremental update | `--rewrite` |
 | `pdfboss overlay` | Draw one file's first page onto every page of another, on top or beneath its content | appends an incremental update | `--rewrite` |
 | `pdfboss rewrite` | Rewrite a document fresh, with no page change | always a fresh document | (its only mode) |
+| `pdfboss encrypt` | AES-256 protect a document, restricted by `--allow` | always a fresh document | (its only mode) |
+| `pdfboss decrypt` | Remove AES-256 protection from a document | always a fresh document | (its only mode) |
 
-`merge`, `split` and `rewrite` always run on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; `rotate`'s and `overlay`'s `--rewrite` modes do too, but their defaults instead append through `Update`, the same way `meta` does. A merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. An encrypted input is refused everywhere, the same as `meta` above; `overlay` checks its base and its overlay file separately, so the error names whichever one is encrypted. `encrypt` follows in a later PR.
+`merge`, `split`, `rewrite`, `encrypt` and `decrypt` always run on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; `rotate`'s and `overlay`'s `--rewrite` modes do too, but their defaults instead append through `Update`, the same way `meta` does. A merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. At the CLI, `merge`, `split`, `rotate`, `rewrite` and `overlay` refuse every encrypted input outright, whether or not the password opened it; `overlay` checks its base and its overlay file separately, so the error names whichever one is encrypted. `encrypt` and `decrypt` are the exception: `--password` opens an already-encrypted input, so `encrypt` re-protects it under new passwords and `decrypt` strips it.
 
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>

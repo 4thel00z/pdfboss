@@ -2,7 +2,7 @@
 
 `pdfboss_write::assemble` builds new documents out of existing ones: `merge_documents` gathers selected pages from several sources under a fresh page tree (ISO 32000-1 §7.7.3), `split_document` cuts one document into consecutive-page parts, `rotate_rewrite` turns selected pages by a quarter-turn multiple in a whole fresh copy, and `rewrite_document`/`rewrite_with_metadata` write a document fresh with no page change. `merge_documents`, `split_document`, `rewrite_document`/`rewrite_with_metadata`, and `rotate_rewrite` all route through [`Importer`](#the-importer), which renumbers every object reference it meets once and copies it into the output; rotate's default append mode instead stages its change through [`Update`](./editing.md), the same way `meta` does.
 
-An encrypted input is refused everywhere, the same way [`Update`](./editing.md) refuses one: the check is for the `/Encrypt` entry itself, not for whether the password opened it, since a plain target has no encryption of its own to carry the content into.
+At the CLI, `merge`, `split`, `rotate`, `rewrite` and `overlay` all refuse every encrypted input outright, whether or not the password opened it, the same way [`Update`](./editing.md) does. The `pdfboss_write` functions underneath are narrower: [`Importer::new`](#the-importer) refuses only a locked source, one that is encrypted with no working decryptor; a source already opened under its password copies its content across as plaintext, the same content [`encrypt_document`](./encryption.md#encrypting-a-file) relies on to re-encrypt a document under new passwords.
 
 ## Merging
 
@@ -83,7 +83,7 @@ clean = rewrite(report_bytes)
 
 ## The Importer
 
-`Importer::new(writer, source)` opens one source document for copying into a `Writer`, refusing an encrypted source for the same reason `merge`/`rotate`/`rewrite` do. `page(index, parent)` imports one page as a self-contained object under `parent`, translating its effective resources, media box and rotation and returning the page's new reference; it is what `merge_documents` calls once per selected page. `document()` instead walks the whole reachable graph from the source catalog and returns the new root reference; `rewrite_document` and `rotate_rewrite` build on it.
+`Importer::new(writer, source)` opens one source document for copying into a `Writer`, refusing a locked source: one that is encrypted with no working decryptor. A source already opened under its password copies across as plaintext instead, the same way [`encrypt_document`](./encryption.md#encrypting-a-file) relies on it to re-encrypt a document under new passwords. `page(index, parent)` imports one page as a self-contained object under `parent`, translating its effective resources, media box and rotation and returning the page's new reference; it is what `merge_documents` calls once per selected page. `document()` instead walks the whole reachable graph from the source catalog and returns the new root reference; `rewrite_document` and `rotate_rewrite` build on it.
 
 ```rust,no_run
 use pdfboss_core::{Dict, Document, Name, Object};
