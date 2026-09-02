@@ -1333,19 +1333,6 @@ fn rewrite<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyBytes>>
     Ok(PyBytes::new(py, &bytes))
 }
 
-/// The full list of `allow` values `encrypt` accepts, kebab-cased to match
-/// the CLI's `--allow` list exactly (`pdfboss-cli/src/assemble.rs`).
-const ALLOW_VALUES: [&str; 8] = [
-    "print",
-    "modify",
-    "copy",
-    "annotate",
-    "fill-forms",
-    "accessibility",
-    "assemble",
-    "print-hires",
-];
-
 /// Parses `allow` into a [`Permissions`]: every permission when `allow` is
 /// `None`, otherwise only the named ones. An unknown value raises
 /// `ValueError`, naming both the offending value and the full accepted list.
@@ -1353,35 +1340,12 @@ fn parse_allow(allow: Option<Vec<String>>) -> PyResult<Permissions> {
     let Some(values) = allow else {
         return Ok(Permissions::all());
     };
-    let mut permissions = Permissions {
-        print: false,
-        modify: false,
-        copy: false,
-        annotate: false,
-        fill_forms: false,
-        accessibility: false,
-        assemble: false,
-        print_hires: false,
-    };
-    for value in values {
-        match value.as_str() {
-            "print" => permissions.print = true,
-            "modify" => permissions.modify = true,
-            "copy" => permissions.copy = true,
-            "annotate" => permissions.annotate = true,
-            "fill-forms" => permissions.fill_forms = true,
-            "accessibility" => permissions.accessibility = true,
-            "assemble" => permissions.assemble = true,
-            "print-hires" => permissions.print_hires = true,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown allow value {other:?}: expected one of {}",
-                    ALLOW_VALUES.join(", ")
-                )))
-            }
-        }
-    }
-    Ok(permissions)
+    Permissions::from_names(values.iter().map(String::as_str)).map_err(|bad| {
+        PyValueError::new_err(format!(
+            "unknown allow value {bad:?}: expected one of {}",
+            pdfboss_core::PERMISSION_NAMES.join(", ")
+        ))
+    })
 }
 
 /// AES-256 protects `data` under `user_password` and/or `owner_password`

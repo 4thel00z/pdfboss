@@ -193,18 +193,6 @@ pub fn cmd_decrypt(file: &Path, out: &Path, password: &str) -> Result<(), String
     Ok(())
 }
 
-/// The full list of `--allow` values, in the order named in its help text.
-const ALLOW_VALUES: [&str; 8] = [
-    "print",
-    "modify",
-    "copy",
-    "annotate",
-    "fill-forms",
-    "accessibility",
-    "assemble",
-    "print-hires",
-];
-
 /// Parses `--allow` into a [`Permissions`]: every permission when `values`
 /// is `None`, otherwise only the named ones. An unknown value fails with
 /// exit code 2, naming both the offending value and the full accepted list.
@@ -212,35 +200,12 @@ fn parse_allow(values: Option<Vec<String>>) -> Result<Permissions, Failure> {
     let Some(values) = values else {
         return Ok(Permissions::all());
     };
-    let mut permissions = Permissions {
-        print: false,
-        modify: false,
-        copy: false,
-        annotate: false,
-        fill_forms: false,
-        accessibility: false,
-        assemble: false,
-        print_hires: false,
-    };
-    for value in values {
-        match value.as_str() {
-            "print" => permissions.print = true,
-            "modify" => permissions.modify = true,
-            "copy" => permissions.copy = true,
-            "annotate" => permissions.annotate = true,
-            "fill-forms" => permissions.fill_forms = true,
-            "accessibility" => permissions.accessibility = true,
-            "assemble" => permissions.assemble = true,
-            "print-hires" => permissions.print_hires = true,
-            other => {
-                return Err(Failure::program(format!(
-                    "invalid value '{other}' for --allow: expected one of {}",
-                    ALLOW_VALUES.join(", ")
-                )))
-            }
-        }
-    }
-    Ok(permissions)
+    Permissions::from_names(values.iter().map(String::as_str)).map_err(|bad| {
+        Failure::program(format!(
+            "invalid value '{bad}' for --allow: expected one of {}",
+            pdfboss_core::PERMISSION_NAMES.join(", ")
+        ))
+    })
 }
 
 /// Runs `pdfboss overlay`: draws the first page of `overlay` onto every

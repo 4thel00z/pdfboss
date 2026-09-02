@@ -1342,6 +1342,21 @@ pub struct Permissions {
     pub print_hires: bool,
 }
 
+/// The permission names [`Permissions::from_names`] accepts, in the order
+/// named in `--allow`/`allow` help text and error messages: `print`,
+/// `modify`, `copy`, `annotate`, `fill-forms`, `accessibility`, `assemble`,
+/// `print-hires`.
+pub const PERMISSION_NAMES: [&str; 8] = [
+    "print",
+    "modify",
+    "copy",
+    "annotate",
+    "fill-forms",
+    "accessibility",
+    "assemble",
+    "print-hires",
+];
+
 impl Permissions {
     /// Every permission granted.
     pub fn all() -> Permissions {
@@ -1355,6 +1370,37 @@ impl Permissions {
             assemble: true,
             print_hires: true,
         }
+    }
+
+    /// Every permission named in `names` granted, everything else denied.
+    /// The first name not in [`PERMISSION_NAMES`] comes back as `Err`,
+    /// carrying that name alone: the CLI and the Python bindings each wrap
+    /// it in their own error type and message text.
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Permissions, String> {
+        let mut permissions = Permissions {
+            print: false,
+            modify: false,
+            copy: false,
+            annotate: false,
+            fill_forms: false,
+            accessibility: false,
+            assemble: false,
+            print_hires: false,
+        };
+        for name in names {
+            match name {
+                "print" => permissions.print = true,
+                "modify" => permissions.modify = true,
+                "copy" => permissions.copy = true,
+                "annotate" => permissions.annotate = true,
+                "fill-forms" => permissions.fill_forms = true,
+                "accessibility" => permissions.accessibility = true,
+                "assemble" => permissions.assemble = true,
+                "print-hires" => permissions.print_hires = true,
+                other => return Err(other.to_string()),
+            }
+        }
+        Ok(permissions)
     }
 
     /// The `/P` integer this set of permissions encodes (ISO 32000-2
