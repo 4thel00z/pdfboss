@@ -714,7 +714,7 @@ class write:
         and object streams, dropping unreachable objects, which usually
         comes out smaller than ``data``. With ``under=True`` the overlay is
         drawn beneath each page's own content instead of on top of it. An
-        encrypted ``data`` raises ``PdfError``."""
+        encrypted ``data`` or ``overlay`` raises ``PdfError``."""
 
     class Standard14:
         """One of the fourteen standard fonts every PDF consumer
