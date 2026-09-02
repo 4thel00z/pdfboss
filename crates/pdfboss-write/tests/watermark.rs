@@ -190,11 +190,14 @@ fn under_draws_before_the_content() {
     let overlay_doc = Document::load(overlay_pdf()).unwrap();
 
     let over = watermark(&base_doc, &overlay_doc).unwrap();
+    let over_content = page0_content_text(&over);
     assert!(
-        page0_content_text(&over)
-            .trim_end()
-            .ends_with("/PdfbossWatermark Do Q"),
-        "over draws the form after the page's own content"
+        over_content.trim_end().ends_with("/PdfbossWatermark Do Q"),
+        "over draws the form after the page's own content: {over_content:?}"
+    );
+    assert!(
+        !over_content.starts_with("q /PdfbossWatermark"),
+        "over does not draw the form before the page's own content: {over_content:?}"
     );
 
     let under = watermark_under(&base_doc, &overlay_doc).unwrap();
@@ -204,16 +207,21 @@ fn under_draws_before_the_content() {
         "under draws the form before the page's own content: {under_content:?}"
     );
     assert!(
-        under_content.trim_end().ends_with('Q'),
-        "under closes with the page's own content: {under_content:?}"
+        !under_content.trim_end().ends_with("Do Q"),
+        "under does not draw the form again after the page's own content: {under_content:?}"
     );
 
     let over_with = watermark_with(&base_doc, &overlay_doc, WriteOptions::default()).unwrap();
+    let over_with_content = page0_content_text(&over_with);
     assert!(
-        page0_content_text(&over_with)
+        over_with_content
             .trim_end()
             .ends_with("/PdfbossWatermark Do Q"),
-        "over_with draws the form after the page's own content"
+        "over_with draws the form after the page's own content: {over_with_content:?}"
+    );
+    assert!(
+        !over_with_content.starts_with("q /PdfbossWatermark"),
+        "over_with does not draw the form before the page's own content: {over_with_content:?}"
     );
 
     let under_with =
@@ -224,8 +232,8 @@ fn under_draws_before_the_content() {
         "under_with draws the form before the page's own content: {under_with_content:?}"
     );
     assert!(
-        under_with_content.trim_end().ends_with('Q'),
-        "under_with closes with the page's own content: {under_with_content:?}"
+        !under_with_content.trim_end().ends_with("Do Q"),
+        "under_with does not draw the form again after the page's own content: {under_with_content:?}"
     );
 }
 
