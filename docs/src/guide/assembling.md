@@ -72,7 +72,7 @@ clean = rewrite(report_bytes)
 
 ## Append or rewrite
 
-| Verb | Default | Full rewrite |
+| Command | Default | Full rewrite |
 |---|---|---|
 | `meta` | appends an incremental update | `--rewrite` / `rewrite=True` |
 | `rotate` | appends an incremental update | `--rewrite` / `rewrite=True` |

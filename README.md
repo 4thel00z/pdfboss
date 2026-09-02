@@ -88,7 +88,7 @@ data = (Pdf() | Metadata(title="Q3 Report") | cover).to_bytes()
 
 An `Outline` of nested `Bookmark`s becomes the document's bookmark panel (`Pdf.outline`); `Attachment` objects embed arbitrary files inside the document (`Pdf.attachments`); `PageLabel` ranges control how page numbers render in viewer UI (`Pdf.page_labels`); and a `Viewer` sets the document's opening layout, mode, and page (`Pdf.viewer`). Each slots into `Pdf` with `|`, exactly like `Metadata`.
 
-Existing files are watermarked in place: `pdfboss.write.watermark(data, overlay)` returns `data` with the first page of `overlay` drawn over every page, as an incremental update appended to the original bytes, so the result grows by the overlay page's size and takes no longer than parsing the two files. `rewrite=True` writes a fresh, compressed file instead, which usually comes out smaller than the original.
+Existing files are watermarked in place: `pdfboss.write.watermark(data, overlay)` returns `data` with the first page of `overlay` drawn over every page, as an incremental update appended to the original bytes, so the result grows by the overlay page's size and takes no longer than parsing the two files. `rewrite=True` writes a fresh, compressed file instead, which usually comes out smaller than the original; `under=True` draws the overlay beneath the page's own content instead of on top of it. The CLI form is `pdfboss overlay report.pdf draft.pdf -o out.pdf --under`.
 
 `pdfboss.write.Update` edits an existing file's metadata the same way, and `pdfboss meta` (above) is its CLI: staged `set_metadata` fields become an appended update, the base file's bytes untouched; an encrypted base is refused.
 
@@ -118,16 +118,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Four more verbs assemble documents out of existing ones, each also available from `pdfboss.write` and `pdfboss_write` directly:
+Five more commands assemble documents out of existing ones, each also available from `pdfboss.write` and `pdfboss_write` directly:
 
-| Verb | What it does | Default | Full rewrite |
+| Command | What it does | Default | Full rewrite |
 |---|---|---|---|
 | `pdfboss merge` | Combine selected pages from several inputs into one fresh document, in argument order | always a fresh document | (its only mode) |
 | `pdfboss split` | Cut a document into consecutive chunks of pages | always fresh documents | (its only mode) |
 | `pdfboss rotate` | Rotate selected pages by a quarter-turn multiple, clockwise | appends an incremental update | `--rewrite` |
+| `pdfboss overlay` | Draw one file's first page onto every page of another, on top or beneath its content | appends an incremental update | `--rewrite` |
 | `pdfboss rewrite` | Rewrite a document fresh, with no page change | always a fresh document | (its only mode) |
 
-`merge`, `split` and `rewrite` always run on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; `rotate`'s `--rewrite` mode does too, but its default instead appends through `Update`, the same way `meta` does. A merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. An encrypted input is refused everywhere, the same as `meta` above. `overlay` and `encrypt` follow in later PRs.
+`merge`, `split` and `rewrite` always run on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; `rotate`'s and `overlay`'s `--rewrite` modes do too, but their defaults instead append through `Update`, the same way `meta` does. A merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. An encrypted input is refused everywhere, the same as `meta` above; `overlay` checks its base and its overlay file separately, so the error names whichever one is encrypted. `encrypt` follows in a later PR.
 
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
@@ -159,13 +160,14 @@ Rust: the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text 
 
 ```rust,no_run
 use pdfboss_core::Document;
+use pdfboss_output::ReadingOrder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doc = Document::open("report.pdf")?;
     let page = doc.page(0)?;
 
-    let text = pdfboss_output::extract_text(&doc, &page)?;
-    let markdown = pdfboss_output::extract_markdown(&doc)?;
+    let text = pdfboss_output::extract_text(&doc, &page, ReadingOrder::Content)?;
+    let markdown = pdfboss_output::extract_markdown(&doc, ReadingOrder::Content)?;
     println!("{text}\n{markdown}");
 
     let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;

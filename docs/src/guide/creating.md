@@ -402,6 +402,7 @@ Each result can be checked immediately with `pdfboss info`, which reports the ve
 The writer and the reader are two halves of the same engine: generated content streams parse with `pdfboss_core::content` like any other PDF, so a created document reads back without leaving the process.
 
 ```rust,no_run
+use pdfboss_output::ReadingOrder;
 use pdfboss_write::{Page, PageSize, Pdf, Standard14};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -416,7 +417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let doc = pdfboss_core::Document::load(bytes)?;
     let first = doc.page(0)?;
-    let text = pdfboss_output::extract_text(&doc, &first)?;
+    let text = pdfboss_output::extract_text(&doc, &first, ReadingOrder::Content)?;
     println!("{text}");
     Ok(())
 }

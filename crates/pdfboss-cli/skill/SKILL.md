@@ -1,6 +1,6 @@
 ---
 name: pdfboss
-description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF, editing or updating PDF metadata without rewriting the file, merging, splitting or rotating pages, rewriting a document fresh, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
+description: Use when reading, extracting, rendering, creating, or exploring PDF files with pdfboss, the from-scratch Rust PDF engine with a CLI and Python bindings. Triggers include extracting text or Markdown from a PDF, rasterizing pages to PNG, PPM, BMP or JPEG, pulling embedded images, composing a new PDF (blank, text, images, Markdown, TOML manifest, or the pdfboss.write API), watermarking an existing PDF or overlaying one PDF's first page onto every page of another, editing or updating PDF metadata without rewriting the file, merging, splitting or rotating pages, rewriting a document fresh, inspecting PDF internals (objects, xref, hexdump, jq-style queries), reading PDFs over HTTP without downloading them whole, and opening encrypted PDFs.
 ---
 
 # pdfboss
@@ -30,6 +30,7 @@ pdfboss meta    doc.pdf -o out.pdf --set title=X --set author=Y   # /Info fields
 pdfboss merge   a.pdf:2-9 b.pdf -o out.pdf              # combine selected pages from several inputs into one fresh document
 pdfboss split   doc.pdf -o 'part-%d.pdf' --every 10     # cut into consecutive chunks of pages
 pdfboss rotate  doc.pdf -o out.pdf --pages 2,4-9 --by 90   # quarter turns clockwise; appends an update, --rewrite for a fresh file instead
+pdfboss overlay doc.pdf mark.pdf -o out.pdf --under        # mark.pdf's first page onto every page, on top by default (--under for beneath); appends an update, --rewrite for a fresh file instead
 pdfboss rewrite doc.pdf -o out.pdf                      # whole document fresh: recompressed, unreachable objects and old update sections dropped
 pdfboss tui     doc.pdf                     # interactive terminal explorer
 ```
@@ -91,8 +92,9 @@ update.set_metadata(title="Q3 Report", author="Finance")   # kwarg per /Info fie
 update.save("out.pdf")                             # or update.to_bytes(); encrypted bases refused here
 
 # watermark an existing file: overlay's first page drawn over every page, as an
-# incremental update appended to the original bytes (rewrite=True writes a fresh, compressed file)
-stamped = pdfboss.write.watermark(original_bytes, overlay_bytes)
+# incremental update appended to the original bytes (rewrite=True writes a fresh, compressed
+# file; under=True draws the overlay beneath the page's own content instead of on top of it)
+out_bytes = pdfboss.write.watermark(original_bytes, overlay_bytes, under=True)
 
 # assemble documents: 0-based page lists throughout; merge/split/rewrite always build a fresh file,
 # rotate appends an incremental update by default (rewrite=True writes a fresh file instead)

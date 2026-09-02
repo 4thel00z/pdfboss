@@ -57,13 +57,14 @@ With `pdfboss-core`, `pdfboss-output` and `pdfboss-render` added:
 
 ```rust,no_run
 use pdfboss_core::Document;
+use pdfboss_output::ReadingOrder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doc = Document::open("report.pdf")?;
     println!("{} pages", doc.page_count());
 
     let page = doc.page(0)?;
-    let text = pdfboss_output::extract_text(&doc, &page)?;
+    let text = pdfboss_output::extract_text(&doc, &page, ReadingOrder::Content)?;
     println!("{text}");
 
     let pixmap = pdfboss_render::render_page(&doc, &page, 2.0)?;
