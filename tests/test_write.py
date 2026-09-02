@@ -358,6 +358,8 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
         "Text",
         "Update",
         "Viewer",
+        "decrypt",
+        "encrypt",
         "merge",
         "rewrite",
         "rotate",

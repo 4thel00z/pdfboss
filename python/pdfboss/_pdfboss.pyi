@@ -703,6 +703,28 @@ class write:
         left behind. An encrypted ``data`` raises ``PdfError``."""
 
     @staticmethod
+    def encrypt(
+        data: bytes,
+        *,
+        user_password: str = "",
+        owner_password: str = "",
+        allow: list[str] | None = None,
+    ) -> bytes:
+        """AES-256 protects ``data`` under ``user_password`` and/or
+        ``owner_password`` (ISO 32000-2 7.6.4.3) and returns the fresh
+        encrypted file, restricted by ``allow``: ``"print"``, ``"modify"``,
+        ``"copy"``, ``"annotate"``, ``"fill-forms"``, ``"accessibility"``,
+        ``"assemble"`` or ``"print-hires"`` (every permission when omitted).
+        Raises ``ValueError`` for an unknown ``allow`` value, naming it, or
+        when both ``user_password`` and ``owner_password`` are empty."""
+
+    @staticmethod
+    def decrypt(data: bytes, *, password: str = "") -> bytes:
+        """Removes AES-256 protection from ``data``, opened under
+        ``password`` (user or owner password), and returns the fresh plain
+        file. A wrong or missing password raises ``PdfError``."""
+
+    @staticmethod
     def watermark(
         data: bytes, overlay: bytes, *, rewrite: bool = False, under: bool = False
     ) -> bytes:
