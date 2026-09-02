@@ -1,18 +1,22 @@
 //! The object-level PDF writer: numbered objects in, finished file bytes
 //! out. Handles the header, stream `/Length` bookkeeping, optional Flate
-//! compression, object streams, both cross-reference styles, the trailer
-//! and a deterministic `/ID`.
+//! compression, object streams, both cross-reference styles, the trailer,
+//! a deterministic `/ID`, and optional AES-256 encryption on the way out.
 //!
 //! Determinism contract: the same sequence of calls with the same options
-//! produces byte-identical output. Nothing here reads clocks or RNGs; the
-//! `/ID` derives from a SHA-256 of the emitted body.
+//! produces byte-identical output; the `/ID` derives from a SHA-256 of the
+//! emitted body. Unencrypted output reads no clock or RNG. Encrypted
+//! output is deterministic too, but only under a caller-supplied
+//! deterministic RNG — [`Encryptor::aes256`] draws from the operating
+//! system's random source instead, exactly like every other real-world
+//! encryption key.
 
 use std::io::Write;
 
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use pdfboss_core::crypt::Sha256;
-use pdfboss_core::{block_on, Dict, Name, ObjRef, Object, Stream};
+use pdfboss_core::{block_on, Dict, Encryptor, Name, ObjRef, Object, Stream};
 
 use crate::error::{Error, Result};
 use crate::ser::{serialize_dict, serialize_object};
@@ -58,11 +62,28 @@ impl Default for WriteOptions {
 /// Accumulates numbered objects and serializes them into a complete PDF
 /// file. Objects are numbered in the order they are first claimed
 /// (`put`, `put_stream`, or `reserve`), starting at 1, generation 0.
-#[derive(Debug)]
 pub struct Writer {
     options: WriteOptions,
     slots: Vec<Slot>,
     info: Option<ObjRef>,
+    /// Set by [`Writer::new_encrypted`]: the encryptor every emitted
+    /// object (save the `/Encrypt` dictionary and the `/Type /XRef`
+    /// stream) is run through, plus the complete `/Encrypt` dictionary
+    /// itself.
+    encryption: Option<(Encryptor, Dict)>,
+}
+
+impl std::fmt::Debug for Writer {
+    /// [`Encryptor`] holds a boxed RNG closure with no useful `Debug`, so
+    /// this reports only whether encryption is configured.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Writer")
+            .field("options", &self.options)
+            .field("slots", &self.slots)
+            .field("info", &self.info)
+            .field("encrypted", &self.encryption.is_some())
+            .finish()
+    }
 }
 
 /// One numbered object: reserved, or holding its body.
@@ -79,6 +100,30 @@ impl Writer {
             options,
             slots: Vec::new(),
             info: None,
+            encryption: None,
+        }
+    }
+
+    /// Creates a writer that encrypts every object it emits under
+    /// `encryptor`, except the `/Encrypt` dictionary itself, the `/ID`
+    /// trailer strings, and the `/Type /XRef` cross-reference stream
+    /// (ISO 32000-2 §7.6.2, which never encrypts the handshake objects a
+    /// reader needs before it has a file key). `encrypt_dict` is the
+    /// complete `/Encrypt` dictionary to place in the trailer — both
+    /// values come from [`Encryptor::aes256`] or
+    /// [`Encryptor::aes256_with_rng`]. `finish` reserves one extra object
+    /// number for `encrypt_dict` and adds the trailer's `/Encrypt` entry;
+    /// `WriteOptions` itself carries no encryption state.
+    pub fn new_encrypted(
+        options: WriteOptions,
+        encryptor: Encryptor,
+        encrypt_dict: Dict,
+    ) -> Writer {
+        Writer {
+            options,
+            slots: Vec::new(),
+            info: None,
+            encryption: Some((encryptor, encrypt_dict)),
         }
     }
 
@@ -177,6 +222,7 @@ impl Writer {
             options,
             slots,
             info,
+            mut encryption,
         } = self;
         let mut bodies = Vec::with_capacity(slots.len());
         for (index, slot) in slots.into_iter().enumerate() {
@@ -190,12 +236,49 @@ impl Writer {
                 Slot::Filled(obj) => bodies.push(obj),
             }
         }
+        let (encryptor, encrypt_dict) = split_encryption(&mut encryption);
         let mut emit = Emit::new(sink);
         match options.xref {
-            XrefStyle::Table => emit_table(options, &bodies, root, info, &mut emit).await?,
-            XrefStyle::Stream => emit_stream(options, &bodies, root, info, &mut emit).await?,
+            XrefStyle::Table => {
+                emit_table(
+                    options,
+                    &bodies,
+                    root,
+                    info,
+                    encryptor,
+                    encrypt_dict,
+                    &mut emit,
+                )
+                .await?
+            }
+            XrefStyle::Stream => {
+                emit_stream(
+                    options,
+                    &bodies,
+                    root,
+                    info,
+                    encryptor,
+                    encrypt_dict,
+                    &mut emit,
+                )
+                .await?
+            }
         }
         Ok(emit.sink)
+    }
+}
+
+/// Splits an owned `(Encryptor, Dict)` pair into the mutable encryptor
+/// borrow `emit_table`/`emit_stream` hold through every `write_indirect`
+/// call (the RNG draws a fresh IV per string and stream) and a shared
+/// borrow of the dict, cloned once into its own object when the trailer
+/// needs it.
+fn split_encryption(
+    encryption: &mut Option<(Encryptor, Dict)>,
+) -> (Option<&mut Encryptor>, Option<&Dict>) {
+    match encryption {
+        Some((enc, dict)) => (Some(enc), Some(&*dict)),
+        None => (None, None),
     }
 }
 
@@ -243,48 +326,68 @@ enum Row {
     Packed { container: u32, index: u16 },
 }
 
-/// Emits the classic-table flavor: bodies, `xref` table, `trailer`
-/// dictionary, `startxref` and `%%EOF`.
+/// Emits the classic-table flavor: bodies, the `/Encrypt` dictionary when
+/// encrypting (its own extra object number, always last, never itself
+/// encrypted), `xref` table, `trailer` dictionary, `startxref` and `%%EOF`.
 async fn emit_table<S: AsyncByteSink>(
     options: WriteOptions,
     bodies: &[Object],
     root: ObjRef,
     info: Option<ObjRef>,
+    mut encryptor: Option<&mut Encryptor>,
+    encrypt_dict: Option<&Dict>,
     emit: &mut Emit<S>,
 ) -> Result<()> {
     let mut head = Vec::new();
     write_header(&mut head, options.version);
     emit.write(&head).await?;
-    let mut offsets = Vec::with_capacity(bodies.len());
+    let mut offsets = Vec::with_capacity(bodies.len() + 1);
     for (index, body) in bodies.iter().enumerate() {
         offsets.push(emit.count);
-        write_indirect(emit, index as u32 + 1, body).await?;
+        let num = index as u32 + 1;
+        write_indirect_maybe_encrypted(emit, num, body, encryptor.as_deref_mut()).await?;
+    }
+    let mut encrypt_ref = None;
+    if let Some(dict) = encrypt_dict {
+        let num = bodies.len() as u32 + 1;
+        offsets.push(emit.count);
+        write_indirect(emit, num, &Object::Dict(dict.clone())).await?;
+        encrypt_ref = Some(ObjRef { num, gen: 0 });
     }
     let id = emit.file_id();
     let xref_off = emit.count;
-    let mut section = format!("xref\n0 {}\n", bodies.len() + 1).into_bytes();
+    let mut section = format!("xref\n0 {}\n", offsets.len() + 1).into_bytes();
     section.extend_from_slice(b"0000000000 65535 f\r\n");
+    let size = offsets.len() as i64 + 1;
     for offset in offsets {
         let offset = table_offset(offset)?;
         section.extend_from_slice(format!("{offset:010} 00000 n\r\n").as_bytes());
     }
     section.extend_from_slice(b"trailer\n");
-    let trailer = trailer_dict(bodies.len() as i64 + 1, root, info, id);
+    let mut trailer = trailer_dict(size, root, info, id);
+    if let Some(r) = encrypt_ref {
+        trailer.insert(literal("Encrypt"), Object::Ref(r));
+    }
     serialize_dict(&trailer, &mut section)?;
     section.extend_from_slice(format!("\nstartxref\n{xref_off}\n%%EOF").as_bytes());
     emit.write(&section).await
 }
 
 /// Emits the cross-reference-stream flavor: bodies (non-stream objects
-/// packed into object streams when the option is set), then a `/Type /XRef`
-/// stream as the last object, `startxref` and `%%EOF`. Object numbering is
-/// dense from 0 through the xref stream itself, so `/Index` is never
-/// needed.
+/// packed into object streams when the option is set), then the
+/// `/Encrypt` dictionary when encrypting, then a `/Type /XRef` stream as
+/// the last object, `startxref` and `%%EOF`. Object numbering is dense
+/// from 0 through the xref stream itself, so `/Index` is never needed.
+/// Neither the `/Encrypt` dictionary nor the xref stream is ever
+/// encrypted; an object-stream container is encrypted as a whole, after
+/// [`build_objstm`] packs its members in plaintext.
 async fn emit_stream<S: AsyncByteSink>(
     options: WriteOptions,
     bodies: &[Object],
     root: ObjRef,
     info: Option<ObjRef>,
+    mut encryptor: Option<&mut Encryptor>,
+    encrypt_dict: Option<&Dict>,
     emit: &mut Emit<S>,
 ) -> Result<()> {
     let mut head = Vec::new();
@@ -319,7 +422,8 @@ async fn emit_stream<S: AsyncByteSink>(
             continue;
         }
         rows[index] = Row::Top(field_offset(emit.count)?);
-        write_indirect(emit, index as u32 + 1, body).await?;
+        let num = index as u32 + 1;
+        write_indirect_maybe_encrypted(emit, num, body, encryptor.as_deref_mut()).await?;
     }
 
     let mut container_offsets = Vec::with_capacity(chunks.len());
@@ -330,10 +434,29 @@ async fn emit_stream<S: AsyncByteSink>(
             .collect();
         let container = build_objstm(&pairs, options.compress)?;
         container_offsets.push(field_offset(emit.count)?);
-        write_indirect(emit, user_count + c as u32 + 1, &Object::Stream(container)).await?;
+        let num = user_count + c as u32 + 1;
+        let mut container = Object::Stream(container);
+        if let Some(encryptor) = encryptor.as_deref_mut() {
+            encryptor.encrypt_object(&mut container, num, 0);
+        }
+        write_indirect(emit, num, &container).await?;
     }
 
-    let xref_num = user_count + chunks.len() as u32 + 1;
+    let mut next_num = user_count + chunks.len() as u32 + 1;
+    let mut encrypt_row = None;
+    if let Some(dict) = encrypt_dict {
+        let offset = field_offset(emit.count)?;
+        write_indirect(emit, next_num, &Object::Dict(dict.clone())).await?;
+        encrypt_row = Some((
+            ObjRef {
+                num: next_num,
+                gen: 0,
+            },
+            offset,
+        ));
+        next_num += 1;
+    }
+    let xref_num = next_num;
     let id = emit.file_id();
     let xref_off = field_offset(emit.count)?;
 
@@ -348,9 +471,15 @@ async fn emit_stream<S: AsyncByteSink>(
     for offset in container_offsets {
         push_row(&mut data, 1, offset, 0);
     }
+    if let Some((_, offset)) = encrypt_row {
+        push_row(&mut data, 1, offset, 0);
+    }
     push_row(&mut data, 1, xref_off, 0);
 
     let mut dict = trailer_dict(xref_num as i64 + 1, root, info, id);
+    if let Some((r, _)) = encrypt_row {
+        dict.insert(literal("Encrypt"), Object::Ref(r));
+    }
     dict.insert(literal("Type"), Object::Name(literal("XRef")));
     dict.insert(
         literal("W"),
@@ -394,6 +523,27 @@ async fn write_indirect<S: AsyncByteSink>(
             lead.extend_from_slice(b"\nendobj\n");
             emit.write(&lead).await
         }
+    }
+}
+
+/// [`write_indirect`], first encrypting a clone of `obj` under `encryptor`
+/// when set. Every body a writer holds passes through here except the
+/// `/Encrypt` dictionary and the `/Type /XRef` stream, which call
+/// `write_indirect` directly and so stay exempt structurally rather than
+/// by a runtime check.
+async fn write_indirect_maybe_encrypted<S: AsyncByteSink>(
+    emit: &mut Emit<S>,
+    num: u32,
+    obj: &Object,
+    encryptor: Option<&mut Encryptor>,
+) -> Result<()> {
+    match encryptor {
+        Some(encryptor) => {
+            let mut obj = obj.clone();
+            encryptor.encrypt_object(&mut obj, num, 0);
+            write_indirect(emit, num, &obj).await
+        }
+        None => write_indirect(emit, num, obj).await,
     }
 }
 
