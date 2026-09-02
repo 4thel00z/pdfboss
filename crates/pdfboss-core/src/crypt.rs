@@ -1999,13 +1999,6 @@ mod tests {
         );
     }
 
-    fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
-        let pad = 16 - (data.len() % 16); // 1..=16 (a full block when aligned)
-        let mut v = data.to_vec();
-        v.resize(data.len() + pad, pad as u8);
-        v
-    }
-
     #[test]
     fn aes_cbc_roundtrip() {
         let key: Vec<u8> = (0u8..16).collect();
