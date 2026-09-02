@@ -222,6 +222,6 @@ directly; `merge`, `split`, `rewrite`, `meta --rewrite` and the
 `--rewrite` forms of `rotate`/`overlay` refuse every encrypted input at
 the CLI regardless of password, even though the `pdfboss_write`
 functions behind them would accept an already-opened one and carry its
-content across as plaintext. The `/Info` metadata stream (the XMP packet), like every
-other string and stream in the file, is always encrypted along with
+content across as plaintext. The `/Info` dictionary's strings and the XMP metadata stream, like every
+other string and stream in the file, are always encrypted along with
 the rest of the content.
