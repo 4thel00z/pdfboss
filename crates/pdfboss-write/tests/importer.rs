@@ -4,7 +4,10 @@
 use pdfboss_core::{Dict, Document, Name, ObjRef, Object, Rect, Stream};
 use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_testkit::{encrypted_rc4_doc, multi_page_doc, simple_doc, PdfBuilder};
-use pdfboss_write::{watermark, watermark_with, Error, Importer, WriteOptions, Writer, XrefStyle};
+use pdfboss_write::{
+    merge_documents, watermark, watermark_with, Error, Importer, Page, PageSize, Pdf, Standard14,
+    WriteOptions, Writer, XrefStyle,
+};
 
 fn name(text: &str) -> Name {
     Name(text.to_string())
@@ -448,4 +451,71 @@ fn watermark_with_refuses_an_encrypted_overlay() {
         Document::load(encrypted_rc4_doc("secret")).expect("empty-password RC4 overlay loads");
     let result = watermark_with(&base_doc, &overlay_doc, WriteOptions::default());
     assert!(matches!(result, Err(Error::EncryptedBase)));
+}
+
+/// A source page dictionary missing `/Type` entirely (legal but sloppy:
+/// ISO 32000 requires it, some producers omit it, and this repo's own
+/// leaf-detection in `pdfboss-core` falls back to "no `/Kids`" when it's
+/// absent) still counts as one page on load, and still gains `/Type
+/// /Page` once it comes through `merge_documents`.
+#[test]
+fn merged_page_gains_type_page_when_the_source_omits_it() {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+    );
+    b.object(3, "<< /Parent 2 0 R >>");
+    let base = b.build(1);
+    let doc = Document::load(base).expect("the typeless-page fixture loads");
+    assert_eq!(
+        doc.page_count(),
+        1,
+        "the fixture's one page must load even without /Type"
+    );
+    assert_eq!(
+        doc.page(0)
+            .expect("the fixture page resolves")
+            .dict()
+            .get_name("Type"),
+        None,
+        "the fixture must start out without /Type for this test to mean anything"
+    );
+
+    let bytes = merge_documents(&[(&doc, Some(&[0]))], WriteOptions::default())
+        .expect("merging the typeless-page source succeeds");
+    let merged = Document::load(bytes).expect("the merged document loads");
+    let page = merged.page(0).expect("the merged page exists");
+    assert_eq!(
+        page.dict().get_name("Type"),
+        Some(&Name("Page".to_string())),
+        "the imported page must carry /Type /Page even though the source lacked it"
+    );
+}
+
+/// A guard alongside the fix above: an ordinary page built through the
+/// `Pdf`/`Page` document API (which already emits `/Type /Page` on its
+/// own) still merges and its text still extracts, so the new unconditional
+/// insert does not disturb the common case.
+#[test]
+fn merge_documents_of_a_pdf_built_page_still_round_trips() {
+    let mut page = Page::new(PageSize::A4);
+    page.canvas
+        .text("merged page", 72.0, 720.0, Standard14::Helvetica, 12.0)
+        .expect("ASCII text encodes");
+    let base = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .expect("the Pdf-built source builds");
+    let doc = Document::load(base).expect("the Pdf-built source loads");
+
+    let bytes = merge_documents(&[(&doc, None)], WriteOptions::default())
+        .expect("merging the Pdf-built source succeeds");
+    let merged = Document::load(bytes).expect("the merged document loads");
+    let page = merged.page(0).expect("the merged page exists");
+    let text = extract_text(&merged, &page, ReadingOrder::Content).expect("text extracts");
+    assert!(text.contains("merged page"), "unexpected text: {text:?}");
 }

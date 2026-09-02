@@ -89,10 +89,11 @@ Whole document, with `pdfboss_output::extract_markdown`:
 
 ```rust,no_run
 use pdfboss_core::Document;
+use pdfboss_output::ReadingOrder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doc = Document::open("report.pdf")?;
-    let markdown = pdfboss_output::extract_markdown(&doc)?;
+    let markdown = pdfboss_output::extract_markdown(&doc, ReadingOrder::Content)?;
     println!("{markdown}");
     Ok(())
 }
@@ -102,11 +103,12 @@ One page, with `extract_page_markdown`:
 
 ```rust,no_run
 use pdfboss_core::Document;
+use pdfboss_output::ReadingOrder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doc = Document::open("report.pdf")?;
     let page = doc.page(0)?;
-    let markdown = pdfboss_output::extract_page_markdown(&doc, &page)?;
+    let markdown = pdfboss_output::extract_page_markdown(&doc, &page, ReadingOrder::Content)?;
     println!("{markdown}");
     Ok(())
 }

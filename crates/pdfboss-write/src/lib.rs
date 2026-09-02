@@ -49,7 +49,7 @@ pub use pdf::{
 };
 pub use sink::{AsyncByteSink, Immediate};
 pub use update::{
-    rotate_pages, set_metadata_with, start_offset, watermark, watermark_with, Overlay, OverlayBase,
-    Update,
+    rotate_pages, set_metadata_with, start_offset, watermark, watermark_under,
+    watermark_under_with, watermark_with, Overlay, OverlayBase, Update,
 };
 pub use writer::{WriteOptions, Writer, XrefStyle};

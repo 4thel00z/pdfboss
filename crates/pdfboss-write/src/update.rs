@@ -10,7 +10,7 @@ use flate2::Compression;
 use pdfboss_core::crypt::Sha256;
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::xref::{parse_section_at, startxref};
-use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Stream, XrefKind};
+use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Page, Stream, XrefKind};
 
 use crate::error::{Error, Result};
 use crate::importer::{rect_array, Importer};
@@ -18,27 +18,97 @@ use crate::pdf::{text_string, Date, Metadata};
 use crate::ser::{serialize_dict, serialize_object};
 use crate::writer::{WriteOptions, Writer, XrefStyle};
 
-/// The resource name every page draws the overlay form under.
+/// The first name tried for the resource every page draws the overlay
+/// form under. [`free_form_name`] falls back to `PdfbossWatermark2`,
+/// `PdfbossWatermark3`, ... when this one is already taken.
 const FORM_NAME: &str = "PdfbossWatermark";
 
-/// Like [`watermark`], but writes a fresh file through the [`Writer`] under
-/// `options` instead of appending an update: every object the base's
-/// catalog reaches is copied over, uncompressed streams are compressed when
-/// `options.compress` is set, and unreachable objects and earlier sections
-/// are left behind, so the result is usually smaller than the base. Both
-/// `base` and `overlay` are refused when encrypted, through
-/// [`crate::importer::Importer::new`].
-pub fn watermark_with(
+/// The first name in the series `PdfbossWatermark`, `PdfbossWatermark2`,
+/// ... whose `/XObject` entry is free in every marked page of `pages`.
+/// Overlaying a file that already carries a mark under an earlier name in
+/// the series draws its own form under the next free one instead of
+/// replacing the earlier entry and leaving its `Do` operators pointing at
+/// the new form. `pages` is fetched once by the caller and reused for the
+/// mark loop that follows: [`Document::page`] materializes a page's
+/// effective resources on every call, so probing by re-fetching would
+/// double that cost across the whole document.
+fn free_form_name(base: &Document, pages: &[Page]) -> Result<String> {
+    let mut candidate = FORM_NAME.to_string();
+    let mut next = 2;
+    while xobject_name_taken(base, pages, &candidate)? {
+        candidate = format!("{FORM_NAME}{next}");
+        next += 1;
+    }
+    Ok(candidate)
+}
+
+/// Whether any page in `pages` that is marked (has an [`ObjRef`] of its
+/// own) already carries an `/XObject` resource named `candidate`,
+/// resolving each page's effective resources the same way
+/// [`marked_page_dict`] and [`watermark_placed`] do before adding their
+/// own entry. A page inlined into `/Kids`, having no object of its own,
+/// is never marked, so it is skipped: only a marked page's `/XObject`
+/// dictionary can ever collide with the name this picks.
+fn xobject_name_taken(base: &Document, pages: &[Page], candidate: &str) -> Result<bool> {
+    for page in pages {
+        if page.object_ref().is_none() {
+            continue;
+        }
+        let Some(existing) = page.resources.get("XObject") else {
+            continue;
+        };
+        let existing = base.resolve(existing).map_err(core_error)?;
+        let Some(dict) = existing.as_dict() else {
+            continue;
+        };
+        if dict.get(candidate).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Every page of `base`, in order, fetched once: shared by the name probe
+/// and the mark loop that follows it, so [`Document::page`] materializes
+/// each page's effective resources only once per watermark construction
+/// rather than once for the probe and again for marking.
+fn fetch_pages(base: &Document) -> Result<Vec<Page>> {
+    (0..base.page_count())
+        .map(|index| base.page(index).map_err(core_error))
+        .collect()
+}
+
+/// The content wrappers for one marked page: what precedes the page's own
+/// content and what follows it. Drawing over paints the form after the
+/// content; drawing under paints it first, so the content covers it.
+fn wrapper_streams(form_name: &str, under: bool) -> (Vec<u8>, Vec<u8>) {
+    if under {
+        return (
+            format!("q /{form_name} Do Q\nq\n").into_bytes(),
+            b"Q\n".to_vec(),
+        );
+    }
+    (
+        b"q\n".to_vec(),
+        format!("Q\nq /{form_name} Do Q\n").into_bytes(),
+    )
+}
+
+/// Shared by [`watermark_with`] and [`watermark_under_with`]: writes a fresh
+/// file through the [`Writer`] under `options` instead of appending an
+/// update, wrapping each page's content per [`wrapper_streams`].
+fn watermark_rewrite_placed(
     base: &Document,
     overlay: &Document,
     options: WriteOptions,
+    under: bool,
 ) -> Result<Vec<u8>> {
+    let pages = fetch_pages(base)?;
+    let form_name = free_form_name(base, &pages)?;
     let mut writer = Writer::new(options);
-    let prefix = writer.put_stream_raw(Dict::new(), b"q\n".to_vec());
-    let suffix = writer.put_stream_raw(
-        Dict::new(),
-        format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
-    );
+    let (prefix_bytes, suffix_bytes) = wrapper_streams(&form_name, under);
+    let prefix = writer.put_stream_raw(Dict::new(), prefix_bytes);
+    let suffix = writer.put_stream_raw(Dict::new(), suffix_bytes);
     let form = overlay_form(&mut writer, overlay)?;
 
     let trailer = &base.xref().trailer;
@@ -46,12 +116,11 @@ pub fn watermark_with(
     let mut importer = Importer::new(&mut writer, base)?;
     let new_root = importer.reference(root);
     let new_info = trailer.get_ref("Info").map(|info| importer.reference(info));
-    for index in 0..base.page_count() {
-        let page = base.page(index).map_err(core_error)?;
+    for page in &pages {
         let Some(page_ref) = page.object_ref() else {
             continue;
         };
-        let dict = marked_page_dict(&mut importer, base, index, form, prefix, suffix)?;
+        let dict = marked_page_dict(&mut importer, base, page, form, prefix, suffix, &form_name)?;
         importer.substitute(page_ref, dict);
     }
     importer.finish()?;
@@ -61,19 +130,55 @@ pub fn watermark_with(
     writer.finish(new_root)
 }
 
-/// The marked dictionary for source page `index`: its own dictionary
-/// translated into the target, its effective resources gaining the overlay
-/// form under [`FORM_NAME`], and its content wrapped in `prefix` and
-/// `suffix`.
+/// Like [`watermark`], but writes a fresh file through the [`Writer`] under
+/// `options` instead of appending an update: every object the base's
+/// catalog reaches is copied over, uncompressed streams are compressed when
+/// `options.compress` is set, and unreachable objects and earlier sections
+/// are left behind, so the result is usually smaller than the base. Both
+/// `base` and `overlay` are refused when encrypted, through
+/// [`crate::importer::Importer::new`].
+///
+/// Placement is absolute and unscaled, and an unbalanced graphics state in
+/// a page's own content can clip or restyle the overlay, for the same
+/// reasons documented on [`watermark`].
+pub fn watermark_with(
+    base: &Document,
+    overlay: &Document,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    watermark_rewrite_placed(base, overlay, options, false)
+}
+
+/// Like [`watermark_with`], but draws the overlay beneath each page's
+/// content: the form paints first and the page's own content paints over
+/// it, so opaque content covers the overlay instead of the other way
+/// round.
+///
+/// Placement is absolute and unscaled, for the same reason documented on
+/// [`watermark`]. Painting the form first means no page state can reach
+/// it, so the unbalanced-graphics-state risk documented on [`watermark`]
+/// does not apply to this placement.
+pub fn watermark_under_with(
+    base: &Document,
+    overlay: &Document,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    watermark_rewrite_placed(base, overlay, options, true)
+}
+
+/// The marked dictionary for `page`, already fetched from `base` by the
+/// caller: its own dictionary translated into the target with `/Type
+/// /Page` guaranteed, its effective resources gaining the overlay form
+/// under `form_name`, and its content wrapped in `prefix` and `suffix`.
 fn marked_page_dict(
     importer: &mut Importer,
     base: &Document,
-    index: usize,
+    page: &Page,
     form: ObjRef,
     prefix: ObjRef,
     suffix: ObjRef,
+    form_name: &str,
 ) -> Result<Object> {
-    let page = base.page(index).map_err(core_error)?;
     let mut dict = importer.copy_dict(page.dict())?;
     let mut resources = importer.copy_dict(&page.resources)?;
     let mut xobjects = match page.resources.get("XObject") {
@@ -86,9 +191,10 @@ fn marked_page_dict(
         }
         None => Dict::new(),
     };
-    xobjects.insert(name(FORM_NAME), Object::Ref(form));
+    xobjects.insert(name(form_name), Object::Ref(form));
     resources.insert(name("XObject"), Object::Dict(xobjects));
     dict.insert(name("Resources"), Object::Dict(resources));
+    dict.insert(name("Type"), Object::Name(name("Page")));
     let mut contents = vec![Object::Ref(prefix)];
     match page.dict().get("Contents") {
         Some(Object::Array(items)) => {
@@ -141,27 +247,31 @@ fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
     Ok(form)
 }
 
-/// Draws the first page of `overlay` over every page of `base`, returning
-/// `base`'s bytes followed by an incremental update: the overlay page as
-/// one form XObject (its resources copied into the base's object space),
-/// and each page's dictionary rewritten with that form in its resources
-/// and its content wrapped in `q … Q` before the form is drawn. Pages
-/// inlined directly into `/Kids`, having no object of their own, are left
-/// as they are. An encrypted `base` is refused: its new strings and
-/// streams would need encrypting too. An encrypted `overlay` is refused
-/// as well: its decrypted content would otherwise copy across into the
-/// plain update section.
-pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
+/// Shared by [`watermark`] and [`watermark_under`]: draws the first page of
+/// `overlay` over (or, when `under` is set, beneath) every page of `base`,
+/// returning `base`'s bytes followed by an incremental update: the overlay
+/// page as one form XObject (its resources copied into the base's object
+/// space), and each page's dictionary rewritten with that form in its
+/// resources, under the first free name [`free_form_name`] finds, and its
+/// content wrapped per [`wrapper_streams`]. Pages inlined directly into
+/// `/Kids`, having no object of their own, are left as they are. An
+/// encrypted `base` is refused: its new strings and streams would need
+/// encrypting too. An encrypted `overlay` is refused as well: its
+/// decrypted content would otherwise copy across into the plain update
+/// section.
+fn watermark_placed(base: &Document, overlay: &Document, under: bool) -> Result<Vec<u8>> {
+    let pages = fetch_pages(base)?;
+    let form_name = free_form_name(base, &pages)?;
     let mut update = Update::new(base)?;
     let form = update.overlay.import_form(overlay)?;
+    let (prefix_bytes, suffix_bytes) = wrapper_streams(&form_name, under);
     let prefix = update
         .overlay
-        .put(Object::Stream(plain_stream(b"q\n".to_vec())));
-    let suffix = update.overlay.put(Object::Stream(plain_stream(
-        format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
-    )));
-    for index in 0..base.page_count() {
-        let page = base.page(index).map_err(core_error)?;
+        .put(Object::Stream(plain_stream(prefix_bytes)));
+    let suffix = update
+        .overlay
+        .put(Object::Stream(plain_stream(suffix_bytes)));
+    for page in &pages {
         let Some(page_ref) = page.object_ref() else {
             continue;
         };
@@ -176,7 +286,7 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
                 .unwrap_or_default(),
             None => Dict::new(),
         };
-        xobjects.insert(name(FORM_NAME), Object::Ref(form));
+        xobjects.insert(name(&form_name), Object::Ref(form));
         resources.insert(name("XObject"), Object::Dict(xobjects));
         dict.insert(name("Resources"), Object::Dict(resources));
         let mut contents = vec![Object::Ref(prefix)];
@@ -193,6 +303,41 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
         update.set(page_ref, Object::Dict(dict));
     }
     update.bytes()
+}
+
+/// Draws the first page of `overlay` over every page of `base`, returning
+/// `base`'s bytes followed by an incremental update: the overlay page as
+/// one form XObject (its resources copied into the base's object space),
+/// and each page's dictionary rewritten with that form in its resources
+/// and its content wrapped in `q … Q` before the form is drawn. Pages
+/// inlined directly into `/Kids`, having no object of their own, are left
+/// as they are. An encrypted `base` is refused: its new strings and
+/// streams would need encrypting too. An encrypted `overlay` is refused
+/// as well: its decrypted content would otherwise copy across into the
+/// plain update section.
+///
+/// Placement is absolute and unscaled: the overlay page draws at its own
+/// coordinates on every page of `base`, with no scaling to that page's
+/// size, and the overlay page's `/Rotate` and `/CropBox` are not applied.
+/// Because the form paints last, a page whose own content leaves
+/// unbalanced graphics state (an unclosed clip or transform) can clip or
+/// restyle the overlay, since the wrapper's one closing `Q` cannot undo
+/// it.
+pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
+    watermark_placed(base, overlay, false)
+}
+
+/// Like [`watermark`], but draws the overlay beneath each page's content:
+/// the form paints first and the page's own content paints over it, so
+/// opaque content covers the overlay instead of the other way round.
+///
+/// The same absolute, unscaled placement documented on [`watermark`]
+/// applies here too. Painting the form first, before any of the page's
+/// own operators run, means no page state can reach it, so the
+/// unbalanced-graphics-state risk documented on [`watermark`] does not
+/// apply to this placement.
+pub fn watermark_under(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
+    watermark_placed(base, overlay, true)
 }
 
 /// Stages `by` degrees of rotation, clockwise, on each of `pages` (0-based
@@ -258,10 +403,10 @@ impl OverlayBase {
     /// document has none (a recovery-scan base refuses with
     /// [`Error::MissingStartxref`] on this fallback path).
     pub fn from_document(doc: &Document) -> Result<OverlayBase> {
-        let trailer = &doc.xref().trailer;
-        if trailer.get("Encrypt").is_some_and(|o| !o.is_null()) {
+        if doc.is_encrypted() {
             return Err(Error::EncryptedBase);
         }
+        let trailer = &doc.xref().trailer;
         let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
         let (prev, kind) = match doc.xref().newest_section() {
             Some(section) => (section.offset, xref_style(section.kind)),
@@ -465,31 +610,17 @@ impl Overlay {
     /// copying its decrypted content across would silently strip its
     /// protection.
     pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
-        if overlay
-            .xref()
-            .trailer
-            .get("Encrypt")
-            .is_some_and(|o| !o.is_null())
-        {
+        if overlay.is_encrypted() {
             return Err(Error::EncryptedBase);
         }
         let page = overlay.page(0).map_err(core_error)?;
         let content = page.content(overlay).map_err(core_error)?;
         let resources = self.import_object(overlay, &Object::Dict(page.resources.clone()))?;
-        let bbox = page.media_box;
         let mut dict = Dict::new();
         dict.insert(name("Type"), Object::Name(name("XObject")));
         dict.insert(name("Subtype"), Object::Name(name("Form")));
         dict.insert(name("FormType"), Object::Int(1));
-        dict.insert(
-            name("BBox"),
-            Object::Array(
-                [bbox.x0, bbox.y0, bbox.x1, bbox.y1]
-                    .iter()
-                    .map(|v| Object::Real(f64::from(*v)))
-                    .collect(),
-            ),
-        );
+        dict.insert(name("BBox"), rect_array(page.media_box));
         dict.insert(name("Resources"), resources);
         dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
         Ok(self.put(Object::Stream(Stream {

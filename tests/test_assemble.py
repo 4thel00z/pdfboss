@@ -1,4 +1,4 @@
-"""Tests for pdfboss.write's assembly verbs: merge, split, rotate and
+"""Tests for pdfboss.write's assembly commands: merge, split, rotate and
 rewrite. Thin bytes-in/bytes-out wrappers over the underlying library
 functions, with 0-based page lists throughout (the 1-based convention is
 CLI-only)."""

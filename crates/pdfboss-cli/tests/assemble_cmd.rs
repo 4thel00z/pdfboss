@@ -287,3 +287,124 @@ fn rewrite_names_the_path_of_an_encrypted_input() {
     );
     assert!(stderr.contains("encrypted"), "no cause in: {stderr}");
 }
+
+#[test]
+fn overlay_appends_by_default_and_keeps_the_prefix() {
+    let input = tmp("overlay-append-in.pdf");
+    let base = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
+    std::fs::write(&input, &base).unwrap();
+    let mark = tmp("overlay-append-mark.pdf");
+    std::fs::write(&mark, pdfboss_testkit::multi_page_doc(&["mark"])).unwrap();
+    let out = tmp("overlay-append-out.pdf");
+
+    let output = pdfboss(&[
+        "overlay",
+        input.to_str().unwrap(),
+        mark.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "overlay failed: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(stdout.contains("wrote"), "no wrote message in: {stdout}");
+
+    let out_bytes = std::fs::read(&out).unwrap();
+    assert_eq!(
+        &out_bytes[..base.len()],
+        &base[..],
+        "an append keeps the base bytes in place"
+    );
+
+    let doc = load(&out);
+    assert_eq!(doc.page_count(), 3);
+}
+
+#[test]
+fn overlay_under_draws_beneath_the_content() {
+    let input = tmp("overlay-under-in.pdf");
+    std::fs::write(
+        &input,
+        pdfboss_testkit::multi_page_doc(&["one", "two", "three"]),
+    )
+    .unwrap();
+    let mark = tmp("overlay-under-mark.pdf");
+    std::fs::write(&mark, pdfboss_testkit::multi_page_doc(&["mark"])).unwrap();
+    let out = tmp("overlay-under-out.pdf");
+
+    let output = pdfboss(&[
+        "overlay",
+        input.to_str().unwrap(),
+        mark.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--under",
+    ]);
+    assert!(output.status.success(), "overlay failed: {output:?}");
+
+    let doc = load(&out);
+    let page = doc.page(0).unwrap();
+    let content = page.content(&doc).unwrap();
+    assert!(
+        content.starts_with(b"q /PdfbossWatermark Do Q"),
+        "content does not start with the overlay draw: {:?}",
+        String::from_utf8_lossy(&content)
+    );
+}
+
+#[test]
+fn overlay_rewrite_flag_writes_a_full_rewrite() {
+    let input = tmp("overlay-rewrite-in.pdf");
+    let base = pdfboss_testkit::multi_page_doc(&["one", "two", "three"]);
+    std::fs::write(&input, &base).unwrap();
+    let mark = tmp("overlay-rewrite-mark.pdf");
+    std::fs::write(&mark, pdfboss_testkit::multi_page_doc(&["mark"])).unwrap();
+    let out = tmp("overlay-rewrite-out.pdf");
+
+    let output = pdfboss(&[
+        "overlay",
+        input.to_str().unwrap(),
+        mark.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--rewrite",
+    ]);
+    assert!(output.status.success(), "overlay failed: {output:?}");
+
+    let out_bytes = std::fs::read(&out).unwrap();
+    assert_ne!(
+        &out_bytes[..base.len().min(out_bytes.len())],
+        &base[..base.len().min(out_bytes.len())],
+        "a rewrite does not keep the base bytes in place"
+    );
+
+    let doc = load(&out);
+    assert_eq!(doc.page_count(), 3);
+}
+
+#[test]
+fn overlay_names_the_path_of_an_encrypted_overlay() {
+    let input = tmp("overlay-encrypted-in.pdf");
+    std::fs::write(
+        &input,
+        pdfboss_testkit::multi_page_doc(&["one", "two", "three"]),
+    )
+    .unwrap();
+    let mark = tmp("overlay-encrypted-mark.pdf");
+    std::fs::write(&mark, pdfboss_testkit::encrypted_rc4_doc("secret")).unwrap();
+    let out = tmp("overlay-encrypted-out.pdf");
+
+    let output = pdfboss(&[
+        "overlay",
+        input.to_str().unwrap(),
+        mark.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("overlay-encrypted-mark.pdf"),
+        "no overlay path in: {stderr}"
+    );
+    assert!(stderr.contains("encrypted"), "no cause in: {stderr}");
+}

@@ -17,7 +17,7 @@ point where one is drawn:
   listed in the resources but never drawn does not appear at all.
 - **Drawing order.** Images come back in the order the content draws them.
 - **Form XObjects are followed.** An image drawn inside a form (a reused
-  header graphic, a stamped figure) is reached through the form, to the same
+  header graphic, an overlaid figure) is reached through the form, to the same
   bounded nesting depth the renderer uses, so a form that draws itself
   terminates instead of recursing forever.
 - **Inline images are included.** `BI … ID … EI` sequences embedded directly

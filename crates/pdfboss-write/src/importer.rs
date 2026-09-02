@@ -32,12 +32,7 @@ impl<'w, 's> Importer<'w, 's> {
     /// silent downgrade; writing an encrypted target is a separate,
     /// not yet implemented feature.
     pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
-        if source
-            .xref()
-            .trailer
-            .get("Encrypt")
-            .is_some_and(|o| !o.is_null())
-        {
+        if source.is_encrypted() {
             return Err(Error::EncryptedBase);
         }
         let compress = writer.compress();
@@ -152,10 +147,10 @@ impl<'w, 's> Importer<'w, 's> {
     /// Page `index` as a self-contained object under `parent`
     /// (target-space): old `/Parent` replaced with `parent`, effective
     /// `/Resources` and `/MediaBox` materialized, `/Rotate` when non-zero,
-    /// `/CropBox` when it differs from the media box. Returns the page's
-    /// new ref. The source `/Parent` is dropped before translation, so
-    /// none of the source's page tree (siblings, ancestors) rides along
-    /// as unreachable objects in the target.
+    /// `/CropBox` when it differs from the media box, `/Type /Page` always
+    /// present. Returns the page's new ref. The source `/Parent` is dropped
+    /// before translation, so none of the source's page tree (siblings,
+    /// ancestors) rides along as unreachable objects in the target.
     ///
     /// ISO 32000 gives a page exactly one parent, so every call gets its
     /// own page object: importing the same source index again (for a
@@ -171,6 +166,7 @@ impl<'w, 's> Importer<'w, 's> {
         let page = self.source.page(index).map_err(core_error)?;
         let mut dict = page.dict().clone();
         dict.remove("Parent");
+        dict.insert(name("Type"), Object::Name(name("Page")));
         dict.insert(name("Resources"), Object::Dict(page.resources.clone()));
         dict.insert(name("MediaBox"), rect_array(page.media_box));
         if page.rotate != 0 {

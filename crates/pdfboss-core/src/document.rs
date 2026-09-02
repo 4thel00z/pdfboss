@@ -248,6 +248,15 @@ impl Document {
         &self.xref
     }
 
+    /// True when the trailer carries a non-null `/Encrypt` entry: the file
+    /// declares encryption, whether or not this handle decrypted it.
+    pub fn is_encrypted(&self) -> bool {
+        self.xref()
+            .trailer
+            .get("Encrypt")
+            .is_some_and(|o| !o.is_null())
+    }
+
     /// Fetches an indirect object by reference (xref lookup, object-stream
     /// indirection, cached). A generation mismatch between the request and
     /// the file is tolerated (lenient).

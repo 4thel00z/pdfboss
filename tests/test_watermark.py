@@ -44,3 +44,33 @@ def test_watermark_rewrite_writes_one_fresh_section() -> None:
 def test_watermark_refuses_bytes_that_are_not_a_pdf() -> None:
     with pytest.raises(pdfboss.PdfError):
         watermark(b"not a pdf", overlay())
+
+
+def test_watermark_under_keeps_the_base_bytes_and_draws_both_texts() -> None:
+    base = two_page_base()
+    out = watermark(base, overlay(), under=True)
+    assert out.startswith(base)
+    doc = pdfboss.Document(data=out)
+    assert doc.page_count == 2
+    for index, expected in enumerate(["Base page one", "Base page two"]):
+        text = doc[index].extract_text()
+        assert expected in text
+        assert "DRAFT" in text
+
+
+def test_watermark_under_differs_from_the_default_result() -> None:
+    base = two_page_base()
+    mark = overlay()
+    assert watermark(base, mark, under=True) != watermark(base, mark)
+
+
+def test_watermark_under_rewrite_writes_one_fresh_section() -> None:
+    base = two_page_base()
+    out = watermark(base, overlay(), under=True, rewrite=True)
+    assert not out.startswith(base)
+    doc = pdfboss.Document(data=out)
+    assert doc.page_count == 2
+    for index, expected in enumerate(["Base page one", "Base page two"]):
+        text = doc[index].extract_text()
+        assert expected in text
+        assert "DRAFT" in text
