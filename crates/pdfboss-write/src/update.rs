@@ -21,24 +21,35 @@ use crate::writer::{WriteOptions, Writer, XrefStyle};
 /// The resource name every page draws the overlay form under.
 const FORM_NAME: &str = "PdfbossWatermark";
 
-/// Like [`watermark`], but writes a fresh file through the [`Writer`] under
-/// `options` instead of appending an update: every object the base's
-/// catalog reaches is copied over, uncompressed streams are compressed when
-/// `options.compress` is set, and unreachable objects and earlier sections
-/// are left behind, so the result is usually smaller than the base. Both
-/// `base` and `overlay` are refused when encrypted, through
-/// [`crate::importer::Importer::new`].
-pub fn watermark_with(
+/// The content wrappers for one marked page: what precedes the page's own
+/// content and what follows it. Drawing over paints the form after the
+/// content; drawing under paints it first, so the content covers it.
+fn wrapper_streams(under: bool) -> (Vec<u8>, Vec<u8>) {
+    if under {
+        return (
+            format!("q /{FORM_NAME} Do Q\nq\n").into_bytes(),
+            b"Q\n".to_vec(),
+        );
+    }
+    (
+        b"q\n".to_vec(),
+        format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
+    )
+}
+
+/// Shared by [`watermark_with`] and [`watermark_under_with`]: writes a fresh
+/// file through the [`Writer`] under `options` instead of appending an
+/// update, wrapping each page's content per [`wrapper_streams`].
+fn watermark_rewrite_placed(
     base: &Document,
     overlay: &Document,
     options: WriteOptions,
+    under: bool,
 ) -> Result<Vec<u8>> {
     let mut writer = Writer::new(options);
-    let prefix = writer.put_stream_raw(Dict::new(), b"q\n".to_vec());
-    let suffix = writer.put_stream_raw(
-        Dict::new(),
-        format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
-    );
+    let (prefix_bytes, suffix_bytes) = wrapper_streams(under);
+    let prefix = writer.put_stream_raw(Dict::new(), prefix_bytes);
+    let suffix = writer.put_stream_raw(Dict::new(), suffix_bytes);
     let form = overlay_form(&mut writer, overlay)?;
 
     let trailer = &base.xref().trailer;
@@ -59,6 +70,33 @@ pub fn watermark_with(
         writer.set_info(new_info);
     }
     writer.finish(new_root)
+}
+
+/// Like [`watermark`], but writes a fresh file through the [`Writer`] under
+/// `options` instead of appending an update: every object the base's
+/// catalog reaches is copied over, uncompressed streams are compressed when
+/// `options.compress` is set, and unreachable objects and earlier sections
+/// are left behind, so the result is usually smaller than the base. Both
+/// `base` and `overlay` are refused when encrypted, through
+/// [`crate::importer::Importer::new`].
+pub fn watermark_with(
+    base: &Document,
+    overlay: &Document,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    watermark_rewrite_placed(base, overlay, options, false)
+}
+
+/// Like [`watermark_with`], but draws the overlay beneath each page's
+/// content: the form paints first and the page's own content paints over
+/// it, so opaque content covers the overlay instead of the other way
+/// round.
+pub fn watermark_under_with(
+    base: &Document,
+    overlay: &Document,
+    options: WriteOptions,
+) -> Result<Vec<u8>> {
+    watermark_rewrite_placed(base, overlay, options, true)
 }
 
 /// The marked dictionary for source page `index`: its own dictionary
@@ -141,25 +179,27 @@ fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
     Ok(form)
 }
 
-/// Draws the first page of `overlay` over every page of `base`, returning
-/// `base`'s bytes followed by an incremental update: the overlay page as
-/// one form XObject (its resources copied into the base's object space),
-/// and each page's dictionary rewritten with that form in its resources
-/// and its content wrapped in `q … Q` before the form is drawn. Pages
+/// Shared by [`watermark`] and [`watermark_under`]: draws the first page of
+/// `overlay` over (or, when `under` is set, beneath) every page of `base`,
+/// returning `base`'s bytes followed by an incremental update: the overlay
+/// page as one form XObject (its resources copied into the base's object
+/// space), and each page's dictionary rewritten with that form in its
+/// resources and its content wrapped per [`wrapper_streams`]. Pages
 /// inlined directly into `/Kids`, having no object of their own, are left
 /// as they are. An encrypted `base` is refused: its new strings and
 /// streams would need encrypting too. An encrypted `overlay` is refused
 /// as well: its decrypted content would otherwise copy across into the
 /// plain update section.
-pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
+fn watermark_placed(base: &Document, overlay: &Document, under: bool) -> Result<Vec<u8>> {
     let mut update = Update::new(base)?;
     let form = update.overlay.import_form(overlay)?;
+    let (prefix_bytes, suffix_bytes) = wrapper_streams(under);
     let prefix = update
         .overlay
-        .put(Object::Stream(plain_stream(b"q\n".to_vec())));
-    let suffix = update.overlay.put(Object::Stream(plain_stream(
-        format!("Q\nq /{FORM_NAME} Do Q\n").into_bytes(),
-    )));
+        .put(Object::Stream(plain_stream(prefix_bytes)));
+    let suffix = update
+        .overlay
+        .put(Object::Stream(plain_stream(suffix_bytes)));
     for index in 0..base.page_count() {
         let page = base.page(index).map_err(core_error)?;
         let Some(page_ref) = page.object_ref() else {
@@ -193,6 +233,27 @@ pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
         update.set(page_ref, Object::Dict(dict));
     }
     update.bytes()
+}
+
+/// Draws the first page of `overlay` over every page of `base`, returning
+/// `base`'s bytes followed by an incremental update: the overlay page as
+/// one form XObject (its resources copied into the base's object space),
+/// and each page's dictionary rewritten with that form in its resources
+/// and its content wrapped in `q … Q` before the form is drawn. Pages
+/// inlined directly into `/Kids`, having no object of their own, are left
+/// as they are. An encrypted `base` is refused: its new strings and
+/// streams would need encrypting too. An encrypted `overlay` is refused
+/// as well: its decrypted content would otherwise copy across into the
+/// plain update section.
+pub fn watermark(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
+    watermark_placed(base, overlay, false)
+}
+
+/// Like [`watermark`], but draws the overlay beneath each page's content:
+/// the form paints first and the page's own content paints over it, so
+/// opaque content covers the overlay instead of the other way round.
+pub fn watermark_under(base: &Document, overlay: &Document) -> Result<Vec<u8>> {
+    watermark_placed(base, overlay, true)
 }
 
 /// Stages `by` degrees of rotation, clockwise, on each of `pages` (0-based
