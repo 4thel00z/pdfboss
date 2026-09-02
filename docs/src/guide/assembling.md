@@ -75,6 +75,7 @@ clean = rewrite(report_bytes)
 | Command | Default | Full rewrite |
 |---|---|---|
 | `meta` | appends an incremental update | `--rewrite` / `rewrite=True` |
+| `overlay` | appends an incremental update | `--rewrite` / `rewrite=True` |
 | `rotate` | appends an incremental update | `--rewrite` / `rewrite=True` |
 | `merge` | always a fresh document | no incremental mode |
 | `split` | always fresh documents | no incremental mode |

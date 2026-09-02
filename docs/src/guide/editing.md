@@ -4,7 +4,7 @@
 
 An encrypted base is refused outright. `Update::new` checks the trailer for an `/Encrypt` entry before reading or writing anything and returns `Error::EncryptedBase` (`cannot update or copy from an encrypted document`) if one is there, whether or not the document was opened with the correct password: the check is for the entry, not for whether decryption succeeded, because the new strings and streams an update writes would need encrypting too.
 
-This chapter covers `meta` and `overlay`. `merge`, `split`, `rotate` and the whole-document `rewrite` are in [Assembling documents](./assembling.md); `encrypt` follows in a later PR. `overlay` is built on the same incremental-append machinery as `meta`, through the `watermark` family of functions described [below](#overlay).
+This chapter covers `meta` and `overlay`. `merge`, `split`, `rotate` and the whole-document `rewrite` are in [Assembling documents](./assembling.md); `encrypt` follows in a later PR. `overlay` is built on the same incremental-append machinery as `meta`, through the `watermark` family of functions described [below](#overlay); see also [Watermarking an existing file](./creating.md#watermarking-an-existing-file) for the same family from the composition side.
 
 When the catalog already names an XMP packet, `set_metadata` rebuilds it from the eight modeled `Metadata` fields alone: any other XMP property the original packet carried (a PDF/A identifier, a rights statement, edit history, a custom schema) is not carried into the new packet, though the original packet's bytes stay physically present in the base, superseded only by the appended section's newer entry for that object number.
 
@@ -88,6 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+### Limitations
+
+Placement is absolute and unscaled: the overlay page draws at its own coordinates on every page of the base file, with no scaling to that page's size, and the overlay page's `/Rotate` and `/CropBox` are not applied, so an overlay file should use the same page size as the base.
+
+For the over placement, a page whose own content leaves unbalanced graphics state (an unclosed clip or transform) can clip or restyle the overlay, since the wrapper's one closing `Q` cannot undo it; `--under` is unaffected, since the form paints before any of the page's own operators run.
 
 ## Async
 
