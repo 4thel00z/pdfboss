@@ -5,18 +5,21 @@
 //! or writing a full rewrite. Also `pdfboss rewrite`: writing a whole
 //! document fresh on its own, with no page change. Also `pdfboss overlay`:
 //! drawing one file's first page onto every page of another, over or under
-//! the content.
+//! the content. Also `pdfboss encrypt` and `pdfboss decrypt`: writing a
+//! fresh AES-256 protected copy of a document, or a fresh plain copy of one
+//! that was encrypted.
 
 use std::path::Path;
 
-use pdfboss_core::Document;
+use pdfboss_core::{Document, Error as CoreError, Permissions};
 use pdfboss_write::{
-    merge_documents, rewrite_document, rotate_pages, rotate_rewrite, split_document, watermark,
-    watermark_under, watermark_under_with, watermark_with, Error as WriteError, Update,
-    WriteOptions,
+    decrypt_document, encrypt_document, merge_documents, rewrite_document, rotate_pages,
+    rotate_rewrite, split_document, watermark, watermark_under, watermark_under_with,
+    watermark_with, Error as WriteError, Update, WriteOptions,
 };
 
 use crate::pages::{parse_ranges, pattern_path, split_input_spec};
+use crate::Failure;
 
 /// Runs `pdfboss merge`: opens every input (splitting an optional
 /// `FILE:RANGE` suffix), resolves each range against its own page count,
@@ -132,6 +135,79 @@ pub fn cmd_rewrite(file: &Path, out: &Path, password: &str) -> Result<(), String
     Ok(())
 }
 
+/// Runs `pdfboss encrypt`: AES-256 protects `file` under `user_password`
+/// and/or `owner_password` (ISO 32000-2 §7.6.4.3) and writes a fresh output
+/// to `out`, restricted by `allow`. `password` opens `file` first, so an
+/// already-encrypted input is re-encrypted under the new passwords once its
+/// content reads as plaintext. At least one of `user_password`/
+/// `owner_password` must be non-empty; that refusal is raised here, with
+/// its own message, ahead of the library's own coarser one. A wrong or
+/// missing `password` names itself as such rather than as an unsupported
+/// input: `encrypt` exists specifically to work with encrypted files.
+pub fn cmd_encrypt(
+    file: &Path,
+    out: &Path,
+    user_password: &str,
+    owner_password: &str,
+    allow: Option<Vec<String>>,
+    password: &str,
+) -> Result<(), Failure> {
+    if user_password.is_empty() && owner_password.is_empty() {
+        return Err(Failure::new(
+            "at least one of --user-password or --owner-password must be set",
+        ));
+    }
+    let permissions = parse_allow(allow)?;
+    let doc = Document::open_with_password(file, password).map_err(|e| match e {
+        CoreError::Encrypted => {
+            Failure::new(format!("{}: wrong or missing password", file.display()))
+        }
+        other => Failure::new(format!("{}: {other}", file.display())),
+    })?;
+    let bytes = encrypt_document(
+        &doc,
+        user_password,
+        owner_password,
+        permissions,
+        WriteOptions::default(),
+    )
+    .map_err(|e| Failure::new(e.to_string()))?;
+    std::fs::write(out, bytes).map_err(|e| Failure::new(format!("{}: {e}", out.display())))?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Runs `pdfboss decrypt`: opens `file` under `password` (user or owner)
+/// and writes a fresh, unencrypted output to `out`. A wrong or missing
+/// password names itself as such, naming `file`, rather than reporting the
+/// input as unsupported: `decrypt` exists specifically to work with
+/// encrypted files.
+pub fn cmd_decrypt(file: &Path, out: &Path, password: &str) -> Result<(), String> {
+    let doc = Document::open_with_password(file, password).map_err(|e| match e {
+        CoreError::Encrypted => format!("{}: wrong or missing password", file.display()),
+        other => format!("{}: {other}", file.display()),
+    })?;
+    let bytes = decrypt_document(&doc, WriteOptions::default()).map_err(|e| e.to_string())?;
+    std::fs::write(out, bytes).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+/// Parses `--allow` into a [`Permissions`]: every permission when `values`
+/// is `None`, otherwise only the named ones. An unknown value fails with
+/// exit code 2, naming both the offending value and the full accepted list.
+fn parse_allow(values: Option<Vec<String>>) -> Result<Permissions, Failure> {
+    let Some(values) = values else {
+        return Ok(Permissions::all());
+    };
+    Permissions::from_names(values.iter().map(String::as_str)).map_err(|bad| {
+        Failure::program(format!(
+            "invalid value '{bad}' for --allow: expected one of {}",
+            pdfboss_core::PERMISSION_NAMES.join(", ")
+        ))
+    })
+}
+
 /// Runs `pdfboss overlay`: draws the first page of `overlay` onto every
 /// page of `file` and writes the result to `out`. On top of the content
 /// by default; `under` draws beneath it instead. Appends an incremental
@@ -164,13 +240,14 @@ pub fn cmd_overlay(
 }
 
 /// Refuses a document carrying an `/Encrypt` entry, naming `path` in the
-/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate`, `cmd_rewrite`
-/// and `cmd_overlay`: none of them copies encrypted content into a fresh
-/// output. `cmd_overlay` calls this once per input rather than relying on
-/// the library's own check, so each refusal names its own file: the
-/// library would refuse an encrypted overlay too, but its error would not
-/// say which file was encrypted.
-fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
+/// error. Shared by `cmd_merge`, `cmd_split`, `cmd_rotate`, `cmd_rewrite`,
+/// `cmd_overlay` and `cmd_meta`: the CLI refuses every encrypted input on
+/// every assembly command, password-opened or not, regardless of the
+/// library's own finer predicate underneath (some library entry points now
+/// accept a password-opened source; this gate runs first and stays coarser
+/// on purpose). `cmd_overlay` calls this once per input rather than
+/// relying on a library check, so each refusal names its own file.
+pub fn reject_encrypted(doc: &Document, path: &Path) -> Result<(), String> {
     if doc.is_encrypted() {
         return Err(format!("{}: {}", path.display(), WriteError::EncryptedBase));
     }

@@ -7,10 +7,14 @@ use std::path::Path;
 use pdfboss_core::Document;
 use pdfboss_write::{rewrite_with_metadata, Metadata, Update, WriteOptions};
 
+use crate::assemble::reject_encrypted;
+
 /// Runs `pdfboss meta`: sets `set`'s assignments on `file`'s metadata and
 /// writes the result to `out`. Appends an incremental update by default;
 /// `rewrite` writes the whole document fresh instead, through
-/// [`rewrite_with_metadata`].
+/// [`rewrite_with_metadata`]. Refuses an encrypted `file` outright, the same
+/// way every other assembly command does, whether or not `password` opened
+/// it: `decrypt` is the one command that deliberately strips encryption.
 pub fn cmd_meta(
     file: &Path,
     out: &Path,
@@ -20,6 +24,7 @@ pub fn cmd_meta(
 ) -> Result<(), String> {
     let meta = parse_assignments(set)?;
     let doc = Document::open_with_password(file, password).map_err(|e| format!("parse: {e}"))?;
+    reject_encrypted(&doc, file)?;
     if rewrite {
         let bytes = rewrite_with_metadata(&doc, meta, WriteOptions::default())
             .map_err(|e| e.to_string())?;

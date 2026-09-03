@@ -27,7 +27,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 
-use pdfboss_core::{Document as CoreDocument, DocumentSeed, Point};
+use pdfboss_core::{Document as CoreDocument, DocumentSeed, Permissions, Point};
 use pdfboss_write::{
     Attachment as CoreAttachment, Bookmark as CoreBookmark, Canvas as CoreCanvas, Color,
     Content as CoreContent, Draw, Image as CoreImage, ImageData, LabelStyle, Link as CoreLink,
@@ -1333,6 +1333,71 @@ fn rewrite<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyBytes>>
     Ok(PyBytes::new(py, &bytes))
 }
 
+/// Parses `allow` into a [`Permissions`]: every permission when `allow` is
+/// `None`, otherwise only the named ones. An unknown value raises
+/// `ValueError`, naming both the offending value and the full accepted list.
+fn parse_allow(allow: Option<Vec<String>>) -> PyResult<Permissions> {
+    let Some(values) = allow else {
+        return Ok(Permissions::all());
+    };
+    Permissions::from_names(values.iter().map(String::as_str)).map_err(|bad| {
+        PyValueError::new_err(format!(
+            "unknown allow value {bad:?}: expected one of {}",
+            pdfboss_core::PERMISSION_NAMES.join(", ")
+        ))
+    })
+}
+
+/// AES-256 protects `data` under `user_password` and/or `owner_password`
+/// (ISO 32000-2 §7.6.4.3) and returns the fresh encrypted file, restricted by
+/// `allow` (every permission when omitted; an unknown value raises
+/// `ValueError` naming it, matching the CLI's `--allow` list exactly). At
+/// least one of `user_password`/`owner_password` must be non-empty, checked
+/// here before any work. Releases the GIL around the actual encryption.
+#[pyfunction]
+#[pyo3(signature = (data, *, user_password=String::new(), owner_password=String::new(), allow=None))]
+fn encrypt<'py>(
+    py: Python<'py>,
+    data: Vec<u8>,
+    user_password: String,
+    owner_password: String,
+    allow: Option<Vec<String>>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    if user_password.is_empty() && owner_password.is_empty() {
+        return Err(PyValueError::new_err(
+            "at least one of user_password or owner_password must be set",
+        ));
+    }
+    let permissions = parse_allow(allow)?;
+    let bytes = py.allow_threads(|| {
+        let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
+        pdfboss_write::encrypt_document(
+            &doc,
+            &user_password,
+            &owner_password,
+            permissions,
+            pdfboss_write::WriteOptions::default(),
+        )
+        .map_err(pdf_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
+/// Removes AES-256 protection from `data`, opened under `password` (user or
+/// owner password), and returns the fresh plain file. A wrong or missing
+/// password raises the same `PdfError` `Document` itself raises for a bad
+/// password. Releases the GIL around the work.
+#[pyfunction]
+#[pyo3(signature = (data, *, password=String::new()))]
+fn decrypt<'py>(py: Python<'py>, data: Vec<u8>, password: String) -> PyResult<Bound<'py, PyBytes>> {
+    let bytes = py.allow_threads(|| {
+        let doc = pdfboss_core::Document::load_with_password(data, &password).map_err(pdf_err)?;
+        pdfboss_write::decrypt_document(&doc, pdfboss_write::WriteOptions::default())
+            .map_err(pdf_err)
+    })?;
+    Ok(PyBytes::new(py, &bytes))
+}
+
 pub(crate) fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let module = PyModule::new(py, "write")?;
     module.add_function(wrap_pyfunction!(watermark, &module)?)?;
@@ -1340,6 +1405,8 @@ pub(crate) fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult
     module.add_function(wrap_pyfunction!(split, &module)?)?;
     module.add_function(wrap_pyfunction!(rotate, &module)?)?;
     module.add_function(wrap_pyfunction!(rewrite, &module)?)?;
+    module.add_function(wrap_pyfunction!(encrypt, &module)?)?;
+    module.add_function(wrap_pyfunction!(decrypt, &module)?)?;
     module.add_class::<Standard14>()?;
     module.add_class::<Text>()?;
     module.add_class::<Image>()?;

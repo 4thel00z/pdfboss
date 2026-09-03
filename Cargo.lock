@@ -1403,6 +1403,7 @@ version = "1.2.0"
 dependencies = [
  "criterion",
  "flate2",
+ "getrandom 0.4.3",
  "memchr",
  "pdfboss-testkit",
  "thiserror",

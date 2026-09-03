@@ -382,13 +382,31 @@ fn document_import_reaches_the_whole_graph() {
     }
 }
 
+/// The fixture's empty user password opens transparently, so `doc` is not
+/// locked: `Importer::new` accepts it, and its already-decrypted page
+/// text copies across like any unencrypted source.
 #[test]
-fn encrypted_source_is_refused() {
+fn a_password_opened_encrypted_source_is_accepted() {
     let base = encrypted_rc4_doc("secret message");
     let doc = Document::load(base).expect("empty-password RC4 document loads");
     let mut writer = Writer::new(WriteOptions::default());
-    let result = Importer::new(&mut writer, &doc);
-    assert!(matches!(result, Err(Error::EncryptedBase)));
+    let root = {
+        let mut importer =
+            Importer::new(&mut writer, &doc).expect("a password-opened source is not locked");
+        importer.document().expect("the whole graph imports")
+    };
+    let bytes = writer
+        .finish(root)
+        .expect("the assembled document finishes");
+
+    let reloaded = Document::load(bytes).expect("assembled document loads");
+    assert!(
+        !reloaded.is_encrypted(),
+        "the copied output carries no /Encrypt"
+    );
+    let page = reloaded.page(0).expect("page 0 exists");
+    let text = extract_text(&reloaded, &page, ReadingOrder::Content).expect("text extracts");
+    assert!(text.contains("secret message"), "{text:?}");
 }
 
 #[test]
@@ -444,13 +462,28 @@ fn watermark_refuses_an_encrypted_overlay() {
     assert!(matches!(result, Err(Error::EncryptedBase)));
 }
 
+/// Unlike [`watermark`] (which stages the overlay through
+/// `OverlayBase::import_form`, a feature that still refuses every
+/// encrypted overlay), `watermark_with` reaches the overlay through
+/// `Importer::new` directly, so a password-opened overlay is not locked
+/// and is accepted: its already-decrypted page paints into the fresh,
+/// plainly unencrypted output.
 #[test]
-fn watermark_with_refuses_an_encrypted_overlay() {
+fn watermark_with_accepts_a_password_opened_encrypted_overlay() {
     let base_doc = Document::load(simple_doc("Base")).expect("plain base loads");
     let overlay_doc =
         Document::load(encrypted_rc4_doc("secret")).expect("empty-password RC4 overlay loads");
-    let result = watermark_with(&base_doc, &overlay_doc, WriteOptions::default());
-    assert!(matches!(result, Err(Error::EncryptedBase)));
+    let bytes = watermark_with(&base_doc, &overlay_doc, WriteOptions::default())
+        .expect("a password-opened overlay is not locked, so watermark_with succeeds");
+    let watermarked = Document::load(bytes).expect("watermarked document loads");
+    assert!(
+        !watermarked.is_encrypted(),
+        "the watermarked output carries no /Encrypt"
+    );
+    let page = watermarked.page(0).expect("page 0 exists");
+    let text = extract_text(&watermarked, &page, ReadingOrder::Content).expect("text extracts");
+    assert!(text.contains("Base"), "{text:?}");
+    assert!(text.contains("secret"), "{text:?}");
 }
 
 /// A source page dictionary missing `/Type` entirely (legal but sloppy:

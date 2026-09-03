@@ -13,8 +13,12 @@
 //! opening an encrypted file, and most callers never name [`Decryptor`]
 //! directly. It is public for code that drives object reads itself, as the
 //! asynchronous API does.
+//!
+//! [`Encryptor`] is the write side, AES-256 (`/V` 5, `/R` 6) only: it builds
+//! the complete `/Encrypt` dictionary and encrypts an object's strings and
+//! stream data in place, the exact inverse of [`Decryptor::decrypt_object`].
 
-use crate::object::{Dict, Object};
+use crate::object::{Dict, Name, Object};
 
 /// Password padding string (ISO 32000 §7.6.3.3, Algorithm 2, step (a)).
 const PAD: [u8; 32] = [
@@ -39,6 +43,18 @@ pub struct Decryptor {
     /// The file key (`n` bytes for RC4/AESV2, 32 for AESV3).
     key: Vec<u8>,
     cipher: Cipher,
+    /// The `/Encrypt` dictionary's `/EncryptMetadata` value (default true
+    /// when absent): when false, a stream whose own dictionary says
+    /// `/Type /Metadata` was stored in plaintext and must not be decrypted.
+    encrypt_metadata: bool,
+}
+
+/// The `/Encrypt` dictionary's `/EncryptMetadata` flag, true when absent
+/// (ISO 32000-2 §7.6.4.2, Table 20).
+fn encrypt_metadata_flag(enc: &Dict) -> bool {
+    enc.get("EncryptMetadata")
+        .and_then(Object::as_bool)
+        .unwrap_or(true)
 }
 
 impl Decryptor {
@@ -93,6 +109,7 @@ impl Decryptor {
         }
         let v = enc.get_int("V").unwrap_or(0);
         let r = enc.get_int("R").unwrap_or(0);
+        let encrypt_metadata = encrypt_metadata_flag(enc);
         match (v, r) {
             // RC4: V1 (40-bit) and V2 (up to 128-bit).
             (1 | 2, 2 | 3) => {
@@ -105,6 +122,7 @@ impl Decryptor {
                 Some(Decryptor {
                     key,
                     cipher: Cipher::Rc4,
+                    encrypt_metadata,
                 })
             }
             // V4: 128-bit key, cipher chosen by the standard crypt filter.
@@ -115,12 +133,17 @@ impl Decryptor {
                     "V2" => Cipher::Rc4,
                     _ => return None, // Identity or unknown
                 };
-                Some(Decryptor { key, cipher })
+                Some(Decryptor {
+                    key,
+                    cipher,
+                    encrypt_metadata,
+                })
             }
             // V5: AES-256 with SHA-2-based key derivation.
             (5, 5 | 6) => aesv3_key(enc, r, password).map(|key| Decryptor {
                 key,
                 cipher: Cipher::Aesv3,
+                encrypt_metadata,
             }),
             _ => None,
         }
@@ -147,7 +170,7 @@ impl Decryptor {
             Cipher::Aesv3 => self.key.clone(), // one file key for every object
             Cipher::Rc4 | Cipher::Aesv2 => self.object_key(num, gen),
         };
-        decrypt_in_place(obj, &key, self.cipher);
+        decrypt_in_place(obj, &key, self.cipher, self.encrypt_metadata);
     }
 
     /// Per-object key: `MD5(filekey ++ num[0..3] ++ gen[0..2] [++ "sAlT"])`
@@ -168,25 +191,36 @@ impl Decryptor {
 }
 
 /// Recursively decrypts every string and stream body reachable from `obj` with
-/// the per-object `key` under `cipher`.
-fn decrypt_in_place(obj: &mut Object, key: &[u8], cipher: Cipher) {
+/// the per-object `key` under `cipher`. When `encrypt_metadata` is false, a
+/// stream whose own dictionary says `/Type /Metadata` was stored in
+/// plaintext (ISO 32000-2 §7.6.4.2, Table 20) and its data is left alone;
+/// the dictionary's own values still walk normally.
+fn decrypt_in_place(obj: &mut Object, key: &[u8], cipher: Cipher, encrypt_metadata: bool) {
     match obj {
         Object::String(bytes) => *bytes = decrypt_bytes(cipher, key, bytes),
         Object::Array(items) => items
             .iter_mut()
-            .for_each(|it| decrypt_in_place(it, key, cipher)),
+            .for_each(|it| decrypt_in_place(it, key, cipher, encrypt_metadata)),
         Object::Dict(dict) => dict
             .values_mut()
-            .for_each(|v| decrypt_in_place(v, key, cipher)),
+            .for_each(|v| decrypt_in_place(v, key, cipher, encrypt_metadata)),
         Object::Stream(stream) => {
             stream
                 .dict
                 .values_mut()
-                .for_each(|v| decrypt_in_place(v, key, cipher));
+                .for_each(|v| decrypt_in_place(v, key, cipher, encrypt_metadata));
+            if !encrypt_metadata && is_metadata_stream(&stream.dict) {
+                return;
+            }
             stream.data = decrypt_bytes(cipher, key, &stream.data);
         }
         _ => {}
     }
+}
+
+/// Whether `dict` names `/Type /Metadata`.
+fn is_metadata_stream(dict: &Dict) -> bool {
+    dict.get_name("Type").map(|n| n.0.as_str()) == Some("Metadata")
 }
 
 /// Applies `cipher` to one string or stream body with the given `key`.
@@ -272,7 +306,7 @@ fn md5_file_key(enc: &Dict, id0: &[u8], r: i64, n: usize, padded: &[u8; 32]) -> 
     input.extend_from_slice(&(p as i32 as u32).to_le_bytes()); // /P low 32 bits, LE
     input.extend_from_slice(id0);
     // Revision 4 with /EncryptMetadata false hashes an extra 0xFFFFFFFF.
-    if r >= 4 && enc.get("EncryptMetadata").and_then(Object::as_bool) == Some(false) {
+    if r >= 4 && !encrypt_metadata_flag(enc) {
         input.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
     }
     let mut digest = md5(&input);
@@ -692,6 +726,27 @@ fn strip_pkcs7(data: &mut Vec<u8>) {
             data.truncate(start);
         }
     }
+}
+
+/// Pads `data` to a whole number of 16-byte blocks with PKCS#7: a full
+/// extra block of `0x10` bytes when `data` is already block-aligned, so
+/// [`strip_pkcs7`] always has a marker to remove.
+fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
+    let pad = 16 - data.len() % 16;
+    let mut out = data.to_vec();
+    out.resize(data.len() + pad, pad as u8);
+    out
+}
+
+/// Encrypts a PDF AES value: a fresh 16-byte IV from `rng` followed by the
+/// PKCS#7-padded plaintext under AES-256-CBC, the exact inverse of
+/// [`aes_cbc_decrypt`].
+fn aes_cbc_encrypt(key: &[u8], rng: &mut dyn FnMut(&mut [u8]), data: &[u8]) -> Vec<u8> {
+    let mut iv = [0u8; 16];
+    rng(&mut iv);
+    let mut out = iv.to_vec();
+    out.extend_from_slice(&aes_cbc_encrypt_blocks(key, &iv, &pkcs7_pad(data)));
+    out
 }
 
 // --- SHA-2 (FIPS 180-4): 256, 512 and 384 --------------------------------
@@ -1178,6 +1233,356 @@ fn hash_2b(r: i64, password: &[u8], salt: &[u8], udata: &[u8]) -> Vec<u8> {
     }
     k.truncate(32);
     k
+}
+
+/// Freshly generated key material for a revision-6 `/Encrypt` dictionary:
+/// the random file key plus `/U`, `/UE`, `/O`, `/OE` and `/Perms` derived
+/// from it (ISO 32000-2 §7.6.4.3.4-3.6, Algorithms 8, 9 and 10).
+pub(crate) struct KeyMaterial {
+    file_key: [u8; 32],
+    u: Vec<u8>,
+    ue: Vec<u8>,
+    o: Vec<u8>,
+    oe: Vec<u8>,
+    perms: Vec<u8>,
+}
+
+/// Builds a [`KeyMaterial`] for `user_pw`/`owner_pw` at permission bits `p`
+/// (ISO 32000-2 §7.6.4.2, Table 22), recording whether metadata is left
+/// unencrypted. `rng` fills the random bytes Algorithms 8-10 call for: the
+/// 32-byte file key, the user and owner validation/key salts, and the
+/// 4-byte `/Perms` pad. Passwords longer than the 127 UTF-8 bytes the
+/// algorithm defines are truncated, matching the validation side.
+pub(crate) fn r6_key_material(
+    user_pw: &[u8],
+    owner_pw: &[u8],
+    p: i32,
+    encrypt_metadata: bool,
+    rng: &mut dyn FnMut(&mut [u8]),
+) -> KeyMaterial {
+    let user_pw = &user_pw[..user_pw.len().min(127)];
+    let owner_pw = &owner_pw[..owner_pw.len().min(127)];
+
+    let mut file_key = [0u8; 32];
+    rng(&mut file_key);
+
+    // Algorithm 8: /U and /UE from a 16-byte random pad, the first 8
+    // bytes the validation salt and the last 8 the key salt.
+    let mut user_salt = [0u8; 16];
+    rng(&mut user_salt);
+    let mut u = hash_2b(6, user_pw, &user_salt[..8], &[]);
+    u.extend_from_slice(&user_salt);
+    let user_intermediate = hash_2b(6, user_pw, &user_salt[8..], &[]);
+    let ue = aes_cbc_encrypt_blocks(&user_intermediate, &[0u8; 16], &file_key);
+
+    // Algorithm 9: /O and /OE, the same derivation but hashing in the
+    // first 48 bytes of /U as well.
+    let mut owner_salt = [0u8; 16];
+    rng(&mut owner_salt);
+    let mut o = hash_2b(6, owner_pw, &owner_salt[..8], &u[..48]);
+    o.extend_from_slice(&owner_salt);
+    let owner_intermediate = hash_2b(6, owner_pw, &owner_salt[8..], &u[..48]);
+    let oe = aes_cbc_encrypt_blocks(&owner_intermediate, &[0u8; 16], &file_key);
+
+    // Algorithm 10: /Perms, the file key applied to a single AES-256 ECB
+    // block (not CBC).
+    let mut perms_block = [0u8; 16];
+    perms_block[..4].copy_from_slice(&p.to_le_bytes());
+    perms_block[4..8].copy_from_slice(&[0xff; 4]);
+    perms_block[8] = if encrypt_metadata { b'T' } else { b'F' };
+    perms_block[9..12].copy_from_slice(b"adb");
+    rng(&mut perms_block[12..]);
+    aes_encrypt_block(&mut perms_block, &aes_expand_key(&file_key));
+
+    KeyMaterial {
+        file_key,
+        u,
+        ue,
+        o,
+        oe,
+        perms: perms_block.to_vec(),
+    }
+}
+
+/// Fills `buf` with operating-system random bytes. Not available on
+/// `wasm32-unknown-unknown`, where `getrandom` is not a dependency at all;
+/// use [`Encryptor::aes256_with_rng`] there with a caller-supplied source.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) fn fill_os_random(buf: &mut [u8]) {
+    getrandom::fill(buf).expect("OS random number generator unavailable");
+}
+
+/// The eight standard-handler permission bits a document opened under the
+/// user password (rather than the owner password) is granted (ISO 32000-2
+/// §7.6.4.2, Table 22). Bits the standard reserves are not represented
+/// here; `p_value` fixes them to the values it mandates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Permissions {
+    /// Print the document, at full quality only when `print_hires` is also
+    /// set (Table 22 bit 3).
+    pub print: bool,
+    /// Modify the document's contents, beyond what `annotate`,
+    /// `fill_forms` and `assemble` separately cover (Table 22 bit 4).
+    pub modify: bool,
+    /// Copy or otherwise extract text and graphics (Table 22 bit 5).
+    pub copy: bool,
+    /// Add or modify text annotations and fill form fields (Table 22 bit
+    /// 6).
+    pub annotate: bool,
+    /// Fill in existing form fields even without `annotate` (Table 22 bit
+    /// 9).
+    pub fill_forms: bool,
+    /// Extract text and graphics for accessibility (Table 22 bit 10).
+    pub accessibility: bool,
+    /// Assemble the document: insert, rotate or delete pages, create
+    /// bookmarks or thumbnails (Table 22 bit 11).
+    pub assemble: bool,
+    /// Print at full quality; without it, printing (if `print` allows it)
+    /// may be limited to a low-resolution rasterization (Table 22 bit 12).
+    pub print_hires: bool,
+}
+
+/// The permission names [`Permissions::from_names`] accepts, in the order
+/// named in `--allow`/`allow` help text and error messages: `print`,
+/// `modify`, `copy`, `annotate`, `fill-forms`, `accessibility`, `assemble`,
+/// `print-hires`.
+pub const PERMISSION_NAMES: [&str; 8] = [
+    "print",
+    "modify",
+    "copy",
+    "annotate",
+    "fill-forms",
+    "accessibility",
+    "assemble",
+    "print-hires",
+];
+
+impl Permissions {
+    /// Every permission granted.
+    pub fn all() -> Permissions {
+        Permissions {
+            print: true,
+            modify: true,
+            copy: true,
+            annotate: true,
+            fill_forms: true,
+            accessibility: true,
+            assemble: true,
+            print_hires: true,
+        }
+    }
+
+    /// Every permission named in `names` granted, everything else denied.
+    /// The first name not in [`PERMISSION_NAMES`] comes back as `Err`,
+    /// carrying that name alone: the CLI and the Python bindings each wrap
+    /// it in their own error type and message text.
+    pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Permissions, String> {
+        let mut permissions = Permissions {
+            print: false,
+            modify: false,
+            copy: false,
+            annotate: false,
+            fill_forms: false,
+            accessibility: false,
+            assemble: false,
+            print_hires: false,
+        };
+        for name in names {
+            match name {
+                "print" => permissions.print = true,
+                "modify" => permissions.modify = true,
+                "copy" => permissions.copy = true,
+                "annotate" => permissions.annotate = true,
+                "fill-forms" => permissions.fill_forms = true,
+                "accessibility" => permissions.accessibility = true,
+                "assemble" => permissions.assemble = true,
+                "print-hires" => permissions.print_hires = true,
+                other => return Err(other.to_string()),
+            }
+        }
+        Ok(permissions)
+    }
+
+    /// The `/P` integer this set of permissions encodes (ISO 32000-2
+    /// §7.6.4.2, Table 22): bits 1 and 2 are reserved and always cleared;
+    /// bits 3, 4, 5, 6, 9, 10, 11 and 12 carry `print`, `modify`, `copy`,
+    /// `annotate`, `fill_forms`, `accessibility`, `assemble` and
+    /// `print_hires` in that order; every other bit is reserved and always
+    /// set. Granting everything therefore yields `-4`.
+    pub(crate) fn p_value(&self) -> i32 {
+        let flags: [(u32, bool); 8] = [
+            (3, self.print),
+            (4, self.modify),
+            (5, self.copy),
+            (6, self.annotate),
+            (9, self.fill_forms),
+            (10, self.accessibility),
+            (11, self.assemble),
+            (12, self.print_hires),
+        ];
+        let mut bits: u32 = !0b11; // every bit set, then clear the two reserved low bits
+        for (bit, granted) in flags {
+            if !granted {
+                bits &= !(1u32 << (bit - 1));
+            }
+        }
+        bits as i32
+    }
+}
+
+impl Default for Permissions {
+    /// Every permission granted, same as [`Permissions::all`].
+    fn default() -> Permissions {
+        Permissions::all()
+    }
+}
+
+/// Builds the complete AES-256, revision 6 `/Encrypt` dictionary
+/// (ISO 32000-2 §7.6.4.2) from generated key material: `/Filter /Standard`,
+/// `/V 5`, `/R 6`, `/Length 256`, a `/CF` naming the standard crypt filter
+/// as `/AESV3` with a 32-byte key, `/StmF` and `/StrF` both pointing at it,
+/// and the `/U`, `/UE`, `/O`, `/OE`, `/P` and `/Perms` entries.
+fn aes256_encrypt_dict(material: &KeyMaterial, p: i32) -> Dict {
+    let mut std_cf = Dict::new();
+    std_cf.insert(
+        Name("CFM".to_string()),
+        Object::Name(Name("AESV3".to_string())),
+    );
+    std_cf.insert(Name("Length".to_string()), Object::Int(32));
+    let mut cf = Dict::new();
+    cf.insert(Name("StdCF".to_string()), Object::Dict(std_cf));
+
+    let mut dict = Dict::new();
+    dict.insert(
+        Name("Filter".to_string()),
+        Object::Name(Name("Standard".to_string())),
+    );
+    dict.insert(Name("V".to_string()), Object::Int(5));
+    dict.insert(Name("R".to_string()), Object::Int(6));
+    dict.insert(Name("Length".to_string()), Object::Int(256));
+    dict.insert(Name("CF".to_string()), Object::Dict(cf));
+    dict.insert(
+        Name("StmF".to_string()),
+        Object::Name(Name("StdCF".to_string())),
+    );
+    dict.insert(
+        Name("StrF".to_string()),
+        Object::Name(Name("StdCF".to_string())),
+    );
+    dict.insert(Name("P".to_string()), Object::Int(i64::from(p)));
+    dict.insert(Name("U".to_string()), Object::String(material.u.clone()));
+    dict.insert(Name("UE".to_string()), Object::String(material.ue.clone()));
+    dict.insert(Name("O".to_string()), Object::String(material.o.clone()));
+    dict.insert(Name("OE".to_string()), Object::String(material.oe.clone()));
+    dict.insert(
+        Name("Perms".to_string()),
+        Object::String(material.perms.clone()),
+    );
+    dict
+}
+
+/// A configured Standard-handler encryptor: AES-256, revision 6, the write
+/// side of [`Decryptor`]. Built by [`Encryptor::aes256`] or
+/// [`Encryptor::aes256_with_rng`], which also return the complete
+/// `/Encrypt` dictionary for the trailer.
+#[allow(
+    clippy::type_complexity,
+    reason = "Box<dyn FnMut(&mut [u8]) + Send> names the one random-byte source the write path takes; a type alias would only rename it"
+)]
+pub struct Encryptor {
+    file_key: [u8; 32],
+    rng: Box<dyn FnMut(&mut [u8]) + Send>,
+}
+
+impl Encryptor {
+    /// AES-256 (`/V` 5, `/R` 6) key material from the operating system's
+    /// random source (ISO 32000-2 §7.6.4.3). Returns the encryptor plus the
+    /// complete `/Encrypt` dictionary to place in the trailer. Passwords
+    /// encode as UTF-8 and are truncated to 127 bytes, matching the reader.
+    ///
+    /// Not available on `wasm32-unknown-unknown`: there is no operating
+    /// system random source to draw from there. Use
+    /// [`Encryptor::aes256_with_rng`] instead, with caller-supplied
+    /// randomness (for example from the host's `crypto.getRandomValues`).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub fn aes256(
+        user_password: &str,
+        owner_password: &str,
+        permissions: Permissions,
+    ) -> (Encryptor, Dict) {
+        Encryptor::aes256_with_rng(
+            user_password,
+            owner_password,
+            permissions,
+            Box::new(fill_os_random),
+        )
+    }
+
+    /// [`Encryptor::aes256`] with a caller-supplied source of random bytes
+    /// in place of the operating system's, for reproducible tests.
+    #[allow(clippy::type_complexity, reason = "see Encryptor's rng field")]
+    pub fn aes256_with_rng(
+        user_password: &str,
+        owner_password: &str,
+        permissions: Permissions,
+        rng: Box<dyn FnMut(&mut [u8]) + Send>,
+    ) -> (Encryptor, Dict) {
+        let mut rng = rng;
+        let p = permissions.p_value();
+        let material = r6_key_material(
+            user_password.as_bytes(),
+            owner_password.as_bytes(),
+            p,
+            true,
+            &mut *rng,
+        );
+        let dict = aes256_encrypt_dict(&material, p);
+        let encryptor = Encryptor {
+            file_key: material.file_key,
+            rng,
+        };
+        (encryptor, dict)
+    }
+
+    /// Encrypts one indirect object's strings and stream data in place, the
+    /// exact inverse of [`Decryptor::decrypt_object`]: every string and
+    /// stream body gets a fresh random IV and PKCS#7 padding before
+    /// AES-256-CBC under the file key. AESV3 applies the same key to every
+    /// object, so `num` and `gen` are accepted and ignored here, purely for
+    /// signature symmetry with `decrypt_object`; a future per-object write
+    /// cipher (an AESV2 write path, say) would need to start deriving its
+    /// key from them instead of discarding them.
+    pub fn encrypt_object(&mut self, obj: &mut Object, num: u32, gen: u16) {
+        let _ = (num, gen);
+        encrypt_in_place(obj, &self.file_key, &mut *self.rng);
+    }
+}
+
+/// Recursively encrypts every string and stream body reachable from `obj`
+/// with the file `key`, mirroring [`decrypt_in_place`]'s walk exactly:
+/// `String`, `Array`, `Dict` values and `Stream` (dict values plus data);
+/// every other object type is left untouched.
+fn encrypt_in_place(obj: &mut Object, key: &[u8], rng: &mut dyn FnMut(&mut [u8])) {
+    match obj {
+        Object::String(bytes) => *bytes = aes_cbc_encrypt(key, rng, bytes),
+        Object::Array(items) => {
+            for it in items {
+                encrypt_in_place(it, key, &mut *rng);
+            }
+        }
+        Object::Dict(dict) => {
+            for v in dict.values_mut() {
+                encrypt_in_place(v, key, &mut *rng);
+            }
+        }
+        Object::Stream(stream) => {
+            for v in stream.dict.values_mut() {
+                encrypt_in_place(v, key, &mut *rng);
+            }
+            stream.data = aes_cbc_encrypt(key, rng, &stream.data);
+        }
+        _ => {}
+    }
 }
 
 /// Per-round left-rotation amounts (RFC 1321).
@@ -1682,13 +2087,6 @@ mod tests {
         );
     }
 
-    fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
-        let pad = 16 - (data.len() % 16); // 1..=16 (a full block when aligned)
-        let mut v = data.to_vec();
-        v.resize(data.len() + pad, pad as u8);
-        v
-    }
-
     #[test]
     fn aes_cbc_roundtrip() {
         let key: Vec<u8> = (0u8..16).collect();
@@ -1773,6 +2171,21 @@ mod tests {
     }
 
     fn encrypted_fixture_aesv3_with(r: i64, user_pw: &[u8], owner_pw: &[u8]) -> Vec<u8> {
+        encrypted_fixture_aesv3_with_metadata(r, user_pw, owner_pw, true, None)
+    }
+
+    /// [`encrypted_fixture_aesv3_with`], plus an `/EncryptMetadata` entry
+    /// and, when `metadata` is given, object 5 as a `/Type /Metadata`
+    /// stream holding its bytes verbatim (never encrypted here, since a
+    /// real writer with `encrypt_metadata` false stores it in plaintext
+    /// too): the fixture a reader must not corrupt.
+    fn encrypted_fixture_aesv3_with_metadata(
+        r: i64,
+        user_pw: &[u8],
+        owner_pw: &[u8],
+        encrypt_metadata: bool,
+        metadata: Option<&[u8]>,
+    ) -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
         let key: Vec<u8> = (0u8..32).map(|i| i ^ 0x5a).collect(); // arbitrary 256-bit file key
         let vsalt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
@@ -1795,15 +2208,27 @@ mod tests {
         let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &iv);
 
         let mut b = PdfBuilder::new().version(1, 7);
-        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        let catalog = match metadata {
+            Some(_) => "<< /Type /Catalog /Pages 2 0 R /Metadata 5 0 R >>",
+            None => "<< /Type /Catalog /Pages 2 0 R >>",
+        };
+        b.object(1, catalog);
         b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
         b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
         b.stream(4, "", &stream);
+        if let Some(metadata) = metadata {
+            b.stream(5, "<< /Type /Metadata /Subtype /XML >>", metadata);
+        }
+        let encrypt_metadata_entry = if encrypt_metadata {
+            ""
+        } else {
+            " /EncryptMetadata false"
+        };
         b.object(
             9,
             &format!(
                 "<< /Filter /Standard /V 5 /R {r} /Length 256 /P {P} /U {} /UE {} \
-                 /O {} /OE {} \
+                 /O {} /OE {}{encrypt_metadata_entry} \
                  /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>",
                 hexstr(&u),
                 hexstr(&ue),
@@ -1844,5 +2269,298 @@ mod tests {
     #[test]
     fn document_load_decrypts_aesv3_r6() {
         assert_aesv3_decrypts(6); // exercises the iterated Algorithm 2.B hash
+    }
+
+    #[test]
+    fn encrypt_metadata_false_leaves_the_metadata_stream_plaintext() {
+        use crate::object::ObjRef;
+        use crate::Document;
+
+        const XMP: &[u8] = b"<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>\
+            <x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF \
+            xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'><rdf:Description \
+            xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:title>XMP Secret \
+            Title</dc:title></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end='w'?>";
+
+        let bytes =
+            encrypted_fixture_aesv3_with_metadata(6, b"user-pw", b"owner-pw", false, Some(XMP));
+        let doc = Document::load_with_password(bytes, "user-pw").expect("user password opens");
+
+        let obj3 = doc.get(ObjRef { num: 3, gen: 0 }).unwrap();
+        let msg = obj3.as_dict().unwrap().get("Msg").unwrap();
+        assert_eq!(
+            msg.as_str_bytes().unwrap(),
+            b"AES-256 secret",
+            "an ordinary string still decrypts under EncryptMetadata false"
+        );
+
+        let obj5 = doc.get(ObjRef { num: 5, gen: 0 }).unwrap();
+        let metadata = doc.stream_data(obj5.as_stream().unwrap()).unwrap();
+        assert_eq!(
+            metadata, XMP,
+            "the metadata stream was stored in plaintext and must not be decrypted"
+        );
+    }
+
+    // --- R6 key material (write side): the existing validation code above
+    // is the oracle everything generated here must open under. ---
+
+    /// Generated key material must open through the same `aesv3_key`
+    /// validation a real reader runs, for both passwords, and reject a
+    /// wrong one; the embedded `/Perms` must decrypt to its marker under
+    /// the generated file key. The dict comes from `aes256_encrypt_dict`,
+    /// the same builder `Encryptor::aes256_with_rng` ships, so this test
+    /// exercises the real production layout rather than a hand-built one.
+    #[test]
+    fn r6_key_material_opens_under_aesv3_key() {
+        let mut c = 0u8;
+        let mut rng = |b: &mut [u8]| {
+            for x in b {
+                c = c.wrapping_add(1);
+                *x = c;
+            }
+        };
+        let material = r6_key_material(b"user-pw", b"owner-pw", P, true, &mut rng);
+        let dict = aes256_encrypt_dict(&material, P);
+
+        let user_key = aesv3_key(&dict, 6, b"user-pw").expect("user password opens");
+        assert_eq!(user_key, material.file_key.to_vec());
+
+        let owner_key = aesv3_key(&dict, 6, b"owner-pw").expect("owner password opens");
+        assert_eq!(owner_key, material.file_key.to_vec());
+
+        assert!(aesv3_key(&dict, 6, b"wrong-pw").is_none());
+
+        assert!(perms_marker_valid(&material.file_key, &material.perms));
+
+        // With /Perms absent, aesv3_key skips the fast path and falls
+        // through to comparing the /U and /O validation hashes directly,
+        // proving those 32 bytes (not just the key-salt derivation the
+        // fast path above exercised) are correct too.
+        let mut without_perms = dict.clone();
+        without_perms.remove("Perms");
+        assert_eq!(
+            aesv3_key(&without_perms, 6, b"user-pw"),
+            Some(material.file_key.to_vec())
+        );
+        assert_eq!(
+            aesv3_key(&without_perms, 6, b"owner-pw"),
+            Some(material.file_key.to_vec())
+        );
+    }
+
+    // --- Permissions: the /P bit layout (ISO 32000-2 Table 22) ---
+
+    #[test]
+    fn permissions_all_grants_every_bit() {
+        // Bits 1-2 reserved and cleared, every other bit set: -4.
+        assert_eq!(Permissions::all().p_value(), -4);
+        assert_eq!(Permissions::default().p_value(), -4);
+    }
+
+    #[test]
+    fn permissions_p_value_clears_exactly_its_own_bit() {
+        let base = Permissions::all().p_value();
+        assert_eq!(
+            Permissions {
+                print: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 2), // bit 3
+        );
+        assert_eq!(
+            Permissions {
+                modify: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 3), // bit 4
+        );
+        assert_eq!(
+            Permissions {
+                copy: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 4), // bit 5
+        );
+        assert_eq!(
+            Permissions {
+                annotate: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 5), // bit 6
+        );
+        assert_eq!(
+            Permissions {
+                fill_forms: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 8), // bit 9
+        );
+        assert_eq!(
+            Permissions {
+                accessibility: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 9), // bit 10
+        );
+        assert_eq!(
+            Permissions {
+                assemble: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 10), // bit 11
+        );
+        assert_eq!(
+            Permissions {
+                print_hires: false,
+                ..Permissions::all()
+            }
+            .p_value(),
+            base & !(1 << 11), // bit 12
+        );
+    }
+
+    // --- Encryptor (write side): the round-trip proof for Task 2 ---
+
+    /// A `FnMut(&mut [u8])` filling buffers from an incrementing counter,
+    /// so key material and IVs are reproducible without touching the OS
+    /// random source.
+    #[allow(clippy::type_complexity, reason = "see Encryptor's rng field")]
+    fn counter_rng() -> Box<dyn FnMut(&mut [u8]) + Send> {
+        let mut c = 0u8;
+        Box::new(move |buf: &mut [u8]| {
+            for b in buf {
+                c = c.wrapping_add(1);
+                *b = c;
+            }
+        })
+    }
+
+    /// Recovers the file key from a produced `/Encrypt` dict through the
+    /// same `aesv3_key` validation a real reader runs, and builds the
+    /// matching `Decryptor`: the oracle every encrypted object must open
+    /// under.
+    fn decryptor_for(dict: &Dict, password: &[u8]) -> Decryptor {
+        let key = aesv3_key(dict, 6, password).expect("password opens the produced dict");
+        Decryptor {
+            key,
+            cipher: Cipher::Aesv3,
+            encrypt_metadata: true,
+        }
+    }
+
+    #[test]
+    fn encrypt_object_round_trips_dict_array_and_leaves_other_types_untouched() {
+        use crate::object::ObjRef;
+
+        let (mut enc, dict) =
+            Encryptor::aes256_with_rng("user-pw", "owner-pw", Permissions::all(), counter_rng());
+
+        let mut d = Dict::new();
+        d.insert(
+            Name("Msg".to_string()),
+            Object::String(b"Top secret message".to_vec()),
+        );
+        d.insert(
+            Name("List".to_string()),
+            Object::Array(vec![
+                Object::String(b"first".to_vec()),
+                Object::String(b"second".to_vec()),
+            ]),
+        );
+        d.insert(
+            Name("Ref".to_string()),
+            Object::Ref(ObjRef { num: 7, gen: 0 }),
+        );
+        d.insert(
+            Name("Kind".to_string()),
+            Object::Name(Name("Example".to_string())),
+        );
+        d.insert(Name("Count".to_string()), Object::Int(42));
+        d.insert(Name("Scale".to_string()), Object::Real(1.5));
+        d.insert(Name("On".to_string()), Object::Bool(true));
+        d.insert(Name("Missing".to_string()), Object::Null);
+        let original = Object::Dict(d);
+
+        let mut obj = original.clone();
+        enc.encrypt_object(&mut obj, 3, 0);
+        assert_ne!(obj, original, "encryption must change the strings");
+
+        // Ref, Name, numbers, bools and null pass through untouched, even
+        // in the still-encrypted object.
+        let (enc_dict, orig_dict) = (obj.as_dict().unwrap(), original.as_dict().unwrap());
+        for key in ["Ref", "Kind", "Count", "Scale", "On", "Missing"] {
+            assert_eq!(
+                enc_dict.get(key),
+                orig_dict.get(key),
+                "{key} passes through untouched"
+            );
+        }
+
+        let decryptor = decryptor_for(&dict, b"user-pw");
+        let mut roundtripped = obj.clone();
+        decryptor.decrypt_object(&mut roundtripped, 3, 0);
+        assert_eq!(roundtripped, original);
+
+        // The owner password recovers the same file key.
+        let owner_decryptor = decryptor_for(&dict, b"owner-pw");
+        let mut via_owner = obj;
+        owner_decryptor.decrypt_object(&mut via_owner, 3, 0);
+        assert_eq!(via_owner, original);
+    }
+
+    #[test]
+    fn encrypt_object_round_trips_a_stream_and_its_dict() {
+        use crate::object::Stream;
+
+        let (mut enc, dict) =
+            Encryptor::aes256_with_rng("", "owner-pw", Permissions::all(), counter_rng());
+
+        let mut stream_dict = Dict::new();
+        stream_dict.insert(
+            Name("Producer".to_string()),
+            Object::String(b"pdfboss".to_vec()),
+        );
+        let original = Object::Stream(Stream {
+            dict: stream_dict,
+            data: b"decrypted stream body".to_vec(),
+        });
+        let mut obj = original.clone();
+        enc.encrypt_object(&mut obj, 4, 0);
+        let encrypted = obj.as_stream().unwrap();
+        assert_ne!(encrypted.data, original.as_stream().unwrap().data);
+        assert_ne!(
+            encrypted.dict.get("Producer"),
+            original.as_stream().unwrap().dict.get("Producer"),
+            "the stream dict's own strings are encrypted too"
+        );
+
+        let decryptor = decryptor_for(&dict, b"");
+        let mut roundtripped = obj;
+        decryptor.decrypt_object(&mut roundtripped, 4, 0);
+        assert_eq!(roundtripped, original);
+    }
+
+    #[test]
+    fn encrypt_object_round_trips_padding_edge_lengths() {
+        let (mut enc, dict) =
+            Encryptor::aes256_with_rng("pw", "owner", Permissions::all(), counter_rng());
+        let decryptor = decryptor_for(&dict, b"pw");
+
+        for plaintext in [Vec::new(), vec![0x41], vec![0x42; 16]] {
+            let original = Object::String(plaintext.clone());
+            let mut obj = original.clone();
+            enc.encrypt_object(&mut obj, 1, 0);
+            let mut roundtripped = obj;
+            decryptor.decrypt_object(&mut roundtripped, 1, 0);
+            assert_eq!(roundtripped, original, "{} bytes", plaintext.len());
+        }
     }
 }

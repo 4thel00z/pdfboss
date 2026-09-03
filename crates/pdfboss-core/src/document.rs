@@ -257,6 +257,14 @@ impl Document {
             .is_some_and(|o| !o.is_null())
     }
 
+    /// True when the file is encrypted and not opened with a working
+    /// password: [`Document::is_encrypted`] but no [`Decryptor`] was
+    /// configured, so object strings and stream data would decode as
+    /// ciphertext rather than the document's actual content.
+    pub fn is_locked(&self) -> bool {
+        self.is_encrypted() && self.decryptor.is_none()
+    }
+
     /// Fetches an indirect object by reference (xref lookup, object-stream
     /// indirection, cached). A generation mismatch between the request and
     /// the file is tolerated (lenient).

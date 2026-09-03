@@ -169,6 +169,38 @@ enum Command {
         #[arg(long, default_value = "")]
         password: String,
     },
+    /// Encrypt a document with AES-256 (a fresh file is always written).
+    Encrypt {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Password readers must supply to open the file.
+        #[arg(long, default_value = "")]
+        user_password: String,
+        /// Owner password; defaults to the user password when omitted.
+        #[arg(long, default_value = "")]
+        owner_password: String,
+        /// Permissions granted to readers, comma-separated; all when omitted.
+        /// Values: print, modify, copy, annotate, fill-forms, accessibility, assemble, print-hires.
+        #[arg(long, value_delimiter = ',')]
+        allow: Option<Vec<String>>,
+        /// Password for reading an input that is itself encrypted.
+        #[arg(long, default_value = "")]
+        password: String,
+    },
+    /// Remove encryption (opens with the password, writes a fresh plain file).
+    Decrypt {
+        /// Path to the PDF file.
+        file: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        out: PathBuf,
+        /// Password for the encrypted file (user or owner password).
+        #[arg(long, default_value = "")]
+        password: String,
+    },
     /// Show version, page count, page sizes and metadata.
     Info {
         /// Path to the PDF file.
@@ -510,6 +542,26 @@ fn main() {
             out,
             password,
         } => assemble::cmd_rewrite(&file, &out, &password).map_err(Failure::from),
+        Command::Encrypt {
+            file,
+            out,
+            user_password,
+            owner_password,
+            allow,
+            password,
+        } => assemble::cmd_encrypt(
+            &file,
+            &out,
+            &user_password,
+            &owner_password,
+            allow,
+            &password,
+        ),
+        Command::Decrypt {
+            file,
+            out,
+            password,
+        } => assemble::cmd_decrypt(&file, &out, &password).map_err(Failure::from),
         Command::Info { file, password } => cmd_info(&file, &password).map_err(Failure::from),
         Command::Text {
             file,

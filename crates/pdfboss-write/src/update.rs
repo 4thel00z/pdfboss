@@ -135,8 +135,10 @@ fn watermark_rewrite_placed(
 /// catalog reaches is copied over, uncompressed streams are compressed when
 /// `options.compress` is set, and unreachable objects and earlier sections
 /// are left behind, so the result is usually smaller than the base. Both
-/// `base` and `overlay` are refused when encrypted, through
-/// [`crate::importer::Importer::new`].
+/// `base` and `overlay` are refused when locked, through
+/// [`crate::importer::Importer::new`]; a password-opened encrypted `base`
+/// or `overlay` copies its plaintext content across like any unencrypted
+/// source.
 ///
 /// Placement is absolute and unscaled, and an unbalanced graphics state in
 /// a page's own content can clip or restyle the overlay, for the same
@@ -401,7 +403,12 @@ impl OverlayBase {
     /// already recorded while core loaded the file, falling back to
     /// re-deriving them from `startxref` and `parse_section_at` when the
     /// document has none (a recovery-scan base refuses with
-    /// [`Error::MissingStartxref`] on this fallback path).
+    /// [`Error::MissingStartxref`] on this fallback path). Refuses any
+    /// encrypted `doc` outright, wider than
+    /// [`crate::importer::Importer::new`]'s own locked-only refusal:
+    /// appending onto an already-encrypted base is a feature this crate
+    /// does not yet implement, so every encrypted base is refused here for
+    /// now, password-opened or not.
     pub fn from_document(doc: &Document) -> Result<OverlayBase> {
         if doc.is_encrypted() {
             return Err(Error::EncryptedBase);
@@ -605,10 +612,11 @@ impl Overlay {
     /// The overlay's first page as a form XObject in the base's object
     /// space: its media box as the form's bounding box, its decoded content
     /// as the form's stream, and its resource graph deep-copied and
-    /// renumbered. Refuses an encrypted `overlay`, for the same reason
-    /// [`crate::importer::Importer::new`] refuses an encrypted source:
-    /// copying its decrypted content across would silently strip its
-    /// protection.
+    /// renumbered. Refuses any encrypted `overlay` outright, wider than
+    /// [`crate::importer::Importer::new`]'s own locked-only refusal:
+    /// appending onto an encrypted base is a feature this crate does not
+    /// yet implement, so every encrypted overlay is refused here for now,
+    /// password-opened or not.
     pub(crate) fn import_form(&mut self, overlay: &Document) -> Result<ObjRef> {
         if overlay.is_encrypted() {
             return Err(Error::EncryptedBase);

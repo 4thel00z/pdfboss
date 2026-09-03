@@ -45,9 +45,11 @@ pages:     1
 
 Every subcommand that reads a PDF (`info`, `text`, `md`,
 `render`, `images`, `obj`, `tui`, `json`, `hex`, `meta` and `q`) takes
-`--password`, accepted as either the user or the owner password; for
-`meta` it only unlocks the base for reading, since writing an update
-against an encrypted base stays refused until a later PR:
+`--password`, accepted as either the user or the owner password. For
+`meta` it only unlocks the base for reading: every assembly command,
+`meta` included, refuses an encrypted input at write time regardless of
+password; `decrypt` is the one command that removes encryption instead
+of refusing it:
 
 ```bash
 pdfboss text --password hunter2 locked.pdf
@@ -127,3 +129,99 @@ Once a document is open, every operation ([text](./text.md),
 [images](./images.md)) works exactly as on an unencrypted file; decryption
 happens transparently underneath. Full option listings live in the
 [CLI reference](../reference/cli.md).
+
+## Encrypting a file
+
+`encrypt` builds a fresh AES-256, revision 6 protected copy of a document
+(ISO 32000-2 §7.6.4.3). At least one of the user or owner password must
+be set; an omitted owner password falls back to the user password, and
+either password opens the file:
+
+```bash
+pdfboss encrypt report.pdf -o locked.pdf --user-password hunter2
+```
+
+`--allow` restricts what a reader opening under the user password may
+do; the owner password always grants everything. Values: `print`,
+`modify`, `copy`, `annotate`, `fill-forms`, `accessibility`, `assemble`,
+`print-hires`; every permission is granted when `--allow` is omitted:
+
+```bash
+pdfboss encrypt report.pdf -o locked.pdf --user-password hunter2 --allow print,copy
+```
+
+`--password` opens an input that is itself encrypted, so an
+already-protected file re-encrypts under new passwords:
+
+```bash
+pdfboss encrypt locked.pdf -o relocked.pdf --password hunter2 --user-password newpass
+```
+
+Rust:
+
+```rust,no_run
+use pdfboss_core::{Document, Permissions};
+use pdfboss_write::{encrypt_document, WriteOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    let permissions = Permissions { modify: false, ..Permissions::all() };
+    let bytes = encrypt_document(&doc, "hunter2", "", permissions, WriteOptions::default())?;
+    std::fs::write("locked.pdf", bytes)?;
+    Ok(())
+}
+```
+
+Python:
+
+```python
+from pdfboss.write import encrypt
+
+locked = encrypt(report_bytes, user_password="hunter2", allow=["print", "copy"])
+```
+
+## Removing encryption
+
+`decrypt` opens a file under its user or owner password and writes a
+fresh, unencrypted copy:
+
+```bash
+pdfboss decrypt locked.pdf -o plain.pdf --password hunter2
+```
+
+```rust,no_run
+use pdfboss_core::Document;
+use pdfboss_write::{decrypt_document, WriteOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open_with_password("locked.pdf", "hunter2")?;
+    let bytes = decrypt_document(&doc, WriteOptions::default())?;
+    std::fs::write("plain.pdf", bytes)?;
+    Ok(())
+}
+```
+
+```python
+from pdfboss.write import decrypt
+
+plain = decrypt(locked_bytes, password="hunter2")
+```
+
+## Limitations
+
+pdfboss writes AES-256, revision 6 encryption only; RC4 and AES-128
+files stay readable but are never produced. Each encrypted output uses
+a fresh random file key, salts and initialization vectors, so
+encrypting the same document twice under the same passwords never
+produces identical bytes. An incremental update appended onto an
+encrypted base (the default mode of `meta`, `rotate` and `overlay`, and
+`pdfboss_write::Update` directly) still refuses the base outright,
+whether or not it opens under a password. `encrypt` and `decrypt` are
+the only commands that take a password-opened encrypted input
+directly; `merge`, `split`, `rewrite`, `meta --rewrite` and the
+`--rewrite` forms of `rotate`/`overlay` refuse every encrypted input at
+the CLI regardless of password, even though the `pdfboss_write`
+functions behind them would accept an already-opened one and carry its
+content across as plaintext. The `/Info` dictionary's strings and the XMP metadata stream, like every
+other string and stream in the file, are always encrypted along with
+the rest of the content.
