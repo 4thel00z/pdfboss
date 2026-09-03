@@ -2,7 +2,9 @@
 //! selected pages from each source, gathered in argument order under a
 //! single new `/Pages` node.
 
-use pdfboss_core::{Dict, Document, Encryptor, Name, Object, Permissions};
+use pdfboss_core::{Dict, Document, Name, Object};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use pdfboss_core::{Encryptor, Permissions};
 
 use crate::error::{Error, Result};
 use crate::importer::Importer;
@@ -153,6 +155,12 @@ fn rewrite_into(mut writer: Writer, doc: &Document) -> Result<Vec<u8>> {
 /// content already reads as plaintext through `Document::get`, so it
 /// copies across like any unencrypted source and gets encrypted afresh
 /// under the new passwords.
+///
+/// Not available on `wasm32-unknown-unknown`: it builds its `Encryptor`
+/// with [`Encryptor::aes256`], which needs the operating system's random
+/// source. Construct an `Encryptor` with `Encryptor::aes256_with_rng` and
+/// [`Writer::new_encrypted`] directly there instead.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn encrypt_document(
     doc: &Document,
     user_password: &str,
