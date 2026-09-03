@@ -464,7 +464,8 @@ mod tests {
         ))
         .unwrap();
         let page = doc.page(0).unwrap();
-        let (_, rulings, _) = extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+        let (_, rulings, _) =
+            extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(rulings.len(), 1, "the beveled bar is one ruling");
         assert!((rulings[0].start.y - 593.7).abs() < 0.5);
         assert!((rulings[0].end.x - rulings[0].start.x - 470.0).abs() < 2.0);
@@ -1018,7 +1019,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(
             !spans[0].bold,
             "a Regular-named face is not bold, whatever StemV claims"
@@ -1054,7 +1055,7 @@ mod tests {
         );
         let doc = Document::load(b.build(1)).unwrap();
         let page = doc.page(0).unwrap();
-        let spans = extract_spans(&doc, &page).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(
             spans[0].bold,
             "Bookman-Demi's thick stem still marks it bold"

@@ -3502,7 +3502,7 @@ pub(crate) mod tests {
                 11.5,
             ));
         }
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         let Block::Heading { level, lines, .. } = &layout.blocks[0] else {
             panic!("the isolated top line is the page's title, got {:?}", layout.blocks[0]);
         };
@@ -3527,7 +3527,7 @@ pub(crate) mod tests {
         }
         spans.push(span("format.", 54.0, 96.0, 390.0, 11.5));
         spans.push(span("Online Survey", 482.0, 558.0, 43.0, 8.0));
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         let Block::Heading { lines, .. } = &layout.blocks[0] else {
             panic!("the folded title is carved out, got {:?}", layout.blocks[0]);
         };
@@ -3552,7 +3552,7 @@ pub(crate) mod tests {
                 11.5,
             ));
         }
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
             !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
             "a sub-body top line never promotes"
@@ -3573,7 +3573,7 @@ pub(crate) mod tests {
                 11.5,
             ));
         }
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
             !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
             "a numbered top line never promotes"
@@ -3600,7 +3600,7 @@ pub(crate) mod tests {
                 11.5,
             ));
         }
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
             !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
             "a full-measure top line never promotes"
@@ -3631,7 +3631,7 @@ pub(crate) mod tests {
                 11.5,
             ));
         }
-        let layout = page_layout(&spans);
+        let layout = page_layout(&spans, ReadingOrder::Content);
         let headings: Vec<&Block> = layout
             .blocks
             .iter()
@@ -3670,7 +3670,7 @@ pub(crate) mod tests {
             for index in 0..doc.page_count() {
                 let Ok(page) = doc.page(index) else { continue };
                 let Ok((mut spans, rulings, _)) =
-                    pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page)
+                    pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content)
                 else {
                     continue;
                 };
@@ -3747,7 +3747,7 @@ pub(crate) mod tests {
         let doc = Document::load(std::fs::read(&path).unwrap()).unwrap();
         let page = doc.page(0).unwrap();
         let (spans, rulings, report) =
-            pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page).unwrap();
+            pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         println!("rulings: {} (report complete: {})", rulings.len(), report.is_complete());
         for r in rulings.iter().take(60) {
             println!(
@@ -3892,7 +3892,7 @@ pub(crate) mod tests {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
             for index in 0..doc.page_count() {
                 let Ok(page) = doc.page(index) else { continue };
-                let Ok((mut spans, _)) = pdfboss_text::extract_spans_reporting(&doc, &page)
+                let Ok((mut spans, _)) = pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content)
                 else {
                     continue;
                 };

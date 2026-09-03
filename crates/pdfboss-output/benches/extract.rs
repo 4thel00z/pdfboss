@@ -68,7 +68,7 @@ fn bench_extract(c: &mut Criterion) {
     let flowy = Document::load(flowy_doc(40, 2)).unwrap();
     let flowy_page = flowy.page(0).unwrap();
     c.bench_function("extract_text_warm_flows_40x2", |b| {
-        b.iter(|| black_box(extract_text(&flowy, &flowy_page).unwrap()));
+        b.iter(|| black_box(extract_text(&flowy, &flowy_page, ReadingOrder::Content).unwrap()));
     });
 
     let bytes = text_doc(500);
