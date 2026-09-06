@@ -47,6 +47,8 @@ impl Rect {
     }
 
     /// Returns the same area with `x0 <= x1` and `y0 <= y1`.
+    ///
+    /// Covers ISO 32000-1 §7.9.5.
     pub fn normalize(self) -> Rect {
         Rect {
             x0: self.x0.min(self.x1),
@@ -143,6 +145,8 @@ impl Matrix {
     }
 
     /// Translation by `(tx, ty)`.
+    ///
+    /// Covers ISO 32000-1 §8.3.3.
     pub const fn translate(tx: f32, ty: f32) -> Matrix {
         Matrix {
             a: 1.0,
@@ -155,6 +159,8 @@ impl Matrix {
     }
 
     /// Scaling by `(sx, sy)` about the origin.
+    ///
+    /// Covers ISO 32000-1 §8.3.3.
     pub const fn scale(sx: f32, sy: f32) -> Matrix {
         Matrix {
             a: sx,
@@ -184,6 +190,8 @@ impl Matrix {
     /// With the row-vector convention this is the matrix product
     /// `self × other`, so `p.apply(self.concat(other)) ==
     /// other.apply(self.apply(p))`.
+    ///
+    /// Covers ISO 32000-1 §8.3.2.5 and §8.3.4.
     pub fn concat(self, other: Matrix) -> Matrix {
         Matrix {
             a: self.a * other.a + self.b * other.c,
@@ -196,6 +204,8 @@ impl Matrix {
     }
 
     /// Transforms a point.
+    ///
+    /// Covers ISO 32000-1 §8.3.4.
     pub fn apply(self, p: Point) -> Point {
         Point {
             x: self.a * p.x + self.c * p.y + self.e,
@@ -268,6 +278,7 @@ mod tests {
         assert_point_eq(id.apply(Point::new(7.5, -2.0)), Point::new(7.5, -2.0));
     }
 
+    // Covers ISO 32000-1 §8.3.3.
     #[test]
     fn apply_translate_scale_rotate() {
         let p = Point::new(1.0, 2.0);
@@ -286,6 +297,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.3.4.
     #[test]
     fn concat_applies_self_then_other() {
         // Translate by (10, 0), then scale by 2: (1, 2) -> (11, 2) -> (22, 4).
@@ -296,6 +308,7 @@ mod tests {
         assert_point_eq(m.apply(Point::new(1.0, 2.0)), Point::new(12.0, 4.0));
     }
 
+    // Covers ISO 32000-1 §8.3.2.5.
     #[test]
     fn concat_matches_sequential_application() {
         let m1 = Matrix::rotate_deg(30.0).concat(Matrix::translate(5.0, -3.0));
@@ -304,6 +317,7 @@ mod tests {
         assert_point_eq(m1.concat(m2).apply(p), m2.apply(m1.apply(p)));
     }
 
+    // Covers ISO 32000-1 §8.3.4.
     #[test]
     fn invert_round_trips() {
         let m = Matrix::translate(4.0, -1.0)
@@ -323,6 +337,7 @@ mod tests {
         assert_matrix_eq(inv, Matrix::translate(-10.0, 2.0));
     }
 
+    // Covers ISO 32000-1 §8.3.4.
     #[test]
     fn invert_singular_is_none() {
         assert!(Matrix::scale(0.0, 0.0).invert().is_none());
@@ -339,6 +354,7 @@ mod tests {
         assert!(m.invert().is_none());
     }
 
+    // Covers ISO 32000-1 §7.9.5.
     #[test]
     fn rect_width_height_normalize() {
         let r = Rect::new(10.0, 20.0, 4.0, 2.0);

@@ -381,6 +381,8 @@ impl MarkedContent for Recorded {
 /// written between two paragraphs stays between them). Stable, so spans
 /// within one sequence keep content order. `false` when the tree reaches
 /// none of the page's marked content, leaving the spans as they were.
+///
+/// Covers ISO 32000-1 §14.8.2.3.
 async fn structure_order<S: AsyncObjectSource>(
     src: &S,
     tree: &StructureTree,
@@ -857,6 +859,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// renderer's `find_res`; the two crates must agree on which resource a
     /// name refers to, or the same file extracts different text than it
     /// paints.
+    ///
+    /// Covers ISO 32000-1 §7.8.3.
     async fn find_res(
         &mut self,
         chain: &[Arc<Dict>],
@@ -996,6 +1000,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// depth-first order the recursive version emitted, which is what keeps span
     /// order identical. Nothing is owed on the way back out: unlike the
     /// renderer, this executor has no state to restore after a nested stream.
+    ///
+    /// Covers ISO 32000-1 §14.6.1 and §9.2.2.
     async fn run(&mut self, root: Frame) {
         let mut frames = vec![root];
         // The running frame is held as a local rather than indexed in place, which
@@ -1100,6 +1106,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// `gs`, and `Do`. `q`/`Q` and `cm` maintain the CTM; text operators
     /// maintain Tm/Tlm; shown strings become spans; path operators feed the
     /// frame's subpaths and paint operators commit them as rulings.
+    ///
+    /// Covers ISO 32000-1 §14.6.3, §9.3.2, §9.3.4, §9.3.5, §9.3.7, §9.4.1, §9.4.2 and §9.4.3.
     fn step(&mut self, frame: &mut Frame, op: &Op) {
         match op {
             Op::Save => frame.saved.push(frame.gs.clone()),
@@ -1247,6 +1255,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
 
     /// The `/MCID` a `BDC` opens: read from an inline property dictionary,
     /// or from the named one in the resource chain's `/Properties`.
+    ///
+    /// Covers ISO 32000-1 §14.6.2.
     async fn marked_mcid(&mut self, props: &Object, chain: &[Arc<Dict>]) -> Option<u32> {
         let named;
         let dict = match props {
@@ -1320,6 +1330,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// the handle is an `Arc` now, so cloning it there costs two atomic updates
     /// per shown string; borrowing `self.fallback` is only possible while nothing
     /// holds `&mut self.spans`.
+    ///
+    /// Covers ISO 32000-1 §14.8.2.5, §9.2.4, §9.3.3, §9.3.4 and §9.3.7.
     fn show(&self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) -> Option<TextSpan> {
         let font: &Font = gs.font.as_deref().unwrap_or(&self.fallback);
         let start = tm.concat(gs.ctm);
@@ -1599,6 +1611,7 @@ mod tests {
     /// A hidden layer's text is excluded and counted once per span, while
     /// its advances still run: the visible text that follows starts where
     /// the hidden run ended, and the walk is still complete.
+    // Covers ISO 32000-1 §8.11.3.2.
     #[test]
     fn hidden_layer_text_is_excluded_but_still_advances() {
         let doc = oc_doc(
@@ -1621,6 +1634,7 @@ mod tests {
     /// A form whose own `/OC` entry is off contributes nothing — no spans,
     /// no skip entry, one count — and rulings drawn in a hidden span are
     /// excluded with the text.
+    // Covers ISO 32000-1 §8.11.3.3.
     #[test]
     fn hidden_forms_and_rulings_are_excluded() {
         let doc = oc_doc(b"/Fx Do /OC /H BDC 72 700 m 272 700 l S EMC 72 650 m 272 650 l S");
@@ -1652,6 +1666,7 @@ mod tests {
 
     /// Without `/OCProperties` there is no configuration to be off in:
     /// every `/OC` span extracts and nothing is counted.
+    // Covers ISO 32000-1 §8.11.4.2.
     #[test]
     fn absent_configuration_extracts_every_layer() {
         use pdfboss_testkit::PdfBuilder;
@@ -1708,6 +1723,7 @@ mod tests {
         assert!(close, "{r:?} is not ({x0},{y0})-({x1},{y1})");
     }
 
+    // Covers ISO 32000-1 §14.8.2.5, §9.3.3, §9.4.3 and Annex A.2.
     #[test]
     fn word_spacing_applies_to_code_32_only() {
         // 'a b' = three codes at 6.0 each; Tw 5 fires once (the space).
@@ -1727,6 +1743,7 @@ mod tests {
         assert!((spans[1].x - 0.0).abs() < 1e-3);
     }
 
+    // Covers ISO 32000-1 §9.3.4 and §9.4.4.
     #[test]
     fn horizontal_scaling_stretches_advances() {
         let spans = spans_of("BT /F1 12 Tf 200 Tz 72 720 Td (AB) Tj ET");
@@ -1734,6 +1751,7 @@ mod tests {
         assert!((spans[0].end_x - 96.0).abs() < 1e-3, "{}", spans[0].end_x);
     }
 
+    // Covers ISO 32000-1 §9.3.7.
     #[test]
     fn text_rise_shifts_baseline() {
         let spans = spans_of("BT /F1 12 Tf 72 720 Td 5 Ts (R) Tj ET");
@@ -1742,12 +1760,14 @@ mod tests {
 
     /// `T*` moves to the next line by translating Tlm by `(0, -leading)`,
     /// the same geometry `'` relies on to start its shown line.
+    // Covers ISO 32000-1 §9.3.5 and §9.4.2.
     #[test]
     fn t_star_advances_tlm_by_leading() {
         let spans = spans_of("BT /F1 12 Tf 14 TL 72 720 Td (a) Tj T* (b) Tj ET");
         assert!((spans[1].y - 706.0).abs() < 1e-3);
     }
 
+    // Covers ISO 32000-1 §9.2.2, §9.4.1 and §9.4.2.
     #[test]
     fn tm_positions_directly_and_bt_resets() {
         let spans = spans_of("BT /F1 12 Tf 1 0 0 1 300 100 Tm (m) Tj ET BT /F1 12 Tf (o) Tj ET");
@@ -1758,6 +1778,7 @@ mod tests {
         assert!((spans[1].y - 0.0).abs() < 1e-3);
     }
 
+    // Covers ISO 32000-1 §9.4.2 and §9.4.4.
     #[test]
     fn tm_scale_sets_device_size() {
         let spans = spans_of("BT /F1 1 Tf 12 0 0 12 72 720 Tm (s) Tj ET");
@@ -1909,6 +1930,7 @@ mod tests {
     /// §7.8.3). The loaded-font cache is keyed by the font dictionary's
     /// object reference, never by name — a cache keyed by name would hand
     /// the form the page's font and fail this test.
+    // Covers ISO 32000-1 §7.8.3.
     #[test]
     fn same_name_binds_a_different_font_per_resource_scope() {
         use pdfboss_testkit::PdfBuilder;

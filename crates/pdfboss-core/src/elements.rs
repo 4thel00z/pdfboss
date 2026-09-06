@@ -452,6 +452,8 @@ impl<'a> Elements<'a> {
     /// Materializes one page's logical elements, in document order: the page
     /// itself, fonts, images, annotations (content ops are appended by the
     /// content-op stage when enabled). Broken pieces surface as `Err` items.
+    ///
+    /// Covers ISO 32000-1 §12.5.2.
     fn page_elements(&self, index: usize) -> VecDeque<Result<Element>> {
         let mut queue = VecDeque::new();
         let page = match self.doc.page(index) {
@@ -992,6 +994,7 @@ mod tests {
         assert!(items.iter().any(|i| matches!(i, Ok(Element::Eof { .. }))));
     }
 
+    // Covers ISO 32000-1 §12.5.2.
     #[test]
     fn logical_walk_reports_page_fonts_images_annots() {
         let mut builder = pdfboss_testkit::PdfBuilder::new();

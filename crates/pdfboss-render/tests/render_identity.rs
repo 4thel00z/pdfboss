@@ -396,6 +396,7 @@ fn render(case: &Case) -> Pixmap {
     render_page_with_options(&doc, &page, case.scale, &opts).expect("render must succeed")
 }
 
+// Covers ISO 32000-1 §8.10.2, §8.4.2, §8.5.3.1, §8.5.3.2, §8.5.4, §8.6.4.2, §8.6.6.3, §8.6.8 and Annex A.2.
 #[test]
 fn rendered_pages_match_their_recorded_digests() {
     let mut moved = Vec::new();
@@ -475,7 +476,7 @@ fn case(name: &str) -> Pixmap {
 }
 
 /// A `d1` (uncoloured) Type3 glyph paints in the **inherited text fill** even when
-/// the painting happens inside a nested form XObject: ISO 32000-1 9.6.5.2 says such
+/// the painting happens inside a nested form XObject: ISO 32000-1 §9.6.5 says such
 /// a glyph "shall not specify any colour", and the lock that enforces that reaches
 /// through the `Do`.
 ///
@@ -486,6 +487,7 @@ fn case(name: &str) -> Pixmap {
 /// needs two different rules — copy the parent's value on a form push, set it from
 /// `d0`/`d1` on a CharProc push — and getting that wrong turns this page blue with
 /// every other render test still green.
+// Covers ISO 32000-1 §9.6.5.
 #[test]
 fn a_d1_char_proc_keeps_the_text_fill_inside_a_nested_form() {
     let pix = case("type3_d1_painting_via_a_form");

@@ -500,6 +500,7 @@ mod tests {
         round_trip(&ops);
     }
 
+    // Covers ISO 32000-1 §8.9.7.
     #[test]
     fn inline_image_hazardous_data_round_trips_via_declared_length() {
         let op = image(

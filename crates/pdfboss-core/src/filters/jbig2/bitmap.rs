@@ -311,6 +311,8 @@ impl Bitmap {
     /// not know whether it is destined for a page, a symbol dictionary, or a
     /// refinement reference, so inverting here would corrupt every use that is
     /// not the last one.
+    ///
+    /// Covers ISO 32000-1 §7.4.7.
     pub(crate) fn pack_rows(&self) -> Vec<u8> {
         let stride = self.width.div_ceil(8) as usize;
         // A bitmap with no columns packs to no bytes, whatever its height, and

@@ -612,6 +612,7 @@ mod tests {
         assert!(stream.next().await.is_some());
     }
 
+    // Covers ISO 32000-1 §12.5.2.
     #[tokio::test]
     async fn logical_layer_lists_pages_fonts_images_annotations() {
         let mut b = PdfBuilder::new();

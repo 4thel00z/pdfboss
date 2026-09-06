@@ -1,4 +1,4 @@
-//! ASCII85Decode: base-85 groups of 5 chars to 4 bytes; whitespace ignored,
+//! ASCII85Decode (ISO 32000-1 §7.4.3): base-85 groups of 5 chars to 4 bytes; whitespace ignored,
 //! `z` is four zero bytes (only between groups), `~>` terminates, a final
 //! partial group of n chars yields n-1 bytes; a leading `<~` is tolerated.
 
@@ -9,6 +9,8 @@ use crate::filters::is_pdf_whitespace;
 /// for four zero bytes (allowed only between groups), `~` terminates
 /// (normally as `~>`; the data simply ending is tolerated too), and a final
 /// partial group of n chars yields n-1 bytes. A leading `<~` is skipped.
+///
+/// Covers ISO 32000-1 §7.4.3.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 5 * 4 + 4);
     let mut group = [0u8; 5];
@@ -55,6 +57,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Converts one 5-digit base-85 group into its first `n - 1` bytes.
+///
+/// Covers ISO 32000-1 §7.4.3.
 fn push_group(out: &mut Vec<u8>, digits: &[u8; 5], n: usize) -> Result<()> {
     let mut value: u64 = 0;
     for &d in digits {
@@ -95,6 +99,8 @@ mod tests {
         out
     }
 
+    // The rules of ISO 32000-1 §7.4.3: 5-character groups, `z` for four zero
+    // bytes, a partial final group of n characters giving n-1 bytes, `~>`.
     #[test]
     fn decodes_known_group() {
         assert_eq!(decode(b"9jqo^~>").unwrap(), b"Man ");
@@ -106,6 +112,7 @@ mod tests {
         assert_eq!(decode(b"  <~9jqo^~>").unwrap(), b"Man ");
     }
 
+    // Covers ISO 32000-1 §7.4.3.
     #[test]
     fn z_is_four_zero_bytes() {
         assert_eq!(decode(b"z~>").unwrap(), [0, 0, 0, 0]);
@@ -115,11 +122,13 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.4.3.
     #[test]
     fn z_inside_group_is_an_error() {
         assert!(matches!(decode(b"9jz~>"), Err(Error::Decode(_))));
     }
 
+    // Covers ISO 32000-1 §7.4.3.
     #[test]
     fn partial_final_groups() {
         // 4 chars -> 3 bytes, 3 chars -> 2 bytes, 2 chars -> 1 byte.
@@ -145,6 +154,7 @@ mod tests {
         assert_eq!(decode(b"9jqo").unwrap(), b"Man");
     }
 
+    // Covers ISO 32000-1 §7.4.3.
     #[test]
     fn group_overflow_is_an_error() {
         // "uuuuu" exceeds 2^32 - 1.

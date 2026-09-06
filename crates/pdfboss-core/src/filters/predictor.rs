@@ -1,4 +1,4 @@
-//! Predictor post-pass shared by Flate and LZW: 2 = TIFF horizontal
+//! Predictor post-pass (ISO 32000-1 §7.4.4.4) shared by Flate and LZW: 2 = TIFF horizontal
 //! differencing (8-bit components only, otherwise pass-through); >= 10 =
 //! PNG filters applied per row (None/Sub/Up/Average/Paeth) with
 //! `bpp = max(1, colors*bpc/8)` and row length `ceil(colors*bpc*columns/8)`.
@@ -43,6 +43,8 @@ pub(crate) fn post_pass(mut data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u
 /// only, otherwise pass-through); values >= 10 treat the data as PNG
 /// filtered rows, each prefixed with its filter-type byte. A truncated
 /// final row is reconstructed as far as the data reaches.
+///
+/// Covers ISO 32000-1 §7.4.4.4.
 pub fn apply(
     data: &[u8],
     predictor: i32,
@@ -67,6 +69,8 @@ pub fn apply(
 /// TIFF predictor 2: each sample is stored as the difference from the
 /// sample one pixel to the left; undo by cumulative addition per row.
 /// Only 8-bit components are handled; other depths pass through.
+///
+/// Covers ISO 32000-1 §7.4.4.4.
 fn tiff_horizontal(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Vec<u8> {
     let mut out = data.to_vec();
     if bpc == 8 {
@@ -210,6 +214,8 @@ mod tests {
         assert_eq!(paeth(10, 100, 100), 10);
     }
 
+    // The PNG and TIFF predictors of ISO 32000-1 §7.4.4.4, driven by the
+    // `/Predictor`, `/Colors`, `/BitsPerComponent` and `/Columns` parameters.
     #[test]
     fn png_every_row_type_round_trips() {
         // colors=3, bpc=8, columns=2 -> row length 6, bpp 3.
@@ -235,6 +241,7 @@ mod tests {
         assert_eq!(apply(&encoded, 15, 1, 8, 4).unwrap(), rows.concat());
     }
 
+    // Covers ISO 32000-1 §7.4.4.4.
     #[test]
     fn png_row_length_rounds_up_for_sub_byte_samples() {
         // colors=1, bpc=1, columns=10 -> row length ceil(10/8) = 2, bpp 1.
@@ -260,6 +267,7 @@ mod tests {
         assert_eq!(apply(&encoded, 12, 1, 8, 3).unwrap(), vec![10, 20, 30, 15]);
     }
 
+    // Covers ISO 32000-1 §7.4.4.4.
     #[test]
     fn tiff_horizontal_diff_round_trips() {
         let raw = [
@@ -273,6 +281,7 @@ mod tests {
         assert_eq!(apply(&encoded, 2, 3, 8, 3).unwrap(), raw);
     }
 
+    // Covers ISO 32000-1 §7.4.4.4.
     #[test]
     fn tiff_non_8bit_components_pass_through() {
         let data = [1u8, 2, 3, 4, 5, 6];
@@ -301,6 +310,7 @@ mod tests {
         assert_eq!(apply(&data, 10, 0, 8, 0).unwrap(), vec![1]);
     }
 
+    // Covers ISO 32000-1 §7.4.4.3.
     #[test]
     fn post_pass_reads_parms_with_defaults() {
         use crate::object::{Name, Object};

@@ -34,6 +34,8 @@ impl Dict {
     }
 
     /// Looks up a value by key (without the leading solidus).
+    ///
+    /// Covers ISO 32000-1 §7.3.7.
     pub fn get(&self, key: &str) -> Option<&Object> {
         self.0.get(key)
     }
@@ -150,6 +152,8 @@ impl Object {
     }
 
     /// Raw string bytes, if this is a `String`.
+    ///
+    /// Covers ISO 32000-1 §7.9.2 and §7.9.2.4.
     pub fn as_str_bytes(&self) -> Option<&[u8]> {
         match self {
             Object::String(bytes) => Some(bytes),
@@ -200,6 +204,8 @@ impl Object {
     }
 
     /// Whether this object is `Null`.
+    ///
+    /// Covers ISO 32000-1 §7.3.9.
     pub fn is_null(&self) -> bool {
         matches!(self, Object::Null)
     }
@@ -208,6 +214,8 @@ impl Object {
 /// Decodes a PDF text string: UTF-16BE with BOM, UTF-8 with BOM (PDF 2.0),
 /// otherwise byte-per-char fallback in the spirit of PDFDocEncoding
 /// (approximately Latin-1).
+///
+/// Covers ISO 32000-1 §7.9.2, §7.9.2.2, §7.9.2.3 and Annex D.3.
 pub fn decode_text_string(bytes: &[u8]) -> String {
     if let Some(rest) = bytes.strip_prefix(&[0xFE, 0xFF]) {
         let units = rest
@@ -350,6 +358,7 @@ mod tests {
         assert_eq!(d.get_ref("Int"), None);
     }
 
+    // Covers ISO 32000-1 §7.9.2 and §7.9.2.2.
     #[test]
     fn decode_utf16be_with_bom() {
         assert_eq!(
@@ -372,6 +381,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.9.2.2.
     #[test]
     fn decode_utf8_with_bom() {
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
@@ -382,6 +392,7 @@ mod tests {
         assert_eq!(decode_text_string(&[0xEF, 0xBB, 0xBF, 0xFF]), "\u{FFFD}");
     }
 
+    // Covers ISO 32000-1 §7.9.2, §7.9.2.3 and Annex D.3.
     #[test]
     fn decode_latin1_fallback() {
         assert_eq!(decode_text_string(b"Hello"), "Hello");

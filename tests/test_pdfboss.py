@@ -113,11 +113,13 @@ class TestDocument:
         assert doc.page_count == 1
         assert len(doc) == 1
 
+    # Covers ISO 32000-1 §7.5.2 and Annex I.
     def test_version_looks_like_pdf_version(self, hello_pdf: Path) -> None:
         doc = Document(str(hello_pdf))
         major, _, minor = doc.version.partition(".")
         assert major.isdigit() and minor.isdigit()
 
+    # Covers ISO 32000-1 §14.3.3.
     def test_metadata_is_dict_of_str(self, hello_pdf: Path) -> None:
         doc = Document(str(hello_pdf))
         meta = doc.metadata
@@ -172,6 +174,7 @@ class TestDocument:
 
 
 class TestText:
+    # Covers ISO 32000-1 §9.2.2.
     def test_hello_text(self, hello_pdf: Path) -> None:
         doc = Document(str(hello_pdf))
         assert "Hello" in doc[0].extract_text()
@@ -198,6 +201,7 @@ class TestText:
         assert "Page two" in parts[1]
         assert "Page three" in parts[2]
 
+    # Covers ISO 32000-1 §7.5.8.
     def test_xref_stream_same_text_as_hello(
         self, hello_pdf: Path, xref_stream_pdf: Path
     ) -> None:
@@ -218,6 +222,7 @@ class TestPageGeometry:
 
 
 class TestPageBoxes:
+    # Covers ISO 32000-1 §14.11.2 and §7.7.3.3.
     def test_undeclared_boxes_fall_back_per_spec(self, hello_pdf: Path) -> None:
         page = Document(str(hello_pdf))[0]
         assert page.media_box == pytest.approx((0.0, 0.0, 612.0, 792.0))
@@ -226,6 +231,7 @@ class TestPageBoxes:
         assert page.trim_box == page.crop_box
         assert page.art_box == page.crop_box
 
+    # Covers ISO 32000-1 §14.11.2.
     def test_declared_boxes_are_reported(self, boxed_pdf: bytes) -> None:
         page = Document(data=boxed_pdf)[0]
         assert page.media_box == pytest.approx((0.0, 0.0, 600.0, 800.0))
@@ -566,6 +572,7 @@ class TestThreadedPageCalls:
 
 
 class TestExtractImages:
+    # Covers ISO 32000-1 §11.6.5.3.
     def test_extracts_the_drawn_image_as_png_with_smask_alpha(
         self, image_pdf: bytes
     ) -> None:

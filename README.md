@@ -445,6 +445,10 @@ Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the docum
 
 </details>
 
+## ISO 32000 conformance
+
+[`iso32000/`](iso32000/) is a Lean 4 package that keeps a ledger of ISO 32000 clauses, one row per clause with the status pdfboss claims: implemented, incomplete, not implemented or out of scope. On every push Lean checks the ledger against this source tree: every clause of chapters 7 to 14 and the normative annexes has a row, every implemented row is cited by implementation code and by a test, every other row says what is missing, and no citation names a clause the standard does not have. The same package holds executable reference decoders for the ASCIIHex, ASCII85 and RunLength filters with kernel-checked decode-after-encode proofs; the vectors they write are part of the Rust test suite. The generated [conformance chapter](https://pdfboss.dev/docs/reference/iso32000.html) lists every row. `make iso32000-gate` runs the gate locally with [elan](https://github.com/leanprover/elan) installed.
+
 ## Documentation
 
 The [pdfboss book](https://pdfboss.dev/docs/) covers installation, guides for every surface (text, Markdown, styled spans, rendering, image extraction, creation, Markdown-to-PDF composition, async and remote documents, the explorer, encryption) and CLI/Python/Rust reference chapters. It is built with mdBook from [`docs/`](docs/) by the `book` workflow and served at pdfboss.dev/docs. Per-crate Rust API documentation is on [docs.rs](https://docs.rs/pdfboss-core).

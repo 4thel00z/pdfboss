@@ -22,6 +22,8 @@ pub struct ObjStm {
 impl ObjStm {
     /// Decodes the header of an object stream, keeping the decompressed bytes
     /// for later per-object parsing.
+    ///
+    /// Covers ISO 32000-1 §7.5.7.
     pub fn parse(data: Vec<u8>, n: usize, first: usize) -> Result<ObjStm> {
         let offsets = {
             let mut lexer = Lexer::new(&data);
@@ -46,6 +48,8 @@ impl ObjStm {
 
     /// Parses the object at `index`, also reporting its byte range within
     /// the decoded stream data.
+    ///
+    /// Covers ISO 32000-1 §7.5.7.
     pub fn object_spanned(&self, index: u32) -> Result<(Object, (usize, usize))> {
         let offset = *self.offsets.get(index as usize).ok_or_else(|| {
             Error::Other(format!(
@@ -110,6 +114,7 @@ mod tests {
         (header.into_bytes(), objects.len(), first)
     }
 
+    // Covers ISO 32000-1 §7.5.7.
     #[test]
     fn extracts_both_objects() {
         let (data, n, first) = build_stream(&[(11, "<< /A 1 >>"), (12, "(hi)")]);

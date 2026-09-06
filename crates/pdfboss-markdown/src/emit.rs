@@ -8,6 +8,8 @@ use crate::Error;
 
 /// Emits one [`Page`] per laid-out page, painting every item onto its
 /// canvas in order and collecting link items onto [`Page::links`].
+///
+/// Covers ISO 32000-1 §12.6.4.7.
 pub(crate) fn emit(laid: Vec<LaidPage>, page_size: PageSize) -> Result<Vec<Page>, Error> {
     laid.into_iter()
         .map(|laid_page| {

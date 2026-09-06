@@ -419,6 +419,7 @@ fn free_chain_starts_at_entry_zero() {
 
 /// The base's own `/ID` half is copied verbatim into the appended trailer;
 /// the second half is replaced, not copied, so it differs from the base's.
+// Covers ISO 32000-1 §14.4.
 #[test]
 fn id_first_half_survives_second_rotates() {
     let base = classic_base();
@@ -740,6 +741,7 @@ fn base_pdf_with_metadata(xref: XrefStyle, meta: Metadata) -> Vec<u8> {
 /// Setting only `title` on a base that already carries `title` and `author`
 /// must keep `author` untouched: a `None` field never clears an existing
 /// key, only a `Some` field overwrites one.
+// Covers ISO 32000-1 §14.3.3.
 #[test]
 fn set_metadata_merges_existing_fields() {
     let base = base_pdf_with_metadata(
@@ -788,6 +790,7 @@ fn set_metadata_creates_info_when_absent() {
 /// A base whose catalog already carries `/Metadata` (every `Pdf` with
 /// metadata writes one) gets that packet rewritten from the merged fields:
 /// the reloaded stream carries the new title, not the old.
+// Covers ISO 32000-1 §14.3.2.
 #[test]
 fn set_metadata_rewrites_xmp_when_catalog_has_it() {
     let base = base_pdf_with_metadata(

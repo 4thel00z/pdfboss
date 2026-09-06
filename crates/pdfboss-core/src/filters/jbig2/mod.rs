@@ -152,6 +152,8 @@ impl From<CcittError> for Jbig2Error {
 /// 1 as ink and `/DeviceGray` reads a 0 sample as black, so the two conventions
 /// are reconciled here — see [`bitmap::Bitmap::to_pdf_samples`], which is the
 /// only place in the codec that flips a bit for this reason.
+///
+/// Covers ISO 32000-1 §7.4.7.
 pub(crate) fn decode_pdf_stream(
     data: &[u8],
     parms: Option<&Dict>,

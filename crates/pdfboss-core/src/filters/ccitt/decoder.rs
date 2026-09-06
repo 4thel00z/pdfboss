@@ -725,6 +725,7 @@ mod tests {
     /// Pass mode arises only when a run on the reference line ends before the
     /// coding line's next change. A wide black bar above an empty row forces
     /// it — and the tally confirms the fixture really does.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn pass_mode_round_trips() {
         let bm = bitmap_from_rows(&["0111111110", "0000000000", "0111111110", "0000110000"]);
@@ -1045,6 +1046,7 @@ mod tests {
     /// With `/K` above zero each row carries a bit saying how it is coded, so
     /// a reference row produced one-dimensionally has to serve a
     /// two-dimensional row after it.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn mixed_coding_follows_the_per_row_bit() {
         let bm = bitmap_from_rows(&["0011110000", "0011110000", "1100001111", "1100001111"]);

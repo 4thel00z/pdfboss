@@ -79,6 +79,28 @@ book: ## Build the mdBook into docs/book
 book-serve: ## Serve the mdBook locally and open it
 	mdbook serve docs --open
 
+##@ ISO 32000 gate
+
+.PHONY: iso32000-index
+iso32000-index: ## Rescan the sources for ISO 32000 citations into iso32000/Iso32000/Generated.lean
+	cd iso32000 && lake build iso32000-index && lake exe iso32000-index .. Iso32000/Generated.lean
+
+.PHONY: iso32000-check
+iso32000-check: iso32000-index ## List every ledger row, clause or citation that would fail the gate
+	cd iso32000 && lake build iso32000-report && lake exe iso32000-report --check
+
+.PHONY: iso32000-gate
+iso32000-gate: iso32000-check ## Check the ISO 32000 ledger against the source tree with Lean
+	cd iso32000 && lake build
+
+.PHONY: iso32000-report
+iso32000-report: iso32000-index ## Regenerate docs/src/reference/iso32000.md from the ledger
+	cd iso32000 && lake build iso32000-report && lake exe iso32000-report > ../docs/src/reference/iso32000.md
+
+.PHONY: iso32000-vectors
+iso32000-vectors: ## Regenerate the filter test vectors from the Lean reference decoders
+	cd iso32000 && lake build iso32000-vectors && lake exe iso32000-vectors ../crates/pdfboss-core/tests/vectors/iso32000
+
 ##@ Benchmarks
 
 .PHONY: bench

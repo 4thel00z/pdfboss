@@ -67,6 +67,8 @@ pub(crate) struct FaceRequest {
 /// supertrait is what keeps it a single-point contract: `&dyn
 /// SubstituteProvider` and `Box<dyn SubstituteProvider>` then carry it
 /// implicitly, and no parameter or field has to spell it out.
+///
+/// Covers ISO 32000-1 §9.8.2.
 pub(crate) trait SubstituteProvider: Send + Sync {
     /// Returns the face's raw font program bytes, or `None` if this provider
     /// has no face for `req` (a missing directory or file, say).
@@ -324,6 +326,7 @@ mod tests {
         assert!(req.italic);
     }
 
+    // Covers ISO 32000-1 §9.6.4.
     #[test]
     fn subset_prefix_stripped_before_matching_and_serif_flag_wins() {
         // "Garamond" matches no name keyword; only the /Flags Serif bit (0x2)
@@ -350,12 +353,14 @@ mod tests {
         assert_eq!(req_for("ZapfDingbatsITC", 0), None);
     }
 
+    // Covers ISO 32000-1 §9.8.2.
     #[test]
     fn force_bold_flag_without_name_hint_is_bold() {
         let req = req_for("SomeFace", 0x40000).expect("some request");
         assert!(req.bold);
     }
 
+    // Covers ISO 32000-1 §9.8.2.
     #[test]
     fn italic_flag_without_name_hint_is_italic() {
         let req = req_for("SomeFace", 0x40).expect("some request");

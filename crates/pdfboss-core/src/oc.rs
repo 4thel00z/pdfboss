@@ -32,6 +32,8 @@ impl OcState {
     /// visible. The default `/D` configuration is applied in specification
     /// order: `/BaseState` (default `ON`), then `/ON`, then `/OFF`, so a
     /// group named in both `/ON` and `/OFF` ends up off.
+    ///
+    /// Covers ISO 32000-1 §7.7.2, §8.11.2.1, §8.11.4.2, §8.11.4.3 and §8.11.4.5.
     pub async fn load_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> Option<OcState> {
         let root = trailer.get("Root")?;
         let catalog = src.resolve(root).await.ok()?;
@@ -66,6 +68,8 @@ impl OcState {
     }
 
     /// Whether the configuration turns `group` off.
+    ///
+    /// Covers ISO 32000-1 §8.11.2.1 and §8.11.4.5.
     pub fn hidden(&self, group: ObjRef) -> bool {
         self.off.contains(&group)
     }
@@ -131,6 +135,8 @@ impl OcState {
     /// reading as visible), else the `/OCGs` groups under the `/P` policy —
     /// `AnyOn` (the default, and the reading of an unrecognized policy),
     /// `AllOn`, `AnyOff`, or `AllOff`. No usable groups means visible.
+    ///
+    /// Covers ISO 32000-1 §8.11.2.2.
     async fn ocmd_visible<S: AsyncObjectSource>(&self, src: &S, dict: &Dict) -> bool {
         if let Some(ve) = dict.get("VE") {
             let Ok(Object::Array(expr)) = src.resolve(ve).await else {
@@ -178,6 +184,8 @@ impl OcState {
     /// must box itself, and a `Send`-boxed future would demand `S: Sync`,
     /// which the synchronous `Immediate` source cannot supply — the same
     /// shape as the content executors' frame stacks.
+    ///
+    /// Covers ISO 32000-1 §8.11.2.2.
     async fn expression_visible<S: AsyncObjectSource>(
         &self,
         src: &S,
@@ -293,6 +301,8 @@ async fn group_refs<S: AsyncObjectSource>(src: &S, value: Option<&Object>) -> Ve
 /// The raw `/Properties` resource value for `name`, innermost dictionary
 /// first — deliberately unresolved, so a reference keeps the identity the
 /// off set is keyed by.
+///
+/// Covers ISO 32000-1 §14.6.2.
 async fn properties_value<S: AsyncObjectSource>(
     src: &S,
     chain: &[Arc<Dict>],
@@ -346,12 +356,14 @@ mod tests {
         block_on(state.visible_with(&Immediate(doc), value))
     }
 
+    // Covers ISO 32000-1 §8.11.4.2.
     #[test]
     fn no_ocproperties_means_no_state() {
         let doc = doc_with_oc("", |_| {});
         assert_eq!(doc.oc_state(), None);
     }
 
+    // Covers ISO 32000-1 §8.11.2.1, §8.11.4.3 and §8.11.4.5.
     #[test]
     fn base_state_defaults_on_and_off_hides() {
         let doc = doc_with_oc("<< /OCGs [10 0 R 11 0 R] /D << /OFF [11 0 R] >> >>", |_| {});
@@ -360,6 +372,7 @@ mod tests {
         assert!(state.hidden(gref(11)));
     }
 
+    // Covers ISO 32000-1 §8.11.4.3.
     #[test]
     fn base_state_off_hides_all_but_on() {
         let doc = doc_with_oc(
@@ -373,6 +386,7 @@ mod tests {
 
     /// §8.11.4.3 applies `/BaseState`, then `/ON`, then `/OFF`: a group
     /// named in both lists ends up off.
+    // Covers ISO 32000-1 §8.11.4.3 and §8.11.4.5.
     #[test]
     fn off_is_applied_after_on() {
         let doc = doc_with_oc(
@@ -385,6 +399,7 @@ mod tests {
 
     /// Indirection at every level: the configuration, its arrays, and the
     /// base state name all resolve through references.
+    // Covers ISO 32000-1 §8.11.4.2.
     #[test]
     fn configuration_resolves_indirection() {
         let doc = doc_with_oc("<< /OCGs 20 0 R /D 21 0 R >>", |b| {
@@ -415,6 +430,7 @@ mod tests {
         (doc, state)
     }
 
+    // Covers ISO 32000-1 §8.11.2.1.
     #[test]
     fn group_reference_visibility_follows_the_off_set() {
         let (doc, state) = split_state();
@@ -422,6 +438,7 @@ mod tests {
         assert!(!visible(&doc, &state, &Object::Ref(gref(11))));
     }
 
+    // Covers ISO 32000-1 §8.11.2.2.
     #[test]
     fn membership_policies_follow_the_specification() {
         let (doc, state) = split_state();
@@ -476,6 +493,7 @@ mod tests {
         visible(&doc, &state, &Object::Ref(gref(40)))
     }
 
+    // Covers ISO 32000-1 §8.11.2.2.
     #[test]
     fn visibility_expressions_evaluate() {
         assert!(ve_visible("[/Not 11 0 R]"), "Not of an off group");
@@ -496,11 +514,13 @@ mod tests {
     /// `/VE` takes precedence over `/OCGs` and `/P`: object 40 carries
     /// `/OCGs [10 0 R]` (on, so AnyOn would show it), yet an expression
     /// naming only the off group hides it.
+    // Covers ISO 32000-1 §8.11.2.2.
     #[test]
     fn expression_takes_precedence_over_policy() {
         assert!(!ve_visible("[/And 11 0 R]"));
     }
 
+    // Covers ISO 32000-1 §8.11.2.2.
     #[test]
     fn malformed_expressions_are_visible() {
         assert!(ve_visible("[]"), "no operator");
@@ -510,6 +530,7 @@ mod tests {
         assert!(ve_visible("[/And 11 0 R (text)]"), "non-group operand");
     }
 
+    // Covers ISO 32000-1 §8.11.2.2.
     #[test]
     fn expression_depth_is_capped() {
         let mut ve = "11 0 R".to_string();
@@ -521,6 +542,7 @@ mod tests {
 
     /// The properties operand of `BDC /OC` may be a resource name; the
     /// lookup keeps the reference, so the named group's off state applies.
+    // Covers ISO 32000-1 §14.6.2 and §8.11.3.2.
     #[test]
     fn named_properties_keep_group_identity() {
         let (doc, state) = split_state();

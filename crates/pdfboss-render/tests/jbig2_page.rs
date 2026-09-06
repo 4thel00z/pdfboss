@@ -222,6 +222,7 @@ fn dark_pixels_per_row(scale: f32) -> (u32, u32, Vec<u32>) {
 /// dropped inversion leaves nearly 100, and an arithmetic decoder that has lost
 /// synchronisation leaves roughly 50 — the three ways this could fail while
 /// still returning `Ok`, and all three are outside the band.
+// Covers ISO 32000-1 §7.4.7 and §8.9.5.2.
 #[test]
 fn a_symbol_coded_page_renders_as_text_rather_than_blank_or_black() {
     let (width, height, rows) = dark_pixels_per_row(1.0);

@@ -62,6 +62,8 @@ fn is_replacement(units: &[u16]) -> bool {
 impl ToUnicode {
     /// Parses a decoded ToUnicode CMap stream. Never fails; anything the
     /// parser does not understand is skipped.
+    ///
+    /// Covers ISO 32000-1 §9.10.3.
     pub fn parse(data: &[u8]) -> ToUnicode {
         let mut out = ToUnicode::default();
         let mut lx = Lexer::new(data);
@@ -81,6 +83,8 @@ impl ToUnicode {
     }
 
     /// Looks up the Unicode string for `code`, if mapped.
+    ///
+    /// Covers ISO 32000-1 §9.10.3.
     pub fn lookup(&self, code: u32) -> Option<String> {
         if let Some(s) = self.singles.get(&code) {
             return Some(s.clone());
@@ -231,6 +235,7 @@ fn next_or_skip<'a>(lx: &mut Lexer<'a>, len: usize) -> Option<RawToken<'a>> {
 mod tests {
     use super::*;
 
+    // Covers ISO 32000-1 §9.10.3.
     #[test]
     fn bfchar_single_and_multi_char() {
         let cmap = ToUnicode::parse(
@@ -253,6 +258,7 @@ mod tests {
         assert_eq!(cmap.lookup(0x1F), None);
     }
 
+    // Covers ISO 32000-1 §9.10.3.
     #[test]
     fn bfrange_array_form() {
         let cmap =
@@ -263,6 +269,7 @@ mod tests {
         assert_eq!(cmap.lookup(0x44), None);
     }
 
+    // Covers ISO 32000-1 §9.10.3.
     #[test]
     fn bfrange_multi_unit_increments_last() {
         let cmap = ToUnicode::parse(b"1 beginbfrange <00> <01> <00410030> endbfrange");
@@ -270,12 +277,14 @@ mod tests {
         assert_eq!(cmap.lookup(0x01).as_deref(), Some("A1"));
     }
 
+    // Covers ISO 32000-1 §9.10.3.
     #[test]
     fn surrogate_pair_destination() {
         let cmap = ToUnicode::parse(b"1 beginbfchar <05> <D83DDE00> endbfchar");
         assert_eq!(cmap.lookup(0x05).as_deref(), Some("\u{1F600}"));
     }
 
+    // Covers ISO 32000-1 §9.10.3.
     #[test]
     fn two_byte_codespace_gives_code_len() {
         let cmap = ToUnicode::parse(

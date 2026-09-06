@@ -257,6 +257,8 @@ impl Type1Font {
     ///
     /// Returns `None` if `segment` fails, or if the program yields zero
     /// charstrings (nothing paintable).
+    ///
+    /// Covers ISO 32000-1 §9.9.
     pub(crate) fn parse(program: Vec<u8>) -> Option<Type1Font> {
         let (clear, private) = segment(&program)?;
 
@@ -1248,6 +1250,7 @@ pub(crate) mod tests {
 
     // --- segmentation: raw, hex, PFB ----------------------------------------
 
+    // Covers ISO 32000-1 §9.9.
     #[test]
     fn segment_raw_splits_clear_and_decrypts_eexec() {
         let prog = raw_program("%!FontType1\n/FontName /X def\n", b"/lenIV 4 def");
@@ -1301,6 +1304,7 @@ pub(crate) mod tests {
         assert_eq!(&priv_dec, b"/lenIV 4 def");
     }
 
+    // Covers ISO 32000-1 §9.9.
     #[test]
     fn segment_pfb_concatenates_and_decrypts() {
         let clear = b"%!FontType1\n";

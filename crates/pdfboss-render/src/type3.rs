@@ -60,6 +60,8 @@ impl Type3Font {
 
     /// [`Type3Font::load`] against any object source; the synchronous form is
     /// this one over [`Immediate`].
+    ///
+    /// Covers ISO 32000-1 §9.6.5.
     pub(crate) async fn load_with<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<Type3Font> {
         let font_matrix = parse_font_matrix(src, font).await?;
         let char_procs_obj = src.resolve(font.get("CharProcs")?).await.ok()?;
@@ -155,9 +157,11 @@ fn parse_char_procs(resolved: &Object) -> Option<FastMap<String, Object>> {
 /// entries (via [`differences`]) take priority; codes it leaves unmapped fall
 /// back to `pdfboss_encoding::standard_encoding_name` only when `/Encoding`
 /// has no `/BaseEncoding` entry, or an explicit `/BaseEncoding
-/// /StandardEncoding` -- Type3's implicit base per ISO 32000-1 §9.6.5.2. A
+/// /StandardEncoding` -- Type3's implicit base per ISO 32000-1 §9.6.5. A
 /// `/BaseEncoding` naming anything else leaves those codes `None`; this is a
 /// documented v1 limit, not a panic path.
+///
+/// Covers ISO 32000-1 §9.6.6.3.
 async fn parse_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> Box<[Option<String>; 256]> {
     let diffs = differences(src, font).await;
     let fallback = allows_standard_fallback(src, font).await;
@@ -178,6 +182,8 @@ async fn parse_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> Box<[Opti
 /// `/Encoding` is absent, is a dictionary with no `/BaseEncoding` key, or has
 /// `/BaseEncoding /StandardEncoding`; false when `/BaseEncoding` names
 /// anything else.
+///
+/// Covers ISO 32000-1 §9.6.6.3.
 async fn allows_standard_fallback<S: AsyncObjectSource>(src: &S, font: &Dict) -> bool {
     let Some(enc) = font.get("Encoding") else {
         return true;
@@ -255,6 +261,7 @@ mod tests {
         (doc, font_dict)
     }
 
+    // Covers ISO 32000-1 §9.6.5 and §9.6.6.3.
     #[test]
     fn load_resolves_charproc_width_and_matrix() {
         let (doc, font_dict) = type3_font_doc();

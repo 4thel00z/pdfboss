@@ -215,6 +215,8 @@ impl GlyphFont {
 
     /// [`GlyphFont::load`] against any object source; the synchronous form is
     /// this one over [`Immediate`].
+    ///
+    /// Covers ISO 32000-1 §9.5 and §9.6.2.3.
     pub(crate) async fn load_with<S: AsyncObjectSource>(
         src: &S,
         font: &Dict,
@@ -482,6 +484,8 @@ fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<Subpath> {
 /// `post` table, then the Adobe Glyph List: name -> Unicode -> `cmap`); then the
 /// base `/Encoding` character -> `cmap`; and finally the raw byte, then the
 /// symbol range `0xF000 + code`, through the font's `cmap`.
+///
+/// Covers ISO 32000-1 §9.6.3 and §9.6.6.4.
 async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
@@ -541,6 +545,8 @@ async fn rv<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Obj
 /// iff `/Widths` is an array, regardless of whether any entry resolves --
 /// once a font declares widths, an unresolved entry still falls back to
 /// `default`, not to the embedded program's own advance.
+///
+/// Covers ISO 32000-1 §9.6.2.1 and §9.8.1.
 async fn simple_widths<S: AsyncObjectSource>(src: &S, font: &Dict) -> WidthMap {
     let first = rv(src, font, "FirstChar")
         .await
@@ -750,6 +756,8 @@ fn resolve_name(tt: &TrueType, name: &str) -> Option<u16> {
 /// Selects the base-encoding accessor (code → char) from a font's `/Encoding`
 /// name or its `/BaseEncoding`. Returns `None` when the font has no `/Encoding`
 /// (leaving the raw-byte fallback in charge, as before).
+///
+/// Covers ISO 32000-1 §9.6.6.1.
 async fn base_encoding<S: AsyncObjectSource>(
     src: &S,
     font: &Dict,
@@ -1086,6 +1094,8 @@ async fn metrics_only<S: AsyncObjectSource>(
 /// Either way the top-level `/Encoding` decides code splitting and the
 /// code-to-CID mapping ([`composite`]); the CID feeds `/CIDToGIDMap` or the
 /// CFF charset, and the CID-keyed width tables.
+///
+/// Covers ISO 32000-1 §9.7.2.
 async fn load_type0<S: AsyncObjectSource>(
     src: &S,
     font: &Dict,
@@ -1132,6 +1142,8 @@ async fn composite<S: AsyncObjectSource>(src: &S, font: &Dict, cid: &Dict) -> Co
 /// Loads a `CIDFontType2` descendant (embedded TrueType), reading its
 /// `/CIDToGIDMap`. The caller ([`load_type0`]) attaches the code-to-CID
 /// mapping.
+///
+/// Covers ISO 32000-1 §9.7.4.2 and §9.8.3.1.
 async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
@@ -1337,6 +1349,8 @@ async fn parse_cid_vmetrics<S: AsyncObjectSource>(
 /// `/CIDToGIDMap` is a `CIDFontType2`-only key (it maps into a `glyf`
 /// program); a `CIDFontType0` descendant is not expected to carry one, so it
 /// is not consulted here.
+///
+/// Covers ISO 32000-1 §9.7.4.2.
 async fn load_cff_cid<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
@@ -1523,6 +1537,7 @@ mod tests {
         dark_pixel_at(&pix, 55, 115)
     }
 
+    // Covers ISO 32000-1 §9.6.6.1 and §9.6.6.4.
     #[test]
     fn differences_name_paints_via_post() {
         // Code 0x80 is unmapped by the font cmap; only the /Differences name
@@ -1537,6 +1552,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.6.1 and §9.6.6.4.
     #[test]
     fn base_encoding_letter_still_paints() {
         // With WinAnsiEncoding, code 0x41 ('A') resolves through the cmap to
@@ -1605,6 +1621,7 @@ mod tests {
         crate::render_page_with_options(&doc, &page, 1.0, &opts).expect("render")
     }
 
+    // Covers ISO 32000-1 §9.5 and §9.9.
     #[test]
     fn cff_simple_font_paints_at_all_embedded_and_full_not_embedded_truetype_only() {
         // Code 0x80's /Differences name resolves through the CFF's own
@@ -1662,6 +1679,7 @@ mod tests {
         b.build(1)
     }
 
+    // Covers ISO 32000-1 §9.7.2, §9.7.4.2 and §9.8.3.1.
     #[test]
     fn cff_cid_font_paints_at_all_embedded_not_embedded_truetype_only() {
         let bytes = cid_cff_font_doc();
@@ -1684,6 +1702,7 @@ mod tests {
     /// which the CFF charset then turns into the box glyph — variable-width
     /// splitting and code-to-CID proven in paint. Under the old fixed
     /// 2-byte identity reading this byte was half a code and nothing drew.
+    // Covers ISO 32000-1 §9.7.5.3.
     #[test]
     fn an_embedded_cmap_stream_maps_one_byte_codes_to_glyphs() {
         let mut b = PdfBuilder::new().version(1, 5);
@@ -1728,6 +1747,7 @@ mod tests {
     /// origin is displaced by the default position vector (vx = w0/2 = 0
     /// here — the CFF fixture has no declared widths — and vy = 880), and
     /// each show advances ty by the `/DW2` default w1 = -1000.
+    // Covers ISO 32000-1 §9.4.4 and §9.7.4.3.
     #[test]
     fn identity_v_advances_downward_with_the_default_position_vector() {
         let mut b = PdfBuilder::new().version(1, 5);
@@ -1782,6 +1802,7 @@ mod tests {
     // `/Widths`-implied x (20 + 80 + 35 = 135) if `advance` reads the PDF
     // width instead of the (zero) program advance.
 
+    // Covers ISO 32000-1 §9.2.4 and §9.6.3.
     #[test]
     fn simple_truetype_widths_advance_governs_second_glyph_origin() {
         // Two 'A's (code 0x41, gid 1): /FirstChar 65 /Widths [800] declares
@@ -1827,6 +1848,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.7.2, §9.7.4.1 and §9.7.4.3.
     #[test]
     fn type0_truetype_w_dw_advance_governs_second_glyph_origin() {
         // Two CID-1 codes (identity CID-to-GID, no /CIDToGIDMap): the
@@ -1925,6 +1947,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.2.2.
     #[test]
     fn standard_14_font_advances_by_afm_width_without_widths() {
         // A bare non-embedded /Helvetica with no /Widths at all: code 'M'
@@ -1972,6 +1995,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.7.4.3.
     #[test]
     fn non_embedded_type0_advances_by_w_array() {
         // A /Type0 whose CIDFontType2 descendant has no FontFile2: nothing
@@ -2062,6 +2086,7 @@ mod tests {
     /// gid 0 and is reported as a NoGlyph skip instead of dropping
     /// silently (the pre-refusal shape: a clean report over wrong ink).
     /// The bytes are a deliberately valid table, so the label decides.
+    // Covers ISO 32000-1 §9.7.4.2.
     #[test]
     fn an_image_codec_cid_to_gid_map_reports_every_drawn_glyph() {
         let doc = cid_map_doc("/Filter /DCTDecode", &[0, 0, 0, 1]);
@@ -2091,6 +2116,7 @@ mod tests {
     /// The inverse: a benign trailing filter on the map decodes and the
     /// glyphs paint — refusal is about the image codecs, not about
     /// `/Filter` being present at all.
+    // Covers ISO 32000-1 §9.7.4.2.
     #[test]
     fn a_filtered_cid_to_gid_map_still_paints() {
         // CID 0 -> gid 0, CID 1 -> gid 1, hex-encoded.
@@ -2219,6 +2245,7 @@ mod tests {
         b.build(1)
     }
 
+    // Covers ISO 32000-1 §9.9.
     #[test]
     fn type1_simple_font_paints_at_all_embedded_not_embedded_truetype_only() {
         let bytes = simple_type1_font_doc(
@@ -2258,6 +2285,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.6.2.
     #[test]
     fn type1_builtin_encoding_paints_without_pdf_encoding() {
         // build_type1_box_fixture already sets a built-in /Encoding mapping
@@ -2271,6 +2299,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.6.2.
     #[test]
     fn type1_builtin_standard_encoding_token_paints_without_pdf_encoding() {
         // The FontFile's built-in /Encoding is the bare `StandardEncoding`
@@ -2308,6 +2337,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.2.1.
     #[test]
     fn type1_widths_advance_governs_second_glyph_origin() {
         // Two 0x80 codes: /FirstChar 128 /Widths [800] declares an 800/1000-em
@@ -2527,6 +2557,7 @@ mod tests {
         b.build(1)
     }
 
+    // Covers ISO 32000-1 §9.6.6.2 and §9.8.2.
     #[test]
     fn nonsymbolic_font_without_encoding_substitutes_via_standard_encoding() {
         let dir = write_temp_face("Tinos-Regular.ttf", &build_font());
@@ -2579,6 +2610,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Covers ISO 32000-1 §9.6.2.2.
     #[test]
     fn non_embedded_helvetica_paints_at_full_via_substitute() {
         // /Type1 /Helvetica, no FontFile* at all (non-embedded),

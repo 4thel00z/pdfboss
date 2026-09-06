@@ -51,6 +51,8 @@ impl IccCache {
 }
 
 /// A color space reduced to what the rasterizer can paint.
+///
+/// Covers ISO 32000-1 §8.6.3.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ColorSpace {
     /// One gray component.
@@ -117,6 +119,8 @@ fn comp(comps: &[f32], i: usize) -> f32 {
 
 impl ColorSpace {
     /// Number of color components an operand for this space carries.
+    ///
+    /// Covers ISO 32000-1 §8.6.2.
     pub(crate) fn components(&self) -> usize {
         match self {
             ColorSpace::DeviceGray => 1,
@@ -149,6 +153,8 @@ impl ColorSpace {
 
     /// Converts component values to RGB in 0..=1. Missing components read
     /// as 0; out-of-range and non-finite values are clamped.
+    ///
+    /// Covers ISO 32000-1 §10.2, §10.3.2, §10.3.5, §8.6.2, §8.6.4.2, §8.6.4.3, §8.6.4.4, §8.6.5.2, §8.6.6.3 and §8.6.6.4.
     pub(crate) fn to_rgb(&self, comps: &[f32]) -> [f32; 3] {
         match self {
             ColorSpace::DeviceGray => {
@@ -269,6 +275,8 @@ impl ColorSpace {
     /// transform will not load or a `DeviceN` names more than 8 colorants.
     ///
     /// [`Other`]: ColorSpace::Other
+    ///
+    /// Covers ISO 32000-1 §8.6.3.
     pub(crate) fn parse(doc: &Document, obj: &Object) -> ColorSpace {
         block_on(Self::parse_with(&Immediate(doc), obj, &IccCache::default()))
     }
@@ -284,6 +292,8 @@ impl ColorSpace {
     /// level covers it. Descending through `/Indexed` pushes its palette;
     /// whatever the loop finally resolves to gets wrapped in the pending
     /// palettes, innermost last.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.5, §8.6.6.3, §8.6.6.4, §8.6.6.5 and §8.6.6.6.
     pub(crate) async fn parse_with<S: AsyncObjectSource>(
         src: &S,
         obj: &Object,
@@ -528,6 +538,7 @@ impl ColorSpace {
         Some([wp[0], wp[1], wp[2]])
     }
 
+    /// Covers ISO 32000-1 §8.6.5.3.
     async fn cie_dict<S: AsyncObjectSource>(src: &S, obj: Option<&Object>) -> Option<Dict> {
         match src.resolve(obj?).await {
             Ok(Object::Dict(dict)) => Some(dict),
@@ -538,6 +549,8 @@ impl ColorSpace {
     /// `[/CalRGB dict]`: gamma defaults to 1 per channel, `/Matrix` to the
     /// identity (§8.6.5.3). A missing or invalid `/WhitePoint` keeps the
     /// old DeviceRGB reading.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.2.
     async fn cal_rgb<S: AsyncObjectSource>(src: &S, obj: Option<&Object>) -> ColorSpace {
         let Some(dict) = Self::cie_dict(src, obj).await else {
             return ColorSpace::DeviceRGB;
@@ -562,6 +575,8 @@ impl ColorSpace {
 
     /// `[/CalGray dict]` (§8.6.5.2); the whitepoint is validated but
     /// cancels out of the conversion.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.4.
     async fn cal_gray<S: AsyncObjectSource>(src: &S, obj: Option<&Object>) -> ColorSpace {
         let Some(dict) = Self::cie_dict(src, obj).await else {
             return ColorSpace::DeviceGray;
@@ -682,6 +697,7 @@ pub(crate) mod tests {
         Parser::new(src).parse_object(&NoResolve).unwrap()
     }
 
+    // Covers ISO 32000-1 §10.3.2, §8.6.2, §8.6.4.2 and §8.6.4.3.
     #[test]
     fn gray_and_rgb_to_rgb() {
         assert_eq!(ColorSpace::DeviceGray.to_rgb(&[0.25]), [0.25, 0.25, 0.25]);
@@ -694,6 +710,7 @@ pub(crate) mod tests {
         assert_eq!(ColorSpace::DeviceGray.to_rgb(&[f32::NAN]), [0.0, 0.0, 0.0]);
     }
 
+    // Covers ISO 32000-1 §10.3.5 and §8.6.4.4.
     #[test]
     fn cmyk_to_rgb_multiplicative() {
         assert_eq!(
@@ -710,6 +727,7 @@ pub(crate) mod tests {
         assert!((b - 0.7).abs() < 1e-6);
     }
 
+    // Covers ISO 32000-1 §10.3.5 and §8.6.4.4.
     #[test]
     fn deep_cmyk_keeps_its_hue() {
         // A rich navy (every channel's ink sum over 1.0). The additive
@@ -723,6 +741,7 @@ pub(crate) mod tests {
         assert!(b > g && g > r, "hue must survive: {r} {g} {b}");
     }
 
+    // Covers ISO 32000-1 §8.6.6.3.
     #[test]
     fn indexed_lookup_and_out_of_range_clamp() {
         let cs = ColorSpace::Indexed {
@@ -753,6 +772,7 @@ pub(crate) mod tests {
         assert_eq!(ColorSpace::Other(1).to_rgb(&[]), [1.0, 1.0, 1.0]);
     }
 
+    // Covers ISO 32000-1 §8.6.2.
     #[test]
     fn component_counts() {
         assert_eq!(ColorSpace::DeviceGray.components(), 1);
@@ -761,6 +781,7 @@ pub(crate) mod tests {
         assert_eq!(ColorSpace::Other(5).components(), 5);
     }
 
+    // Covers ISO 32000-1 §8.6.3.
     #[test]
     fn parse_names_and_abbreviations() {
         let doc = test_doc();
@@ -777,6 +798,7 @@ pub(crate) mod tests {
         assert_eq!(p(b"42"), ColorSpace::DeviceGray);
     }
 
+    // Covers ISO 32000-1 §8.6.3, §8.6.5.2 and §8.6.5.3.
     #[test]
     fn parse_array_families() {
         let doc = test_doc();
@@ -813,6 +835,7 @@ pub(crate) mod tests {
         assert_eq!(p(b"[/ICCBased 99 0 R]"), ColorSpace::DeviceRGB);
     }
 
+    // Covers ISO 32000-1 §8.6.6.3.
     #[test]
     fn parse_indexed_with_string_lookup() {
         let doc = test_doc();
@@ -859,6 +882,7 @@ pub(crate) mod tests {
 
     /// A `/Separation` whose tint transform is a type 4 calculator: the
     /// program maps tint `t` to `(1-t, 0, 0)` in the DeviceRGB alternate.
+    // Covers ISO 32000-1 §7.10.5 and §8.6.6.4.
     #[test]
     fn separation_with_a_calculator_tint_evaluates() {
         let mut b = PdfBuilder::new();
@@ -880,6 +904,7 @@ pub(crate) mod tests {
 
     /// DeviceN is Separation with n colorants (§8.6.6.5): every input
     /// reaches the transform, whose outputs are read in the alternate space.
+    // Covers ISO 32000-1 §8.6.6.5.
     #[test]
     fn devicen_evaluates_its_multi_input_tint_transform() {
         let mut b = PdfBuilder::new();
@@ -902,6 +927,7 @@ pub(crate) mod tests {
 
     /// The same seam over a two-input sampled grid: the tint pair lands in
     /// the gray computed by the bilinear blend of the 2x2 table.
+    // Covers ISO 32000-1 §7.10.2, §8.6.6.5 and §8.6.6.6.
     #[test]
     fn devicen_evaluates_a_sampled_grid_tint() {
         let mut b = PdfBuilder::new();
@@ -923,6 +949,7 @@ pub(crate) mod tests {
 
     /// More colorants than the pipeline carries stay on the documented
     /// ink approximation.
+    // Covers ISO 32000-1 §8.6.6.5.
     #[test]
     fn devicen_beyond_eight_colorants_keeps_the_ink_approximation() {
         let mut b = PdfBuilder::new();
@@ -1003,6 +1030,7 @@ pub(crate) mod tests {
 
     /// An `ICCBased` stream wrapping sRGB reads as plain DeviceRGB — the
     /// fast path that keeps such files byte-identical.
+    // Covers ISO 32000-1 §8.6.5.5.
     #[test]
     fn an_srgb_icc_stream_maps_to_device_rgb() {
         let doc = icc_doc("/N 3", &rgb_profile(&srgb_trc()));
@@ -1012,6 +1040,7 @@ pub(crate) mod tests {
 
     /// A gamma-1,8 profile transforms: mid-gray brightens to the sRGB
     /// encoding of 0,5^1,8, and pure inputs stay on their axis.
+    // Covers ISO 32000-1 §10.2 and §8.6.5.5.
     #[test]
     fn a_gamma_18_icc_stream_transforms() {
         let mut trc = b"curv\0\0\0\0\0\0\0\x01".to_vec();
@@ -1029,6 +1058,7 @@ pub(crate) mod tests {
 
     /// A profile whose arity disagrees with `/N` is distrusted: the `/N`
     /// reduction wins.
+    // Covers ISO 32000-1 §8.6.5.5.
     #[test]
     fn an_icc_profile_disagreeing_with_n_falls_back() {
         let doc = icc_doc("/N 4", &rgb_profile(&srgb_trc()));
@@ -1039,6 +1069,7 @@ pub(crate) mod tests {
     /// CalGray with gamma 2,2 renders mid-gray as the sRGB encoding of
     /// 0,5^2,2; CalRGB with default gamma and matrix sends white to white;
     /// Lab maps L* = 100 to white and +a* toward red.
+    // Covers ISO 32000-1 §10.2, §8.6.5.2, §8.6.5.3, §8.6.5.4 and §8.6.5.7.
     #[test]
     fn cie_spaces_convert() {
         let doc = test_doc();
@@ -1076,6 +1107,7 @@ pub(crate) mod tests {
 
     /// An `/Indexed` palette over a Lab base rescales its bytes into the
     /// Lab component ranges instead of 0..=1.
+    // Covers ISO 32000-1 §8.6.5.4.
     #[test]
     fn indexed_over_lab_expands_palette() {
         let doc = test_doc();
@@ -1093,6 +1125,7 @@ pub(crate) mod tests {
         assert!(black.iter().all(|&v| v < 0.01), "{black:?}");
     }
 
+    // Covers ISO 32000-1 §8.6.6.3.
     #[test]
     fn parse_indexed_with_stream_lookup() {
         let doc = test_doc();

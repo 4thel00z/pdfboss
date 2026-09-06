@@ -126,6 +126,8 @@ pub(crate) struct StartXrefRecord {
 /// whole-file recovery scan exists here — that would defeat the
 /// never-read-the-whole-file guarantee — so an absent keyword is
 /// `InvalidXref`.
+///
+/// Covers ISO 32000-1 Annex I.
 pub(crate) async fn find_tail(fetcher: &Fetcher) -> Result<(StartXrefRecord, Option<Span>)> {
     let mut window = TAIL_WINDOW;
     loop {
@@ -1829,6 +1831,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.5.5.
     #[tokio::test]
     async fn tail_scan_finds_startxref_and_eof() {
         let data = simple_doc("tail scan");
@@ -1869,6 +1872,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 Annex I.
     #[test]
     fn version_parse_matches_header_and_defaults() {
         assert_eq!(parse_version(b"%PDF-1.7\nrest"), (1, 7));
@@ -1951,6 +1955,7 @@ mod tests {
         assert!(parse_section_window(cut, base, base + 40, true).is_err());
     }
 
+    // Covers ISO 32000-1 §7.5.8.3.
     #[test]
     fn xref_stream_section_window_parses_entries() {
         let (dict, payload) = pdfboss_testkit::objstm_payload(&[
@@ -2181,6 +2186,7 @@ mod tests {
         data
     }
 
+    // Covers ISO 32000-1 §7.5.8.4.
     #[tokio::test]
     async fn hybrid_xrefstm_beats_the_tables_free_entry() {
         let data = hybrid_doc();
@@ -2330,6 +2336,7 @@ mod tests {
     /// doubling re-fetches from `offset`, re-reading) most of a 300+ MiB
     /// file for one bogus object -- exactly the amplification
     /// `MAX_GROWTH_WINDOW` exists to bound.
+    // Covers ISO 32000-1 Annex C.3.
     #[tokio::test]
     async fn corrupt_offset_in_a_huge_file_errors_within_the_growth_cap_instead_of_reading_to_eof()
     {

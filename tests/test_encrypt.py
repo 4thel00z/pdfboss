@@ -22,6 +22,7 @@ def test_encrypt_round_trips_under_the_user_password() -> None:
     assert "secret contents" in doc.extract_text()
 
 
+# Covers ISO 32000-1 §7.6.3.
 def test_decrypt_returns_a_plainly_loadable_document() -> None:
     data = build_pdf("secret contents")
     encrypted = encrypt(data, user_password="hunter2")
@@ -30,6 +31,7 @@ def test_decrypt_returns_a_plainly_loadable_document() -> None:
     assert "secret contents" in doc.extract_text()
 
 
+# Covers ISO 32000-1 §7.6.3.4.
 def test_decrypt_raises_pdf_error_for_a_wrong_password() -> None:
     data = build_pdf("secret contents")
     encrypted = encrypt(data, user_password="hunter2")

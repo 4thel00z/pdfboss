@@ -1,4 +1,4 @@
-//! ASCIIHexDecode: hex pairs to bytes; whitespace ignored, `>` terminates,
+//! ASCIIHexDecode (ISO 32000-1 §7.4.2): hex pairs to bytes; whitespace ignored, `>` terminates,
 //! an odd trailing digit is padded with `0`.
 
 use crate::error::Result;
@@ -7,6 +7,8 @@ use crate::filters::is_pdf_whitespace;
 /// Decodes ASCIIHexDecode data. Whitespace is ignored, `>` ends the data
 /// (anything after it is ignored), an odd number of digits is padded with a
 /// trailing `0`, and other unexpected bytes are leniently skipped.
+///
+/// Covers ISO 32000-1 §7.4.2.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len() / 2);
     let mut high: Option<u8> = None;
@@ -38,6 +40,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    // The rules of ISO 32000-1 §7.4.2: hex pairs, either case, whitespace
+    // ignored, an odd trailing digit padded with 0, `>` as end of data.
     #[test]
     fn decodes_simple_pairs() {
         assert_eq!(decode(b"48656C6C6F>").unwrap(), b"Hello");
@@ -54,12 +58,14 @@ mod tests {
         assert_eq!(decode(b"4\n8656C6C6F>").unwrap(), b"Hello");
     }
 
+    // Covers ISO 32000-1 §7.4.2.
     #[test]
     fn odd_length_pads_with_zero() {
         assert_eq!(decode(b"48656C6C6F7>").unwrap(), b"Hello\x70");
         assert_eq!(decode(b"7>").unwrap(), [0x70]);
     }
 
+    // Covers ISO 32000-1 §7.4.2.
     #[test]
     fn terminator_stops_decoding() {
         assert_eq!(decode(b"4869>4141").unwrap(), b"Hi");

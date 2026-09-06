@@ -19,6 +19,7 @@ class TestSyncElements:
         assert elements
         assert all(isinstance(e, Element) for e in elements)
 
+    # Covers ISO 32000-1 §12.5.2.
     def test_kinds_are_known(self, hello_pdf: Path) -> None:
         doc = Document(str(hello_pdf))
         for element in doc.elements():

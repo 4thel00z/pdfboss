@@ -1,4 +1,4 @@
-//! RunLengthDecode: length byte 0-127 copies the next n+1 bytes literally,
+//! RunLengthDecode (ISO 32000-1 §7.4.5): length byte 0-127 copies the next n+1 bytes literally,
 //! 129-255 repeats the next byte 257-n times, 128 is end of data.
 
 use crate::error::{Error, Result};
@@ -7,6 +7,8 @@ use crate::filters::MAX_DECODED_LEN;
 /// Decodes RunLengthDecode data. Truncated runs and a missing end-of-data
 /// byte are tolerated: whatever decoded so far is returned. Output larger
 /// than `MAX_DECODED_LEN` (a decompression bomb) is an error.
+///
+/// Covers ISO 32000-1 §7.4.5.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len());
     let mut i = 0;
@@ -45,6 +47,8 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    // The rules of ISO 32000-1 §7.4.5: literal runs for lengths 0-127,
+    // repeat runs for 129-255, 128 as end of data.
     #[test]
     fn literal_run() {
         assert_eq!(decode(&[2, b'a', b'b', b'c', 128]).unwrap(), b"abc");
@@ -56,6 +60,7 @@ mod tests {
         assert_eq!(decode(&[254, b'x', 128]).unwrap(), b"xxx");
     }
 
+    // Covers ISO 32000-1 §7.4.5.
     #[test]
     fn mixed_runs() {
         let data = [1, b'h', b'i', 253, b'!', 0, b'?', 128];
@@ -76,6 +81,7 @@ mod tests {
         assert!(out[128..].iter().all(|&b| b == b'z'));
     }
 
+    // Covers ISO 32000-1 §7.4.5.
     #[test]
     fn eod_stops_decoding() {
         assert_eq!(decode(&[0, b'a', 128, 0, b'b']).unwrap(), b"a");
@@ -103,6 +109,7 @@ mod tests {
         assert!(decode(&[128]).unwrap().is_empty());
     }
 
+    // Covers ISO 32000-1 §7.4.5.
     #[test]
     fn decompression_bomb_is_rejected() {
         // Each `129, 0` pair expands to 128 zero bytes (the maximum 128:1

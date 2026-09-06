@@ -39,6 +39,7 @@ fn hello_single_page_round_trips() {
     assert!(text.contains("Hello, world!"), "extracted: {text:?}");
 }
 
+// Covers ISO 32000-1 §14.3.3.
 #[test]
 fn metadata_and_multipage_round_trip() {
     let mut second = Page::new(PageSize::A5);
@@ -224,6 +225,7 @@ fn resolve_form(doc: &Document, resources: &Dict, resource_name: &str) -> Stream
         .clone()
 }
 
+// Covers ISO 32000-1 §8.10.2.
 #[test]
 fn draw_group_paints_the_registered_subcanvas() {
     let mut page = Page::new(PageSize::A4);
@@ -392,6 +394,7 @@ fn nested_groups_recurse_through_extraction() {
     assert!(text.contains("Inner"), "extracted: {text:?}");
 }
 
+// Covers ISO 32000-1 §8.4.5.
 #[test]
 fn fill_alpha_resolves_to_ca_in_extgstate() {
     let mut page = Page::new(PageSize::A4);
@@ -523,6 +526,7 @@ fn both_xref_styles_load() {
     }
 }
 
+// Covers ISO 32000-1 §12.5.4, §12.5.6.5 and §12.6.4.7.
 #[test]
 fn link_annotations_round_trip() {
     let mut page = Page::new(PageSize::A4);
@@ -550,6 +554,7 @@ fn link_annotations_round_trip() {
     assert_eq!(doc.page_count(), 1);
 }
 
+// Covers ISO 32000-1 §12.3.2, §12.3.2.2, §12.5.6.5, §12.6.2, §12.6.4 and §12.6.4.2.
 #[test]
 fn goto_links_resolve_to_their_page() {
     let mut first = Page::new(PageSize::A4);
@@ -588,6 +593,7 @@ fn goto_links_resolve_to_their_page() {
     assert_eq!(resolved_page_types, vec!["Page".to_string()]);
 }
 
+// Covers ISO 32000-1 §12.5.2, §12.5.6.5, §12.6.2, §12.6.4 and §12.6.4.7.
 #[test]
 fn link_element_lands_in_page_links() {
     let mut page = Page::new(PageSize::A4);
@@ -651,6 +657,7 @@ fn paragraph_wraps_and_extracts_across_lines() {
     );
 }
 
+// Covers ISO 32000-1 §12.5.6.5 and §12.6.4.2.
 #[test]
 fn goto_link_out_of_range_errors() {
     let mut page = Page::new(PageSize::A4);
@@ -713,6 +720,7 @@ fn xmp_packet(doc: &Document) -> Option<String> {
     Some(String::from_utf8(bytes).expect("XMP packet is valid UTF-8"))
 }
 
+// Covers ISO 32000-1 §14.3.2.
 #[test]
 fn xmp_packet_maps_full_metadata_and_stays_uncompressed() {
     let pdf = Pdf {
@@ -850,6 +858,7 @@ fn title_of(item: &Dict) -> String {
 /// Two top-level bookmarks, the first with one nested child — each pointing
 /// at a page of a distinct size, so a `/Dest` that resolves to the wrong
 /// page shows up as a mismatched `/MediaBox` rather than passing by luck.
+// Covers ISO 32000-1 §12.3.2, §12.3.2.2 and §12.3.3.
 #[test]
 fn outline_tree_walks_prev_next_and_dest_pages() {
     let pages: Vec<Page> = [PageSize::A4, PageSize::Letter, PageSize::A5]
@@ -914,6 +923,7 @@ fn outline_tree_walks_prev_next_and_dest_pages() {
     assert_dest_page(&doc, &chapter_two, PageSize::A5);
 }
 
+// Covers ISO 32000-1 §12.3.3.
 #[test]
 fn outline_document_serializes_byte_identically() {
     fn build() -> Vec<u8> {
@@ -937,6 +947,7 @@ fn outline_document_serializes_byte_identically() {
     assert_eq!(build(), build());
 }
 
+// Covers ISO 32000-1 §12.3.3.
 #[test]
 fn empty_outline_emits_no_outlines_entry() {
     let bytes = Pdf {
@@ -950,6 +961,7 @@ fn empty_outline_emits_no_outlines_entry() {
     assert!(catalog(&doc).get("Outlines").is_none());
 }
 
+// Covers ISO 32000-1 §12.3.3.
 #[test]
 fn bookmark_out_of_range_page_errors() {
     let err = Pdf {
@@ -1199,6 +1211,7 @@ fn four_pages() -> Vec<Page> {
 /// then a decimal range from page 2 on with a chapter prefix and a
 /// numbering offset — `/PageLabels /Nums` must carry both ranges, sorted
 /// by `first_page`, each with the right `/S`, `/P` and `/St`.
+// Covers ISO 32000-1 §12.4.2.
 #[test]
 fn page_labels_resolve_roman_front_matter_and_offset_decimal() {
     let pdf = Pdf {
@@ -1246,6 +1259,7 @@ fn page_labels_resolve_roman_front_matter_and_offset_decimal() {
     assert_eq!(body.get_int("St"), Some(5));
 }
 
+// Covers ISO 32000-1 §12.4.2.
 #[test]
 fn page_labels_missing_zero_page_errors() {
     let pdf = Pdf {
@@ -1265,6 +1279,7 @@ fn page_labels_missing_zero_page_errors() {
     }
 }
 
+// Covers ISO 32000-1 §12.4.2.
 #[test]
 fn page_labels_duplicate_first_page_errors() {
     let pdf = Pdf {
@@ -1292,6 +1307,7 @@ fn page_labels_duplicate_first_page_errors() {
     }
 }
 
+// Covers ISO 32000-1 §12.4.2.
 #[test]
 fn page_labels_zero_start_at_errors() {
     let pdf = Pdf {
@@ -1311,6 +1327,7 @@ fn page_labels_zero_start_at_errors() {
     }
 }
 
+// Covers ISO 32000-1 §12.4.2.
 #[test]
 fn no_page_labels_emits_no_page_labels_entry() {
     let bytes = Pdf {
@@ -1326,6 +1343,7 @@ fn no_page_labels_emits_no_page_labels_entry() {
 /// Viewer preferences resolve structurally: `/PageLayout` and `/PageMode`
 /// as catalog names, `/OpenAction` as an `/XYZ` destination landing on the
 /// requested page.
+// Covers ISO 32000-1 §12.3.2, §12.3.2.2 and §12.6.3.
 #[test]
 fn viewer_preferences_resolve_layout_mode_and_open_to() {
     let pdf = Pdf {
@@ -1363,6 +1381,7 @@ fn viewer_preferences_resolve_layout_mode_and_open_to() {
     assert_eq!(media_box[3].as_f64(), Some(792.0));
 }
 
+// Covers ISO 32000-1 §12.6.3.
 #[test]
 fn no_viewer_emits_no_viewer_entries() {
     let bytes = Pdf {
@@ -1378,6 +1397,7 @@ fn no_viewer_emits_no_viewer_entries() {
     assert!(catalog.get("OpenAction").is_none());
 }
 
+// Covers ISO 32000-1 §12.6.3.
 #[test]
 fn viewer_open_to_out_of_range_errors() {
     let pdf = Pdf {

@@ -116,6 +116,7 @@ fn page_import_pulls_in_no_sibling_content_without_links() {
 /// imported page it should now point at, or dropping it) is not yet
 /// implemented; see the limitation noted in
 /// `docs/src/guide/assembling.md`.
+// Covers ISO 32000-1 §12.3.2.2.
 #[test]
 fn page_import_of_a_linked_source_carries_the_linked_page_along() {
     let mut b = PdfBuilder::new();

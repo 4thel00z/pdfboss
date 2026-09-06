@@ -471,6 +471,7 @@ mod tests {
         assert_eq!(image.placed_size(), (50.0, 90.0));
     }
 
+    // Covers ISO 32000-1 §9.4.3.
     #[test]
     fn text_draw_sets_fill_then_shows_text() {
         let mut canvas = Canvas::new();
@@ -579,6 +580,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §9.3.3.
     #[test]
     fn paragraph_justify_stretches_non_final_lines_and_resets_once() {
         let mut canvas = Canvas::new();

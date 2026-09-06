@@ -9,6 +9,8 @@ use crate::Pixmap;
 const SUBSAMPLES: u32 = 4;
 
 /// Which interior rule decides what a path encloses.
+///
+/// Covers ISO 32000-1 §8.5.3.3.2 and §8.5.3.3.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FillRule {
     /// Nonzero winding number.
@@ -96,6 +98,8 @@ impl Mask {
 
     /// Rasterizes `polys` under `rule` into a fresh mask sized to `polys`'
     /// own bounding box (clamped to the page), not the full page.
+    ///
+    /// Covers ISO 32000-1 §11.6.4.2.
     pub(crate) fn from_path(
         width: u32,
         height: u32,
@@ -280,6 +284,8 @@ fn prepare_edges(edges: &mut Vec<Edge>, polys: &[Subpath]) {
 /// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
 /// `weight`, to a row buffer, and widens `[dirty_lo, dirty_hi)` to cover the
 /// pixels it wrote so the caller can restrict its work to the touched extent.
+///
+/// Covers ISO 32000-1 §10.6.4.
 fn add_span(
     row: &mut [f32],
     x0: f32,
@@ -318,6 +324,8 @@ fn add_span(
 /// is zero), and columns outside `[x_lo, x_hi)` in an emitted row are
 /// guaranteed zero. The caller runs [`prepare_edges`] first; on return,
 /// `scratch.row` is all-zero again.
+///
+/// Covers ISO 32000-1 §10.6.4 and §11.6.4.2.
 fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
     scratch: &mut RasterScratch,
     width: u32,
@@ -612,7 +620,7 @@ fn inside(wind: i32, rule: FillRule) -> bool {
 }
 
 /// The blend modes this rasterizer paints: `Normal`, the separable modes
-/// (ISO 32000-1 §11.3.5.2) and the non-separable four (§11.3.5.3).
+/// (ISO 32000-2 §11.3.5.2) and the non-separable four (§11.3.5.3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum BlendMode {
     #[default]
@@ -639,6 +647,8 @@ impl BlendMode {
     /// The page backdrop is always opaque here, so compositing stays
     /// `(1 − αs)·Cb + αs·B(Cb, Cs)` — the caller feeds this through the
     /// ordinary source-over composite in place of the raw source.
+    ///
+    /// Covers ISO 32000-1 §11.3.4 and §11.3.5.
     pub(crate) fn blend(self, cb: [u8; 3], cs: [u8; 3]) -> [u8; 3] {
         if self == BlendMode::Normal {
             return cs;
@@ -672,6 +682,8 @@ impl BlendMode {
 }
 
 /// One channel of a separable blend function (§11.3.5.2).
+///
+/// Covers ISO 32000-2 §11.3.5.2.
 fn blend_channel(mode: BlendMode, b: f32, s: f32) -> f32 {
     match mode {
         BlendMode::Multiply => b * s,
@@ -714,6 +726,8 @@ fn blend_channel(mode: BlendMode, b: f32, s: f32) -> f32 {
 }
 
 /// `Lum(C)` per §11.3.5.3.
+///
+/// Covers ISO 32000-1 §10.3.2 and §11.3.5.
 fn lum(c: [f32; 3]) -> f32 {
     0.3 * c[0] + 0.59 * c[1] + 0.11 * c[2]
 }
@@ -721,6 +735,8 @@ fn lum(c: [f32; 3]) -> f32 {
 /// `ClipColor(C)` per §11.3.5.3: pulls out-of-range components back toward
 /// the color's luminosity. `n` and `x` are taken once, before either fixup,
 /// exactly as the spec's pseudocode reads them.
+///
+/// Covers ISO 32000-2 §11.3.5.3.
 fn clip_color(mut c: [f32; 3]) -> [f32; 3] {
     let l = lum(c);
     let n = c[0].min(c[1]).min(c[2]);
@@ -765,6 +781,8 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
 
 /// `HardLight(Cb, Cs)` per §11.3.5.2; `Overlay` is the same with the
 /// operands swapped.
+///
+/// Covers ISO 32000-2 §11.3.5.2.
 fn hard_light(b: f32, s: f32) -> f32 {
     if s <= 0.5 {
         b * (2.0 * s)
@@ -790,6 +808,8 @@ static UNIT: [f32; 256] = {
 
 /// Composites `rgb` at alpha `a` (0..=1) over one straight-alpha RGBA8
 /// pixel using the source-over rule.
+///
+/// Covers ISO 32000-1 §11.3.2, §11.3.3, §11.3.7 and §11.3.7.3.
 pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
     let da = dst[3] as f32 / 255.0;
     let oa = a + da * (1.0 - a);
@@ -810,6 +830,8 @@ pub(crate) fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// `rgba`, further scaled by the constant `alpha` (0..=1) and, when
 /// present, the `clip` coverage mask. Anti-aliased coverage is composited
 /// source-over.
+///
+/// Covers ISO 32000-1 §11.3.6, §11.3.7, §11.3.7.2, §11.6.4, §8.5.3.3.1 and §8.5.3.3.2.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_path(
     pix: &mut Pixmap,
@@ -841,6 +863,8 @@ pub(crate) fn fill_path(
 /// narrowing to the clip mask's stored bbox and dispatching to the blend
 /// loop — the single row-painting path behind both [`fill_path`] and
 /// [`fill_spans`].
+///
+/// Covers ISO 32000-1 §11.3.7.2.
 #[allow(clippy::too_many_arguments)]
 fn paint_row(
     pix: &mut Pixmap,
@@ -1166,6 +1190,8 @@ fn fill_run(dst: &mut [u8], px: [u8; 4]) {
 }
 
 /// Source-over paints one pixel at alpha `a`, honoring the blend mode.
+///
+/// Covers ISO 32000-1 §11.2, §11.3.3 and §11.3.8.
 #[inline(always)]
 pub(crate) fn paint_pixel<const NORMAL: bool>(
     dst: &mut [u8],
@@ -1205,6 +1231,7 @@ mod blend_hw_tests {
     /// [`paint_pixel`] calls across every lane-shortcut combination:
     /// zero coverage, full coverage, transparent destinations, and
     /// anti-aliased fractions, mixed within one vector.
+    // Covers ISO 32000-1 §11.3.3.
     #[test]
     fn vector_blend_matches_scalar_bytes() {
         let mut state = 0x2468aceu32;
@@ -1307,6 +1334,7 @@ mod tests {
 
     const RED: [u8; 4] = [255, 0, 0, 255];
 
+    // Covers ISO 32000-1 §10.6.4.
     #[test]
     fn axis_aligned_rect_exact_interior() {
         let mut pix = Pixmap::new(10, 10);
@@ -1332,6 +1360,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §10.6.4 and §11.3.7.2.
     #[test]
     fn half_pixel_horizontal_edge_antialiases() {
         let mut pix = Pixmap::new(10, 10);
@@ -1351,6 +1380,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 1, 4), 0);
     }
 
+    // Covers ISO 32000-1 §10.6.4 and §11.6.4.2.
     #[test]
     fn half_pixel_vertical_edge_antialiases() {
         let mut pix = Pixmap::new(10, 10);
@@ -1397,6 +1427,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 5, 0), 0, "above");
     }
 
+    // Covers ISO 32000-1 §10.6.4 and §8.5.3.3.3.
     #[test]
     fn even_odd_donut_has_hole() {
         let mut pix = Pixmap::new(12, 12);
@@ -1420,6 +1451,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 0, 6), 0, "outside");
     }
 
+    // Covers ISO 32000-1 §8.5.3.3.2.
     #[test]
     fn nonzero_same_winding_donut_fills_solid() {
         let mut pix = Pixmap::new(12, 12);
@@ -1442,6 +1474,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 0, 6), 0, "outside");
     }
 
+    // Covers ISO 32000-1 §10.6.4 and §8.5.3.3.2.
     #[test]
     fn nonzero_opposite_winding_donut_has_hole() {
         let mut pix = Pixmap::new(12, 12);
@@ -1468,6 +1501,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 2, 6), 255, "ring");
     }
 
+    // Covers ISO 32000-1 §8.5.4.
     #[test]
     fn clip_mask_restricts_fill() {
         let mut pix = Pixmap::new(10, 10);
@@ -1493,6 +1527,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §8.5.4.
     #[test]
     fn mask_intersect_takes_minimum() {
         let mut a = mask_from_path(8, 8, &[rect_poly(0.0, 0.0, 6.0, 8.0)], FillRule::NonZero);
@@ -1620,6 +1655,7 @@ mod tests {
         assert!(mask.data.iter().all(|&b| b == 0));
     }
 
+    // Covers ISO 32000-1 §11.3.3, §11.3.7 and §11.6.4.4.
     #[test]
     fn constant_alpha_composites_over_white() {
         let mut pix = Pixmap::new(4, 4);
@@ -1641,9 +1677,10 @@ mod tests {
         assert_eq!(px[3], 255);
     }
 
-    // Non-separable blend vectors, hand-computed from the ISO 32000-1
+    // Non-separable blend vectors, hand-computed from the ISO 32000-2
     // §11.3.5.3 formulas (Lum weights 0.3/0.59/0.11).
 
+    // Covers ISO 32000-2 §11.3.5.3.
     #[test]
     fn hue_takes_source_hue_at_backdrop_luminosity() {
         // B(red, blue) = SetLum(SetSat(blue, Sat(red)=1) = blue, Lum(red)=0.3):
@@ -1661,6 +1698,7 @@ mod tests {
         assert_eq!(got, [227, 227, 227]);
     }
 
+    // Covers ISO 32000-2 §11.3.5.3.
     #[test]
     fn saturation_of_a_gray_source_desaturates_the_backdrop() {
         // Sat(gray) = 0, so SetSat(yellow, 0) = [0, 0, 0]; SetLum lifts it
@@ -1669,6 +1707,7 @@ mod tests {
         assert_eq!(got, [227, 227, 227]);
     }
 
+    // Covers ISO 32000-2 §11.3.5.3.
     #[test]
     fn color_takes_source_color_at_backdrop_luminosity() {
         // SetLum(red, Lum(mid-gray) = 128/255): d = 0.201961 →
@@ -1678,6 +1717,7 @@ mod tests {
         assert_eq!(got, [255, 74, 74]);
     }
 
+    // Covers ISO 32000-2 §11.3.5.3.
     #[test]
     fn luminosity_takes_source_luminosity_at_backdrop_color() {
         // SetLum(red, Lum(mid-gray)) — the Color vector with the operands
@@ -1686,6 +1726,7 @@ mod tests {
         assert_eq!(got, [255, 74, 74]);
     }
 
+    // Covers ISO 32000-2 §11.3.5.3.
     #[test]
     fn luminosity_darkening_exercises_the_negative_clip() {
         // SetLum(red, Lum(dark gray) = 64/255): d = −0.049020 →
@@ -1695,6 +1736,7 @@ mod tests {
         assert_eq!(got, [213, 0, 0]);
     }
 
+    // Covers ISO 32000-1 §10.6.4 and §8.5.3.3.1.
     #[test]
     fn open_subpath_is_implicitly_closed_for_fill() {
         let mut pix = Pixmap::new(10, 10);

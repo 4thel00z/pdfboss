@@ -107,6 +107,7 @@ fn render_clean(bytes: &[u8]) -> Pixmap {
 
 /// An `ICCBased` fill through a profile that is sRGB renders byte-identical
 /// to the same fill in plain `/DeviceRGB`.
+// Covers ISO 32000-1 §8.6.5.5.
 #[test]
 fn an_srgb_iccbased_fill_matches_device_rgb_exactly() {
     let device = render_clean(&fill_page("/DeviceRGB", None));
@@ -119,6 +120,7 @@ fn an_srgb_iccbased_fill_matches_device_rgb_exactly() {
 
 /// The same fill through a gamma-1,8 profile moves mid-gray to the sRGB
 /// encoding of 0,5^1,8, computed here rather than transcribed.
+// Covers ISO 32000-1 §10.2 and §8.6.5.5.
 #[test]
 fn a_gamma_18_iccbased_fill_shifts_by_the_computed_amount() {
     let pix = render_clean(&fill_page(
@@ -143,6 +145,7 @@ fn a_gamma_18_iccbased_fill_shifts_by_the_computed_amount() {
 /// A 1x1 `/Lab` image with no `/Decode` reads its samples through the Lab
 /// component ranges: bytes (255, 128, 128) decode to L* = 100 near the
 /// whitepoint, not to a dark L* = 1.
+// Covers ISO 32000-1 §8.6.5.4 and §8.9.5.2.
 #[test]
 fn a_lab_image_defaults_its_decode_to_the_lab_ranges() {
     let mut b = PdfBuilder::new();

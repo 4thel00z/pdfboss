@@ -82,6 +82,7 @@ impl fmt::Display for CcittError {
     }
 }
 
+/// Covers ISO 32000-1 §7.4.6.
 impl From<CcittError> for Error {
     fn from(err: CcittError) -> Error {
         Error::Decode(err.to_string())
@@ -134,6 +135,8 @@ impl From<CcittError> for Error {
 ///   inventing the pixels in between. This build does not invent pixels: it
 ///   reports the damage, which is what the default asks for and stricter than
 ///   what any other value asks for.
+///
+/// Covers ISO 32000-1 §7.4.6.
 pub(crate) fn decode_pdf_stream(data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>> {
     let params = Params {
         columns: columns_parm(parms)?,

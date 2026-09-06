@@ -267,6 +267,7 @@ size = "a4"
 /// (mirroring the markdown crate's own roundtrip idiom: `/Annots` -> `Annot`
 /// dict -> `/A` -> `/URI`, since the annotation dict is packed into a
 /// compressed object stream and never appears literally in the file).
+// Covers ISO 32000-1 §12.5.6.5 and §12.6.4.7.
 #[test]
 fn manifest_maps_toml_through_the_compose_layer() {
     let dir = tmp("manifest");

@@ -135,6 +135,8 @@ fn srgb_from_xyz_d65() -> [[f64; 3]; 3] {
 
 /// Matrix taking XYZ relative to `white` to linear sRGB: Bradford adaptation
 /// to D65 followed by the sRGB primary matrix.
+///
+/// Covers ISO 32000-1 §8.6.5.7.
 pub fn xyz_to_linear_srgb(white: [f32; 3]) -> Mat3 {
     let m = mul64(&srgb_from_xyz_d65(), &bradford_to_d65(white));
     let mut out = [[0.0f32; 3]; 3];
@@ -168,6 +170,8 @@ pub fn mat_apply(m: &Mat3, v: [f32; 3]) -> [f32; 3] {
 
 /// The IEC 61966-2-1 sRGB opto-electronic transfer: linear 0..=1 in,
 /// non-linear 0..=1 out. Out-of-range and non-finite inputs clamp.
+///
+/// Covers ISO 32000-1 §8.6.5.7.
 pub fn srgb_encode(v: f32) -> f32 {
     if !v.is_finite() {
         return 0.0;
@@ -182,6 +186,8 @@ pub fn srgb_encode(v: f32) -> f32 {
 /// CIE L*a*b* to XYZ relative to `white`, per the CIE definition used by
 /// ISO 32000-1 clause 8.6.5.4: the inverse transfer g(t) = t^3 above 6/29
 /// continues linearly with slope 108/841 below it.
+///
+/// Covers ISO 32000-1 §8.6.5.4.
 pub fn lab_to_xyz(lab: [f32; 3], white: [f32; 3]) -> [f32; 3] {
     let finv = |t: f32| -> f32 {
         if t > 6.0 / 29.0 {
@@ -262,6 +268,7 @@ mod tests {
 
     /// Bradford adaptation is exact on the white points it is built from:
     /// D50 maps to D65, so PCS white lands on linear sRGB (1, 1, 1).
+    // Covers ISO 32000-1 §10.2 and §8.6.5.7.
     #[test]
     fn d50_white_adapts_to_srgb_white() {
         let m = xyz_to_linear_srgb(D50);
@@ -274,6 +281,7 @@ mod tests {
     /// An identity adaptation (white already D65) followed by the primary
     /// matrix sends the D65 white to (1, 1, 1) and the red primary's XYZ to
     /// pure red.
+    // Covers ISO 32000-1 §8.6.5.7.
     #[test]
     fn srgb_matrix_maps_primaries_to_axes() {
         let d65 = [
@@ -308,6 +316,7 @@ mod tests {
 
     /// L* = 100 with zero a*, b* reproduces the white point exactly; L* = 50
     /// gives Y = ((66/116))^3, hand-computed.
+    // Covers ISO 32000-1 §8.6.5.4.
     #[test]
     fn lab_to_xyz_hand_values() {
         let xyz = lab_to_xyz([100.0, 0.0, 0.0], D50);

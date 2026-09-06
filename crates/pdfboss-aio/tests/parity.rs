@@ -295,6 +295,7 @@ fn page_boxes_doc() -> Vec<u8> {
 /// dictionary. The fixture declares everything on `/Pages` nodes, so a
 /// traversal that fails to inherit reports US Letter for an A4 page —
 /// silently, which is why this compares every field rather than probing one.
+// Covers ISO 32000-1 §7.7.3.4.
 #[tokio::test]
 async fn pages_agree_with_the_sync_document() {
     let mut cases = fixtures();
@@ -450,6 +451,7 @@ async fn optional_content_renders_identically() {
 /// An RC4-encrypted document (Standard handler, empty user password) opens
 /// asynchronously and decrypts identically to the synchronous document:
 /// strings, stream data, and extracted text.
+// Covers ISO 32000-1 §7.6.2.
 #[tokio::test]
 async fn encrypted_documents_decrypt_identically() {
     let bytes = pdfboss_testkit::encrypted_rc4_doc("Top secret message");

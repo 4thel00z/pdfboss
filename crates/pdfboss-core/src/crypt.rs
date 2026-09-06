@@ -51,6 +51,8 @@ pub struct Decryptor {
 
 /// The `/Encrypt` dictionary's `/EncryptMetadata` flag, true when absent
 /// (ISO 32000-2 §7.6.4.2, Table 20).
+///
+/// Covers ISO 32000-1 §7.6.3.2.
 fn encrypt_metadata_flag(enc: &Dict) -> bool {
     enc.get("EncryptMetadata")
         .and_then(Object::as_bool)
@@ -73,6 +75,8 @@ impl Decryptor {
     /// // An empty dictionary names no handler, so there is nothing to build.
     /// assert!(Decryptor::from_standard(&Dict::default(), &[]).is_none());
     /// ```
+    ///
+    /// Covers ISO 32000-1 §7.6.3.
     pub fn from_standard(enc: &Dict, id0: &[u8]) -> Option<Decryptor> {
         Decryptor::from_standard_with_password(enc, id0, b"")
     }
@@ -99,6 +103,8 @@ impl Decryptor {
     /// recovers the user-level key, ISO 32000 §7.6.3.4 Algorithm 7 for the
     /// RC4/AES-128 revisions, §7.6.4.3.3 for AES-256). `None` when the
     /// password opens nothing.
+    ///
+    /// Covers ISO 32000-1 §7.6.3, §7.6.3.2 and §7.6.5.
     pub fn from_standard_with_password(
         enc: &Dict,
         id0: &[u8],
@@ -176,6 +182,8 @@ impl Decryptor {
     /// Per-object key: `MD5(filekey ++ num[0..3] ++ gen[0..2] [++ "sAlT"])`
     /// truncated to `min(n + 5, 16)` bytes (ISO 32000 §7.6.2, Algorithm 1). The
     /// `sAlT` suffix is added for AES crypt filters.
+    ///
+    /// Covers ISO 32000-1 §7.6.2.
     fn object_key(&self, num: u32, gen: u16) -> Vec<u8> {
         let mut input = Vec::with_capacity(self.key.len() + 9);
         input.extend_from_slice(&self.key);
@@ -195,6 +203,8 @@ impl Decryptor {
 /// stream whose own dictionary says `/Type /Metadata` was stored in
 /// plaintext (ISO 32000-2 §7.6.4.2, Table 20) and its data is left alone;
 /// the dictionary's own values still walk normally.
+///
+/// Covers ISO 32000-1 §7.6.2.
 fn decrypt_in_place(obj: &mut Object, key: &[u8], cipher: Cipher, encrypt_metadata: bool) {
     match obj {
         Object::String(bytes) => *bytes = decrypt_bytes(cipher, key, bytes),
@@ -233,6 +243,8 @@ fn decrypt_bytes(cipher: Cipher, key: &[u8], data: &[u8]) -> Vec<u8> {
 
 /// The Standard stream crypt filter's method (`/CF` → `/StmF` → `/CFM`):
 /// `V2`, `AESV2`, or `Identity`.
+///
+/// Covers ISO 32000-1 §7.6.5.
 fn crypt_filter_method(enc: &Dict) -> Option<String> {
     let stmf = enc
         .get_name("StmF")
@@ -245,6 +257,8 @@ fn crypt_filter_method(enc: &Dict) -> Option<String> {
 /// Pads or truncates a password to the 32 bytes every legacy algorithm
 /// hashes (ISO 32000 §7.6.3.3, Algorithm 2 step (a)). The empty password
 /// pads to [`PAD`] itself.
+///
+/// Covers ISO 32000-1 §7.6.3.3.
 fn pad_password(password: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     let n = password.len().min(32);
@@ -257,6 +271,8 @@ fn pad_password(password: &[u8]) -> [u8; 32] {
 /// password (Algorithm 2 + the `/U` check), then as the owner password
 /// (Algorithm 7: the owner key decrypts `/O` back into the padded user
 /// password, which must then verify like any user password).
+///
+/// Covers ISO 32000-1 §7.6.3.4.
 fn rc4_family_key(enc: &Dict, id0: &[u8], r: i64, n: usize, password: &[u8]) -> Option<Vec<u8>> {
     let u = enc.get("U").and_then(Object::as_str_bytes)?;
     if let Some(key) = md5_file_key(enc, id0, r, n, &pad_password(password)) {
@@ -294,6 +310,8 @@ fn rc4_family_key(enc: &Dict, id0: &[u8], r: i64, n: usize, password: &[u8]) -> 
 }
 
 /// Algorithm 2: derive the RC4/AESV2 file key from a padded user password.
+///
+/// Covers ISO 32000-1 §7.6.3.3.
 fn md5_file_key(enc: &Dict, id0: &[u8], r: i64, n: usize, padded: &[u8; 32]) -> Option<Vec<u8>> {
     let o = enc.get("O").and_then(Object::as_str_bytes)?;
     if o.len() < 32 {
@@ -319,6 +337,8 @@ fn md5_file_key(enc: &Dict, id0: &[u8], r: i64, n: usize, padded: &[u8; 32]) -> 
 }
 
 /// Checks the empty user password by recomputing `/U` and comparing.
+///
+/// Covers ISO 32000-1 §7.6.3.4.
 fn verify_user_password(key: &[u8], r: i64, id0: &[u8], u: &[u8]) -> bool {
     if r == 2 {
         // Algorithm 4: U = RC4(key, PAD).
@@ -1918,6 +1938,7 @@ mod tests {
         b.trailer_extra(&trailer).build(1)
     }
 
+    // Covers ISO 32000-1 §7.6.2, §7.6.3.2 and §7.6.3.3.
     #[test]
     fn document_load_decrypts_standard_rc4() {
         use crate::object::ObjRef;
@@ -1940,6 +1961,7 @@ mod tests {
         assert_eq!(data, b"decrypted stream body", "stream decrypted");
     }
 
+    // Covers ISO 32000-1 §7.6.3.4.
     #[test]
     fn document_load_rejects_when_password_does_not_verify() {
         use crate::error::Error;
@@ -1952,6 +1974,7 @@ mod tests {
         assert!(matches!(err, Err(Error::Encrypted)));
     }
 
+    // Covers ISO 32000-1 §7.6.3, §7.6.3.3 and §7.6.3.4.
     #[test]
     fn real_user_password_opens_an_rc4_file() {
         use crate::error::Error;
@@ -1969,6 +1992,7 @@ mod tests {
         assert_eq!(msg.as_str_bytes().unwrap(), b"Top secret message");
     }
 
+    // Covers ISO 32000-1 §7.6.3.4.
     #[test]
     fn owner_password_opens_an_rc4_file() {
         use crate::object::ObjRef;
@@ -1982,6 +2006,7 @@ mod tests {
         assert_eq!(msg.as_str_bytes().unwrap(), b"Top secret message");
     }
 
+    // Covers ISO 32000-1 §7.6.3.4.
     #[test]
     fn wrong_password_stays_encrypted() {
         use crate::error::Error;
@@ -1992,6 +2017,7 @@ mod tests {
         assert!(matches!(err, Err(Error::Encrypted)));
     }
 
+    // Covers ISO 32000-1 §7.6.3 and §7.6.3.4.
     #[test]
     fn real_passwords_open_an_aes256_r6_file() {
         use crate::error::Error;
@@ -2016,6 +2042,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §7.6.3.
     #[test]
     fn empty_password_files_still_open_through_the_password_api() {
         use crate::object::ObjRef;
@@ -2031,6 +2058,7 @@ mod tests {
         assert_eq!(msg.as_str_bytes().unwrap(), b"Top secret message");
     }
 
+    // Covers ISO 32000-1 §7.6.3.2.
     #[test]
     fn unsupported_handler_is_declined() {
         // A future/unknown handler version is declined so the caller reports the
@@ -2143,6 +2171,7 @@ mod tests {
         b.trailer_extra(&trailer).build(1)
     }
 
+    // Covers ISO 32000-1 §7.6.2, §7.6.3.2, §7.6.3.3 and §7.6.5.
     #[test]
     fn document_load_decrypts_aesv2() {
         use crate::object::ObjRef;
@@ -2261,16 +2290,19 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.6.2.
     #[test]
     fn document_load_decrypts_aesv3_r5() {
         assert_aesv3_decrypts(5);
     }
 
+    // Covers ISO 32000-1 §7.6.3.3 and §7.6.5.
     #[test]
     fn document_load_decrypts_aesv3_r6() {
         assert_aesv3_decrypts(6); // exercises the iterated Algorithm 2.B hash
     }
 
+    // Covers ISO 32000-1 §14.3.2, §7.6.3.2 and §7.6.5.
     #[test]
     fn encrypt_metadata_false_leaves_the_metadata_stream_plaintext() {
         use crate::object::ObjRef;
@@ -2311,6 +2343,7 @@ mod tests {
     /// the generated file key. The dict comes from `aes256_encrypt_dict`,
     /// the same builder `Encryptor::aes256_with_rng` ships, so this test
     /// exercises the real production layout rather than a hand-built one.
+    // Covers ISO 32000-1 §7.6.3.3.
     #[test]
     fn r6_key_material_opens_under_aesv3_key() {
         let mut c = 0u8;
