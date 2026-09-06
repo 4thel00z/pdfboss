@@ -73,13 +73,10 @@ jobs:
           curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
           "$HOME/.elan/bin/elan" toolchain install "$(cat iso32000/lean-toolchain)"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - name: Rescan the sources for citations
-        run: make iso32000-index
-      - name: Explain any failure before the proofs run
-        run: make iso32000-check
+      # Rescans the sources, lists any offending row before Lean runs, then checks the ledger.
       - name: Check the ledger
         run: make iso32000-gate
       - name: Regenerate the vectors and the book chapter
         run: make iso32000-vectors iso32000-report
       - name: Committed copies must match what the tree generates
-        run: git diff --exit-code -- iso32000/Iso32000/Generated.lean crates/pdfboss-core/tests/vectors docs/src/reference/iso32000.md
+        run: git diff --exit-code -- iso32000/Iso32000/Generated.lean crates/pdfboss-core/tests/vectors/iso32000 docs/src/reference/iso32000.md
