@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.0.0](https://github.com/4thel00z/pdfboss/compare/v1.2.0...v2.0.0) (2026-09-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* extract_text, extract_markdown, extract_page_markdown, extract_spans and their _reporting, _cached and _with twins take a ReadingOrder; document_layout and document_layout_with_rulings take a per-page order.
+
+### Features
+
+* **render:** paint bold sans substitutes with static Arimo bold faces ([#150](https://github.com/4thel00z/pdfboss/issues/150)) ([5685da3](https://github.com/4thel00z/pdfboss/commit/5685da3f2bf6e411a6e9f440586d823dfac750ac))
+* selectable reading order on every extraction entry point ([#154](https://github.com/4thel00z/pdfboss/issues/154)) ([cf22c92](https://github.com/4thel00z/pdfboss/commit/cf22c928a4e9466fba7e2ea1f91db0fb1caa3cdc))
+* **write:** AES-256 encrypt and decrypt (P4 PR D1) ([#158](https://github.com/4thel00z/pdfboss/issues/158)) ([cb4dbcd](https://github.com/4thel00z/pdfboss/commit/cb4dbcdd9a91d1ddeebcf411a4986791617e4173))
+* **write:** Importer and the assembly verbs (P4 PR B) ([#155](https://github.com/4thel00z/pdfboss/issues/155)) ([6e66fdc](https://github.com/4thel00z/pdfboss/commit/6e66fdc54b057df8dc7deb8bade297003e3b29e9))
+* **write:** overlay command with under placement (P4 PR C) ([#157](https://github.com/4thel00z/pdfboss/issues/157)) ([ca45d8d](https://github.com/4thel00z/pdfboss/commit/ca45d8def8e6bdb5ad7a9fc0aecec41e9b5bd025))
+* **write:** public Update with incremental append (P4 PR A) ([#153](https://github.com/4thel00z/pdfboss/issues/153)) ([abe3cc3](https://github.com/4thel00z/pdfboss/commit/abe3cc39e645564974ecc1d4bc6dfa47223e7429))
+
 ## [1.2.0](https://github.com/4thel00z/pdfboss/compare/v1.1.0...v1.2.0) (2026-08-31)
 
 
