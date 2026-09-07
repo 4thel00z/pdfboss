@@ -1650,6 +1650,11 @@ impl Shading {
         to_device: Matrix,
         blend: BlendMode,
     ) {
+        // A shading in a `/Separation /None` space never marks the page
+        // (ISO 32000-1 §8.6.6.4).
+        if self.cs == ColorSpace::SeparationNone {
+            return;
+        }
         let Some(alpha) = clamped_alpha(alpha) else {
             return;
         };
@@ -1751,6 +1756,11 @@ impl Shading {
         let Some(bg) = self.background else {
             return;
         };
+        // The background is a colour in the shading's space, so a
+        // `/Separation /None` shading has none to paint (§8.6.6.4).
+        if self.cs == ColorSpace::SeparationNone {
+            return;
+        }
         let Some(alpha) = clamped_alpha(alpha) else {
             return;
         };

@@ -116,10 +116,19 @@ pub(crate) struct CffFont {
 }
 
 impl CffFont {
-    /// Parses a bare CFF font program (no OpenType/`OTTO` wrapper). Returns
-    /// `None` if the header, any INDEX, the Top DICT, or the CharStrings
-    /// INDEX cannot be read.
+    /// Parses a CFF font program, bare or inside an OpenType container
+    /// (`OTTO` header), whose `CFF ` table is the program; a `FontFile3` of
+    /// `/Subtype /OpenType` takes that form. Returns `None` if the header,
+    /// any INDEX, the Top DICT, or the CharStrings INDEX cannot be read, or
+    /// the container has no `CFF ` table.
+    ///
+    /// Covers ISO 32000-1 §9.7.4.2.
     pub(crate) fn parse(data: Vec<u8>) -> Option<CffFont> {
+        let data = if data.starts_with(b"OTTO") {
+            cff_table(&data)?.to_vec()
+        } else {
+            data
+        };
         let hdr_size = *data.get(2)? as usize;
         if hdr_size > data.len() {
             return None;
@@ -217,14 +226,18 @@ impl CffFont {
         self.charset.gid_for_code(cid)
     }
 
-    /// Inverts the charset into a `cid -> gid` table (CID-keyed fonts only):
+    /// Inverts the charset into a `cid -> gid` table for a CID-keyed font:
     /// `out[cid]` is that CID's glyph index (0/`.notdef` where no glyph
     /// claims the CID). Sized to the largest CID the charset actually uses,
     /// plus one; CIDs are `u16`, so this is bounded to 65536 entries no
-    /// matter how a malformed charset is shaped. Empty for non-CID fonts.
-    pub(crate) fn cid_to_gid(&self) -> Vec<u16> {
+    /// matter how a malformed charset is laid out. `None` for a font
+    /// without CIDFont operators, whose CIDs are the glyph indices
+    /// themselves (ISO 32000-1 §9.7.4.2).
+    ///
+    /// Covers ISO 32000-1 §9.7.4.2.
+    pub(crate) fn cid_to_gid(&self) -> Option<Vec<u16>> {
         if !self.is_cid {
-            return Vec::new();
+            return None;
         }
         let max_cid = self.charset.codes.iter().copied().max().unwrap_or(0);
         let mut out = vec![0u16; max_cid as usize + 1];
@@ -235,7 +248,7 @@ impl CffFont {
                 *slot = gid as u16;
             }
         }
-        out
+        Some(out)
     }
 
     /// Font design units per em, from the Top DICT's `FontMatrix` (default
@@ -1046,6 +1059,25 @@ impl Index {
             consumed,
         ))
     }
+}
+
+/// The `CFF ` table of an OpenType container: `OTTO`, a table count at
+/// offset 4, and 16-byte records (tag, checksum, offset, length) from offset
+/// 12. `None` when no record carries that tag or the table runs past the
+/// data.
+///
+/// Covers ISO 32000-1 §9.7.4.2.
+fn cff_table(data: &[u8]) -> Option<&[u8]> {
+    let num_tables = usize::from(u16::from_be_bytes([*data.get(4)?, *data.get(5)?]));
+    (0..num_tables).find_map(|i| {
+        let record = data.get(12 + i * 16..28 + i * 16)?;
+        if &record[..4] != b"CFF " {
+            return None;
+        }
+        let offset = u32::from_be_bytes([record[8], record[9], record[10], record[11]]) as usize;
+        let length = u32::from_be_bytes([record[12], record[13], record[14], record[15]]) as usize;
+        data.get(offset..offset.checked_add(length)?)
+    })
 }
 
 /// Maps between a glyph index and either a name SID (non-CID fonts) or a CID
@@ -1925,6 +1957,35 @@ pub(crate) mod tests {
         out.extend_from_slice(&fd_select);
         out.extend_from_slice(&charstrings_index);
         out
+    }
+
+    /// Wraps a bare CFF program in a one-table OpenType container: the
+    /// `OTTO` header and a single `CFF ` table record, which is what a
+    /// `FontFile3` of `/Subtype /OpenType` carries.
+    pub(crate) fn wrap_in_opentype(cff: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"OTTO");
+        out.extend_from_slice(&1u16.to_be_bytes()); // numTables
+        out.extend_from_slice(&[0; 6]); // searchRange, entrySelector, rangeShift
+        out.extend_from_slice(b"CFF ");
+        out.extend_from_slice(&[0; 4]); // checksum, not verified
+        out.extend_from_slice(&28u32.to_be_bytes()); // 12-byte header + one record
+        out.extend_from_slice(&(cff.len() as u32).to_be_bytes());
+        out.extend_from_slice(cff);
+        out
+    }
+
+    // Covers ISO 32000-1 §9.7.4.2: a FontFile3 of /Subtype /OpenType carries
+    // the CFF program in its `CFF ` table.
+    #[test]
+    fn an_opentype_wrapped_cff_parses_from_its_cff_table() {
+        let wrapped = wrap_in_opentype(&build_box_glyph_fixture_cid(5));
+        let font = CffFont::parse(wrapped).expect("the CFF table parses");
+        assert_eq!(font.gid_for_cid(5), Some(1));
+        // A container without a CFF table has nothing to parse.
+        let mut glyf_only = wrap_in_opentype(&[]);
+        glyf_only[12..16].copy_from_slice(b"glyf");
+        assert!(CffFont::parse(glyf_only).is_none());
     }
 
     #[test]

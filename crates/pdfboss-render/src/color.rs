@@ -82,6 +82,16 @@ pub(crate) enum ColorSpace {
         alternate: Box<ColorSpace>,
         inputs: usize,
     },
+    /// A `Separation` space naming the special colorant `All` (§8.6.6.4):
+    /// the tint goes to every colorant at once, which on a composite output
+    /// is gray `1 - tint`. The alternate space and tint transform are
+    /// ignored, as the clause asks.
+    SeparationAll,
+    /// A `Separation` space naming the special colorant `None` (§8.6.6.4):
+    /// painting in it never marks the page. `to_rgb` answers white so a
+    /// caller that converts unconditionally gets a finite value; the
+    /// painters drop the colour before it reaches a pixel.
+    SeparationNone,
     /// An `ICCBased` space whose profile parsed and is not equivalent to a
     /// device space: `n` components map through the profile to sRGB.
     Icc { profile: Arc<Profile>, n: usize },
@@ -128,6 +138,7 @@ impl ColorSpace {
             ColorSpace::DeviceCMYK => 4,
             ColorSpace::Indexed { .. } => 1,
             ColorSpace::Separation { inputs, .. } => *inputs,
+            ColorSpace::SeparationAll | ColorSpace::SeparationNone => 1,
             ColorSpace::Icc { n, .. } => *n,
             ColorSpace::CalRgb { .. } => 3,
             ColorSpace::CalGray { .. } => 1,
@@ -209,6 +220,11 @@ impl ColorSpace {
                 let written = tint.eval(&tints[..*inputs], &mut components);
                 alternate.to_rgb(&components[..written])
             }
+            // Every colorant at the tint (§8.6.6.4): on a composite output
+            // that is the gray a registration black of that tint gives.
+            ColorSpace::SeparationAll => [1.0 - comp(comps, 0); 3],
+            // Never painted; white is the "no colorant" answer.
+            ColorSpace::SeparationNone => [1.0; 3],
             ColorSpace::Icc { profile, n } => {
                 let mut vals = [0.0f32; MAX_COMPS];
                 for (i, slot) in vals.iter_mut().take(*n).enumerate() {
@@ -389,6 +405,28 @@ impl ColorSpace {
                             }
                         }
                         "Separation" => {
+                            // The special colorant names All and None ignore
+                            // the alternate space and the tint transform
+                            // (§8.6.6.4), so they are decided before either
+                            // is read.
+                            let colorant = match items.get(1) {
+                                Some(o) => match src.resolve(o).await {
+                                    Ok(Object::Name(n)) => Some(n.0),
+                                    _ => None,
+                                },
+                                None => None,
+                            };
+                            match colorant.as_deref() {
+                                Some("All") => {
+                                    result = ColorSpace::SeparationAll;
+                                    break;
+                                }
+                                Some("None") => {
+                                    result = ColorSpace::SeparationNone;
+                                    break;
+                                }
+                                _ => {}
+                            }
                             // [/Separation name alternate transform]: keep the
                             // transform and carry on into the alternate space,
                             // whose components the transform's output *is*.
@@ -779,6 +817,28 @@ pub(crate) mod tests {
         assert_eq!(ColorSpace::DeviceRGB.components(), 3);
         assert_eq!(ColorSpace::DeviceCMYK.components(), 4);
         assert_eq!(ColorSpace::Other(5).components(), 5);
+    }
+
+    // Covers ISO 32000-1 §8.6.6.4: the special colorant names ignore the
+    // alternate space and the tint transform, even a missing one.
+    #[test]
+    fn separation_all_and_none_ignore_the_alternate_and_transform() {
+        let doc = test_doc();
+        let p = |s: &[u8]| ColorSpace::parse(&doc, &obj(s));
+        assert_eq!(
+            p(b"[/Separation /All /DeviceCMYK 4 0 R]"),
+            ColorSpace::SeparationAll
+        );
+        assert_eq!(
+            p(b"[/Separation /None /DeviceCMYK 4 0 R]"),
+            ColorSpace::SeparationNone
+        );
+        assert_eq!(p(b"[/Separation /All]"), ColorSpace::SeparationAll);
+        assert_eq!(ColorSpace::SeparationAll.components(), 1);
+        assert_eq!(ColorSpace::SeparationNone.components(), 1);
+        assert_eq!(ColorSpace::SeparationAll.to_rgb(&[0.25]), [0.75; 3]);
+        assert_eq!(ColorSpace::SeparationAll.to_rgb(&[1.0]), [0.0; 3]);
+        assert_eq!(ColorSpace::SeparationNone.to_rgb(&[1.0]), [1.0; 3]);
     }
 
     // Covers ISO 32000-1 §8.6.3.

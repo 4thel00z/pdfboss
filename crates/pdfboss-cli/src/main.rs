@@ -731,6 +731,16 @@ fn info_text(
             let _ = writeln!(out, "pages:     unknown");
         }
     }
+    // A date that parses (ISO 32000-1 §7.9.4) prints as ISO 8601; one that
+    // does not prints as written.
+    let created = meta
+        .creation_date_parsed()
+        .map(|d| d.to_iso8601())
+        .or_else(|| meta.creation_date.clone());
+    let modified = meta
+        .mod_date_parsed()
+        .map(|d| d.to_iso8601())
+        .or_else(|| meta.mod_date.clone());
     let rows: [(&str, &Option<String>); 8] = [
         ("title", &meta.title),
         ("author", &meta.author),
@@ -738,8 +748,8 @@ fn info_text(
         ("keywords", &meta.keywords),
         ("creator", &meta.creator),
         ("producer", &meta.producer),
-        ("created", &meta.creation_date),
-        ("modified", &meta.mod_date),
+        ("created", &created),
+        ("modified", &modified),
     ];
     if rows.iter().any(|(_, v)| v.is_some()) {
         let _ = writeln!(out, "metadata:");

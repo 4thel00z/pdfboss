@@ -81,8 +81,11 @@ enum Outlines {
 enum GlyphKind {
     /// Simple font: one byte per code, mapped through this 256-entry table.
     Simple(Box<[u16; 256]>),
-    /// `CIDFontType2`: two bytes per code (a CID). `None` is the identity
-    /// CID-to-GID map; `Some` is an explicit table indexed by CID.
+    /// Composite font: the code is a CID. `None` is the identity CID-to-GID
+    /// map (`CIDFontType2` with `/CIDToGIDMap /Identity`, or a
+    /// `CIDFontType0` whose CFF has no CIDFont operators); `Some` is an
+    /// explicit table indexed by CID (a `/CIDToGIDMap` stream, or a CID-keyed
+    /// CFF's inverted charset).
     Cid(Option<Vec<u16>>),
 }
 
@@ -1355,13 +1358,16 @@ async fn load_cff_cid<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<Glyph
     let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
     let cff = CffFont::parse(program)?;
+    // A CFF with CIDFont operators maps CIDs through its charset; one
+    // without uses the CIDs directly as glyph indices (§9.7.4.2), which is
+    // the `None` identity map.
     let cid_to_gid = cff.cid_to_gid();
     let widths = cid_widths(src, cid).await;
     Some(GlyphFont {
         outline_cache: Mutex::new(FastMap::default()),
         flat_cache: Mutex::new(FastMap::default()),
         outlines: Outlines::Cff(cff),
-        kind: GlyphKind::Cid(Some(cid_to_gid)),
+        kind: GlyphKind::Cid(cid_to_gid),
         composite: Composite::default(),
         widths,
         afm_widths: FastMap::default(),
@@ -1390,7 +1396,9 @@ mod tests {
     use pdfboss_core::Document;
     use pdfboss_testkit::PdfBuilder;
 
-    use crate::cff::tests::{build_box_glyph_fixture, build_box_glyph_fixture_cid};
+    use crate::cff::tests::{
+        build_box_glyph_fixture, build_box_glyph_fixture_cid, wrap_in_opentype,
+    };
     use crate::truetype::tests::build_font;
     use crate::type1::tests::{
         build_type1_box_fixture, build_type1_box_fixture_standard_encoding,
@@ -1652,6 +1660,13 @@ mod tests {
     /// CFF charset) of a `/Type0`/`CIDFontType0` font carrying an embedded
     /// CFF program.
     fn cid_cff_font_doc() -> Vec<u8> {
+        cid_cff_font_doc_with(&build_box_glyph_fixture_cid(5), "", "<0005>")
+    }
+
+    /// Builds a one-page PDF showing `text` (an Identity-H hex string) in a
+    /// `/Type0`/`CIDFontType0` font whose `FontFile3` stream is `program`
+    /// with `file_dict` as extra stream dictionary entries.
+    fn cid_cff_font_doc_with(program: &[u8], file_dict: &str, text: &str) -> Vec<u8> {
         let mut b = PdfBuilder::new().version(1, 5);
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -1660,7 +1675,11 @@ mod tests {
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
              /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
         );
-        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <0005> Tj ET");
+        b.stream(
+            4,
+            "",
+            format!("BT /F0 100 Tf 20 50 Td {text} Tj ET").as_bytes(),
+        );
         b.object(
             5,
             "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
@@ -1675,8 +1694,34 @@ mod tests {
             7,
             "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile3 8 0 R >>",
         );
-        b.stream(8, "", &build_box_glyph_fixture_cid(5));
+        b.stream(8, file_dict, program);
         b.build(1)
+    }
+
+    // Covers ISO 32000-1 §9.7.4.2: a CIDFontType0 whose CFF has no CIDFont
+    // operators uses the CID directly as the glyph index.
+    #[test]
+    fn cff_cid_font_over_a_non_cid_program_uses_cids_as_gids() {
+        // The box glyph is gid 1 of the non-CID fixture, so CID 1 shows it.
+        let bytes = cid_cff_font_doc_with(&build_box_glyph_fixture("box"), "", "<0001>");
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "CID 1 is gid 1 of a CFF without CIDFont operators"
+        );
+    }
+
+    // Covers ISO 32000-1 §9.7.4.2: FontFile3 may be /Subtype /OpenType, the
+    // CFF program wrapped in an OpenType container.
+    #[test]
+    fn cff_cid_font_in_an_opentype_wrapper_paints() {
+        let program = wrap_in_opentype(&build_box_glyph_fixture_cid(5));
+        let bytes = cid_cff_font_doc_with(&program, "/Subtype /OpenType", "<0005>");
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "the CFF table inside the OpenType wrapper paints"
+        );
     }
 
     // Covers ISO 32000-1 §9.7.2, §9.7.4.2 and §9.8.3.1.
