@@ -1,6 +1,7 @@
 //! Structure-tree reading order (ISO 32000-1 §14.7): where a page's
 //! marked-content sequences sit in the document's logical structure, so a
-//! tagged page can be read in the order its author declared.
+//! tagged page can be read in the order its author declared, and which
+//! structure type the element holding each sequence declares (§14.7.3).
 
 use std::sync::Arc;
 
@@ -23,6 +24,21 @@ pub struct MarkedContentId {
     pub mcid: u32,
 }
 
+/// Where one marked-content sequence sits in the tree: its rank in the
+/// tree's depth-first order, and the structure type of the element holding
+/// it, as written and after the root's `/RoleMap`.
+///
+/// Covers ISO 32000-1 §14.7.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub rank: u32,
+    /// The element's `/S`, as the file writes it.
+    pub structure_type: Option<String>,
+    /// `structure_type` followed through the role map until a name the map
+    /// has no entry for; the same name when the map never names it.
+    pub mapped_type: Option<String>,
+}
+
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
 /// document and asked per page where that page's marked content sits in
 /// the tree. `/MarkInfo` is never consulted: a tree with leaves counts,
@@ -31,6 +47,9 @@ pub struct MarkedContentId {
 pub struct StructureTree {
     root: Dict,
     root_ref: Option<ObjRef>,
+    /// The root's `/RoleMap`: structure type names to the names they stand
+    /// for (§14.7.3), entries whose value is not a name dropped.
+    role_map: FastMap<String, String>,
 }
 
 impl StructureTree {
@@ -46,18 +65,38 @@ impl StructureTree {
         let root_ref = entry.as_ref();
         let resolved = src.resolve(entry).await.ok()?;
         let root = resolved.as_dict()?.clone();
-        Some(StructureTree { root, root_ref })
+        let role_map = match root.get("RoleMap") {
+            Some(entry) => role_map_of(resolved_dict(src, entry).await),
+            None => FastMap::default(),
+        };
+        Some(StructureTree {
+            root,
+            root_ref,
+            role_map,
+        })
     }
 
-    /// Ranks `ids`, one page's marked-content sequences, by their position in
-    /// the tree's depth-first order: 0 for the first the tree reaches, and so
-    /// on. An id the tree never reaches (untagged content, a key the parent
-    /// tree lacks, an element whose ancestry is broken) is absent, so an
-    /// empty map means the page has no leaves in the tree.
+    /// `name` followed through the root's `/RoleMap` until a name the map
+    /// has no entry for. The map is meant to reach a standard structure type
+    /// (§14.8.4) in one step; a chain is followed in case a mapped name is
+    /// itself mapped, and a cycle leaves the name as written.
     ///
-    /// The lookup goes through the parent tree (`/ParentTree`, keyed by
-    /// `/StructParents`) and each element's `/P` chain, so it costs the page's
-    /// own elements, never a walk of the whole tree.
+    /// Covers ISO 32000-1 §14.7.3.
+    pub fn mapped_type(&self, name: &str) -> String {
+        let mut seen: FastSet<&str> = FastSet::default();
+        let mut current = name;
+        while let Some(next) = self.role_map.get(current) {
+            if !seen.insert(current) {
+                return name.to_string();
+            }
+            current = next;
+        }
+        current.to_string()
+    }
+
+    /// The ranks of [`StructureTree::place_with`] alone: one page's
+    /// marked-content sequences by their position in the tree's depth-first
+    /// order, 0 for the first the tree reaches.
     ///
     /// Covers ISO 32000-1 §14.8.2 and §14.8.2.3.
     pub async fn ranks_with<S: AsyncObjectSource>(
@@ -66,12 +105,37 @@ impl StructureTree {
         page: &Page,
         ids: &[MarkedContentId],
     ) -> FastMap<MarkedContentId, u32> {
-        let mut ranks: FastMap<MarkedContentId, u32> = FastMap::default();
+        self.place_with(src, page, ids)
+            .await
+            .into_iter()
+            .map(|(id, placement)| (id, placement.rank))
+            .collect()
+    }
+
+    /// Places `ids`, one page's marked-content sequences, in the tree: each
+    /// gets its rank in the tree's depth-first order (0 for the first the
+    /// tree reaches, and so on) and the structure type of the element holding
+    /// it. An id the tree never reaches (untagged content, a key the parent
+    /// tree lacks, an element whose ancestry is broken) is absent, so an
+    /// empty map means the page has no leaves in the tree.
+    ///
+    /// The lookup goes through the parent tree (`/ParentTree`, keyed by
+    /// `/StructParents`) and each element's `/P` chain, so it costs the page's
+    /// own elements, never a walk of the whole tree.
+    ///
+    /// Covers ISO 32000-1 §14.7.3, §14.8.2 and §14.8.2.3.
+    pub async fn place_with<S: AsyncObjectSource>(
+        &self,
+        src: &S,
+        page: &Page,
+        ids: &[MarkedContentId],
+    ) -> FastMap<MarkedContentId, Placement> {
+        let mut placed: FastMap<MarkedContentId, Placement> = FastMap::default();
         let Some(parent_tree) = self.root.get("ParentTree") else {
-            return ranks;
+            return placed;
         };
         let Some(parent_tree) = resolved_dict(src, parent_tree).await else {
-            return ranks;
+            return placed;
         };
         let mut walk = Walk {
             src,
@@ -81,23 +145,43 @@ impl StructureTree {
             paths: FastMap::default(),
             parents: FastMap::default(),
         };
-        let mut keyed: Vec<(MarkedContentId, Vec<u32>)> = Vec::new();
+        let mut keyed: Vec<(MarkedContentId, Vec<u32>, Option<String>)> = Vec::new();
         let mut seen: FastSet<MarkedContentId> = FastSet::default();
         for id in ids {
             if !seen.insert(*id) {
                 continue;
             }
-            let Some(key) = walk.key_of(&parent_tree, *id).await else {
+            let Some((key, structure_type)) = walk.key_of(&parent_tree, *id).await else {
                 continue;
             };
-            keyed.push((*id, key));
+            keyed.push((*id, key, structure_type));
         }
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
-        for (rank, (id, _)) in keyed.into_iter().enumerate() {
-            ranks.insert(id, rank as u32);
+        for (rank, (id, _, structure_type)) in keyed.into_iter().enumerate() {
+            let mapped_type = structure_type.as_deref().map(|s| self.mapped_type(s));
+            placed.insert(
+                id,
+                Placement {
+                    rank: rank as u32,
+                    structure_type,
+                    mapped_type,
+                },
+            );
         }
-        ranks
+        placed
     }
+}
+
+/// The `/RoleMap` dictionary as name-to-name pairs.
+///
+/// Covers ISO 32000-1 §14.7.3.
+fn role_map_of(dict: Option<Dict>) -> FastMap<String, String> {
+    let Some(dict) = dict else {
+        return FastMap::default();
+    };
+    dict.iter()
+        .filter_map(|(key, value)| Some((key.0.clone(), value.as_name()?.0.clone())))
+        .collect()
 }
 
 /// One page's walk through the tree: the dictionaries it has already read
@@ -116,9 +200,14 @@ struct Walk<'a, S> {
 }
 
 impl<S: AsyncObjectSource> Walk<'_, S> {
-    /// The sort key of one marked-content sequence: its element's path from
-    /// the root, then its own index among the element's kids.
-    async fn key_of(&mut self, parent_tree: &Dict, id: MarkedContentId) -> Option<Vec<u32>> {
+    /// The sort key of one marked-content sequence, its element's path from
+    /// the root then its own index among the element's kids, with the
+    /// element's structure type (`/S`, §14.7.3).
+    async fn key_of(
+        &mut self,
+        parent_tree: &Dict,
+        id: MarkedContentId,
+    ) -> Option<(Vec<u32>, Option<String>)> {
         let elements = self.parent_array(parent_tree, id.parents).await?;
         let element = elements.get(id.mcid as usize)?.as_ref()?;
         let path = self.path_of(element).await?;
@@ -127,7 +216,8 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         let mut key = Vec::with_capacity(path.len() + 1);
         key.extend_from_slice(&path);
         key.push(index);
-        Some(key)
+        let structure_type = dict.get_name("S").map(|n| n.0.clone());
+        Some((key, structure_type))
     }
 
     /// The parent tree's entry for a `/StructParents` key: the array whose
@@ -382,6 +472,87 @@ mod tests {
         let tree = doc.structure_tree().expect("tree");
         let page = doc.page(0).unwrap();
         block_on(tree.ranks_with(&Immediate(doc), &page, ids))
+    }
+
+    fn placements(doc: &Document, ids: &[MarkedContentId]) -> FastMap<MarkedContentId, Placement> {
+        let tree = doc.structure_tree().expect("tree");
+        let page = doc.page(0).unwrap();
+        block_on(tree.place_with(&Immediate(doc), &page, ids))
+    }
+
+    // Covers ISO 32000-1 §14.7.3.
+    #[test]
+    fn structure_types_are_read_and_mapped_through_the_role_map() {
+        // Four elements typed Para, Sub, Loop1 and P. The role map, an
+        // indirect object, maps Para to P, Sub to Head and Head to H1, and
+        // Loop1 and Loop2 to each other.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R /RoleMap 20 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 14 0 R 15 0 R 16 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [13 0 R 14 0 R 15 0 R 16 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /Para /P 11 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /Sub /P 11 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    15,
+                    "<< /Type /StructElem /S /Loop1 /P 11 0 R /Pg 3 0 R /K [2] >>",
+                ),
+                (
+                    16,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [3] >>",
+                ),
+                (
+                    20,
+                    "<< /Para /P /Sub /Head /Head /H1 /Loop1 /Loop2 /Loop2 /Loop1 >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 3), id(0, 2), id(0, 1), id(0, 0)]);
+        let typed = |n: u32| {
+            let p = &placed[&id(0, n)];
+            (p.structure_type.as_deref(), p.mapped_type.as_deref())
+        };
+        assert_eq!(typed(0), (Some("Para"), Some("P")));
+        assert_eq!(typed(1), (Some("Sub"), Some("H1")));
+        assert_eq!(typed(2), (Some("Loop1"), Some("Loop1")));
+        assert_eq!(typed(3), (Some("P"), Some("P")));
+        assert_eq!(placed[&id(0, 3)].rank, 3);
+        let tree = doc.structure_tree().unwrap();
+        assert_eq!(tree.mapped_type("Head"), "H1");
+        assert_eq!(tree.mapped_type("Span"), "Span");
+    }
+
+    // Covers ISO 32000-1 §14.7.3.
+    #[test]
+    fn an_element_without_a_type_places_with_none() {
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (11, "<< /Type /StructElem /P 10 0 R /Pg 3 0 R /K [0] >>"),
+                (12, "<< /Nums [0 [11 0 R]] >>"),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0)]);
+        assert_eq!(placed[&id(0, 0)].rank, 0);
+        assert_eq!(placed[&id(0, 0)].structure_type, None);
+        assert_eq!(placed[&id(0, 0)].mapped_type, None);
     }
 
     // Covers ISO 32000-1 §7.7.2.
