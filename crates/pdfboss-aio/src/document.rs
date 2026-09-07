@@ -1423,6 +1423,19 @@ impl AsyncDocument {
         pdfboss_core::StructureTree::load_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The object that `key` names in the catalog's `tree` (ISO 32000-1
+    /// §7.7.4), resolved: the async twin of the sync document's `named`.
+    pub async fn named(&self, tree: pdfboss_core::NameTree, key: &[u8]) -> Option<Object> {
+        pdfboss_core::named_with(self, &self.inner.xref.trailer, tree, key).await
+    }
+
+    /// Every name in the catalog's `tree` with the object it names,
+    /// unresolved, in tree order: the async twin of the sync document's
+    /// `names`.
+    pub async fn names(&self, tree: pdfboss_core::NameTree) -> Vec<(Vec<u8>, Object)> {
+        pdfboss_core::names_with(self, &self.inner.xref.trailer, tree).await
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.

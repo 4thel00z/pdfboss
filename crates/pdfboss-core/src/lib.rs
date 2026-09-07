@@ -14,6 +14,7 @@ pub mod filters;
 pub mod geom;
 pub mod hash;
 pub mod lexer;
+pub mod names;
 pub mod object;
 pub mod objstm;
 pub mod oc;
@@ -37,6 +38,7 @@ pub use elements::{Element, ElementOpts, Span, XrefKind};
 pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
+pub use names::{name_tree_root_with, named_with, names_with, NameTree};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
 pub use oc::OcState;
 pub use source::{

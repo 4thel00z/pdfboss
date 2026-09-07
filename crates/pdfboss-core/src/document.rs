@@ -539,6 +539,29 @@ impl Document {
         ))
     }
 
+    /// The object that `key` names in the catalog's `tree` (ISO 32000-1
+    /// §7.7.4), resolved: a destination for [`NameTree::Dests`], a file
+    /// specification for [`NameTree::EmbeddedFiles`]. `None` when the
+    /// document has no such tree or the tree has no such name.
+    pub fn named(&self, tree: crate::names::NameTree, key: &[u8]) -> Option<Object> {
+        block_on(crate::names::named_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            tree,
+            key,
+        ))
+    }
+
+    /// Every name in the catalog's `tree` with the object it names,
+    /// unresolved, in tree order; empty when the document has no such tree.
+    pub fn names(&self, tree: crate::names::NameTree) -> Vec<(Vec<u8>, Object)> {
+        block_on(crate::names::names_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            tree,
+        ))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     ///
     /// Covers ISO 32000-1 §7.9.2.2.

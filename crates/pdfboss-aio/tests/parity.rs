@@ -6,7 +6,7 @@ use flate2::Compression;
 use futures_util::StreamExt;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::ElementOpts;
-use pdfboss_core::{Document, ObjRef};
+use pdfboss_core::{Document, NameTree, ObjRef};
 use pdfboss_output::ReadingOrder;
 use pdfboss_testkit::{hybrid_doc, multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
 use std::io::Write;
@@ -32,7 +32,34 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (compressed) Tj ET");
     fixtures.push(("objstm", b.build_xref_stream(1)));
     fixtures.push(("circular_font_ref", circular_font_ref_doc()));
+    fixtures.push(("names", names_doc()));
     fixtures
+}
+
+/// A page with a catalog `/Names` dictionary: a two-leaf `/Dests` tree and
+/// a direct `/EmbeddedFiles` root, so both name accessors have something to
+/// agree on.
+fn names_doc() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R /Names 5 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+    b.object(
+        5,
+        "<< /Dests 6 0 R /EmbeddedFiles << /Names [(a.txt) 9 0 R] >> >>",
+    );
+    b.object(6, "<< /Kids [7 0 R 8 0 R] >>");
+    b.object(
+        7,
+        "<< /Limits [(A) (B)] /Names [(A) [3 0 R /Fit] (B) 10 0 R] >>",
+    );
+    b.object(
+        8,
+        "<< /Limits [(C) (C)] /Names [(C) [3 0 R /XYZ 0 0 null]] >>",
+    );
+    b.object(9, "<< /Type /Filespec /F (a.txt) >>");
+    b.object(10, "[3 0 R /FitH 700]");
+    b.build(1)
 }
 
 /// A page whose `/Resources /Font /F1` entry is a self-referencing
@@ -94,6 +121,20 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             sync_doc.metadata(),
             "{name}: metadata"
         );
+        for tree in NameTree::ALL {
+            assert_eq!(
+                doc.names(tree).await,
+                sync_doc.names(tree),
+                "{name}: names {tree:?}"
+            );
+            for key in [b"A".as_slice(), b"B", b"C", b"a.txt", b"missing"] {
+                assert_eq!(
+                    doc.named(tree, key).await,
+                    sync_doc.named(tree, key),
+                    "{name}: named {tree:?} {key:?}"
+                );
+            }
+        }
         for num in 1..=10u32 {
             let r = ObjRef { num, gen: 0 };
             match sync_doc.get(r) {
