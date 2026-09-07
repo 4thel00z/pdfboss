@@ -805,7 +805,7 @@ struct Frame {
 /// nor Lab (ISO 32000-1 §8.6.5.6). A device colour space selected while
 /// one is present paints in the default instead, its component values
 /// passed through unchanged.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct DefaultSpaces {
     gray: Option<ColorSpace>,
     rgb: Option<ColorSpace>,
@@ -1092,7 +1092,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         frame.ts.tm = Matrix::identity();
                         frame.ts.tlm = Matrix::identity();
                         frame.in_text = true;
-                        if matches!(frame.gs.text_render, 4..=7) {
+                        if mode_clips(frame.gs.text_render) {
                             frame.text_clip.get_or_insert_with(Vec::new);
                         }
                     }
@@ -1115,7 +1115,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     Op::SetTextRise(v) if v.is_finite() => frame.gs.text.rise = *v,
                     Op::SetTextRender(mode) => {
                         frame.gs.text_render = *mode;
-                        if frame.in_text && matches!(*mode, 4..=7) {
+                        if frame.in_text && mode_clips(*mode) {
                             frame.text_clip.get_or_insert_with(Vec::new);
                         }
                     }
@@ -2157,8 +2157,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         // Table 106: what the mode asks of each outline. Outlines join the
         // text clip whether or not the span is hidden, because the clip is
         // graphics state, not a mark on the page.
-        let fills = matches!(mode, 0 | 2 | 4 | 6) && !suppressed;
-        let strokes = matches!(mode, 1 | 2 | 5 | 6) && !suppressed;
+        let fills = mode_fills(mode) && !suppressed;
+        let strokes = mode_strokes(mode) && !suppressed;
         let mut clip = frame.text_clip.take();
         let gs = &frame.gs;
         let text = &gs.text;
@@ -2429,19 +2429,22 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             Op::SetFillColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
                 // A pattern space's underlying space is subject to the
-                // defaults too (§8.6.5.6).
+                // defaults too (§8.6.5.6); the initial colour stays the
+                // named space's, passed through like any other components.
+                let initial = initial_components(&cs);
                 let cs = self.device_or_default(frame, cs).await;
                 let gs = &mut frame.gs;
-                gs.fill_rgb = initial_color(&cs);
+                gs.fill_rgb = cs.to_rgb(initial);
                 gs.fill_space = cs;
                 gs.fill_pattern = pattern;
                 gs.fill_pattern_name = None;
             }
             Op::SetStrokeColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                let initial = initial_components(&cs);
                 let cs = self.device_or_default(frame, cs).await;
                 let gs = &mut frame.gs;
-                gs.stroke_rgb = initial_color(&cs);
+                gs.stroke_rgb = cs.to_rgb(initial);
                 gs.stroke_space = cs;
                 gs.stroke_pattern = pattern;
                 gs.stroke_pattern_name = None;
@@ -2618,21 +2621,39 @@ fn type3_glyph_plan(
     planned
 }
 
-/// The initial color after selecting a color space: black for the device
-/// and Indexed spaces (CMYK black is `K = 1`). Separation/DeviceN start at
-/// full tint 1.0 (ISO 32000-1 8.6.6.4/8.6.6.5) — a `Separation` runs that
-/// through its tint transform, while the `Other` approximation paints it as
-/// gray 0; feeding 1.0 everywhere also gives the right dark initial color
-/// for Lab (`L = 0`), the other `Other` space.
-fn initial_color(cs: &ColorSpace) -> [f32; 3] {
+/// The components of the initial color after selecting a color space:
+/// black for the device and Indexed spaces (CMYK black is `K = 1`).
+/// Separation/DeviceN start at full tint 1.0 (ISO 32000-1 8.6.6.4/8.6.6.5);
+/// a `Separation` runs that through its tint transform, while the `Other`
+/// approximation paints it as gray 0; feeding 1.0 everywhere also gives the
+/// right dark initial color for Lab (`L = 0`), the other `Other` space.
+fn initial_components(cs: &ColorSpace) -> &'static [f32] {
     match cs {
-        ColorSpace::DeviceCMYK => cs.to_rgb(&[0.0, 0.0, 0.0, 1.0]),
+        ColorSpace::DeviceCMYK => &[0.0, 0.0, 0.0, 1.0],
         ColorSpace::Separation { .. }
         | ColorSpace::SeparationAll
         | ColorSpace::SeparationNone
-        | ColorSpace::Other(_) => cs.to_rgb(&[1.0; 8]),
-        _ => cs.to_rgb(&[0.0, 0.0, 0.0, 0.0]),
+        | ColorSpace::Other(_) => &[1.0; 8],
+        _ => &[0.0, 0.0, 0.0, 0.0],
     }
+}
+
+/// Whether a `Tr` operand fills the glyphs. Table 106 lists 0 to 7; the
+/// low two bits say fill (0), stroke (1), both (2) or neither (3) and the
+/// third bit adds the outlines to the clip, so an operand outside the table
+/// is read by its bits, as pdf.js reads it, instead of painting nothing.
+fn mode_fills(mode: i32) -> bool {
+    matches!(mode & 3, 0 | 2)
+}
+
+/// See [`mode_fills`].
+fn mode_strokes(mode: i32) -> bool {
+    matches!(mode & 3, 1 | 2)
+}
+
+/// See [`mode_fills`].
+fn mode_clips(mode: i32) -> bool {
+    mode & 4 != 0
 }
 
 /// Selects `cs` as the fill space with the colour `components` names in
@@ -2692,11 +2713,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             };
             frame.default_spaces = Some(resolved);
         }
-        let defaults = frame.default_spaces.clone().unwrap_or_default();
+        let defaults = frame.default_spaces.as_ref();
         let default = match cs {
-            ColorSpace::DeviceGray => defaults.gray,
-            ColorSpace::DeviceRGB => defaults.rgb,
-            _ => defaults.cmyk,
+            ColorSpace::DeviceGray => defaults.and_then(|d| d.gray.clone()),
+            ColorSpace::DeviceRGB => defaults.and_then(|d| d.rgb.clone()),
+            _ => defaults.and_then(|d| d.cmyk.clone()),
         };
         default.unwrap_or(cs)
     }
@@ -3843,6 +3864,10 @@ mod tests {
         assert_eq!(px(&pix, 55, 115), BLUE, "mode 0 fills");
         assert_eq!(px(&pix, 30, 115), BLUE, "mode 0 does not stroke");
         assert_eq!(px(&pix, 28, 115), WHITE);
+        // An operand outside the table is read by its bits, as pdf.js reads
+        // it: 8 has neither the stroke bit nor the clip bit, so it fills.
+        let pix = show("8");
+        assert_eq!(px(&pix, 55, 115), BLUE, "mode 8 fills");
     }
 
     /// Modes 4 to 7 add the glyph outlines to the clipping path when the text
@@ -4662,6 +4687,10 @@ mod tests {
         assert_eq!(px(&pix, 50, 25), RED, "0 G strokes in the default");
         let pix = page(b"/DeviceGray cs 0 sc 0 0 100 100 re f");
         assert_eq!(px(&pix, 50, 50), RED, "cs /DeviceGray takes the default");
+        // The initial colour is the device space's, black, passed through:
+        // tint 0, not the Separation's own initial tint 1.
+        let pix = page(b"/DeviceGray cs 0 0 100 100 re f");
+        assert_eq!(px(&pix, 50, 50), RED, "the initial colour passes through");
         let pix = page(b"q 100 0 0 100 0 0 cm /Im Do Q");
         assert_eq!(
             px(&pix, 50, 50),
