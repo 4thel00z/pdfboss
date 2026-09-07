@@ -394,7 +394,7 @@ class Page:
 
         ``warnings`` holds one line per distinct piece of content the
         render dropped or approximated, e.g. ``"1 image skipped:
-        unsupported filter /Crypt"``, and is empty when the page
+        the data could not be interpreted"``, and is empty when the page
         rasterized exactly as it describes itself.
         """
 
