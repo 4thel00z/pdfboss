@@ -33,7 +33,32 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     fixtures.push(("objstm", b.build_xref_stream(1)));
     fixtures.push(("circular_font_ref", circular_font_ref_doc()));
     fixtures.push(("names", names_doc()));
+    fixtures.push(("outline", outline_doc()));
     fixtures
+}
+
+/// A page with a two-level outline: an open chapter with one child that
+/// jumps through a `/GoTo` action, and a closed, bold, coloured chapter.
+fn outline_doc() -> Vec<u8> {
+    let mut b = PdfBuilder::new();
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+    b.object(5, "<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 2 >>");
+    b.object(
+        6,
+        "<< /Title (One) /Parent 5 0 R /Next 8 0 R /First 7 0 R /Last 7 0 R /Count 1 \\
+         /Dest [3 0 R /Fit] >>",
+    );
+    b.object(
+        7,
+        "<< /Title (One point one) /Parent 6 0 R /A << /S /GoTo /D [3 0 R /FitH 700] >> >>",
+    );
+    b.object(
+        8,
+        "<< /Title (Two) /Parent 5 0 R /Prev 6 0 R /Count -1 /C [0 0 1] /F 2 /Dest [3 0 R /FitB] >>",
+    );
+    b.build(1)
 }
 
 /// A page with a catalog `/Names` dictionary (a two-leaf `/Dests` tree and
@@ -143,6 +168,7 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             sync_doc.named_destinations(),
             "{name}: named destinations"
         );
+        assert_eq!(doc.outline().await, sync_doc.outline(), "{name}: outline");
         for key in [b"A".as_slice(), b"B", b"C", b"Old", b"missing"] {
             assert_eq!(
                 doc.named_destination(key).await,

@@ -591,6 +591,15 @@ impl Document {
         ))
     }
 
+    /// The document outline (ISO 32000-1 §12.3.3): the top-level items with
+    /// their descendants, in display order; empty when there is none.
+    pub fn outline(&self) -> Vec<crate::outline::OutlineItem> {
+        block_on(crate::outline::outline_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     ///
     /// Covers ISO 32000-1 §7.9.2.2.

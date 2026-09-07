@@ -1454,6 +1454,12 @@ impl AsyncDocument {
         pdfboss_core::destination_value_with(self, &self.inner.xref.trailer, value).await
     }
 
+    /// The document outline (ISO 32000-1 §12.3.3): the async twin of the
+    /// sync document's `outline`.
+    pub async fn outline(&self) -> Vec<pdfboss_core::OutlineItem> {
+        pdfboss_core::outline_with(self, &self.inner.xref.trailer).await
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.
