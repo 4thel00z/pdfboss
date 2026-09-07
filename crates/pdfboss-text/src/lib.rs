@@ -210,6 +210,12 @@ pub struct TextSpan {
     /// element above it. A description, not a replacement: `text` stays
     /// what was shown.
     pub alt: Option<String>,
+    /// The language of the span's text (ISO 32000-1 §14.9.2): the `/Lang`
+    /// of the innermost marked-content sequence it was shown inside that
+    /// declares one, else, under [`ReadingOrder::StructureTree`], the
+    /// `/Lang` of the nearest structure element above it. `None` leaves the
+    /// document's own language, `Document::language`.
+    pub lang: Option<String>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -1721,6 +1727,41 @@ mod tests {
         assert_eq!(spans[2].alt, None);
         let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans.iter().all(|span| span.alt.is_none()));
+    }
+
+    /// A sequence's `/Lang` reaches every span shown inside it; under
+    /// structure-tree order a span with none takes the nearest structure
+    /// element's, and a sequence's own language wins over the element's.
+    // Covers ISO 32000-1 §14.9.2 and §14.9.2.3.
+    #[test]
+    fn natural_languages_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /Lang (fr) >> BDC (bonjour) Tj EMC (plain) Tj ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(spans[0].lang.as_deref(), Some("fr"));
+        assert_eq!(spans[1].lang, None);
+
+        // The left paragraph's element says de; its first sequence says fr.
+        let content: &[u8] = b"BT /F1 12 Tf \
+            /P << /MCID 0 /Lang (fr) >> BDC 1 0 0 1 72 700 Tm (L1) Tj EMC \
+            /P << /MCID 2 >> BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+            /P << /MCID 1 >> BDC 1 0 0 1 300 700 Tm (R1) Tj EMC ET";
+        let doc = tagged_doc(content, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0 2] /Lang (de) >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["L1", "L2", "R1"]);
+        assert_eq!(spans[0].lang.as_deref(), Some("fr"));
+        assert_eq!(spans[1].lang.as_deref(), Some("de"));
+        assert_eq!(spans[2].lang, None);
+        assert_eq!(doc.language(), None);
     }
 
     #[test]

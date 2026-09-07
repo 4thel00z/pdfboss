@@ -43,7 +43,7 @@ fn outline_doc() -> Vec<u8> {
     let mut b = PdfBuilder::new();
     b.object(
         1,
-        "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R \
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Lang (en-US) \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -192,6 +192,11 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             doc.page_labels().await,
             sync_doc.page_labels(),
             "{name}: page labels"
+        );
+        assert_eq!(
+            doc.language().await,
+            sync_doc.language(),
+            "{name}: language"
         );
         for index in 0..=doc.page_count() {
             assert_eq!(

@@ -609,6 +609,15 @@ impl Document {
         ))
     }
 
+    /// The language the catalog declares for the document's text
+    /// (`/Lang`, ISO 32000-1 §14.9.2), or `None` when it declares none.
+    pub fn language(&self) -> Option<String> {
+        block_on(crate::language::language_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The label the page at `index` shows, or `None` when the document
     /// has no page labels or no such page.
     pub fn page_label(&self, index: usize) -> Option<String> {

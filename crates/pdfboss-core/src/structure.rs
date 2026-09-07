@@ -308,6 +308,9 @@ pub struct Placement {
     /// The alternate description (`/Alt`, §14.9.3) of the element, or of
     /// the nearest ancestor that has one, decoded as a text string.
     pub alt: Option<String>,
+    /// The language (`/Lang`, §14.9.2) of the element, or of the nearest
+    /// ancestor that declares one; `None` leaves the document's own.
+    pub lang: Option<String>,
 }
 
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
@@ -444,6 +447,7 @@ impl StructureTree {
                 })
                 .collect();
             let alt = ancestry.iter().rev().find_map(|a| a.alt.clone());
+            let lang = ancestry.iter().rev().find_map(|a| a.lang.clone());
             placed.insert(
                 id,
                 Placement {
@@ -453,6 +457,7 @@ impl StructureTree {
                     standard_type,
                     path,
                     alt,
+                    lang,
                 },
             );
         }
@@ -461,11 +466,12 @@ impl StructureTree {
 }
 
 /// One element on the way from a marked-content sequence up to the root:
-/// its object, its `/S` as written and its `/Alt` decoded.
+/// its object, its `/S` as written, and its `/Alt` and `/Lang` decoded.
 struct Ancestor {
     object: ObjRef,
     structure_type: Option<String>,
     alt: Option<String>,
+    lang: Option<String>,
 }
 
 /// An element and its ancestors up to the root, the root's child first and
@@ -520,13 +526,13 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     }
 
     /// The element and its ancestors up to the root, the root's child first
-    /// and the element itself last, each with its `/S` and `/Alt`: what a
-    /// placement's structure type, path and description are read from. The
-    /// climb stops at the root, at a missing `/P`, or after
-    /// [`MAX_ELEMENT_DEPTH`] elements; the dictionaries are the ones
+    /// and the element itself last, each with its `/S`, `/Alt` and `/Lang`:
+    /// what a placement's structure type, path, description and language
+    /// are read from. The climb stops at the root, at a missing `/P`, or
+    /// after [`MAX_ELEMENT_DEPTH`] elements; the dictionaries are the ones
     /// [`Walk::path_of`] already read.
     ///
-    /// Covers ISO 32000-1 §14.7.3, §14.8.4.3 and §14.9.3.
+    /// Covers ISO 32000-1 §14.7.3, §14.8.4.3, §14.9.2 and §14.9.3.
     async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
         let mut chain: Ancestry = Vec::new();
         let mut current = element;
@@ -538,10 +544,15 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
                 Some(alt) => self.text_string(alt).await,
                 None => None,
             };
+            let lang = match dict.get("Lang") {
+                Some(lang) => self.text_string(lang).await,
+                None => None,
+            };
             chain.push(Ancestor {
                 object: current,
                 structure_type: dict.get_name("S").map(|n| n.0.clone()),
                 alt,
+                lang,
             });
             let Some(parent) = dict.get("P").and_then(Object::as_ref) else {
                 break;
@@ -1033,6 +1044,40 @@ mod tests {
         assert_eq!(placed[&id(0, 0)].alt.as_deref(), Some("A chart"));
         assert_eq!(placed[&id(0, 1)].alt, None);
         assert_eq!(placed[&id(0, 2)].alt.as_deref(), Some("\u{e9}"));
+    }
+
+    // Covers ISO 32000-1 §14.9.2 and §14.9.2.3.
+    #[test]
+    fn placements_carry_the_nearest_language() {
+        // The Document element says en; the second paragraph says de for
+        // itself; the tree of `two_paragraphs` says nothing at all.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /Lang (en) /K [13 0 R 14 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [13 0 R 14 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /Lang (de) /K [1] >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1)]);
+        assert_eq!(placed[&id(0, 0)].lang.as_deref(), Some("en"));
+        assert_eq!(placed[&id(0, 1)].lang.as_deref(), Some("de"));
+        let untagged = two_paragraphs("<< /Nums [0 [13 0 R 14 0 R 13 0 R 14 0 R]] >>");
+        assert_eq!(placements(&untagged, &[id(0, 0)])[&id(0, 0)].lang, None);
     }
 
     // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and

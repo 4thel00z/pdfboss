@@ -381,10 +381,13 @@ impl MarkedContent for Recorded {
 /// written between two paragraphs stays between them). Stable, so spans
 /// within one sequence keep content order. Every span the tree reaches
 /// also takes its element's standard type and standard-typed ancestry as
-/// `structure`. `false` when the tree reaches none of the page's marked
-/// content, leaving the spans as they were.
+/// `structure`, and the nearest element's description and language when
+/// its own sequence declared none: the sequence's `/Lang` outranks the
+/// element's, the element's its ancestors' (§14.9.2.3). `false` when the
+/// tree reaches none of the page's marked content, leaving the spans as
+/// they were.
 ///
-/// Covers ISO 32000-1 §14.8.2.3 and §14.8.4.3.
+/// Covers ISO 32000-1 §14.8.2.3, §14.8.4.3, §14.9.2 and §14.9.2.3.
 async fn structure_order<S: AsyncObjectSource>(
     src: &S,
     tree: &StructureTree,
@@ -411,6 +414,9 @@ async fn structure_order<S: AsyncObjectSource>(
             });
             if span.alt.is_none() {
                 span.alt.clone_from(&placement.alt);
+            }
+            if span.lang.is_none() {
+                span.lang.clone_from(&placement.lang);
             }
         }
         keyed.push((current, span));
@@ -708,6 +714,8 @@ struct Mark {
     artifact: Option<Artifact>,
     /// The sequence's `/Alt` (§14.9.3), decoded.
     alt: Option<String>,
+    /// The sequence's `/Lang` (§14.9.2), decoded.
+    lang: Option<String>,
 }
 
 /// A sequence's `/ActualText` (ISO 32000-1 §14.9.4): the text that stands
@@ -1114,6 +1122,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                                 emitted: None,
                             });
                         let alt = self.marked_text_string(props, &frame.chain, "Alt").await;
+                        let lang = self.marked_text_string(props, &frame.chain, "Lang").await;
                         let artifact = if tag.0 == "Artifact" {
                             Some(self.marked_artifact(props, &frame.chain).await)
                         } else {
@@ -1125,6 +1134,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                             actual,
                             artifact,
                             alt,
+                            lang,
                         });
                     }
                     op => self.step(&mut frame, op),
@@ -1278,6 +1288,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     subtype: None,
                 }),
                 alt: None,
+                lang: None,
             }),
             Op::EndMarkedContent => {
                 frame.marks.pop();
@@ -1377,6 +1388,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         }
         span.artifact = frame.marks.iter().rev().find_map(|m| m.artifact.clone());
         span.alt = frame.marks.iter().rev().find_map(|m| m.alt.clone());
+        span.lang = frame.marks.iter().rev().find_map(|m| m.lang.clone());
         let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
             self.spans.push(span);
             self.marks.record(frame);
@@ -1442,13 +1454,13 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         }
     }
 
-    /// The text string entry `key` (`/ActualText`, `/Alt`) a `BDC` attaches
-    /// to its sequence, decoded: from an inline property dictionary, or from
-    /// the named one in the resource chain's `/Properties`. Any tag is
-    /// accepted, not only `/Span`, since files put these on paragraph tags
-    /// too.
+    /// The text string entry `key` (`/ActualText`, `/Alt`, `/Lang`) a `BDC`
+    /// attaches to its sequence, decoded: from an inline property
+    /// dictionary, or from the named one in the resource chain's
+    /// `/Properties`. Any tag is accepted, not only `/Span`, since files put
+    /// these on paragraph tags too.
     ///
-    /// Covers ISO 32000-1 §14.9.3 and §14.9.4.
+    /// Covers ISO 32000-1 §14.9.2, §14.9.3 and §14.9.4.
     async fn marked_text_string(
         &mut self,
         props: &Object,
@@ -1556,6 +1568,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             artifact: None,
             structure: None,
             alt: None,
+            lang: None,
         })
     }
 
