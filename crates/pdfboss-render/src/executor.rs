@@ -785,6 +785,39 @@ struct Frame {
     /// scoped, and it never crosses a content-stream boundary. A stray
     /// `EMC` pops nothing.
     marks: Vec<bool>,
+    /// Whether a `BT` is open: a clipping `Tr` inside the text object
+    /// starts text clipping just as a `BT` under one does.
+    in_text: bool,
+    /// Glyph outlines, in device space, accumulating for the clipping text
+    /// rendering modes (`Tr` 4 to 7): `Some` from the moment a clipping
+    /// mode is in force inside a text object until `ET` intersects the
+    /// clip with them.
+    text_clip: Option<Vec<Subpath>>,
+    /// The frame's default colour spaces, resolved from its `/ColorSpace`
+    /// resources the first time a device colour space is selected; the
+    /// resource chain is fixed for the frame's life, so once is enough.
+    default_spaces: Option<DefaultSpaces>,
+}
+
+/// The `/DefaultGray`, `/DefaultRGB` and `/DefaultCMYK` entries of a
+/// `/ColorSpace` resource dictionary that qualify as defaults: the same
+/// component count as the device space they replace and neither Indexed
+/// nor Lab (ISO 32000-1 §8.6.5.6). A device colour space selected while
+/// one is present paints in the default instead, its component values
+/// passed through unchanged.
+#[derive(Clone)]
+struct DefaultSpaces {
+    gray: Option<ColorSpace>,
+    rgb: Option<ColorSpace>,
+    cmyk: Option<ColorSpace>,
+}
+
+/// A glyph outline ready to paint: the flattened subpaths under the
+/// device transform's linear part, shared from the font's cache, and the
+/// device translation that places this occurrence.
+struct PlacedOutline {
+    polys: Arc<Vec<Subpath>>,
+    at: (f32, f32),
 }
 
 /// What kind of content stream a [`Frame`] is running, and therefore what
@@ -850,6 +883,9 @@ impl Frame {
             kind,
             pattern_base,
             marks: Vec::new(),
+            in_text: false,
+            text_clip: None,
+            default_spaces: None,
         }
     }
 
@@ -1055,13 +1091,34 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     Op::BeginText => {
                         frame.ts.tm = Matrix::identity();
                         frame.ts.tlm = Matrix::identity();
+                        frame.in_text = true;
+                        if mode_clips(frame.gs.text_render) {
+                            frame.text_clip.get_or_insert_with(Vec::new);
+                        }
+                    }
+                    // The outlines a clipping mode accumulated become one
+                    // nonzero path intersected with the clip, after the text
+                    // object's own painting; no outlines, no clip (ISO
+                    // 32000-1 §9.3.6).
+                    Op::EndText => {
+                        frame.in_text = false;
+                        if let Some(polys) = frame.text_clip.take() {
+                            if !polys.is_empty() {
+                                self.intersect_clip(&mut frame.gs, &polys, FillRule::NonZero);
+                            }
+                        }
                     }
                     Op::SetCharSpacing(v) if v.is_finite() => frame.gs.text.char_spacing = *v,
                     Op::SetWordSpacing(v) if v.is_finite() => frame.gs.text.word_spacing = *v,
                     Op::SetHorizScaling(v) if v.is_finite() => frame.gs.text.horiz = v / 100.0,
                     Op::SetLeading(v) if v.is_finite() => frame.gs.text.leading = *v,
                     Op::SetTextRise(v) if v.is_finite() => frame.gs.text.rise = *v,
-                    Op::SetTextRender(mode) => frame.gs.text_render = *mode,
+                    Op::SetTextRender(mode) => {
+                        frame.gs.text_render = *mode;
+                        if frame.in_text && mode_clips(*mode) {
+                            frame.text_clip.get_or_insert_with(Vec::new);
+                        }
+                    }
                     Op::SetFont(name, size) => {
                         frame.gs.text.size = if size.is_finite() { *size } else { 0.0 };
                         frame.gs.text.font = self
@@ -1355,8 +1412,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         let Some(rule) = frame.pending_clip.take() else {
             return;
         };
+        self.intersect_clip(&mut frame.gs, polys, rule);
+    }
+
+    /// Narrows the graphics state's clip to its intersection with `polys`
+    /// under `rule`: what a path's `W`/`W*` and a text object's clipping
+    /// rendering modes both do.
+    ///
+    /// Covers ISO 32000-1 §8.5.4 and §9.3.6.
+    fn intersect_clip(&mut self, gs: &mut GState, polys: &[Subpath], rule: FillRule) {
         let rasterized = self.rasterize_clip(polys, rule);
-        let gs = &mut frame.gs;
         gs.clip = Some(match &gs.clip {
             Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
             None => rasterized,
@@ -2004,39 +2069,33 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
-    /// Paints `code` from the font's per-glyph fallback face (see
-    /// [`GlyphFallback`]), building the face on first use. `true` means the
-    /// code is handled — painted, or mapped to a genuinely empty outline —
-    /// so no `NoGlyph` report applies; `false` leaves the caller's report to
-    /// fire exactly as without a fallback (none planned, no provider face,
-    /// the fallback misses too, or a non-finite transform).
+    /// The outline of `code` from the font's per-glyph fallback face (see
+    /// [`GlyphFallback`]), building the face on first use, with its device
+    /// translation. `Some` means the code is handled — an outline to paint,
+    /// or a genuinely empty one — so no `NoGlyph` report applies; `None`
+    /// leaves the caller's report to fire exactly as without a fallback
+    /// (none planned, no provider face, the fallback misses too, or a
+    /// non-finite transform).
     ///
     /// `params` is the text-space parameter matrix `show_text` built for
     /// this glyph; the device transform is recomposed here from the FALLBACK
     /// face's own units-per-em, which need not match the primary font's. The
     /// advance is untouched: it stays the primary font's (`/Widths` is keyed
     /// per code, not per face).
-    fn paint_fallback(
+    fn fallback_outline(
         &mut self,
         fallback: Option<&GlyphFallback>,
         code: u32,
         params: Matrix,
         tm: Matrix,
         gs: &GState,
-        fill: [u8; 4],
-    ) -> bool {
-        let Some(fallback) = fallback else {
-            return false;
-        };
-        let Some(provider) = self.provider.as_deref() else {
-            return false;
-        };
-        let Some(font) = fallback.font(provider) else {
-            return false;
-        };
+    ) -> Option<PlacedOutline> {
+        let fallback = fallback?;
+        let provider = self.provider.as_deref()?;
+        let font = fallback.font(provider)?;
         let gid = font.gid(code);
         if gid == 0 {
-            return false;
+            return None;
         }
         let upm = font.units_per_em();
         let to_device = Matrix::scale(1.0 / upm, 1.0 / upm)
@@ -2044,7 +2103,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .concat(tm)
             .concat(gs.ctm);
         if !finite_matrix(&to_device) {
-            return false;
+            return None;
         }
         let linear = Matrix {
             a: to_device.a,
@@ -2054,15 +2113,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             e: 0.0,
             f: 0.0,
         };
-        let polys = font.flattened(gid, linear);
-        if !polys.is_empty() {
-            self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
-        }
-        true
+        Some(PlacedOutline {
+            polys: font.flattened(gid, linear),
+            at: (to_device.e, to_device.f),
+        })
     }
 
-    /// Paints one show-string's glyphs and advances the text matrix. Codes with
-    /// no drawable glyph still advance, so surrounding text stays positioned.
+    /// Paints one show-string's glyphs as the text rendering mode asks
+    /// (filled, stroked, both, neither, and accumulated for the text clip)
+    /// and advances the text matrix. Codes with no drawable glyph still
+    /// advance, so surrounding text stays positioned.
     ///
     /// Synchronous on purpose: an outline font is already loaded, so no I/O
     /// enters the per-glyph loop; and a Type3 string only *plans* here — its
@@ -2071,24 +2131,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     ///
     /// Covers ISO 32000-1 §9.2.3, §9.2.4, §9.3.6 and §9.4.4.
     fn show_text(&mut self, frame: &mut Frame, bytes: &[u8]) {
-        // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6), and a hidden
-        // optional-content span shows nothing either (§8.11); the advances
-        // below still happen, so a visible run that follows stays placed.
+        // A hidden optional-content span shows nothing (§8.11); the
+        // advances below still happen, so a visible run that follows stays
+        // placed.
         let suppressed = frame.suppressed();
-        let visible = !matches!(frame.gs.text_render, 3 | 7) && !suppressed;
-        // Modes 4-7 also ask the glyph outlines to join the clipping path,
-        // which this renderer does not do: whatever the author clipped to
-        // the text paints unclipped, and that approximation is reported.
-        // Not from a hidden span: its text was configured away, so nothing
-        // the report owes the caller was lost.
-        if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() && !suppressed {
-            self.skip(SkippedKind::TextClip, SkipReason::Unsupported);
-        }
+        let mode = frame.gs.text_render;
         if let Some(t3) = frame.gs.text.type3.clone() {
-            // The depth guard bounds a self-referential glyph: each CharProc
+            // Only mode 3 has any effect on a Type3 font (§9.3.6). The
+            // depth guard bounds a self-referential glyph: each CharProc
             // frame is pushed at `depth + 1`, so painting stops at
             // `MAX_FORM_DEPTH` while the advances still happen.
-            let paint = visible && frame.depth < MAX_FORM_DEPTH;
+            let paint = mode != 3 && !suppressed && frame.depth < MAX_FORM_DEPTH;
             let planned = type3_glyph_plan(
                 &frame.gs.text,
                 &mut frame.ts,
@@ -2101,10 +2154,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             frame.pending_t3 = Some(t3);
             return;
         }
+        // Table 106: what the mode asks of each outline. Outlines join the
+        // text clip whether or not the span is hidden, because the clip is
+        // graphics state, not a mark on the page.
+        let fills = mode_fills(mode) && !suppressed;
+        let strokes = mode_strokes(mode) && !suppressed;
+        let mut clip = frame.text_clip.take();
         let gs = &frame.gs;
         let text = &gs.text;
         let ts = &mut frame.ts;
         let Some((font, label, fallback)) = text.font.clone() else {
+            frame.text_clip = clip;
             return;
         };
         let upm = font.units_per_em();
@@ -2145,11 +2205,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 .concat(params)
                 .concat(ts.tm)
                 .concat(gs.ctm);
-            if !font.paints() || !visible {
-                // A metrics-only font or an invisible rendering mode: the
-                // advance below is the whole point, and nothing was going to
-                // paint, so neither the paint attempt nor the no-glyph
-                // report applies.
+            if !font.paints() || !(fills || strokes || clip.is_some()) {
+                // A metrics-only font, or a mode that neither paints nor
+                // clips: the advance below is the whole point, and nothing
+                // was going to paint, so neither the paint attempt nor the
+                // no-glyph report applies.
             } else if gid != 0 && finite_matrix(&to_device) {
                 // Flatten under the linear part only (memoized per glyph +
                 // linear map); the per-glyph translation is applied when the
@@ -2165,26 +2225,32 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 };
                 let polys = font.flattened(gid, linear);
                 if !polys.is_empty() {
-                    self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
+                    let at = (to_device.e, to_device.f);
+                    self.paint_glyph(&polys, at, gs, (fills, strokes), fill, &mut clip);
                 }
             } else if gid == 0 && !(n == 1 && code == 32) {
                 // A loaded font with no glyph for this code: at `Full` with
                 // a provider, a per-glyph substitute face gets the code
-                // first (`paint_fallback`); only an unhandled miss is
+                // first (`fallback_outline`); only an unhandled miss is
                 // reported, so a lossy render is never mistaken for a clean
                 // one. The advance below still happens either way, so
                 // surrounding text stays positioned. The single-byte space
                 // is exempt because a space paints nothing whether or not
                 // the font maps it; a two-byte 0x20 is a real CID, not a
                 // space.
-                if !self.paint_fallback(fallback.as_deref(), code, params, ts.tm, gs, fill) {
-                    self.skip(
+                match self.fallback_outline(fallback.as_deref(), code, params, ts.tm, gs) {
+                    Some(PlacedOutline { polys, at }) => {
+                        if !polys.is_empty() {
+                            self.paint_glyph(&polys, at, gs, (fills, strokes), fill, &mut clip);
+                        }
+                    }
+                    None => self.skip(
                         SkippedKind::Glyph,
                         SkipReason::NoGlyph {
                             code,
                             font: label.to_string(),
                         },
-                    );
+                    ),
                 }
             }
 
@@ -2209,6 +2275,51 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             if tx.is_finite() && ty.is_finite() {
                 ts.tm = Matrix::translate(tx, ty).concat(ts.tm);
             }
+        }
+        frame.text_clip = clip;
+    }
+
+    /// Paints one glyph outline, `polys` in device space translated by
+    /// `at`, the way the text rendering mode asks: filled in the fill
+    /// colour, stroked in the stroke colour with the graphics state's line
+    /// parameters (user-space quantities, so the pen follows the CTM and
+    /// not the text size), and copied into the text clip accumulating for
+    /// the clipping modes. Each glyph is filled then stroked on its own, so
+    /// overlapping glyphs stack.
+    ///
+    /// Covers ISO 32000-1 §9.3.6.
+    fn paint_glyph(
+        &mut self,
+        polys: &Arc<Vec<Subpath>>,
+        at: (f32, f32),
+        gs: &GState,
+        (fills, strokes): (bool, bool),
+        fill: [u8; 4],
+        clip: &mut Option<Vec<Subpath>>,
+    ) {
+        if fills {
+            self.blit_glyph(polys, at.0, at.1, fill, gs);
+        }
+        if !strokes && clip.is_none() {
+            return;
+        }
+        self.translate_into_blit_scratch(polys, at.0, at.1);
+        let placed = &self.glyph_blit[..polys.len()];
+        if strokes {
+            let quads = stroke_path(placed, gs.stroke_style(), gs.ctm, &gs.dash, gs.dash_phase);
+            fill_path(
+                &mut self.pix,
+                &mut self.raster,
+                &quads,
+                FillRule::NonZero,
+                gs.stroke_rgba8(),
+                gs.stroke_alpha,
+                effective_mask(gs).as_deref(),
+                gs.blend_mode,
+            );
+        }
+        if let Some(outlines) = clip {
+            outlines.extend(placed.iter().cloned());
         }
     }
 
@@ -2317,16 +2428,23 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         match op {
             Op::SetFillColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                // A pattern space's underlying space is subject to the
+                // defaults too (§8.6.5.6); the initial colour stays the
+                // named space's, passed through like any other components.
+                let initial = initial_components(&cs);
+                let cs = self.device_or_default(frame, cs).await;
                 let gs = &mut frame.gs;
-                gs.fill_rgb = initial_color(&cs);
+                gs.fill_rgb = cs.to_rgb(initial);
                 gs.fill_space = cs;
                 gs.fill_pattern = pattern;
                 gs.fill_pattern_name = None;
             }
             Op::SetStrokeColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                let initial = initial_components(&cs);
+                let cs = self.device_or_default(frame, cs).await;
                 let gs = &mut frame.gs;
-                gs.stroke_rgb = initial_color(&cs);
+                gs.stroke_rgb = cs.to_rgb(initial);
                 gs.stroke_space = cs;
                 gs.stroke_pattern = pattern;
                 gs.stroke_pattern_name = None;
@@ -2359,47 +2477,31 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     gs.stroke_rgb = gs.stroke_space.to_rgb(c);
                 }
             }
+            // The device colour operators select the device space, or the
+            // default standing in for it, and pass the operands through.
             Op::SetFillGray(g) => {
-                let gs = &mut frame.gs;
-                gs.fill_space = ColorSpace::DeviceGray;
-                gs.fill_pattern = false;
-                gs.fill_pattern_name = None;
-                gs.fill_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceGray).await;
+                set_fill(&mut frame.gs, cs, &[*g]);
             }
             Op::SetStrokeGray(g) => {
-                let gs = &mut frame.gs;
-                gs.stroke_space = ColorSpace::DeviceGray;
-                gs.stroke_pattern = false;
-                gs.stroke_pattern_name = None;
-                gs.stroke_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceGray).await;
+                set_stroke(&mut frame.gs, cs, &[*g]);
             }
             Op::SetFillRGB(r, g, b) => {
-                let gs = &mut frame.gs;
-                gs.fill_space = ColorSpace::DeviceRGB;
-                gs.fill_pattern = false;
-                gs.fill_pattern_name = None;
-                gs.fill_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceRGB).await;
+                set_fill(&mut frame.gs, cs, &[*r, *g, *b]);
             }
             Op::SetStrokeRGB(r, g, b) => {
-                let gs = &mut frame.gs;
-                gs.stroke_space = ColorSpace::DeviceRGB;
-                gs.stroke_pattern = false;
-                gs.stroke_pattern_name = None;
-                gs.stroke_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceRGB).await;
+                set_stroke(&mut frame.gs, cs, &[*r, *g, *b]);
             }
             Op::SetFillCMYK(c, m, y, k) => {
-                let gs = &mut frame.gs;
-                gs.fill_space = ColorSpace::DeviceCMYK;
-                gs.fill_pattern = false;
-                gs.fill_pattern_name = None;
-                gs.fill_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceCMYK).await;
+                set_fill(&mut frame.gs, cs, &[*c, *m, *y, *k]);
             }
             Op::SetStrokeCMYK(c, m, y, k) => {
-                let gs = &mut frame.gs;
-                gs.stroke_space = ColorSpace::DeviceCMYK;
-                gs.stroke_pattern = false;
-                gs.stroke_pattern_name = None;
-                gs.stroke_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceCMYK).await;
+                set_stroke(&mut frame.gs, cs, &[*c, *m, *y, *k]);
             }
             Op::XObject(name) => {
                 // Inside a hidden span the whole invocation is part of the
@@ -2519,21 +2621,56 @@ fn type3_glyph_plan(
     planned
 }
 
-/// The initial color after selecting a color space: black for the device
-/// and Indexed spaces (CMYK black is `K = 1`). Separation/DeviceN start at
-/// full tint 1.0 (ISO 32000-1 8.6.6.4/8.6.6.5) — a `Separation` runs that
-/// through its tint transform, while the `Other` approximation paints it as
-/// gray 0; feeding 1.0 everywhere also gives the right dark initial color
-/// for Lab (`L = 0`), the other `Other` space.
-fn initial_color(cs: &ColorSpace) -> [f32; 3] {
+/// The components of the initial color after selecting a color space:
+/// black for the device and Indexed spaces (CMYK black is `K = 1`).
+/// Separation/DeviceN start at full tint 1.0 (ISO 32000-1 8.6.6.4/8.6.6.5);
+/// a `Separation` runs that through its tint transform, while the `Other`
+/// approximation paints it as gray 0; feeding 1.0 everywhere also gives the
+/// right dark initial color for Lab (`L = 0`), the other `Other` space.
+fn initial_components(cs: &ColorSpace) -> &'static [f32] {
     match cs {
-        ColorSpace::DeviceCMYK => cs.to_rgb(&[0.0, 0.0, 0.0, 1.0]),
+        ColorSpace::DeviceCMYK => &[0.0, 0.0, 0.0, 1.0],
         ColorSpace::Separation { .. }
         | ColorSpace::SeparationAll
         | ColorSpace::SeparationNone
-        | ColorSpace::Other(_) => cs.to_rgb(&[1.0; 8]),
-        _ => cs.to_rgb(&[0.0, 0.0, 0.0, 0.0]),
+        | ColorSpace::Other(_) => &[1.0; 8],
+        _ => &[0.0, 0.0, 0.0, 0.0],
     }
+}
+
+/// Whether a `Tr` operand fills the glyphs. Table 106 lists 0 to 7; the
+/// low two bits say fill (0), stroke (1), both (2) or neither (3) and the
+/// third bit adds the outlines to the clip, so an operand outside the table
+/// is read by its bits, as pdf.js reads it, instead of painting nothing.
+fn mode_fills(mode: i32) -> bool {
+    matches!(mode & 3, 0 | 2)
+}
+
+/// See [`mode_fills`].
+fn mode_strokes(mode: i32) -> bool {
+    matches!(mode & 3, 1 | 2)
+}
+
+/// See [`mode_fills`].
+fn mode_clips(mode: i32) -> bool {
+    mode & 4 != 0
+}
+
+/// Selects `cs` as the fill space with the colour `components` names in
+/// it, leaving any pattern behind (the `g`, `rg` and `k` operators).
+fn set_fill(gs: &mut GState, cs: ColorSpace, components: &[f32]) {
+    gs.fill_rgb = cs.to_rgb(components);
+    gs.fill_space = cs;
+    gs.fill_pattern = false;
+    gs.fill_pattern_name = None;
+}
+
+/// [`set_fill`] for the stroke colour (`G`, `RG` and `K`).
+fn set_stroke(gs: &mut GState, cs: ColorSpace, components: &[f32]) {
+    gs.stroke_rgb = cs.to_rgb(components);
+    gs.stroke_space = cs;
+    gs.stroke_pattern = false;
+    gs.stroke_pattern_name = None;
 }
 
 impl<S: AsyncObjectSource> Executor<'_, S> {
@@ -2553,6 +2690,68 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Covers ISO 32000-1 §7.8.3.
     async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
         crate::extract::find_res(self.src, chain, category, name).await
+    }
+
+    /// The space a device colour space selection paints in: the frame's
+    /// default for it when its `/ColorSpace` resources declare one, else
+    /// the device space itself. Any other space passes through. The
+    /// frame's defaults are resolved on the first call and kept.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.6.
+    async fn device_or_default(&self, frame: &mut Frame, cs: ColorSpace) -> ColorSpace {
+        if !matches!(
+            cs,
+            ColorSpace::DeviceGray | ColorSpace::DeviceRGB | ColorSpace::DeviceCMYK
+        ) {
+            return cs;
+        }
+        if frame.default_spaces.is_none() {
+            let resolved = DefaultSpaces {
+                gray: self.default_space(&frame.chain, "DefaultGray", 1).await,
+                rgb: self.default_space(&frame.chain, "DefaultRGB", 3).await,
+                cmyk: self.default_space(&frame.chain, "DefaultCMYK", 4).await,
+            };
+            frame.default_spaces = Some(resolved);
+        }
+        let defaults = frame.default_spaces.as_ref();
+        let default = match cs {
+            ColorSpace::DeviceGray => defaults.and_then(|d| d.gray.clone()),
+            ColorSpace::DeviceRGB => defaults.and_then(|d| d.rgb.clone()),
+            _ => defaults.and_then(|d| d.cmyk.clone()),
+        };
+        default.unwrap_or(cs)
+    }
+
+    /// The `/ColorSpace` resource entry `key` (`DefaultGray`, `DefaultRGB`
+    /// or `DefaultCMYK`) when it names a space that may stand in for the
+    /// device space with `components` components: the same component count
+    /// and neither Indexed nor Lab (§8.6.5.6), nor a space that did not
+    /// parse. Returns the entry's object alongside the parsed space, so an
+    /// image can be read through the entry as if it were its own.
+    async fn default_space(
+        &self,
+        chain: &[Arc<Dict>],
+        key: &str,
+        components: usize,
+    ) -> Option<ColorSpace> {
+        Some(self.default_space_entry(chain, key, components).await?.1)
+    }
+
+    /// See [`Executor::default_space`].
+    async fn default_space_entry(
+        &self,
+        chain: &[Arc<Dict>],
+        key: &str,
+        components: usize,
+    ) -> Option<(Object, ColorSpace)> {
+        let obj = self.find_res(chain, "ColorSpace", key).await?;
+        let cs = ColorSpace::parse_with(self.src, &obj, &self.icc).await;
+        let unsuitable = cs.components() != components
+            || matches!(
+                cs,
+                ColorSpace::Indexed { .. } | ColorSpace::Lab { .. } | ColorSpace::Other(_)
+            );
+        (!unsuitable).then_some((obj, cs))
     }
 
     /// Resolves a `cs`/`CS` operand: a device space name directly, the
@@ -2818,11 +3017,6 @@ pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
     if let Some(obj) = dict.get("SMask") {
         match src.resolve(obj).await {
             Ok(Object::Stream(s)) => {
-                if s.dict.get("Matte").is_some() {
-                    // Pre-blended matte colors are not un-blended here;
-                    // the alpha still applies, the colors approximate.
-                    report.record(SkippedKind::SoftMask, SkipReason::Unsupported);
-                }
                 let data = match src.stream_data(&s).await {
                     Ok(data) => data,
                     Err(e) => {
@@ -2832,9 +3026,16 @@ pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
                 };
                 let cs_obj = s.dict.get("ColorSpace").cloned();
                 let meta = image::ImageMeta::read_with(src, &s.dict, cs_obj.as_ref(), icc).await;
-                let mask = image::decode_alpha(&meta, &data);
-                if mask.is_none() {
-                    report.record(SkippedKind::SoftMask, SkipReason::Undecodable);
+                let mut mask = image::decode_alpha(&meta, &data);
+                match &mut mask {
+                    // A `/Matte` says the base's samples are pre-blended
+                    // with this colour; the draw un-blends them (§11.6.5.3).
+                    Some(mask) => {
+                        mask.matte = image::floats_of(src, &s.dict, "Matte")
+                            .await
+                            .map(|matte| image::matte_rgb(base, &matte));
+                    }
+                    None => report.record(SkippedKind::SoftMask, SkipReason::Undecodable),
                 }
                 return mask;
             }
@@ -3476,9 +3677,26 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// The image's `/ColorSpace` value with resource-name indirection
-    /// resolved: a non-device name is looked up in `/ColorSpace` resources.
+    /// resolved (a non-device name is looked up in `/ColorSpace` resources)
+    /// and a device space replaced by the default colour space the
+    /// resources declare for it, when they declare a suitable one.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.6.
     async fn image_colorspace(&self, dict: &Dict, chain: &[Arc<Dict>]) -> Option<Object> {
-        crate::extract::image_colorspace(self.src, dict, chain).await
+        let resolved = crate::extract::image_colorspace(self.src, dict, chain).await?;
+        let Object::Name(n) = &resolved else {
+            return Some(resolved);
+        };
+        let (key, components) = match n.0.as_str() {
+            "DeviceGray" | "G" => ("DefaultGray", 1),
+            "DeviceRGB" | "RGB" => ("DefaultRGB", 3),
+            "DeviceCMYK" | "CMYK" => ("DefaultCMYK", 4),
+            _ => return Some(resolved),
+        };
+        match self.default_space_entry(chain, key, components).await {
+            Some((default, _)) => Some(default),
+            None => Some(resolved),
+        }
     }
 }
 
@@ -3586,13 +3804,13 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), BLACK, "visible glyph after the advance");
     }
 
-    /// The clipping half of modes 4-7 is not implemented — the glyph
-    /// outlines never join the clipping path, so content the author clipped
-    /// to text paints unclipped — and an approximation is never silent:
-    /// showing text in those modes must land in the report. Mode 0 must not.
+    /// "Only a value of 3 for text rendering mode shall have any effect on
+    /// text displayed in a Type 3 font" (ISO 32000-1 §9.3.6): a Type3 glyph
+    /// shown in mode 7 paints as its CharProc says and clips nothing, and
+    /// nothing is reported.
     // Covers ISO 32000-1 §9.2.3 and §9.3.6.
     #[test]
-    fn text_clip_modes_are_reported() {
+    fn type3_text_ignores_every_mode_but_invisible() {
         let font = |b: &mut PdfBuilder| {
             b.object(
                 5,
@@ -3605,22 +3823,101 @@ mod tests {
         };
         let clipping = small_doc(
             "/Font << /T3 5 0 R >>",
-            b"BT /T3 100 Tf 7 Tr 0 20 Td <41> Tj ET",
+            b"BT /T3 100 Tf 7 Tr 0 20 Td <41> Tj ET 1 0 0 rg 60 60 30 30 re f",
             font,
         );
         let (pix, report) = render_reporting(clipping);
-        assert_eq!(
-            drops(&report),
-            vec![(SkippedKind::TextClip, SkipReason::Unsupported, 1)],
-        );
-        assert_eq!(px(&pix, 25, 50), WHITE, "mode 7 shows nothing");
-        let plain = small_doc(
+        assert_eq!(drops(&report), vec![], "mode 7 reports nothing");
+        assert_eq!(px(&pix, 25, 50), BLACK, "mode 7 paints a Type3 glyph");
+        assert_eq!(px(&pix, 75, 25), RED, "mode 7 clips nothing for Type3");
+        let invisible = small_doc(
             "/Font << /T3 5 0 R >>",
-            b"BT /T3 100 Tf 0 20 Td <41> Tj ET",
+            b"BT /T3 100 Tf 3 Tr 0 20 Td <41> Tj ET",
             font,
         );
-        let (_, report) = render_reporting(plain);
-        assert_eq!(drops(&report), vec![], "mode 0 reports nothing");
+        let (pix, _) = render_reporting(invisible);
+        assert_eq!(px(&pix, 25, 50), WHITE, "mode 3 hides a Type3 glyph");
+    }
+
+    /// The fixture glyph is the rectangle x 100..600, y 0..700 of a
+    /// 1000-unit em; at `100 Tf` from `20 50 Td` on the 200-unit page it
+    /// covers user x 30..80, y 50..120, so its interior is device (55, 115),
+    /// its left edge device column 30 and its top edge device row 80.
+    // Covers ISO 32000-1 §9.3.6.
+    #[test]
+    fn stroke_render_modes_paint_the_outline_in_the_stroke_colour() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let show = |mode: &str| {
+            let content =
+                format!("1 0 0 RG 0 0 1 rg 4 w BT /F0 100 Tf {mode} Tr 20 50 Td <41> Tj ET");
+            render(doc_with_incomplete_truetype_font(content.as_bytes()), 1.0)
+        };
+        let pix = show("1");
+        assert_eq!(px(&pix, 55, 115), WHITE, "mode 1 leaves the interior");
+        assert_eq!(px(&pix, 30, 115), RED, "mode 1 strokes the left edge");
+        assert_eq!(px(&pix, 55, 80), RED, "mode 1 strokes the top edge");
+        assert_eq!(px(&pix, 26, 115), WHITE, "the 4-unit band ends 2 units out");
+        let pix = show("2");
+        assert_eq!(px(&pix, 55, 115), BLUE, "mode 2 fills the interior");
+        assert_eq!(px(&pix, 30, 115), RED, "mode 2 strokes over the fill");
+        let pix = show("0");
+        assert_eq!(px(&pix, 55, 115), BLUE, "mode 0 fills");
+        assert_eq!(px(&pix, 30, 115), BLUE, "mode 0 does not stroke");
+        assert_eq!(px(&pix, 28, 115), WHITE);
+        // An operand outside the table is read by its bits, as pdf.js reads
+        // it: 8 has neither the stroke bit nor the clip bit, so it fills.
+        let pix = show("8");
+        assert_eq!(px(&pix, 55, 115), BLUE, "mode 8 fills");
+    }
+
+    /// Modes 4 to 7 add the glyph outlines to the clipping path when the text
+    /// object ends; the clip stays until `Q`, and no glyph means no clip.
+    // Covers ISO 32000-1 §9.2.3 and §9.3.6.
+    #[test]
+    fn clip_render_modes_intersect_the_clip_when_the_text_object_ends() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let page =
+            |content: &str| render_reporting(doc_with_incomplete_truetype_font(content.as_bytes()));
+        let (pix, report) = page("BT /F0 100 Tf 7 Tr 20 50 Td <41> Tj ET 0 0 200 200 re f");
+        assert_eq!(drops(&report), vec![], "mode 7 is no approximation");
+        assert_eq!(px(&pix, 55, 115), BLACK, "inside the glyph");
+        assert_eq!(px(&pix, 10, 10), WHITE, "outside the glyph");
+        assert_eq!(px(&pix, 100, 115), WHITE, "beside the glyph");
+        // Mode 4 fills the glyph, then the clip narrows what follows.
+        let (pix, _) =
+            page("1 0 0 rg BT /F0 100 Tf 4 Tr 20 50 Td <41> Tj ET 0 0 1 rg 0 0 200 200 re f");
+        assert_eq!(px(&pix, 55, 115), BLUE);
+        assert_eq!(px(&pix, 10, 10), WHITE);
+        // Mode 5 strokes the glyph in the stroke colour, then clips: the
+        // outer half of the stroke band stays, the inner half is painted
+        // over by the fill the clip lets through.
+        let (pix, _) =
+            page("1 0 0 RG 4 w BT /F0 100 Tf 5 Tr 20 50 Td <41> Tj ET 0 0 1 rg 0 0 200 200 re f");
+        assert_eq!(px(&pix, 28, 115), RED, "mode 5 strokes");
+        assert_eq!(
+            px(&pix, 55, 95),
+            BLUE,
+            "the later fill paints inside the glyph"
+        );
+        assert_eq!(px(&pix, 150, 50), WHITE, "and nowhere else");
+        // The clip is graphics state: Q restores the page.
+        let (pix, _) = page("q BT /F0 100 Tf 7 Tr 20 50 Td <41> Tj ET Q 0 0 200 200 re f");
+        assert_eq!(px(&pix, 10, 10), BLACK, "Q restored the clip");
+        // No glyph outlines, no clip: an empty text object and a space.
+        let (pix, _) = page("BT /F0 100 Tf 7 Tr ET 0 0 200 200 re f");
+        assert_eq!(px(&pix, 10, 10), BLACK, "empty text object");
+        let (pix, _) = page("BT /F0 100 Tf 7 Tr 20 50 Td <20> Tj ET 0 0 200 200 re f");
+        assert_eq!(px(&pix, 10, 10), BLACK, "a space has no outline");
+        // A clipping mode set inside the text object accumulates from there,
+        // and the clip applies only after the object's own painting.
+        let (pix, _) = page("BT /F0 100 Tf 20 50 Td 0 Tr <41> Tj 7 Tr <41> Tj ET 0 0 200 200 re f");
+        assert_eq!(
+            px(&pix, 55, 115),
+            BLACK,
+            "the first glyph was filled before the clip"
+        );
+        assert_eq!(px(&pix, 105, 115), BLACK, "the second glyph is the clip");
+        assert_eq!(px(&pix, 10, 10), WHITE);
     }
 
     /// The rendering mode is graphics state (ISO 32000-1 §9.3.1, Table 104),
@@ -4277,6 +4574,167 @@ mod tests {
             "expected the transform's pale cream, got {:?}",
             [r, g, b_],
         );
+    }
+
+    /// A two-sample gray image, black then white, drawn 80 units wide from
+    /// x=10: the sample centres land on device columns 30 and 70, so column
+    /// 50 is exactly between them. Without `/Interpolate` it takes the
+    /// nearer sample; with it, the blend.
+    // Covers ISO 32000-1 §8.9.5.3.
+    #[test]
+    fn interpolate_blends_a_magnified_image() {
+        let page = |interpolate: &str| {
+            let dict = format!(
+                "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 {interpolate}"
+            );
+            small_doc(
+                "/XObject << /Im1 5 0 R >>",
+                b"q 80 0 0 20 10 40 cm /Im1 Do Q",
+                |b| {
+                    b.stream(5, &dict, &[0x00, 0xFF]);
+                },
+            )
+        };
+        let pix = render(page(""), 1.0);
+        assert_eq!(px(&pix, 49, 50), BLACK, "nearest: the black sample");
+        assert_eq!(px(&pix, 50, 50), WHITE, "nearest: the white sample");
+        let pix = render(page("/Interpolate true"), 1.0);
+        let mid = px(&pix, 50, 50)[0];
+        assert!(
+            (115..=145).contains(&mid),
+            "blend between the samples: {mid}"
+        );
+        assert_eq!(px(&pix, 12, 50), BLACK, "the black sample's own centre");
+        assert_eq!(px(&pix, 88, 50), WHITE, "the white sample's own centre");
+        // The inline abbreviation /I asks for the same.
+        let mut content = b"q 80 0 0 20 10 40 cm BI /W 2 /H 1 /CS /G /BPC 8 /I true ID ".to_vec();
+        content.extend_from_slice(&[0x00, 0xFF]);
+        content.extend_from_slice(b" EI Q");
+        let pix = render(small_doc("", &content, |_| {}), 1.0);
+        let mid = px(&pix, 50, 50)[0];
+        assert!((115..=145).contains(&mid), "inline /I blends too: {mid}");
+    }
+
+    /// An image whose samples were pre-blended with a white `/Matte` at
+    /// half coverage is stored as (255, 128, 128); over a black page it must
+    /// paint half red, (128, 0, 0), and the matte is no approximation to
+    /// report.
+    // Covers ISO 32000-1 §11.6.5.3.
+    #[test]
+    fn matte_samples_are_unblended_before_painting() {
+        let (pix, report) = render_reporting(small_doc(
+            "/XObject << /Im 5 0 R >>",
+            b"0 g 0 0 100 100 re f q 100 0 0 100 0 0 cm /Im Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R",
+                    &[255, 128, 128],
+                );
+                b.stream(
+                    6,
+                    "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [1 1 1]",
+                    &[128],
+                );
+            },
+        ));
+        assert_eq!(drops(&report), vec![], "a matte is honoured, not reported");
+        let [r, g, b, _] = px(&pix, 50, 50);
+        assert!((126..=130).contains(&r), "half red: {r}");
+        assert!(g <= 2 && b <= 2, "no matte white left over: ({g}, {b})");
+    }
+
+    /// A `/DefaultGray` stands in for DeviceGray wherever a device gray is
+    /// selected: here a Separation whose transform maps tint 0 to red and
+    /// tint 1 to blue, so `0 g` paints red instead of black.
+    // Covers ISO 32000-1 §8.6.5.6.
+    #[test]
+    fn default_colour_spaces_remap_device_colours() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let page = |content: &[u8]| {
+            render(
+                small_doc(
+                    "/ColorSpace << /DefaultGray [/Separation /Spot /DeviceRGB 6 0 R] >> \
+                     /XObject << /Im 8 0 R /Fx 9 0 R >>",
+                    content,
+                    |b| {
+                        b.object(
+                            6,
+                            "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>",
+                        );
+                        b.stream(
+                            8,
+                            "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                             /ColorSpace /DeviceGray /BitsPerComponent 8",
+                            &[0x00],
+                        );
+                        b.stream(
+                            9,
+                            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << >>",
+                            b"0 g 0 0 50 50 re f",
+                        );
+                    },
+                ),
+                1.0,
+            )
+        };
+        let pix = page(b"0 g 0 0 50 50 re f 1 g 50 0 50 50 re f 0 G 4 w 25 75 m 75 75 l S");
+        assert_eq!(px(&pix, 25, 75), RED, "0 g takes the default");
+        assert_eq!(px(&pix, 75, 75), BLUE, "1 g takes the default");
+        assert_eq!(px(&pix, 50, 25), RED, "0 G strokes in the default");
+        let pix = page(b"/DeviceGray cs 0 sc 0 0 100 100 re f");
+        assert_eq!(px(&pix, 50, 50), RED, "cs /DeviceGray takes the default");
+        // The initial colour is the device space's, black, passed through:
+        // tint 0, not the Separation's own initial tint 1.
+        let pix = page(b"/DeviceGray cs 0 0 100 100 re f");
+        assert_eq!(px(&pix, 50, 50), RED, "the initial colour passes through");
+        let pix = page(b"q 100 0 0 100 0 0 cm /Im Do Q");
+        assert_eq!(
+            px(&pix, 50, 50),
+            RED,
+            "an image's DeviceGray takes the default"
+        );
+        let mut inline = b"q 100 0 0 100 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID ".to_vec();
+        inline.push(0x00);
+        inline.extend_from_slice(b" EI Q");
+        let pix = page(&inline);
+        assert_eq!(
+            px(&pix, 50, 50),
+            RED,
+            "an inline image's /G takes the default"
+        );
+        let pix = page(b"/Fx Do");
+        assert_eq!(
+            px(&pix, 25, 75),
+            RED,
+            "a form without its own default inherits the page's"
+        );
+        let pix = page(b"0 0 0 rg 0 0 100 100 re f");
+        assert_eq!(px(&pix, 50, 50), BLACK, "no DefaultRGB, so rg is untouched");
+    }
+
+    /// A default must have the device space's component count and may not
+    /// be Indexed or Lab; anything else is ignored.
+    // Covers ISO 32000-1 §8.6.5.6.
+    #[test]
+    fn an_unsuitable_default_colour_space_is_ignored() {
+        let pix = render(
+            small_doc(
+                "/ColorSpace << /DefaultGray /DeviceRGB /DefaultRGB [/Indexed /DeviceRGB 0 <ff0000>] >>",
+                b"0 g 0 0 50 100 re f 1 1 1 rg 50 0 50 100 re f",
+                |_| {},
+            ),
+            1.0,
+        );
+        assert_eq!(
+            px(&pix, 25, 50),
+            BLACK,
+            "a three-component DefaultGray is ignored"
+        );
+        assert_eq!(px(&pix, 75, 50), WHITE, "an Indexed DefaultRGB is ignored");
     }
 
     // Covers ISO 32000-1 §8.6.6.4.

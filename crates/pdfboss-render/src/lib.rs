@@ -425,9 +425,9 @@ pub enum SkippedKind {
     /// still loads its metrics so the text advances.
     Glyph,
     /// Text shown in a clipping rendering mode (`Tr` 4-7, ISO 32000-1
-    /// §9.3.6). The painting half of the mode is honored, but the glyph
-    /// outlines never join the clipping path, so content the author
-    /// clipped to the text paints unclipped.
+    /// §9.3.6) used to be reported here while the glyph outlines never
+    /// joined the clipping path. They do now, so no render produces this
+    /// kind any more; it stays so callers matching on it keep compiling.
     TextClip,
 }
 
