@@ -144,6 +144,40 @@ impl Rgba<'_> {
         out
     }
 
+    /// A copy with the soft mask's matte colour un-blended: the stored
+    /// sample c' = m + α(c − m) gives back c = m + (c' − m) / α for each
+    /// channel, clamped to the channel's range, where α is the mask sample
+    /// at the same pixel; a fully transparent pixel keeps its stored value.
+    /// `None` when the mask's dimensions differ from the image's, which
+    /// Table 145 forbids and leaves nothing to un-blend against.
+    ///
+    /// Covers ISO 32000-1 §11.6.5.3.
+    fn unmatted(&self, mask: &SampleMask, matte: [u8; 3]) -> Option<Rgba<'static>> {
+        if mask.width != self.width || mask.height != self.height {
+            return None;
+        }
+        let mut quads = vec![0u8; self.width * self.height * 4];
+        for (idx, texel) in quads.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let stored = self.at(idx % self.width, idx / self.width);
+            let alpha = f32::from(mask.data[idx]) / 255.0;
+            *texel = stored;
+            if alpha <= 0.0 {
+                continue;
+            }
+            for c in 0..3 {
+                let m = f32::from(matte[c]);
+                let original = m + (f32::from(stored[c]) - m) / alpha;
+                texel[c] = (original + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        }
+        Some(Rgba {
+            width: self.width,
+            height: self.height,
+            pixels: Pixels::Quads(quads),
+            truncated: self.truncated,
+        })
+    }
+
     /// A copy shrunk by integer factors: each output pixel averages an
     /// `rx` by `ry` block of this image (smaller blocks at the right and
     /// bottom edges). One sequential pass over the source; drawing then
@@ -502,7 +536,11 @@ async fn bool_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Optio
 }
 
 /// Reads an array of finite numbers, chasing references at both levels.
-async fn floats_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Vec<f32>> {
+pub(crate) async fn floats_of<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+    key: &str,
+) -> Option<Vec<f32>> {
     let arr = match src.resolve(dict.get(key)?).await {
         Ok(Object::Array(a)) => a,
         _ => return None,
@@ -616,6 +654,10 @@ pub(crate) struct SampleMask {
     height: usize,
     /// Row-major alpha, row 0 at the image's top edge.
     data: Vec<u8>,
+    /// The soft mask's `/Matte` colour, converted to RGB through the base
+    /// image's colour space: the base's samples were pre-blended with it
+    /// and are un-blended before compositing (ISO 32000-1 §11.6.5.3).
+    pub(crate) matte: Option<[u8; 3]>,
 }
 
 impl SampleMask {
@@ -650,7 +692,21 @@ pub(crate) fn decode_alpha(meta: &ImageMeta, data: &[u8]) -> Option<SampleMask> 
         width,
         height,
         data: out,
+        matte: None,
     })
+}
+
+/// The soft mask's `/Matte` colour, given in the base image's colour
+/// space, as the RGB the base's samples convert to: the un-blending runs on
+/// converted samples, which is exact for the device gray and RGB spaces and
+/// an approximation through a non-linear conversion.
+///
+/// Covers ISO 32000-1 §11.6.5.3.
+pub(crate) fn matte_rgb(base: &ImageMeta, matte: &[f32]) -> [u8; 3] {
+    let cs = base.cs.as_ref().unwrap_or(&ColorSpace::DeviceGray);
+    let rgb = cs.to_rgb(matte);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    [byte(rgb[0]), byte(rgb[1]), byte(rgb[2])]
 }
 
 /// Builds the alpha a color-key `/Mask` array describes: a sample whose
@@ -694,6 +750,7 @@ pub(crate) fn color_key_mask(meta: &ImageMeta, data: &[u8], key: &[i64]) -> Opti
         width,
         height,
         data: out,
+        matte: None,
     })
 }
 
@@ -1481,6 +1538,12 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams, interpolate: bool
     let Some(inv) = p.ctm.invert() else {
         return;
     };
+    // Pre-blended samples give back their original colours before anything
+    // is composited (§11.6.5.3).
+    let unmatted = p
+        .smask
+        .and_then(|mask| mask.matte.and_then(|matte| img.unmatted(mask, matte)));
+    let img = unmatted.as_ref().unwrap_or(img);
     let alpha = if p.alpha.is_finite() {
         p.alpha.clamp(0.0, 1.0)
     } else {
@@ -2705,6 +2768,57 @@ mod tests {
         assert_eq!(pix_at(&pix, 6, 1), [255, 255, 255, 255], "row 1 right");
         assert_eq!(pix_at(&pix, 1, 6), [255, 0, 0, 255], "row 0 left below");
         assert_eq!(pix_at(&pix, 6, 6), [0, 255, 0, 255], "row 0 right");
+    }
+
+    /// A red pixel pre-blended with a white matte at half coverage is stored
+    /// as (255, 128, 128). Composited over black at that coverage it must
+    /// come out as half red, (128, 0, 0), which only happens if the matte
+    /// is un-blended first; compositing the stored value gives (128, 64, 64).
+    // Covers ISO 32000-1 §11.6.5.3.
+    #[test]
+    fn matte_is_unblended_before_compositing() {
+        let img = Rgba {
+            width: 1,
+            height: 1,
+            pixels: Pixels::Quads(vec![255, 128, 128, 255]),
+            truncated: false,
+        };
+        let mask = SampleMask {
+            width: 1,
+            height: 1,
+            data: vec![128],
+            matte: Some([255, 255, 255]),
+        };
+        let mut pix = Pixmap::new(1, 1);
+        pix.fill([0, 0, 0, 255]);
+        let p = DrawParams {
+            ctm: Matrix::identity(),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: Some(&mask),
+        };
+        draw_rgba(&mut pix, &img, &p, false);
+        let [r, g, b, _] = pix_at(&pix, 0, 0);
+        assert!((126..=130).contains(&r), "half red: {r}");
+        assert!(g <= 2 && b <= 2, "no matte white left over: ({g}, {b})");
+        // A mask of other dimensions cannot be un-blended and is used as is.
+        let odd = SampleMask {
+            width: 2,
+            height: 1,
+            data: vec![128, 128],
+            matte: Some([255, 255, 255]),
+        };
+        let mut pix = Pixmap::new(1, 1);
+        pix.fill([0, 0, 0, 255]);
+        let p = DrawParams {
+            smask: Some(&odd),
+            ..p
+        };
+        draw_rgba(&mut pix, &img, &p, false);
+        let [_, g, _, _] = pix_at(&pix, 0, 0);
+        assert!((62..=66).contains(&g), "stored value composited: {g}");
     }
 
     // Covers ISO 32000-1 §11.3.7.2, §11.6.4, §11.6.4.4 and §8.9.4.

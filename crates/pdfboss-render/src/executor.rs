@@ -2996,11 +2996,6 @@ pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
     if let Some(obj) = dict.get("SMask") {
         match src.resolve(obj).await {
             Ok(Object::Stream(s)) => {
-                if s.dict.get("Matte").is_some() {
-                    // Pre-blended matte colors are not un-blended here;
-                    // the alpha still applies, the colors approximate.
-                    report.record(SkippedKind::SoftMask, SkipReason::Unsupported);
-                }
                 let data = match src.stream_data(&s).await {
                     Ok(data) => data,
                     Err(e) => {
@@ -3010,9 +3005,16 @@ pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
                 };
                 let cs_obj = s.dict.get("ColorSpace").cloned();
                 let meta = image::ImageMeta::read_with(src, &s.dict, cs_obj.as_ref(), icc).await;
-                let mask = image::decode_alpha(&meta, &data);
-                if mask.is_none() {
-                    report.record(SkippedKind::SoftMask, SkipReason::Undecodable);
+                let mut mask = image::decode_alpha(&meta, &data);
+                match &mut mask {
+                    // A `/Matte` says the base's samples are pre-blended
+                    // with this colour; the draw un-blends them (§11.6.5.3).
+                    Some(mask) => {
+                        mask.matte = image::floats_of(src, &s.dict, "Matte")
+                            .await
+                            .map(|matte| image::matte_rgb(base, &matte));
+                    }
+                    None => report.record(SkippedKind::SoftMask, SkipReason::Undecodable),
                 }
                 return mask;
             }
@@ -4587,6 +4589,37 @@ mod tests {
         let pix = render(small_doc("", &content, |_| {}), 1.0);
         let mid = px(&pix, 50, 50)[0];
         assert!((115..=145).contains(&mid), "inline /I blends too: {mid}");
+    }
+
+    /// An image whose samples were pre-blended with a white `/Matte` at
+    /// half coverage is stored as (255, 128, 128); over a black page it must
+    /// paint half red, (128, 0, 0), and the matte is no approximation to
+    /// report.
+    // Covers ISO 32000-1 §11.6.5.3.
+    #[test]
+    fn matte_samples_are_unblended_before_painting() {
+        let (pix, report) = render_reporting(small_doc(
+            "/XObject << /Im 5 0 R >>",
+            b"0 g 0 0 100 100 re f q 100 0 0 100 0 0 cm /Im Do Q",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R",
+                    &[255, 128, 128],
+                );
+                b.stream(
+                    6,
+                    "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                     /ColorSpace /DeviceGray /BitsPerComponent 8 /Matte [1 1 1]",
+                    &[128],
+                );
+            },
+        ));
+        assert_eq!(drops(&report), vec![], "a matte is honoured, not reported");
+        let [r, g, b, _] = px(&pix, 50, 50);
+        assert!((126..=130).contains(&r), "half red: {r}");
+        assert!(g <= 2 && b <= 2, "no matte white left over: ({g}, {b})");
     }
 
     /// A `/DefaultGray` stands in for DeviceGray wherever a device gray is
