@@ -23,7 +23,9 @@ pub mod structure;
 pub mod xref;
 
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
-pub use crypt::{Decryptor, Encryptor, Permissions, PERMISSION_NAMES};
+pub use crypt::{
+    crypt_filter_refs, direct_crypt_filters, Decryptor, Encryptor, Permissions, PERMISSION_NAMES,
+};
 pub use document::{
     content_stream_data_with, decoded_stream_data_with, map_pages, page_content_with, Document,
     DocumentSeed, Metadata, Page,

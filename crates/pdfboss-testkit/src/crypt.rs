@@ -213,3 +213,44 @@ pub fn encrypted_rc4_doc(text: &str) -> Vec<u8> {
     let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
     b.trailer_extra(&trailer).build(1)
 }
+
+/// [`encrypted_rc4_doc`] as a V4 file whose `/CF` dictionary is an indirect
+/// object (8 0) naming the RC4 crypt filter both `/StmF` and `/StrF` use.
+/// Only the strings of an encryption dictionary must be direct, so a reader
+/// has to follow the reference to learn the cipher.
+pub fn encrypted_rc4_doc_with_indirect_cf(text: &str) -> Vec<u8> {
+    let o = owner_entry();
+    let key = file_key(&o);
+    let u = user_entry(&key);
+
+    let content = crate::show_text_content(text);
+    let enc_content = rc4(&obj_key(&key, 5, 0), content.as_bytes());
+    let enc_msg = rc4(&obj_key(&key, 6, 0), text.as_bytes());
+
+    let mut b = PdfBuilder::new().version(1, 5);
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [4 0 R] /Count 1 >>");
+    b.object(
+        3,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    );
+    b.object(
+        4,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>",
+    );
+    b.stream(5, "", &enc_content);
+    b.object(6, &format!("<< /Msg {} >>", hexstr(&enc_msg)));
+    b.object(8, "<< /StdCF << /CFM /V2 /Length 16 >> >>");
+    b.object(
+        9,
+        &format!(
+            "<< /Filter /Standard /V 4 /R 4 /Length 128 /P {P} /O {} /U {} \
+             /CF 8 0 R /StmF /StdCF /StrF /StdCF >>",
+            hexstr(&o),
+            hexstr(&u)
+        ),
+    );
+    let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
+    b.trailer_extra(&trailer).build(1)
+}

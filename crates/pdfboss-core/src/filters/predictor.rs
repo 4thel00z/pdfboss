@@ -1,5 +1,5 @@
 //! Predictor post-pass (ISO 32000-1 §7.4.4.4) shared by Flate and LZW: 2 = TIFF horizontal
-//! differencing (8-bit components only, otherwise pass-through); >= 10 =
+//! differencing at 1, 2, 4, 8 or 16 bits per component; >= 10 =
 //! PNG filters applied per row (None/Sub/Up/Average/Paeth) with
 //! `bpp = max(1, colors*bpc/8)` and row length `ceil(colors*bpc*columns/8)`.
 
@@ -39,10 +39,10 @@ pub(crate) fn post_pass(mut data: Vec<u8>, parms: Option<&Dict>) -> Result<Vec<u
 /// Reverses the predictor transform on decompressed data.
 ///
 /// `predictor` 1 (or any unrecognised value) passes the data through
-/// unchanged; 2 applies TIFF horizontal differencing (8-bit components
-/// only, otherwise pass-through); values >= 10 treat the data as PNG
-/// filtered rows, each prefixed with its filter-type byte. A truncated
-/// final row is reconstructed as far as the data reaches.
+/// unchanged; 2 applies TIFF horizontal differencing at any of the five
+/// component depths; values >= 10 treat the data as PNG filtered rows,
+/// each prefixed with its filter-type byte. A truncated final row is
+/// reconstructed as far as the data reaches.
 ///
 /// Covers ISO 32000-1 §7.4.4.4.
 pub fn apply(
@@ -66,15 +66,20 @@ pub fn apply(
     }
 }
 
-/// TIFF predictor 2: each sample is stored as the difference from the
-/// sample one pixel to the left; undo by cumulative addition per row.
-/// Only 8-bit components are handled; other depths pass through.
+/// TIFF predictor 2: each colour component is stored as the difference
+/// from the same component of the sample one pixel to the left; undo by
+/// cumulative addition per row, modulo 2^bpc. Rows are
+/// `ceil(colors * bpc * columns / 8)` bytes; 16-bit components are
+/// big-endian, and sub-byte components are packed high bits first with a
+/// row's padding bits left as stored.
 ///
 /// Covers ISO 32000-1 §7.4.4.4.
 fn tiff_horizontal(data: &[u8], colors: usize, bpc: usize, columns: usize) -> Vec<u8> {
     let mut out = data.to_vec();
-    if bpc == 8 {
-        tiff_horizontal_in_place(&mut out, colors, columns);
+    match bpc {
+        8 => tiff_horizontal_in_place(&mut out, colors, columns),
+        16 => tiff_horizontal_16(&mut out, colors, columns),
+        _ => tiff_horizontal_packed(&mut out, colors, bpc, columns),
     }
     out
 }
@@ -88,6 +93,54 @@ fn tiff_horizontal_in_place(buf: &mut [u8], colors: usize, columns: usize) {
     for row in buf.chunks_mut(row_len) {
         for i in colors..row.len() {
             row[i] = row[i].wrapping_add(row[i - colors]);
+        }
+    }
+}
+
+/// Undoes TIFF horizontal differencing on big-endian 16-bit components in
+/// place; a trailing odd byte is left alone.
+fn tiff_horizontal_16(buf: &mut [u8], colors: usize, columns: usize) {
+    let stride = colors.saturating_mul(2);
+    let row_len = stride.saturating_mul(columns);
+    if row_len == 0 {
+        return;
+    }
+    for row in buf.chunks_mut(row_len) {
+        for i in (stride..row.len().saturating_sub(1)).step_by(2) {
+            let left = u16::from_be_bytes([row[i - stride], row[i - stride + 1]]);
+            let cur = u16::from_be_bytes([row[i], row[i + 1]]);
+            row[i..i + 2].copy_from_slice(&cur.wrapping_add(left).to_be_bytes());
+        }
+    }
+}
+
+/// Undoes TIFF horizontal differencing on 1-, 2- or 4-bit components in
+/// place. Every row starts over: its first `colors` components are stored
+/// as they are, and each later one adds the last decoded value of its own
+/// colour.
+fn tiff_horizontal_packed(buf: &mut [u8], colors: usize, bpc: usize, columns: usize) {
+    let samples = colors.saturating_mul(columns);
+    let row_len = samples.saturating_mul(bpc).div_ceil(8);
+    if row_len == 0 {
+        return;
+    }
+    let per_byte = 8 / bpc;
+    let mask = (1u8 << bpc) - 1;
+    let mut left = vec![0u8; colors];
+    for row in buf.chunks_mut(row_len) {
+        let count = samples.min(row.len() * per_byte);
+        for s in 0..count {
+            let byte = s / per_byte;
+            let shift = 8 - bpc * (s % per_byte + 1);
+            let stored = (row[byte] >> shift) & mask;
+            let colour = s % colors;
+            let value = if s < colors {
+                stored
+            } else {
+                stored.wrapping_add(left[colour]) & mask
+            };
+            left[colour] = value;
+            row[byte] = (row[byte] & !(mask << shift)) | (value << shift);
         }
     }
 }
@@ -281,12 +334,51 @@ mod tests {
         assert_eq!(apply(&encoded, 2, 3, 8, 3).unwrap(), raw);
     }
 
-    // Covers ISO 32000-1 §7.4.4.4.
+    // Covers ISO 32000-1 §7.4.4.4: 16-bit samples are big-endian and add
+    // modulo 2^16, per row.
     #[test]
-    fn tiff_non_8bit_components_pass_through() {
-        let data = [1u8, 2, 3, 4, 5, 6];
-        assert_eq!(apply(&data, 2, 1, 4, 8).unwrap(), data);
-        assert_eq!(apply(&data, 2, 1, 16, 3).unwrap(), data);
+    fn tiff_16bit_samples_add_big_endian() {
+        // colors=1, columns=3, two rows. Row 1 raw 0x0100 0x0203 0xFFFF;
+        // row 2 raw 0x8000 0x8001 0x0000.
+        let encoded = [
+            0x01u8, 0x00, 0x01, 0x03, 0xFD, 0xFC, // row 1 diffed
+            0x80, 0x00, 0x00, 0x01, 0x7F, 0xFF, // row 2 diffed
+        ];
+        let raw = [
+            0x01u8, 0x00, 0x02, 0x03, 0xFF, 0xFF, //
+            0x80, 0x00, 0x80, 0x01, 0x00, 0x00,
+        ];
+        assert_eq!(apply(&encoded, 2, 1, 16, 3).unwrap(), raw);
+    }
+
+    // Covers ISO 32000-1 §7.4.4.4: 4-bit samples add modulo 16 inside their
+    // packed bytes, and each row starts over.
+    #[test]
+    fn tiff_4bit_samples_add_within_packed_bytes() {
+        // colors=1, columns=4: raw samples 1 3 15 2 then 8 8 8 8.
+        let encoded = [0x12u8, 0xC3, 0x80, 0x00];
+        assert_eq!(
+            apply(&encoded, 2, 1, 4, 4).unwrap(),
+            [0x13, 0xF2, 0x88, 0x88]
+        );
+    }
+
+    // Covers ISO 32000-1 §7.4.4.4: with several colours each sample adds the
+    // same colour of the pixel to the left, sub-byte samples included.
+    #[test]
+    fn tiff_2bit_samples_add_per_colour() {
+        // colors=2, columns=3: raw pixels (1,2) (3,0) (2,1) -> 01 10 11 00 10 01.
+        let encoded = [0x6Au8, 0xD0];
+        assert_eq!(apply(&encoded, 2, 2, 2, 3).unwrap(), [0x6C, 0x90]);
+    }
+
+    // Covers ISO 32000-1 §7.4.4.4: 1-bit samples add modulo 2, the row's
+    // padding bits staying as stored.
+    #[test]
+    fn tiff_1bit_samples_add_modulo_two() {
+        // colors=1, columns=10: raw bits 1010101011, padded to two bytes.
+        let encoded = [0xFFu8, 0x80];
+        assert_eq!(apply(&encoded, 2, 1, 1, 10).unwrap(), [0xAA, 0xC0]);
     }
 
     #[test]

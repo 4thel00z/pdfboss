@@ -8,7 +8,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::crypt::Decryptor;
+use crate::crypt::{direct_crypt_filters, Decryptor};
 use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
@@ -211,6 +211,9 @@ impl Document {
             .unwrap_or(Object::Null);
         let enc = self.resolve(&enc_obj)?;
         let enc_dict = enc.as_dict().ok_or(Error::Encrypted)?;
+        // Only the strings of an encryption dictionary must be direct, so
+        // the crypt filters may sit in objects of their own.
+        let enc_dict = direct_crypt_filters(enc_dict, |r| self.get(r).ok());
         let id0: Vec<u8> = self
             .xref
             .trailer
@@ -220,7 +223,7 @@ impl Document {
             .and_then(Object::as_str_bytes)
             .unwrap_or(&[])
             .to_vec();
-        match Decryptor::from_standard_with_password_str(enc_dict, &id0, password) {
+        match Decryptor::from_standard_with_password_str(&enc_dict, &id0, password) {
             Some(dec) => {
                 self.decryptor = Some(dec);
                 // Objects fetched while resolving /Encrypt were cached without

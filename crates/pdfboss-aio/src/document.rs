@@ -775,9 +775,26 @@ impl AsyncDocument {
             .cloned()
             .unwrap_or(Object::Null);
         let enc = self.resolve(&enc_obj).await?;
-        let enc_dict = enc
+        let mut enc_dict = enc
             .as_dict()
-            .ok_or(Error::Core(pdfboss_core::Error::Encrypted))?;
+            .ok_or(Error::Core(pdfboss_core::Error::Encrypted))?
+            .clone();
+        // Only the strings of an encryption dictionary must be direct, so
+        // the crypt filters may sit in objects of their own: two rounds
+        // cover an indirect /CF whose entries are indirect in turn.
+        for _ in 0..2 {
+            let refs = pdfboss_core::crypt_filter_refs(&enc_dict);
+            if refs.is_empty() {
+                break;
+            }
+            let mut fetched = HashMap::new();
+            for r in refs {
+                if let Ok(obj) = self.resolve(&Object::Ref(r)).await {
+                    fetched.insert(r, obj);
+                }
+            }
+            enc_dict = pdfboss_core::direct_crypt_filters(&enc_dict, |r| fetched.get(&r).cloned());
+        }
         let id0: Vec<u8> = self
             .inner
             .xref
@@ -788,7 +805,7 @@ impl AsyncDocument {
             .and_then(Object::as_str_bytes)
             .unwrap_or(&[])
             .to_vec();
-        match pdfboss_core::Decryptor::from_standard_with_password_str(enc_dict, &id0, password) {
+        match pdfboss_core::Decryptor::from_standard_with_password_str(&enc_dict, &id0, password) {
             Some(dec) => {
                 self.inner
                     .decryptor

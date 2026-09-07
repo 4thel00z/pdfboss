@@ -3,7 +3,10 @@
 //! transparently).
 //!
 //! Handles RC4 (`/V` 1–2, `/R` 2–3, 40–128-bit), AESV2 (`/V` 4, 128-bit
-//! AES-CBC) and AESV3 (`/V` 5, `/R` 5–6, 256-bit AES-CBC). Documents whose
+//! AES-CBC) and AESV3 (`/V` 5, `/R` 5–6, 256-bit AES-CBC). V4 and V5 files
+//! pick the cipher per crypt filter: `/StmF` for streams, `/StrF` for
+//! strings and `/EFF` for embedded files, the standard `Identity` filter
+//! included. Documents whose
 //! password the caller does not supply are reported as encrypted. The
 //! primitives — MD5, RC4, AES and the SHA-2 family — are implemented here from
 //! their published specifications so the crate needs no cryptographic
@@ -18,7 +21,7 @@
 //! the complete `/Encrypt` dictionary and encrypts an object's strings and
 //! stream data in place, the exact inverse of [`Decryptor::decrypt_object`].
 
-use crate::object::{Dict, Name, Object};
+use crate::object::{Dict, Name, ObjRef, Object};
 
 /// Password padding string (ISO 32000 §7.6.3.3, Algorithm 2, step (a)).
 const PAD: [u8; 32] = [
@@ -26,9 +29,12 @@ const PAD: [u8; 32] = [
     0x2E, 0x2E, 0x00, 0xB6, 0xD0, 0x68, 0x3E, 0x80, 0x2F, 0x0C, 0xA9, 0xFE, 0x64, 0x53, 0x69, 0x7A,
 ];
 
-/// Which cipher a configured [`Decryptor`] applies to strings and streams.
-#[derive(Clone, Copy, PartialEq)]
+/// The method a crypt filter applies to strings and streams.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Cipher {
+    /// The standard `Identity` crypt filter: data passes through unchanged
+    /// (ISO 32000-1 Table 26).
+    Identity,
     /// RC4 stream cipher, per-object key (V1/V2, and V4 with `/CFM /V2`).
     Rc4,
     /// AES-128-CBC, per-object key with the `sAlT` suffix (V4, `/CFM /AESV2`).
@@ -42,11 +48,214 @@ enum Cipher {
 pub struct Decryptor {
     /// The file key (`n` bytes for RC4/AESV2, 32 for AESV3).
     key: Vec<u8>,
-    cipher: Cipher,
+    /// The ciphers for streams, strings and embedded files.
+    filters: CryptFilters,
     /// The `/Encrypt` dictionary's `/EncryptMetadata` value (default true
     /// when absent): when false, a stream whose own dictionary says
     /// `/Type /Metadata` was stored in plaintext and must not be decrypted.
     encrypt_metadata: bool,
+}
+
+/// The ciphers an encryption dictionary assigns: V4 and V5 files declare
+/// crypt filters in `/CF` and pick among them with `/StmF` for streams,
+/// `/StrF` for strings and `/EFF` for embedded file streams (ISO 32000-1
+/// Table 20 and Table 25); V1 and V2 files apply RC4 to everything.
+#[derive(Clone)]
+struct CryptFilters {
+    /// The `/CF` entries with a supported `/CFM`, by name, for streams that
+    /// pick one through their own `/Crypt` filter. `Identity` is never
+    /// listed: the standard filter always passes data through.
+    named: Vec<(String, Cipher)>,
+    /// `/StmF`: the cipher for streams (Identity when absent).
+    stream: Cipher,
+    /// `/StrF`: the cipher for strings (Identity when absent).
+    string: Cipher,
+    /// `/EFF`: the cipher for `/Type /EmbeddedFile` streams (`/StmF` when absent).
+    embedded_file: Cipher,
+}
+
+impl CryptFilters {
+    /// One cipher for strings, streams and embedded files alike.
+    fn uniform(cipher: Cipher) -> CryptFilters {
+        CryptFilters {
+            named: Vec::new(),
+            stream: cipher,
+            string: cipher,
+            embedded_file: cipher,
+        }
+    }
+
+    /// Reads `/CF`, `/StmF`, `/StrF` and `/EFF`. The standard `Identity`
+    /// filter needs no `/CF` entry and any entry of that name is ignored
+    /// (Table 20). `None` when a filter one of the three defaults names is
+    /// missing from `/CF` or has a `/CFM` other than `V2`, `AESV2` or
+    /// `AESV3`, which Table 25 says a reader shall report as an unsupported
+    /// algorithm; a `/CF` entry nothing names may say what it likes.
+    ///
+    /// Covers ISO 32000-1 §7.6.5 and §7.6.3.2.
+    fn parse(enc: &Dict) -> Option<CryptFilters> {
+        let named: Vec<(String, Cipher)> = enc
+            .get_dict("CF")
+            .into_iter()
+            .flat_map(Dict::iter)
+            .filter(|(name, _)| name.0 != "Identity")
+            .filter_map(|(name, filter)| Some((name.0.clone(), cipher_method(filter.as_dict()?)?)))
+            .collect();
+        let filters = CryptFilters {
+            named,
+            stream: Cipher::Identity,
+            string: Cipher::Identity,
+            embedded_file: Cipher::Identity,
+        };
+        let pick = |key: &str, default: Cipher| match enc.get_name(key) {
+            None => Some(default),
+            Some(n) => filters.named(&n.0),
+        };
+        let stream = pick("StmF", Cipher::Identity)?;
+        let string = pick("StrF", Cipher::Identity)?;
+        let embedded_file = pick("EFF", stream)?;
+        Some(CryptFilters {
+            stream,
+            string,
+            embedded_file,
+            ..filters
+        })
+    }
+
+    /// The cipher of the crypt filter called `name`: the standard
+    /// `Identity`, or the `/CF` entry of that name if its method is
+    /// supported.
+    fn named(&self, name: &str) -> Option<Cipher> {
+        if name == "Identity" {
+            return Some(Cipher::Identity);
+        }
+        self.named
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, cipher)| *cipher)
+    }
+}
+
+/// The crypt filter a stream names for itself: a `/Crypt` entry first in
+/// its `/Filter` (ISO 32000-1 §7.4.10) selects the `/Name` of the matching
+/// `/DecodeParms` dictionary, `Identity` when that is absent. `None` when
+/// the stream has no `/Crypt` filter. Indirect `/Filter` or `/DecodeParms`
+/// values cannot be followed here (the decryptor has no resolver) and read
+/// as absent.
+///
+/// Covers ISO 32000-1 §7.4.10.
+fn stream_crypt_filter(dict: &Dict) -> Option<String> {
+    let first = match dict.get("Filter")? {
+        Object::Name(n) => n,
+        Object::Array(items) => items.first()?.as_name()?,
+        _ => return None,
+    };
+    if first.0 != "Crypt" {
+        return None;
+    }
+    let parms = match dict.get("DecodeParms") {
+        Some(Object::Dict(d)) => Some(d),
+        Some(Object::Array(items)) => items.first().and_then(Object::as_dict),
+        _ => None,
+    };
+    let name = parms
+        .and_then(|p| p.get_name("Name"))
+        .map_or("Identity", |n| n.0.as_str());
+    Some(name.to_string())
+}
+
+/// The indirect references among an encryption dictionary's crypt filters:
+/// `/CF` itself when it is one, otherwise the entries of `/CF` that are.
+/// Only the strings of an encryption dictionary must be direct (ISO 32000-1
+/// §7.6.1), so a writer may store the crypt filters as separate objects; a
+/// caller fetches these and hands them to [`direct_crypt_filters`] before
+/// building a [`Decryptor`]. Call the pair twice when `/CF` is itself a
+/// reference, since its entries only become visible once it is fetched.
+///
+/// ```
+/// use pdfboss_core::{crypt_filter_refs, Dict, Name, ObjRef, Object};
+///
+/// let mut enc = Dict::new();
+/// enc.insert(Name("CF".into()), Object::Ref(ObjRef { num: 7, gen: 0 }));
+/// assert_eq!(crypt_filter_refs(&enc), vec![ObjRef { num: 7, gen: 0 }]);
+/// ```
+///
+/// Covers ISO 32000-1 §7.6.3.2.
+pub fn crypt_filter_refs(enc: &Dict) -> Vec<ObjRef> {
+    match enc.get("CF") {
+        Some(Object::Ref(r)) => vec![*r],
+        Some(Object::Dict(cf)) => cf.iter().filter_map(|(_, v)| v.as_ref()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `enc` with `/CF`, and each entry of it, replaced by `lookup`'s value
+/// when it is an indirect reference; a reference `lookup` cannot supply
+/// stays as it is, and the filter it names then counts as missing.
+///
+/// ```
+/// use pdfboss_core::{direct_crypt_filters, Dict, Name, ObjRef, Object};
+///
+/// let mut enc = Dict::new();
+/// enc.insert(Name("CF".into()), Object::Ref(ObjRef { num: 7, gen: 0 }));
+/// let direct = direct_crypt_filters(&enc, |_| Some(Object::Dict(Dict::new())));
+/// assert!(direct.get_dict("CF").is_some());
+/// ```
+///
+/// Covers ISO 32000-1 §7.6.3.2.
+pub fn direct_crypt_filters(enc: &Dict, mut lookup: impl FnMut(ObjRef) -> Option<Object>) -> Dict {
+    let mut out = enc.clone();
+    let cf = match out.get("CF") {
+        Some(Object::Ref(r)) => lookup(*r),
+        Some(Object::Dict(cf)) => Some(Object::Dict(cf.clone())),
+        _ => None,
+    };
+    let Some(Object::Dict(mut cf)) = cf else {
+        return out;
+    };
+    for value in cf.values_mut() {
+        if let Object::Ref(r) = *value {
+            if let Some(direct) = lookup(r) {
+                *value = direct;
+            }
+        }
+    }
+    out.insert(Name("CF".to_string()), Object::Dict(cf));
+    out
+}
+
+/// The cipher a crypt filter dictionary's `/CFM` selects; `None` for the
+/// value `None` (the security handler would decrypt by itself, which the
+/// Standard handler never does), for an absent method and for unknown ones.
+///
+/// Covers ISO 32000-1 §7.6.5.
+fn cipher_method(filter: &Dict) -> Option<Cipher> {
+    match filter.get_name("CFM")?.0.as_str() {
+        "V2" => Some(Cipher::Rc4),
+        "AESV2" => Some(Cipher::Aesv2),
+        "AESV3" => Some(Cipher::Aesv3),
+        _ => None,
+    }
+}
+
+/// The V4 file key length in bytes: the encryption dictionary's `/Length`
+/// in bits when present, else the `/Length` of the stream or the string
+/// crypt filter, which the Standard handler writes in bytes (Table 25: "16
+/// means 128"; a value of 40 or more is taken as bits), else 16.
+///
+/// Covers ISO 32000-1 §7.6.5.
+fn v4_key_length(enc: &Dict) -> usize {
+    let filter_length = ["StmF", "StrF"].iter().find_map(|key| {
+        let name = enc.get_name(key)?;
+        enc.get_dict("CF")?.get_dict(&name.0)?.get_int("Length")
+    });
+    let bytes = match (enc.get_int("Length"), filter_length) {
+        (Some(bits), _) => bits / 8,
+        (None, Some(len)) if len >= 40 => len / 8,
+        (None, Some(len)) => len,
+        (None, None) => 16,
+    };
+    bytes.clamp(5, 16) as usize
 }
 
 /// The `/Encrypt` dictionary's `/EncryptMetadata` flag, true when absent
@@ -116,7 +325,7 @@ impl Decryptor {
         let v = enc.get_int("V").unwrap_or(0);
         let r = enc.get_int("R").unwrap_or(0);
         let encrypt_metadata = encrypt_metadata_flag(enc);
-        match (v, r) {
+        let (key, filters) = match (v, r) {
             // RC4: V1 (40-bit) and V2 (up to 128-bit).
             (1 | 2, 2 | 3) => {
                 let n = if v == 1 {
@@ -125,34 +334,29 @@ impl Decryptor {
                     (enc.get_int("Length").unwrap_or(40) / 8).clamp(5, 16) as usize
                 };
                 let key = rc4_family_key(enc, id0, r, n, password)?;
-                Some(Decryptor {
-                    key,
-                    cipher: Cipher::Rc4,
-                    encrypt_metadata,
-                })
+                (key, CryptFilters::uniform(Cipher::Rc4))
             }
-            // V4: 128-bit key, cipher chosen by the standard crypt filter.
+            // V4: RC4 or AES-128 under the legacy key algorithm, the ciphers
+            // chosen by the crypt filters.
             (4, 4) => {
-                let key = rc4_family_key(enc, id0, r, 16, password)?;
-                let cipher = match crypt_filter_method(enc)?.as_str() {
-                    "AESV2" => Cipher::Aesv2,
-                    "V2" => Cipher::Rc4,
-                    _ => return None, // Identity or unknown
-                };
-                Some(Decryptor {
-                    key,
-                    cipher,
-                    encrypt_metadata,
-                })
+                let filters = CryptFilters::parse(enc)?;
+                let key = rc4_family_key(enc, id0, r, v4_key_length(enc), password)?;
+                (key, filters)
             }
-            // V5: AES-256 with SHA-2-based key derivation.
-            (5, 5 | 6) => aesv3_key(enc, r, password).map(|key| Decryptor {
-                key,
-                cipher: Cipher::Aesv3,
-                encrypt_metadata,
-            }),
-            _ => None,
-        }
+            // V5: AES-256 with SHA-2-based key derivation, the ciphers
+            // chosen by the crypt filters.
+            (5, 5 | 6) => {
+                let filters = CryptFilters::parse(enc)?;
+                let key = aesv3_key(enc, r, password)?;
+                (key, filters)
+            }
+            _ => return None,
+        };
+        Some(Decryptor {
+            key,
+            filters,
+            encrypt_metadata,
+        })
     }
 
     /// Decrypts one indirect object's strings and stream data in place. Objects
@@ -172,59 +376,90 @@ impl Decryptor {
     /// let _ = apply;
     /// ```
     pub fn decrypt_object(&self, obj: &mut Object, num: u32, gen: u16) {
-        let key = match self.cipher {
+        self.decrypt_in_place(obj, num, gen);
+    }
+
+    /// Recursively decrypts every string and stream body reachable from
+    /// `obj`: strings under the string filter, stream data under the stream
+    /// filter, or the embedded file filter for a `/Type /EmbeddedFile`
+    /// stream. A stream with a `/Crypt` filter of its own names the crypt
+    /// filter instead and is decrypted with the file key as is, Algorithm 1
+    /// not applied (ISO 32000-1 §7.4.10); a name that matches no `/CF`
+    /// entry leaves the data as stored. When `encrypt_metadata` is false,
+    /// a stream whose own dictionary says `/Type /Metadata` was stored in
+    /// plaintext (ISO 32000-2 §7.6.4.2, Table 20) and its data is left
+    /// alone; the dictionary's own values still walk normally.
+    ///
+    /// Covers ISO 32000-1 §7.6.2, §7.6.5 and §7.4.10.
+    fn decrypt_in_place(&self, obj: &mut Object, num: u32, gen: u16) {
+        match obj {
+            Object::String(bytes) => self.apply(self.filters.string, num, gen, bytes),
+            Object::Array(items) => items
+                .iter_mut()
+                .for_each(|it| self.decrypt_in_place(it, num, gen)),
+            Object::Dict(dict) => dict
+                .values_mut()
+                .for_each(|v| self.decrypt_in_place(v, num, gen)),
+            Object::Stream(stream) => {
+                stream
+                    .dict
+                    .values_mut()
+                    .for_each(|v| self.decrypt_in_place(v, num, gen));
+                if !self.encrypt_metadata && is_metadata_stream(&stream.dict) {
+                    return;
+                }
+                if let Some(name) = stream_crypt_filter(&stream.dict) {
+                    match self.filters.named(&name) {
+                        Some(Cipher::Identity) | None => {}
+                        Some(cipher) => {
+                            stream.data = decrypt_bytes(cipher, &self.key, &stream.data)
+                        }
+                    }
+                    return;
+                }
+                let cipher = if is_embedded_file_stream(&stream.dict) {
+                    self.filters.embedded_file
+                } else {
+                    self.filters.stream
+                };
+                self.apply(cipher, num, gen, &mut stream.data);
+            }
+            _ => {}
+        }
+    }
+
+    /// Decrypts one string or stream body in place under `cipher` with the
+    /// key Algorithm 1 derives for object `num gen`; the Identity filter
+    /// leaves it as stored.
+    fn apply(&self, cipher: Cipher, num: u32, gen: u16, data: &mut Vec<u8>) {
+        let key = match cipher {
+            Cipher::Identity => return,
             Cipher::Aesv3 => self.key.clone(), // one file key for every object
-            Cipher::Rc4 | Cipher::Aesv2 => self.object_key(num, gen),
+            Cipher::Rc4 | Cipher::Aesv2 => self.object_key(cipher, num, gen),
         };
-        decrypt_in_place(obj, &key, self.cipher, self.encrypt_metadata);
+        *data = decrypt_bytes(cipher, &key, data);
     }
 
     /// Per-object key: `MD5(filekey ++ num[0..3] ++ gen[0..2] [++ "sAlT"])`
-    /// truncated to `min(n + 5, 16)` bytes (ISO 32000 §7.6.2, Algorithm 1). The
-    /// `sAlT` suffix is added for AES crypt filters.
+    /// truncated to `min(n + 5, 16)` bytes for RC4 (ISO 32000 §7.6.2,
+    /// Algorithm 1). AESV2 is AES-128, so it adds the `sAlT` suffix and
+    /// keeps the whole 16-byte digest whatever the file key's length.
     ///
     /// Covers ISO 32000-1 §7.6.2.
-    fn object_key(&self, num: u32, gen: u16) -> Vec<u8> {
+    fn object_key(&self, cipher: Cipher, num: u32, gen: u16) -> Vec<u8> {
         let mut input = Vec::with_capacity(self.key.len() + 9);
         input.extend_from_slice(&self.key);
         input.extend_from_slice(&num.to_le_bytes()[..3]);
         input.extend_from_slice(&gen.to_le_bytes()[..2]);
-        if self.cipher == Cipher::Aesv2 {
+        if cipher == Cipher::Aesv2 {
             input.extend_from_slice(b"sAlT");
         }
         let digest = md5(&input);
-        let n = (self.key.len() + 5).min(16);
+        let n = match cipher {
+            Cipher::Aesv2 => 16,
+            _ => (self.key.len() + 5).min(16),
+        };
         digest[..n].to_vec()
-    }
-}
-
-/// Recursively decrypts every string and stream body reachable from `obj` with
-/// the per-object `key` under `cipher`. When `encrypt_metadata` is false, a
-/// stream whose own dictionary says `/Type /Metadata` was stored in
-/// plaintext (ISO 32000-2 §7.6.4.2, Table 20) and its data is left alone;
-/// the dictionary's own values still walk normally.
-///
-/// Covers ISO 32000-1 §7.6.2.
-fn decrypt_in_place(obj: &mut Object, key: &[u8], cipher: Cipher, encrypt_metadata: bool) {
-    match obj {
-        Object::String(bytes) => *bytes = decrypt_bytes(cipher, key, bytes),
-        Object::Array(items) => items
-            .iter_mut()
-            .for_each(|it| decrypt_in_place(it, key, cipher, encrypt_metadata)),
-        Object::Dict(dict) => dict
-            .values_mut()
-            .for_each(|v| decrypt_in_place(v, key, cipher, encrypt_metadata)),
-        Object::Stream(stream) => {
-            stream
-                .dict
-                .values_mut()
-                .for_each(|v| decrypt_in_place(v, key, cipher, encrypt_metadata));
-            if !encrypt_metadata && is_metadata_stream(&stream.dict) {
-                return;
-            }
-            stream.data = decrypt_bytes(cipher, key, &stream.data);
-        }
-        _ => {}
     }
 }
 
@@ -233,25 +468,18 @@ fn is_metadata_stream(dict: &Dict) -> bool {
     dict.get_name("Type").map(|n| n.0.as_str()) == Some("Metadata")
 }
 
+/// Whether `dict` names `/Type /EmbeddedFile`.
+fn is_embedded_file_stream(dict: &Dict) -> bool {
+    dict.get_name("Type").map(|n| n.0.as_str()) == Some("EmbeddedFile")
+}
+
 /// Applies `cipher` to one string or stream body with the given `key`.
 fn decrypt_bytes(cipher: Cipher, key: &[u8], data: &[u8]) -> Vec<u8> {
     match cipher {
+        Cipher::Identity => data.to_vec(),
         Cipher::Rc4 => rc4(key, data),
         Cipher::Aesv2 | Cipher::Aesv3 => aes_cbc_decrypt(key, data),
     }
-}
-
-/// The Standard stream crypt filter's method (`/CF` → `/StmF` → `/CFM`):
-/// `V2`, `AESV2`, or `Identity`.
-///
-/// Covers ISO 32000-1 §7.6.5.
-fn crypt_filter_method(enc: &Dict) -> Option<String> {
-    let stmf = enc
-        .get_name("StmF")
-        .map(|n| n.0.as_str())
-        .unwrap_or("StdCF");
-    let filter = enc.get_dict("CF")?.get_dict(stmf)?;
-    Some(filter.get_name("CFM")?.0.clone())
 }
 
 /// Pads or truncates a password to the 32 bytes every legacy algorithm
@@ -680,6 +908,11 @@ mod aes_hw {
 /// AES-CBC decryption of whole blocks (no IV prefix, no padding removal).
 /// Returns an empty vector when the input is not a positive multiple of 16.
 fn aes_cbc_decrypt_blocks(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+    // Only AES-128 and AES-256 keys expand; anything else comes from a
+    // dictionary that lies about its method and yields nothing.
+    if !matches!(key.len(), 16 | 32) {
+        return Vec::new();
+    }
     if data.is_empty() || !data.len().is_multiple_of(16) || iv.len() < 16 {
         return Vec::new();
     }
@@ -1599,6 +1832,12 @@ fn encrypt_in_place(obj: &mut Object, key: &[u8], rng: &mut dyn FnMut(&mut [u8])
             for v in stream.dict.values_mut() {
                 encrypt_in_place(v, key, &mut *rng);
             }
+            // A stream that names the Identity crypt filter says its data
+            // is stored in the clear (ISO 32000-1 §7.4.10); keep it so, or
+            // no reader could get it back.
+            if stream_crypt_filter(&stream.dict).as_deref() == Some("Identity") {
+                return;
+            }
             stream.data = aes_cbc_encrypt(key, rng, &stream.data);
         }
         _ => {}
@@ -1846,11 +2085,16 @@ mod tests {
 
     /// `/O` for the given owner and user passwords (Algorithm 3, R3).
     fn owner_entry(owner_pw: &[u8], user_pw: &[u8]) -> Vec<u8> {
+        owner_entry_with(N, owner_pw, user_pw)
+    }
+
+    /// [`owner_entry`] for an `n`-byte key.
+    fn owner_entry_with(n: usize, owner_pw: &[u8], user_pw: &[u8]) -> Vec<u8> {
         let mut d = md5(&pad_password(owner_pw));
         for _ in 0..50 {
-            d = md5(&d[..N]);
+            d = md5(&d[..n]);
         }
-        let rc4key = d[..N].to_vec();
+        let rc4key = d[..n].to_vec();
         let mut o = rc4(&rc4key, &pad_password(user_pw));
         for i in 1u8..=19 {
             let k: Vec<u8> = rc4key.iter().map(|b| b ^ i).collect();
@@ -1861,6 +2105,11 @@ mod tests {
 
     /// File key from `/O` for the given user password (Algorithm 2, R3).
     fn file_key(o: &[u8], user_pw: &[u8]) -> Vec<u8> {
+        file_key_with(N, o, user_pw)
+    }
+
+    /// [`file_key`] for an `n`-byte key.
+    fn file_key_with(n: usize, o: &[u8], user_pw: &[u8]) -> Vec<u8> {
         let mut input = Vec::new();
         input.extend_from_slice(&pad_password(user_pw));
         input.extend_from_slice(o);
@@ -1868,9 +2117,29 @@ mod tests {
         input.extend_from_slice(ID0);
         let mut d = md5(&input);
         for _ in 0..50 {
-            d = md5(&d[..N]);
+            d = md5(&d[..n]);
         }
-        d[..N].to_vec()
+        d[..n].to_vec()
+    }
+
+    /// The `/Msg` string of dictionary object `num`, as loaded.
+    fn msg_of(doc: &crate::Document, num: u32) -> Vec<u8> {
+        use crate::object::ObjRef;
+        let obj = doc.get(ObjRef { num, gen: 0 }).unwrap();
+        obj.as_dict()
+            .unwrap()
+            .get("Msg")
+            .unwrap()
+            .as_str_bytes()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// The decoded data of stream object `num`.
+    fn body_of(doc: &crate::Document, num: u32) -> Vec<u8> {
+        use crate::object::ObjRef;
+        let obj = doc.get(ObjRef { num, gen: 0 }).unwrap();
+        doc.stream_data(obj.as_stream().unwrap()).unwrap()
     }
 
     /// `/U` for the given file key (Algorithm 5, R3).
@@ -2193,6 +2462,220 @@ mod tests {
         );
     }
 
+    // --- V4 crypt filters: /CF, /StmF, /StrF, /EFF and the filter /Length ---
+
+    /// A V4/R4 file under the empty user password. `encrypt_entries` is the
+    /// crypt filter part of the `/Encrypt` dictionary (`/CF`, `/StmF`,
+    /// `/StrF`, `/EFF`, `/Length`), `n` the key length in bytes, and `body`
+    /// adds the objects under test, encrypting them with the file key it is
+    /// handed. Object 9 is the encryption dictionary.
+    fn v4_fixture(
+        n: usize,
+        encrypt_entries: &str,
+        body: impl FnOnce(&mut pdfboss_testkit::PdfBuilder, &[u8]),
+    ) -> Vec<u8> {
+        use pdfboss_testkit::PdfBuilder;
+        let o = owner_entry_with(n, b"", b"");
+        let key = file_key_with(n, &o, b"");
+        let u = user_entry(&key);
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        body(&mut b, &key);
+        b.object(
+            9,
+            &format!(
+                "<< /Filter /Standard /V 4 /R 4 /P {P} /O {} /U {} {encrypt_entries} >>",
+                hexstr(&o),
+                hexstr(&u)
+            ),
+        );
+        let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
+        b.trailer_extra(&trailer).build(1)
+    }
+
+    const AESV2_CF: &str = "/CF << /StdCF << /CFM /AESV2 /Length 16 >> >>";
+    const TWO_CF: &str =
+        "/CF << /StdCF << /CFM /AESV2 /Length 16 >> /RcCF << /CFM /V2 /Length 16 >> >>";
+    const IV: [u8; 16] = [0x11; 16];
+
+    // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: /StmF may name the standard
+    // Identity filter, which leaves every stream as stored while /StrF still
+    // decrypts the strings.
+    #[test]
+    fn identity_stream_filter_leaves_streams_as_stored() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {AESV2_CF} /StmF /Identity /StrF /StdCF"),
+            |b, key| {
+                let msg = aes_encrypt_pdf(&obj_key_aes(key, 3, 0), b"Top secret message", &IV);
+                b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
+                b.stream(4, "", b"stored in the clear");
+            },
+        );
+        let doc = Document::load(data).expect("an Identity stream filter is a valid V4 file");
+        assert_eq!(msg_of(&doc, 3), b"Top secret message");
+        assert_eq!(body_of(&doc, 4), b"stored in the clear");
+    }
+
+    // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: /StrF picks the string cipher
+    // on its own, so strings and streams may use different methods.
+    #[test]
+    fn string_filter_is_chosen_independently_of_the_stream_filter() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {TWO_CF} /StmF /StdCF /StrF /RcCF"),
+            |b, key| {
+                let msg = rc4(&obj_key(key, 3, 0), b"Top secret message");
+                b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
+                let stream =
+                    aes_encrypt_pdf(&obj_key_aes(key, 4, 0), b"decrypted stream body", &IV);
+                b.stream(4, "", &stream);
+            },
+        );
+        let doc = Document::load(data).expect("two crypt filters open");
+        assert_eq!(msg_of(&doc, 3), b"Top secret message");
+        assert_eq!(body_of(&doc, 4), b"decrypted stream body");
+    }
+
+    // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: /EFF names the filter for
+    // embedded file streams; other streams keep /StmF.
+    #[test]
+    fn embedded_file_filter_applies_to_embedded_file_streams() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {TWO_CF} /StmF /StdCF /StrF /StdCF /EFF /RcCF"),
+            |b, key| {
+                let attached = rc4(&obj_key(key, 4, 0), b"attached file bytes");
+                b.stream(4, "/Type /EmbeddedFile", &attached);
+                let stream =
+                    aes_encrypt_pdf(&obj_key_aes(key, 5, 0), b"decrypted stream body", &IV);
+                b.stream(5, "", &stream);
+            },
+        );
+        let doc = Document::load(data).expect("an /EFF entry opens");
+        assert_eq!(body_of(&doc, 4), b"attached file bytes");
+        assert_eq!(body_of(&doc, 5), b"decrypted stream body");
+    }
+
+    // Covers ISO 32000-1 §7.6.5: the Standard handler writes the crypt
+    // filter's /Length in bytes, and it sets the key size when the
+    // encryption dictionary itself has no /Length.
+    #[test]
+    fn crypt_filter_length_sets_the_key_size() {
+        use crate::Document;
+        let data = v4_fixture(
+            5,
+            "/CF << /StdCF << /CFM /V2 /Length 5 >> >> /StmF /StdCF /StrF /StdCF",
+            |b, key| {
+                let msg = rc4(&obj_key(key, 3, 0), b"Top secret message");
+                b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
+                b.stream(4, "", &rc4(&obj_key(key, 4, 0), b"decrypted stream body"));
+            },
+        );
+        let doc = Document::load(data).expect("a 40-bit V4 file opens");
+        assert_eq!(msg_of(&doc, 3), b"Top secret message");
+        assert_eq!(body_of(&doc, 4), b"decrypted stream body");
+    }
+
+    // Covers ISO 32000-1 §7.6.2 and §7.6.5: AESV2 is AES-128, so its object
+    // key is the whole 16-byte MD5 digest whatever the file key's length,
+    // and a 40-bit file key must not reach the block cipher with 10 bytes.
+    #[test]
+    fn aesv2_always_derives_a_16_byte_object_key() {
+        use crate::Document;
+        let object_key = |key: &[u8], num: u32| {
+            let mut input = key.to_vec();
+            input.extend_from_slice(&num.to_le_bytes()[..3]);
+            input.extend_from_slice(&[0, 0]);
+            input.extend_from_slice(b"sAlT");
+            md5(&input).to_vec()
+        };
+        let data = v4_fixture(
+            5,
+            "/Length 40 /CF << /StdCF << /CFM /AESV2 /Length 5 >> >> /StmF /StdCF /StrF /StdCF",
+            |b, key| {
+                let msg = aes_encrypt_pdf(&object_key(key, 3), b"Top secret message", &IV);
+                b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
+                let stream = aes_encrypt_pdf(&object_key(key, 4), b"decrypted stream body", &IV);
+                b.stream(4, "", &stream);
+            },
+        );
+        let doc = Document::load(data).expect("a 40-bit AESV2 file opens");
+        assert_eq!(msg_of(&doc, 3), b"Top secret message");
+        assert_eq!(body_of(&doc, 4), b"decrypted stream body");
+    }
+
+    // --- Per-stream /Crypt filters ---
+
+    // Covers ISO 32000-1 §7.4.10 and §7.6.5: a stream naming the Identity
+    // crypt filter is stored in the clear inside an encrypted document.
+    #[test]
+    fn a_stream_crypt_filter_naming_identity_is_left_as_stored() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {AESV2_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, key| {
+                b.stream(
+                    4,
+                    "/Filter /Crypt /DecodeParms << /Type /CryptFilterDecodeParms /Name /Identity >>",
+                    b"stored in the clear",
+                );
+                let stream =
+                    aes_encrypt_pdf(&obj_key_aes(key, 5, 0), b"decrypted stream body", &IV);
+                b.stream(5, "", &stream);
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"stored in the clear");
+        assert_eq!(body_of(&doc, 5), b"decrypted stream body");
+    }
+
+    // Covers ISO 32000-1 §7.4.10: without a /Name the Crypt filter means
+    // Identity, and the filters after it still run.
+    #[test]
+    fn a_stream_crypt_filter_without_a_name_means_identity() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {AESV2_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, _| {
+                b.stream(
+                    4,
+                    "/Filter [/Crypt /ASCIIHexDecode]",
+                    b"73746F72656420617320686578>",
+                );
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"stored as hex");
+    }
+
+    // Covers ISO 32000-1 §7.4.10 and §7.6.5: a stream naming one of the /CF
+    // filters is decrypted with that filter's method and the file key as
+    // is, without the per-object key of Algorithm 1.
+    #[test]
+    fn a_stream_crypt_filter_naming_a_cf_entry_uses_the_file_key_as_is() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {TWO_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, key| {
+                b.stream(
+                    4,
+                    "/Filter /Crypt /DecodeParms << /Name /RcCF >>",
+                    &rc4(key, b"under the file key"),
+                );
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
     // --- AESV3 (V5/R5 and R6) end-to-end fixture ---
 
     fn encrypted_fixture_aesv3(r: i64) -> Vec<u8> {
@@ -2216,22 +2699,7 @@ mod tests {
         metadata: Option<&[u8]>,
     ) -> Vec<u8> {
         use pdfboss_testkit::PdfBuilder;
-        let key: Vec<u8> = (0u8..32).map(|i| i ^ 0x5a).collect(); // arbitrary 256-bit file key
-        let vsalt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-        let ksalt: [u8; 8] = [9, 10, 11, 12, 13, 14, 15, 16];
-        let mut u = hash_2b(r, user_pw, &vsalt, &[]); // 32-byte validation hash
-        u.extend_from_slice(&vsalt);
-        u.extend_from_slice(&ksalt);
-        let intermediate = hash_2b(r, user_pw, &ksalt, &[]);
-        let ue = aes_cbc_encrypt_blocks(&intermediate, &[0u8; 16], &key);
-        // The owner hashes additionally salt in the first 48 bytes of /U.
-        let ovsalt: [u8; 8] = [21, 22, 23, 24, 25, 26, 27, 28];
-        let oksalt: [u8; 8] = [31, 32, 33, 34, 35, 36, 37, 38];
-        let mut o = hash_2b(r, owner_pw, &ovsalt, &u[..48]);
-        o.extend_from_slice(&ovsalt);
-        o.extend_from_slice(&oksalt);
-        let ointermediate = hash_2b(r, owner_pw, &oksalt, &u[..48]);
-        let oe = aes_cbc_encrypt_blocks(&ointermediate, &[0u8; 16], &key);
+        let key = aesv3_file_key();
         let iv = [0x22u8; 16];
         let msg = aes_encrypt_pdf(&key, b"AES-256 secret", &iv);
         let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &iv);
@@ -2256,17 +2724,101 @@ mod tests {
         b.object(
             9,
             &format!(
-                "<< /Filter /Standard /V 5 /R {r} /Length 256 /P {P} /U {} /UE {} \
-                 /O {} /OE {}{encrypt_metadata_entry} \
+                "<< /Filter /Standard /V 5 /R {r} /Length 256 /P {P} {}{encrypt_metadata_entry} \
                  /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /StdCF >>",
-                hexstr(&u),
-                hexstr(&ue),
-                hexstr(&o),
-                hexstr(&oe)
+                aesv3_password_entries(r, user_pw, owner_pw, &key),
             ),
         );
         let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
         b.trailer_extra(&trailer).build(1)
+    }
+
+    /// The arbitrary 256-bit file key every AESV3 fixture is encrypted with.
+    fn aesv3_file_key() -> Vec<u8> {
+        (0u8..32).map(|i| i ^ 0x5a).collect()
+    }
+
+    /// The `/U`, `/UE`, `/O` and `/OE` entries of a revision `r` AES-256
+    /// dictionary that open `key` under the given passwords.
+    fn aesv3_password_entries(r: i64, user_pw: &[u8], owner_pw: &[u8], key: &[u8]) -> String {
+        let vsalt: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let ksalt: [u8; 8] = [9, 10, 11, 12, 13, 14, 15, 16];
+        let mut u = hash_2b(r, user_pw, &vsalt, &[]); // 32-byte validation hash
+        u.extend_from_slice(&vsalt);
+        u.extend_from_slice(&ksalt);
+        let intermediate = hash_2b(r, user_pw, &ksalt, &[]);
+        let ue = aes_cbc_encrypt_blocks(&intermediate, &[0u8; 16], key);
+        // The owner hashes additionally salt in the first 48 bytes of /U.
+        let ovsalt: [u8; 8] = [21, 22, 23, 24, 25, 26, 27, 28];
+        let oksalt: [u8; 8] = [31, 32, 33, 34, 35, 36, 37, 38];
+        let mut o = hash_2b(r, owner_pw, &ovsalt, &u[..48]);
+        o.extend_from_slice(&ovsalt);
+        o.extend_from_slice(&oksalt);
+        let ointermediate = hash_2b(r, owner_pw, &oksalt, &u[..48]);
+        let oe = aes_cbc_encrypt_blocks(&ointermediate, &[0u8; 16], key);
+        format!(
+            "/U {} /UE {} /O {} /OE {}",
+            hexstr(&u),
+            hexstr(&ue),
+            hexstr(&o),
+            hexstr(&oe)
+        )
+    }
+
+    // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: only the strings of an
+    // encryption dictionary must be direct, so /CF may be an indirect
+    // reference (pdf.js issue7665 is such a file) and still be read.
+    #[test]
+    fn an_indirect_cf_dictionary_is_followed() {
+        use crate::Document;
+        use pdfboss_testkit::PdfBuilder;
+        let key = aesv3_file_key();
+        let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &[0x22u8; 16]);
+        let mut b = PdfBuilder::new().version(1, 7);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.stream(4, "", &stream);
+        b.object(8, "<< /StdCF << /CFM /AESV3 /Length 32 >> >>");
+        b.object(
+            9,
+            &format!(
+                "<< /Filter /Standard /V 5 /R 6 /Length 256 /P {P} {} \
+                 /CF 8 0 R /StmF /StdCF /StrF /StdCF >>",
+                aesv3_password_entries(6, b"", b"", &key),
+            ),
+        );
+        let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
+        let doc = Document::load(b.trailer_extra(&trailer).build(1))
+            .expect("an indirect /CF still names the filters");
+        assert_eq!(body_of(&doc, 4), b"AES-256 stream body");
+    }
+
+    // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: a V5 file picks its filters
+    // from /CF the way a V4 file does, the Identity filter included.
+    #[test]
+    fn aesv3_identity_string_filter_leaves_strings_as_stored() {
+        use crate::Document;
+        use pdfboss_testkit::PdfBuilder;
+        let key = aesv3_file_key();
+        let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &[0x22u8; 16]);
+        let mut b = PdfBuilder::new().version(1, 7);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.object(3, "<< /Msg (stored in the clear) >>");
+        b.stream(4, "", &stream);
+        b.object(
+            9,
+            &format!(
+                "<< /Filter /Standard /V 5 /R 6 /Length 256 /P {P} {} \
+                 /CF << /StdCF << /CFM /AESV3 /Length 32 >> >> /StmF /StdCF /StrF /Identity >>",
+                aesv3_password_entries(6, b"", b"", &key),
+            ),
+        );
+        let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
+        let doc = Document::load(b.trailer_extra(&trailer).build(1))
+            .expect("an Identity string filter is a valid V5 file");
+        assert_eq!(msg_of(&doc, 3), b"stored in the clear");
+        assert_eq!(body_of(&doc, 4), b"AES-256 stream body");
     }
 
     fn assert_aesv3_decrypts(r: i64) {
@@ -2484,7 +3036,7 @@ mod tests {
         let key = aesv3_key(dict, 6, password).expect("password opens the produced dict");
         Decryptor {
             key,
-            cipher: Cipher::Aesv3,
+            filters: CryptFilters::uniform(Cipher::Aesv3),
             encrypt_metadata: true,
         }
     }
@@ -2579,6 +3131,40 @@ mod tests {
         let mut roundtripped = obj;
         decryptor.decrypt_object(&mut roundtripped, 4, 0);
         assert_eq!(roundtripped, original);
+    }
+
+    // Covers ISO 32000-1 §7.4.10: a stream that names the Identity crypt
+    // filter stays in the clear when the document is encrypted, so the
+    // writer and the reader agree on what the dictionary says.
+    #[test]
+    fn encrypt_object_leaves_an_identity_crypt_stream_as_stored() {
+        use crate::object::Stream;
+
+        let (mut enc, dict) =
+            Encryptor::aes256_with_rng("", "owner-pw", Permissions::all(), counter_rng());
+        let mut stream_dict = Dict::new();
+        stream_dict.insert(
+            Name("Filter".to_string()),
+            Object::Name(Name("Crypt".to_string())),
+        );
+        let mut parms = Dict::new();
+        parms.insert(
+            Name("Name".to_string()),
+            Object::Name(Name("Identity".to_string())),
+        );
+        stream_dict.insert(Name("DecodeParms".to_string()), Object::Dict(parms));
+        let original = Object::Stream(Stream {
+            dict: stream_dict,
+            data: b"<?xpacket?> metadata in the clear".to_vec(),
+        });
+
+        let mut obj = original.clone();
+        enc.encrypt_object(&mut obj, 6, 0);
+        assert_eq!(obj, original, "an Identity stream is written as stored");
+
+        let decryptor = decryptor_for(&dict, b"");
+        decryptor.decrypt_object(&mut obj, 6, 0);
+        assert_eq!(obj, original, "and read back as stored");
     }
 
     #[test]

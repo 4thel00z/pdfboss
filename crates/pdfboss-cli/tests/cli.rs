@@ -281,7 +281,7 @@ fn render_warns_about_a_dropped_image_and_still_succeeds() {
     builder.stream(
         5,
         "/Type /XObject /Subtype /Image /Width 8 /Height 8 /BitsPerComponent 1 \
-         /ColorSpace /DeviceGray /Filter /Crypt",
+         /ColorSpace /DeviceGray /Filter /NotAFilterDecode",
         &[0; 8],
     );
     let dir = std::env::temp_dir();
@@ -305,7 +305,7 @@ fn render_warns_about_a_dropped_image_and_still_succeeds() {
     assert!(png_written, "no PNG written despite exit 0");
     let warnings = String::from_utf8_lossy(&output.stderr);
     assert!(
-        warnings.contains("warning: page 1: 1 image skipped: unsupported filter /Crypt"),
+        warnings.contains("warning: page 1: 1 image skipped: unsupported filter /NotAFilterDecode"),
         "no warning naming the filter in: {warnings}"
     );
     let text = stdout(&output);

@@ -211,9 +211,64 @@ impl Object {
     }
 }
 
+/// The character a PDFDocEncoding byte stands for, or `None` for the codes
+/// the encoding leaves undefined (0x00 to 0x17 except tab, line feed and
+/// carriage return, 0x7F, 0x9F and 0xAD). The encoding agrees with Latin-1
+/// except for the eight accents at 0x18 to 0x1F, the punctuation and
+/// ligatures at 0x80 to 0x9E and the Euro sign at 0xA0.
+///
+/// Covers ISO 32000-1 §7.9.2.3 and Annex D.3.
+pub fn pdf_doc_char(code: u8) -> Option<char> {
+    let c = match code {
+        0x09 | 0x0A | 0x0D | 0x20..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => char::from(code),
+        0x18 => '\u{2D8}',
+        0x19 => '\u{2C7}',
+        0x1A => '\u{2C6}',
+        0x1B => '\u{2D9}',
+        0x1C => '\u{2DD}',
+        0x1D => '\u{2DB}',
+        0x1E => '\u{2DA}',
+        0x1F => '\u{2DC}',
+        0x80 => '\u{2022}',
+        0x81 => '\u{2020}',
+        0x82 => '\u{2021}',
+        0x83 => '\u{2026}',
+        0x84 => '\u{2014}',
+        0x85 => '\u{2013}',
+        0x86 => '\u{192}',
+        0x87 => '\u{2044}',
+        0x88 => '\u{2039}',
+        0x89 => '\u{203A}',
+        0x8A => '\u{2212}',
+        0x8B => '\u{2030}',
+        0x8C => '\u{201E}',
+        0x8D => '\u{201C}',
+        0x8E => '\u{201D}',
+        0x8F => '\u{2018}',
+        0x90 => '\u{2019}',
+        0x91 => '\u{201A}',
+        0x92 => '\u{2122}',
+        0x93 => '\u{FB01}',
+        0x94 => '\u{FB02}',
+        0x95 => '\u{141}',
+        0x96 => '\u{152}',
+        0x97 => '\u{160}',
+        0x98 => '\u{178}',
+        0x99 => '\u{17D}',
+        0x9A => '\u{131}',
+        0x9B => '\u{142}',
+        0x9C => '\u{153}',
+        0x9D => '\u{161}',
+        0x9E => '\u{17E}',
+        0xA0 => '\u{20AC}',
+        _ => return None,
+    };
+    Some(c)
+}
+
 /// Decodes a PDF text string: UTF-16BE with BOM, UTF-8 with BOM (PDF 2.0),
-/// otherwise byte-per-char fallback in the spirit of PDFDocEncoding
-/// (approximately Latin-1).
+/// otherwise PDFDocEncoding, with the replacement character for the codes
+/// that encoding leaves undefined.
 ///
 /// Covers ISO 32000-1 §7.9.2, §7.9.2.2, §7.9.2.3 and Annex D.3.
 pub fn decode_text_string(bytes: &[u8]) -> String {
@@ -234,9 +289,10 @@ pub fn decode_text_string(bytes: &[u8]) -> String {
     } else if let Some(rest) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(rest).into_owned()
     } else {
-        // PDFDocEncoding-flavored fallback: each byte maps to the Unicode
-        // scalar of the same value (Latin-1).
-        bytes.iter().map(|&b| char::from(b)).collect()
+        bytes
+            .iter()
+            .map(|&b| pdf_doc_char(b).unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect()
     }
 }
 
@@ -394,12 +450,62 @@ mod tests {
 
     // Covers ISO 32000-1 §7.9.2, §7.9.2.3 and Annex D.3.
     #[test]
-    fn decode_latin1_fallback() {
+    fn decode_without_bom_uses_pdf_doc_encoding() {
         assert_eq!(decode_text_string(b"Hello"), "Hello");
         assert_eq!(decode_text_string(&[0x48, 0xE9]), "Hé");
         assert_eq!(decode_text_string(&[0xFF]), "ÿ");
         assert_eq!(decode_text_string(&[]), "");
-        // A lone 0xFE (no full UTF-16 BOM) falls back to Latin-1.
+        // A lone 0xFE (no full UTF-16 BOM) is PDFDocEncoding's thorn.
         assert_eq!(decode_text_string(&[0xFE]), "\u{FE}");
+    }
+
+    // Covers ISO 32000-1 §7.9.2.3 and Annex D.3: the codes where
+    // PDFDocEncoding departs from Latin-1.
+    #[test]
+    fn decode_pdf_doc_encoding_accents_at_0x18() {
+        assert_eq!(
+            decode_text_string(&[0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F]),
+            "\u{2D8}\u{2C7}\u{2C6}\u{2D9}\u{2DD}\u{2DB}\u{2DA}\u{2DC}"
+        );
+    }
+
+    // Covers ISO 32000-1 §7.9.2.3 and Annex D.3.
+    #[test]
+    fn decode_pdf_doc_encoding_punctuation_at_0x80() {
+        assert_eq!(
+            decode_text_string(&[0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87]),
+            "•†‡…—–ƒ⁄"
+        );
+        assert_eq!(
+            decode_text_string(&[0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F]),
+            "‹›−‰„“”‘"
+        );
+        assert_eq!(
+            decode_text_string(&[0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97]),
+            "’‚™ﬁﬂŁŒŠ"
+        );
+        assert_eq!(
+            decode_text_string(&[0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E]),
+            "ŸŽıłœšž"
+        );
+        assert_eq!(decode_text_string(&[0xA0]), "€");
+    }
+
+    // Covers ISO 32000-1 §7.9.2.3 and Annex D.3: everywhere else the two
+    // agree, so Latin-1 text keeps decoding as before.
+    #[test]
+    fn decode_pdf_doc_encoding_agrees_with_latin1_elsewhere() {
+        assert_eq!(
+            decode_text_string(&[0x09, 0x0A, 0x0D, 0x20, 0x7E, 0xA1, 0xE9, 0xFE, 0xFF]),
+            "\t\n\r ~¡éþÿ"
+        );
+    }
+
+    // Covers ISO 32000-1 §7.9.2.3 and Annex D.3: codes the encoding leaves
+    // undefined decode to the replacement character instead of a guess.
+    #[test]
+    fn decode_pdf_doc_encoding_undefined_codes_are_replaced() {
+        assert_eq!(decode_text_string(&[0x9F, 0xAD]), "\u{FFFD}\u{FFFD}");
+        assert_eq!(decode_text_string(&[0x00, 0x7F]), "\u{FFFD}\u{FFFD}");
     }
 }
