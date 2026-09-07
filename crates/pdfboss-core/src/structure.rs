@@ -24,11 +24,261 @@ pub struct MarkedContentId {
     pub mcid: u32,
 }
 
+/// The four groups §14.8.4 sorts the standard structure types into, one per
+/// clause that defines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardKind {
+    /// §14.8.4.2: elements that group other elements and hold no content
+    /// of their own.
+    Grouping,
+    /// §14.8.4.3: paragraphs, headings, lists and tables, laid out as
+    /// blocks.
+    BlockLevel,
+    /// §14.8.4.4: elements within a block's text.
+    InlineLevel,
+    /// §14.8.4.5: figures, formulas and forms.
+    Illustration,
+}
+
+/// The standard structure types of ISO 32000-1 §14.8.4, each variant spelled
+/// as the standard spells the `/S` name it stands for.
+///
+/// Covers ISO 32000-1 §14.8.4.
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardType {
+    // Grouping elements (§14.8.4.2).
+    Document,
+    Part,
+    Art,
+    Sect,
+    Div,
+    BlockQuote,
+    Caption,
+    TOC,
+    TOCI,
+    Index,
+    NonStruct,
+    Private,
+    // Block-level structure elements (§14.8.4.3).
+    P,
+    H,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    L,
+    LI,
+    Lbl,
+    LBody,
+    Table,
+    TR,
+    TH,
+    TD,
+    THead,
+    TBody,
+    TFoot,
+    // Inline-level structure elements (§14.8.4.4).
+    Span,
+    Quote,
+    Note,
+    Reference,
+    BibEntry,
+    Code,
+    Link,
+    Annot,
+    Ruby,
+    RB,
+    RT,
+    RP,
+    Warichu,
+    WT,
+    WP,
+    // Illustration elements (§14.8.4.5).
+    Figure,
+    Formula,
+    Form,
+}
+
+impl StandardType {
+    /// Every standard type, grouping elements first, in the standard's order.
+    pub const ALL: [StandardType; 49] = [
+        StandardType::Document,
+        StandardType::Part,
+        StandardType::Art,
+        StandardType::Sect,
+        StandardType::Div,
+        StandardType::BlockQuote,
+        StandardType::Caption,
+        StandardType::TOC,
+        StandardType::TOCI,
+        StandardType::Index,
+        StandardType::NonStruct,
+        StandardType::Private,
+        StandardType::P,
+        StandardType::H,
+        StandardType::H1,
+        StandardType::H2,
+        StandardType::H3,
+        StandardType::H4,
+        StandardType::H5,
+        StandardType::H6,
+        StandardType::L,
+        StandardType::LI,
+        StandardType::Lbl,
+        StandardType::LBody,
+        StandardType::Table,
+        StandardType::TR,
+        StandardType::TH,
+        StandardType::TD,
+        StandardType::THead,
+        StandardType::TBody,
+        StandardType::TFoot,
+        StandardType::Span,
+        StandardType::Quote,
+        StandardType::Note,
+        StandardType::Reference,
+        StandardType::BibEntry,
+        StandardType::Code,
+        StandardType::Link,
+        StandardType::Annot,
+        StandardType::Ruby,
+        StandardType::RB,
+        StandardType::RT,
+        StandardType::RP,
+        StandardType::Warichu,
+        StandardType::WT,
+        StandardType::WP,
+        StandardType::Figure,
+        StandardType::Formula,
+        StandardType::Form,
+    ];
+
+    /// The standard type a structure type name stands for, `None` for a name
+    /// outside the standard set. Names are case-sensitive; a document's own
+    /// types reach the standard set through the role map (§14.7.3), not here.
+    pub fn from_name(name: &str) -> Option<StandardType> {
+        StandardType::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The name as the standard spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            StandardType::Document => "Document",
+            StandardType::Part => "Part",
+            StandardType::Art => "Art",
+            StandardType::Sect => "Sect",
+            StandardType::Div => "Div",
+            StandardType::BlockQuote => "BlockQuote",
+            StandardType::Caption => "Caption",
+            StandardType::TOC => "TOC",
+            StandardType::TOCI => "TOCI",
+            StandardType::Index => "Index",
+            StandardType::NonStruct => "NonStruct",
+            StandardType::Private => "Private",
+            StandardType::P => "P",
+            StandardType::H => "H",
+            StandardType::H1 => "H1",
+            StandardType::H2 => "H2",
+            StandardType::H3 => "H3",
+            StandardType::H4 => "H4",
+            StandardType::H5 => "H5",
+            StandardType::H6 => "H6",
+            StandardType::L => "L",
+            StandardType::LI => "LI",
+            StandardType::Lbl => "Lbl",
+            StandardType::LBody => "LBody",
+            StandardType::Table => "Table",
+            StandardType::TR => "TR",
+            StandardType::TH => "TH",
+            StandardType::TD => "TD",
+            StandardType::THead => "THead",
+            StandardType::TBody => "TBody",
+            StandardType::TFoot => "TFoot",
+            StandardType::Span => "Span",
+            StandardType::Quote => "Quote",
+            StandardType::Note => "Note",
+            StandardType::Reference => "Reference",
+            StandardType::BibEntry => "BibEntry",
+            StandardType::Code => "Code",
+            StandardType::Link => "Link",
+            StandardType::Annot => "Annot",
+            StandardType::Ruby => "Ruby",
+            StandardType::RB => "RB",
+            StandardType::RT => "RT",
+            StandardType::RP => "RP",
+            StandardType::Warichu => "Warichu",
+            StandardType::WT => "WT",
+            StandardType::WP => "WP",
+            StandardType::Figure => "Figure",
+            StandardType::Formula => "Formula",
+            StandardType::Form => "Form",
+        }
+    }
+
+    /// The clause of §14.8.4 that defines the type.
+    pub fn kind(self) -> StandardKind {
+        match self {
+            StandardType::Document
+            | StandardType::Part
+            | StandardType::Art
+            | StandardType::Sect
+            | StandardType::Div
+            | StandardType::BlockQuote
+            | StandardType::Caption
+            | StandardType::TOC
+            | StandardType::TOCI
+            | StandardType::Index
+            | StandardType::NonStruct
+            | StandardType::Private => StandardKind::Grouping,
+            StandardType::P
+            | StandardType::H
+            | StandardType::H1
+            | StandardType::H2
+            | StandardType::H3
+            | StandardType::H4
+            | StandardType::H5
+            | StandardType::H6
+            | StandardType::L
+            | StandardType::LI
+            | StandardType::Lbl
+            | StandardType::LBody
+            | StandardType::Table
+            | StandardType::TR
+            | StandardType::TH
+            | StandardType::TD
+            | StandardType::THead
+            | StandardType::TBody
+            | StandardType::TFoot => StandardKind::BlockLevel,
+            StandardType::Span
+            | StandardType::Quote
+            | StandardType::Note
+            | StandardType::Reference
+            | StandardType::BibEntry
+            | StandardType::Code
+            | StandardType::Link
+            | StandardType::Annot
+            | StandardType::Ruby
+            | StandardType::RB
+            | StandardType::RT
+            | StandardType::RP
+            | StandardType::Warichu
+            | StandardType::WT
+            | StandardType::WP => StandardKind::InlineLevel,
+            StandardType::Figure | StandardType::Formula | StandardType::Form => {
+                StandardKind::Illustration
+            }
+        }
+    }
+}
+
 /// Where one marked-content sequence sits in the tree: its rank in the
 /// tree's depth-first order, and the structure type of the element holding
-/// it, as written and after the root's `/RoleMap`.
+/// it, as written, after the root's `/RoleMap`, and as a standard type.
 ///
-/// Covers ISO 32000-1 §14.7.3.
+/// Covers ISO 32000-1 §14.7.3 and §14.8.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
     pub rank: u32,
@@ -37,6 +287,8 @@ pub struct Placement {
     /// `structure_type` followed through the role map until a name the map
     /// has no entry for; the same name when the map never names it.
     pub mapped_type: Option<String>,
+    /// The standard type `mapped_type` names, `None` when it names none.
+    pub standard_type: Option<StandardType>,
 }
 
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
@@ -159,12 +411,14 @@ impl StructureTree {
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
         for (rank, (id, _, structure_type)) in keyed.into_iter().enumerate() {
             let mapped_type = structure_type.as_deref().map(|s| self.mapped_type(s));
+            let standard_type = mapped_type.as_deref().and_then(StandardType::from_name);
             placed.insert(
                 id,
                 Placement {
                     rank: rank as u32,
                     structure_type,
                     mapped_type,
+                    standard_type,
                 },
             );
         }
@@ -530,6 +784,9 @@ mod tests {
         assert_eq!(typed(2), (Some("Loop1"), Some("Loop1")));
         assert_eq!(typed(3), (Some("P"), Some("P")));
         assert_eq!(placed[&id(0, 3)].rank, 3);
+        assert_eq!(placed[&id(0, 0)].standard_type, Some(StandardType::P));
+        assert_eq!(placed[&id(0, 1)].standard_type, Some(StandardType::H1));
+        assert_eq!(placed[&id(0, 2)].standard_type, None);
         let tree = doc.structure_tree().unwrap();
         assert_eq!(tree.mapped_type("Head"), "H1");
         assert_eq!(tree.mapped_type("Span"), "Span");
@@ -553,6 +810,47 @@ mod tests {
         assert_eq!(placed[&id(0, 0)].rank, 0);
         assert_eq!(placed[&id(0, 0)].structure_type, None);
         assert_eq!(placed[&id(0, 0)].mapped_type, None);
+        assert_eq!(placed[&id(0, 0)].standard_type, None);
+    }
+
+    // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and
+    // §14.8.4.5.
+    #[test]
+    fn standard_types_are_recognized_by_name_and_grouped_by_clause() {
+        assert_eq!(StandardType::from_name("H1"), Some(StandardType::H1));
+        assert_eq!(StandardType::H1.kind(), StandardKind::BlockLevel);
+        assert_eq!(
+            StandardType::from_name("TOCI").map(StandardType::kind),
+            Some(StandardKind::Grouping)
+        );
+        assert_eq!(
+            StandardType::from_name("LBody").map(StandardType::kind),
+            Some(StandardKind::BlockLevel)
+        );
+        assert_eq!(
+            StandardType::from_name("TFoot").map(StandardType::kind),
+            Some(StandardKind::BlockLevel)
+        );
+        assert_eq!(
+            StandardType::from_name("Ruby").map(StandardType::kind),
+            Some(StandardKind::InlineLevel)
+        );
+        assert_eq!(
+            StandardType::from_name("Formula").map(StandardType::kind),
+            Some(StandardKind::Illustration)
+        );
+        // Names are case-sensitive and a document's own types are not standard.
+        assert_eq!(StandardType::from_name("h1"), None);
+        assert_eq!(StandardType::from_name("Para"), None);
+        assert_eq!(StandardType::ALL.len(), 49);
+        for t in StandardType::ALL {
+            assert_eq!(StandardType::from_name(t.name()), Some(t), "{}", t.name());
+        }
+        let grouping = StandardType::ALL
+            .iter()
+            .filter(|t| t.kind() == StandardKind::Grouping)
+            .count();
+        assert_eq!(grouping, 12);
     }
 
     // Covers ISO 32000-1 §7.7.2.
