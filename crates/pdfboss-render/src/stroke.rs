@@ -344,11 +344,91 @@ fn dot(c: Point, along: Option<Point>, pen: Pen, cap: LineCap) -> Option<Subpath
     }
 }
 
-/// The polygon that fills the corner at the vertex `v` between two
-/// segments: the pen disc, for every join style until miter and bevel
-/// joins are built.
-fn join(v: Point, pen: Pen) -> Option<Subpath> {
-    Some(disc(v, pen))
+/// Twice the signed area of the polygon `points`; its sign is the
+/// polygon's orientation.
+fn signed_area(points: &[Point]) -> f32 {
+    let n = points.len();
+    (0..n)
+        .map(|i| {
+            let p = points[i];
+            let q = points[(i + 1) % n];
+            p.x * q.y - q.x * p.y
+        })
+        .sum()
+}
+
+/// `points` as a closed polygon wound the way [`segment_quad`] winds its
+/// quads, whose signed area has the opposite sign to [`Pen::winding`], so
+/// the nonzero union with them holds.
+fn wound(mut points: Vec<Point>, pen: Pen) -> Subpath {
+    if signed_area(&points) * pen.winding > 0.0 {
+        points.reverse();
+    }
+    Subpath {
+        points,
+        closed: true,
+    }
+}
+
+/// Whether a miter join between segments in the device directions `d1`
+/// and `d2` stays within `limit`: the miter length over the line width is
+/// 1 / sin(φ/2) for the angle φ between the segments, and the ratio is
+/// defined in user space, so the directions are measured there.
+///
+/// Covers ISO 32000-1 §8.4.3.5.
+fn miter_fits(d1: Point, d2: Point, pen: Pen, limit: f32) -> bool {
+    let (Some(u1), Some(u2)) = (unit(linear(pen.to_user, d1)), unit(linear(pen.to_user, d2)))
+    else {
+        return false;
+    };
+    // 1 / sin²(φ/2) = 2 / (1 + cos θ), θ being the turn between the two
+    // directions.
+    let denominator = 1.0 + u1.x * u2.x + u1.y * u2.y;
+    denominator > 1e-6 && 2.0 / denominator <= limit * limit
+}
+
+/// The polygon that fills the outer corner where the segment `p`→`v`
+/// meets `v`→`q`: the pen disc for a round join; otherwise the two bands'
+/// outer edges carried on to where they meet (a miter) or cut across at
+/// their ends (a bevel), the miter giving way to the bevel when its ratio
+/// is over the miter limit. Collinear segments need no join, and a
+/// segment turning straight back gets only the round disc, its two bands
+/// already covering each other.
+///
+/// Covers ISO 32000-1 §8.4.3.4 and §8.4.3.5.
+fn join(p: Point, v: Point, q: Point, pen: Pen, style: StrokeStyle) -> Option<Subpath> {
+    if style.join == LineJoin::Round {
+        return Some(disc(v, pen));
+    }
+    let d1 = unit(sub(v, p))?;
+    let d2 = unit(sub(q, v))?;
+    let turn = d1.x * d2.y - d1.y * d2.x;
+    if turn.abs() <= 1e-6 {
+        return None;
+    }
+    // Each band's outer edge is the one the other segment points away from.
+    let o1 = offset(p, v, pen)?;
+    let o1 = if o1.x * d2.x + o1.y * d2.y > 0.0 {
+        scale(o1, -1.0)
+    } else {
+        o1
+    };
+    let o2 = offset(v, q, pen)?;
+    let o2 = if o2.x * d1.x + o2.y * d1.y < 0.0 {
+        scale(o2, -1.0)
+    } else {
+        o2
+    };
+    let a = add(v, o1);
+    let b = add(v, o2);
+    if style.join == LineJoin::Miter && miter_fits(d1, d2, pen, style.miter_limit) {
+        // The outer edges a + t d1 and b + s d2 meet at the miter tip.
+        let ab = sub(b, a);
+        let t = (ab.x * d2.y - ab.y * d2.x) / turn;
+        let tip = add(a, scale(d1, t));
+        return Some(wound(vec![v, a, tip, b], pen));
+    }
+    Some(wound(vec![v, a, b], pen))
 }
 
 /// A small fan around `c` approximating the pen's own shape — the device
@@ -394,7 +474,7 @@ fn disc(c: Point, pen: Pen) -> Subpath {
 /// be inverted cannot carry the pen either way and is treated as the
 /// identity, which keeps the stroke visible.
 ///
-/// Covers ISO 32000-1 §8.4.3.2, §8.4.3.3 and §8.5.3.2.
+/// Covers ISO 32000-1 §8.4.3.2, §8.4.3.3, §8.4.3.4 and §8.5.3.2.
 pub(crate) fn stroke_path(
     subpaths: &[Subpath],
     style: StrokeStyle,
@@ -468,10 +548,10 @@ pub(crate) fn stroke_path(
                 out.extend(segment_quad(seg[0], seg[1], pen));
             }
             for w in rp.windows(3) {
-                out.extend(join(w[1], pen));
+                out.extend(join(w[0], w[1], w[2], pen, style));
             }
             if closed {
-                out.extend(join(rp[0], pen));
+                out.extend(join(rp[n - 2], rp[0], rp[1], pen, style));
             } else {
                 out.extend(cap(rp[0], sub(rp[0], rp[1]), pen, style.cap));
                 out.extend(cap(rp[n - 1], sub(rp[n - 1], rp[n - 2]), pen, style.cap));
@@ -603,6 +683,115 @@ mod tests {
         assert_eq!(alpha_at(&pix, 2, 3), 255, "left corner");
         assert_eq!(alpha_at(&pix, 17, 6), 255, "right corner");
         assert_eq!(alpha_at(&pix, 1, 5), 0, "beyond the extension");
+    }
+
+    /// An L of width 4 turning at (2, 10): the outer corner is the square
+    /// x 0..2, y 10..12, which only a miter fills; the bevel is the
+    /// triangle cut from (0, 10) to (2, 12), which every join fills; and
+    /// the plain quads reach neither.
+    fn corner(join: LineJoin, miter_limit: f32, ctm: Matrix) -> Pixmap {
+        let mut pix = Pixmap::new(14, 14);
+        let polys = stroke_path(
+            &[line(&[(2.0, 2.0), (2.0, 10.0), (10.0, 10.0)])],
+            StrokeStyle {
+                join,
+                miter_limit,
+                ..solid(4.0)
+            },
+            ctm,
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        pix
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn miter_joins_fill_the_outer_corner() {
+        let pix = corner(LineJoin::Miter, 10.0, Matrix::identity());
+        assert_eq!(alpha_at(&pix, 0, 11), 255, "miter corner");
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "bevel triangle");
+        assert_eq!(alpha_at(&pix, 5, 5), 0, "inside the L");
+        // The same L turning the other way.
+        let mut pix = Pixmap::new(14, 14);
+        let polys = stroke_path(
+            &[line(&[(12.0, 2.0), (12.0, 10.0), (4.0, 10.0)])],
+            solid(4.0),
+            Matrix::identity(),
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        assert_eq!(alpha_at(&pix, 13, 11), 255, "mirrored miter corner");
+        assert_eq!(alpha_at(&pix, 8, 5), 0, "inside the mirrored L");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn bevel_joins_cut_the_corner() {
+        let pix = corner(LineJoin::Bevel, 10.0, Matrix::identity());
+        assert!(alpha_at(&pix, 0, 11) < 30, "bevel leaves the corner");
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "bevel triangle");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn round_joins_keep_the_pen_disc() {
+        let pix = corner(LineJoin::Round, 10.0, Matrix::identity());
+        assert!(
+            alpha_at(&pix, 0, 11) < 200,
+            "disc leaves most of the corner"
+        );
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "disc covers the notch");
+    }
+
+    /// A flipped matrix reverses the pen's winding; the join polygons must
+    /// follow or the nonzero union breaks.
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn joins_follow_a_flipped_matrix() {
+        let flipped = Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        let pix = corner(LineJoin::Miter, 10.0, flipped);
+        assert_eq!(alpha_at(&pix, 0, 11), 255, "miter corner");
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "bevel triangle");
+        assert_eq!(alpha_at(&pix, 2, 9), 255, "no hole where pieces overlap");
+        let pix = corner(LineJoin::Round, 10.0, flipped);
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "disc covers the notch");
+        assert_eq!(alpha_at(&pix, 2, 9), 255, "no hole under the disc");
+    }
+
+    /// A V of width 4 whose arms meet at (7, 12) at a miter ratio of
+    /// sqrt(5) ~ 2.236: the spike reaches y ~ 16.5 and covers the pixel
+    /// (7, 13), which a bevel leaves empty.
+    // Covers ISO 32000-1 §8.4.3.5.
+    #[test]
+    fn the_miter_limit_cuts_sharp_joins_to_bevels() {
+        let spike = |miter_limit: f32| {
+            let mut pix = Pixmap::new(14, 18);
+            let polys = stroke_path(
+                &[line(&[(2.0, 2.0), (7.0, 12.0), (12.0, 2.0)])],
+                StrokeStyle {
+                    miter_limit,
+                    ..solid(4.0)
+                },
+                Matrix::identity(),
+                &[],
+                0.0,
+            );
+            paint(&mut pix, &polys);
+            alpha_at(&pix, 7, 13)
+        };
+        assert_eq!(spike(10.0), 255, "within the default limit");
+        assert_eq!(spike(2.3), 255, "just within the limit");
+        assert_eq!(spike(2.0), 0, "over the limit: bevel");
     }
 
     // Covers ISO 32000-1 §8.5.3.2.

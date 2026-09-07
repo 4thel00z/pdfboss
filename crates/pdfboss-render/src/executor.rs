@@ -2678,10 +2678,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// Applies the named `/ExtGState` resource: `/SMask` (a mask group or
-    /// `/None`), `/BM`, `/ca /CA /LW /LC /LJ /D`. Other entries are
+    /// `/None`), `/BM`, `/ca /CA /LW /LC /LJ /ML /D`. Other entries are
     /// ignored.
     ///
-    /// Covers ISO 32000-1 §11.2, §11.6.3, §11.6.4.4, §11.6.5.2, §8.4.3.3, §8.4.3.4, §8.4.3.6 and §8.4.5.
+    /// Covers ISO 32000-1 §11.2, §11.6.3, §11.6.4.4, §11.6.5.2, §8.4.3.3, §8.4.3.4, §8.4.3.5, §8.4.3.6 and §8.4.5.
     async fn apply_ext_gstate_op(&mut self, name: &Name, frame: &mut Frame) {
         let Some(Object::Dict(dict)) = self.find_res(&frame.chain, "ExtGState", &name.0).await
         else {
@@ -2725,6 +2725,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
         if let Some(lj) = dict_f32(self.src, &dict, "LJ").await {
             gs.line_join = LineJoin::from_code(lj as i32);
+        }
+        if let Some(ml) = dict_f32(self.src, &dict, "ML").await {
+            if ml >= 1.0 {
+                gs.miter_limit = ml;
+            }
         }
         let d = match dict.get("D") {
             Some(o) => self.src.resolve(o).await.ok(),
@@ -4083,6 +4088,44 @@ mod tests {
         assert_eq!(px(&pix, 16, 50), WHITE);
         let pix = stroke("/G gs 4 w 20 50 m 80 50 l S");
         assert_eq!(px(&pix, 18, 48), BLACK, "/LC sets the cap");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4, §8.4.3.5 and §8.4.5.
+    #[test]
+    fn line_joins_follow_j_lj_m_and_ml() {
+        let stroke = |content: &str| {
+            render(
+                small_doc(
+                    "/ExtGState << /Bevel << /LJ 2 >> /Limit << /ML 2 >> >>",
+                    content.as_bytes(),
+                    |_| {},
+                ),
+                1.0,
+            )
+        };
+        // An L of width 4 turning at (20, 60): its outer corner, user
+        // space x 18..20 and y 60..62, is device pixel (18, 38).
+        let l = "4 w 20 20 m 20 60 l 60 60 l S";
+        let pix = stroke(&format!("0 j {l}"));
+        assert_eq!(px(&pix, 18, 38), BLACK, "miter fills the corner");
+        let pix = stroke(&format!("2 j {l}"));
+        assert!(px(&pix, 18, 38)[0] > 200, "bevel cuts the corner");
+        assert_eq!(px(&pix, 19, 39), BLACK, "bevel fills the notch");
+        let pix = stroke(&format!("1 j {l}"));
+        assert_ne!(px(&pix, 18, 38), BLACK, "round join leaves the corner");
+        let pix = stroke(&format!("/Bevel gs {l}"));
+        assert!(px(&pix, 18, 38)[0] > 200, "/LJ sets the join");
+        // A V of width 6 meeting at (40, 60) at a miter ratio of ~2.236:
+        // the spike covers device pixel (39, 37), a bevel does not.
+        let v = "6 w 20 20 m 40 60 l 60 20 l S";
+        let pix = stroke(v);
+        assert_eq!(px(&pix, 39, 37), BLACK, "default limit 10 keeps the spike");
+        let pix = stroke(&format!("2 M {v}"));
+        assert_eq!(px(&pix, 39, 37), WHITE, "M 2 cuts it to a bevel");
+        let pix = stroke(&format!("2.3 M {v}"));
+        assert_eq!(px(&pix, 39, 37), BLACK, "M 2.3 keeps it");
+        let pix = stroke(&format!("/Limit gs {v}"));
+        assert_eq!(px(&pix, 39, 37), WHITE, "/ML sets the limit");
     }
 
     // Covers ISO 32000-1 §8.5.3.2.

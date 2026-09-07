@@ -132,7 +132,7 @@ fn cases() -> Vec<Case> {
             ),
             scale: 1.0,
             tier: GlyphPainting::AllEmbedded,
-            digest: "80b2fc103a5bf135",
+            digest: "8e029d896696b6c5",
         },
         // Nested clips: the inner rect is clipped twice, so only the overlap paints.
         // Exercises Mask::intersected and the clip handle surviving a q/Q pair.
@@ -380,7 +380,7 @@ fn cases() -> Vec<Case> {
             .expect("committed fixture"),
             scale: 1.5,
             tier: GlyphPainting::AllEmbedded,
-            digest: "344d48f4371cbc9f",
+            digest: "35d8396cb3f40e47",
         },
     ]
 }
