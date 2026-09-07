@@ -540,8 +540,8 @@ impl Document {
     }
 
     /// The object that `key` names in the catalog's `tree` (ISO 32000-1
-    /// §7.7.4), resolved: a destination for [`NameTree::Dests`], a file
-    /// specification for [`NameTree::EmbeddedFiles`]. `None` when the
+    /// §7.7.4), resolved: a destination for `NameTree::Dests`, a file
+    /// specification for `NameTree::EmbeddedFiles`. `None` when the
     /// document has no such tree or the tree has no such name.
     pub fn named(&self, tree: crate::names::NameTree, key: &[u8]) -> Option<Object> {
         block_on(crate::names::named_with(
