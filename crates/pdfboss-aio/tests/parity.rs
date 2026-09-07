@@ -36,12 +36,15 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
     fixtures
 }
 
-/// A page with a catalog `/Names` dictionary: a two-leaf `/Dests` tree and
-/// a direct `/EmbeddedFiles` root, so both name accessors have something to
-/// agree on.
+/// A page with a catalog `/Names` dictionary (a two-leaf `/Dests` tree and
+/// a direct `/EmbeddedFiles` root) and a PDF 1.1 `/Dests` dictionary, so
+/// the name and destination accessors have something to agree on.
 fn names_doc() -> Vec<u8> {
     let mut b = PdfBuilder::new();
-    b.object(1, "<< /Type /Catalog /Pages 2 0 R /Names 5 0 R >>");
+    b.object(
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /Names 5 0 R /Dests << /Old [3 0 R /FitB] >> >>",
+    );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
     b.object(
@@ -134,6 +137,24 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                     "{name}: named {tree:?} {key:?}"
                 );
             }
+        }
+        assert_eq!(
+            doc.named_destinations().await,
+            sync_doc.named_destinations(),
+            "{name}: named destinations"
+        );
+        for key in [b"A".as_slice(), b"B", b"C", b"Old", b"missing"] {
+            assert_eq!(
+                doc.named_destination(key).await,
+                sync_doc.named_destination(key),
+                "{name}: named destination {key:?}"
+            );
+            let value = pdfboss_core::Object::String(key.to_vec());
+            assert_eq!(
+                doc.destination(&value).await,
+                sync_doc.destination(&value),
+                "{name}: destination {key:?}"
+            );
         }
         for num in 1..=10u32 {
             let r = ObjRef { num, gen: 0 };

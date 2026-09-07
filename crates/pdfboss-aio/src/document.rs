@@ -1436,6 +1436,24 @@ impl AsyncDocument {
         pdfboss_core::names_with(self, &self.inner.xref.trailer, tree).await
     }
 
+    /// The destination `name` designates (ISO 32000-1 §12.3.2.3): the async
+    /// twin of the sync document's `named_destination`.
+    pub async fn named_destination(&self, name: &[u8]) -> Option<pdfboss_core::Destination> {
+        pdfboss_core::named_destination_with(self, &self.inner.xref.trailer, name).await
+    }
+
+    /// Every named destination, sorted by name: the async twin of the sync
+    /// document's `named_destinations`.
+    pub async fn named_destinations(&self) -> Vec<(Vec<u8>, pdfboss_core::Destination)> {
+        pdfboss_core::named_destinations_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The destination a `/Dest` or `/D` value denotes: the async twin of
+    /// the sync document's `destination`.
+    pub async fn destination(&self, value: &Object) -> Option<pdfboss_core::Destination> {
+        pdfboss_core::destination_value_with(self, &self.inner.xref.trailer, value).await
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.

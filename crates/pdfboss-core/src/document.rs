@@ -562,6 +562,35 @@ impl Document {
         ))
     }
 
+    /// The destination `name` designates (ISO 32000-1 §12.3.2.3), from the
+    /// `/Names` `/Dests` tree or the catalog's `/Dests` dictionary.
+    pub fn named_destination(&self, name: &[u8]) -> Option<crate::destination::Destination> {
+        block_on(crate::destination::named_destination_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            name,
+        ))
+    }
+
+    /// Every named destination of the document, sorted by name.
+    pub fn named_destinations(&self) -> Vec<(Vec<u8>, crate::destination::Destination)> {
+        block_on(crate::destination::named_destinations_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The destination a `/Dest` or `/D` value denotes: an explicit array,
+    /// a name or string looked up among the named destinations, or a
+    /// dictionary whose `/D` holds one of those (ISO 32000-1 §12.3.2).
+    pub fn destination(&self, value: &Object) -> Option<crate::destination::Destination> {
+        block_on(crate::destination::destination_value_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            value,
+        ))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     ///
     /// Covers ISO 32000-1 §7.9.2.2.

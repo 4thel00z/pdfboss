@@ -31,7 +31,10 @@ pub use crypt::{
     crypt_filter_refs, direct_crypt_filters, Decryptor, Encryptor, Permissions, PERMISSION_NAMES,
 };
 pub use date::Date;
-pub use destination::{destination_with, Destination, DestinationPage, Fit};
+pub use destination::{
+    destination_value_with, destination_with, named_destination_with, named_destinations_with,
+    Destination, DestinationPage, Fit,
+};
 pub use document::{
     content_stream_data_with, decoded_stream_data_with, map_pages, page_content_with, Document,
     DocumentSeed, Metadata, Page,

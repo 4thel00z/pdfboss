@@ -1,8 +1,11 @@
-//! Explicit destinations (ISO 32000-1 §12.3.2.2): the page a link, outline
-//! item or action shows, and how that page is fitted in the window.
+//! Destinations (ISO 32000-1 §12.3.2): the page a link, outline item or
+//! action shows and how that page is fitted in the window, given
+//! explicitly as an array (§12.3.2.2) or by name (§12.3.2.3).
 
-use crate::object::{ObjRef, Object};
+use crate::names::{name_tree_root_with, NameTree};
+use crate::object::{Dict, ObjRef, Object};
 use crate::source::AsyncObjectSource;
+use crate::tree::{self, resolved_dict};
 
 /// The page a destination shows.
 ///
@@ -128,6 +131,102 @@ pub async fn destination_with<S: AsyncObjectSource>(
         direct.push(resolved);
     }
     Destination::parse(&direct)
+}
+
+/// The destination `name` designates (§12.3.2.3): looked up in the
+/// catalog's `/Names` `/Dests` tree first (PDF 1.2, string keys), then in
+/// the catalog's `/Dests` dictionary (PDF 1.1, name keys); either value
+/// may be a destination array or a dictionary whose `/D` holds one.
+///
+/// Covers ISO 32000-1 §12.3.2.3.
+pub async fn named_destination_with<S: AsyncObjectSource>(
+    src: &S,
+    trailer: &Dict,
+    name: &[u8],
+) -> Option<Destination> {
+    if let Some(root) = name_tree_root_with(src, trailer, NameTree::Dests).await {
+        if let Some(value) = tree::lookup(src, &root, &name.to_vec()).await {
+            if let Some(found) = destination_entry_with(src, &value).await {
+                return Some(found);
+            }
+        }
+    }
+    let dests = catalog_dests_with(src, trailer).await?;
+    let key = std::str::from_utf8(name).ok()?;
+    destination_entry_with(src, dests.get(key)?).await
+}
+
+/// The catalog's PDF 1.1 `/Dests` dictionary, when it has one.
+async fn catalog_dests_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> Option<Dict> {
+    let catalog = resolved_dict(src, trailer.get("Root")?).await?;
+    resolved_dict(src, catalog.get("Dests")?).await
+}
+
+/// One named destination's value: a destination array, or a dictionary
+/// whose `/D` holds one (§12.3.2.3, note 2).
+async fn destination_entry_with<S: AsyncObjectSource>(
+    src: &S,
+    value: &Object,
+) -> Option<Destination> {
+    match src.resolve(value).await.ok()? {
+        Object::Array(_) => destination_with(src, value).await,
+        Object::Dict(d) => destination_with(src, d.get("D")?).await,
+        _ => None,
+    }
+}
+
+/// Every named destination of the document, the `/Names` tree's and the
+/// catalog dictionary's together, sorted by name; a name present in both
+/// takes the tree's. Entries whose value is not a destination are left out.
+///
+/// Covers ISO 32000-1 §12.3.2.3.
+pub async fn named_destinations_with<S: AsyncObjectSource>(
+    src: &S,
+    trailer: &Dict,
+) -> Vec<(Vec<u8>, Destination)> {
+    let mut found: Vec<(Vec<u8>, Destination)> = Vec::new();
+    if let Some(root) = name_tree_root_with(src, trailer, NameTree::Dests).await {
+        for (name, value) in tree::entries::<Vec<u8>, S>(src, &root).await {
+            if let Some(destination) = destination_entry_with(src, &value).await {
+                found.push((name, destination));
+            }
+        }
+    }
+    if let Some(dests) = catalog_dests_with(src, trailer).await {
+        for (name, value) in dests.iter() {
+            let key = name.0.as_bytes().to_vec();
+            if found.iter().any(|(known, _)| *known == key) {
+                continue;
+            }
+            if let Some(destination) = destination_entry_with(src, value).await {
+                found.push((key, destination));
+            }
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+    found
+}
+
+/// The destination a `/Dest` or `/D` value denotes: an explicit array, a
+/// name or string looked up among the named destinations, or a dictionary
+/// whose `/D` holds one of those.
+///
+/// Covers ISO 32000-1 §12.3.2.2 and §12.3.2.3.
+pub async fn destination_value_with<S: AsyncObjectSource>(
+    src: &S,
+    trailer: &Dict,
+    value: &Object,
+) -> Option<Destination> {
+    let mut current = src.resolve(value).await.ok()?;
+    if let Object::Dict(d) = &current {
+        current = src.resolve(d.get("D")?).await.ok()?;
+    }
+    match current {
+        Object::Array(items) => destination_with(src, &Object::Array(items)).await,
+        Object::Name(name) => named_destination_with(src, trailer, name.0.as_bytes()).await,
+        Object::String(name) => named_destination_with(src, trailer, &name).await,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +442,99 @@ mod tests {
         );
         let string = Object::Ref(ObjRef { num: 13, gen: 0 });
         assert_eq!(block_on(destination_with(&Immediate(&doc), &string)), None);
+    }
+
+    /// A page whose catalog has both sources of named destinations: a
+    /// `/Names` `/Dests` tree (Chapter1 as an array, Chapter2 as a
+    /// dictionary with `/D`, Broken as a string) and a PDF 1.1 `/Dests`
+    /// dictionary (Intro as an array, Chapter1 again with a different fit,
+    /// Junk as a number).
+    fn named_doc() -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /Names << /Dests 10 0 R >> \
+             /Dests << /Intro [3 0 R /Fit] /Chapter1 [3 0 R /FitB] /Junk 7 >> >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.object(
+            10,
+            "<< /Names [(Broken) (nope) (Chapter1) [3 0 R /XYZ 0 700 null] (Chapter2) 11 0 R] >>",
+        );
+        b.object(11, "<< /D [3 0 R /FitH 500] /Extra true >>");
+        Document::load(b.build(1)).unwrap()
+    }
+
+    fn on_page(fit: Fit) -> Option<Destination> {
+        Some(Destination {
+            page: DestinationPage::Object(ObjRef { num: 3, gen: 0 }),
+            fit,
+        })
+    }
+
+    // Covers ISO 32000-1 §12.3.2.3.
+    #[test]
+    fn named_destinations_come_from_the_name_tree_and_the_catalog_dictionary() {
+        let doc = named_doc();
+        let xyz = Fit::Xyz {
+            left: Some(0.0),
+            top: Some(700.0),
+            zoom: None,
+        };
+        // The tree wins over the PDF 1.1 dictionary for a name in both.
+        assert_eq!(doc.named_destination(b"Chapter1"), on_page(xyz));
+        // A dictionary value contributes its /D.
+        assert_eq!(
+            doc.named_destination(b"Chapter2"),
+            on_page(Fit::FitH { top: Some(500.0) })
+        );
+        // A name only the catalog dictionary knows.
+        assert_eq!(doc.named_destination(b"Intro"), on_page(Fit::Fit));
+        assert_eq!(doc.named_destination(b"Broken"), None, "a string value");
+        assert_eq!(doc.named_destination(b"Junk"), None, "a number value");
+        assert_eq!(doc.named_destination(b"Chapter9"), None, "absent");
+        let all: Vec<(String, Fit)> = doc
+            .named_destinations()
+            .into_iter()
+            .map(|(name, d)| (String::from_utf8(name).unwrap(), d.fit))
+            .collect();
+        assert_eq!(
+            all,
+            [
+                ("Chapter1".to_string(), xyz),
+                ("Chapter2".to_string(), Fit::FitH { top: Some(500.0) }),
+                ("Intro".to_string(), Fit::Fit),
+            ]
+        );
+        // A document without either source has none.
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        let plain = Document::load(b.build(1)).unwrap();
+        assert_eq!(plain.named_destination(b"Intro"), None);
+        assert!(plain.named_destinations().is_empty());
+    }
+
+    // Covers ISO 32000-1 §12.3.2.2 and §12.3.2.3.
+    #[test]
+    fn destination_values_follow_arrays_names_strings_and_d_dictionaries() {
+        let doc = named_doc();
+        let array = Object::Array(vec![page(), name("FitV"), Object::Int(9)]);
+        assert_eq!(
+            doc.destination(&array),
+            on_page(Fit::FitV { left: Some(9.0) })
+        );
+        assert_eq!(doc.destination(&name("Intro")), on_page(Fit::Fit));
+        assert_eq!(
+            doc.destination(&Object::String(b"Chapter2".to_vec())),
+            on_page(Fit::FitH { top: Some(500.0) })
+        );
+        let mut d = crate::object::Dict::default();
+        d.insert(Name("D".into()), Object::String(b"Intro".to_vec()));
+        assert_eq!(doc.destination(&Object::Dict(d)), on_page(Fit::Fit));
+        assert_eq!(doc.destination(&Object::Dict(Default::default())), None);
+        assert_eq!(doc.destination(&name("Chapter9")), None);
+        assert_eq!(doc.destination(&Object::Int(3)), None);
     }
 }
