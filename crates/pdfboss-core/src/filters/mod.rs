@@ -1,7 +1,8 @@
 //! Stream filters (ISO 32000 §7.4): FlateDecode, LZWDecode, ASCIIHexDecode,
 //! ASCII85Decode, RunLengthDecode, CCITTFaxDecode, JBIG2Decode, plus PNG/TIFF
 //! predictors. `DCTDecode` and `JPXDecode` are passthrough (decoded at the
-//! image layer); `Crypt` and the rest are unsupported.
+//! image layer), `Crypt` is a no-op (the document's decryptor applied it
+//! when the object was loaded), and unknown names are unsupported.
 //!
 //! The two bilevel codecs, `CCITTFaxDecode` (§7.4.6) and `JBIG2Decode`
 //! (§7.4.7), are decoded here rather than at the image layer, because what
@@ -138,9 +139,12 @@ fn parms_at(parms: Option<&Object>, index: usize, resolver: &dyn Resolve) -> Opt
 /// is not among them — it consumes only the bytes it is handed, so it decodes
 /// at any position, and a chain that puts something after it fails in that
 /// later stage rather than being reported as an unsupported filter it is not.
-/// `Crypt` and unknown filters yield [`Error::UnsupportedFilter`].
+/// `Crypt` is a no-op: the document's decryptor already applied the crypt
+/// filter it names when the object was loaded, and in an unencrypted
+/// document it can only mean the pass-through `Identity` filter (ISO
+/// 32000-1 §7.4.10). Unknown filters yield [`Error::UnsupportedFilter`].
 ///
-/// Covers ISO 32000-1 §7.3.8.1 and §7.4.2.
+/// Covers ISO 32000-1 §7.3.8.1, §7.4.2 and §7.4.10.
 pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>> {
     let filter = resolve_value(stream.dict.get("Filter"), resolver);
     // Filters keep their original position so that `/DecodeParms` arrays
@@ -201,6 +205,8 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
             // ISO 32000-1 Table 94 defines none.)
             "DCTDecode" | "DCT" if pos == last => data,
             "JPXDecode" if pos == last => data,
+            // Decryption is done by the time a stream reaches a decoder.
+            "Crypt" => data,
             other => return Err(Error::UnsupportedFilter(other.to_string())),
         };
         // Defense in depth: the expanding decoders cap their own output,
@@ -758,13 +764,29 @@ mod tests {
         assert_eq!(decode_stream(&s, &resolver).unwrap(), raw);
     }
 
+    // Covers ISO 32000-1 §7.4.10: decryption happened when the object was
+    // loaded, so the Crypt filter has nothing left to do here.
     #[test]
-    fn crypt_filter_is_unsupported() {
+    fn crypt_filter_leaves_data_as_stored() {
         let s = make_stream(vec![("Filter", Object::Name(name("Crypt")))], b"x");
-        match decode_stream(&s, &NoResolve) {
-            Err(Error::UnsupportedFilter(n)) => assert_eq!(n, "Crypt"),
-            other => panic!("expected UnsupportedFilter, got {other:?}"),
-        }
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"x");
+    }
+
+    // Covers ISO 32000-1 §7.4.10: the Crypt filter comes first and the
+    // filters after it still run.
+    #[test]
+    fn crypt_filter_first_in_a_chain_is_a_no_op() {
+        let s = make_stream(
+            vec![(
+                "Filter",
+                Object::Array(vec![
+                    Object::Name(name("Crypt")),
+                    Object::Name(name("ASCIIHexDecode")),
+                ]),
+            )],
+            b"6869>",
+        );
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"hi");
     }
 
     #[test]

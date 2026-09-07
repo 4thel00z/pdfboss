@@ -62,6 +62,10 @@ pub struct Decryptor {
 /// Table 20 and Table 25); V1 and V2 files apply RC4 to everything.
 #[derive(Clone)]
 struct CryptFilters {
+    /// The `/CF` entries with a supported `/CFM`, by name, for streams that
+    /// pick one through their own `/Crypt` filter. `Identity` is never
+    /// listed: the standard filter always passes data through.
+    named: Vec<(String, Cipher)>,
     /// `/StmF`: the cipher for streams (Identity when absent).
     stream: Cipher,
     /// `/StrF`: the cipher for strings (Identity when absent).
@@ -74,6 +78,7 @@ impl CryptFilters {
     /// One cipher for strings, streams and embedded files alike.
     fn uniform(cipher: Cipher) -> CryptFilters {
         CryptFilters {
+            named: Vec::new(),
             stream: cipher,
             string: cipher,
             embedded_file: cipher,
@@ -89,10 +94,22 @@ impl CryptFilters {
     ///
     /// Covers ISO 32000-1 §7.6.5 and §7.6.3.2.
     fn parse(enc: &Dict) -> Option<CryptFilters> {
+        let named: Vec<(String, Cipher)> = enc
+            .get_dict("CF")
+            .into_iter()
+            .flat_map(Dict::iter)
+            .filter(|(name, _)| name.0 != "Identity")
+            .filter_map(|(name, filter)| Some((name.0.clone(), cipher_method(filter.as_dict()?)?)))
+            .collect();
+        let filters = CryptFilters {
+            named,
+            stream: Cipher::Identity,
+            string: Cipher::Identity,
+            embedded_file: Cipher::Identity,
+        };
         let pick = |key: &str, default: Cipher| match enc.get_name(key) {
             None => Some(default),
-            Some(n) if n.0 == "Identity" => Some(Cipher::Identity),
-            Some(n) => cipher_method(enc.get_dict("CF")?.get_dict(&n.0)?),
+            Some(n) => filters.named(&n.0),
         };
         let stream = pick("StmF", Cipher::Identity)?;
         let string = pick("StrF", Cipher::Identity)?;
@@ -101,8 +118,50 @@ impl CryptFilters {
             stream,
             string,
             embedded_file,
+            ..filters
         })
     }
+
+    /// The cipher of the crypt filter called `name`: the standard
+    /// `Identity`, or the `/CF` entry of that name if its method is
+    /// supported.
+    fn named(&self, name: &str) -> Option<Cipher> {
+        if name == "Identity" {
+            return Some(Cipher::Identity);
+        }
+        self.named
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, cipher)| *cipher)
+    }
+}
+
+/// The crypt filter a stream names for itself: a `/Crypt` entry first in
+/// its `/Filter` (ISO 32000-1 §7.4.10) selects the `/Name` of the matching
+/// `/DecodeParms` dictionary, `Identity` when that is absent. `None` when
+/// the stream has no `/Crypt` filter. Indirect `/Filter` or `/DecodeParms`
+/// values cannot be followed here (the decryptor has no resolver) and read
+/// as absent.
+///
+/// Covers ISO 32000-1 §7.4.10.
+fn stream_crypt_filter(dict: &Dict) -> Option<String> {
+    let first = match dict.get("Filter")? {
+        Object::Name(n) => n,
+        Object::Array(items) => items.first()?.as_name()?,
+        _ => return None,
+    };
+    if first.0 != "Crypt" {
+        return None;
+    }
+    let parms = match dict.get("DecodeParms") {
+        Some(Object::Dict(d)) => Some(d),
+        Some(Object::Array(items)) => items.first().and_then(Object::as_dict),
+        _ => None,
+    };
+    let name = parms
+        .and_then(|p| p.get_name("Name"))
+        .map_or("Identity", |n| n.0.as_str());
+    Some(name.to_string())
 }
 
 /// The cipher a crypt filter dictionary's `/CFM` selects; `None` for the
@@ -263,12 +322,15 @@ impl Decryptor {
     /// Recursively decrypts every string and stream body reachable from
     /// `obj`: strings under the string filter, stream data under the stream
     /// filter, or the embedded file filter for a `/Type /EmbeddedFile`
-    /// stream. When `encrypt_metadata` is false, a stream whose own
-    /// dictionary says `/Type /Metadata` was stored in plaintext (ISO
-    /// 32000-2 §7.6.4.2, Table 20) and its data is left alone; the
-    /// dictionary's own values still walk normally.
+    /// stream. A stream with a `/Crypt` filter of its own names the crypt
+    /// filter instead and is decrypted with the file key as is, Algorithm 1
+    /// not applied (ISO 32000-1 §7.4.10); a name that matches no `/CF`
+    /// entry leaves the data as stored. When `encrypt_metadata` is false,
+    /// a stream whose own dictionary says `/Type /Metadata` was stored in
+    /// plaintext (ISO 32000-2 §7.6.4.2, Table 20) and its data is left
+    /// alone; the dictionary's own values still walk normally.
     ///
-    /// Covers ISO 32000-1 §7.6.2 and §7.6.5.
+    /// Covers ISO 32000-1 §7.6.2, §7.6.5 and §7.4.10.
     fn decrypt_in_place(&self, obj: &mut Object, num: u32, gen: u16) {
         match obj {
             Object::String(bytes) => self.apply(self.filters.string, num, gen, bytes),
@@ -284,6 +346,15 @@ impl Decryptor {
                     .values_mut()
                     .for_each(|v| self.decrypt_in_place(v, num, gen));
                 if !self.encrypt_metadata && is_metadata_stream(&stream.dict) {
+                    return;
+                }
+                if let Some(name) = stream_crypt_filter(&stream.dict) {
+                    match self.filters.named(&name) {
+                        Some(Cipher::Identity) | None => {}
+                        Some(cipher) => {
+                            stream.data = decrypt_bytes(cipher, &self.key, &stream.data)
+                        }
+                    }
                     return;
                 }
                 let cipher = if is_embedded_file_stream(&stream.dict) {
@@ -2433,6 +2504,73 @@ mod tests {
         let doc = Document::load(data).expect("a 40-bit V4 file opens");
         assert_eq!(msg_of(&doc, 3), b"Top secret message");
         assert_eq!(body_of(&doc, 4), b"decrypted stream body");
+    }
+
+    // --- Per-stream /Crypt filters ---
+
+    // Covers ISO 32000-1 §7.4.10 and §7.6.5: a stream naming the Identity
+    // crypt filter is stored in the clear inside an encrypted document.
+    #[test]
+    fn a_stream_crypt_filter_naming_identity_is_left_as_stored() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {AESV2_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, key| {
+                b.stream(
+                    4,
+                    "/Filter /Crypt /DecodeParms << /Type /CryptFilterDecodeParms /Name /Identity >>",
+                    b"stored in the clear",
+                );
+                let stream =
+                    aes_encrypt_pdf(&obj_key_aes(key, 5, 0), b"decrypted stream body", &IV);
+                b.stream(5, "", &stream);
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"stored in the clear");
+        assert_eq!(body_of(&doc, 5), b"decrypted stream body");
+    }
+
+    // Covers ISO 32000-1 §7.4.10: without a /Name the Crypt filter means
+    // Identity, and the filters after it still run.
+    #[test]
+    fn a_stream_crypt_filter_without_a_name_means_identity() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {AESV2_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, _| {
+                b.stream(
+                    4,
+                    "/Filter [/Crypt /ASCIIHexDecode]",
+                    b"73746F72656420617320686578>",
+                );
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"stored as hex");
+    }
+
+    // Covers ISO 32000-1 §7.4.10 and §7.6.5: a stream naming one of the /CF
+    // filters is decrypted with that filter's method and the file key as
+    // is, without the per-object key of Algorithm 1.
+    #[test]
+    fn a_stream_crypt_filter_naming_a_cf_entry_uses_the_file_key_as_is() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {TWO_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, key| {
+                b.stream(
+                    4,
+                    "/Filter /Crypt /DecodeParms << /Name /RcCF >>",
+                    &rc4(key, b"under the file key"),
+                );
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
     }
 
     // --- AESV3 (V5/R5 and R6) end-to-end fixture ---

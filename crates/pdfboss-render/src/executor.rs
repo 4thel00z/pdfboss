@@ -4468,14 +4468,14 @@ mod tests {
         // The page's only content is `/Im0 Do`, where Im0 carries a filter
         // the core does not implement. The page must still render (lenient),
         // but the drop must be reported.
-        let (pix, report) = render_reporting(doc_with_image_filter("Crypt"));
+        let (pix, report) = render_reporting(doc_with_image_filter("NotAFilterDecode"));
 
         assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4483,7 +4483,7 @@ mod tests {
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
         assert_eq!(
             report.warnings(),
-            vec!["1 image skipped: unsupported filter /Crypt".to_string()],
+            vec!["1 image skipped: unsupported filter /NotAFilterDecode".to_string()],
         );
     }
 
@@ -4504,13 +4504,13 @@ mod tests {
     #[test]
     fn unsupported_inline_image_filter_is_reported() {
         let content = "q 100 0 0 100 0 0 cm BI /W 8 /H 8 /BPC 1 /CS /G \
-                       /F /Crypt ID 01234567 EI Q";
+                       /F /NotAFilterDecode ID 01234567 EI Q";
         let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4550,7 +4550,7 @@ mod tests {
             b.stream(
                 5,
                 "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /NotAFilterDecode",
                 &[0; 8],
             );
         });
@@ -4582,7 +4582,7 @@ mod tests {
         b.stream(
             5,
             "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
+             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /NotAFilterDecode",
             &[0; 8],
         );
         for level in 0..LEVELS {
@@ -4639,14 +4639,14 @@ mod tests {
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
         );
-        b.stream(4, "/Filter /Crypt", b"0 0 100 100 re f");
+        b.stream(4, "/Filter /NotAFilterDecode", b"0 0 100 100 re f");
         let (pix, report) = render_reporting(b.build(1));
         assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::PageContents,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4663,7 +4663,7 @@ mod tests {
         let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
             b.stream(
                 5,
-                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /Crypt",
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /NotAFilterDecode",
                 b"0 0 100 100 re f",
             );
         });
@@ -4673,7 +4673,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Form,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4871,7 +4871,7 @@ mod tests {
                      /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 255 6 0 R]",
                     &[0; 64],
                 );
-                b.stream(6, "/Filter /Crypt", &[0; 12]);
+                b.stream(6, "/Filter /NotAFilterDecode", &[0; 12]);
             },
         );
         let (_, report) = render_reporting(bytes);
@@ -4879,7 +4879,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
