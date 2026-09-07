@@ -21,7 +21,7 @@
 //! the complete `/Encrypt` dictionary and encrypts an object's strings and
 //! stream data in place, the exact inverse of [`Decryptor::decrypt_object`].
 
-use crate::object::{Dict, Name, Object};
+use crate::object::{Dict, Name, ObjRef, Object};
 
 /// Password padding string (ISO 32000 §7.6.3.3, Algorithm 2, step (a)).
 const PAD: [u8; 32] = [
@@ -162,6 +162,66 @@ fn stream_crypt_filter(dict: &Dict) -> Option<String> {
         .and_then(|p| p.get_name("Name"))
         .map_or("Identity", |n| n.0.as_str());
     Some(name.to_string())
+}
+
+/// The indirect references among an encryption dictionary's crypt filters:
+/// `/CF` itself when it is one, otherwise the entries of `/CF` that are.
+/// Only the strings of an encryption dictionary must be direct (ISO 32000-1
+/// §7.6.1), so a writer may store the crypt filters as separate objects; a
+/// caller fetches these and hands them to [`direct_crypt_filters`] before
+/// building a [`Decryptor`]. Call the pair twice when `/CF` is itself a
+/// reference, since its entries only become visible once it is fetched.
+///
+/// ```
+/// use pdfboss_core::{crypt_filter_refs, Dict, Name, ObjRef, Object};
+///
+/// let mut enc = Dict::new();
+/// enc.insert(Name("CF".into()), Object::Ref(ObjRef { num: 7, gen: 0 }));
+/// assert_eq!(crypt_filter_refs(&enc), vec![ObjRef { num: 7, gen: 0 }]);
+/// ```
+///
+/// Covers ISO 32000-1 §7.6.3.2.
+pub fn crypt_filter_refs(enc: &Dict) -> Vec<ObjRef> {
+    match enc.get("CF") {
+        Some(Object::Ref(r)) => vec![*r],
+        Some(Object::Dict(cf)) => cf.iter().filter_map(|(_, v)| v.as_ref()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `enc` with `/CF`, and each entry of it, replaced by `lookup`'s value
+/// when it is an indirect reference; a reference `lookup` cannot supply
+/// stays as it is, and the filter it names then counts as missing.
+///
+/// ```
+/// use pdfboss_core::{direct_crypt_filters, Dict, Name, ObjRef, Object};
+///
+/// let mut enc = Dict::new();
+/// enc.insert(Name("CF".into()), Object::Ref(ObjRef { num: 7, gen: 0 }));
+/// let direct = direct_crypt_filters(&enc, |_| Some(Object::Dict(Dict::new())));
+/// assert!(direct.get_dict("CF").is_some());
+/// ```
+///
+/// Covers ISO 32000-1 §7.6.3.2.
+pub fn direct_crypt_filters(enc: &Dict, mut lookup: impl FnMut(ObjRef) -> Option<Object>) -> Dict {
+    let mut out = enc.clone();
+    let cf = match out.get("CF") {
+        Some(Object::Ref(r)) => lookup(*r),
+        Some(Object::Dict(cf)) => Some(Object::Dict(cf.clone())),
+        _ => None,
+    };
+    let Some(Object::Dict(mut cf)) = cf else {
+        return out;
+    };
+    for value in cf.values_mut() {
+        if let Object::Ref(r) = *value {
+            if let Some(direct) = lookup(r) {
+                *value = direct;
+            }
+        }
+    }
+    out.insert(Name("CF".to_string()), Object::Dict(cf));
+    out
 }
 
 /// The cipher a crypt filter dictionary's `/CFM` selects; `None` for the
@@ -381,8 +441,9 @@ impl Decryptor {
     }
 
     /// Per-object key: `MD5(filekey ++ num[0..3] ++ gen[0..2] [++ "sAlT"])`
-    /// truncated to `min(n + 5, 16)` bytes (ISO 32000 §7.6.2, Algorithm 1). The
-    /// `sAlT` suffix is added for AES crypt filters.
+    /// truncated to `min(n + 5, 16)` bytes for RC4 (ISO 32000 §7.6.2,
+    /// Algorithm 1). AESV2 is AES-128, so it adds the `sAlT` suffix and
+    /// keeps the whole 16-byte digest whatever the file key's length.
     ///
     /// Covers ISO 32000-1 §7.6.2.
     fn object_key(&self, cipher: Cipher, num: u32, gen: u16) -> Vec<u8> {
@@ -394,7 +455,10 @@ impl Decryptor {
             input.extend_from_slice(b"sAlT");
         }
         let digest = md5(&input);
-        let n = (self.key.len() + 5).min(16);
+        let n = match cipher {
+            Cipher::Aesv2 => 16,
+            _ => (self.key.len() + 5).min(16),
+        };
         digest[..n].to_vec()
     }
 }
@@ -844,6 +908,11 @@ mod aes_hw {
 /// AES-CBC decryption of whole blocks (no IV prefix, no padding removal).
 /// Returns an empty vector when the input is not a positive multiple of 16.
 fn aes_cbc_decrypt_blocks(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
+    // Only AES-128 and AES-256 keys expand; anything else comes from a
+    // dictionary that lies about its method and yields nothing.
+    if !matches!(key.len(), 16 | 32) {
+        return Vec::new();
+    }
     if data.is_empty() || !data.len().is_multiple_of(16) || iv.len() < 16 {
         return Vec::new();
     }
@@ -1763,6 +1832,12 @@ fn encrypt_in_place(obj: &mut Object, key: &[u8], rng: &mut dyn FnMut(&mut [u8])
             for v in stream.dict.values_mut() {
                 encrypt_in_place(v, key, &mut *rng);
             }
+            // A stream that names the Identity crypt filter says its data
+            // is stored in the clear (ISO 32000-1 §7.4.10); keep it so, or
+            // no reader could get it back.
+            if stream_crypt_filter(&stream.dict).as_deref() == Some("Identity") {
+                return;
+            }
             stream.data = aes_cbc_encrypt(key, rng, &stream.data);
         }
         _ => {}
@@ -2506,6 +2581,34 @@ mod tests {
         assert_eq!(body_of(&doc, 4), b"decrypted stream body");
     }
 
+    // Covers ISO 32000-1 §7.6.2 and §7.6.5: AESV2 is AES-128, so its object
+    // key is the whole 16-byte MD5 digest whatever the file key's length,
+    // and a 40-bit file key must not reach the block cipher with 10 bytes.
+    #[test]
+    fn aesv2_always_derives_a_16_byte_object_key() {
+        use crate::Document;
+        let object_key = |key: &[u8], num: u32| {
+            let mut input = key.to_vec();
+            input.extend_from_slice(&num.to_le_bytes()[..3]);
+            input.extend_from_slice(&[0, 0]);
+            input.extend_from_slice(b"sAlT");
+            md5(&input).to_vec()
+        };
+        let data = v4_fixture(
+            5,
+            "/Length 40 /CF << /StdCF << /CFM /AESV2 /Length 5 >> >> /StmF /StdCF /StrF /StdCF",
+            |b, key| {
+                let msg = aes_encrypt_pdf(&object_key(key, 3), b"Top secret message", &IV);
+                b.object(3, &format!("<< /Msg {} >>", hexstr(&msg)));
+                let stream = aes_encrypt_pdf(&object_key(key, 4), b"decrypted stream body", &IV);
+                b.stream(4, "", &stream);
+            },
+        );
+        let doc = Document::load(data).expect("a 40-bit AESV2 file opens");
+        assert_eq!(msg_of(&doc, 3), b"Top secret message");
+        assert_eq!(body_of(&doc, 4), b"decrypted stream body");
+    }
+
     // --- Per-stream /Crypt filters ---
 
     // Covers ISO 32000-1 §7.4.10 and §7.6.5: a stream naming the Identity
@@ -2660,6 +2763,34 @@ mod tests {
             hexstr(&o),
             hexstr(&oe)
         )
+    }
+
+    // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: only the strings of an
+    // encryption dictionary must be direct, so /CF may be an indirect
+    // reference (pdf.js issue7665 is such a file) and still be read.
+    #[test]
+    fn an_indirect_cf_dictionary_is_followed() {
+        use crate::Document;
+        use pdfboss_testkit::PdfBuilder;
+        let key = aesv3_file_key();
+        let stream = aes_encrypt_pdf(&key, b"AES-256 stream body", &[0x22u8; 16]);
+        let mut b = PdfBuilder::new().version(1, 7);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        b.stream(4, "", &stream);
+        b.object(8, "<< /StdCF << /CFM /AESV3 /Length 32 >> >>");
+        b.object(
+            9,
+            &format!(
+                "<< /Filter /Standard /V 5 /R 6 /Length 256 /P {P} {} \
+                 /CF 8 0 R /StmF /StdCF /StrF /StdCF >>",
+                aesv3_password_entries(6, b"", b"", &key),
+            ),
+        );
+        let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
+        let doc = Document::load(b.trailer_extra(&trailer).build(1))
+            .expect("an indirect /CF still names the filters");
+        assert_eq!(body_of(&doc, 4), b"AES-256 stream body");
     }
 
     // Covers ISO 32000-1 §7.6.5 and §7.6.3.2: a V5 file picks its filters
@@ -3000,6 +3131,40 @@ mod tests {
         let mut roundtripped = obj;
         decryptor.decrypt_object(&mut roundtripped, 4, 0);
         assert_eq!(roundtripped, original);
+    }
+
+    // Covers ISO 32000-1 §7.4.10: a stream that names the Identity crypt
+    // filter stays in the clear when the document is encrypted, so the
+    // writer and the reader agree on what the dictionary says.
+    #[test]
+    fn encrypt_object_leaves_an_identity_crypt_stream_as_stored() {
+        use crate::object::Stream;
+
+        let (mut enc, dict) =
+            Encryptor::aes256_with_rng("", "owner-pw", Permissions::all(), counter_rng());
+        let mut stream_dict = Dict::new();
+        stream_dict.insert(
+            Name("Filter".to_string()),
+            Object::Name(Name("Crypt".to_string())),
+        );
+        let mut parms = Dict::new();
+        parms.insert(
+            Name("Name".to_string()),
+            Object::Name(Name("Identity".to_string())),
+        );
+        stream_dict.insert(Name("DecodeParms".to_string()), Object::Dict(parms));
+        let original = Object::Stream(Stream {
+            dict: stream_dict,
+            data: b"<?xpacket?> metadata in the clear".to_vec(),
+        });
+
+        let mut obj = original.clone();
+        enc.encrypt_object(&mut obj, 6, 0);
+        assert_eq!(obj, original, "an Identity stream is written as stored");
+
+        let decryptor = decryptor_for(&dict, b"");
+        decryptor.decrypt_object(&mut obj, 6, 0);
+        assert_eq!(obj, original, "and read back as stored");
     }
 
     #[test]
