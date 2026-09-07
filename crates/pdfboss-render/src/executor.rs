@@ -785,6 +785,22 @@ struct Frame {
     /// scoped, and it never crosses a content-stream boundary. A stray
     /// `EMC` pops nothing.
     marks: Vec<bool>,
+    /// Whether a `BT` is open: a clipping `Tr` inside the text object
+    /// starts text clipping just as a `BT` under one does.
+    in_text: bool,
+    /// Glyph outlines, in device space, accumulating for the clipping text
+    /// rendering modes (`Tr` 4 to 7): `Some` from the moment a clipping
+    /// mode is in force inside a text object until `ET` intersects the
+    /// clip with them.
+    text_clip: Option<Vec<Subpath>>,
+}
+
+/// A glyph outline ready to paint: the flattened subpaths under the
+/// device transform's linear part, shared from the font's cache, and the
+/// device translation that places this occurrence.
+struct PlacedOutline {
+    polys: Arc<Vec<Subpath>>,
+    at: (f32, f32),
 }
 
 /// What kind of content stream a [`Frame`] is running, and therefore what
@@ -850,6 +866,8 @@ impl Frame {
             kind,
             pattern_base,
             marks: Vec::new(),
+            in_text: false,
+            text_clip: None,
         }
     }
 
@@ -1055,13 +1073,34 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     Op::BeginText => {
                         frame.ts.tm = Matrix::identity();
                         frame.ts.tlm = Matrix::identity();
+                        frame.in_text = true;
+                        if matches!(frame.gs.text_render, 4..=7) {
+                            frame.text_clip.get_or_insert_with(Vec::new);
+                        }
+                    }
+                    // The outlines a clipping mode accumulated become one
+                    // nonzero path intersected with the clip, after the text
+                    // object's own painting; no outlines, no clip (ISO
+                    // 32000-1 §9.3.6).
+                    Op::EndText => {
+                        frame.in_text = false;
+                        if let Some(polys) = frame.text_clip.take() {
+                            if !polys.is_empty() {
+                                self.intersect_clip(&mut frame.gs, &polys, FillRule::NonZero);
+                            }
+                        }
                     }
                     Op::SetCharSpacing(v) if v.is_finite() => frame.gs.text.char_spacing = *v,
                     Op::SetWordSpacing(v) if v.is_finite() => frame.gs.text.word_spacing = *v,
                     Op::SetHorizScaling(v) if v.is_finite() => frame.gs.text.horiz = v / 100.0,
                     Op::SetLeading(v) if v.is_finite() => frame.gs.text.leading = *v,
                     Op::SetTextRise(v) if v.is_finite() => frame.gs.text.rise = *v,
-                    Op::SetTextRender(mode) => frame.gs.text_render = *mode,
+                    Op::SetTextRender(mode) => {
+                        frame.gs.text_render = *mode;
+                        if frame.in_text && matches!(*mode, 4..=7) {
+                            frame.text_clip.get_or_insert_with(Vec::new);
+                        }
+                    }
                     Op::SetFont(name, size) => {
                         frame.gs.text.size = if size.is_finite() { *size } else { 0.0 };
                         frame.gs.text.font = self
@@ -1355,8 +1394,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         let Some(rule) = frame.pending_clip.take() else {
             return;
         };
+        self.intersect_clip(&mut frame.gs, polys, rule);
+    }
+
+    /// Narrows the graphics state's clip to its intersection with `polys`
+    /// under `rule`: what a path's `W`/`W*` and a text object's clipping
+    /// rendering modes both do.
+    ///
+    /// Covers ISO 32000-1 §8.5.4 and §9.3.6.
+    fn intersect_clip(&mut self, gs: &mut GState, polys: &[Subpath], rule: FillRule) {
         let rasterized = self.rasterize_clip(polys, rule);
-        let gs = &mut frame.gs;
         gs.clip = Some(match &gs.clip {
             Some(old) => Arc::new(Mask::intersected(&rasterized, old)),
             None => rasterized,
@@ -2004,39 +2051,33 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         }
     }
 
-    /// Paints `code` from the font's per-glyph fallback face (see
-    /// [`GlyphFallback`]), building the face on first use. `true` means the
-    /// code is handled — painted, or mapped to a genuinely empty outline —
-    /// so no `NoGlyph` report applies; `false` leaves the caller's report to
-    /// fire exactly as without a fallback (none planned, no provider face,
-    /// the fallback misses too, or a non-finite transform).
+    /// The outline of `code` from the font's per-glyph fallback face (see
+    /// [`GlyphFallback`]), building the face on first use, with its device
+    /// translation. `Some` means the code is handled — an outline to paint,
+    /// or a genuinely empty one — so no `NoGlyph` report applies; `None`
+    /// leaves the caller's report to fire exactly as without a fallback
+    /// (none planned, no provider face, the fallback misses too, or a
+    /// non-finite transform).
     ///
     /// `params` is the text-space parameter matrix `show_text` built for
     /// this glyph; the device transform is recomposed here from the FALLBACK
     /// face's own units-per-em, which need not match the primary font's. The
     /// advance is untouched: it stays the primary font's (`/Widths` is keyed
     /// per code, not per face).
-    fn paint_fallback(
+    fn fallback_outline(
         &mut self,
         fallback: Option<&GlyphFallback>,
         code: u32,
         params: Matrix,
         tm: Matrix,
         gs: &GState,
-        fill: [u8; 4],
-    ) -> bool {
-        let Some(fallback) = fallback else {
-            return false;
-        };
-        let Some(provider) = self.provider.as_deref() else {
-            return false;
-        };
-        let Some(font) = fallback.font(provider) else {
-            return false;
-        };
+    ) -> Option<PlacedOutline> {
+        let fallback = fallback?;
+        let provider = self.provider.as_deref()?;
+        let font = fallback.font(provider)?;
         let gid = font.gid(code);
         if gid == 0 {
-            return false;
+            return None;
         }
         let upm = font.units_per_em();
         let to_device = Matrix::scale(1.0 / upm, 1.0 / upm)
@@ -2044,7 +2085,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .concat(tm)
             .concat(gs.ctm);
         if !finite_matrix(&to_device) {
-            return false;
+            return None;
         }
         let linear = Matrix {
             a: to_device.a,
@@ -2054,15 +2095,16 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             e: 0.0,
             f: 0.0,
         };
-        let polys = font.flattened(gid, linear);
-        if !polys.is_empty() {
-            self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
-        }
-        true
+        Some(PlacedOutline {
+            polys: font.flattened(gid, linear),
+            at: (to_device.e, to_device.f),
+        })
     }
 
-    /// Paints one show-string's glyphs and advances the text matrix. Codes with
-    /// no drawable glyph still advance, so surrounding text stays positioned.
+    /// Paints one show-string's glyphs as the text rendering mode asks
+    /// (filled, stroked, both, neither, and accumulated for the text clip)
+    /// and advances the text matrix. Codes with no drawable glyph still
+    /// advance, so surrounding text stays positioned.
     ///
     /// Synchronous on purpose: an outline font is already loaded, so no I/O
     /// enters the per-glyph loop; and a Type3 string only *plans* here — its
@@ -2071,24 +2113,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     ///
     /// Covers ISO 32000-1 §9.2.3, §9.2.4, §9.3.6 and §9.4.4.
     fn show_text(&mut self, frame: &mut Frame, bytes: &[u8]) {
-        // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6), and a hidden
-        // optional-content span shows nothing either (§8.11); the advances
-        // below still happen, so a visible run that follows stays placed.
+        // A hidden optional-content span shows nothing (§8.11); the
+        // advances below still happen, so a visible run that follows stays
+        // placed.
         let suppressed = frame.suppressed();
-        let visible = !matches!(frame.gs.text_render, 3 | 7) && !suppressed;
-        // Modes 4-7 also ask the glyph outlines to join the clipping path,
-        // which this renderer does not do: whatever the author clipped to
-        // the text paints unclipped, and that approximation is reported.
-        // Not from a hidden span: its text was configured away, so nothing
-        // the report owes the caller was lost.
-        if matches!(frame.gs.text_render, 4..=7) && !bytes.is_empty() && !suppressed {
-            self.skip(SkippedKind::TextClip, SkipReason::Unsupported);
-        }
+        let mode = frame.gs.text_render;
         if let Some(t3) = frame.gs.text.type3.clone() {
-            // The depth guard bounds a self-referential glyph: each CharProc
+            // Only mode 3 has any effect on a Type3 font (§9.3.6). The
+            // depth guard bounds a self-referential glyph: each CharProc
             // frame is pushed at `depth + 1`, so painting stops at
             // `MAX_FORM_DEPTH` while the advances still happen.
-            let paint = visible && frame.depth < MAX_FORM_DEPTH;
+            let paint = mode != 3 && !suppressed && frame.depth < MAX_FORM_DEPTH;
             let planned = type3_glyph_plan(
                 &frame.gs.text,
                 &mut frame.ts,
@@ -2101,10 +2136,17 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             frame.pending_t3 = Some(t3);
             return;
         }
+        // Table 106: what the mode asks of each outline. Outlines join the
+        // text clip whether or not the span is hidden, because the clip is
+        // graphics state, not a mark on the page.
+        let fills = matches!(mode, 0 | 2 | 4 | 6) && !suppressed;
+        let strokes = matches!(mode, 1 | 2 | 5 | 6) && !suppressed;
+        let mut clip = frame.text_clip.take();
         let gs = &frame.gs;
         let text = &gs.text;
         let ts = &mut frame.ts;
         let Some((font, label, fallback)) = text.font.clone() else {
+            frame.text_clip = clip;
             return;
         };
         let upm = font.units_per_em();
@@ -2145,11 +2187,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 .concat(params)
                 .concat(ts.tm)
                 .concat(gs.ctm);
-            if !font.paints() || !visible {
-                // A metrics-only font or an invisible rendering mode: the
-                // advance below is the whole point, and nothing was going to
-                // paint, so neither the paint attempt nor the no-glyph
-                // report applies.
+            if !font.paints() || !(fills || strokes || clip.is_some()) {
+                // A metrics-only font, or a mode that neither paints nor
+                // clips: the advance below is the whole point, and nothing
+                // was going to paint, so neither the paint attempt nor the
+                // no-glyph report applies.
             } else if gid != 0 && finite_matrix(&to_device) {
                 // Flatten under the linear part only (memoized per glyph +
                 // linear map); the per-glyph translation is applied when the
@@ -2165,26 +2207,32 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 };
                 let polys = font.flattened(gid, linear);
                 if !polys.is_empty() {
-                    self.blit_glyph(&polys, to_device.e, to_device.f, fill, gs);
+                    let at = (to_device.e, to_device.f);
+                    self.paint_glyph(&polys, at, gs, (fills, strokes), fill, &mut clip);
                 }
             } else if gid == 0 && !(n == 1 && code == 32) {
                 // A loaded font with no glyph for this code: at `Full` with
                 // a provider, a per-glyph substitute face gets the code
-                // first (`paint_fallback`); only an unhandled miss is
+                // first (`fallback_outline`); only an unhandled miss is
                 // reported, so a lossy render is never mistaken for a clean
                 // one. The advance below still happens either way, so
                 // surrounding text stays positioned. The single-byte space
                 // is exempt because a space paints nothing whether or not
                 // the font maps it; a two-byte 0x20 is a real CID, not a
                 // space.
-                if !self.paint_fallback(fallback.as_deref(), code, params, ts.tm, gs, fill) {
-                    self.skip(
+                match self.fallback_outline(fallback.as_deref(), code, params, ts.tm, gs) {
+                    Some(PlacedOutline { polys, at }) => {
+                        if !polys.is_empty() {
+                            self.paint_glyph(&polys, at, gs, (fills, strokes), fill, &mut clip);
+                        }
+                    }
+                    None => self.skip(
                         SkippedKind::Glyph,
                         SkipReason::NoGlyph {
                             code,
                             font: label.to_string(),
                         },
-                    );
+                    ),
                 }
             }
 
@@ -2209,6 +2257,51 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             if tx.is_finite() && ty.is_finite() {
                 ts.tm = Matrix::translate(tx, ty).concat(ts.tm);
             }
+        }
+        frame.text_clip = clip;
+    }
+
+    /// Paints one glyph outline, `polys` in device space translated by
+    /// `at`, the way the text rendering mode asks: filled in the fill
+    /// colour, stroked in the stroke colour with the graphics state's line
+    /// parameters (user-space quantities, so the pen follows the CTM and
+    /// not the text size), and copied into the text clip accumulating for
+    /// the clipping modes. Each glyph is filled then stroked on its own, so
+    /// overlapping glyphs stack.
+    ///
+    /// Covers ISO 32000-1 §9.3.6.
+    fn paint_glyph(
+        &mut self,
+        polys: &Arc<Vec<Subpath>>,
+        at: (f32, f32),
+        gs: &GState,
+        (fills, strokes): (bool, bool),
+        fill: [u8; 4],
+        clip: &mut Option<Vec<Subpath>>,
+    ) {
+        if fills {
+            self.blit_glyph(polys, at.0, at.1, fill, gs);
+        }
+        if !strokes && clip.is_none() {
+            return;
+        }
+        self.translate_into_blit_scratch(polys, at.0, at.1);
+        let placed = &self.glyph_blit[..polys.len()];
+        if strokes {
+            let quads = stroke_path(placed, gs.stroke_style(), gs.ctm, &gs.dash, gs.dash_phase);
+            fill_path(
+                &mut self.pix,
+                &mut self.raster,
+                &quads,
+                FillRule::NonZero,
+                gs.stroke_rgba8(),
+                gs.stroke_alpha,
+                effective_mask(gs).as_deref(),
+                gs.blend_mode,
+            );
+        }
+        if let Some(outlines) = clip {
+            outlines.extend(placed.iter().cloned());
         }
     }
 
@@ -3586,13 +3679,13 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), BLACK, "visible glyph after the advance");
     }
 
-    /// The clipping half of modes 4-7 is not implemented — the glyph
-    /// outlines never join the clipping path, so content the author clipped
-    /// to text paints unclipped — and an approximation is never silent:
-    /// showing text in those modes must land in the report. Mode 0 must not.
+    /// "Only a value of 3 for text rendering mode shall have any effect on
+    /// text displayed in a Type 3 font" (ISO 32000-1 §9.3.6): a Type3 glyph
+    /// shown in mode 7 paints as its CharProc says and clips nothing, and
+    /// nothing is reported.
     // Covers ISO 32000-1 §9.2.3 and §9.3.6.
     #[test]
-    fn text_clip_modes_are_reported() {
+    fn type3_text_ignores_every_mode_but_invisible() {
         let font = |b: &mut PdfBuilder| {
             b.object(
                 5,
@@ -3605,22 +3698,97 @@ mod tests {
         };
         let clipping = small_doc(
             "/Font << /T3 5 0 R >>",
-            b"BT /T3 100 Tf 7 Tr 0 20 Td <41> Tj ET",
+            b"BT /T3 100 Tf 7 Tr 0 20 Td <41> Tj ET 1 0 0 rg 60 60 30 30 re f",
             font,
         );
         let (pix, report) = render_reporting(clipping);
-        assert_eq!(
-            drops(&report),
-            vec![(SkippedKind::TextClip, SkipReason::Unsupported, 1)],
-        );
-        assert_eq!(px(&pix, 25, 50), WHITE, "mode 7 shows nothing");
-        let plain = small_doc(
+        assert_eq!(drops(&report), vec![], "mode 7 reports nothing");
+        assert_eq!(px(&pix, 25, 50), BLACK, "mode 7 paints a Type3 glyph");
+        assert_eq!(px(&pix, 75, 25), RED, "mode 7 clips nothing for Type3");
+        let invisible = small_doc(
             "/Font << /T3 5 0 R >>",
-            b"BT /T3 100 Tf 0 20 Td <41> Tj ET",
+            b"BT /T3 100 Tf 3 Tr 0 20 Td <41> Tj ET",
             font,
         );
-        let (_, report) = render_reporting(plain);
-        assert_eq!(drops(&report), vec![], "mode 0 reports nothing");
+        let (pix, _) = render_reporting(invisible);
+        assert_eq!(px(&pix, 25, 50), WHITE, "mode 3 hides a Type3 glyph");
+    }
+
+    /// The fixture glyph is the rectangle x 100..600, y 0..700 of a
+    /// 1000-unit em; at `100 Tf` from `20 50 Td` on the 200-unit page it
+    /// covers user x 30..80, y 50..120, so its interior is device (55, 115),
+    /// its left edge device column 30 and its top edge device row 80.
+    // Covers ISO 32000-1 §9.3.6.
+    #[test]
+    fn stroke_render_modes_paint_the_outline_in_the_stroke_colour() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let show = |mode: &str| {
+            let content =
+                format!("1 0 0 RG 0 0 1 rg 4 w BT /F0 100 Tf {mode} Tr 20 50 Td <41> Tj ET");
+            render(doc_with_incomplete_truetype_font(content.as_bytes()), 1.0)
+        };
+        let pix = show("1");
+        assert_eq!(px(&pix, 55, 115), WHITE, "mode 1 leaves the interior");
+        assert_eq!(px(&pix, 30, 115), RED, "mode 1 strokes the left edge");
+        assert_eq!(px(&pix, 55, 80), RED, "mode 1 strokes the top edge");
+        assert_eq!(px(&pix, 26, 115), WHITE, "the 4-unit band ends 2 units out");
+        let pix = show("2");
+        assert_eq!(px(&pix, 55, 115), BLUE, "mode 2 fills the interior");
+        assert_eq!(px(&pix, 30, 115), RED, "mode 2 strokes over the fill");
+        let pix = show("0");
+        assert_eq!(px(&pix, 55, 115), BLUE, "mode 0 fills");
+        assert_eq!(px(&pix, 30, 115), BLUE, "mode 0 does not stroke");
+        assert_eq!(px(&pix, 28, 115), WHITE);
+    }
+
+    /// Modes 4 to 7 add the glyph outlines to the clipping path when the text
+    /// object ends; the clip stays until `Q`, and no glyph means no clip.
+    // Covers ISO 32000-1 §9.2.3 and §9.3.6.
+    #[test]
+    fn clip_render_modes_intersect_the_clip_when_the_text_object_ends() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let page =
+            |content: &str| render_reporting(doc_with_incomplete_truetype_font(content.as_bytes()));
+        let (pix, report) = page("BT /F0 100 Tf 7 Tr 20 50 Td <41> Tj ET 0 0 200 200 re f");
+        assert_eq!(drops(&report), vec![], "mode 7 is no approximation");
+        assert_eq!(px(&pix, 55, 115), BLACK, "inside the glyph");
+        assert_eq!(px(&pix, 10, 10), WHITE, "outside the glyph");
+        assert_eq!(px(&pix, 100, 115), WHITE, "beside the glyph");
+        // Mode 4 fills the glyph, then the clip narrows what follows.
+        let (pix, _) =
+            page("1 0 0 rg BT /F0 100 Tf 4 Tr 20 50 Td <41> Tj ET 0 0 1 rg 0 0 200 200 re f");
+        assert_eq!(px(&pix, 55, 115), BLUE);
+        assert_eq!(px(&pix, 10, 10), WHITE);
+        // Mode 5 strokes the glyph in the stroke colour, then clips: the
+        // outer half of the stroke band stays, the inner half is painted
+        // over by the fill the clip lets through.
+        let (pix, _) =
+            page("1 0 0 RG 4 w BT /F0 100 Tf 5 Tr 20 50 Td <41> Tj ET 0 0 1 rg 0 0 200 200 re f");
+        assert_eq!(px(&pix, 28, 115), RED, "mode 5 strokes");
+        assert_eq!(
+            px(&pix, 55, 95),
+            BLUE,
+            "the later fill paints inside the glyph"
+        );
+        assert_eq!(px(&pix, 150, 50), WHITE, "and nowhere else");
+        // The clip is graphics state: Q restores the page.
+        let (pix, _) = page("q BT /F0 100 Tf 7 Tr 20 50 Td <41> Tj ET Q 0 0 200 200 re f");
+        assert_eq!(px(&pix, 10, 10), BLACK, "Q restored the clip");
+        // No glyph outlines, no clip: an empty text object and a space.
+        let (pix, _) = page("BT /F0 100 Tf 7 Tr ET 0 0 200 200 re f");
+        assert_eq!(px(&pix, 10, 10), BLACK, "empty text object");
+        let (pix, _) = page("BT /F0 100 Tf 7 Tr 20 50 Td <20> Tj ET 0 0 200 200 re f");
+        assert_eq!(px(&pix, 10, 10), BLACK, "a space has no outline");
+        // A clipping mode set inside the text object accumulates from there,
+        // and the clip applies only after the object's own painting.
+        let (pix, _) = page("BT /F0 100 Tf 20 50 Td 0 Tr <41> Tj 7 Tr <41> Tj ET 0 0 200 200 re f");
+        assert_eq!(
+            px(&pix, 55, 115),
+            BLACK,
+            "the first glyph was filled before the clip"
+        );
+        assert_eq!(px(&pix, 105, 115), BLACK, "the second glyph is the clip");
+        assert_eq!(px(&pix, 10, 10), WHITE);
     }
 
     /// The rendering mode is graphics state (ISO 32000-1 §9.3.1, Table 104),
