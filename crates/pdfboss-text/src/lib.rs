@@ -852,6 +852,78 @@ mod tests {
     /// The source-generic entry points take the optional-content state a
     /// document-owning caller can read (`Document::oc_state`, or the async
     /// document's `oc_state()`), so a hidden layer is excluded over any
+    /// One page whose content stream is `content`, with Helvetica as `/F1`
+    /// and `properties` as the page's `/Properties` resource dictionary.
+    fn marked_doc(content: &[u8], properties: &str) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> /Properties << {properties} >> >> \
+                 /Contents 4 0 R >>"
+            ),
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        Document::load(b.build(1)).unwrap()
+    }
+
+    /// The clause's own example: a hyphenated German word whose shown
+    /// `k-` stands for a `c`, so the extracted text reads Drucker. The
+    /// replacement span keeps the geometry of the glyphs it stands for.
+    // Covers ISO 32000-1 §14.9.4.
+    #[test]
+    fn actual_text_replaces_the_shown_glyphs() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td (Dru) Tj /Span << /ActualText (c) >> BDC (k-) Tj EMC (ker) Tj ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["Dru", "c", "ker"]);
+        assert!(
+            spans[1].end_x > spans[1].x + 8.0,
+            "the c keeps the advance of k-: {:?}",
+            spans[1]
+        );
+    }
+
+    /// Every string shown inside the sequence is one replacement: the
+    /// first show carries the text, later shows only widen it. An empty
+    /// replacement removes the sequence's text. A named property list and
+    /// a UTF-16 value read like inline ones.
+    // Covers ISO 32000-1 §14.9.4.
+    #[test]
+    fn actual_text_covers_the_whole_sequence_and_may_be_empty() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /ActualText (fi) >> BDC (f) Tj (i) Tj EMC \
+              /Span << /ActualText () >> BDC (gone) Tj EMC \
+              /Span /Eacute BDC (e) Tj EMC (nd) Tj ET",
+            "/Eacute << /ActualText <FEFF00E9> >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["fi", "\u{E9}", "nd"]);
+        // The ligature span spans both shown glyphs; the dropped word still
+        // advanced the text matrix, so the next span starts past it.
+        let f_width = 12.0 * 0.278;
+        assert!(
+            spans[0].end_x - spans[0].x > f_width * 1.5,
+            "{:?}",
+            spans[0]
+        );
+        assert!(spans[1].x > spans[0].end_x + 12.0, "{:?}", spans[1]);
+    }
+
     /// source exactly as the document-level entries exclude it; `None`
     /// still extracts every layer.
     // Covers ISO 32000-1 §7.7.2.

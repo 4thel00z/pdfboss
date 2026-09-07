@@ -688,12 +688,23 @@ struct Frame {
 }
 
 /// One open marked-content sequence: whether a `BDC /OC` span the
-/// optional-content configuration hides, and its `/MCID` when the walk is
-/// tracking marked content for the structure tree.
-#[derive(Clone, Copy)]
+/// optional-content configuration hides, its `/MCID` when the walk is
+/// tracking marked content for the structure tree, and the replacement
+/// text its property list gives.
 struct Mark {
     hidden: bool,
     mcid: Option<u32>,
+    actual: Option<ActualText>,
+}
+
+/// A sequence's `/ActualText` (ISO 32000-1 §14.9.4): the text that stands
+/// for every string shown inside it, and the index of the span that
+/// carries it once the first string has been shown.
+///
+/// Covers ISO 32000-1 §14.9.4.
+struct ActualText {
+    text: String,
+    emitted: Option<usize>,
 }
 
 impl Frame {
@@ -1082,7 +1093,18 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                         } else {
                             None
                         };
-                        frame.marks.push(Mark { hidden, mcid });
+                        let actual =
+                            self.marked_actual_text(props, &frame.chain)
+                                .await
+                                .map(|text| ActualText {
+                                    text,
+                                    emitted: None,
+                                });
+                        frame.marks.push(Mark {
+                            hidden,
+                            mcid,
+                            actual,
+                        });
                     }
                     op => self.step(&mut frame, op),
                 }
@@ -1227,6 +1249,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             Op::BeginMarkedContent(_) => frame.marks.push(Mark {
                 hidden: false,
                 mcid: None,
+                actual: None,
             }),
             Op::EndMarkedContent => {
                 frame.marks.pop();
@@ -1310,14 +1333,66 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// Shows one string, appending the span it produces (if any) to the
     /// page. Inside a hidden optional-content span the advance still runs —
     /// `show` moves the text matrix either way — but the text is excluded.
+    /// Inside a sequence with `/ActualText`, the first string shown becomes
+    /// a span carrying the replacement text and every later string only
+    /// widens that span (ISO 32000-1 §14.9.4); an empty replacement leaves
+    /// the sequence without text.
+    ///
+    /// Covers ISO 32000-1 §14.9.4.
     fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
         let suppressed = frame.suppressed();
-        if let Some(span) = self.show(&frame.gs, &mut frame.tm, bytes) {
-            if !suppressed {
+        let Some(mut span) = self.show(&frame.gs, &mut frame.tm, bytes) else {
+            return;
+        };
+        if suppressed {
+            return;
+        }
+        let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
+            self.spans.push(span);
+            self.marks.record(frame);
+            return;
+        };
+        match actual.emitted {
+            None => {
+                actual.emitted = Some(self.spans.len());
+                if actual.text.is_empty() {
+                    return;
+                }
+                span.text.clone_from(&actual.text);
                 self.spans.push(span);
                 self.marks.record(frame);
             }
+            Some(index) => {
+                if let Some(carrier) = self.spans.get_mut(index) {
+                    if carrier.text == actual.text {
+                        carrier.end_x = span.end_x;
+                        carrier.bbox = carrier.bbox.union(span.bbox);
+                    }
+                }
+            }
         }
+    }
+
+    /// The `/ActualText` a `BDC` attaches to its sequence, decoded as a text
+    /// string: from an inline property dictionary, or from the named one in
+    /// the resource chain's `/Properties`. Any tag is accepted, not only
+    /// `/Span`, since files put it on paragraph tags too.
+    ///
+    /// Covers ISO 32000-1 §14.9.4.
+    async fn marked_actual_text(&mut self, props: &Object, chain: &[Arc<Dict>]) -> Option<String> {
+        let named;
+        let dict = match props {
+            Object::Dict(dict) => dict,
+            Object::Name(name) => {
+                named = self.find_res(chain, "Properties", &name.0).await?;
+                named.as_dict()?
+            }
+            _ => return None,
+        };
+        let value = self.src.resolve(dict.get("ActualText")?).await.ok()?;
+        Some(pdfboss_core::object::decode_text_string(
+            value.as_str_bytes()?,
+        ))
     }
 
     /// Shows one string: decodes each code, advances the text matrix by
