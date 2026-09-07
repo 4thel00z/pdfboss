@@ -223,22 +223,31 @@ impl GState {
     }
 
     /// The fill color as RGBA8 (patterns paint mid-gray, documented v0.1
-    /// approximation).
+    /// approximation). A `/Separation /None` fill is fully transparent:
+    /// painting in that space never marks the page (ISO 32000-1 §8.6.6.4),
+    /// and the rasterizer drops a zero-alpha colour before touching a pixel.
+    ///
+    /// Covers ISO 32000-1 §8.6.6.4.
     fn fill_rgba8(&self) -> [u8; 4] {
-        rgba8(if self.fill_pattern {
+        let rgb = if self.fill_pattern {
             [0.5; 3]
         } else {
             self.fill_rgb
-        })
+        };
+        marking_rgba8(rgb, &self.fill_space)
     }
 
-    /// The stroke color as RGBA8.
+    /// The stroke color as RGBA8, transparent for `/Separation /None` like
+    /// [`GState::fill_rgba8`].
+    ///
+    /// Covers ISO 32000-1 §8.6.6.4.
     fn stroke_rgba8(&self) -> [u8; 4] {
-        rgba8(if self.stroke_pattern {
+        let rgb = if self.stroke_pattern {
             [0.5; 3]
         } else {
             self.stroke_rgb
-        })
+        };
+        marking_rgba8(rgb, &self.stroke_space)
     }
 }
 
@@ -390,6 +399,17 @@ fn effective_mask(gs: &GState) -> Option<Arc<Mask>> {
 fn rgba8(rgb: [f32; 3]) -> [u8; 4] {
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     [q(rgb[0]), q(rgb[1]), q(rgb[2]), 255]
+}
+
+/// [`rgba8`] with the alpha a colour in `space` marks the page with: zero
+/// for `/Separation /None`, whose painting operations have no effect
+/// (ISO 32000-1 §8.6.6.4), opaque otherwise.
+fn marking_rgba8(rgb: [f32; 3], space: &ColorSpace) -> [u8; 4] {
+    let mut rgba = rgba8(rgb);
+    if matches!(space, ColorSpace::SeparationNone) {
+        rgba[3] = 0;
+    }
+    rgba
 }
 
 /// True when every value is finite (NaN/Inf operands skip the op).
@@ -2499,7 +2519,10 @@ fn type3_glyph_plan(
 fn initial_color(cs: &ColorSpace) -> [f32; 3] {
     match cs {
         ColorSpace::DeviceCMYK => cs.to_rgb(&[0.0, 0.0, 0.0, 1.0]),
-        ColorSpace::Separation { .. } | ColorSpace::Other(_) => cs.to_rgb(&[1.0; 8]),
+        ColorSpace::Separation { .. }
+        | ColorSpace::SeparationAll
+        | ColorSpace::SeparationNone
+        | ColorSpace::Other(_) => cs.to_rgb(&[1.0; 8]),
         _ => cs.to_rgb(&[0.0, 0.0, 0.0, 0.0]),
     }
 }
@@ -3401,6 +3424,12 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             self.skip(SkippedKind::Pattern, SkipReason::Unsupported);
         }
         let fill = gs.fill_rgba8();
+        // A stencil paints the fill colour, and a `/Separation /None` fill
+        // never marks the page (ISO 32000-1 §8.6.6.4): nothing to draw and
+        // nothing lost, so nothing to report.
+        if meta.stencil && fill[3] == 0 {
+            return;
+        }
         let coverage = effective_mask(gs);
         let outcome = image::draw(
             &mut self.pix,
@@ -4180,6 +4209,85 @@ mod tests {
         );
         let gray = px(&render(bytes, 1.0), 50, 50);
         assert_eq!(gray, [191, 191, 191, 255]);
+    }
+
+    // Covers ISO 32000-1 §8.6.6.4: the special colorant None never marks the
+    // page, whatever the alternate space and tint transform would paint.
+    #[test]
+    fn separation_none_never_marks_the_page() {
+        // The transform maps every tint to black, so any leak shows on the
+        // white page.
+        const TRANSFORM: &str = "<< /FunctionType 2 /Domain [0 1] /C0 [0] /C1 [0] /N 1 >>";
+        for content in [
+            "/N cs 1 scn 10 10 80 80 re f",
+            "/N CS 1 SCN 20 w 10 50 m 90 50 l S",
+            // A stencil mask paints the fill colour.
+            "/N cs 1 scn q 100 0 0 100 0 0 cm /Mask Do Q",
+            // An image whose own colour space is the None separation.
+            "q 100 0 0 100 0 0 cm /Im Do Q",
+            // A shading in the None separation.
+            "/Sh sh",
+        ] {
+            let bytes = small_doc(
+                "/ColorSpace << /N 6 0 R >> /XObject << /Mask 7 0 R /Im 8 0 R >> \
+                 /Shading << /Sh 9 0 R >>",
+                content.as_bytes(),
+                |b| {
+                    b.object(5, TRANSFORM);
+                    b.object(6, "[/Separation /None /DeviceGray 5 0 R]");
+                    b.stream(
+                        7,
+                        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                         /ImageMask true /BitsPerComponent 1",
+                        &[0x00],
+                    );
+                    b.stream(
+                        8,
+                        "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                         /ColorSpace 6 0 R /BitsPerComponent 8",
+                        &[0xFF],
+                    );
+                    b.object(
+                        9,
+                        "<< /ShadingType 2 /ColorSpace 6 0 R /Coords [0 0 100 0] \
+                         /Extend [true true] /Function 5 0 R >>",
+                    );
+                },
+            );
+            assert_eq!(px(&render(bytes, 1.0), 50, 50), WHITE, "`{content}`");
+        }
+    }
+
+    // Covers ISO 32000-1 §8.6.6.4: the special colorant All puts the tint on
+    // every colorant at once and ignores the alternate space and the tint
+    // transform.
+    #[test]
+    fn separation_all_paints_the_tint_on_every_colorant() {
+        // The transform maps every tint to white; All must not consult it.
+        let doc = |content: &[u8]| {
+            small_doc("/ColorSpace << /A 6 0 R >>", content, |b| {
+                b.object(
+                    5,
+                    "<< /FunctionType 2 /Domain [0 1] /C0 [1] /C1 [1] /N 1 >>",
+                );
+                b.object(6, "[/Separation /All /DeviceGray 5 0 R]");
+            })
+        };
+        assert_eq!(
+            px(&render(doc(b"/A cs 1 scn 0 0 100 100 re f"), 1.0), 50, 50),
+            BLACK,
+            "full tint is black on every plate"
+        );
+        assert_eq!(
+            px(&render(doc(b"/A cs 0.5 scn 0 0 100 100 re f"), 1.0), 50, 50),
+            [128, 128, 128, 255],
+            "half tint is mid gray"
+        );
+        assert_eq!(
+            px(&render(doc(b"/A cs 0 0 100 100 re f"), 1.0), 50, 50),
+            BLACK,
+            "the initial tint is 1.0"
+        );
     }
 
     // Covers ISO 32000-1 §8.6.6.5.

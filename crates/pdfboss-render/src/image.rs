@@ -431,6 +431,11 @@ impl ImageMeta {
 ///
 /// Covers ISO 32000-1 §8.9.2 and §8.9.4.
 pub(crate) fn draw(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> Drawn {
+    // An image in a `/Separation /None` space never marks the page
+    // (ISO 32000-1 §8.6.6.4); nothing was lost, so nothing is reported.
+    if matches!(meta.cs, Some(ColorSpace::SeparationNone)) {
+        return Drawn::Whole;
+    }
     if meta.jpx {
         return draw_jpx(pix, meta, data, p);
     }
