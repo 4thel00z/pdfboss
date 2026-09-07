@@ -8,14 +8,11 @@ use crate::document::Page;
 use crate::hash::{FastMap, FastSet};
 use crate::object::{Dict, ObjRef, Object};
 use crate::source::AsyncObjectSource;
+use crate::tree::resolved_dict;
 
 /// Maximum number of ancestors walked from an element up to the root.
 /// Deeper ancestry reads as malformed and leaves the element unranked.
 const MAX_ELEMENT_DEPTH: usize = 64;
-
-/// Maximum parent-tree nodes visited for one lookup: past it the lookup
-/// gives up, so a cyclic `/Kids` graph cannot spin the walk.
-const MAX_NUMBER_TREE_NODES: usize = 4096;
 
 /// One marked-content sequence: its `/MCID`, and the `/StructParents` key of
 /// the content stream it appeared in: the page's, or a form XObject's own
@@ -141,7 +138,7 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         if let Some(cached) = self.parents.get(&key) {
             return cached.clone();
         }
-        let found = match number_tree_lookup(self.src, parent_tree, i64::from(key)).await {
+        let found = match crate::tree::lookup(self.src, parent_tree, &i64::from(key)).await {
             Some(entry) => match self.src.resolve(&entry).await.ok()? {
                 Object::Array(items) => Some(Arc::new(items)),
                 _ => None,
@@ -322,96 +319,6 @@ fn kid_index(parent: &Dict, child: ObjRef) -> Option<u32> {
         .iter()
         .position(|kid| kid.as_ref() == Some(child))?;
     u32::try_from(index).ok()
-}
-
-/// Resolves `o` to a dictionary, a stream's dictionary included.
-async fn resolved_dict<S: AsyncObjectSource>(src: &S, o: &Object) -> Option<Dict> {
-    match src.resolve(o).await.ok()? {
-        Object::Dict(dict) => Some(dict),
-        Object::Stream(stream) => Some(stream.dict),
-        _ => None,
-    }
-}
-
-/// Looks `key` up in a number tree (ISO 32000-1 §7.9.7): `/Nums` holds the
-/// leaf pairs, `/Kids` the subtrees, each with the `/Limits` its keys fall
-/// in. The value comes back unresolved. Malformed nodes are skipped, and
-/// the walk stops after [`MAX_NUMBER_TREE_NODES`] nodes.
-///
-/// Covers ISO 32000-1 §14.7.4 and §14.7.4.4.
-async fn number_tree_lookup<S: AsyncObjectSource>(
-    src: &S,
-    root: &Dict,
-    key: i64,
-) -> Option<Object> {
-    let mut pending: Vec<Dict> = vec![root.clone()];
-    let mut visited = 0usize;
-    while let Some(node) = pending.pop() {
-        visited += 1;
-        if visited > MAX_NUMBER_TREE_NODES {
-            return None;
-        }
-        if let Some(nums) = node.get("Nums") {
-            if let Some(found) = leaf_value(src, nums, key).await {
-                return Some(found);
-            }
-        }
-        let Some(kids) = node.get("Kids") else {
-            continue;
-        };
-        let Ok(Object::Array(kids)) = src.resolve(kids).await else {
-            continue;
-        };
-        for kid in kids.iter().rev() {
-            let Some(kid) = resolved_dict(src, kid).await else {
-                continue;
-            };
-            if within_limits(src, &kid, key).await {
-                pending.push(kid);
-            }
-        }
-    }
-    None
-}
-
-/// Whether `key` falls in a node's `/Limits`; a node without readable
-/// limits is searched regardless.
-///
-/// Covers ISO 32000-1 §7.9.7.
-async fn within_limits<S: AsyncObjectSource>(src: &S, node: &Dict, key: i64) -> bool {
-    let Some(limits) = node.get("Limits") else {
-        return true;
-    };
-    let Ok(Object::Array(limits)) = src.resolve(limits).await else {
-        return true;
-    };
-    match (bound(src, &limits, 0).await, bound(src, &limits, 1).await) {
-        (Some(lo), Some(hi)) => lo <= key && key <= hi,
-        _ => true,
-    }
-}
-
-/// One `/Limits` bound as an integer, resolving an indirect one.
-async fn bound<S: AsyncObjectSource>(src: &S, limits: &[Object], i: usize) -> Option<i64> {
-    let o = limits.get(i)?;
-    src.resolve(o).await.ok()?.as_int()
-}
-
-/// The value paired with `key` in a `/Nums` array, unresolved.
-async fn leaf_value<S: AsyncObjectSource>(src: &S, nums: &Object, key: i64) -> Option<Object> {
-    let Ok(Object::Array(pairs)) = src.resolve(nums).await else {
-        return None;
-    };
-    for [number, value] in pairs.as_chunks::<2>().0 {
-        let found = match number {
-            Object::Int(n) => *n == key,
-            other => src.resolve(other).await.ok().and_then(|v| v.as_int()) == Some(key),
-        };
-        if found {
-            return Some(value.clone());
-        }
-    }
-    None
 }
 
 #[cfg(test)]

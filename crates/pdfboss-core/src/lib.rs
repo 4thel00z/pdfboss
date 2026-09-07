@@ -21,6 +21,7 @@ pub mod parser;
 pub mod pretty;
 pub mod source;
 pub mod structure;
+pub mod tree;
 pub mod xref;
 
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
