@@ -793,6 +793,23 @@ struct Frame {
     /// mode is in force inside a text object until `ET` intersects the
     /// clip with them.
     text_clip: Option<Vec<Subpath>>,
+    /// The frame's default colour spaces, resolved from its `/ColorSpace`
+    /// resources the first time a device colour space is selected; the
+    /// resource chain is fixed for the frame's life, so once is enough.
+    default_spaces: Option<DefaultSpaces>,
+}
+
+/// The `/DefaultGray`, `/DefaultRGB` and `/DefaultCMYK` entries of a
+/// `/ColorSpace` resource dictionary that qualify as defaults: the same
+/// component count as the device space they replace and neither Indexed
+/// nor Lab (ISO 32000-1 §8.6.5.6). A device colour space selected while
+/// one is present paints in the default instead, its component values
+/// passed through unchanged.
+#[derive(Clone, Default)]
+struct DefaultSpaces {
+    gray: Option<ColorSpace>,
+    rgb: Option<ColorSpace>,
+    cmyk: Option<ColorSpace>,
 }
 
 /// A glyph outline ready to paint: the flattened subpaths under the
@@ -868,6 +885,7 @@ impl Frame {
             marks: Vec::new(),
             in_text: false,
             text_clip: None,
+            default_spaces: None,
         }
     }
 
@@ -2410,6 +2428,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         match op {
             Op::SetFillColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                // A pattern space's underlying space is subject to the
+                // defaults too (§8.6.5.6).
+                let cs = self.device_or_default(frame, cs).await;
                 let gs = &mut frame.gs;
                 gs.fill_rgb = initial_color(&cs);
                 gs.fill_space = cs;
@@ -2418,6 +2439,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
             Op::SetStrokeColorSpace(name) => {
                 let (cs, pattern) = self.resolve_colorspace(name, &frame.chain).await;
+                let cs = self.device_or_default(frame, cs).await;
                 let gs = &mut frame.gs;
                 gs.stroke_rgb = initial_color(&cs);
                 gs.stroke_space = cs;
@@ -2452,47 +2474,31 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                     gs.stroke_rgb = gs.stroke_space.to_rgb(c);
                 }
             }
+            // The device colour operators select the device space, or the
+            // default standing in for it, and pass the operands through.
             Op::SetFillGray(g) => {
-                let gs = &mut frame.gs;
-                gs.fill_space = ColorSpace::DeviceGray;
-                gs.fill_pattern = false;
-                gs.fill_pattern_name = None;
-                gs.fill_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceGray).await;
+                set_fill(&mut frame.gs, cs, &[*g]);
             }
             Op::SetStrokeGray(g) => {
-                let gs = &mut frame.gs;
-                gs.stroke_space = ColorSpace::DeviceGray;
-                gs.stroke_pattern = false;
-                gs.stroke_pattern_name = None;
-                gs.stroke_rgb = ColorSpace::DeviceGray.to_rgb(&[*g]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceGray).await;
+                set_stroke(&mut frame.gs, cs, &[*g]);
             }
             Op::SetFillRGB(r, g, b) => {
-                let gs = &mut frame.gs;
-                gs.fill_space = ColorSpace::DeviceRGB;
-                gs.fill_pattern = false;
-                gs.fill_pattern_name = None;
-                gs.fill_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceRGB).await;
+                set_fill(&mut frame.gs, cs, &[*r, *g, *b]);
             }
             Op::SetStrokeRGB(r, g, b) => {
-                let gs = &mut frame.gs;
-                gs.stroke_space = ColorSpace::DeviceRGB;
-                gs.stroke_pattern = false;
-                gs.stroke_pattern_name = None;
-                gs.stroke_rgb = ColorSpace::DeviceRGB.to_rgb(&[*r, *g, *b]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceRGB).await;
+                set_stroke(&mut frame.gs, cs, &[*r, *g, *b]);
             }
             Op::SetFillCMYK(c, m, y, k) => {
-                let gs = &mut frame.gs;
-                gs.fill_space = ColorSpace::DeviceCMYK;
-                gs.fill_pattern = false;
-                gs.fill_pattern_name = None;
-                gs.fill_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceCMYK).await;
+                set_fill(&mut frame.gs, cs, &[*c, *m, *y, *k]);
             }
             Op::SetStrokeCMYK(c, m, y, k) => {
-                let gs = &mut frame.gs;
-                gs.stroke_space = ColorSpace::DeviceCMYK;
-                gs.stroke_pattern = false;
-                gs.stroke_pattern_name = None;
-                gs.stroke_rgb = ColorSpace::DeviceCMYK.to_rgb(&[*c, *m, *y, *k]);
+                let cs = self.device_or_default(frame, ColorSpace::DeviceCMYK).await;
+                set_stroke(&mut frame.gs, cs, &[*c, *m, *y, *k]);
             }
             Op::XObject(name) => {
                 // Inside a hidden span the whole invocation is part of the
@@ -2629,6 +2635,23 @@ fn initial_color(cs: &ColorSpace) -> [f32; 3] {
     }
 }
 
+/// Selects `cs` as the fill space with the colour `components` names in
+/// it, leaving any pattern behind (the `g`, `rg` and `k` operators).
+fn set_fill(gs: &mut GState, cs: ColorSpace, components: &[f32]) {
+    gs.fill_rgb = cs.to_rgb(components);
+    gs.fill_space = cs;
+    gs.fill_pattern = false;
+    gs.fill_pattern_name = None;
+}
+
+/// [`set_fill`] for the stroke colour (`G`, `RG` and `K`).
+fn set_stroke(gs: &mut GState, cs: ColorSpace, components: &[f32]) {
+    gs.stroke_rgb = cs.to_rgb(components);
+    gs.stroke_space = cs;
+    gs.stroke_pattern = false;
+    gs.stroke_pattern_name = None;
+}
+
 impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Looks up `/category/name` in the resource chain (innermost dict
     /// first), resolving references at every step.
@@ -2646,6 +2669,68 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Covers ISO 32000-1 §7.8.3.
     async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
         crate::extract::find_res(self.src, chain, category, name).await
+    }
+
+    /// The space a device colour space selection paints in: the frame's
+    /// default for it when its `/ColorSpace` resources declare one, else
+    /// the device space itself. Any other space passes through. The
+    /// frame's defaults are resolved on the first call and kept.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.6.
+    async fn device_or_default(&self, frame: &mut Frame, cs: ColorSpace) -> ColorSpace {
+        if !matches!(
+            cs,
+            ColorSpace::DeviceGray | ColorSpace::DeviceRGB | ColorSpace::DeviceCMYK
+        ) {
+            return cs;
+        }
+        if frame.default_spaces.is_none() {
+            let resolved = DefaultSpaces {
+                gray: self.default_space(&frame.chain, "DefaultGray", 1).await,
+                rgb: self.default_space(&frame.chain, "DefaultRGB", 3).await,
+                cmyk: self.default_space(&frame.chain, "DefaultCMYK", 4).await,
+            };
+            frame.default_spaces = Some(resolved);
+        }
+        let defaults = frame.default_spaces.clone().unwrap_or_default();
+        let default = match cs {
+            ColorSpace::DeviceGray => defaults.gray,
+            ColorSpace::DeviceRGB => defaults.rgb,
+            _ => defaults.cmyk,
+        };
+        default.unwrap_or(cs)
+    }
+
+    /// The `/ColorSpace` resource entry `key` (`DefaultGray`, `DefaultRGB`
+    /// or `DefaultCMYK`) when it names a space that may stand in for the
+    /// device space with `components` components: the same component count
+    /// and neither Indexed nor Lab (§8.6.5.6), nor a space that did not
+    /// parse. Returns the entry's object alongside the parsed space, so an
+    /// image can be read through the entry as if it were its own.
+    async fn default_space(
+        &self,
+        chain: &[Arc<Dict>],
+        key: &str,
+        components: usize,
+    ) -> Option<ColorSpace> {
+        Some(self.default_space_entry(chain, key, components).await?.1)
+    }
+
+    /// See [`Executor::default_space`].
+    async fn default_space_entry(
+        &self,
+        chain: &[Arc<Dict>],
+        key: &str,
+        components: usize,
+    ) -> Option<(Object, ColorSpace)> {
+        let obj = self.find_res(chain, "ColorSpace", key).await?;
+        let cs = ColorSpace::parse_with(self.src, &obj, &self.icc).await;
+        let unsuitable = cs.components() != components
+            || matches!(
+                cs,
+                ColorSpace::Indexed { .. } | ColorSpace::Lab { .. } | ColorSpace::Other(_)
+            );
+        (!unsuitable).then_some((obj, cs))
     }
 
     /// Resolves a `cs`/`CS` operand: a device space name directly, the
@@ -3569,9 +3654,26 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// The image's `/ColorSpace` value with resource-name indirection
-    /// resolved: a non-device name is looked up in `/ColorSpace` resources.
+    /// resolved (a non-device name is looked up in `/ColorSpace` resources)
+    /// and a device space replaced by the default colour space the
+    /// resources declare for it, when they declare a suitable one.
+    ///
+    /// Covers ISO 32000-1 §8.6.5.6.
     async fn image_colorspace(&self, dict: &Dict, chain: &[Arc<Dict>]) -> Option<Object> {
-        crate::extract::image_colorspace(self.src, dict, chain).await
+        let resolved = crate::extract::image_colorspace(self.src, dict, chain).await?;
+        let Object::Name(n) = &resolved else {
+            return Some(resolved);
+        };
+        let (key, components) = match n.0.as_str() {
+            "DeviceGray" | "G" => ("DefaultGray", 1),
+            "DeviceRGB" | "RGB" => ("DefaultRGB", 3),
+            "DeviceCMYK" | "CMYK" => ("DefaultCMYK", 4),
+            _ => return Some(resolved),
+        };
+        match self.default_space_entry(chain, key, components).await {
+            Some((default, _)) => Some(default),
+            None => Some(resolved),
+        }
     }
 }
 
@@ -4485,6 +4587,92 @@ mod tests {
         let pix = render(small_doc("", &content, |_| {}), 1.0);
         let mid = px(&pix, 50, 50)[0];
         assert!((115..=145).contains(&mid), "inline /I blends too: {mid}");
+    }
+
+    /// A `/DefaultGray` stands in for DeviceGray wherever a device gray is
+    /// selected: here a Separation whose transform maps tint 0 to red and
+    /// tint 1 to blue, so `0 g` paints red instead of black.
+    // Covers ISO 32000-1 §8.6.5.6.
+    #[test]
+    fn default_colour_spaces_remap_device_colours() {
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let page = |content: &[u8]| {
+            render(
+                small_doc(
+                    "/ColorSpace << /DefaultGray [/Separation /Spot /DeviceRGB 6 0 R] >> \
+                     /XObject << /Im 8 0 R /Fx 9 0 R >>",
+                    content,
+                    |b| {
+                        b.object(
+                            6,
+                            "<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>",
+                        );
+                        b.stream(
+                            8,
+                            "/Type /XObject /Subtype /Image /Width 1 /Height 1 \
+                             /ColorSpace /DeviceGray /BitsPerComponent 8",
+                            &[0x00],
+                        );
+                        b.stream(
+                            9,
+                            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << >>",
+                            b"0 g 0 0 50 50 re f",
+                        );
+                    },
+                ),
+                1.0,
+            )
+        };
+        let pix = page(b"0 g 0 0 50 50 re f 1 g 50 0 50 50 re f 0 G 4 w 25 75 m 75 75 l S");
+        assert_eq!(px(&pix, 25, 75), RED, "0 g takes the default");
+        assert_eq!(px(&pix, 75, 75), BLUE, "1 g takes the default");
+        assert_eq!(px(&pix, 50, 25), RED, "0 G strokes in the default");
+        let pix = page(b"/DeviceGray cs 0 sc 0 0 100 100 re f");
+        assert_eq!(px(&pix, 50, 50), RED, "cs /DeviceGray takes the default");
+        let pix = page(b"q 100 0 0 100 0 0 cm /Im Do Q");
+        assert_eq!(
+            px(&pix, 50, 50),
+            RED,
+            "an image's DeviceGray takes the default"
+        );
+        let mut inline = b"q 100 0 0 100 0 0 cm BI /W 1 /H 1 /CS /G /BPC 8 ID ".to_vec();
+        inline.push(0x00);
+        inline.extend_from_slice(b" EI Q");
+        let pix = page(&inline);
+        assert_eq!(
+            px(&pix, 50, 50),
+            RED,
+            "an inline image's /G takes the default"
+        );
+        let pix = page(b"/Fx Do");
+        assert_eq!(
+            px(&pix, 25, 75),
+            RED,
+            "a form without its own default inherits the page's"
+        );
+        let pix = page(b"0 0 0 rg 0 0 100 100 re f");
+        assert_eq!(px(&pix, 50, 50), BLACK, "no DefaultRGB, so rg is untouched");
+    }
+
+    /// A default must have the device space's component count and may not
+    /// be Indexed or Lab; anything else is ignored.
+    // Covers ISO 32000-1 §8.6.5.6.
+    #[test]
+    fn an_unsuitable_default_colour_space_is_ignored() {
+        let pix = render(
+            small_doc(
+                "/ColorSpace << /DefaultGray /DeviceRGB /DefaultRGB [/Indexed /DeviceRGB 0 <ff0000>] >>",
+                b"0 g 0 0 50 100 re f 1 1 1 rg 50 0 50 100 re f",
+                |_| {},
+            ),
+            1.0,
+        );
+        assert_eq!(
+            px(&pix, 25, 50),
+            BLACK,
+            "a three-component DefaultGray is ignored"
+        );
+        assert_eq!(px(&pix, 75, 50), WHITE, "an Indexed DefaultRGB is ignored");
     }
 
     // Covers ISO 32000-1 §8.6.6.4.
