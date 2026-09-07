@@ -1972,6 +1972,20 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.4.8: the clause allows two-component JPEGs,
+    // which the decoder crate does not handle; they are skipped, not a
+    // panic.
+    #[test]
+    fn dct_two_component_jpeg_is_skipped() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /ColorSpace /DeviceGray >>",
+        );
+        let jpeg = flat_jpeg(&[100, 200], None);
+        assert!(decode_rgba(&doc, &d, &jpeg, None, [0; 3]).is_none());
+    }
+
     // Covers ISO 32000-1 §7.4.8: /ColorTransform 1 reads four components as
     // YCCK when no Adobe marker says otherwise.
     #[test]
