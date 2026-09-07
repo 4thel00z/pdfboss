@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::crypt::{direct_crypt_filters, Decryptor};
+use crate::date::Date;
 use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
@@ -833,7 +834,9 @@ impl crate::source::ObjectSource for Document {
 }
 
 /// Document information from the trailer `/Info` dictionary. Only present,
-/// well-formed entries are populated.
+/// well-formed entries are populated. The two dates hold the text as
+/// written; [`Metadata::creation_date_parsed`] and
+/// [`Metadata::mod_date_parsed`] read them as [`Date`]s.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
     pub title: Option<String>,
@@ -844,6 +847,23 @@ pub struct Metadata {
     pub producer: Option<String>,
     pub creation_date: Option<String>,
     pub mod_date: Option<String>,
+}
+
+impl Metadata {
+    /// `/CreationDate` as a date (ISO 32000-1 §7.9.4), `None` when absent
+    /// or not a date string; the text as written stays in `creation_date`.
+    ///
+    /// Covers ISO 32000-1 §7.9.4.
+    pub fn creation_date_parsed(&self) -> Option<Date> {
+        Date::parse_pdf(self.creation_date.as_deref()?)
+    }
+
+    /// `/ModDate` as a date, like [`Metadata::creation_date_parsed`].
+    ///
+    /// Covers ISO 32000-1 §7.9.4.
+    pub fn mod_date_parsed(&self) -> Option<Date> {
+        Date::parse_pdf(self.mod_date.as_deref()?)
+    }
 }
 
 /// A single page with inherited attributes already applied.
@@ -1377,6 +1397,38 @@ mod tests {
         assert_eq!(meta.subject, None);
         assert_eq!(meta.keywords, None);
         assert_eq!(meta.creation_date, None);
+    }
+
+    // Covers ISO 32000-1 §7.9.4 and §14.3.3: the dates read as dates, and a
+    // string that is not one keeps only its text.
+    #[test]
+    fn metadata_dates_parse_per_the_date_clause() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [] /Count 0 >>");
+        // The clause's own example, and a month 20 no calendar has.
+        b.object(
+            6,
+            "<< /CreationDate (D:199812231952-08'00) /ModDate (D:191020717014604) >>",
+        );
+        let data = replace_once(&b.build(1), b"<< /Size", b"<< /Info 6 0 R /Size");
+        let doc = Document::load(data).unwrap();
+        let meta = doc.metadata();
+        assert_eq!(meta.creation_date.as_deref(), Some("D:199812231952-08'00"));
+        assert_eq!(
+            meta.creation_date_parsed(),
+            Some(Date {
+                year: 1998,
+                month: 12,
+                day: 23,
+                hour: 19,
+                minute: 52,
+                second: 0,
+                utc_offset_minutes: -480,
+            })
+        );
+        assert_eq!(meta.mod_date.as_deref(), Some("D:191020717014604"));
+        assert_eq!(meta.mod_date_parsed(), None, "month 20 is not a date");
     }
 
     #[test]

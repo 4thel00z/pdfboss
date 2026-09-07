@@ -6,6 +6,7 @@
 pub mod cmap;
 pub mod content;
 pub mod crypt;
+pub mod date;
 pub mod document;
 pub mod elements;
 pub mod error;
@@ -26,6 +27,7 @@ pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encod
 pub use crypt::{
     crypt_filter_refs, direct_crypt_filters, Decryptor, Encryptor, Permissions, PERMISSION_NAMES,
 };
+pub use date::Date;
 pub use document::{
     content_stream_data_with, decoded_stream_data_with, map_pages, page_content_with, Document,
     DocumentSeed, Metadata, Page,
