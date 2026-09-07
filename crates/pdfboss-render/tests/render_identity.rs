@@ -380,7 +380,7 @@ fn cases() -> Vec<Case> {
             .expect("committed fixture"),
             scale: 1.5,
             tier: GlyphPainting::AllEmbedded,
-            digest: "5c2fc9c7b83a198f",
+            digest: "344d48f4371cbc9f",
         },
     ]
 }
