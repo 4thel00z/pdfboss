@@ -10,6 +10,7 @@ pub mod date;
 pub mod destination;
 pub mod document;
 pub mod elements;
+pub mod embedded_file;
 pub mod error;
 pub mod filters;
 pub mod geom;
@@ -42,6 +43,10 @@ pub use document::{
     DocumentSeed, Metadata, Page,
 };
 pub use elements::{Element, ElementOpts, Span, XrefKind};
+pub use embedded_file::{
+    embedded_file_data_with, embedded_files_with, file_spec_with, spec_components, EmbeddedFile,
+    FileSpec,
+};
 pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};

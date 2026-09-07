@@ -215,13 +215,30 @@ def renderRef? : Option Ref → String
 def renderCitation (c : Citation) : String :=
   s!"  ⟨{renderNat? c.part}, {renderRef? c.ref}, {c.file.quote}, {c.line}, {c.inTest}⟩"
 
+/-- Rows per generated list literal. Lean elaborates a list literal one
+element per recursion step, so a single literal of every citation trips
+`maxRecDepth` once the tree passes about 1,900 mentions; the index is
+written as literals of this size joined with `++`. -/
+def chunkRows : Nat := 200
+
+partial def chunks (xs : List Citation) : List (List Citation) :=
+  if xs.isEmpty then [] else xs.take chunkRows :: chunks (xs.drop chunkRows)
+
+def renderChunk (index : Nat) (citations : List Citation) : String :=
+  let rows := ",\n".intercalate (citations.map renderCitation)
+  s!"def Generated.citations{index} : List Citation := [\n" ++ rows ++ "\n]\n\n"
+
 def renderModule (citations : Array Citation) : String :=
-  let rows := ",\n".intercalate (citations.toList.map renderCitation)
+  let parts := chunks citations.toList
+  let indices := List.range parts.length
+  let defs := String.join ((indices.zip parts).map fun (i, part) => renderChunk i part)
+  let joined := if parts.isEmpty then "[]" else
+    " ++ ".intercalate (indices.map fun i => s!"Generated.citations{i}")
   "import Iso32000.Feature\n\n" ++
   "/-!\nMentions of ISO 32000 in the pdfboss source tree, written by\n" ++
   "`lake exe iso32000-index`. Regenerate rather than edit.\n-/\n\n" ++
-  "namespace Iso32000\n\n" ++
-  "def Generated.citations : List Citation := [\n" ++ rows ++ "\n]\n\n" ++
+  "namespace Iso32000\n\n" ++ defs ++
+  "def Generated.citations : List Citation :=\n  " ++ joined ++ "\n\n" ++
   "end Iso32000\n"
 
 end Index

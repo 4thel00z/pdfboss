@@ -619,6 +619,28 @@ impl Document {
         Some(crate::page_label::page_label(&ranges, index))
     }
 
+    /// The document-level embedded files (ISO 32000-1 §7.11.4): every entry
+    /// of the catalog's `/EmbeddedFiles` name tree, in tree order.
+    pub fn embedded_files(&self) -> Vec<crate::embedded_file::EmbeddedFile> {
+        block_on(crate::embedded_file::embedded_files_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The decoded bytes of one embedded file.
+    ///
+    /// # Errors
+    ///
+    /// `MissingKey("EF")` when the file specification embeds no stream,
+    /// and the stream's own decoding errors.
+    pub fn embedded_file_data(&self, file: &crate::embedded_file::EmbeddedFile) -> Result<Vec<u8>> {
+        block_on(crate::embedded_file::embedded_file_data_with(
+            &Immediate(self),
+            file,
+        ))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     ///
     /// Covers ISO 32000-1 §7.9.2.2.
@@ -871,7 +893,7 @@ fn make_page_rec(
 }
 
 /// Human-readable object type name for error messages.
-fn type_name(o: &Object) -> &'static str {
+pub(crate) fn type_name(o: &Object) -> &'static str {
     match o {
         Object::Null => "null",
         Object::Bool(_) => "boolean",

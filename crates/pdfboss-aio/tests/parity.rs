@@ -89,7 +89,12 @@ fn names_doc() -> Vec<u8> {
         8,
         "<< /Limits [(C) (C)] /Names [(C) [3 0 R /XYZ 0 0 null]] >>",
     );
-    b.object(9, "<< /Type /Filespec /F (a.txt) >>");
+    b.object(9, "<< /Type /Filespec /F (a.txt) /EF << /F 11 0 R >> >>");
+    b.stream(
+        11,
+        "/Type /EmbeddedFile /Subtype /text#2Fplain /Params << /Size 5 >>",
+        b"hello",
+    );
     b.object(10, "[3 0 R /FitH 700]");
     b.build(1)
 }
@@ -173,6 +178,16 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             "{name}: named destinations"
         );
         assert_eq!(doc.outline().await, sync_doc.outline(), "{name}: outline");
+        let files = doc.embedded_files().await;
+        assert_eq!(files, sync_doc.embedded_files(), "{name}: embedded files");
+        for file in &files {
+            assert_eq!(
+                doc.embedded_file_data(file).await.ok(),
+                sync_doc.embedded_file_data(file).ok(),
+                "{name}: embedded file {}",
+                file.name
+            );
+        }
         assert_eq!(
             doc.page_labels().await,
             sync_doc.page_labels(),

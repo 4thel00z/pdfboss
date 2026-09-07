@@ -1476,6 +1476,23 @@ impl AsyncDocument {
         Some(pdfboss_core::page_label(&ranges, index))
     }
 
+    /// The document-level embedded files (ISO 32000-1 §7.11.4): the async
+    /// twin of the sync document's `embedded_files`.
+    pub async fn embedded_files(&self) -> Vec<pdfboss_core::EmbeddedFile> {
+        pdfboss_core::embedded_files_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The decoded bytes of one embedded file: the async twin of the sync
+    /// document's `embedded_file_data`.
+    ///
+    /// # Errors
+    ///
+    /// `MissingKey("EF")` when the file specification embeds no stream,
+    /// and the stream's own decoding errors.
+    pub async fn embedded_file_data(&self, file: &pdfboss_core::EmbeddedFile) -> Result<Vec<u8>> {
+        Ok(pdfboss_core::embedded_file_data_with(self, file).await?)
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.
