@@ -4447,6 +4447,46 @@ mod tests {
         );
     }
 
+    /// A two-sample gray image, black then white, drawn 80 units wide from
+    /// x=10: the sample centres land on device columns 30 and 70, so column
+    /// 50 is exactly between them. Without `/Interpolate` it takes the
+    /// nearer sample; with it, the blend.
+    // Covers ISO 32000-1 §8.9.5.3.
+    #[test]
+    fn interpolate_blends_a_magnified_image() {
+        let page = |interpolate: &str| {
+            let dict = format!(
+                "/Type /XObject /Subtype /Image /Width 2 /Height 1 \
+                 /ColorSpace /DeviceGray /BitsPerComponent 8 {interpolate}"
+            );
+            small_doc(
+                "/XObject << /Im1 5 0 R >>",
+                b"q 80 0 0 20 10 40 cm /Im1 Do Q",
+                |b| {
+                    b.stream(5, &dict, &[0x00, 0xFF]);
+                },
+            )
+        };
+        let pix = render(page(""), 1.0);
+        assert_eq!(px(&pix, 49, 50), BLACK, "nearest: the black sample");
+        assert_eq!(px(&pix, 50, 50), WHITE, "nearest: the white sample");
+        let pix = render(page("/Interpolate true"), 1.0);
+        let mid = px(&pix, 50, 50)[0];
+        assert!(
+            (115..=145).contains(&mid),
+            "blend between the samples: {mid}"
+        );
+        assert_eq!(px(&pix, 12, 50), BLACK, "the black sample's own centre");
+        assert_eq!(px(&pix, 88, 50), WHITE, "the white sample's own centre");
+        // The inline abbreviation /I asks for the same.
+        let mut content = b"q 80 0 0 20 10 40 cm BI /W 2 /H 1 /CS /G /BPC 8 /I true ID ".to_vec();
+        content.extend_from_slice(&[0x00, 0xFF]);
+        content.extend_from_slice(b" EI Q");
+        let pix = render(small_doc("", &content, |_| {}), 1.0);
+        let mid = px(&pix, 50, 50)[0];
+        assert!((115..=145).contains(&mid), "inline /I blends too: {mid}");
+    }
+
     // Covers ISO 32000-1 §8.6.6.4.
     #[test]
     fn separation_image_samples_go_through_the_tint_transform() {

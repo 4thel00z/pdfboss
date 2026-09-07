@@ -112,6 +112,38 @@ impl Rgba<'_> {
         }
     }
 
+    /// The bilinear blend of the four pixels around (`ic`, `jc`), continuous
+    /// image coordinates with pixel centres at half-integers: what an
+    /// `/Interpolate` image samples when drawn larger than itself, so a
+    /// source sample fades into its neighbours instead of painting a block.
+    /// Every channel is blended, alpha included; the outermost half pixel
+    /// on each side holds the edge sample's own value.
+    ///
+    /// Covers ISO 32000-1 §8.9.5.3.
+    fn bilinear(&self, ic: f32, jc: f32) -> [u8; 4] {
+        let x = (ic - 0.5).clamp(0.0, (self.width - 1) as f32);
+        let y = (jc - 0.5).clamp(0.0, (self.height - 1) as f32);
+        let i0 = x as usize;
+        let j0 = y as usize;
+        let i1 = (i0 + 1).min(self.width - 1);
+        let j1 = (j0 + 1).min(self.height - 1);
+        let tx = x - i0 as f32;
+        let ty = y - j0 as f32;
+        let (a, b, c, d) = (
+            self.at(i0, j0),
+            self.at(i1, j0),
+            self.at(i0, j1),
+            self.at(i1, j1),
+        );
+        let mut out = [0u8; 4];
+        for (k, v) in out.iter_mut().enumerate() {
+            let top = f32::from(a[k]) * (1.0 - tx) + f32::from(b[k]) * tx;
+            let bottom = f32::from(c[k]) * (1.0 - tx) + f32::from(d[k]) * tx;
+            *v = (top * (1.0 - ty) + bottom * ty + 0.5) as u8;
+        }
+        out
+    }
+
     /// A copy shrunk by integer factors: each output pixel averages an
     /// `rx` by `ry` block of this image (smaller blocks at the right and
     /// bottom edges). One sequential pass over the source; drawing then
@@ -370,6 +402,11 @@ pub(crate) struct ImageMeta {
     /// (samples then read as gray).
     cs: Option<ColorSpace>,
     bpc: Option<f64>,
+    /// `/Interpolate` (the inline `/I`): smooth between samples when the
+    /// image is drawn larger than itself.
+    ///
+    /// Covers ISO 32000-1 §8.9.5.3.
+    interpolate: bool,
 }
 
 impl ImageMeta {
@@ -414,6 +451,7 @@ impl ImageMeta {
             decode: floats_of(src, dict, "Decode").await,
             cs,
             bpc: num_of(src, dict, "BitsPerComponent").await,
+            interpolate: bool_of(src, dict, "Interpolate").await.unwrap_or(false),
         }
     }
 }
@@ -442,7 +480,7 @@ pub(crate) fn draw(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawPara
     match decode_rgba(meta, data, p.fill_rgb) {
         Some(img) => {
             let truncated = img.truncated;
-            draw_rgba(pix, &img, p);
+            draw_rgba(pix, &img, p, meta.interpolate);
             if truncated {
                 Drawn::Truncated
             } else {
@@ -1058,7 +1096,7 @@ fn draw_jpx(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> 
         Ok(converted) => converted,
         Err(reason) => return Drawn::Failed(reason),
     };
-    draw_rgba(pix, &img, p);
+    draw_rgba(pix, &img, p, meta.interpolate);
     if notes.is_empty() {
         Drawn::Whole
     } else {
@@ -1430,14 +1468,16 @@ fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// and clip mask.
 ///
 /// Nearest is right at 1:1 and under magnification, where it keeps bilevel
-/// edges crisp. Under minification a device pixel spans several source
-/// pixels and point sampling keeps one of them, which reads a halftoned
-/// scan as moiré stripes and drops the thin strokes of scanned text; there
-/// the sample is the average of the device pixel's source footprint
-/// instead ([`Rgba::averaged`]).
+/// edges crisp; an image that asks for it (`interpolate`, the dictionary's
+/// `/Interpolate`) blends between samples under magnification instead
+/// ([`Rgba::bilinear`]). Under minification a device pixel spans several
+/// source pixels and point sampling keeps one of them, which reads a
+/// halftoned scan as moiré stripes and drops the thin strokes of scanned
+/// text; there the sample is the average of the device pixel's source
+/// footprint instead ([`Rgba::averaged`]).
 ///
-/// Covers ISO 32000-1 §11.3.6, §8.3.2.4 and §8.9.4.
-fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
+/// Covers ISO 32000-1 §11.3.6, §8.3.2.4, §8.9.4 and §8.9.5.3.
+fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams, interpolate: bool) {
     let Some(inv) = p.ctm.invert() else {
         return;
     };
@@ -1484,6 +1524,9 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
     let (fx, fy) = (fx / rx as f32, fy / ry as f32);
     let footprint = (minified && (fx > MINIFICATION_THRESHOLD || fy > MINIFICATION_THRESHOLD))
         .then_some((fx.max(1.0) / 2.0, fy.max(1.0) / 2.0));
+    // Magnified on at least one axis: a source sample covers more than one
+    // device pixel there, which is where interpolation smooths.
+    let smooth = interpolate && !minified && (fx < 1.0 || fy < 1.0);
     for py in y0..y1 {
         for px in x0..x1 {
             let u = inv.apply(Point::new(px as f32 + 0.5, py as f32 + 0.5));
@@ -1495,8 +1538,9 @@ fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
             let i = (ic as usize).min(img.width - 1);
             let j = (jc as usize).min(img.height - 1);
             let s = match footprint {
-                None => img.at(i, j),
                 Some((hx, hy)) => img.averaged(ic, jc, hx, hy),
+                None if smooth => img.bilinear(ic, jc),
+                None => img.at(i, j),
             };
             let mut a = f32::from(s[3]) / 255.0 * alpha;
             if let Some(m) = p.smask {
@@ -2603,6 +2647,45 @@ mod tests {
         pix.data[off..off + 4].try_into().unwrap()
     }
 
+    /// A two-pixel image, black then white, stretched over eight device
+    /// pixels: nearest sampling paints four black and four white, and an
+    /// `/Interpolate` image blends across the middle four.
+    // Covers ISO 32000-1 §8.9.5.3.
+    #[test]
+    fn interpolated_magnification_blends_between_samples() {
+        let img = Rgba {
+            width: 2,
+            height: 1,
+            pixels: Pixels::Quads(vec![0, 0, 0, 255, 255, 255, 255, 255]),
+            truncated: false,
+        };
+        let p = DrawParams {
+            ctm: Matrix::scale(8.0, 1.0),
+            alpha: 1.0,
+            fill_rgb: [0; 3],
+            clip: None,
+            blend: BlendMode::Normal,
+            smask: None,
+        };
+        let mut pix = Pixmap::new(8, 1);
+        draw_rgba(&mut pix, &img, &p, false);
+        assert_eq!(pix_at(&pix, 3, 0)[0], 0, "nearest: black to the middle");
+        assert_eq!(pix_at(&pix, 4, 0)[0], 255, "nearest: white from the middle");
+        let mut pix = Pixmap::new(8, 1);
+        draw_rgba(&mut pix, &img, &p, true);
+        assert_eq!(pix_at(&pix, 0, 0)[0], 0, "the left sample keeps its value");
+        assert_eq!(
+            pix_at(&pix, 7, 0)[0],
+            255,
+            "the right sample keeps its value"
+        );
+        let left = pix_at(&pix, 3, 0)[0];
+        let right = pix_at(&pix, 4, 0)[0];
+        assert!((80..=112).contains(&left), "blend at 3: {left}");
+        assert!((143..=175).contains(&right), "blend at 4: {right}");
+        assert_eq!(pix_at(&pix, 4, 0)[3], 255, "opaque stays opaque");
+    }
+
     // Covers ISO 32000-1 §8.3.2.4 and §8.9.4.
     #[test]
     fn draw_maps_row_zero_to_the_v1_edge() {
@@ -2617,7 +2700,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &quad_image(), &p);
+        draw_rgba(&mut pix, &quad_image(), &p, false);
         assert_eq!(pix_at(&pix, 1, 1), [0, 0, 255, 255], "row 1 left on top");
         assert_eq!(pix_at(&pix, 6, 1), [255, 255, 255, 255], "row 1 right");
         assert_eq!(pix_at(&pix, 1, 6), [255, 0, 0, 255], "row 0 left below");
@@ -2645,7 +2728,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &quad_image(), &p);
+        draw_rgba(&mut pix, &quad_image(), &p, false);
         assert_eq!(pix_at(&pix, 1, 1), [255, 255, 255, 255], "outside image");
         let [r, g, b, _] = pix_at(&pix, 5, 1);
         assert_eq!(b, 255, "blue keeps its own channel");
@@ -2708,7 +2791,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &img, &p);
+        draw_rgba(&mut pix, &img, &p, false);
         for y in 0..2 {
             for x in 0..2 {
                 let [r, _, _, a] = pix_at(&pix, x, y);
@@ -2748,7 +2831,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &checkerboard(11), &p);
+        draw_rgba(&mut pix, &checkerboard(11), &p, false);
         // Interior pixels only: at the image's edges the residual box can
         // degenerate to a single one-source-pixel block, which is not gray.
         for y in 1..3 {
@@ -2772,7 +2855,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &checkerboard(32), &p);
+        draw_rgba(&mut pix, &checkerboard(32), &p, false);
         for y in 0..2 {
             for x in 0..2 {
                 let [r, _, _, _] = pix_at(&pix, x, y);
@@ -2808,7 +2891,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &img, &p);
+        draw_rgba(&mut pix, &img, &p, false);
         for y in 0..2 {
             for x in 0..2 {
                 let [r, _, _, _] = pix_at(&pix, x, y);
@@ -2846,7 +2929,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &img, &p);
+        draw_rgba(&mut pix, &img, &p, false);
         let [r, _, _, _] = pix_at(&pix, 1, 1);
         assert!((112..=144).contains(&r), "coverage gray {r}, want ~128");
     }
@@ -2862,7 +2945,7 @@ mod tests {
             blend: BlendMode::Normal,
             smask: None,
         };
-        draw_rgba(&mut pix, &quad_image(), &p);
+        draw_rgba(&mut pix, &quad_image(), &p, false);
         assert!(pix.data.iter().all(|&b| b == 0), "pixmap untouched");
     }
 }
