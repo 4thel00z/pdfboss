@@ -1959,6 +1959,7 @@ pub(crate) mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.7.4.2.
     #[test]
     fn cid_font_maps_cid_to_gid_via_charset() {
         let font = CffFont::parse(build_fixture_cid()).expect("CID fixture parses");

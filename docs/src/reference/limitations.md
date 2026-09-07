@@ -4,6 +4,8 @@ Rendering is lenient and it says so: content pdfboss cannot read is skipped so t
 
 The whole not-yet-supported list is two faces: `/Symbol` and `/ZapfDingbats` have no license-clean substitute, so they stay blank rather than borrowing an unrelated face's glyphs.
 
+Clause by clause, the [ISO 32000 conformance](iso32000.md) chapter lists every part of the standard with the status pdfboss claims for it and what is missing where the status is not implemented.
+
 ## Fonts
 
 Glyph painting is staged in tiers (`embedded-only`, `all-embedded`, `full`) selected with `--fonts` (CLI), the `fonts` parameter (Python) or `RenderOptions::glyph_painting` (Rust); the tiers are described in [Rendering pages](../guide/rendering.md#font-tiers). What stays limited:

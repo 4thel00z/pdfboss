@@ -8,7 +8,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::crypt::Decryptor;
+use crate::crypt::{direct_crypt_filters, Decryptor};
 use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
@@ -75,6 +75,8 @@ impl Clone for DocumentSeed {
 }
 
 /// The flattened, inheritance-applied record for one page.
+///
+/// Covers ISO 32000-1 §7.7.3.4.
 struct PageRec {
     obj_ref: Option<ObjRef>,
     media_box: Rect,
@@ -98,10 +100,13 @@ struct Inherited {
 
 /// Parses the `%PDF-x.y` header, scanning the first 1 KiB; absent or
 /// malformed headers default to version 1.4.
+///
+/// Covers ISO 32000-1 §7.5.2 and Annex I.
 fn parse_version(data: &[u8]) -> (u8, u8) {
     try_parse_version(data).unwrap_or((1, 4))
 }
 
+/// Covers ISO 32000-1 §7.5.2.
 fn try_parse_version(data: &[u8]) -> Option<(u8, u8)> {
     let window = &data[..data.len().min(1024)];
     let pos = memchr::memmem::find(window, b"%PDF-")?;
@@ -206,6 +211,9 @@ impl Document {
             .unwrap_or(Object::Null);
         let enc = self.resolve(&enc_obj)?;
         let enc_dict = enc.as_dict().ok_or(Error::Encrypted)?;
+        // Only the strings of an encryption dictionary must be direct, so
+        // the crypt filters may sit in objects of their own.
+        let enc_dict = direct_crypt_filters(enc_dict, |r| self.get(r).ok());
         let id0: Vec<u8> = self
             .xref
             .trailer
@@ -215,7 +223,7 @@ impl Document {
             .and_then(Object::as_str_bytes)
             .unwrap_or(&[])
             .to_vec();
-        match Decryptor::from_standard_with_password_str(enc_dict, &id0, password) {
+        match Decryptor::from_standard_with_password_str(&enc_dict, &id0, password) {
             Some(dec) => {
                 self.decryptor = Some(dec);
                 // Objects fetched while resolving /Encrypt were cached without
@@ -286,6 +294,8 @@ impl Document {
 
     /// Uncached fetch: parses the object at its file offset or extracts it
     /// from its containing object stream.
+    ///
+    /// Covers ISO 32000-1 §7.5.3.
     fn load_object(&self, r: ObjRef) -> Result<Object> {
         match self.xref.get(r.num) {
             None | Some(XrefEntry::Free) => Err(Error::ObjectNotFound(r.num, r.gen)),
@@ -447,6 +457,8 @@ impl Document {
     /// entry is missing, non-integer, negative, or larger than the file could
     /// possibly hold (a corrupt count), so the caller falls back to a real
     /// walk.
+    ///
+    /// Covers ISO 32000-1 §7.7.3 and §7.7.3.2.
     fn declared_page_count(&self) -> Option<usize> {
         let root = self.xref.trailer.get("Root")?;
         let catalog = self.resolve(root).ok()?;
@@ -479,6 +491,8 @@ impl Document {
 
     /// Document metadata from the trailer `/Info` dictionary (lenient:
     /// absent or malformed entries are simply `None`).
+    ///
+    /// Covers ISO 32000-1 §14.3.3, §7.9.4 and §8.11.4.3.
     pub fn metadata(&self) -> Metadata {
         let mut meta = Metadata::default();
         let Some(info) = self.xref.trailer.get("Info") else {
@@ -505,6 +519,8 @@ impl Document {
     /// configuration (ISO 32000-1 §8.11.4.3), or `None` when the catalog
     /// declares no `/OCProperties` — no optional content, everything
     /// visible. Computed per call from a handful of object reads.
+    ///
+    /// Covers ISO 32000-1 §8.11.4.2.
     pub fn oc_state(&self) -> Option<crate::oc::OcState> {
         block_on(crate::oc::OcState::load_with(
             &Immediate(self),
@@ -523,6 +539,8 @@ impl Document {
     }
 
     /// Reads `key` from an info dictionary as a decoded text string.
+    ///
+    /// Covers ISO 32000-1 §7.9.2.2.
     fn meta_string(&self, dict: &Dict, key: &str) -> Option<String> {
         let value = self.resolve(dict.get(key)?).ok()?;
         Some(decode_text_string(value.as_str_bytes()?))
@@ -532,6 +550,8 @@ impl Document {
     /// with a visited-reference cycle guard and a depth cap, applying
     /// attribute inheritance. Any structural problem simply truncates or
     /// skips (lenient) — this never fails.
+    ///
+    /// Covers ISO 32000-1 §14.11.2, §7.7.2, §7.7.3, §7.7.3.2, §7.7.3.3, §7.7.3.4 and §8.3.2.2.
     fn flatten_pages(&self) -> Vec<PageRec> {
         let mut pages = Vec::new();
         let Some(root) = self.xref.trailer.get("Root") else {
@@ -637,6 +657,8 @@ impl Document {
 
     /// Resolves `dict[key]` to a normalized rectangle: a four-number array
     /// whose elements may themselves be references.
+    ///
+    /// Covers ISO 32000-1 §7.9.5.
     fn rect_value(&self, dict: &Dict, key: &str) -> Option<Rect> {
         let items = self.array_value(dict, key)?;
         if items.len() != 4 {
@@ -732,6 +754,8 @@ where
 /// attributes. The defaults live in [`Page::from_tree_attrs`] — the one
 /// implementation of page defaulting, shared with the asynchronous API —
 /// and this only reshapes its output into the index-less cache record.
+///
+/// Covers ISO 32000-1 §7.7.3.3.
 fn make_page_rec(
     obj_ref: Option<ObjRef>,
     dict: Dict,
@@ -870,6 +894,8 @@ impl Page {
     /// `bleed_box`, `trim_box` and `art_box` are set to `crop_box` — their
     /// ISO 32000 §14.11.2 default. A caller that resolved real values
     /// overwrites the public fields afterwards.
+    ///
+    /// Covers ISO 32000-1 §14.11.2.
     pub fn from_parts(
         index: usize,
         media_box: Rect,
@@ -1271,6 +1297,7 @@ mod tests {
 
     const FONT: &str = "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>";
 
+    // Covers ISO 32000-1 §7.5.3 and §7.7.2.
     #[test]
     fn loads_simple_doc() {
         let doc = Document::load(simple_doc("Greetings, cosmos!")).unwrap();
@@ -1287,6 +1314,7 @@ mod tests {
         assert!(contains(&content, b"Greetings, cosmos!"));
     }
 
+    // Covers ISO 32000-1 §7.7.3 and §7.7.3.2.
     #[test]
     fn multi_page_ordering() {
         let doc = Document::load(multi_page_doc(&["alpha", "beta", "gamma"])).unwrap();
@@ -1322,6 +1350,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §7.5.5.
     #[test]
     fn encrypt_in_trailer_is_rejected() {
         let data = replace_once(
@@ -1332,6 +1361,7 @@ mod tests {
         assert!(matches!(Document::load(data), Err(Error::Encrypted)));
     }
 
+    // Covers ISO 32000-1 §14.3.3, §7.5.5 and §7.9.2.2.
     #[test]
     fn metadata_utf16be_round_trip() {
         let mut b = PdfBuilder::new();
@@ -1355,6 +1385,7 @@ mod tests {
         assert_eq!(doc.metadata(), Metadata::default());
     }
 
+    // Covers ISO 32000-1 §7.3.10 and §7.3.9.
     #[test]
     fn missing_object_resolves_to_null() {
         let doc = Document::load(simple_doc("x")).unwrap();
@@ -1379,6 +1410,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §7.3.10.
     #[test]
     fn generation_mismatch_is_tolerated() {
         let doc = Document::load(simple_doc("x")).unwrap();
@@ -1387,6 +1419,7 @@ mod tests {
         assert_eq!(dict.get_name("Type").map(|n| n.0.as_str()), Some("Catalog"));
     }
 
+    // Covers ISO 32000-1 §7.5.7.
     #[test]
     fn objects_in_object_streams_are_fetched() {
         let mut b = PdfBuilder::new();
@@ -1413,6 +1446,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.7.3.3 and §7.8.2.
     #[test]
     fn contents_array_is_joined_with_newlines() {
         let mut b = PdfBuilder::new();
@@ -1430,6 +1464,7 @@ mod tests {
         assert_eq!(content, b"q\nQ", "streams joined by \\n, null skipped");
     }
 
+    // Covers ISO 32000-1 §7.7.3 and §7.7.3.4.
     #[test]
     fn inheritance_from_pages_node_and_rotate_swap() {
         let mut b = PdfBuilder::new();
@@ -1461,6 +1496,7 @@ mod tests {
         assert_eq!(second.size(), (600.0, 400.0), "rotate 270 swaps w/h");
     }
 
+    // Covers ISO 32000-1 §7.7.3.4 and §7.9.5.
     #[test]
     fn crop_box_intersected_and_rotate_normalized() {
         let mut b = PdfBuilder::new();
@@ -1493,6 +1529,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §14.11.2, §7.7.3.3 and §7.9.5.
     #[test]
     fn page_boxes_declared_and_defaulted() {
         let mut b = PdfBuilder::new();
@@ -1529,6 +1566,7 @@ mod tests {
         assert_eq!(bare.art_box, bare.crop_box);
     }
 
+    // Covers ISO 32000-1 §14.11.2 and §7.7.3.3.
     #[test]
     fn page_boxes_clip_to_media_and_fall_back() {
         let mut b = PdfBuilder::new();
@@ -1561,6 +1599,7 @@ mod tests {
     /// `/BleedBox`, `/TrimBox` and `/ArtBox` are not in ISO 32000 Table 30's
     /// inheritable set: a value on a `/Pages` node must not leak into its
     /// leaves, which read their spec default (the crop box) instead.
+    // Covers ISO 32000-1 §14.11.2 and §7.7.3.3.
     #[test]
     fn page_boxes_are_not_inherited() {
         let mut b = PdfBuilder::new();
@@ -1579,6 +1618,7 @@ mod tests {
         assert_eq!(page.art_box, page.crop_box);
     }
 
+    // Covers ISO 32000-1 §7.7.3.2.
     #[test]
     fn kids_cycle_truncates_without_hanging() {
         let mut b = PdfBuilder::new();
@@ -1599,6 +1639,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §7.7.3.2 and Annex C.2.
     #[test]
     fn tree_depth_is_capped() {
         let mut b = PdfBuilder::new();
@@ -1624,6 +1665,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.7.3.2.
     #[test]
     fn page_count_reports_declared_count_cheaply() {
         // The tree declares five pages but supplies only one kid. `page_count`
@@ -1642,6 +1684,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.7.3.2.
     #[test]
     fn page_count_falls_back_to_walk_when_count_absent() {
         let mut b = PdfBuilder::new();
@@ -1656,6 +1699,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.7.3.2.
     #[test]
     fn page_count_ignores_corrupt_oversized_count() {
         // A `/Count` larger than the whole file is impossible: fall back to a
@@ -1668,6 +1712,7 @@ mod tests {
         assert_eq!(doc.page_count(), 1, "implausible /Count is rejected");
     }
 
+    // Covers ISO 32000-1 §7.5.2 and Annex I.
     #[test]
     fn version_scan_and_default() {
         let mut b = PdfBuilder::new().version(2, 0);
@@ -1678,6 +1723,7 @@ mod tests {
         assert_eq!(Document::load(data).unwrap().version(), (1, 4));
     }
 
+    // Covers ISO 32000-1 Annex C.2.
     #[test]
     fn deeply_nested_root_object_does_not_overflow_the_stack() {
         // A ~100 KB file whose Root is a 50k-deep array used to drive the
@@ -1941,6 +1987,7 @@ mod tests {
         b.trailer_extra(&trailer).build(1)
     }
 
+    // Covers ISO 32000-1 §7.6.2.
     #[test]
     fn encrypted_generation_mismatch_still_decrypts() {
         // `object_at_spanned` derives the per-object RC4/AESV2 decrypt key
@@ -1967,6 +2014,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.5.7.
     #[test]
     fn objstm_doc_fixture_loads_and_resolves_members() {
         let data = objstm_doc(&[(7, "<< /Marker (inside) >>")]);

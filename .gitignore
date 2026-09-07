@@ -10,3 +10,6 @@ docs/superpowers/
 
 # mdBook build output; the source lives in docs/src.
 docs/book/
+
+# Lean build output of the ISO 32000 gate.
+iso32000/.lake/

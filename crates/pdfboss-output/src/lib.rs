@@ -195,6 +195,7 @@ mod tests {
 
     /// The tagged two-column fixture read three ways: the stream as
     /// written, the page by position, the page as its structure tree says.
+    // Covers ISO 32000-1 §14.8.2.
     #[test]
     fn three_reading_orders_read_the_tagged_page_three_ways() {
         let doc = Document::load(tagged_two_column_doc()).unwrap();
@@ -217,6 +218,7 @@ mod tests {
 
     /// Markdown reads by the same order as text, page by page and
     /// document-wide.
+    // Covers ISO 32000-1 §14.8.2.3.
     #[test]
     fn markdown_follows_the_reading_order() {
         let doc = Document::load(tagged_two_column_doc()).unwrap();

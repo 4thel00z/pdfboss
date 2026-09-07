@@ -5,6 +5,8 @@ use pdfboss_core::geom::{Matrix, Point};
 
 /// Maximum deviation, in device pixels, of a flattened cubic from the true
 /// curve.
+///
+/// Covers ISO 32000-1 §10.6.2.
 const TOLERANCE: f32 = 0.1;
 /// Maximum subdivision depth for one cubic; caps the segment count per
 /// curve at `2^10 = 1024`.
@@ -81,6 +83,8 @@ impl PathBuilder {
     }
 
     /// Begins a new subpath at `(x, y)`.
+    ///
+    /// Covers ISO 32000-1 §8.5.2.1.
     pub(crate) fn move_to(&mut self, x: f32, y: f32) {
         self.flush(false);
         self.start_user = Point::new(x, y);
@@ -99,6 +103,8 @@ impl PathBuilder {
 
     /// Appends a cubic Bezier segment with control points `(x1, y1)` and
     /// `(x2, y2)` ending at `(x3, y3)` (operator `c`).
+    ///
+    /// Covers ISO 32000-1 §8.5.2.2.
     pub(crate) fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
         self.ensure_started();
         let p0 = self.ctm.apply(self.last_user);
@@ -120,6 +126,8 @@ impl PathBuilder {
 
     /// Cubic segment using the current point as the first control point
     /// (operator `v`).
+    ///
+    /// Covers ISO 32000-1 §8.5.2.2.
     pub(crate) fn curve_to_v(&mut self, x2: f32, y2: f32, x3: f32, y3: f32) {
         let c = self.last_user;
         self.curve_to(c.x, c.y, x2, y2, x3, y3);
@@ -166,6 +174,8 @@ impl PathBuilder {
 
 /// Whether the control points of a cubic lie within [`TOLERANCE`] of the
 /// chord `p0..p3`, meaning a single line segment approximates the curve.
+///
+/// Covers ISO 32000-1 §10.6.2.
 fn cubic_is_flat(p0: Point, p1: Point, p2: Point, p3: Point) -> bool {
     let dx = p3.x - p0.x;
     let dy = p3.y - p0.y;
@@ -208,6 +218,7 @@ fn flatten_cubic(p0: Point, p1: Point, p2: Point, p3: Point, depth: u32, out: &m
 mod tests {
     use super::*;
 
+    // Covers ISO 32000-1 §8.5.2.1.
     #[test]
     fn rect_produces_closed_quad() {
         let mut b = PathBuilder::new(Matrix::identity());
@@ -236,6 +247,7 @@ mod tests {
         assert_eq!(subs[0].points[2], Point::new(18.0, 32.0));
     }
 
+    // Covers ISO 32000-1 §8.5.2.2.
     #[test]
     fn straight_cubic_flattens_to_endpoint() {
         let mut b = PathBuilder::new(Matrix::identity());
@@ -266,6 +278,7 @@ mod tests {
         assert_eq!(*subs[0].points.last().unwrap(), Point::new(200.0, 0.0));
     }
 
+    // Covers ISO 32000-1 §10.6.2 and §8.5.2.2.
     #[test]
     fn curved_cubic_stays_within_tolerance() {
         let mut b = PathBuilder::new(Matrix::identity());
@@ -291,6 +304,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §10.6.2 and §8.5.2.2.
     #[test]
     fn cubic_segment_cap_holds() {
         // A wild curve spanning a huge range must not exceed 2^10 segments.
@@ -301,6 +315,7 @@ mod tests {
         assert!(subs[0].points.len() <= 1025);
     }
 
+    // Covers ISO 32000-1 §8.5.2.1.
     #[test]
     fn close_then_line_starts_at_subpath_start() {
         let mut b = PathBuilder::new(Matrix::identity());
@@ -315,6 +330,7 @@ mod tests {
         assert!(!subs[1].closed);
     }
 
+    // Covers ISO 32000-1 §8.5.2.2.
     #[test]
     fn v_and_y_curve_forms() {
         let mut b = PathBuilder::new(Matrix::identity());
@@ -325,6 +341,7 @@ mod tests {
         assert_eq!(b.current_point(), Point::new(40.0, 0.0));
     }
 
+    // Covers ISO 32000-1 §8.5.2.1.
     #[test]
     fn line_before_move_starts_at_origin() {
         let mut b = PathBuilder::new(Matrix::identity());

@@ -52,3 +52,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
+
+  # The ISO 32000 gate: Lean checks the conformance ledger in iso32000/
+  # against the source tree (see iso32000/Iso32000/Gate.lean). The index, the
+  # vectors and the book chapter are regenerated so a stale committed copy
+  # fails the job.
+  iso32000:
+    name: iso32000 gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.elan
+            iso32000/.lake
+          key: lean-${{ runner.os }}-${{ hashFiles('iso32000/lean-toolchain', 'iso32000/lakefile.toml') }}
+      - name: Install Lean through elan
+        run: |
+          curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          "$HOME/.elan/bin/elan" toolchain install "$(cat iso32000/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      # Rescans the sources, lists any offending row before Lean runs, then checks the ledger.
+      - name: Check the ledger
+        run: make iso32000-gate
+      - name: Regenerate the vectors and the book chapter
+        run: make iso32000-vectors iso32000-report
+      - name: Committed copies must match what the tree generates
+        run: git diff --exit-code -- iso32000/Iso32000/Generated.lean crates/pdfboss-core/tests/vectors/iso32000 docs/src/reference/iso32000.md

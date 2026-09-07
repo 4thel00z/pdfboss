@@ -1,6 +1,6 @@
-//! LZWDecode: 9- to 12-bit variable codes, clear code 256, EOD 257,
-//! `/EarlyChange` defaulting to 1, followed by an optional predictor
-//! post-pass.
+//! LZWDecode (ISO 32000-1 §7.4.4, coding details in §7.4.4.2): 9- to 12-bit
+//! variable codes, clear code 256, EOD 257, `/EarlyChange` (ISO 32000-1
+//! §7.4.4.3) defaulting to 1, followed by an optional predictor post-pass.
 
 use crate::error::{Error, Result};
 use crate::filters::{int_parm, predictor, MAX_DECODED_LEN};
@@ -43,6 +43,8 @@ impl<'a> BitReader<'a> {
 
 /// The initial code table: 256 single-byte entries plus placeholders for
 /// the clear (256) and end-of-data (257) codes, which are never looked up.
+///
+/// Covers ISO 32000-1 §7.4.4.2.
 fn base_table() -> Vec<Vec<u8>> {
     let mut table = Vec::with_capacity(MAX_TABLE);
     for b in 0..=255u8 {
@@ -60,6 +62,8 @@ fn base_table() -> Vec<Vec<u8>> {
 /// (the default) the width increases one code early, i.e. when the table
 /// reaches 511/1023/2047 entries instead of 512/1024/2048. Truncated or
 /// corrupt input leniently yields the prefix decoded so far.
+///
+/// Covers ISO 32000-1 §7.4.4, §7.4.4.2 and §7.4.4.3.
 pub fn decode(data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>> {
     let early: usize = if int_parm(parms, "EarlyChange", 1) == 0 {
         0
@@ -185,6 +189,9 @@ mod tests {
         d
     }
 
+    // LZWDecode per ISO 32000-1 §7.4.4: the worked example of §7.4.4.2,
+    // code-width growth, clear and EOD codes; the `/EarlyChange` tests below
+    // cover the parameter of ISO 32000-1 §7.4.4.3.
     #[test]
     fn handmade_byte_vector_decodes() {
         // 9-bit codes 256 (clear), 65 'A', 66 'B', 258 "AB", 257 (EOD),
@@ -193,6 +200,7 @@ mod tests {
         assert_eq!(decode(&data, None).unwrap(), b"ABAB");
     }
 
+    // Covers ISO 32000-1 §7.4.4.2.
     #[test]
     fn kwkwk_code_just_beyond_table() {
         // 256, 65 'A', 258 (defined by this very code: "AA"), 257.
@@ -203,6 +211,7 @@ mod tests {
         assert_eq!(decode(&w.finish(), None).unwrap(), b"AAA");
     }
 
+    // Covers ISO 32000-1 §7.4.4.2.
     #[test]
     fn clear_code_resets_table_and_width() {
         let mut w = BitWriter::new();
@@ -212,6 +221,7 @@ mod tests {
         assert_eq!(decode(&w.finish(), None).unwrap(), b"ABBA");
     }
 
+    // Covers ISO 32000-1 §7.4.4.2.
     #[test]
     fn codes_after_eod_are_ignored() {
         let mut w = BitWriter::new();
@@ -238,6 +248,7 @@ mod tests {
         assert_eq!(decode(&w.finish(), None).unwrap(), b"XY");
     }
 
+    // Covers ISO 32000-1 §7.4.4.3.
     #[test]
     fn width_grows_at_511_with_early_change_one() {
         // 254 literals make the table 511 entries big; with EarlyChange 1
@@ -262,6 +273,7 @@ mod tests {
         assert_eq!(decode(&stream0, Some(&early_parms(0))).unwrap(), bytes);
     }
 
+    // Covers ISO 32000-1 §7.4.4.2.
     #[test]
     fn width_growth_across_511_1023_and_2047() {
         // 2500 literal codes push the table past all three growth points
@@ -278,6 +290,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.4.4.3.
     #[test]
     fn default_early_change_is_one() {
         let bytes = vec![7u8; 300];
@@ -286,6 +299,7 @@ mod tests {
         assert_eq!(decode(&stream, Some(&early_parms(1))).unwrap(), bytes);
     }
 
+    // Covers ISO 32000-1 §7.4.4.2.
     #[test]
     fn corrupt_code_keeps_prefix() {
         let mut w = BitWriter::new();

@@ -205,6 +205,8 @@ pub enum Op {
 /// image data runs from after `ID` plus one whitespace byte to `EI` at a
 /// token boundary (or the declared `/L`ength when present, which is
 /// trusted).
+///
+/// Covers ISO 32000-1 §7.8.2.
 pub fn parse_content(data: &[u8]) -> Result<Vec<Op>> {
     let mut ops = Vec::with_capacity(ops_estimate(data.len()));
     parse_content_ops(data, |op, _| ops.push(op))?;
@@ -279,6 +281,8 @@ impl<'a> ContentOps<'a> {
 
     /// Parses forward to the next complete operator and returns it with
     /// its span, or `None` at the end of the stream.
+    ///
+    /// Covers ISO 32000-1 §7.8.2.
     pub fn next_op(&mut self) -> Result<Option<(Op, Span)>> {
         loop {
             let (token_start, raw) = self.lexer.next_raw_token_spanned()?;
@@ -470,6 +474,8 @@ fn parse_dict(lexer: &mut Lexer, depth: usize) -> Result<Dict> {
 /// keyword — so heap operands (strings, names) are moved into the `Op`
 /// rather than cloned, and a mismatch may leave the stack partially
 /// emptied.
+///
+/// Covers ISO 32000-1 §8.2, §8.4.4, §8.5.2.1, §8.6.5.8 and Annex A.2.
 fn dispatch(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
     Some(match kw {
         // Graphics state.
@@ -540,6 +546,8 @@ fn dispatch(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
 }
 
 /// Continuation of [`dispatch`]: color and text operators.
+///
+/// Covers ISO 32000-1 §8.6.8, §9.2.2, §9.3.2, §9.4.2, §9.4.3 and Annex A.2.
 fn dispatch_color_text(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
     Some(match kw {
         // Color.
@@ -640,6 +648,8 @@ fn dispatch_color_text(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
 
 /// Continuation of [`dispatch`]: XObject, shading, marked-content, and
 /// compatibility operators.
+///
+/// Covers ISO 32000-1 §14.6.1 and §8.8.1.
 fn dispatch_misc(kw: &[u8], stack: &mut [Object]) -> Option<Op> {
     Some(match kw {
         b"Do" => Op::XObject(name1(stack)?),
@@ -705,6 +715,8 @@ fn tag_props(stack: &mut [Object]) -> Option<(Name, Object)> {
 /// Parses an inline image; the `BI` keyword has already been consumed.
 /// Returns `None` (image skipped) when the stream ends before `ID` or no
 /// `EI` terminator can be located.
+///
+/// Covers ISO 32000-1 §8.9.7.
 fn parse_inline_image(lexer: &mut Lexer) -> Option<Op> {
     let mut dict = Dict::new();
     loop {
@@ -802,6 +814,8 @@ fn consume_ei(lexer: &mut Lexer) {
 
 /// Canonical spelling of an inline image dictionary key (ISO 32000
 /// §8.9.7, Table 91).
+///
+/// Covers ISO 32000-1 §8.9.7.
 fn expand_image_key(key: &str) -> &str {
     match key {
         "BPC" => "BitsPerComponent",
@@ -882,6 +896,7 @@ mod tests {
         Name(s.to_string())
     }
 
+    // Covers ISO 32000-1 §7.8.2, §8.2 and Annex A.2.
     #[test]
     fn shapes_fixture_parses_to_expected_ops() {
         let path = concat!(
@@ -920,6 +935,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.3.2.3, §8.4.3.3, §8.4.3.4, §8.4.3.5, §8.4.4, §8.6.5.8 and Annex A.2.
     #[test]
     fn graphics_state_ops_round_trip() {
         let got = ops(b"q Q 1 0 0 1 10 20 cm 2 w 1 J 2 j 3.5 M [3 1] 0.5 d \
@@ -949,11 +965,13 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.4.3.6.
     #[test]
     fn empty_dash_array_round_trips() {
         assert_eq!(ops(b"[] 0 d"), vec![Op::SetDash(vec![], 0.0)]);
     }
 
+    // Covers ISO 32000-1 §8.5.2.1 and Annex A.2.
     #[test]
     fn path_ops_round_trip() {
         let got = ops(b"10 20 m 30 40 l 1 2 3 4 5 6 c 1 2 3 4 v 5 6 7 8 y h \
@@ -980,6 +998,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §14.6.1, §14.6.2, §8.2 and Annex A.2.
     #[test]
     fn xobject_shading_marked_content_round_trip() {
         let got = ops(b"/Im1 Do /Sh1 sh /Tag MP /Tag /P DP /Span BMC \
@@ -1002,6 +1021,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.8.2, §8.2, Annex A.2 and Annex I.
     #[test]
     fn unknown_operator_is_skipped_without_breaking_following_ops() {
         assert_eq!(
@@ -1012,6 +1032,7 @@ mod tests {
         assert_eq!(ops(b"1 2 zz 3 4 l"), vec![Op::LineTo(3.0, 4.0)]);
     }
 
+    // Covers ISO 32000-1 §7.8.2.
     #[test]
     fn malformed_operands_are_skipped() {
         // Too few operands.
@@ -1036,6 +1057,7 @@ mod tests {
         assert_eq!(ops(b"9 9 1 2 m"), vec![Op::MoveTo(1.0, 2.0)]);
     }
 
+    // Covers ISO 32000-1 §7.8.2, §8.9.7 and Annex A.2.
     #[test]
     fn inline_image_with_hex_data_ending_in_ei() {
         let got = ops(b"q BI /W 2 /H 2 /BPC 8 /CS /G /F /AHx ID 00FF80FF> EI Q");
@@ -1053,6 +1075,7 @@ mod tests {
         assert_eq!(img.dict.get_name("Filter"), Some(&name("AHx")));
     }
 
+    // Covers ISO 32000-1 §8.9.7.
     #[test]
     fn inline_image_trusts_declared_length() {
         // Binary payload contains a spurious ` EI ` sequence; /L must win.
@@ -1069,6 +1092,7 @@ mod tests {
         assert_eq!(got[1], Op::MoveTo(1.0, 2.0));
     }
 
+    // Covers ISO 32000-1 §8.9.7.
     #[test]
     fn inline_image_expands_indexed_colorspace_array() {
         let got = ops(
@@ -1115,6 +1139,7 @@ mod tests {
         assert_eq!(ops(b"   \n  "), Vec::<Op>::new());
     }
 
+    // Covers ISO 32000-1 §9.3.1, §9.3.2, §9.3.4 and Annex A.2.
     #[test]
     fn text_state_ops_round_trip() {
         let got = ops(b"BT 0.5 Tc 1 Tw 90 Tz 14 TL /F1 12 Tf 3 Tr 4.5 Ts ET");
@@ -1134,6 +1159,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.3.5, §9.4.2, §9.4.3 and Annex A.2.
     #[test]
     fn text_positioning_and_showing_round_trip() {
         let got = ops(b"BT 72 720 Td 0 -14 TD 1 0 0 1 50 60 Tm T* \
@@ -1161,12 +1187,14 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 Annex A.2.
     #[test]
     fn parses_d0_glyph_width() {
         let ops = parse_content(b"1000 0 d0").expect("parse");
         assert_eq!(ops, vec![Op::SetGlyphWidth(1000.0, 0.0)]);
     }
 
+    // Covers ISO 32000-1 §9.6.5 and Annex A.2.
     #[test]
     fn parses_d1_glyph_width_bbox() {
         let ops = parse_content(b"1000 0 0 0 750 700 d1").expect("parse");
@@ -1183,6 +1211,7 @@ mod tests {
         assert!(ops.is_empty());
     }
 
+    // Covers ISO 32000-1 §9.4.3.
     #[test]
     fn tj_array_mixes_strings_and_numbers() {
         let got = ops(b"[(He) -120 (llo) 33.5 <20>] TJ");
@@ -1198,6 +1227,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.6.2, §8.6.8 and Annex A.2.
     #[test]
     fn color_ops_round_trip() {
         let got = ops(b"/DeviceRGB CS /DeviceGray cs 1 0 0 SC 0.5 sc \
@@ -1219,6 +1249,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.6.6.2, §8.6.8 and Annex A.2.
     #[test]
     fn scn_with_and_without_pattern_name() {
         let got = ops(b"0.2 0.4 0.6 scn /P1 scn 0.1 0.2 /P2 SCN 1 SCN");
@@ -1233,6 +1264,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.5.3.1, §8.5.3.3.3 and Annex A.2.
     #[test]
     fn painting_and_clipping_ops_round_trip() {
         let got = ops(b"S s f F f* B B* b b* n W W*");
@@ -1284,6 +1316,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Syntax { .. })));
     }
 
+    // Covers ISO 32000-1 §14.6.1 and Annex C.2.
     #[test]
     fn nesting_within_the_limit_still_parses() {
         // A BDC property dict holding a modestly nested array operand.

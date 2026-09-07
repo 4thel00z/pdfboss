@@ -40,6 +40,8 @@ impl StructureTree {
     /// Loads the catalog's `/StructTreeRoot`, or `None` when the document
     /// declares none, or when the entry is missing or unreadable, which
     /// leaves every page in content order.
+    ///
+    /// Covers ISO 32000-1 §14.7.2.
     pub async fn load_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> Option<StructureTree> {
         let root = trailer.get("Root")?;
         let catalog = src.resolve(root).await.ok()?;
@@ -59,6 +61,8 @@ impl StructureTree {
     /// The lookup goes through the parent tree (`/ParentTree`, keyed by
     /// `/StructParents`) and each element's `/P` chain, so it costs the page's
     /// own elements, never a walk of the whole tree.
+    ///
+    /// Covers ISO 32000-1 §14.8.2 and §14.8.2.3.
     pub async fn ranks_with<S: AsyncObjectSource>(
         &self,
         src: &S,
@@ -131,6 +135,8 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
 
     /// The parent tree's entry for a `/StructParents` key: the array whose
     /// index is a marked-content id and whose value is that id's element.
+    ///
+    /// Covers ISO 32000-1 §14.7.4.4.
     async fn parent_array(&mut self, parent_tree: &Dict, key: u32) -> Option<Arc<Vec<Object>>> {
         if let Some(cached) = self.parents.get(&key) {
             return cached.clone();
@@ -163,6 +169,8 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// up through `/P` until it reaches the structure tree root, then each
     /// ancestor's index among its parent's kids is read on the way back down.
     /// Every ancestor's own path is remembered as a by-product.
+    ///
+    /// Covers ISO 32000-1 §14.7.2.
     async fn path_of(&mut self, element: ObjRef) -> Option<Arc<Vec<u32>>> {
         if let Some(cached) = self.paths.get(&element) {
             return cached.clone();
@@ -247,6 +255,8 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// page) or a marked-content reference dictionary naming the page. A
     /// direct match is taken first; only when there is none are the
     /// indirect kids read, in case the reference dictionary is one of them.
+    ///
+    /// Covers ISO 32000-1 §14.7.4 and §14.7.4.2.
     async fn mcid_index(&mut self, element: &Dict, mcid: u32) -> Option<u32> {
         let kids = kids_of(element);
         let page_ref = self.page_ref;
@@ -288,6 +298,8 @@ fn on_page(pg: Option<ObjRef>, page_ref: Option<ObjRef>) -> bool {
 }
 
 /// Whether `dict` is the marked-content reference for `mcid`.
+///
+/// Covers ISO 32000-1 §14.7.4.2.
 fn is_mcr(dict: &Dict, mcid: u32) -> bool {
     dict.get_int("MCID")
         .and_then(|n| u32::try_from(n).ok())
@@ -325,6 +337,8 @@ async fn resolved_dict<S: AsyncObjectSource>(src: &S, o: &Object) -> Option<Dict
 /// leaf pairs, `/Kids` the subtrees, each with the `/Limits` its keys fall
 /// in. The value comes back unresolved. Malformed nodes are skipped, and
 /// the walk stops after [`MAX_NUMBER_TREE_NODES`] nodes.
+///
+/// Covers ISO 32000-1 §14.7.4 and §14.7.4.4.
 async fn number_tree_lookup<S: AsyncObjectSource>(
     src: &S,
     root: &Dict,
@@ -362,6 +376,8 @@ async fn number_tree_lookup<S: AsyncObjectSource>(
 
 /// Whether `key` falls in a node's `/Limits`; a node without readable
 /// limits is searched regardless.
+///
+/// Covers ISO 32000-1 §7.9.7.
 async fn within_limits<S: AsyncObjectSource>(src: &S, node: &Dict, key: i64) -> bool {
     let Some(limits) = node.get("Limits") else {
         return true;
@@ -461,6 +477,7 @@ mod tests {
         block_on(tree.ranks_with(&Immediate(doc), &page, ids))
     }
 
+    // Covers ISO 32000-1 §7.7.2.
     #[test]
     fn no_struct_tree_root_means_no_tree() {
         let mut b = PdfBuilder::new();
@@ -471,6 +488,7 @@ mod tests {
         assert!(doc.structure_tree().is_none());
     }
 
+    // Covers ISO 32000-1 §14.7.2 and §7.9.7.
     #[test]
     fn ranks_follow_the_tree_not_the_ids() {
         let doc = two_paragraphs("<< /Nums [0 [13 0 R 14 0 R 13 0 R 14 0 R]] >>");
@@ -481,6 +499,7 @@ mod tests {
         assert_eq!(ranks[&id(0, 3)], 3);
     }
 
+    // Covers ISO 32000-1 §14.7.4, §14.7.4.4 and §7.9.7.
     #[test]
     fn parent_tree_kids_and_limits_are_descended() {
         let doc = tagged_doc(
@@ -507,6 +526,7 @@ mod tests {
         assert_eq!(ranks[&id(7, 0)], 0);
     }
 
+    // Covers ISO 32000-1 §14.7.4.4.
     #[test]
     fn a_page_without_a_parent_tree_entry_has_no_ranks() {
         let doc = two_paragraphs("<< /Nums [5 [13 0 R]] >>");
@@ -521,6 +541,7 @@ mod tests {
         assert_eq!(ranks[&id(0, 0)], 0);
     }
 
+    // Covers ISO 32000-1 §14.7.2.
     #[test]
     fn a_broken_ancestry_leaves_only_that_element_unranked() {
         let doc = tagged_doc(
@@ -551,6 +572,7 @@ mod tests {
         assert_eq!(ranks[&id(0, 0)], 0);
     }
 
+    // Covers ISO 32000-1 §14.7.4 and §14.7.4.2.
     #[test]
     fn marked_content_references_name_their_page() {
         // One element spanning two pages: the same id number on each. The
@@ -588,6 +610,7 @@ mod tests {
         drop(tree);
     }
 
+    // Covers ISO 32000-1 §14.7.4.2.
     #[test]
     fn a_bare_integer_on_another_page_is_not_this_page() {
         let doc = tagged_doc(
@@ -607,6 +630,7 @@ mod tests {
         assert!(ranks(&doc, &[id(0, 0)]).is_empty());
     }
 
+    // Covers ISO 32000-1 §14.7.4.4.
     #[test]
     fn a_form_key_ranks_alongside_the_page() {
         // The form's marked content (key 1) is a child of the second
@@ -638,6 +662,7 @@ mod tests {
         assert_eq!(ranks[&id(1, 0)], 1);
     }
 
+    // Covers ISO 32000-1 §14.7.2.
     #[test]
     fn a_single_kid_needs_no_array() {
         let doc = tagged_doc(

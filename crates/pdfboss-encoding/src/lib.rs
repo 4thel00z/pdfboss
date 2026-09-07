@@ -45,6 +45,8 @@ const WIN_ANSI_80_9F: [Option<char>; 32] = [
 ];
 
 /// Unicode value of `code` in `WinAnsiEncoding`.
+///
+/// Covers ISO 32000-1 Annex D.2.
 pub fn win_ansi(code: u8) -> Option<char> {
     match code {
         0x20..=0x7E => Some(code as char),
@@ -63,6 +65,8 @@ pub fn win_ansi(code: u8) -> Option<char> {
 /// nonbreaking space draws as the space glyph) and `0xAD` carries `hyphen`
 /// (likewise the soft hyphen) — see the self-verifying
 /// `win_ansi_glyph_name_matches_win_ansi_table` test below.
+///
+/// Covers ISO 32000-1 Annex D.2.
 pub fn win_ansi_glyph_name(code: u8) -> Option<&'static str> {
     match code {
         0x27 => Some("quotesingle"),
@@ -770,6 +774,8 @@ const GLYPHS_TEX: &[(&str, char)] = &[
 /// its own. A bare `StandardEncoding` token expands to that table, and any
 /// `dup <code> /<name> put` entries override it code by code. `None` when
 /// the program states no `/Encoding` at all.
+///
+/// Covers ISO 32000-1 §9.6.6.2.
 pub fn type1_builtin_encoding(program: &[u8]) -> Option<Box<[Option<String>; 256]>> {
     let clear = type1_clear_text(program);
     let mut tokens = PsTokens {
@@ -892,6 +898,7 @@ fn is_ps_delimiter(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    // Covers ISO 32000-1 §9.6.6.1 and Annex D.2.
     #[test]
     fn win_ansi_spot_checks() {
         assert_eq!(win_ansi(b'A'), Some('A'));
@@ -923,6 +930,7 @@ mod tests {
     /// Unicode value — with exactly two documented exceptions, codes that
     /// render an existing glyph rather than owning one: `0xA0` (nonbreaking
     /// space, drawn by `space`) and `0xAD` (soft hyphen, drawn by `hyphen`).
+    // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn win_ansi_glyph_name_matches_win_ansi_table() {
         assert_eq!(win_ansi_glyph_name(0xA0), Some("space"));
@@ -950,6 +958,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn mac_roman_spot_checks() {
         assert_eq!(mac_roman(b'A'), Some('A'));
@@ -960,6 +969,7 @@ mod tests {
         assert_eq!(mac_roman(0x00), None);
     }
 
+    // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn standard_spot_checks() {
         assert_eq!(standard(b'A'), Some('A'));
@@ -971,6 +981,7 @@ mod tests {
         assert_eq!(standard(0xA0), None); // unassigned in Standard
     }
 
+    // Covers ISO 32000-1 §9.10.2.
     #[test]
     fn glyph_names_hex_forms() {
         assert_eq!(glyph_to_unicode("uni03B1"), Some('\u{3B1}'));
@@ -989,6 +1000,7 @@ mod tests {
     /// `standard` maps to a char) must hold for every code; value agreement
     /// only where `glyph_to_unicode` also resolves the name (some names
     /// aren't in the bundled glyph-name subset).
+    // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn standard_encoding_name_matches_standard_table() {
         for code in 0u16..=255 {
@@ -1075,6 +1087,7 @@ mod tests {
     /// The math and symbol names a TeX-produced document's fonts carry in
     /// their built-in encodings are all in the Adobe Glyph List, as are the
     /// Hebrew names whose text is two scalars.
+    // Covers ISO 32000-1 §14.8.2.4.2.
     #[test]
     fn glyph_names_cover_the_full_adobe_glyph_list() {
         assert_eq!(glyph_to_unicode("universal"), Some('\u{2200}'));
@@ -1106,6 +1119,7 @@ mod tests {
         assert_eq!(glyph_to_unicode("Circle"), Some('\u{25CB}'));
     }
 
+    // Covers ISO 32000-1 §9.6.6.2.
     #[test]
     fn type1_program_encoding_reads_dup_put_entries() {
         let program: &[u8] = b"%!PS-AdobeFont-1.0: CMSY10\n/FontName /CMSY10 def\n\

@@ -1,4 +1,4 @@
-//! FlateDecode: zlib/deflate decompression, tolerant of trailing junk and
+//! FlateDecode (ISO 32000-1 §7.4.4): zlib/deflate decompression, tolerant of trailing junk and
 //! truncated data, followed by an optional predictor post-pass.
 
 use crate::error::{Error, Result};
@@ -12,6 +12,8 @@ use flate2::{Decompress, FlushDecompress, Status};
 /// Malformed real-world streams are tolerated: junk after the compressed
 /// stream is ignored, and truncated or mid-stream-corrupted data yields
 /// whatever prefix decoded cleanly.
+///
+/// Covers ISO 32000-1 §7.4.4 and §7.4.4.1.
 pub fn decode(data: &[u8], parms: Option<&Dict>) -> Result<Vec<u8>> {
     let inflated = inflate_tolerant(data)?;
     predictor::post_pass(inflated, parms)
@@ -26,6 +28,7 @@ fn has_zlib_header(data: &[u8]) -> bool {
         && (u16::from(data[0]) << 8 | u16::from(data[1])) % 31 == 0
 }
 
+/// Covers ISO 32000-1 §7.4.4.1.
 fn inflate_tolerant(data: &[u8]) -> Result<Vec<u8>> {
     let mut input = data;
     // Some writers leave stray EOL bytes before the compressed data; only
@@ -57,6 +60,8 @@ fn inflate_tolerant(data: &[u8]) -> Result<Vec<u8>> {
 /// the compressed stream ended cleanly (trailing junk is fine); false means
 /// truncation or corruption, with the decoded prefix returned. Output
 /// larger than `MAX_DECODED_LEN` (a decompression bomb) is an error.
+///
+/// Covers ISO 32000-1 Annex C.3.
 fn inflate(data: &[u8], zlib_header: bool) -> Result<(Vec<u8>, bool)> {
     let mut inflater = Decompress::new(zlib_header);
     // Typical PDF streams decompress 3-5x; starting at 4x (same 4 MiB cap)
@@ -113,6 +118,9 @@ mod tests {
             .collect()
     }
 
+    // FlateDecode per ISO 32000-1 §7.4.4: zlib-wrapped deflate data, with
+    // the predictor post-pass of §7.4.4.4 exercised further down.
+    // Covers ISO 32000-1 §7.4.4.1.
     #[test]
     fn round_trips_zlib_data() {
         let text = sample_text(4096);
@@ -127,6 +135,7 @@ mod tests {
         assert_eq!(decode(&stored, None).unwrap(), text);
     }
 
+    // Covers ISO 32000-1 §7.4.4.1.
     #[test]
     fn truncated_data_returns_decoded_prefix() {
         let text = sample_text(50_000);
@@ -138,6 +147,7 @@ mod tests {
         assert_eq!(&text[..out.len()], &out[..]);
     }
 
+    // Covers ISO 32000-1 §7.4.4.1.
     #[test]
     fn accepts_headerless_raw_deflate() {
         let text = sample_text(600);
@@ -147,6 +157,7 @@ mod tests {
         assert_eq!(decode(&raw, None).unwrap(), text);
     }
 
+    // Covers ISO 32000-1 §7.4.4.1.
     #[test]
     fn skips_leading_whitespace_before_zlib_header() {
         let text = sample_text(100);
@@ -166,6 +177,7 @@ mod tests {
         assert!(matches!(decode(&garbage, None), Err(Error::Decode(_))));
     }
 
+    // Covers ISO 32000-1 §7.4.4.4.
     #[test]
     fn png_predictor_post_pass_applies() {
         // Two rows of 3 bytes, Sub filter (type 1), colors=1 bpc=8.

@@ -372,6 +372,8 @@ pub(crate) struct ImageMeta {
 impl ImageMeta {
     /// Reads the metadata synchronously; [`ImageMeta::read_with`] over
     /// [`Immediate`].
+    ///
+    /// Covers ISO 32000-1 §8.9.2 and §8.9.5.1.
     #[cfg(test)]
     pub(crate) fn read(doc: &Document, dict: &Dict, cs_obj: Option<&Object>) -> ImageMeta {
         block_on(Self::read_with(
@@ -422,6 +424,8 @@ impl ImageMeta {
 /// otherwise read as samples.
 /// Undecodable images are skipped (lenient); the return value says what was
 /// painted, so the caller can record the miss.
+///
+/// Covers ISO 32000-1 §8.9.2 and §8.9.4.
 pub(crate) fn draw(pix: &mut Pixmap, meta: &ImageMeta, data: &[u8], p: &DrawParams) -> Drawn {
     if meta.jpx {
         return draw_jpx(pix, meta, data, p);
@@ -472,6 +476,8 @@ async fn floats_of<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Opt
 /// "Trailing" is read by the shared core helper, which skips non-Name
 /// entries exactly as `decode_stream` does — `[/DCTDecode null]` is still
 /// a passthrough.
+///
+/// Covers ISO 32000-1 §7.4.8.
 async fn is_dct<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
     matches!(
         pdfboss_core::filters::trailing_filter_with(src, dict)
@@ -499,6 +505,8 @@ async fn is_jpx<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
 
 /// Reads the big-endian `bpc`-bit sample starting at `bit` in `data`.
 /// Bits past the end of `data` read as 0 (lenient on short data).
+///
+/// Covers ISO 32000-1 §8.9.3.
 fn sample_bits(data: &[u8], bit: usize, bpc: usize) -> u32 {
     if bpc == 8 {
         return u32::from(data.get(bit / 8).copied().unwrap_or(0));
@@ -546,6 +554,8 @@ impl SampleMask {
 /// (its gray sample IS the alpha, `/Decode` applied), or a `/Mask`
 /// stencil's paintable bits (sample 1 hides the base sample, §8.9.6.4 —
 /// which is exactly the stencil decode's transparent side).
+///
+/// Covers ISO 32000-1 §11.6.5.3 and §8.9.6.3.
 pub(crate) fn decode_alpha(meta: &ImageMeta, data: &[u8]) -> Option<SampleMask> {
     let img = decode_rgba(meta, data, [255, 255, 255])?;
     let (width, height) = (img.width, img.height);
@@ -570,6 +580,8 @@ pub(crate) fn decode_alpha(meta: &ImageMeta, data: &[u8]) -> Option<SampleMask> 
 /// every raw component lies inside its `[min, max]` range is transparent
 /// (§8.9.6.4). `None` when the base's samples cannot be walked here (a
 /// passed-through JPEG or JPEG 2000 codestream, or a stencil).
+///
+/// Covers ISO 32000-1 §8.9.6.4.
 pub(crate) fn color_key_mask(meta: &ImageMeta, data: &[u8], key: &[i64]) -> Option<SampleMask> {
     if meta.dct || meta.jpx || meta.stencil {
         return None;
@@ -683,6 +695,8 @@ fn decode_rgba<'a>(meta: &ImageMeta, data: &'a [u8], fill_rgb: [u8; 3]) -> Optio
 /// Decodes a 1-bit `/ImageMask` stencil: samples that map to 0 through the
 /// `/Decode` array (default `[0 1]`; `[1 0]` inverts) paint `fill_rgb`,
 /// the rest stay transparent.
+///
+/// Covers ISO 32000-1 §8.9.5.2 and §8.9.6.2.
 fn decode_stencil(
     width: usize,
     height: usize,
@@ -715,6 +729,8 @@ fn decode_stencil(
 /// through its `/Decode` range (default `[0 1]`, or `[0 2^bpc-1]` for
 /// Indexed) and the results converted to RGB via the color space. Rows are
 /// byte-aligned; missing bytes read as 0.
+///
+/// Covers ISO 32000-1 §8.9.3 and §8.9.5.2.
 fn decode_samples<'a>(
     width: usize,
     height: usize,
@@ -796,7 +812,7 @@ fn sample_lut(cs: &ColorSpace, bpc: usize, range: (f32, f32), max: f32) -> Vec<[
         .collect()
 }
 
-/// Decodes a raw JPEG (`DCTDecode` payload) to RGBA. Gray, RGB, and CMYK
+/// Decodes a raw JPEG (`DCTDecode` payload, ISO 32000-1 §7.4.8) to RGBA. Gray, RGB, and CMYK
 /// pixel layouts are supported; CMYK JPEGs are assumed to carry
 /// Adobe-style inverted ink values (the common case) and are un-inverted
 /// before conversion. `/Decode` arrays are not applied to JPEG data.
@@ -920,6 +936,8 @@ fn jpx_dimensions(img: &pdfboss_jpx::DecodedImage) -> Result<(usize, usize), Str
 /// or 255; the midpoint threshold is exact for those and still sensible
 /// for a (malformed) deeper channel. More than one channel cannot be a
 /// stencil at all: a named failure, and the caller skips the image.
+///
+/// Covers ISO 32000-1 §8.9.6.2.
 fn jpx_stencil(
     meta: &ImageMeta,
     img: &pdfboss_jpx::DecodedImage,
@@ -976,6 +994,8 @@ fn jpx_stencil(
 /// `Err` is a reason to skip the image. The `Vec<String>` collects material
 /// degradation: decoder warnings that cost pixels, plus this function's own
 /// approximation notes.
+///
+/// Covers ISO 32000-1 §7.4.9.
 fn jpx_rgba(
     meta: &ImageMeta,
     img: pdfboss_jpx::DecodedImage,
@@ -1256,6 +1276,8 @@ fn composite_over(dst: &mut [u8], rgb: [u8; 3], a: f32) {
 /// scan as moiré stripes and drops the thin strokes of scanned text; there
 /// the sample is the average of the device pixel's source footprint
 /// instead ([`Rgba::averaged`]).
+///
+/// Covers ISO 32000-1 §11.3.6, §8.3.2.4 and §8.9.4.
 fn draw_rgba(pix: &mut Pixmap, img: &Rgba<'_>, p: &DrawParams) {
     let Some(inv) = p.ctm.invert() else {
         return;
@@ -1392,6 +1414,7 @@ mod tests {
         super::decode_rgba(&ImageMeta::read(doc, dict, cs_obj), data, fill_rgb)
     }
 
+    // Covers ISO 32000-1 §8.9.3.
     #[test]
     fn sample_bits_all_depths() {
         let data = [0b1011_0110, 0b0101_0011];
@@ -1408,6 +1431,7 @@ mod tests {
         assert_eq!(sample_bits(&data, 16, 8), 0);
     }
 
+    // Covers ISO 32000-1 §8.9.2 and §8.9.3.
     #[test]
     fn gray_bpc_variants_decode() {
         let doc = test_doc();
@@ -1480,6 +1504,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §8.9.3.
     #[test]
     fn rows_are_byte_aligned() {
         let doc = test_doc();
@@ -1494,6 +1519,7 @@ mod tests {
         assert_eq!(rgba_at(&img, 2, 1)[0], 0);
     }
 
+    // Covers ISO 32000-1 §8.9.5.2.
     #[test]
     fn decode_array_inverts_gray() {
         let doc = test_doc();
@@ -1503,6 +1529,7 @@ mod tests {
         assert_eq!(rgba_at(&img, 1, 0), [0, 0, 0, 255], "255 inverts to 0");
     }
 
+    // Covers ISO 32000-1 §8.6.4.3 and §8.9.2.
     #[test]
     fn rgb_and_cmyk_samples_decode() {
         let doc = test_doc();
@@ -1518,6 +1545,7 @@ mod tests {
         assert_eq!(rgba_at(&img, 0, 0), [0, 255, 255, 255], "pure cyan");
     }
 
+    // Covers ISO 32000-1 §8.6.6.3.
     #[test]
     fn indexed_lookup_via_palette() {
         let doc = test_doc();
@@ -1531,6 +1559,7 @@ mod tests {
         assert_eq!(rgba_at(&img, 3, 0), [0, 0, 0, 255]);
     }
 
+    // Covers ISO 32000-1 §8.9.6.2.
     #[test]
     fn stencil_and_inverted_stencil() {
         let doc = test_doc();
@@ -1573,6 +1602,8 @@ mod tests {
         j
     }
 
+    // DCTDecode per ISO 32000-1 §7.4.8: the filter chain passes the JPEG
+    // through and the image path decodes it.
     #[test]
     fn dct_image_decodes_via_jpeg() {
         let doc = test_doc();
@@ -1591,6 +1622,7 @@ mod tests {
         assert!(decode_rgba(&doc, &d, &[1, 2, 3], None, [0; 3]).is_none());
     }
 
+    // Covers ISO 32000-1 §7.4.8.
     #[test]
     fn jpeg_with_huge_sof_dimensions_is_rejected_before_decoding() {
         let doc = test_doc();
@@ -1926,6 +1958,7 @@ mod tests {
         assert!(reason.contains("no colour space for 9"), "{reason}");
     }
 
+    // Covers ISO 32000-1 §11.6.5.3.
     #[test]
     fn jpx_alpha_channel_masks_only_when_smask_in_data_asks() {
         let doc = test_doc();
@@ -1955,6 +1988,7 @@ mod tests {
         assert_eq!(rgba_at(&img, 0, 0), [255, 0, 0, 128]);
     }
 
+    // Covers ISO 32000-1 §11.6.5.3.
     #[test]
     fn jpx_premultiplied_color_is_divided_back_out() {
         let doc = test_doc();
@@ -2138,6 +2172,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §10.3.5 and §8.6.4.4.
     #[test]
     fn inverted_cmyk_conversion() {
         // Stored 255 everywhere = zero ink = white.
@@ -2148,6 +2183,7 @@ mod tests {
         assert_eq!(inverted_cmyk_to_rgb([0, 255, 255, 255]), [0, 255, 255]);
     }
 
+    // Covers ISO 32000-1 §8.9.2.
     #[test]
     fn bad_dimensions_are_rejected() {
         let doc = test_doc();
@@ -2182,6 +2218,7 @@ mod tests {
         pix.data[off..off + 4].try_into().unwrap()
     }
 
+    // Covers ISO 32000-1 §8.3.2.4 and §8.9.4.
     #[test]
     fn draw_maps_row_zero_to_the_v1_edge() {
         // Without a y-flip in the CTM, image row 0 (the v=1 edge) lands at
@@ -2202,6 +2239,7 @@ mod tests {
         assert_eq!(pix_at(&pix, 6, 6), [0, 255, 0, 255], "row 0 right");
     }
 
+    // Covers ISO 32000-1 §11.3.7.2, §11.6.4, §11.6.4.4 and §8.9.4.
     #[test]
     fn draw_respects_offset_alpha_and_clip() {
         let mut pix = Pixmap::new(8, 8);
@@ -2397,6 +2435,7 @@ mod tests {
     /// The stencil analogue: a mask whose alpha alternates opaque/clear per
     /// pixel paints half-coverage when minified, not the all-or-nothing a
     /// point sample gives. Black at 50% over white must land mid-gray.
+    // Covers ISO 32000-1 §11.6.4.2 and §8.9.6.2.
     #[test]
     fn minified_stencil_paints_fractional_coverage() {
         let mut quads = Vec::with_capacity(8 * 8 * 4);

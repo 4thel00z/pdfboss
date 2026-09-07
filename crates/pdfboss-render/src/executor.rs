@@ -34,6 +34,8 @@ use crate::{
 };
 
 /// Maximum `q`/`Q` nesting depth.
+///
+/// Covers ISO 32000-1 §8.4.2.
 const MAX_GSTATE_DEPTH: usize = 64;
 /// Maximum form XObject recursion depth.
 pub(crate) const MAX_FORM_DEPTH: u32 = 16;
@@ -80,6 +82,8 @@ impl ClipKey {
 
 /// The graphics state carried across operators and saved/restored by
 /// `q`/`Q`.
+///
+/// Covers ISO 32000-1 §8.4.1, §9.3.1 and §9.3.6.
 #[derive(Debug, Clone)]
 struct GState {
     /// Current transformation matrix, user space to device pixels.
@@ -190,6 +194,7 @@ impl std::fmt::Debug for TextParams {
 }
 
 impl GState {
+    /// Covers ISO 32000-1 §8.3.2.3 and §8.4.1.
     fn new(ctm: Matrix) -> GState {
         GState {
             ctm,
@@ -330,6 +335,8 @@ impl Default for TextState {
 /// alpha channel alone for alpha masks, each byte then remapped through the
 /// group's `/TR` transfer LUT when it has one (§11.6.5.2). Pixels the group
 /// never painted keep its backdrop and read as that backdrop's coverage.
+///
+/// Covers ISO 32000-1 §11.5.2 and §11.5.3.
 fn mask_from_group(pix: &Pixmap, luminosity: bool, transfer: Option<&[u8; 256]>) -> Mask {
     let mut mask = Mask::new(pix.width, pix.height);
     for (px, out) in pix.data.as_chunks::<4>().0.iter().zip(mask.data.iter_mut()) {
@@ -368,6 +375,8 @@ fn transfer_lut(f: &Functions) -> Box<[u8; 256]> {
 /// The coverage a paint composites through: the clip intersected with the
 /// active group soft mask. Cheap when either is absent; the per-paint
 /// intersection only ever runs on the rare content under a group mask.
+///
+/// Covers ISO 32000-1 §11.6.4 and §11.6.4.3.
 fn effective_mask(gs: &GState) -> Option<Arc<Mask>> {
     match (&gs.clip, &gs.soft_mask) {
         (Some(clip), Some(soft)) => Some(Arc::new(Mask::intersected(clip, soft))),
@@ -397,6 +406,8 @@ fn finite_matrix(m: &Matrix) -> bool {
 /// translate the crop origin away, apply `/Rotate` clockwise into the
 /// display quadrant, then flip y and scale so the display top-left lands
 /// on pixel (0, 0).
+///
+/// Covers ISO 32000-1 §8.3.2.2.
 fn base_ctm(crop: pdfboss_core::Rect, rotate: i32, scale: f32) -> Matrix {
     let (cw, ch) = (crop.width(), crop.height());
     let spin = match rotate {
@@ -478,6 +489,8 @@ pub(crate) fn render_page_reporting(
 /// that is `Send + Sync`, and `'static` as long as the borrow of `page` is
 /// created inside the consumer's own `async move` block, which owns the
 /// page. See `pdfboss_core::source`'s "Signing a shared algorithm".
+///
+/// Covers ISO 32000-1 §11.4.7 and §14.11.2.2.
 pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
     src: S,
     page: &Page,
@@ -601,7 +614,7 @@ struct Executor<'a, S> {
     pix: Pixmap,
     painting: GlyphPainting,
     /// Set while painting a `d1` (uncolored) Type3 CharProc: ISO 32000-1
-    /// §9.6.5.2 says such a glyph "shall not specify any color", so
+    /// §9.6.5 says such a glyph "shall not specify any color", so
     /// `run_color_or_misc` turns every fill/stroke color-setting op into a
     /// no-op and the glyph keeps the color inherited from the text state.
     color_locked: bool,
@@ -747,6 +760,8 @@ struct Frame {
 
 /// What kind of content stream a [`Frame`] is running, and therefore what
 /// its pop restores.
+///
+/// Covers ISO 32000-1 §8.10.3.
 enum FrameKind {
     /// A page or form XObject content stream. Pops restore nothing. In
     /// particular the color lock is deliberately NOT saved here: a form
@@ -755,7 +770,7 @@ enum FrameKind {
     /// pixels.
     PageOrForm,
     /// A Type3 CharProc. Its pop restores the executor's color lock to what
-    /// it was before this glyph pushed (ISO 32000-1 9.6.5.2: a `d1` glyph's
+    /// it was before this glyph pushed (ISO 32000-1 §9.6.5: a `d1` glyph's
     /// own color operators are ignored; a `d0` glyph nested inside a `d1`
     /// one regains color control for its own subtree).
     CharProc { saved_lock: bool },
@@ -779,6 +794,7 @@ enum FrameKind {
 }
 
 impl Frame {
+    /// Covers ISO 32000-1 §8.7.2.
     fn new(
         ops: Arc<[Op]>,
         chain: Vec<Arc<Dict>>,
@@ -824,6 +840,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// so its skips land in report order, or one Type3 glyph from the
     /// pending queue — and a child runs to completion before its parent's
     /// next operator, which is the recursive version's depth-first order.
+    ///
+    /// Covers ISO 32000-1 §11.6.4.3, §8.2, §8.3.2.3, §8.3.2.5, §8.4.2, §8.4.3.2, §8.4.3.3, §8.4.3.4, §8.4.3.5, §8.4.3.6, §8.4.4, §8.5.3.1, §8.5.4, §8.6.5.8 and §9.4.1.
     async fn run(&mut self, root: Frame) {
         let mut frames = vec![root];
         'frames: while let Some(mut frame) = frames.pop() {
@@ -1199,6 +1217,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// from `W`/`W*`, and resets the path. A shading-pattern color paints
     /// its gradient through the path; any other pattern paints the mid-gray
     /// stand-in with a report (see [`Executor::pattern_shading`]).
+    ///
+    /// Covers ISO 32000-1 §11.6.2, §8.5.3.1, §8.5.3.2 and §8.5.3.3.1.
     async fn paint_frame(&mut self, frame: &mut Frame, how: Paint) {
         let polys = match frame.path.take() {
             Some(mut pb) => {
@@ -1300,6 +1320,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// Applies a pending `W`/`W*` clip from the painted path, if any.
+    ///
+    /// Covers ISO 32000-1 §8.5.4.
     fn clip_frame(&mut self, frame: &mut Frame, polys: &[Subpath]) {
         let Some(rule) = frame.pending_clip.take() else {
             return;
@@ -1319,6 +1341,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// has already been reported here with its real reason: an
     /// unresolvable name, an unsupported shading kind, an unreadable cell,
     /// or a structural failure.
+    ///
+    /// Covers ISO 32000-1 §8.7.4.1.
     async fn resolve_pattern(
         &mut self,
         chain: &[Arc<Dict>],
@@ -1446,6 +1470,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Per paint even for a cached pattern: the base differs per stream, so
     /// the same pattern can be paintable in one paint and degenerate in the
     /// next, each reporting for itself.
+    ///
+    /// Covers ISO 32000-1 §8.7.2.
     fn pattern_to_device(&mut self, matrix: Matrix, pattern_base: Matrix) -> Option<Matrix> {
         let to_device = matrix.concat(pattern_base);
         if !finite_matrix(&to_device) || to_device.invert().is_none() {
@@ -1471,6 +1497,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// and steps (defaulting a missing or degenerate step to the cell's
     /// extent, so a broken step tiles edge-to-edge instead of dividing by
     /// zero). Failures report as a dropped pattern.
+    ///
+    /// Covers ISO 32000-1 §8.7.3.1, §8.7.3.2 and §8.7.3.3.
     async fn load_tiling(&mut self, stream: &Stream, dict: &Dict) -> Option<Arc<TilingPattern>> {
         let data = match content_stream_data_with(self.src, stream).await {
             Ok(data) => data,
@@ -1533,6 +1561,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// lock, restored by their `CharProc` frame kind. Past
     /// [`MAX_PATTERN_TILES`] the whole paint reports as dropped instead of
     /// running unbounded work.
+    ///
+    /// Covers ISO 32000-1 §11.6.7, §8.7.3.1, §8.7.3.2 and §8.7.3.3.
     #[allow(clippy::too_many_arguments)]
     fn plan_tiles(
         &mut self,
@@ -1657,6 +1687,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// group soft mask and the shading's own `/BBox`), first laying down
     /// `/Background` over that same region where the shading declares one
     /// (§8.7.4.3 — pattern fills only, which is the single caller).
+    ///
+    /// Covers ISO 32000-1 §11.6.7.
     fn paint_shading_through(
         &mut self,
         polys: &[Subpath],
@@ -2007,6 +2039,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// enters the per-glyph loop; and a Type3 string only *plans* here — its
     /// CharProc frames are pushed by the driver, one at a time, before the
     /// frame's next operator.
+    ///
+    /// Covers ISO 32000-1 §9.2.3, §9.2.4, §9.3.6 and §9.4.4.
     fn show_text(&mut self, frame: &mut Frame, bytes: &[u8]) {
         // Modes 3 and 7 show nothing (ISO 32000-1 §9.3.6), and a hidden
         // optional-content span shows nothing either (§8.11); the advances
@@ -2156,7 +2190,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// in). Every failure is `None` — a silent skip, matching the
     /// still-advance leniency of the planner.
     ///
-    /// ISO 32000-1 §9.6.5.2: the CharProc's *first* operator is `d0`
+    /// ISO 32000-1 §9.6.5: the CharProc's *first* operator is `d0`
     /// (colored) or `d1` (uncolored). A `d1` glyph "shall not specify any
     /// color" -- its own color operators are ignored and it paints in the
     /// current text fill color -- so `color_locked` is set for the nested
@@ -2228,9 +2262,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     ///
     /// Every fill/stroke color-setting arm is a no-op while
     /// `self.color_locked` (inside a `d1` Type3 CharProc, ISO 32000-1
-    /// §9.6.5.2): the glyph keeps the fill/stroke color inherited from the
+    /// §9.6.5): the glyph keeps the fill/stroke color inherited from the
     /// text graphics state instead of applying its own. XObject, inline
     /// image, shading, and marked-content ops are unaffected by the lock.
+    ///
+    /// Covers ISO 32000-1 §14.6.3, §8.11.3.2, §8.6.6.2 and §8.6.8.
     async fn run_color_or_misc(&mut self, op: &Op, frame: &mut Frame) -> Option<Frame> {
         if self.color_locked {
             match op {
@@ -2374,6 +2410,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Whether a `BDC` opens a span the optional-content configuration
     /// hides: only `/OC` tags gate anything, and with no configuration (or
     /// anything unresolvable) every span is visible.
+    ///
+    /// Covers ISO 32000-1 §8.11.3.2.
     async fn marked_hidden(&self, tag: &Name, props: &Object, chain: &[Arc<Dict>]) -> bool {
         let Some(oc) = &self.oc else {
             return false;
@@ -2404,6 +2442,8 @@ struct Type3Glyph {
 /// Codes with no CharProc, a non-finite matrix, or `paint` false (the caller
 /// is at the recursion limit) still advance, keeping surrounding text
 /// positioned.
+///
+/// Covers ISO 32000-1 §9.6.5.
 fn type3_glyph_plan(
     text: &TextParams,
     ts: &mut TextState,
@@ -2477,6 +2517,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// and `run_char_proc` reaches into the `Type3Font` its caller happens to hold
     /// — so neither could survive being stored in a work-stack frame, which is how
     /// the asynchronous path has to express this recursion.
+    ///
+    /// Covers ISO 32000-1 §7.8.3.
     async fn find_res(&self, chain: &[Arc<Dict>], category: &str, name: &str) -> Option<Object> {
         crate::extract::find_res(self.src, chain, category, name).await
     }
@@ -2484,6 +2526,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Resolves a `cs`/`CS` operand: a device space name directly, the
     /// `/Pattern` space as a mid-gray flag, anything else through the
     /// `/ColorSpace` resource dictionary. Returns `(space, is_pattern)`.
+    ///
+    /// Covers ISO 32000-1 §8.6.6.2.
     async fn resolve_colorspace(&self, name: &Name, chain: &[Arc<Dict>]) -> (ColorSpace, bool) {
         match name.0.as_str() {
             "Pattern" => return (ColorSpace::DeviceGray, true),
@@ -2527,6 +2571,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// transfer function bakes into a byte LUT the harvested mask maps
     /// through; one that will not load is approximated as identity and
     /// reported.
+    ///
+    /// Covers ISO 32000-1 §11.5.2, §11.5.3, §11.6.5, §11.6.5.2 and §8.10.3.
     async fn soft_mask_group(&mut self, sm: &Dict, frame: &Frame) -> Option<Frame> {
         let luminosity = match sm.get_name("S").map(|n| n.0.as_str()) {
             Some("Luminosity") => true,
@@ -2602,6 +2648,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Applies the named `/ExtGState` resource: `/SMask` (a mask group or
     /// `/None`), `/BM`, `/ca /CA /LW /LC /LJ /D`. Other entries are
     /// ignored.
+    ///
+    /// Covers ISO 32000-1 §11.2, §11.6.3, §11.6.4.4, §11.6.5.2, §8.4.3.3, §8.4.3.4, §8.4.3.6 and §8.4.5.
     async fn apply_ext_gstate_op(&mut self, name: &Name, frame: &mut Frame) {
         let Some(Object::Dict(dict)) = self.find_res(&frame.chain, "ExtGState", &name.0).await
         else {
@@ -2720,6 +2768,8 @@ fn skip_reason_for(e: &Error) -> SkipReason {
 /// unmasked — exactly the pre-mask behavior, now the exception instead of
 /// the rule. Shared between drawing and extraction, so both honor a mask
 /// identically.
+///
+/// Covers ISO 32000-1 §11.6.5, §11.6.5.3, §8.9.6.1, §8.9.6.3 and §8.9.6.4.
 pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
     src: &S,
     dict: &Dict,
@@ -2813,6 +2863,8 @@ pub(crate) async fn image_alpha_mask<S: AsyncObjectSource>(
 /// unrecognized name reads as Normal, exactly as the spec tells a
 /// conforming reader to treat it — that is compliance, not an
 /// approximation, so it is not reported.
+///
+/// Covers ISO 32000-1 §11.6.3 and §8.4.5.
 async fn blend_mode_entry<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<BlendMode> {
     let bm = dict.get("BM")?;
     // An array-valued `/BM` names the first mode the reader supports.
@@ -2849,6 +2901,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// a form, which the driver pushes. Every await and every skip happens
     /// here at the `Do`, so the order-sensitive report reads exactly as the
     /// recursive version wrote it.
+    ///
+    /// Covers ISO 32000-1 §8.10.4.1, §8.11.3.3, §8.8.1 and §8.9.5.1.
     async fn do_xobject(
         &mut self,
         name: &Name,
@@ -2909,6 +2963,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// that exists but cannot be read or placed reports as a dropped
     /// annotation, so a page whose visible content is a stamp or a filled
     /// form field never rasterizes blank without saying why.
+    ///
+    /// Covers ISO 32000-1 §12.5.2, §12.5.3, §12.5.5, §12.5.6, §12.5.6.10, §12.5.6.11, §12.5.6.12, §12.5.6.13, §12.5.6.14, §12.5.6.15, §12.5.6.16, §12.5.6.17, §12.5.6.18, §12.5.6.20, §12.5.6.21, §12.5.6.22, §12.5.6.23, §12.5.6.4, §12.5.6.6, §12.5.6.7, §12.5.6.8, §12.5.6.9 and §8.11.3.3.
     async fn paint_annotations(&mut self, page: &Page, base: Matrix) {
         let Some(annots) = page.dict().get("Annots") else {
             return;
@@ -2955,6 +3011,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// that is neither stream nor dictionary, an `/AS` naming no state, an
     /// ambiguous stateless dictionary — is a real drop and is reported; an
     /// absent `/AP` or `/N` declares nothing and stays silent.
+    ///
+    /// Covers ISO 32000-1 §12.5.5, §12.5.6.19, §12.7.4, §12.7.4.2, §12.7.4.2.3 and §12.7.4.2.4.
     async fn normal_appearance(&mut self, annot: &Dict) -> Option<Stream> {
         let ap = match annot.get("AP") {
             Some(o) => match self.src.resolve(o).await {
@@ -3000,6 +3058,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// with the untransformed `/BBox` as its clip. `None` reports the
     /// annotation as dropped — every bail-out here loses a declared
     /// appearance.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.12 and §8.10.2.
     async fn appearance_frame(
         &mut self,
         stream: &Stream,
@@ -3119,6 +3179,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// when it has one, in the current user space at the fill alpha.
     /// Every structural failure reports as a dropped shading — the page
     /// loses a gradient either way.
+    ///
+    /// Covers ISO 32000-1 §8.7.4.2.
     async fn sh_operator(&mut self, name: &str, frame: &mut Frame) {
         if frame.suppressed() {
             return;
@@ -3151,6 +3213,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// The coverage region a shading paints under: the active clip and
     /// group soft mask, intersected with the shading's `/BBox` (rasterized
     /// under the same matrix the shading paints with) when it declares one.
+    ///
+    /// Covers ISO 32000-1 §8.7.4.2.
     fn shading_region(
         &mut self,
         shading: &Shading,
@@ -3181,6 +3245,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// the CTM, `/BBox` intersected into the clip, own `/Resources` prepended
     /// to the chain, depth-bounded. `None` where the recursive version bailed
     /// out, with the identical report entry.
+    ///
+    /// Covers ISO 32000-1 §8.10.2 and §8.3.2.4.
     async fn form_frame(
         &mut self,
         stream: &Stream,
@@ -3453,6 +3519,7 @@ mod tests {
     /// them double-prints every such page — the scan and the recognized
     /// text over it. The advance must survive, though, so a later visible
     /// run lands where the invisible one left off.
+    // Covers ISO 32000-1 §9.2.3 and §9.6.6.3.
     #[test]
     fn invisible_text_mode_advances_without_painting() {
         let bytes = small_doc(
@@ -3480,6 +3547,7 @@ mod tests {
     /// outlines never join the clipping path, so content the author clipped
     /// to text paints unclipped — and an approximation is never silent:
     /// showing text in those modes must land in the report. Mode 0 must not.
+    // Covers ISO 32000-1 §9.2.3 and §9.3.6.
     #[test]
     fn text_clip_modes_are_reported() {
         let font = |b: &mut PdfBuilder| {
@@ -3517,6 +3585,7 @@ mod tests {
     /// the restore instead of issuing `0 Tr`. A mode that leaked past `Q`
     /// would blank every glyph after the OCR block — worse than the
     /// double-print it was hiding.
+    // Covers ISO 32000-1 §8.4.2 and §9.3.6.
     #[test]
     fn text_render_mode_is_restored_by_q() {
         let bytes = small_doc(
@@ -3568,6 +3637,7 @@ mod tests {
     /// paints nothing; a span whose group stays on paints normally. Hidden
     /// content is configured behavior: one count on the dedicated counter,
     /// nothing in the drop list, and the report still reads empty.
+    // Covers ISO 32000-1 §8.11.2.1 and §8.11.3.2.
     #[test]
     fn hidden_span_suppresses_marks_and_counts() {
         let bytes = oc_doc(
@@ -3587,6 +3657,7 @@ mod tests {
     /// stays suppressed, and a hidden span inside a visible one suppresses
     /// only itself. State set inside a hidden span (here the fill color)
     /// still executes and survives the span.
+    // Covers ISO 32000-1 §8.11.3.2.
     #[test]
     fn suppression_nests_and_state_survives() {
         let bytes = oc_doc(
@@ -3612,6 +3683,7 @@ mod tests {
 
     /// A stray `EMC` pops nothing, and a hidden span left open at the end
     /// of the stream suppresses to the end without leaking anywhere else.
+    // Covers ISO 32000-1 §8.11.3.2.
     #[test]
     fn stray_emc_clamps_and_open_spans_end_with_the_stream() {
         let bytes = oc_doc(
@@ -3629,6 +3701,7 @@ mod tests {
     /// `/OCGs` groups keep their reference identity through the raw
     /// `/Properties` lookup, so the off group hides the span. With no
     /// `/OCProperties` at all the same span paints — nothing to be off.
+    // Covers ISO 32000-1 §8.11.2.2 and §8.11.4.5.
     #[test]
     fn membership_properties_and_absent_configuration() {
         let bytes = oc_doc(
@@ -3657,6 +3730,7 @@ mod tests {
     /// Text in a hidden span paints nothing but still advances — a visible
     /// run after `EMC` lands where the hidden one left off (the same
     /// contract as `3 Tr`), with no no-glyph noise from the hidden run.
+    // Covers ISO 32000-1 §8.11.3.2.
     #[test]
     fn hidden_span_text_advances_without_painting() {
         let bytes = oc_doc(
@@ -3682,6 +3756,7 @@ mod tests {
 
     /// `W n` inside a hidden span still narrows the clip: clipping is
     /// graphics state carried past `EMC`, not a mark on the page.
+    // Covers ISO 32000-1 §8.11.3.2.
     #[test]
     fn clip_from_hidden_span_still_applies() {
         let bytes = oc_doc(
@@ -3719,6 +3794,7 @@ mod tests {
 
     /// A `gs` inside a hidden span leaves the soft-mask machinery alone: no
     /// offscreen group runs, and the paint after `EMC` composites unmasked.
+    // Covers ISO 32000-1 §11.6.5.2.
     #[test]
     fn hidden_span_skips_soft_mask_groups() {
         let bytes = oc_doc(
@@ -3742,6 +3818,7 @@ mod tests {
     /// An `/OC` entry on the XObject itself gates both arms: a hidden form
     /// and a hidden image draw nothing and count once each; the same form
     /// under the on group draws.
+    // Covers ISO 32000-1 §8.11.3.3 and §8.9.5.1.
     #[test]
     fn xobject_oc_entry_gates_forms_and_images() {
         let form = |oc: &str| {
@@ -3782,6 +3859,7 @@ mod tests {
     /// An annotation's `/OC` entry hides it like the Hidden flag — silent
     /// in the drop list, counted on the dedicated counter — and an on-group
     /// annotation paints exactly as without the entry.
+    // Covers ISO 32000-1 §12.5.3, §12.5.6.12 and §8.11.3.3.
     #[test]
     fn annotation_oc_entry_gates_the_appearance() {
         let stamp = |oc: &str, extra: &mut PdfBuilder| {
@@ -3827,6 +3905,7 @@ mod tests {
     }
 
     /// An inline image inside a hidden span is a mark like any other.
+    // Covers ISO 32000-1 §8.11.3.2.
     #[test]
     fn hidden_span_suppresses_inline_images() {
         let bytes = oc_doc(
@@ -3841,6 +3920,7 @@ mod tests {
         assert_eq!(drops(&report), vec![]);
     }
 
+    // Covers ISO 32000-1 §8.3.2.2 and §8.5.3.3.1.
     #[test]
     fn red_rect_fills_at_yflipped_device_location() {
         // 612x792 page; user rect [100,300]x[100,250] -> device rows
@@ -3861,6 +3941,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.5.4.
     #[test]
     fn clip_limits_full_page_fill() {
         let content = "20 20 40 40 re W n 0 0 612 792 re f";
@@ -3872,6 +3953,7 @@ mod tests {
         assert_eq!(px(&pix, 300, 400), WHITE, "page center untouched");
     }
 
+    // Covers ISO 32000-1 §8.3.2.3 and §8.3.2.5.
     #[test]
     fn cm_translate_scale_moves_rect() {
         let content = "1 0 0 rg q 2 0 0 2 50 30 cm 10 10 20 20 re f Q";
@@ -3884,6 +3966,7 @@ mod tests {
         assert_eq!(px(&pix, 20, 770), WHITE, "untransformed location clear");
     }
 
+    // Covers ISO 32000-1 §8.3.4, §8.4.1, §8.4.2, §8.4.4 and §8.6.8.
     #[test]
     fn q_restore_resets_color_and_nonfinite_cm_is_skipped() {
         let content = "1 0 0 rg q 0 1 0 rg Q 10 10 20 20 re f";
@@ -3896,6 +3979,7 @@ mod tests {
         assert_eq!(px(&pix, 20, 770), RED, "rect painted with identity ctm");
     }
 
+    // Covers ISO 32000-1 §11.2, §11.3.6, §11.3.7.2, §11.6.4.4 and §8.4.5.
     #[test]
     fn extgstate_ca_blends_toward_white() {
         let bytes = small_doc(
@@ -3913,6 +3997,7 @@ mod tests {
         assert_eq!(a, 255);
     }
 
+    // Covers ISO 32000-1 §8.4.3.2 and §8.5.3.2.
     #[test]
     fn stroke_width_scales_with_ctm() {
         // 4x CTM scale turns a 1pt pen into a ~4px device band; the line
@@ -3929,6 +4014,7 @@ mod tests {
         assert!((1..=2).contains(&inked), "hairline thickness {inked}");
     }
 
+    // Covers ISO 32000-1 §8.4.3.6 and Annex A.2.
     #[test]
     fn dashed_stroke_leaves_gaps() {
         let content = "2 w [6 6] 0 d 10 50 m 90 50 l S";
@@ -3946,6 +4032,7 @@ mod tests {
         assert!(runs >= 4, "expected several dash runs, got {runs}");
     }
 
+    // Covers ISO 32000-1 §8.4.1 and §8.6.6.4.
     #[test]
     fn separation_and_devicen_initial_color_is_full_tint() {
         // ISO 32000-1 8.6.6.4/8.6.6.5: selecting a Separation or DeviceN
@@ -3999,6 +4086,7 @@ mod tests {
         assert_eq!(px(&render(bytes, 1.0), 50, 50), WHITE, "0 scn wins");
     }
 
+    // Covers ISO 32000-1 §7.10.3 and §8.6.6.4.
     #[test]
     fn separation_tint_transform_decides_the_color() {
         // A spot colour is whatever its tint transform says, which is not
@@ -4025,6 +4113,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.6.6.4.
     #[test]
     fn separation_image_samples_go_through_the_tint_transform() {
         // An image in a Separation space reaches the transform through the
@@ -4093,6 +4182,7 @@ mod tests {
         assert_eq!(gray, [191, 191, 191, 255]);
     }
 
+    // Covers ISO 32000-1 §8.6.6.5.
     #[test]
     fn devicen_paints_through_its_tint_transform() {
         // Two tints map straight to red and green; blue stays 0.
@@ -4111,6 +4201,7 @@ mod tests {
         assert_eq!(px(&render(bytes, 1.0), 50, 50), [51, 153, 0, 255]);
     }
 
+    // Covers ISO 32000-1 §8.10.2, §8.3.2.4 and §8.8.1.
     #[test]
     fn form_xobject_matrix_paints_displaced() {
         let bytes = small_doc("/XObject << /Fm1 5 0 R >>", b"/Fm1 Do", |b| {
@@ -4130,6 +4221,7 @@ mod tests {
         assert_eq!(px(&pix, 40, 10), WHITE, "above form");
     }
 
+    // Covers ISO 32000-1 §8.10.2.
     #[test]
     fn form_bbox_clips_its_content() {
         let bytes = small_doc("/XObject << /Fm1 5 0 R >>", b"/Fm1 Do", |b| {
@@ -4145,6 +4237,7 @@ mod tests {
         assert_eq!(px(&pix, 60, 40), WHITE, "outside bbox");
     }
 
+    // Covers ISO 32000-1 §8.9.4, §8.9.7 and Annex A.2.
     #[test]
     fn inline_image_blits_quadrant_colors() {
         // 2x2 RGB hex image over the unit square [25,75]^2 (user): row 0
@@ -4161,6 +4254,7 @@ mod tests {
         assert_eq!(px(&pix, 10, 50), WHITE, "outside image");
     }
 
+    // Covers ISO 32000-1 §8.9.6.2.
     #[test]
     fn image_mask_stencils_fill_color() {
         // Rows: 0b01 (paint, skip) / 0b10 (skip, paint).
@@ -4184,6 +4278,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 75), blue, "row 1 sample 1 painted");
     }
 
+    // Covers ISO 32000-1 §8.9.5.2 and §8.9.6.2.
     #[test]
     fn image_mask_decode_inverts_stencil() {
         let bytes = small_doc(
@@ -4373,14 +4468,14 @@ mod tests {
         // The page's only content is `/Im0 Do`, where Im0 carries a filter
         // the core does not implement. The page must still render (lenient),
         // but the drop must be reported.
-        let (pix, report) = render_reporting(doc_with_image_filter("Crypt"));
+        let (pix, report) = render_reporting(doc_with_image_filter("NotAFilterDecode"));
 
         assert!(pix.width > 0 && pix.height > 0, "page still rasterizes");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4388,7 +4483,7 @@ mod tests {
         assert_eq!(report.summary().as_deref(), Some("1 image skipped"));
         assert_eq!(
             report.warnings(),
-            vec!["1 image skipped: unsupported filter /Crypt".to_string()],
+            vec!["1 image skipped: unsupported filter /NotAFilterDecode".to_string()],
         );
     }
 
@@ -4405,16 +4500,17 @@ mod tests {
         assert!(report.warnings().is_empty());
     }
 
+    // Covers ISO 32000-1 §8.9.7.
     #[test]
     fn unsupported_inline_image_filter_is_reported() {
         let content = "q 100 0 0 100 0 0 cm BI /W 8 /H 8 /BPC 1 /CS /G \
-                       /F /Crypt ID 01234567 EI Q";
+                       /F /NotAFilterDecode ID 01234567 EI Q";
         let (_, report) = render_reporting(small_doc("", content.as_bytes(), |_| {}));
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4454,7 +4550,7 @@ mod tests {
             b.stream(
                 5,
                 "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
+                 /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /NotAFilterDecode",
                 &[0; 8],
             );
         });
@@ -4486,7 +4582,7 @@ mod tests {
         b.stream(
             5,
             "/Type /XObject /Subtype /Image /Width 8 /Height 8 \
-             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /Crypt",
+             /BitsPerComponent 1 /ColorSpace /DeviceGray /Filter /NotAFilterDecode",
             &[0; 8],
         );
         for level in 0..LEVELS {
@@ -4543,14 +4639,14 @@ mod tests {
             3,
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>",
         );
-        b.stream(4, "/Filter /Crypt", b"0 0 100 100 re f");
+        b.stream(4, "/Filter /NotAFilterDecode", b"0 0 100 100 re f");
         let (pix, report) = render_reporting(b.build(1));
         assert_eq!(px(&pix, 50, 50), WHITE, "nothing painted");
         assert_eq!(
             drops(&report),
             vec![(
                 SkippedKind::PageContents,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4567,7 +4663,7 @@ mod tests {
         let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
             b.stream(
                 5,
-                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /Crypt",
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Filter /NotAFilterDecode",
                 b"0 0 100 100 re f",
             );
         });
@@ -4577,7 +4673,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Form,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4669,6 +4765,7 @@ mod tests {
     /// 7.3.8.1). The XObject dispatch resolves it: a form declared through
     /// a reference paints, rather than being skipped as an unsupported
     /// XObject with its whole content subtree.
+    // Covers ISO 32000-1 §8.8.1.
     #[test]
     fn a_form_whose_subtype_is_indirect_still_paints() {
         let bytes = small_doc("/XObject << /Fm0 5 0 R >>", b"/Fm0 Do", |b| {
@@ -4684,6 +4781,7 @@ mod tests {
         assert!(drops(&report).is_empty(), "nothing to report");
     }
 
+    // Covers ISO 32000-1 §8.8.1.
     #[test]
     fn unresolvable_and_untyped_xobjects_are_reported() {
         // `/Im0` is not in the resource dictionary at all; `/X1` is a stream
@@ -4732,6 +4830,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.9.2.
     #[test]
     fn image_with_too_few_samples_is_reported() {
         // 8x8 at 8 bits gray needs 64 bytes; 4 are supplied, so 60 pixels
@@ -4772,7 +4871,7 @@ mod tests {
                      /BitsPerComponent 8 /ColorSpace [/Indexed /DeviceRGB 255 6 0 R]",
                     &[0; 64],
                 );
-                b.stream(6, "/Filter /Crypt", &[0; 12]);
+                b.stream(6, "/Filter /NotAFilterDecode", &[0; 12]);
             },
         );
         let (_, report) = render_reporting(bytes);
@@ -4780,7 +4879,7 @@ mod tests {
             drops(&report),
             vec![(
                 SkippedKind::Image,
-                SkipReason::UnsupportedFilter("Crypt".to_string()),
+                SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
                 1,
             )],
         );
@@ -4797,6 +4896,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.10.3, §8.7.4.2 and §8.7.4.5.3.
     #[test]
     fn sh_paints_an_axial_gradient() {
         // Red at x=0 to blue at x=100, linear (/N 1), extended both ways.
@@ -4815,6 +4915,7 @@ mod tests {
         assert_near(px(&pix, 95, 50), [11, 0, 244, 255], 4, "right is blue");
     }
 
+    // Covers ISO 32000-1 §8.7.4.2 and Annex A.2.
     #[test]
     fn sh_respects_the_active_clip() {
         let bytes = small_doc(
@@ -4835,6 +4936,7 @@ mod tests {
         assert_eq!(px(&pix, 10, 50), WHITE, "outside the clip stays clear");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.4.
     #[test]
     fn radial_shading_paints_concentric_gradient() {
         // Red at the center of (50,50), green at radius 40, nothing beyond
@@ -4857,6 +4959,7 @@ mod tests {
         assert_eq!(px(&pix, 3, 3), WHITE, "beyond r1 unpainted without extend");
     }
 
+    // Covers ISO 32000-1 §7.10.4, §8.7.4.4 and §8.7.4.5.3.
     #[test]
     fn stitching_function_selects_and_remaps_subfunctions() {
         // Red→green over the first half of the axis, green→blue over the
@@ -4877,6 +4980,7 @@ mod tests {
         assert_near(px(&pix, 75, 50), [0, 126, 129, 255], 4, "second half");
     }
 
+    // Covers ISO 32000-1 §7.10.2 and §8.7.4.5.3.
     #[test]
     fn sampled_function_interpolates_its_samples() {
         // Three RGB8 samples — red, green, blue — across the axis: x=25
@@ -4901,6 +5005,7 @@ mod tests {
         assert_near(px(&pix, 95, 50), [0, 23, 232, 255], 5, "near the last");
     }
 
+    // Covers ISO 32000-1 §8.6.6.2, §8.7.3.1 and §8.7.3.2.
     #[test]
     fn tiling_pattern_fill_repeats_its_cell() {
         // A 10x10 cell whose lower-left 5x5 quarter is red, tiled over the
@@ -4929,6 +5034,7 @@ mod tests {
         assert_eq!(px(&pix, 2, 82), WHITE, "the tile above's empty upper half");
     }
 
+    // Covers ISO 32000-1 §8.7.3.1.
     #[test]
     fn tiling_pattern_is_clipped_to_the_fill_path() {
         // The same pattern through a small rect: tiles outside the path
@@ -4950,6 +5056,7 @@ mod tests {
         assert_eq!(px(&pix, 50, 25), WHITE, "outside the fill rect below");
     }
 
+    // Covers ISO 32000-1 §8.6.6.2 and §8.7.3.3.
     #[test]
     fn uncolored_tiling_pattern_paints_in_the_scn_color() {
         // /PaintType 2: the cell has no color of its own — the fill paints
@@ -4982,6 +5089,7 @@ mod tests {
         assert_eq!(px(&pix, 7, 97), WHITE, "unpainted cell corner");
     }
 
+    // Covers ISO 32000-1 §8.7.2.
     #[test]
     fn repeated_pattern_paints_under_each_use_site_matrix() {
         // The same indirect pattern fills twice: once from the page content
@@ -5016,6 +5124,7 @@ mod tests {
         assert_eq!(px(&pix, 50, 97), WHITE, "left of the form's fill path");
     }
 
+    // Covers ISO 32000-1 §8.7.2.
     #[test]
     fn repeated_shading_pattern_paints_under_each_use_site_matrix() {
         // The tiling test's shading twin: the same indirect axial pattern
@@ -5071,6 +5180,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.7.3.1.
     #[test]
     fn hostile_tile_step_hits_the_cap_and_reports() {
         // An XStep small enough to demand millions of tiles must stop at
@@ -5092,6 +5202,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.7.3.1.
     #[test]
     fn tile_cell_gstate_stays_inside_its_tile() {
         // A cell that pushes `q`, scales the CTM and never pops: every tile
@@ -5122,6 +5233,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.7.3.1.
     #[test]
     fn tile_cell_clip_stays_inside_its_tile() {
         // A cell that clips itself down to 3x3 before filling: the clip
@@ -5150,6 +5262,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.7.3.3.
     #[test]
     fn uncolored_pattern_color_lock_ends_with_the_fill() {
         // /PaintType 2 tiles run under the color lock. Once the pattern
@@ -5204,6 +5317,7 @@ mod tests {
         d
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.5.
     #[test]
     fn type4_mesh_interpolates_vertex_colors() {
         // Triangle (0,0)R (99,0)G (0,99)B, then flag 1 adds (99,99)W on the
@@ -5229,6 +5343,7 @@ mod tests {
         assert_eq!(px(&pix, 99, 50), WHITE, "outside both triangles");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.5.
     #[test]
     fn type4_mesh_flag2_shares_the_va_vc_edge() {
         // After (0,0)R (0,99)G (99,0)B, flag 2 forms (v_a, v_c, v_d) with
@@ -5250,6 +5365,7 @@ mod tests {
         assert_near(px(&pix, 80, 70), [124, 76, 207, 255], 1, "fan triangle");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.6.
     #[test]
     fn type5_lattice_triangulates_row_pairs() {
         // A 2x2 lattice: rows (0,0)R (99,0)G and (0,99)B (99,99)W split
@@ -5275,6 +5391,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.7.
     #[test]
     fn type6_straight_coons_patch_degenerates_to_bilinear() {
         // A square patch with every control point at exact thirds of its
@@ -5307,6 +5424,7 @@ mod tests {
         assert_near(px(&pix, 75, 75), [192, 162, 195, 255], 3, "lower right");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.8.
     #[test]
     fn type7_tensor_patch_paints_like_the_matching_coons() {
         // The same square with the four interior points given explicitly at
@@ -5342,6 +5460,7 @@ mod tests {
         assert_near(px(&pix, 75, 75), [192, 162, 195, 255], 3, "lower right");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.7.
     #[test]
     fn type6_flag2_reuses_the_previous_patch_edge() {
         // Patch one covers x 0..48; a flag-2 patch shares its p7..p10 edge
@@ -5391,6 +5510,7 @@ mod tests {
         assert_near(px(&pix, 72, 50), [128, 128, 125, 255], 3, "second patch");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.7.
     #[test]
     fn type6_flag3_reuses_the_previous_patch_edge() {
         // Patch one covers y 51..99; a flag-3 patch shares its p10..p1 edge
@@ -5440,6 +5560,7 @@ mod tests {
         assert_near(px(&pix, 24, 72), [130, 128, 130, 255], 3, "second patch");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.5.
     #[test]
     fn truncated_mesh_paints_what_decoded() {
         // The stream ends one byte into the fourth vertex: the complete
@@ -5481,6 +5602,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.7.4.4 and §8.7.4.5.5.
     #[test]
     fn type4_mesh_function_maps_vertex_t() {
         // With /Function, each vertex carries one t instead of components:
@@ -5502,6 +5624,7 @@ mod tests {
         assert_near(px(&pix, 25, 60), [189, 0, 66, 255], 1, "blend of C0/C1");
     }
 
+    // Covers ISO 32000-1 §8.7.4.5.2.
     #[test]
     fn function_based_shading_paints_per_pixel() {
         // Type 1: a 2-in calculator turns the x coordinate into a gray
@@ -5524,6 +5647,7 @@ mod tests {
         assert_near(px(&pix, 80, 20), [205, 205, 205, 255], 1, "x = 80.5 gray");
     }
 
+    // Covers ISO 32000-1 §8.7.4.3 and §8.7.4.5.2.
     #[test]
     fn function_based_shading_clips_to_domain_and_matrix() {
         // /Matrix maps the unit /Domain square onto x 0..50, y 0..100;
@@ -5547,6 +5671,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "far outside");
     }
 
+    // Covers ISO 32000-1 §7.8.3, §8.7.4.2 and §8.7.4.3.
     #[test]
     fn missing_shading_resource_reports_missing() {
         let (pix, report) = render_reporting(small_doc("", b"q /Sh0 sh Q", |_| {}));
@@ -5557,6 +5682,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.6.6.2.
     #[test]
     fn missing_pattern_fill_paints_gray_and_reports() {
         // /P0 resolves to nothing: the stand-in gray with a report.
@@ -5576,6 +5702,7 @@ mod tests {
          /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] \
          /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> >>";
 
+    // Covers ISO 32000-1 §8.6.6.2 and §8.7.4.1.
     #[test]
     fn shading_pattern_fill_paints_through_the_path() {
         let content = b"/Pattern cs /P0 scn 20 20 60 60 re f";
@@ -5586,6 +5713,7 @@ mod tests {
         assert_eq!(px(&pix, 10, 50), WHITE, "outside the path stays clear");
     }
 
+    // Covers ISO 32000-1 §8.3.2.4, §8.7.2 and §8.7.3.1.
     #[test]
     fn pattern_space_is_anchored_to_the_page_not_the_cm() {
         // The same pattern under a translated CTM: the path moves with the
@@ -5605,6 +5733,7 @@ mod tests {
          /Extend [true true] /Function << /FunctionType 2 /Domain [0 1] \
          /C0 [0 1 0] /C1 [0 1 0] /N 1 >> >>";
 
+    // Covers ISO 32000-2 §11.3.5.2, §11.6.7 and §8.7.4.2.
     #[test]
     fn sh_honors_the_blend_mode() {
         // Multiply over a mid-gray backdrop keeps half of each source
@@ -5619,6 +5748,7 @@ mod tests {
         assert_eq!(px(&pix, 50, 50), [0, 128, 0, 255], "multiply with backdrop");
     }
 
+    // Covers ISO 32000-1 §11.6.4.3 and §11.6.7.
     #[test]
     fn sh_composites_through_the_group_soft_mask() {
         // The group paints white over the left half: the shading may only
@@ -5639,6 +5769,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
+    // Covers ISO 32000-1 §11.6.2, §11.6.7 and §8.7.4.1.
     #[test]
     fn shading_pattern_fill_honors_the_blend_mode() {
         let resources = "/Pattern << /P0 << /PatternType 2 /Shading 5 0 R >> >> \
@@ -5654,6 +5785,7 @@ mod tests {
         assert_eq!(px(&pix, 10, 50), [128, 128, 128, 255], "outside untouched");
     }
 
+    // Covers ISO 32000-1 §11.6.7.
     #[test]
     fn shading_pattern_fill_composites_through_the_group_soft_mask() {
         let resources = "/Pattern << /P0 << /PatternType 2 /Shading 6 0 R >> >> \
@@ -5673,6 +5805,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
+    // Covers ISO 32000-1 §8.7.4.1 and §8.7.4.3.
     #[test]
     fn pattern_background_respects_the_shading_bbox() {
         // /Background obeys /BBox exactly as the gradient does — both are
@@ -5702,6 +5835,7 @@ mod tests {
         assert_eq!(px(&pix, 40, 10), WHITE, "above the BBox");
     }
 
+    // Covers ISO 32000-1 §11.6.7 and §8.7.3.2.
     #[test]
     fn tiles_inherit_the_blend_mode() {
         // The Multiply set before the pattern fill must reach the tile
@@ -5723,6 +5857,7 @@ mod tests {
         assert_eq!(px(&pix, 50, 50), [0, 128, 0, 255], "tile multiplies");
     }
 
+    // Covers ISO 32000-1 §11.6.4.3, §11.6.7 and §8.7.3.2.
     #[test]
     fn tiles_inherit_the_group_soft_mask() {
         let resources = "/Pattern << /P0 6 0 R >> \
@@ -5747,6 +5882,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
+    // Covers ISO 32000-1 §11.3.5.
     #[test]
     fn hue_blend_paints_the_overlap() {
         // Blue huemixed over red: SetLum(blue, Lum(red) = 0.3) clips to
@@ -5766,6 +5902,7 @@ mod tests {
         assert_eq!(px(&pix, 10, 89), RED, "red-only region untouched");
     }
 
+    // Covers ISO 32000-1 §11.3.5.
     #[test]
     fn luminosity_blend_paints_the_overlap() {
         // Mid-gray (128) luminosity onto red: SetLum(red, 128/255) clips to
@@ -5785,6 +5922,7 @@ mod tests {
         "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> >>"
     }
 
+    // Covers ISO 32000-1 §10.3.2, §11.3.7.2, §11.5.3, §11.6.4, §11.6.4.3, §11.6.5, §11.6.5.2, §8.10.3 and §8.4.5.
     #[test]
     fn luminosity_soft_mask_gates_painting() {
         // The group paints white over the left half of the page: luminosity
@@ -5803,6 +5941,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
+    // Covers ISO 32000-1 §11.5.2, §11.6.5.2 and §8.10.3.
     #[test]
     fn alpha_soft_mask_uses_the_group_alpha() {
         // /S /Alpha: coverage comes from the group's alpha channel — the
@@ -5822,6 +5961,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "transparent half is masked");
     }
 
+    // Covers ISO 32000-1 §11.6.5.2.
     #[test]
     fn smask_none_resets_the_mask() {
         let resources = "/ExtGState << /GS0 << /SMask << /S /Luminosity /G 5 0 R >> >> \
@@ -5838,6 +5978,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), [0, 0, 0, 255], "/SMask /None unmasks");
     }
 
+    // Covers ISO 32000-1 §11.6.4.3 and §8.4.2.
     #[test]
     fn soft_mask_restores_with_grestore() {
         let bytes = small_doc(smask_resources(), b"q /GS0 gs Q 0 0 100 100 re f", |b| {
@@ -5867,6 +6008,7 @@ mod tests {
         })
     }
 
+    // Covers ISO 32000-1 §11.5.3 and §11.6.5.2.
     #[test]
     fn inverting_exponential_transfer_flips_the_mask() {
         // /TR is 1 − x (type 2): the white half's mask byte 255 maps to 0
@@ -5879,6 +6021,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), BLACK, "inverted backdrop paints");
     }
 
+    // Covers ISO 32000-1 §11.6.5.2.
     #[test]
     fn inverting_calculator_transfer_flips_the_mask() {
         // The same inversion as a type-4 program.
@@ -5895,6 +6038,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), BLACK, "inverted backdrop paints");
     }
 
+    // Covers ISO 32000-1 §11.6.5.2.
     #[test]
     fn identity_and_default_transfers_match_an_absent_one() {
         // /TR /Identity and /TR /Default are byte-for-byte the no-/TR
@@ -5910,6 +6054,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §11.6.5.2.
     #[test]
     fn unloadable_transfer_stays_reported_as_identity() {
         // A /TR that is no function still reports a dropped soft-mask
@@ -5923,6 +6068,7 @@ mod tests {
         assert_eq!(px(&pix, 75, 50), WHITE, "masked half shows the page");
     }
 
+    // Covers ISO 32000-1 §8.9.6.1 and §8.9.6.3.
     #[test]
     fn stencil_mask_stream_hides_where_it_is_one() {
         // A /Mask stencil whose top half is all ones: those samples of the
@@ -5953,6 +6099,7 @@ mod tests {
         assert!(report.is_empty(), "an applied stencil mask is not a drop");
     }
 
+    // Covers ISO 32000-1 §8.9.6.1 and §8.9.6.4.
     #[test]
     fn color_key_mask_hides_matching_samples() {
         // /Mask [0 32]: the dark half of a two-tone gray image becomes
@@ -5979,6 +6126,7 @@ mod tests {
         assert!(report.is_empty(), "an applied color key is not a drop");
     }
 
+    // Covers ISO 32000-1 §11.2, §11.3.5, §11.6.2, §11.6.3 and §8.4.5.
     #[test]
     fn multiply_blend_darkens_the_overlap() {
         // A red square, then a blue square multiplied over it: the overlap
@@ -6002,6 +6150,7 @@ mod tests {
         assert_eq!(px(&pix, 10, 89), RED, "red-only region untouched");
     }
 
+    // Covers ISO 32000-1 §11.3.5, §11.6.3 and §8.4.5.
     #[test]
     fn blend_mode_array_takes_the_first_recognized_name() {
         let resources = "/ExtGState << /GS0 << /BM [/Multiply /Normal] >> >>";
@@ -6011,6 +6160,7 @@ mod tests {
         assert_eq!(px(&pix, 45, 55), [0, 0, 0, 255], "array form blends too");
     }
 
+    // Covers ISO 32000-1 §11.3.5.
     #[test]
     fn screen_blend_lightens_the_overlap() {
         // Screen of red and blue is magenta: 1-(1-r)(1-b) per channel.
@@ -6021,6 +6171,7 @@ mod tests {
         assert_eq!(px(&pix, 45, 55), [255, 0, 255, 255], "screen makes magenta");
     }
 
+    // Covers ISO 32000-1 §11.6.4.2, §11.6.5, §11.6.5.3, §8.9.5.1 and §8.9.6.1.
     #[test]
     fn image_soft_mask_applies_per_sample_alpha() {
         // A solid black image whose /SMask is transparent on its left half
@@ -6054,6 +6205,7 @@ mod tests {
         assert!(report.is_empty(), "an applied mask is not a drop");
     }
 
+    // Covers ISO 32000-1 §12.5.2, §12.5.5, §12.5.6 and §12.5.6.12.
     #[test]
     fn annotation_normal_appearance_paints_onto_rect() {
         // A stamp whose /AP /N fills its whole /BBox red must paint the
@@ -6116,6 +6268,7 @@ mod tests {
         b.build(1)
     }
 
+    // Covers ISO 32000-1 §12.5.3, §12.5.6, §12.5.6.14 and §12.5.6.5.
     #[test]
     fn invisible_and_apless_annotations_stay_silent() {
         // A hidden stamp, a Link with no /AP, and a Popup: none paints,
@@ -6137,6 +6290,7 @@ mod tests {
         assert!(report.is_empty(), "none of these is a drop");
     }
 
+    // Covers ISO 32000-1 §12.5.5, §12.5.6, §12.5.6.19, §12.7.4, §12.7.4.2, §12.7.4.2.3 and §12.7.4.2.4.
     #[test]
     fn appearance_state_dictionary_selects_by_as() {
         // /N is a dictionary of states: /AS picks /On (red). The /Off
@@ -6171,6 +6325,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §12.5.5 and §12.5.6.12.
     #[test]
     fn appearance_matrix_is_normalized_by_the_rect_fit() {
         // §12.5.5: the form /Matrix participates in the bbox-to-rect fit,
@@ -6190,6 +6345,7 @@ mod tests {
         assert!(report.is_empty());
     }
 
+    // Covers ISO 32000-1 §12.5.5 and §12.5.6.12.
     #[test]
     fn unreadable_appearance_stream_is_reported() {
         // The declared appearance names a filter nobody decodes: the
@@ -6214,6 +6370,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §12.5.5 and §12.5.6.12.
     #[test]
     fn non_dictionary_ap_is_reported() {
         // /AP is declared but is not a dictionary: the annotation declared
@@ -6231,6 +6388,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.3.2.2.
     #[test]
     fn rotate_90_swaps_dimensions_and_spins_content() {
         let mut b = PdfBuilder::new();
@@ -6251,6 +6409,7 @@ mod tests {
         assert_eq!(px(&pix, 194, 94), WHITE);
     }
 
+    // Covers ISO 32000-1 §8.3.2.2.
     #[test]
     fn scale_doubles_pixel_size_and_coordinates() {
         let content = "1 0 0 rg 10 10 20 20 re f";
@@ -6268,6 +6427,7 @@ mod tests {
             .join(name)
     }
 
+    // Covers ISO 32000-1 §8.2.
     #[test]
     fn shapes_fixture_renders_expected_colors() {
         let doc = Document::open(fixture("shapes.pdf")).expect("open");
@@ -6312,6 +6472,7 @@ mod tests {
         assert!(pix.data.iter().all(|&b| b == 255), "expected a white page");
     }
 
+    // Covers ISO 32000-1 §8.5.3.1, §8.5.3.3.3 and Annex A.2.
     #[test]
     fn even_odd_fill_and_close_fill_stroke() {
         // f* with two same-winding squares leaves an even-odd hole.
@@ -6439,6 +6600,7 @@ mod tests {
         )
     }
 
+    // Covers ISO 32000-1 §9.6.5 and §9.6.6.3.
     #[test]
     fn type3_glyph_paints_at_all_embedded_not_embedded_truetype_only() {
         let doc = type3_page_doc(
@@ -6479,6 +6641,7 @@ mod tests {
     /// Nothing covered that before. The one fixture carrying a CharProc
     /// `/Resources` put it on the stream dictionary, which `Type3Font::load` never
     /// reads, and reached its font through the page's chain instead.
+    // Covers ISO 32000-1 §7.8.3.
     #[test]
     fn a_char_proc_resolves_names_from_the_fonts_own_resources() {
         let mut b = PdfBuilder::new().version(1, 5);
@@ -6513,6 +6676,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.3.2.4, §9.2.4 and §9.6.5.
     #[test]
     fn type3_width_governs_second_glyph_origin() {
         let doc = type3_page_doc_widths(800, b"BT /F0 100 Tf 20 50 Td <4141> Tj ET");
@@ -6524,6 +6688,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.5.
     #[test]
     fn type3_d1_glyph_ignores_its_own_color_and_uses_text_fill() {
         // Page sets fill RED before the text; the d1 CharProc tries to set blue.
@@ -6555,9 +6720,10 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.5.
     #[test]
     fn type3_d0_nested_in_d1_regains_color() {
-        // ISO 32000-1 9.6.5.2: a `d1` (uncolored) CharProc must not apply its
+        // ISO 32000-1 §9.6.5: a `d1` (uncolored) CharProc must not apply its
         // own color -- it paints in the inherited text fill (red here). But
         // that lock must not leak into a `d0` (colored) CharProc shown *from
         // inside* the `d1` glyph (a Type3 font showing itself, ISO 32000-1
@@ -6918,6 +7084,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Covers ISO 32000-1 §8.4.2, §9.3.1 and §9.3.2.
     #[test]
     fn grestore_restores_char_spacing() {
         // Tc is a graphics-state parameter (ISO 32000-1 §9.3.1, Table 51):
@@ -6944,6 +7111,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.3.2 and §9.4.1.
     #[test]
     fn char_spacing_persists_across_text_blocks() {
         // The flip side of the q/Q rule: BT/ET reset only the text and line
@@ -6961,6 +7129,7 @@ mod tests {
         assert!(!dark_at(&pix, 95, 115), "the unspaced position stays blank");
     }
 
+    // Covers ISO 32000-1 §9.7.6.3.
     #[test]
     fn type0_missing_gid_never_falls_back() {
         // An embedded Type0/CIDFontType2 showing CID 0 (gid 0 under the

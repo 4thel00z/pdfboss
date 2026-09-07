@@ -467,6 +467,7 @@ mod tests {
         Name(text.into())
     }
 
+    // Covers ISO 32000-1 §8.4.4.
     #[test]
     fn state_ops_push_single_operators() {
         let mut canvas = Canvas::new();
@@ -665,6 +666,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.2.2.
     #[test]
     fn text_pushes_five_op_sequence() {
         let mut canvas = Canvas::new();

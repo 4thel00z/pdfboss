@@ -220,6 +220,8 @@ fn disc(c: Point, pen: Pen) -> Subpath {
 /// pixels is widened to a visible hairline. A matrix that cannot be
 /// inverted cannot carry the pen either way and is treated as the
 /// identity, which keeps the stroke visible.
+///
+/// Covers ISO 32000-1 §8.4.3.2 and §8.5.3.2.
 pub(crate) fn stroke_path(
     subpaths: &[Subpath],
     width: f32,
@@ -313,6 +315,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.5.3.2.
     #[test]
     fn horizontal_line_paints_band_of_expected_thickness() {
         let mut pix = Pixmap::new(20, 10);
@@ -331,6 +334,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 10, 9), 0, "below band clear");
     }
 
+    // Covers ISO 32000-1 §8.4.3.3.
     #[test]
     fn round_caps_extend_past_endpoints() {
         let mut pix = Pixmap::new(20, 10);
@@ -348,6 +352,7 @@ mod tests {
         assert_eq!(alpha_at(&pix, 0, 5), 0);
     }
 
+    // Covers ISO 32000-1 §8.4.3.2.
     #[test]
     fn minimum_device_width_keeps_hairlines_visible() {
         let mut pix = Pixmap::new(20, 10);
@@ -387,6 +392,7 @@ mod tests {
         assert_eq!(runs, 3, "expected 3 painted runs");
     }
 
+    // Covers ISO 32000-1 §8.4.3.6.
     #[test]
     fn dash_split_counts_and_phase() {
         let pts = [Point::new(0.0, 0.0), Point::new(20.0, 0.0)];
@@ -414,6 +420,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §8.5.3.2.
     #[test]
     fn closed_subpath_strokes_closing_segment() {
         let mut pix = Pixmap::new(12, 12);
@@ -451,6 +458,7 @@ mod tests {
     /// (device-horizontal) lines is 4.26 * 2.0629 ~ 8.8 pixels — not the
     /// 4.26 * sqrt(|det|) ~ 4.26 a scalar width yields, which leaves gaps
     /// between strokes spaced 8.1 apart and stripes every such gradient.
+    // Covers ISO 32000-1 §8.4.3.2.
     #[test]
     fn anisotropic_ctm_widens_the_pen_across_the_stroke() {
         let ctm = Matrix {

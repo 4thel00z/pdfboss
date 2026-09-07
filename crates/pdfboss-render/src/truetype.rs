@@ -37,6 +37,8 @@ pub(crate) struct TrueType {
 impl TrueType {
     /// Parses a font program, returning `None` if it is not `glyf`-based or is
     /// too malformed to yield the required tables.
+    ///
+    /// Covers ISO 32000-1 §9.6.3 and §9.9.
     pub(crate) fn parse(data: Vec<u8>) -> Option<TrueType> {
         let sfnt = be32(&data, 0)?;
         // Accept TrueType (0x00010000) and the 'true'/'ttcf' tags; reject OTTO
@@ -443,6 +445,7 @@ struct Cmap {
     format: u16,
 }
 
+/// Covers ISO 32000-1 §9.6.6.4.
 impl Cmap {
     /// Chooses the best supported subtable: a Unicode/Windows table if present,
     /// otherwise the first symbol or Mac table.
@@ -840,6 +843,7 @@ pub(crate) mod tests {
         assert!(font.has_cmap());
     }
 
+    // Covers ISO 32000-1 §9.6.3.
     #[test]
     fn maps_char_to_glyph_and_reads_outline() {
         let font = TrueType::parse(build_font()).unwrap();
@@ -860,6 +864,7 @@ pub(crate) mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.6.4.
     #[test]
     fn post_maps_custom_name_to_glyph() {
         let font = TrueType::parse(build_font()).expect("font parses");
@@ -873,6 +878,7 @@ pub(crate) mod tests {
         assert_eq!(font.gid_for_name(".notdef"), None); // standard index, not resolved
     }
 
+    // Covers ISO 32000-1 §9.9.
     #[test]
     fn otto_and_garbage_are_rejected() {
         let mut otto = 0x4F54_544Fu32.to_be_bytes().to_vec();
@@ -925,6 +931,7 @@ pub(crate) mod tests {
 
     /// End-to-end: a page showing one CID from an embedded `CIDFontType2`
     /// Type0 font must paint the glyph's filled outline on the page.
+    // Covers ISO 32000-1 §9.6.3, §9.7.4.1, §9.7.4.2 and §9.9.
     #[test]
     fn renders_embedded_glyph_onto_page() {
         use pdfboss_core::Document;

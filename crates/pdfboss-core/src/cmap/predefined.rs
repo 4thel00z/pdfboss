@@ -23,6 +23,8 @@ enum Collection {
 
 /// Which collection owns a predefined CMap name; `None` for names ISO 32000
 /// does not predefine (an `/Encoding` naming one must embed it instead).
+///
+/// Covers ISO 32000-1 §9.7.5.2.
 #[cfg(feature = "predefined-cmaps")]
 fn collection_of(name: &str) -> Option<Collection> {
     match name {
@@ -47,6 +49,8 @@ fn collection_of(name: &str) -> Option<Collection> {
 /// The predefined CMap called `name`, or `None` when ISO 32000 does not
 /// predefine it (or the `predefined-cmaps` feature left the data out).
 /// Parsed once per name; `usecmap` dependencies resolve within the set.
+///
+/// Covers ISO 32000-1 §9.7.5.2.
 pub fn predefined(name: &str) -> Option<Arc<CidCmap>> {
     match name {
         "Identity-H" => Some(Arc::clone(identity(false))),
@@ -85,6 +89,8 @@ impl CidToUnicode {
 /// Japan1 also folds in UniJIS-UCS2-HW-H: the halfwidth-form CIDs it remaps
 /// Latin and digits onto (231-325) have no preimage in UniJIS-UTF16-H, and
 /// they are what every Shift-JIS ASCII run selects.
+///
+/// Covers ISO 32000-1 §9.7.3.
 pub fn cid_to_unicode(ordering: &str) -> Option<Arc<CidToUnicode>> {
     let (slot, names): (usize, &[&str]) = match ordering {
         "Japan1" => (0, &["UniJIS-UTF16-H", "UniJIS-UCS2-HW-H"]),
@@ -251,6 +257,7 @@ fn predefined_at(name: &str, depth: usize) -> Option<Arc<CidCmap>> {
 mod tests {
     use super::*;
 
+    // Covers ISO 32000-1 §9.7.5.2.
     #[test]
     fn rksj_h_splits_and_maps_hiragana() {
         let c = predefined("90ms-RKSJ-H").unwrap();
@@ -264,6 +271,7 @@ mod tests {
         assert!(c.single_byte(0x20));
     }
 
+    // Covers ISO 32000-1 §9.7.5.2.
     #[test]
     fn rksj_v_layers_vertical_variants_over_the_h_base() {
         let v = predefined("90ms-RKSJ-V").unwrap();
@@ -276,6 +284,7 @@ mod tests {
         assert_eq!(h.cid(0x8141, 2), Some(634));
     }
 
+    // Covers ISO 32000-1 §9.7.5.2.
     #[test]
     fn every_shipped_name_loads_and_identity_needs_no_data() {
         for name in [
@@ -322,6 +331,7 @@ mod tests {
         assert!(predefined("WinAnsiEncoding").is_none());
     }
 
+    // Covers ISO 32000-1 §9.10.2 and §9.7.3.
     #[test]
     fn japan1_cids_read_back_as_unicode() {
         let inv = cid_to_unicode("Japan1").unwrap();

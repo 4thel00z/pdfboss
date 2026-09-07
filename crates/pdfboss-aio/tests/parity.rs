@@ -295,6 +295,7 @@ fn page_boxes_doc() -> Vec<u8> {
 /// dictionary. The fixture declares everything on `/Pages` nodes, so a
 /// traversal that fails to inherit reports US Letter for an A4 page —
 /// silently, which is why this compares every field rather than probing one.
+// Covers ISO 32000-1 §7.7.3.4.
 #[tokio::test]
 async fn pages_agree_with_the_sync_document() {
     let mut cases = fixtures();
@@ -447,9 +448,36 @@ async fn optional_content_renders_identically() {
     );
 }
 
+/// An encryption dictionary whose `/CF` is an indirect object is followed by
+/// both readers, so the file opens and decrypts the same way on each side.
+// Covers ISO 32000-1 §7.6.3.2 and §7.6.5.
+#[tokio::test]
+async fn indirect_crypt_filter_dictionaries_decrypt_identically() {
+    let bytes = pdfboss_testkit::encrypted_rc4_doc_with_indirect_cf("Behind a reference");
+    let sync_doc = Document::load(bytes.clone()).expect("sync follows the /CF reference");
+    let async_doc = AsyncDocument::from_bytes(bytes)
+        .await
+        .expect("async follows the /CF reference");
+
+    let msg_ref = ObjRef { num: 6, gen: 0 };
+    let sync_msg = sync_doc.get(msg_ref).expect("sync object");
+    let async_msg = async_doc.get_object(msg_ref).await.expect("async object");
+    assert_eq!(sync_msg, async_msg, "decrypted dictionaries agree");
+    assert_eq!(
+        async_msg
+            .as_dict()
+            .unwrap()
+            .get("Msg")
+            .unwrap()
+            .as_str_bytes(),
+        Some(b"Behind a reference".as_slice()),
+    );
+}
+
 /// An RC4-encrypted document (Standard handler, empty user password) opens
 /// asynchronously and decrypts identically to the synchronous document:
 /// strings, stream data, and extracted text.
+// Covers ISO 32000-1 §7.6.2.
 #[tokio::test]
 async fn encrypted_documents_decrypt_identically() {
     let bytes = pdfboss_testkit::encrypted_rc4_doc("Top secret message");

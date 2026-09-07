@@ -217,6 +217,7 @@ fn encrypt_dict_strings_are_never_encrypted() {
 /// `write_indirect`, so they are never encrypted. A raw, undecrypted parse
 /// of the trailer must show a plausible 16-byte pair, identical to what a
 /// password-authenticated `Document` reports.
+// Covers ISO 32000-1 §14.4.
 #[test]
 fn id_pair_is_never_encrypted() {
     let (encryptor, dict) = encryptor();

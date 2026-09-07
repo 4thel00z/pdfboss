@@ -155,6 +155,7 @@ def test_image_decode_error_is_pdf_error() -> None:
         (Pdf() | page).to_bytes()
 
 
+# Covers ISO 32000-1 §12.5.6.5 and §12.6.4.7.
 def test_link_composes_into_page() -> None:
     page = Page() | Link(rect=(0, 0, 100, 20), url="https://example.com")
     data = (Pdf() | page).to_bytes()
@@ -242,6 +243,7 @@ def test_viewer_duplicate_slot_raises() -> None:
         Pdf() | Viewer(mode="use-none") | Viewer(mode="use-outlines")
 
 
+# Covers ISO 32000-1 §12.3.3.
 def test_full_vocabulary_compose_reopens_with_expected_text_and_pages(tmp_path: Path) -> None:
     first = Page(size="a4") | Text("Cover page", at=(72, 700))
     second = Page(size="a4") | Text("Appendix page", at=(72, 700))
@@ -283,6 +285,7 @@ def test_full_vocabulary_compose_is_deterministic() -> None:
     assert build() == build()
 
 
+# Covers ISO 32000-1 §12.4.2.
 def test_multiple_attachments_and_page_labels_compose() -> None:
     page = Page(size="a4") | Text("x", at=(72, 700))
     pdf = (
@@ -368,6 +371,7 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
     ]
 
 
+# Covers ISO 32000-1 §9.6.2.2.
 def test_standard14_exposes_all_fourteen_names() -> None:
     names = [
         "HELVETICA",

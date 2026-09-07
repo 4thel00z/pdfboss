@@ -58,6 +58,8 @@ impl Xref {
     }
 
     /// Inserts `entry` for `num` unless an entry is already present.
+    ///
+    /// Covers ISO 32000-1 §7.5.4.
     fn add(&mut self, num: u32, entry: XrefEntry) {
         self.map.entry(num).or_insert(entry);
     }
@@ -65,6 +67,8 @@ impl Xref {
     /// Merges an older section into this one. Entries already present win
     /// (sections are walked newest to oldest, first-seen wins); trailer
     /// keys and the newest-section record already present are kept.
+    ///
+    /// Covers ISO 32000-1 §7.5.6.
     pub fn merge(&mut self, older: Xref) {
         for (num, entry) in older.map {
             self.map.entry(num).or_insert(entry);
@@ -118,6 +122,8 @@ pub fn startxref(data: &[u8]) -> Option<usize> {
 /// Finds the byte offset announced after the last `startxref` keyword,
 /// searching the last 1 KiB first and widening to the last 64 KiB when the
 /// keyword is absent from the smaller window.
+///
+/// Covers ISO 32000-1 §7.5.5.
 fn find_startxref(data: &[u8]) -> Option<usize> {
     for window in [1024usize, 64 * 1024] {
         let tail = data.len().saturating_sub(window);
@@ -146,6 +152,8 @@ fn to_offset(v: i64, data: &[u8]) -> Option<usize> {
 /// `/XRefStm` section (hybrid file) merges ahead of its table — the table
 /// marks the stream's objects free to hide them from old readers — and both
 /// merge before `/Prev` is followed. Visited offsets guard against loops.
+///
+/// Covers ISO 32000-1 §7.5.6 and §7.5.8.4.
 fn load_chain(data: &[u8], start: usize) -> Result<Xref> {
     let mut acc = Xref::default();
     let mut visited: FastSet<usize> = FastSet::default();
@@ -182,6 +190,8 @@ fn load_chain(data: &[u8], start: usize) -> Result<Xref> {
 }
 
 /// Big-endian integer from up to 8 bytes; an empty slice reads as 0.
+///
+/// Covers ISO 32000-1 §7.5.8.3.
 fn read_be(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0, |acc, &b| (acc << 8) | u64::from(b))
 }
@@ -207,6 +217,8 @@ pub struct XrefSectionInfo {
 
 /// Parses the cross-reference section at `off` — a classic table or a
 /// cross-reference stream — reporting entries, chain pointers, and spans.
+///
+/// Covers ISO 32000-1 §7.5.8.
 pub fn parse_section_at(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
     let mut lexer = Lexer::at(data, off);
     if matches!(lexer.peek_token(), Ok(Token::Keyword(ref k)) if k.as_slice() == b"xref") {
@@ -220,6 +232,8 @@ pub fn parse_section_at(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
 /// headers, then `count` entries each of `offset gen n|f`, ending with
 /// `trailer` and its dictionary. Entries are read token-wise, so malformed
 /// 19- or 21-byte entry lines load just as well as conforming 20-byte ones.
+///
+/// Covers ISO 32000-1 §7.5.4, §7.5.5 and §7.5.8.4.
 fn parse_classic(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
     let mut lexer = Lexer::at(data, off);
     match lexer.next_token()? {
@@ -291,6 +305,8 @@ fn parse_classic(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
 /// decoded data holds fixed-width big-endian fields laid out per `/W`; a
 /// zero-width type field defaults to type 1, `/Index` defaults to
 /// `[0 Size]`, and the stream's own dictionary is the section trailer.
+///
+/// Covers ISO 32000-1 §7.5.8, §7.5.8.2 and §7.5.8.3.
 fn parse_stream_section(data: &[u8], off: usize) -> Result<XrefSectionInfo> {
     let mut parser = Parser::at(data, off);
     let (_, obj) = parser.parse_indirect(&NoResolve)?;
@@ -541,6 +557,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.5.4 and §7.5.5.
     #[test]
     fn classic_table_loads_all_entries() {
         let data = simple_doc("Hello");
@@ -554,6 +571,7 @@ mod tests {
         assert_eq!(xref.trailer.get_int("Size"), Some(6));
     }
 
+    // Covers ISO 32000-1 §7.5.8, §7.5.8.2 and §7.5.8.3.
     #[test]
     fn xref_stream_loads_infile_and_instream_entries() {
         let (dict, payload) = objstm_payload(&[
@@ -588,6 +606,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.5.3.
     #[test]
     fn recovery_scan_after_corrupt_startxref() {
         let mut data = simple_doc("rescue me");
@@ -614,6 +633,7 @@ mod tests {
         assert_eq!(xref.trailer.get_int("Size"), Some(6), "synthesized /Size");
     }
 
+    // Covers ISO 32000-1 §7.5.3.
     #[test]
     fn recovery_last_occurrence_of_an_object_wins() {
         let mut data = simple_doc("x");
@@ -633,6 +653,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.5.3.
     #[test]
     fn recovery_ignores_endobj_and_bad_headers() {
         let data = b"garbage endobj more\n7 2 obj\n<< /Type /Catalog >>\nendobj\nxobj 9 9";
@@ -650,6 +671,7 @@ mod tests {
         assert!(matches!(load_xref(b""), Err(Error::InvalidXref)));
     }
 
+    // Covers ISO 32000-1 §7.5.4.
     #[test]
     fn classic_table_with_19_and_21_byte_lines() {
         let mut data = b"%PDF-1.4\n".to_vec();
@@ -679,6 +701,7 @@ mod tests {
         assert_eq!(xref.trailer.get_ref("Root").map(|r| r.num), Some(1));
     }
 
+    // Covers ISO 32000-1 §7.5.6 and §7.5.8.2.
     #[test]
     fn xref_stream_prev_chains_to_classic_section() {
         let mut data = b"%PDF-1.5\n".to_vec();
@@ -732,6 +755,7 @@ mod tests {
         assert_eq!(xref.trailer.get_ref("Root").map(|r| r.num), Some(1));
     }
 
+    // Covers ISO 32000-1 §7.5.8.4.
     #[test]
     fn hybrid_xrefstm_overrides_entries_the_table_marks_free() {
         let mut data = b"%PDF-1.5\n".to_vec();
@@ -784,6 +808,7 @@ mod tests {
         assert_eq!(xref.trailer.get_ref("Root").map(|r| r.num), Some(1));
     }
 
+    // Covers ISO 32000-1 §7.5.6.
     #[test]
     fn prev_loop_is_broken_by_the_visited_guard() {
         let mut data = b"%PDF-1.4\n".to_vec();
@@ -806,6 +831,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.5.5.
     #[test]
     fn startxref_found_beyond_the_last_1_kib() {
         let mut data = simple_doc("padded");
@@ -819,6 +845,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.5.6.
     #[test]
     fn merge_keeps_first_seen_entries_and_trailer_keys() {
         let mut newer = Xref::default();
@@ -863,6 +890,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.5.4.
     #[test]
     fn parse_section_at_classic_reports_spans() {
         let data = pdfboss_testkit::simple_doc("spans");
@@ -889,6 +917,7 @@ mod tests {
         assert!(tspan.end as usize <= data.len());
     }
 
+    // Covers ISO 32000-1 §7.5.4.
     #[test]
     fn newest_section_reports_table_offset_and_kind() {
         let data = simple_doc("newest section");
@@ -903,6 +932,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.5.8.3.
     #[test]
     fn newest_section_reports_stream_offset_and_kind() {
         let (dict, payload) = objstm_payload(&[
@@ -923,6 +953,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.5.8.4.
     #[test]
     fn newest_section_hybrid_reports_table_at_table_offset() {
         let data = pdfboss_testkit::hybrid_doc();
@@ -991,6 +1022,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.5.8.
     #[test]
     fn parse_section_at_stream_reports_spans() {
         let mut builder = pdfboss_testkit::PdfBuilder::new();

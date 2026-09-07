@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 mod crypt;
-pub use crypt::encrypted_rc4_doc;
+pub use crypt::{encrypted_rc4_doc, encrypted_rc4_doc_with_indirect_cf};
 
 /// A lightweight reference to an object added to a [`PdfBuilder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

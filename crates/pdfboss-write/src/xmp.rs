@@ -13,6 +13,8 @@ const PACKET_ID: &str = "W5M0MpCehiHzreSzNTczkc9d";
 
 /// Builds a minimal RDF/XMP packet from `meta`. Each `dc:`/`pdf:`/`xmp:`
 /// element is present only when its `Metadata` field is `Some`.
+///
+/// Covers ISO 32000-1 §14.3.2.
 pub(crate) fn packet(meta: &Metadata) -> Vec<u8> {
     let mut elements = String::new();
     if let Some(title) = &meta.title {
@@ -133,6 +135,7 @@ mod tests {
         String::from_utf8(bytes).expect("packet is valid UTF-8")
     }
 
+    // Covers ISO 32000-1 §14.3.2.
     #[test]
     fn full_metadata_maps_every_field() {
         let xml = text(packet(&full_metadata()));

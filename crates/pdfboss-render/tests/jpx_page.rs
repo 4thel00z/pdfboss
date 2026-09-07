@@ -70,6 +70,7 @@ fn colored(pix: &Pixmap) -> usize {
 /// source image has no white pixels at all and is chromatic nearly
 /// everywhere, so a blank page, a gray misread of the interleave, and a
 /// skipped image all land far below the thresholds.
+// Covers ISO 32000-1 §7.4.9.
 #[test]
 fn a_jpx_rgb_image_renders_in_color_with_no_skips() {
     let pix = render_clean(include_bytes!("fixtures/pdf-rgb-53.pdf"));
@@ -243,6 +244,7 @@ fn probe_px(pix: &Pixmap, x: u32, y: u32) -> [u8; 4] {
 /// (which 7.4.9 keeps FOR masks) maps them to painting: the whole page
 /// must come out red, not the white a sample of 1 would paint if the
 /// image were (wrongly) drawn in its own colours.
+// Covers ISO 32000-1 §7.4.9 and §8.9.6.2.
 #[test]
 fn an_imagemask_jpx_stencils_the_fill_color() {
     let pdf = jpx_probe_pdf_with_content(

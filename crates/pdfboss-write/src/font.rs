@@ -182,6 +182,7 @@ mod tests {
     use super::*;
     use crate::error::Error;
 
+    // Covers ISO 32000-1 §9.6.2.2.
     #[test]
     fn base_font_round_trips_all_fourteen() {
         for font in Standard14::ALL {
@@ -202,6 +203,7 @@ mod tests {
         assert_eq!(Standard14::from_base_font(""), None);
     }
 
+    // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn encode_ascii_and_win_ansi_specials() {
         assert_eq!(Standard14::Helvetica.encode("Hi").unwrap(), b"Hi");
@@ -233,6 +235,7 @@ mod tests {
         assert_eq!(Standard14::Symbol.encode("").unwrap(), Vec::<u8>::new());
     }
 
+    // Covers ISO 32000-1 §9.6.2.2.
     #[test]
     fn width_matches_direct_afm_lookups() {
         let font = Standard14::Helvetica;
@@ -264,6 +267,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §9.5 and §9.6.2.1.
     #[test]
     fn font_dict_win_ansi_and_symbol() {
         let dict = Standard14::HelveticaOblique.font_dict();

@@ -5,6 +5,7 @@
 //! mode. The value domain is codes to CID integers — distinct from the
 //! ToUnicode CMaps parsed in `pdfboss-text`, whose destinations are text.
 
+/// Covers ISO 32000-1 §9.7.6.2.
 mod predefined;
 
 pub use predefined::{cid_to_unicode, predefined, CidToUnicode};
@@ -20,6 +21,8 @@ use std::sync::Arc;
 /// codes of `len` bytes (ISO 32000-1 §9.7.6.2 — a code matches when every
 /// byte lies within the bounds at its position, not when the folded value
 /// does).
+///
+/// Covers ISO 32000-1 §9.7.5.1.
 #[derive(Clone, Copy)]
 struct Codespace {
     len: u8,
@@ -109,6 +112,8 @@ impl CidCmap {
     /// dictionary's `/UseCMap`, if any; an in-content `usecmap` operator
     /// resolves through `resolve` and fills the parent slot only when it is
     /// still empty (a CMap has one parent).
+    ///
+    /// Covers ISO 32000-1 §9.7.5.4.
     pub fn parse_with(
         data: &[u8],
         parent: Option<Arc<CidCmap>>,
@@ -212,6 +217,8 @@ impl CidCmap {
     /// byte is consumed. Always consumes at least one byte. With no
     /// codespaces at all, codes are two bytes — the Type0 default this
     /// module's callers otherwise assume.
+    ///
+    /// Covers ISO 32000-1 §9.7.5.1, §9.7.6.2 and §9.7.6.3.
     pub fn code_at(&self, bytes: &[u8], pos: usize) -> (u32, u8) {
         let rest = &bytes[pos..];
         if self.codespaces.is_empty() {
@@ -421,6 +428,8 @@ async fn rv<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Obj
 /// `/UseCMap` chain (streams or predefined names, bounded depth) layered
 /// underneath and its `/WMode` overriding the content's. Whatever fails
 /// resolves to the Identity assumption with `known` false.
+///
+/// Covers ISO 32000-1 §9.7.5.3.
 pub async fn type0_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> Type0Encoding {
     let identity = |vertical: bool, known: bool| Type0Encoding {
         cmap: None,
@@ -455,6 +464,8 @@ pub async fn type0_encoding<S: AsyncObjectSource>(src: &S, font: &Dict) -> Type0
 
 /// Parses an embedded CMap stream with its `/UseCMap` ancestry. `None` when
 /// the stream will not read or parses to nothing.
+///
+/// Covers ISO 32000-1 §9.7.5.3.
 async fn embedded_cmap<S: AsyncObjectSource>(src: &S, stream: &Stream) -> Option<Arc<CidCmap>> {
     // Walk the /UseCMap chain outward first (bounded), then parse from the
     // deepest layer up so each child wraps its parent.
@@ -536,6 +547,7 @@ mod tests {
         CidCmap::parse(data.as_bytes())
     }
 
+    // Covers ISO 32000-1 §9.7.5.1 and §9.7.6.2.
     #[test]
     fn rksj_codespaces_split_mixed_widths() {
         let c = rksj();
@@ -546,6 +558,7 @@ mod tests {
         assert_eq!(c.code_at(&bytes, 3), (0xA1, 1));
     }
 
+    // Covers ISO 32000-1 §9.7.5.4.
     #[test]
     fn cidrange_arithmetic_offsets_within_the_range() {
         let c = rksj();
@@ -557,12 +570,14 @@ mod tests {
         assert_eq!(c.cid(0x82FF, 2), None);
     }
 
+    // Covers ISO 32000-1 §9.7.5.4.
     #[test]
     fn cidchar_singletons_map() {
         let c = rksj();
         assert_eq!(c.cid(0xA1, 1), Some(9000));
     }
 
+    // Covers ISO 32000-1 §9.7.5.4 and §9.7.6.3.
     #[test]
     fn notdef_ranges_lose_to_real_mappings() {
         let data = format!(
@@ -576,6 +591,7 @@ mod tests {
         assert_eq!(c.cid(0x20, 1), None);
     }
 
+    // Covers ISO 32000-1 §9.7.6.2.
     #[test]
     fn a_one_byte_code_and_a_two_byte_code_with_equal_values_stay_apart() {
         let data = "2 begincodespacerange <00> <20> <4000> <41FF> endcodespacerange\n\
@@ -585,6 +601,7 @@ mod tests {
         assert_eq!(c.cid(0x20, 2), Some(9));
     }
 
+    // Covers ISO 32000-1 §9.7.5.3.
     #[test]
     fn usecmap_layers_child_over_parent() {
         let parent = Arc::new(CidCmap::parse(
@@ -610,6 +627,7 @@ mod tests {
         assert_eq!(child.parent().map(|p| p.cid(0x8141, 2)), Some(Some(634)));
     }
 
+    // Covers ISO 32000-1 §9.7.5.1.
     #[test]
     fn wmode_reads_and_defaults_horizontal() {
         assert!(!CidCmap::parse(b"/WMode 0 def").vertical());
@@ -618,6 +636,7 @@ mod tests {
         assert!(CidCmap::identity(true).vertical());
     }
 
+    // Covers ISO 32000-1 §9.7.5.1.
     #[test]
     fn identity_maps_code_to_cid() {
         let c = CidCmap::identity(false);
@@ -626,6 +645,7 @@ mod tests {
         assert!(!c.single_byte(0x20));
     }
 
+    // Covers ISO 32000-1 §9.3.3.
     #[test]
     fn word_spacing_evidence_is_a_one_byte_codespace() {
         assert!(rksj().single_byte(0x20));
@@ -634,6 +654,7 @@ mod tests {
 
     /// The never-stall invariant: whatever the bytes, `code_at` consumes at
     /// least one and never reads past the end.
+    // Covers ISO 32000-1 §9.7.6.2 and §9.7.6.3.
     #[test]
     fn splitting_always_consumes_at_least_one_byte() {
         let cmaps = [rksj(), CidCmap::identity(false), CidCmap::parse(b"")];
@@ -654,6 +675,7 @@ mod tests {
         assert_eq!(rksj().code_at(&[0x81], 0), (0x81, 1));
     }
 
+    // Covers ISO 32000-1 §9.7.5.4.
     #[test]
     fn a_truncated_section_keeps_what_parsed_so_far() {
         let c = CidCmap::parse(b"2 begincidrange <20> <7d> 231 <8140> <81");

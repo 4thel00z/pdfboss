@@ -81,6 +81,7 @@ class TestDocument:
         assert doc.extract_text() == CONTENT_ORDER
         assert doc.extract_text(reading_order=ReadingOrder.CONTENT) == CONTENT_ORDER
 
+    # Covers ISO 32000-1 §14.8.2.3.
     def test_three_orders_on_document_and_page(self, tagged_pdf: bytes) -> None:
         doc = Document(data=tagged_pdf)
         for target in (doc, doc[0]):

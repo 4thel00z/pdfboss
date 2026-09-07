@@ -14,6 +14,7 @@
 use pdfboss_core::Document;
 use pdfboss_render::{render_page_reporting, RenderOptions};
 
+// Covers ISO 32000-1 §8.6.6.4.
 #[test]
 fn separation_fill_takes_its_color_from_the_tint_transform() {
     let bytes = include_bytes!("fixtures/separation-tint.pdf").to_vec();

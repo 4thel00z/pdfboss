@@ -76,6 +76,8 @@ impl<'a> Parser<'a> {
 
     /// Parses the object that `token` begins. `depth` counts enclosing
     /// containers (bounded by `MAX_NESTING_DEPTH`).
+    ///
+    /// Covers ISO 32000-1 §7.3.2, §7.3.9 and §7.9.2.4.
     fn parse_from_token(
         &mut self,
         token: Token,
@@ -107,6 +109,8 @@ impl<'a> Parser<'a> {
     /// After an integer has been read: if `int R` follows, the three tokens
     /// form an indirect reference; otherwise the lexer is rewound so the
     /// integer stands alone.
+    ///
+    /// Covers ISO 32000-1 §7.3.10.
     fn try_reference(&mut self, num: i64) -> Object {
         let save = self.lexer.pos();
         if (0..=i64::from(u32::MAX)).contains(&num) {
@@ -127,6 +131,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses array elements up to `]` (leniently also up to end of input).
+    ///
+    /// Covers ISO 32000-1 §7.3.6.
     fn parse_array(&mut self, resolver: &dyn Resolve, depth: usize) -> Result<Object> {
         if depth >= MAX_NESTING_DEPTH {
             return Err(self.syntax("container nesting too deep"));
@@ -145,6 +151,8 @@ impl<'a> Parser<'a> {
     /// Parses dictionary entries up to `>>`; if the `stream` keyword follows,
     /// the dictionary becomes a stream's dictionary and the stream data is
     /// read as well.
+    ///
+    /// Covers ISO 32000-1 §7.3.7 and §7.3.8.
     fn parse_dict_or_stream(&mut self, resolver: &dyn Resolve, depth: usize) -> Result<Object> {
         if depth >= MAX_NESTING_DEPTH {
             return Err(self.syntax("container nesting too deep"));
@@ -183,6 +191,8 @@ impl<'a> Parser<'a> {
     /// indirect length via `resolver`), and verify `endstream` follows. When
     /// `/Length` is missing or wrong, recover by scanning for the nearest
     /// `endstream` and trimming one trailing EOL from the data.
+    ///
+    /// Covers ISO 32000-1 §7.3.8, §7.3.8.1 and §7.3.8.2.
     fn parse_stream_body(&mut self, dict: Dict, resolver: &dyn Resolve) -> Result<Object> {
         let data = self.lexer.data();
         let mut start = self.lexer.pos();
@@ -241,6 +251,8 @@ impl<'a> Parser<'a> {
     /// Expects `N G obj ... endobj` at the current position and returns the
     /// reference plus the contained object. Lenient: a missing `endobj` is
     /// accepted at the next `obj` or end of input.
+    ///
+    /// Covers ISO 32000-1 §7.3.10 and §7.5.3.
     pub fn parse_indirect(&mut self, resolver: &dyn Resolve) -> Result<(ObjRef, Object)> {
         let num = match self.lexer.next_token()? {
             Token::Int(n) if (0..=i64::from(u32::MAX)).contains(&n) => n as u32,
@@ -279,6 +291,7 @@ mod tests {
         Parser::new(data).parse_object(&NoResolve).unwrap()
     }
 
+    // Covers ISO 32000-1 §7.3.2 and §7.3.9.
     #[test]
     fn atom_null_and_bools() {
         assert_eq!(parse(b"null"), Object::Null);
@@ -286,6 +299,7 @@ mod tests {
         assert_eq!(parse(b"false"), Object::Bool(false));
     }
 
+    // Covers ISO 32000-1 §7.3.3.
     #[test]
     fn atom_numbers() {
         assert_eq!(parse(b"42"), Object::Int(42));
@@ -295,6 +309,7 @@ mod tests {
         assert_eq!(parse(b"-.25"), Object::Real(-0.25));
     }
 
+    // Covers ISO 32000-1 §7.3.4 and §7.9.2.4.
     #[test]
     fn atom_strings() {
         assert_eq!(parse(b"(hello)"), Object::String(b"hello".to_vec()));
@@ -306,6 +321,7 @@ mod tests {
         assert_eq!(parse(b"/Type"), Object::Name(Name("Type".into())));
     }
 
+    // Covers ISO 32000-1 §7.3.6 and §7.3.7.
     #[test]
     fn nested_arrays_and_dicts() {
         let obj = parse(b"<< /A [1 2 [3]] /B << /C /D >> >>");
@@ -318,6 +334,7 @@ mod tests {
         assert_eq!(b.get_name("C"), Some(&Name("D".into())));
     }
 
+    // Covers ISO 32000-1 §7.3.10.
     #[test]
     fn reference_from_lookahead() {
         assert_eq!(parse(b"12 0 R"), Object::Ref(ObjRef { num: 12, gen: 0 }));
@@ -330,6 +347,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.3.10.
     #[test]
     fn two_ints_without_r_stay_ints() {
         let mut p = Parser::new(b"12 0");
@@ -345,6 +363,7 @@ mod tests {
         assert_eq!(p.parse_object(&NoResolve).unwrap(), Object::Int(0));
     }
 
+    // Covers ISO 32000-1 §7.3.10 and §7.5.3.
     #[test]
     fn indirect_round_trip() {
         let mut p = Parser::new(b"1 0 obj << /Type /Test /N 3 >> endobj");
@@ -356,6 +375,7 @@ mod tests {
         assert_eq!(p.lexer.next_token().unwrap(), Token::Eof);
     }
 
+    // Covers ISO 32000-1 §7.3.8 and §7.3.8.1.
     #[test]
     fn stream_with_direct_length() {
         let mut p = Parser::new(b"<< /Length 5 >>\nstream\nhello\nendstream");
@@ -374,6 +394,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.3.8.2.
     #[test]
     fn stream_with_indirect_length() {
         let resolver = OneResolve(ObjRef { num: 9, gen: 0 }, Object::Int(7));
@@ -382,6 +403,7 @@ mod tests {
         assert_eq!(obj.as_stream().unwrap().data, b"hello!!");
     }
 
+    // Covers ISO 32000-1 §7.3.8.2.
     #[test]
     fn stream_with_wrong_length_recovers() {
         let mut p = Parser::new(b"<< /Length 3 >>stream\nhello world\nendstream endobj");
@@ -394,6 +416,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.3.8.2.
     #[test]
     fn stream_with_overlong_length_recovers() {
         let mut p = Parser::new(b"<< /Length 999 >>stream\nxy\r\nendstream");
@@ -401,6 +424,7 @@ mod tests {
         assert_eq!(obj.as_stream().unwrap().data, b"xy");
     }
 
+    // Covers ISO 32000-1 §7.3.8.2.
     #[test]
     fn stream_without_length_recovers() {
         let mut p = Parser::new(b"<< /Type /XObject >>stream\nabc\nendstream");
@@ -410,6 +434,7 @@ mod tests {
         assert_eq!(s.dict.get_name("Type"), Some(&Name("XObject".into())));
     }
 
+    // Covers ISO 32000-1 §7.3.8.2.
     #[test]
     fn stream_with_unresolvable_length_recovers() {
         // The resolver knows nothing, so the indirect length falls through
@@ -419,6 +444,7 @@ mod tests {
         assert_eq!(obj.as_stream().unwrap().data, b"data");
     }
 
+    // Covers ISO 32000-1 §7.3.10.
     #[test]
     fn missing_endobj_accepted_at_next_obj() {
         let mut p = Parser::new(b"1 0 obj 42 2 0 obj (next) endobj");
@@ -447,6 +473,7 @@ mod tests {
         assert_eq!(p.lexer.next_token().unwrap(), Token::Eof);
     }
 
+    // Covers ISO 32000-1 §7.3.8.
     #[test]
     fn indirect_stream_object() {
         let data = b"4 0 obj << /Length 3 >> stream\nxyz\nendstream endobj";
@@ -457,6 +484,7 @@ mod tests {
         assert_eq!(p.lexer.next_token().unwrap(), Token::Eof);
     }
 
+    // Covers ISO 32000-1 §7.3.7.
     #[test]
     fn dict_value_reference() {
         let obj = parse(b"<< /Parent 6 0 R /Count 2 >>");
@@ -477,6 +505,7 @@ mod tests {
             .expect("parser must not overflow the stack")
     }
 
+    // Covers ISO 32000-1 §7.3.6 and Annex C.2.
     #[test]
     fn deeply_nested_array_is_rejected_not_stack_overflow() {
         let mut data = vec![b'['; 200_000];
@@ -485,6 +514,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Syntax { .. })));
     }
 
+    // Covers ISO 32000-1 §7.3.7.
     #[test]
     fn deeply_nested_dict_is_rejected_not_stack_overflow() {
         let mut data = Vec::new();
@@ -495,6 +525,7 @@ mod tests {
         assert!(matches!(result, Err(Error::Syntax { .. })));
     }
 
+    // Covers ISO 32000-1 §7.3.6 and Annex C.2.
     #[test]
     fn nesting_within_the_limit_still_parses() {
         let mut data = vec![b'['; 100];

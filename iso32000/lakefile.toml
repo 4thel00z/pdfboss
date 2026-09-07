@@ -1,0 +1,20 @@
+name = "iso32000"
+version = "0.1.0"
+defaultTargets = ["Iso32000"]
+# A `sorry` or any other warning fails the build: the gate has no holes.
+moreLeanArgs = ["-DwarningAsError=true"]
+
+[[lean_lib]]
+name = "Iso32000"
+
+[[lean_exe]]
+name = "iso32000-index"
+root = "Index"
+
+[[lean_exe]]
+name = "iso32000-report"
+root = "Report"
+
+[[lean_exe]]
+name = "iso32000-vectors"
+root = "Vectors"

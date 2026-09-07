@@ -576,6 +576,7 @@ mod tests {
 
     /// `resolve_with` must stop at the depth cap and name the last reference
     /// it followed, rather than looping forever.
+    // Covers ISO 32000-1 Annex C.2.
     #[test]
     fn resolve_with_stops_at_the_depth_cap() {
         let chain = Object::Ref(ObjRef { num: 7, gen: 0 });

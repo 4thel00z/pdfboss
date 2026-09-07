@@ -15,6 +15,8 @@ pub use pdfboss_core::{MarkedContentId, Point, Rect};
 
 /// The order a page's text is read in. Every extraction entry point takes
 /// one; [`ReadingOrder::Content`] is the default.
+///
+/// Covers ISO 32000-1 §14.8.2.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum ReadingOrder {
     /// The content stream's order: what the producer wrote, which in a
@@ -421,6 +423,7 @@ mod tests {
         assert!((spans[1].y - 700.0).abs() < 1e-3); // form matrix applied
     }
 
+    // Covers ISO 32000-1 §9.2.2.
     #[test]
     fn extract_spans_sane_positions() {
         let doc = Document::load(simple_doc("Hi")).unwrap();
@@ -557,6 +560,7 @@ mod tests {
 
     /// The bbox spans origin to advance horizontally and the descriptor's
     /// `/Descent`..`/Ascent` vertically, both scaled by the effective size.
+    // Covers ISO 32000-1 §9.8.1.
     #[test]
     fn span_bbox_uses_descriptor_metrics() {
         let mut b = PdfBuilder::new();
@@ -602,6 +606,7 @@ mod tests {
 
     /// A descriptor stating `/CapHeight` but no `/Ascent` uses it for the
     /// upper edge.
+    // Covers ISO 32000-1 §9.8.1.
     #[test]
     fn span_bbox_falls_back_to_cap_height() {
         let mut b = PdfBuilder::new();
@@ -630,6 +635,7 @@ mod tests {
     }
 
     /// Table 123 bit 1 (FixedPitch) surfaces as `monospace`.
+    // Covers ISO 32000-1 §9.8.2.
     #[test]
     fn fixed_pitch_flag_marks_monospace() {
         let spans = flag_spans(1);
@@ -638,6 +644,7 @@ mod tests {
     }
 
     /// Table 123 bit 2 (Serif) surfaces as `serif`.
+    // Covers ISO 32000-1 §14.8.2.4.3 and §9.8.2.
     #[test]
     fn serif_flag_marks_serif() {
         let spans = flag_spans(2);
@@ -671,6 +678,7 @@ mod tests {
     }
 
     /// The span records the text rise (`Ts`) it was shown under.
+    // Covers ISO 32000-1 §9.3.7.
     #[test]
     fn span_carries_text_rise() {
         let doc = Document::load(pdfboss_testkit::doc_with_graphics(
@@ -684,6 +692,7 @@ mod tests {
     }
 
     /// A writing-mode-1 (`Identity-V`) font marks its spans vertical.
+    // Covers ISO 32000-1 §9.7.6.1.
     #[test]
     fn span_marks_vertical_writing() {
         let mut b = PdfBuilder::new();
@@ -719,6 +728,7 @@ mod tests {
     /// Render modes 3 and 7 paint nothing (ISO 32000-1 Table 106) — the
     /// shape of an OCR text layer — and mark the span invisible; a later
     /// `Tr` back to a painting mode clears the mark.
+    // Covers ISO 32000-1 §9.3.6.
     #[test]
     fn invisible_render_modes_mark_the_span() {
         let doc = Document::load(pdfboss_testkit::doc_with_graphics(
@@ -844,6 +854,7 @@ mod tests {
     /// document's `oc_state()`), so a hidden layer is excluded over any
     /// source exactly as the document-level entries exclude it; `None`
     /// still extracts every layer.
+    // Covers ISO 32000-1 §7.7.2.
     #[test]
     fn the_source_generic_entry_points_honor_optional_content() {
         let mut b = PdfBuilder::new();
@@ -899,6 +910,7 @@ mod tests {
     /// Verify the exact bit position against ISO 32000-1 Table 123 while
     /// implementing — bit 7 (mask 64) is Italic, bit 19 (mask 0x40000) is
     /// ForceBold — and cite the table in the implementation comment.
+    // Covers ISO 32000-1 §14.8.2.4, §14.8.2.4.3 and §9.8.2.
     #[test]
     fn descriptor_flags_set_span_style() {
         let mut b = PdfBuilder::new();
@@ -929,6 +941,7 @@ mod tests {
     /// Table 122 `/StemV`: a thick dominant vertical stem marks a bold face
     /// whose descriptor carries neither a weight nor a telling name — the
     /// URW `-Medi` faces LaTeX embeds. A regular-width stem stays regular.
+    // Covers ISO 32000-1 §14.8.2.4.3 and §9.8.1.
     #[test]
     fn thick_stemv_reads_as_bold() {
         let mut b = PdfBuilder::new();
@@ -966,6 +979,7 @@ mod tests {
     }
 
     /// BaseFont-name fallback when no descriptor exists, and ItalicAngle.
+    // Covers ISO 32000-1 §14.8.2.4.3 and §9.8.1.
     #[test]
     fn basefont_name_and_italic_angle_fallbacks() {
         let mut b = PdfBuilder::new();
@@ -1002,6 +1016,7 @@ mod tests {
     }
 
     /// Type0: the descriptor hangs off the descendant font.
+    // Covers ISO 32000-1 §9.7.6.1 and §9.8.3.1.
     #[test]
     fn type0_descendant_descriptor_sets_style() {
         let mut b = PdfBuilder::new();
@@ -1439,6 +1454,7 @@ mod tests {
         assert_eq!(order, ReadingOrder::Geometric);
     }
 
+    // Covers ISO 32000-1 §14.8.2 and §14.8.2.3.
     #[test]
     fn structure_tree_order_follows_the_tree() {
         let doc = tagged_doc(TWO_COLUMNS, "", |_| {});
@@ -1457,6 +1473,7 @@ mod tests {
         assert_eq!(report.order, ReadingOrder::Content);
     }
 
+    // Covers ISO 32000-1 §14.8.2.3.
     #[test]
     fn a_page_the_tree_does_not_reach_reads_in_content_order() {
         // Marked content on the page, but the parent tree keys 0 to nothing.
@@ -1481,6 +1498,7 @@ mod tests {
         assert_eq!(spans, ["L1", "L2", "footer", "R1", "R2"]);
     }
 
+    // Covers ISO 32000-1 §14.6.2.
     #[test]
     fn named_marked_content_properties_are_read() {
         let content = b"BT /F1 12 Tf \
@@ -1496,6 +1514,7 @@ mod tests {
         assert_eq!(order, ReadingOrder::StructureTree);
     }
 
+    // Covers ISO 32000-1 §14.7.4.2 and §14.7.4.4.
     #[test]
     fn a_form_files_its_marked_content_under_its_own_parents_key() {
         // The page holds the right column (key 0, ids 1 and 3 in element

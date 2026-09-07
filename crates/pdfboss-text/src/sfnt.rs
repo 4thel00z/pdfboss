@@ -105,6 +105,7 @@ mod tests {
         out
     }
 
+    // Covers ISO 32000-1 §9.6.6.4.
     #[test]
     fn reads_the_platforms_a_cmap_advertises() {
         let both = cmap_platforms(&sfnt_with(&[(1, 0), (3, 0)]));

@@ -503,6 +503,7 @@ mod tests {
     /// An RGB profile whose A2B0 collapses everything to the PCS white
     /// paints white for any input — proof the lookup transform is selected
     /// when the matrix/TRC set is absent.
+    // Covers ISO 32000-1 §8.6.5.5.
     #[test]
     fn a2b0_lut_profile() {
         let mut lut = Vec::new();

@@ -126,6 +126,8 @@ pub(crate) struct StartXrefRecord {
 /// whole-file recovery scan exists here — that would defeat the
 /// never-read-the-whole-file guarantee — so an absent keyword is
 /// `InvalidXref`.
+///
+/// Covers ISO 32000-1 Annex I.
 pub(crate) async fn find_tail(fetcher: &Fetcher) -> Result<(StartXrefRecord, Option<Span>)> {
     let mut window = TAIL_WINDOW;
     loop {
@@ -773,9 +775,26 @@ impl AsyncDocument {
             .cloned()
             .unwrap_or(Object::Null);
         let enc = self.resolve(&enc_obj).await?;
-        let enc_dict = enc
+        let mut enc_dict = enc
             .as_dict()
-            .ok_or(Error::Core(pdfboss_core::Error::Encrypted))?;
+            .ok_or(Error::Core(pdfboss_core::Error::Encrypted))?
+            .clone();
+        // Only the strings of an encryption dictionary must be direct, so
+        // the crypt filters may sit in objects of their own: two rounds
+        // cover an indirect /CF whose entries are indirect in turn.
+        for _ in 0..2 {
+            let refs = pdfboss_core::crypt_filter_refs(&enc_dict);
+            if refs.is_empty() {
+                break;
+            }
+            let mut fetched = HashMap::new();
+            for r in refs {
+                if let Ok(obj) = self.resolve(&Object::Ref(r)).await {
+                    fetched.insert(r, obj);
+                }
+            }
+            enc_dict = pdfboss_core::direct_crypt_filters(&enc_dict, |r| fetched.get(&r).cloned());
+        }
         let id0: Vec<u8> = self
             .inner
             .xref
@@ -786,7 +805,7 @@ impl AsyncDocument {
             .and_then(Object::as_str_bytes)
             .unwrap_or(&[])
             .to_vec();
-        match pdfboss_core::Decryptor::from_standard_with_password_str(enc_dict, &id0, password) {
+        match pdfboss_core::Decryptor::from_standard_with_password_str(&enc_dict, &id0, password) {
             Some(dec) => {
                 self.inner
                     .decryptor
@@ -1829,6 +1848,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.5.5.
     #[tokio::test]
     async fn tail_scan_finds_startxref_and_eof() {
         let data = simple_doc("tail scan");
@@ -1869,6 +1889,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 Annex I.
     #[test]
     fn version_parse_matches_header_and_defaults() {
         assert_eq!(parse_version(b"%PDF-1.7\nrest"), (1, 7));
@@ -1951,6 +1972,7 @@ mod tests {
         assert!(parse_section_window(cut, base, base + 40, true).is_err());
     }
 
+    // Covers ISO 32000-1 §7.5.8.3.
     #[test]
     fn xref_stream_section_window_parses_entries() {
         let (dict, payload) = pdfboss_testkit::objstm_payload(&[
@@ -2181,6 +2203,7 @@ mod tests {
         data
     }
 
+    // Covers ISO 32000-1 §7.5.8.4.
     #[tokio::test]
     async fn hybrid_xrefstm_beats_the_tables_free_entry() {
         let data = hybrid_doc();
@@ -2330,6 +2353,7 @@ mod tests {
     /// doubling re-fetches from `offset`, re-reading) most of a 300+ MiB
     /// file for one bogus object -- exactly the amplification
     /// `MAX_GROWTH_WINDOW` exists to bound.
+    // Covers ISO 32000-1 Annex C.3.
     #[tokio::test]
     async fn corrupt_offset_in_a_huge_file_errors_within_the_growth_cap_instead_of_reading_to_eof()
     {

@@ -1763,6 +1763,8 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 /// Extends the run the span continues, or opens one when its style differs.
 /// A `spaced` span puts its word-gap space at the end of the run before it,
 /// so the space is never lost at a style boundary.
+///
+/// Covers ISO 32000-1 §14.8.2.5.
 fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity: usize) {
     if let Some(last) = inlines.last_mut() {
         let already_spaced =
@@ -2580,6 +2582,7 @@ pub(crate) mod tests {
     /// space width: a Times word gap of 251/1000 em under a slightly
     /// compressed text matrix lands just under 0.25 em in device space,
     /// and a 0.25·size gap threshold reads the whole line as one word.
+    // Covers ISO 32000-1 §14.8.2.5.
     #[test]
     fn shrunk_justified_word_gaps_still_become_spaces() {
         let text = text_of("BT /F1 12 Tf 0.993 0 0 1 72 720 Tm [(We) -251 (would)] TJ ET");
@@ -2707,6 +2710,7 @@ pub(crate) mod tests {
 
     /// A space glyph followed by a positioning gap is one word break, not
     /// two: the gap only says where the next word starts.
+    // Covers ISO 32000-1 §14.8.2.5.
     #[test]
     fn a_space_glyph_before_a_word_gap_is_one_space() {
         let text = text_of("BT /F1 12 Tf 72 700 Td [(Hello ) -300 (world) -300 ( again)] TJ ET");

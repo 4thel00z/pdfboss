@@ -10,6 +10,8 @@
 
 /// Strips a PDF font-subset tag (`ISO 32000-1` 9.6.4: six uppercase
 /// letters followed by `+`, e.g. `ABCDEF+Times-Bold`) from `base_font`.
+///
+/// Covers ISO 32000-1 §9.6.4.
 fn strip_subset_prefix(base_font: &str) -> &str {
     let bytes = base_font.as_bytes();
     // `> 7`, not `> 6`: the guard must require at least one character after
@@ -129,6 +131,8 @@ fn lookup(table: &[(&str, u16)], glyph_name: &str) -> Option<f32> {
 /// Oblique variants share their upright counterpart's widths (Helvetica
 /// and Helvetica-Oblique are metrically identical, likewise the bold
 /// pair), so only upright/bold tables are stored.
+///
+/// Covers ISO 32000-1 §9.6.2.2.
 pub fn standard_14_width(base_font: &str, glyph_name: &str) -> Option<f32> {
     let (family, bold, italic) = classify(base_font)?;
     match family {
@@ -151,6 +155,8 @@ pub fn standard_14_width(base_font: &str, glyph_name: &str) -> Option<f32> {
 
 /// Whether `base_font` (after subset-prefix stripping and alias
 /// normalization) names one of the standard 14 fonts.
+///
+/// Covers ISO 32000-1 §9.6.2.2.
 pub fn is_standard_14(base_font: &str) -> bool {
     classify(base_font).is_some()
 }
@@ -1563,6 +1569,7 @@ const TIMES_BOLD_ITALIC: &[(&str, u16)] = &[
 mod tests {
     use super::*;
 
+    // Covers ISO 32000-1 §9.6.2.2.
     #[test]
     fn standard_14_known_widths() {
         assert_eq!(standard_14_width("Helvetica", "space"), Some(278.0));
@@ -1584,6 +1591,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §9.6.2.2 and §9.6.4.
     #[test]
     fn standard_14_aliases_and_non_members() {
         assert_eq!(standard_14_width("Arial", "space"), Some(278.0)); // Arial -> Helvetica

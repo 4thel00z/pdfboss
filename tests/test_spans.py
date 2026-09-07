@@ -96,6 +96,7 @@ class TestPageSpans:
         assert span.font == "F1"
         assert span.font_name != ""
 
+    # Covers ISO 32000-1 §9.3.6 and §9.8.2.
     def test_style_attributes(self, styled_pdf: bytes) -> None:
         doc = Document(data=styled_pdf)
         plain, styled, ocr = doc[0].spans()

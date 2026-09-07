@@ -212,6 +212,8 @@ impl Font {
 
     /// Loads a font from its (resolved) font dictionary. Lenient: anything
     /// missing or malformed degrades to defaults rather than failing.
+    ///
+    /// Covers ISO 32000-1 §9.5, §9.6.2.3 and §9.7.6.1.
     pub async fn load<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Font {
         let subtype = rv(src, dict, "Subtype").await;
         let is_type0 = subtype
@@ -231,6 +233,8 @@ impl Font {
     /// checked fetch, not raw `stream_data`: a CMap whose trailing `/Filter`
     /// is an image codec holds a passthrough codestream, and token-scanning
     /// one yields an empty — or in principle a bogus — mapping.
+    ///
+    /// Covers ISO 32000-1 §14.8.2.4.2.
     async fn load_to_unicode<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<ToUnicode> {
         let obj = rv(src, dict, "ToUnicode").await?;
         let data = decoded_stream_data_with(src, obj.as_stream()?).await.ok()?;
@@ -331,6 +335,8 @@ impl Font {
     /// codegen fallout, and asking for these three back explicitly recovers
     /// about 1.9% of it. Measured by interleaved A/B runs of prebuilt
     /// benchmark binaries, which is the only method this machine's drift permits.
+    ///
+    /// Covers ISO 32000-1 §14.8.2.4, §14.8.2.4.2 and §9.10.2.
     #[inline]
     pub fn decode_into(&self, cc: CharCode, out: &mut String) {
         let code = cc.code;
@@ -378,6 +384,8 @@ impl Font {
     /// a vertical CMap only swaps in rotated-variant CIDs — presentation
     /// forms to the collection's Unicode mapping, when it knows them at
     /// all — while its horizontal base names the character itself.
+    ///
+    /// Covers ISO 32000-1 §9.10.2.
     fn collection_unicode(&self, cc: CharCode) -> Option<char> {
         let inv = self.cid_to_unicode.as_ref()?;
         let Some(cmap) = &self.cmap else {
@@ -471,6 +479,8 @@ impl Font {
     /// already-resolved descendant dict for Type0 — refining the guess with
     /// `/Flags`, `/FontWeight`, and `/ItalicAngle` (ISO 32000-1 §9.8.1,
     /// Table 123).
+    ///
+    /// Covers ISO 32000-1 §14.8.2.4, §14.8.2.4.3 and §9.8.2.
     async fn style<S: AsyncObjectSource>(src: &S, dict: &Dict, descriptor_holder: &Dict) -> Style {
         let name = rv(src, dict, "BaseFont")
             .await
@@ -553,6 +563,8 @@ impl Font {
 
     /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
     /// plus `/Differences`, widths from `/FirstChar` + `/Widths`.
+    ///
+    /// Covers ISO 32000-1 §9.6.2.1.
     async fn load_simple<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
@@ -680,6 +692,8 @@ impl Font {
     /// The built-in encoding of the font's embedded Type 1 program
     /// (`/FontFile`), code to glyph name, when it embeds one that states an
     /// `/Encoding`.
+    ///
+    /// Covers ISO 32000-1 §9.6.6.2.
     async fn program_encoding<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
@@ -695,6 +709,8 @@ impl Font {
     /// embedded Type 1 program's own encoding (ISO 32000-1 9.6.6.2); failing
     /// that, Standard. A font naming no `/Encoding` and embedding no Type 1
     /// program has no table and decodes through StandardEncoding directly.
+    ///
+    /// Covers ISO 32000-1 §9.6.6.1.
     async fn load_encoding<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
@@ -762,6 +778,8 @@ impl Font {
     /// `/CIDSystemInfo` collection's own mapping. Widths are the
     /// descendant's `/W` + `/DW` keyed by CID; vertical displacements its
     /// `/W2` + `/DW2`.
+    ///
+    /// Covers ISO 32000-1 §9.7.2, §9.7.3, §9.7.4.1, §9.7.6.1 and §9.8.3.1.
     async fn load_type0<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
@@ -840,6 +858,8 @@ impl Font {
 
     /// The first entry of `/DescendantFonts`, which is where a Type0 font keeps
     /// its widths. ISO 32000-1 9.7.4 allows the array exactly one element.
+    ///
+    /// Covers ISO 32000-1 §9.7.4.1.
     async fn load_descendant<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<Dict> {
         let obj = rv(src, dict, "DescendantFonts").await?;
         let first = obj.as_array()?.first()?.clone();
@@ -849,6 +869,8 @@ impl Font {
     /// Parses a CID `/W` array: `c [w1 w2 …]` gives consecutive widths
     /// from CID `c`; `c1 c2 w` gives every CID in `c1..=c2` width `w`
     /// (ranges capped at 65536 entries).
+    ///
+    /// Covers ISO 32000-1 §9.7.4.3.
     async fn parse_cid_widths<S: AsyncObjectSource>(
         src: &S,
         items: &[Object],
@@ -986,6 +1008,7 @@ mod tests {
         block_on(Font::load(&Immediate(&doc), obj.as_dict().unwrap()))
     }
 
+    // Covers ISO 32000-1 §9.5, §9.6.2.1 and Annex D.2.
     #[test]
     fn simple_winansi_font() {
         let f = font_from(
@@ -1029,6 +1052,7 @@ mod tests {
     /// embedded program says it was built for Windows. Its curly quotes and
     /// dashes sit at codes StandardEncoding does not define, and used to
     /// extract as U+FFFD.
+    // Covers ISO 32000-1 §9.6.3 and §9.6.6.4.
     #[test]
     fn an_embedded_windows_font_reads_its_high_codes_as_winansi() {
         let f = font_from(
@@ -1069,6 +1093,7 @@ mod tests {
 
     /// `/Differences` without a `/BaseEncoding` apply on top of the
     /// program's encoding, not on top of StandardEncoding.
+    // Covers ISO 32000-1 §9.6.6.2.
     #[test]
     fn differences_apply_over_the_embedded_program_encoding() {
         let f = font_from(
@@ -1086,6 +1111,7 @@ mod tests {
     }
 
     /// A named `/Encoding` replaces the program's encoding outright.
+    // Covers ISO 32000-1 §9.6.6.2 and Annex D.2.
     #[test]
     fn a_named_encoding_outranks_the_embedded_program_encoding() {
         let f = font_from(
@@ -1102,6 +1128,7 @@ mod tests {
     /// they represent. Modeled on a real Garamond Premier Pro subset whose
     /// low codes carry `/f_i`, `/T_h`, and `/eight.oldstyle` and used to
     /// extract as U+FFFD.
+    // Covers ISO 32000-1 §14.8.2.4.2, §9.10.2 and §9.6.6.1.
     #[test]
     fn differences_agl_ligatures_and_variants_decode() {
         let f = font_from(
@@ -1211,6 +1238,7 @@ mod tests {
     /// defines must still decode to what it says, even for the font that is
     /// allowed to guess, or a font that was reading correctly would quietly
     /// change meaning.
+    // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn the_winansi_fallback_never_overrides_standard_encoding() {
         let f = font_from(
@@ -1302,6 +1330,7 @@ mod tests {
     /// The inverse of the refusal: a benign trailing filter the decoder can
     /// run (here ASCIIHexDecode) must keep working — over-refusal would
     /// silently strip the mappings from every compressed ToUnicode.
+    // Covers ISO 32000-1 §9.10.3.
     #[test]
     fn a_hex_encoded_tounicode_still_reads() {
         let hex: Vec<u8> = OMEGA_CMAP
@@ -1313,6 +1342,7 @@ mod tests {
         assert_eq!(f.decode(65), "\u{3A9}", "the mapping must apply");
     }
 
+    // Covers ISO 32000-1 §9.2.4, §9.6.2.1 and §9.6.6.1.
     #[test]
     fn differences_and_widths() {
         let f = font_from(
@@ -1331,6 +1361,7 @@ mod tests {
         assert_eq!(f.width(one(67)), 500.0); // default
     }
 
+    // Covers ISO 32000-1 §9.6.2.1 and §9.8.1.
     #[test]
     fn missing_width_from_descriptor() {
         let f = font_from(
@@ -1342,6 +1373,7 @@ mod tests {
         assert_eq!(f.width(one(65)), 300.0);
     }
 
+    // Covers ISO 32000-1 §14.8.2.4, §14.8.2.4.2 and §9.10.2.
     #[test]
     fn tounicode_beats_encoding() {
         let f = font_from(
@@ -1354,6 +1386,7 @@ mod tests {
         assert_eq!(f.decode(0x42), "B"); // falls through to WinAnsi
     }
 
+    // Covers ISO 32000-1 §9.5, §9.7.2, §9.7.4.1, §9.7.4.3 and §9.7.6.1.
     #[test]
     fn type0_font() {
         let cmap: &[u8] = b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
@@ -1385,6 +1418,7 @@ mod tests {
     /// codespaces, `/W` keys on the CID the CMap yields (843 for あ, not
     /// the code 0x82A0), and with no `/ToUnicode` the Japan1 collection's
     /// own mapping supplies the Unicode.
+    // Covers ISO 32000-1 §9.10.2, §9.3.3, §9.7.3 and §9.7.5.2.
     #[test]
     fn type0_predefined_rksj_maps_codes_to_cids() {
         let f = font_from(
@@ -1412,6 +1446,7 @@ mod tests {
     /// on the CID (the rotated variant's), `/DW2` for the rest, and
     /// Unicode answered by the horizontal base so punctuation reads as
     /// the character rather than a presentation form.
+    // Covers ISO 32000-1 §9.7.4.3.
     #[test]
     fn type0_predefined_rksj_vertical() {
         let f = font_from(
@@ -1432,6 +1467,7 @@ mod tests {
 
     /// The `c1 c2 w1 vx vy` form of `/W2`, and the -1000 default without
     /// a `/DW2`.
+    // Covers ISO 32000-1 §9.7.4.3.
     #[test]
     fn w2_range_form_and_default() {
         let f = font_from(
@@ -1450,6 +1486,7 @@ mod tests {
     /// An embedded CMap stream as `/Encoding`: 1-byte codes split per its
     /// codespace and map through its cidranges — previously ignored and
     /// read as 2-byte identity.
+    // Covers ISO 32000-1 §9.7.5.3.
     #[test]
     fn type0_embedded_cmap_stream() {
         let cmap: &[u8] = b"1 begincodespacerange <00> <FF> endcodespacerange\n\

@@ -13,6 +13,8 @@ use crate::error::Result;
 use crate::object::Name;
 
 /// A single token produced by the [`Lexer`].
+///
+/// Covers ISO 32000-1 Annex C.2.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Int(i64),
@@ -34,11 +36,15 @@ pub enum Token {
 }
 
 /// Whether `b` is PDF whitespace (ISO 32000 §7.2.2, Table 1).
+///
+/// Covers ISO 32000-1 §7.2.2.
 pub(crate) const fn is_whitespace(b: u8) -> bool {
     matches!(b, b'\0' | b'\t' | b'\n' | b'\x0C' | b'\r' | b' ')
 }
 
 /// Whether `b` is a PDF delimiter character (ISO 32000 §7.2.2, Table 2).
+///
+/// Covers ISO 32000-1 §7.2.2.
 pub(crate) const fn is_delimiter(b: u8) -> bool {
     matches!(
         b,
@@ -97,6 +103,8 @@ const EXACT_POW10: [f64; 23] = [
 /// standard library parser produces. Any other shape, a `u64` overflow, or
 /// a bound violation returns `None`, and the caller falls back to the
 /// standard parse.
+///
+/// Covers ISO 32000-1 §7.3.3.
 fn parse_number_fast(run: &[u8]) -> Option<Token> {
     let (negative, digits) = match run.split_first() {
         Some((&b'-', rest)) => (true, rest),
@@ -287,6 +295,8 @@ impl<'a> Lexer<'a> {
     /// by a single space or newline, and the content parser skips before
     /// every token), so this checks one byte at a time and returns on the
     /// first non-whitespace instead of setting up a run scan.
+    ///
+    /// Covers ISO 32000-1 §7.2.3.
     pub fn skip_whitespace_and_comments(&mut self) {
         while let Some(&b) = self.data.get(self.pos) {
             if is_whitespace(b) {
@@ -323,6 +333,8 @@ impl<'a> Lexer<'a> {
     /// A run the fast path cannot represent exactly (a stray sign or second
     /// period, an overflowing mantissa) falls back to [`number_token`]'s
     /// full parse, unchanged.
+    ///
+    /// Covers ISO 32000-1 §7.3.2.
     fn lex_number_or_keyword(&mut self) -> RawToken<'a> {
         let start = self.pos;
         let mut numeric = true;
@@ -393,6 +405,8 @@ impl<'a> Lexer<'a> {
 /// path first (the overwhelming majority of runs) — its guards guarantee
 /// bit-identical results — and anything it declines goes through the
 /// standard parses, then the lenient cleaner, unchanged.
+///
+/// Covers ISO 32000-1 §7.3.3 and Annex C.2.
 fn number_token(run: &[u8]) -> Token {
     if let Some(token) = parse_number_fast(run) {
         return token;
@@ -462,6 +476,8 @@ fn number_token(run: &[u8]) -> Token {
 impl<'a> Lexer<'a> {
     /// Lexes a name after the leading `/`, decoding `#xx` escapes. A `#`
     /// not followed by two hex digits is kept literally.
+    ///
+    /// Covers ISO 32000-1 §7.3.5.
     fn lex_name(&mut self) -> Token {
         let start = self.pos;
         while let Some(&b) = self.data.get(self.pos) {
@@ -500,6 +516,8 @@ impl<'a> Lexer<'a> {
     /// parentheses, all standard escapes, 1-3 digit octal, backslash-EOL
     /// line continuation, and raw EOL normalized to `\n`. An unterminated
     /// string yields whatever was accumulated (lenient).
+    ///
+    /// Covers ISO 32000-1 §7.3.4 and §7.3.4.2.
     fn lex_literal_string(&mut self) -> Token {
         // Fast path: nothing before the closing `)` escapes (`\`), nests
         // (`(`), or needs EOL normalization (`\r`), so the string's bytes
@@ -583,6 +601,8 @@ impl<'a> Lexer<'a> {
     /// (lenient), and a missing `>` terminates at end of input.
     /// Consumes a hex string's raw span: everything up to (and past) the
     /// closing `>`, returned undecoded.
+    ///
+    /// Covers ISO 32000-1 §7.3.4 and §7.3.4.3.
     fn hex_span(&mut self) -> &'a [u8] {
         let start = self.pos;
         let rest = &self.data[start..];
@@ -675,6 +695,7 @@ mod tests {
         all.pop().unwrap()
     }
 
+    // Covers ISO 32000-1 §7.3.3 and Annex C.2.
     #[test]
     fn numeric_forms() {
         assert_eq!(
@@ -780,6 +801,7 @@ mod tests {
     /// leading zeros, plus literal corner cases (bare signs and dots,
     /// multi-sign and multi-dot runs, `i64`/`u64` boundaries, and huge
     /// literals whose `f32` cast overflows to infinity).
+    // Covers ISO 32000-1 §7.3.3 and Annex C.2.
     #[test]
     fn numeric_fast_path_matches_reference() {
         let corner_cases = [
@@ -862,6 +884,7 @@ mod tests {
         eprintln!("differential cases: {}", cases.len());
     }
 
+    // Covers ISO 32000-1 §7.3.3.
     #[test]
     fn lenient_numbers() {
         // First sign wins; later signs are ignored.
@@ -878,6 +901,7 @@ mod tests {
         assert_eq!(one(b"1e5"), Token::Keyword(b"1e5".to_vec()));
     }
 
+    // Covers ISO 32000-1 §7.2.2.
     #[test]
     fn structural_delimiters() {
         assert_eq!(
@@ -907,6 +931,7 @@ mod tests {
         assert_eq!(one(b"}"), Token::Keyword(b"}".to_vec()));
     }
 
+    // Covers ISO 32000-1 §7.3.5.
     #[test]
     fn names() {
         assert_eq!(one(b"/Name1"), Token::Name(Name("Name1".into())));
@@ -936,6 +961,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.3.4 and §7.9.2.4.
     #[test]
     fn literal_string_basics() {
         assert_eq!(one(b"()"), Token::LitString(Vec::new()));
@@ -947,6 +973,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.3.4.2.
     #[test]
     fn literal_string_every_escape_form() {
         assert_eq!(
@@ -957,6 +984,7 @@ mod tests {
         assert_eq!(one(b"(\\q)"), Token::LitString(b"q".to_vec()));
     }
 
+    // Covers ISO 32000-1 §7.3.4.2.
     #[test]
     fn literal_string_octal_escapes() {
         assert_eq!(one(b"(\\053)"), Token::LitString(b"+".to_vec()));
@@ -971,6 +999,7 @@ mod tests {
         assert_eq!(one(b"(\\1x)"), Token::LitString(vec![0x01, b'x']));
     }
 
+    // Covers ISO 32000-1 §7.3.4.2.
     #[test]
     fn literal_string_line_continuations() {
         assert_eq!(one(b"(ab\\\ncd)"), Token::LitString(b"abcd".to_vec()));
@@ -978,6 +1007,7 @@ mod tests {
         assert_eq!(one(b"(ab\\\r\ncd)"), Token::LitString(b"abcd".to_vec()));
     }
 
+    // Covers ISO 32000-1 §7.3.4.2.
     #[test]
     fn literal_string_eol_normalization() {
         assert_eq!(one(b"(a\nb)"), Token::LitString(b"a\nb".to_vec()));
@@ -1011,6 +1041,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.3.4 and §7.3.4.3.
     #[test]
     fn hex_strings() {
         assert_eq!(one(b"<>"), Token::HexString(Vec::new()));
@@ -1035,6 +1066,7 @@ mod tests {
     /// past [`HEX_STRING_PREALLOC_CAP`] bytes grows to its full content, and
     /// a stray `<` whose `>` lies far away (mostly non-hex bytes) still
     /// decodes only the actual digits.
+    // Covers ISO 32000-1 §7.3.4.3.
     #[test]
     fn hex_string_prealloc_cap_is_invisible() {
         let long = "4F".repeat(HEX_STRING_PREALLOC_CAP + 17);
@@ -1049,6 +1081,7 @@ mod tests {
         assert_eq!(one(&corrupt), Token::HexString(vec![0x41, 0x42]));
     }
 
+    // Covers ISO 32000-1 §7.2.3.
     #[test]
     fn comments() {
         assert_eq!(
@@ -1063,6 +1096,7 @@ mod tests {
         assert_eq!(toks(b"%%EOF"), Vec::new());
     }
 
+    // Covers ISO 32000-1 §7.3.2.
     #[test]
     fn keywords() {
         let src = b"obj endobj stream endstream R xref trailer startxref true false null n f";
@@ -1145,6 +1179,7 @@ mod tests {
         assert_eq!(resumed.data(), src);
     }
 
+    // Covers ISO 32000-1 §7.2.3.
     #[test]
     fn skip_whitespace_and_comments_stops_at_token() {
         let mut lexer = Lexer::new(b"  % one\n % two\r\n  7");
@@ -1179,6 +1214,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §7.2.2.
     #[test]
     fn character_classes() {
         for b in [0x00u8, b'\t', b'\n', 0x0C, b'\r', b' '] {

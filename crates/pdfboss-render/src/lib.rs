@@ -508,7 +508,7 @@ pub enum SkipReason {
 
 impl std::fmt::Display for SkipReason {
     /// The reason as the clause after the colon of a warning line, e.g.
-    /// `unsupported filter /Crypt`.
+    /// `unsupported filter /NotAFilterDecode`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SkipReason::UnsupportedFilter(name) => write!(f, "unsupported filter /{name}"),
@@ -597,7 +597,7 @@ impl RenderReport {
     }
 
     /// One human-readable line per distinct drop, for callers that warn
-    /// about them: `"1 image skipped: unsupported filter /Crypt"`.
+    /// about them: `"1 image skipped: unsupported filter /NotAFilterDecode"`.
     pub fn warnings(&self) -> Vec<String> {
         let mut out: Vec<String> = self
             .skipped
@@ -719,7 +719,7 @@ mod tests {
         report.record(SkippedKind::Image, SkipReason::Undecodable);
         report.record(
             SkippedKind::Image,
-            SkipReason::UnsupportedFilter("Crypt".to_string()),
+            SkipReason::UnsupportedFilter("NotAFilterDecode".to_string()),
         );
         report.record(SkippedKind::Shading, SkipReason::Unsupported);
 
@@ -735,7 +735,7 @@ mod tests {
             report.warnings(),
             vec![
                 "2 images skipped: the data could not be interpreted".to_string(),
-                "1 image skipped: unsupported filter /Crypt".to_string(),
+                "1 image skipped: unsupported filter /NotAFilterDecode".to_string(),
                 "1 shading skipped: not supported yet".to_string(),
             ],
         );

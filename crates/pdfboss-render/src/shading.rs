@@ -194,6 +194,7 @@ impl Functions {
         written
     }
 
+    /// Covers ISO 32000-1 §7.10.2, §7.10.3 and §7.10.4.
     fn eval_node(&self, idx: usize, inputs: &[f32], out: &mut [f32]) -> usize {
         match &self.nodes[idx] {
             Node::Exponential { domain, c0, c1, n } => {
@@ -352,6 +353,8 @@ fn sample_at(data: &[u8], index: u64, bps: u32) -> u64 {
 
 /// The item a calculator token names, or `None` for anything that has to
 /// be a number.
+///
+/// Covers ISO 32000-1 Annex B.2, Annex B.3 and Annex B.5.
 fn calc_item(token: &str) -> Option<CalcItem> {
     let op = match token {
         "abs" => Calc::Abs,
@@ -405,6 +408,8 @@ fn calc_item(token: &str) -> Option<CalcItem> {
 /// optionally surrounded by whitespace or `%` comments. Anything else —
 /// unbalanced braces, an unknown operator, trailing tokens — is a load
 /// error, so the caller's report machinery fires.
+///
+/// Covers ISO 32000-1 §7.10.5 and Annex B.4.
 fn parse_calculator(data: &[u8]) -> Result<Vec<CalcItem>, Error> {
     let malformed = |what: &str| Error::Other(format!("calculator program {what}"));
     let mut blocks: Vec<Vec<CalcItem>> = Vec::new();
@@ -477,6 +482,8 @@ fn parse_calculator(data: &[u8]) -> Result<Vec<CalcItem>, Error> {
 /// Flattens parsed items into instructions. A procedure block is legal only
 /// as the operand of `if`/`ifelse` (§7.10.5.4), where it becomes a forward
 /// jump over the branch body.
+///
+/// Covers ISO 32000-1 §7.10.5.
 fn compile_calculator(items: &[CalcItem], out: &mut Vec<Calc>) -> Result<(), Error> {
     let mut i = 0;
     while i < items.len() {
@@ -554,6 +561,8 @@ fn calc_num(stack: &mut Vec<Value>) -> Option<f32> {
 
 /// Replaces the top two numbers with `f` of them; `None` from `f` is a
 /// domain error (division by zero, log of a non-positive number).
+///
+/// Covers ISO 32000-1 §7.10.5.2.
 fn calc_binary(stack: &mut Vec<Value>, f: impl Fn(f32, f32) -> Option<f32>) -> Option<()> {
     let b = calc_num(stack)?;
     let a = calc_num(stack)?;
@@ -569,6 +578,8 @@ fn calc_unary(stack: &mut Vec<Value>, f: impl Fn(f32) -> Option<f32>) -> Option<
 }
 
 /// Replaces the top two numbers with their comparison.
+///
+/// Covers ISO 32000-1 Annex B.3.
 fn calc_compare(stack: &mut Vec<Value>, f: impl Fn(f32, f32) -> bool) -> Option<()> {
     let b = calc_num(stack)?;
     let a = calc_num(stack)?;
@@ -610,6 +621,8 @@ fn calc_equal(stack: &mut Vec<Value>) -> Option<bool> {
 /// Runs a compiled calculator over `inputs`. `None` is any runtime failure
 /// — stack underflow or overflow, a type mismatch, a domain error, or a
 /// runaway program — which the caller paints as range-clamped zeros.
+///
+/// Covers ISO 32000-1 §7.10.5.2, Annex B.2 and Annex B.5.
 fn run_calculator(program: &[Calc], inputs: &[f32]) -> Option<Vec<Value>> {
     if inputs.len() > CALC_STACK {
         return None;
@@ -817,6 +830,8 @@ impl Geometry {
 
 /// Clamps an extended parameter to 0..=1, or rejects it where the matching
 /// `/Extend` flag is off.
+///
+/// Covers ISO 32000-1 §8.7.4.5.3.
 fn clamp_extended(s: f32, extend: [bool; 2]) -> Option<f32> {
     if !s.is_finite() {
         return None;
@@ -864,6 +879,8 @@ struct Vertex {
 /// One tensor-product patch: `grid[i][j]` is control point p_ij — column
 /// `i` along `u`, row `j` along `v` (§8.7.4.5.8) — and `rgb` holds the
 /// corner colors at (u,v) = (0,0), (0,1), (1,1), (1,0).
+///
+/// Covers ISO 32000-1 §8.7.4.5.8.
 #[derive(Clone, Copy, Debug)]
 struct Patch {
     grid: [[Point; 4]; 4],
@@ -1012,6 +1029,8 @@ fn mesh_too_large() -> Error {
 /// and 2 attach one vertex to the previous triangle's v_b v_c or v_a v_c
 /// edge (§8.7.4.5.5). A truncated or malformed record stops decoding; what
 /// already decoded still paints.
+///
+/// Covers ISO 32000-1 §8.7.4.5.5.
 fn free_triangles(
     data: &[u8],
     layout: &MeshLayout,
@@ -1057,6 +1076,8 @@ fn free_triangles(
 
 /// Decodes a type 5 lattice stream and triangulates each row pair as
 /// (V_i,j V_i,j+1 V_i+1,j) and (V_i,j+1 V_i+1,j V_i+1,j+1) (§8.7.4.5.6).
+///
+/// Covers ISO 32000-1 §8.7.4.5.6.
 fn lattice_triangles(
     data: &[u8],
     layout: &MeshLayout,
@@ -1091,6 +1112,8 @@ fn lattice_triangles(
 /// patch's shared edge and corner colors per Tables 85/86. Byte alignment
 /// is applied per patch record — §8.7.4.5.5 states it for vertices, and a
 /// patch is the analogous record here.
+///
+/// Covers ISO 32000-1 §8.7.4.5.7 and §8.7.4.5.8.
 fn patch_list(
     data: &[u8],
     layout: &MeshLayout,
@@ -1156,6 +1179,8 @@ fn patch_list(
 
 /// The four interior control points a Coons patch implies: each is a fixed
 /// affine combination of the boundary points (§8.7.4.5.8).
+///
+/// Covers ISO 32000-1 §8.7.4.5.7.
 fn fill_coons_interior(g: &mut [[Point; 4]; 4]) {
     let combine = |m4: Point,
                    s6a: Point,
@@ -1192,6 +1217,8 @@ fn fill_coons_interior(g: &mut [[Point; 4]; 4]) {
 
 /// Reads the bit-layout entries of a mesh shading dictionary, validating
 /// the field widths §8.7.4.5.5-7 allow.
+///
+/// Covers ISO 32000-1 §8.7.4.4 and §8.7.4.5.5.
 async fn mesh_layout<S: AsyncObjectSource>(
     src: &S,
     dict: &Dict,
@@ -1297,6 +1324,8 @@ async fn function_dict<S: AsyncObjectSource>(
 
 /// Loads `/Function` — one function or an array of them — into an arena.
 /// `Err` is a structural failure worth reporting verbatim.
+///
+/// Covers ISO 32000-1 §7.10.2, §7.10.3 and §7.10.4.
 pub(crate) async fn load_functions<S: AsyncObjectSource>(
     src: &S,
     obj: &Object,
@@ -1469,6 +1498,8 @@ pub(crate) async fn load_functions<S: AsyncObjectSource>(
 impl Shading {
     /// Loads a shading dictionary (types 1-3) or stream (mesh types 4-7).
     /// `Err` is a structural failure, reported by the caller.
+    ///
+    /// Covers ISO 32000-1 §8.7.4.3, §8.7.4.4, §8.7.4.5.2, §8.7.4.5.3, §8.7.4.5.4 and §8.7.4.5.6.
     pub(crate) async fn load_with<S: AsyncObjectSource>(
         src: &S,
         obj: &Object,
@@ -1609,6 +1640,8 @@ impl Shading {
     /// when `None`), compositing at `alpha` × coverage under `blend`.
     /// `to_device` maps the shading's target space to device pixels; a
     /// singular matrix paints nothing (the caller reports it).
+    ///
+    /// Covers ISO 32000-1 §10.6.3.
     pub(crate) fn paint(
         &self,
         pix: &mut Pixmap,
@@ -1706,6 +1739,8 @@ impl Shading {
     /// `alpha` × coverage under `blend` — the first half of the spec's
     /// paint-twice model (Table 78: background first, then the shading
     /// over it), sharing the shading's own clipping including `/BBox`.
+    ///
+    /// Covers ISO 32000-1 §10.6.3.
     pub(crate) fn paint_background(
         &self,
         pix: &mut Pixmap,
@@ -1988,6 +2023,7 @@ mod tests {
     /// A 2x2 sample grid interpolated per ISO 32000-2 7.10.2: the first
     /// dimension varies fastest, so the four bytes are f(0,0), f(1,0),
     /// f(0,1), f(1,1).
+    // Covers ISO 32000-1 §7.10.2.
     #[test]
     fn a_two_input_sampled_grid_interpolates_multilinearly() {
         let f = load(
@@ -2008,6 +2044,7 @@ mod tests {
         close(&eval(&f, &[-2.0, 7.0]), &[200.0 / 255.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.2.
     #[test]
     fn a_one_input_sampled_function_still_interpolates_linearly() {
         let f = load(
@@ -2022,6 +2059,7 @@ mod tests {
 
     /// A missing multi-input /Encode defaults to [0 size_i-1] per dimension,
     /// and /Decode maps samples into each output's range.
+    // Covers ISO 32000-1 §7.10.2.
     #[test]
     fn multi_input_encode_and_decode_defaults_apply_per_dimension() {
         let f = load(
@@ -2036,6 +2074,7 @@ mod tests {
         close(&eval(&f, &[0.5, 1.0]), &[1.0 - 204.0 / 255.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.3 and §7.10.4.
     #[test]
     fn exponential_and_stitching_read_only_the_first_input() {
         let f = load(
@@ -2056,6 +2095,7 @@ mod tests {
         .unwrap()
     }
 
+    // Covers ISO 32000-1 §7.10.5 and Annex B.2.
     #[test]
     fn calculator_arithmetic_operators_compute() {
         let f = calc(
@@ -2066,6 +2106,7 @@ mod tests {
         close(&eval(&f, &[0.0]), &[14.0, 1024.0, 2.0, 3.0, 3.5, 0.0]);
     }
 
+    // Covers ISO 32000-1 Annex B.2.
     #[test]
     fn calculator_atan_returns_degrees_in_every_quadrant() {
         let f = calc(
@@ -2076,6 +2117,7 @@ mod tests {
         close(&eval(&f, &[0.0]), &[45.0, 135.0, 225.0, 315.0, 90.0]);
     }
 
+    // Covers ISO 32000-1 Annex B.2.
     #[test]
     fn calculator_integer_division_and_modulo_keep_the_dividend_sign() {
         let f = calc(
@@ -2086,6 +2128,7 @@ mod tests {
         close(&eval(&f, &[0.0]), &[-3.0, -1.0, 1.0, 3.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5 and Annex B.5.
     #[test]
     fn calculator_roll_rotates_both_directions() {
         let up = calc("0 1", "0 5 0 5 0 5", "{ 1 2 3 3 1 roll }");
@@ -2094,6 +2137,7 @@ mod tests {
         close(&eval(&down, &[0.0]), &[2.0, 3.0, 1.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5 and Annex B.5.
     #[test]
     fn calculator_stack_operators_manage_the_stack() {
         let index = calc("0 1", "0 5 0 5 0 5 0 5", "{ 1 2 3 2 index }");
@@ -2104,6 +2148,7 @@ mod tests {
         close(&eval(&mix, &[0.3]), &[0.7]);
     }
 
+    // Covers ISO 32000-1 §7.10.5 and Annex B.4.
     #[test]
     fn calculator_nested_conditionals_branch() {
         let f = calc(
@@ -2116,6 +2161,7 @@ mod tests {
         close(&eval(&f, &[0.9]), &[1.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5 and Annex B.3.
     #[test]
     fn calculator_logic_operators_split_on_operand_type() {
         let ints = calc(
@@ -2132,12 +2178,14 @@ mod tests {
         close(&eval(&bools, &[0.0]), &[1.0, 0.0]);
     }
 
+    // Covers ISO 32000-1 Annex B.3.
     #[test]
     fn calculator_bitshift_shifts_both_directions() {
         let f = calc("0 1", "0 10 0 10", "{ 1 3 bitshift 8 -2 bitshift }");
         close(&eval(&f, &[0.0]), &[8.0, 2.0]);
     }
 
+    // Covers ISO 32000-1 Annex B.3.
     #[test]
     fn calculator_comparisons_and_mixed_type_equality() {
         let f = calc(
@@ -2151,6 +2199,7 @@ mod tests {
 
     /// `round` resolves ties toward the greater integer, unlike a
     /// round-half-away-from-zero.
+    // Covers ISO 32000-1 Annex B.2.
     #[test]
     fn calculator_rounding_family() {
         let f = calc(
@@ -2168,6 +2217,7 @@ mod tests {
         close(&eval(&f, &[2.0, -1.0]), &[1.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5.2.
     #[test]
     fn calculator_runtime_failures_clamp_to_the_range_floor() {
         // Stack underflow: `add` finds one operand, not two.
@@ -2189,6 +2239,7 @@ mod tests {
         close(&eval(&f, &[0.5]), &[1.0, 0.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5.2.
     #[test]
     fn a_runaway_calculator_program_clamps_instead_of_hanging() {
         let mut runaway = String::from("{ 0 ");
@@ -2208,12 +2259,14 @@ mod tests {
         close(&eval(&f, &[0.0]), &[100.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5.
     #[test]
     fn calculator_comments_and_whitespace_are_skipped() {
         let f = calc("0 1", "0 10", "{ % a comment\n 3 4 add pop 5 }");
         close(&eval(&f, &[0.0]), &[5.0]);
     }
 
+    // Covers ISO 32000-1 §7.10.5.2.
     #[test]
     fn malformed_calculator_programs_fail_at_load() {
         let check = |program: &str| {
@@ -2234,11 +2287,13 @@ mod tests {
         check("");
     }
 
+    // Covers ISO 32000-1 §7.10.5.2.
     #[test]
     fn a_calculator_function_without_range_fails_at_load() {
         assert!(load("/FunctionType 4 /Domain [0 1]", b"{ 1 }").is_err());
     }
 
+    // Covers ISO 32000-1 §7.10.2.
     #[test]
     fn oversized_sample_grids_are_refused() {
         // Nine input dimensions overflow every consumer (MAX_COMPS is 8).

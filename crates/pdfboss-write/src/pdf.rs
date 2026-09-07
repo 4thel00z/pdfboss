@@ -126,6 +126,8 @@ impl Date {
     /// Formats as an ISO-8601 date-time, `YYYY-MM-DDTHH:mm:SS±HH:MM` — with
     /// a literal `Z` in place of the offset when the date is exactly UTC.
     /// Used for the XMP `xmp:CreateDate`/`xmp:ModifyDate` elements.
+    ///
+    /// Covers ISO 32000-1 §7.9.4.
     pub(crate) fn to_iso8601(self) -> String {
         let Date {
             year,
@@ -271,6 +273,8 @@ pub struct Page {
 /// A clickable rectangle on a page that opens a URI or jumps to a page in
 /// the same document (a `/Link` annotation with a `/URI` or `/GoTo`
 /// action; ISO 32000 §12.5.6.5, §12.6.4.7, §12.3.2).
+///
+/// Covers ISO 32000-1 §12.5.6.5.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkAnnotation {
     /// The clickable area, `[x0, y0, x1, y1]` in the page's user space.
@@ -301,6 +305,8 @@ impl Page {
 
 /// A document's bookmark panel: an ordered forest of [`Bookmark`] nodes,
 /// each linking to a page via an explicit `/XYZ` destination.
+///
+/// Covers ISO 32000-1 §12.3.3.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Outline {
     /// Top-level bookmarks, in reading order.
@@ -353,6 +359,8 @@ pub struct Attachment {
 
 /// A page-numbering style for a [`PageLabel`] range, written as its `/S`
 /// (ISO 32000 §12.4.2, Table 159).
+///
+/// Covers ISO 32000-1 §12.4.2.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LabelStyle {
     /// Arabic numerals: 1, 2, 3…
@@ -371,6 +379,8 @@ pub enum LabelStyle {
 /// until the next range's `first_page` or the document's end (ISO 32000
 /// §12.4.2). A document's `page_labels` must include a range with
 /// `first_page == 0` whenever it is non-empty.
+///
+/// Covers ISO 32000-1 §12.4.2.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageLabel {
     /// 0-based page index where this range begins.
@@ -488,6 +498,8 @@ impl Pdf {
 
     /// Builds the writer every write path finishes: all objects placed,
     /// the catalog's reference returned alongside.
+    ///
+    /// Covers ISO 32000-1 §12.3.2, §12.3.2.2, §12.3.3, §12.5.4, §12.5.6.5, §12.6.2, §12.6.3, §12.6.4, §12.6.4.2, §12.6.4.7 and §14.3.2.
     fn assemble(self) -> Result<(Writer, ObjRef)> {
         let Pdf {
             metadata,
@@ -708,6 +720,8 @@ fn name(text: &str) -> Name {
 }
 
 /// Builds the `/Info` dictionary, or `None` when every field is `None`.
+///
+/// Covers ISO 32000-1 §14.3.3.
 fn info_dict(meta: Metadata) -> Option<Dict> {
     let mut dict = Dict::new();
     let texts = [
@@ -1146,6 +1160,7 @@ mod tests {
         assert_eq!(PageSize::Letter.landscape().dimensions(), (792.0, 612.0));
     }
 
+    // Covers ISO 32000-1 §7.9.4.
     #[test]
     fn date_utc_formats_with_z() {
         let date = Date {
@@ -1230,11 +1245,13 @@ mod tests {
         assert_eq!(date.to_iso8601(), "1999-12-31T23:59:58-05:30");
     }
 
+    // Covers ISO 32000-1 §7.9.4.
     #[test]
     fn parse_pdf_full() {
         assert!(Date::parse_pdf("D:20260901120000+02'00").is_some());
     }
 
+    // Covers ISO 32000-1 §7.9.4.
     #[test]
     fn parse_pdf_date_only_defaults_time() {
         let date = Date::parse_pdf("D:20260901").expect("a date-only string parses");

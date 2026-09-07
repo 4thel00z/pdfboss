@@ -44,6 +44,7 @@ fn output_is_deterministic() {
     assert_eq!(first, second);
 }
 
+// Covers ISO 32000-1 §12.5.6.5, §12.6.2 and §12.6.4.7.
 #[test]
 fn links_reach_the_written_file() {
     // The annotation dict is packed into a compressed object stream under

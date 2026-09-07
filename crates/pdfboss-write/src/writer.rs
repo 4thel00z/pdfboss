@@ -308,6 +308,8 @@ impl<S: AsyncByteSink> Emit<S> {
 
     /// The `/ID` array at this point of emission: two identical 16-byte
     /// strings from a SHA-256 of every byte written so far.
+    ///
+    /// Covers ISO 32000-1 §14.4.
     fn file_id(&self) -> Object {
         let digest = self.hasher.clone().finalize();
         let id = Object::String(digest[..16].to_vec());
@@ -569,6 +571,8 @@ fn build_objstm(pairs: &[(u32, &Object)], compress: bool) -> Result<Stream> {
 
 /// The shared trailer entries: `/Size`, `/Root`, the optional `/Info`, and
 /// the `/ID` pair.
+///
+/// Covers ISO 32000-1 §14.4.
 fn trailer_dict(size: i64, root: ObjRef, info: Option<ObjRef>, id: Object) -> Dict {
     let mut trailer = Dict::new();
     trailer.insert(literal("Size"), Object::Int(size));
@@ -762,6 +766,7 @@ mod tests {
             .count()
     }
 
+    // Covers ISO 32000-1 Annex I.
     #[test]
     fn table_mode_minimal_document_loads() {
         let (bytes, refs) = minimal_pdf(table_options());
@@ -976,6 +981,7 @@ mod tests {
         assert!(table_offset(10_000_000_000).is_err());
     }
 
+    // Covers ISO 32000-1 §14.4.
     #[test]
     fn id_derives_from_the_emitted_content() {
         let (a, refs) = minimal_pdf(table_options());
@@ -1002,6 +1008,7 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §14.4.
     #[test]
     fn id_pair_is_present_and_identical() {
         for options in [table_options(), stream_options(), objstm_options()] {

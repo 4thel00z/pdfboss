@@ -812,6 +812,7 @@ fn png_reader_matches_independently_verified_samples() {
     );
 }
 
+// Covers ISO 32000-1 §7.4.9.
 #[test]
 fn reversible_oracles_are_pixel_identical() {
     // For 5-3 reversible cases the independent decode must equal the

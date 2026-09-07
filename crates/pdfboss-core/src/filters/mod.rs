@@ -1,7 +1,8 @@
 //! Stream filters (ISO 32000 §7.4): FlateDecode, LZWDecode, ASCIIHexDecode,
 //! ASCII85Decode, RunLengthDecode, CCITTFaxDecode, JBIG2Decode, plus PNG/TIFF
 //! predictors. `DCTDecode` and `JPXDecode` are passthrough (decoded at the
-//! image layer); `Crypt` and the rest are unsupported.
+//! image layer), `Crypt` is a no-op (the document's decryptor applied it
+//! when the object was loaded), and unknown names are unsupported.
 //!
 //! The two bilevel codecs, `CCITTFaxDecode` (§7.4.6) and `JBIG2Decode`
 //! (§7.4.7), are decoded here rather than at the image layer, because what
@@ -34,6 +35,8 @@ use crate::source::AsyncObjectSource;
 /// expanding decoder and after each chain stage. Without it a crafted
 /// "decompression bomb" (e.g. chained FlateDecode stages, each ~1000:1)
 /// turns a few KiB of input into tens of GiB of allocations.
+///
+/// Covers ISO 32000-1 Annex C.3.
 pub(crate) const MAX_DECODED_LEN: usize = 256 << 20; // 256 MiB
 
 /// Upper bound on the number of entries honored in a `/Filter` array;
@@ -136,7 +139,12 @@ fn parms_at(parms: Option<&Object>, index: usize, resolver: &dyn Resolve) -> Opt
 /// is not among them — it consumes only the bytes it is handed, so it decodes
 /// at any position, and a chain that puts something after it fails in that
 /// later stage rather than being reported as an unsupported filter it is not.
-/// `Crypt` and unknown filters yield [`Error::UnsupportedFilter`].
+/// `Crypt` is a no-op: the document's decryptor already applied the crypt
+/// filter it names when the object was loaded, and in an unencrypted
+/// document it can only mean the pass-through `Identity` filter (ISO
+/// 32000-1 §7.4.10). Unknown filters yield [`Error::UnsupportedFilter`].
+///
+/// Covers ISO 32000-1 §7.3.8.1, §7.4.2 and §7.4.10.
 pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>> {
     let filter = resolve_value(stream.dict.get("Filter"), resolver);
     // Filters keep their original position so that `/DecodeParms` arrays
@@ -197,6 +205,8 @@ pub fn decode_stream(stream: &Stream, resolver: &dyn Resolve) -> Result<Vec<u8>>
             // ISO 32000-1 Table 94 defines none.)
             "DCTDecode" | "DCT" if pos == last => data,
             "JPXDecode" if pos == last => data,
+            // Decryption is done by the time a stream reaches a decoder.
+            "Crypt" => data,
             other => return Err(Error::UnsupportedFilter(other.to_string())),
         };
         // Defense in depth: the expanding decoders cap their own output,
@@ -604,6 +614,7 @@ mod tests {
     /// says "no filter": a dangling reference is `null` (ISO 32000-1
     /// 7.3.10), and null means unfiltered — exactly `decode_stream`'s
     /// treatment. Only unreadability is an error.
+    // Covers ISO 32000-1 §7.3.10.
     #[test]
     fn a_dangling_filter_reads_as_no_filter_for_both_readers() {
         use crate::source::{block_on, Immediate};
@@ -629,6 +640,7 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"raw bytes");
     }
 
+    // Covers ISO 32000-1 §7.3.9.
     #[test]
     fn null_filter_returns_raw_data() {
         let s = make_stream(vec![("Filter", Object::Null)], b"raw bytes");
@@ -641,6 +653,7 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"raw");
     }
 
+    // Covers ISO 32000-1 §7.4.2.
     #[test]
     fn single_name_filter_hex() {
         let s = make_stream(
@@ -650,12 +663,14 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"Hello");
     }
 
+    // Covers ISO 32000-1 §7.4.2.
     #[test]
     fn abbreviated_filter_names_accepted() {
         let s = make_stream(vec![("Filter", Object::Name(name("AHx")))], b"4869>");
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"Hi");
     }
 
+    // Covers ISO 32000-1 §7.3.8.1 and §7.4.4.
     #[test]
     fn chained_hex_then_flate() {
         let text = b"chained filters exercise the whole pipeline";
@@ -673,6 +688,7 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), text);
     }
 
+    // Covers ISO 32000-1 §7.4.4.4.
     #[test]
     fn decode_parms_single_dict_png_predictor() {
         // Two rows of 4 bytes, PNG "Up" filter (type 2) applied per row.
@@ -692,6 +708,7 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), raw);
     }
 
+    // Covers ISO 32000-1 §7.4.4.3.
     #[test]
     fn decode_parms_array_aligns_with_filter_array() {
         let raw = [10u8, 20, 30, 40, 50, 60, 70, 80];
@@ -720,6 +737,7 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), raw);
     }
 
+    // Covers ISO 32000-1 §7.4.4.3.
     #[test]
     fn indirect_filter_and_parms_resolved() {
         // /Filter 5 0 R -> /FlateDecode, /DecodeParms 6 0 R -> dict whose
@@ -746,13 +764,29 @@ mod tests {
         assert_eq!(decode_stream(&s, &resolver).unwrap(), raw);
     }
 
+    // Covers ISO 32000-1 §7.4.10: decryption happened when the object was
+    // loaded, so the Crypt filter has nothing left to do here.
     #[test]
-    fn crypt_filter_is_unsupported() {
+    fn crypt_filter_leaves_data_as_stored() {
         let s = make_stream(vec![("Filter", Object::Name(name("Crypt")))], b"x");
-        match decode_stream(&s, &NoResolve) {
-            Err(Error::UnsupportedFilter(n)) => assert_eq!(n, "Crypt"),
-            other => panic!("expected UnsupportedFilter, got {other:?}"),
-        }
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"x");
+    }
+
+    // Covers ISO 32000-1 §7.4.10: the Crypt filter comes first and the
+    // filters after it still run.
+    #[test]
+    fn crypt_filter_first_in_a_chain_is_a_no_op() {
+        let s = make_stream(
+            vec![(
+                "Filter",
+                Object::Array(vec![
+                    Object::Name(name("Crypt")),
+                    Object::Name(name("ASCIIHexDecode")),
+                ]),
+            )],
+            b"6869>",
+        );
+        assert_eq!(decode_stream(&s, &NoResolve).unwrap(), b"hi");
     }
 
     #[test]
@@ -767,6 +801,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.4.8.
     #[test]
     fn dct_passthrough_when_last() {
         let jpeg = b"\xff\xd8pretend jpeg payload";
@@ -790,6 +825,7 @@ mod tests {
         assert_eq!(decode_stream(&s, &NoResolve).unwrap(), jpeg);
     }
 
+    // Covers ISO 32000-1 §7.4.8.
     #[test]
     fn dct_not_last_is_unsupported() {
         let s = make_stream(
@@ -808,6 +844,7 @@ mod tests {
         }
     }
 
+    // Covers ISO 32000-1 §7.4.9.
     #[test]
     fn jpx_passthrough_when_last() {
         // JPEG 2000 data stays encoded here and is decoded at the image
@@ -877,6 +914,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §7.4.4.1 and Annex C.3.
     #[test]
     fn decompression_bomb_chain_is_rejected() {
         // Two chained FlateDecode stages: a few hundred KiB of stored bytes
@@ -933,6 +971,7 @@ mod tests {
 
     /// The segments may equally arrive through `/JBIG2Globals`, which is how a
     /// document shares one symbol dictionary across its pages (T.88 Annex D.3).
+    // Covers ISO 32000-1 §7.4.7.
     #[test]
     fn jbig2_globals_are_decoded_before_the_page_stream() {
         let (data, width, height) = jbig2::testing::generic_region_stream();
@@ -962,6 +1001,7 @@ mod tests {
 
     /// `/JBIG2Globals` is nearly always an indirect reference, since the point
     /// of it is to be shared between the images of many pages.
+    // Covers ISO 32000-1 §7.4.7.
     #[test]
     fn jbig2_globals_are_resolved_through_a_reference() {
         let (data, width, height) = jbig2::testing::generic_region_stream();
@@ -1085,6 +1125,7 @@ mod tests {
 
     /// `JBIG2Decode` reads the stream's own bytes, so it cannot sit before
     /// another filter in the chain.
+    // Covers ISO 32000-1 §7.4.7.
     #[test]
     fn jbig2_not_last_is_unsupported() {
         let s = make_stream(
@@ -1166,6 +1207,7 @@ mod tests {
     /// `/BlackIs1` true means they are the rows themselves. Stating both by
     /// hand is what separates a missing inversion from a doubled one, since
     /// each alone produces a perfectly plausible image.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn ccitt_black_is_1_selects_the_output_polarity() {
         let bm = bitmap_from_rows(&["11110000", "00001111"]);
@@ -1247,6 +1289,7 @@ mod tests {
     /// Scanners routinely compress the coded bytes as well, so the filter has
     /// to work as the second stage of a chain, with its parameters at the
     /// matching index of the `/DecodeParms` array.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn flate_then_ccitt_decodes() {
         let bm = bitmap_from_rows(&["11110000", "00001111"]);
@@ -1282,6 +1325,7 @@ mod tests {
     /// pure one-dimensional coding; `/Columns` 1728; `/Rows` 0, so the height
     /// comes from the data; `/BlackIs1` false; `/EncodedByteAlign` false;
     /// `/EndOfLine` false.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn ccitt_defaults_match_the_specification() {
         let mut bm = Bitmap::new(1728, 3).expect("fixture");
@@ -1307,6 +1351,7 @@ mod tests {
     /// `/K` 0 with `/EncodedByteAlign` — the other end of the parameter space
     /// from the pure two-dimensional case, and the combination a fax machine's
     /// own output takes.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn ccitt_one_dimensional_byte_aligned_rows_decode() {
         let bm = bitmap_from_rows(&["11110000", "00111100", "00001111"]);
@@ -1328,6 +1373,7 @@ mod tests {
 
     /// `/Rows` 0 — the default — means the height is however many rows the data
     /// holds.
+    // Covers ISO 32000-1 §7.4.6.
     #[test]
     fn ccitt_an_unstated_row_count_is_inferred_from_the_data() {
         let bm = bitmap_from_rows(&["11110000"; 5]);
@@ -1504,6 +1550,7 @@ mod tests {
         ));
     }
 
+    // Covers ISO 32000-1 §7.4.4.3.
     #[test]
     fn int_parm_coercions() {
         let d = make_dict(vec![
