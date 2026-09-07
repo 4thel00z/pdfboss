@@ -205,43 +205,7 @@ pub struct Attachment {
     pub description: Option<String>,
 }
 
-/// A page-numbering style for a [`PageLabel`] range, written as its `/S`
-/// (ISO 32000 §12.4.2, Table 159).
-///
-/// Covers ISO 32000-1 §12.4.2.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum LabelStyle {
-    /// Arabic numerals: 1, 2, 3…
-    Decimal,
-    /// Uppercase Roman numerals: I, II, III…
-    RomanUpper,
-    /// Lowercase Roman numerals: i, ii, iii…
-    RomanLower,
-    /// Uppercase letters: A, B, …, Z, AA…
-    LettersUpper,
-    /// Lowercase letters: a, b, …, z, aa…
-    LettersLower,
-}
-
-/// One page-numbering range, taking effect from `first_page` (0-based)
-/// until the next range's `first_page` or the document's end (ISO 32000
-/// §12.4.2). A document's `page_labels` must include a range with
-/// `first_page == 0` whenever it is non-empty.
-///
-/// Covers ISO 32000-1 §12.4.2.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PageLabel {
-    /// 0-based page index where this range begins.
-    pub first_page: usize,
-    /// Numbering style, written as `/S`; `None` omits it, showing only
-    /// `prefix` for every page in the range.
-    pub style: Option<LabelStyle>,
-    /// Text prepended to every number in the range, written as `/P`.
-    pub prefix: Option<String>,
-    /// The number shown on `first_page`, written as `/St` only when not
-    /// `1`. Conventionally `1`.
-    pub start_at: u32,
-}
+pub use pdfboss_core::page_label::{LabelStyle, PageLabel};
 
 /// Initial page-layout mode, written as the catalog's `/PageLayout` (ISO
 /// 32000 §7.7.2, Table 27).
@@ -709,7 +673,7 @@ fn page_labels_dict(mut labels: Vec<PageLabel>) -> Result<Option<Dict>> {
         } = label;
         let mut range = Dict::new();
         if let Some(style) = style {
-            range.insert(name("S"), Object::Name(name(label_style_name(style))));
+            range.insert(name("S"), Object::Name(name(style.code())));
         }
         if let Some(prefix) = prefix {
             range.insert(name("P"), text_string(&prefix));
@@ -723,17 +687,6 @@ fn page_labels_dict(mut labels: Vec<PageLabel>) -> Result<Option<Dict>> {
     let mut dict = Dict::new();
     dict.insert(name("Nums"), Object::Array(nums));
     Ok(Some(dict))
-}
-
-/// The `/S` name for a [`LabelStyle`].
-fn label_style_name(style: LabelStyle) -> &'static str {
-    match style {
-        LabelStyle::Decimal => "D",
-        LabelStyle::RomanUpper => "R",
-        LabelStyle::RomanLower => "r",
-        LabelStyle::LettersUpper => "A",
-        LabelStyle::LettersLower => "a",
-    }
 }
 
 /// The `/PageLayout` name for a [`PageLayout`].

@@ -41,7 +41,11 @@ fn fixtures() -> Vec<(&'static str, Vec<u8>)> {
 /// jumps through a `/GoTo` action, and a closed, bold, coloured chapter.
 fn outline_doc() -> Vec<u8> {
     let mut b = PdfBuilder::new();
-    b.object(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>");
+    b.object(
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R \
+         /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
+    );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
     b.object(5, "<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 2 >>");
@@ -169,6 +173,18 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             "{name}: named destinations"
         );
         assert_eq!(doc.outline().await, sync_doc.outline(), "{name}: outline");
+        assert_eq!(
+            doc.page_labels().await,
+            sync_doc.page_labels(),
+            "{name}: page labels"
+        );
+        for index in 0..=doc.page_count() {
+            assert_eq!(
+                doc.page_label(index).await,
+                sync_doc.page_label(index),
+                "{name}: page label {index}"
+            );
+        }
         for key in [b"A".as_slice(), b"B", b"C", b"Old", b"missing"] {
             assert_eq!(
                 doc.named_destination(key).await,

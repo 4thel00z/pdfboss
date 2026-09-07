@@ -1460,6 +1460,22 @@ impl AsyncDocument {
         pdfboss_core::outline_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The document's page labelling ranges (ISO 32000-1 §12.4.2): the
+    /// async twin of the sync document's `page_labels`.
+    pub async fn page_labels(&self) -> Option<Vec<pdfboss_core::PageLabel>> {
+        pdfboss_core::page_labels_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The label the page at `index` shows: the async twin of the sync
+    /// document's `page_label`.
+    pub async fn page_label(&self, index: usize) -> Option<String> {
+        if index >= self.page_count() {
+            return None;
+        }
+        let ranges = self.page_labels().await?;
+        Some(pdfboss_core::page_label(&ranges, index))
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.

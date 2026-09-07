@@ -600,6 +600,25 @@ impl Document {
         ))
     }
 
+    /// The document's page labelling ranges (ISO 32000-1 §12.4.2), sorted
+    /// by first page; `None` when the catalog has no `/PageLabels`.
+    pub fn page_labels(&self) -> Option<Vec<crate::page_label::PageLabel>> {
+        block_on(crate::page_label::page_labels_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The label the page at `index` shows, or `None` when the document
+    /// has no page labels or no such page.
+    pub fn page_label(&self, index: usize) -> Option<String> {
+        if index >= self.page_count() {
+            return None;
+        }
+        let ranges = self.page_labels()?;
+        Some(crate::page_label::page_label(&ranges, index))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     ///
     /// Covers ISO 32000-1 §7.9.2.2.
