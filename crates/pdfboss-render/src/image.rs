@@ -350,6 +350,9 @@ pub(crate) struct ImageMeta {
     /// The data is still a raw JPEG: the trailing `/Filter` entry is
     /// `DCTDecode`, one of the two codecs the stream filters pass through.
     dct: bool,
+    /// `/ColorTransform` from the trailing filter's decode parameters
+    /// (ISO 32000-1 Table 13), when present.
+    color_transform: Option<i64>,
     /// The data is still a JPEG 2000 file or codestream: the trailing
     /// `/Filter` entry is `JPXDecode`, the other passed-through codec.
     jpx: bool,
@@ -399,6 +402,7 @@ impl ImageMeta {
         };
         ImageMeta {
             dct: is_dct(src, dict).await,
+            color_transform: dct_color_transform(src, dict).await,
             jpx: is_jpx(src, dict).await,
             smask_in_data: num_of(src, dict, "SMaskInData")
                 .await
@@ -486,6 +490,36 @@ async fn is_dct<S: AsyncObjectSource>(src: &S, dict: &Dict) -> bool {
             .map(|n| n.0.as_str()),
         Some("DCTDecode" | "DCT")
     )
+}
+
+/// The `/ColorTransform` entry of the trailing filter's decode parameters:
+/// `/DecodeParms` (or the inline-image `/DP`) as a dictionary, or the
+/// element of a `/DecodeParms` array aligned with the last named filter.
+///
+/// Covers ISO 32000-1 §7.4.8.
+async fn dct_color_transform<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<i64> {
+    let parms = dict.get("DecodeParms").or_else(|| dict.get("DP"))?;
+    let parms = match src.resolve(parms).await.ok()? {
+        Object::Dict(d) => d,
+        Object::Array(items) => {
+            let filter = dict.get("Filter").or_else(|| dict.get("F"))?;
+            let index = match src.resolve(filter).await.ok()? {
+                Object::Array(filters) => {
+                    filters.iter().rposition(|f| matches!(f, Object::Name(_)))?
+                }
+                _ => 0,
+            };
+            match src.resolve(items.get(index)?).await.ok()? {
+                Object::Dict(d) => d,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    src.resolve(parms.get("ColorTransform")?)
+        .await
+        .ok()?
+        .as_int()
 }
 
 /// Whether the trailing filter of the image's `/Filter` chain is
@@ -672,7 +706,7 @@ fn decode_rgba<'a>(meta: &ImageMeta, data: &'a [u8], fill_rgb: [u8; 3]) -> Optio
         // A short JPEG is the decoder's business: it either reconstructs
         // what it has or fails outright, and there is no zero padding of
         // ours to own up to.
-        return decode_jpeg(data);
+        return decode_jpeg(data, meta.color_transform, meta.decode.as_deref());
     }
     let width = meta.width? as usize;
     let height = meta.height? as usize;
@@ -812,11 +846,19 @@ fn sample_lut(cs: &ColorSpace, bpc: usize, range: (f32, f32), max: f32) -> Vec<[
         .collect()
 }
 
-/// Decodes a raw JPEG (`DCTDecode` payload, ISO 32000-1 §7.4.8) to RGBA. Gray, RGB, and CMYK
-/// pixel layouts are supported; CMYK JPEGs are assumed to carry
-/// Adobe-style inverted ink values (the common case) and are un-inverted
-/// before conversion. `/Decode` arrays are not applied to JPEG data.
-fn decode_jpeg<'a>(data: &[u8]) -> Option<Rgba<'a>> {
+/// Decodes a raw JPEG (`DCTDecode` payload, ISO 32000-1 §7.4.8) to RGBA.
+/// Gray, RGB and CMYK layouts are supported. The colour transform follows
+/// Table 13 (the Adobe marker first, then `/ColorTransform`), the `/Decode`
+/// array maps every component like any other sample, and four-component
+/// samples are ink values as stored, 0 meaning no ink; the decoder crate
+/// hands those back as `255 - ink`, which is undone first.
+///
+/// Covers ISO 32000-1 §7.4.8 and §8.9.5.2.
+fn decode_jpeg<'a>(
+    data: &[u8],
+    color_transform: Option<i64>,
+    decode: Option<&[f32]>,
+) -> Option<Rgba<'a>> {
     let mut dec = jpeg_decoder::Decoder::new(data);
     // The dimensions come from the JPEG's own SOF marker, not the trusted
     // PDF dictionary, so parse only the header first and validate them
@@ -829,32 +871,50 @@ fn decode_jpeg<'a>(data: &[u8]) -> Option<Rgba<'a>> {
         return None;
     }
     w.checked_mul(h).filter(|&n| n <= MAX_PIXELS)?;
+    let components = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 | jpeg_decoder::PixelFormat::L16 => 1,
+        jpeg_decoder::PixelFormat::RGB24 => 3,
+        jpeg_decoder::PixelFormat::CMYK32 => 4,
+    };
+    if let Some(transform) =
+        jpeg_color_transform(components, adobe_transform(data), color_transform)
+    {
+        dec.set_color_transform(transform);
+    }
     // Belt and braces: cap the decoder's internal output buffer too
     // (4 bytes/pixel covers the widest supported layout, CMYK32).
     dec.set_max_decoding_buffer_size(MAX_PIXELS * 4);
-    let pixels = dec.decode().ok()?;
-    let mut out = vec![255u8; w * h * 4];
+    let mut samples = dec.decode().ok()?;
     match info.pixel_format {
-        jpeg_decoder::PixelFormat::L8 => {
-            for (i, &g) in pixels.iter().enumerate().take(w * h) {
-                out[i * 4..i * 4 + 3].copy_from_slice(&[g, g, g]);
-            }
-        }
+        // Big-endian: the high byte carries the tone.
         jpeg_decoder::PixelFormat::L16 => {
-            for (i, pair) in pixels.as_chunks::<2>().0.iter().enumerate().take(w * h) {
-                let g = pair[0]; // big-endian: high byte carries the tone
+            samples = samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| pair[0])
+                .collect();
+        }
+        jpeg_decoder::PixelFormat::CMYK32 => samples.iter_mut().for_each(|v| *v = 255 - *v),
+        _ => {}
+    }
+    apply_decode(&mut samples, components, decode);
+    let n = w * h;
+    let mut out = vec![255u8; n * 4];
+    match components {
+        1 => {
+            for (i, &g) in samples.iter().enumerate().take(n) {
                 out[i * 4..i * 4 + 3].copy_from_slice(&[g, g, g]);
             }
         }
-        jpeg_decoder::PixelFormat::RGB24 => {
-            for (i, rgb) in pixels.as_chunks::<3>().0.iter().enumerate().take(w * h) {
+        3 => {
+            for (i, rgb) in samples.as_chunks::<3>().0.iter().enumerate().take(n) {
                 out[i * 4..i * 4 + 3].copy_from_slice(rgb);
             }
         }
-        jpeg_decoder::PixelFormat::CMYK32 => {
-            for (i, cmyk) in pixels.as_chunks::<4>().0.iter().enumerate().take(w * h) {
-                let rgb = inverted_cmyk_to_rgb([cmyk[0], cmyk[1], cmyk[2], cmyk[3]]);
-                out[i * 4..i * 4 + 3].copy_from_slice(&rgb);
+        _ => {
+            for (i, cmyk) in samples.as_chunks::<4>().0.iter().enumerate().take(n) {
+                out[i * 4..i * 4 + 3].copy_from_slice(&cmyk_to_rgb(*cmyk));
             }
         }
     }
@@ -864,6 +924,100 @@ fn decode_jpeg<'a>(data: &[u8]) -> Option<Rgba<'a>> {
         pixels: Pixels::Quads(out),
         truncated: false,
     })
+}
+
+/// The transform flag of a JPEG's Adobe APP14 marker (Adobe Technical Note
+/// #5116): 0 for none, 1 for YCbCr, 2 for YCCK. `None` when no such marker
+/// precedes the first scan or the headers are malformed.
+///
+/// Covers ISO 32000-1 §7.4.8.
+fn adobe_transform(data: &[u8]) -> Option<u8> {
+    if data.len() < 4 || data[..2] != [0xFF, 0xD8] {
+        return None;
+    }
+    let mut pos = 2;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xFF {
+            pos += 1;
+            continue;
+        }
+        let marker = data[pos + 1];
+        // Fill bytes and the standalone markers carry no length.
+        if marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            pos += 2;
+            continue;
+        }
+        let len = usize::from(u16::from_be_bytes([data[pos + 2], data[pos + 3]]));
+        let payload = data.get(pos + 4..pos + 2 + len)?;
+        match marker {
+            0xDA | 0xD9 => return None,
+            0xEE if payload.len() >= 12 && &payload[..5] == b"Adobe" => return Some(payload[11]),
+            _ => {}
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
+/// The colour transform to force on the decoder, per Table 13: the Adobe
+/// marker's flag when present, else the `/ColorTransform` parameter, else
+/// nothing, since the decoder's own default already matches the clause's
+/// (YCbCr for three components, none for four).
+///
+/// Covers ISO 32000-1 §7.4.8.
+fn jpeg_color_transform(
+    components: usize,
+    adobe: Option<u8>,
+    parm: Option<i64>,
+) -> Option<jpeg_decoder::ColorTransform> {
+    use jpeg_decoder::ColorTransform as Transform;
+    let flag = match adobe {
+        Some(flag) => i64::from(flag),
+        None => parm?,
+    };
+    match (components, flag) {
+        (3, 0) => Some(Transform::RGB),
+        (3, 1) => Some(Transform::YCbCr),
+        (4, 0) => Some(Transform::CMYK),
+        (4, 1 | 2) => Some(Transform::YCCK),
+        _ => None,
+    }
+}
+
+/// Maps 8-bit samples through the `/Decode` ranges of their components
+/// (ISO 32000-1 Table 90 with Dmax 255): nothing happens when the array is
+/// absent, too short, or the identity `[0 1 …]`.
+///
+/// Covers ISO 32000-1 §8.9.5.2.
+fn apply_decode(samples: &mut [u8], components: usize, decode: Option<&[f32]>) {
+    let Some(decode) = decode.filter(|d| d.len() >= 2 * components) else {
+        return;
+    };
+    let luts: Vec<Option<[u8; 256]>> = (0..components)
+        .map(|c| {
+            let (d0, d1) = (decode[2 * c], decode[2 * c + 1]);
+            if d0 == 0.0 && d1 == 1.0 {
+                return None;
+            }
+            Some(std::array::from_fn(|v| {
+                ((d0 + v as f32 / 255.0 * (d1 - d0)).clamp(0.0, 1.0) * 255.0 + 0.5) as u8
+            }))
+        })
+        .collect();
+    if luts.iter().all(Option::is_none) {
+        return;
+    }
+    for px in samples.chunks_exact_mut(components) {
+        for (v, lut) in px.iter_mut().zip(&luts) {
+            if let Some(lut) = lut {
+                *v = lut[usize::from(*v)];
+            }
+        }
+    }
 }
 
 /// JPEG 2000 decode bounds mapped from this module's own image guards: the
@@ -1236,10 +1390,10 @@ fn material_jpx_warnings(warnings: &[pdfboss_jpx::JpxWarning]) -> Vec<String> {
         .collect()
 }
 
-/// Converts one Adobe-inverted CMYK pixel (stored as `255 - ink`) to RGB
-/// bytes with the naive `1 - min(1, x + k)` formula.
-fn inverted_cmyk_to_rgb(px: [u8; 4]) -> [u8; 3] {
-    let ink = |v: u8| 1.0 - f32::from(v) / 255.0;
+/// Converts one CMYK pixel of ink values (255 = full ink) to RGB bytes
+/// through the device conversion.
+fn cmyk_to_rgb(px: [u8; 4]) -> [u8; 3] {
+    let ink = |v: u8| f32::from(v) / 255.0;
     let rgb = ColorSpace::DeviceCMYK.to_rgb(&[ink(px[0]), ink(px[1]), ink(px[2]), ink(px[3])]);
     [
         (rgb[0] * 255.0 + 0.5) as u8,
@@ -1620,6 +1774,218 @@ mod tests {
         assert_eq!((g, b, a), (r, r, 255));
         // Garbage JPEG data is rejected, not a panic.
         assert!(decode_rgba(&doc, &d, &[1, 2, 3], None, [0; 3]).is_none());
+    }
+
+    /// Appends JPEG entropy-coded bits, stuffing a zero byte after 0xFF and
+    /// padding the last byte with ones.
+    struct BitWriter {
+        out: Vec<u8>,
+        acc: u32,
+        n: u32,
+    }
+
+    impl BitWriter {
+        fn put(&mut self, value: u32, bits: u32) {
+            for i in (0..bits).rev() {
+                self.acc = (self.acc << 1) | ((value >> i) & 1);
+                self.n += 1;
+                if self.n == 8 {
+                    self.out.push(self.acc as u8);
+                    if self.acc == 0xFF {
+                        self.out.push(0x00);
+                    }
+                    self.acc = 0;
+                    self.n = 0;
+                }
+            }
+        }
+
+        fn finish(mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.put((1 << (8 - self.n)) - 1, 8 - self.n);
+            }
+            self.out
+        }
+    }
+
+    /// The standard luminance DC Huffman table (ITU T.81 Table K.3): code
+    /// lengths per size category 0 to 11, as (code, length) pairs.
+    fn dc_codes() -> Vec<(u32, u32)> {
+        let bits = [0u32, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+        let mut codes = Vec::new();
+        let mut code = 0u32;
+        for (len_minus_one, &count) in bits.iter().enumerate() {
+            for _ in 0..count {
+                codes.push((code, len_minus_one as u32 + 1));
+                code += 1;
+            }
+            code <<= 1;
+        }
+        codes
+    }
+
+    /// A 1x1 baseline JPEG with one component per entry of `samples`, each
+    /// decoding to that sample value (DC-only blocks over a flat quantizer),
+    /// component ids 1, 2, 3, 4, no JFIF marker, and an Adobe APP14 marker
+    /// carrying `adobe` as its transform flag when given.
+    fn flat_jpeg(samples: &[u8], adobe: Option<u8>) -> Vec<u8> {
+        let n = samples.len() as u8;
+        let mut j = vec![0xFF, 0xD8];
+        if let Some(transform) = adobe {
+            j.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x0E]);
+            j.extend_from_slice(b"Adobe\x00\x64\x00\x00\x00\x00");
+            j.push(transform);
+        }
+        j.extend_from_slice(&[0xFF, 0xDB, 0x00, 0x43, 0x00]);
+        j.extend_from_slice(&[1u8; 64]);
+        j.extend_from_slice(&[0xFF, 0xC0, 0x00, 8 + 3 * n, 0x08, 0x00, 0x01, 0x00, 0x01, n]);
+        for id in 1..=n {
+            j.extend_from_slice(&[id, 0x11, 0x00]);
+        }
+        // DHT DC0: the standard luminance table, sizes 0 to 11.
+        j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x1F, 0x00]);
+        j.extend_from_slice(&[0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]);
+        j.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        // DHT AC0: one 1-bit code for symbol 0 (EOB).
+        j.extend_from_slice(&[0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01]);
+        j.extend_from_slice(&[0u8; 15]);
+        j.push(0x00);
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 6 + 2 * n, n]);
+        for id in 1..=n {
+            j.extend_from_slice(&[id, 0x00]);
+        }
+        j.extend_from_slice(&[0x00, 0x3F, 0x00]);
+        let codes = dc_codes();
+        let mut bits = BitWriter {
+            out: Vec::new(),
+            acc: 0,
+            n: 0,
+        };
+        for &sample in samples {
+            // A flat block's DC coefficient is 8 times its level-shifted value.
+            let dc = (i32::from(sample) - 128) * 8;
+            let size = 32 - dc.unsigned_abs().leading_zeros();
+            let (code, len) = codes[size as usize];
+            bits.put(code, len);
+            if size > 0 {
+                let value = if dc < 0 { dc - 1 } else { dc };
+                bits.put((value as u32) & ((1 << size) - 1), size);
+            }
+            bits.put(0, 1); // EOB
+        }
+        j.extend_from_slice(&bits.finish());
+        j.extend_from_slice(&[0xFF, 0xD9]);
+        j
+    }
+
+    fn near(actual: [u8; 4], expected: [u8; 3]) -> bool {
+        actual[3] == 255
+            && (0..3).all(|i| (i32::from(actual[i]) - i32::from(expected[i])).abs() <= 2)
+    }
+
+    // Covers ISO 32000-1 §8.9.5.2 and §7.4.8: /Decode maps JPEG samples like
+    // any other sample.
+    #[test]
+    fn dct_decode_array_applies_to_jpeg_samples() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /ColorSpace /DeviceGray /Decode [1 0] >>",
+        );
+        let jpeg = flat_jpeg(&[200], None);
+        let img = decode_rgba(&doc, &d, &jpeg, None, [0; 3]).unwrap();
+        let px = rgba_at(&img, 0, 0);
+        assert!(near(px, [55, 55, 55]), "inverted gray, got {px:?}");
+    }
+
+    // Covers ISO 32000-1 §7.4.8: four-component JPEG samples are ink values
+    // as stored, 0 meaning no ink.
+    #[test]
+    fn dct_cmyk_samples_are_direct_ink_values() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /ColorSpace /DeviceCMYK >>",
+        );
+        let no_ink = flat_jpeg(&[0, 0, 0, 0], Some(0));
+        let white = decode_rgba(&doc, &d, &no_ink, None, [0; 3]).unwrap();
+        assert!(
+            near(rgba_at(&white, 0, 0), [255, 255, 255]),
+            "no ink is white"
+        );
+        let full_black = flat_jpeg(&[0, 0, 0, 255], Some(0));
+        let black = decode_rgba(&doc, &d, &full_black, None, [0; 3]).unwrap();
+        assert!(
+            near(rgba_at(&black, 0, 0), [0, 0, 0]),
+            "full black ink is black"
+        );
+    }
+
+    // Covers ISO 32000-1 §8.9.5.2 and §7.4.8: a Photoshop-style JPEG stores
+    // inverted ink and the PDF says so with /Decode [1 0 1 0 1 0 1 0].
+    #[test]
+    fn dct_decode_array_inverts_photoshop_cmyk() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /ColorSpace /DeviceCMYK /Decode [1 0 1 0 1 0 1 0] >>",
+        );
+        let jpeg = flat_jpeg(&[255, 255, 255, 255], Some(0));
+        let img = decode_rgba(&doc, &d, &jpeg, None, [0; 3]).unwrap();
+        let px = rgba_at(&img, 0, 0);
+        assert!(
+            near(px, [255, 255, 255]),
+            "inverted no-ink is white, got {px:?}"
+        );
+    }
+
+    // Covers ISO 32000-1 §7.4.8: /ColorTransform 0 keeps three components as
+    // stored instead of treating them as YCbCr.
+    #[test]
+    fn dct_color_transform_zero_keeps_three_components_as_stored() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /DecodeParms << /ColorTransform 0 >> /ColorSpace /DeviceRGB >>",
+        );
+        let jpeg = flat_jpeg(&[200, 30, 60], None);
+        let img = decode_rgba(&doc, &d, &jpeg, None, [0; 3]).unwrap();
+        let px = rgba_at(&img, 0, 0);
+        assert!(near(px, [200, 30, 60]), "stored RGB, got {px:?}");
+    }
+
+    // Covers ISO 32000-1 §7.4.8: the Adobe marker's transform flag wins over
+    // the dictionary's /ColorTransform.
+    #[test]
+    fn dct_adobe_marker_overrides_color_transform() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /DecodeParms << /ColorTransform 1 >> /ColorSpace /DeviceRGB >>",
+        );
+        let jpeg = flat_jpeg(&[200, 30, 60], Some(0));
+        let img = decode_rgba(&doc, &d, &jpeg, None, [0; 3]).unwrap();
+        let px = rgba_at(&img, 0, 0);
+        assert!(
+            near(px, [200, 30, 60]),
+            "the marker says no transform, got {px:?}"
+        );
+    }
+
+    // Covers ISO 32000-1 §7.4.8: /ColorTransform 1 reads four components as
+    // YCCK when no Adobe marker says otherwise.
+    #[test]
+    fn dct_color_transform_one_reads_four_components_as_ycck() {
+        let doc = test_doc();
+        let d = dict(
+            b"<< /Width 1 /Height 1 /BitsPerComponent 8 /Filter /DCTDecode \
+               /DecodeParms << /ColorTransform 1 >> /ColorSpace /DeviceCMYK >>",
+        );
+        // Y 255, Cb Cr 128 is RGB white, so CMY come out as no ink; K 0.
+        let jpeg = flat_jpeg(&[255, 128, 128, 0], None);
+        let img = decode_rgba(&doc, &d, &jpeg, None, [0; 3]).unwrap();
+        let px = rgba_at(&img, 0, 0);
+        assert!(near(px, [255, 255, 255]), "YCCK white, got {px:?}");
     }
 
     // Covers ISO 32000-1 §7.4.8.
@@ -2174,13 +2540,13 @@ mod tests {
 
     // Covers ISO 32000-1 §10.3.5 and §8.6.4.4.
     #[test]
-    fn inverted_cmyk_conversion() {
-        // Stored 255 everywhere = zero ink = white.
-        assert_eq!(inverted_cmyk_to_rgb([255, 255, 255, 255]), [255, 255, 255]);
-        // Stored 0 black channel = full black ink.
-        assert_eq!(inverted_cmyk_to_rgb([255, 255, 255, 0]), [0, 0, 0]);
+    fn cmyk_conversion_takes_ink_values() {
+        // Zero ink everywhere is white.
+        assert_eq!(cmyk_to_rgb([0, 0, 0, 0]), [255, 255, 255]);
+        // Full black ink is black.
+        assert_eq!(cmyk_to_rgb([0, 0, 0, 255]), [0, 0, 0]);
         // Full cyan ink only.
-        assert_eq!(inverted_cmyk_to_rgb([0, 255, 255, 255]), [0, 255, 255]);
+        assert_eq!(cmyk_to_rgb([255, 0, 0, 0]), [0, 255, 255]);
     }
 
     // Covers ISO 32000-1 §8.9.2.
