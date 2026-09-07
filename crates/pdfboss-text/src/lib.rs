@@ -203,6 +203,13 @@ pub struct TextSpan {
     /// (ISO 32000-1 §14.8.4). `None` under the other orders, and for
     /// content the tree does not reach.
     pub structure: Option<Structure>,
+    /// The alternate description that applies to the span (ISO 32000-1
+    /// §14.9.3): the `/Alt` of the innermost marked-content sequence it was
+    /// shown inside that has one, else, under
+    /// [`ReadingOrder::StructureTree`], the `/Alt` of the nearest structure
+    /// element above it. A description, not a replacement: `text` stays
+    /// what was shown.
+    pub alt: Option<String>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -1674,6 +1681,46 @@ mod tests {
         assert_eq!(kinds(&spans[2]), [StandardType::Document, StandardType::P]);
         let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans.iter().all(|span| span.structure.is_none()));
+    }
+
+    /// A sequence's `/Alt`, inline or named, reaches every span shown inside
+    /// it as a description, the shown text staying what it is.
+    // Covers ISO 32000-1 §14.9.3.
+    #[test]
+    fn alternate_descriptions_from_property_lists_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /Alt (a smile) >> BDC (grin) Tj EMC \
+              /Span /Named BDC (e) Tj EMC (plain) Tj ET",
+            "/Named << /Alt <FEFF00E9> >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["grin", "e", "plain"]);
+        assert_eq!(spans[0].alt.as_deref(), Some("a smile"));
+        assert_eq!(spans[1].alt.as_deref(), Some("\u{e9}"));
+        assert_eq!(spans[2].alt, None);
+    }
+
+    /// Under structure-tree order a span with no description of its own
+    /// takes the nearest structure element's `/Alt`.
+    // Covers ISO 32000-1 §14.9.3.
+    #[test]
+    fn alternate_descriptions_from_structure_elements_reach_the_spans() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /Figure /P 11 0 R /Pg 3 0 R /K [0 2] /Alt (Left chart) >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["L1", "L2", "R1", "R2"]);
+        assert_eq!(spans[0].alt.as_deref(), Some("Left chart"));
+        assert_eq!(spans[1].alt.as_deref(), Some("Left chart"));
+        assert_eq!(spans[2].alt, None);
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans.iter().all(|span| span.alt.is_none()));
     }
 
     #[test]

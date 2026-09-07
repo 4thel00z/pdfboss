@@ -1111,6 +1111,15 @@ impl Span {
         self.inner.artifact.as_ref()?.subtype.clone()
     }
 
+    /// The alternate description that applies to the span (ISO 32000-1
+    /// 14.9.3): its marked-content sequence's /Alt, else under
+    /// structure-tree order the nearest structure element's; None when
+    /// neither gives one.
+    #[getter]
+    fn alt(&self) -> Option<String> {
+        self.inner.alt.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Span(page={}, text={:?}, font_name={:?})",

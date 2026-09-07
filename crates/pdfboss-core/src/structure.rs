@@ -305,6 +305,9 @@ pub struct Placement {
     /// child first and the element itself last; an ancestor of no standard
     /// type is skipped, its children keeping their place.
     pub path: Vec<StructureElement>,
+    /// The alternate description (`/Alt`, §14.9.3) of the element, or of
+    /// the nearest ancestor that has one, decoded as a text string.
+    pub alt: Option<String>,
 }
 
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
@@ -426,19 +429,21 @@ impl StructureTree {
         }
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
         for (rank, (id, _, ancestry)) in keyed.into_iter().enumerate() {
-            let structure_type = ancestry.last().and_then(|(_, s)| s.clone());
+            let structure_type = ancestry.last().and_then(|a| a.structure_type.clone());
             let mapped_type = structure_type.as_deref().map(|s| self.mapped_type(s));
             let standard_type = mapped_type.as_deref().and_then(StandardType::from_name);
             let path = ancestry
                 .iter()
-                .filter_map(|(object, s)| {
-                    let standard_type = StandardType::from_name(&self.mapped_type(s.as_deref()?))?;
+                .filter_map(|ancestor| {
+                    let name = ancestor.structure_type.as_deref()?;
+                    let standard_type = StandardType::from_name(&self.mapped_type(name))?;
                     Some(StructureElement {
                         standard_type,
-                        object: *object,
+                        object: ancestor.object,
                     })
                 })
                 .collect();
+            let alt = ancestry.iter().rev().find_map(|a| a.alt.clone());
             placed.insert(
                 id,
                 Placement {
@@ -447,6 +452,7 @@ impl StructureTree {
                     mapped_type,
                     standard_type,
                     path,
+                    alt,
                 },
             );
         }
@@ -454,9 +460,17 @@ impl StructureTree {
     }
 }
 
+/// One element on the way from a marked-content sequence up to the root:
+/// its object, its `/S` as written and its `/Alt` decoded.
+struct Ancestor {
+    object: ObjRef,
+    structure_type: Option<String>,
+    alt: Option<String>,
+}
+
 /// An element and its ancestors up to the root, the root's child first and
-/// the element last, each with its `/S` as written.
-type Ancestry = Vec<(ObjRef, Option<String>)>;
+/// the element last.
+type Ancestry = Vec<Ancestor>;
 
 /// The `/RoleMap` dictionary as name-to-name pairs.
 ///
@@ -506,12 +520,13 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     }
 
     /// The element and its ancestors up to the root, the root's child first
-    /// and the element itself last, each with its `/S`: what a placement's
-    /// structure type and path are read from. The climb stops at the root,
-    /// at a missing `/P`, or after [`MAX_ELEMENT_DEPTH`] elements; the
-    /// dictionaries are the ones [`Walk::path_of`] already read.
+    /// and the element itself last, each with its `/S` and `/Alt`: what a
+    /// placement's structure type, path and description are read from. The
+    /// climb stops at the root, at a missing `/P`, or after
+    /// [`MAX_ELEMENT_DEPTH`] elements; the dictionaries are the ones
+    /// [`Walk::path_of`] already read.
     ///
-    /// Covers ISO 32000-1 §14.7.3 and §14.8.4.3.
+    /// Covers ISO 32000-1 §14.7.3, §14.8.4.3 and §14.9.3.
     async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
         let mut chain: Ancestry = Vec::new();
         let mut current = element;
@@ -519,7 +534,15 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
             let Some(dict) = self.dict(current).await else {
                 break;
             };
-            chain.push((current, dict.get_name("S").map(|n| n.0.clone())));
+            let alt = match dict.get("Alt") {
+                Some(alt) => self.text_string(alt).await,
+                None => None,
+            };
+            chain.push(Ancestor {
+                object: current,
+                structure_type: dict.get_name("S").map(|n| n.0.clone()),
+                alt,
+            });
             let Some(parent) = dict.get("P").and_then(Object::as_ref) else {
                 break;
             };
@@ -530,6 +553,13 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         }
         chain.reverse();
         chain
+    }
+
+    /// A text string entry (§7.9.2.2), resolved and decoded; `None` for
+    /// anything but a string.
+    async fn text_string(&mut self, value: &Object) -> Option<String> {
+        let resolved = self.src.resolve(value).await.ok()?;
+        Some(crate::object::decode_text_string(resolved.as_str_bytes()?))
     }
 
     /// The parent tree's entry for a `/StructParents` key: the array whose
@@ -962,6 +992,47 @@ mod tests {
         );
         assert_eq!(kinds(3), [StandardType::Document, StandardType::P]);
         assert_eq!(objects(3), [11, 21]);
+    }
+
+    // Covers ISO 32000-1 §14.9.3.
+    #[test]
+    fn placements_carry_the_nearest_alternate_description() {
+        // A Figure with /Alt holding a P with id 0; a P with no /Alt anywhere
+        // above it holding id 1; a Span with a UTF-16 /Alt holding id 2.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 15 0 R 16 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [14 0 R 15 0 R 16 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /Figure /P 11 0 R /Alt (A chart) /K [14 0 R] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /P /P 13 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    15,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    16,
+                    "<< /Type /StructElem /S /Span /P 11 0 R /Pg 3 0 R /K [2] /Alt <FEFF00E9> >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1), id(0, 2)]);
+        assert_eq!(placed[&id(0, 0)].alt.as_deref(), Some("A chart"));
+        assert_eq!(placed[&id(0, 1)].alt, None);
+        assert_eq!(placed[&id(0, 2)].alt.as_deref(), Some("\u{e9}"));
     }
 
     // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and

@@ -181,6 +181,15 @@ class Span:
         ``"Footer"``, ``"Watermark"`` or a producer's own name; ``None``
         otherwise."""
 
+    @property
+    def alt(self) -> str | None:
+        """The alternate description that applies to the span (ISO 32000-1
+        14.9.3): the ``/Alt`` of the marked-content sequence it was shown
+        inside, else, under structure-tree reading order, the ``/Alt`` of
+        the nearest structure element above it; ``None`` when neither gives
+        one. A description, not a replacement: ``text`` stays what was
+        shown."""
+
 class SpanIter:
     """Lazy sync iterator over a document's styled spans; buffers one
     page's spans at a time, extracting each page with the GIL released."""
