@@ -450,12 +450,19 @@ impl Font {
             "wingdings3",
             "webdings",
         ];
-        let Some(name) = rv(src, dict, "BaseFont")
+        match Font::base_family(src, dict).await {
+            Some(family) => PICTURE_FAMILIES.contains(&family.as_str()),
+            None => false,
+        }
+    }
+
+    /// The family part of `/BaseFont`, lowercased: a subset prefix (six
+    /// capitals and a plus sign, ISO 32000-1 9.6.4) and any `,Bold` or
+    /// `-Bold` style suffix are stripped first.
+    async fn base_family<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<String> {
+        let name = rv(src, dict, "BaseFont")
             .await
-            .and_then(|o| o.as_name().map(|n| n.0.clone()))
-        else {
-            return false;
-        };
+            .and_then(|o| o.as_name().map(|n| n.0.clone()))?;
         let family = name
             .split_once('+')
             .map_or(name.as_str(), |(prefix, rest)| {
@@ -470,7 +477,23 @@ impl Font {
             .unwrap_or_default()
             .replace(' ', "")
             .to_ascii_lowercase();
-        PICTURE_FAMILIES.contains(&family.as_str())
+        Some(family)
+    }
+
+    /// The built-in encoding of the two standard 14 faces that have one:
+    /// Symbol's (Annex D.5) and ZapfDingbats' (Annex D.6), by `/BaseFont`
+    /// family. Every other face has none the reader can know.
+    ///
+    /// Covers ISO 32000-1 Annex D.5 and Annex D.6.
+    async fn standard_symbol_encoding<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+    ) -> Option<fn(u8) -> Option<char>> {
+        match Font::base_family(src, dict).await?.as_str() {
+            "symbol" => Some(encodings::symbol),
+            "zapfdingbats" | "dingbats" => Some(encodings::zapf_dingbats),
+            _ => None,
+        }
     }
 
     /// Bold/italic evidence for `dict` (whose `/BaseFont` is read directly):
@@ -707,8 +730,10 @@ impl Font {
     /// with `/Differences` glyph names applied on top. The base is the
     /// encoding named directly or via `/BaseEncoding`; failing that, the
     /// embedded Type 1 program's own encoding (ISO 32000-1 9.6.6.2); failing
-    /// that, Standard. A font naming no `/Encoding` and embedding no Type 1
-    /// program has no table and decodes through StandardEncoding directly.
+    /// that, Symbol's or ZapfDingbats' built-in encoding when `/BaseFont`
+    /// names one of them (Annex D.5 and D.6); failing that, Standard. A font
+    /// naming no `/Encoding` with none of those has no table and decodes
+    /// through StandardEncoding directly.
     ///
     /// Covers ISO 32000-1 §9.6.6.1.
     async fn load_encoding<S: AsyncObjectSource>(
@@ -727,7 +752,11 @@ impl Font {
             Some(_) => None,
             None => Font::program_encoding(src, dict).await,
         };
-        if enc.is_none() && program.is_none() {
+        let builtin = match (&base_name, &program) {
+            (None, None) => Font::standard_symbol_encoding(src, dict).await,
+            _ => None,
+        };
+        if enc.is_none() && program.is_none() && builtin.is_none() {
             return None;
         }
         let mut table: Box<[Option<Decoded>; 256]> = Box::new(std::array::from_fn(|_| None));
@@ -741,7 +770,7 @@ impl Font {
                 let base: fn(u8) -> Option<char> = match base_name.as_deref() {
                     Some("WinAnsiEncoding") => encodings::win_ansi,
                     Some("MacRomanEncoding") => encodings::mac_roman,
-                    _ => encodings::standard,
+                    _ => builtin.unwrap_or(encodings::standard),
                 };
                 for (code, slot) in table.iter_mut().enumerate() {
                     *slot = base(code as u8).map(Decoded::Char);
@@ -1183,13 +1212,7 @@ mod tests {
     /// WinAnsi turned a real document's list markers into `Ø`.
     #[test]
     fn a_picture_font_does_not_guess_at_its_high_codes() {
-        for base in [
-            "/JOGDGG+Wingdings",
-            "/Wingdings",
-            "/Symbol,Italic",
-            "/ZapfDingbats",
-            "/Webdings",
-        ] {
+        for base in ["/JOGDGG+Wingdings", "/Wingdings", "/Webdings"] {
             let f = font_from(
                 &format!(
                     "<< /Type /Font /Subtype /TrueType /BaseFont {base} \
@@ -1201,6 +1224,49 @@ mod tests {
             assert!(!f.winansi_high_codes, "{base} must not guess");
             assert_eq!(f.decode(0xD8), "\u{FFFD}", "{base}");
         }
+    }
+
+    /// Symbol and ZapfDingbats carry the built-in encodings of Annex D.5 and
+    /// D.6, so their codes read as the glyphs those tables name whether or
+    /// not a program is embedded, with `/Differences` still applied on top.
+    // Covers ISO 32000-1 Annex D.5, Annex D.6 and §9.6.6.4.
+    #[test]
+    fn symbol_and_zapf_dingbats_decode_through_their_built_in_encodings() {
+        let symbol = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>",
+            &[],
+            &[],
+        );
+        assert_eq!(symbol.decode(0o141), "\u{03B1}", "alpha");
+        assert_eq!(symbol.decode(0o127), "\u{2126}", "Omega");
+        assert_eq!(symbol.decode(0o240), "\u{20AC}", "Euro");
+        assert_eq!(symbol.decode(0o060), "0");
+        assert_eq!(symbol.decode(0o360), "\u{FFFD}", "unassigned");
+        assert!(!symbol.winansi_high_codes);
+
+        let embedded = font_from(
+            "<< /Type /Font /Subtype /TrueType /BaseFont /ABCDEF+Symbol,Italic \
+             /FontDescriptor 7 0 R /Encoding << /Differences [97 /beta] >> >>",
+            &[(6, &sfnt_program(&[(1, 0), (3, 0)]))],
+            &[(7, "<< /Type /FontDescriptor /Flags 4 /FontFile2 6 0 R >>")],
+        );
+        assert_eq!(embedded.decode(0o141), "\u{03B2}", "the difference wins");
+        assert_eq!(
+            embedded.decode(0o142),
+            "\u{03B2}",
+            "the table fills the rest"
+        );
+        assert_eq!(embedded.decode(0xD8), "\u{00AC}", "logicalnot, not a guess");
+
+        let dingbats = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>",
+            &[],
+            &[],
+        );
+        assert_eq!(dingbats.decode(0o041), "\u{2701}", "a1");
+        assert_eq!(dingbats.decode(0o315), "\u{278D}", "a153");
+        assert_eq!(dingbats.decode(0o200), "\u{FFFD}", "unassigned");
+        assert_eq!(dingbats.decode(0o040), " ");
     }
 
     /// The name check keys on the family, so a text face is not excluded just

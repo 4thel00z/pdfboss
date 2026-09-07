@@ -5,6 +5,7 @@
 
 mod afm;
 mod agl;
+mod symbol;
 pub use afm::{is_standard_14, standard_14_width};
 
 /// WinAnsiEncoding codes `0x80..=0x9F` (the region that differs from
@@ -495,6 +496,49 @@ pub fn standard_encoding_name(code: u8) -> Option<&'static str> {
             .map(|&(_, n)| n),
         _ => None,
     }
+}
+
+/// The glyph name Symbol's built-in encoding gives `code` (ISO 32000-1
+/// Annex D.5), `None` for an unassigned code.
+///
+/// Covers ISO 32000-1 Annex D.5.
+pub fn symbol_glyph_name(code: u8) -> Option<&'static str> {
+    let i = symbol::SYMBOL
+        .binary_search_by_key(&code, |&(c, _)| c)
+        .ok()?;
+    Some(symbol::SYMBOL[i].1)
+}
+
+/// The character Symbol's built-in encoding gives `code`: its glyph name
+/// through the Adobe Glyph List, so the six bracket and radical pieces
+/// resolve to their Corporate Use Subarea code points.
+///
+/// Covers ISO 32000-1 Annex D.5.
+pub fn symbol(code: u8) -> Option<char> {
+    glyph_to_unicode(symbol_glyph_name(code)?)
+}
+
+/// The glyph name ZapfDingbats' built-in encoding gives `code` (ISO 32000-1
+/// Annex D.6), `None` for an unassigned code.
+///
+/// Covers ISO 32000-1 Annex D.6.
+pub fn zapf_dingbats_glyph_name(code: u8) -> Option<&'static str> {
+    let i = symbol::ZAPF_DINGBATS
+        .binary_search_by_key(&code, |&(c, _, _)| c)
+        .ok()?;
+    Some(symbol::ZAPF_DINGBATS[i].1)
+}
+
+/// The character ZapfDingbats' built-in encoding gives `code`, from the
+/// Dingbats block; the glyph list does not name these, so the table carries
+/// the value itself.
+///
+/// Covers ISO 32000-1 Annex D.6.
+pub fn zapf_dingbats(code: u8) -> Option<char> {
+    let i = symbol::ZAPF_DINGBATS
+        .binary_search_by_key(&code, |&(c, _, _)| c)
+        .ok()?;
+    Some(symbol::ZAPF_DINGBATS[i].2)
 }
 
 /// Resolves a glyph name (as used in `/Differences`) to a Unicode scalar:
@@ -1000,6 +1044,77 @@ mod tests {
     /// `standard` maps to a char) must hold for every code; value agreement
     /// only where `glyph_to_unicode` also resolves the name (some names
     /// aren't in the bundled glyph-name subset).
+    // Covers ISO 32000-1 Annex D.2.
+    // Covers ISO 32000-1 Annex D.5.
+    #[test]
+    fn symbol_encoding_follows_annex_d5() {
+        // Greek letters sit on the Latin codes, the Euro at 0o240, the
+        // Hebrew aleph and fraktur letters in the 0o300 row, and the
+        // bracket pieces resolve to the Corporate Use Subarea.
+        assert_eq!(symbol_glyph_name(0o141), Some("alpha"));
+        assert_eq!(symbol(0o141), Some('\u{03B1}'));
+        // The glyph list maps Omega, Delta and mu to the ohm sign, the
+        // increment sign and the micro sign, as pdf.js reads them too.
+        assert_eq!(symbol(0o127), Some('\u{2126}'), "Omega");
+        assert_eq!(symbol(0o104), Some('\u{2206}'), "Delta");
+        assert_eq!(symbol(0o155), Some('\u{00B5}'), "mu");
+        assert_eq!(symbol(0o240), Some('\u{20AC}'), "Euro");
+        assert_eq!(symbol(0o300), Some('\u{2135}'), "aleph");
+        assert_eq!(symbol(0o301), Some('\u{2111}'), "Ifraktur");
+        assert_eq!(symbol(0o354), Some('\u{F8F1}'), "bracelefttp");
+        assert_eq!(symbol(0o040), Some(' '));
+        assert_eq!(symbol(0o060), Some('0'), "digits keep their ASCII places");
+        // Unassigned: everything below space, 0o177 to 0o237, 0o377, and
+        // 0o360, where Adobe's font keeps its apple but the annex lists
+        // nothing.
+        for code in [0o000, 0o037, 0o177, 0o200, 0o237, 0o360, 0o377] {
+            assert_eq!(symbol_glyph_name(code), None, "{code:o}");
+            assert_eq!(symbol(code), None, "{code:o}");
+        }
+        let assigned = (0..=255u8)
+            .filter(|c| symbol_glyph_name(*c).is_some())
+            .count();
+        assert_eq!(assigned, 189, "Annex D.5 assigns 189 codes");
+        for code in 0..=255u8 {
+            assert_eq!(
+                symbol(code).is_some(),
+                symbol_glyph_name(code).is_some(),
+                "every named code has a character: {code:o}"
+            );
+        }
+    }
+
+    // Covers ISO 32000-1 Annex D.6.
+    #[test]
+    fn zapf_dingbats_encoding_follows_annex_d6() {
+        assert_eq!(zapf_dingbats_glyph_name(0o041), Some("a1"));
+        assert_eq!(zapf_dingbats(0o041), Some('\u{2701}'));
+        assert_eq!(zapf_dingbats_glyph_name(0o043), Some("a202"));
+        assert_eq!(zapf_dingbats(0o043), Some('\u{2703}'));
+        assert_eq!(zapf_dingbats_glyph_name(0o315), Some("a153"));
+        assert_eq!(zapf_dingbats(0o315), Some('\u{278D}'));
+        assert_eq!(zapf_dingbats_glyph_name(0o376), Some("a191"));
+        assert_eq!(zapf_dingbats(0o376), Some('\u{27BE}'));
+        assert_eq!(zapf_dingbats(0o040), Some(' '));
+        for code in [0o000, 0o177, 0o200, 0o240, 0o360, 0o377] {
+            assert_eq!(zapf_dingbats_glyph_name(code), None, "{code:o}");
+            assert_eq!(zapf_dingbats(code), None, "{code:o}");
+        }
+        // Adobe's font also fills 0o200 to 0o215; the annex leaves them out.
+        assert_eq!(zapf_dingbats_glyph_name(0o200), None);
+        let assigned = (0..=255u8)
+            .filter(|c| zapf_dingbats_glyph_name(*c).is_some())
+            .count();
+        assert_eq!(assigned, 188, "Annex D.6 assigns space and 187 dingbats");
+        for code in 0..=255u8 {
+            assert_eq!(
+                zapf_dingbats(code).is_some(),
+                zapf_dingbats_glyph_name(code).is_some(),
+                "{code:o}"
+            );
+        }
+    }
+
     // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn standard_encoding_name_matches_standard_table() {
