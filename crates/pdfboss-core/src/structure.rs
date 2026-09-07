@@ -274,9 +274,21 @@ impl StandardType {
     }
 }
 
+/// One structure element on a placement's path: its standard type and the
+/// object holding it, so two neighbouring elements of one type are told
+/// apart.
+///
+/// Covers ISO 32000-1 §14.8.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructureElement {
+    pub standard_type: StandardType,
+    pub object: ObjRef,
+}
+
 /// Where one marked-content sequence sits in the tree: its rank in the
 /// tree's depth-first order, and the structure type of the element holding
-/// it, as written, after the root's `/RoleMap`, and as a standard type.
+/// it, as written, after the root's `/RoleMap`, and as a standard type,
+/// with the standard-typed elements above it.
 ///
 /// Covers ISO 32000-1 §14.7.3 and §14.8.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +301,10 @@ pub struct Placement {
     pub mapped_type: Option<String>,
     /// The standard type `mapped_type` names, `None` when it names none.
     pub standard_type: Option<StandardType>,
+    /// The element and its ancestors that have a standard type, the root's
+    /// child first and the element itself last; an ancestor of no standard
+    /// type is skipped, its children keeping their place.
+    pub path: Vec<StructureElement>,
 }
 
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
@@ -397,21 +413,32 @@ impl StructureTree {
             paths: FastMap::default(),
             parents: FastMap::default(),
         };
-        let mut keyed: Vec<(MarkedContentId, Vec<u32>, Option<String>)> = Vec::new();
+        let mut keyed: Vec<(MarkedContentId, Vec<u32>, Ancestry)> = Vec::new();
         let mut seen: FastSet<MarkedContentId> = FastSet::default();
         for id in ids {
             if !seen.insert(*id) {
                 continue;
             }
-            let Some((key, structure_type)) = walk.key_of(&parent_tree, *id).await else {
+            let Some((key, ancestry)) = walk.key_of(&parent_tree, *id).await else {
                 continue;
             };
-            keyed.push((*id, key, structure_type));
+            keyed.push((*id, key, ancestry));
         }
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
-        for (rank, (id, _, structure_type)) in keyed.into_iter().enumerate() {
+        for (rank, (id, _, ancestry)) in keyed.into_iter().enumerate() {
+            let structure_type = ancestry.last().and_then(|(_, s)| s.clone());
             let mapped_type = structure_type.as_deref().map(|s| self.mapped_type(s));
             let standard_type = mapped_type.as_deref().and_then(StandardType::from_name);
+            let path = ancestry
+                .iter()
+                .filter_map(|(object, s)| {
+                    let standard_type = StandardType::from_name(&self.mapped_type(s.as_deref()?))?;
+                    Some(StructureElement {
+                        standard_type,
+                        object: *object,
+                    })
+                })
+                .collect();
             placed.insert(
                 id,
                 Placement {
@@ -419,12 +446,17 @@ impl StructureTree {
                     structure_type,
                     mapped_type,
                     standard_type,
+                    path,
                 },
             );
         }
         placed
     }
 }
+
+/// An element and its ancestors up to the root, the root's child first and
+/// the element last, each with its `/S` as written.
+type Ancestry = Vec<(ObjRef, Option<String>)>;
 
 /// The `/RoleMap` dictionary as name-to-name pairs.
 ///
@@ -456,12 +488,12 @@ struct Walk<'a, S> {
 impl<S: AsyncObjectSource> Walk<'_, S> {
     /// The sort key of one marked-content sequence, its element's path from
     /// the root then its own index among the element's kids, with the
-    /// element's structure type (`/S`, §14.7.3).
+    /// element's ancestry and its structure types (`/S`, §14.7.3).
     async fn key_of(
         &mut self,
         parent_tree: &Dict,
         id: MarkedContentId,
-    ) -> Option<(Vec<u32>, Option<String>)> {
+    ) -> Option<(Vec<u32>, Ancestry)> {
         let elements = self.parent_array(parent_tree, id.parents).await?;
         let element = elements.get(id.mcid as usize)?.as_ref()?;
         let path = self.path_of(element).await?;
@@ -470,8 +502,34 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         let mut key = Vec::with_capacity(path.len() + 1);
         key.extend_from_slice(&path);
         key.push(index);
-        let structure_type = dict.get_name("S").map(|n| n.0.clone());
-        Some((key, structure_type))
+        Some((key, self.ancestry(element).await))
+    }
+
+    /// The element and its ancestors up to the root, the root's child first
+    /// and the element itself last, each with its `/S`: what a placement's
+    /// structure type and path are read from. The climb stops at the root,
+    /// at a missing `/P`, or after [`MAX_ELEMENT_DEPTH`] elements; the
+    /// dictionaries are the ones [`Walk::path_of`] already read.
+    ///
+    /// Covers ISO 32000-1 §14.7.3 and §14.8.4.3.
+    async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
+        let mut chain: Ancestry = Vec::new();
+        let mut current = element;
+        for _ in 0..MAX_ELEMENT_DEPTH {
+            let Some(dict) = self.dict(current).await else {
+                break;
+            };
+            chain.push((current, dict.get_name("S").map(|n| n.0.clone())));
+            let Some(parent) = dict.get("P").and_then(Object::as_ref) else {
+                break;
+            };
+            if self.is_root(parent).await {
+                break;
+            }
+            current = parent;
+        }
+        chain.reverse();
+        chain
     }
 
     /// The parent tree's entry for a `/StructParents` key: the array whose
@@ -811,6 +869,99 @@ mod tests {
         assert_eq!(placed[&id(0, 0)].structure_type, None);
         assert_eq!(placed[&id(0, 0)].mapped_type, None);
         assert_eq!(placed[&id(0, 0)].standard_type, None);
+    }
+
+    // Covers ISO 32000-1 §14.7.3 and §14.8.4.3.
+    #[test]
+    fn placements_carry_the_standard_typed_ancestry() {
+        // Document > Sect > H holds id 0; Document > L > LI > Lbl holds 1
+        // and > LBody > P holds 2; a Sidebar element of no standard type
+        // holds a P with id 3.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 15 0 R 20 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [14 0 R 17 0 R 19 0 R 21 0 R]] >>"),
+                (13, "<< /Type /StructElem /S /Sect /P 11 0 R /K [14 0 R] >>"),
+                (
+                    14,
+                    "<< /Type /StructElem /S /H /P 13 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (15, "<< /Type /StructElem /S /L /P 11 0 R /K [16 0 R] >>"),
+                (
+                    16,
+                    "<< /Type /StructElem /S /LI /P 15 0 R /K [17 0 R 18 0 R] >>",
+                ),
+                (
+                    17,
+                    "<< /Type /StructElem /S /Lbl /P 16 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    18,
+                    "<< /Type /StructElem /S /LBody /P 16 0 R /K [19 0 R] >>",
+                ),
+                (
+                    19,
+                    "<< /Type /StructElem /S /P /P 18 0 R /Pg 3 0 R /K [2] >>",
+                ),
+                (
+                    20,
+                    "<< /Type /StructElem /S /Sidebar /P 11 0 R /K [21 0 R] >>",
+                ),
+                (
+                    21,
+                    "<< /Type /StructElem /S /P /P 20 0 R /Pg 3 0 R /K [3] >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1), id(0, 2), id(0, 3)]);
+        let kinds = |n: u32| -> Vec<StandardType> {
+            placed[&id(0, n)]
+                .path
+                .iter()
+                .map(|e| e.standard_type)
+                .collect()
+        };
+        let objects = |n: u32| -> Vec<u32> {
+            placed[&id(0, n)]
+                .path
+                .iter()
+                .map(|e| e.object.num)
+                .collect()
+        };
+        assert_eq!(
+            kinds(0),
+            [StandardType::Document, StandardType::Sect, StandardType::H]
+        );
+        assert_eq!(objects(0), [11, 13, 14]);
+        assert_eq!(
+            kinds(1),
+            [
+                StandardType::Document,
+                StandardType::L,
+                StandardType::LI,
+                StandardType::Lbl
+            ]
+        );
+        assert_eq!(
+            kinds(2),
+            [
+                StandardType::Document,
+                StandardType::L,
+                StandardType::LI,
+                StandardType::LBody,
+                StandardType::P
+            ]
+        );
+        assert_eq!(kinds(3), [StandardType::Document, StandardType::P]);
+        assert_eq!(objects(3), [11, 21]);
     }
 
     // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and

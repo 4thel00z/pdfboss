@@ -59,4 +59,6 @@ pub use source::{
     block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
     ObjectSource, MAX_RESOLVE_DEPTH,
 };
-pub use structure::{MarkedContentId, Placement, StandardKind, StandardType, StructureTree};
+pub use structure::{
+    MarkedContentId, Placement, StandardKind, StandardType, StructureElement, StructureTree,
+};

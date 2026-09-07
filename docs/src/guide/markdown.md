@@ -21,6 +21,13 @@ The analysis infers:
   right. The `reading_order` keyword (CLI `--reading-order`) selects content order,
   the structure tree of a tagged PDF, or geometric position; see
   [Reading order](./text.md#reading-order).
+- **Tagged PDFs**: under structure-tree reading order the tags decide the
+  blocks on every page the tree reaches (ISO 32000-1 14.8.4.3): H1 to H6 are
+  headings at that level, H a heading as deep as its Part, Art and Sect
+  elements nest, L a list with one item per LI and the Lbl text as the
+  marker, Table a table with a row per TR and a cell per TH or TD, and every
+  other block-level element a paragraph. Column and row spans are not read,
+  and content the tree does not reach still goes through the heuristics below.
 - **Page headers, footers and page numbers**: a page's first or last line,
   repeated near-verbatim at the same height on at least half the pages (three at
   minimum), is tagged

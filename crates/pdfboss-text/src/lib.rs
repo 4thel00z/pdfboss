@@ -11,7 +11,9 @@ use pdfboss_core::{
 };
 
 pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
-pub use pdfboss_core::{MarkedContentId, Point, Rect};
+pub use pdfboss_core::{
+    MarkedContentId, Point, Rect, StandardKind, StandardType, StructureElement,
+};
 
 /// The order a page's text is read in. Every extraction entry point takes
 /// one; [`ReadingOrder::Content`] is the default.
@@ -114,6 +116,21 @@ pub struct Artifact {
     pub subtype: Option<String>,
 }
 
+/// Where a span's marked-content sequence sits in the document's structure
+/// tree (ISO 32000-1 §14.7): the standard type of the element holding it
+/// and the standard-typed elements from the root down to it.
+///
+/// Covers ISO 32000-1 §14.8.4.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Structure {
+    /// The holding element's type after the role map, when it is one of the
+    /// standard types.
+    pub standard_type: Option<StandardType>,
+    /// The standard-typed elements enclosing the sequence, the outermost
+    /// first and the holding element itself last when it is standard.
+    pub path: Vec<StructureElement>,
+}
+
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
@@ -180,6 +197,12 @@ pub struct TextSpan {
     /// inside (ISO 32000-1 §14.8.2.2): a running head, a page number, a
     /// footnote rule. `None` for real content.
     pub artifact: Option<Artifact>,
+    /// The span's place in the structure tree under
+    /// [`ReadingOrder::StructureTree`]: the element holding its
+    /// marked-content sequence and the standard-typed elements above it
+    /// (ISO 32000-1 §14.8.4). `None` under the other orders, and for
+    /// content the tree does not reach.
+    pub structure: Option<Structure>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -1615,6 +1638,42 @@ mod tests {
         let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
         assert_eq!(spans, ["L1", "L2", "R1", "R2"]);
         assert_eq!(order, ReadingOrder::StructureTree);
+    }
+
+    // Covers ISO 32000-1 §14.8.4.3.
+    #[test]
+    fn structure_tree_order_attaches_each_span_s_standard_typed_ancestry() {
+        // The left paragraph retagged as a heading: L1 and L2 sit in an H1,
+        // R1 and R2 in a P, both under the Document element.
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /H1 /P 11 0 R /Pg 3 0 R /K [0 2] >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, report) =
+            extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(report.order, ReadingOrder::StructureTree);
+        assert_eq!(texts(&spans), ["L1", "L2", "R1", "R2"]);
+        let kinds = |span: &TextSpan| -> Vec<StandardType> {
+            span.structure
+                .as_ref()
+                .unwrap()
+                .path
+                .iter()
+                .map(|e| e.standard_type)
+                .collect()
+        };
+        assert_eq!(
+            spans[0].structure.as_ref().unwrap().standard_type,
+            Some(StandardType::H1)
+        );
+        assert_eq!(kinds(&spans[0]), [StandardType::Document, StandardType::H1]);
+        assert_eq!(kinds(&spans[1]), [StandardType::Document, StandardType::H1]);
+        assert_eq!(kinds(&spans[2]), [StandardType::Document, StandardType::P]);
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans.iter().all(|span| span.structure.is_none()));
     }
 
     #[test]

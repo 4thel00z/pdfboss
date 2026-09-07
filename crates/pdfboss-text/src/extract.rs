@@ -2,7 +2,7 @@
 //! Ts), glyph advances, and form XObject recursion.
 
 use crate::font::Font;
-use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, TextSpan};
+use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, Structure, TextSpan};
 use pdfboss_core::content::{ContentOps, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, MarkedContentId,
@@ -379,10 +379,12 @@ impl MarkedContent for Recorded {
 /// the tree, an untagged one keeps its place after the last tagged span
 /// before it (a running header written first stays first, an artifact
 /// written between two paragraphs stays between them). Stable, so spans
-/// within one sequence keep content order. `false` when the tree reaches
-/// none of the page's marked content, leaving the spans as they were.
+/// within one sequence keep content order. Every span the tree reaches
+/// also takes its element's standard type and standard-typed ancestry as
+/// `structure`. `false` when the tree reaches none of the page's marked
+/// content, leaving the spans as they were.
 ///
-/// Covers ISO 32000-1 §14.8.2.3.
+/// Covers ISO 32000-1 §14.8.2.3 and §14.8.4.3.
 async fn structure_order<S: AsyncObjectSource>(
     src: &S,
     tree: &StructureTree,
@@ -394,15 +396,19 @@ async fn structure_order<S: AsyncObjectSource>(
     if ids.is_empty() {
         return false;
     }
-    let ranks = tree.ranks_with(src, page, &ids).await;
-    if ranks.is_empty() {
+    let placed = tree.place_with(src, page, &ids).await;
+    if placed.is_empty() {
         return false;
     }
     let mut keyed: Vec<(i64, TextSpan)> = Vec::with_capacity(spans.len());
     let mut current: i64 = -1;
-    for (span, mark) in spans.drain(..).zip(marks) {
-        if let Some(rank) = mark.and_then(|id| ranks.get(&id)) {
-            current = i64::from(*rank);
+    for (mut span, mark) in spans.drain(..).zip(marks) {
+        if let Some(placement) = mark.and_then(|id| placed.get(&id)) {
+            current = i64::from(placement.rank);
+            span.structure = Some(Structure {
+                standard_type: placement.standard_type,
+                path: placement.path.clone(),
+            });
         }
         keyed.push((current, span));
     }
@@ -1533,6 +1539,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             underline: false,
             strikethrough: false,
             artifact: None,
+            structure: None,
         })
     }
 

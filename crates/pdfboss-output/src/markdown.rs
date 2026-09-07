@@ -67,7 +67,10 @@ fn paragraph(lines: &[Line]) -> String {
 /// Canonical bullets and numbers: `- ` regardless of the source glyph, and
 /// `{n}. ` preserving the detected number. The first line loses its matched
 /// marker prefix; continuation lines render on their own line, unprefixed —
-/// the soft wrap the source layout already shows.
+/// the soft wrap the source layout already shows. A first line that was
+/// nothing but the marker (a tagged item's label on a line of its own)
+/// leaves nothing to open the item with, so the item opens on the line
+/// after it.
 fn list(items: &[ListItem]) -> String {
     items
         .iter()
@@ -84,10 +87,17 @@ fn list_item(item: &ListItem) -> String {
     let Some((first, rest)) = item.lines.split_first() else {
         return String::new();
     };
-    let head = Line {
+    let mut head = Line {
         inlines: strip_marker(first, item.marker_len),
         ..first.clone()
     };
+    let mut rest = rest;
+    if line_text(&head).trim().is_empty() {
+        if let Some((next, after)) = rest.split_first() {
+            head = next.clone();
+            rest = after;
+        }
+    }
     let mut out = format!("{prefix}{}", emphasized(&head));
     for line in rest {
         out.push('\n');
