@@ -2,7 +2,7 @@
 //! Ts), glyph advances, and form XObject recursion.
 
 use crate::font::Font;
-use crate::{ReadingOrder, Ruling, TextSpan};
+use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, TextSpan};
 use pdfboss_core::content::{ContentOps, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, MarkedContentId,
@@ -695,6 +695,8 @@ struct Mark {
     hidden: bool,
     mcid: Option<u32>,
     actual: Option<ActualText>,
+    /// The sequence's artifact class when its tag is `/Artifact`.
+    artifact: Option<Artifact>,
 }
 
 /// A sequence's `/ActualText` (ISO 32000-1 §14.9.4): the text that stands
@@ -1100,10 +1102,16 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                                     text,
                                     emitted: None,
                                 });
+                        let artifact = if tag.0 == "Artifact" {
+                            Some(self.marked_artifact(props, &frame.chain).await)
+                        } else {
+                            None
+                        };
                         frame.marks.push(Mark {
                             hidden,
                             mcid,
                             actual,
+                            artifact,
                         });
                     }
                     op => self.step(&mut frame, op),
@@ -1246,10 +1254,16 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             Op::EndPath => frame.subpaths.clear(),
             // Marked content: every open is pushed (hidden or not) so `EMC`
             // stays balanced; `BDC` needs I/O and is handled in `run`.
-            Op::BeginMarkedContent(_) => frame.marks.push(Mark {
+            // A bare `/Artifact BMC` is a generic artifact (ISO 32000-1
+            // §14.8.2.2); every other tag opens plain real content.
+            Op::BeginMarkedContent(tag) => frame.marks.push(Mark {
                 hidden: false,
                 mcid: None,
                 actual: None,
+                artifact: (tag.0 == "Artifact").then_some(Artifact {
+                    kind: ArtifactKind::Unspecified,
+                    subtype: None,
+                }),
             }),
             Op::EndMarkedContent => {
                 frame.marks.pop();
@@ -1347,6 +1361,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         if suppressed {
             return;
         }
+        span.artifact = frame.marks.iter().rev().find_map(|m| m.artifact.clone());
         let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
             self.spans.push(span);
             self.marks.record(frame);
@@ -1370,6 +1385,45 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     }
                 }
             }
+        }
+    }
+
+    /// The artifact an `/Artifact BDC` describes: its property list's
+    /// `/Type` (Table 330) and `/Subtype`, from an inline dictionary or the
+    /// named one in the resource chain's `/Properties`; a list that is not a
+    /// dictionary makes a generic artifact.
+    ///
+    /// Covers ISO 32000-1 §14.8.2.2.
+    async fn marked_artifact(&mut self, props: &Object, chain: &[Arc<Dict>]) -> Artifact {
+        let generic = Artifact {
+            kind: ArtifactKind::Unspecified,
+            subtype: None,
+        };
+        let named;
+        let dict = match props {
+            Object::Dict(dict) => dict,
+            Object::Name(name) => match self.find_res(chain, "Properties", &name.0).await {
+                Some(found) => {
+                    named = found;
+                    match named.as_dict() {
+                        Some(dict) => dict,
+                        None => return generic,
+                    }
+                }
+                None => return generic,
+            },
+            _ => return generic,
+        };
+        let kind = match dict.get_name("Type").map(|n| n.0.as_str()) {
+            Some("Pagination") => ArtifactKind::Pagination,
+            Some("Layout") => ArtifactKind::Layout,
+            Some("Page") => ArtifactKind::Page,
+            Some("Background") => ArtifactKind::Background,
+            _ => ArtifactKind::Unspecified,
+        };
+        Artifact {
+            kind,
+            subtype: dict.get_name("Subtype").map(|n| n.0.clone()),
         }
     }
 
@@ -1478,6 +1532,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             color: gs.fill_color,
             underline: false,
             strikethrough: false,
+            artifact: None,
         })
     }
 

@@ -83,6 +83,37 @@ fn structure_for(doc: &Document, order: ReadingOrder) -> Option<StructureTree> {
     }
 }
 
+/// The class of an artifact marked-content sequence (ISO 32000-1 Table
+/// 330, `/Type`): what a producer says a piece of content is there for.
+///
+/// Covers ISO 32000-1 §14.8.2.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    /// Running heads, folios, watermarks: `/Pagination`.
+    Pagination,
+    /// Cosmetic typography such as footnote rules: `/Layout`.
+    Layout,
+    /// Production aids such as cut marks and colour bars: `/Page`.
+    Page,
+    /// A background under the real content: `/Background`.
+    Background,
+    /// An `/Artifact` sequence without a `/Type`, or with one outside the
+    /// table.
+    Unspecified,
+}
+
+/// An `/Artifact` marked-content sequence a span was shown inside: content
+/// the producer marked as not part of the author's text.
+///
+/// Covers ISO 32000-1 §14.8.2.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub kind: ArtifactKind,
+    /// `/Subtype` of a pagination artifact: `Header`, `Footer`, `Watermark`
+    /// or a producer's own name.
+    pub subtype: Option<String>,
+}
+
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
@@ -145,6 +176,10 @@ pub struct TextSpan {
     /// A drawn ruling crosses the span's x-height band — geometry-read,
     /// like `underline`.
     pub strikethrough: bool,
+    /// The innermost `/Artifact` marked-content sequence the span was shown
+    /// inside (ISO 32000-1 §14.8.2.2): a running head, a page number, a
+    /// footnote rule. `None` for real content.
+    pub artifact: Option<Artifact>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -873,6 +908,53 @@ mod tests {
              /Encoding /WinAnsiEncoding >>",
         );
         Document::load(b.build(1)).unwrap()
+    }
+
+    /// A span inside an `/Artifact` sequence carries the sequence's class
+    /// and subtype; a generic `BMC` artifact has neither; real content has
+    /// no artifact at all.
+    // Covers ISO 32000-1 §14.8.2.2.
+    #[test]
+    fn artifact_marks_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 10 Tf 72 770 Td /Artifact << /Type /Pagination /Subtype /Header >> BDC \
+              (ACME) Tj EMC /Artifact BMC (rule) Tj EMC /Artifact /Bg BDC (wm) Tj EMC \
+              0 -50 Td (body) Tj ET",
+            "/Bg << /Type /Background >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let got: Vec<(&str, Option<&Artifact>)> = spans
+            .iter()
+            .map(|s| (s.text.as_str(), s.artifact.as_ref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "ACME",
+                    Some(&Artifact {
+                        kind: ArtifactKind::Pagination,
+                        subtype: Some("Header".to_string()),
+                    })
+                ),
+                (
+                    "rule",
+                    Some(&Artifact {
+                        kind: ArtifactKind::Unspecified,
+                        subtype: None,
+                    })
+                ),
+                (
+                    "wm",
+                    Some(&Artifact {
+                        kind: ArtifactKind::Background,
+                        subtype: None,
+                    })
+                ),
+                ("body", None),
+            ]
+        );
     }
 
     /// The clause's own example: a hyphenated German word whose shown

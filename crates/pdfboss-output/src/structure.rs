@@ -3,7 +3,7 @@
 
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
-use pdfboss_text::{ReadingOrder, Ruling, TextSpan};
+use pdfboss_text::{ArtifactKind, ReadingOrder, Ruling, TextSpan};
 
 /// Fraction of the device font size a horizontal gap must exceed to read
 /// as a word break. The ceiling is justified LaTeX's shrunk inter-word
@@ -406,10 +406,84 @@ fn page_layout_with_stats(
 ) -> PageLayout {
     let grids = ruled_grids(rulings);
     let mut blocks = Vec::new();
-    for segment in segments(spans, order) {
+    // Content the producer marked as pagination artifacts (running heads,
+    // folios, watermarks) is laid out apart from the real content, so it
+    // can take the page header and footer roles without joining a paragraph.
+    let pagination: Vec<TextSpan> = spans.iter().filter(|s| is_pagination(s)).cloned().collect();
+    let body: Vec<TextSpan>;
+    let content: &[TextSpan] = if pagination.is_empty() {
+        spans
+    } else {
+        body = spans
+            .iter()
+            .filter(|s| !is_pagination(s))
+            .cloned()
+            .collect();
+        &body
+    };
+    for segment in segments(content, order) {
         push_segment_blocks(segment, &grids, stats, order, &mut blocks);
     }
+    if !pagination.is_empty() {
+        attach_pagination_artifacts(spans, &pagination, order, &mut blocks);
+    }
     PageLayout { blocks }
+}
+
+/// Whether a span sits inside an `/Artifact` sequence of type `Pagination`.
+fn is_pagination(span: &TextSpan) -> bool {
+    span.artifact
+        .as_ref()
+        .is_some_and(|a| a.kind == ArtifactKind::Pagination)
+}
+
+/// Pagination artifacts take the page header and footer roles on the
+/// producer's word, without the repetition across pages the heuristic needs:
+/// their lines above the midline of the page's text lead the page as
+/// `PageHeader`, the rest close it as `PageFooter`.
+///
+/// Covers ISO 32000-1 §14.8.2.2.
+fn attach_pagination_artifacts(
+    all: &[TextSpan],
+    pagination: &[TextSpan],
+    order: ReadingOrder,
+    blocks: &mut Vec<Block>,
+) {
+    let (lo, hi) = all
+        .iter()
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), s| {
+            (lo.min(s.y), hi.max(s.y))
+        });
+    let mid = (lo + hi) / 2.0;
+    let mut head = Vec::new();
+    let mut foot = Vec::new();
+    for segment in segments(pagination, order) {
+        for group in segment.into_groups() {
+            let line = assembled(&group).line;
+            if line.y > mid {
+                head.push(line);
+            } else {
+                foot.push(line);
+            }
+        }
+    }
+    if !head.is_empty() {
+        blocks.insert(
+            0,
+            Block::Paragraph {
+                bbox: bbox(&head),
+                lines: head,
+                role: Role::PageHeader,
+            },
+        );
+    }
+    if !foot.is_empty() {
+        blocks.push(Block::Paragraph {
+            bbox: bbox(&foot),
+            lines: foot,
+            role: Role::PageFooter,
+        });
+    }
 }
 
 /// One segment's blocks. A segment no grid claims — every segment, when the

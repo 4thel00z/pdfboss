@@ -168,6 +168,19 @@ class Span:
         """Fill color as RGB in ``[0, 1]``; ``None`` for pattern fills,
         which have no single color."""
 
+    @property
+    def artifact(self) -> str | None:
+        """The class of the ``/Artifact`` marked-content sequence the span
+        was shown inside (ISO 32000-1 14.8.2.2): ``"Pagination"``,
+        ``"Layout"``, ``"Page"``, ``"Background"``, or ``"Artifact"`` for one
+        without a type; ``None`` for real content."""
+
+    @property
+    def artifact_subtype(self) -> str | None:
+        """The ``/Subtype`` of a pagination artifact: ``"Header"``,
+        ``"Footer"``, ``"Watermark"`` or a producer's own name; ``None``
+        otherwise."""
+
 class SpanIter:
     """Lazy sync iterator over a document's styled spans; buffers one
     page's spans at a time, extracting each page with the GIL released."""

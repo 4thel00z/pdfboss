@@ -1089,6 +1089,28 @@ impl Span {
         self.inner.color
     }
 
+    /// The class of the /Artifact sequence the span was shown inside, as
+    /// the producer named it: "Pagination", "Layout", "Page", "Background",
+    /// or "Artifact" for one without a type; None for real content.
+    #[getter]
+    fn artifact(&self) -> Option<&'static str> {
+        use pdfboss_text::ArtifactKind;
+        Some(match self.inner.artifact.as_ref()?.kind {
+            ArtifactKind::Pagination => "Pagination",
+            ArtifactKind::Layout => "Layout",
+            ArtifactKind::Page => "Page",
+            ArtifactKind::Background => "Background",
+            ArtifactKind::Unspecified => "Artifact",
+        })
+    }
+
+    /// The /Subtype of a pagination artifact ("Header", "Footer",
+    /// "Watermark" or a producer's own name); None otherwise.
+    #[getter]
+    fn artifact_subtype(&self) -> Option<String> {
+        self.inner.artifact.as_ref()?.subtype.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Span(page={}, text={:?}, font_name={:?})",
