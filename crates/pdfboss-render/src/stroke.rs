@@ -43,7 +43,7 @@ pub(crate) enum LineCap {
 
 impl LineCap {
     /// The style a `J` operand or `/LC` value names; a code outside the
-    /// table leaves the initial butt cap.
+    /// table sets the initial style, butt.
     pub(crate) fn from_code(code: i32) -> LineCap {
         match code {
             1 => LineCap::Round,
@@ -66,7 +66,7 @@ pub(crate) enum LineJoin {
 
 impl LineJoin {
     /// The style a `j` operand or `/LJ` value names; a code outside the
-    /// table leaves the initial miter join.
+    /// table sets the initial style, miter.
     pub(crate) fn from_code(code: i32) -> LineJoin {
         match code {
             1 => LineJoin::Round,
@@ -406,15 +406,18 @@ fn join(p: Point, v: Point, q: Point, pen: Pen, style: StrokeStyle) -> Option<Su
     if turn.abs() <= 1e-6 {
         return None;
     }
-    // Each band's outer edge is the one the other segment points away from.
+    // Each band's outer edge is the one on the far side of the turn. The
+    // side is read from the offset's cross product with its own segment,
+    // because under an anisotropic pen the offset is far from
+    // perpendicular and its angle to the other segment says nothing.
     let o1 = offset(p, v, pen)?;
-    let o1 = if o1.x * d2.x + o1.y * d2.y > 0.0 {
+    let o1 = if (d1.x * o1.y - d1.y * o1.x) * turn > 0.0 {
         scale(o1, -1.0)
     } else {
         o1
     };
     let o2 = offset(v, q, pen)?;
-    let o2 = if o2.x * d1.x + o2.y * d1.y < 0.0 {
+    let o2 = if (d2.x * o2.y - d2.y * o2.x) * turn > 0.0 {
         scale(o2, -1.0)
     } else {
         o2
@@ -766,6 +769,38 @@ mod tests {
         let pix = corner(LineJoin::Round, 10.0, flipped);
         assert_eq!(alpha_at(&pix, 1, 10), 255, "disc covers the notch");
         assert_eq!(alpha_at(&pix, 2, 9), 255, "no hole under the disc");
+    }
+
+    /// Under an anisotropic pen the offsets are far from perpendicular to
+    /// a diagonal segment, so the outer edge of each band must be chosen
+    /// by which side of the turn it lies on, not by its angle to the other
+    /// segment. Picking one band's inner edge sends the miter tip far down
+    /// the path as a sliver past the end of this nearly straight polyline.
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn joins_pick_the_outer_side_under_a_skewed_pen() {
+        let skewed = Matrix {
+            a: 2.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.5,
+            e: 0.0,
+            f: 0.0,
+        };
+        let mut pix = Pixmap::new(40, 40);
+        let polys = stroke_path(
+            &[line(&[(4.0, 4.0), (20.0, 20.0), (28.0, 27.0)])],
+            solid(4.0),
+            skewed,
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        assert_eq!(alpha_at(&pix, 12, 12), 255, "band");
+        // The wrong edge sends the tip behind the start or past the end,
+        // depending on the turn; butt caps leave both empty.
+        assert_eq!(alpha_at(&pix, 1, 1), 0, "no sliver behind the start");
+        assert_eq!(alpha_at(&pix, 36, 35), 0, "no sliver past the end");
     }
 
     /// A V of width 4 whose arms meet at (7, 12) at a miter ratio of
