@@ -37,6 +37,10 @@ pub(crate) struct PathBuilder {
     /// curve-heavy path (e.g. a glyph outline) does not allocate a fresh
     /// vector for every Bezier segment.
     scratch: Vec<Point>,
+    /// Whether a segment operator has reached the current subpath. A
+    /// single remaining point is then coincident points, a degenerate
+    /// subpath the stroker paints as a dot, rather than a lone move.
+    segment_drawn: bool,
 }
 
 impl PathBuilder {
@@ -49,6 +53,7 @@ impl PathBuilder {
             start_user: Point::new(0.0, 0.0),
             last_user: Point::new(0.0, 0.0),
             scratch: Vec::new(),
+            segment_drawn: false,
         }
     }
 
@@ -63,13 +68,19 @@ impl PathBuilder {
         }
     }
 
+    /// Ends the current subpath. A single point survives when the subpath
+    /// was closed or a segment reached it: that is a degenerate subpath,
+    /// which stroking paints as a dot under round caps (ISO 32000-1
+    /// §8.5.3.2). A lone move is discarded.
     fn flush(&mut self, closed: bool) {
-        if self.current.len() >= 2 {
+        let degenerate = self.current.len() == 1 && (closed || self.segment_drawn);
+        if self.current.len() >= 2 || degenerate {
             let points = std::mem::take(&mut self.current);
             self.done.push(Subpath { points, closed });
         } else {
             self.current.clear();
         }
+        self.segment_drawn = false;
     }
 
     /// Starts an open subpath if none is in progress, anchored at the
@@ -96,6 +107,7 @@ impl PathBuilder {
     /// Appends a straight segment to `(x, y)`.
     pub(crate) fn line_to(&mut self, x: f32, y: f32) {
         self.ensure_started();
+        self.segment_drawn = true;
         self.last_user = Point::new(x, y);
         let p = self.ctm.apply(self.last_user);
         self.push_device(p);
@@ -107,6 +119,7 @@ impl PathBuilder {
     /// Covers ISO 32000-1 §8.5.2.2.
     pub(crate) fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x3: f32, y3: f32) {
         self.ensure_started();
+        self.segment_drawn = true;
         let p0 = self.ctm.apply(self.last_user);
         let p1 = self.ctm.apply(Point::new(x1, y1));
         let p2 = self.ctm.apply(Point::new(x2, y2));
@@ -161,13 +174,7 @@ impl PathBuilder {
     /// the accumulated geometry moves out instead of being cloned (every
     /// caller discards the builder immediately after `finish`).
     pub(crate) fn finish(mut self) -> Vec<Subpath> {
-        if self.current.len() >= 2 {
-            let points = std::mem::take(&mut self.current);
-            self.done.push(Subpath {
-                points,
-                closed: false,
-            });
-        }
+        self.flush(false);
         self.done
     }
 }
@@ -328,6 +335,25 @@ mod tests {
         assert!(subs[0].closed);
         assert_eq!(subs[1].points[0], Point::new(5.0, 5.0));
         assert!(!subs[1].closed);
+    }
+
+    // Covers ISO 32000-1 §8.5.3.2.
+    #[test]
+    fn degenerate_subpaths_are_kept_for_the_stroker() {
+        let mut b = PathBuilder::new(Matrix::identity());
+        // Two coincident points, a closed single point, and a trailing
+        // move alone, which is not a subpath at all.
+        b.move_to(5.0, 5.0);
+        b.line_to(5.0, 5.0);
+        b.move_to(8.0, 8.0);
+        b.close();
+        b.move_to(9.0, 9.0);
+        let subs = b.finish();
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(subs[0].points, vec![Point::new(5.0, 5.0)]);
+        assert!(!subs[0].closed);
+        assert_eq!(subs[1].points, vec![Point::new(8.0, 8.0)]);
+        assert!(subs[1].closed);
     }
 
     // Covers ISO 32000-1 §8.5.2.2.

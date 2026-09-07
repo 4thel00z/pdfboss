@@ -1,5 +1,6 @@
-//! Stroking: flattened segments expanded to offset quads with approximated
-//! round joins/caps, and dash patterns applied at the flatten level.
+//! Stroking: flattened segments expanded to offset quads, with the line
+//! cap and join styles added at run ends and vertices, and dash patterns
+//! applied at the flatten level.
 //!
 //! The pen is a circle in *user* space (ISO 32000-1 §8.4.3.2), so in device
 //! space it is that circle carried through the current transformation — an
@@ -24,9 +25,107 @@ const FAN_SEGMENTS: usize = 12;
 /// Upper bound on dash pieces produced per path, guarding pathological
 /// patterns (e.g. many near-zero entries).
 const MAX_DASH_PIECES: usize = 65_536;
+/// Device distance below which consecutive points count as one: a
+/// flattened curve or a dash cut on a vertex leaves such pairs, and they
+/// have no direction to cap or join.
+const MIN_SEGMENT: f32 = 1e-2;
+
+/// Line cap style: the `J` operator and `/LC` (Table 54).
+///
+/// Covers ISO 32000-1 §8.4.3.3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum LineCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+impl LineCap {
+    /// The style a `J` operand or `/LC` value names; a code outside the
+    /// table sets the initial style, butt.
+    pub(crate) fn from_code(code: i32) -> LineCap {
+        match code {
+            1 => LineCap::Round,
+            2 => LineCap::Square,
+            _ => LineCap::Butt,
+        }
+    }
+}
+
+/// Line join style: the `j` operator and `/LJ` (Table 55).
+///
+/// Covers ISO 32000-1 §8.4.3.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum LineJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+impl LineJoin {
+    /// The style a `j` operand or `/LJ` value names; a code outside the
+    /// table sets the initial style, miter.
+    pub(crate) fn from_code(code: i32) -> LineJoin {
+        match code {
+            1 => LineJoin::Round,
+            2 => LineJoin::Bevel,
+            _ => LineJoin::Miter,
+        }
+    }
+}
+
+/// The stroking parameters of the graphics state, all user-space
+/// quantities (Table 52).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StrokeStyle {
+    /// The `/LineWidth`; the pen radius is half of it.
+    pub(crate) width: f32,
+    pub(crate) cap: LineCap,
+    pub(crate) join: LineJoin,
+    /// The ratio of miter length to line width above which a miter join
+    /// is cut to a bevel; 1 or more.
+    ///
+    /// Covers ISO 32000-1 §8.4.3.5.
+    pub(crate) miter_limit: f32,
+}
 
 fn lerp(a: Point, b: Point, t: f32) -> Point {
     Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t)
+}
+
+fn add(a: Point, b: Point) -> Point {
+    Point::new(a.x + b.x, a.y + b.y)
+}
+
+fn sub(a: Point, b: Point) -> Point {
+    Point::new(a.x - b.x, a.y - b.y)
+}
+
+fn scale(v: Point, k: f32) -> Point {
+    Point::new(v.x * k, v.y * k)
+}
+
+/// `v` at unit length, or `None` when it has no usable length.
+fn unit(v: Point) -> Option<Point> {
+    let len = v.x.hypot(v.y);
+    (len > 1e-6 && len.is_finite()).then(|| scale(v, 1.0 / len))
+}
+
+/// `points` with each run of points closer than [`MIN_SEGMENT`] collapsed
+/// into its first.
+fn distinct(points: &[Point]) -> Vec<Point> {
+    let mut out: Vec<Point> = Vec::with_capacity(points.len());
+    for &p in points {
+        let dup = out
+            .last()
+            .is_some_and(|last| (p.x - last.x).hypot(p.y - last.y) <= MIN_SEGMENT);
+        if !dup {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// The linear part of `m` applied to a vector — a direction or offset,
@@ -35,13 +134,23 @@ fn linear(m: Matrix, v: Point) -> Point {
     Point::new(m.a * v.x + m.c * v.y, m.b * v.x + m.d * v.y)
 }
 
-/// Splits a polyline of device-space points into its painted ("on") runs
-/// according to a dash pattern. The pattern and phase are user-space
-/// quantities (ISO 32000-1 §8.4.3.6), so each segment is measured through
-/// `inv`, the device-to-user matrix; the cut positions themselves are
-/// fractions along the segment, which a linear map preserves. An empty or
-/// degenerate pattern yields the whole polyline.
-fn dash_split(points: &[Point], dash: &[f32], phase: f32, inv: Matrix) -> Vec<Vec<Point>> {
+/// One painted run of a polyline, with the device direction of the
+/// segment it starts on. A run of one point, which a zero-length dash
+/// produces, has no direction of its own and takes its caps from that
+/// segment.
+struct Run {
+    points: Vec<Point>,
+    along: Point,
+}
+
+/// Splits a polyline of at least two device-space points into its painted
+/// ("on") runs according to a dash pattern. The pattern and phase are
+/// user-space quantities (ISO 32000-1 §8.4.3.6), so each segment is
+/// measured through `inv`, the device-to-user matrix; the cut positions
+/// themselves are fractions along the segment, which a linear map
+/// preserves. An empty or degenerate pattern yields the whole polyline.
+fn dash_split(points: &[Point], dash: &[f32], phase: f32, inv: Matrix) -> Vec<Run> {
+    let first = sub(points[1], points[0]);
     let pattern: Vec<f32> = dash
         .iter()
         .copied()
@@ -49,7 +158,10 @@ fn dash_split(points: &[Point], dash: &[f32], phase: f32, inv: Matrix) -> Vec<Ve
         .collect();
     let total: f32 = pattern.iter().sum();
     if pattern.len() != dash.len() || pattern.is_empty() || total <= 0.0 {
-        return vec![points.to_vec()];
+        return vec![Run {
+            points: points.to_vec(),
+            along: first,
+        }];
     }
     // Consume the phase to find the starting pattern position.
     let mut idx = 0usize;
@@ -70,13 +182,14 @@ fn dash_split(points: &[Point], dash: &[f32], phase: f32, inv: Matrix) -> Vec<Ve
         }
     }
     let mut on = idx.is_multiple_of(2);
-    let mut runs: Vec<Vec<Point>> = Vec::new();
+    let mut runs: Vec<Run> = Vec::new();
     let mut cur: Vec<Point> = if on { vec![points[0]] } else { Vec::new() };
+    let mut cur_along = first;
     let mut pieces = 0usize;
     for seg in points.windows(2) {
         let (a, b) = (seg[0], seg[1]);
         let seglen = {
-            let u = linear(inv, Point::new(b.x - a.x, b.y - a.y));
+            let u = linear(inv, sub(b, a));
             u.x.hypot(u.y)
         };
         let mut done = 0.0f32;
@@ -86,12 +199,16 @@ fn dash_split(points: &[Point], dash: &[f32], phase: f32, inv: Matrix) -> Vec<Ve
             if on {
                 cur.push(p);
                 if cur.len() >= 2 {
-                    runs.push(std::mem::take(&mut cur));
+                    runs.push(Run {
+                        points: std::mem::take(&mut cur),
+                        along: cur_along,
+                    });
                 } else {
                     cur.clear();
                 }
             } else {
                 cur = vec![p];
+                cur_along = sub(b, a);
             }
             on = !on;
             idx = (idx + 1) % pattern.len();
@@ -104,7 +221,10 @@ fn dash_split(points: &[Point], dash: &[f32], phase: f32, inv: Matrix) -> Vec<Ve
         }
     }
     if on && cur.len() >= 2 {
-        runs.push(cur);
+        runs.push(Run {
+            points: cur,
+            along: cur_along,
+        });
     }
     runs
 }
@@ -128,14 +248,14 @@ struct Pen {
     uniform_r: Option<f32>,
 }
 
-/// The offset quad covering one stroked segment of device points. The
-/// offset is the device image of the user-space pen radius perpendicular
-/// to the segment *in user space* — generally not perpendicular to the
-/// device segment; the parallelogram it spans is the transformed pen band.
-/// All quads share the orientation [`Pen::winding`] names, so overlapping
-/// pieces union under the nonzero rule. Returns `None` for zero-length
-/// segments.
-fn segment_quad(p: Point, q: Point, pen: Pen) -> Option<Subpath> {
+/// The half-width offset of the band around the device segment `p`→`q`:
+/// the device image of the user-space pen radius perpendicular to the
+/// segment *in user space* — generally not perpendicular to the device
+/// segment; the parallelogram it spans is the transformed pen band. The
+/// offset carries the sign [`Pen::winding`] names, so every quad built
+/// from one shares an orientation and overlapping pieces union under the
+/// nonzero rule. Returns `None` for zero-length segments.
+fn offset(p: Point, q: Point, pen: Pen) -> Option<Point> {
     let dx = q.x - p.x;
     let dy = q.y - p.y;
     let len = dx.hypot(dy);
@@ -168,15 +288,150 @@ fn segment_quad(p: Point, q: Point, pen: Pen) -> Option<Subpath> {
         let k = MIN_WIDTH / 2.0 / across;
         o = Point::new(o.x * k, o.y * k);
     }
+    Some(o)
+}
+
+/// The offset quad covering one stroked segment of device points, see
+/// [`offset`]. Returns `None` for zero-length segments.
+fn segment_quad(p: Point, q: Point, pen: Pen) -> Option<Subpath> {
+    let o = offset(p, q, pen)?;
     Some(Subpath {
-        points: vec![
-            Point::new(p.x + o.x, p.y + o.y),
-            Point::new(q.x + o.x, q.y + o.y),
-            Point::new(q.x - o.x, q.y - o.y),
-            Point::new(p.x - o.x, p.y - o.y),
-        ],
+        points: vec![add(p, o), add(q, o), sub(q, o), sub(p, o)],
         closed: true,
     })
+}
+
+/// The device vector one user-space pen radius long in the direction of
+/// the device vector `along`: how far a projecting square cap carries the
+/// band past a run end, and half the side of the square a zero-length
+/// dash paints. `None` when the pen or the direction has no length.
+fn extension(along: Point, pen: Pen) -> Option<Point> {
+    if let Some(r) = pen.uniform_r {
+        return Some(scale(unit(along)?, r));
+    }
+    let u = unit(linear(pen.to_user, along))?;
+    Some(linear(pen.to_device, scale(u, pen.r)))
+}
+
+/// The polygon a cap adds at the run end `e`, with `away` pointing out of
+/// the run: nothing for a butt cap, the pen disc for a round cap, and for
+/// a projecting square cap the band carried on by one pen radius.
+///
+/// Covers ISO 32000-1 §8.4.3.3.
+fn cap(e: Point, away: Point, pen: Pen, cap: LineCap) -> Option<Subpath> {
+    match cap {
+        LineCap::Butt => None,
+        LineCap::Round => Some(disc(e, pen)),
+        LineCap::Square => segment_quad(e, add(e, extension(away, pen)?), pen),
+    }
+}
+
+/// What a run collapsed to the single point `c` paints: a filled disc
+/// under round caps, nothing under butt caps, and under projecting square
+/// caps a square along the underlying path's direction `along` when there
+/// is one (a zero-length dash) and nothing when there is not (a
+/// degenerate subpath, whose caps have no orientation).
+///
+/// Covers ISO 32000-1 §8.5.3.2.
+fn dot(c: Point, along: Option<Point>, pen: Pen, cap: LineCap) -> Option<Subpath> {
+    match cap {
+        LineCap::Butt => None,
+        LineCap::Round => Some(disc(c, pen)),
+        LineCap::Square => {
+            let ext = extension(along?, pen)?;
+            segment_quad(sub(c, ext), add(c, ext), pen)
+        }
+    }
+}
+
+/// Twice the signed area of the polygon `points`; its sign is the
+/// polygon's orientation.
+fn signed_area(points: &[Point]) -> f32 {
+    let n = points.len();
+    (0..n)
+        .map(|i| {
+            let p = points[i];
+            let q = points[(i + 1) % n];
+            p.x * q.y - q.x * p.y
+        })
+        .sum()
+}
+
+/// `points` as a closed polygon wound the way [`segment_quad`] winds its
+/// quads, whose signed area has the opposite sign to [`Pen::winding`], so
+/// the nonzero union with them holds.
+fn wound(mut points: Vec<Point>, pen: Pen) -> Subpath {
+    if signed_area(&points) * pen.winding > 0.0 {
+        points.reverse();
+    }
+    Subpath {
+        points,
+        closed: true,
+    }
+}
+
+/// Whether a miter join between segments in the device directions `d1`
+/// and `d2` stays within `limit`: the miter length over the line width is
+/// 1 / sin(φ/2) for the angle φ between the segments, and the ratio is
+/// defined in user space, so the directions are measured there.
+///
+/// Covers ISO 32000-1 §8.4.3.5.
+fn miter_fits(d1: Point, d2: Point, pen: Pen, limit: f32) -> bool {
+    let (Some(u1), Some(u2)) = (unit(linear(pen.to_user, d1)), unit(linear(pen.to_user, d2)))
+    else {
+        return false;
+    };
+    // 1 / sin²(φ/2) = 2 / (1 + cos θ), θ being the turn between the two
+    // directions.
+    let denominator = 1.0 + u1.x * u2.x + u1.y * u2.y;
+    denominator > 1e-6 && 2.0 / denominator <= limit * limit
+}
+
+/// The polygon that fills the outer corner where the segment `p`→`v`
+/// meets `v`→`q`: the pen disc for a round join; otherwise the two bands'
+/// outer edges carried on to where they meet (a miter) or cut across at
+/// their ends (a bevel), the miter giving way to the bevel when its ratio
+/// is over the miter limit. Collinear segments need no join, and a
+/// segment turning straight back gets only the round disc, its two bands
+/// already covering each other.
+///
+/// Covers ISO 32000-1 §8.4.3.4 and §8.4.3.5.
+fn join(p: Point, v: Point, q: Point, pen: Pen, style: StrokeStyle) -> Option<Subpath> {
+    if style.join == LineJoin::Round {
+        return Some(disc(v, pen));
+    }
+    let d1 = unit(sub(v, p))?;
+    let d2 = unit(sub(q, v))?;
+    let turn = d1.x * d2.y - d1.y * d2.x;
+    if turn.abs() <= 1e-6 {
+        return None;
+    }
+    // Each band's outer edge is the one on the far side of the turn. The
+    // side is read from the offset's cross product with its own segment,
+    // because under an anisotropic pen the offset is far from
+    // perpendicular and its angle to the other segment says nothing.
+    let o1 = offset(p, v, pen)?;
+    let o1 = if (d1.x * o1.y - d1.y * o1.x) * turn > 0.0 {
+        scale(o1, -1.0)
+    } else {
+        o1
+    };
+    let o2 = offset(v, q, pen)?;
+    let o2 = if (d2.x * o2.y - d2.y * o2.x) * turn > 0.0 {
+        scale(o2, -1.0)
+    } else {
+        o2
+    };
+    let a = add(v, o1);
+    let b = add(v, o2);
+    if style.join == LineJoin::Miter && miter_fits(d1, d2, pen, style.miter_limit) {
+        // The outer edges a + t d1 and b + s d2 meet at the miter tip.
+        let ab = sub(b, a);
+        let t = (ab.x * d2.y - ab.y * d2.x) / turn;
+        let tip = add(a, scale(d1, t));
+        return Some(wound(vec![v, a, tip, b], pen));
+    }
+    Some(wound(vec![v, a, b], pen))
 }
 
 /// A small fan around `c` approximating the pen's own shape — the device
@@ -213,24 +468,25 @@ fn disc(c: Point, pen: Pen) -> Subpath {
 
 /// Expands flattened device-space subpaths into closed polygons that,
 /// filled with the nonzero rule, paint the stroke: one offset quad per
-/// segment plus a fan at every vertex (round joins at interior vertices,
-/// round caps at run ends). `width`, `dash` and `phase` are user-space
-/// quantities carried into device space through `ctm` (only its linear
-/// part matters to a pen); a stroke thinner than [`MIN_WIDTH`] device
-/// pixels is widened to a visible hairline. A matrix that cannot be
-/// inverted cannot carry the pen either way and is treated as the
+/// segment, a join at every interior vertex (and at the start of a closed
+/// subpath), a cap at both ends of every open run, and for a degenerate
+/// subpath the dot its cap style allows. `style`, `dash` and `phase` are
+/// user-space quantities carried into device space through `ctm` (only
+/// its linear part matters to a pen); a stroke thinner than [`MIN_WIDTH`]
+/// device pixels is widened to a visible hairline. A matrix that cannot
+/// be inverted cannot carry the pen either way and is treated as the
 /// identity, which keeps the stroke visible.
 ///
-/// Covers ISO 32000-1 §8.4.3.2 and §8.5.3.2.
+/// Covers ISO 32000-1 §8.4.3.2, §8.4.3.3, §8.4.3.4 and §8.5.3.2.
 pub(crate) fn stroke_path(
     subpaths: &[Subpath],
-    width: f32,
+    style: StrokeStyle,
     ctm: Matrix,
     dash: &[f32],
     phase: f32,
 ) -> Vec<Subpath> {
-    let width = if width.is_finite() {
-        width.max(0.0)
+    let width = if style.width.is_finite() {
+        style.width.max(0.0)
     } else {
         0.0
     };
@@ -242,9 +498,9 @@ pub(crate) fn stroke_path(
     // tolerance forgives the drift a chain of concatenations leaves.
     let c1 = to_device.a * to_device.a + to_device.b * to_device.b;
     let c2 = to_device.c * to_device.c + to_device.d * to_device.d;
-    let dot = to_device.a * to_device.c + to_device.b * to_device.d;
-    let scale = c1.max(c2);
-    let uniform_r = ((c1 - c2).abs() <= scale * 1e-3 && dot.abs() <= scale * 1e-3)
+    let skew = to_device.a * to_device.c + to_device.b * to_device.d;
+    let largest = c1.max(c2);
+    let uniform_r = ((c1 - c2).abs() <= largest * 1e-3 && skew.abs() <= largest * 1e-3)
         .then(|| width / 2.0 * c1.sqrt());
     let pen = Pen {
         to_device,
@@ -258,25 +514,50 @@ pub(crate) fn stroke_path(
         uniform_r,
     };
     let mut out = Vec::new();
-    for sub in subpaths {
-        if sub.points.is_empty() {
-            continue;
+    for subpath in subpaths {
+        let mut pts = distinct(&subpath.points);
+        if subpath.closed && pts.len() >= 2 {
+            let (first, last) = (pts[0], pts[pts.len() - 1]);
+            if (first.x - last.x).hypot(first.y - last.y) <= MIN_SEGMENT {
+                pts.pop();
+            }
         }
-        let mut pts = sub.points.clone();
-        if sub.closed && pts.last() != pts.first() {
+        match pts.len() {
+            0 => continue,
+            1 => {
+                out.extend(dot(pts[0], None, pen, style.cap));
+                continue;
+            }
+            _ => {}
+        }
+        if subpath.closed {
             pts.push(pts[0]);
         }
-        if pts.len() < 2 {
-            continue;
-        }
-        for run in dash_split(&pts, dash, phase, to_user) {
-            for seg in run.windows(2) {
-                if let Some(quad) = segment_quad(seg[0], seg[1], pen) {
-                    out.push(quad);
-                }
+        let runs = dash_split(&pts, dash, phase, to_user);
+        // A closed subpath the dash pattern never cuts joins its two ends
+        // instead of capping them.
+        let closed = subpath.closed && runs.len() == 1 && runs[0].points.len() == pts.len();
+        for run in runs {
+            let rp = distinct(&run.points);
+            let n = rp.len();
+            if n == 0 {
+                continue;
             }
-            for &v in &run {
-                out.push(disc(v, pen));
+            if n == 1 {
+                out.extend(dot(rp[0], Some(run.along), pen, style.cap));
+                continue;
+            }
+            for seg in rp.windows(2) {
+                out.extend(segment_quad(seg[0], seg[1], pen));
+            }
+            for w in rp.windows(3) {
+                out.extend(join(w[0], w[1], w[2], pen, style));
+            }
+            if closed {
+                out.extend(join(rp[n - 2], rp[0], rp[1], pen, style));
+            } else {
+                out.extend(cap(rp[0], sub(rp[0], rp[1]), pen, style.cap));
+                out.extend(cap(rp[n - 1], sub(rp[n - 1], rp[n - 2]), pen, style.cap));
             }
         }
     }
@@ -300,6 +581,17 @@ mod tests {
         pix.data[((y * pix.width + x) * 4 + 3) as usize]
     }
 
+    /// The initial graphics state's stroke parameters at `width`: butt
+    /// caps, miter joins, miter limit 10.
+    fn solid(width: f32) -> StrokeStyle {
+        StrokeStyle {
+            width,
+            cap: LineCap::Butt,
+            join: LineJoin::Miter,
+            miter_limit: 10.0,
+        }
+    }
+
     const BLACK: [u8; 4] = [0, 0, 0, 255];
 
     fn paint(pix: &mut Pixmap, polys: &[Subpath]) {
@@ -321,7 +613,7 @@ mod tests {
         let mut pix = Pixmap::new(20, 10);
         let polys = stroke_path(
             &[line(&[(2.0, 5.0), (18.0, 5.0)])],
-            4.0,
+            solid(4.0),
             Matrix::identity(),
             &[],
             0.0,
@@ -340,7 +632,10 @@ mod tests {
         let mut pix = Pixmap::new(20, 10);
         let polys = stroke_path(
             &[line(&[(4.0, 5.0), (16.0, 5.0)])],
-            4.0,
+            StrokeStyle {
+                cap: LineCap::Round,
+                ..solid(4.0)
+            },
             Matrix::identity(),
             &[],
             0.0,
@@ -350,6 +645,247 @@ mod tests {
         assert!(alpha_at(&pix, 2, 5) > 127, "left cap");
         assert!(alpha_at(&pix, 17, 5) > 127, "right cap");
         assert_eq!(alpha_at(&pix, 0, 5), 0);
+        // The corner a square cap would fill lies outside the half disc.
+        assert!(alpha_at(&pix, 2, 3) < 200, "round cap corner");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.3.
+    #[test]
+    fn butt_caps_stop_at_the_endpoints() {
+        let mut pix = Pixmap::new(20, 10);
+        let polys = stroke_path(
+            &[line(&[(4.0, 5.0), (16.0, 5.0)])],
+            solid(4.0),
+            Matrix::identity(),
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        assert_eq!(alpha_at(&pix, 2, 5), 0, "past the left end");
+        assert_eq!(alpha_at(&pix, 17, 5), 0, "past the right end");
+        assert_eq!(alpha_at(&pix, 5, 5), 255, "band");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.3.
+    #[test]
+    fn square_caps_extend_the_band_by_half_the_width() {
+        let mut pix = Pixmap::new(20, 10);
+        let polys = stroke_path(
+            &[line(&[(4.0, 5.0), (16.0, 5.0)])],
+            StrokeStyle {
+                cap: LineCap::Square,
+                ..solid(4.0)
+            },
+            Matrix::identity(),
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        // The band runs from x=2 to x=18 and keeps its full height there.
+        assert_eq!(alpha_at(&pix, 2, 5), 255, "left extension");
+        assert_eq!(alpha_at(&pix, 2, 3), 255, "left corner");
+        assert_eq!(alpha_at(&pix, 17, 6), 255, "right corner");
+        assert_eq!(alpha_at(&pix, 1, 5), 0, "beyond the extension");
+    }
+
+    /// An L of width 4 turning at (2, 10): the outer corner is the square
+    /// x 0..2, y 10..12, which only a miter fills; the bevel is the
+    /// triangle cut from (0, 10) to (2, 12), which every join fills; and
+    /// the plain quads reach neither.
+    fn corner(join: LineJoin, miter_limit: f32, ctm: Matrix) -> Pixmap {
+        let mut pix = Pixmap::new(14, 14);
+        let polys = stroke_path(
+            &[line(&[(2.0, 2.0), (2.0, 10.0), (10.0, 10.0)])],
+            StrokeStyle {
+                join,
+                miter_limit,
+                ..solid(4.0)
+            },
+            ctm,
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        pix
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn miter_joins_fill_the_outer_corner() {
+        let pix = corner(LineJoin::Miter, 10.0, Matrix::identity());
+        assert_eq!(alpha_at(&pix, 0, 11), 255, "miter corner");
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "bevel triangle");
+        assert_eq!(alpha_at(&pix, 5, 5), 0, "inside the L");
+        // The same L turning the other way.
+        let mut pix = Pixmap::new(14, 14);
+        let polys = stroke_path(
+            &[line(&[(12.0, 2.0), (12.0, 10.0), (4.0, 10.0)])],
+            solid(4.0),
+            Matrix::identity(),
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        assert_eq!(alpha_at(&pix, 13, 11), 255, "mirrored miter corner");
+        assert_eq!(alpha_at(&pix, 8, 5), 0, "inside the mirrored L");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn bevel_joins_cut_the_corner() {
+        let pix = corner(LineJoin::Bevel, 10.0, Matrix::identity());
+        assert!(alpha_at(&pix, 0, 11) < 30, "bevel leaves the corner");
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "bevel triangle");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn round_joins_keep_the_pen_disc() {
+        let pix = corner(LineJoin::Round, 10.0, Matrix::identity());
+        assert!(
+            alpha_at(&pix, 0, 11) < 200,
+            "disc leaves most of the corner"
+        );
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "disc covers the notch");
+    }
+
+    /// A flipped matrix reverses the pen's winding; the join polygons must
+    /// follow or the nonzero union breaks.
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn joins_follow_a_flipped_matrix() {
+        let flipped = Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: -1.0,
+            e: 0.0,
+            f: 0.0,
+        };
+        let pix = corner(LineJoin::Miter, 10.0, flipped);
+        assert_eq!(alpha_at(&pix, 0, 11), 255, "miter corner");
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "bevel triangle");
+        assert_eq!(alpha_at(&pix, 2, 9), 255, "no hole where pieces overlap");
+        let pix = corner(LineJoin::Round, 10.0, flipped);
+        assert_eq!(alpha_at(&pix, 1, 10), 255, "disc covers the notch");
+        assert_eq!(alpha_at(&pix, 2, 9), 255, "no hole under the disc");
+    }
+
+    /// Under an anisotropic pen the offsets are far from perpendicular to
+    /// a diagonal segment, so the outer edge of each band must be chosen
+    /// by which side of the turn it lies on, not by its angle to the other
+    /// segment. Picking one band's inner edge sends the miter tip far down
+    /// the path as a sliver past the end of this nearly straight polyline.
+    // Covers ISO 32000-1 §8.4.3.4.
+    #[test]
+    fn joins_pick_the_outer_side_under_a_skewed_pen() {
+        let skewed = Matrix {
+            a: 2.0,
+            b: 0.0,
+            c: 0.0,
+            d: 0.5,
+            e: 0.0,
+            f: 0.0,
+        };
+        let mut pix = Pixmap::new(40, 40);
+        let polys = stroke_path(
+            &[line(&[(4.0, 4.0), (20.0, 20.0), (28.0, 27.0)])],
+            solid(4.0),
+            skewed,
+            &[],
+            0.0,
+        );
+        paint(&mut pix, &polys);
+        assert_eq!(alpha_at(&pix, 12, 12), 255, "band");
+        // The wrong edge sends the tip behind the start or past the end,
+        // depending on the turn; butt caps leave both empty.
+        assert_eq!(alpha_at(&pix, 1, 1), 0, "no sliver behind the start");
+        assert_eq!(alpha_at(&pix, 36, 35), 0, "no sliver past the end");
+    }
+
+    /// A V of width 4 whose arms meet at (7, 12) at a miter ratio of
+    /// sqrt(5) ~ 2.236: the spike reaches y ~ 16.5 and covers the pixel
+    /// (7, 13), which a bevel leaves empty.
+    // Covers ISO 32000-1 §8.4.3.5.
+    #[test]
+    fn the_miter_limit_cuts_sharp_joins_to_bevels() {
+        let spike = |miter_limit: f32| {
+            let mut pix = Pixmap::new(14, 18);
+            let polys = stroke_path(
+                &[line(&[(2.0, 2.0), (7.0, 12.0), (12.0, 2.0)])],
+                StrokeStyle {
+                    miter_limit,
+                    ..solid(4.0)
+                },
+                Matrix::identity(),
+                &[],
+                0.0,
+            );
+            paint(&mut pix, &polys);
+            alpha_at(&pix, 7, 13)
+        };
+        assert_eq!(spike(10.0), 255, "within the default limit");
+        assert_eq!(spike(2.3), 255, "just within the limit");
+        assert_eq!(spike(2.0), 0, "over the limit: bevel");
+    }
+
+    // Covers ISO 32000-1 §8.5.3.2.
+    #[test]
+    fn degenerate_subpaths_paint_a_dot_only_under_round_caps() {
+        let closed_point = Subpath {
+            points: vec![Point::new(5.0, 5.0)],
+            closed: true,
+        };
+        let coincident = Subpath {
+            points: vec![Point::new(14.0, 5.0), Point::new(14.0, 5.0)],
+            closed: false,
+        };
+        for cap in [LineCap::Butt, LineCap::Round, LineCap::Square] {
+            let mut pix = Pixmap::new(20, 10);
+            let polys = stroke_path(
+                &[closed_point.clone(), coincident.clone()],
+                StrokeStyle { cap, ..solid(4.0) },
+                Matrix::identity(),
+                &[],
+                0.0,
+            );
+            paint(&mut pix, &polys);
+            let want = if cap == LineCap::Round { 255 } else { 0 };
+            assert_eq!(alpha_at(&pix, 5, 5), want, "closed point under {cap:?}");
+            assert_eq!(
+                alpha_at(&pix, 14, 5),
+                want,
+                "coincident points under {cap:?}"
+            );
+        }
+    }
+
+    // Covers ISO 32000-1 §8.4.3.6 and §8.5.3.2.
+    #[test]
+    fn zero_length_dashes_take_the_cap_style() {
+        // [0 8] puts a zero-length dash at x = 1, 9 and 17.
+        let stroke = |cap| {
+            let mut pix = Pixmap::new(20, 10);
+            let polys = stroke_path(
+                &[line(&[(1.0, 5.0), (19.0, 5.0)])],
+                StrokeStyle { cap, ..solid(4.0) },
+                Matrix::identity(),
+                &[0.0, 8.0],
+                0.0,
+            );
+            paint(&mut pix, &polys);
+            pix
+        };
+        let pix = stroke(LineCap::Round);
+        assert_eq!(alpha_at(&pix, 9, 5), 255, "round dot");
+        assert_eq!(alpha_at(&pix, 5, 5), 0, "gap");
+        assert!(alpha_at(&pix, 7, 3) < 200, "round dot corner");
+        let pix = stroke(LineCap::Square);
+        assert_eq!(alpha_at(&pix, 9, 5), 255, "square dot");
+        assert_eq!(alpha_at(&pix, 7, 3), 255, "square dot corner");
+        assert_eq!(alpha_at(&pix, 5, 5), 0, "gap");
+        let pix = stroke(LineCap::Butt);
+        assert_eq!(alpha_at(&pix, 9, 5), 0, "butt caps paint nothing");
     }
 
     // Covers ISO 32000-1 §8.4.3.2.
@@ -358,7 +894,7 @@ mod tests {
         let mut pix = Pixmap::new(20, 10);
         let polys = stroke_path(
             &[line(&[(2.0, 5.5), (18.0, 5.5)])],
-            0.05,
+            solid(0.05),
             Matrix::identity(),
             &[],
             0.0,
@@ -374,7 +910,7 @@ mod tests {
         let mut pix = Pixmap::new(21, 10);
         let polys = stroke_path(
             &[line(&[(1.0, 5.0), (19.0, 5.0)])],
-            2.0,
+            solid(2.0),
             Matrix::identity(),
             &[4.0, 4.0],
             0.0,
@@ -433,7 +969,7 @@ mod tests {
             ],
             closed: true,
         };
-        let polys = stroke_path(&[square], 2.0, Matrix::identity(), &[], 0.0);
+        let polys = stroke_path(&[square], solid(2.0), Matrix::identity(), &[], 0.0);
         paint(&mut pix, &polys);
         // The closing (left) edge is painted, the interior is not.
         assert_eq!(alpha_at(&pix, 2, 6), 255, "left edge");
@@ -470,7 +1006,13 @@ mod tests {
             f: 0.0,
         };
         let mut pix = Pixmap::new(40, 20);
-        let polys = stroke_path(&[line(&[(2.0, 10.0), (38.0, 10.0)])], 4.26, ctm, &[], 0.0);
+        let polys = stroke_path(
+            &[line(&[(2.0, 10.0), (38.0, 10.0)])],
+            solid(4.26),
+            ctm,
+            &[],
+            0.0,
+        );
         paint(&mut pix, &polys);
         let thick = (0..20).filter(|&y| alpha_at(&pix, 20, y) > 127).count();
         assert!(
@@ -496,7 +1038,7 @@ mod tests {
         let mut pix = Pixmap::new(40, 20);
         let polys = stroke_path(
             &[line(&[(1.0, 10.0), (39.0, 10.0)])],
-            1.5,
+            solid(1.5),
             ctm,
             &[4.0, 4.0],
             0.0,

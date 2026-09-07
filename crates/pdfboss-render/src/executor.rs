@@ -24,7 +24,7 @@ use crate::raster::{
     capture_spans, fill_path, fill_spans, BlendMode, FillRule, Mask, RasterScratch, SpanSet,
 };
 use crate::shading::{load_functions, Functions, Shading, MAX_COMPS};
-use crate::stroke::stroke_path;
+use crate::stroke::{stroke_path, LineCap, LineJoin, StrokeStyle};
 #[cfg(feature = "substitute-fonts")]
 use crate::substitute::BuiltinProvider;
 use crate::substitute::{DirProvider, SubstituteProvider};
@@ -103,14 +103,11 @@ struct GState {
     stroke_pattern_name: Option<String>,
     /// Line width in user space.
     line_width: f32,
-    /// Stored but unused: stroking approximates round caps (v0.1).
-    #[allow(dead_code)]
-    line_cap: i32,
-    /// Stored but unused: stroking approximates round joins (v0.1).
-    #[allow(dead_code)]
-    line_join: i32,
-    /// Stored but unused: joins are round, so the miter limit never cuts.
-    #[allow(dead_code)]
+    /// Line cap style (`J`, `/LC`).
+    line_cap: LineCap,
+    /// Line join style (`j`, `/LJ`).
+    line_join: LineJoin,
+    /// Miter limit (`M`, `/ML`), 1 or more.
     miter_limit: f32,
     /// Dash pattern lengths in user space (empty = solid).
     dash: Vec<f32>,
@@ -208,8 +205,8 @@ impl GState {
             stroke_pattern_name: None,
             line_width: 1.0,
             text_render: 0,
-            line_cap: 0,
-            line_join: 0,
+            line_cap: LineCap::Butt,
+            line_join: LineJoin::Miter,
             miter_limit: 10.0,
             dash: Vec::new(),
             dash_phase: 0.0,
@@ -235,6 +232,18 @@ impl GState {
             self.fill_rgb
         };
         marking_rgba8(rgb, &self.fill_space)
+    }
+
+    /// The line width, cap, join and miter limit the stroker paints with.
+    ///
+    /// Covers ISO 32000-1 §8.4.3.3, §8.4.3.4 and §8.4.3.5.
+    fn stroke_style(&self) -> StrokeStyle {
+        StrokeStyle {
+            width: self.line_width,
+            cap: self.line_cap,
+            join: self.line_join,
+            miter_limit: self.miter_limit,
+        }
     }
 
     /// The stroke color as RGBA8, transparent for `/Separation /None` like
@@ -941,10 +950,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                             frame.gs.line_width = *w;
                         }
                     }
-                    Op::SetLineCap(c) => frame.gs.line_cap = *c,
-                    Op::SetLineJoin(j) => frame.gs.line_join = *j,
+                    Op::SetLineCap(c) => frame.gs.line_cap = LineCap::from_code(*c),
+                    Op::SetLineJoin(j) => frame.gs.line_join = LineJoin::from_code(*j),
                     Op::SetMiterLimit(m) => {
-                        if m.is_finite() {
+                        if m.is_finite() && *m >= 1.0 {
                             frame.gs.miter_limit = *m;
                         }
                     }
@@ -1303,7 +1312,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         if how.stroke {
-            let quads = stroke_path(&polys, gs.line_width, gs.ctm, &gs.dash, gs.dash_phase);
+            let quads = stroke_path(&polys, gs.stroke_style(), gs.ctm, &gs.dash, gs.dash_phase);
             match &stroke_pattern {
                 Some(PatternPaint::Shading(shading, to_device)) => self.paint_shading_through(
                     &quads,
@@ -2669,10 +2678,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// Applies the named `/ExtGState` resource: `/SMask` (a mask group or
-    /// `/None`), `/BM`, `/ca /CA /LW /LC /LJ /D`. Other entries are
+    /// `/None`), `/BM`, `/ca /CA /LW /LC /LJ /ML /D`. Other entries are
     /// ignored.
     ///
-    /// Covers ISO 32000-1 §11.2, §11.6.3, §11.6.4.4, §11.6.5.2, §8.4.3.3, §8.4.3.4, §8.4.3.6 and §8.4.5.
+    /// Covers ISO 32000-1 §11.2, §11.6.3, §11.6.4.4, §11.6.5.2, §8.4.3.3, §8.4.3.4, §8.4.3.5, §8.4.3.6 and §8.4.5.
     async fn apply_ext_gstate_op(&mut self, name: &Name, frame: &mut Frame) {
         let Some(Object::Dict(dict)) = self.find_res(&frame.chain, "ExtGState", &name.0).await
         else {
@@ -2712,10 +2721,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             }
         }
         if let Some(lc) = dict_f32(self.src, &dict, "LC").await {
-            gs.line_cap = lc as i32;
+            gs.line_cap = LineCap::from_code(lc as i32);
         }
         if let Some(lj) = dict_f32(self.src, &dict, "LJ").await {
-            gs.line_join = lj as i32;
+            gs.line_join = LineJoin::from_code(lj as i32);
+        }
+        if let Some(ml) = dict_f32(self.src, &dict, "ML").await {
+            if ml >= 1.0 {
+                gs.miter_limit = ml;
+            }
         }
         let d = match dict.get("D") {
             Some(o) => self.src.resolve(o).await.ok(),
@@ -4041,6 +4055,129 @@ mod tests {
         let pix = render(doc_with_graphics("1 w 10 80 m 560 80 l S"), 1.0);
         let inked = (700..725).filter(|&y| px(&pix, 300, y)[0] < 200).count();
         assert!((1..=2).contains(&inked), "hairline thickness {inked}");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.3 and §8.4.5.
+    #[test]
+    fn line_caps_follow_j_and_lc() {
+        // A 4-unit band from x=20 to x=80 on device row 50; row 48 is the
+        // band's top edge, which only a square cap fills past x=20.
+        let stroke = |content: &str| {
+            render(
+                small_doc(
+                    "/ExtGState << /G << /LC 2 >> >>",
+                    content.as_bytes(),
+                    |_| {},
+                ),
+                1.0,
+            )
+        };
+        let pix = stroke("0 J 4 w 20 50 m 80 50 l S");
+        assert_eq!(px(&pix, 18, 50), WHITE, "butt cap stops at the end");
+        assert_eq!(px(&pix, 21, 50), BLACK, "band");
+        let pix = stroke("1 J 4 w 20 50 m 80 50 l S");
+        assert!(
+            px(&pix, 18, 50)[0] < 128,
+            "round cap extends the centre line"
+        );
+        assert_ne!(px(&pix, 18, 48), BLACK, "round cap leaves the corner");
+        assert_eq!(px(&pix, 16, 50), WHITE);
+        let pix = stroke("2 J 4 w 20 50 m 80 50 l S");
+        assert_eq!(px(&pix, 18, 48), BLACK, "square cap fills the corner");
+        assert_eq!(px(&pix, 81, 51), BLACK, "square cap on the far end");
+        assert_eq!(px(&pix, 16, 50), WHITE);
+        let pix = stroke("/G gs 4 w 20 50 m 80 50 l S");
+        assert_eq!(px(&pix, 18, 48), BLACK, "/LC sets the cap");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.4, §8.4.3.5 and §8.4.5.
+    #[test]
+    fn line_joins_follow_j_lj_m_and_ml() {
+        let stroke = |content: &str| {
+            render(
+                small_doc(
+                    "/ExtGState << /Bevel << /LJ 2 >> /Limit << /ML 2 >> >>",
+                    content.as_bytes(),
+                    |_| {},
+                ),
+                1.0,
+            )
+        };
+        // An L of width 4 turning at (20, 60): its outer corner, user
+        // space x 18..20 and y 60..62, is device pixel (18, 38).
+        let l = "4 w 20 20 m 20 60 l 60 60 l S";
+        let pix = stroke(&format!("0 j {l}"));
+        assert_eq!(px(&pix, 18, 38), BLACK, "miter fills the corner");
+        let pix = stroke(&format!("2 j {l}"));
+        assert!(px(&pix, 18, 38)[0] > 200, "bevel cuts the corner");
+        assert_eq!(px(&pix, 19, 39), BLACK, "bevel fills the notch");
+        let pix = stroke(&format!("1 j {l}"));
+        assert_ne!(px(&pix, 18, 38), BLACK, "round join leaves the corner");
+        let pix = stroke(&format!("/Bevel gs {l}"));
+        assert!(px(&pix, 18, 38)[0] > 200, "/LJ sets the join");
+        // A V of width 6 meeting at (40, 60) at a miter ratio of ~2.236:
+        // the spike covers device pixel (39, 37), a bevel does not.
+        let v = "6 w 20 20 m 40 60 l 60 20 l S";
+        let pix = stroke(v);
+        assert_eq!(px(&pix, 39, 37), BLACK, "default limit 10 keeps the spike");
+        let pix = stroke(&format!("2 M {v}"));
+        assert_eq!(px(&pix, 39, 37), WHITE, "M 2 cuts it to a bevel");
+        let pix = stroke(&format!("2.3 M {v}"));
+        assert_eq!(px(&pix, 39, 37), BLACK, "M 2.3 keeps it");
+        let pix = stroke(&format!("/Limit gs {v}"));
+        assert_eq!(px(&pix, 39, 37), WHITE, "/ML sets the limit");
+    }
+
+    // Covers ISO 32000-1 §8.5.3.2.
+    #[test]
+    fn degenerate_subpaths_paint_a_dot_only_under_round_caps() {
+        // Two coincident points, a single-point closed subpath and a
+        // zero-size rectangle, each 6 units wide.
+        let dots = "20 50 m 20 50 l S 50 50 m h S 80 50 0 0 re S";
+        let pix = render(
+            small_doc("", format!("1 J 6 w {dots}").as_bytes(), |_| {}),
+            1.0,
+        );
+        assert_eq!(px(&pix, 20, 50), BLACK, "coincident points");
+        assert_eq!(px(&pix, 50, 50), BLACK, "closed point");
+        assert_eq!(px(&pix, 80, 50), BLACK, "zero-size rectangle");
+        for cap in ["0 J", "2 J"] {
+            let pix = render(
+                small_doc("", format!("{cap} 6 w {dots}").as_bytes(), |_| {}),
+                1.0,
+            );
+            assert_eq!(px(&pix, 20, 50), WHITE, "{cap}");
+            assert_eq!(px(&pix, 50, 50), WHITE, "{cap}");
+            assert_eq!(px(&pix, 80, 50), WHITE, "{cap}");
+        }
+        // A single-point open subpath paints nothing, and filling a
+        // degenerate subpath paints nothing either.
+        let pix = render(
+            small_doc("", b"1 J 6 w 20 50 m S 80 50 0 0 re f", |_| {}),
+            1.0,
+        );
+        assert_eq!(px(&pix, 20, 50), WHITE, "open point");
+        assert_eq!(px(&pix, 80, 50), WHITE, "filled degenerate rectangle");
+    }
+
+    // Covers ISO 32000-1 §8.4.3.6 and §8.5.3.2.
+    #[test]
+    fn zero_length_dashes_take_the_cap_style() {
+        // [0 10] puts a zero-length dash every 10 units from x=10.
+        let stroke = |cap: &str| {
+            let content = format!("{cap} 4 w [0 10] 0 d 10 50 m 90 50 l S");
+            render(small_doc("", content.as_bytes(), |_| {}), 1.0)
+        };
+        let pix = stroke("1 J");
+        assert_eq!(px(&pix, 10, 50), BLACK, "round dot");
+        assert_eq!(px(&pix, 20, 50), BLACK, "next round dot");
+        assert_eq!(px(&pix, 15, 50), WHITE, "gap");
+        assert_ne!(px(&pix, 11, 48), BLACK, "round dot corner");
+        let pix = stroke("2 J");
+        assert_eq!(px(&pix, 11, 48), BLACK, "square dot corner");
+        assert_eq!(px(&pix, 15, 50), WHITE, "gap");
+        let pix = stroke("0 J");
+        assert_eq!(px(&pix, 10, 50), WHITE, "butt caps paint nothing");
     }
 
     // Covers ISO 32000-1 §8.4.3.6 and Annex A.2.
