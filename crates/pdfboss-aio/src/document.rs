@@ -1423,6 +1423,76 @@ impl AsyncDocument {
         pdfboss_core::StructureTree::load_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The object that `key` names in the catalog's `tree` (ISO 32000-1
+    /// §7.7.4), resolved: the async twin of the sync document's `named`.
+    pub async fn named(&self, tree: pdfboss_core::NameTree, key: &[u8]) -> Option<Object> {
+        pdfboss_core::named_with(self, &self.inner.xref.trailer, tree, key).await
+    }
+
+    /// Every name in the catalog's `tree` with the object it names,
+    /// unresolved, in tree order: the async twin of the sync document's
+    /// `names`.
+    pub async fn names(&self, tree: pdfboss_core::NameTree) -> Vec<(Vec<u8>, Object)> {
+        pdfboss_core::names_with(self, &self.inner.xref.trailer, tree).await
+    }
+
+    /// The destination `name` designates (ISO 32000-1 §12.3.2.3): the async
+    /// twin of the sync document's `named_destination`.
+    pub async fn named_destination(&self, name: &[u8]) -> Option<pdfboss_core::Destination> {
+        pdfboss_core::named_destination_with(self, &self.inner.xref.trailer, name).await
+    }
+
+    /// Every named destination, sorted by name: the async twin of the sync
+    /// document's `named_destinations`.
+    pub async fn named_destinations(&self) -> Vec<(Vec<u8>, pdfboss_core::Destination)> {
+        pdfboss_core::named_destinations_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The destination a `/Dest` or `/D` value denotes: the async twin of
+    /// the sync document's `destination`.
+    pub async fn destination(&self, value: &Object) -> Option<pdfboss_core::Destination> {
+        pdfboss_core::destination_value_with(self, &self.inner.xref.trailer, value).await
+    }
+
+    /// The document outline (ISO 32000-1 §12.3.3): the async twin of the
+    /// sync document's `outline`.
+    pub async fn outline(&self) -> Vec<pdfboss_core::OutlineItem> {
+        pdfboss_core::outline_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The document's page labelling ranges (ISO 32000-1 §12.4.2): the
+    /// async twin of the sync document's `page_labels`.
+    pub async fn page_labels(&self) -> Option<Vec<pdfboss_core::PageLabel>> {
+        pdfboss_core::page_labels_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The label the page at `index` shows: the async twin of the sync
+    /// document's `page_label`.
+    pub async fn page_label(&self, index: usize) -> Option<String> {
+        if index >= self.page_count() {
+            return None;
+        }
+        let ranges = self.page_labels().await?;
+        Some(pdfboss_core::page_label(&ranges, index))
+    }
+
+    /// The document-level embedded files (ISO 32000-1 §7.11.4): the async
+    /// twin of the sync document's `embedded_files`.
+    pub async fn embedded_files(&self) -> Vec<pdfboss_core::EmbeddedFile> {
+        pdfboss_core::embedded_files_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The decoded bytes of one embedded file: the async twin of the sync
+    /// document's `embedded_file_data`.
+    ///
+    /// # Errors
+    ///
+    /// `MissingKey("EF")` when the file specification embeds no stream,
+    /// and the stream's own decoding errors.
+    pub async fn embedded_file_data(&self, file: &pdfboss_core::EmbeddedFile) -> Result<Vec<u8>> {
+        Ok(pdfboss_core::embedded_file_data_with(self, file).await?)
+    }
+
     /// Number of pages: the flattened page tree's length. The tree is
     /// flattened once at open, so this is synchronous and authoritative —
     /// mirroring the sync document once its tree has been flattened.

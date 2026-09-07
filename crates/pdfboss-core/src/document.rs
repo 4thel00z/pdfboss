@@ -539,6 +539,108 @@ impl Document {
         ))
     }
 
+    /// The object that `key` names in the catalog's `tree` (ISO 32000-1
+    /// §7.7.4), resolved: a destination for `NameTree::Dests`, a file
+    /// specification for `NameTree::EmbeddedFiles`. `None` when the
+    /// document has no such tree or the tree has no such name.
+    pub fn named(&self, tree: crate::names::NameTree, key: &[u8]) -> Option<Object> {
+        block_on(crate::names::named_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            tree,
+            key,
+        ))
+    }
+
+    /// Every name in the catalog's `tree` with the object it names,
+    /// unresolved, in tree order; empty when the document has no such tree.
+    pub fn names(&self, tree: crate::names::NameTree) -> Vec<(Vec<u8>, Object)> {
+        block_on(crate::names::names_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            tree,
+        ))
+    }
+
+    /// The destination `name` designates (ISO 32000-1 §12.3.2.3), from the
+    /// `/Names` `/Dests` tree or the catalog's `/Dests` dictionary.
+    pub fn named_destination(&self, name: &[u8]) -> Option<crate::destination::Destination> {
+        block_on(crate::destination::named_destination_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            name,
+        ))
+    }
+
+    /// Every named destination of the document, sorted by name.
+    pub fn named_destinations(&self) -> Vec<(Vec<u8>, crate::destination::Destination)> {
+        block_on(crate::destination::named_destinations_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The destination a `/Dest` or `/D` value denotes: an explicit array,
+    /// a name or string looked up among the named destinations, or a
+    /// dictionary whose `/D` holds one of those (ISO 32000-1 §12.3.2).
+    pub fn destination(&self, value: &Object) -> Option<crate::destination::Destination> {
+        block_on(crate::destination::destination_value_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            value,
+        ))
+    }
+
+    /// The document outline (ISO 32000-1 §12.3.3): the top-level items with
+    /// their descendants, in display order; empty when there is none.
+    pub fn outline(&self) -> Vec<crate::outline::OutlineItem> {
+        block_on(crate::outline::outline_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The document's page labelling ranges (ISO 32000-1 §12.4.2), sorted
+    /// by first page; `None` when the catalog has no `/PageLabels`.
+    pub fn page_labels(&self) -> Option<Vec<crate::page_label::PageLabel>> {
+        block_on(crate::page_label::page_labels_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The label the page at `index` shows, or `None` when the document
+    /// has no page labels or no such page.
+    pub fn page_label(&self, index: usize) -> Option<String> {
+        if index >= self.page_count() {
+            return None;
+        }
+        let ranges = self.page_labels()?;
+        Some(crate::page_label::page_label(&ranges, index))
+    }
+
+    /// The document-level embedded files (ISO 32000-1 §7.11.4): every entry
+    /// of the catalog's `/EmbeddedFiles` name tree, in tree order.
+    pub fn embedded_files(&self) -> Vec<crate::embedded_file::EmbeddedFile> {
+        block_on(crate::embedded_file::embedded_files_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The decoded bytes of one embedded file.
+    ///
+    /// # Errors
+    ///
+    /// `MissingKey("EF")` when the file specification embeds no stream,
+    /// and the stream's own decoding errors.
+    pub fn embedded_file_data(&self, file: &crate::embedded_file::EmbeddedFile) -> Result<Vec<u8>> {
+        block_on(crate::embedded_file::embedded_file_data_with(
+            &Immediate(self),
+            file,
+        ))
+    }
+
     /// Reads `key` from an info dictionary as a decoded text string.
     ///
     /// Covers ISO 32000-1 §7.9.2.2.
@@ -791,7 +893,7 @@ fn make_page_rec(
 }
 
 /// Human-readable object type name for error messages.
-fn type_name(o: &Object) -> &'static str {
+pub(crate) fn type_name(o: &Object) -> &'static str {
     match o {
         Object::Null => "null",
         Object::Bool(_) => "boolean",
