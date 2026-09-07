@@ -498,6 +498,28 @@ pub fn standard_encoding_name(code: u8) -> Option<&'static str> {
     }
 }
 
+/// The Mac OS Roman code for `ch`: MacRomanEncoding (Annex D.2) plus the
+/// fifteen additions and the Euro of Table 115, which is the encoding a
+/// TrueType `(1, 0)` cmap subtable is indexed by. `None` for a character
+/// the encoding lacks.
+///
+/// Covers ISO 32000-1 §9.6.6.4.
+pub fn mac_os_roman_code(ch: char) -> Option<u8> {
+    // `MAC_ROMAN_HIGH` already carries Table 115's additions and the Euro;
+    // Omega is stored as the Greek letter, while the glyph list resolves the
+    // name to the ohm sign, so both reach code 189.
+    if ch == '\u{2126}' {
+        return Some(0xBD);
+    }
+    if ('\u{20}'..='\u{7E}').contains(&ch) {
+        return Some(ch as u8);
+    }
+    MAC_ROMAN_HIGH
+        .iter()
+        .position(|&c| c == ch)
+        .map(|i| 0x80 + i as u8)
+}
+
 /// The glyph name Symbol's built-in encoding gives `code` (ISO 32000-1
 /// Annex D.5), `None` for an unassigned code.
 ///
@@ -1045,6 +1067,42 @@ mod tests {
     /// only where `glyph_to_unicode` also resolves the name (some names
     /// aren't in the bundled glyph-name subset).
     // Covers ISO 32000-1 Annex D.2.
+    // Covers ISO 32000-1 §9.6.6.4.
+    #[test]
+    fn mac_os_roman_codes_follow_table_115() {
+        assert_eq!(mac_os_roman_code('A'), Some(0x41));
+        assert_eq!(mac_os_roman_code('\u{E9}'), Some(0x8E), "eacute");
+        assert_eq!(mac_os_roman_code('\u{2022}'), Some(0xA5), "bullet");
+        // Table 115: the codes MacRomanEncoding leaves out.
+        assert_eq!(mac_os_roman_code('\u{2260}'), Some(173), "notequal");
+        assert_eq!(mac_os_roman_code('\u{221E}'), Some(176), "infinity");
+        assert_eq!(mac_os_roman_code('\u{03C0}'), Some(185), "pi");
+        assert_eq!(
+            mac_os_roman_code('\u{2126}'),
+            Some(189),
+            "Omega, the glyph list's ohm"
+        );
+        assert_eq!(
+            mac_os_roman_code('\u{2206}'),
+            Some(198),
+            "Delta, the glyph list's increment"
+        );
+        assert_eq!(mac_os_roman_code('\u{25CA}'), Some(215), "lozenge");
+        assert_eq!(
+            mac_os_roman_code('\u{20AC}'),
+            Some(219),
+            "Euro replaces currency"
+        );
+        assert_eq!(mac_os_roman_code('\u{A4}'), None, "currency is gone");
+        assert_eq!(mac_os_roman_code('\u{F8FF}'), Some(240), "apple");
+        assert_eq!(
+            mac_os_roman_code('\u{0394}'),
+            None,
+            "Greek Delta is not the glyph list's Delta"
+        );
+        assert_eq!(mac_os_roman_code('\u{4E00}'), None);
+    }
+
     // Covers ISO 32000-1 Annex D.5.
     #[test]
     fn symbol_encoding_follows_annex_d5() {

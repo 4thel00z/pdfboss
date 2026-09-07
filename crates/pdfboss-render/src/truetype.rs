@@ -141,14 +141,54 @@ impl TrueType {
         self.units_per_em
     }
 
-    /// Maps a Unicode scalar to a glyph index via the selected `cmap` subtable.
+    /// Maps a Unicode scalar to a glyph index through the Unicode `cmap`
+    /// subtable; a font without one answers from its `(3, 0)` symbol table,
+    /// then its `(1, 0)` Macintosh table, with the value used as a code.
     pub(crate) fn gid_for_unicode(&self, cp: u32) -> Option<u16> {
-        self.cmap.as_ref().and_then(|c| c.lookup(&self.data, cp))
+        let cmap = self.cmap.as_ref()?;
+        let table = cmap.unicode.or(cmap.symbol).or(cmap.mac)?;
+        table.lookup(&self.data, cp)
+    }
+
+    /// Maps a code to a glyph index through the `(3, 0)` symbol subtable.
+    ///
+    /// Covers ISO 32000-1 §9.6.6.4.
+    pub(crate) fn gid_for_symbol(&self, code: u32) -> Option<u16> {
+        self.cmap.as_ref()?.symbol?.lookup(&self.data, code)
+    }
+
+    /// Maps a Mac OS Roman code to a glyph index through the `(1, 0)`
+    /// subtable.
+    ///
+    /// Covers ISO 32000-1 §9.6.6.4.
+    pub(crate) fn gid_for_mac(&self, code: u8) -> Option<u16> {
+        self.cmap.as_ref()?.mac?.lookup(&self.data, u32::from(code))
     }
 
     /// Whether a usable `cmap` subtable was found.
     pub(crate) fn has_cmap(&self) -> bool {
         self.cmap.is_some()
+    }
+
+    /// Whether the font has a Unicode `cmap` subtable: `(3, 1)`, `(3, 10)`
+    /// or platform 0.
+    pub(crate) fn has_unicode_cmap(&self) -> bool {
+        self.cmap.as_ref().is_some_and(|c| c.unicode.is_some())
+    }
+
+    /// Whether the font has a `(3, 0)` symbol subtable.
+    pub(crate) fn has_symbol_cmap(&self) -> bool {
+        self.cmap.as_ref().is_some_and(|c| c.symbol.is_some())
+    }
+
+    /// Whether the font has a `(1, 0)` Macintosh Roman subtable.
+    pub(crate) fn has_mac_cmap(&self) -> bool {
+        self.cmap.as_ref().is_some_and(|c| c.mac.is_some())
+    }
+
+    /// The number of glyphs the `loca` table addresses.
+    pub(crate) fn num_glyphs(&self) -> u16 {
+        u16::try_from(self.loca.len().saturating_sub(1)).unwrap_or(u16::MAX)
     }
 
     /// Maps a glyph name to a glyph index via the `post` table's custom names.
@@ -439,41 +479,75 @@ fn contour_segs(pts: &[Pt], out: &mut Vec<Seg>) {
 
 // --- cmap -----------------------------------------------------------------
 
-/// A selected `cmap` subtable, stored as its absolute byte offset and format.
-struct Cmap {
+/// One `cmap` subtable, stored as its absolute byte offset and format.
+#[derive(Clone, Copy)]
+struct Subtable {
     offset: usize,
     format: u16,
 }
 
+/// The `cmap` subtables the clause distinguishes: a Unicode one (`(3, 1)`,
+/// `(3, 10)` or platform 0, the best of them kept), the `(3, 0)` symbol
+/// table and the `(1, 0)` Macintosh Roman table.
+///
 /// Covers ISO 32000-1 §9.6.6.4.
+struct Cmap {
+    unicode: Option<Subtable>,
+    symbol: Option<Subtable>,
+    mac: Option<Subtable>,
+}
+
 impl Cmap {
-    /// Chooses the best supported subtable: a Unicode/Windows table if present,
-    /// otherwise the first symbol or Mac table.
+    /// Reads every supported subtable (formats 0, 4, 6 and 12); `None` when
+    /// there is none.
     fn parse(data: &[u8], base: usize) -> Option<Cmap> {
         let num = be16(data, base + 2)? as usize;
-        let mut best: Option<(i32, usize)> = None; // (score, subtable offset)
+        let mut unicode: Option<(i32, Subtable)> = None;
+        let mut symbol = None;
+        let mut mac = None;
         for i in 0..num {
             let rec = base + 4 + i * 8;
             let platform = be16(data, rec)?;
             let encoding = be16(data, rec + 2)?;
-            let sub = base + be32(data, rec + 4)? as usize;
-            let score = match (platform, encoding) {
-                (3, 10) => 5, // Windows UCS-4
-                (0, _) => 4,  // Unicode
-                (3, 1) => 4,  // Windows BMP
-                (3, 0) => 2,  // Windows symbol
-                (1, 0) => 1,  // Mac Roman
-                _ => 0,
+            let offset = base + be32(data, rec + 4)? as usize;
+            let Some(format) = be16(data, offset) else {
+                continue;
             };
-            if score > 0 && best.map(|(s, _)| score > s).unwrap_or(true) {
-                best = Some((score, sub));
+            if !matches!(format, 0 | 4 | 6 | 12) {
+                continue;
+            }
+            let table = Subtable { offset, format };
+            match (platform, encoding) {
+                (3, 10) | (3, 1) | (0, _) => {
+                    // Prefer the full-range Windows table, then the BMP one,
+                    // then a platform-0 table.
+                    let score = match (platform, encoding) {
+                        (3, 10) => 3,
+                        (3, 1) => 2,
+                        _ => 1,
+                    };
+                    if unicode.is_none_or(|(best, _)| score > best) {
+                        unicode = Some((score, table));
+                    }
+                }
+                (3, 0) => symbol = symbol.or(Some(table)),
+                (1, 0) => mac = mac.or(Some(table)),
+                _ => {}
             }
         }
-        let offset = best?.1;
-        let format = be16(data, offset)?;
-        matches!(format, 0 | 4 | 6 | 12).then_some(Cmap { offset, format })
+        let unicode = unicode.map(|(_, table)| table);
+        if unicode.is_none() && symbol.is_none() && mac.is_none() {
+            return None;
+        }
+        Some(Cmap {
+            unicode,
+            symbol,
+            mac,
+        })
     }
+}
 
+impl Subtable {
     fn lookup(&self, data: &[u8], cp: u32) -> Option<u16> {
         match self.format {
             0 => self.lookup_0(data, cp),
@@ -736,8 +810,45 @@ pub(crate) mod tests {
         t
     }
 
-    /// Format-4 cmap mapping the single character `ch` to glyph 1.
+    /// Format-4 cmap mapping the single character `ch` to glyph 1, as a
+    /// `(3, 1)` subtable.
     fn table_cmap(ch: u16) -> Vec<u8> {
+        table_cmap_records(&[(3, 1, subtable_format4(ch))])
+    }
+
+    /// A `cmap` table holding the given `(platform, encoding, subtable)`
+    /// records.
+    pub(crate) fn table_cmap_records(records: &[(u16, u16, Vec<u8>)]) -> Vec<u8> {
+        let mut t = Vec::new();
+        t.extend_from_slice(&be(0)); // version
+        t.extend_from_slice(&be(records.len() as u16)); // numTables
+        let mut offset = 4 + 8 * records.len();
+        for (platform, encoding, sub) in records {
+            t.extend_from_slice(&be(*platform));
+            t.extend_from_slice(&be(*encoding));
+            t.extend_from_slice(&(offset as u32).to_be_bytes());
+            offset += sub.len();
+        }
+        for (_, _, sub) in records {
+            t.extend_from_slice(sub);
+        }
+        t
+    }
+
+    /// A format-0 subtable mapping the single byte `code` to glyph 1.
+    pub(crate) fn subtable_format0(code: u8) -> Vec<u8> {
+        let mut sub = Vec::new();
+        sub.extend_from_slice(&be(0)); // format
+        sub.extend_from_slice(&be(262)); // length
+        sub.extend_from_slice(&be(0)); // language
+        let mut glyphs = [0u8; 256];
+        glyphs[code as usize] = 1;
+        sub.extend_from_slice(&glyphs);
+        sub
+    }
+
+    /// A format-4 subtable mapping the single character `ch` to glyph 1.
+    pub(crate) fn subtable_format4(ch: u16) -> Vec<u8> {
         let mut sub = Vec::new();
         sub.extend_from_slice(&be(4)); // format
         sub.extend_from_slice(&be(0)); // length placeholder
@@ -757,15 +868,7 @@ pub(crate) mod tests {
         sub.extend_from_slice(&be(0)); // idRangeOffset[1]
         let len = sub.len() as u16;
         sub[2..4].copy_from_slice(&be(len));
-
-        let mut t = Vec::new();
-        t.extend_from_slice(&be(0)); // version
-        t.extend_from_slice(&be(1)); // numTables
-        t.extend_from_slice(&be(3)); // platformID = Windows
-        t.extend_from_slice(&be(1)); // encodingID = BMP
-        t.extend_from_slice(&12u32.to_be_bytes()); // subtable offset
-        t.extend_from_slice(&sub);
-        t
+        sub
     }
 
     /// A `post` format-2.0 table naming glyph 1 "foo" (glyph 0 keeps the
@@ -791,6 +894,12 @@ pub(crate) mod tests {
     /// glyph's coordinates scale along, keeping the same em-relative shape)
     /// and `ch` the single cmap-mapped character.
     pub(crate) fn build_font_with(upm: u16, ch: u16) -> Vec<u8> {
+        build_font_with_cmap(upm, Some(table_cmap(ch)))
+    }
+
+    /// [`build_font_with`] with a `cmap` table of the caller's choosing, or
+    /// no `cmap` table at all.
+    pub(crate) fn build_font_with_cmap(upm: u16, cmap: Option<Vec<u8>>) -> Vec<u8> {
         let s = |v: i32| (v * i32::from(upm) / 1000) as i16;
         let glyph1 = rect_glyph(s(100), s(0), s(600), s(700));
         let glyf = glyph1.clone(); // gid 0 empty, gid 1 at offset 0
@@ -800,14 +909,17 @@ pub(crate) mod tests {
         loca.extend_from_slice(&be(0));
         loca.extend_from_slice(&be((glyf.len() / 2) as u16));
 
-        let tables: [(&[u8; 4], Vec<u8>); 6] = [
-            (b"cmap", table_cmap(ch)),
-            (b"glyf", glyf),
+        let mut tables: Vec<(&[u8; 4], Vec<u8>)> = Vec::new();
+        if let Some(cmap) = cmap {
+            tables.push((b"cmap", cmap));
+        }
+        tables.extend([
+            (b"glyf" as &[u8; 4], glyf),
             (b"head", table_head(upm)),
             (b"loca", loca),
             (b"maxp", table_maxp(2)),
             (b"post", table_post()),
-        ];
+        ]);
 
         let mut out = Vec::new();
         out.extend_from_slice(&0x0001_0000u32.to_be_bytes()); // sfnt version

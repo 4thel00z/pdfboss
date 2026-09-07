@@ -482,11 +482,25 @@ fn build_glyph(segs: &[Seg], to_device: Matrix) -> Vec<Subpath> {
     pb.finish()
 }
 
-/// Loads a simple `/TrueType` font, building its 256-entry code-to-glyph table
-/// by resolving each code in three tiers: a `/Differences` glyph name (via the
-/// `post` table, then the Adobe Glyph List: name -> Unicode -> `cmap`); then the
-/// base `/Encoding` character -> `cmap`; and finally the raw byte, then the
-/// symbol range `0xF000 + code`, through the font's `cmap`.
+/// The descriptor's Symbolic flag (Table 123, bit 3).
+const FLAG_SYMBOLIC: i64 = 0x4;
+
+/// The descriptor's Nonsymbolic flag (Table 123, bit 6).
+const FLAG_NONSYMBOLIC: i64 = 0x20;
+
+/// Loads a simple `/TrueType` font, building its 256-entry code-to-glyph
+/// table as 9.6.6.4 says. A code's glyph name comes from `/Differences`,
+/// else, when the font names MacRomanEncoding or WinAnsiEncoding, is flagged
+/// Nonsymbolic, or carries any `/Encoding` without being flagged Symbolic,
+/// from the base encoding with StandardEncoding filling what it leaves
+/// undefined. The name goes through the glyph list into a Unicode subtable,
+/// or, without one, back to a Mac OS Roman code into the `(1, 0)` subtable,
+/// and failing both through the `post` table. A code still unmapped takes
+/// the symbolic route: the `(3, 0)` subtable at the byte and at the 0xF000,
+/// 0xF100 and 0xF200 ranges, else the `(1, 0)` subtable at the byte; then,
+/// as this reader's own mapping, a Unicode subtable at the byte and at
+/// 0xF000 plus the byte, and in a program with no `cmap` the byte itself as
+/// the glyph index.
 ///
 /// Covers ISO 32000-1 §9.6.3 and §9.6.6.4.
 async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
@@ -494,35 +508,110 @@ async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<Glyph
     let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
     let tt = TrueType::parse(program)?;
 
-    let base = base_encoding(src, font).await;
+    let flags = descriptor.get_int("Flags").unwrap_or(0);
+    let symbolic = flags & FLAG_SYMBOLIC != 0 && flags & FLAG_NONSYMBOLIC == 0;
+    let base_name = base_encoding_name(src, font).await;
+    let named_base = matches!(
+        base_name.as_deref(),
+        Some("WinAnsiEncoding" | "MacRomanEncoding")
+    ) && matches!(rv(src, font, "Encoding").await, Some(Object::Name(_)));
+    let names_apply =
+        named_base || flags & FLAG_NONSYMBOLIC != 0 || (base_name.is_some() && !symbolic);
+    let base = base_name.as_deref().map(base_accessors);
     let diffs = differences(src, font).await;
+
+    // The glyph a code's name reaches: through the glyph list into the
+    // Unicode subtable; for a font on the name-table path without one, back
+    // to a Mac OS Roman code into the (1, 0) subtable; for a symbolic font,
+    // whose (1, 0) table is keyed by its own codes, by the name's value in
+    // the (3, 0) table instead; and failing those, through `post`.
+    let by_name = |name: Option<&str>, ch: Option<char>| -> u16 {
+        let mut gid = 0u16;
+        if let Some(ch) = ch {
+            gid = if tt.has_unicode_cmap() {
+                tt.gid_for_unicode(ch as u32).unwrap_or(0)
+            } else if names_apply && tt.has_mac_cmap() {
+                pdfboss_encoding::mac_os_roman_code(ch)
+                    .and_then(|c| tt.gid_for_mac(c))
+                    .unwrap_or(0)
+            } else if !names_apply && tt.has_symbol_cmap() {
+                tt.gid_for_symbol(ch as u32).unwrap_or(0)
+            } else {
+                0
+            };
+        }
+        if gid == 0 {
+            if let Some(name) = name {
+                gid = tt.gid_for_name(name).unwrap_or(0);
+            }
+        }
+        gid
+    };
+    // The glyph a code reaches on its own: the (3, 0) subtable at the byte
+    // and in the 0xF000, 0xF100 and 0xF200 ranges, else the (1, 0) subtable
+    // at the byte; then, as this reader's own mapping, a Unicode subtable at
+    // the byte or 0xF000 plus the byte, and with no cmap the byte itself.
+    let by_code = |code: u8| -> u16 {
+        let cp = u32::from(code);
+        let mut gid = 0u16;
+        if tt.has_symbol_cmap() {
+            gid = [0x0000, 0xF000, 0xF100, 0xF200]
+                .into_iter()
+                .filter_map(|high| tt.gid_for_symbol(high + cp))
+                .find(|&g| g != 0)
+                .unwrap_or(0);
+        } else if tt.has_mac_cmap() {
+            gid = tt.gid_for_mac(code).unwrap_or(0);
+        }
+        if gid == 0 && tt.has_unicode_cmap() {
+            gid = tt
+                .gid_for_unicode(cp)
+                .filter(|&g| g != 0)
+                .or_else(|| tt.gid_for_unicode(0xF000 + cp))
+                .unwrap_or(0);
+        }
+        if gid == 0 && !tt.has_cmap() && u16::from(code) < tt.num_glyphs() {
+            gid = u16::from(code);
+        }
+        gid
+    };
+    // A symbolic font with a (3, 0) table is addressed by code, whatever an
+    // /Encoding says (pdf.js's canvas.pdf names its codes after letters it
+    // does not show); every other font follows the clause's name table first.
+    let code_first = symbolic && tt.has_symbol_cmap();
 
     let mut table = Box::new([0u16; 256]);
     for (code, slot) in table.iter_mut().enumerate() {
         let code = code as u8;
-        // 1. A /Differences name takes priority (post table, then glyph list).
-        if let Some(name) = diffs.get(&code) {
-            if let Some(gid) = resolve_name(&tt, name) {
-                *slot = gid;
-                continue;
+        let (name, ch): (Option<String>, Option<char>) = match diffs.get(&code) {
+            Some(name) => (Some(name.clone()), pdfboss_encoding::glyph_to_unicode(name)),
+            None if names_apply => {
+                let (name, ch) = base
+                    .map(|(name_of, char_of)| (name_of(code), char_of(code)))
+                    .unwrap_or((None, None));
+                match ch {
+                    Some(ch) => (name.map(str::to_string), Some(ch)),
+                    None => (
+                        pdfboss_encoding::standard_encoding_name(code).map(str::to_string),
+                        pdfboss_encoding::standard(code),
+                    ),
+                }
             }
+            None => (None, None),
+        };
+        let mut gid = if code_first {
+            by_code(code)
+        } else {
+            by_name(name.as_deref(), ch)
+        };
+        if gid == 0 {
+            gid = if code_first {
+                by_name(name.as_deref(), ch)
+            } else {
+                by_code(code)
+            };
         }
-        // 2. The base encoding gives a character to look up in the cmap.
-        if let Some(ch) = base.and_then(|f| f(code)) {
-            if let Some(gid) = tt.gid_for_unicode(ch as u32).filter(|&g| g != 0) {
-                *slot = gid;
-                continue;
-            }
-        }
-        // 3. Fallback: the raw byte, then the symbol PUA range 0xF000+code.
-        if tt.has_cmap() {
-            let cp = u32::from(code);
-            let mut gid = tt.gid_for_unicode(cp).unwrap_or(0);
-            if gid == 0 {
-                gid = tt.gid_for_unicode(0xF000 + cp).unwrap_or(0);
-            }
-            *slot = gid;
-        }
+        *slot = gid;
     }
     Some(GlyphFont {
         outline_cache: Mutex::new(FastMap::default()),
@@ -533,6 +622,27 @@ async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<Glyph
         widths: simple_widths(src, font).await,
         afm_widths: FastMap::default(),
     })
+}
+
+/// A code-to-glyph-name accessor of an encoding.
+type NameOf = fn(u8) -> Option<&'static str>;
+
+/// A code-to-character accessor of an encoding.
+type CharOf = fn(u8) -> Option<char>;
+
+/// The glyph-name and character accessors of a named base encoding.
+fn base_accessors(name: &str) -> (NameOf, CharOf) {
+    match name {
+        "WinAnsiEncoding" => (
+            pdfboss_encoding::win_ansi_glyph_name,
+            pdfboss_encoding::win_ansi,
+        ),
+        "MacRomanEncoding" => (|_| None, pdfboss_encoding::mac_roman),
+        _ => (
+            pdfboss_encoding::standard_encoding_name,
+            pdfboss_encoding::standard,
+        ),
+    }
 }
 
 /// Resolves `dict[key]`, treating an absent key and a failed resolution the
@@ -745,15 +855,21 @@ async fn load_type1_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option
     })
 }
 
-/// Resolves a glyph name to a glyph id: the font's `post` table first, then the
-/// Adobe Glyph List (name → Unicode) through the `cmap`. Glyph id 0 (`.notdef`)
-/// counts as "not found" so resolution can fall through.
-fn resolve_name(tt: &TrueType, name: &str) -> Option<u16> {
-    if let Some(gid) = tt.gid_for_name(name).filter(|&g| g != 0) {
-        return Some(gid);
+/// The name of a font's base encoding: its `/Encoding` name, or a
+/// dictionary's `/BaseEncoding`, `StandardEncoding` when the dictionary
+/// names none. `None` when the font has no `/Encoding`.
+///
+/// Covers ISO 32000-1 §9.6.6.1.
+async fn base_encoding_name<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<String> {
+    match rv(src, font, "Encoding").await {
+        Some(Object::Name(n)) => Some(n.0),
+        Some(Object::Dict(d)) => Some(
+            d.get_name("BaseEncoding")
+                .map(|n| n.0.clone())
+                .unwrap_or_else(|| "StandardEncoding".to_string()),
+        ),
+        _ => None,
     }
-    let ch = pdfboss_encoding::glyph_to_unicode(name)?;
-    tt.gid_for_unicode(ch as u32).filter(|&g| g != 0)
 }
 
 /// Selects the base-encoding accessor (code → char) from a font's `/Encoding`
@@ -765,19 +881,8 @@ async fn base_encoding<S: AsyncObjectSource>(
     src: &S,
     font: &Dict,
 ) -> Option<fn(u8) -> Option<char>> {
-    let name = match rv(src, font, "Encoding").await {
-        Some(Object::Name(n)) => n.0,
-        Some(Object::Dict(d)) => d
-            .get_name("BaseEncoding")
-            .map(|n| n.0.clone())
-            .unwrap_or_else(|| "StandardEncoding".to_string()),
-        _ => return None,
-    };
-    Some(match name.as_str() {
-        "WinAnsiEncoding" => pdfboss_encoding::win_ansi,
-        "MacRomanEncoding" => pdfboss_encoding::mac_roman,
-        _ => pdfboss_encoding::standard,
-    })
+    let name = base_encoding_name(src, font).await?;
+    Some(base_accessors(&name).1)
 }
 
 /// Parses `/Encoding /Differences` into a code → glyph-name map (empty when
@@ -1502,6 +1607,12 @@ mod tests {
     /// Builds a one-page PDF showing `content` with a simple `/TrueType` font
     /// (the synthetic `build_font` program) and the given `/Encoding` entry.
     fn simple_font_doc(encoding: &str, content: &[u8]) -> Vec<u8> {
+        simple_font_doc_with(&build_font(), 4, encoding, content)
+    }
+
+    /// [`simple_font_doc`] with the font program and descriptor `/Flags` of
+    /// the caller's choosing.
+    fn simple_font_doc_with(font: &[u8], flags: u32, encoding: &str, content: &[u8]) -> Vec<u8> {
         let mut b = PdfBuilder::new().version(1, 5);
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -1520,10 +1631,137 @@ mod tests {
         );
         b.object(
             6,
-            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 7 0 R >>",
+            &format!("<< /Type /FontDescriptor /FontName /X /Flags {flags} /FontFile2 7 0 R >>"),
         );
-        b.stream(7, "", &build_font());
+        b.stream(7, "", font);
         b.build(1)
+    }
+
+    /// A symbolic font whose only `cmap` subtable is a `(3, 0)` one keyed in
+    /// the 0xF100 range: the byte 0x41 reaches its glyph through that range,
+    /// as the clause lists it next to 0xF000 and 0xF200.
+    // Covers ISO 32000-1 §9.6.6.4.
+    #[test]
+    fn symbolic_font_codes_go_through_the_3_0_subtable_ranges() {
+        use crate::truetype::tests::{build_font_with_cmap, subtable_format4, table_cmap_records};
+        let font = build_font_with_cmap(
+            1000,
+            Some(table_cmap_records(&[(3, 0, subtable_format4(0xF141))])),
+        );
+        let doc = simple_font_doc_with(&font, 4, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        assert!(glyph_painted(doc), "0x41 should reach glyph 1 as 0xF141");
+    }
+
+    /// With a `(1, 0)` subtable and no Unicode one, a code's glyph name is
+    /// mapped back to a Mac OS Roman code: WinAnsi's bullet at 0x95 is Mac's
+    /// 0xA5, and a /Differences name from Table 115 (Omega, 189) resolves the
+    /// same way.
+    // Covers ISO 32000-1 §9.6.6.4.
+    #[test]
+    fn mac_roman_subtable_takes_the_name_mapped_to_a_mac_os_code() {
+        use crate::truetype::tests::{build_font_with_cmap, subtable_format0, table_cmap_records};
+        let bullet = build_font_with_cmap(
+            1000,
+            Some(table_cmap_records(&[(1, 0, subtable_format0(0xA5))])),
+        );
+        let doc = simple_font_doc_with(
+            &bullet,
+            32,
+            "/Encoding /WinAnsiEncoding",
+            b"BT /F0 100 Tf 20 50 Td <95> Tj ET",
+        );
+        assert!(
+            glyph_painted(doc),
+            "the bullet should paint through the (1, 0) subtable"
+        );
+
+        let omega = build_font_with_cmap(
+            1000,
+            Some(table_cmap_records(&[(1, 0, subtable_format0(189))])),
+        );
+        let doc = simple_font_doc_with(
+            &omega,
+            32,
+            "/Encoding << /Differences [65 /Omega] >>",
+            b"BT /F0 100 Tf 20 50 Td <41> Tj ET",
+        );
+        assert!(
+            glyph_painted(doc),
+            "Omega should paint through Table 115's code 189"
+        );
+    }
+
+    /// A symbolic font's `(1, 0)` subtable is keyed by the font's own codes,
+    /// not by Mac OS Roman, so a `/Differences` name on such a font must not
+    /// be mapped back to a Mac OS Roman code and looked up there: pdf.js's
+    /// canvas.pdf subsets have `(1, 0)` tables keyed 1 to 47 and a `(3, 0)`
+    /// table at 0xF001 and up, and naming code 1 `space` turned it into a
+    /// letter. The name may still reach a glyph through `post` or, by its
+    /// glyph-list value, through the `(3, 0)` table.
+    // Covers ISO 32000-1 §9.6.6.4.
+    #[test]
+    fn a_symbolic_fonts_differences_names_do_not_go_through_mac_os_roman() {
+        use crate::truetype::tests::{
+            build_font_with_cmap, subtable_format0, subtable_format4, table_cmap_records,
+        };
+        // (1, 0) maps 0x20 to the box: the wrong path would paint it for
+        // code 1 named /space. The right path finds nothing and paints nothing.
+        let mac_only = build_font_with_cmap(
+            1000,
+            Some(table_cmap_records(&[(1, 0, subtable_format0(0x20))])),
+        );
+        let doc = simple_font_doc_with(
+            &mac_only,
+            4,
+            "/Encoding << /Differences [1 /space] >>",
+            b"BT /F0 100 Tf 20 50 Td <01> Tj ET",
+        );
+        assert!(
+            !glyph_painted(doc),
+            "code 1 must not become Mac OS Roman 0x20"
+        );
+
+        // With a (3, 0) table at 0xF001 the same code reaches its glyph
+        // through the range, whatever the name says.
+        let symbol = build_font_with_cmap(
+            1000,
+            Some(table_cmap_records(&[
+                (1, 0, subtable_format0(0x20)),
+                (3, 0, subtable_format4(0xF001)),
+            ])),
+        );
+        let doc = simple_font_doc_with(
+            &symbol,
+            4,
+            "/Encoding << /Differences [1 /space] >>",
+            b"BT /F0 100 Tf 20 50 Td <01> Tj ET",
+        );
+        assert!(glyph_painted(doc), "code 1 reaches the box through 0xF001");
+
+        // A /Differences name whose glyph-list value the (3, 0) table maps
+        // reaches its glyph by that value.
+        let doc = simple_font_doc_with(
+            &symbol,
+            4,
+            "/Encoding << /Differences [2 /uniF001] >>",
+            b"BT /F0 100 Tf 20 50 Td <02> Tj ET",
+        );
+        assert!(
+            glyph_painted(doc),
+            "uniF001 reaches the box through the symbol table"
+        );
+    }
+
+    /// A program with no `cmap` at all: a code with no name to look up in
+    /// `post` is used as the glyph index, the mapping of this reader's
+    /// choosing.
+    // Covers ISO 32000-1 §9.6.6.4.
+    #[test]
+    fn a_font_without_a_cmap_uses_the_code_as_the_glyph_index() {
+        use crate::truetype::tests::build_font_with_cmap;
+        let font = build_font_with_cmap(1000, None);
+        let doc = simple_font_doc_with(&font, 4, "", b"BT /F0 100 Tf 20 50 Td <01> Tj ET");
+        assert!(glyph_painted(doc), "code 1 should select glyph 1 directly");
     }
 
     /// True iff a dark pixel lands at (55,115) — the known interior point of
