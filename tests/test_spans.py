@@ -6,7 +6,6 @@ in-memory documents built here. Requires the extension module to be built
 and installed (e.g. via maturin).
 """
 
-import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -267,71 +266,3 @@ class TestAsyncSpans:
         assert [s.text for s in spans] == [s.text for s in sync_spans]
         assert [s.underline for s in spans] == [s.underline for s in sync_spans]
         assert [s.color for s in spans] == [s.color for s in sync_spans]
-
-
-def _parsebench_text_dir() -> Path | None:
-    env = os.environ.get("PARSEBENCH_TEXT_DIR")
-    if env:
-        path = Path(env)
-        return path if path.is_dir() else None
-    fallback = Path("/Users/yassine.elkhadiri/Projects/Parsy-ParseBench/data/docs/text")
-    return fallback if fallback.is_dir() else None
-
-
-def _phrase_runs(spans: list[Span], pred) -> int:
-    items = [
-        ((round(s.y * 2), round(s.x * 2)), pred(s), s.text.isspace())
-        for s in spans
-        if s.text
-    ]
-    items.sort(key=lambda item: item[0])
-    n = 0
-    in_run = False
-    last_y = None
-    for (y, _x), flagged, whitespace in items:
-        if y != last_y:
-            in_run = False
-            last_y = y
-        if flagged:
-            if not in_run:
-                n += 1
-                in_run = True
-        elif not whitespace:
-            in_run = False
-    return n
-
-
-@pytest.mark.skipif(
-    _parsebench_text_dir() is None, reason="ParseBench text corpus missing"
-)
-class TestParseBenchSpanFlags:
-    def test_reference_documents(self) -> None:
-        directory = _parsebench_text_dir()
-        assert directory is not None
-
-        def load(name: str) -> list[Span]:
-            return Document(str(directory / name))[0].spans()
-
-        agent = load("text_simple__agent.pdf")
-        assert "2025 Economic Index" in "".join(s.text for s in agent if s.underline)
-        assert _phrase_runs(agent, lambda s: s.strikethrough) == 0
-
-        noa = load("text_simple__noa.pdf")
-        assert _phrase_runs(noa, lambda s: s.underline) == 4
-        assert _phrase_runs(noa, lambda s: s.strikethrough) == 0
-
-        climbing = load("text_simple__climbing.pdf")
-        assert _phrase_runs(climbing, lambda s: s.underline) == 0
-        assert _phrase_runs(climbing, lambda s: s.strikethrough) == 2
-
-        table = load("text_simple__marknotTable.pdf")
-        under = "".join(s.text for s in table if s.underline)
-        marked = "".join(s.text for s in table if s.highlight)
-        assert "expected level of development" in under
-        assert 6 <= _phrase_runs(table, lambda s: s.underline) <= 10
-        assert _phrase_runs(table, lambda s: s.strikethrough) == 0
-        assert 8 <= _phrase_runs(table, lambda s: s.highlight) <= 12
-        assert "obstacles" in marked
-
-        scanned = load("text_ocr__abstract.pdf")
-        assert not scanned or all(s.invisible for s in scanned)

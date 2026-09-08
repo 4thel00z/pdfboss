@@ -35,8 +35,7 @@ pub(crate) enum MarkupKind {
 const DECORATED_MIN_OVERLAP: f32 = 0.6;
 
 /// Strikethrough band as a fraction of the glyph box, measured from the
-/// bottom: a bar crossing the body of the glyphs (Holmes / pypdfium2 use
-/// 0.38–0.62 of box height).
+/// bottom: a bar crossing the body of the glyphs.
 const STRIKE_LOW: f32 = 0.38;
 const STRIKE_HIGH: f32 = 0.62;
 
@@ -54,7 +53,7 @@ const ANNOT_OVERLAP: f32 = 0.2;
 const HIGHLIGHT_H_OVERLAP: f32 = 0.52;
 const HIGHLIGHT_V_OVERLAP: f32 = 0.08;
 
-/// Highlight band height in PDF points (Holmes' 4–40 px at 200 DPI).
+/// Highlight band height in PDF points (line-height, not a hairline).
 const HIGHLIGHT_MIN_HEIGHT: f32 = 1.44;
 const HIGHLIGHT_MAX_HEIGHT: f32 = 14.4;
 
