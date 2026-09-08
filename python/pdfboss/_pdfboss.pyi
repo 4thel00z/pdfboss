@@ -181,6 +181,23 @@ class Span:
         ``"Footer"``, ``"Watermark"`` or a producer's own name; ``None``
         otherwise."""
 
+    @property
+    def alt(self) -> str | None:
+        """The alternate description that applies to the span (ISO 32000-1
+        14.9.3): the ``/Alt`` of the marked-content sequence it was shown
+        inside, else, under structure-tree reading order, the ``/Alt`` of
+        the nearest structure element above it; ``None`` when neither gives
+        one. A description, not a replacement: ``text`` stays what was
+        shown."""
+
+    @property
+    def lang(self) -> str | None:
+        """The language of the span's text (ISO 32000-1 14.9.2): the
+        ``/Lang`` of the marked-content sequence it was shown inside, else,
+        under structure-tree reading order, the ``/Lang`` of the nearest
+        structure element above it; ``None`` leaves the document's own
+        ``Document.language``."""
+
 class SpanIter:
     """Lazy sync iterator over a document's styled spans; buffers one
     page's spans at a time, extracting each page with the GIL released."""
@@ -244,6 +261,12 @@ class Document:
         Possible keys: ``title``, ``author``, ``subject``, ``keywords``,
         ``creator``, ``producer``, ``creation_date``, ``mod_date``.
         """
+
+    @property
+    def language(self) -> str | None:
+        """The language the catalog declares for the document's text (ISO
+        32000-1 14.9.2), e.g. ``"en-US"``; ``None`` when it declares none.
+        A span's own ``lang`` overrides it for that span."""
 
     def __len__(self) -> int:
         """Number of pages, so ``len(doc)`` mirrors ``doc.page_count``."""
@@ -526,6 +549,10 @@ class AsyncDocument:
         """Document metadata; only keys present in the file are included.
         Same keys as ``Document.metadata``. A coroutine, unlike the sync
         property: the info dictionary is fetched on demand."""
+
+    async def language(self) -> str | None:
+        """The language the catalog declares for the document's text (ISO
+        32000-1 14.9.2); the async twin of ``Document.language``."""
 
     async def get_object(self, num: int, gen: int = 0) -> object:
         """Fetches and parses the indirect object ``num gen``, returning

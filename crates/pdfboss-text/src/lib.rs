@@ -11,7 +11,9 @@ use pdfboss_core::{
 };
 
 pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
-pub use pdfboss_core::{MarkedContentId, Point, Rect};
+pub use pdfboss_core::{
+    MarkedContentId, Point, Rect, StandardKind, StandardType, StructureElement,
+};
 
 /// The order a page's text is read in. Every extraction entry point takes
 /// one; [`ReadingOrder::Content`] is the default.
@@ -114,6 +116,21 @@ pub struct Artifact {
     pub subtype: Option<String>,
 }
 
+/// Where a span's marked-content sequence sits in the document's structure
+/// tree (ISO 32000-1 §14.7): the standard type of the element holding it
+/// and the standard-typed elements from the root down to it.
+///
+/// Covers ISO 32000-1 §14.8.4.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Structure {
+    /// The holding element's type after the role map, when it is one of the
+    /// standard types.
+    pub standard_type: Option<StandardType>,
+    /// The standard-typed elements enclosing the sequence, the outermost
+    /// first and the holding element itself last when it is standard.
+    pub path: Vec<StructureElement>,
+}
+
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
@@ -180,6 +197,25 @@ pub struct TextSpan {
     /// inside (ISO 32000-1 §14.8.2.2): a running head, a page number, a
     /// footnote rule. `None` for real content.
     pub artifact: Option<Artifact>,
+    /// The span's place in the structure tree under
+    /// [`ReadingOrder::StructureTree`]: the element holding its
+    /// marked-content sequence and the standard-typed elements above it
+    /// (ISO 32000-1 §14.8.4). `None` under the other orders, and for
+    /// content the tree does not reach.
+    pub structure: Option<Structure>,
+    /// The alternate description that applies to the span (ISO 32000-1
+    /// §14.9.3): the `/Alt` of the innermost marked-content sequence it was
+    /// shown inside that has one, else, under
+    /// [`ReadingOrder::StructureTree`], the `/Alt` of the nearest structure
+    /// element above it. A description, not a replacement: `text` stays
+    /// what was shown.
+    pub alt: Option<String>,
+    /// The language of the span's text (ISO 32000-1 §14.9.2): the `/Lang`
+    /// of the innermost marked-content sequence it was shown inside that
+    /// declares one, else, under [`ReadingOrder::StructureTree`], the
+    /// `/Lang` of the nearest structure element above it. `None` leaves the
+    /// document's own language, `Document::language`.
+    pub lang: Option<String>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -1615,6 +1651,117 @@ mod tests {
         let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
         assert_eq!(spans, ["L1", "L2", "R1", "R2"]);
         assert_eq!(order, ReadingOrder::StructureTree);
+    }
+
+    // Covers ISO 32000-1 §14.8.4.3.
+    #[test]
+    fn structure_tree_order_attaches_each_span_s_standard_typed_ancestry() {
+        // The left paragraph retagged as a heading: L1 and L2 sit in an H1,
+        // R1 and R2 in a P, both under the Document element.
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /H1 /P 11 0 R /Pg 3 0 R /K [0 2] >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, report) =
+            extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(report.order, ReadingOrder::StructureTree);
+        assert_eq!(texts(&spans), ["L1", "L2", "R1", "R2"]);
+        let kinds = |span: &TextSpan| -> Vec<StandardType> {
+            span.structure
+                .as_ref()
+                .unwrap()
+                .path
+                .iter()
+                .map(|e| e.standard_type)
+                .collect()
+        };
+        assert_eq!(
+            spans[0].structure.as_ref().unwrap().standard_type,
+            Some(StandardType::H1)
+        );
+        assert_eq!(kinds(&spans[0]), [StandardType::Document, StandardType::H1]);
+        assert_eq!(kinds(&spans[1]), [StandardType::Document, StandardType::H1]);
+        assert_eq!(kinds(&spans[2]), [StandardType::Document, StandardType::P]);
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans.iter().all(|span| span.structure.is_none()));
+    }
+
+    /// A sequence's `/Alt`, inline or named, reaches every span shown inside
+    /// it as a description, the shown text staying what it is.
+    // Covers ISO 32000-1 §14.9.3.
+    #[test]
+    fn alternate_descriptions_from_property_lists_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /Alt (a smile) >> BDC (grin) Tj EMC \
+              /Span /Named BDC (e) Tj EMC (plain) Tj ET",
+            "/Named << /Alt <FEFF00E9> >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["grin", "e", "plain"]);
+        assert_eq!(spans[0].alt.as_deref(), Some("a smile"));
+        assert_eq!(spans[1].alt.as_deref(), Some("\u{e9}"));
+        assert_eq!(spans[2].alt, None);
+    }
+
+    /// Under structure-tree order a span with no description of its own
+    /// takes the nearest structure element's `/Alt`.
+    // Covers ISO 32000-1 §14.9.3.
+    #[test]
+    fn alternate_descriptions_from_structure_elements_reach_the_spans() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /Figure /P 11 0 R /Pg 3 0 R /K [0 2] /Alt (Left chart) >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["L1", "L2", "R1", "R2"]);
+        assert_eq!(spans[0].alt.as_deref(), Some("Left chart"));
+        assert_eq!(spans[1].alt.as_deref(), Some("Left chart"));
+        assert_eq!(spans[2].alt, None);
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans.iter().all(|span| span.alt.is_none()));
+    }
+
+    /// A sequence's `/Lang` reaches every span shown inside it; under
+    /// structure-tree order a span with none takes the nearest structure
+    /// element's, and a sequence's own language wins over the element's.
+    // Covers ISO 32000-1 §14.9.2 and §14.9.2.3.
+    #[test]
+    fn natural_languages_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /Lang (fr) >> BDC (bonjour) Tj EMC (plain) Tj ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(spans[0].lang.as_deref(), Some("fr"));
+        assert_eq!(spans[1].lang, None);
+
+        // The left paragraph's element says de; its first sequence says fr.
+        let content: &[u8] = b"BT /F1 12 Tf \
+            /P << /MCID 0 /Lang (fr) >> BDC 1 0 0 1 72 700 Tm (L1) Tj EMC \
+            /P << /MCID 2 >> BDC 1 0 0 1 72 680 Tm (L2) Tj EMC \
+            /P << /MCID 1 >> BDC 1 0 0 1 300 700 Tm (R1) Tj EMC ET";
+        let doc = tagged_doc(content, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0 2] /Lang (de) >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["L1", "L2", "R1"]);
+        assert_eq!(spans[0].lang.as_deref(), Some("fr"));
+        assert_eq!(spans[1].lang.as_deref(), Some("de"));
+        assert_eq!(spans[2].lang, None);
+        assert_eq!(doc.language(), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Structure-tree reading order (ISO 32000-1 §14.7): where a page's
 //! marked-content sequences sit in the document's logical structure, so a
-//! tagged page can be read in the order its author declared.
+//! tagged page can be read in the order its author declared, and which
+//! structure type the element holding each sequence declares (§14.7.3).
 
 use std::sync::Arc;
 
@@ -23,6 +24,295 @@ pub struct MarkedContentId {
     pub mcid: u32,
 }
 
+/// The four groups §14.8.4 sorts the standard structure types into, one per
+/// clause that defines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardKind {
+    /// §14.8.4.2: elements that group other elements and hold no content
+    /// of their own.
+    Grouping,
+    /// §14.8.4.3: paragraphs, headings, lists and tables, laid out as
+    /// blocks.
+    BlockLevel,
+    /// §14.8.4.4: elements within a block's text.
+    InlineLevel,
+    /// §14.8.4.5: figures, formulas and forms.
+    Illustration,
+}
+
+/// The standard structure types of ISO 32000-1 §14.8.4, each variant spelled
+/// as the standard spells the `/S` name it stands for.
+///
+/// Covers ISO 32000-1 §14.8.4.
+#[allow(clippy::upper_case_acronyms)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardType {
+    // Grouping elements (§14.8.4.2).
+    Document,
+    Part,
+    Art,
+    Sect,
+    Div,
+    BlockQuote,
+    Caption,
+    TOC,
+    TOCI,
+    Index,
+    NonStruct,
+    Private,
+    // Block-level structure elements (§14.8.4.3).
+    P,
+    H,
+    H1,
+    H2,
+    H3,
+    H4,
+    H5,
+    H6,
+    L,
+    LI,
+    Lbl,
+    LBody,
+    Table,
+    TR,
+    TH,
+    TD,
+    THead,
+    TBody,
+    TFoot,
+    // Inline-level structure elements (§14.8.4.4).
+    Span,
+    Quote,
+    Note,
+    Reference,
+    BibEntry,
+    Code,
+    Link,
+    Annot,
+    Ruby,
+    RB,
+    RT,
+    RP,
+    Warichu,
+    WT,
+    WP,
+    // Illustration elements (§14.8.4.5).
+    Figure,
+    Formula,
+    Form,
+}
+
+impl StandardType {
+    /// Every standard type, grouping elements first, in the standard's order.
+    pub const ALL: [StandardType; 49] = [
+        StandardType::Document,
+        StandardType::Part,
+        StandardType::Art,
+        StandardType::Sect,
+        StandardType::Div,
+        StandardType::BlockQuote,
+        StandardType::Caption,
+        StandardType::TOC,
+        StandardType::TOCI,
+        StandardType::Index,
+        StandardType::NonStruct,
+        StandardType::Private,
+        StandardType::P,
+        StandardType::H,
+        StandardType::H1,
+        StandardType::H2,
+        StandardType::H3,
+        StandardType::H4,
+        StandardType::H5,
+        StandardType::H6,
+        StandardType::L,
+        StandardType::LI,
+        StandardType::Lbl,
+        StandardType::LBody,
+        StandardType::Table,
+        StandardType::TR,
+        StandardType::TH,
+        StandardType::TD,
+        StandardType::THead,
+        StandardType::TBody,
+        StandardType::TFoot,
+        StandardType::Span,
+        StandardType::Quote,
+        StandardType::Note,
+        StandardType::Reference,
+        StandardType::BibEntry,
+        StandardType::Code,
+        StandardType::Link,
+        StandardType::Annot,
+        StandardType::Ruby,
+        StandardType::RB,
+        StandardType::RT,
+        StandardType::RP,
+        StandardType::Warichu,
+        StandardType::WT,
+        StandardType::WP,
+        StandardType::Figure,
+        StandardType::Formula,
+        StandardType::Form,
+    ];
+
+    /// The standard type a structure type name stands for, `None` for a name
+    /// outside the standard set. Names are case-sensitive; a document's own
+    /// types reach the standard set through the role map (§14.7.3), not here.
+    pub fn from_name(name: &str) -> Option<StandardType> {
+        StandardType::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The name as the standard spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            StandardType::Document => "Document",
+            StandardType::Part => "Part",
+            StandardType::Art => "Art",
+            StandardType::Sect => "Sect",
+            StandardType::Div => "Div",
+            StandardType::BlockQuote => "BlockQuote",
+            StandardType::Caption => "Caption",
+            StandardType::TOC => "TOC",
+            StandardType::TOCI => "TOCI",
+            StandardType::Index => "Index",
+            StandardType::NonStruct => "NonStruct",
+            StandardType::Private => "Private",
+            StandardType::P => "P",
+            StandardType::H => "H",
+            StandardType::H1 => "H1",
+            StandardType::H2 => "H2",
+            StandardType::H3 => "H3",
+            StandardType::H4 => "H4",
+            StandardType::H5 => "H5",
+            StandardType::H6 => "H6",
+            StandardType::L => "L",
+            StandardType::LI => "LI",
+            StandardType::Lbl => "Lbl",
+            StandardType::LBody => "LBody",
+            StandardType::Table => "Table",
+            StandardType::TR => "TR",
+            StandardType::TH => "TH",
+            StandardType::TD => "TD",
+            StandardType::THead => "THead",
+            StandardType::TBody => "TBody",
+            StandardType::TFoot => "TFoot",
+            StandardType::Span => "Span",
+            StandardType::Quote => "Quote",
+            StandardType::Note => "Note",
+            StandardType::Reference => "Reference",
+            StandardType::BibEntry => "BibEntry",
+            StandardType::Code => "Code",
+            StandardType::Link => "Link",
+            StandardType::Annot => "Annot",
+            StandardType::Ruby => "Ruby",
+            StandardType::RB => "RB",
+            StandardType::RT => "RT",
+            StandardType::RP => "RP",
+            StandardType::Warichu => "Warichu",
+            StandardType::WT => "WT",
+            StandardType::WP => "WP",
+            StandardType::Figure => "Figure",
+            StandardType::Formula => "Formula",
+            StandardType::Form => "Form",
+        }
+    }
+
+    /// The clause of §14.8.4 that defines the type.
+    pub fn kind(self) -> StandardKind {
+        match self {
+            StandardType::Document
+            | StandardType::Part
+            | StandardType::Art
+            | StandardType::Sect
+            | StandardType::Div
+            | StandardType::BlockQuote
+            | StandardType::Caption
+            | StandardType::TOC
+            | StandardType::TOCI
+            | StandardType::Index
+            | StandardType::NonStruct
+            | StandardType::Private => StandardKind::Grouping,
+            StandardType::P
+            | StandardType::H
+            | StandardType::H1
+            | StandardType::H2
+            | StandardType::H3
+            | StandardType::H4
+            | StandardType::H5
+            | StandardType::H6
+            | StandardType::L
+            | StandardType::LI
+            | StandardType::Lbl
+            | StandardType::LBody
+            | StandardType::Table
+            | StandardType::TR
+            | StandardType::TH
+            | StandardType::TD
+            | StandardType::THead
+            | StandardType::TBody
+            | StandardType::TFoot => StandardKind::BlockLevel,
+            StandardType::Span
+            | StandardType::Quote
+            | StandardType::Note
+            | StandardType::Reference
+            | StandardType::BibEntry
+            | StandardType::Code
+            | StandardType::Link
+            | StandardType::Annot
+            | StandardType::Ruby
+            | StandardType::RB
+            | StandardType::RT
+            | StandardType::RP
+            | StandardType::Warichu
+            | StandardType::WT
+            | StandardType::WP => StandardKind::InlineLevel,
+            StandardType::Figure | StandardType::Formula | StandardType::Form => {
+                StandardKind::Illustration
+            }
+        }
+    }
+}
+
+/// One structure element on a placement's path: its standard type and the
+/// object holding it, so two neighbouring elements of one type are told
+/// apart.
+///
+/// Covers ISO 32000-1 §14.8.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructureElement {
+    pub standard_type: StandardType,
+    pub object: ObjRef,
+}
+
+/// Where one marked-content sequence sits in the tree: its rank in the
+/// tree's depth-first order, and the structure type of the element holding
+/// it, as written, after the root's `/RoleMap`, and as a standard type,
+/// with the standard-typed elements above it.
+///
+/// Covers ISO 32000-1 §14.7.3 and §14.8.4.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    pub rank: u32,
+    /// The element's `/S`, as the file writes it.
+    pub structure_type: Option<String>,
+    /// `structure_type` followed through the role map until a name the map
+    /// has no entry for; the same name when the map never names it.
+    pub mapped_type: Option<String>,
+    /// The standard type `mapped_type` names, `None` when it names none.
+    pub standard_type: Option<StandardType>,
+    /// The element and its ancestors that have a standard type, the root's
+    /// child first and the element itself last; an ancestor of no standard
+    /// type is skipped, its children keeping their place.
+    pub path: Vec<StructureElement>,
+    /// The alternate description (`/Alt`, §14.9.3) of the element, or of
+    /// the nearest ancestor that has one, decoded as a text string.
+    pub alt: Option<String>,
+    /// The language (`/Lang`, §14.9.2) of the element, or of the nearest
+    /// ancestor that declares one; `None` leaves the document's own.
+    pub lang: Option<String>,
+}
+
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
 /// document and asked per page where that page's marked content sits in
 /// the tree. `/MarkInfo` is never consulted: a tree with leaves counts,
@@ -31,6 +321,9 @@ pub struct MarkedContentId {
 pub struct StructureTree {
     root: Dict,
     root_ref: Option<ObjRef>,
+    /// The root's `/RoleMap`: structure type names to the names they stand
+    /// for (§14.7.3), entries whose value is not a name dropped.
+    role_map: FastMap<String, String>,
 }
 
 impl StructureTree {
@@ -46,18 +339,38 @@ impl StructureTree {
         let root_ref = entry.as_ref();
         let resolved = src.resolve(entry).await.ok()?;
         let root = resolved.as_dict()?.clone();
-        Some(StructureTree { root, root_ref })
+        let role_map = match root.get("RoleMap") {
+            Some(entry) => role_map_of(resolved_dict(src, entry).await),
+            None => FastMap::default(),
+        };
+        Some(StructureTree {
+            root,
+            root_ref,
+            role_map,
+        })
     }
 
-    /// Ranks `ids`, one page's marked-content sequences, by their position in
-    /// the tree's depth-first order: 0 for the first the tree reaches, and so
-    /// on. An id the tree never reaches (untagged content, a key the parent
-    /// tree lacks, an element whose ancestry is broken) is absent, so an
-    /// empty map means the page has no leaves in the tree.
+    /// `name` followed through the root's `/RoleMap` until a name the map
+    /// has no entry for. The map is meant to reach a standard structure type
+    /// (§14.8.4) in one step; a chain is followed in case a mapped name is
+    /// itself mapped, and a cycle leaves the name as written.
     ///
-    /// The lookup goes through the parent tree (`/ParentTree`, keyed by
-    /// `/StructParents`) and each element's `/P` chain, so it costs the page's
-    /// own elements, never a walk of the whole tree.
+    /// Covers ISO 32000-1 §14.7.3.
+    pub fn mapped_type(&self, name: &str) -> String {
+        let mut seen: FastSet<&str> = FastSet::default();
+        let mut current = name;
+        while let Some(next) = self.role_map.get(current) {
+            if !seen.insert(current) {
+                return name.to_string();
+            }
+            current = next;
+        }
+        current.to_string()
+    }
+
+    /// The ranks of [`StructureTree::place_with`] alone: one page's
+    /// marked-content sequences by their position in the tree's depth-first
+    /// order, 0 for the first the tree reaches.
     ///
     /// Covers ISO 32000-1 §14.8.2 and §14.8.2.3.
     pub async fn ranks_with<S: AsyncObjectSource>(
@@ -66,12 +379,37 @@ impl StructureTree {
         page: &Page,
         ids: &[MarkedContentId],
     ) -> FastMap<MarkedContentId, u32> {
-        let mut ranks: FastMap<MarkedContentId, u32> = FastMap::default();
+        self.place_with(src, page, ids)
+            .await
+            .into_iter()
+            .map(|(id, placement)| (id, placement.rank))
+            .collect()
+    }
+
+    /// Places `ids`, one page's marked-content sequences, in the tree: each
+    /// gets its rank in the tree's depth-first order (0 for the first the
+    /// tree reaches, and so on) and the structure type of the element holding
+    /// it. An id the tree never reaches (untagged content, a key the parent
+    /// tree lacks, an element whose ancestry is broken) is absent, so an
+    /// empty map means the page has no leaves in the tree.
+    ///
+    /// The lookup goes through the parent tree (`/ParentTree`, keyed by
+    /// `/StructParents`) and each element's `/P` chain, so it costs the page's
+    /// own elements, never a walk of the whole tree.
+    ///
+    /// Covers ISO 32000-1 §14.7.3, §14.8.2 and §14.8.2.3.
+    pub async fn place_with<S: AsyncObjectSource>(
+        &self,
+        src: &S,
+        page: &Page,
+        ids: &[MarkedContentId],
+    ) -> FastMap<MarkedContentId, Placement> {
+        let mut placed: FastMap<MarkedContentId, Placement> = FastMap::default();
         let Some(parent_tree) = self.root.get("ParentTree") else {
-            return ranks;
+            return placed;
         };
         let Some(parent_tree) = resolved_dict(src, parent_tree).await else {
-            return ranks;
+            return placed;
         };
         let mut walk = Walk {
             src,
@@ -81,23 +419,75 @@ impl StructureTree {
             paths: FastMap::default(),
             parents: FastMap::default(),
         };
-        let mut keyed: Vec<(MarkedContentId, Vec<u32>)> = Vec::new();
+        let mut keyed: Vec<(MarkedContentId, Vec<u32>, Ancestry)> = Vec::new();
         let mut seen: FastSet<MarkedContentId> = FastSet::default();
         for id in ids {
             if !seen.insert(*id) {
                 continue;
             }
-            let Some(key) = walk.key_of(&parent_tree, *id).await else {
+            let Some((key, ancestry)) = walk.key_of(&parent_tree, *id).await else {
                 continue;
             };
-            keyed.push((*id, key));
+            keyed.push((*id, key, ancestry));
         }
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
-        for (rank, (id, _)) in keyed.into_iter().enumerate() {
-            ranks.insert(id, rank as u32);
+        for (rank, (id, _, ancestry)) in keyed.into_iter().enumerate() {
+            let structure_type = ancestry.last().and_then(|a| a.structure_type.clone());
+            let mapped_type = structure_type.as_deref().map(|s| self.mapped_type(s));
+            let standard_type = mapped_type.as_deref().and_then(StandardType::from_name);
+            let path = ancestry
+                .iter()
+                .filter_map(|ancestor| {
+                    let name = ancestor.structure_type.as_deref()?;
+                    let standard_type = StandardType::from_name(&self.mapped_type(name))?;
+                    Some(StructureElement {
+                        standard_type,
+                        object: ancestor.object,
+                    })
+                })
+                .collect();
+            let alt = ancestry.iter().rev().find_map(|a| a.alt.clone());
+            let lang = ancestry.iter().rev().find_map(|a| a.lang.clone());
+            placed.insert(
+                id,
+                Placement {
+                    rank: rank as u32,
+                    structure_type,
+                    mapped_type,
+                    standard_type,
+                    path,
+                    alt,
+                    lang,
+                },
+            );
         }
-        ranks
+        placed
     }
+}
+
+/// One element on the way from a marked-content sequence up to the root:
+/// its object, its `/S` as written, and its `/Alt` and `/Lang` decoded.
+struct Ancestor {
+    object: ObjRef,
+    structure_type: Option<String>,
+    alt: Option<String>,
+    lang: Option<String>,
+}
+
+/// An element and its ancestors up to the root, the root's child first and
+/// the element last.
+type Ancestry = Vec<Ancestor>;
+
+/// The `/RoleMap` dictionary as name-to-name pairs.
+///
+/// Covers ISO 32000-1 §14.7.3.
+fn role_map_of(dict: Option<Dict>) -> FastMap<String, String> {
+    let Some(dict) = dict else {
+        return FastMap::default();
+    };
+    dict.iter()
+        .filter_map(|(key, value)| Some((key.0.clone(), value.as_name()?.0.clone())))
+        .collect()
 }
 
 /// One page's walk through the tree: the dictionaries it has already read
@@ -116,9 +506,14 @@ struct Walk<'a, S> {
 }
 
 impl<S: AsyncObjectSource> Walk<'_, S> {
-    /// The sort key of one marked-content sequence: its element's path from
-    /// the root, then its own index among the element's kids.
-    async fn key_of(&mut self, parent_tree: &Dict, id: MarkedContentId) -> Option<Vec<u32>> {
+    /// The sort key of one marked-content sequence, its element's path from
+    /// the root then its own index among the element's kids, with the
+    /// element's ancestry and its structure types (`/S`, §14.7.3).
+    async fn key_of(
+        &mut self,
+        parent_tree: &Dict,
+        id: MarkedContentId,
+    ) -> Option<(Vec<u32>, Ancestry)> {
         let elements = self.parent_array(parent_tree, id.parents).await?;
         let element = elements.get(id.mcid as usize)?.as_ref()?;
         let path = self.path_of(element).await?;
@@ -127,7 +522,55 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         let mut key = Vec::with_capacity(path.len() + 1);
         key.extend_from_slice(&path);
         key.push(index);
-        Some(key)
+        Some((key, self.ancestry(element).await))
+    }
+
+    /// The element and its ancestors up to the root, the root's child first
+    /// and the element itself last, each with its `/S`, `/Alt` and `/Lang`:
+    /// what a placement's structure type, path, description and language
+    /// are read from. The climb stops at the root, at a missing `/P`, or
+    /// after [`MAX_ELEMENT_DEPTH`] elements; the dictionaries are the ones
+    /// [`Walk::path_of`] already read.
+    ///
+    /// Covers ISO 32000-1 §14.7.3, §14.8.4.3, §14.9.2 and §14.9.3.
+    async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
+        let mut chain: Ancestry = Vec::new();
+        let mut current = element;
+        for _ in 0..MAX_ELEMENT_DEPTH {
+            let Some(dict) = self.dict(current).await else {
+                break;
+            };
+            let alt = match dict.get("Alt") {
+                Some(alt) => self.text_string(alt).await,
+                None => None,
+            };
+            let lang = match dict.get("Lang") {
+                Some(lang) => self.text_string(lang).await,
+                None => None,
+            };
+            chain.push(Ancestor {
+                object: current,
+                structure_type: dict.get_name("S").map(|n| n.0.clone()),
+                alt,
+                lang,
+            });
+            let Some(parent) = dict.get("P").and_then(Object::as_ref) else {
+                break;
+            };
+            if self.is_root(parent).await {
+                break;
+            }
+            current = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// A text string entry (§7.9.2.2), resolved and decoded; `None` for
+    /// anything but a string.
+    async fn text_string(&mut self, value: &Object) -> Option<String> {
+        let resolved = self.src.resolve(value).await.ok()?;
+        Some(crate::object::decode_text_string(resolved.as_str_bytes()?))
     }
 
     /// The parent tree's entry for a `/StructParents` key: the array whose
@@ -382,6 +825,299 @@ mod tests {
         let tree = doc.structure_tree().expect("tree");
         let page = doc.page(0).unwrap();
         block_on(tree.ranks_with(&Immediate(doc), &page, ids))
+    }
+
+    fn placements(doc: &Document, ids: &[MarkedContentId]) -> FastMap<MarkedContentId, Placement> {
+        let tree = doc.structure_tree().expect("tree");
+        let page = doc.page(0).unwrap();
+        block_on(tree.place_with(&Immediate(doc), &page, ids))
+    }
+
+    // Covers ISO 32000-1 §14.7.3.
+    #[test]
+    fn structure_types_are_read_and_mapped_through_the_role_map() {
+        // Four elements typed Para, Sub, Loop1 and P. The role map, an
+        // indirect object, maps Para to P, Sub to Head and Head to H1, and
+        // Loop1 and Loop2 to each other.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R /RoleMap 20 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 14 0 R 15 0 R 16 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [13 0 R 14 0 R 15 0 R 16 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /Para /P 11 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /Sub /P 11 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    15,
+                    "<< /Type /StructElem /S /Loop1 /P 11 0 R /Pg 3 0 R /K [2] >>",
+                ),
+                (
+                    16,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [3] >>",
+                ),
+                (
+                    20,
+                    "<< /Para /P /Sub /Head /Head /H1 /Loop1 /Loop2 /Loop2 /Loop1 >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 3), id(0, 2), id(0, 1), id(0, 0)]);
+        let typed = |n: u32| {
+            let p = &placed[&id(0, n)];
+            (p.structure_type.as_deref(), p.mapped_type.as_deref())
+        };
+        assert_eq!(typed(0), (Some("Para"), Some("P")));
+        assert_eq!(typed(1), (Some("Sub"), Some("H1")));
+        assert_eq!(typed(2), (Some("Loop1"), Some("Loop1")));
+        assert_eq!(typed(3), (Some("P"), Some("P")));
+        assert_eq!(placed[&id(0, 3)].rank, 3);
+        assert_eq!(placed[&id(0, 0)].standard_type, Some(StandardType::P));
+        assert_eq!(placed[&id(0, 1)].standard_type, Some(StandardType::H1));
+        assert_eq!(placed[&id(0, 2)].standard_type, None);
+        let tree = doc.structure_tree().unwrap();
+        assert_eq!(tree.mapped_type("Head"), "H1");
+        assert_eq!(tree.mapped_type("Span"), "Span");
+    }
+
+    // Covers ISO 32000-1 §14.7.3.
+    #[test]
+    fn an_element_without_a_type_places_with_none() {
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (11, "<< /Type /StructElem /P 10 0 R /Pg 3 0 R /K [0] >>"),
+                (12, "<< /Nums [0 [11 0 R]] >>"),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0)]);
+        assert_eq!(placed[&id(0, 0)].rank, 0);
+        assert_eq!(placed[&id(0, 0)].structure_type, None);
+        assert_eq!(placed[&id(0, 0)].mapped_type, None);
+        assert_eq!(placed[&id(0, 0)].standard_type, None);
+    }
+
+    // Covers ISO 32000-1 §14.7.3 and §14.8.4.3.
+    #[test]
+    fn placements_carry_the_standard_typed_ancestry() {
+        // Document > Sect > H holds id 0; Document > L > LI > Lbl holds 1
+        // and > LBody > P holds 2; a Sidebar element of no standard type
+        // holds a P with id 3.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 15 0 R 20 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [14 0 R 17 0 R 19 0 R 21 0 R]] >>"),
+                (13, "<< /Type /StructElem /S /Sect /P 11 0 R /K [14 0 R] >>"),
+                (
+                    14,
+                    "<< /Type /StructElem /S /H /P 13 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (15, "<< /Type /StructElem /S /L /P 11 0 R /K [16 0 R] >>"),
+                (
+                    16,
+                    "<< /Type /StructElem /S /LI /P 15 0 R /K [17 0 R 18 0 R] >>",
+                ),
+                (
+                    17,
+                    "<< /Type /StructElem /S /Lbl /P 16 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    18,
+                    "<< /Type /StructElem /S /LBody /P 16 0 R /K [19 0 R] >>",
+                ),
+                (
+                    19,
+                    "<< /Type /StructElem /S /P /P 18 0 R /Pg 3 0 R /K [2] >>",
+                ),
+                (
+                    20,
+                    "<< /Type /StructElem /S /Sidebar /P 11 0 R /K [21 0 R] >>",
+                ),
+                (
+                    21,
+                    "<< /Type /StructElem /S /P /P 20 0 R /Pg 3 0 R /K [3] >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1), id(0, 2), id(0, 3)]);
+        let kinds = |n: u32| -> Vec<StandardType> {
+            placed[&id(0, n)]
+                .path
+                .iter()
+                .map(|e| e.standard_type)
+                .collect()
+        };
+        let objects = |n: u32| -> Vec<u32> {
+            placed[&id(0, n)]
+                .path
+                .iter()
+                .map(|e| e.object.num)
+                .collect()
+        };
+        assert_eq!(
+            kinds(0),
+            [StandardType::Document, StandardType::Sect, StandardType::H]
+        );
+        assert_eq!(objects(0), [11, 13, 14]);
+        assert_eq!(
+            kinds(1),
+            [
+                StandardType::Document,
+                StandardType::L,
+                StandardType::LI,
+                StandardType::Lbl
+            ]
+        );
+        assert_eq!(
+            kinds(2),
+            [
+                StandardType::Document,
+                StandardType::L,
+                StandardType::LI,
+                StandardType::LBody,
+                StandardType::P
+            ]
+        );
+        assert_eq!(kinds(3), [StandardType::Document, StandardType::P]);
+        assert_eq!(objects(3), [11, 21]);
+    }
+
+    // Covers ISO 32000-1 §14.9.3.
+    #[test]
+    fn placements_carry_the_nearest_alternate_description() {
+        // A Figure with /Alt holding a P with id 0; a P with no /Alt anywhere
+        // above it holding id 1; a Span with a UTF-16 /Alt holding id 2.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 15 0 R 16 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [14 0 R 15 0 R 16 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /Figure /P 11 0 R /Alt (A chart) /K [14 0 R] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /P /P 13 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    15,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    16,
+                    "<< /Type /StructElem /S /Span /P 11 0 R /Pg 3 0 R /K [2] /Alt <FEFF00E9> >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1), id(0, 2)]);
+        assert_eq!(placed[&id(0, 0)].alt.as_deref(), Some("A chart"));
+        assert_eq!(placed[&id(0, 1)].alt, None);
+        assert_eq!(placed[&id(0, 2)].alt.as_deref(), Some("\u{e9}"));
+    }
+
+    // Covers ISO 32000-1 §14.9.2 and §14.9.2.3.
+    #[test]
+    fn placements_carry_the_nearest_language() {
+        // The Document element says en; the second paragraph says de for
+        // itself; the tree of `two_paragraphs` says nothing at all.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /Lang (en) /K [13 0 R 14 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [13 0 R 14 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /Lang (de) /K [1] >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1)]);
+        assert_eq!(placed[&id(0, 0)].lang.as_deref(), Some("en"));
+        assert_eq!(placed[&id(0, 1)].lang.as_deref(), Some("de"));
+        let untagged = two_paragraphs("<< /Nums [0 [13 0 R 14 0 R 13 0 R 14 0 R]] >>");
+        assert_eq!(placements(&untagged, &[id(0, 0)])[&id(0, 0)].lang, None);
+    }
+
+    // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and
+    // §14.8.4.5.
+    #[test]
+    fn standard_types_are_recognized_by_name_and_grouped_by_clause() {
+        assert_eq!(StandardType::from_name("H1"), Some(StandardType::H1));
+        assert_eq!(StandardType::H1.kind(), StandardKind::BlockLevel);
+        assert_eq!(
+            StandardType::from_name("TOCI").map(StandardType::kind),
+            Some(StandardKind::Grouping)
+        );
+        assert_eq!(
+            StandardType::from_name("LBody").map(StandardType::kind),
+            Some(StandardKind::BlockLevel)
+        );
+        assert_eq!(
+            StandardType::from_name("TFoot").map(StandardType::kind),
+            Some(StandardKind::BlockLevel)
+        );
+        assert_eq!(
+            StandardType::from_name("Ruby").map(StandardType::kind),
+            Some(StandardKind::InlineLevel)
+        );
+        assert_eq!(
+            StandardType::from_name("Formula").map(StandardType::kind),
+            Some(StandardKind::Illustration)
+        );
+        // Names are case-sensitive and a document's own types are not standard.
+        assert_eq!(StandardType::from_name("h1"), None);
+        assert_eq!(StandardType::from_name("Para"), None);
+        assert_eq!(StandardType::ALL.len(), 49);
+        for t in StandardType::ALL {
+            assert_eq!(StandardType::from_name(t.name()), Some(t), "{}", t.name());
+        }
+        let grouping = StandardType::ALL
+            .iter()
+            .filter(|t| t.kind() == StandardKind::Grouping)
+            .count();
+        assert_eq!(grouping, 12);
     }
 
     // Covers ISO 32000-1 §7.7.2.

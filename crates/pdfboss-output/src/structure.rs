@@ -3,7 +3,9 @@
 
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
-use pdfboss_text::{ArtifactKind, ReadingOrder, Ruling, TextSpan};
+use pdfboss_text::{
+    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardType, StructureElement, TextSpan,
+};
 
 /// Fraction of the device font size a horizontal gap must exceed to read
 /// as a word break. The ceiling is justified LaTeX's shrunk inter-word
@@ -498,6 +500,15 @@ fn push_segment_blocks(
     order: ReadingOrder,
     out: &mut Vec<Block>,
 ) {
+    if order == ReadingOrder::StructureTree
+        && segment
+            .spans
+            .iter()
+            .any(|span| block_element(span).is_some())
+    {
+        push_tagged_blocks(&segment.spans, stats, out);
+        return;
+    }
     let groups = segment.into_groups();
     if grids.is_empty() {
         push_lane_blocks(&groups, stats, out);
@@ -553,6 +564,325 @@ fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &
         .flat_map(|group| group.spans.iter().copied())
         .collect();
     push_lane_blocks(&line_groups(&spans), stats, out);
+}
+
+/// The outermost block-level element on a span's path (§14.8.4.3): the
+/// block the span belongs to. `None` for a span the tree does not reach and
+/// for one whose path holds no block-level element.
+fn block_element(span: &TextSpan) -> Option<StructureElement> {
+    span.structure
+        .as_ref()?
+        .path
+        .iter()
+        .copied()
+        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel)
+}
+
+/// Blocks on the tree's own word: consecutive spans of one outermost
+/// block-level element form one block, typed by that element. H1 to H6 and
+/// H are headings, L a list, Table a table, every other block-level element
+/// a paragraph, so two P elements a line apart stay two paragraphs and a
+/// heading needs no size step. Stretches of spans with no block-level
+/// element go through the layout heuristics as on an untagged page. Ruled
+/// grids are not consulted here: a tagged table's rows are its TR elements.
+///
+/// Covers ISO 32000-1 §14.8.4.3.
+fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
+    for (element, run) in stretches(spans, block_element) {
+        match element {
+            None => push_lane_blocks(&sequential_groups(run.iter().copied()), stats, out),
+            Some(element) => push_tagged_block(element, run, out),
+        }
+    }
+}
+
+/// `spans` cut into maximal stretches on which `key` is constant, each with
+/// its key.
+fn stretches<'r, 's, K: PartialEq>(
+    spans: &'r [&'s TextSpan],
+    key: impl Fn(&TextSpan) -> K,
+) -> Vec<(K, &'r [&'s TextSpan])> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < spans.len() {
+        let current = key(spans[start]);
+        let mut end = start + 1;
+        while end < spans.len() && key(spans[end]) == current {
+            end += 1;
+        }
+        out.push((current, &spans[start..end]));
+        start = end;
+    }
+    out
+}
+
+fn push_tagged_block(element: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+    match element.standard_type {
+        StandardType::H1 => push_tagged_heading(1, spans, out),
+        StandardType::H2 => push_tagged_heading(2, spans, out),
+        StandardType::H3 => push_tagged_heading(3, spans, out),
+        StandardType::H4 => push_tagged_heading(4, spans, out),
+        StandardType::H5 => push_tagged_heading(5, spans, out),
+        StandardType::H6 => push_tagged_heading(6, spans, out),
+        StandardType::H => push_tagged_heading(section_depth(spans[0]), spans, out),
+        StandardType::L => push_tagged_list(element, spans, out),
+        StandardType::Table => push_tagged_table(element, spans, out),
+        _ => push_tagged_paragraph(spans, out),
+    }
+}
+
+/// The level of an H heading: how deep its Part, Art and Sect ancestors
+/// nest, at least one and at most six. Strongly structured documents number
+/// their headings by nesting instead of naming a level (§14.8.4.3.2).
+fn section_depth(span: &TextSpan) -> u8 {
+    let depth = span.structure.as_ref().map_or(0, |structure| {
+        structure
+            .path
+            .iter()
+            .filter(|element| {
+                matches!(
+                    element.standard_type,
+                    StandardType::Part | StandardType::Art | StandardType::Sect
+                )
+            })
+            .count()
+    });
+    clamped_level(depth.max(1))
+}
+
+/// The lines of a run of tagged spans, in the order they came.
+fn tagged_lines(spans: &[&TextSpan]) -> Vec<Line> {
+    sequential_groups(spans.iter().copied())
+        .iter()
+        .map(|group| assembled(group).line)
+        .collect()
+}
+
+fn push_tagged_heading(level: u8, spans: &[&TextSpan], out: &mut Vec<Block>) {
+    let lines = tagged_lines(spans);
+    if lines.is_empty() {
+        return;
+    }
+    out.push(Block::Heading {
+        level,
+        bbox: bbox(&lines),
+        lines,
+    });
+}
+
+fn push_tagged_paragraph(spans: &[&TextSpan], out: &mut Vec<Block>) {
+    let lines = tagged_lines(spans);
+    if lines.is_empty() {
+        return;
+    }
+    out.push(Block::Paragraph {
+        bbox: bbox(&lines),
+        lines,
+        role: Role::Body,
+    });
+}
+
+/// The first element of one of `kinds` below `ancestor` on the span's path.
+fn descendant(
+    span: &TextSpan,
+    ancestor: StructureElement,
+    kinds: &[StandardType],
+) -> Option<StructureElement> {
+    span.structure
+        .as_ref()?
+        .path
+        .iter()
+        .skip_while(|element| **element != ancestor)
+        .skip(1)
+        .find(|element| kinds.contains(&element.standard_type))
+        .copied()
+}
+
+/// A tagged list: its items are the LI elements below the L, each item's
+/// lines the item's spans as they came, label included, and its marker the
+/// Lbl's text: digits closed by `.` or `)` or by nothing are that number,
+/// any other label is a bullet. An item with no Lbl (a slide deck's bullet
+/// glyph inside the LBody) reads its marker off its first line as an
+/// untagged page does. The marker's length is the label's on the item's
+/// first line, so the Markdown adapter strips it as it strips a detected
+/// one; a first line that is nothing but the marker stays in the item's
+/// lines, so plain text keeps the glyph, and the Markdown adapter opens the
+/// item on the line after it. A nested list's content stays inside the
+/// item holding it. Spans in the L but in no LI (a caption) become a
+/// paragraph where they stand, closing the list before them.
+fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+    let mut items: Vec<ListItem> = Vec::new();
+    for (item, run) in stretches(spans, |span| descendant(span, list, &[StandardType::LI])) {
+        let Some(item) = item else {
+            push_tagged_list_items(&mut items, out);
+            push_tagged_paragraph(run, out);
+            continue;
+        };
+        let lines = tagged_lines(run);
+        let Some(first) = lines.first() else {
+            continue;
+        };
+        let label: String = run
+            .iter()
+            .filter(|span| is_label(span, item))
+            .map(|span| span.text.trim())
+            .collect();
+        let (marker, marker_len) = tagged_marker(&label, first);
+        items.push(ListItem {
+            marker,
+            marker_len,
+            lines,
+        });
+    }
+    push_tagged_list_items(&mut items, out);
+}
+
+fn push_tagged_list_items(items: &mut Vec<ListItem>, out: &mut Vec<Block>) {
+    if items.is_empty() {
+        return;
+    }
+    let items = std::mem::take(items);
+    out.push(Block::List {
+        bbox: bbox(items.iter().flat_map(|item| &item.lines)),
+        items,
+    });
+}
+
+/// Whether a span is the item's own label: the first Lbl or L below the
+/// item on its path is a Lbl. A label inside a list nested in the item
+/// belongs to that list's item, not to this one.
+fn is_label(span: &TextSpan, item: StructureElement) -> bool {
+    descendant(span, item, &[StandardType::Lbl, StandardType::L])
+        .is_some_and(|element| element.standard_type == StandardType::Lbl)
+}
+
+/// An item's marker and the marker's length on the item's first line. With
+/// a Lbl the marker comes from its text and the length is the label's on
+/// the line: leading whitespace, the label and the whitespace after it, or
+/// zero when the line does not open with the label. Without one the line
+/// is read as [`list_marker`] reads an untagged line, and a line that is
+/// nothing but a bullet glyph or a number is that marker in full.
+fn tagged_marker(label: &str, first: &Line) -> (Marker, usize) {
+    let text = line_text(first);
+    if label.is_empty() {
+        if let Some(found) = list_marker(&text) {
+            return found;
+        }
+        let trimmed = text.trim();
+        return match bare_marker(trimmed) {
+            Some(marker) => (marker, text.chars().count()),
+            None => (Marker::Bullet, 0),
+        };
+    }
+    let marker = label_marker(label);
+    let lead = text.chars().take_while(|c| c.is_whitespace()).count();
+    let rest: String = text.chars().skip(lead).collect();
+    if !rest.starts_with(label) {
+        return (marker, 0);
+    }
+    let label_chars = label.chars().count();
+    let trailing = rest
+        .chars()
+        .skip(label_chars)
+        .take_while(|c| c.is_whitespace())
+        .count();
+    (marker, lead + label_chars + trailing)
+}
+
+/// The marker a line consisting of nothing else is: one glyph from
+/// [`BULLETS`], or digits closed by `.` or `)` or by nothing.
+fn bare_marker(text: &str) -> Option<Marker> {
+    let mut chars = text.chars();
+    if let (Some(first), None) = (chars.next(), chars.next()) {
+        if BULLETS.contains(&first) {
+            return Some(Marker::Bullet);
+        }
+    }
+    match label_marker(text) {
+        Marker::Number(n) => Some(Marker::Number(n)),
+        Marker::Bullet => None,
+    }
+}
+
+/// Digits, closed by `.` or `)` or by nothing, are that number; every other
+/// label (a bullet glyph, a letter, a dash) is a bullet.
+fn label_marker(label: &str) -> Marker {
+    let digits: String = label.chars().take_while(char::is_ascii_digit).collect();
+    let rest = &label[digits.len()..];
+    if digits.is_empty() || !(rest.is_empty() || rest == "." || rest == ")") {
+        return Marker::Bullet;
+    }
+    digits.parse().map_or(Marker::Bullet, Marker::Number)
+}
+
+/// A tagged table: its rows are the TR elements below the Table, wherever
+/// THead, TBody and TFoot put them, and a row's cells its TH and TD
+/// elements, each cell one line. Spans in the table but in no row (a
+/// caption) become a paragraph ahead of the table. Column and row spans
+/// live in the elements' attributes (§14.8.5.7), which are not read, so
+/// every cell spans one.
+fn push_tagged_table(table: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut aside: Vec<&TextSpan> = Vec::new();
+    for (row, run) in stretches(spans, |span| descendant(span, table, &[StandardType::TR])) {
+        match row {
+            None => aside.extend(run),
+            Some(row) => rows.push(tagged_cells(row, run)),
+        }
+    }
+    if !aside.is_empty() {
+        push_tagged_paragraph(&aside, out);
+    }
+    if rows.is_empty() {
+        return;
+    }
+    out.push(Block::Table {
+        bbox: table_bbox(&rows),
+        rows,
+    });
+}
+
+fn tagged_cells(row: StructureElement, spans: &[&TextSpan]) -> Vec<Cell> {
+    stretches(spans, |span| {
+        descendant(span, row, &[StandardType::TH, StandardType::TD])
+    })
+    .into_iter()
+    .map(|(_, run)| Cell {
+        line: joined_line(tagged_lines(run)),
+        colspan: 1,
+        rowspan: 1,
+    })
+    .collect()
+}
+
+/// A cell's lines as the one line a cell carries: the texts follow one
+/// another with a single space between lines, the geometry the first
+/// line's, widened to the widest.
+fn joined_line(lines: Vec<Line>) -> Option<Line> {
+    let mut lines = lines.into_iter();
+    let mut joined = lines.next()?;
+    for line in lines {
+        let spaced = joined
+            .inlines
+            .last()
+            .is_some_and(|inline| inline.text.ends_with(char::is_whitespace))
+            || line
+                .inlines
+                .first()
+                .is_some_and(|inline| inline.text.starts_with(char::is_whitespace));
+        if !spaced {
+            joined.inlines.push(Inline {
+                text: " ".to_string(),
+                bold: false,
+                italic: false,
+            });
+        }
+        joined.inlines.extend(line.inlines);
+        joined.x = joined.x.min(line.x);
+        joined.end_x = joined.end_x.max(line.end_x);
+        joined.size = joined.size.max(line.size);
+    }
+    Some(joined)
 }
 
 /// Character-weighted histogram of span sizes rounded to half a point. Body
@@ -1968,7 +2298,7 @@ fn geometric_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
 /// when it sits on that line (see [`same_line`]) and opens a new one
 /// otherwise, so lines stay in the order their first spans came. Spans
 /// sort left to right inside each line, as [`line_groups`] sorts them.
-fn sequential_groups(spans: &[TextSpan]) -> Vec<Group<'_>> {
+fn sequential_groups<'s>(spans: impl IntoIterator<Item = &'s TextSpan>) -> Vec<Group<'s>> {
     let mut groups: Vec<Group> = Vec::new();
     for span in spans {
         match groups.last_mut() {

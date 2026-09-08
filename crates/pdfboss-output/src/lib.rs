@@ -236,6 +236,239 @@ mod tests {
         );
     }
 
+    /// One tagged page whose every block the layout heuristics would read
+    /// differently: an H1 at body size and weight, two paragraphs a line
+    /// apart, a numbered list whose labels share their items' lines, and a
+    /// two-row table with no rulings.
+    fn tagged_blocks_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str) {
+            b.object(
+                num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /H1 << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Title) Tj EMC \
+              /P << /MCID 1 >> BDC 1 0 0 1 72 680 Tm (First) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 72 666 Tm (Second) Tj EMC \
+              /Lbl << /MCID 3 >> BDC 1 0 0 1 72 640 Tm (1.) Tj EMC \
+              /LBody << /MCID 4 >> BDC 1 0 0 1 90 640 Tm (One) Tj EMC \
+              /Lbl << /MCID 5 >> BDC 1 0 0 1 72 626 Tm (2.) Tj EMC \
+              /LBody << /MCID 6 >> BDC 1 0 0 1 90 626 Tm (Two) Tj EMC \
+              /TD << /MCID 7 >> BDC 1 0 0 1 72 600 Tm (a) Tj EMC \
+              /TD << /MCID 8 >> BDC 1 0 0 1 200 600 Tm (b) Tj EMC \
+              /TD << /MCID 9 >> BDC 1 0 0 1 72 586 Tm (c) Tj EMC \
+              /TD << /MCID 10 >> BDC 1 0 0 1 200 586 Tm (d) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R \
+             /K [13 0 R 14 0 R 15 0 R 16 0 R 20 0 R] >>",
+        );
+        b.object(
+            12,
+            "<< /Nums [0 [13 0 R 14 0 R 15 0 R 30 0 R 31 0 R 32 0 R 33 0 R \
+             23 0 R 24 0 R 25 0 R 26 0 R]] >>",
+        );
+        element(&mut b, 13, "H1", 11, "[0]");
+        element(&mut b, 14, "P", 11, "[1]");
+        element(&mut b, 15, "P", 11, "[2]");
+        element(&mut b, 16, "L", 11, "[17 0 R 18 0 R]");
+        element(&mut b, 17, "LI", 16, "[30 0 R 31 0 R]");
+        element(&mut b, 30, "Lbl", 17, "[3]");
+        element(&mut b, 31, "LBody", 17, "[4]");
+        element(&mut b, 18, "LI", 16, "[32 0 R 33 0 R]");
+        element(&mut b, 32, "Lbl", 18, "[5]");
+        element(&mut b, 33, "LBody", 18, "[6]");
+        element(&mut b, 20, "Table", 11, "[21 0 R 22 0 R]");
+        element(&mut b, 21, "TR", 20, "[23 0 R 24 0 R]");
+        element(&mut b, 23, "TD", 21, "[7]");
+        element(&mut b, 24, "TD", 21, "[8]");
+        element(&mut b, 22, "TR", 20, "[25 0 R 26 0 R]");
+        element(&mut b, 25, "TD", 22, "[9]");
+        element(&mut b, 26, "TD", 22, "[10]");
+        b.build(1)
+    }
+
+    /// Under structure-tree order the tags decide the blocks: the heading
+    /// needs no size step, the paragraphs no gap, the list no marker
+    /// pattern and the table no third row.
+    // Covers ISO 32000-1 §14.8.4.3.
+    #[test]
+    fn tagged_block_elements_decide_the_markdown_under_structure_tree_order() {
+        let doc = Document::load(tagged_blocks_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(
+            md,
+            "# Title\n\nFirst\n\nSecond\n\n1. One\n2. Two\n\n| a | b |\n| --- | --- |\n| c | d |"
+        );
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "Title\nFirst\nSecond\n1. One\n2. Two\na b\nc d");
+    }
+
+    /// A tagged list whose items carry no Lbl element: the bullet glyph sits
+    /// inside the LBody, on the item's line for the first item and on a
+    /// line of its own for the second.
+    fn tagged_unlabelled_list_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str) {
+            b.object(
+                num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /LBody << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (\\225) Tj 1 0 0 1 90 700 Tm (One) Tj EMC \
+              /LBody << /MCID 1 >> BDC 1 0 0 1 72 680 Tm (\\225) Tj EMC \
+              /LBody << /MCID 2 >> BDC 1 0 0 1 90 664 Tm (Two) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [16 0 R 17 0 R 17 0 R]] >>");
+        element(&mut b, 13, "L", 11, "[14 0 R 15 0 R]");
+        element(&mut b, 14, "LI", 13, "[16 0 R]");
+        element(&mut b, 16, "LBody", 14, "[0]");
+        element(&mut b, 15, "LI", 13, "[17 0 R]");
+        element(&mut b, 17, "LBody", 15, "[1 2]");
+        b.build(1)
+    }
+
+    /// Without a Lbl the marker is read off the item's first line as on an
+    /// untagged page, and a line that is nothing but the marker is dropped
+    /// so the item opens with its text.
+    // Covers ISO 32000-1 §14.8.4.3.
+    #[test]
+    fn a_tagged_list_without_labels_reads_its_markers_off_the_lines() {
+        let doc = Document::load(tagged_unlabelled_list_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "- One\n- Two");
+    }
+
+    /// One list item whose Lbl sits on a line of its own and whose LBody
+    /// holds a nested list with a dash label.
+    fn tagged_nested_list_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str) {
+            b.object(
+                num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /Lbl << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (\\225) Tj EMC \
+              /LBody << /MCID 1 >> BDC 1 0 0 1 90 684 Tm (Outer) Tj EMC \
+              /Lbl << /MCID 2 >> BDC 1 0 0 1 90 668 Tm (\\226) Tj EMC \
+              /LBody << /MCID 3 >> BDC 1 0 0 1 108 668 Tm (Inner) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [15 0 R 16 0 R 19 0 R 20 0 R]] >>");
+        element(&mut b, 13, "L", 11, "[14 0 R]");
+        element(&mut b, 14, "LI", 13, "[15 0 R 16 0 R]");
+        element(&mut b, 15, "Lbl", 14, "[0]");
+        element(&mut b, 16, "LBody", 14, "[1 17 0 R]");
+        element(&mut b, 17, "L", 16, "[18 0 R]");
+        element(&mut b, 18, "LI", 17, "[19 0 R 20 0 R]");
+        element(&mut b, 19, "Lbl", 18, "[2]");
+        element(&mut b, 20, "LBody", 18, "[3]");
+        b.build(1)
+    }
+
+    /// An item's marker is its own Lbl, not the labels of the list nested
+    /// inside it, whose content stays in the item as lines.
+    // Covers ISO 32000-1 §14.8.4.3.
+    #[test]
+    fn a_nested_list_keeps_its_labels_out_of_the_outer_marker() {
+        let doc = Document::load(tagged_nested_list_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "- Outer\n\u{2013} Inner");
+    }
+
+    /// The same page in content order goes through the layout heuristics,
+    /// which see no heading, one paragraph and no table.
+    // Covers ISO 32000-1 §14.8.4.3.
+    #[test]
+    fn the_same_page_in_content_order_reads_by_the_layout_heuristics() {
+        let doc = Document::load(tagged_blocks_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!md.contains('#'), "{md}");
+        assert!(!md.contains('|'), "{md}");
+        assert!(md.contains("First\nSecond"), "{md}");
+        assert!(md.contains("1. One\n2. Two"), "{md}");
+    }
+
     /// An untagged document asked for structure-tree order reads exactly as
     /// it does in content order, and its report says so.
     #[test]

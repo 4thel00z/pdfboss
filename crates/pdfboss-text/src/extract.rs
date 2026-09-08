@@ -2,7 +2,7 @@
 //! Ts), glyph advances, and form XObject recursion.
 
 use crate::font::Font;
-use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, TextSpan};
+use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, Structure, TextSpan};
 use pdfboss_core::content::{ContentOps, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, MarkedContentId,
@@ -379,10 +379,15 @@ impl MarkedContent for Recorded {
 /// the tree, an untagged one keeps its place after the last tagged span
 /// before it (a running header written first stays first, an artifact
 /// written between two paragraphs stays between them). Stable, so spans
-/// within one sequence keep content order. `false` when the tree reaches
-/// none of the page's marked content, leaving the spans as they were.
+/// within one sequence keep content order. Every span the tree reaches
+/// also takes its element's standard type and standard-typed ancestry as
+/// `structure`, and the nearest element's description and language when
+/// its own sequence declared none: the sequence's `/Lang` outranks the
+/// element's, the element's its ancestors' (§14.9.2.3). `false` when the
+/// tree reaches none of the page's marked content, leaving the spans as
+/// they were.
 ///
-/// Covers ISO 32000-1 §14.8.2.3.
+/// Covers ISO 32000-1 §14.8.2.3, §14.8.4.3, §14.9.2 and §14.9.2.3.
 async fn structure_order<S: AsyncObjectSource>(
     src: &S,
     tree: &StructureTree,
@@ -394,15 +399,25 @@ async fn structure_order<S: AsyncObjectSource>(
     if ids.is_empty() {
         return false;
     }
-    let ranks = tree.ranks_with(src, page, &ids).await;
-    if ranks.is_empty() {
+    let placed = tree.place_with(src, page, &ids).await;
+    if placed.is_empty() {
         return false;
     }
     let mut keyed: Vec<(i64, TextSpan)> = Vec::with_capacity(spans.len());
     let mut current: i64 = -1;
-    for (span, mark) in spans.drain(..).zip(marks) {
-        if let Some(rank) = mark.and_then(|id| ranks.get(&id)) {
-            current = i64::from(*rank);
+    for (mut span, mark) in spans.drain(..).zip(marks) {
+        if let Some(placement) = mark.and_then(|id| placed.get(&id)) {
+            current = i64::from(placement.rank);
+            span.structure = Some(Structure {
+                standard_type: placement.standard_type,
+                path: placement.path.clone(),
+            });
+            if span.alt.is_none() {
+                span.alt.clone_from(&placement.alt);
+            }
+            if span.lang.is_none() {
+                span.lang.clone_from(&placement.lang);
+            }
         }
         keyed.push((current, span));
     }
@@ -697,6 +712,10 @@ struct Mark {
     actual: Option<ActualText>,
     /// The sequence's artifact class when its tag is `/Artifact`.
     artifact: Option<Artifact>,
+    /// The sequence's `/Alt` (§14.9.3), decoded.
+    alt: Option<String>,
+    /// The sequence's `/Lang` (§14.9.2), decoded.
+    lang: Option<String>,
 }
 
 /// A sequence's `/ActualText` (ISO 32000-1 §14.9.4): the text that stands
@@ -1095,13 +1114,15 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                         } else {
                             None
                         };
-                        let actual =
-                            self.marked_actual_text(props, &frame.chain)
-                                .await
-                                .map(|text| ActualText {
-                                    text,
-                                    emitted: None,
-                                });
+                        let actual = self
+                            .marked_text_string(props, &frame.chain, "ActualText")
+                            .await
+                            .map(|text| ActualText {
+                                text,
+                                emitted: None,
+                            });
+                        let alt = self.marked_text_string(props, &frame.chain, "Alt").await;
+                        let lang = self.marked_text_string(props, &frame.chain, "Lang").await;
                         let artifact = if tag.0 == "Artifact" {
                             Some(self.marked_artifact(props, &frame.chain).await)
                         } else {
@@ -1112,6 +1133,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                             mcid,
                             actual,
                             artifact,
+                            alt,
+                            lang,
                         });
                     }
                     op => self.step(&mut frame, op),
@@ -1264,6 +1287,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     kind: ArtifactKind::Unspecified,
                     subtype: None,
                 }),
+                alt: None,
+                lang: None,
             }),
             Op::EndMarkedContent => {
                 frame.marks.pop();
@@ -1362,6 +1387,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             return;
         }
         span.artifact = frame.marks.iter().rev().find_map(|m| m.artifact.clone());
+        span.alt = frame.marks.iter().rev().find_map(|m| m.alt.clone());
+        span.lang = frame.marks.iter().rev().find_map(|m| m.lang.clone());
         let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
             self.spans.push(span);
             self.marks.record(frame);
@@ -1427,13 +1454,19 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         }
     }
 
-    /// The `/ActualText` a `BDC` attaches to its sequence, decoded as a text
-    /// string: from an inline property dictionary, or from the named one in
-    /// the resource chain's `/Properties`. Any tag is accepted, not only
-    /// `/Span`, since files put it on paragraph tags too.
+    /// The text string entry `key` (`/ActualText`, `/Alt`, `/Lang`) a `BDC`
+    /// attaches to its sequence, decoded: from an inline property
+    /// dictionary, or from the named one in the resource chain's
+    /// `/Properties`. Any tag is accepted, not only `/Span`, since files put
+    /// these on paragraph tags too.
     ///
-    /// Covers ISO 32000-1 §14.9.4.
-    async fn marked_actual_text(&mut self, props: &Object, chain: &[Arc<Dict>]) -> Option<String> {
+    /// Covers ISO 32000-1 §14.9.2, §14.9.3 and §14.9.4.
+    async fn marked_text_string(
+        &mut self,
+        props: &Object,
+        chain: &[Arc<Dict>],
+        key: &str,
+    ) -> Option<String> {
         let named;
         let dict = match props {
             Object::Dict(dict) => dict,
@@ -1443,7 +1476,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             }
             _ => return None,
         };
-        let value = self.src.resolve(dict.get("ActualText")?).await.ok()?;
+        let value = self.src.resolve(dict.get(key)?).await.ok()?;
         Some(pdfboss_core::object::decode_text_string(
             value.as_str_bytes()?,
         ))
@@ -1533,6 +1566,9 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             underline: false,
             strikethrough: false,
             artifact: None,
+            structure: None,
+            alt: None,
+            lang: None,
         })
     }
 

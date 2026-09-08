@@ -405,6 +405,13 @@ impl Document {
         metadata_dict(py, meta)
     }
 
+    /// The language the catalog declares for the document's text (ISO
+    /// 32000-1 14.9.2), e.g. "en-US"; None when it declares none.
+    #[getter]
+    fn language(&self) -> Option<String> {
+        self.inner.lock().language()
+    }
+
     fn __len__(&self) -> usize {
         self.inner.lock().page_count()
     }
@@ -1111,6 +1118,24 @@ impl Span {
         self.inner.artifact.as_ref()?.subtype.clone()
     }
 
+    /// The alternate description that applies to the span (ISO 32000-1
+    /// 14.9.3): its marked-content sequence's /Alt, else under
+    /// structure-tree order the nearest structure element's; None when
+    /// neither gives one.
+    #[getter]
+    fn alt(&self) -> Option<String> {
+        self.inner.alt.clone()
+    }
+
+    /// The language of the span's text (ISO 32000-1 14.9.2): its
+    /// marked-content sequence's /Lang, else under structure-tree order the
+    /// nearest structure element's; None leaves the document's own
+    /// language.
+    #[getter]
+    fn lang(&self) -> Option<String> {
+        self.inner.lang.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Span(page={}, text={:?}, font_name={:?})",
@@ -1649,6 +1674,15 @@ impl AsyncDocument {
             Python::with_gil(|py| {
                 Ok::<Py<PyAny>, PyErr>(metadata_dict(py, meta)?.into_any().unbind())
             })
+        })
+    }
+
+    /// The language the catalog declares for the document's text (ISO
+    /// 32000-1 14.9.2); coroutine resolving to a str or None.
+    fn language<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<String>, PyErr>(inner.language().await)
         })
     }
 

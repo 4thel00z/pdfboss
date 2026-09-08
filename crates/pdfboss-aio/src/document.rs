@@ -1466,6 +1466,12 @@ impl AsyncDocument {
         pdfboss_core::page_labels_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The language the catalog declares for the document's text (ISO
+    /// 32000-1 §14.9.2): the async twin of the sync document's `language`.
+    pub async fn language(&self) -> Option<String> {
+        pdfboss_core::language_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {
