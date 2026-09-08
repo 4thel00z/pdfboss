@@ -19,6 +19,9 @@ pub struct Inline {
     pub text: String,
     pub bold: bool,
     pub italic: bool,
+    /// The run sits inside a `Code` structure element (ISO 32000-1
+    /// §14.8.4.4), under structure-tree reading order.
+    pub code: bool,
 }
 
 /// One visual line. The geometry travels with it because later structure

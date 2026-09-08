@@ -897,6 +897,7 @@ fn joined_line(lines: Vec<Line>) -> Option<Line> {
                 text: " ".to_string(),
                 bold: false,
                 italic: false,
+                code: false,
             });
         }
         joined.inlines.extend(line.inlines);
@@ -2192,13 +2193,14 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 ///
 /// Covers ISO 32000-1 §14.8.2.5.
 fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity: usize) {
+    let code = in_code(span);
     if let Some(last) = inlines.last_mut() {
         let already_spaced =
             last.text.ends_with(char::is_whitespace) || span.text.starts_with(char::is_whitespace);
         if spaced && !already_spaced {
             last.text.push(' ');
         }
-        if last.bold == span.bold && last.italic == span.italic {
+        if last.bold == span.bold && last.italic == span.italic && last.code == code {
             last.text.push_str(&span.text);
             return;
         }
@@ -2209,7 +2211,23 @@ fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity:
         text,
         bold: span.bold,
         italic: span.italic,
+        code,
     });
+}
+
+/// Whether the span was shown inside a `Code` structure element (§14.8.4.4):
+/// computer code, which the Markdown adapter sets as inline code. The other
+/// inline-level elements (Span, Quote, Reference, BibEntry, Annot, Link,
+/// Note, Ruby, Warichu) leave their text flowing as shown.
+///
+/// Covers ISO 32000-1 §14.8.4.4.
+fn in_code(span: &TextSpan) -> bool {
+    span.structure.as_ref().is_some_and(|structure| {
+        structure
+            .path
+            .iter()
+            .any(|element| element.standard_type == StandardType::Code)
+    })
 }
 
 /// The lines' device-space box. Spans carry no glyph extents, so the top is

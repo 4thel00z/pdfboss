@@ -527,6 +527,65 @@ mod tests {
         assert_eq!(text, "a\nc d\ne");
     }
 
+    /// A paragraph whose middle sequence sits in a Code element, the other
+    /// two directly in the P.
+    fn tagged_code_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str) {
+            b.object(
+                num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Run) Tj EMC \
+              /Code << /MCID 1 >> BDC 1 0 0 1 100 700 Tm (ls -la) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 150 700 Tm (now) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [13 0 R 14 0 R 13 0 R]] >>");
+        element(&mut b, 13, "P", 11, "[0 14 0 R 2]");
+        element(&mut b, 14, "Code", 13, "[1]");
+        b.build(1)
+    }
+
+    /// Text inside a Code element renders as inline code; plain text keeps
+    /// the line as shown.
+    // Covers ISO 32000-1 §14.8.4.4.
+    #[test]
+    fn code_elements_render_as_inline_code() {
+        let doc = Document::load(tagged_code_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "Run `ls -la` now");
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "Run ls -la now");
+    }
+
     /// The same page in content order goes through the layout heuristics,
     /// which see no heading, one paragraph and no table.
     // Covers ISO 32000-1 §14.8.4.3.

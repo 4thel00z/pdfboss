@@ -121,6 +121,7 @@ fn strip_marker(line: &Line, chars: usize) -> Vec<Inline> {
             text: inline.text.chars().skip(remaining).collect(),
             bold: inline.bold,
             italic: inline.italic,
+            code: inline.code,
         });
         remaining = 0;
     }
@@ -227,12 +228,21 @@ fn emphasized(line: &Line) -> String {
 /// The run's text with its markers around the trimmed middle only, so a run
 /// that starts or ends on a space still reads as `plain **loud** tail`.
 ///
+/// A run inside a `Code` structure element (ISO 32000-1 §14.8.4.4) is inline
+/// code: backticks around the trimmed middle, one more than the longest
+/// backtick run inside, and no emphasis, since a code span shows its text
+/// literally.
+///
 /// A run with no letter or digit in it — the italic full stop that ends a
 /// title, a bold space — gets no markers: emphasis needs something to
 /// emphasize, CommonMark's flanking rules leave `word*.*` unparsed anyway,
 /// and the stray asterisks are pure edit distance against ground truth that
 /// carries none.
 fn push_inline(out: &mut String, inline: &Inline) {
+    if inline.code {
+        push_code(out, &inline.text);
+        return;
+    }
     let marker = match (inline.bold, inline.italic) {
         (true, true) => "***",
         (true, false) => "**",
@@ -251,6 +261,28 @@ fn push_inline(out: &mut String, inline: &Inline) {
     out.push_str(marker);
     out.push_str(trimmed);
     out.push_str(marker);
+    out.push_str(&text[tail..]);
+}
+
+/// `text` as a CommonMark code span: its trimmed middle between backtick
+/// fences one longer than any backtick run it contains, the surrounding
+/// whitespace kept outside the fences. Whitespace-only text stays as it is.
+///
+/// Covers ISO 32000-1 §14.8.4.4.
+fn push_code(out: &mut String, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        out.push_str(text);
+        return;
+    }
+    let longest = trimmed.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let lead = text.len() - text.trim_start().len();
+    let tail = text.trim_end().len();
+    out.push_str(&text[..lead]);
+    out.push_str(&fence);
+    out.push_str(trimmed);
+    out.push_str(&fence);
     out.push_str(&text[tail..]);
 }
 
