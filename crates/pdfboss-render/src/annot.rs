@@ -27,7 +27,8 @@ const ENDING_MIN: f32 = 4.0;
 /// not synthesized, or for one whose entries describe nothing to paint (no
 /// colour, or a zero-width border and no interior).
 ///
-/// Covers ISO 32000-1 §12.5.6.7, §12.5.6.8, §12.5.6.9, §12.5.6.10 and §12.5.6.13.
+/// Covers ISO 32000-1 §12.5.4, §12.5.6.5, §12.5.6.7, §12.5.6.8, §12.5.6.9, §12.5.6.10 and
+/// §12.5.6.13.
 pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Option<Stream> {
     let subtype = annot.get_name("Subtype")?.0.clone();
     let paint = Paint::read(src, annot).await;
@@ -55,6 +56,10 @@ pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> 
         "Ink" => {
             let paths = ink_list(src, annot.get("InkList")?).await?;
             paint.ink(&paths)?
+        }
+        "Link" => {
+            let rect = normalized(&floats_from(src, annot.get("Rect"), 4).await?);
+            (rect, paint.link_border(rect)?)
         }
         "Highlight" | "Underline" | "StrikeOut" | "Squiggly" => {
             let quads = number_list(src, annot.get("QuadPoints")?).await?;
@@ -106,6 +111,12 @@ impl Paint {
     /// `q`, the opacity state, the colours, the width and the dash pattern:
     /// what every synthesized content stream opens with.
     fn preamble(&self) -> String {
+        self.preamble_at(self.border.width)
+    }
+
+    /// [`Paint::preamble`] with `width` as the stroke width in place of the
+    /// border's own.
+    fn preamble_at(&self, width: f32) -> String {
         let mut content = String::from("q\n");
         if self.opacity.is_some() {
             content.push_str(&format!("/{GRAPHICS_STATE} gs\n"));
@@ -113,7 +124,7 @@ impl Paint {
         if let Some(op) = self.stroking() {
             content.push_str(op);
             content.push('\n');
-            content.push_str(&format!("{} w\n", num(self.border.width)));
+            content.push_str(&format!("{} w\n", num(width)));
             if !self.border.dash.is_empty() {
                 content.push_str(&format!("[{}] 0 d\n", nums(&self.border.dash)));
             }
@@ -444,6 +455,80 @@ fn squiggle(left: f32, right: f32, bottom: f32, step: f32) -> String {
     content
 }
 
+impl Paint {
+    /// The content of a Link's border: the rectangle inside `rect` with the
+    /// `/Border` corner radii, or for the U style a line along its bottom
+    /// edge, stroked in `/C` at the border width and dash pattern. `None`
+    /// when the annotation declares neither `/Border` nor `/BS` (Acrobat and
+    /// pdf.js draw nothing then, despite §12.5.4's 1-point default), has no
+    /// colour or width, or an empty rectangle. A width past half the
+    /// rectangle would fill it, so it falls back to 1 as pdf.js does.
+    ///
+    /// Covers ISO 32000-1 §12.5.4 and §12.5.6.5.
+    fn link_border(&self, rect: [f32; 4]) -> Option<String> {
+        if !self.border.declared {
+            return None;
+        }
+        self.stroking()?;
+        let (w, h) = (rect[2] - rect[0], rect[3] - rect[1]);
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let width = if self.border.width > w / 2.0 || self.border.width > h / 2.0 {
+            1.0
+        } else {
+            self.border.width
+        };
+        let half = width / 2.0;
+        let inner = [
+            rect[0] + half,
+            rect[1] + half,
+            rect[2] - half,
+            rect[3] - half,
+        ];
+        let mut content = self.preamble_at(width);
+        match self.border.style {
+            BorderStyle::Underline => content.push_str(&rule(inner[0], inner[2], inner[1])),
+            _ => {
+                content.push_str(&rounded_rect(inner, self.border.radii));
+                content.push_str("S\n");
+            }
+        }
+        content.push_str("Q\n");
+        Some(content)
+    }
+}
+
+/// A rectangle path with elliptical corners of radii `radii`, each clamped
+/// to half the rectangle's side; a plain `re` when either is zero.
+fn rounded_rect(rect: [f32; 4], radii: [f32; 2]) -> String {
+    let [x0, y0, x1, y1] = rect;
+    let rx = radii[0].min((x1 - x0) / 2.0);
+    let ry = radii[1].min((y1 - y0) / 2.0);
+    if rx <= 0.0 || ry <= 0.0 {
+        return format!(
+            "{} {} {} {} re\n",
+            num(x0),
+            num(y0),
+            num(x1 - x0),
+            num(y1 - y0)
+        );
+    }
+    let (kx, ky) = (rx * KAPPA, ry * KAPPA);
+    let corner = |p: [f32; 6]| format!("{} c\n", nums(&p));
+    let mut path = format!("{} {} m\n", num(x0 + rx), num(y0));
+    path.push_str(&format!("{} {} l\n", num(x1 - rx), num(y0)));
+    path.push_str(&corner([x1 - rx + kx, y0, x1, y0 + ry - ky, x1, y0 + ry]));
+    path.push_str(&format!("{} {} l\n", num(x1), num(y1 - ry)));
+    path.push_str(&corner([x1, y1 - ry + ky, x1 - rx + kx, y1, x1 - rx, y1]));
+    path.push_str(&format!("{} {} l\n", num(x0 + rx), num(y1)));
+    path.push_str(&corner([x0 + rx - kx, y1, x0, y1 - ry + ky, x0, y1 - ry]));
+    path.push_str(&format!("{} {} l\n", num(x0), num(y0 + ry)));
+    path.push_str(&corner([x0, y0 + ry - ky, x0 + rx - kx, y0, x0 + rx, y0]));
+    path.push_str("h\n");
+    path
+}
+
 /// A line ending style of Table 176.
 #[derive(Clone, Copy, PartialEq)]
 enum Ending {
@@ -594,6 +679,22 @@ impl Leader {
 struct Border {
     width: f32,
     dash: Vec<f32>,
+    style: BorderStyle,
+    /// The `/Border` array's horizontal and vertical corner radii.
+    radii: [f32; 2],
+    /// Whether the annotation carries `/BS` or `/Border` at all.
+    declared: bool,
+}
+
+/// The `/S` entry of a border style dictionary (Table 166); a `/Border`
+/// array is solid, or dashed when it carries a dash array.
+#[derive(Clone, Copy, PartialEq)]
+enum BorderStyle {
+    Solid,
+    Dashed,
+    Beveled,
+    Inset,
+    Underline,
 }
 
 impl Border {
@@ -601,17 +702,33 @@ impl Border {
         if let Some(bs) = annot.get("BS") {
             if let Ok(Object::Dict(bs)) = src.resolve(bs).await {
                 let width = dict_f32(src, &bs, "W").await.unwrap_or(1.0).max(0.0);
-                let dashed = bs.get_name("S").is_some_and(|s| s.0 == "D");
-                let dash = match (dashed, bs.get("D")) {
-                    (false, _) => Vec::new(),
-                    (true, Some(d)) => dash_array(src, d).await,
-                    (true, None) => vec![3.0],
+                let style = match bs.get_name("S").map(|s| s.0.as_str()) {
+                    Some("D") => BorderStyle::Dashed,
+                    Some("B") => BorderStyle::Beveled,
+                    Some("I") => BorderStyle::Inset,
+                    Some("U") => BorderStyle::Underline,
+                    _ => BorderStyle::Solid,
                 };
-                return Border { width, dash };
+                let dash = match (style, bs.get("D")) {
+                    (BorderStyle::Dashed, Some(d)) => dash_array(src, d).await,
+                    (BorderStyle::Dashed, None) => vec![3.0],
+                    _ => Vec::new(),
+                };
+                return Border {
+                    width,
+                    dash,
+                    style,
+                    radii: [0.0, 0.0],
+                    declared: true,
+                };
             }
         }
         if let Some(border) = annot.get("Border") {
             if let Ok(Object::Array(items)) = src.resolve(border).await {
+                let mut radii = [0.0, 0.0];
+                for (radius, item) in radii.iter_mut().zip(&items) {
+                    *radius = num_f32(src, item).await.unwrap_or(0.0).max(0.0);
+                }
                 let width = match items.get(2) {
                     Some(w) => num_f32(src, w).await.unwrap_or(1.0).max(0.0),
                     None => 1.0,
@@ -620,12 +737,26 @@ impl Border {
                     Some(d) => dash_array(src, d).await,
                     None => Vec::new(),
                 };
-                return Border { width, dash };
+                let style = if dash.is_empty() {
+                    BorderStyle::Solid
+                } else {
+                    BorderStyle::Dashed
+                };
+                return Border {
+                    width,
+                    dash,
+                    style,
+                    radii,
+                    declared: true,
+                };
             }
         }
         Border {
             width: 1.0,
             dash: Vec::new(),
+            style: BorderStyle::Solid,
+            radii: [0.0, 0.0],
+            declared: false,
         }
     }
 }

@@ -7407,6 +7407,54 @@ mod tests {
         assert!(report.is_empty(), "no drop: {:?}", report.warnings());
     }
 
+    // Covers ISO 32000-1 §12.5.4 and §12.5.6.5.
+    #[test]
+    fn link_borders_without_appearance_follow_the_border_style() {
+        // Links carry no appearance of their own; their border comes from
+        // /Border or /BS in the /C colour, drawn inside /Rect. Top-left: a
+        // 2-unit solid red band inside the rect, white interior. Top-right:
+        // /C with neither /Border nor /BS paints nothing, as Acrobat and
+        // pdf.js do. Bottom-left: /BS style U is a 2-unit line along the
+        // bottom edge and nothing up the sides. Bottom-right: a /Border width
+        // wider than half the rect falls back to 1 unit. Middle: the /Border
+        // corner radii round the corner away while the edge stays.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Link /Rect [10 60 40 90] /C [1 0 0] /Border [0 0 2] >>",
+                "<< /Type /Annot /Subtype /Link /Rect [60 60 90 90] /C [0 0 1] >>",
+                "<< /Type /Annot /Subtype /Link /Rect [10 10 40 40] /C [0 1 0] /BS << /W 2 /S /U >> >>",
+                "<< /Type /Annot /Subtype /Link /Rect [60 10 90 40] /C [0 0 1] /Border [0 0 112] >>",
+                "<< /Type /Annot /Subtype /Link /Rect [42 44 58 56] /C [1 0 0] /Border [5 5 2] >>",
+            ],
+            &[],
+        );
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 11, 25),
+            RED,
+            "the solid border band inside the rect"
+        );
+        assert_eq!(px(&pix, 25, 25), WHITE, "the solid border's interior");
+        assert_eq!(px(&pix, 61, 25), WHITE, "no border entry, no border");
+        assert_eq!(px(&pix, 25, 89), GREEN, "the U style along the bottom edge");
+        assert_eq!(
+            px(&pix, 11, 75),
+            WHITE,
+            "the U style leaves the sides clear"
+        );
+        assert_eq!(
+            px(&pix, 60, 75),
+            BLUE,
+            "an oversized width falls back to 1 unit"
+        );
+        assert_eq!(px(&pix, 75, 75), WHITE, "and leaves the interior clear");
+        assert_eq!(px(&pix, 42, 55), WHITE, "the rounded corner is cut away");
+        assert_eq!(px(&pix, 50, 55), RED, "the edge between the corners stays");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
     // Covers ISO 32000-1 §12.5.5, §12.5.6, §12.5.6.19, §12.7.4, §12.7.4.2, §12.7.4.2.3 and §12.7.4.2.4.
     #[test]
     fn appearance_state_dictionary_selects_by_as() {
