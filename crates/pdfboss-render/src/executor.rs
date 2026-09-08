@@ -16,6 +16,7 @@ use pdfboss_core::{
     Error, Immediate, Name, Object, Page, Result, Stream,
 };
 
+use crate::annot;
 use crate::color::{self, ColorSpace};
 use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
@@ -2960,18 +2961,18 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
 }
 
 /// Resolves an object to a finite `f32`.
-async fn num_f32<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<f32> {
+pub(crate) async fn num_f32<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<f32> {
     let v = src.resolve(obj).await.ok()?.as_f64()? as f32;
     v.is_finite().then_some(v)
 }
 
 /// Resolves `dict[key]` to a finite `f32`.
-async fn dict_f32<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<f32> {
+pub(crate) async fn dict_f32<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<f32> {
     num_f32(src, dict.get(key)?).await
 }
 
 /// Reads the first `n` finite numbers of a (possibly indirect) array.
-async fn floats_from<S: AsyncObjectSource>(
+pub(crate) async fn floats_from<S: AsyncObjectSource>(
     src: &S,
     obj: Option<&Object>,
     n: usize,
@@ -3195,12 +3196,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// content (ISO 32000-1 §12.5.5). Each appearance is a form XObject
     /// whose `/BBox`, transformed by its `/Matrix`, is fitted onto the
     /// annotation's `/Rect` and then run like any other form, in default
-    /// user space. Annotations flagged Hidden or NoView (§12.5.3), `/Popup`
-    /// annotations (a viewer-UI artifact), and annotations with no usable
-    /// normal appearance paint nothing and report nothing; an appearance
-    /// that exists but cannot be read or placed reports as a dropped
-    /// annotation, so a page whose visible content is a stamp or a filled
-    /// form field never rasterizes blank without saying why.
+    /// user space. Annotations flagged Hidden or NoView (§12.5.3) and
+    /// `/Popup` annotations (a viewer-UI artifact) paint nothing and report
+    /// nothing. An annotation with no `/AP` at all gets the appearance its
+    /// own entries describe when its subtype has one (Square and Circle,
+    /// §12.5.6.8); other annotations without a usable normal appearance
+    /// paint nothing and report nothing. An appearance that exists but
+    /// cannot be read or placed reports as a dropped annotation, so a page
+    /// whose visible content is a stamp or a filled form field never
+    /// rasterizes blank without saying why.
     ///
     /// Covers ISO 32000-1 §12.5.2, §12.5.3, §12.5.5, §12.5.6, §12.5.6.10, §12.5.6.11, §12.5.6.12, §12.5.6.13, §12.5.6.14, §12.5.6.15, §12.5.6.16, §12.5.6.17, §12.5.6.18, §12.5.6.20, §12.5.6.21, §12.5.6.22, §12.5.6.23, §12.5.6.4, §12.5.6.6, §12.5.6.7, §12.5.6.8, §12.5.6.9 and §8.11.3.3.
     async fn paint_annotations(&mut self, page: &Page, base: Matrix) {
@@ -3232,8 +3236,18 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             if dict.get_name("Subtype").is_some_and(|n| n.0 == "Popup") {
                 continue;
             }
-            let Some(stream) = self.normal_appearance(dict).await else {
-                continue;
+            let stream = match self.normal_appearance(dict).await {
+                Some(stream) => stream,
+                // An annotation declaring no /AP at all gets the appearance
+                // its own entries describe (§12.5.6.8); a declared appearance
+                // that could not be read was reported and is not replaced.
+                None if dict.get("AP").is_none() => {
+                    match annot::synthesized(self.src, dict).await {
+                        Some(stream) => stream,
+                        None => continue,
+                    }
+                }
+                None => continue,
             };
             if let Some(frame) = self.appearance_frame(&stream, dict, &chain, base).await {
                 self.run(frame).await;
@@ -6991,6 +7005,47 @@ mod tests {
         let (pix, report) = render_reporting(bytes);
         assert_eq!(px(&pix, 40, 60), WHITE, "nothing may paint");
         assert!(report.is_empty(), "none of these is a drop");
+    }
+
+    // Covers ISO 32000-1 §12.5.6.8.
+    #[test]
+    fn square_and_circle_annotations_without_appearance_are_drawn() {
+        // A Square with a red 4-unit /Border and a blue /IC: the border band
+        // lies inside the Rect (user x 10..14), the interior is blue, the
+        // page outside stays white. A Circle inscribes its ellipse in the
+        // Rect: the centre is blue, the Rect's corner stays white, and the
+        // 2-unit /BS border band at the bottom edge is red. Neither is a
+        // drop: the appearance comes from the annotation's own entries.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Square /Rect [10 10 50 50] /C [1 0 0] /IC [0 0 1] \
+                 /Border [0 0 4] >>",
+                "<< /Type /Annot /Subtype /Circle /Rect [60 60 90 90] /C [1 0 0] /IC [0 0 1] \
+                 /BS << /W 2 >> >>",
+            ],
+            &[],
+        );
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 30, 70), BLUE, "square interior");
+        assert_eq!(px(&pix, 12, 70), RED, "square border band inside the rect");
+        assert_eq!(px(&pix, 5, 70), WHITE, "outside the square's rect");
+        assert_eq!(px(&pix, 75, 25), BLUE, "circle centre");
+        assert_eq!(
+            px(&pix, 62, 38),
+            WHITE,
+            "the ellipse leaves the rect corner clear"
+        );
+        assert_eq!(
+            px(&pix, 75, 39),
+            RED,
+            "circle border band at the bottom edge"
+        );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
     }
 
     // Covers ISO 32000-1 §12.5.5, §12.5.6, §12.5.6.19, §12.7.4, §12.7.4.2, §12.7.4.2.3 and §12.7.4.2.4.
