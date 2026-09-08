@@ -257,11 +257,49 @@ impl FieldFlags {
         self.bit(27)
     }
 
+    /// Bit 15, `NoToggleToOff` (radio buttons, Table 226): one button is
+    /// always on; clicking the selected one does nothing.
+    pub fn no_toggle_to_off(self) -> bool {
+        self.bit(15)
+    }
+
+    /// Bit 16, `Radio` (button fields): a set of radio buttons rather than
+    /// a check box.
+    pub fn radio(self) -> bool {
+        self.bit(16)
+    }
+
+    /// Bit 17, `Pushbutton` (button fields): a pushbutton, which keeps no
+    /// value.
+    pub fn pushbutton(self) -> bool {
+        self.bit(17)
+    }
+
+    /// Bit 26, `RadiosInUnison` (radio buttons): buttons sharing an on
+    /// state turn on and off together.
+    pub fn radios_in_unison(self) -> bool {
+        self.bit(26)
+    }
+
     /// Whether the bit at `position`, numbered from 1 as the standard
     /// does, is set.
     fn bit(self, position: u32) -> bool {
         self.0 & (1 << (position - 1)) != 0
     }
+}
+
+/// The three kinds of button field (ISO 32000-1 §12.7.4.2), told apart by
+/// the `Pushbutton` and `Radio` flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// `Pushbutton` set: a control that keeps no value (§12.7.4.2.2).
+    PushButton,
+    /// Both flags clear: one or more check boxes toggling between on and
+    /// off (§12.7.4.2.3).
+    CheckBox,
+    /// `Radio` set: a set of related buttons of which normally one is on
+    /// (§12.7.4.2.4).
+    RadioButtons,
 }
 
 /// One entry of a choice field's `/Opt` array (ISO 32000-1 §12.7.4.4,
@@ -338,6 +376,37 @@ impl FormField {
             return None;
         }
         Some(decode_text_string(self.value.as_ref()?.as_str_bytes()?))
+    }
+
+    /// Which kind of button a button field is (ISO 32000-1 §12.7.4.2,
+    /// Table 226): a pushbutton when the `Pushbutton` flag is set, radio
+    /// buttons when `Radio` is set, a check box otherwise. `None` for a
+    /// field of another type.
+    pub fn button_kind(&self) -> Option<ButtonKind> {
+        if self.field_type != Some(FieldType::Button) {
+            return None;
+        }
+        Some(if self.flags.pushbutton() {
+            ButtonKind::PushButton
+        } else if self.flags.radio() {
+            ButtonKind::RadioButtons
+        } else {
+            ButtonKind::CheckBox
+        })
+    }
+
+    /// The appearance state a check box or radio button field is in (ISO
+    /// 32000-1 §12.7.4.2): `/V` as a name, the one the widgets' `/AP /N`
+    /// dictionaries key their on and off appearances by. `None` for a
+    /// pushbutton, which keeps no value, for another field type, and for a
+    /// value that is no name; an absent value means the off state.
+    pub fn state(&self) -> Option<&str> {
+        match self.button_kind()? {
+            ButtonKind::PushButton => None,
+            ButtonKind::CheckBox | ButtonKind::RadioButtons => {
+                Some(self.value.as_ref()?.as_name()?.0.as_str())
+            }
+        }
     }
 
     /// The names of a choice field's selected options (ISO 32000-1
@@ -636,7 +705,9 @@ fn references(value: Option<&Object>) -> Vec<ObjRef> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChoiceOption, FieldFlags, FieldType, InteractiveForm, Quadding, SignatureFlags};
+    use super::{
+        ButtonKind, ChoiceOption, FieldFlags, FieldType, InteractiveForm, Quadding, SignatureFlags,
+    };
     use crate::object::{Name, ObjRef, Object};
     use crate::Document;
     use pdfboss_testkit::PdfBuilder;
@@ -1116,5 +1187,55 @@ mod tests {
         assert_eq!(fields[2].top_index, 0);
         assert_eq!(fields[2].selected_indices, vec![0]);
         assert_eq!(fields[2].selected(), Vec::<String>::new());
+    }
+
+    /// The `Pushbutton` and `Radio` bits pick the kind; `NoToggleToOff` and
+    /// `RadiosInUnison` are read alongside; a field of another type has no
+    /// kind.
+    // Covers ISO 32000-1 §12.7.4.2.
+    #[test]
+    fn button_fields_are_told_apart_by_their_flags() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R 8 0 R] >>",
+            &[
+                (5, "<< /T (go) /FT /Btn /Ff 65536 >>"),
+                (6, "<< /T (card) /FT /Btn /Ff 33603584 /V /visa >>"),
+                (7, "<< /T (urgent) /FT /Btn /V /Yes >>"),
+                (8, "<< /T (name) /FT /Tx /V (x) >>"),
+            ],
+        )
+        .form_fields();
+        assert_eq!(fields[0].button_kind(), Some(ButtonKind::PushButton));
+        assert!(fields[0].flags.pushbutton() && !fields[0].flags.radio());
+        assert_eq!(fields[1].button_kind(), Some(ButtonKind::RadioButtons));
+        assert!(fields[1].flags.radio() && fields[1].flags.no_toggle_to_off());
+        assert!(fields[1].flags.radios_in_unison() && !fields[1].flags.pushbutton());
+        assert_eq!(fields[2].button_kind(), Some(ButtonKind::CheckBox));
+        assert!(!fields[2].flags.no_toggle_to_off() && !fields[2].flags.radios_in_unison());
+        assert_eq!(fields[3].button_kind(), None);
+    }
+
+    /// A check box's or radio button field's `/V` names its appearance
+    /// state; a pushbutton keeps no value even when one is written; a
+    /// missing value and a value that is no name give none.
+    // Covers ISO 32000-1 §12.7.4.2.
+    #[test]
+    fn a_button_field_s_state_is_its_value_name() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R] >>",
+            &[
+                (5, "<< /T (urgent) /FT /Btn /V /Yes >>"),
+                (6, "<< /T (card) /FT /Btn /Ff 32768 /V /cardbrand1 >>"),
+                (7, "<< /T (blank) /FT /Btn >>"),
+                (8, "<< /T (go) /FT /Btn /Ff 65536 /V /Yes >>"),
+                (9, "<< /T (odd) /FT /Btn /V (Yes) >>"),
+            ],
+        )
+        .form_fields();
+        assert_eq!(fields[0].state(), Some("Yes"));
+        assert_eq!(fields[1].state(), Some("cardbrand1"));
+        assert_eq!(fields[2].state(), None);
+        assert_eq!(fields[3].state(), None);
+        assert_eq!(fields[4].state(), None);
     }
 }
