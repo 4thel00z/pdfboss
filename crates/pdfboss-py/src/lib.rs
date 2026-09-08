@@ -8,10 +8,12 @@
 //! ([`DocumentSeed`]), so heavy calls on different threads run truly in
 //! parallel instead of serializing on that lock.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures_util::StreamExt;
+use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyIndexError, PyStopAsyncIteration, PyValueError};
 use pyo3::prelude::*;
@@ -32,6 +34,23 @@ use pdfboss_text::{FontCache, TextSpan};
 mod catalog;
 mod forms;
 mod write;
+
+/// The bytes of a buffer-like argument, copied once.
+///
+/// Extracting `Vec<u8>` walks a `bytes` object one element at a time under
+/// the GIL: about 5 ms per MB, paid before any coroutine starts. `bytes`
+/// and `bytearray` come through `Cow<[u8]>` and anything else exposing the
+/// buffer protocol (`memoryview`) through `PyBuffer`, each a single copy.
+/// A plain sequence of ints keeps the element-wise path it always had.
+pub(crate) fn byte_arg(data: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(buffer) = data.extract::<Cow<'_, [u8]>>() {
+        return Ok(buffer.into_owned());
+    }
+    if let Ok(buffer) = PyBuffer::<u8>::get(data) {
+        return buffer.to_vec(data.py());
+    }
+    data.extract::<Vec<u8>>()
+}
 
 create_exception!(
     pdfboss,
@@ -434,10 +453,16 @@ struct Document {
 impl Document {
     #[new]
     #[pyo3(signature = (path=None, *, data=None, password=""))]
-    fn new(path: Option<PathBuf>, data: Option<Vec<u8>>, password: &str) -> PyResult<Self> {
+    fn new(
+        path: Option<PathBuf>,
+        data: Option<&Bound<'_, PyAny>>,
+        password: &str,
+    ) -> PyResult<Self> {
         let core = match (path, data) {
             (Some(p), None) => CoreDocument::open_with_password(p, password).map_err(pdf_err)?,
-            (None, Some(d)) => CoreDocument::load_with_password(d, password).map_err(pdf_err)?,
+            (None, Some(d)) => {
+                CoreDocument::load_with_password(byte_arg(d)?, password).map_err(pdf_err)?
+            }
             _ => {
                 return Err(PyValueError::new_err(
                     "Document() takes exactly one of `path` or `data`",
@@ -1639,7 +1664,12 @@ impl AsyncDocument {
     /// or the owner password.
     #[staticmethod]
     #[pyo3(signature = (data, *, password=String::new()))]
-    fn from_bytes(py: Python<'_>, data: Vec<u8>, password: String) -> PyResult<Bound<'_, PyAny>> {
+    fn from_bytes<'py>(
+        py: Python<'py>,
+        data: &Bound<'py, PyAny>,
+        password: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let data = byte_arg(data)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = AioDocument::from_bytes_with_password(data, &password)
                 .await
