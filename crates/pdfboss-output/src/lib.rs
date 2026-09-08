@@ -315,7 +315,7 @@ mod tests {
     /// Under structure-tree order the tags decide the blocks: the heading
     /// needs no size step, the paragraphs no gap, the list no marker
     /// pattern and the table no third row.
-    // Covers ISO 32000-1 §14.8.4.3.
+    // Covers ISO 32000-1 §14.8.3 and §14.8.4.3.
     #[test]
     fn tagged_block_elements_decide_the_markdown_under_structure_tree_order() {
         let doc = Document::load(tagged_blocks_doc()).unwrap();

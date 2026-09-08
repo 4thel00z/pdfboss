@@ -25,7 +25,8 @@ pub struct MarkedContentId {
 }
 
 /// The four groups §14.8.4 sorts the standard structure types into, one per
-/// clause that defines them.
+/// clause that defines them; the block-level and inline-level ones are the
+/// two the basic layout model of §14.8.3 lays out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardKind {
     /// §14.8.4.2: elements that group other elements and hold no content

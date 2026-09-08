@@ -582,7 +582,7 @@ enum Run {
 
 /// The run a span belongs to (see [`Run`]).
 ///
-/// Covers ISO 32000-1 §14.8.4.5.
+/// Covers ISO 32000-1 §14.8.3 and §14.8.4.5.
 fn run_of(span: &TextSpan) -> Run {
     let Some(structure) = span.structure.as_ref() else {
         return Run::Untagged;
@@ -641,9 +641,12 @@ fn in_block_quote(span: &TextSpan) -> bool {
 /// read as a table, while none of it joins the untagged text or the tagged
 /// blocks around it. Stretches of untagged spans go through the layout
 /// heuristics as on an untagged page. Ruled grids are not consulted here: a
-/// tagged table's rows are its TR elements.
+/// tagged table's rows are its TR elements. This is the clause's basic
+/// layout model with the tree's order as the block progression direction:
+/// block-level elements stack as blocks, inline-level elements flow inside
+/// their block's lines.
 ///
-/// Covers ISO 32000-1 §14.8.4.2, §14.8.4.3 and §14.8.4.5.
+/// Covers ISO 32000-1 §14.8.3, §14.8.4.2, §14.8.4.3 and §14.8.4.5.
 fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
     for (run, spans) in stretches(spans, run_of) {
         match run {
