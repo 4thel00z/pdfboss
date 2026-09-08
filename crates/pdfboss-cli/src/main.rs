@@ -1424,6 +1424,9 @@ mod tests {
                 value: None,
                 default_value: None,
                 max_len: None,
+                options: Vec::new(),
+                top_index: 0,
+                selected_indices: Vec::new(),
                 additional_actions: None,
             }
         }

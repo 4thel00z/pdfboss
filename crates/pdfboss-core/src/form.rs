@@ -227,11 +227,53 @@ impl FieldFlags {
         self.bit(26)
     }
 
+    /// Bit 18, `Combo` (choice fields, Table 230): a combo box rather than
+    /// a list box.
+    pub fn combo(self) -> bool {
+        self.bit(18)
+    }
+
+    /// Bit 19, `Edit` (choice fields): the combo box has an editable text
+    /// box next to its list.
+    pub fn edit(self) -> bool {
+        self.bit(19)
+    }
+
+    /// Bit 20, `Sort` (choice fields): a writer sorts the options; readers
+    /// show them in `/Opt` order regardless.
+    pub fn sort(self) -> bool {
+        self.bit(20)
+    }
+
+    /// Bit 22, `MultiSelect` (choice fields): more than one option may be
+    /// selected.
+    pub fn multi_select(self) -> bool {
+        self.bit(22)
+    }
+
+    /// Bit 27, `CommitOnSelChange` (choice fields): a new selection is
+    /// committed at once instead of when the field is left.
+    pub fn commit_on_sel_change(self) -> bool {
+        self.bit(27)
+    }
+
     /// Whether the bit at `position`, numbered from 1 as the standard
     /// does, is set.
     fn bit(self, position: u32) -> bool {
         self.0 & (1 << (position - 1)) != 0
     }
+}
+
+/// One entry of a choice field's `/Opt` array (ISO 32000-1 §12.7.4.4,
+/// Table 231): the value exported for the option and the text shown for
+/// it. A lone text string in the array is both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceOption {
+    /// The export value.
+    pub export_value: String,
+    /// The text shown to the user; also what `/V` names when the option is
+    /// selected.
+    pub name: String,
 }
 
 /// One field dictionary (ISO 32000-1 §12.7.3, Table 220) with the
@@ -273,6 +315,17 @@ pub struct FormField {
     /// `/MaxLen`, inherited (§12.7.4.3, Table 229): the most characters a
     /// text field's text may hold.
     pub max_len: Option<u32>,
+    /// `/Opt`, inherited: the options of a choice field (§12.7.4.4, Table
+    /// 231) or the export values of a check box or radio button
+    /// (§12.7.4.2, Table 227); an entry that is neither a text string nor a
+    /// pair of them is skipped.
+    pub options: Vec<ChoiceOption>,
+    /// `/TI` (§12.7.4.4): the index into `options` of the first option a
+    /// scrollable list box shows; 0 by default.
+    pub top_index: u32,
+    /// `/I` (§12.7.4.4): the indices into `options` of the selected options
+    /// of a multi-select choice field, as written.
+    pub selected_indices: Vec<u32>,
     /// `/AA`: the field's additional-actions dictionary, as written.
     pub additional_actions: Option<Dict>,
 }
@@ -285,6 +338,24 @@ impl FormField {
             return None;
         }
         Some(decode_text_string(self.value.as_ref()?.as_str_bytes()?))
+    }
+
+    /// The names of a choice field's selected options (ISO 32000-1
+    /// §12.7.4.4): `/V` as one text string or, for a multi-select field,
+    /// an array of them. Empty for a field of another type, without a
+    /// value, or whose value is neither.
+    pub fn selected(&self) -> Vec<String> {
+        if self.field_type != Some(FieldType::Choice) {
+            return Vec::new();
+        }
+        match &self.value {
+            Some(Object::String(name)) => vec![decode_text_string(name)],
+            Some(Object::Array(names)) => names
+                .iter()
+                .filter_map(|name| Some(decode_text_string(name.as_str_bytes()?)))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -336,6 +407,7 @@ struct Inherited {
     default_value: Option<Object>,
     name: String,
     max_len: Option<u32>,
+    options: Vec<ChoiceOption>,
 }
 
 /// A field dictionary waiting to be read, with what it inherits.
@@ -390,6 +462,28 @@ async fn read_field<S: AsyncObjectSource>(
         .await
         .and_then(|len| u32::try_from(len.as_int()?).ok())
         .or(inherited.max_len);
+    let options = match entries.value("Opt").await {
+        Some(opt) => choice_options(src, &opt).await,
+        None => inherited.options,
+    };
+    let top_index = entries
+        .value("TI")
+        .await
+        .and_then(|ti| u32::try_from(ti.as_int()?).ok())
+        .unwrap_or(0);
+    let selected_indices = entries
+        .value("I")
+        .await
+        .and_then(|indices| {
+            Some(
+                indices
+                    .as_array()?
+                    .iter()
+                    .filter_map(|index| u32::try_from(index.as_int()?).ok())
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
     let partial_name = text_string(&entries, "T").await;
     let name = qualified_name(&inherited.name, partial_name.as_deref());
     let additional_actions = match dict.get("AA") {
@@ -426,6 +520,7 @@ async fn read_field<S: AsyncObjectSource>(
                     default_value: default_value.clone(),
                     name: name.clone(),
                     max_len,
+                    options: options.clone(),
                 },
                 depth: depth + 1,
             });
@@ -445,6 +540,9 @@ async fn read_field<S: AsyncObjectSource>(
         value,
         default_value,
         max_len,
+        options,
+        top_index,
+        selected_indices,
         additional_actions,
     };
     (field, children)
@@ -462,6 +560,47 @@ fn qualified_name(parent: &str, partial: Option<&str>) -> String {
         Some(partial) => format!("{parent}.{partial}"),
         None => parent.to_string(),
     }
+}
+
+/// The options an `/Opt` array holds (ISO 32000-1 §12.7.4.4, Table 231):
+/// a text string is an option whose export value is its name, a pair of
+/// text strings is an export value and a name; indirect entries are
+/// followed and anything else is skipped.
+async fn choice_options<S: AsyncObjectSource>(src: &S, opt: &Object) -> Vec<ChoiceOption> {
+    let Some(items) = opt.as_array() else {
+        return Vec::new();
+    };
+    let mut options = Vec::new();
+    for item in items {
+        let Ok(item) = src.resolve(item).await else {
+            continue;
+        };
+        match &item {
+            Object::String(name) => {
+                let name = decode_text_string(name);
+                options.push(ChoiceOption {
+                    export_value: name.clone(),
+                    name,
+                });
+            }
+            Object::Array(pair) => {
+                let [export_value, name] = pair.as_slice() else {
+                    continue;
+                };
+                let (Some(export_value), Some(name)) =
+                    (export_value.as_str_bytes(), name.as_str_bytes())
+                else {
+                    continue;
+                };
+                options.push(ChoiceOption {
+                    export_value: decode_text_string(export_value),
+                    name: decode_text_string(name),
+                });
+            }
+            _ => {}
+        }
+    }
+    options
 }
 
 /// The dictionary a reference points at, `None` for anything else.
@@ -497,7 +636,7 @@ fn references(value: Option<&Object>) -> Vec<ObjRef> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FieldFlags, FieldType, InteractiveForm, Quadding, SignatureFlags};
+    use super::{ChoiceOption, FieldFlags, FieldType, InteractiveForm, Quadding, SignatureFlags};
     use crate::object::{Name, ObjRef, Object};
     use crate::Document;
     use pdfboss_testkit::PdfBuilder;
@@ -876,5 +1015,106 @@ mod tests {
         assert_eq!(fields[1].text(), None);
         assert_eq!(fields[2].text(), None);
         assert_eq!(fields[2].max_len, None);
+    }
+
+    /// A combo box: `/Opt` mixes lone names with export/name pairs, `/TI`
+    /// and `/I` are read, `/V` names the selected option, and the Table
+    /// 230 bits are read by position.
+    // Covers ISO 32000-1 §12.7.4.4.
+    #[test]
+    fn choice_fields_list_their_options_top_index_and_selection() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R] >>",
+            &[(
+                5,
+                "<< /T (colour) /FT /Ch /Ff 393216 /Opt [(Red) [(b) (Blue)] <FEFF0047>] \
+                 /TI 1 /I [1] /V (Blue) >>",
+            )],
+        )
+        .form_fields();
+        let field = &fields[0];
+        assert_eq!(
+            field.options,
+            vec![
+                ChoiceOption {
+                    export_value: "Red".into(),
+                    name: "Red".into(),
+                },
+                ChoiceOption {
+                    export_value: "b".into(),
+                    name: "Blue".into(),
+                },
+                ChoiceOption {
+                    export_value: "G".into(),
+                    name: "G".into(),
+                },
+            ]
+        );
+        assert_eq!(field.top_index, 1);
+        assert_eq!(field.selected_indices, vec![1]);
+        assert_eq!(field.selected(), vec!["Blue".to_string()]);
+        assert!(field.flags.combo() && field.flags.edit());
+        assert!(!field.flags.sort() && !field.flags.multi_select());
+        assert!(!field.flags.commit_on_sel_change());
+    }
+
+    /// A multi-select list box holds an array of names in `/V`; an indirect
+    /// `/Opt` array with an indirect element is followed; `/Opt` is taken
+    /// from the parent when the field has none.
+    // Covers ISO 32000-1 §12.7.4.4.
+    #[test]
+    fn multi_select_choice_fields_hold_several_selected_names() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R] >>",
+            &[
+                (
+                    5,
+                    "<< /T (toppings) /FT /Ch /Ff 69730304 /Opt 6 0 R /Kids [8 0 R] >>",
+                ),
+                (6, "[(a) 7 0 R (c)]"),
+                (7, "[(bee) (b)]"),
+                (8, "<< /Parent 5 0 R /V [(a) (c)] /I [0 2] >>"),
+            ],
+        )
+        .form_fields();
+        let kid = &fields[1];
+        assert_eq!(kid.options.len(), 3);
+        assert_eq!(kid.options[1].export_value, "bee");
+        assert_eq!(kid.selected(), vec!["a".to_string(), "c".to_string()]);
+        assert_eq!(kid.selected_indices, vec![0, 2]);
+        assert!(kid.flags.sort() && kid.flags.multi_select() && kid.flags.commit_on_sel_change());
+        assert!(!kid.flags.combo());
+        assert_eq!(fields[0].selected(), Vec::<String>::new());
+    }
+
+    /// Other field types have no selection even with a string value; a
+    /// choice field without `/Opt` has no options and the default top
+    /// index; an `/Opt` entry that is a number or a three-element array, a
+    /// negative `/TI` and a negative index in `/I` are skipped.
+    // Covers ISO 32000-1 §12.7.4.4.
+    #[test]
+    fn choice_entries_default_for_other_types_and_skip_odd_values() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R] >>",
+            &[
+                (5, "<< /T (text) /FT /Tx /V (x) /Opt [(y)] >>"),
+                (6, "<< /T (bare) /FT /Ch >>"),
+                (
+                    7,
+                    "<< /T (odd) /FT /Ch /Opt [7 [(a) (b) (c)] (ok)] /TI -3 /I [-1 0] /V 5 >>",
+                ),
+            ],
+        )
+        .form_fields();
+        assert_eq!(fields[0].selected(), Vec::<String>::new());
+        assert_eq!(fields[0].options.len(), 1);
+        assert_eq!(fields[1].options, Vec::new());
+        assert_eq!(fields[1].top_index, 0);
+        assert_eq!(fields[1].selected(), Vec::<String>::new());
+        assert_eq!(fields[2].options.len(), 1);
+        assert_eq!(fields[2].options[0].name, "ok");
+        assert_eq!(fields[2].top_index, 0);
+        assert_eq!(fields[2].selected_indices, vec![0]);
+        assert_eq!(fields[2].selected(), Vec::<String>::new());
     }
 }
