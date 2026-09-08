@@ -634,6 +634,15 @@ impl Document {
         ))
     }
 
+    /// The catalog's viewer preferences (ISO 32000-1 §12.2), `None` when
+    /// the catalog declares none.
+    pub fn viewer_preferences(&self) -> Option<crate::viewer_preferences::ViewerPreferences> {
+        block_on(crate::viewer_preferences::viewer_preferences_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The label the page at `index` shows, or `None` when the document
     /// has no page labels or no such page.
     pub fn page_label(&self, index: usize) -> Option<String> {

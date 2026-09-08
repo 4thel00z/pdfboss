@@ -29,6 +29,7 @@ pub mod pretty;
 pub mod source;
 pub mod structure;
 pub mod tree;
+pub mod viewer_preferences;
 pub mod xref;
 
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
@@ -66,4 +67,8 @@ pub use source::{
 pub use structure::{
     AttributeObject, MarkedContentId, Placement, StandardKind, StandardOwner, StandardType,
     StructureElement, StructureTree,
+};
+pub use viewer_preferences::{
+    viewer_preferences_with, Direction, Duplex, NonFullScreenPageMode, PageBoundary, PrintScaling,
+    ViewerPreferences,
 };

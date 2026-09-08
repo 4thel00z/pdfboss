@@ -45,6 +45,7 @@ fn outline_doc() -> Vec<u8> {
         1,
         "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Lang (en-US) \
          /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> >> \
+         /ViewerPreferences << /Direction /R2L /HideToolbar true /PrintPageRange [1 1] >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -203,6 +204,11 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             doc.extensions().await,
             sync_doc.extensions(),
             "{name}: extensions"
+        );
+        assert_eq!(
+            doc.viewer_preferences().await,
+            sync_doc.viewer_preferences(),
+            "{name}: viewer preferences"
         );
         for index in 0..=doc.page_count() {
             assert_eq!(
