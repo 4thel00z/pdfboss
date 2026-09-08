@@ -3200,9 +3200,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// `/Popup` annotations (a viewer-UI artifact) paint nothing and report
     /// nothing. An annotation with no `/AP` at all gets the appearance its
     /// own entries describe when its subtype has one (Line, §12.5.6.7;
-    /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9; Ink,
-    /// §12.5.6.13); other annotations without a usable normal appearance
-    /// paint nothing and report nothing. An appearance
+    /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9; the
+    /// text markups, §12.5.6.10; Ink, §12.5.6.13); other annotations without
+    /// a usable normal appearance paint nothing and report nothing. An
+    /// appearance
     /// that exists but
     /// cannot be read or placed reports as a dropped annotation, so a page
     /// whose visible content is a stamp or a filled form field never
@@ -6970,6 +6971,13 @@ mod tests {
     /// object bodies added from object number 10 up) — the appearance
     /// streams they reference are given as `(num, dict_extra, content)`.
     fn annots_doc(annots: &[&str], streams: &[(u32, &str, &[u8])]) -> Vec<u8> {
+        annots_doc_over(b"", annots, streams)
+    }
+
+    /// A one-page document whose page content is `content`, carrying the
+    /// annotation dictionaries `annots` as objects 10, 11, ... and the extra
+    /// `streams`.
+    fn annots_doc_over(content: &[u8], annots: &[&str], streams: &[(u32, &str, &[u8])]) -> Vec<u8> {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -6984,7 +6992,7 @@ mod tests {
                 refs.join(" ")
             ),
         );
-        b.stream(4, "", b"");
+        b.stream(4, "", content);
         for (i, body) in annots.iter().enumerate() {
             b.object(10 + i as u32, body);
         }
@@ -7159,6 +7167,57 @@ mod tests {
         assert_eq!(px(&pix, 75, 10), RED, "the L's horizontal leg along y 90");
         assert_eq!(px(&pix, 20, 20), RED, "the single point as a dot");
         assert_eq!(px(&pix, 30, 50), WHITE, "between the strokes");
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn text_markup_annotations_without_appearance_are_drawn() {
+        // Four markups on separate lines of the page, each one /QuadPoints
+        // quadrilateral written upper edge first as writers emit it: the
+        // Highlight fills its quad in yellow and multiplies over the black
+        // page content under it, the Underline strokes along the bottom edge
+        // of its quad, the StrikeOut through its middle, the Squiggly
+        // zigzags along its bottom; where nothing is drawn the quads stay
+        // white.
+        let bytes = annots_doc_over(
+            b"0 g 20 82 5 6 re f",
+            &[
+                "<< /Type /Annot /Subtype /Highlight /Rect [10 80 40 90] /C [1 1 0] \
+                 /QuadPoints [10 90 40 90 10 80 40 80] >>",
+                "<< /Type /Annot /Subtype /Underline /Rect [10 60 40 70] /C [0 0 1] \
+                 /QuadPoints [10 70 40 70 10 60 40 60] >>",
+                "<< /Type /Annot /Subtype /StrikeOut /Rect [10 40 40 49] /C [1 0 0] \
+                 /QuadPoints [10 49 40 49 10 40 40 40] >>",
+                "<< /Type /Annot /Subtype /Squiggly /Rect [10 20 40 30] /C [0 1 0] \
+                 /QuadPoints [10 30 40 30 10 20 40 20] >>",
+            ],
+            &[],
+        );
+        const YELLOW: [u8; 4] = [255, 255, 0, 255];
+        const BLACK: [u8; 4] = [0, 0, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 15, 15), YELLOW, "the highlight over white");
+        assert_eq!(
+            px(&pix, 22, 15),
+            BLACK,
+            "the highlight multiplies over the page content"
+        );
+        assert_eq!(
+            px(&pix, 25, 39),
+            BLUE,
+            "the underline along the quad's bottom edge"
+        );
+        assert_eq!(px(&pix, 25, 35), WHITE, "the underlined quad's middle");
+        assert_eq!(px(&pix, 25, 55), RED, "the strike-out through the middle");
+        assert_eq!(px(&pix, 25, 58), WHITE, "below the strike-out");
+        assert_ne!(px(&pix, 11, 78), WHITE, "the squiggle along the bottom");
+        assert_eq!(px(&pix, 25, 75), WHITE, "the squiggly quad's middle");
         assert!(
             report.is_empty(),
             "a synthesized appearance is not a drop: {:?}",

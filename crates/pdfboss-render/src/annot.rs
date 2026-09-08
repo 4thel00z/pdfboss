@@ -10,8 +10,12 @@ use crate::executor::{dict_f32, floats_from, num_f32};
 /// Bezier control distance that draws a quarter circle of radius 1.
 const KAPPA: f32 = 0.552_284_8;
 
-/// The name of the graphics state parameter dictionary carrying `/CA`.
-const OPACITY_STATE: &str = "GS";
+/// The name of the graphics state parameter dictionary carrying the `/CA`
+/// opacity and, for a Highlight, the `/BM` blend mode.
+const GRAPHICS_STATE: &str = "GS";
+
+/// The line width of an Underline, StrikeOut or Squiggly stroke.
+const MARKUP_WIDTH: f32 = 1.0;
 
 /// A line ending's size relative to the line width, and its floor in
 /// default user space units.
@@ -23,7 +27,7 @@ const ENDING_MIN: f32 = 4.0;
 /// not synthesized, or for one whose entries describe nothing to paint (no
 /// colour, or a zero-width border and no interior).
 ///
-/// Covers ISO 32000-1 §12.5.6.7, §12.5.6.8, §12.5.6.9 and §12.5.6.13.
+/// Covers ISO 32000-1 §12.5.6.7, §12.5.6.8, §12.5.6.9, §12.5.6.10 and §12.5.6.13.
 pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Option<Stream> {
     let subtype = annot.get_name("Subtype")?.0.clone();
     let paint = Paint::read(src, annot).await;
@@ -52,9 +56,15 @@ pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> 
             let paths = ink_list(src, annot.get("InkList")?).await?;
             paint.ink(&paths)?
         }
+        "Highlight" | "Underline" | "StrikeOut" | "Squiggly" => {
+            let quads = number_list(src, annot.get("QuadPoints")?).await?;
+            let fill = colour_op(src, annot, "C", false).await;
+            paint.markup(&subtype, &quads, fill.as_deref())?
+        }
         _ => return None,
     };
-    Some(form(bbox, paint.opacity, content))
+    let blend = (subtype == "Highlight").then_some("Multiply");
+    Some(form(bbox, paint.opacity, blend, content))
 }
 
 /// What the annotation's common entries say about how to paint it: the
@@ -93,7 +103,7 @@ impl Paint {
     fn preamble(&self) -> String {
         let mut content = String::from("q\n");
         if self.opacity.is_some() {
-            content.push_str(&format!("/{OPACITY_STATE} gs\n"));
+            content.push_str(&format!("/{GRAPHICS_STATE} gs\n"));
         }
         if let Some(op) = self.stroking() {
             content.push_str(op);
@@ -338,6 +348,95 @@ impl Paint {
         content.push_str("Q\n");
         Some((bounds(&points, self.border.width), content))
     }
+}
+
+impl Paint {
+    /// The content of a text markup annotation over `quads`, eight numbers
+    /// each and taken by their extent rather than their corner order, and
+    /// the box it covers: a Highlight fills each quadrilateral (its form
+    /// blends with Multiply), an Underline strokes a [`MARKUP_WIDTH`] line
+    /// along its bottom edge, a StrikeOut one through its middle, a Squiggly
+    /// a zigzag a quarter of its height along the bottom. `None` without a
+    /// colour or a complete quadrilateral.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.10.
+    fn markup(
+        &self,
+        subtype: &str,
+        quads: &[f32],
+        fill: Option<&str>,
+    ) -> Option<([f32; 4], String)> {
+        let colour = match subtype {
+            "Highlight" => fill?,
+            _ => self.stroke.as_deref()?,
+        };
+        let boxes: Vec<[f32; 4]> = quads
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|q| {
+                bounds(
+                    &[[q[0], q[1]], [q[2], q[3]], [q[4], q[5]], [q[6], q[7]]],
+                    0.0,
+                )
+            })
+            .collect();
+        if boxes.is_empty() {
+            return None;
+        }
+        let mut content = String::from("q\n");
+        if self.opacity.is_some() || subtype == "Highlight" {
+            content.push_str(&format!("/{GRAPHICS_STATE} gs\n"));
+        }
+        content.push_str(colour);
+        content.push('\n');
+        content.push_str(&format!("{} w\n", num(MARKUP_WIDTH)));
+        for &[left, bottom, right, top] in &boxes {
+            match subtype {
+                "Highlight" => content.push_str(&format!(
+                    "{} {} {} {} re f\n",
+                    num(left),
+                    num(bottom),
+                    num(right - left),
+                    num(top - bottom)
+                )),
+                "Underline" => content.push_str(&rule(left, right, bottom + MARKUP_WIDTH / 2.0)),
+                "StrikeOut" => content.push_str(&rule(left, right, (top + bottom) / 2.0)),
+                _ => content.push_str(&squiggle(left, right, bottom, (top - bottom) / 4.0)),
+            }
+        }
+        content.push_str("Q\n");
+        let corners: Vec<[f32; 2]> = boxes
+            .iter()
+            .flat_map(|b| [[b[0], b[1]], [b[2], b[3]]])
+            .collect();
+        Some((bounds(&corners, MARKUP_WIDTH), content))
+    }
+}
+
+/// A horizontal stroke from `left` to `right` at `y`.
+fn rule(left: f32, right: f32, y: f32) -> String {
+    format!("{} {} m {} {} l S\n", num(left), num(y), num(right), num(y))
+}
+
+/// A zigzag from `left` to `right` between `bottom` and `bottom + step`,
+/// turning every `step`; nothing when the step is not positive or the span
+/// is empty.
+fn squiggle(left: f32, right: f32, bottom: f32, step: f32) -> String {
+    if !step.is_finite() || step <= 0.0 || right <= left {
+        return String::new();
+    }
+    let mut content = format!("{} {} m\n", num(left), num(bottom + step));
+    let mut x = left;
+    let mut up = true;
+    while x < right {
+        x = (x + step).min(right);
+        up = !up;
+        let y = if up { bottom + step } else { bottom };
+        content.push_str(&format!("{} {} l\n", num(x), num(y)));
+    }
+    content.push_str("S\n");
+    content
 }
 
 /// A line ending style of Table 176.
@@ -683,9 +782,9 @@ fn bounds(points: &[[f32; 2]], margin: f32) -> [f32; 4] {
 }
 
 /// The form XObject: `/BBox` is the box the content covers in default user
-/// space, so §12.5.5's fit is the identity, and a `/CA` below 1 becomes an
-/// `/ExtGState` the content selects first.
-fn form(bbox: [f32; 4], opacity: Option<f32>, content: String) -> Stream {
+/// space, so §12.5.5's fit is the identity, and a `/CA` below 1 or a blend
+/// mode becomes an `/ExtGState` the content selects first.
+fn form(bbox: [f32; 4], opacity: Option<f32>, blend: Option<&str>, content: String) -> Stream {
     let mut dict = Dict::new();
     dict.insert(name("Type"), Object::Name(name("XObject")));
     dict.insert(name("Subtype"), Object::Name(name("Form")));
@@ -693,12 +792,17 @@ fn form(bbox: [f32; 4], opacity: Option<f32>, content: String) -> Stream {
         name("BBox"),
         Object::Array(bbox.iter().map(|v| Object::Real(f64::from(*v))).collect()),
     );
-    if let Some(ca) = opacity {
+    if opacity.is_some() || blend.is_some() {
         let mut state = Dict::new();
-        state.insert(name("CA"), Object::Real(f64::from(ca)));
-        state.insert(name("ca"), Object::Real(f64::from(ca)));
+        if let Some(ca) = opacity {
+            state.insert(name("CA"), Object::Real(f64::from(ca)));
+            state.insert(name("ca"), Object::Real(f64::from(ca)));
+        }
+        if let Some(mode) = blend {
+            state.insert(name("BM"), Object::Name(name(mode)));
+        }
         let mut states = Dict::new();
-        states.insert(name(OPACITY_STATE), Object::Dict(state));
+        states.insert(name(GRAPHICS_STATE), Object::Dict(state));
         let mut resources = Dict::new();
         resources.insert(name("ExtGState"), Object::Dict(states));
         dict.insert(name("Resources"), Object::Dict(resources));
