@@ -25,8 +25,10 @@ The analysis infers:
   repeated near-verbatim at the same height on at least half the pages (three at
   minimum), is tagged
   as a running page header or footer; a line that is nothing but a page number is
-  tagged without any repetition required. Tagged lines are dropped from the
-  Markdown output.
+  tagged without any repetition required. Content the producer marked as a
+  pagination artifact (ISO 32000-1 14.8.2.2: a running head, a folio, a
+  watermark) is tagged on the producer's word, with no repetition needed.
+  Tagged lines are dropped from the Markdown output.
 
 ## CLI
 

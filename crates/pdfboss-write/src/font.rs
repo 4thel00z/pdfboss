@@ -93,19 +93,26 @@ impl Standard14 {
         !matches!(self, Standard14::Symbol | Standard14::ZapfDingbats)
     }
 
-    /// The WinAnsi code for `ch`, scanning codes in ascending order so a
-    /// duplicated character would resolve to its lowest code. Symbol and
-    /// ZapfDingbats have no encoding tables yet, so every character is an
-    /// [`Error::Unencodable`] there.
-    fn encode_char(self, ch: char) -> Result<u8> {
-        if !self.is_win_ansi() {
-            return Err(Error::Unencodable {
-                ch,
-                font: self.base_font(),
-            });
+    /// The face's code-to-character table: WinAnsi for the twelve text
+    /// faces, the built-in encodings of Annex D.5 and D.6 for Symbol and
+    /// ZapfDingbats.
+    ///
+    /// Covers ISO 32000-1 Annex D.5 and Annex D.6.
+    fn decoder(self) -> fn(u8) -> Option<char> {
+        match self {
+            Standard14::Symbol => pdfboss_encoding::symbol,
+            Standard14::ZapfDingbats => pdfboss_encoding::zapf_dingbats,
+            _ => pdfboss_encoding::win_ansi,
         }
+    }
+
+    /// The code for `ch` in the face's encoding, scanning codes in
+    /// ascending order so a duplicated character would resolve to its lowest
+    /// code. A character the encoding lacks is an [`Error::Unencodable`].
+    fn encode_char(self, ch: char) -> Result<u8> {
+        let decode = self.decoder();
         (0u8..=255)
-            .find(|&code| pdfboss_encoding::win_ansi(code) == Some(ch))
+            .find(|&code| decode(code) == Some(ch))
             .ok_or(Error::Unencodable {
                 ch,
                 font: self.base_font(),
@@ -116,17 +123,20 @@ impl Standard14 {
     /// the font-specific built-in encoding for Symbol and ZapfDingbats.
     /// A character without a code is an [`Error::Unencodable`]
     /// (crate::Error::Unencodable) — never silently dropped or replaced.
-    /// Symbol and ZapfDingbats currently reject every character: their
-    /// encoding tables come with a later phase.
     pub fn encode(self, text: &str) -> Result<Vec<u8>> {
         text.chars().map(|ch| self.encode_char(ch)).collect()
     }
 
     /// Advance width of one character in units per 1000 of font size, from
-    /// the AFM metrics. `None` when the character has no code or metric.
+    /// the AFM metrics. `None` when the character has no code or metric;
+    /// Symbol and ZapfDingbats carry no metrics, so theirs are always `None`.
     pub fn width(self, ch: char) -> Option<f32> {
         let code = self.encode_char(ch).ok()?;
-        let glyph = pdfboss_encoding::win_ansi_glyph_name(code)?;
+        let glyph = match self {
+            Standard14::Symbol => pdfboss_encoding::symbol_glyph_name(code)?,
+            Standard14::ZapfDingbats => pdfboss_encoding::zapf_dingbats_glyph_name(code)?,
+            _ => pdfboss_encoding::win_ansi_glyph_name(code)?,
+        };
         pdfboss_encoding::standard_14_width(self.base_font(), glyph)
     }
 
@@ -224,13 +234,24 @@ mod tests {
     }
 
     #[test]
-    fn symbol_faces_reject_every_char_for_now() {
+    fn symbol_faces_encode_through_their_built_in_encodings() {
+        // Greek through Symbol's table, a dingbat through ZapfDingbats', and
+        // a character neither table has is still refused; the two faces
+        // have no bundled metrics, so widths stay unknown.
+        assert_eq!(
+            Standard14::Symbol.encode("\u{03B1}\u{2126}").unwrap(),
+            [0o141, 0o127]
+        );
+        assert_eq!(
+            Standard14::ZapfDingbats.encode("\u{2701}").unwrap(),
+            [0o041]
+        );
         for font in [Standard14::Symbol, Standard14::ZapfDingbats] {
             assert!(matches!(
                 font.encode("a"),
                 Err(Error::Unencodable { ch: 'a', .. })
             ));
-            assert_eq!(font.width('a'), None);
+            assert_eq!(font.width('\u{03B1}'), None);
         }
         assert_eq!(Standard14::Symbol.encode("").unwrap(), Vec::<u8>::new());
     }

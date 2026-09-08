@@ -83,6 +83,37 @@ fn structure_for(doc: &Document, order: ReadingOrder) -> Option<StructureTree> {
     }
 }
 
+/// The class of an artifact marked-content sequence (ISO 32000-1 Table
+/// 330, `/Type`): what a producer says a piece of content is there for.
+///
+/// Covers ISO 32000-1 §14.8.2.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactKind {
+    /// Running heads, folios, watermarks: `/Pagination`.
+    Pagination,
+    /// Cosmetic typography such as footnote rules: `/Layout`.
+    Layout,
+    /// Production aids such as cut marks and colour bars: `/Page`.
+    Page,
+    /// A background under the real content: `/Background`.
+    Background,
+    /// An `/Artifact` sequence without a `/Type`, or with one outside the
+    /// table.
+    Unspecified,
+}
+
+/// An `/Artifact` marked-content sequence a span was shown inside: content
+/// the producer marked as not part of the author's text.
+///
+/// Covers ISO 32000-1 §14.8.2.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Artifact {
+    pub kind: ArtifactKind,
+    /// `/Subtype` of a pagination artifact: `Header`, `Footer`, `Watermark`
+    /// or a producer's own name.
+    pub subtype: Option<String>,
+}
+
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
@@ -145,6 +176,10 @@ pub struct TextSpan {
     /// A drawn ruling crosses the span's x-height band — geometry-read,
     /// like `underline`.
     pub strikethrough: bool,
+    /// The innermost `/Artifact` marked-content sequence the span was shown
+    /// inside (ISO 32000-1 §14.8.2.2): a running head, a page number, a
+    /// footnote rule. `None` for real content.
+    pub artifact: Option<Artifact>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -852,6 +887,125 @@ mod tests {
     /// The source-generic entry points take the optional-content state a
     /// document-owning caller can read (`Document::oc_state`, or the async
     /// document's `oc_state()`), so a hidden layer is excluded over any
+    /// One page whose content stream is `content`, with Helvetica as `/F1`
+    /// and `properties` as the page's `/Properties` resource dictionary.
+    fn marked_doc(content: &[u8], properties: &str) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> /Properties << {properties} >> >> \
+                 /Contents 4 0 R >>"
+            ),
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        Document::load(b.build(1)).unwrap()
+    }
+
+    /// A span inside an `/Artifact` sequence carries the sequence's class
+    /// and subtype; a generic `BMC` artifact has neither; real content has
+    /// no artifact at all.
+    // Covers ISO 32000-1 §14.8.2.2.
+    #[test]
+    fn artifact_marks_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 10 Tf 72 770 Td /Artifact << /Type /Pagination /Subtype /Header >> BDC \
+              (ACME) Tj EMC /Artifact BMC (rule) Tj EMC /Artifact /Bg BDC (wm) Tj EMC \
+              0 -50 Td (body) Tj ET",
+            "/Bg << /Type /Background >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let got: Vec<(&str, Option<&Artifact>)> = spans
+            .iter()
+            .map(|s| (s.text.as_str(), s.artifact.as_ref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "ACME",
+                    Some(&Artifact {
+                        kind: ArtifactKind::Pagination,
+                        subtype: Some("Header".to_string()),
+                    })
+                ),
+                (
+                    "rule",
+                    Some(&Artifact {
+                        kind: ArtifactKind::Unspecified,
+                        subtype: None,
+                    })
+                ),
+                (
+                    "wm",
+                    Some(&Artifact {
+                        kind: ArtifactKind::Background,
+                        subtype: None,
+                    })
+                ),
+                ("body", None),
+            ]
+        );
+    }
+
+    /// The clause's own example: a hyphenated German word whose shown
+    /// `k-` stands for a `c`, so the extracted text reads Drucker. The
+    /// replacement span keeps the geometry of the glyphs it stands for.
+    // Covers ISO 32000-1 §14.9.4.
+    #[test]
+    fn actual_text_replaces_the_shown_glyphs() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td (Dru) Tj /Span << /ActualText (c) >> BDC (k-) Tj EMC (ker) Tj ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["Dru", "c", "ker"]);
+        assert!(
+            spans[1].end_x > spans[1].x + 8.0,
+            "the c keeps the advance of k-: {:?}",
+            spans[1]
+        );
+    }
+
+    /// Every string shown inside the sequence is one replacement: the
+    /// first show carries the text, later shows only widen it. An empty
+    /// replacement removes the sequence's text. A named property list and
+    /// a UTF-16 value read like inline ones.
+    // Covers ISO 32000-1 §14.9.4.
+    #[test]
+    fn actual_text_covers_the_whole_sequence_and_may_be_empty() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /ActualText (fi) >> BDC (f) Tj (i) Tj EMC \
+              /Span << /ActualText () >> BDC (gone) Tj EMC \
+              /Span /Eacute BDC (e) Tj EMC (nd) Tj ET",
+            "/Eacute << /ActualText <FEFF00E9> >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["fi", "\u{E9}", "nd"]);
+        // The ligature span spans both shown glyphs; the dropped word still
+        // advanced the text matrix, so the next span starts past it.
+        let f_width = 12.0 * 0.278;
+        assert!(
+            spans[0].end_x - spans[0].x > f_width * 1.5,
+            "{:?}",
+            spans[0]
+        );
+        assert!(spans[1].x > spans[0].end_x + 12.0, "{:?}", spans[1]);
+    }
+
     /// source exactly as the document-level entries exclude it; `None`
     /// still extracts every layer.
     // Covers ISO 32000-1 §7.7.2.
