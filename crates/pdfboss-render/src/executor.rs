@@ -3200,7 +3200,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// `/Popup` annotations (a viewer-UI artifact) paint nothing and report
     /// nothing. An annotation with no `/AP` at all gets the appearance its
     /// own entries describe when its subtype has one (Line, §12.5.6.7;
-    /// Square and Circle, §12.5.6.8); other annotations without a usable
+    /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9);
+    /// other annotations without a usable
     /// normal appearance paint nothing and report nothing. An appearance
     /// that exists but
     /// cannot be read or placed reports as a dropped annotation, so a page
@@ -7086,6 +7087,48 @@ mod tests {
             px(&pix, 50, 10),
             BLUE,
             "a line with an empty /Rect still paints"
+        );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.9.
+    #[test]
+    fn polygon_and_polyline_annotations_without_appearance_are_drawn() {
+        // Left: a Polygon whose /Vertices give a triangle, red 2-unit border,
+        // blue /IC interior: the centroid is blue, the closing edge from the
+        // last vertex back to the first is red, the page beside it white.
+        // Right: a PolyLine through three points with /LE [/None /Square]
+        // and no /IC: its second segment paints red, the square ending at
+        // the last vertex is outlined, and nothing closes it back to the
+        // start.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Polygon /Rect [0 0 50 100] /Vertices [10 10 40 10 25 40] \
+                 /C [1 0 0] /IC [0 0 1] /BS << /W 2 >> >>",
+                "<< /Type /Annot /Subtype /PolyLine /Rect [50 0 100 100] \
+                 /Vertices [60 60 60 90 90 90] /C [1 0 0] /BS << /W 2 >> /LE [/None /Square] >>",
+            ],
+            &[],
+        );
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 80), BLUE, "polygon interior");
+        assert_eq!(px(&pix, 25, 90), RED, "the closing edge along y 10");
+        assert_eq!(px(&pix, 45, 75), WHITE, "beside the polygon");
+        assert_eq!(
+            px(&pix, 75, 10),
+            RED,
+            "the polyline's second segment along y 90"
+        );
+        assert_eq!(px(&pix, 75, 25), WHITE, "the polyline is not closed");
+        assert_eq!(
+            px(&pix, 96, 10),
+            RED,
+            "the square ending's right edge at the last vertex"
         );
         assert!(
             report.is_empty(),

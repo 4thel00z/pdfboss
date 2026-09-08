@@ -23,7 +23,7 @@ const ENDING_MIN: f32 = 4.0;
 /// not synthesized, or for one whose entries describe nothing to paint (no
 /// colour, or a zero-width border and no interior).
 ///
-/// Covers ISO 32000-1 §12.5.6.7 and §12.5.6.8.
+/// Covers ISO 32000-1 §12.5.6.7, §12.5.6.8 and §12.5.6.9.
 pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Option<Stream> {
     let subtype = annot.get_name("Subtype")?.0.clone();
     let paint = Paint::read(src, annot).await;
@@ -38,6 +38,15 @@ pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> 
             let endings = Ending::pair(src, annot).await;
             let leader = Leader::read(src, annot).await;
             paint.line([l[0], l[1]], [l[2], l[3]], endings, leader)?
+        }
+        "Polygon" => {
+            let vertices = number_list(src, annot.get("Vertices")?).await?;
+            paint.polyline(&vertices, true, [Ending::None, Ending::None])?
+        }
+        "PolyLine" => {
+            let vertices = number_list(src, annot.get("Vertices")?).await?;
+            let endings = Ending::pair(src, annot).await;
+            paint.polyline(&vertices, false, endings)?
         }
         _ => return None,
     };
@@ -215,6 +224,78 @@ impl Paint {
         content.push_str("Q\n");
         let margin = self.border.width + size;
         Some((bounds(&points, margin), content))
+    }
+}
+
+impl Paint {
+    /// The content of a polygon or polyline through `coords`, alternating
+    /// x and y, and the box it covers: the vertices joined by straight
+    /// lines, closed back to the first and filled with the interior colour
+    /// for a polygon, left open with a line ending at each end for a
+    /// polyline. `None` with fewer than two vertices or nothing to paint.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.9.
+    fn polyline(
+        &self,
+        coords: &[f32],
+        closed: bool,
+        endings: [Ending; 2],
+    ) -> Option<([f32; 4], String)> {
+        let vertices: Vec<[f32; 2]> = coords.as_chunks::<2>().0.to_vec();
+        if vertices.len() < 2 {
+            return None;
+        }
+        let stroke = self.stroking();
+        let operator = match (closed, self.fill.as_deref(), stroke) {
+            (true, Some(_), Some(_)) => "b",
+            (true, Some(_), None) => "f",
+            (true, None, Some(_)) => "s",
+            (false, _, Some(_)) => "S",
+            (_, None, None) | (false, Some(_), None) => return None,
+        };
+        let mut content = self.preamble();
+        for (i, v) in vertices.iter().enumerate() {
+            content.push_str(&format!(
+                "{} {} {}\n",
+                num(v[0]),
+                num(v[1]),
+                if i == 0 { "m" } else { "l" }
+            ));
+        }
+        content.push_str(operator);
+        content.push('\n');
+        let mut points = vertices.clone();
+        let mut size = 0.0;
+        if !closed {
+            let first = vertices[0];
+            let last = vertices[vertices.len() - 1];
+            let ends = [
+                (first, vertices[1], endings[0]),
+                (last, vertices[vertices.len() - 2], endings[1]),
+            ];
+            for (point, neighbour, ending) in ends {
+                let (dx, dy) = (point[0] - neighbour[0], point[1] - neighbour[1]);
+                let length = (dx * dx + dy * dy).sqrt();
+                if !length.is_finite() || length <= 0.0 {
+                    continue;
+                }
+                let outward = [dx / length, dy / length];
+                let side = [outward[1], -outward[0]];
+                size = (self.border.width * ENDING_SCALE)
+                    .max(ENDING_MIN)
+                    .min(length);
+                content.push_str(&ending.content(
+                    point,
+                    outward,
+                    side,
+                    size,
+                    self.fill.is_some(),
+                    &mut points,
+                ));
+            }
+        }
+        content.push_str("Q\n");
+        Some((bounds(&points, self.border.width + size), content))
     }
 }
 
@@ -421,6 +502,20 @@ async fn dash_array<S: AsyncObjectSource>(src: &S, obj: &Object) -> Vec<f32> {
         return Vec::new();
     }
     dash
+}
+
+/// Every number of a (possibly indirect) array, resolving indirect
+/// entries; `None` when the object is not an array or an entry is not a
+/// finite number.
+async fn number_list<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Vec<f32>> {
+    let Ok(Object::Array(items)) = src.resolve(obj).await else {
+        return None;
+    };
+    let mut numbers = Vec::with_capacity(items.len());
+    for item in &items {
+        numbers.push(num_f32(src, item).await?);
+    }
+    Some(numbers)
 }
 
 /// A `/C` or `/IC` colour as the operator that selects it: 1, 3 or 4
