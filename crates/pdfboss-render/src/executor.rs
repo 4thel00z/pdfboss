@@ -612,6 +612,46 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
 /// ISO 32000-1 §12.5.3.
 const INVISIBLE_ANNOTS: i64 = (1 << 1) | (1 << 5);
 
+/// The Invisible flag (bit 1): an annotation outside Table 169's standard
+/// types is not displayed when it is set, ISO 32000-1 §12.5.3.
+const INVISIBLE_FLAG: i64 = 1;
+
+/// The NoRotate flag (bit 5): the annotation keeps its orientation on a page
+/// with `/Rotate`, pivoting about the upper-left corner of its `/Rect`,
+/// ISO 32000-1 §12.5.3.
+const NO_ROTATE_FLAG: i64 = 1 << 4;
+
+/// Table 169's standard annotation types, which the Invisible flag leaves
+/// alone.
+const STANDARD_ANNOTS: [&str; 26] = [
+    "Text",
+    "Link",
+    "FreeText",
+    "Line",
+    "Square",
+    "Circle",
+    "Polygon",
+    "PolyLine",
+    "Highlight",
+    "Underline",
+    "Squiggly",
+    "StrikeOut",
+    "Stamp",
+    "Caret",
+    "Ink",
+    "Popup",
+    "FileAttachment",
+    "Sound",
+    "Movie",
+    "Widget",
+    "Screen",
+    "PrinterMark",
+    "TrapNet",
+    "Watermark",
+    "3D",
+    "Redact",
+];
+
 /// Upper bound on distinct parsed CharProcs kept per page render. A real
 /// Type3 font has at most 256 mapped codes, so this is never approached
 /// honestly; past the cap a glyph re-parses uncached, bounding memory
@@ -3196,10 +3236,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// content (ISO 32000-1 §12.5.5). Each appearance is a form XObject
     /// whose `/BBox`, transformed by its `/Matrix`, is fitted onto the
     /// annotation's `/Rect` and then run like any other form, in default
-    /// user space. Annotations flagged Hidden or NoView (§12.5.3) and
-    /// `/Popup` annotations (a viewer-UI artifact) paint nothing and report
-    /// nothing. An annotation with no `/AP` at all gets the appearance its
-    /// own entries describe when its subtype has one (Line, §12.5.6.7;
+    /// user space. Annotations flagged Hidden or NoView (§12.5.3), an
+    /// annotation of a non-standard subtype flagged Invisible, and `/Popup`
+    /// annotations (a viewer-UI artifact) paint nothing and report nothing;
+    /// one flagged NoRotate on a page with `/Rotate` is turned back about
+    /// the upper-left corner of its `/Rect` so it stays upright where the
+    /// page rotation put that corner. An annotation with no `/AP` at all
+    /// gets the appearance its own entries describe when its subtype has
+    /// one (Line, §12.5.6.7;
     /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9; the
     /// text markups, §12.5.6.10; Ink, §12.5.6.13); other annotations without
     /// a usable normal appearance paint nothing and report nothing. An
@@ -3225,7 +3269,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             let Some(dict) = resolved.as_dict() else {
                 continue;
             };
-            if dict.get_int("F").unwrap_or(0) & INVISIBLE_ANNOTS != 0 {
+            let flags = dict.get_int("F").unwrap_or(0);
+            if flags & INVISIBLE_ANNOTS != 0 {
+                continue;
+            }
+            let standard = dict
+                .get_name("Subtype")
+                .is_some_and(|n| STANDARD_ANNOTS.contains(&n.0.as_str()));
+            if flags & INVISIBLE_FLAG != 0 && !standard {
                 continue;
             }
             // An `/OC` entry hides the annotation exactly like the Hidden
@@ -3260,6 +3311,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 }
                 None => continue,
             };
+            let upright = match page.rotate {
+                0 => None,
+                rotate if flags & NO_ROTATE_FLAG != 0 => {
+                    floats_from(self.src, dict.get("Rect"), 4).await.map(|r| {
+                        let (x0, y1) = (r[0].min(r[2]), r[1].max(r[3]));
+                        Matrix::translate(-x0, -y1)
+                            .concat(Matrix::rotate_deg(rotate as f32))
+                            .concat(Matrix::translate(x0, y1))
+                    })
+                }
+                _ => None,
+            };
+            let base = upright.map_or(base, |m| m.concat(base));
             if let Some(frame) = self.appearance_frame(&stream, fit, &chain, base).await {
                 self.run(frame).await;
             }
@@ -6978,6 +7042,17 @@ mod tests {
     /// annotation dictionaries `annots` as objects 10, 11, ... and the extra
     /// `streams`.
     fn annots_doc_over(content: &[u8], annots: &[&str], streams: &[(u32, &str, &[u8])]) -> Vec<u8> {
+        annots_doc_page("", content, annots, streams)
+    }
+
+    /// [`annots_doc_over`] with `page_extra` spliced into the page
+    /// dictionary, for a `/Rotate` or other page-level entry.
+    fn annots_doc_page(
+        page_extra: &str,
+        content: &[u8],
+        annots: &[&str],
+        streams: &[(u32, &str, &[u8])],
+    ) -> Vec<u8> {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -6988,7 +7063,7 @@ mod tests {
             3,
             &format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
-                 /Annots [{}] >>",
+                 {page_extra} /Annots [{}] >>",
                 refs.join(" ")
             ),
         );
@@ -7254,6 +7329,81 @@ mod tests {
             "the synthesized square is half transparent: {blended:?}"
         );
         assert_eq!(px(&pix, 75, 25), RED, "the /AP appearance ignores /CA");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
+    // Covers ISO 32000-1 §12.5.3.
+    #[test]
+    fn invisible_flag_hides_only_unknown_annotation_types() {
+        // Table 165 bit 1 applies to annotations outside the standard types:
+        // the /Foo with Invisible set paints nothing, the /Foo without it
+        // paints its appearance, and a standard /Stamp paints despite the
+        // bit. None is a drop.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Foo /Rect [10 10 30 30] /F 1 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Foo /Rect [60 60 80 80] /F 0 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Stamp /Rect [10 60 30 80] /F 1 /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 20]",
+                b"1 0 0 rg 0 0 20 20 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 20, 80),
+            WHITE,
+            "an unknown type with Invisible set"
+        );
+        assert_eq!(
+            px(&pix, 70, 30),
+            RED,
+            "an unknown type with Invisible clear"
+        );
+        assert_eq!(px(&pix, 20, 30), RED, "a standard type ignores Invisible");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
+    // Covers ISO 32000-1 §12.5.3.
+    #[test]
+    fn no_rotate_annotations_stay_upright_on_a_rotated_page() {
+        // A /Rotate 90 page turns clockwise, so user (x, y) lands at device
+        // (y, x). Both annotations use an appearance that paints only the
+        // upper half of its box red. The one with NoRotate (bit 5) keeps its
+        // upper-left corner, user (10, 80), at device (80, 10) and stands
+        // upright there: red in device x 80..100, y 10..30, nothing below,
+        // and nothing where the page rotation would have put it. The one
+        // without the flag turns with the page: its red half lies at device
+        // x 60..80, y 50..70.
+        let bytes = annots_doc_page(
+            "/Rotate 90",
+            b"",
+            &[
+                "<< /Type /Annot /Subtype /Stamp /Rect [10 40 30 80] /F 16 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Stamp /Rect [50 40 70 80] /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 40]",
+                b"1 0 0 rg 0 20 20 20 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 90, 20),
+            RED,
+            "the NoRotate appearance stands upright"
+        );
+        assert_eq!(px(&pix, 90, 40), WHITE, "its lower half is unpainted");
+        assert_eq!(px(&pix, 70, 20), WHITE, "it did not turn with the page");
+        assert_eq!(
+            px(&pix, 70, 60),
+            RED,
+            "the plain annotation turned with the page"
+        );
+        assert_eq!(px(&pix, 50, 60), WHITE, "its lower half is unpainted");
         assert!(report.is_empty(), "no drop: {:?}", report.warnings());
     }
 
