@@ -206,6 +206,10 @@ pub struct FormField {
     pub field_type: Option<FieldType>,
     /// `/T`: the partial field name (§12.7.3.2).
     pub partial_name: Option<String>,
+    /// The fully qualified field name (§12.7.3.2): the partial names from
+    /// the root field down, joined by a period; a field without a `/T`
+    /// shares its parent's name, and a root without one has the empty name.
+    pub name: String,
     /// `/TU`: the name shown to the user in place of the field name.
     pub alternate_name: Option<String>,
     /// `/TM`: the name used when the field's data is exported.
@@ -260,13 +264,15 @@ pub async fn form_fields_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> 
 }
 
 /// The entries a field takes from its parent when its own dictionary lacks
-/// them: the rows of Table 220 marked inheritable.
+/// them, the rows of Table 220 marked inheritable, and the parent's fully
+/// qualified name the field's own name is built on.
 #[derive(Clone, Default)]
 struct Inherited {
     field_type: Option<FieldType>,
     flags: Option<FieldFlags>,
     value: Option<Object>,
     default_value: Option<Object>,
+    name: String,
 }
 
 /// A field dictionary waiting to be read, with what it inherits.
@@ -309,6 +315,8 @@ async fn read_field<S: AsyncObjectSource>(
         .unwrap_or_default();
     let value = entries.value("V").await.or(inherited.value);
     let default_value = entries.value("DV").await.or(inherited.default_value);
+    let partial_name = text_string(&entries, "T").await;
+    let name = qualified_name(&inherited.name, partial_name.as_deref());
     let additional_actions = match dict.get("AA") {
         Some(entry) => resolved_dict(src, entry).await,
         None => None,
@@ -341,6 +349,7 @@ async fn read_field<S: AsyncObjectSource>(
                     flags: Some(flags),
                     value: value.clone(),
                     default_value: default_value.clone(),
+                    name: name.clone(),
                 },
                 depth: depth + 1,
             });
@@ -352,7 +361,8 @@ async fn read_field<S: AsyncObjectSource>(
         kids,
         widgets,
         field_type,
-        partial_name: text_string(&entries, "T").await,
+        partial_name,
+        name,
         alternate_name: text_string(&entries, "TU").await,
         mapping_name: text_string(&entries, "TM").await,
         flags,
@@ -361,6 +371,20 @@ async fn read_field<S: AsyncObjectSource>(
         additional_actions,
     };
     (field, children)
+}
+
+/// The fully qualified name of a field with partial name `partial` under
+/// a parent named `parent`: the two joined by a period, the partial name
+/// alone under an unnamed root, and the parent's name for a field without
+/// a `/T`.
+///
+/// Covers ISO 32000-1 §12.7.3.2.
+fn qualified_name(parent: &str, partial: Option<&str>) -> String {
+    match partial {
+        Some(partial) if parent.is_empty() => partial.to_string(),
+        Some(partial) => format!("{parent}.{partial}"),
+        None => parent.to_string(),
+    }
 }
 
 /// The dictionary a reference points at, `None` for anything else.
@@ -629,5 +653,63 @@ mod tests {
         assert_eq!(fields[0].kids, vec![r(7)]);
         assert_eq!(fields[1].parent, Some(r(6)));
         assert_eq!(fields[1].field_type, Some(FieldType::Signature));
+    }
+
+    /// The standard's own example: PersonalData, Address and ZipCode nested
+    /// three deep give the leaf the name PersonalData.Address.ZipCode, and
+    /// each level's name is a prefix of its children's.
+    // Covers ISO 32000-1 §12.7.3.2.
+    #[test]
+    fn fully_qualified_names_join_the_partial_names_with_periods() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R] >>",
+            &[
+                (5, "<< /T (PersonalData) /Kids [6 0 R] >>"),
+                (6, "<< /T (Address) /Parent 5 0 R /Kids [7 0 R] >>"),
+                (7, "<< /T (ZipCode) /FT /Tx /Parent 6 0 R >>"),
+            ],
+        )
+        .form_fields();
+        let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "PersonalData",
+                "PersonalData.Address",
+                "PersonalData.Address.ZipCode"
+            ]
+        );
+    }
+
+    /// A kid without a `/T` is another representation of its parent's
+    /// field and shares the fully qualified name; a root without a `/T`
+    /// has the empty name and its named child carries no leading period.
+    // Covers ISO 32000-1 §12.7.3.2.
+    #[test]
+    fn fields_without_a_partial_name_share_their_parent_s_name() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 8 0 R] >>",
+            &[
+                (5, "<< /T (choice) /FT /Btn /Kids [6 0 R 7 0 R] >>"),
+                (6, "<< /Parent 5 0 R /Kids [9 0 R] >>"),
+                (7, "<< /Parent 5 0 R /Subtype /Widget /Rect [0 0 1 1] >>"),
+                (8, "<< /FT /Tx /Kids [10 0 R] >>"),
+                (9, "<< /Parent 6 0 R /Subtype /Widget /Rect [0 0 1 1] >>"),
+                (10, "<< /T (lonely) /Parent 8 0 R >>"),
+            ],
+        )
+        .form_fields();
+        let names: Vec<(ObjRef, &str)> =
+            fields.iter().map(|f| (f.object, f.name.as_str())).collect();
+        assert_eq!(
+            names,
+            [
+                (r(5), "choice"),
+                (r(6), "choice"),
+                (r(8), ""),
+                (r(10), "lonely")
+            ]
+        );
+        assert_eq!(fields[1].partial_name, None);
     }
 }

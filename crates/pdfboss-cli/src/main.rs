@@ -1417,6 +1417,7 @@ mod tests {
                 widgets: Vec::new(),
                 field_type,
                 partial_name: None,
+                name: String::new(),
                 alternate_name: None,
                 mapping_name: None,
                 flags: FieldFlags::default(),
