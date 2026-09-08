@@ -7225,6 +7225,38 @@ mod tests {
         );
     }
 
+    // Covers ISO 32000-1 §12.5.6.2.
+    #[test]
+    fn constant_opacity_applies_to_synthesized_appearances_only() {
+        // Table 170's /CA is folded into an appearance pdfboss builds from
+        // the annotation's own entries: the borderless red Square without
+        // /AP blends half-way into the white page. It shall not be used when
+        // the annotation carries an appearance stream, so the Square whose
+        // /AP paints solid red stays solid red.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Square /Rect [10 10 40 40] /IC [1 0 0] \
+                 /Border [0 0 0] /CA 0.5 >>",
+                "<< /Type /Annot /Subtype /Square /Rect [60 60 90 90] /IC [1 0 0] \
+                 /Border [0 0 0] /CA 0.5 /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 30 30]",
+                b"1 0 0 rg 0 0 30 30 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        let blended = px(&pix, 25, 75);
+        assert_eq!(blended[0], 255, "the synthesized square keeps full red");
+        assert!(
+            (120..=135).contains(&blended[1]) && blended[1] == blended[2],
+            "the synthesized square is half transparent: {blended:?}"
+        );
+        assert_eq!(px(&pix, 75, 25), RED, "the /AP appearance ignores /CA");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
     // Covers ISO 32000-1 §12.5.5, §12.5.6, §12.5.6.19, §12.7.4, §12.7.4.2, §12.7.4.2.3 and §12.7.4.2.4.
     #[test]
     fn appearance_state_dictionary_selects_by_as() {

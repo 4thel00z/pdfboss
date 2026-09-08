@@ -79,6 +79,11 @@ struct Paint {
 }
 
 impl Paint {
+    /// Reads the common entries. The `/CA` opacity is kept when it changes
+    /// anything, because an appearance built here folds it in; an existing
+    /// appearance stream never gets it (Table 170).
+    ///
+    /// Covers ISO 32000-1 §12.5.6.2.
     async fn read<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Paint {
         Paint {
             stroke: colour_op(src, annot, "C", true).await,
