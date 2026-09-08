@@ -288,6 +288,21 @@ impl FieldFlags {
     }
 }
 
+/// A widget annotation that draws a field (ISO 32000-1 §12.5.6.19), as
+/// far as the field's state needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Widget {
+    /// The annotation dictionary's reference; the field's own for a merged
+    /// field.
+    pub object: ObjRef,
+    /// `/AS`: the appearance state the widget shows.
+    pub appearance_state: Option<String>,
+    /// The widget's on state (§12.7.4.2.3): the one key of its `/AP /N`
+    /// dictionary other than `Off`. `None` when the normal appearance is a
+    /// single stream or names no or several other states.
+    pub on_state: Option<String>,
+}
+
 /// The three kinds of button field (ISO 32000-1 §12.7.4.2), told apart by
 /// the `Pushbutton` and `Radio` flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,7 +343,7 @@ pub struct FormField {
     /// The widget annotations that draw this field: the `/Kids` that are
     /// `/Subtype /Widget` dictionaries without a `/T` of their own, or the
     /// field itself when its single widget is merged into it.
-    pub widgets: Vec<ObjRef>,
+    pub widgets: Vec<Widget>,
     /// `/FT`, inherited; `None` for a non-terminal field that names none
     /// and for a name Table 220 does not list.
     pub field_type: Option<FieldType>,
@@ -407,6 +422,31 @@ impl FormField {
                 Some(self.value.as_ref()?.as_name()?.0.as_str())
             }
         }
+    }
+
+    /// Whether a check box is checked (ISO 32000-1 §12.7.4.2.3): its state
+    /// is a name other than `Off`; an absent value is the off state. `None`
+    /// for a field that is no check box.
+    pub fn checked(&self) -> Option<bool> {
+        (self.button_kind()? == ButtonKind::CheckBox)
+            .then(|| self.state().is_some_and(|state| state != "Off"))
+    }
+
+    /// The widgets of a check box or radio button field that are in the on
+    /// state (ISO 32000-1 §12.7.4.2.3, §12.7.4.2.4): those whose on state
+    /// is the field's state, as indices into `widgets`. The same indices
+    /// pick the Table 227 export values out of `options`. Empty for a field
+    /// in the off state, a pushbutton, or another field type.
+    pub fn on_widgets(&self) -> Vec<usize> {
+        let Some(state) = self.state().filter(|state| *state != "Off") else {
+            return Vec::new();
+        };
+        self.widgets
+            .iter()
+            .enumerate()
+            .filter(|(_, widget)| widget.on_state.as_deref() == Some(state))
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// The names of a choice field's selected options (ISO 32000-1
@@ -561,7 +601,7 @@ async fn read_field<S: AsyncObjectSource>(
     };
     let mut widgets = Vec::new();
     if is_widget(&dict) {
-        widgets.push(object);
+        widgets.push(widget(src, object, &dict).await);
     }
     let mut kids = Vec::new();
     let mut children = Vec::new();
@@ -574,7 +614,7 @@ async fn read_field<S: AsyncObjectSource>(
                 continue;
             };
             if is_widget(&kid_dict) && kid_dict.get("T").is_none() {
-                widgets.push(kid);
+                widgets.push(widget(src, kid, &kid_dict).await);
                 continue;
             }
             kids.push(kid);
@@ -680,6 +720,32 @@ async fn field_dict<S: AsyncObjectSource>(src: &S, object: ObjRef) -> Option<Dic
     }
 }
 
+/// The widget record of an annotation dictionary: its reference, its
+/// `/AS` and its on state.
+async fn widget<S: AsyncObjectSource>(src: &S, object: ObjRef, dict: &Dict) -> Widget {
+    Widget {
+        object,
+        appearance_state: dict.get_name("AS").map(|state| state.0.clone()),
+        on_state: on_state(src, dict).await,
+    }
+}
+
+/// The on state of a widget (ISO 32000-1 §12.7.4.2.3): the one key of its
+/// `/AP /N` dictionary other than `Off`; `None` when `/N` is a single
+/// stream or names no or several other states.
+async fn on_state<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<String> {
+    let appearance = resolved_dict(src, dict.get("AP")?).await?;
+    let Object::Dict(states) = src.resolve(appearance.get("N")?).await.ok()? else {
+        return None;
+    };
+    let mut on = states
+        .iter()
+        .map(|(state, _)| state)
+        .filter(|state| state.0 != "Off");
+    let state = on.next()?;
+    on.next().is_none().then(|| state.0.clone())
+}
+
 /// Whether a dictionary is a widget annotation (`/Subtype /Widget`).
 fn is_widget(dict: &Dict) -> bool {
     dict.get_name("Subtype")
@@ -706,7 +772,8 @@ fn references(value: Option<&Object>) -> Vec<ObjRef> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ButtonKind, ChoiceOption, FieldFlags, FieldType, InteractiveForm, Quadding, SignatureFlags,
+        ButtonKind, ChoiceOption, FieldFlags, FieldType, FormField, InteractiveForm, Quadding,
+        SignatureFlags, Widget,
     };
     use crate::object::{Name, ObjRef, Object};
     use crate::Document;
@@ -728,6 +795,10 @@ mod tests {
 
     fn r(num: u32) -> ObjRef {
         ObjRef { num, gen: 0 }
+    }
+
+    fn widget_refs(field: &FormField) -> Vec<ObjRef> {
+        field.widgets.iter().map(|widget| widget.object).collect()
     }
 
     /// `doc` with one stream object added.
@@ -849,7 +920,7 @@ mod tests {
         assert_eq!(field.object, r(5));
         assert_eq!(field.parent, None);
         assert_eq!(field.kids, Vec::new());
-        assert_eq!(field.widgets, vec![r(5)]);
+        assert_eq!(widget_refs(field), vec![r(5)]);
         assert_eq!(field.field_type, Some(FieldType::Text));
         assert_eq!(field.partial_name.as_deref(), Some("Name"));
         assert_eq!(field.alternate_name.as_deref(), Some("Your name"));
@@ -891,7 +962,7 @@ mod tests {
         .form_fields();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].kids, Vec::new());
-        assert_eq!(fields[0].widgets, vec![r(6), r(7)]);
+        assert_eq!(widget_refs(&fields[0]), vec![r(6), r(7)]);
         assert_eq!(fields[0].value, Some(Object::Name(Name("visa".into()))));
     }
 
@@ -917,7 +988,7 @@ mod tests {
         assert_eq!(objects, vec![r(5), r(6), r(7), r(9)]);
         let root = &fields[0];
         assert_eq!(root.kids, vec![r(6), r(7)]);
-        assert_eq!(root.widgets, Vec::new());
+        assert_eq!(widget_refs(root), Vec::new());
         let first = &fields[1];
         assert_eq!(first.parent, Some(r(5)));
         assert_eq!(first.partial_name.as_deref(), Some("first"));
@@ -925,12 +996,12 @@ mod tests {
         assert_eq!(first.flags, FieldFlags(1));
         assert_eq!(first.value, Some(Object::String(b"from parent".to_vec())));
         assert_eq!(first.default_value, Some(Object::String(b"reset".to_vec())));
-        assert_eq!(first.widgets, vec![r(6)]);
+        assert_eq!(widget_refs(first), vec![r(6)]);
         let last = &fields[2];
         assert_eq!(last.flags, FieldFlags(2));
         assert_eq!(last.value, Some(Object::String(b"own".to_vec())));
         assert_eq!(last.default_value, Some(Object::String(b"reset".to_vec())));
-        assert_eq!(last.widgets, vec![r(8)]);
+        assert_eq!(widget_refs(last), vec![r(8)]);
         assert_eq!(fields[3].field_type, Some(FieldType::Choice));
         assert_eq!(fields[3].flags, FieldFlags::default());
     }
@@ -1237,5 +1308,101 @@ mod tests {
         assert_eq!(fields[2].state(), None);
         assert_eq!(fields[3].state(), None);
         assert_eq!(fields[4].state(), None);
+    }
+
+    /// A merged check box: `/V /Yes` is checked, `/V /Off` and no value are
+    /// not; its widget carries `/AS` and the on state read from `/AP /N`;
+    /// a radio field and a text field have no checked state.
+    // Covers ISO 32000-1 §12.7.4.2.3.
+    #[test]
+    fn a_check_box_is_checked_when_its_state_is_not_off() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R 8 0 R 9 0 R] >>",
+            &[
+                (
+                    5,
+                    "<< /T (urgent) /FT /Btn /V /Yes /AS /Yes /Subtype /Widget /Rect [0 0 1 1] \
+                     /AP << /N << /Yes 10 0 R /Off 11 0 R >> >> >>",
+                ),
+                (
+                    6,
+                    "<< /T (done) /FT /Btn /V /Off /AS /Off /Subtype /Widget /Rect [0 0 1 1] >>",
+                ),
+                (7, "<< /T (blank) /FT /Btn >>"),
+                (8, "<< /T (card) /FT /Btn /Ff 32768 /V /a >>"),
+                (9, "<< /T (name) /FT /Tx /V (Yes) >>"),
+            ],
+        )
+        .form_fields();
+        assert_eq!(fields[0].checked(), Some(true));
+        assert_eq!(
+            fields[0].widgets,
+            vec![Widget {
+                object: r(5),
+                appearance_state: Some("Yes".into()),
+                on_state: Some("Yes".into()),
+            }]
+        );
+        assert_eq!(fields[0].on_widgets(), vec![0]);
+        assert_eq!(fields[1].checked(), Some(false));
+        assert_eq!(fields[1].widgets[0].on_state, None);
+        assert_eq!(fields[1].on_widgets(), Vec::<usize>::new());
+        assert_eq!(fields[2].checked(), Some(false));
+        assert_eq!(fields[3].checked(), None);
+        assert_eq!(fields[4].checked(), None);
+    }
+
+    /// A check box field with two widgets and `/Opt` (Table 227): each
+    /// widget's on state is its position in `/Kids` as a name, the field's
+    /// state picks the widget that is on, and that index picks the export
+    /// value; a widget whose `/N` is one stream or names two on states has
+    /// no on state.
+    // Covers ISO 32000-1 §12.7.4.2.3.
+    #[test]
+    fn check_box_widgets_are_matched_to_the_state_and_their_export_values() {
+        let fields = doc_with_stream(
+            "/AcroForm << /Fields [5 0 R 9 0 R] >>",
+            &[
+                (
+                    5,
+                    "<< /T (size) /FT /Btn /Opt [(small) (large)] /V /1 /Kids [6 0 R 7 0 R] >>",
+                ),
+                (
+                    6,
+                    "<< /Subtype /Widget /Parent 5 0 R /AS /Off /Rect [0 0 1 1] \
+                     /AP << /N << /0 10 0 R /Off 10 0 R >> >> >>",
+                ),
+                (
+                    7,
+                    "<< /Subtype /Widget /Parent 5 0 R /AS /1 /Rect [0 0 1 1] \
+                     /AP 8 0 R >>",
+                ),
+                (8, "<< /N << /1 10 0 R /Off 10 0 R >> >>"),
+                (9, "<< /T (odd) /FT /Btn /V /Yes /Kids [11 0 R 12 0 R] >>"),
+                (
+                    11,
+                    "<< /Subtype /Widget /Parent 9 0 R /AP << /N 10 0 R >> /Rect [0 0 1 1] >>",
+                ),
+                (
+                    12,
+                    "<< /Subtype /Widget /Parent 9 0 R /Rect [0 0 1 1] \
+                     /AP << /N << /Yes 10 0 R /Also 10 0 R /Off 10 0 R >> >> >>",
+                ),
+            ],
+            (10, "/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b""),
+        )
+        .form_fields();
+        let size = &fields[0];
+        assert_eq!(size.checked(), Some(true));
+        assert_eq!(size.on_widgets(), vec![1]);
+        assert_eq!(size.widgets[0].on_state.as_deref(), Some("0"));
+        assert_eq!(size.widgets[1].on_state.as_deref(), Some("1"));
+        assert_eq!(size.widgets[1].appearance_state.as_deref(), Some("1"));
+        assert_eq!(size.options[1].export_value, "large");
+        let odd = &fields[1];
+        assert_eq!(odd.widgets[0].on_state, None);
+        assert_eq!(odd.widgets[1].on_state, None);
+        assert_eq!(odd.on_widgets(), Vec::<usize>::new());
+        assert_eq!(odd.checked(), Some(true));
     }
 }
