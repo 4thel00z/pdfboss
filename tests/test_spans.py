@@ -6,6 +6,7 @@ in-memory documents built here. Requires the extension module to be built
 and installed (e.g. via maturin).
 """
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -38,6 +39,24 @@ def stream(dict_body: bytes, data: bytes) -> bytes:
         dict_body,
         len(data),
         data,
+    )
+
+
+def page_with_content(content: bytes) -> bytes:
+    return build_pdf(
+        {
+            1: b"<< /Type /Catalog /Pages 2 0 R >>",
+            2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: (
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            ),
+            4: stream(b"", content),
+            5: (
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                b"/Encoding /WinAnsiEncoding >>"
+            ),
+        }
     )
 
 
@@ -91,6 +110,10 @@ class TestPageSpans:
         assert x0 < x1 and y0 < y1
         assert x0 == pytest.approx(span.x)
         assert y0 < span.y < y1
+        assert span.ascent == pytest.approx(y1 - span.y)
+        assert span.descent == pytest.approx(y0 - span.y)
+        assert span.ascent > 0.0
+        assert span.descent <= 0.0
         assert span.size > 0.0
         assert span.page == 0
         assert span.font == "F1"
@@ -103,6 +126,7 @@ class TestPageSpans:
         assert plain.text == "plain"
         assert not plain.bold and not plain.italic
         assert not plain.underline and not plain.strikethrough
+        assert not plain.highlight
         assert plain.color == pytest.approx((0.0, 0.0, 0.0))
         assert not plain.invisible
 
@@ -111,6 +135,7 @@ class TestPageSpans:
         assert styled.bold and styled.italic
         assert styled.serif and not styled.monospace
         assert styled.underline and not styled.strikethrough
+        assert not styled.highlight
         assert styled.color == pytest.approx((1.0, 0.0, 0.0))
         assert not styled.vertical
         assert styled.rise == 0.0
@@ -143,6 +168,50 @@ class TestPageSpans:
         )
         doc = Document(data=data)
         assert [s.text for s in doc[0].spans()] == ["kept"]
+
+    def test_thin_mid_glyph_fill_is_strikethrough(self) -> None:
+        data = page_with_content(
+            b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0.8 0.8 0.2 rg 72 723 33 0.84 re f"
+        )
+        span = Document(data=data)[0].spans()[0]
+        assert span.strikethrough
+        assert not span.underline
+        assert not span.highlight
+
+    def test_line_height_marker_is_highlight(self) -> None:
+        data = page_with_content(
+            b"0.95 0.95 0.5 rg 70 710 80 12 re f 0 0 0 rg "
+            b"BT /F1 12 Tf 72 720 Td (mark) Tj ET"
+        )
+        span = Document(data=data)[0].spans()[0]
+        assert span.highlight
+        assert span.highlight_color == pytest.approx((0.95, 0.95, 0.5))
+        assert not span.underline and not span.strikethrough
+
+    def test_highlight_annotation_sets_the_flag(self) -> None:
+        data = build_pdf(
+            {
+                1: b"<< /Type /Catalog /Pages 2 0 R >>",
+                2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                3: (
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                    b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R "
+                    b"/Annots [6 0 R] >>"
+                ),
+                4: stream(b"", b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET"),
+                5: (
+                    b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                    b"/Encoding /WinAnsiEncoding >>"
+                ),
+                6: (
+                    b"<< /Type /Annot /Subtype /Highlight /Rect [70 710 120 735] "
+                    b"/QuadPoints [70 735 120 735 70 710 120 710] >>"
+                ),
+            }
+        )
+        span = Document(data=data)[0].spans()[0]
+        assert span.highlight
+        assert span.highlight_color is None
 
 
 class TestDocumentSpans:
@@ -198,3 +267,71 @@ class TestAsyncSpans:
         assert [s.text for s in spans] == [s.text for s in sync_spans]
         assert [s.underline for s in spans] == [s.underline for s in sync_spans]
         assert [s.color for s in spans] == [s.color for s in sync_spans]
+
+
+def _parsebench_text_dir() -> Path | None:
+    env = os.environ.get("PARSEBENCH_TEXT_DIR")
+    if env:
+        path = Path(env)
+        return path if path.is_dir() else None
+    fallback = Path("/Users/yassine.elkhadiri/Projects/Parsy-ParseBench/data/docs/text")
+    return fallback if fallback.is_dir() else None
+
+
+def _phrase_runs(spans: list[Span], pred) -> int:
+    items = [
+        ((round(s.y * 2), round(s.x * 2)), pred(s), s.text.isspace())
+        for s in spans
+        if s.text
+    ]
+    items.sort(key=lambda item: item[0])
+    n = 0
+    in_run = False
+    last_y = None
+    for (y, _x), flagged, whitespace in items:
+        if y != last_y:
+            in_run = False
+            last_y = y
+        if flagged:
+            if not in_run:
+                n += 1
+                in_run = True
+        elif not whitespace:
+            in_run = False
+    return n
+
+
+@pytest.mark.skipif(
+    _parsebench_text_dir() is None, reason="ParseBench text corpus missing"
+)
+class TestParseBenchSpanFlags:
+    def test_reference_documents(self) -> None:
+        directory = _parsebench_text_dir()
+        assert directory is not None
+
+        def load(name: str) -> list[Span]:
+            return Document(str(directory / name))[0].spans()
+
+        agent = load("text_simple__agent.pdf")
+        assert "2025 Economic Index" in "".join(s.text for s in agent if s.underline)
+        assert _phrase_runs(agent, lambda s: s.strikethrough) == 0
+
+        noa = load("text_simple__noa.pdf")
+        assert _phrase_runs(noa, lambda s: s.underline) == 4
+        assert _phrase_runs(noa, lambda s: s.strikethrough) == 0
+
+        climbing = load("text_simple__climbing.pdf")
+        assert _phrase_runs(climbing, lambda s: s.underline) == 0
+        assert _phrase_runs(climbing, lambda s: s.strikethrough) == 2
+
+        table = load("text_simple__marknotTable.pdf")
+        under = "".join(s.text for s in table if s.underline)
+        marked = "".join(s.text for s in table if s.highlight)
+        assert "expected level of development" in under
+        assert 6 <= _phrase_runs(table, lambda s: s.underline) <= 10
+        assert _phrase_runs(table, lambda s: s.strikethrough) == 0
+        assert 8 <= _phrase_runs(table, lambda s: s.highlight) <= 12
+        assert "obstacles" in marked
+
+        scanned = load("text_ocr__abstract.pdf")
+        assert not scanned or all(s.invisible for s in scanned)

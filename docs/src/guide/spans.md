@@ -14,25 +14,64 @@ layer from printed text, or feeding a layout analysis of your own.
 | `text` | The decoded text. |
 | `x`, `y` | Device-space origin and baseline of the span. |
 | `end_x` | Device-space x after the last glyph's advance. |
+| `ascent`, `descent` | Font `/Ascent` (positive) and `/Descent` (typically negative) at the rendered size. `bbox.y1 ≈ y + ascent`, `bbox.y0 ≈ y + descent`. |
 | `size` | Effective font size. |
 | `font` | Font resource name (e.g. `"F1"`). |
 | `font_name` | The font's `/BaseFont` name verbatim, subset prefix included (e.g. `"NZEVTB+Arial-BoldItalicMT"`); empty when the file names the font nowhere. |
 | `page` | 0-based index of the page the span came from. |
-| `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up: origin to advance horizontally, the font's descent..ascent vertically. |
+| `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up. See [Box and baseline](#box-and-baseline). |
 | `bold`, `italic` | From FontDescriptor evidence, falling back to the `/BaseFont` name. |
 | `monospace`, `serif` | FontDescriptor `/Flags` FixedPitch and Serif. |
-| `underline`, `strikethrough` | A drawn ruling below the baseline / across the x-height band. See the caveat below. |
+| `underline`, `strikethrough`, `highlight` | Drawn decorations and text-markup annotations. See the caveat below. |
+| `highlight_color` | The highlight bar's resolved RGB, when the flag came from a drawn fill. |
 | `rise` | The text rise (`Ts`) the span was shown under: positive above the baseline, a superscript/subscript signal. |
 | `vertical` | Writing mode 1: the text advances downward. |
 | `invisible` | Shown under render mode 3 or 7, which paint nothing. |
 | `color` | Fill color as RGB in `[0, 1]`; `None` for pattern fills. |
 
-Three of these deserve honesty up front:
+## Box and baseline
 
-- **`underline` and `strikethrough` are read from the page's geometry.** PDF
-  has no underline attribute; a span is underlined when a drawn ruling sits
-  just below its baseline covering most of it. A table border hugging a cell's
-  text can read as an underline.
+Coordinates are in **unrotated PDF user space** after every content-stream
+CTM: y grows up, units are PDF points (1/72 in). They are **not** spun by
+the page's `/Rotate` and are **not** flipped to image space — that is the
+space `Page.render` paints in. Compare boxes to a raster only after
+applying the same crop-origin translation and `/Rotate` the renderer uses.
+
+- **`bbox` is `(x0, y0, x1, y1)`**, not `(x, y, w, h)`. Origin is
+  bottom-left.
+- It is the font's **`/Descent`..`/Ascent` frame** at the rendered size,
+  times the run's advance — an em box, not a glyph-tight ink outline.
+  Tight boxes shrink with letter case (x-height vs cap-height); this frame
+  does not.
+- **`y` is the baseline.** `x` is the origin of the first glyph; `end_x`
+  is the origin after the last advance. `y` sits between `bbox.y0` and
+  `bbox.y1`: `bbox.y0 ≈ y + descent`, `bbox.y1 ≈ y + ascent`. The
+  `ascent` and `descent` fields are those two offsets, so a consumer
+  never has to reverse-engineer the frame from the box.
+
+## Decorations
+
+PDF has no underline / strikethrough / highlight attributes. The flags
+are read from the page:
+
+- **`underline`**: a thin horizontal ruling (stroke or filled bar) whose
+  centerline sits just below the baseline, covering most of the span; or
+  an `/Underline` annotation whose rect/quads overlap it. Page-wide
+  rules (table borders, header separators) are ignored.
+- **`strikethrough`**: a thin ruling that **crosses the glyph body**
+  (about 40–60% of the span box height from the bottom), or a
+  `/StrikeOut` annotation. A ~1 pt filled bar through the letters is a
+  strike, not an underline. A line-height highlight band is a
+  highlight, not a strike.
+- **`highlight`**: a filled rectangle of roughly line height, in a
+  light/saturated color, sitting behind **dark** text; or a `/Highlight`
+  annotation. `highlight_color` is the bar's resolved DeviceRGB when the
+  evidence was a drawn fill.
+
+`/Link` annotations are ignored. A scanned or image-only page returns an
+empty span list, not an error.
+
+Three of these deserve honesty up front:
 - **`invisible` is the signature of an OCR text layer.** Scanned PDFs with a
   text layer draw the page image and then show the recognized text under
   render mode 3 or 7, which paint nothing. The text extracts normally: it is
@@ -98,9 +137,9 @@ doc.spans()`, described in [Async and remote documents](./async.md).
 
 `pdfboss_text::extract_spans` returns a `Vec<TextSpan>` carrying the same
 fields as the Python `Span` (as plain struct fields: `text`, `x`, `y`,
-`end_x`, `size`, `font`, `font_name`, `page`, `bbox`, `bold`, `italic`,
-`monospace`, `serif`, `rise`, `vertical`, `invisible`, `color`, `underline`,
-`strikethrough`):
+`end_x`, `ascent`, `descent`, `size`, `font`, `font_name`, `page`, `bbox`,
+`bold`, `italic`, `monospace`, `serif`, `rise`, `vertical`, `invisible`,
+`color`, `underline`, `strikethrough`, `highlight`, `highlight_color`):
 
 ```rust,no_run
 use pdfboss_core::Document;

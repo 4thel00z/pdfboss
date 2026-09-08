@@ -964,7 +964,8 @@ impl Page {
 
 /// One styled text span: a positioned run of text with everything the
 /// file states about how it is shown — font, size, weight and slant,
-/// drawn underline/strikethrough, fill color, visibility, writing mode.
+/// drawn underline/strikethrough/highlight, fill color, visibility,
+/// writing mode.
 #[pyclass(frozen)]
 struct Span {
     inner: TextSpan,
@@ -994,6 +995,20 @@ impl Span {
     #[getter]
     fn end_x(&self) -> f32 {
         self.inner.end_x
+    }
+
+    /// Font `/Ascent` at the rendered size, in points (positive).
+    /// `bbox.y1 ≈ y + ascent`.
+    #[getter]
+    fn ascent(&self) -> f32 {
+        self.inner.ascent
+    }
+
+    /// Font `/Descent` at the rendered size, in points (negative or zero).
+    /// `bbox.y0 ≈ y + descent`.
+    #[getter]
+    fn descent(&self) -> f32 {
+        self.inner.descent
     }
 
     /// Effective font size.
@@ -1053,20 +1068,36 @@ impl Span {
         self.inner.serif
     }
 
-    /// A drawn ruling sits just below the baseline covering most of the
-    /// span. Read from the page's geometry — PDF has no underline
-    /// attribute — so a table border hugging a cell's text can read as
-    /// one.
+    /// A drawn ruling or `/Underline` annotation sits just below the
+    /// baseline covering most of the span. Read from the page's geometry
+    /// and markup annotations — PDF has no underline attribute — so a
+    /// table border hugging a cell's text can read as one.
     #[getter]
     fn underline(&self) -> bool {
         self.inner.underline
     }
 
-    /// A drawn ruling crosses the span's x-height band — geometry-read,
-    /// like `underline`.
+    /// A drawn ruling or `/StrikeOut` annotation crosses the glyph body
+    /// (about 40–60% of the span box height) — geometry-read, like
+    /// `underline`.
     #[getter]
     fn strikethrough(&self) -> bool {
         self.inner.strikethrough
+    }
+
+    /// A filled line-height bar in a light/saturated color sits behind
+    /// dark text, or a `/Highlight` annotation covers the span.
+    #[getter]
+    fn highlight(&self) -> bool {
+        self.inner.highlight
+    }
+
+    /// The bar's resolved DeviceRGB fill when `highlight` came from a
+    /// drawn rectangle. `None` for annotation-only highlights and when
+    /// the span is not highlighted.
+    #[getter]
+    fn highlight_color(&self) -> Option<(f32, f32, f32)> {
+        self.inner.highlight_color
     }
 
     /// The text rise (Ts) the span was shown under: positive above the

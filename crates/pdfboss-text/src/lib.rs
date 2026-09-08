@@ -2,6 +2,7 @@
 //! and positional text spans.
 
 mod cmap;
+mod decorations;
 mod extract;
 mod font;
 mod sfnt;
@@ -142,6 +143,12 @@ pub struct TextSpan {
     pub y: f32,
     /// Device-space x after the last glyph's advance.
     pub end_x: f32,
+    /// Font `/Ascent` at the rendered size, in points (positive).
+    /// `bbox.y1 ≈ y + ascent`.
+    pub ascent: f32,
+    /// Font `/Descent` at the rendered size, in points (negative or zero).
+    /// `bbox.y0 ≈ y + descent`.
+    pub descent: f32,
     /// Effective font size.
     pub size: f32,
     /// Font resource name.
@@ -186,13 +193,23 @@ pub struct TextSpan {
     /// count (1 gray, 3 RGB, 4 CMYK) without running the space's
     /// transform. `None` for pattern fills, which have no single color.
     pub color: Option<(f32, f32, f32)>,
-    /// A drawn ruling sits just below the baseline and covers most of the
-    /// span. PDF has no underline attribute — this is read from the page's
-    /// geometry, so a table border hugging a cell's text can read as one.
+    /// A drawn ruling or `/Underline` annotation sits just below the
+    /// baseline and covers most of the span. PDF has no underline
+    /// attribute — this is read from the page's geometry and markup
+    /// annotations, so a table border hugging a cell's text can read as
+    /// one.
     pub underline: bool,
-    /// A drawn ruling crosses the span's x-height band — geometry-read,
-    /// like `underline`.
+    /// A drawn ruling or `/StrikeOut` annotation crosses the glyph body
+    /// (about 40–60% of the span box height). Geometry-read, like
+    /// `underline`.
     pub strikethrough: bool,
+    /// A filled line-height bar in a light/saturated color sits behind
+    /// dark text, or a `/Highlight` annotation covers the span.
+    pub highlight: bool,
+    /// The bar's resolved DeviceRGB fill when [`highlight`](Self::highlight)
+    /// came from a drawn rectangle. `None` for annotation-only highlights
+    /// and when the span is not highlighted.
+    pub highlight_color: Option<(f32, f32, f32)>,
     /// The innermost `/Artifact` marked-content sequence the span was shown
     /// inside (ISO 32000-1 §14.8.2.2): a running head, a page number, a
     /// footnote rule. `None` for real content.
@@ -522,6 +539,10 @@ mod tests {
             extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].text, "Hi");
+        assert!((spans[0].ascent - (spans[0].bbox.y1 - spans[0].y)).abs() < 1e-3);
+        assert!((spans[0].descent - (spans[0].bbox.y0 - spans[0].y)).abs() < 1e-3);
+        assert!(spans[0].ascent > 0.0);
+        assert!(spans[0].descent <= 0.0);
         assert_eq!(rulings.len(), 1);
         assert!((rulings[0].start.y - 700.0).abs() < 1e-3);
         assert!(report.is_complete());
@@ -892,6 +913,91 @@ mod tests {
         assert!(!spans[0].underline);
     }
 
+    /// A thin filled bar through the middle of the glyphs is strikethrough,
+    /// not underline — the marknotTable failure mode.
+    #[test]
+    fn a_thin_mid_glyph_fill_is_strikethrough_not_underline() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0.8 0.8 0.2 rg 72 723 33 0.84 re f",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].strikethrough, "mid-glyph bar must strike");
+        assert!(!spans[0].underline, "must not also count as underline");
+        assert!(!spans[0].highlight);
+    }
+
+    /// A thin filled bar just below the baseline is an underline — the
+    /// same geometry as a stroked hairline (agent / noa link rules).
+    #[test]
+    fn a_thin_filled_bar_below_baseline_is_underline() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0 0 0 rg 72 718.5 33 0.84 re f",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// A page-wide rule (table border / header separator) is not an
+    /// underline, even when it sits just below the baseline.
+    #[test]
+    fn a_page_wide_rule_is_not_underline() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hello) Tj ET 0 718.5 m 612 718.5 l S",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// A line-height yellow fill behind dark text is a highlight.
+    #[test]
+    fn a_line_height_marker_fill_is_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "0.95 0.95 0.5 rg 70 710 80 12 re f 0 0 0 rg \
+             BT /F1 12 Tf 72 720 Td (mark) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].highlight);
+        let (r, g, b) = spans[0].highlight_color.expect("bar color");
+        assert!((r - 0.95).abs() < 1e-3 && (g - 0.95).abs() < 1e-3 && (b - 0.5).abs() < 1e-3);
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// A black line-height fill is a banner, not a highlight.
+    #[test]
+    fn a_black_banner_is_not_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "0 0 0 rg 70 710 80 12 re f BT /F1 12 Tf 72 720 Td (mark) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
+    /// Light text on a yellow bar is not a highlight (dark-text gate).
+    #[test]
+    fn light_text_on_a_marker_is_not_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "0.95 0.95 0.5 rg 70 710 80 12 re f \
+             BT /F1 12 Tf 1 1 1 rg 72 720 Td (mark) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
     /// A ruling far from the baseline — a table border, a separator —
     /// decorates nothing.
     #[test]
@@ -918,6 +1024,69 @@ mod tests {
         let page = doc.page(0).unwrap();
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(!spans[0].underline);
+    }
+
+    fn annot_doc(subtype: &str, extra: &str) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+             /Annots [6 0 R] >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            6,
+            &format!("<< /Type /Annot /Subtype /{subtype} /Rect [70 710 120 735] {extra} >>"),
+        );
+        Document::load(b.build(1)).unwrap()
+    }
+
+    /// `/Highlight` annotations fold into the same highlight flag.
+    #[test]
+    fn a_highlight_annotation_marks_the_span() {
+        let doc = annot_doc("Highlight", "/QuadPoints [70 735 120 735 70 710 120 710]");
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].highlight);
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// `/StrikeOut` annotations fold into strikethrough.
+    #[test]
+    fn a_strikeout_annotation_marks_the_span() {
+        let doc = annot_doc("StrikeOut", "");
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].strikethrough);
+    }
+
+    /// `/Underline` annotations fold into underline.
+    #[test]
+    fn an_underline_annotation_marks_the_span() {
+        let doc = annot_doc("Underline", "");
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].underline);
+    }
+
+    /// `/Link` annotations are ignored — they must not error or set flags.
+    #[test]
+    fn a_link_annotation_does_not_mark_the_span() {
+        let doc = annot_doc("Link", "/A << /S /URI /URI (https://example.com) >>");
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+        assert!(!spans[0].highlight);
     }
 
     /// The source-generic entry points take the optional-content state a
@@ -1844,5 +2013,155 @@ mod tests {
         let (spans, order) = ordered(&doc, ReadingOrder::StructureTree);
         assert_eq!(spans, ["L1", "L2", "R1", "R2"]);
         assert_eq!(order, ReadingOrder::StructureTree);
+    }
+
+    fn parsebench_text_dir() -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("PARSEBENCH_TEXT_DIR") {
+            return Some(std::path::PathBuf::from(dir));
+        }
+        let fallback = std::path::Path::new(
+            "/Users/yassine.elkhadiri/Projects/Parsy-ParseBench/data/docs/text",
+        );
+        fallback.is_dir().then(|| fallback.to_path_buf())
+    }
+
+    /// Contiguous flagged phrases: adjacent fragments on one baseline that
+    /// share the flag, with only whitespace between them, count as one run.
+    /// Climbing and noa emit one glyph per span, so this matches unique
+    /// baselines there; marknotTable's glossary terms are one run each.
+    fn flagged_phrase_runs(spans: &[TextSpan], pred: fn(&TextSpan) -> bool) -> usize {
+        let mut items: Vec<(i32, i32, bool, bool)> = spans
+            .iter()
+            .filter(|s| !s.text.is_empty())
+            .map(|s| {
+                (
+                    (s.y * 2.0).round() as i32,
+                    (s.x * 2.0).round() as i32,
+                    pred(s),
+                    s.text.chars().all(char::is_whitespace),
+                )
+            })
+            .collect();
+        items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut n = 0;
+        let mut i = 0;
+        while i < items.len() {
+            let y = items[i].0;
+            let mut in_run = false;
+            while i < items.len() && items[i].0 == y {
+                if items[i].2 {
+                    if !in_run {
+                        n += 1;
+                        in_run = true;
+                    }
+                } else if !items[i].3 {
+                    in_run = false;
+                }
+                i += 1;
+            }
+        }
+        n
+    }
+
+    fn flagged_text(spans: &[TextSpan], pred: fn(&TextSpan) -> bool) -> String {
+        spans
+            .iter()
+            .filter(|s| pred(s))
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    /// ParseBench acceptance: `Page.spans()` flags on the four reference
+    /// documents plus a scanned page. Skips when the corpus is not on disk.
+    #[test]
+    fn parsebench_span_flags_match_the_ticket() {
+        let Some(dir) = parsebench_text_dir() else {
+            eprintln!("PARSEBENCH_TEXT_DIR unset and default corpus missing; skip");
+            return;
+        };
+
+        let load = |name: &str| {
+            let path = dir.join(name);
+            assert!(path.exists(), "missing {path:?}");
+            let doc = Document::open(&path).unwrap();
+            let page = doc.page(0).unwrap();
+            extract_spans(&doc, &page, ReadingOrder::Content).unwrap()
+        };
+
+        let agent = load("text_simple__agent.pdf");
+        let under = flagged_text(&agent, |s| s.underline);
+        assert!(
+            under.contains("2025 Economic Index"),
+            "agent underlines: {under:?}"
+        );
+        assert_eq!(flagged_phrase_runs(&agent, |s| s.strikethrough), 0);
+        assert_eq!(flagged_phrase_runs(&agent, |s| s.highlight), 0);
+
+        let noa = load("text_simple__noa.pdf");
+        assert_eq!(
+            flagged_phrase_runs(&noa, |s| s.underline),
+            4,
+            "noa underlines: {}",
+            flagged_text(&noa, |s| s.underline)
+        );
+        assert_eq!(flagged_phrase_runs(&noa, |s| s.strikethrough), 0);
+
+        let climbing = load("text_simple__climbing.pdf");
+        assert_eq!(
+            flagged_phrase_runs(&climbing, |s| s.underline),
+            0,
+            "climbing underlines: {}",
+            flagged_text(&climbing, |s| s.underline)
+        );
+        assert_eq!(
+            flagged_phrase_runs(&climbing, |s| s.strikethrough),
+            2,
+            "climbing strikes: {}",
+            flagged_text(&climbing, |s| s.strikethrough)
+        );
+
+        let table = load("text_simple__marknotTable.pdf");
+        let under_n = flagged_phrase_runs(&table, |s| s.underline);
+        let struck_n = flagged_phrase_runs(&table, |s| s.strikethrough);
+        let marked_n = flagged_phrase_runs(&table, |s| s.highlight);
+        let under = flagged_text(&table, |s| s.underline);
+        let marked = flagged_text(&table, |s| s.highlight);
+        assert!(
+            under.contains("expected level of development"),
+            "marknotTable should underline the ELG formula: {under}"
+        );
+        assert!(
+            (6..=10).contains(&under_n),
+            "marknotTable underlines (want ~7–9 local 0.84 pt bars): {under_n} {under}"
+        );
+        // The 0.84 pt bars sit ~1.6 pt below the baseline in the em-box,
+        // the same band as agent/noa underlines. A mid-glyph strike
+        // (climbing) is a different geometry. Highlight bands are
+        // highlights, not strikes.
+        assert_eq!(
+            struck_n,
+            0,
+            "marknotTable strikes: {}",
+            flagged_text(&table, |s| s.strikethrough)
+        );
+        assert!(
+            (8..=12).contains(&marked_n),
+            "marknotTable highlights (want ~10): {marked_n} {marked}"
+        );
+        assert!(
+            marked.contains("obstacles") && marked.contains("tripod"),
+            "marknotTable highlights should include the cyan ELG marks: {marked}"
+        );
+
+        let scanned = dir.join("text_ocr__abstract.pdf");
+        let doc = Document::open(&scanned).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(
+            spans.is_empty() || spans.iter().all(|s| s.invisible),
+            "{} produced visible spans: {:?}",
+            scanned.display(),
+            spans.iter().map(|s| &s.text).collect::<Vec<_>>()
+        );
     }
 }

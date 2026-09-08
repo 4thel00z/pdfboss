@@ -98,6 +98,16 @@ class Span:
         """Device-space x after the last glyph's advance."""
 
     @property
+    def ascent(self) -> float:
+        """Font ``/Ascent`` at the rendered size, in points (positive).
+        ``bbox.y1 ≈ y + ascent``."""
+
+    @property
+    def descent(self) -> float:
+        """Font ``/Descent`` at the rendered size, in points (negative
+        or zero). ``bbox.y0 ≈ y + descent``."""
+
+    @property
     def size(self) -> float:
         """Effective font size."""
 
@@ -139,15 +149,29 @@ class Span:
 
     @property
     def underline(self) -> bool:
-        """A drawn ruling sits just below the baseline covering most of
-        the span. Read from the page's geometry — PDF has no underline
+        """A drawn ruling or ``/Underline`` annotation sits just below
+        the baseline covering most of the span. Read from the page's
+        geometry and markup annotations — PDF has no underline
         attribute — so a table border hugging a cell's text can read as
         one."""
 
     @property
     def strikethrough(self) -> bool:
-        """A drawn ruling crosses the span's x-height band —
-        geometry-read, like ``underline``."""
+        """A drawn ruling or ``/StrikeOut`` annotation crosses the glyph
+        body (about 40–60% of the span box height) — geometry-read, like
+        ``underline``."""
+
+    @property
+    def highlight(self) -> bool:
+        """A filled line-height bar in a light/saturated color sits
+        behind dark text, or a ``/Highlight`` annotation covers the
+        span."""
+
+    @property
+    def highlight_color(self) -> tuple[float, float, float] | None:
+        """The bar's resolved DeviceRGB fill when ``highlight`` came from
+        a drawn rectangle. ``None`` for annotation-only highlights and
+        when the span is not highlighted."""
 
     @property
     def rise(self) -> float:
