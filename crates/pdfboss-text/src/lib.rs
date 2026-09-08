@@ -12,7 +12,8 @@ use pdfboss_core::{
 
 pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
 pub use pdfboss_core::{
-    MarkedContentId, Point, Rect, StandardKind, StandardType, StructureElement,
+    AttributeObject, LanguageTag, MarkedContentId, Point, Rect, StandardKind, StandardOwner,
+    StandardType, StructureElement,
 };
 
 /// The order a page's text is read in. Every extraction entry point takes
@@ -129,6 +130,11 @@ pub struct Structure {
     /// The standard-typed elements enclosing the sequence, the outermost
     /// first and the holding element itself last when it is standard.
     pub path: Vec<StructureElement>,
+    /// The attribute objects of the holding element and its ancestors
+    /// (ISO 32000-1 §14.7.5), the outermost element's first; for one
+    /// element, class objects before direct ones, so a later object
+    /// overrides an earlier one.
+    pub attributes: Vec<AttributeObject>,
 }
 
 /// A positioned run of extracted text.
@@ -1762,6 +1768,27 @@ mod tests {
         assert_eq!(spans[1].lang.as_deref(), Some("de"));
         assert_eq!(spans[2].lang, None);
         assert_eq!(doc.language(), None);
+    }
+
+    /// The attribute objects of a span's element and ancestors travel with
+    /// its structure.
+    // Covers ISO 32000-1 §14.7.5.
+    #[test]
+    fn attribute_objects_reach_the_spans() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0 2] \
+                 /A << /O /Layout /Placement /Block >> >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        let attributes = &spans[0].structure.as_ref().unwrap().attributes;
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].owner, "Layout");
+        assert_eq!(attributes[0].element.num, 13);
+        assert!(spans[2].structure.as_ref().unwrap().attributes.is_empty());
     }
 
     #[test]

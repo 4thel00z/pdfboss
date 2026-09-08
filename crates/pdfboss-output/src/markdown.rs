@@ -24,12 +24,11 @@ impl Output for Markdown {
 fn render_block(block: &Block) -> Option<String> {
     let rendered = match block {
         Block::Heading { level, lines, .. } => heading(*level, lines)?,
-        Block::Paragraph { lines, role, .. } => {
-            if !matches!(role, Role::Body) {
-                return None;
-            }
-            paragraph(lines)
-        }
+        Block::Paragraph { lines, role, .. } => match role {
+            Role::Body => paragraph(lines),
+            Role::Quote => quote(lines),
+            Role::PageHeader | Role::PageFooter => return None,
+        },
         Block::List { items, .. } => list(items),
         Block::Table { rows, .. } => table(rows),
     };
@@ -60,6 +59,17 @@ fn paragraph(lines: &[Line]) -> String {
     lines
         .iter()
         .map(emphasized)
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// A block quotation: the paragraph's lines, each opened with `> `.
+///
+/// Covers ISO 32000-1 §14.8.4.2.
+fn quote(lines: &[Line]) -> String {
+    paragraph(lines)
+        .lines()
+        .map(|line| format!("> {line}"))
         .collect::<Vec<String>>()
         .join("\n")
 }
@@ -121,20 +131,25 @@ fn strip_marker(line: &Line, chars: usize) -> Vec<Inline> {
             text: inline.text.chars().skip(remaining).collect(),
             bold: inline.bold,
             italic: inline.italic,
+            code: inline.code,
         });
         remaining = 0;
     }
     out
 }
 
-/// Pipes while every cell stands in one column, HTML as soon as one does
-/// not: GFM's pipe table has no way to say colspan, and an evaluator reading
-/// a merged cell reads it off that attribute.
+/// Pipes while every cell stands in one column and one row, HTML as soon
+/// as one does not: GFM's pipe table has no way to say colspan or rowspan,
+/// and an evaluator reading a merged cell reads it off that attribute.
 ///
 /// Cells carry no emphasis. A table's markers are pure edit distance against
 /// ground truth that carries none, exactly as in a heading.
 fn table(rows: &[Vec<Cell>]) -> String {
-    if rows.iter().flatten().any(|cell| cell.colspan > 1) {
+    if rows
+        .iter()
+        .flatten()
+        .any(|cell| cell.colspan > 1 || cell.rowspan > 1)
+    {
         return html_table(rows);
     }
     pipe_table(rows)
@@ -185,10 +200,14 @@ fn html_table(rows: &[Vec<Cell>]) -> String {
 
 fn html_cell(cell: &Cell) -> String {
     let text = html_escape(&cell_text(cell));
-    if cell.colspan <= 1 {
-        return format!("<td>{text}</td>");
+    let mut attributes = String::new();
+    if cell.colspan > 1 {
+        attributes.push_str(&format!(" colspan=\"{}\"", cell.colspan));
     }
-    format!("<td colspan=\"{}\">{text}</td>", cell.colspan)
+    if cell.rowspan > 1 {
+        attributes.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
+    }
+    format!("<td{attributes}>{text}</td>")
 }
 
 /// The three characters that would otherwise open markup of their own.
@@ -219,12 +238,21 @@ fn emphasized(line: &Line) -> String {
 /// The run's text with its markers around the trimmed middle only, so a run
 /// that starts or ends on a space still reads as `plain **loud** tail`.
 ///
+/// A run inside a `Code` structure element (ISO 32000-1 §14.8.4.4) is inline
+/// code: backticks around the trimmed middle, one more than the longest
+/// backtick run inside, and no emphasis, since a code span shows its text
+/// literally.
+///
 /// A run with no letter or digit in it — the italic full stop that ends a
 /// title, a bold space — gets no markers: emphasis needs something to
 /// emphasize, CommonMark's flanking rules leave `word*.*` unparsed anyway,
 /// and the stray asterisks are pure edit distance against ground truth that
 /// carries none.
 fn push_inline(out: &mut String, inline: &Inline) {
+    if inline.code {
+        push_code(out, &inline.text);
+        return;
+    }
     let marker = match (inline.bold, inline.italic) {
         (true, true) => "***",
         (true, false) => "**",
@@ -243,6 +271,28 @@ fn push_inline(out: &mut String, inline: &Inline) {
     out.push_str(marker);
     out.push_str(trimmed);
     out.push_str(marker);
+    out.push_str(&text[tail..]);
+}
+
+/// `text` as a CommonMark code span: its trimmed middle between backtick
+/// fences one longer than any backtick run it contains, the surrounding
+/// whitespace kept outside the fences. Whitespace-only text stays as it is.
+///
+/// Covers ISO 32000-1 §14.8.4.4.
+fn push_code(out: &mut String, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        out.push_str(text);
+        return;
+    }
+    let longest = trimmed.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let lead = text.len() - text.trim_start().len();
+    let tail = text.trim_end().len();
+    out.push_str(&text[..lead]);
+    out.push_str(&fence);
+    out.push_str(trimmed);
+    out.push_str(&fence);
     out.push_str(&text[tail..]);
 }
 

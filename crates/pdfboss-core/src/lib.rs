@@ -51,7 +51,7 @@ pub use embedded_file::{
 pub use error::{Error, Result};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
-pub use language::language_with;
+pub use language::{language_with, LanguageTag};
 pub use names::{name_tree_root_with, named_with, names_with, NameTree};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
 pub use oc::OcState;
@@ -62,5 +62,6 @@ pub use source::{
     ObjectSource, MAX_RESOLVE_DEPTH,
 };
 pub use structure::{
-    MarkedContentId, Placement, StandardKind, StandardType, StructureElement, StructureTree,
+    AttributeObject, MarkedContentId, Placement, StandardKind, StandardOwner, StandardType,
+    StructureElement, StructureTree,
 };

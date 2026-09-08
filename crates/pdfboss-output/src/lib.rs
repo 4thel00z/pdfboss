@@ -455,6 +455,265 @@ mod tests {
         assert_eq!(md, "- Outer\n\u{2013} Inner");
     }
 
+    /// A tagged table whose cells declare `ColSpan` and `RowSpan` through
+    /// their attribute objects.
+    fn tagged_spanning_table_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str, extra: &str) {
+            b.object(
+                num,
+                &format!(
+                    "<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} {extra} >>"
+                ),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /TD << /MCID 0 >> BDC 1 0 0 1 72 600 Tm (a) Tj EMC \
+              /TD << /MCID 1 >> BDC 1 0 0 1 72 586 Tm (c) Tj EMC \
+              /TD << /MCID 2 >> BDC 1 0 0 1 200 586 Tm (d) Tj EMC \
+              /TD << /MCID 3 >> BDC 1 0 0 1 200 572 Tm (e) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [20 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [23 0 R 25 0 R 26 0 R 28 0 R]] >>");
+        element(&mut b, 20, "Table", 11, "[21 0 R 22 0 R 27 0 R]", "");
+        element(&mut b, 21, "TR", 20, "[23 0 R]", "");
+        element(&mut b, 23, "TD", 21, "[0]", "/A << /O /Table /ColSpan 2 >>");
+        element(&mut b, 22, "TR", 20, "[25 0 R 26 0 R]", "");
+        element(&mut b, 25, "TD", 22, "[1]", "/A << /O /Table /RowSpan 2 >>");
+        element(&mut b, 26, "TD", 22, "[2]", "");
+        element(&mut b, 27, "TR", 20, "[28 0 R]", "");
+        element(&mut b, 28, "TD", 27, "[3]", "");
+        b.build(1)
+    }
+
+    /// The cells' `ColSpan` and `RowSpan` reach the table, which renders as
+    /// HTML because pipe tables cannot say either.
+    // Covers ISO 32000-1 §14.8.5.7.
+    #[test]
+    fn tagged_cells_carry_their_column_and_row_spans() {
+        let doc = Document::load(tagged_spanning_table_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(
+            md,
+            "<table>\n<tr><td colspan=\"2\">a</td></tr>\n\
+             <tr><td rowspan=\"2\">c</td><td>d</td></tr>\n<tr><td>e</td></tr>\n</table>"
+        );
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "a\nc d\ne");
+    }
+
+    /// A paragraph whose middle sequence sits in a Code element, the other
+    /// two directly in the P.
+    fn tagged_code_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str) {
+            b.object(
+                num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Run) Tj EMC \
+              /Code << /MCID 1 >> BDC 1 0 0 1 100 700 Tm (ls -la) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 150 700 Tm (now) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [13 0 R 14 0 R 13 0 R]] >>");
+        element(&mut b, 13, "P", 11, "[0 14 0 R 2]");
+        element(&mut b, 14, "Code", 13, "[1]");
+        b.build(1)
+    }
+
+    /// Text inside a Code element renders as inline code; plain text keeps
+    /// the line as shown.
+    // Covers ISO 32000-1 §14.8.4.4.
+    #[test]
+    fn code_elements_render_as_inline_code() {
+        let doc = Document::load(tagged_code_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "Run `ls -la` now");
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "Run ls -la now");
+    }
+
+    /// One tagged page built from `content` and a structure tree given as
+    /// (object number, type, parent, kids) rows under the Document element
+    /// 11, with the parent tree `nums`.
+    fn tagged_tree_doc(content: &[u8], nums: &str, elements: &[(u32, &str, u32, &str)]) -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        let top: Vec<String> = elements
+            .iter()
+            .filter(|(_, _, parent, _)| *parent == 11)
+            .map(|(num, _, _, _)| format!("{num} 0 R"))
+            .collect();
+        b.object(
+            11,
+            &format!(
+                "<< /Type /StructElem /S /Document /P 10 0 R /K [{}] >>",
+                top.join(" ")
+            ),
+        );
+        b.object(12, &format!("<< /Nums [0 [{nums}]] >>"));
+        for (num, s, parent, kids) in elements {
+            b.object(
+                *num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        b.build(1)
+    }
+
+    /// The paragraphs of a BlockQuote element render as a Markdown block
+    /// quote; plain text keeps the lines as shown.
+    // Covers ISO 32000-1 §14.8.4.2.
+    #[test]
+    fn block_quote_paragraphs_render_as_markdown_quotes() {
+        let doc = Document::load(tagged_tree_doc(
+            b"BT /F1 12 Tf \
+              /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (A quoted line) Tj EMC \
+              /P << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (and its second) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 72 660 Tm (Body) Tj EMC ET",
+            "21 0 R 21 0 R 13 0 R",
+            &[
+                (20, "BlockQuote", 11, "[21 0 R]"),
+                (21, "P", 20, "[0 1]"),
+                (13, "P", 11, "[2]"),
+            ],
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "> A quoted line\n> and its second\n\nBody");
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "A quoted line\nand its second\nBody");
+    }
+
+    /// TOCI entries a line apart, with no block-level element inside, are
+    /// blocks of their own instead of one paragraph, and a NonStruct wrapper
+    /// changes nothing.
+    // Covers ISO 32000-1 §14.8.4.2.
+    #[test]
+    fn toc_entries_are_their_own_blocks() {
+        let doc = Document::load(tagged_tree_doc(
+            b"BT /F1 12 Tf \
+              /TOCI << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Chapter 1 ... 3) Tj EMC \
+              /TOCI << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (Chapter 2 ... 9) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 72 660 Tm (Body) Tj EMC ET",
+            "21 0 R 22 0 R 31 0 R",
+            &[
+                (20, "TOC", 11, "[21 0 R 22 0 R]"),
+                (21, "TOCI", 20, "[0]"),
+                (22, "TOCI", 20, "[1]"),
+                (30, "NonStruct", 11, "[31 0 R]"),
+                (31, "P", 30, "[2]"),
+            ],
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "Chapter 1 ... 3\n\nChapter 2 ... 9\n\nBody");
+    }
+
+    /// Illustration text stays apart from untagged text: an untagged line
+    /// followed by two figures' labels and a formula makes two blocks, the
+    /// illustrations one run laid out by the heuristics, and the first
+    /// figure's description reaches its spans.
+    // Covers ISO 32000-1 §14.8.4.5.
+    #[test]
+    fn illustration_elements_are_their_own_blocks() {
+        let doc = Document::load(tagged_tree_doc(
+            b"BT /F1 12 Tf 1 0 0 1 72 714 Tm (Draft) Tj \
+              /Figure << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Chart A) Tj EMC \
+              /Figure << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (Chart B) Tj EMC \
+              /Formula << /MCID 2 >> BDC 1 0 0 1 72 672 Tm (E = mc2) Tj EMC ET",
+            "20 0 R 21 0 R 22 0 R",
+            &[
+                (20, "Figure", 11, "[0] /Alt (Sales by quarter)"),
+                (21, "Figure", 11, "[1]"),
+                (22, "Formula", 11, "[2]"),
+            ],
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "Draft\n\nChart A\nChart B\nE = mc2");
+        let (spans, _) =
+            pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree)
+                .unwrap();
+        assert_eq!(spans[0].alt, None);
+        assert_eq!(spans[1].alt.as_deref(), Some("Sales by quarter"));
+        assert_eq!(spans[2].alt, None);
+    }
+
     /// The same page in content order goes through the layout heuristics,
     /// which see no heading, one paragraph and no table.
     // Covers ISO 32000-1 §14.8.4.3.

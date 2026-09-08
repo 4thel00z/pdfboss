@@ -276,13 +276,111 @@ impl StandardType {
 
 /// One structure element on a placement's path: its standard type and the
 /// object holding it, so two neighbouring elements of one type are told
-/// apart.
+/// apart, and its revision number.
 ///
 /// Covers ISO 32000-1 §14.8.4.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StructureElement {
     pub standard_type: StandardType,
     pub object: ObjRef,
+    /// The element's `/R` (§14.7.5.3), 0 when it declares none.
+    pub revision: i64,
+}
+
+/// The standard attribute owners of ISO 32000-1 Table 331: the four owners
+/// the standard defines attributes for, and the seven document formats whose
+/// own attributes an attribute object may carry.
+///
+/// Covers ISO 32000-1 §14.8.5.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardOwner {
+    /// `Layout`: layout attributes (§14.8.5.4).
+    Layout,
+    /// `List`: the list attribute (§14.8.5.5).
+    List,
+    /// `PrintField`: print-field attributes (§14.8.5.6).
+    PrintField,
+    /// `Table`: table attributes (§14.8.5.7).
+    Table,
+    /// `XML-1.00`: attributes of XML 1.00.
+    Xml100,
+    /// `HTML-3.2`: attributes of HTML 3.2.
+    Html32,
+    /// `HTML-4.01`: attributes of HTML 4.01.
+    Html401,
+    /// `OEB-1.0`: attributes of the Open eBook 1.0 format.
+    Oeb10,
+    /// `RTF-1.05`: attributes of RTF 1.05.
+    Rtf105,
+    /// `CSS-1.00`: attributes of CSS 1.00.
+    Css100,
+    /// `CSS-2.00`: attributes of CSS 2.00.
+    Css200,
+}
+
+impl StandardOwner {
+    /// Every standard owner, in the order of Table 331.
+    pub const ALL: [StandardOwner; 11] = [
+        StandardOwner::Layout,
+        StandardOwner::List,
+        StandardOwner::PrintField,
+        StandardOwner::Table,
+        StandardOwner::Xml100,
+        StandardOwner::Html32,
+        StandardOwner::Html401,
+        StandardOwner::Oeb10,
+        StandardOwner::Rtf105,
+        StandardOwner::Css100,
+        StandardOwner::Css200,
+    ];
+
+    /// The standard owner an `/O` name stands for, `None` for a producer's
+    /// own owner (or `UserProperties`, §14.7.5.4, which is not one of them).
+    /// Names are case-sensitive.
+    pub fn from_name(name: &str) -> Option<StandardOwner> {
+        StandardOwner::ALL
+            .into_iter()
+            .find(|owner| owner.name() == name)
+    }
+
+    /// The name as the standard spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            StandardOwner::Layout => "Layout",
+            StandardOwner::List => "List",
+            StandardOwner::PrintField => "PrintField",
+            StandardOwner::Table => "Table",
+            StandardOwner::Xml100 => "XML-1.00",
+            StandardOwner::Html32 => "HTML-3.2",
+            StandardOwner::Html401 => "HTML-4.01",
+            StandardOwner::Oeb10 => "OEB-1.0",
+            StandardOwner::Rtf105 => "RTF-1.05",
+            StandardOwner::Css100 => "CSS-1.00",
+            StandardOwner::Css200 => "CSS-2.00",
+        }
+    }
+}
+
+/// One attribute object of a structure element (§14.7.5): the element it
+/// belongs to, its owner (`/O`, empty when it names none), the revision
+/// number that follows it in an `/A` or `/C` array (0 when none does,
+/// §14.7.5.3), and its entries as written, `/O` included.
+///
+/// Covers ISO 32000-1 §14.7.5.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeObject {
+    pub element: ObjRef,
+    pub owner: String,
+    pub revision: i64,
+    pub entries: Dict,
+}
+
+impl AttributeObject {
+    /// The standard owner the object's `/O` names (§14.8.5.2), `None` for a
+    /// producer's own.
+    pub fn standard_owner(&self) -> Option<StandardOwner> {
+        StandardOwner::from_name(&self.owner)
+    }
 }
 
 /// Where one marked-content sequence sits in the tree: its rank in the
@@ -291,7 +389,7 @@ pub struct StructureElement {
 /// with the standard-typed elements above it.
 ///
 /// Covers ISO 32000-1 §14.7.3 and §14.8.4.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     pub rank: u32,
     /// The element's `/S`, as the file writes it.
@@ -311,6 +409,26 @@ pub struct Placement {
     /// The language (`/Lang`, §14.9.2) of the element, or of the nearest
     /// ancestor that declares one; `None` leaves the document's own.
     pub lang: Option<String>,
+    /// Every attribute object of the element and its ancestors (§14.7.5),
+    /// the root's child's first; for one element, the objects its `/C`
+    /// classes name come before its direct `/A` objects, so a later object
+    /// overrides an earlier one (see [`Placement::attribute`]).
+    pub attributes: Vec<AttributeObject>,
+}
+
+impl Placement {
+    /// The value `key` takes for `element` among its attribute objects of
+    /// `owner`: the last object that has the key wins, so a direct `/A`
+    /// object overrides a class's and a later class an earlier one.
+    ///
+    /// Covers ISO 32000-1 §14.7.5 and §14.7.5.2.
+    pub fn attribute(&self, element: ObjRef, owner: &str, key: &str) -> Option<&Object> {
+        self.attributes
+            .iter()
+            .rev()
+            .filter(|a| a.element == element && a.owner == owner)
+            .find_map(|a| a.entries.get(key))
+    }
 }
 
 /// The document's structure tree root (`/StructTreeRoot`), loaded once per
@@ -324,6 +442,9 @@ pub struct StructureTree {
     /// The root's `/RoleMap`: structure type names to the names they stand
     /// for (§14.7.3), entries whose value is not a name dropped.
     role_map: FastMap<String, String>,
+    /// The root's `/ClassMap`: attribute class names to their attribute
+    /// objects, as written (§14.7.5.2).
+    class_map: FastMap<String, Object>,
 }
 
 impl StructureTree {
@@ -343,10 +464,15 @@ impl StructureTree {
             Some(entry) => role_map_of(resolved_dict(src, entry).await),
             None => FastMap::default(),
         };
+        let class_map = match root.get("ClassMap") {
+            Some(entry) => class_map_of(resolved_dict(src, entry).await),
+            None => FastMap::default(),
+        };
         Some(StructureTree {
             root,
             root_ref,
             role_map,
+            class_map,
         })
     }
 
@@ -415,6 +541,7 @@ impl StructureTree {
             src,
             page_ref: page.object_ref(),
             root_ref: self.root_ref,
+            class_map: &self.class_map,
             dicts: FastMap::default(),
             paths: FastMap::default(),
             parents: FastMap::default(),
@@ -443,11 +570,16 @@ impl StructureTree {
                     Some(StructureElement {
                         standard_type,
                         object: ancestor.object,
+                        revision: ancestor.revision,
                     })
                 })
                 .collect();
             let alt = ancestry.iter().rev().find_map(|a| a.alt.clone());
             let lang = ancestry.iter().rev().find_map(|a| a.lang.clone());
+            let attributes = ancestry
+                .into_iter()
+                .flat_map(|ancestor| ancestor.attributes)
+                .collect();
             placed.insert(
                 id,
                 Placement {
@@ -458,6 +590,7 @@ impl StructureTree {
                     path,
                     alt,
                     lang,
+                    attributes,
                 },
             );
         }
@@ -466,17 +599,51 @@ impl StructureTree {
 }
 
 /// One element on the way from a marked-content sequence up to the root:
-/// its object, its `/S` as written, and its `/Alt` and `/Lang` decoded.
+/// its object, its `/S` as written, its `/Alt` and `/Lang` decoded, its
+/// `/R` and its attribute objects.
 struct Ancestor {
     object: ObjRef,
     structure_type: Option<String>,
     alt: Option<String>,
     lang: Option<String>,
+    revision: i64,
+    attributes: Vec<AttributeObject>,
 }
 
 /// An element and its ancestors up to the root, the root's child first and
 /// the element last.
 type Ancestry = Vec<Ancestor>;
+
+/// The `/ClassMap` dictionary as class name to attribute objects, the
+/// objects kept as written and read when an element names the class.
+///
+/// Covers ISO 32000-1 §14.7.5.2.
+fn class_map_of(dict: Option<Dict>) -> FastMap<String, Object> {
+    let Some(dict) = dict else {
+        return FastMap::default();
+    };
+    dict.iter()
+        .map(|(key, value)| (key.0.clone(), value.clone()))
+        .collect()
+}
+
+/// One attribute object as read: its `/O` owner (empty when it names none)
+/// and its entries, at revision 0 until an array says otherwise. A
+/// `/UserProperties` object arrives like any other, its `/P` array
+/// uninterpreted.
+///
+/// Covers ISO 32000-1 §14.7.5 and §14.7.5.4.
+fn attribute_object(element: ObjRef, entries: Dict) -> AttributeObject {
+    AttributeObject {
+        element,
+        owner: entries
+            .get_name("O")
+            .map(|n| n.0.clone())
+            .unwrap_or_default(),
+        revision: 0,
+        entries,
+    }
+}
 
 /// The `/RoleMap` dictionary as name-to-name pairs.
 ///
@@ -497,6 +664,8 @@ struct Walk<'a, S> {
     src: &'a S,
     page_ref: Option<ObjRef>,
     root_ref: Option<ObjRef>,
+    /// The root's `/ClassMap`, for elements that name attribute classes.
+    class_map: &'a FastMap<String, Object>,
     dicts: FastMap<ObjRef, Option<Arc<Dict>>>,
     /// Each element's kid-index path from the root, or `None` once its
     /// ancestry proved unwalkable.
@@ -526,13 +695,14 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     }
 
     /// The element and its ancestors up to the root, the root's child first
-    /// and the element itself last, each with its `/S`, `/Alt` and `/Lang`:
-    /// what a placement's structure type, path, description and language
-    /// are read from. The climb stops at the root, at a missing `/P`, or
-    /// after [`MAX_ELEMENT_DEPTH`] elements; the dictionaries are the ones
-    /// [`Walk::path_of`] already read.
+    /// and the element itself last, each with its `/S`, `/Alt`, `/Lang`,
+    /// `/R` and attribute objects: what a placement's structure type, path,
+    /// description, language and attributes are read from. The climb stops
+    /// at the root, at a missing `/P`, or after [`MAX_ELEMENT_DEPTH`]
+    /// elements; the dictionaries are the ones [`Walk::path_of`] already
+    /// read.
     ///
-    /// Covers ISO 32000-1 §14.7.3, §14.8.4.3, §14.9.2 and §14.9.3.
+    /// Covers ISO 32000-1 §14.7.3, §14.7.5, §14.8.4.3, §14.9.2 and §14.9.3.
     async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
         let mut chain: Ancestry = Vec::new();
         let mut current = element;
@@ -548,11 +718,14 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
                 Some(lang) => self.text_string(lang).await,
                 None => None,
             };
+            let attributes = self.attribute_objects(current, &dict).await;
             chain.push(Ancestor {
                 object: current,
                 structure_type: dict.get_name("S").map(|n| n.0.clone()),
                 alt,
                 lang,
+                revision: dict.get_int("R").unwrap_or(0),
+                attributes,
             });
             let Some(parent) = dict.get("P").and_then(Object::as_ref) else {
                 break;
@@ -564,6 +737,102 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         }
         chain.reverse();
         chain
+    }
+
+    /// The attribute objects of one element (§14.7.5): those its `/C`
+    /// classes name in the root's `/ClassMap` (§14.7.5.2) first, then its
+    /// direct `/A` objects, so a later object overrides an earlier one.
+    ///
+    /// Covers ISO 32000-1 §14.7.5 and §14.7.5.2.
+    async fn attribute_objects(&mut self, element: ObjRef, dict: &Dict) -> Vec<AttributeObject> {
+        let mut out = Vec::new();
+        if let Some(classes) = dict.get("C") {
+            self.class_attributes(element, classes, &mut out).await;
+        }
+        if let Some(direct) = dict.get("A") {
+            self.direct_attributes(element, direct, &mut out).await;
+        }
+        out
+    }
+
+    /// `value` as attribute objects: one dictionary, or an array of
+    /// dictionaries, indirect ones resolved, each optionally followed by an
+    /// integer, its revision number; anything else in the array is skipped.
+    ///
+    /// Covers ISO 32000-1 §14.7.5 and §14.7.5.3.
+    async fn direct_attributes(
+        &mut self,
+        element: ObjRef,
+        value: &Object,
+        out: &mut Vec<AttributeObject>,
+    ) {
+        let Ok(resolved) = self.src.resolve(value).await else {
+            return;
+        };
+        let items = match resolved {
+            Object::Dict(dict) => {
+                out.push(attribute_object(element, dict));
+                return;
+            }
+            Object::Array(items) => items,
+            _ => return,
+        };
+        let start = out.len();
+        for item in items {
+            if let Some(revision) = item.as_int() {
+                if out.len() > start {
+                    if let Some(last) = out.last_mut() {
+                        last.revision = revision;
+                    }
+                }
+                continue;
+            }
+            let Ok(resolved) = self.src.resolve(&item).await else {
+                continue;
+            };
+            if let Object::Dict(dict) = resolved {
+                out.push(attribute_object(element, dict));
+            }
+        }
+    }
+
+    /// `value` as attribute class names, one or an array each optionally
+    /// followed by a revision number that then applies to every object the
+    /// class brought; a name the root's `/ClassMap` lacks brings nothing.
+    ///
+    /// Covers ISO 32000-1 §14.7.5.2 and §14.7.5.3.
+    async fn class_attributes(
+        &mut self,
+        element: ObjRef,
+        value: &Object,
+        out: &mut Vec<AttributeObject>,
+    ) {
+        let Ok(resolved) = self.src.resolve(value).await else {
+            return;
+        };
+        let names = match resolved {
+            Object::Name(_) => vec![resolved],
+            Object::Array(items) => items,
+            _ => return,
+        };
+        let mut added = 0..0;
+        for item in names {
+            if let Some(revision) = item.as_int() {
+                for attribute in &mut out[added.clone()] {
+                    attribute.revision = revision;
+                }
+                continue;
+            }
+            let Some(name) = item.as_name() else {
+                continue;
+            };
+            let Some(class) = self.class_map.get(&name.0).cloned() else {
+                continue;
+            };
+            let start = out.len();
+            self.direct_attributes(element, &class, out).await;
+            added = start..out.len();
+        }
     }
 
     /// A text string entry (§7.9.2.2), resolved and decoded; `None` for
@@ -1080,6 +1349,133 @@ mod tests {
         assert_eq!(placements(&untagged, &[id(0, 0)])[&id(0, 0)].lang, None);
     }
 
+    // Covers ISO 32000-1 §14.7.5, §14.7.5.2 and §14.7.5.3.
+    #[test]
+    fn placements_carry_the_elements_attribute_objects() {
+        // Cell 14 has one direct attribute object and revision 1; cell 15 a
+        // class from the root's /ClassMap, numbered 4 in its /C array, and a
+        // direct object overriding one of the class's entries; cell 16 an
+        // /A array whose first object is followed by its revision number and
+        // whose second is indirect; paragraph 17 has none.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R \
+                     /ClassMap << /Wide << /O /Table /ColSpan 3 /RowSpan 2 >> >> >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Table /P 10 0 R /K [13 0 R 17 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [14 0 R 15 0 R 16 0 R 17 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /TR /P 11 0 R /K [14 0 R 15 0 R 16 0 R] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /TD /P 13 0 R /Pg 3 0 R /K [0] /R 1 \
+                     /A << /O /Table /ColSpan 2 >> >>",
+                ),
+                (
+                    15,
+                    "<< /Type /StructElem /S /TD /P 13 0 R /Pg 3 0 R /K [1] \
+                     /C [/Wide 4] /A << /O /Table /ColSpan 1 >> >>",
+                ),
+                (
+                    16,
+                    "<< /Type /StructElem /S /TD /P 13 0 R /Pg 3 0 R /K [2] \
+                     /A [<< /O /Layout /Placement /Block >> 2 20 0 R] >>",
+                ),
+                (
+                    17,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [3] >>",
+                ),
+                (20, "<< /O /Table /RowSpan 3 >>"),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1), id(0, 2), id(0, 3)]);
+        let cell = |num: u32| ObjRef { num, gen: 0 };
+        let int = |value: Option<&Object>| value.and_then(Object::as_int);
+        let objects = |p: &Placement, element: ObjRef| -> Vec<(String, i64)> {
+            p.attributes
+                .iter()
+                .filter(|a| a.element == element)
+                .map(|a| (a.owner.clone(), a.revision))
+                .collect()
+        };
+
+        let p0 = &placed[&id(0, 0)];
+        assert_eq!(int(p0.attribute(cell(14), "Table", "ColSpan")), Some(2));
+        assert_eq!(p0.attribute(cell(14), "Table", "RowSpan"), None);
+        assert_eq!(p0.attributes.len(), 1, "the row and table carry none");
+        assert_eq!(p0.path.last().unwrap().revision, 1);
+
+        // Class objects come first, direct objects after and win.
+        let p1 = &placed[&id(0, 1)];
+        assert_eq!(
+            objects(p1, cell(15)),
+            [("Table".to_string(), 4), ("Table".to_string(), 0)]
+        );
+        assert_eq!(int(p1.attribute(cell(15), "Table", "ColSpan")), Some(1));
+        assert_eq!(int(p1.attribute(cell(15), "Table", "RowSpan")), Some(2));
+        assert_eq!(p1.path.last().unwrap().revision, 0);
+
+        let p2 = &placed[&id(0, 2)];
+        assert_eq!(
+            objects(p2, cell(16)),
+            [("Layout".to_string(), 2), ("Table".to_string(), 0)]
+        );
+        assert_eq!(int(p2.attribute(cell(16), "Table", "RowSpan")), Some(3));
+        assert_eq!(
+            p2.attribute(cell(16), "Layout", "Placement")
+                .and_then(Object::as_name)
+                .map(|n| n.0.as_str()),
+            Some("Block")
+        );
+        assert_eq!(p2.attribute(cell(16), "Table", "ColSpan"), None);
+
+        assert!(placed[&id(0, 3)].attributes.is_empty());
+    }
+
+    // Covers ISO 32000-1 §14.8.5.2.
+    #[test]
+    fn standard_attribute_owners_are_recognized_by_name() {
+        assert_eq!(
+            StandardOwner::from_name("Table"),
+            Some(StandardOwner::Table)
+        );
+        assert_eq!(
+            StandardOwner::from_name("XML-1.00"),
+            Some(StandardOwner::Xml100)
+        );
+        assert_eq!(StandardOwner::from_name("Acme"), None);
+        assert_eq!(StandardOwner::from_name("table"), None);
+        assert_eq!(StandardOwner::ALL.len(), 11);
+        for owner in StandardOwner::ALL {
+            assert_eq!(
+                StandardOwner::from_name(owner.name()),
+                Some(owner),
+                "{}",
+                owner.name()
+            );
+        }
+        let object = AttributeObject {
+            element: ObjRef { num: 1, gen: 0 },
+            owner: "Layout".to_string(),
+            revision: 0,
+            entries: Dict::default(),
+        };
+        assert_eq!(object.standard_owner(), Some(StandardOwner::Layout));
+        let own = AttributeObject {
+            owner: "Acme".to_string(),
+            ..object
+        };
+        assert_eq!(own.standard_owner(), None);
+    }
+
     // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and
     // §14.8.4.5.
     #[test]
@@ -1244,6 +1640,7 @@ mod tests {
             src: &Immediate(&doc),
             page_ref: page.object_ref(),
             root_ref: Some(ObjRef { num: 10, gen: 0 }),
+            class_map: &tree.class_map,
             dicts: FastMap::default(),
             paths: FastMap::default(),
             parents: FastMap::default(),

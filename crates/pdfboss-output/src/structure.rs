@@ -4,7 +4,8 @@
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::{
-    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardType, StructureElement, TextSpan,
+    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardOwner, StandardType,
+    StructureElement, TextSpan,
 };
 
 /// Fraction of the device font size a horizontal gap must exceed to read
@@ -504,7 +505,7 @@ fn push_segment_blocks(
         && segment
             .spans
             .iter()
-            .any(|span| block_element(span).is_some())
+            .any(|span| run_of(span) != Run::Untagged)
     {
         push_tagged_blocks(&segment.spans, stats, out);
         return;
@@ -566,32 +567,90 @@ fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &
     push_lane_blocks(&line_groups(&spans), stats, out);
 }
 
-/// The outermost block-level element on a span's path (§14.8.4.3): the
-/// block the span belongs to. `None` for a span the tree does not reach and
-/// for one whose path holds no block-level element.
-fn block_element(span: &TextSpan) -> Option<StructureElement> {
-    span.structure
-        .as_ref()?
-        .path
+/// What a span belongs to under structure-tree order: the outermost
+/// block-level element on its path (§14.8.4.3) or, when the path holds none,
+/// the innermost Caption or TOCI, the two grouping elements that hold text of
+/// their own (§14.8.4.2); an illustration when a Figure, Formula or Form
+/// encloses it instead (§14.8.4.5); untagged when the tree does not reach it
+/// or nothing but containers do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    Block(StructureElement),
+    Illustration,
+    Untagged,
+}
+
+/// The run a span belongs to (see [`Run`]).
+///
+/// Covers ISO 32000-1 §14.8.4.5.
+fn run_of(span: &TextSpan) -> Run {
+    let Some(structure) = span.structure.as_ref() else {
+        return Run::Untagged;
+    };
+    let path = &structure.path;
+    let block = path
         .iter()
         .copied()
-        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel)
+        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel);
+    if let Some(element) = block {
+        return Run::Block(element);
+    }
+    let holder = path.iter().copied().rev().find(|element| {
+        matches!(
+            element.standard_type,
+            StandardType::Caption | StandardType::TOCI
+        )
+    });
+    if let Some(element) = holder {
+        return Run::Block(element);
+    }
+    if path
+        .iter()
+        .any(|element| element.standard_type.kind() == StandardKind::Illustration)
+    {
+        return Run::Illustration;
+    }
+    Run::Untagged
+}
+
+/// Whether the span sits inside a `BlockQuote` grouping element (§14.8.4.2),
+/// which makes its paragraph a block quotation. The other grouping elements
+/// (Document, Part, Art, Sect, Div, TOC, Index, NonStruct, Private) hold
+/// blocks rather than being one and leave their content as it is; Sect,
+/// Part and Art nesting sets the level of an H heading.
+///
+/// Covers ISO 32000-1 §14.8.4.2.
+fn in_block_quote(span: &TextSpan) -> bool {
+    span.structure.as_ref().is_some_and(|structure| {
+        structure
+            .path
+            .iter()
+            .any(|element| element.standard_type == StandardType::BlockQuote)
+    })
 }
 
 /// Blocks on the tree's own word: consecutive spans of one outermost
 /// block-level element form one block, typed by that element. H1 to H6 and
 /// H are headings, L a list, Table a table, every other block-level element
 /// a paragraph, so two P elements a line apart stay two paragraphs and a
-/// heading needs no size step. Stretches of spans with no block-level
-/// element go through the layout heuristics as on an untagged page. Ruled
-/// grids are not consulted here: a tagged table's rows are its TR elements.
+/// heading needs no size step; a Caption or TOCI (§14.8.4.2) with no
+/// block-level element inside is a paragraph of its own. The text of a
+/// Figure, Formula or Form (§14.8.4.5) is laid out by the heuristics on its
+/// own, since the tree says nothing about what it is: adjacent illustrations
+/// form one run, so a table a producer drew as a row of figures is still
+/// read as a table, while none of it joins the untagged text or the tagged
+/// blocks around it. Stretches of untagged spans go through the layout
+/// heuristics as on an untagged page. Ruled grids are not consulted here: a
+/// tagged table's rows are its TR elements.
 ///
-/// Covers ISO 32000-1 §14.8.4.3.
+/// Covers ISO 32000-1 §14.8.4.2, §14.8.4.3 and §14.8.4.5.
 fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
-    for (element, run) in stretches(spans, block_element) {
-        match element {
-            None => push_lane_blocks(&sequential_groups(run.iter().copied()), stats, out),
-            Some(element) => push_tagged_block(element, run, out),
+    for (run, spans) in stretches(spans, run_of) {
+        match run {
+            Run::Block(element) => push_tagged_block(element, spans, out),
+            Run::Illustration | Run::Untagged => {
+                push_lane_blocks(&sequential_groups(spans.iter().copied()), stats, out)
+            }
         }
     }
 }
@@ -616,6 +675,7 @@ fn stretches<'r, 's, K: PartialEq>(
     out
 }
 
+/// One tagged block from its element's type.
 fn push_tagged_block(element: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
     match element.standard_type {
         StandardType::H1 => push_tagged_heading(1, spans, out),
@@ -675,10 +735,15 @@ fn push_tagged_paragraph(spans: &[&TextSpan], out: &mut Vec<Block>) {
     if lines.is_empty() {
         return;
     }
+    let role = if spans.iter().any(|span| in_block_quote(span)) {
+        Role::Quote
+    } else {
+        Role::Body
+    };
     out.push(Block::Paragraph {
         bbox: bbox(&lines),
         lines,
-        role: Role::Body,
+        role,
     });
 }
 
@@ -817,10 +882,9 @@ fn label_marker(label: &str) -> Marker {
 
 /// A tagged table: its rows are the TR elements below the Table, wherever
 /// THead, TBody and TFoot put them, and a row's cells its TH and TD
-/// elements, each cell one line. Spans in the table but in no row (a
-/// caption) become a paragraph ahead of the table. Column and row spans
-/// live in the elements' attributes (§14.8.5.7), which are not read, so
-/// every cell spans one.
+/// elements, each cell one line spanning the columns and rows its `ColSpan`
+/// and `RowSpan` table attributes say (§14.8.5.7). Spans in the table but
+/// in no row (a caption) become a paragraph ahead of the table.
 fn push_tagged_table(table: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut aside: Vec<&TextSpan> = Vec::new();
@@ -847,12 +911,34 @@ fn tagged_cells(row: StructureElement, spans: &[&TextSpan]) -> Vec<Cell> {
         descendant(span, row, &[StandardType::TH, StandardType::TD])
     })
     .into_iter()
-    .map(|(_, run)| Cell {
+    .map(|(cell, run)| Cell {
         line: joined_line(tagged_lines(run)),
-        colspan: 1,
-        rowspan: 1,
+        colspan: table_span(run[0], cell, "ColSpan"),
+        rowspan: table_span(run[0], cell, "RowSpan"),
     })
     .collect()
+}
+
+/// A cell's `ColSpan` or `RowSpan` (§14.8.5.7): the value the cell element's
+/// attribute objects of the standard owner `Table` (§14.8.5.2) give, the
+/// last one that has the key winning, at least 1 and at most 255; 1 for a
+/// cell with no element or no such attribute.
+///
+/// Covers ISO 32000-1 §14.8.5.2 and §14.8.5.7.
+fn table_span(span: &TextSpan, cell: Option<StructureElement>, key: &str) -> u8 {
+    let Some(cell) = cell else {
+        return 1;
+    };
+    let Some(structure) = span.structure.as_ref() else {
+        return 1;
+    };
+    structure
+        .attributes
+        .iter()
+        .rev()
+        .filter(|a| a.element == cell.object && a.standard_owner() == Some(StandardOwner::Table))
+        .find_map(|a| a.entries.get_int(key))
+        .map_or(1, |n| n.clamp(1, 255) as u8)
 }
 
 /// A cell's lines as the one line a cell carries: the texts follow one
@@ -875,6 +961,7 @@ fn joined_line(lines: Vec<Line>) -> Option<Line> {
                 text: " ".to_string(),
                 bold: false,
                 italic: false,
+                code: false,
             });
         }
         joined.inlines.extend(line.inlines);
@@ -2170,13 +2257,14 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 ///
 /// Covers ISO 32000-1 §14.8.2.5.
 fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity: usize) {
+    let code = in_code(span);
     if let Some(last) = inlines.last_mut() {
         let already_spaced =
             last.text.ends_with(char::is_whitespace) || span.text.starts_with(char::is_whitespace);
         if spaced && !already_spaced {
             last.text.push(' ');
         }
-        if last.bold == span.bold && last.italic == span.italic {
+        if last.bold == span.bold && last.italic == span.italic && last.code == code {
             last.text.push_str(&span.text);
             return;
         }
@@ -2187,7 +2275,23 @@ fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity:
         text,
         bold: span.bold,
         italic: span.italic,
+        code,
     });
+}
+
+/// Whether the span was shown inside a `Code` structure element (§14.8.4.4):
+/// computer code, which the Markdown adapter sets as inline code. The other
+/// inline-level elements (Span, Quote, Reference, BibEntry, Annot, Link,
+/// Note, Ruby, Warichu) leave their text flowing as shown.
+///
+/// Covers ISO 32000-1 §14.8.4.4.
+fn in_code(span: &TextSpan) -> bool {
+    span.structure.as_ref().is_some_and(|structure| {
+        structure
+            .path
+            .iter()
+            .any(|element| element.standard_type == StandardType::Code)
+    })
 }
 
 /// The lines' device-space box. Spans carry no glyph extents, so the top is
