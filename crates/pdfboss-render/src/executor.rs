@@ -3199,9 +3199,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// user space. Annotations flagged Hidden or NoView (§12.5.3) and
     /// `/Popup` annotations (a viewer-UI artifact) paint nothing and report
     /// nothing. An annotation with no `/AP` at all gets the appearance its
-    /// own entries describe when its subtype has one (Square and Circle,
-    /// §12.5.6.8); other annotations without a usable normal appearance
-    /// paint nothing and report nothing. An appearance that exists but
+    /// own entries describe when its subtype has one (Line, §12.5.6.7;
+    /// Square and Circle, §12.5.6.8); other annotations without a usable
+    /// normal appearance paint nothing and report nothing. An appearance
+    /// that exists but
     /// cannot be read or placed reports as a dropped annotation, so a page
     /// whose visible content is a stamp or a filled form field never
     /// rasterizes blank without saying why.
@@ -3236,20 +3237,28 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             if dict.get_name("Subtype").is_some_and(|n| n.0 == "Popup") {
                 continue;
             }
-            let stream = match self.normal_appearance(dict).await {
-                Some(stream) => stream,
+            let (stream, fit) = match self.normal_appearance(dict).await {
+                Some(stream) => {
+                    let Some(rect) = floats_from(self.src, dict.get("Rect"), 4).await else {
+                        self.skip(SkippedKind::Annotation, SkipReason::Missing);
+                        continue;
+                    };
+                    (stream, Some([rect[0], rect[1], rect[2], rect[3]]))
+                }
                 // An annotation declaring no /AP at all gets the appearance
-                // its own entries describe (§12.5.6.8); a declared appearance
-                // that could not be read was reported and is not replaced.
+                // its own entries describe (§12.5.6.7, §12.5.6.8), already in
+                // default user space so nothing is fitted; a declared
+                // appearance that could not be read was reported and is not
+                // replaced.
                 None if dict.get("AP").is_none() => {
                     match annot::synthesized(self.src, dict).await {
-                        Some(stream) => stream,
+                        Some(stream) => (stream, None),
                         None => continue,
                     }
                 }
                 None => continue,
             };
-            if let Some(frame) = self.appearance_frame(&stream, dict, &chain, base).await {
+            if let Some(frame) = self.appearance_frame(&stream, fit, &chain, base).await {
                 self.run(frame).await;
             }
         }
@@ -3305,9 +3314,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
 
     /// Builds the frame that paints one appearance stream: the form's
     /// `/BBox` corners are transformed by its `/Matrix`, their bounding box
-    /// is fitted onto the annotation's normalized `/Rect` (§12.5.5's
+    /// is fitted onto `fit`, the annotation's normalized `/Rect` (§12.5.5's
     /// appearance algorithm), and the form runs under `Matrix ∘ fit ∘ base`
-    /// with the untransformed `/BBox` as its clip. `None` reports the
+    /// with the untransformed `/BBox` as its clip. Without `fit` the
+    /// transformed box is left where it is, which is how a synthesized
+    /// appearance drawn in default user space is placed. `None` reports the
     /// annotation as dropped — every bail-out here loses a declared
     /// appearance.
     ///
@@ -3315,14 +3326,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     async fn appearance_frame(
         &mut self,
         stream: &Stream,
-        annot: &Dict,
+        fit: Option<[f32; 4]>,
         chain: &[Arc<Dict>],
         base: Matrix,
     ) -> Option<Frame> {
-        let Some(rect) = floats_from(self.src, annot.get("Rect"), 4).await else {
-            self.skip(SkippedKind::Annotation, SkipReason::Missing);
-            return None;
-        };
         let data = match content_stream_data_with(self.src, stream).await {
             Ok(data) => data,
             Err(e) => {
@@ -3371,6 +3378,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .iter()
             .map(|p| p.y)
             .fold(f32::NEG_INFINITY, f32::max);
+        let rect = fit.unwrap_or([tx0, ty0, tx1, ty1]);
         let (rx0, rx1) = (rect[0].min(rect[2]), rect[0].max(rect[2]));
         let (ry0, ry1) = (rect[1].min(rect[3]), rect[1].max(rect[3]));
         // A degenerate transformed box cannot be fitted by scaling; §12.5.5
@@ -7040,6 +7048,44 @@ mod tests {
             px(&pix, 75, 39),
             RED,
             "circle border band at the bottom edge"
+        );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.7.
+    #[test]
+    fn line_annotations_without_appearance_are_drawn() {
+        // Top: a red 4-unit line along user y 20 paints its band and nothing
+        // above it. Middle: a 2-unit line whose /LE ends in a ClosedArrow
+        // filled with /IC has a blue interior near the tip and clear page
+        // beside the arrow. Bottom: a producer wrote /Rect [0 0 0 0] (pdf.js
+        // annotation-line-without-appearance-empty-Rect.pdf); the line is
+        // still drawn where /L puts it.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Line /Rect [0 0 100 100] /L [10 20 90 20] /C [1 0 0] \
+                 /Border [0 0 4] >>",
+                "<< /Type /Annot /Subtype /Line /Rect [0 0 100 100] /L [10 60 90 60] /C [1 0 0] \
+                 /IC [0 0 1] /BS << /W 2 >> /LE [/None /ClosedArrow] >>",
+                "<< /Type /Annot /Subtype /Line /Rect [0 0 0 0] /L [10 90 90 90] /C [0 0 1] \
+                 /Border [0 0 4] >>",
+            ],
+            &[],
+        );
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 80), RED, "the line's band");
+        assert_eq!(px(&pix, 50, 74), WHITE, "above the band");
+        assert_eq!(px(&pix, 80, 40), BLUE, "inside the closed arrowhead");
+        assert_eq!(px(&pix, 84, 33), WHITE, "beside the arrowhead");
+        assert_eq!(
+            px(&pix, 50, 10),
+            BLUE,
+            "a line with an empty /Rect still paints"
         );
         assert!(
             report.is_empty(),

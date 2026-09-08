@@ -13,22 +13,35 @@ const KAPPA: f32 = 0.552_284_8;
 /// The name of the graphics state parameter dictionary carrying `/CA`.
 const OPACITY_STATE: &str = "GS";
 
-/// A form XObject painting the annotation from its own entries: `None` for
-/// a subtype whose appearance is not synthesized, or for one whose entries
-/// describe nothing to paint (no colour, or a zero-width border and no
-/// interior).
+/// A line ending's size relative to the line width, and its floor in
+/// default user space units.
+const ENDING_SCALE: f32 = 6.0;
+const ENDING_MIN: f32 = 4.0;
+
+/// A form XObject painting the annotation from its own entries, its
+/// `/BBox` in default user space: `None` for a subtype whose appearance is
+/// not synthesized, or for one whose entries describe nothing to paint (no
+/// colour, or a zero-width border and no interior).
 ///
-/// Covers ISO 32000-1 §12.5.6.8.
+/// Covers ISO 32000-1 §12.5.6.7 and §12.5.6.8.
 pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Option<Stream> {
     let subtype = annot.get_name("Subtype")?.0.clone();
-    let rect = normalized(&floats_from(src, annot.get("Rect"), 4).await?);
     let paint = Paint::read(src, annot).await;
-    let content = match subtype.as_str() {
-        "Square" => paint.shape(inner(rect, &paint.differences), false)?,
-        "Circle" => paint.shape(inner(rect, &paint.differences), true)?,
+    let (bbox, content) = match subtype.as_str() {
+        "Square" | "Circle" => {
+            let rect = normalized(&floats_from(src, annot.get("Rect"), 4).await?);
+            let content = paint.shape(inner(rect, &paint.differences), subtype == "Circle")?;
+            (rect, content)
+        }
+        "Line" => {
+            let l = floats_from(src, annot.get("L"), 4).await?;
+            let endings = Ending::pair(src, annot).await;
+            let leader = Leader::read(src, annot).await;
+            paint.line([l[0], l[1]], [l[2], l[3]], endings, leader)?
+        }
         _ => return None,
     };
-    Some(form(rect, paint.opacity, content))
+    Some(form(bbox, paint.opacity, content))
 }
 
 /// What the annotation's common entries say about how to paint it: the
@@ -57,13 +70,40 @@ impl Paint {
         }
     }
 
+    /// The stroke colour operator, when there is a colour and a width.
+    fn stroking(&self) -> Option<&str> {
+        self.stroke.as_deref().filter(|_| self.border.width > 0.0)
+    }
+
+    /// `q`, the opacity state, the colours, the width and the dash pattern:
+    /// what every synthesized content stream opens with.
+    fn preamble(&self) -> String {
+        let mut content = String::from("q\n");
+        if self.opacity.is_some() {
+            content.push_str(&format!("/{OPACITY_STATE} gs\n"));
+        }
+        if let Some(op) = self.stroking() {
+            content.push_str(op);
+            content.push('\n');
+            content.push_str(&format!("{} w\n", num(self.border.width)));
+            if !self.border.dash.is_empty() {
+                content.push_str(&format!("[{}] 0 d\n", nums(&self.border.dash)));
+            }
+        }
+        if let Some(op) = &self.fill {
+            content.push_str(op);
+            content.push('\n');
+        }
+        content
+    }
+
     /// The content that fills `rect` with the interior colour and strokes
     /// its outline, a rectangle or the inscribed ellipse, with the border
     /// drawn completely inside it (§12.5.4); `None` when nothing paints.
     ///
     /// Covers ISO 32000-1 §12.5.6.8.
     fn shape(&self, rect: [f32; 4], ellipse: bool) -> Option<String> {
-        let stroke = self.stroke.as_deref().filter(|_| self.border.width > 0.0);
+        let stroke = self.stroking();
         let operator = match (self.fill.as_deref(), stroke) {
             (Some(_), Some(_)) => "B",
             (Some(_), None) => "f",
@@ -84,24 +124,13 @@ impl Paint {
         if x1 <= x0 || y1 <= y0 {
             return None;
         }
-        let mut content = String::from("q\n");
-        if self.opacity.is_some() {
-            content.push_str(&format!("/{OPACITY_STATE} gs\n"));
-        }
-        if let Some(op) = stroke {
-            content.push_str(op);
-            content.push('\n');
-            content.push_str(&format!("{} w\n", num(self.border.width)));
-            if !self.border.dash.is_empty() {
-                content.push_str(&format!("[{}] 0 d\n", nums(&self.border.dash)));
-            }
-        }
-        if let Some(op) = &self.fill {
-            content.push_str(op);
-            content.push('\n');
-        }
+        let mut content = self.preamble();
         if ellipse {
-            content.push_str(&ellipse_path(x0, y0, x1, y1));
+            content.push_str(&ellipse_path(
+                [(x0 + x1) / 2.0, (y0 + y1) / 2.0],
+                (x1 - x0) / 2.0,
+                (y1 - y0) / 2.0,
+            ));
         } else {
             content.push_str(&format!(
                 "{} {} {} {} re\n",
@@ -114,6 +143,221 @@ impl Paint {
         content.push_str(operator);
         content.push_str("\nQ\n");
         Some(content)
+    }
+
+    /// The content of a line annotation and the box it covers: the line
+    /// from `p1` to `p2`, moved sideways by the leader length when there
+    /// are leader lines, the leader lines and their extensions, and a line
+    /// ending at each end, the closed ones filled with the interior colour.
+    /// `None` without a stroke colour and width, or for a zero-length line.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.7.
+    fn line(
+        &self,
+        p1: [f32; 2],
+        p2: [f32; 2],
+        endings: [Ending; 2],
+        leader: Leader,
+    ) -> Option<([f32; 4], String)> {
+        self.stroking()?;
+        let (dx, dy) = (p2[0] - p1[0], p2[1] - p1[1]);
+        let length = (dx * dx + dy * dy).sqrt();
+        if !length.is_finite() || length <= 0.0 {
+            return None;
+        }
+        let along = [dx / length, dy / length];
+        // Clockwise from the direction of travel: where a positive /LL goes.
+        let right = [along[1], -along[0]];
+        let shifted = |p: [f32; 2], by: f32| [p[0] + right[0] * by, p[1] + right[1] * by];
+        let a = shifted(p1, leader.length);
+        let b = shifted(p2, leader.length);
+        let mut points = vec![p1, p2, a, b];
+        let mut content = self.preamble();
+        content.push_str(&format!(
+            "{} {} m {} {} l S\n",
+            num(a[0]),
+            num(a[1]),
+            num(b[0]),
+            num(b[1])
+        ));
+        if leader.length != 0.0 {
+            let sign = leader.length.signum();
+            for p in [p1, p2] {
+                let from = shifted(p, sign * leader.offset);
+                let to = shifted(p, leader.length + sign * leader.extension);
+                content.push_str(&format!(
+                    "{} {} m {} {} l S\n",
+                    num(from[0]),
+                    num(from[1]),
+                    num(to[0]),
+                    num(to[1])
+                ));
+                points.push(from);
+                points.push(to);
+            }
+        }
+        let size = (self.border.width * ENDING_SCALE)
+            .max(ENDING_MIN)
+            .min(length);
+        for (point, outward, ending) in [
+            (a, [-along[0], -along[1]], endings[0]),
+            (b, along, endings[1]),
+        ] {
+            content.push_str(&ending.content(
+                point,
+                outward,
+                right,
+                size,
+                self.fill.is_some(),
+                &mut points,
+            ));
+        }
+        content.push_str("Q\n");
+        let margin = self.border.width + size;
+        Some((bounds(&points, margin), content))
+    }
+}
+
+/// A line ending style of Table 176.
+#[derive(Clone, Copy, PartialEq)]
+enum Ending {
+    None,
+    Square,
+    Circle,
+    Diamond,
+    OpenArrow,
+    ClosedArrow,
+    Butt,
+    ROpenArrow,
+    RClosedArrow,
+    Slash,
+}
+
+impl Ending {
+    /// The `/LE` pair, `[/None /None]` when absent or unreadable.
+    async fn pair<S: AsyncObjectSource>(src: &S, annot: &Dict) -> [Ending; 2] {
+        let Some(le) = annot.get("LE") else {
+            return [Ending::None, Ending::None];
+        };
+        let Ok(Object::Array(items)) = src.resolve(le).await else {
+            return [Ending::None, Ending::None];
+        };
+        let at = |i: usize| {
+            items
+                .get(i)
+                .and_then(Object::as_name)
+                .map_or(Ending::None, |n| Ending::named(&n.0))
+        };
+        [at(0), at(1)]
+    }
+
+    fn named(name: &str) -> Ending {
+        match name {
+            "Square" => Ending::Square,
+            "Circle" => Ending::Circle,
+            "Diamond" => Ending::Diamond,
+            "OpenArrow" => Ending::OpenArrow,
+            "ClosedArrow" => Ending::ClosedArrow,
+            "Butt" => Ending::Butt,
+            "ROpenArrow" => Ending::ROpenArrow,
+            "RClosedArrow" => Ending::RClosedArrow,
+            "Slash" => Ending::Slash,
+            _ => Ending::None,
+        }
+    }
+
+    /// The ending drawn at `point`, `outward` being the unit vector that
+    /// leaves the line there and `side` the unit vector across it; `size`
+    /// is the ending's extent. Closed shapes fill when `filled`. Every
+    /// point drawn is added to `points` for the bounding box.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.7.
+    fn content(
+        self,
+        point: [f32; 2],
+        outward: [f32; 2],
+        side: [f32; 2],
+        size: f32,
+        filled: bool,
+        points: &mut Vec<[f32; 2]>,
+    ) -> String {
+        let at = |o: f32, s: f32| {
+            [
+                point[0] + outward[0] * o + side[0] * s,
+                point[1] + outward[1] * o + side[1] * s,
+            ]
+        };
+        let half = size / 2.0;
+        let closed = if filled { "b" } else { "s" };
+        let (path, operator): (Vec<[f32; 2]>, &str) = match self {
+            Ending::None => return String::new(),
+            Ending::Square => (
+                vec![
+                    at(half, half),
+                    at(half, -half),
+                    at(-half, -half),
+                    at(-half, half),
+                ],
+                closed,
+            ),
+            Ending::Diamond => (
+                vec![at(half, 0.0), at(0.0, -half), at(-half, 0.0), at(0.0, half)],
+                closed,
+            ),
+            Ending::OpenArrow => (vec![at(-size, half), point, at(-size, -half)], "S"),
+            Ending::ClosedArrow => (vec![at(-size, half), point, at(-size, -half)], closed),
+            Ending::ROpenArrow => (vec![at(size, half), point, at(size, -half)], "S"),
+            Ending::RClosedArrow => (vec![at(size, half), point, at(size, -half)], closed),
+            Ending::Butt => (vec![at(0.0, half), at(0.0, -half)], "S"),
+            Ending::Slash => {
+                // 30 degrees clockwise from the perpendicular.
+                let (sin, cos) = (0.5, 0.866_025_4);
+                (
+                    vec![at(sin * half, cos * half), at(-sin * half, -cos * half)],
+                    "S",
+                )
+            }
+            Ending::Circle => {
+                points.push(at(half, half));
+                points.push(at(-half, -half));
+                let mut content = ellipse_path(point, half, half);
+                content.push_str(if filled { "B\n" } else { "S\n" });
+                return content;
+            }
+        };
+        points.extend_from_slice(&path);
+        let mut content = String::new();
+        for (i, p) in path.iter().enumerate() {
+            content.push_str(&format!(
+                "{} {} {}\n",
+                num(p[0]),
+                num(p[1]),
+                if i == 0 { "m" } else { "l" }
+            ));
+        }
+        content.push_str(operator);
+        content.push('\n');
+        content
+    }
+}
+
+/// The leader lines of a line annotation (Table 175): `/LL` is their
+/// length, positive on the clockwise side of the line; `/LLE` extends them
+/// past the line and `/LLO` leaves a gap at the annotation's endpoints.
+#[derive(Clone, Copy)]
+struct Leader {
+    length: f32,
+    extension: f32,
+    offset: f32,
+}
+
+impl Leader {
+    async fn read<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Leader {
+        Leader {
+            length: dict_f32(src, annot, "LL").await.unwrap_or(0.0),
+            extension: dict_f32(src, annot, "LLE").await.unwrap_or(0.0).max(0.0),
+            offset: dict_f32(src, annot, "LLO").await.unwrap_or(0.0).max(0.0),
+        }
     }
 }
 
@@ -225,10 +469,10 @@ fn inner(rect: [f32; 4], differences: &Option<[f32; 4]>) -> [f32; 4] {
     shrunk
 }
 
-/// The four Bezier arcs of the ellipse inscribed in the box, closed.
-fn ellipse_path(x0: f32, y0: f32, x1: f32, y1: f32) -> String {
-    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-    let (rx, ry) = ((x1 - x0) / 2.0, (y1 - y0) / 2.0);
+/// The four Bezier arcs of the ellipse with the given centre and radii,
+/// closed.
+fn ellipse_path(centre: [f32; 2], rx: f32, ry: f32) -> String {
+    let [cx, cy] = centre;
     let (kx, ky) = (rx * KAPPA, ry * KAPPA);
     let curve = |p1: (f32, f32), p2: (f32, f32), p: (f32, f32)| {
         format!(
@@ -266,9 +510,31 @@ fn ellipse_path(x0: f32, y0: f32, x1: f32, y1: f32) -> String {
     path
 }
 
-/// The form XObject: `/BBox` is the annotation's Rect so §12.5.5's fit is
-/// the identity, and a `/CA` below 1 becomes an `/ExtGState` the content
-/// selects first.
+/// The box around `points`, grown by `margin` on every side.
+fn bounds(points: &[[f32; 2]], margin: f32) -> [f32; 4] {
+    let mut box_ = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for p in points {
+        box_[0] = box_[0].min(p[0]);
+        box_[1] = box_[1].min(p[1]);
+        box_[2] = box_[2].max(p[0]);
+        box_[3] = box_[3].max(p[1]);
+    }
+    [
+        box_[0] - margin,
+        box_[1] - margin,
+        box_[2] + margin,
+        box_[3] + margin,
+    ]
+}
+
+/// The form XObject: `/BBox` is the box the content covers in default user
+/// space, so §12.5.5's fit is the identity, and a `/CA` below 1 becomes an
+/// `/ExtGState` the content selects first.
 fn form(bbox: [f32; 4], opacity: Option<f32>, content: String) -> Stream {
     let mut dict = Dict::new();
     dict.insert(name("Type"), Object::Name(name("XObject")));
