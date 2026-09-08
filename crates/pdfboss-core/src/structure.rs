@@ -25,7 +25,8 @@ pub struct MarkedContentId {
 }
 
 /// The four groups §14.8.4 sorts the standard structure types into, one per
-/// clause that defines them.
+/// clause that defines them; the block-level and inline-level ones are the
+/// two the basic layout model of §14.8.3 lays out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StandardKind {
     /// §14.8.4.2: elements that group other elements and hold no content
@@ -409,6 +410,10 @@ pub struct Placement {
     /// The language (`/Lang`, §14.9.2) of the element, or of the nearest
     /// ancestor that declares one; `None` leaves the document's own.
     pub lang: Option<String>,
+    /// The expansion (`/E`, §14.9.5) of the abbreviation or acronym the
+    /// element's text is, or the nearest ancestor's, decoded as a text
+    /// string.
+    pub expansion: Option<String>,
     /// Every attribute object of the element and its ancestors (§14.7.5),
     /// the root's child's first; for one element, the objects its `/C`
     /// classes name come before its direct `/A` objects, so a later object
@@ -419,9 +424,11 @@ pub struct Placement {
 impl Placement {
     /// The value `key` takes for `element` among its attribute objects of
     /// `owner`: the last object that has the key wins, so a direct `/A`
-    /// object overrides a class's and a later class an earlier one.
+    /// object overrides a class's and a later class an earlier one, the
+    /// order §14.8.5.3 gives the standard attributes. Inheritance from an
+    /// ancestor is the caller's, since only some attributes inherit.
     ///
-    /// Covers ISO 32000-1 §14.7.5 and §14.7.5.2.
+    /// Covers ISO 32000-1 §14.7.5, §14.7.5.2, §14.8.5 and §14.8.5.3.
     pub fn attribute(&self, element: ObjRef, owner: &str, key: &str) -> Option<&Object> {
         self.attributes
             .iter()
@@ -576,6 +583,7 @@ impl StructureTree {
                 .collect();
             let alt = ancestry.iter().rev().find_map(|a| a.alt.clone());
             let lang = ancestry.iter().rev().find_map(|a| a.lang.clone());
+            let expansion = ancestry.iter().rev().find_map(|a| a.expansion.clone());
             let attributes = ancestry
                 .into_iter()
                 .flat_map(|ancestor| ancestor.attributes)
@@ -590,6 +598,7 @@ impl StructureTree {
                     path,
                     alt,
                     lang,
+                    expansion,
                     attributes,
                 },
             );
@@ -606,6 +615,7 @@ struct Ancestor {
     structure_type: Option<String>,
     alt: Option<String>,
     lang: Option<String>,
+    expansion: Option<String>,
     revision: i64,
     attributes: Vec<AttributeObject>,
 }
@@ -702,7 +712,8 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// elements; the dictionaries are the ones [`Walk::path_of`] already
     /// read.
     ///
-    /// Covers ISO 32000-1 §14.7.3, §14.7.5, §14.8.4.3, §14.9.2 and §14.9.3.
+    /// Covers ISO 32000-1 §14.7.3, §14.7.5, §14.8.4.3, §14.9.2, §14.9.3 and
+    /// §14.9.5.
     async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
         let mut chain: Ancestry = Vec::new();
         let mut current = element;
@@ -718,12 +729,17 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
                 Some(lang) => self.text_string(lang).await,
                 None => None,
             };
+            let expansion = match dict.get("E") {
+                Some(expansion) => self.text_string(expansion).await,
+                None => None,
+            };
             let attributes = self.attribute_objects(current, &dict).await;
             chain.push(Ancestor {
                 object: current,
                 structure_type: dict.get_name("S").map(|n| n.0.clone()),
                 alt,
                 lang,
+                expansion,
                 revision: dict.get_int("R").unwrap_or(0),
                 attributes,
             });
@@ -1313,6 +1329,50 @@ mod tests {
         assert_eq!(placed[&id(0, 0)].alt.as_deref(), Some("A chart"));
         assert_eq!(placed[&id(0, 1)].alt, None);
         assert_eq!(placed[&id(0, 2)].alt.as_deref(), Some("\u{e9}"));
+    }
+
+    // Covers ISO 32000-1 §14.9.5.
+    #[test]
+    fn placements_carry_the_nearest_expansion() {
+        // A Span with /E holding a Span with id 0; a P with no /E anywhere
+        // above it holding id 1; a Span with a UTF-16 /E holding id 2.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 15 0 R 16 0 R] >>",
+                ),
+                (12, "<< /Nums [0 [14 0 R 15 0 R 16 0 R]] >>"),
+                (
+                    13,
+                    "<< /Type /StructElem /S /Span /P 11 0 R /E (Portable Document Format) /K [14 0 R] >>",
+                ),
+                (
+                    14,
+                    "<< /Type /StructElem /S /Span /P 13 0 R /Pg 3 0 R /K [0] >>",
+                ),
+                (
+                    15,
+                    "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [1] >>",
+                ),
+                (
+                    16,
+                    "<< /Type /StructElem /S /Span /P 11 0 R /Pg 3 0 R /K [2] /E <FEFF00C9> >>",
+                ),
+            ],
+        );
+        let placed = placements(&doc, &[id(0, 0), id(0, 1), id(0, 2)]);
+        assert_eq!(
+            placed[&id(0, 0)].expansion.as_deref(),
+            Some("Portable Document Format")
+        );
+        assert_eq!(placed[&id(0, 1)].expansion, None);
+        assert_eq!(placed[&id(0, 2)].expansion.as_deref(), Some("\u{c9}"));
     }
 
     // Covers ISO 32000-1 §14.9.2 and §14.9.2.3.

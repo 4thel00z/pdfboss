@@ -153,12 +153,12 @@ def chapter7 : List Feature := [
     note := "No /CI collection item dictionaries are read or written." },
   { ref := .clause [7, 11, 7], title := "Maintenance of File Specifications", status := .outOfScope,
     note := "This clause describes how applications that move or rename files keep specifications valid, a file-management duty pdfboss has no role in." },
-  { ref := .clause [7, 12, 2], title := "Developer Extensions Dictionary", status := .notImplemented,
-    note := "The catalog /Extensions dictionary is never read or written." },
-  { ref := .clause [7, 12, 3], title := "BaseVersion", status := .notImplemented,
-    note := "No /BaseVersion handling exists; only the header version is reported (document.rs)." },
-  { ref := .clause [7, 12, 4], title := "ExtensionLevel", status := .notImplemented,
-    note := "No /ExtensionLevel handling exists." }
+  { ref := .clause [7, 12, 2], title := "Developer Extensions Dictionary", status := .implemented,
+    note := "crates/pdfboss-core/src/extension.rs extensions_with reads the catalog's /Extensions dictionary into one DeveloperExtension per developer prefix (Table 50: the prefix is the key, /BaseVersion a name, /ExtensionLevel an integer; the dictionary's own /Type entry and an entry missing either value are skipped, indirect objects followed although the clause asks for direct ones, the result sorted by prefix since a dictionary keeps no order); Document::extensions and AsyncDocument::extensions expose it and the CLI's info command prints each extension after the version (tests extension.rs the_catalog_extensions_are_read_sorted_by_prefix with the clause's EXAMPLE 3, crates/pdfboss-aio/tests/parity.rs, crates/pdfboss-cli/src/main.rs info_text_lists_developer_extensions). Not exposed to Python; pdfboss-write emits no extensions dictionary." },
+  { ref := .clause [7, 12, 3], title := "BaseVersion", status := .implemented,
+    note := "DeveloperExtension::base_version keeps the /BaseVersion name as written and DeveloperExtension::base_version_numbers reads it as the two integers around a period the clause prescribes, not as a real number, None for anything else (test extension.rs base_versions_are_two_integers). The clause's requirement that the base version not exceed the header or catalog version is not checked." },
+  { ref := .clause [7, 12, 4], title := "ExtensionLevel", status := .implemented,
+    note := "DeveloperExtension::extension_level carries the /ExtensionLevel integer of each developer extensions dictionary, read with 7.12.2 (test extension.rs the_catalog_extensions_are_read_sorted_by_prefix: the levels 3 and 1002 of the clause's EXAMPLE 3). Ordering the levels over time is the developer's business and nothing pdfboss checks." }
 ]
 
 end Iso32000.Catalogue
