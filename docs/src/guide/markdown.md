@@ -25,7 +25,10 @@ The analysis infers:
   blocks on every page the tree reaches (ISO 32000-1 14.8.4.3): H1 to H6 are
   headings at that level, H a heading as deep as its Part, Art and Sect
   elements nest, L a list with one item per LI and the Lbl text as the
-  marker, Table a table with a row per TR and a cell per TH or TD spanning
+  marker (read as a number, a letter or a Roman numeral when the list's
+  `ListNumbering` attribute names that numbering system, an unlabelled item
+  continuing the count), Table a table with a row per TR and a cell per TH
+  or TD spanning
   what its `ColSpan` and `RowSpan` attributes say, and every other
   block-level element a paragraph; a Caption or a TOC entry is a paragraph of
   its own, the text of Figures, Formulas and Forms is laid out by the

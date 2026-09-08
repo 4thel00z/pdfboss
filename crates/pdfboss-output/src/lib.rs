@@ -391,6 +391,120 @@ mod tests {
         assert_eq!(md, "- One\n- Two");
     }
 
+    /// Three tagged lists with a `ListNumbering` attribute: an UpperAlpha
+    /// list whose Lbl elements read A. and B., a Decimal list whose items
+    /// have no Lbl and no marker in their text, and a LowerRoman list whose
+    /// Lbl elements read ii. and iv.
+    fn tagged_numbered_lists_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str, extra: &str) {
+            b.object(
+                num,
+                &format!(
+                    "<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} {extra} >>"
+                ),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /Lbl << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (A.) Tj EMC \
+              /LBody << /MCID 1 >> BDC 1 0 0 1 90 700 Tm (First) Tj EMC \
+              /Lbl << /MCID 2 >> BDC 1 0 0 1 72 686 Tm (B.) Tj EMC \
+              /LBody << /MCID 3 >> BDC 1 0 0 1 90 686 Tm (Second) Tj EMC \
+              /LBody << /MCID 4 >> BDC 1 0 0 1 72 650 Tm (Three) Tj EMC \
+              /LBody << /MCID 5 >> BDC 1 0 0 1 72 636 Tm (Four) Tj EMC \
+              /Lbl << /MCID 6 >> BDC 1 0 0 1 72 600 Tm (ii.) Tj EMC \
+              /LBody << /MCID 7 >> BDC 1 0 0 1 90 600 Tm (Five) Tj EMC \
+              /Lbl << /MCID 8 >> BDC 1 0 0 1 72 586 Tm (iv.) Tj EMC \
+              /LBody << /MCID 9 >> BDC 1 0 0 1 90 586 Tm (Six) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 20 0 R 25 0 R] >>",
+        );
+        b.object(
+            12,
+            "<< /Nums [0 [15 0 R 16 0 R 18 0 R 19 0 R 22 0 R 24 0 R 27 0 R 28 0 R 30 0 R 31 0 R]] >>",
+        );
+        element(
+            &mut b,
+            13,
+            "L",
+            11,
+            "[14 0 R 17 0 R]",
+            "/A << /O /List /ListNumbering /UpperAlpha >>",
+        );
+        element(&mut b, 14, "LI", 13, "[15 0 R 16 0 R]", "");
+        element(&mut b, 15, "Lbl", 14, "[0]", "");
+        element(&mut b, 16, "LBody", 14, "[1]", "");
+        element(&mut b, 17, "LI", 13, "[18 0 R 19 0 R]", "");
+        element(&mut b, 18, "Lbl", 17, "[2]", "");
+        element(&mut b, 19, "LBody", 17, "[3]", "");
+        element(
+            &mut b,
+            20,
+            "L",
+            11,
+            "[21 0 R 23 0 R]",
+            "/A << /O /List /ListNumbering /Decimal >>",
+        );
+        element(&mut b, 21, "LI", 20, "[22 0 R]", "");
+        element(&mut b, 22, "LBody", 21, "[4]", "");
+        element(&mut b, 23, "LI", 20, "[24 0 R]", "");
+        element(&mut b, 24, "LBody", 23, "[5]", "");
+        element(
+            &mut b,
+            25,
+            "L",
+            11,
+            "[26 0 R 29 0 R]",
+            "/A << /O /List /ListNumbering /LowerRoman >>",
+        );
+        element(&mut b, 26, "LI", 25, "[27 0 R 28 0 R]", "");
+        element(&mut b, 27, "Lbl", 26, "[6]", "");
+        element(&mut b, 28, "LBody", 26, "[7]", "");
+        element(&mut b, 29, "LI", 25, "[30 0 R 31 0 R]", "");
+        element(&mut b, 30, "Lbl", 29, "[8]", "");
+        element(&mut b, 31, "LBody", 29, "[9]", "");
+        b.build(1)
+    }
+
+    /// A list whose `ListNumbering` names a numbering system is numbered:
+    /// an item by the number its label writes in that system, an unlabelled
+    /// item by the number after the previous item's, so alphabetic and Roman
+    /// labels and unlabelled items come out numbered.
+    // Covers ISO 32000-1 §14.8.5.5.
+    #[test]
+    fn list_numbering_numbers_the_items_of_a_numbered_list() {
+        let doc = Document::load(tagged_numbered_lists_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(
+            md,
+            "1. First\n2. Second\n\n1. Three\n2. Four\n\n2. Five\n4. Six"
+        );
+    }
+
     /// One list item whose Lbl sits on a line of its own and whose LBody
     /// holds a nested list with a dash label.
     fn tagged_nested_list_doc() -> Vec<u8> {

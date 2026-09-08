@@ -774,9 +774,15 @@ fn descendant(
 /// lines, so plain text keeps the glyph, and the Markdown adapter opens the
 /// item on the line after it. A nested list's content stays inside the
 /// item holding it. Spans in the L but in no LI (a caption) become a
-/// paragraph where they stand, closing the list before them.
+/// paragraph where they stand, closing the list before them. A list whose
+/// `ListNumbering` attribute names a numbering system (§14.8.5.5) is
+/// numbered: an item by the number its label writes in that system, an
+/// unlabelled item by the number after the previous item's
+/// ([`numbered_marker`]).
 fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+    let numbering = spans.first().and_then(|span| list_numbering(span, list));
     let mut items: Vec<ListItem> = Vec::new();
+    let mut next: u32 = 1;
     for (item, run) in stretches(spans, |span| descendant(span, list, &[StandardType::LI])) {
         let Some(item) = item else {
             push_tagged_list_items(&mut items, out);
@@ -793,6 +799,13 @@ fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<B
             .map(|span| span.text.trim())
             .collect();
         let (marker, marker_len) = tagged_marker(&label, first);
+        let marker = match numbering {
+            Some(numbering) => numbered_marker(&label, marker, numbering, next),
+            None => marker,
+        };
+        if let Marker::Number(n) = marker {
+            next = n.saturating_add(1);
+        }
         items.push(ListItem {
             marker,
             marker_len,
@@ -811,6 +824,145 @@ fn push_tagged_list_items(items: &mut Vec<ListItem>, out: &mut Vec<Block>) {
         bbox: bbox(items.iter().flat_map(|item| &item.lines)),
         items,
     });
+}
+
+/// The numbering systems a list's `ListNumbering` attribute can name
+/// (§14.8.5.5, Table 347); `None` and the bullet symbols `Disc`, `Circle`
+/// and `Square` name none.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ListNumbering {
+    Decimal,
+    UpperRoman,
+    LowerRoman,
+    UpperAlpha,
+    LowerAlpha,
+}
+
+impl ListNumbering {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Decimal" => Some(Self::Decimal),
+            "UpperRoman" => Some(Self::UpperRoman),
+            "LowerRoman" => Some(Self::LowerRoman),
+            "UpperAlpha" => Some(Self::UpperAlpha),
+            "LowerAlpha" => Some(Self::LowerAlpha),
+            _ => None,
+        }
+    }
+}
+
+/// A list's numbering system (§14.8.5.5): the `ListNumbering` the L
+/// element's attribute objects of the standard owner `List` (§14.8.5.2)
+/// give, the last one that has the key winning; `None` for a bullet symbol,
+/// for `None` itself and for a list with no such attribute, whose markers
+/// stay with the labels and lines.
+///
+/// Covers ISO 32000-1 §14.8.5.2 and §14.8.5.5.
+fn list_numbering(span: &TextSpan, list: StructureElement) -> Option<ListNumbering> {
+    let structure = span.structure.as_ref()?;
+    structure
+        .attributes
+        .iter()
+        .rev()
+        .filter(|a| a.element == list.object && a.standard_owner() == Some(StandardOwner::List))
+        .find_map(|a| a.entries.get_name("ListNumbering"))
+        .and_then(|name| ListNumbering::from_name(&name.0))
+}
+
+/// An item's marker in a list with a numbering system: the number its label
+/// writes in that system; for an item with no label, the number its line
+/// opens with, else `next`; a label outside the system (a lettered sub-item
+/// in a Decimal list) keeps the marker [`tagged_marker`] read.
+///
+/// Covers ISO 32000-1 §14.8.5.5.
+fn numbered_marker(label: &str, marker: Marker, numbering: ListNumbering, next: u32) -> Marker {
+    if let Some(n) = numbered_label(label, numbering) {
+        return Marker::Number(n);
+    }
+    if !label.is_empty() {
+        return marker;
+    }
+    match marker {
+        Marker::Number(n) => Marker::Number(n),
+        Marker::Bullet => Marker::Number(next),
+    }
+}
+
+/// The number a label writes in a numbering system, the label closed by `.`
+/// or `)` or by nothing: decimal digits; a letter of the system's case,
+/// repeated past Z (A is 1, Z 26, AA 27); Roman numerals of the system's
+/// case. `None` for a label outside the system.
+///
+/// Covers ISO 32000-1 §14.8.5.5.
+fn numbered_label(label: &str, numbering: ListNumbering) -> Option<u32> {
+    let body = label
+        .strip_suffix('.')
+        .or_else(|| label.strip_suffix(')'))
+        .unwrap_or(label);
+    if body.is_empty() {
+        return None;
+    }
+    match numbering {
+        ListNumbering::Decimal => body
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            .then(|| body.parse().ok())
+            .flatten(),
+        ListNumbering::UpperAlpha => alpha_label(body, true),
+        ListNumbering::LowerAlpha => alpha_label(body, false),
+        ListNumbering::UpperRoman => roman_label(body, true),
+        ListNumbering::LowerRoman => roman_label(body, false),
+    }
+}
+
+/// One letter of the given case, repeated: A is 1, Z 26, AA 27.
+fn alpha_label(body: &str, upper: bool) -> Option<u32> {
+    let mut chars = body.chars();
+    let first = chars.next()?;
+    let in_case = if upper {
+        first.is_ascii_uppercase()
+    } else {
+        first.is_ascii_lowercase()
+    };
+    if !in_case || !chars.all(|c| c == first) {
+        return None;
+    }
+    let letter = u32::from(first.to_ascii_uppercase()) - u32::from('A') + 1;
+    Some((body.len() as u32 - 1) * 26 + letter)
+}
+
+/// Roman numerals of the given case, a numeral before a larger one
+/// subtracted (IV is 4, XC 90).
+fn roman_label(body: &str, upper: bool) -> Option<u32> {
+    let mut total: i64 = 0;
+    let mut previous: i64 = 0;
+    for c in body.chars().rev() {
+        let in_case = if upper {
+            c.is_ascii_uppercase()
+        } else {
+            c.is_ascii_lowercase()
+        };
+        if !in_case {
+            return None;
+        }
+        let value = match c.to_ascii_uppercase() {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => return None,
+        };
+        if value < previous {
+            total -= value;
+        } else {
+            total += value;
+            previous = value;
+        }
+    }
+    u32::try_from(total).ok().filter(|n| *n > 0)
 }
 
 /// Whether a span is the item's own label: the first Lbl or L below the
@@ -3560,5 +3712,29 @@ pub(crate) mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 30);
         assert_eq!(lines[0], "10 Partyaa Nameebb Row0");
+    }
+
+    /// A label is read in the list's numbering system and only in it:
+    /// digits for Decimal, letters of the system's case (repeated past Z)
+    /// for the alphabetic systems, numerals of the system's case for the
+    /// Roman ones, each closed by `.` or `)` or by nothing.
+    // Covers ISO 32000-1 §14.8.5.5.
+    #[test]
+    fn labels_are_read_in_the_list_s_numbering_system() {
+        assert_eq!(numbered_label("3.", ListNumbering::Decimal), Some(3));
+        assert_eq!(numbered_label("A.", ListNumbering::Decimal), None);
+        assert_eq!(numbered_label("B)", ListNumbering::UpperAlpha), Some(2));
+        assert_eq!(numbered_label("AA", ListNumbering::UpperAlpha), Some(27));
+        assert_eq!(numbered_label("b.", ListNumbering::UpperAlpha), None);
+        assert_eq!(numbered_label("c.", ListNumbering::LowerAlpha), Some(3));
+        assert_eq!(numbered_label("iv.", ListNumbering::LowerRoman), Some(4));
+        assert_eq!(numbered_label("xiv", ListNumbering::LowerRoman), Some(14));
+        assert_eq!(numbered_label("IV.", ListNumbering::LowerRoman), None);
+        assert_eq!(
+            numbered_label("MCMXC.", ListNumbering::UpperRoman),
+            Some(1990)
+        );
+        assert_eq!(numbered_label("", ListNumbering::Decimal), None);
+        assert_eq!(numbered_label("-", ListNumbering::Decimal), None);
     }
 }
