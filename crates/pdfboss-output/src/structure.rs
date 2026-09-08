@@ -817,10 +817,9 @@ fn label_marker(label: &str) -> Marker {
 
 /// A tagged table: its rows are the TR elements below the Table, wherever
 /// THead, TBody and TFoot put them, and a row's cells its TH and TD
-/// elements, each cell one line. Spans in the table but in no row (a
-/// caption) become a paragraph ahead of the table. Column and row spans
-/// live in the elements' attributes (§14.8.5.7), which are not read, so
-/// every cell spans one.
+/// elements, each cell one line spanning the columns and rows its `ColSpan`
+/// and `RowSpan` table attributes say (§14.8.5.7). Spans in the table but
+/// in no row (a caption) become a paragraph ahead of the table.
 fn push_tagged_table(table: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut aside: Vec<&TextSpan> = Vec::new();
@@ -847,12 +846,34 @@ fn tagged_cells(row: StructureElement, spans: &[&TextSpan]) -> Vec<Cell> {
         descendant(span, row, &[StandardType::TH, StandardType::TD])
     })
     .into_iter()
-    .map(|(_, run)| Cell {
+    .map(|(cell, run)| Cell {
         line: joined_line(tagged_lines(run)),
-        colspan: 1,
-        rowspan: 1,
+        colspan: table_span(run[0], cell, "ColSpan"),
+        rowspan: table_span(run[0], cell, "RowSpan"),
     })
     .collect()
+}
+
+/// A cell's `ColSpan` or `RowSpan` (§14.8.5.7): the value the cell element's
+/// attribute objects with owner `Table` give, the last one that has the key
+/// winning, at least 1 and at most 255; 1 for a cell with no element or no
+/// such attribute.
+///
+/// Covers ISO 32000-1 §14.8.5.7.
+fn table_span(span: &TextSpan, cell: Option<StructureElement>, key: &str) -> u8 {
+    let Some(cell) = cell else {
+        return 1;
+    };
+    let Some(structure) = span.structure.as_ref() else {
+        return 1;
+    };
+    structure
+        .attributes
+        .iter()
+        .rev()
+        .filter(|a| a.element == cell.object && a.owner == "Table")
+        .find_map(|a| a.entries.get_int(key))
+        .map_or(1, |n| n.clamp(1, 255) as u8)
 }
 
 /// A cell's lines as the one line a cell carries: the texts follow one

@@ -411,6 +411,7 @@ async fn structure_order<S: AsyncObjectSource>(
             span.structure = Some(Structure {
                 standard_type: placement.standard_type,
                 path: placement.path.clone(),
+                attributes: placement.attributes.clone(),
             });
             if span.alt.is_none() {
                 span.alt.clone_from(&placement.alt);

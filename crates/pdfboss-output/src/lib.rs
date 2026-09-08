@@ -455,6 +455,78 @@ mod tests {
         assert_eq!(md, "- Outer\n\u{2013} Inner");
     }
 
+    /// A tagged table whose cells declare `ColSpan` and `RowSpan` through
+    /// their attribute objects.
+    fn tagged_spanning_table_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str, extra: &str) {
+            b.object(
+                num,
+                &format!(
+                    "<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} {extra} >>"
+                ),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /TD << /MCID 0 >> BDC 1 0 0 1 72 600 Tm (a) Tj EMC \
+              /TD << /MCID 1 >> BDC 1 0 0 1 72 586 Tm (c) Tj EMC \
+              /TD << /MCID 2 >> BDC 1 0 0 1 200 586 Tm (d) Tj EMC \
+              /TD << /MCID 3 >> BDC 1 0 0 1 200 572 Tm (e) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [20 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [23 0 R 25 0 R 26 0 R 28 0 R]] >>");
+        element(&mut b, 20, "Table", 11, "[21 0 R 22 0 R 27 0 R]", "");
+        element(&mut b, 21, "TR", 20, "[23 0 R]", "");
+        element(&mut b, 23, "TD", 21, "[0]", "/A << /O /Table /ColSpan 2 >>");
+        element(&mut b, 22, "TR", 20, "[25 0 R 26 0 R]", "");
+        element(&mut b, 25, "TD", 22, "[1]", "/A << /O /Table /RowSpan 2 >>");
+        element(&mut b, 26, "TD", 22, "[2]", "");
+        element(&mut b, 27, "TR", 20, "[28 0 R]", "");
+        element(&mut b, 28, "TD", 27, "[3]", "");
+        b.build(1)
+    }
+
+    /// The cells' `ColSpan` and `RowSpan` reach the table, which renders as
+    /// HTML because pipe tables cannot say either.
+    // Covers ISO 32000-1 §14.8.5.7.
+    #[test]
+    fn tagged_cells_carry_their_column_and_row_spans() {
+        let doc = Document::load(tagged_spanning_table_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(
+            md,
+            "<table>\n<tr><td colspan=\"2\">a</td></tr>\n\
+             <tr><td rowspan=\"2\">c</td><td>d</td></tr>\n<tr><td>e</td></tr>\n</table>"
+        );
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "a\nc d\ne");
+    }
+
     /// The same page in content order goes through the layout heuristics,
     /// which see no heading, one paragraph and no table.
     // Covers ISO 32000-1 §14.8.4.3.

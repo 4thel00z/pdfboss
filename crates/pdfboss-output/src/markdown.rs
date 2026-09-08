@@ -127,14 +127,18 @@ fn strip_marker(line: &Line, chars: usize) -> Vec<Inline> {
     out
 }
 
-/// Pipes while every cell stands in one column, HTML as soon as one does
-/// not: GFM's pipe table has no way to say colspan, and an evaluator reading
-/// a merged cell reads it off that attribute.
+/// Pipes while every cell stands in one column and one row, HTML as soon
+/// as one does not: GFM's pipe table has no way to say colspan or rowspan,
+/// and an evaluator reading a merged cell reads it off that attribute.
 ///
 /// Cells carry no emphasis. A table's markers are pure edit distance against
 /// ground truth that carries none, exactly as in a heading.
 fn table(rows: &[Vec<Cell>]) -> String {
-    if rows.iter().flatten().any(|cell| cell.colspan > 1) {
+    if rows
+        .iter()
+        .flatten()
+        .any(|cell| cell.colspan > 1 || cell.rowspan > 1)
+    {
         return html_table(rows);
     }
     pipe_table(rows)
@@ -185,10 +189,14 @@ fn html_table(rows: &[Vec<Cell>]) -> String {
 
 fn html_cell(cell: &Cell) -> String {
     let text = html_escape(&cell_text(cell));
-    if cell.colspan <= 1 {
-        return format!("<td>{text}</td>");
+    let mut attributes = String::new();
+    if cell.colspan > 1 {
+        attributes.push_str(&format!(" colspan=\"{}\"", cell.colspan));
     }
-    format!("<td colspan=\"{}\">{text}</td>", cell.colspan)
+    if cell.rowspan > 1 {
+        attributes.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
+    }
+    format!("<td{attributes}>{text}</td>")
 }
 
 /// The three characters that would otherwise open markup of their own.
