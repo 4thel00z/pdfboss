@@ -56,7 +56,7 @@ def chapter12 : List Feature := [
   { ref := .clause [12, 5, 6, 9], title := "Polygon and Polyline Annotations", status := .incomplete,
     note := "Painted only through the group /AP path; /Vertices, /LE, /BE, /IC, /IT and /Measure are ignored." },
   { ref := .clause [12, 5, 6, 10], title := "Text Markup Annotations", status := .incomplete,
-    note := "Painted only through the group /AP path; /QuadPoints are never read, so highlights, underlines, squiggles and strike-outs without /AP paint nothing and text extraction does not report marked-up spans." },
+    note := "Painted only through the group /AP path (no appearance from QuadPoints alone). crates/pdfboss-text/src/decorations.rs markup_annotations reads `/Underline`, `/StrikeOut` and `/Highlight` (QuadPoints or Rect) onto TextSpan flags; `/Link` and `/Squiggly` are ignored (tests crates/pdfboss-text/src/lib.rs a_highlight_annotation_marks_the_span, a_strikeout_annotation_marks_the_span, an_underline_annotation_marks_the_span, a_link_annotation_does_not_mark_the_span)." },
   { ref := .clause [12, 5, 6, 11], title := "Caret Annotations", status := .incomplete,
     note := "Painted only through the group /AP path; /RD and /Sy are ignored." },
   { ref := .clause [12, 5, 6, 12], title := "/Stamp annotations", status := .implemented,

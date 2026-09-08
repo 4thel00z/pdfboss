@@ -257,6 +257,8 @@ pub(crate) fn filled_rect_bbox(device: &[Point]) -> Option<Rect> {
 
 /// Reads `/Annots` and keeps Underline / StrikeOut / Highlight. Link and
 /// unknown subtypes are skipped; one unreadable annot never fails the page.
+///
+/// Covers ISO 32000-1 §12.5.6.10.
 pub(crate) async fn markup_annotations<S: AsyncObjectSource>(src: &S, page: &Page) -> Vec<Markup> {
     let Some(annots) = page.dict().get("Annots") else {
         return Vec::new();
@@ -309,7 +311,9 @@ async fn read_rect<S: AsyncObjectSource>(src: &S, obj: Option<&Object>) -> Optio
 
 async fn read_quads<S: AsyncObjectSource>(src: &S, obj: Option<&Object>) -> Vec<Rect> {
     let nums = read_numbers(src, obj).await;
-    nums.chunks_exact(8)
+    nums.as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| {
             let xs = [c[0], c[2], c[4], c[6]];
             let ys = [c[1], c[3], c[5], c[7]];

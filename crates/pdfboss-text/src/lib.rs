@@ -1063,6 +1063,8 @@ mod tests {
     }
 
     /// `/Highlight` annotations fold into the same highlight flag.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.10.
     #[test]
     fn a_highlight_annotation_marks_the_span() {
         let doc = annot_doc("Highlight", "/QuadPoints [70 735 120 735 70 710 120 710]");
@@ -1074,6 +1076,8 @@ mod tests {
     }
 
     /// `/StrikeOut` annotations fold into strikethrough.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.10.
     #[test]
     fn a_strikeout_annotation_marks_the_span() {
         let doc = annot_doc("StrikeOut", "");
@@ -1083,6 +1087,8 @@ mod tests {
     }
 
     /// `/Underline` annotations fold into underline.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.10.
     #[test]
     fn an_underline_annotation_marks_the_span() {
         let doc = annot_doc("Underline", "");
@@ -1092,6 +1098,8 @@ mod tests {
     }
 
     /// `/Link` annotations are ignored — they must not error or set flags.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.10.
     #[test]
     fn a_link_annotation_does_not_mark_the_span() {
         let doc = annot_doc("Link", "/A << /S /URI /URI (https://example.com) >>");
