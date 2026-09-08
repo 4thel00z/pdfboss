@@ -222,6 +222,13 @@ pub struct TextSpan {
     /// `/Lang` of the nearest structure element above it. `None` leaves the
     /// document's own language, `Document::language`.
     pub lang: Option<String>,
+    /// The expansion of the abbreviation or acronym the span shows (ISO
+    /// 32000-1 §14.9.5): the `/E` of the innermost marked-content sequence
+    /// it was shown inside that has one, else, under
+    /// [`ReadingOrder::StructureTree`], the `/E` of the nearest structure
+    /// element above it. Like `alt`, a description: `text` stays what was
+    /// shown.
+    pub expansion: Option<String>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -1733,6 +1740,49 @@ mod tests {
         assert_eq!(spans[2].alt, None);
         let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans.iter().all(|span| span.alt.is_none()));
+    }
+
+    /// A sequence's `/E`, inline or named, reaches every span shown inside
+    /// it as the expansion of the abbreviation shown, the shown text staying
+    /// what it is.
+    // Covers ISO 32000-1 §14.9.5.
+    #[test]
+    fn expansions_from_property_lists_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /E (Portable Document Format) >> BDC (PDF) Tj EMC \
+              /Span /Named BDC (ISO) Tj EMC (plain) Tj ET",
+            "/Named << /E <FEFF00C9> >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(texts(&spans), ["PDF", "ISO", "plain"]);
+        assert_eq!(
+            spans[0].expansion.as_deref(),
+            Some("Portable Document Format")
+        );
+        assert_eq!(spans[1].expansion.as_deref(), Some("\u{c9}"));
+        assert_eq!(spans[2].expansion, None);
+    }
+
+    /// Under structure-tree order a span with no expansion of its own takes
+    /// the nearest structure element's `/E`.
+    // Covers ISO 32000-1 §14.9.5.
+    #[test]
+    fn expansions_from_structure_elements_reach_the_spans() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /Span /P 11 0 R /Pg 3 0 R /K [0 2] /E (Left column) >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["L1", "L2", "R1", "R2"]);
+        assert_eq!(spans[0].expansion.as_deref(), Some("Left column"));
+        assert_eq!(spans[1].expansion.as_deref(), Some("Left column"));
+        assert_eq!(spans[2].expansion, None);
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans.iter().all(|span| span.expansion.is_none()));
     }
 
     /// A sequence's `/Lang` reaches every span shown inside it; under
