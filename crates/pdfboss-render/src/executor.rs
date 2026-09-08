@@ -7149,7 +7149,7 @@ mod tests {
     #[test]
     fn ink_annotations_without_appearance_are_drawn() {
         // Three paths in one /InkList: a horizontal stroke along user y 30,
-        // an L-shaped one, and a single point; the strokes paint in /C at
+        // one bent like an L, and a single point; the strokes paint in /C at
         // the /BS width, the point becomes a round dot of that width, the
         // page between them stays white, and an unnormalized /Rect (pdf.js
         // annotation-ink-without-appearance.pdf writes x1 < x0) does not

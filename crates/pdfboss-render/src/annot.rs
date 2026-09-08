@@ -34,7 +34,7 @@ pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> 
     let (bbox, content) = match subtype.as_str() {
         "Square" | "Circle" => {
             let rect = normalized(&floats_from(src, annot.get("Rect"), 4).await?);
-            let content = paint.shape(inner(rect, &paint.differences), subtype == "Circle")?;
+            let content = paint.outline(inner(rect, &paint.differences), subtype == "Circle")?;
             (rect, content)
         }
         "Line" => {
@@ -125,7 +125,7 @@ impl Paint {
     /// drawn completely inside it (§12.5.4); `None` when nothing paints.
     ///
     /// Covers ISO 32000-1 §12.5.6.8.
-    fn shape(&self, rect: [f32; 4], ellipse: bool) -> Option<String> {
+    fn outline(&self, rect: [f32; 4], ellipse: bool) -> Option<String> {
         let stroke = self.stroking();
         let operator = match (self.fill.as_deref(), stroke) {
             (Some(_), Some(_)) => "B",
@@ -489,7 +489,7 @@ impl Ending {
 
     /// The ending drawn at `point`, `outward` being the unit vector that
     /// leaves the line there and `side` the unit vector across it; `size`
-    /// is the ending's extent. Closed shapes fill when `filled`. Every
+    /// is the ending's extent. Closed endings fill when `filled`. Every
     /// point drawn is added to `points` for the bounding box.
     ///
     /// Covers ISO 32000-1 §12.5.6.7.
