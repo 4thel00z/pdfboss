@@ -424,9 +424,11 @@ pub struct Placement {
 impl Placement {
     /// The value `key` takes for `element` among its attribute objects of
     /// `owner`: the last object that has the key wins, so a direct `/A`
-    /// object overrides a class's and a later class an earlier one.
+    /// object overrides a class's and a later class an earlier one, the
+    /// order §14.8.5.3 gives the standard attributes. Inheritance from an
+    /// ancestor is the caller's, since only some attributes inherit.
     ///
-    /// Covers ISO 32000-1 §14.7.5 and §14.7.5.2.
+    /// Covers ISO 32000-1 §14.7.5, §14.7.5.2, §14.8.5 and §14.8.5.3.
     pub fn attribute(&self, element: ObjRef, owner: &str, key: &str) -> Option<&Object> {
         self.attributes
             .iter()

@@ -505,6 +505,90 @@ mod tests {
         );
     }
 
+    /// A Sect carrying `ListNumbering Decimal` for the two unlabelled lists
+    /// inside it; the second list says `None` for itself.
+    fn tagged_inherited_numbering_doc() -> Vec<u8> {
+        fn element(b: &mut PdfBuilder, num: u32, s: &str, parent: u32, kids: &str, extra: &str) {
+            b.object(
+                num,
+                &format!(
+                    "<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} {extra} >>"
+                ),
+            );
+        }
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf \
+              /LBody << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (One) Tj EMC \
+              /LBody << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (Two) Tj EMC \
+              /LBody << /MCID 2 >> BDC 1 0 0 1 72 650 Tm (Three) Tj EMC \
+              /LBody << /MCID 3 >> BDC 1 0 0 1 72 636 Tm (Four) Tj EMC ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [16 0 R 18 0 R 22 0 R 24 0 R]] >>");
+        element(
+            &mut b,
+            13,
+            "Sect",
+            11,
+            "[14 0 R 20 0 R]",
+            "/A << /O /List /ListNumbering /Decimal >>",
+        );
+        element(&mut b, 14, "L", 13, "[15 0 R 17 0 R]", "");
+        element(&mut b, 15, "LI", 14, "[16 0 R]", "");
+        element(&mut b, 16, "LBody", 15, "[0]", "");
+        element(&mut b, 17, "LI", 14, "[18 0 R]", "");
+        element(&mut b, 18, "LBody", 17, "[1]", "");
+        element(
+            &mut b,
+            20,
+            "L",
+            13,
+            "[21 0 R 23 0 R]",
+            "/A << /O /List /ListNumbering /None >>",
+        );
+        element(&mut b, 21, "LI", 20, "[22 0 R]", "");
+        element(&mut b, 22, "LBody", 21, "[2]", "");
+        element(&mut b, 23, "LI", 20, "[24 0 R]", "");
+        element(&mut b, 24, "LBody", 23, "[3]", "");
+        b.build(1)
+    }
+
+    /// `ListNumbering` is inheritable: a list without one takes the nearest
+    /// ancestor's, and a list that says `None` for itself keeps its markers
+    /// as they are.
+    // Covers ISO 32000-1 §14.8.5.3 and §14.8.5.5.
+    #[test]
+    fn list_numbering_is_inherited_from_an_ancestor_unless_the_list_says_none() {
+        let doc = Document::load(tagged_inherited_numbering_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "1. One\n2. Two\n\n- Three\n- Four");
+    }
+
     /// One list item whose Lbl sits on a line of its own and whose LBody
     /// holds a nested list with a dash label.
     fn tagged_nested_list_doc() -> Vec<u8> {

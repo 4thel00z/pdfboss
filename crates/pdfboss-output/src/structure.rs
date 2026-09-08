@@ -856,19 +856,29 @@ impl ListNumbering {
 
 /// A list's numbering system (§14.8.5.5): the `ListNumbering` the L
 /// element's attribute objects of the standard owner `List` (§14.8.5.2)
-/// give, the last one that has the key winning; `None` for a bullet symbol,
-/// for `None` itself and for a list with no such attribute, whose markers
-/// stay with the labels and lines.
+/// give, the last one that has the key winning, else, the attribute being
+/// inheritable (§14.8.5.3), the nearest ancestor's; `None` for a bullet
+/// symbol, for `None` itself and for a list no element above gives one,
+/// whose markers stay with the labels and lines.
 ///
-/// Covers ISO 32000-1 §14.8.5.2 and §14.8.5.5.
+/// Covers ISO 32000-1 §14.8.5.2, §14.8.5.3 and §14.8.5.5.
 fn list_numbering(span: &TextSpan, list: StructureElement) -> Option<ListNumbering> {
     let structure = span.structure.as_ref()?;
     structure
-        .attributes
+        .path
         .iter()
         .rev()
-        .filter(|a| a.element == list.object && a.standard_owner() == Some(StandardOwner::List))
-        .find_map(|a| a.entries.get_name("ListNumbering"))
+        .skip_while(|element| **element != list)
+        .find_map(|element| {
+            structure
+                .attributes
+                .iter()
+                .rev()
+                .filter(|a| {
+                    a.element == element.object && a.standard_owner() == Some(StandardOwner::List)
+                })
+                .find_map(|a| a.entries.get_name("ListNumbering"))
+        })
         .and_then(|name| ListNumbering::from_name(&name.0))
 }
 
