@@ -1009,7 +1009,7 @@ mod tests {
     /// The clause's own example: a hyphenated German word whose shown
     /// `k-` stands for a `c`, so the extracted text reads Drucker. The
     /// replacement span keeps the geometry of the glyphs it stands for.
-    // Covers ISO 32000-1 §14.9.4.
+    // Covers ISO 32000-1 §14.8.2.4.2 and §14.9.4.
     #[test]
     fn actual_text_replaces_the_shown_glyphs() {
         let doc = marked_doc(
