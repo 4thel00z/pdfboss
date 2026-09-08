@@ -3,7 +3,9 @@
 Before/after renders of bugs fixed in this repository. Each pair is named
 after the short hash of the commit that fixed it (plus a slug when one commit
 fixed several): `<hash>-before.png` is the render at that commit's parent,
-`<hash>-after.png` the render at the commit.
+`<hash>-after.png` the render at the commit. A change that renders nothing
+differently gets one image instead of a pair, `<hash>-<slug>.png`: the output
+of the new reader on a real file.
 
 | Commit | Failure |
 | --- | --- |
@@ -26,4 +28,8 @@ fixed several): `<hash>-before.png` is the render at that commit's parent,
 | `6b19fba` (defaults) | `/DefaultGray`, `/DefaultRGB` and `/DefaultCMYK` were never read, so a document's request to remap its device colours was ignored. This page declares a `/DefaultGray` that maps gray to a sepia Separation: the ramp of `g` fills, the `G` stroke and the DeviceGray image all painted neutral gray before and paint in sepia now, their component values passed through unchanged as the clause asks. |
 | `6b19fba` (matte) | A soft mask's `/Matte` was reported and ignored, so an image pre-blended with its matte colour kept that colour mixed in over any other backdrop. Top row, a red image pre-blended with a white matte at 25, 50, 75 and 100 percent coverage over a black page; bottom row, plain red fills at the same alphas. The top row used to come out washed towards white; un-blended, it matches the bottom row. |
 | `6b19fba` (initial) | A `cs`/`CS` operand replaced by a `/DefaultGray`, `/DefaultRGB` or `/DefaultCMYK` took the default space's own initial colour instead of the device space's black passed through, and a `Tr` operand outside Table 106 painted nothing. Under a `/DefaultGray` mapping tint 0 to red and tint 1 to blue: the left square, filled right after `/DeviceGray cs`, was the Separation's tint 1 (blue) and is now black passed through (red), matching the `0 g` square on the right; the line under `8 Tr` was missing and now fills, the operand read by its bits as pdf.js reads it. |
+| `d422059` (outline) | Nothing read the catalog's `/Outlines`. The `catalog` example of `pdfboss-core` walks the `/First` and `/Next` chains of this test report, 73 items over three levels, and shows each item's title with the page, page label and `/XYZ` position its destination points to. |
+| `d422059` (page-labels) | Nothing read `/PageLabels`. pdf.js `labelled_pages.pdf` has four ranges (lowercase Roman, decimal, lowercase letters, decimal starting at 4), giving the labels i to iv, 1 to 3, a, b, 4 and 5; the outline below it shows every destination's page with that label. |
+| `d422059` (named-destinations) | Nothing read named destinations. This archival finding aid names 17, each resolved to its page and `/XYZ` position; a null left coordinate shows as the viewer's current value. |
+| `d422059` (embedded-files) | Nothing read `/EmbeddedFiles`. pdf.js `bug1997343.pdf` carries nine MathML attachments: the name, the MIME type from `/Subtype`, the decoded size, `/ModDate` and the file specification's description. |
 | `20f876c` | A simple TrueType font's codes reached its glyphs through one `cmap` subtable chosen by score, so three of the paths 9.6.6.4 describes never ran. Three one-glyph fonts whose glyph is a box: left, a symbolic font whose only subtable is a `(3, 0)` one keyed in the 0xF100 range, showing byte 0x41; middle, a font with only a `(1, 0)` subtable at Mac OS Roman 0xA5, WinAnsi-encoded, showing the bullet 0x95; right, a font with no `cmap` at all, showing byte 0x01. Before, the left and right glyphs were skipped and the middle one came from a substitute face as a round bullet; now each byte finds its box through the subtable range, the name mapped back to a Mac OS Roman code, and the byte used as the glyph index. |
