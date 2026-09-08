@@ -610,7 +610,7 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
 /// The `/F` flag bits whose annotations are not displayed even by a renderer
 /// that paints appearance streams: Hidden (bit 2) and NoView (bit 6),
 /// ISO 32000-1 §12.5.3.
-const INVISIBLE_ANNOTS: i64 = (1 << 1) | (1 << 5);
+const HIDDEN_ANNOTS: i64 = (1 << 1) | (1 << 5);
 
 /// The Invisible flag (bit 1): an annotation outside Table 169's standard
 /// types is not displayed when it is set, ISO 32000-1 §12.5.3.
@@ -3245,7 +3245,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// gets the appearance its own entries describe when its subtype has
     /// one (Line, §12.5.6.7;
     /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9; the
-    /// text markups, §12.5.6.10; Ink, §12.5.6.13); other annotations without
+    /// text markups, §12.5.6.10; Ink, §12.5.6.13; a Link's declared border,
+    /// §12.5.4); other annotations without
     /// a usable normal appearance paint nothing and report nothing. An
     /// appearance
     /// that exists but
@@ -3270,7 +3271,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 continue;
             };
             let flags = dict.get_int("F").unwrap_or(0);
-            if flags & INVISIBLE_ANNOTS != 0 {
+            if flags & HIDDEN_ANNOTS != 0 {
                 continue;
             }
             let standard = dict
