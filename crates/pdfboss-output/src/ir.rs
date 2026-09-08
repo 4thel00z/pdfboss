@@ -64,11 +64,14 @@ pub struct Cell {
     pub rowspan: u8,
 }
 
-/// What a paragraph is to the page: its body, or a page header or footer repeated on
-/// every page.
+/// What a paragraph is to the page: its body, a block quotation, or a page
+/// header or footer repeated on every page.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Role {
     Body,
+    /// A paragraph inside a `BlockQuote` structure element (ISO 32000-1
+    /// §14.8.4.2), under structure-tree reading order.
+    Quote,
     PageHeader,
     PageFooter,
 }

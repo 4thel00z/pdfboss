@@ -24,12 +24,11 @@ impl Output for Markdown {
 fn render_block(block: &Block) -> Option<String> {
     let rendered = match block {
         Block::Heading { level, lines, .. } => heading(*level, lines)?,
-        Block::Paragraph { lines, role, .. } => {
-            if !matches!(role, Role::Body) {
-                return None;
-            }
-            paragraph(lines)
-        }
+        Block::Paragraph { lines, role, .. } => match role {
+            Role::Body => paragraph(lines),
+            Role::Quote => quote(lines),
+            Role::PageHeader | Role::PageFooter => return None,
+        },
         Block::List { items, .. } => list(items),
         Block::Table { rows, .. } => table(rows),
     };
@@ -60,6 +59,17 @@ fn paragraph(lines: &[Line]) -> String {
     lines
         .iter()
         .map(emphasized)
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// A block quotation: the paragraph's lines, each opened with `> `.
+///
+/// Covers ISO 32000-1 §14.8.4.2.
+fn quote(lines: &[Line]) -> String {
+    paragraph(lines)
+        .lines()
+        .map(|line| format!("> {line}"))
         .collect::<Vec<String>>()
         .join("\n")
 }

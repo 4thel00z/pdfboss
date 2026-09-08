@@ -586,6 +586,103 @@ mod tests {
         assert_eq!(text, "Run ls -la now");
     }
 
+    /// One tagged page built from `content` and a structure tree given as
+    /// (object number, type, parent, kids) rows under the Document element
+    /// 11, with the parent tree `nums`.
+    fn tagged_tree_doc(content: &[u8], nums: &str, elements: &[(u32, &str, u32, &str)]) -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /StructParents 0 \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        let top: Vec<String> = elements
+            .iter()
+            .filter(|(_, _, parent, _)| *parent == 11)
+            .map(|(num, _, _, _)| format!("{num} 0 R"))
+            .collect();
+        b.object(
+            11,
+            &format!(
+                "<< /Type /StructElem /S /Document /P 10 0 R /K [{}] >>",
+                top.join(" ")
+            ),
+        );
+        b.object(12, &format!("<< /Nums [0 [{nums}]] >>"));
+        for (num, s, parent, kids) in elements {
+            b.object(
+                *num,
+                &format!("<< /Type /StructElem /S /{s} /P {parent} 0 R /Pg 3 0 R /K {kids} >>"),
+            );
+        }
+        b.build(1)
+    }
+
+    /// The paragraphs of a BlockQuote element render as a Markdown block
+    /// quote; plain text keeps the lines as shown.
+    // Covers ISO 32000-1 §14.8.4.2.
+    #[test]
+    fn block_quote_paragraphs_render_as_markdown_quotes() {
+        let doc = Document::load(tagged_tree_doc(
+            b"BT /F1 12 Tf \
+              /P << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (A quoted line) Tj EMC \
+              /P << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (and its second) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 72 660 Tm (Body) Tj EMC ET",
+            "21 0 R 21 0 R 13 0 R",
+            &[
+                (20, "BlockQuote", 11, "[21 0 R]"),
+                (21, "P", 20, "[0 1]"),
+                (13, "P", 11, "[2]"),
+            ],
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "> A quoted line\n> and its second\n\nBody");
+        let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(text, "A quoted line\nand its second\nBody");
+    }
+
+    /// TOCI entries a line apart, with no block-level element inside, are
+    /// blocks of their own instead of one paragraph, and a NonStruct wrapper
+    /// changes nothing.
+    // Covers ISO 32000-1 §14.8.4.2.
+    #[test]
+    fn toc_entries_are_their_own_blocks() {
+        let doc = Document::load(tagged_tree_doc(
+            b"BT /F1 12 Tf \
+              /TOCI << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Chapter 1 ... 3) Tj EMC \
+              /TOCI << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (Chapter 2 ... 9) Tj EMC \
+              /P << /MCID 2 >> BDC 1 0 0 1 72 660 Tm (Body) Tj EMC ET",
+            "21 0 R 22 0 R 31 0 R",
+            &[
+                (20, "TOC", 11, "[21 0 R 22 0 R]"),
+                (21, "TOCI", 20, "[0]"),
+                (22, "TOCI", 20, "[1]"),
+                (30, "NonStruct", 11, "[31 0 R]"),
+                (31, "P", 30, "[2]"),
+            ],
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "Chapter 1 ... 3\n\nChapter 2 ... 9\n\nBody");
+    }
+
     /// The same page in content order goes through the layout heuristics,
     /// which see no heading, one paragraph and no table.
     // Covers ISO 32000-1 §14.8.4.3.

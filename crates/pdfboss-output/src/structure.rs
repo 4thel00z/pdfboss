@@ -567,27 +567,53 @@ fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &
     push_lane_blocks(&line_groups(&spans), stats, out);
 }
 
-/// The outermost block-level element on a span's path (§14.8.4.3): the
-/// block the span belongs to. `None` for a span the tree does not reach and
-/// for one whose path holds no block-level element.
+/// The element whose block a span belongs to: the outermost block-level
+/// element on its path (§14.8.4.3), or, when the path holds none, the
+/// innermost Caption or TOCI, the two grouping elements that hold text of
+/// their own (§14.8.4.2). `None` for a span the tree does not reach and for
+/// one under nothing but containers.
 fn block_element(span: &TextSpan) -> Option<StructureElement> {
-    span.structure
-        .as_ref()?
-        .path
-        .iter()
+    let path = &span.structure.as_ref()?.path;
+    path.iter()
         .copied()
         .find(|element| element.standard_type.kind() == StandardKind::BlockLevel)
+        .or_else(|| {
+            path.iter().copied().rev().find(|element| {
+                matches!(
+                    element.standard_type,
+                    StandardType::Caption | StandardType::TOCI
+                )
+            })
+        })
+}
+
+/// Whether the span sits inside a `BlockQuote` grouping element (§14.8.4.2),
+/// which makes its paragraph a block quotation. The other grouping elements
+/// (Document, Part, Art, Sect, Div, TOC, Index, NonStruct, Private) hold
+/// blocks rather than being one and leave their content as it is; Sect,
+/// Part and Art nesting sets the level of an H heading.
+///
+/// Covers ISO 32000-1 §14.8.4.2.
+fn in_block_quote(span: &TextSpan) -> bool {
+    span.structure.as_ref().is_some_and(|structure| {
+        structure
+            .path
+            .iter()
+            .any(|element| element.standard_type == StandardType::BlockQuote)
+    })
 }
 
 /// Blocks on the tree's own word: consecutive spans of one outermost
 /// block-level element form one block, typed by that element. H1 to H6 and
 /// H are headings, L a list, Table a table, every other block-level element
 /// a paragraph, so two P elements a line apart stay two paragraphs and a
-/// heading needs no size step. Stretches of spans with no block-level
-/// element go through the layout heuristics as on an untagged page. Ruled
-/// grids are not consulted here: a tagged table's rows are its TR elements.
+/// heading needs no size step; a Caption or TOCI with no block-level element
+/// inside is a paragraph of its own (§14.8.4.2). Stretches of spans with no
+/// such element go through the layout heuristics as on an untagged page.
+/// Ruled grids are not consulted here: a tagged table's rows are its TR
+/// elements.
 ///
-/// Covers ISO 32000-1 §14.8.4.3.
+/// Covers ISO 32000-1 §14.8.4.2 and §14.8.4.3.
 fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
     for (element, run) in stretches(spans, block_element) {
         match element {
@@ -676,10 +702,15 @@ fn push_tagged_paragraph(spans: &[&TextSpan], out: &mut Vec<Block>) {
     if lines.is_empty() {
         return;
     }
+    let role = if spans.iter().any(|span| in_block_quote(span)) {
+        Role::Quote
+    } else {
+        Role::Body
+    };
     out.push(Block::Paragraph {
         bbox: bbox(&lines),
         lines,
-        role: Role::Body,
+        role,
     });
 }
 
