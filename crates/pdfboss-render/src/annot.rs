@@ -23,7 +23,7 @@ const ENDING_MIN: f32 = 4.0;
 /// not synthesized, or for one whose entries describe nothing to paint (no
 /// colour, or a zero-width border and no interior).
 ///
-/// Covers ISO 32000-1 §12.5.6.7, §12.5.6.8 and §12.5.6.9.
+/// Covers ISO 32000-1 §12.5.6.7, §12.5.6.8, §12.5.6.9 and §12.5.6.13.
 pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> Option<Stream> {
     let subtype = annot.get_name("Subtype")?.0.clone();
     let paint = Paint::read(src, annot).await;
@@ -47,6 +47,10 @@ pub(crate) async fn synthesized<S: AsyncObjectSource>(src: &S, annot: &Dict) -> 
             let vertices = number_list(src, annot.get("Vertices")?).await?;
             let endings = Ending::pair(src, annot).await;
             paint.polyline(&vertices, false, endings)?
+        }
+        "Ink" => {
+            let paths = ink_list(src, annot.get("InkList")?).await?;
+            paint.ink(&paths)?
         }
         _ => return None,
     };
@@ -299,6 +303,43 @@ impl Paint {
     }
 }
 
+impl Paint {
+    /// The content of the ink `paths`, each alternating x and y, and the
+    /// box they cover: every path is stroked through its points with round
+    /// caps and joins, a single point becoming a dot of the line width.
+    /// `None` without a stroking colour and width or without any point.
+    ///
+    /// Covers ISO 32000-1 §12.5.6.13.
+    fn ink(&self, paths: &[Vec<f32>]) -> Option<([f32; 4], String)> {
+        self.stroking()?;
+        let mut content = self.preamble();
+        content.push_str("1 J 1 j\n");
+        let mut points: Vec<[f32; 2]> = Vec::new();
+        for path in paths {
+            let vertices = path.as_chunks::<2>().0;
+            let Some(first) = vertices.first() else {
+                continue;
+            };
+            content.push_str(&format!("{} {} m\n", num(first[0]), num(first[1])));
+            let rest = if vertices.len() == 1 {
+                vertices
+            } else {
+                &vertices[1..]
+            };
+            for v in rest {
+                content.push_str(&format!("{} {} l\n", num(v[0]), num(v[1])));
+            }
+            content.push_str("S\n");
+            points.extend_from_slice(vertices);
+        }
+        if points.is_empty() {
+            return None;
+        }
+        content.push_str("Q\n");
+        Some((bounds(&points, self.border.width), content))
+    }
+}
+
 /// A line ending style of Table 176.
 #[derive(Clone, Copy, PartialEq)]
 enum Ending {
@@ -516,6 +557,20 @@ async fn number_list<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Vec<
         numbers.push(num_f32(src, item).await?);
     }
     Some(numbers)
+}
+
+/// Every path of an `/InkList`: the numbers of each inner array, resolving
+/// indirect entries; `None` when the object is not an array of arrays or a
+/// coordinate is not a finite number.
+async fn ink_list<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<Vec<Vec<f32>>> {
+    let Ok(Object::Array(items)) = src.resolve(obj).await else {
+        return None;
+    };
+    let mut paths = Vec::with_capacity(items.len());
+    for item in &items {
+        paths.push(number_list(src, item).await?);
+    }
+    Some(paths)
 }
 
 /// A `/C` or `/IC` colour as the operator that selects it: 1, 3 or 4

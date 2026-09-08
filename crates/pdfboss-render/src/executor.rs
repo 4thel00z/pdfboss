@@ -3200,9 +3200,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// `/Popup` annotations (a viewer-UI artifact) paint nothing and report
     /// nothing. An annotation with no `/AP` at all gets the appearance its
     /// own entries describe when its subtype has one (Line, §12.5.6.7;
-    /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9);
-    /// other annotations without a usable
-    /// normal appearance paint nothing and report nothing. An appearance
+    /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9; Ink,
+    /// §12.5.6.13); other annotations without a usable normal appearance
+    /// paint nothing and report nothing. An appearance
     /// that exists but
     /// cannot be read or placed reports as a dropped annotation, so a page
     /// whose visible content is a stamp or a filled form field never
@@ -7130,6 +7130,35 @@ mod tests {
             RED,
             "the square ending's right edge at the last vertex"
         );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.13.
+    #[test]
+    fn ink_annotations_without_appearance_are_drawn() {
+        // Three paths in one /InkList: a horizontal stroke along user y 30,
+        // an L-shaped one, and a single point; the strokes paint in /C at
+        // the /BS width, the point becomes a round dot of that width, the
+        // page between them stays white, and an unnormalized /Rect (pdf.js
+        // annotation-ink-without-appearance.pdf writes x1 < x0) does not
+        // matter because the appearance is placed by its own box.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Ink /Rect [90 90 10 10] /C [1 0 0] /BS << /W 4 >> \
+                 /InkList [[10 30 50 30] [60 60 60 90 90 90] [20 80]] >>",
+            ],
+            &[],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 30, 70), RED, "the horizontal stroke along y 30");
+        assert_eq!(px(&pix, 60, 25), RED, "the L's vertical leg along x 60");
+        assert_eq!(px(&pix, 75, 10), RED, "the L's horizontal leg along y 90");
+        assert_eq!(px(&pix, 20, 20), RED, "the single point as a dot");
+        assert_eq!(px(&pix, 30, 50), WHITE, "between the strokes");
         assert!(
             report.is_empty(),
             "a synthesized appearance is not a drop: {:?}",
