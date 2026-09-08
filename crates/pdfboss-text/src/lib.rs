@@ -1791,6 +1791,27 @@ mod tests {
         assert!(spans[2].structure.as_ref().unwrap().attributes.is_empty());
     }
 
+    /// Inside a `/ReversedChars` sequence each show string's characters come
+    /// back in logical order, a space at either end of the string staying
+    /// where it was; text outside the sequence, and a sequence's
+    /// `/ActualText`, are untouched.
+    // Covers ISO 32000-1 §14.8.2.3.3.
+    #[test]
+    fn reversed_chars_sequences_put_their_strings_back_in_order() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td \
+              /ReversedChars BMC (dlrow ) Tj (olleh) Tj EMC \
+              /ReversedChars << /MCID 3 >> BDC ( cba) Tj EMC \
+              /ReversedChars << /ActualText (kept) >> BDC (tpek) Tj EMC \
+              (xyz) Tj ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["world ", "hello", " abc", "kept", "xyz"]);
+    }
+
     #[test]
     fn structure_tree_order_reads_an_untagged_document_in_content_order() {
         let doc = Document::load(pdfboss_testkit::multi_page_doc(&["one", "two"])).unwrap();
