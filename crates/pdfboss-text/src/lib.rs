@@ -13,7 +13,8 @@ use pdfboss_core::{
 
 pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
 pub use pdfboss_core::{
-    MarkedContentId, Point, Rect, StandardKind, StandardType, StructureElement,
+    AttributeObject, LanguageTag, MarkedContentId, Point, Rect, StandardKind, StandardOwner,
+    StandardType, StructureElement,
 };
 
 /// The order a page's text is read in. Every extraction entry point takes
@@ -130,6 +131,11 @@ pub struct Structure {
     /// The standard-typed elements enclosing the sequence, the outermost
     /// first and the holding element itself last when it is standard.
     pub path: Vec<StructureElement>,
+    /// The attribute objects of the holding element and its ancestors
+    /// (ISO 32000-1 §14.7.5), the outermost element's first; for one
+    /// element, class objects before direct ones, so a later object
+    /// overrides an earlier one.
+    pub attributes: Vec<AttributeObject>,
 }
 
 /// A positioned run of extracted text.
@@ -233,6 +239,13 @@ pub struct TextSpan {
     /// `/Lang` of the nearest structure element above it. `None` leaves the
     /// document's own language, `Document::language`.
     pub lang: Option<String>,
+    /// The expansion of the abbreviation or acronym the span shows (ISO
+    /// 32000-1 §14.9.5): the `/E` of the innermost marked-content sequence
+    /// it was shown inside that has one, else, under
+    /// [`ReadingOrder::StructureTree`], the `/E` of the nearest structure
+    /// element above it. Like `alt`, a description: `text` stays what was
+    /// shown.
+    pub expansion: Option<String>,
 }
 
 /// An axis-aligned line segment a page draws, in the same y-up user space as
@@ -1165,7 +1178,7 @@ mod tests {
     /// The clause's own example: a hyphenated German word whose shown
     /// `k-` stands for a `c`, so the extracted text reads Drucker. The
     /// replacement span keeps the geometry of the glyphs it stands for.
-    // Covers ISO 32000-1 §14.9.4.
+    // Covers ISO 32000-1 §14.8.2.4.2 and §14.9.4.
     #[test]
     fn actual_text_replaces_the_shown_glyphs() {
         let doc = marked_doc(
@@ -1209,6 +1222,22 @@ mod tests {
             spans[0]
         );
         assert!(spans[1].x > spans[0].end_x + 12.0, "{:?}", spans[1]);
+    }
+
+    /// A word break inside a replacement is a space in the text: words are
+    /// found in the Unicode character stream, ActualText included, not in
+    /// glyph positions, so two glyph runs shown as one word come out as two
+    /// words when the replacement says so.
+    // Covers ISO 32000-1 §14.8.2.5 and §14.9.4.
+    #[test]
+    fn actual_text_spaces_are_word_breaks() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /ActualText (two words) >> BDC (twowords) Tj EMC ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(texts(&spans), ["two words"]);
     }
 
     /// source exactly as the document-level entries exclude it; `None`
@@ -1898,6 +1927,49 @@ mod tests {
         assert!(spans.iter().all(|span| span.alt.is_none()));
     }
 
+    /// A sequence's `/E`, inline or named, reaches every span shown inside
+    /// it as the expansion of the abbreviation shown, the shown text staying
+    /// what it is.
+    // Covers ISO 32000-1 §14.9.5.
+    #[test]
+    fn expansions_from_property_lists_reach_the_spans() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /E (Portable Document Format) >> BDC (PDF) Tj EMC \
+              /Span /Named BDC (ISO) Tj EMC (plain) Tj ET",
+            "/Named << /E <FEFF00C9> >>",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(texts(&spans), ["PDF", "ISO", "plain"]);
+        assert_eq!(
+            spans[0].expansion.as_deref(),
+            Some("Portable Document Format")
+        );
+        assert_eq!(spans[1].expansion.as_deref(), Some("\u{c9}"));
+        assert_eq!(spans[2].expansion, None);
+    }
+
+    /// Under structure-tree order a span with no expansion of its own takes
+    /// the nearest structure element's `/E`.
+    // Covers ISO 32000-1 §14.9.5.
+    #[test]
+    fn expansions_from_structure_elements_reach_the_spans() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /Span /P 11 0 R /Pg 3 0 R /K [0 2] /E (Left column) >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(texts(&spans), ["L1", "L2", "R1", "R2"]);
+        assert_eq!(spans[0].expansion.as_deref(), Some("Left column"));
+        assert_eq!(spans[1].expansion.as_deref(), Some("Left column"));
+        assert_eq!(spans[2].expansion, None);
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans.iter().all(|span| span.expansion.is_none()));
+    }
+
     /// A sequence's `/Lang` reaches every span shown inside it; under
     /// structure-tree order a span with none takes the nearest structure
     /// element's, and a sequence's own language wins over the element's.
@@ -1931,6 +2003,48 @@ mod tests {
         assert_eq!(spans[1].lang.as_deref(), Some("de"));
         assert_eq!(spans[2].lang, None);
         assert_eq!(doc.language(), None);
+    }
+
+    /// The attribute objects of a span's element and ancestors travel with
+    /// its structure.
+    // Covers ISO 32000-1 §14.7.5.
+    #[test]
+    fn attribute_objects_reach_the_spans() {
+        let doc = tagged_doc(TWO_COLUMNS, "", |b| {
+            b.object(
+                13,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0 2] \
+                 /A << /O /Layout /Placement /Block >> >>",
+            );
+        });
+        let page = doc.page(0).unwrap();
+        let (spans, _) = extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        let attributes = &spans[0].structure.as_ref().unwrap().attributes;
+        assert_eq!(attributes.len(), 1);
+        assert_eq!(attributes[0].owner, "Layout");
+        assert_eq!(attributes[0].element.num, 13);
+        assert!(spans[2].structure.as_ref().unwrap().attributes.is_empty());
+    }
+
+    /// Inside a `/ReversedChars` sequence each show string's characters come
+    /// back in logical order, a space at either end of the string staying
+    /// where it was; text outside the sequence, and a sequence's
+    /// `/ActualText`, are untouched.
+    // Covers ISO 32000-1 §14.8.2.3.3.
+    #[test]
+    fn reversed_chars_sequences_put_their_strings_back_in_order() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td \
+              /ReversedChars BMC (dlrow ) Tj (olleh) Tj EMC \
+              /ReversedChars << /MCID 3 >> BDC ( cba) Tj EMC \
+              /ReversedChars << /ActualText (kept) >> BDC (tpek) Tj EMC \
+              (xyz) Tj ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["world ", "hello", " abc", "kept", "xyz"]);
     }
 
     #[test]

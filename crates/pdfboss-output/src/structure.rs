@@ -4,7 +4,8 @@
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::{
-    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardType, StructureElement, TextSpan,
+    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardOwner, StandardType,
+    StructureElement, TextSpan,
 };
 
 /// Fraction of the device font size a horizontal gap must exceed to read
@@ -504,7 +505,7 @@ fn push_segment_blocks(
         && segment
             .spans
             .iter()
-            .any(|span| block_element(span).is_some())
+            .any(|span| run_of(span) != Run::Untagged)
     {
         push_tagged_blocks(&segment.spans, stats, out);
         return;
@@ -566,32 +567,93 @@ fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &
     push_lane_blocks(&line_groups(&spans), stats, out);
 }
 
-/// The outermost block-level element on a span's path (§14.8.4.3): the
-/// block the span belongs to. `None` for a span the tree does not reach and
-/// for one whose path holds no block-level element.
-fn block_element(span: &TextSpan) -> Option<StructureElement> {
-    span.structure
-        .as_ref()?
-        .path
+/// What a span belongs to under structure-tree order: the outermost
+/// block-level element on its path (§14.8.4.3) or, when the path holds none,
+/// the innermost Caption or TOCI, the two grouping elements that hold text of
+/// their own (§14.8.4.2); an illustration when a Figure, Formula or Form
+/// encloses it instead (§14.8.4.5); untagged when the tree does not reach it
+/// or nothing but containers do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    Block(StructureElement),
+    Illustration,
+    Untagged,
+}
+
+/// The run a span belongs to (see [`Run`]).
+///
+/// Covers ISO 32000-1 §14.8.3 and §14.8.4.5.
+fn run_of(span: &TextSpan) -> Run {
+    let Some(structure) = span.structure.as_ref() else {
+        return Run::Untagged;
+    };
+    let path = &structure.path;
+    let block = path
         .iter()
         .copied()
-        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel)
+        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel);
+    if let Some(element) = block {
+        return Run::Block(element);
+    }
+    let holder = path.iter().copied().rev().find(|element| {
+        matches!(
+            element.standard_type,
+            StandardType::Caption | StandardType::TOCI
+        )
+    });
+    if let Some(element) = holder {
+        return Run::Block(element);
+    }
+    if path
+        .iter()
+        .any(|element| element.standard_type.kind() == StandardKind::Illustration)
+    {
+        return Run::Illustration;
+    }
+    Run::Untagged
+}
+
+/// Whether the span sits inside a `BlockQuote` grouping element (§14.8.4.2),
+/// which makes its paragraph a block quotation. The other grouping elements
+/// (Document, Part, Art, Sect, Div, TOC, Index, NonStruct, Private) hold
+/// blocks rather than being one and leave their content as it is; Sect,
+/// Part and Art nesting sets the level of an H heading.
+///
+/// Covers ISO 32000-1 §14.8.4.2.
+fn in_block_quote(span: &TextSpan) -> bool {
+    span.structure.as_ref().is_some_and(|structure| {
+        structure
+            .path
+            .iter()
+            .any(|element| element.standard_type == StandardType::BlockQuote)
+    })
 }
 
 /// Blocks on the tree's own word: consecutive spans of one outermost
 /// block-level element form one block, typed by that element. H1 to H6 and
 /// H are headings, L a list, Table a table, every other block-level element
 /// a paragraph, so two P elements a line apart stay two paragraphs and a
-/// heading needs no size step. Stretches of spans with no block-level
-/// element go through the layout heuristics as on an untagged page. Ruled
-/// grids are not consulted here: a tagged table's rows are its TR elements.
+/// heading needs no size step; a Caption or TOCI (§14.8.4.2) with no
+/// block-level element inside is a paragraph of its own. The text of a
+/// Figure, Formula or Form (§14.8.4.5) is laid out by the heuristics on its
+/// own, since the tree says nothing about what it is: adjacent illustrations
+/// form one run, so a table a producer drew as a row of figures is still
+/// read as a table, while none of it joins the untagged text or the tagged
+/// blocks around it. Stretches of untagged spans go through the layout
+/// heuristics as on an untagged page. Ruled grids are not consulted here: a
+/// tagged table's rows are its TR elements. This is the clause's basic
+/// layout model with the tree's order as the block progression direction:
+/// block-level elements stack as blocks, inline-level elements flow inside
+/// their block's lines.
 ///
-/// Covers ISO 32000-1 §14.8.4.3.
+/// Covers ISO 32000-1 §14.8.3, §14.8.4.2, §14.8.4.3 and §14.8.4.5.
 fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
-    for (element, run) in stretches(spans, block_element) {
-        match element {
-            None => push_lane_blocks(&sequential_groups(run.iter().copied()), stats, out),
-            Some(element) => push_tagged_block(element, run, out),
+    for (run, spans) in stretches(spans, run_of) {
+        match run {
+            Run::Block(element) => push_tagged_block(element, spans, out),
+            Run::Illustration | Run::Untagged => {
+                push_lane_blocks(&sequential_groups(spans.iter().copied()), stats, out)
+            }
         }
     }
 }
@@ -616,6 +678,7 @@ fn stretches<'r, 's, K: PartialEq>(
     out
 }
 
+/// One tagged block from its element's type.
 fn push_tagged_block(element: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
     match element.standard_type {
         StandardType::H1 => push_tagged_heading(1, spans, out),
@@ -675,10 +738,15 @@ fn push_tagged_paragraph(spans: &[&TextSpan], out: &mut Vec<Block>) {
     if lines.is_empty() {
         return;
     }
+    let role = if spans.iter().any(|span| in_block_quote(span)) {
+        Role::Quote
+    } else {
+        Role::Body
+    };
     out.push(Block::Paragraph {
         bbox: bbox(&lines),
         lines,
-        role: Role::Body,
+        role,
     });
 }
 
@@ -709,9 +777,15 @@ fn descendant(
 /// lines, so plain text keeps the glyph, and the Markdown adapter opens the
 /// item on the line after it. A nested list's content stays inside the
 /// item holding it. Spans in the L but in no LI (a caption) become a
-/// paragraph where they stand, closing the list before them.
+/// paragraph where they stand, closing the list before them. A list whose
+/// `ListNumbering` attribute names a numbering system (§14.8.5.5) is
+/// numbered: an item by the number its label writes in that system, an
+/// unlabelled item by the number after the previous item's
+/// ([`numbered_marker`]).
 fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+    let numbering = spans.first().and_then(|span| list_numbering(span, list));
     let mut items: Vec<ListItem> = Vec::new();
+    let mut next: u32 = 1;
     for (item, run) in stretches(spans, |span| descendant(span, list, &[StandardType::LI])) {
         let Some(item) = item else {
             push_tagged_list_items(&mut items, out);
@@ -728,6 +802,13 @@ fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<B
             .map(|span| span.text.trim())
             .collect();
         let (marker, marker_len) = tagged_marker(&label, first);
+        let marker = match numbering {
+            Some(numbering) => numbered_marker(&label, marker, numbering, next),
+            None => marker,
+        };
+        if let Marker::Number(n) = marker {
+            next = n.saturating_add(1);
+        }
         items.push(ListItem {
             marker,
             marker_len,
@@ -746,6 +827,155 @@ fn push_tagged_list_items(items: &mut Vec<ListItem>, out: &mut Vec<Block>) {
         bbox: bbox(items.iter().flat_map(|item| &item.lines)),
         items,
     });
+}
+
+/// The numbering systems a list's `ListNumbering` attribute can name
+/// (§14.8.5.5, Table 347); `None` and the bullet symbols `Disc`, `Circle`
+/// and `Square` name none.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ListNumbering {
+    Decimal,
+    UpperRoman,
+    LowerRoman,
+    UpperAlpha,
+    LowerAlpha,
+}
+
+impl ListNumbering {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Decimal" => Some(Self::Decimal),
+            "UpperRoman" => Some(Self::UpperRoman),
+            "LowerRoman" => Some(Self::LowerRoman),
+            "UpperAlpha" => Some(Self::UpperAlpha),
+            "LowerAlpha" => Some(Self::LowerAlpha),
+            _ => None,
+        }
+    }
+}
+
+/// A list's numbering system (§14.8.5.5): the `ListNumbering` the L
+/// element's attribute objects of the standard owner `List` (§14.8.5.2)
+/// give, the last one that has the key winning, else, the attribute being
+/// inheritable (§14.8.5.3), the nearest ancestor's; `None` for a bullet
+/// symbol, for `None` itself and for a list no element above gives one,
+/// whose markers stay with the labels and lines.
+///
+/// Covers ISO 32000-1 §14.8.5.2, §14.8.5.3 and §14.8.5.5.
+fn list_numbering(span: &TextSpan, list: StructureElement) -> Option<ListNumbering> {
+    let structure = span.structure.as_ref()?;
+    structure
+        .path
+        .iter()
+        .rev()
+        .skip_while(|element| **element != list)
+        .find_map(|element| {
+            structure
+                .attributes
+                .iter()
+                .rev()
+                .filter(|a| {
+                    a.element == element.object && a.standard_owner() == Some(StandardOwner::List)
+                })
+                .find_map(|a| a.entries.get_name("ListNumbering"))
+        })
+        .and_then(|name| ListNumbering::from_name(&name.0))
+}
+
+/// An item's marker in a list with a numbering system: the number its label
+/// writes in that system; for an item with no label, the number its line
+/// opens with, else `next`; a label outside the system (a lettered sub-item
+/// in a Decimal list) keeps the marker [`tagged_marker`] read.
+///
+/// Covers ISO 32000-1 §14.8.5.5.
+fn numbered_marker(label: &str, marker: Marker, numbering: ListNumbering, next: u32) -> Marker {
+    if let Some(n) = numbered_label(label, numbering) {
+        return Marker::Number(n);
+    }
+    if !label.is_empty() {
+        return marker;
+    }
+    match marker {
+        Marker::Number(n) => Marker::Number(n),
+        Marker::Bullet => Marker::Number(next),
+    }
+}
+
+/// The number a label writes in a numbering system, the label closed by `.`
+/// or `)` or by nothing: decimal digits; a letter of the system's case,
+/// repeated past Z (A is 1, Z 26, AA 27); Roman numerals of the system's
+/// case. `None` for a label outside the system.
+///
+/// Covers ISO 32000-1 §14.8.5.5.
+fn numbered_label(label: &str, numbering: ListNumbering) -> Option<u32> {
+    let body = label
+        .strip_suffix('.')
+        .or_else(|| label.strip_suffix(')'))
+        .unwrap_or(label);
+    if body.is_empty() {
+        return None;
+    }
+    match numbering {
+        ListNumbering::Decimal => body
+            .chars()
+            .all(|c| c.is_ascii_digit())
+            .then(|| body.parse().ok())
+            .flatten(),
+        ListNumbering::UpperAlpha => alpha_label(body, true),
+        ListNumbering::LowerAlpha => alpha_label(body, false),
+        ListNumbering::UpperRoman => roman_label(body, true),
+        ListNumbering::LowerRoman => roman_label(body, false),
+    }
+}
+
+/// One letter of the given case, repeated: A is 1, Z 26, AA 27.
+fn alpha_label(body: &str, upper: bool) -> Option<u32> {
+    let mut chars = body.chars();
+    let first = chars.next()?;
+    let in_case = if upper {
+        first.is_ascii_uppercase()
+    } else {
+        first.is_ascii_lowercase()
+    };
+    if !in_case || !chars.all(|c| c == first) {
+        return None;
+    }
+    let letter = u32::from(first.to_ascii_uppercase()) - u32::from('A') + 1;
+    Some((body.len() as u32 - 1) * 26 + letter)
+}
+
+/// Roman numerals of the given case, a numeral before a larger one
+/// subtracted (IV is 4, XC 90).
+fn roman_label(body: &str, upper: bool) -> Option<u32> {
+    let mut total: i64 = 0;
+    let mut previous: i64 = 0;
+    for c in body.chars().rev() {
+        let in_case = if upper {
+            c.is_ascii_uppercase()
+        } else {
+            c.is_ascii_lowercase()
+        };
+        if !in_case {
+            return None;
+        }
+        let value = match c.to_ascii_uppercase() {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => return None,
+        };
+        if value < previous {
+            total -= value;
+        } else {
+            total += value;
+            previous = value;
+        }
+    }
+    u32::try_from(total).ok().filter(|n| *n > 0)
 }
 
 /// Whether a span is the item's own label: the first Lbl or L below the
@@ -817,10 +1047,9 @@ fn label_marker(label: &str) -> Marker {
 
 /// A tagged table: its rows are the TR elements below the Table, wherever
 /// THead, TBody and TFoot put them, and a row's cells its TH and TD
-/// elements, each cell one line. Spans in the table but in no row (a
-/// caption) become a paragraph ahead of the table. Column and row spans
-/// live in the elements' attributes (§14.8.5.7), which are not read, so
-/// every cell spans one.
+/// elements, each cell one line spanning the columns and rows its `ColSpan`
+/// and `RowSpan` table attributes say (§14.8.5.7). Spans in the table but
+/// in no row (a caption) become a paragraph ahead of the table.
 fn push_tagged_table(table: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut aside: Vec<&TextSpan> = Vec::new();
@@ -847,12 +1076,34 @@ fn tagged_cells(row: StructureElement, spans: &[&TextSpan]) -> Vec<Cell> {
         descendant(span, row, &[StandardType::TH, StandardType::TD])
     })
     .into_iter()
-    .map(|(_, run)| Cell {
+    .map(|(cell, run)| Cell {
         line: joined_line(tagged_lines(run)),
-        colspan: 1,
-        rowspan: 1,
+        colspan: table_span(run[0], cell, "ColSpan"),
+        rowspan: table_span(run[0], cell, "RowSpan"),
     })
     .collect()
+}
+
+/// A cell's `ColSpan` or `RowSpan` (§14.8.5.7): the value the cell element's
+/// attribute objects of the standard owner `Table` (§14.8.5.2) give, the
+/// last one that has the key winning, at least 1 and at most 255; 1 for a
+/// cell with no element or no such attribute.
+///
+/// Covers ISO 32000-1 §14.8.5.2 and §14.8.5.7.
+fn table_span(span: &TextSpan, cell: Option<StructureElement>, key: &str) -> u8 {
+    let Some(cell) = cell else {
+        return 1;
+    };
+    let Some(structure) = span.structure.as_ref() else {
+        return 1;
+    };
+    structure
+        .attributes
+        .iter()
+        .rev()
+        .filter(|a| a.element == cell.object && a.standard_owner() == Some(StandardOwner::Table))
+        .find_map(|a| a.entries.get_int(key))
+        .map_or(1, |n| n.clamp(1, 255) as u8)
 }
 
 /// A cell's lines as the one line a cell carries: the texts follow one
@@ -875,6 +1126,7 @@ fn joined_line(lines: Vec<Line>) -> Option<Line> {
                 text: " ".to_string(),
                 bold: false,
                 italic: false,
+                code: false,
             });
         }
         joined.inlines.extend(line.inlines);
@@ -2170,13 +2422,14 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
 ///
 /// Covers ISO 32000-1 §14.8.2.5.
 fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity: usize) {
+    let code = in_code(span);
     if let Some(last) = inlines.last_mut() {
         let already_spaced =
             last.text.ends_with(char::is_whitespace) || span.text.starts_with(char::is_whitespace);
         if spaced && !already_spaced {
             last.text.push(' ');
         }
-        if last.bold == span.bold && last.italic == span.italic {
+        if last.bold == span.bold && last.italic == span.italic && last.code == code {
             last.text.push_str(&span.text);
             return;
         }
@@ -2187,7 +2440,23 @@ fn push_span(inlines: &mut Vec<Inline>, span: &TextSpan, spaced: bool, capacity:
         text,
         bold: span.bold,
         italic: span.italic,
+        code,
     });
+}
+
+/// Whether the span was shown inside a `Code` structure element (§14.8.4.4):
+/// computer code, which the Markdown adapter sets as inline code. The other
+/// inline-level elements (Span, Quote, Reference, BibEntry, Annot, Link,
+/// Note, Ruby, Warichu) leave their text flowing as shown.
+///
+/// Covers ISO 32000-1 §14.8.4.4.
+fn in_code(span: &TextSpan) -> bool {
+    span.structure.as_ref().is_some_and(|structure| {
+        structure
+            .path
+            .iter()
+            .any(|element| element.standard_type == StandardType::Code)
+    })
 }
 
 /// The lines' device-space box. Spans carry no glyph extents, so the top is
@@ -3456,5 +3725,29 @@ pub(crate) mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 30);
         assert_eq!(lines[0], "10 Partyaa Nameebb Row0");
+    }
+
+    /// A label is read in the list's numbering system and only in it:
+    /// digits for Decimal, letters of the system's case (repeated past Z)
+    /// for the alphabetic systems, numerals of the system's case for the
+    /// Roman ones, each closed by `.` or `)` or by nothing.
+    // Covers ISO 32000-1 §14.8.5.5.
+    #[test]
+    fn labels_are_read_in_the_list_s_numbering_system() {
+        assert_eq!(numbered_label("3.", ListNumbering::Decimal), Some(3));
+        assert_eq!(numbered_label("A.", ListNumbering::Decimal), None);
+        assert_eq!(numbered_label("B)", ListNumbering::UpperAlpha), Some(2));
+        assert_eq!(numbered_label("AA", ListNumbering::UpperAlpha), Some(27));
+        assert_eq!(numbered_label("b.", ListNumbering::UpperAlpha), None);
+        assert_eq!(numbered_label("c.", ListNumbering::LowerAlpha), Some(3));
+        assert_eq!(numbered_label("iv.", ListNumbering::LowerRoman), Some(4));
+        assert_eq!(numbered_label("xiv", ListNumbering::LowerRoman), Some(14));
+        assert_eq!(numbered_label("IV.", ListNumbering::LowerRoman), None);
+        assert_eq!(
+            numbered_label("MCMXC.", ListNumbering::UpperRoman),
+            Some(1990)
+        );
+        assert_eq!(numbered_label("", ListNumbering::Decimal), None);
+        assert_eq!(numbered_label("-", ListNumbering::Decimal), None);
     }
 }

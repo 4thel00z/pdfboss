@@ -12,6 +12,7 @@ pub mod document;
 pub mod elements;
 pub mod embedded_file;
 pub mod error;
+pub mod extension;
 pub mod filters;
 pub mod geom;
 pub mod hash;
@@ -28,6 +29,7 @@ pub mod pretty;
 pub mod source;
 pub mod structure;
 pub mod tree;
+pub mod viewer_preferences;
 pub mod xref;
 
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
@@ -49,9 +51,10 @@ pub use embedded_file::{
     FileSpec,
 };
 pub use error::{Error, Result};
+pub use extension::{extensions_with, DeveloperExtension};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
-pub use language::language_with;
+pub use language::{language_with, LanguageTag};
 pub use names::{name_tree_root_with, named_with, names_with, NameTree};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
 pub use oc::OcState;
@@ -62,5 +65,10 @@ pub use source::{
     ObjectSource, MAX_RESOLVE_DEPTH,
 };
 pub use structure::{
-    MarkedContentId, Placement, StandardKind, StandardType, StructureElement, StructureTree,
+    AttributeObject, MarkedContentId, Placement, StandardKind, StandardOwner, StandardType,
+    StructureElement, StructureTree,
+};
+pub use viewer_preferences::{
+    viewer_preferences_with, Direction, Duplex, NonFullScreenPageMode, PageBoundary, PrintScaling,
+    ViewerPreferences,
 };

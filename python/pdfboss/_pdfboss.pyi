@@ -222,6 +222,15 @@ class Span:
         structure element above it; ``None`` leaves the document's own
         ``Document.language``."""
 
+    @property
+    def expansion(self) -> str | None:
+        """The expansion of the abbreviation or acronym the span shows (ISO
+        32000-1 14.9.5): the ``/E`` of the marked-content sequence it was
+        shown inside, else, under structure-tree reading order, the ``/E``
+        of the nearest structure element above it; ``None`` when neither
+        gives one. Like ``alt``, a description: ``text`` stays what was
+        shown."""
+
 class SpanIter:
     """Lazy sync iterator over a document's styled spans; buffers one
     page's spans at a time, extracting each page with the GIL released."""

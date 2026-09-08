@@ -1472,6 +1472,18 @@ impl AsyncDocument {
         pdfboss_core::language_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The developer extensions the catalog declares (ISO 32000-1 §7.12):
+    /// the async twin of the sync document's `extensions`.
+    pub async fn extensions(&self) -> Vec<pdfboss_core::DeveloperExtension> {
+        pdfboss_core::extensions_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The catalog's viewer preferences (ISO 32000-1 §12.2): the async twin
+    /// of the sync document's `viewer_preferences`.
+    pub async fn viewer_preferences(&self) -> Option<pdfboss_core::ViewerPreferences> {
+        pdfboss_core::viewer_preferences_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

@@ -101,6 +101,7 @@ mod tests {
                     text: text.to_string(),
                     bold: false,
                     italic: false,
+                    code: false,
                 }],
                 y: 700.0,
                 x: 72.0,

@@ -429,6 +429,7 @@ async fn structure_order<S: AsyncObjectSource>(
             span.structure = Some(Structure {
                 standard_type: placement.standard_type,
                 path: placement.path.clone(),
+                attributes: placement.attributes.clone(),
             });
             if span.alt.is_none() {
                 span.alt.clone_from(&placement.alt);
@@ -436,12 +437,32 @@ async fn structure_order<S: AsyncObjectSource>(
             if span.lang.is_none() {
                 span.lang.clone_from(&placement.lang);
             }
+            if span.expansion.is_none() {
+                span.expansion.clone_from(&placement.expansion);
+            }
         }
         keyed.push((current, span));
     }
     keyed.sort_by_key(|(key, _)| *key);
     spans.extend(keyed.into_iter().map(|(_, span)| span));
     true
+}
+
+/// A show string from a `/ReversedChars` sequence put back in logical
+/// order (ISO 32000-1 §14.8.2.3.3): its characters reversed, except that a
+/// space at the beginning or the end of the string stays where it was, since
+/// those spaces separate the string from its neighbours rather than belong
+/// to the reversed run.
+///
+/// Covers ISO 32000-1 §14.8.2.3.3.
+fn reversed_chars(text: &str) -> String {
+    let lead = text.len() - text.trim_start().len();
+    let tail = text.trim_end().len().max(lead);
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..lead]);
+    out.extend(text[lead..tail].chars().rev());
+    out.push_str(&text[tail..]);
+    out
 }
 
 /// The graphics-state parameters text extraction cares about. Saved and
@@ -686,6 +707,11 @@ struct Mark {
     alt: Option<String>,
     /// The sequence's `/Lang` (§14.9.2), decoded.
     lang: Option<String>,
+    /// The sequence's `/E` (§14.9.5), decoded.
+    expansion: Option<String>,
+    /// The sequence's tag is `/ReversedChars` (§14.8.2.3.3): its show
+    /// strings hold right-to-left text in visual order, characters reversed.
+    reversed: bool,
 }
 
 /// A sequence's `/ActualText` (ISO 32000-1 §14.9.4): the text that stands
@@ -1098,6 +1124,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                             });
                         let alt = self.marked_text_string(props, &frame.chain, "Alt").await;
                         let lang = self.marked_text_string(props, &frame.chain, "Lang").await;
+                        let expansion = self.marked_text_string(props, &frame.chain, "E").await;
                         let artifact = if tag.0 == "Artifact" {
                             Some(self.marked_artifact(props, &frame.chain).await)
                         } else {
@@ -1110,6 +1137,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                             artifact,
                             alt,
                             lang,
+                            expansion,
+                            reversed: tag.0 == "ReversedChars",
                         });
                     }
                     op => self.step(&mut frame, op),
@@ -1253,7 +1282,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             // Marked content: every open is pushed (hidden or not) so `EMC`
             // stays balanced; `BDC` needs I/O and is handled in `run`.
             // A bare `/Artifact BMC` is a generic artifact (ISO 32000-1
-            // §14.8.2.2); every other tag opens plain real content.
+            // §14.8.2.2) and a bare `/ReversedChars BMC` reverses its strings
+            // (§14.8.2.3.3); every other tag opens plain real content.
             Op::BeginMarkedContent(tag) => frame.marks.push(Mark {
                 hidden: false,
                 mcid: None,
@@ -1264,6 +1294,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 }),
                 alt: None,
                 lang: None,
+                expansion: None,
+                reversed: tag.0 == "ReversedChars",
             }),
             Op::EndMarkedContent => {
                 frame.marks.pop();
@@ -1362,7 +1394,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// widens that span (ISO 32000-1 §14.9.4); an empty replacement leaves
     /// the sequence without text.
     ///
-    /// Covers ISO 32000-1 §14.9.4.
+    /// Covers ISO 32000-1 §14.8.2.4.2, §14.8.2.5 and §14.9.4.
     fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
         let suppressed = frame.suppressed();
         let Some(mut span) = self.show(&frame.gs, &mut frame.tm, bytes) else {
@@ -1374,6 +1406,10 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         span.artifact = frame.marks.iter().rev().find_map(|m| m.artifact.clone());
         span.alt = frame.marks.iter().rev().find_map(|m| m.alt.clone());
         span.lang = frame.marks.iter().rev().find_map(|m| m.lang.clone());
+        span.expansion = frame.marks.iter().rev().find_map(|m| m.expansion.clone());
+        if frame.marks.iter().any(|m| m.reversed) {
+            span.text = reversed_chars(&span.text);
+        }
         let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
             self.spans.push(span);
             self.marks.record(frame);
@@ -1439,13 +1475,13 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         }
     }
 
-    /// The text string entry `key` (`/ActualText`, `/Alt`, `/Lang`) a `BDC`
-    /// attaches to its sequence, decoded: from an inline property
+    /// The text string entry `key` (`/ActualText`, `/Alt`, `/Lang`, `/E`) a
+    /// `BDC` attaches to its sequence, decoded: from an inline property
     /// dictionary, or from the named one in the resource chain's
     /// `/Properties`. Any tag is accepted, not only `/Span`, since files put
     /// these on paragraph tags too.
     ///
-    /// Covers ISO 32000-1 §14.9.2, §14.9.3 and §14.9.4.
+    /// Covers ISO 32000-1 §14.9.2, §14.9.3, §14.9.4 and §14.9.5.
     async fn marked_text_string(
         &mut self,
         props: &Object,
@@ -1558,6 +1594,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             structure: None,
             alt: None,
             lang: None,
+            expansion: None,
         })
     }
 

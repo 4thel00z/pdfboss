@@ -25,9 +25,16 @@ The analysis infers:
   blocks on every page the tree reaches (ISO 32000-1 14.8.4.3): H1 to H6 are
   headings at that level, H a heading as deep as its Part, Art and Sect
   elements nest, L a list with one item per LI and the Lbl text as the
-  marker, Table a table with a row per TR and a cell per TH or TD, and every
-  other block-level element a paragraph. Column and row spans are not read,
-  and content the tree does not reach still goes through the heuristics below.
+  marker (read as a number, a letter or a Roman numeral when the list's
+  `ListNumbering` attribute names that numbering system, an unlabelled item
+  continuing the count), Table a table with a row per TR and a cell per TH
+  or TD spanning
+  what its `ColSpan` and `RowSpan` attributes say, and every other
+  block-level element a paragraph; a Caption or a TOC entry is a paragraph of
+  its own, the text of Figures, Formulas and Forms is laid out by the
+  heuristics below apart from the text around it, and the paragraphs of a
+  BlockQuote render as a block quote. Content the tree does not reach still
+  goes through the heuristics below.
 - **Page headers, footers and page numbers**: a page's first or last line,
   repeated near-verbatim at the same height on at least half the pages (three at
   minimum), is tagged
@@ -132,8 +139,10 @@ shape. Asynchronous callers compose `extract_page_markdown_with` against any obj
 source. See [Async and remote documents](./async.md).
 
 Emphasis survives into the output: bold and italic runs render as `**bold**` and
-`*italic*` inside paragraphs and list items. Headings drop emphasis markers: a
-heading is already the strongest thing on the page. Blocks are separated by a blank
+`*italic*` inside paragraphs and list items, and under structure-tree reading
+order text tagged as a `Code` element renders as inline code between backticks.
+Headings drop emphasis markers: a heading is already the strongest thing on the
+page. Blocks are separated by a blank
 line, across page boundaries too, so the document reads as one continuous Markdown
 file. For the raw style information itself, see [Styled spans](./spans.md); for the
 reverse direction (Markdown composed into a PDF), see

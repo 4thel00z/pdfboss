@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.1.0](https://github.com/4thel00z/pdfboss/compare/v2.0.0...v2.1.0) (2026-09-08)
+
+
+### Features
+
+* **core:** read name trees, destinations, the outline, page labels and embedded files ([#164](https://github.com/4thel00z/pdfboss/issues/164)) ([d422059](https://github.com/4thel00z/pdfboss/commit/d4220596af7b31e13f53921c9c60602bef6d2a9c))
+* **iso32000:** Lean-checked ISO 32000 conformance gate ([#159](https://github.com/4thel00z/pdfboss/issues/159)) ([9bf1ee9](https://github.com/4thel00z/pdfboss/commit/9bf1ee9740fbc371eefa3e37479a88c586878395))
+* structure attributes, table spans, code spans, block quotes and figure blocks from the tree ([#169](https://github.com/4thel00z/pdfboss/issues/169)) ([9dde8ef](https://github.com/4thel00z/pdfboss/commit/9dde8ef4e99d05ef1b33c56e26764d9a8551323c))
+* structure types and tagged blocks in Markdown, /Alt and /Lang on spans ([#168](https://github.com/4thel00z/pdfboss/issues/168)) ([a28bf87](https://github.com/4thel00z/pdfboss/commit/a28bf87afa11db2d5109964426169188ab5e0604))
+* Symbol and ZapfDingbats encodings, TrueType cmap selection, ActualText and artifacts ([#167](https://github.com/4thel00z/pdfboss/issues/167)) ([b0cb5d3](https://github.com/4thel00z/pdfboss/commit/b0cb5d3ce1e565e862183b2b7c475fccec82f3c9))
+
+
+### Bug Fixes
+
+* **render:** ISO 32000 rows 7.4.8, 8.6.6.4, 9.7.4.2 and 7.9.4 ([#161](https://github.com/4thel00z/pdfboss/issues/161)) ([c61139f](https://github.com/4thel00z/pdfboss/commit/c61139f75df7af979e78f32464d31edc392d7c28))
+* **render:** line caps, joins, miter limit and degenerate subpaths ([#162](https://github.com/4thel00z/pdfboss/issues/162)) ([0735882](https://github.com/4thel00z/pdfboss/commit/07358823bb0ce7cd3e07e7fc346d7b94b8f253fd))
+* **render:** text rendering modes, image interpolation, default colour spaces and matte ([#163](https://github.com/4thel00z/pdfboss/issues/163)) ([6b19fba](https://github.com/4thel00z/pdfboss/commit/6b19fba5439d1363daa60c592d526272d7f6bfeb))
+
+
+### Documentation
+
+* **failure-modes:** images of the catalog readers merged in d422059 ([#166](https://github.com/4thel00z/pdfboss/issues/166)) ([a40dfe2](https://github.com/4thel00z/pdfboss/commit/a40dfe23bba2c03bed026c6e9e77275259f8eac1))
+
 ## [2.0.0](https://github.com/4thel00z/pdfboss/compare/v1.2.0...v2.0.0) (2026-09-03)
 
 

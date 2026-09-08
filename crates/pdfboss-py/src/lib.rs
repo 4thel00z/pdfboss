@@ -1167,6 +1167,16 @@ impl Span {
         self.inner.lang.clone()
     }
 
+    /// The expansion of the abbreviation or acronym the span shows (ISO
+    /// 32000-1 14.9.5): its marked-content sequence's /E, else under
+    /// structure-tree order the nearest structure element's; None when
+    /// neither gives one. Like alt, a description: text stays what was
+    /// shown.
+    #[getter]
+    fn expansion(&self) -> Option<String> {
+        self.inner.expansion.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Span(page={}, text={:?}, font_name={:?})",
