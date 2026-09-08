@@ -62,6 +62,6 @@ pub use source::{
     ObjectSource, MAX_RESOLVE_DEPTH,
 };
 pub use structure::{
-    AttributeObject, MarkedContentId, Placement, StandardKind, StandardType, StructureElement,
-    StructureTree,
+    AttributeObject, MarkedContentId, Placement, StandardKind, StandardOwner, StandardType,
+    StructureElement, StructureTree,
 };

@@ -287,6 +287,80 @@ pub struct StructureElement {
     pub revision: i64,
 }
 
+/// The standard attribute owners of ISO 32000-1 Table 331: the four owners
+/// the standard defines attributes for, and the seven document formats whose
+/// own attributes an attribute object may carry.
+///
+/// Covers ISO 32000-1 §14.8.5.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StandardOwner {
+    /// `Layout`: layout attributes (§14.8.5.4).
+    Layout,
+    /// `List`: the list attribute (§14.8.5.5).
+    List,
+    /// `PrintField`: print-field attributes (§14.8.5.6).
+    PrintField,
+    /// `Table`: table attributes (§14.8.5.7).
+    Table,
+    /// `XML-1.00`: attributes of XML 1.00.
+    Xml100,
+    /// `HTML-3.2`: attributes of HTML 3.2.
+    Html32,
+    /// `HTML-4.01`: attributes of HTML 4.01.
+    Html401,
+    /// `OEB-1.0`: attributes of the Open eBook 1.0 format.
+    Oeb10,
+    /// `RTF-1.05`: attributes of RTF 1.05.
+    Rtf105,
+    /// `CSS-1.00`: attributes of CSS 1.00.
+    Css100,
+    /// `CSS-2.00`: attributes of CSS 2.00.
+    Css200,
+}
+
+impl StandardOwner {
+    /// Every standard owner, in the order of Table 331.
+    pub const ALL: [StandardOwner; 11] = [
+        StandardOwner::Layout,
+        StandardOwner::List,
+        StandardOwner::PrintField,
+        StandardOwner::Table,
+        StandardOwner::Xml100,
+        StandardOwner::Html32,
+        StandardOwner::Html401,
+        StandardOwner::Oeb10,
+        StandardOwner::Rtf105,
+        StandardOwner::Css100,
+        StandardOwner::Css200,
+    ];
+
+    /// The standard owner an `/O` name stands for, `None` for a producer's
+    /// own owner (or `UserProperties`, §14.7.5.4, which is not one of them).
+    /// Names are case-sensitive.
+    pub fn from_name(name: &str) -> Option<StandardOwner> {
+        StandardOwner::ALL
+            .into_iter()
+            .find(|owner| owner.name() == name)
+    }
+
+    /// The name as the standard spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            StandardOwner::Layout => "Layout",
+            StandardOwner::List => "List",
+            StandardOwner::PrintField => "PrintField",
+            StandardOwner::Table => "Table",
+            StandardOwner::Xml100 => "XML-1.00",
+            StandardOwner::Html32 => "HTML-3.2",
+            StandardOwner::Html401 => "HTML-4.01",
+            StandardOwner::Oeb10 => "OEB-1.0",
+            StandardOwner::Rtf105 => "RTF-1.05",
+            StandardOwner::Css100 => "CSS-1.00",
+            StandardOwner::Css200 => "CSS-2.00",
+        }
+    }
+}
+
 /// One attribute object of a structure element (§14.7.5): the element it
 /// belongs to, its owner (`/O`, empty when it names none), the revision
 /// number that follows it in an `/A` or `/C` array (0 when none does,
@@ -299,6 +373,14 @@ pub struct AttributeObject {
     pub owner: String,
     pub revision: i64,
     pub entries: Dict,
+}
+
+impl AttributeObject {
+    /// The standard owner the object's `/O` names (§14.8.5.2), `None` for a
+    /// producer's own.
+    pub fn standard_owner(&self) -> Option<StandardOwner> {
+        StandardOwner::from_name(&self.owner)
+    }
 }
 
 /// Where one marked-content sequence sits in the tree: its rank in the
@@ -1356,6 +1438,42 @@ mod tests {
         assert_eq!(p2.attribute(cell(16), "Table", "ColSpan"), None);
 
         assert!(placed[&id(0, 3)].attributes.is_empty());
+    }
+
+    // Covers ISO 32000-1 §14.8.5.2.
+    #[test]
+    fn standard_attribute_owners_are_recognized_by_name() {
+        assert_eq!(
+            StandardOwner::from_name("Table"),
+            Some(StandardOwner::Table)
+        );
+        assert_eq!(
+            StandardOwner::from_name("XML-1.00"),
+            Some(StandardOwner::Xml100)
+        );
+        assert_eq!(StandardOwner::from_name("Acme"), None);
+        assert_eq!(StandardOwner::from_name("table"), None);
+        assert_eq!(StandardOwner::ALL.len(), 11);
+        for owner in StandardOwner::ALL {
+            assert_eq!(
+                StandardOwner::from_name(owner.name()),
+                Some(owner),
+                "{}",
+                owner.name()
+            );
+        }
+        let object = AttributeObject {
+            element: ObjRef { num: 1, gen: 0 },
+            owner: "Layout".to_string(),
+            revision: 0,
+            entries: Dict::default(),
+        };
+        assert_eq!(object.standard_owner(), Some(StandardOwner::Layout));
+        let own = AttributeObject {
+            owner: "Acme".to_string(),
+            ..object
+        };
+        assert_eq!(own.standard_owner(), None);
     }
 
     // Covers ISO 32000-1 §14.8.4, §14.8.4.2, §14.8.4.3, §14.8.4.4 and

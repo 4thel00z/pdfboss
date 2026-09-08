@@ -4,7 +4,8 @@
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::{
-    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardType, StructureElement, TextSpan,
+    ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardOwner, StandardType,
+    StructureElement, TextSpan,
 };
 
 /// Fraction of the device font size a horizontal gap must exceed to read
@@ -855,11 +856,11 @@ fn tagged_cells(row: StructureElement, spans: &[&TextSpan]) -> Vec<Cell> {
 }
 
 /// A cell's `ColSpan` or `RowSpan` (§14.8.5.7): the value the cell element's
-/// attribute objects with owner `Table` give, the last one that has the key
-/// winning, at least 1 and at most 255; 1 for a cell with no element or no
-/// such attribute.
+/// attribute objects of the standard owner `Table` (§14.8.5.2) give, the
+/// last one that has the key winning, at least 1 and at most 255; 1 for a
+/// cell with no element or no such attribute.
 ///
-/// Covers ISO 32000-1 §14.8.5.7.
+/// Covers ISO 32000-1 §14.8.5.2 and §14.8.5.7.
 fn table_span(span: &TextSpan, cell: Option<StructureElement>, key: &str) -> u8 {
     let Some(cell) = cell else {
         return 1;
@@ -871,7 +872,7 @@ fn table_span(span: &TextSpan, cell: Option<StructureElement>, key: &str) -> u8 
         .attributes
         .iter()
         .rev()
-        .filter(|a| a.element == cell.object && a.owner == "Table")
+        .filter(|a| a.element == cell.object && a.standard_owner() == Some(StandardOwner::Table))
         .find_map(|a| a.entries.get_int(key))
         .map_or(1, |n| n.clamp(1, 255) as u8)
 }
