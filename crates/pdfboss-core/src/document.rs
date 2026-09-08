@@ -618,6 +618,13 @@ impl Document {
         ))
     }
 
+    /// The document's language as a parsed identifier (ISO 32000-1
+    /// §14.9.2.2), `None` when the catalog declares none or the tag is not
+    /// well formed.
+    pub fn language_tag(&self) -> Option<crate::language::LanguageTag> {
+        crate::language::LanguageTag::parse(&self.language()?)
+    }
+
     /// The label the page at `index` shows, or `None` when the document
     /// has no page labels or no such page.
     pub fn page_label(&self, index: usize) -> Option<String> {

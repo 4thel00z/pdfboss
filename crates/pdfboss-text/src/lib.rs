@@ -12,8 +12,8 @@ use pdfboss_core::{
 
 pub use extract::{ExtractReport, FontCache, SkipCause, SkippedText, SkippedTextKind};
 pub use pdfboss_core::{
-    AttributeObject, MarkedContentId, Point, Rect, StandardKind, StandardOwner, StandardType,
-    StructureElement,
+    AttributeObject, LanguageTag, MarkedContentId, Point, Rect, StandardKind, StandardOwner,
+    StandardType, StructureElement,
 };
 
 /// The order a page's text is read in. Every extraction entry point takes
