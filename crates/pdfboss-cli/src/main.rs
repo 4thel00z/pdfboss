@@ -1423,6 +1423,7 @@ mod tests {
                 flags: FieldFlags::default(),
                 value: None,
                 default_value: None,
+                max_len: None,
                 additional_actions: None,
             }
         }

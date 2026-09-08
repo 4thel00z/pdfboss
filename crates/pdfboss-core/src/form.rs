@@ -184,6 +184,54 @@ impl FieldFlags {
     pub fn no_export(self) -> bool {
         self.0 & 4 != 0
     }
+
+    /// Bit 13, `Multiline` (text fields, Table 228): the text may span
+    /// several lines.
+    pub fn multiline(self) -> bool {
+        self.bit(13)
+    }
+
+    /// Bit 14, `Password` (text fields): the text is echoed unreadably and
+    /// should not be stored in the file.
+    pub fn password(self) -> bool {
+        self.bit(14)
+    }
+
+    /// Bit 21, `FileSelect` (text fields): the text is the path of a file
+    /// whose contents are the field's value.
+    pub fn file_select(self) -> bool {
+        self.bit(21)
+    }
+
+    /// Bit 23, `DoNotSpellCheck` (text and choice fields): the text is not
+    /// spell-checked.
+    pub fn do_not_spell_check(self) -> bool {
+        self.bit(23)
+    }
+
+    /// Bit 24, `DoNotScroll` (text fields): the field takes no more text
+    /// than fits its rectangle.
+    pub fn do_not_scroll(self) -> bool {
+        self.bit(24)
+    }
+
+    /// Bit 25, `Comb` (text fields): the text is laid out in `MaxLen`
+    /// equally spaced cells.
+    pub fn comb(self) -> bool {
+        self.bit(25)
+    }
+
+    /// Bit 26, `RichText` (text fields): the value is a rich text string
+    /// held in `/RV`.
+    pub fn rich_text(self) -> bool {
+        self.bit(26)
+    }
+
+    /// Whether the bit at `position`, numbered from 1 as the standard
+    /// does, is set.
+    fn bit(self, position: u32) -> bool {
+        self.0 & (1 << (position - 1)) != 0
+    }
 }
 
 /// One field dictionary (ISO 32000-1 §12.7.3, Table 220) with the
@@ -222,8 +270,22 @@ pub struct FormField {
     /// `/DV`, inherited, resolved one level: the value a reset-form action
     /// restores.
     pub default_value: Option<Object>,
+    /// `/MaxLen`, inherited (§12.7.4.3, Table 229): the most characters a
+    /// text field's text may hold.
+    pub max_len: Option<u32>,
     /// `/AA`: the field's additional-actions dictionary, as written.
     pub additional_actions: Option<Dict>,
+}
+
+impl FormField {
+    /// The text of a text field (ISO 32000-1 §12.7.4.3): `/V` decoded as a
+    /// text string. `None` for a field of another type or without a value.
+    pub fn text(&self) -> Option<String> {
+        if self.field_type != Some(FieldType::Text) {
+            return None;
+        }
+        Some(decode_text_string(self.value.as_ref()?.as_str_bytes()?))
+    }
 }
 
 /// Every field dictionary reachable from the form's `/Fields`, depth first
@@ -273,6 +335,7 @@ struct Inherited {
     value: Option<Object>,
     default_value: Option<Object>,
     name: String,
+    max_len: Option<u32>,
 }
 
 /// A field dictionary waiting to be read, with what it inherits.
@@ -313,8 +376,20 @@ async fn read_field<S: AsyncObjectSource>(
         .map(FieldFlags)
         .or(inherited.flags)
         .unwrap_or_default();
-    let value = entries.value("V").await.or(inherited.value);
+    let value = match entries.value("V").await.or(inherited.value) {
+        // A text field's value may be a stream since PDF 1.5 (§12.7.4.3);
+        // its data is the text.
+        Some(Object::Stream(stream)) if field_type == Some(FieldType::Text) => {
+            src.stream_data(&stream).await.ok().map(Object::String)
+        }
+        value => value,
+    };
     let default_value = entries.value("DV").await.or(inherited.default_value);
+    let max_len = entries
+        .value("MaxLen")
+        .await
+        .and_then(|len| u32::try_from(len.as_int()?).ok())
+        .or(inherited.max_len);
     let partial_name = text_string(&entries, "T").await;
     let name = qualified_name(&inherited.name, partial_name.as_deref());
     let additional_actions = match dict.get("AA") {
@@ -350,6 +425,7 @@ async fn read_field<S: AsyncObjectSource>(
                     value: value.clone(),
                     default_value: default_value.clone(),
                     name: name.clone(),
+                    max_len,
                 },
                 depth: depth + 1,
             });
@@ -368,6 +444,7 @@ async fn read_field<S: AsyncObjectSource>(
         flags,
         value,
         default_value,
+        max_len,
         additional_actions,
     };
     (field, children)
@@ -441,6 +518,26 @@ mod tests {
 
     fn r(num: u32) -> ObjRef {
         ObjRef { num, gen: 0 }
+    }
+
+    /// `doc` with one stream object added.
+    fn doc_with_stream(
+        catalog_extra: &str,
+        objects: &[(u32, &str)],
+        stream: (u32, &str, &[u8]),
+    ) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            &format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        for (num, body) in objects {
+            b.object(*num, body);
+        }
+        b.stream(stream.0, stream.1, stream.2);
+        Document::load(b.build(1)).unwrap()
     }
 
     /// Every entry of Table 218 set, the dictionary itself and its flags
@@ -711,5 +808,73 @@ mod tests {
             ]
         );
         assert_eq!(fields[1].partial_name, None);
+    }
+
+    /// A text field's value is a text string; `/MaxLen` is inheritable; the
+    /// Table 228 bits are read by position, numbered from 1.
+    // Covers ISO 32000-1 §12.7.4.3.
+    #[test]
+    fn text_fields_decode_their_value_and_read_max_len_and_their_flags() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R] >>",
+            &[
+                (
+                    5,
+                    "<< /T (box) /FT /Tx /MaxLen 8 /Ff 16781312 /Kids [6 0 R] >>",
+                ),
+                (6, "<< /T (line) /Parent 5 0 R /V <FEFF00480069> >>"),
+            ],
+        )
+        .form_fields();
+        let line = &fields[1];
+        assert_eq!(line.text().as_deref(), Some("Hi"));
+        assert_eq!(line.max_len, Some(8));
+        assert!(line.flags.multiline() && line.flags.comb());
+        assert!(!line.flags.password() && !line.flags.file_select());
+        assert!(!line.flags.do_not_spell_check() && !line.flags.do_not_scroll());
+        assert!(!line.flags.rich_text());
+        assert_eq!(fields[0].text(), None);
+        let all = FieldFlags((1 << 25) | (1 << 24) | (1 << 23) | (1 << 22) | (1 << 20) | (1 << 13));
+        assert!(all.password() && all.file_select() && all.do_not_spell_check());
+        assert!(all.do_not_scroll() && all.comb() && all.rich_text());
+        assert!(!all.multiline());
+    }
+
+    /// Since PDF 1.5 the value may be a stream; its data is the text.
+    // Covers ISO 32000-1 §12.7.4.3.
+    #[test]
+    fn a_stream_value_of_a_text_field_is_read_as_its_text() {
+        let fields = doc_with_stream(
+            "/AcroForm << /Fields [5 0 R] >>",
+            &[(5, "<< /T (essay) /FT /Tx /V 6 0 R >>")],
+            (6, "", b"From a stream"),
+        )
+        .form_fields();
+        assert_eq!(fields[0].text().as_deref(), Some("From a stream"));
+        assert_eq!(
+            fields[0].value,
+            Some(Object::String(b"From a stream".to_vec()))
+        );
+    }
+
+    /// Only text fields have text: a button's name value and a text field
+    /// without a value give none, and a value that is no string or stream
+    /// gives none.
+    // Covers ISO 32000-1 §12.7.4.3.
+    #[test]
+    fn other_field_types_and_odd_values_have_no_text() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R] >>",
+            &[
+                (5, "<< /T (check) /FT /Btn /V /Yes >>"),
+                (6, "<< /T (empty) /FT /Tx >>"),
+                (7, "<< /T (odd) /FT /Tx /V 42 /MaxLen -1 >>"),
+            ],
+        )
+        .form_fields();
+        assert_eq!(fields[0].text(), None);
+        assert_eq!(fields[1].text(), None);
+        assert_eq!(fields[2].text(), None);
+        assert_eq!(fields[2].max_len, None);
     }
 }
