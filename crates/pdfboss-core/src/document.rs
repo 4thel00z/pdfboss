@@ -652,6 +652,15 @@ impl Document {
         ))
     }
 
+    /// Every field of the document's interactive form (ISO 32000-1
+    /// §12.7.3), depth first from the root fields; empty without a form.
+    pub fn form_fields(&self) -> Vec<crate::form::FormField> {
+        block_on(crate::form::form_fields_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The label the page at `index` shows, or `None` when the document
     /// has no page labels or no such page.
     pub fn page_label(&self, index: usize) -> Option<String> {
