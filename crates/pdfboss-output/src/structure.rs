@@ -505,7 +505,7 @@ fn push_segment_blocks(
         && segment
             .spans
             .iter()
-            .any(|span| block_element(span).is_some())
+            .any(|span| run_of(span) != Run::Untagged)
     {
         push_tagged_blocks(&segment.spans, stats, out);
         return;
@@ -567,24 +567,50 @@ fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &
     push_lane_blocks(&line_groups(&spans), stats, out);
 }
 
-/// The element whose block a span belongs to: the outermost block-level
-/// element on its path (§14.8.4.3), or, when the path holds none, the
-/// innermost Caption or TOCI, the two grouping elements that hold text of
-/// their own (§14.8.4.2). `None` for a span the tree does not reach and for
-/// one under nothing but containers.
-fn block_element(span: &TextSpan) -> Option<StructureElement> {
-    let path = &span.structure.as_ref()?.path;
-    path.iter()
+/// What a span belongs to under structure-tree order: the outermost
+/// block-level element on its path (§14.8.4.3) or, when the path holds none,
+/// the innermost Caption or TOCI, the two grouping elements that hold text of
+/// their own (§14.8.4.2); an illustration when a Figure, Formula or Form
+/// encloses it instead (§14.8.4.5); untagged when the tree does not reach it
+/// or nothing but containers do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    Block(StructureElement),
+    Illustration,
+    Untagged,
+}
+
+/// The run a span belongs to (see [`Run`]).
+///
+/// Covers ISO 32000-1 §14.8.4.5.
+fn run_of(span: &TextSpan) -> Run {
+    let Some(structure) = span.structure.as_ref() else {
+        return Run::Untagged;
+    };
+    let path = &structure.path;
+    let block = path
+        .iter()
         .copied()
-        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel)
-        .or_else(|| {
-            path.iter().copied().rev().find(|element| {
-                matches!(
-                    element.standard_type,
-                    StandardType::Caption | StandardType::TOCI
-                )
-            })
-        })
+        .find(|element| element.standard_type.kind() == StandardKind::BlockLevel);
+    if let Some(element) = block {
+        return Run::Block(element);
+    }
+    let holder = path.iter().copied().rev().find(|element| {
+        matches!(
+            element.standard_type,
+            StandardType::Caption | StandardType::TOCI
+        )
+    });
+    if let Some(element) = holder {
+        return Run::Block(element);
+    }
+    if path
+        .iter()
+        .any(|element| element.standard_type.kind() == StandardKind::Illustration)
+    {
+        return Run::Illustration;
+    }
+    Run::Untagged
 }
 
 /// Whether the span sits inside a `BlockQuote` grouping element (§14.8.4.2),
@@ -607,18 +633,24 @@ fn in_block_quote(span: &TextSpan) -> bool {
 /// block-level element form one block, typed by that element. H1 to H6 and
 /// H are headings, L a list, Table a table, every other block-level element
 /// a paragraph, so two P elements a line apart stay two paragraphs and a
-/// heading needs no size step; a Caption or TOCI with no block-level element
-/// inside is a paragraph of its own (§14.8.4.2). Stretches of spans with no
-/// such element go through the layout heuristics as on an untagged page.
-/// Ruled grids are not consulted here: a tagged table's rows are its TR
-/// elements.
+/// heading needs no size step; a Caption or TOCI (§14.8.4.2) with no
+/// block-level element inside is a paragraph of its own. The text of a
+/// Figure, Formula or Form (§14.8.4.5) is laid out by the heuristics on its
+/// own, since the tree says nothing about what it is: adjacent illustrations
+/// form one run, so a table a producer drew as a row of figures is still
+/// read as a table, while none of it joins the untagged text or the tagged
+/// blocks around it. Stretches of untagged spans go through the layout
+/// heuristics as on an untagged page. Ruled grids are not consulted here: a
+/// tagged table's rows are its TR elements.
 ///
-/// Covers ISO 32000-1 §14.8.4.2 and §14.8.4.3.
+/// Covers ISO 32000-1 §14.8.4.2, §14.8.4.3 and §14.8.4.5.
 fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
-    for (element, run) in stretches(spans, block_element) {
-        match element {
-            None => push_lane_blocks(&sequential_groups(run.iter().copied()), stats, out),
-            Some(element) => push_tagged_block(element, run, out),
+    for (run, spans) in stretches(spans, run_of) {
+        match run {
+            Run::Block(element) => push_tagged_block(element, spans, out),
+            Run::Illustration | Run::Untagged => {
+                push_lane_blocks(&sequential_groups(spans.iter().copied()), stats, out)
+            }
         }
     }
 }
@@ -643,6 +675,7 @@ fn stretches<'r, 's, K: PartialEq>(
     out
 }
 
+/// One tagged block from its element's type.
 fn push_tagged_block(element: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
     match element.standard_type {
         StandardType::H1 => push_tagged_heading(1, spans, out),

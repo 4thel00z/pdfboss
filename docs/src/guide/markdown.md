@@ -28,8 +28,10 @@ The analysis infers:
   marker, Table a table with a row per TR and a cell per TH or TD spanning
   what its `ColSpan` and `RowSpan` attributes say, and every other
   block-level element a paragraph; a Caption or a TOC entry is a paragraph of
-  its own, and the paragraphs of a BlockQuote render as a block quote. Content
-  the tree does not reach still goes through the heuristics below.
+  its own, the text of Figures, Formulas and Forms is laid out by the
+  heuristics below apart from the text around it, and the paragraphs of a
+  BlockQuote render as a block quote. Content the tree does not reach still
+  goes through the heuristics below.
 - **Page headers, footers and page numbers**: a page's first or last line,
   repeated near-verbatim at the same height on at least half the pages (three at
   minimum), is tagged

@@ -683,6 +683,37 @@ mod tests {
         assert_eq!(md, "Chapter 1 ... 3\n\nChapter 2 ... 9\n\nBody");
     }
 
+    /// Illustration text stays apart from untagged text: an untagged line
+    /// followed by two figures' labels and a formula makes two blocks, the
+    /// illustrations one run laid out by the heuristics, and the first
+    /// figure's description reaches its spans.
+    // Covers ISO 32000-1 §14.8.4.5.
+    #[test]
+    fn illustration_elements_are_their_own_blocks() {
+        let doc = Document::load(tagged_tree_doc(
+            b"BT /F1 12 Tf 1 0 0 1 72 714 Tm (Draft) Tj \
+              /Figure << /MCID 0 >> BDC 1 0 0 1 72 700 Tm (Chart A) Tj EMC \
+              /Figure << /MCID 1 >> BDC 1 0 0 1 72 686 Tm (Chart B) Tj EMC \
+              /Formula << /MCID 2 >> BDC 1 0 0 1 72 672 Tm (E = mc2) Tj EMC ET",
+            "20 0 R 21 0 R 22 0 R",
+            &[
+                (20, "Figure", 11, "[0] /Alt (Sales by quarter)"),
+                (21, "Figure", 11, "[1]"),
+                (22, "Formula", 11, "[2]"),
+            ],
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::StructureTree).unwrap();
+        assert_eq!(md, "Draft\n\nChart A\nChart B\nE = mc2");
+        let (spans, _) =
+            pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::StructureTree)
+                .unwrap();
+        assert_eq!(spans[0].alt, None);
+        assert_eq!(spans[1].alt.as_deref(), Some("Sales by quarter"));
+        assert_eq!(spans[2].alt, None);
+    }
+
     /// The same page in content order goes through the layout heuristics,
     /// which see no heading, one paragraph and no table.
     // Covers ISO 32000-1 §14.8.4.3.
