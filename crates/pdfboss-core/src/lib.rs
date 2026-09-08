@@ -14,6 +14,7 @@ pub mod embedded_file;
 pub mod error;
 pub mod extension;
 pub mod filters;
+pub mod form;
 pub mod geom;
 pub mod hash;
 pub mod language;
@@ -52,6 +53,7 @@ pub use embedded_file::{
 };
 pub use error::{Error, Result};
 pub use extension::{extensions_with, DeveloperExtension};
+pub use form::{interactive_form_with, InteractiveForm, Quadding, SignatureFlags};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use language::{language_with, LanguageTag};

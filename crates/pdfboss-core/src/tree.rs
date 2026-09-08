@@ -199,6 +199,30 @@ pub(crate) async fn resolved_dict<S: AsyncObjectSource>(src: &S, o: &Object) -> 
     }
 }
 
+/// The entries of one dictionary, each resolved through the source when it
+/// is an indirect object.
+pub(crate) struct Entries<'a, S> {
+    pub(crate) src: &'a S,
+    pub(crate) dict: &'a Dict,
+}
+
+impl<S: AsyncObjectSource> Entries<'_, S> {
+    /// The value under `key`, resolved; `None` when absent or unreadable.
+    pub(crate) async fn value(&self, key: &str) -> Option<Object> {
+        self.src.resolve(self.dict.get(key)?).await.ok()
+    }
+
+    /// The boolean under `key`, `None` when absent or not a boolean.
+    pub(crate) async fn flag(&self, key: &str) -> Option<bool> {
+        self.value(key).await?.as_bool()
+    }
+
+    /// The name under `key` mapped through `from_name`.
+    pub(crate) async fn named<T>(&self, key: &str, from_name: fn(&str) -> Option<T>) -> Option<T> {
+        from_name(&self.value(key).await?.as_name()?.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

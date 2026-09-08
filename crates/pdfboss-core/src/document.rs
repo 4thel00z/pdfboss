@@ -643,6 +643,15 @@ impl Document {
         ))
     }
 
+    /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
+    /// `None` when the catalog has no `/AcroForm`.
+    pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {
+        block_on(crate::form::interactive_form_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The label the page at `index` shows, or `None` when the document
     /// has no page labels or no such page.
     pub fn page_label(&self, index: usize) -> Option<String> {

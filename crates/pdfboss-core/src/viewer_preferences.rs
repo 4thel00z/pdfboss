@@ -4,7 +4,7 @@
 
 use crate::object::{Dict, Object};
 use crate::source::AsyncObjectSource;
-use crate::tree::resolved_dict;
+use crate::tree::{resolved_dict, Entries};
 
 /// The page mode a reader returns to on leaving full-screen mode
 /// (`/NonFullScreenPageMode`), meaningful only when the catalog's
@@ -228,27 +228,6 @@ pub async fn viewer_preferences_with<S: AsyncObjectSource>(
             .and_then(|copies| u32::try_from(copies).ok())
             .filter(|copies| *copies > 0),
     })
-}
-
-/// The entries of one dictionary, each resolved through the source when it
-/// is an indirect object.
-struct Entries<'a, S> {
-    src: &'a S,
-    dict: &'a Dict,
-}
-
-impl<S: AsyncObjectSource> Entries<'_, S> {
-    async fn value(&self, key: &str) -> Option<Object> {
-        self.src.resolve(self.dict.get(key)?).await.ok()
-    }
-
-    async fn flag(&self, key: &str) -> Option<bool> {
-        self.value(key).await?.as_bool()
-    }
-
-    async fn named<T>(&self, key: &str, from_name: fn(&str) -> Option<T>) -> Option<T> {
-        from_name(&self.value(key).await?.as_name()?.0)
-    }
 }
 
 /// The (first, last) pairs of a `/PrintPageRange` array: complete pairs of
