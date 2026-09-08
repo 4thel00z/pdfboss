@@ -678,7 +678,13 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 .collect();
             print!(
                 "{}",
-                info_text(Some(doc.version()), false, Some(&sizes), &doc.metadata())
+                info_text(
+                    Some(doc.version()),
+                    false,
+                    Some(&sizes),
+                    &doc.metadata(),
+                    &doc.extensions(),
+                )
             );
             Ok(())
         }
@@ -686,7 +692,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let data = std::fs::read(file).map_err(|e| e.to_string())?;
             print!(
                 "{}",
-                info_text(scan_version(&data), true, None, &Metadata::default())
+                info_text(scan_version(&data), true, None, &Metadata::default(), &[])
             );
             Ok(())
         }
@@ -702,6 +708,7 @@ fn info_text(
     encrypted: bool,
     sizes: Option<&[Option<(f32, f32)>]>,
     meta: &Metadata,
+    extensions: &[pdfboss_core::DeveloperExtension],
 ) -> String {
     let mut out = String::new();
     match version {
@@ -710,6 +717,16 @@ fn info_text(
         }
         None => {
             let _ = writeln!(out, "version:   unknown");
+        }
+    }
+    if !extensions.is_empty() {
+        let _ = writeln!(out, "extensions:");
+        for extension in extensions {
+            let _ = writeln!(
+                out,
+                "  {:<9} {} level {}",
+                extension.prefix, extension.base_version, extension.extension_level
+            );
         }
     }
     let _ = writeln!(out, "encrypted: {encrypted}");
@@ -1305,7 +1322,7 @@ mod tests {
             title: Some("Demo".to_string()),
             ..Metadata::default()
         };
-        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta);
+        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[]);
         assert!(report.contains("version:   1.7"));
         assert!(report.contains("encrypted: false"));
         assert!(report.contains("pages:     1"));
@@ -1314,9 +1331,28 @@ mod tests {
         assert!(report.contains("Demo"));
     }
 
+    /// The catalog's developer extensions print after the version, one
+    /// per line with the base version and the level; none prints nothing.
+    // Covers ISO 32000-1 §7.12.2.
+    #[test]
+    fn info_text_lists_developer_extensions() {
+        let extensions = [pdfboss_core::DeveloperExtension {
+            prefix: "ADBE".to_string(),
+            base_version: "1.7".to_string(),
+            extension_level: 3,
+        }];
+        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &extensions);
+        assert!(
+            report.contains("version:   1.7\nextensions:\n  ADBE      1.7 level 3\n"),
+            "{report}"
+        );
+        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &[]);
+        assert!(!report.contains("extensions"), "{report}");
+    }
+
     #[test]
     fn info_text_encrypted_document() {
-        let report = info_text(Some((1, 4)), true, None, &Metadata::default());
+        let report = info_text(Some((1, 4)), true, None, &Metadata::default(), &[]);
         assert!(report.contains("encrypted: true"));
         assert!(report.contains("pages:     unknown"));
         assert!(!report.contains("metadata:"));
@@ -1325,7 +1361,7 @@ mod tests {
     #[test]
     fn info_text_unavailable_page() {
         let sizes = [None];
-        let report = info_text(None, false, Some(&sizes), &Metadata::default());
+        let report = info_text(None, false, Some(&sizes), &Metadata::default(), &[]);
         assert!(report.contains("version:   unknown"));
         assert!(report.contains("page 1: (unavailable)"));
     }

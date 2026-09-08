@@ -12,6 +12,7 @@ pub mod document;
 pub mod elements;
 pub mod embedded_file;
 pub mod error;
+pub mod extension;
 pub mod filters;
 pub mod geom;
 pub mod hash;
@@ -49,6 +50,7 @@ pub use embedded_file::{
     FileSpec,
 };
 pub use error::{Error, Result};
+pub use extension::{extensions_with, DeveloperExtension};
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use language::{language_with, LanguageTag};
