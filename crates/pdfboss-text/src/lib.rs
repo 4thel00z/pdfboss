@@ -1055,6 +1055,22 @@ mod tests {
         assert!(spans[1].x > spans[0].end_x + 12.0, "{:?}", spans[1]);
     }
 
+    /// A word break inside a replacement is a space in the text: words are
+    /// found in the Unicode character stream, ActualText included, not in
+    /// glyph positions, so two glyph runs shown as one word come out as two
+    /// words when the replacement says so.
+    // Covers ISO 32000-1 §14.8.2.5 and §14.9.4.
+    #[test]
+    fn actual_text_spaces_are_word_breaks() {
+        let doc = marked_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /ActualText (two words) >> BDC (twowords) Tj EMC ET",
+            "",
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(texts(&spans), ["two words"]);
+    }
+
     /// source exactly as the document-level entries exclude it; `None`
     /// still extracts every layer.
     // Covers ISO 32000-1 §7.7.2.

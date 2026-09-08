@@ -1409,7 +1409,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// widens that span (ISO 32000-1 §14.9.4); an empty replacement leaves
     /// the sequence without text.
     ///
-    /// Covers ISO 32000-1 §14.8.2.4.2 and §14.9.4.
+    /// Covers ISO 32000-1 §14.8.2.4.2, §14.8.2.5 and §14.9.4.
     fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
         let suppressed = frame.suppressed();
         let Some(mut span) = self.show(&frame.gs, &mut frame.tm, bytes) else {
