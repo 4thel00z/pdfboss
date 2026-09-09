@@ -412,15 +412,17 @@ impl FormField {
 
     /// The appearance state a check box or radio button field is in (ISO
     /// 32000-1 §12.7.4.2): `/V` as a name, the one the widgets' `/AP /N`
-    /// dictionaries key their on and off appearances by. `None` for a
-    /// pushbutton, which keeps no value, for another field type, and for a
-    /// value that is no name; an absent value means the off state.
+    /// dictionaries key their on and off appearances by, `Off` when there
+    /// is no value (§12.7.4.2.4's default). `None` for a pushbutton, which
+    /// keeps no value, for another field type, and for a value that is no
+    /// name.
     pub fn state(&self) -> Option<&str> {
         match self.button_kind()? {
             ButtonKind::PushButton => None,
-            ButtonKind::CheckBox | ButtonKind::RadioButtons => {
-                Some(self.value.as_ref()?.as_name()?.0.as_str())
-            }
+            ButtonKind::CheckBox | ButtonKind::RadioButtons => match &self.value {
+                None => Some("Off"),
+                Some(value) => Some(value.as_name()?.0.as_str()),
+            },
         }
     }
 
@@ -1288,8 +1290,9 @@ mod tests {
 
     /// A check box's or radio button field's `/V` names its appearance
     /// state; a pushbutton keeps no value even when one is written; a
-    /// missing value and a value that is no name give none.
-    // Covers ISO 32000-1 §12.7.4.2.
+    /// missing value is the `Off` state and a value that is no name gives
+    /// none.
+    // Covers ISO 32000-1 §12.7.4.2, §12.7.4.2.4.
     #[test]
     fn a_button_field_s_state_is_its_value_name() {
         let fields = doc(
@@ -1305,7 +1308,7 @@ mod tests {
         .form_fields();
         assert_eq!(fields[0].state(), Some("Yes"));
         assert_eq!(fields[1].state(), Some("cardbrand1"));
-        assert_eq!(fields[2].state(), None);
+        assert_eq!(fields[2].state(), Some("Off"));
         assert_eq!(fields[3].state(), None);
         assert_eq!(fields[4].state(), None);
     }
@@ -1404,5 +1407,72 @@ mod tests {
         assert_eq!(odd.widgets[1].on_state, None);
         assert_eq!(odd.on_widgets(), Vec::<usize>::new());
         assert_eq!(odd.checked(), Some(true));
+    }
+
+    /// The standard's radio button example: the parent's `/V` names the
+    /// on state of the button that is on, each kid widget's on state comes
+    /// from its own `/AP /N`, and the on widget's index picks its Table
+    /// 227 export value; a radio field is no check box.
+    // Covers ISO 32000-1 §12.7.4.2.4.
+    #[test]
+    fn a_radio_button_field_names_the_widget_that_is_on() {
+        let fields = doc_with_stream(
+            "/AcroForm << /Fields [10 0 R] >>",
+            &[
+                (
+                    10,
+                    "<< /FT /Btn /Ff 32768 /T (Credit card) /V /cardbrand1 /Opt [(Visa) (Master)] \
+                     /Kids [11 0 R 12 0 R] >>",
+                ),
+                (
+                    11,
+                    "<< /Parent 10 0 R /Subtype /Widget /AS /cardbrand1 /Rect [0 0 1 1] \
+                     /AP << /N << /cardbrand1 8 0 R /Off 8 0 R >> >> >>",
+                ),
+                (
+                    12,
+                    "<< /Parent 10 0 R /Subtype /Widget /AS /Off /Rect [0 0 1 1] \
+                     /AP << /N << /cardbrand2 8 0 R /Off 8 0 R >> >> >>",
+                ),
+            ],
+            (8, "/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b""),
+        )
+        .form_fields();
+        let card = &fields[0];
+        assert_eq!(card.button_kind(), Some(ButtonKind::RadioButtons));
+        assert_eq!(card.state(), Some("cardbrand1"));
+        assert_eq!(card.on_widgets(), vec![0]);
+        assert_eq!(card.widgets[0].on_state.as_deref(), Some("cardbrand1"));
+        assert_eq!(card.widgets[1].on_state.as_deref(), Some("cardbrand2"));
+        assert_eq!(card.widgets[1].appearance_state.as_deref(), Some("Off"));
+        assert_eq!(card.options[0].export_value, "Visa");
+        assert_eq!(card.checked(), None);
+    }
+
+    /// With `RadiosInUnison` two buttons sharing an on state are on
+    /// together; a radio field without `/V` is in the `Off` state with no
+    /// button on; `NoToggleToOff` is read.
+    // Covers ISO 32000-1 §12.7.4.2.4.
+    #[test]
+    fn radios_in_unison_are_on_together_and_a_valueless_radio_field_is_off() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 9 0 R] >>",
+            &[
+                (5, "<< /T (size) /FT /Btn /Ff 33587200 /V /a /Kids [6 0 R 7 0 R 8 0 R] >>"),
+                (6, "<< /Parent 5 0 R /Subtype /Widget /AS /a /AP << /N << /a 6 0 R /Off 6 0 R >> >> >>"),
+                (7, "<< /Parent 5 0 R /Subtype /Widget /AS /a /AP << /N << /a 6 0 R /Off 6 0 R >> >> >>"),
+                (8, "<< /Parent 5 0 R /Subtype /Widget /AS /Off /AP << /N << /b 6 0 R /Off 6 0 R >> >> >>"),
+                (9, "<< /T (none) /FT /Btn /Ff 49152 /Kids [10 0 R] >>"),
+                (10, "<< /Parent 9 0 R /Subtype /Widget /AS /Off /AP << /N << /x 6 0 R /Off 6 0 R >> >> >>"),
+            ],
+        )
+        .form_fields();
+        let size = &fields[0];
+        assert!(size.flags.radio() && size.flags.radios_in_unison());
+        assert_eq!(size.on_widgets(), vec![0, 1]);
+        let none = &fields[1];
+        assert!(none.flags.radio() && none.flags.no_toggle_to_off());
+        assert_eq!(none.state(), Some("Off"));
+        assert_eq!(none.on_widgets(), Vec::<usize>::new());
     }
 }
