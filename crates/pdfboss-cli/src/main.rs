@@ -1428,6 +1428,8 @@ mod tests {
                 top_index: 0,
                 selected_indices: Vec::new(),
                 additional_actions: None,
+                lock: None,
+                seed_value: None,
             }
         }
         let fields = [

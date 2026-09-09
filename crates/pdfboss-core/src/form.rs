@@ -134,6 +134,8 @@ pub async fn interactive_form_with<S: AsyncObjectSource>(
 }
 
 /// The type of a terminal field (`/FT`, ISO 32000-1 §12.7.3, Table 220).
+///
+/// Covers ISO 32000-1 §12.7.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldType {
     /// `Btn`: a push button, check box or radio button (§12.7.4.2).
@@ -381,6 +383,34 @@ pub enum ButtonKind {
     RadioButtons,
 }
 
+/// A signature dictionary (ISO 32000-1 §12.8.1, Table 252) as the value of
+/// a signature field, read as data: nothing here is verified.
+///
+/// Covers ISO 32000-1 §12.8.1.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Signature {
+    /// `/Filter`: the preferred signature handler.
+    pub filter: Option<String>,
+    /// `/SubFilter`: the encoding of the signature value and key
+    /// information, such as `adbe.pkcs7.detached`.
+    pub sub_filter: Option<String>,
+    /// `/ByteRange`: the (offset, length) pairs of the bytes the digest
+    /// covers; an incomplete pair or a negative number ends the list.
+    pub byte_range: Vec<(u64, u64)>,
+    /// `/Contents`: the signature value as written; empty when absent.
+    pub contents: Vec<u8>,
+    /// `/Name`: the signer named in the dictionary.
+    pub name: Option<String>,
+    /// `/M`: the time of signing as written, a PDF date string.
+    pub signing_time: Option<String>,
+    /// `/Location`: where the signing took place.
+    pub location: Option<String>,
+    /// `/Reason`: why the document was signed.
+    pub reason: Option<String>,
+    /// `/ContactInfo`: how to reach the signer.
+    pub contact_info: Option<String>,
+}
+
 /// One entry of a choice field's `/Opt` array (ISO 32000-1 §12.7.4.4,
 /// Table 231): the value exported for the option and the text shown for
 /// it. A lone text string in the array is both.
@@ -445,6 +475,12 @@ pub struct FormField {
     pub selected_indices: Vec<u32>,
     /// `/AA`: the field's additional-actions dictionary, as written.
     pub additional_actions: Option<Dict>,
+    /// `/Lock` (§12.7.4.5, Table 232): the signature field lock dictionary
+    /// naming the fields that lock once this field is signed, by reference.
+    pub lock: Option<ObjRef>,
+    /// `/SV` (§12.7.4.5, Table 232): the seed value dictionary constraining
+    /// a signature applied to this field, by reference.
+    pub seed_value: Option<ObjRef>,
 }
 
 impl FormField {
@@ -513,6 +549,33 @@ impl FormField {
             .filter(|(_, widget)| widget.on_state.as_deref() == Some(state))
             .map(|(index, _)| index)
             .collect()
+    }
+
+    /// The signature a signature field holds (ISO 32000-1 §12.7.4.5): its
+    /// `/V` read as a signature dictionary. `None` for another field type,
+    /// an unsigned field, or a value that is no dictionary.
+    pub fn signature(&self) -> Option<Signature> {
+        if self.field_type != Some(FieldType::Signature) {
+            return None;
+        }
+        let dict = self.value.as_ref()?.as_dict()?;
+        let text = |key: &str| Some(decode_text_string(dict.get(key)?.as_str_bytes()?));
+        let name = |key: &str| Some(dict.get_name(key)?.0.clone());
+        Some(Signature {
+            filter: name("Filter"),
+            sub_filter: name("SubFilter"),
+            byte_range: byte_range(dict.get("ByteRange")),
+            contents: dict
+                .get("Contents")
+                .and_then(Object::as_str_bytes)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            name: text("Name"),
+            signing_time: text("M"),
+            location: text("Location"),
+            reason: text("Reason"),
+            contact_info: text("ContactInfo"),
+        })
     }
 
     /// The names of a choice field's selected options (ISO 32000-1
@@ -719,6 +782,8 @@ async fn read_field<S: AsyncObjectSource>(
         top_index,
         selected_indices,
         additional_actions,
+        lock: dict.get("Lock").and_then(Object::as_ref),
+        seed_value: dict.get("SV").and_then(Object::as_ref),
     };
     (field, children)
 }
@@ -776,6 +841,26 @@ async fn choice_options<S: AsyncObjectSource>(src: &S, opt: &Object) -> Vec<Choi
         }
     }
     options
+}
+
+/// The (offset, length) pairs of a `/ByteRange` array (ISO 32000-1
+/// §12.8.1): complete pairs of non-negative integers up to the first
+/// element that is not one.
+fn byte_range(value: Option<&Object>) -> Vec<(u64, u64)> {
+    let Some(items) = value.and_then(Object::as_array) else {
+        return Vec::new();
+    };
+    items
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map_while(|[offset, length]| {
+            Some((
+                u64::try_from(offset.as_int()?).ok()?,
+                u64::try_from(length.as_int()?).ok()?,
+            ))
+        })
+        .collect()
 }
 
 /// The dictionary a reference points at, `None` for anything else.
@@ -867,7 +952,7 @@ fn references(value: Option<&Object>) -> Vec<ObjRef> {
 mod tests {
     use super::{
         AppearanceCharacteristics, ButtonKind, CaptionPosition, ChoiceOption, FieldFlags,
-        FieldType, FormField, InteractiveForm, Quadding, SignatureFlags, Widget,
+        FieldType, FormField, InteractiveForm, Quadding, Signature, SignatureFlags, Widget,
     };
     use crate::object::{Name, ObjRef, Object};
     use crate::Document;
@@ -1646,5 +1731,81 @@ mod tests {
             Some(CaptionPosition::Overlaid)
         );
         assert_eq!(CaptionPosition::from_int(7), None);
+    }
+
+    /// A signed signature field: `/V` is a signature dictionary whose
+    /// Table 252 entries are read as data, and the field's own `/Lock` and
+    /// `/SV` are kept by reference.
+    // Covers ISO 32000-1 §12.7.4.5.
+    #[test]
+    fn a_signed_signature_field_exposes_its_signature_dictionary() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R] /SigFlags 3 >>",
+            &[
+                (5, "<< /T (sig) /FT /Sig /V 6 0 R /Lock 7 0 R /SV 8 0 R /Subtype /Widget /Rect [0 0 0 0] >>"),
+                (
+                    6,
+                    "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached \
+                     /ByteRange [0 100 200 50] /Contents <3031> /Name <FEFF00410064> \
+                     /M (D:20260909100000Z) /Location (Berlin) /Reason (I agree) \
+                     /ContactInfo (ada@example.org) >>",
+                ),
+                (7, "<< /Type /SigFieldLock /Action /All >>"),
+                (8, "<< /Type /SV /Ff 1 >>"),
+            ],
+        )
+        .form_fields();
+        let sig = &fields[0];
+        assert_eq!(sig.field_type, Some(FieldType::Signature));
+        assert_eq!(
+            sig.signature(),
+            Some(Signature {
+                filter: Some("Adobe.PPKLite".into()),
+                sub_filter: Some("adbe.pkcs7.detached".into()),
+                byte_range: vec![(0, 100), (200, 50)],
+                contents: b"01".to_vec(),
+                name: Some("Ad".into()),
+                signing_time: Some("D:20260909100000Z".into()),
+                location: Some("Berlin".into()),
+                reason: Some("I agree".into()),
+                contact_info: Some("ada@example.org".into()),
+            })
+        );
+        assert_eq!(sig.lock, Some(r(7)));
+        assert_eq!(sig.seed_value, Some(r(8)));
+        assert_eq!(sig.text(), None);
+        assert_eq!(sig.selected(), Vec::<String>::new());
+    }
+
+    /// An unsigned signature field has no signature; a text field's
+    /// dictionary value is none either; a signature dictionary with only
+    /// `/Type`, an odd `/ByteRange` and a direct `/Lock` read as defaults or
+    /// absent.
+    // Covers ISO 32000-1 §12.7.4.5.
+    #[test]
+    fn unsigned_fields_and_odd_signature_entries_read_as_absent() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R] >>",
+            &[
+                (5, "<< /T (unsigned) /FT /Sig /Lock << /Action /All >> >>"),
+                (6, "<< /T (name) /FT /Tx /V << /Filter /X >> >>"),
+                (
+                    7,
+                    "<< /T (odd) /FT /Sig /V << /Type /Sig /ByteRange [0 10 20] /Contents 5 >> >>",
+                ),
+            ],
+        )
+        .form_fields();
+        assert_eq!(fields[0].signature(), None);
+        assert_eq!(fields[0].lock, None);
+        assert_eq!(fields[0].seed_value, None);
+        assert_eq!(fields[1].signature(), None);
+        assert_eq!(
+            fields[2].signature(),
+            Some(Signature {
+                byte_range: vec![(0, 10)],
+                ..Signature::default()
+            })
+        );
     }
 }
