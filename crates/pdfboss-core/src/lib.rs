@@ -54,8 +54,9 @@ pub use embedded_file::{
 pub use error::{Error, Result};
 pub use extension::{extensions_with, DeveloperExtension};
 pub use form::{
-    form_fields_with, interactive_form_with, ButtonKind, ChoiceOption, FieldFlags, FieldType,
-    FormField, InteractiveForm, Quadding, SignatureFlags, Widget,
+    form_fields_with, interactive_form_with, AppearanceCharacteristics, ButtonKind,
+    CaptionPosition, ChoiceOption, FieldFlags, FieldType, FormField, InteractiveForm, Quadding,
+    SignatureFlags, Widget,
 };
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};

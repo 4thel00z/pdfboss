@@ -301,6 +301,70 @@ pub struct Widget {
     /// dictionary other than `Off`. `None` when the normal appearance is a
     /// single stream or names no or several other states.
     pub on_state: Option<String>,
+    /// `/MK`: the captions and icons a button is drawn with (§12.7.4.2.2,
+    /// Table 189); `None` without the dictionary.
+    pub characteristics: Option<AppearanceCharacteristics>,
+}
+
+/// The entries of a widget's appearance characteristics dictionary (`/MK`,
+/// ISO 32000-1 §12.5.6.19, Table 189) that give a button its captions and
+/// icons. The normal caption may sit on any button; the rest are for
+/// pushbuttons (§12.7.4.2.2).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppearanceCharacteristics {
+    /// `/CA`: the normal caption, shown when the button is at rest.
+    pub caption: Option<String>,
+    /// `/RC`: the rollover caption, shown while the cursor is over the
+    /// button.
+    pub rollover_caption: Option<String>,
+    /// `/AC`: the alternate caption, shown while the mouse button is down.
+    pub alternate_caption: Option<String>,
+    /// `/I`: the normal icon, a form XObject by reference.
+    pub icon: Option<ObjRef>,
+    /// `/RI`: the rollover icon.
+    pub rollover_icon: Option<ObjRef>,
+    /// `/IX`: the alternate icon.
+    pub alternate_icon: Option<ObjRef>,
+    /// `/TP`: where the caption sits relative to the icon; caption only by
+    /// default.
+    pub caption_position: CaptionPosition,
+}
+
+/// Where a pushbutton's caption sits relative to its icon (`/TP`, ISO
+/// 32000-1 §12.5.6.19, Table 189).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptionPosition {
+    /// 0: no icon, caption only.
+    #[default]
+    CaptionOnly,
+    /// 1: no caption, icon only.
+    IconOnly,
+    /// 2: caption below the icon.
+    Below,
+    /// 3: caption above the icon.
+    Above,
+    /// 4: caption to the right of the icon.
+    Right,
+    /// 5: caption to the left of the icon.
+    Left,
+    /// 6: caption overlaid on the icon.
+    Overlaid,
+}
+
+impl CaptionPosition {
+    /// The position a `/TP` code names, `None` for a code outside 0 to 6.
+    pub fn from_int(code: i64) -> Option<CaptionPosition> {
+        Some(match code {
+            0 => CaptionPosition::CaptionOnly,
+            1 => CaptionPosition::IconOnly,
+            2 => CaptionPosition::Below,
+            3 => CaptionPosition::Above,
+            4 => CaptionPosition::Right,
+            5 => CaptionPosition::Left,
+            6 => CaptionPosition::Overlaid,
+            _ => return None,
+        })
+    }
 }
 
 /// The three kinds of button field (ISO 32000-1 §12.7.4.2), told apart by
@@ -729,7 +793,35 @@ async fn widget<S: AsyncObjectSource>(src: &S, object: ObjRef, dict: &Dict) -> W
         object,
         appearance_state: dict.get_name("AS").map(|state| state.0.clone()),
         on_state: on_state(src, dict).await,
+        characteristics: characteristics(src, dict).await,
     }
+}
+
+/// The caption and icon entries of a widget's `/MK` dictionary (Table
+/// 189); `None` without the dictionary. A caption that is no string, an
+/// icon that is no reference and a `/TP` outside 0 to 6 read as absent.
+///
+/// Covers ISO 32000-1 §12.7.4.2.2.
+async fn characteristics<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+) -> Option<AppearanceCharacteristics> {
+    let mk = resolved_dict(src, dict.get("MK")?).await?;
+    let entries = Entries { src, dict: &mk };
+    let reference = |key: &str| mk.get(key).and_then(Object::as_ref);
+    Some(AppearanceCharacteristics {
+        caption: text_string(&entries, "CA").await,
+        rollover_caption: text_string(&entries, "RC").await,
+        alternate_caption: text_string(&entries, "AC").await,
+        icon: reference("I"),
+        rollover_icon: reference("RI"),
+        alternate_icon: reference("IX"),
+        caption_position: entries
+            .value("TP")
+            .await
+            .and_then(|code| CaptionPosition::from_int(code.as_int()?))
+            .unwrap_or_default(),
+    })
 }
 
 /// The on state of a widget (ISO 32000-1 §12.7.4.2.3): the one key of its
@@ -774,8 +866,8 @@ fn references(value: Option<&Object>) -> Vec<ObjRef> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ButtonKind, ChoiceOption, FieldFlags, FieldType, FormField, InteractiveForm, Quadding,
-        SignatureFlags, Widget,
+        AppearanceCharacteristics, ButtonKind, CaptionPosition, ChoiceOption, FieldFlags,
+        FieldType, FormField, InteractiveForm, Quadding, SignatureFlags, Widget,
     };
     use crate::object::{Name, ObjRef, Object};
     use crate::Document;
@@ -1344,6 +1436,7 @@ mod tests {
                 object: r(5),
                 appearance_state: Some("Yes".into()),
                 on_state: Some("Yes".into()),
+                characteristics: None,
             }]
         );
         assert_eq!(fields[0].on_widgets(), vec![0]);
@@ -1474,5 +1567,84 @@ mod tests {
         assert!(none.flags.radio() && none.flags.no_toggle_to_off());
         assert_eq!(none.state(), Some("Off"));
         assert_eq!(none.on_widgets(), Vec::<usize>::new());
+    }
+
+    /// A merged pushbutton with every caption and icon entry of Table 189:
+    /// the captions are text strings, the icons references, the caption
+    /// position a code.
+    // Covers ISO 32000-1 §12.7.4.2.2.
+    #[test]
+    fn a_pushbutton_s_widget_carries_its_captions_and_icons() {
+        let fields = doc_with_stream(
+            "/AcroForm << /Fields [5 0 R] >>",
+            &[
+                (
+                    5,
+                    "<< /T (go) /FT /Btn /Ff 65536 /V /Yes /Subtype /Widget /Rect [0 0 10 10] \
+                     /MK 7 0 R >>",
+                ),
+                (
+                    7,
+                    "<< /CA <FEFF00530065006E0064> /RC (Go!) /AC (Sending) /I 6 0 R /RI 6 0 R \
+                     /IX 6 0 R /TP 2 /BC [0] /BG [1 1 1] >>",
+                ),
+            ],
+            (6, "/Type /XObject /Subtype /Form /BBox [0 0 1 1]", b""),
+        )
+        .form_fields();
+        let go = &fields[0];
+        assert_eq!(go.button_kind(), Some(ButtonKind::PushButton));
+        assert_eq!(go.state(), None);
+        assert_eq!(
+            go.widgets[0].characteristics,
+            Some(AppearanceCharacteristics {
+                caption: Some("Send".into()),
+                rollover_caption: Some("Go!".into()),
+                alternate_caption: Some("Sending".into()),
+                icon: Some(r(6)),
+                rollover_icon: Some(r(6)),
+                alternate_icon: Some(r(6)),
+                caption_position: CaptionPosition::Below,
+            })
+        );
+    }
+
+    /// A check box may carry the normal caption alone, with the caption
+    /// position at its default; a widget without `/MK` has no
+    /// characteristics; a caption that is a number, an icon written
+    /// directly and a `/TP` of 9 read as absent.
+    // Covers ISO 32000-1 §12.7.4.2.2.
+    #[test]
+    fn captions_default_and_odd_characteristics_read_as_absent() {
+        let fields = doc(
+            "/AcroForm << /Fields [5 0 R 6 0 R 7 0 R] >>",
+            &[
+                (5, "<< /T (urgent) /FT /Btn /V /Yes /Subtype /Widget /Rect [0 0 1 1] /MK << /CA (8) >> >>"),
+                (6, "<< /T (plain) /FT /Btn /Ff 65536 /Subtype /Widget /Rect [0 0 1 1] >>"),
+                (
+                    7,
+                    "<< /T (odd) /FT /Btn /Ff 65536 /Subtype /Widget /Rect [0 0 1 1] \
+                     /MK << /CA 5 /I << /Type /XObject >> /TP 9 >> >>",
+                ),
+            ],
+        )
+        .form_fields();
+        assert_eq!(
+            fields[0].widgets[0].characteristics,
+            Some(AppearanceCharacteristics {
+                caption: Some("8".into()),
+                ..AppearanceCharacteristics::default()
+            })
+        );
+        assert_eq!(fields[1].widgets[0].characteristics, None);
+        assert_eq!(
+            fields[2].widgets[0].characteristics,
+            Some(AppearanceCharacteristics::default())
+        );
+        assert_eq!(
+            CaptionPosition::from_int(6),
+            Some(CaptionPosition::Overlaid)
+        );
+        assert_eq!(CaptionPosition::from_int(7), None);
     }
 }
