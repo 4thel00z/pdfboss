@@ -121,6 +121,18 @@ class Span:
         horizontally, the font's descent..ascent vertically."""
 
     @property
+    def ascent(self) -> float:
+        """Height of the box above the baseline, in device units:
+        ``bbox[3] - y``. For horizontal text the font's ``/Ascent`` scaled
+        by the size."""
+
+    @property
+    def descent(self) -> float:
+        """Depth of the box below the baseline, in device units, zero or
+        negative: ``bbox[1] - y``. For horizontal text the font's
+        ``/Descent`` scaled by the size."""
+
+    @property
     def bold(self) -> bool:
         """Bold, from FontDescriptor evidence with BaseFont-name fallback."""
 
@@ -139,15 +151,34 @@ class Span:
 
     @property
     def underline(self) -> bool:
-        """A drawn ruling sits just below the baseline covering most of
-        the span. Read from the page's geometry — PDF has no underline
-        attribute — so a table border hugging a cell's text can read as
-        one."""
+        """A drawn ruling sits just below the baseline, covers most of the
+        span and stops within an em of the text it covers, or an
+        ``/Underline`` or ``/Squiggly`` annotation covers the span. PDF has
+        no underline attribute: the drawn case is read from the page's
+        geometry, so a cell border that ends where the cell's text ends can
+        read as one."""
 
     @property
     def strikethrough(self) -> bool:
-        """A drawn ruling crosses the span's x-height band —
-        geometry-read, like ``underline``."""
+        """A drawn ruling crosses the span's x-height band under the same
+        coverage rules as ``underline``, or a ``/StrikeOut`` annotation
+        covers the span."""
+
+    @property
+    def highlight(self) -> bool:
+        """A filled rectangle about a line tall lies behind the span:
+        painted before it, colored (white and gray bands are backgrounds),
+        lighter than its text, covering most of it and stopping within an
+        em of the text it covers. Paragraph shading and cell backgrounds run
+        to their box edges and do not count. A ``/Highlight`` annotation
+        covering the span sets it too."""
+
+    @property
+    def highlight_color(self) -> tuple[float, float, float] | None:
+        """The highlight's color as RGB in ``[0, 1]``: the rectangle's fill
+        color, read the way ``color`` is, or the annotation's ``/C``;
+        ``None`` without a highlight, and for an annotation without a
+        color."""
 
     @property
     def rise(self) -> float:

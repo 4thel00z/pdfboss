@@ -1,6 +1,7 @@
 //! Content-op execution with full text state (Tm/Tlm, Tf, Tc, Tw, Tz, TL,
 //! Ts), glyph advances, and form XObject recursion.
 
+use crate::decorations::{self, Band};
 use crate::font::Font;
 use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, Structure, TextSpan};
 use pdfboss_core::content::{ContentOps, Op, TextItem};
@@ -256,7 +257,8 @@ async fn structure_tree_order_with<S: AsyncObjectSource>(
 
 /// One page walk, compiled once per [`MarkedContent`] strategy: the
 /// executor over the page's content and every form it invokes, then the
-/// underline and strikethrough pass over the rulings it drew.
+/// decoration passes over the rulings and bands it drew and the text
+/// markup annotations the page carries.
 async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
     src: &S,
     page: &Page,
@@ -279,6 +281,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         src,
         spans: Vec::new(),
         rulings: Vec::new(),
+        bands: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
         report,
@@ -293,7 +296,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         vec![Arc::new(page.resources.clone())],
         GState::new(),
         0,
-        (0, 0),
+        (0, 0, 0),
         M::parents_of(page.dict()),
     );
     exec.run(root).await;
@@ -301,22 +304,11 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
     for span in &mut spans {
         span.page = page.index;
     }
-    // The decoration pass touches only pages that draw horizontal rulings,
-    // and each span consults only the rulings inside its vertical band —
-    // sorting once keeps a page full of table borders from turning the
-    // pass into spans × rulings work.
-    let mut horizontals: Vec<&Ruling> = exec
-        .rulings
-        .iter()
-        .filter(|r| r.start.y == r.end.y)
-        .collect();
-    if !horizontals.is_empty() {
-        horizontals.sort_by(|a, b| a.start.y.total_cmp(&b.start.y));
-        for span in &mut spans {
-            mark_underline_and_strikethrough(span, &horizontals);
-        }
+    decorations::mark_drawn(&mut spans, &exec.rulings, &exec.bands);
+    if !spans.is_empty() {
+        let markups = decorations::markup_annotations(src, page, oc).await;
+        decorations::mark_annotated(&mut spans, &markups);
     }
-    drop(horizontals);
     (spans, exec.rulings, exec.report, exec.marks)
 }
 
@@ -447,56 +439,6 @@ fn reversed_chars(text: &str) -> String {
     out
 }
 
-/// How far below the baseline (in fractions of the effective size) an
-/// underline may sit, and the slack above it for lines drawn exactly on
-/// the baseline.
-const UNDERLINE_BELOW: f32 = 0.3;
-const UNDERLINE_ABOVE: f32 = 0.05;
-
-/// The x-height band (in fractions of the effective size above the
-/// baseline) a strikethrough crosses.
-const STRIKETHROUGH_LOW: f32 = 0.15;
-const STRIKETHROUGH_HIGH: f32 = 0.6;
-
-/// The fraction of a span's width a ruling must cover to decorate it: a
-/// neighbour's underline running past a word boundary is not this span's.
-const DECORATED_MIN_OVERLAP: f32 = 0.6;
-
-/// Sets `underline`/`strikethrough` from the page's horizontal rulings
-/// (pre-sorted by y): underline when one sits just below the baseline
-/// covering most of the span, strikethrough when one crosses the x-height
-/// band. Vertical writing is left unmarked — its decorations are vertical
-/// lines beside the text, which are indistinguishable from column rules
-/// here.
-fn mark_underline_and_strikethrough(span: &mut TextSpan, horizontals: &[&Ruling]) {
-    if span.vertical || span.size <= 0.0 {
-        return;
-    }
-    let width = span.bbox.x1 - span.bbox.x0;
-    if width <= 0.0 {
-        return;
-    }
-    let low = span.y - UNDERLINE_BELOW * span.size;
-    let high = span.y + STRIKETHROUGH_HIGH * span.size;
-    let first = horizontals.partition_point(|r| r.start.y < low);
-    for r in &horizontals[first..] {
-        if r.start.y > high {
-            break;
-        }
-        let overlap = r.end.x.min(span.bbox.x1) - r.start.x.max(span.bbox.x0);
-        if overlap < DECORATED_MIN_OVERLAP * width {
-            continue;
-        }
-        let above = r.start.y - span.y;
-        if above <= UNDERLINE_ABOVE * span.size {
-            span.underline = true;
-        }
-        if above >= STRIKETHROUGH_LOW * span.size {
-            span.strikethrough = true;
-        }
-    }
-}
-
 /// The graphics-state parameters text extraction cares about. Saved and
 /// restored by `q`/`Q`; carried into form XObjects.
 #[derive(Clone)]
@@ -541,7 +483,7 @@ impl GState {
 /// Reads color components by count — 1 gray, 3 RGB, 4 CMYK, clamped to
 /// `[0, 1]` — the approximation span colors carry for spaces whose
 /// transform extraction does not run. Any other count is no color.
-fn components_color(comps: &[f32]) -> Option<(f32, f32, f32)> {
+pub(crate) fn components_color(comps: &[f32]) -> Option<(f32, f32, f32)> {
     let c = |v: f32| {
         if v.is_finite() {
             v.clamp(0.0, 1.0)
@@ -603,11 +545,10 @@ fn ruling_from_segment(a: Point, b: Point, width: f32) -> Option<Ruling> {
     None
 }
 
-/// The centerline of a thin filled rectangle: a closed 4-vertex subpath in
-/// device space whose edges are all axis-aligned, with a thin dimension at
-/// most [`RULING_MAX_FILL_THICKNESS`] and a long dimension at least
-/// [`RULING_MIN_LENGTH`]. Width is 0.0 — a fill has no stroke width.
-fn filled_rect_ruling(device: &[Point]) -> Option<Ruling> {
+/// The normalized box of a filled rectangle: a closed 4-vertex subpath in
+/// device space whose edges are all axis-aligned. `None` for any other
+/// subpath.
+fn filled_rect(device: &[Point]) -> Option<Rect> {
     let corners = match device {
         [a, b, c, d] => [*a, *b, *c, *d],
         [a, b, c, d, e]
@@ -639,23 +580,30 @@ fn filled_rect_ruling(device: &[Point]) -> Option<Ruling> {
         .iter()
         .map(|p| p.y)
         .fold(f32::NEG_INFINITY, f32::max);
-    let w = x1 - x0;
-    let h = y1 - y0;
+    Some(Rect::new(x0, y0, x1, y1))
+}
+
+/// The centerline of a thin filled rectangle: a thin dimension at most
+/// [`RULING_MAX_FILL_THICKNESS`] and a long dimension at least
+/// [`RULING_MIN_LENGTH`]. Width is 0.0, since a fill has no stroke width.
+fn ruling_of_rect(rect: Rect) -> Option<Ruling> {
+    let w = rect.width();
+    let h = rect.height();
     if w.min(h) > RULING_MAX_FILL_THICKNESS || w.max(h) < RULING_MIN_LENGTH {
         return None;
     }
     if h <= w {
-        let y = (y0 + y1) / 2.0;
+        let y = (rect.y0 + rect.y1) / 2.0;
         return Some(Ruling {
-            start: Point::new(x0, y),
-            end: Point::new(x1, y),
+            start: Point::new(rect.x0, y),
+            end: Point::new(rect.x1, y),
             width: 0.0,
         });
     }
-    let x = (x0 + x1) / 2.0;
+    let x = (rect.x0 + rect.x1) / 2.0;
     Some(Ruling {
-        start: Point::new(x, y0),
-        end: Point::new(x, y1),
+        start: Point::new(x, rect.y0),
+        end: Point::new(x, rect.y1),
         width: 0.0,
     })
 }
@@ -694,12 +642,13 @@ struct Frame {
     /// Byte offset of the next operator: the pull parser's whole state at
     /// an operator boundary, so a suspended frame resumes from it exactly.
     pos: usize,
-    /// Lengths of the executor's spans and rulings when this frame was
-    /// created. A stream that stops parsing mid-way contributes nothing —
+    /// Lengths of the executor's spans, rulings and bands when this frame
+    /// was created. A stream that stops parsing mid-way contributes nothing,
     /// exactly as it contributed nothing when the whole stream was parsed
-    /// up front — so its error truncates both back to these marks.
+    /// up front, so its error truncates all three back to these marks.
     spans_mark: usize,
     rulings_mark: usize,
+    bands_mark: usize,
     /// Form-XObject nesting depth, checked against `MAX_FORM_DEPTH`.
     depth: usize,
     gs: GState,
@@ -760,7 +709,7 @@ impl Frame {
         chain: Vec<Arc<Dict>>,
         gs: GState,
         depth: usize,
-        (spans_mark, rulings_mark): (usize, usize),
+        (spans_mark, rulings_mark, bands_mark): (usize, usize, usize),
         parents: Option<u32>,
     ) -> Frame {
         Frame {
@@ -769,6 +718,7 @@ impl Frame {
             pos: 0,
             spans_mark,
             rulings_mark,
+            bands_mark,
             depth,
             gs,
             saved: Vec::new(),
@@ -858,6 +808,9 @@ struct Executor<'a, S, M> {
     src: &'a S,
     spans: Vec<TextSpan>,
     rulings: Vec<Ruling>,
+    /// Filled rectangles too thick to be rulings, in paint order: the
+    /// highlight candidates the decoration pass weighs against the spans.
+    bands: Vec<Band>,
     fallback: Arc<Font>,
     /// Form-XObject invocations so far, checked against
     /// `MAX_FORM_INVOCATIONS`.
@@ -1083,6 +1036,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                         self.spans.truncate(frame.spans_mark);
                         self.marks.truncate(frame.spans_mark);
                         self.rulings.truncate(frame.rulings_mark);
+                        self.bands.truncate(frame.bands_mark);
                         let kind = if frame.depth == 0 {
                             SkippedTextKind::PageContents
                         } else {
@@ -1366,8 +1320,9 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
 
     /// Commits the accumulated path on a painting operator and clears it.
     /// Stroked subpaths yield one ruling per axis-aligned segment at the
-    /// device-space line width; filled subpaths yield the centerline of a
-    /// thin axis-aligned rectangle. Poisoned subpaths yield nothing.
+    /// device-space line width; filled axis-aligned rectangles yield the
+    /// centerline of a thin one or a band for a thicker one. Poisoned
+    /// subpaths yield nothing.
     fn commit_rulings(&mut self, frame: &mut Frame, stroke: bool, fill: bool) {
         // A hidden span's lines are configured away with its text; the
         // path still clears, exactly as a paint operator leaves it.
@@ -1394,11 +1349,34 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 }
             }
             if fill {
-                if let Some(ruling) = filled_rect_ruling(&device) {
-                    self.rulings.push(ruling);
-                }
+                self.commit_fill(&device, frame.gs.fill_color);
             }
         }
+    }
+
+    /// Records one filled subpath: an axis-aligned rectangle is a ruling
+    /// when thin, a band when both its dimensions exceed
+    /// [`RULING_MAX_FILL_THICKNESS`] and its color is known, and nothing
+    /// when thin but too short to be a ruling.
+    fn commit_fill(&mut self, device: &[Point], color: Option<(f32, f32, f32)>) {
+        let Some(rect) = filled_rect(device) else {
+            return;
+        };
+        if let Some(ruling) = ruling_of_rect(rect) {
+            self.rulings.push(ruling);
+            return;
+        }
+        if rect.width() <= RULING_MAX_FILL_THICKNESS || rect.height() <= RULING_MAX_FILL_THICKNESS {
+            return;
+        }
+        let Some(color) = color else {
+            return;
+        };
+        self.bands.push(Band {
+            rect,
+            color,
+            spans_before: self.spans.len(),
+        });
     }
 
     /// Shows one string, appending the span it produces (if any) to the
@@ -1445,6 +1423,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     if carrier.text == actual.text {
                         carrier.end_x = span.end_x;
                         carrier.bbox = carrier.bbox.union(span.bbox);
+                        carrier.ascent = carrier.bbox.y1 - carrier.y;
+                        carrier.descent = carrier.bbox.y0 - carrier.y;
                     }
                 }
             }
@@ -1588,6 +1568,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             end_x: end.x,
             size,
             bbox,
+            ascent: bbox.y1 - origin.y,
+            descent: bbox.y0 - origin.y,
             font: gs.font_name.clone(),
             font_name: font.base_name.clone(),
             page: 0,
@@ -1601,6 +1583,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             color: gs.fill_color,
             underline: false,
             strikethrough: false,
+            highlight: false,
+            highlight_color: None,
             artifact: None,
             structure: None,
             alt: None,
@@ -1703,7 +1687,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             inner_chain,
             inner,
             depth + 1,
-            (self.spans.len(), self.rulings.len()),
+            (self.spans.len(), self.rulings.len(), self.bands.len()),
             M::parents_of(&stream.dict).or(parents),
         ))
     }

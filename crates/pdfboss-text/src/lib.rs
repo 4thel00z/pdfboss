@@ -2,6 +2,7 @@
 //! and positional text spans.
 
 mod cmap;
+mod decorations;
 mod extract;
 mod font;
 mod sfnt;
@@ -164,6 +165,16 @@ pub struct TextSpan {
     /// matrices; vertical writing takes the advance as its vertical extent
     /// and half the size to each side of the baseline.
     pub bbox: Rect,
+    /// Height of the box above the baseline, in device units: `bbox.y1 - y`.
+    /// For horizontal text the font's `/Ascent` (else `/CapHeight`, else
+    /// 800 per mille) scaled by the effective size; for vertical writing
+    /// the advance's extent above the origin.
+    pub ascent: f32,
+    /// Depth of the box below the baseline, in device units, zero or
+    /// negative: `bbox.y0 - y`. For horizontal text the font's `/Descent`
+    /// (else -200 per mille) scaled by the effective size; for vertical
+    /// writing the advance's extent below the origin.
+    pub descent: f32,
     /// Whether the font that produced this span is bold: FontDescriptor
     /// `/FontWeight` >= 600, `/Flags` ForceBold, or a `/StemV` in bold
     /// stem-width territory, else a `Bold` substring
@@ -192,13 +203,32 @@ pub struct TextSpan {
     /// count (1 gray, 3 RGB, 4 CMYK) without running the space's
     /// transform. `None` for pattern fills, which have no single color.
     pub color: Option<(f32, f32, f32)>,
-    /// A drawn ruling sits just below the baseline and covers most of the
-    /// span. PDF has no underline attribute — this is read from the page's
-    /// geometry, so a table border hugging a cell's text can read as one.
+    /// A drawn ruling sits just below the baseline (from 0.3 of the size
+    /// below it, or a tenth of the size under the box bottom when the font's
+    /// descent reaches deeper, to 0.05 of the size above it), covers most of
+    /// the span, and stops within an em of the text it covers on both ends,
+    /// or an `/Underline` or `/Squiggly` annotation covers the span. PDF has
+    /// no underline attribute: the drawn case is read from the page's
+    /// geometry, and a cell border that ends where the cell's text ends can
+    /// read as one. A mark over one word of a span that is a whole line
+    /// covers too little of it to count.
     pub underline: bool,
-    /// A drawn ruling crosses the span's x-height band — geometry-read,
-    /// like `underline`.
+    /// A drawn ruling crosses the x-height band (0.15 to 0.6 of the size
+    /// above the baseline) under the same coverage rules as `underline`, or
+    /// a `/StrikeOut` annotation covers the span.
     pub strikethrough: bool,
+    /// A filled rectangle about a line tall lies behind the span: painted
+    /// before it, colored (white and gray bands are backgrounds), lighter
+    /// than its text, covering most of it, and stopping within an em of the
+    /// text it covers on both ends. Paragraph shading and cell backgrounds
+    /// run to their box edges rather than the text's and do not count,
+    /// though a shaded cell whose text fills it can read as one. A
+    /// `/Highlight` annotation covering the span sets it too.
+    pub highlight: bool,
+    /// The highlight's color as RGB in `[0, 1]`: the rectangle's fill color,
+    /// read the way `color` is, or the annotation's `/C`. `None` when
+    /// `highlight` is false, and for an annotation without a color.
+    pub highlight_color: Option<(f32, f32, f32)>,
     /// The innermost `/Artifact` marked-content sequence the span was shown
     /// inside (ISO 32000-1 §14.8.2.2): a running head, a page number, a
     /// footnote rule. `None` for real content.
@@ -931,6 +961,438 @@ mod tests {
         let page = doc.page(0).unwrap();
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(!spans[0].underline);
+    }
+
+    /// A ruling that runs far past the text it sits under is a border or a
+    /// separator whatever its height: the flag needs the ruling to stop
+    /// within an em of the text on both ends.
+    #[test]
+    fn a_ruling_running_past_the_text_is_not_an_underline() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hello) Tj ET 60 718.5 m 300 718.5 l S",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// One border under two cells' text covers both spans, but the gap
+    /// between them is wider than an em, so the covered text is two runs
+    /// and the border fits neither.
+    #[test]
+    fn a_border_under_two_cells_is_not_an_underline() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hello) Tj 128 0 Td (World) Tj ET 72 718.5 m 230 718.5 l S",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|s| !s.underline));
+    }
+
+    /// The box metrics are the box's offsets from the baseline, so
+    /// `y + descent` and `y + ascent` are the box's bottom and top: the
+    /// FontDescriptor's `/Descent` and `/Ascent` scaled by the size.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn ascent_and_descent_are_the_box_offsets_from_the_baseline() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Custom-Face \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Custom-Face /Flags 32 \
+             /Ascent 718 /Descent -207 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        let s = &spans[0];
+        assert!((s.ascent - 12.0 * 0.718).abs() < 1e-3);
+        assert!((s.descent + 12.0 * 0.207).abs() < 1e-3);
+        assert!((s.y + s.ascent - s.bbox.y1).abs() < 1e-4);
+        assert!((s.y + s.descent - s.bbox.y0).abs() < 1e-4);
+    }
+
+    /// A filled rectangle about a line tall, painted before the text,
+    /// lighter than it and stopping where the text does is a highlight; the
+    /// span carries its color.
+    #[test]
+    fn a_fill_behind_the_text_is_a_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "1 1 0 rg 70 717 32 13 re f 0 g BT /F1 12 Tf 72 720 Td (Hello) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].highlight);
+        assert_eq!(spans[0].highlight_color, Some((1.0, 1.0, 0.0)));
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// Shading that runs to the margin is a paragraph or cell background:
+    /// a highlight stops within an em of the text on both ends.
+    #[test]
+    fn shading_running_past_the_text_is_not_a_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "1 1 0 rg 60 717 480 13 re f 0 g BT /F1 12 Tf 72 720 Td (Hello) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+        assert_eq!(spans[0].highlight_color, None);
+    }
+
+    /// Bands that tile one shaded area are judged together: when one line's
+    /// text happens to fill its band but the next line's does not, the area
+    /// is shading and neither line is highlighted.
+    #[test]
+    fn a_shaded_area_is_not_a_highlight_when_one_of_its_lines_overhangs() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "1 1 0 rg 70 717 40 13 re f 70 704 40 13 re f 0 g \
+             BT /F1 12 Tf 72 720 Td (Hello) Tj 0 -13 Td (Hi) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|s| !s.highlight));
+    }
+
+    /// A marker over two lines comes as one band per line, each ending
+    /// where its line's text does: different extents, so each band is
+    /// judged alone and both lines are highlighted.
+    #[test]
+    fn a_marker_over_two_lines_highlights_both() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "1 1 0 rg 70 717 32 13 re f 70 704 16 13 re f 0 g \
+             BT /F1 12 Tf 72 720 Td (Hello) Tj 0 -13 Td (Hi) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(spans.len(), 2);
+        assert!(spans.iter().all(|s| s.highlight));
+    }
+
+    /// A white box behind text is a knockout or a cell fill: a marker has
+    /// a hue.
+    #[test]
+    fn a_white_band_behind_the_text_is_not_a_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "1 g 70 717 32 13 re f 0 g BT /F1 12 Tf 72 720 Td (Hello) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
+    /// A dark banner behind light text is a design element: a marker is
+    /// lighter than the ink over it.
+    #[test]
+    fn a_dark_banner_behind_light_text_is_not_a_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "0 0 0.5 rg 70 717 32 13 re f 1 g BT /F1 12 Tf 72 720 Td (Hello) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
+    /// A fill painted after the text covers it rather than lying behind it.
+    #[test]
+    fn a_fill_painted_over_the_text_is_not_a_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "BT /F1 12 Tf 72 720 Td (Hello) Tj ET 1 1 0 rg 70 717 32 13 re f",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
+    /// A panel much taller than the line is a box around the text rather
+    /// than a marker over it.
+    #[test]
+    fn a_panel_taller_than_a_line_is_not_a_highlight() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "1 1 0 rg 70 700 32 100 re f 0 g BT /F1 12 Tf 72 720 Td (Hello) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
+    /// A thin filled bar is a ruling, never a band: it underlines the text
+    /// and cannot also highlight it.
+    #[test]
+    fn a_thin_filled_bar_underlines_and_never_highlights() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "0 g 72 718 30 0.8 re f BT /F1 12 Tf 72 720 Td (Hello) Tj ET",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let (spans, rulings, _) =
+            extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(rulings.len(), 1);
+        assert!(spans[0].underline);
+        assert!(!spans[0].highlight);
+    }
+
+    /// One page showing `content` with Helvetica as `/F1`, carrying one
+    /// annotation per entry of `annots` (each an annotation dictionary
+    /// body) in its `/Annots`.
+    fn annotated_doc(content: &[u8], annots: &[&str]) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        let refs: Vec<String> = (0..annots.len())
+            .map(|i| format!("{} 0 R", 6 + i))
+            .collect();
+        b.object(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+                 /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R \
+                 /Annots [{}] >>",
+                refs.join(" ")
+            ),
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        for (i, annot) in annots.iter().enumerate() {
+            b.object(6 + i as u32, annot);
+        }
+        Document::load(b.build(1)).unwrap()
+    }
+
+    const HELLO: &[u8] = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET";
+
+    /// A `/Highlight` annotation whose quadrilateral covers the span sets
+    /// the flag and hands over its `/C` color.
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn a_highlight_annotation_marks_the_span() {
+        let doc = annotated_doc(
+            HELLO,
+            &[
+                "<< /Type /Annot /Subtype /Highlight /Rect [70 716 102 731] /C [1 1 0] \
+               /QuadPoints [70 731 102 731 70 716 102 716] >>",
+            ],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].highlight);
+        assert_eq!(spans[0].highlight_color, Some((1.0, 1.0, 0.0)));
+        assert!(!spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn a_strikeout_annotation_marks_the_span() {
+        let doc = annotated_doc(
+            HELLO,
+            &[
+                "<< /Type /Annot /Subtype /StrikeOut /Rect [70 716 102 731] /C [1 0 0] \
+               /QuadPoints [70 731 102 731 70 716 102 716] >>",
+            ],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].strikethrough);
+        assert!(!spans[0].underline);
+        assert!(!spans[0].highlight);
+    }
+
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn an_underline_annotation_marks_the_span() {
+        let doc = annotated_doc(
+            HELLO,
+            &[
+                "<< /Type /Annot /Subtype /Underline /Rect [70 716 102 731] \
+               /QuadPoints [70 731 102 731 70 716 102 716] >>",
+            ],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].underline);
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// A squiggly underline is an underline.
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn a_squiggly_annotation_reads_as_an_underline() {
+        let doc = annotated_doc(
+            HELLO,
+            &["<< /Type /Annot /Subtype /Squiggly /Rect [70 716 102 731] \
+               /QuadPoints [70 731 102 731 70 716 102 716] >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].underline);
+    }
+
+    /// The vertex order of a quadrilateral does not matter: its box does.
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn a_quadrilateral_marks_by_its_extent_whatever_its_vertex_order() {
+        let doc = annotated_doc(
+            HELLO,
+            &[
+                "<< /Type /Annot /Subtype /Highlight /Rect [70 716 102 731] \
+               /QuadPoints [70 716 102 716 102 731 70 731] >>",
+            ],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].highlight);
+        assert_eq!(spans[0].highlight_color, None);
+    }
+
+    /// Without `/QuadPoints` the annotation's `/Rect` is the marked area.
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn a_markup_annotation_without_quadpoints_marks_its_rect() {
+        let doc = annotated_doc(
+            HELLO,
+            &["<< /Type /Annot /Subtype /Underline /Rect [102 731 70 716] >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(spans[0].underline);
+    }
+
+    /// A quadrilateral covering little of the span does not mark it: the
+    /// same coverage rule drawn decorations follow.
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn a_quadrilateral_covering_little_of_the_span_marks_nothing() {
+        let doc = annotated_doc(
+            HELLO,
+            &["<< /Type /Annot /Subtype /Highlight /Rect [70 716 80 731] \
+               /QuadPoints [70 731 80 731 70 716 80 716] >>"],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].highlight);
+    }
+
+    /// A markup annotation flagged Hidden is not shown and marks nothing.
+    // Covers ISO 32000-1 §12.5.3.
+    #[test]
+    fn a_hidden_markup_annotation_marks_nothing() {
+        let doc = annotated_doc(
+            HELLO,
+            &[
+                "<< /Type /Annot /Subtype /StrikeOut /F 2 /Rect [70 716 102 731] \
+               /QuadPoints [70 731 102 731 70 716 102 716] >>",
+            ],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].strikethrough);
+    }
+
+    /// Only the text markup subtypes decorate: a link over the span is not
+    /// an underline.
+    // Covers ISO 32000-1 §12.5.6.5.
+    #[test]
+    fn a_link_annotation_marks_nothing() {
+        let doc = annotated_doc(
+            HELLO,
+            &[
+                "<< /Type /Annot /Subtype /Link /Rect [70 716 102 731] /Border [0 0 0] \
+               /A << /S /URI /URI (https://example.com) >> >>",
+            ],
+        );
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].underline);
+        assert!(!spans[0].highlight);
+    }
+
+    /// The number of maximal runs of consecutive spans, in content order,
+    /// on one baseline that carry `flag`.
+    fn decorated_runs(spans: &[TextSpan], flag: impl Fn(&TextSpan) -> bool) -> usize {
+        let mut runs = 0;
+        let mut baseline: Option<f32> = None;
+        for span in spans {
+            if !flag(span) {
+                baseline = None;
+                continue;
+            }
+            if baseline.is_none_or(|y| (y - span.y).abs() > 0.01) {
+                runs += 1;
+            }
+            baseline = Some(span.y);
+        }
+        runs
+    }
+
+    /// The decorations real pages carry, checked against their renders:
+    /// underlined phrases and links, rule text struck through, marker
+    /// highlights over words and over two full lines, and an OCR text layer
+    /// with nothing drawn. Runs when `PDFBOSS_TEXT_REAL_DIR` names a
+    /// directory holding the files; the pale row shading, cell borders and
+    /// table background on the fourth page must not count.
+    #[test]
+    fn real_pages_carry_the_decorations_their_renders_show() {
+        let Some(dir) = std::env::var_os("PDFBOSS_TEXT_REAL_DIR") else {
+            eprintln!("PDFBOSS_TEXT_REAL_DIR unset; skipping");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let first_page = |name: &str| {
+            let doc = Document::open(dir.join(name)).unwrap();
+            let page = doc.page(0).unwrap();
+            extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap()
+        };
+        let runs = |name: &str| {
+            let (spans, _, report) = first_page(name);
+            assert!(report.is_complete(), "{name}: {report:?}");
+            (
+                decorated_runs(&spans, |s| s.underline),
+                decorated_runs(&spans, |s| s.strikethrough),
+                decorated_runs(&spans, |s| s.highlight),
+            )
+        };
+        assert_eq!(runs("text_simple__agent.pdf"), (1, 0, 0));
+        assert_eq!(runs("text_simple__noa.pdf"), (4, 0, 0));
+        assert_eq!(runs("text_simple__climbing.pdf"), (0, 2, 0));
+        assert_eq!(runs("text_simple__marknotTable.pdf"), (10, 0, 12));
+        let (spans, _, report) = first_page("text_ocr__abstract.pdf");
+        assert!(report.is_complete());
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|s| s.invisible));
+        assert!(spans
+            .iter()
+            .all(|s| !s.underline && !s.strikethrough && !s.highlight));
     }
 
     /// The source-generic entry points take the optional-content state a

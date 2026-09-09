@@ -19,25 +19,79 @@ layer from printed text, or feeding a layout analysis of your own.
 | `font_name` | The font's `/BaseFont` name verbatim, subset prefix included (e.g. `"NZEVTB+Arial-BoldItalicMT"`); empty when the file names the font nowhere. |
 | `page` | 0-based index of the page the span came from. |
 | `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up: origin to advance horizontally, the font's descent..ascent vertically. |
+| `ascent`, `descent` | The box's offsets from the baseline in device units: `y + ascent` is the box top, `y + descent` (zero or negative) its bottom. See [Box and baseline](#box-and-baseline). |
 | `bold`, `italic` | From FontDescriptor evidence, falling back to the `/BaseFont` name. |
 | `monospace`, `serif` | FontDescriptor `/Flags` FixedPitch and Serif. |
-| `underline`, `strikethrough` | A drawn ruling below the baseline / across the x-height band. See the caveat below. |
+| `underline`, `strikethrough` | A drawn ruling below the baseline / across the x-height band, or a text markup annotation over the span. See [Decorations](#decorations). |
+| `highlight`, `highlight_color` | A marker-style filled rectangle behind the span, or a `/Highlight` annotation over it, and its RGB color. See [Decorations](#decorations). |
 | `rise` | The text rise (`Ts`) the span was shown under: positive above the baseline, a superscript/subscript signal. |
 | `vertical` | Writing mode 1: the text advances downward. |
 | `invisible` | Shown under render mode 3 or 7, which paint nothing. |
 | `color` | Fill color as RGB in `[0, 1]`; `None` for pattern fills. |
 
-Three of these deserve honesty up front:
+Two of these deserve a note up front:
 
-- **`underline` and `strikethrough` are read from the page's geometry.** PDF
-  has no underline attribute; a span is underlined when a drawn ruling sits
-  just below its baseline covering most of it. A table border hugging a cell's
-  text can read as an underline.
 - **`invisible` is the signature of an OCR text layer.** Scanned PDFs with a
   text layer draw the page image and then show the recognized text under
   render mode 3 or 7, which paint nothing. The text extracts normally: it is
   just never painted.
 - **`color` is `None` for pattern fills**, which have no single color.
+
+## Box and baseline
+
+`y` is the baseline. The box is the em box the font declares, placed on
+it: `bbox[1] == y + descent` and `bbox[3] == y + ascent`, where `ascent` is
+the FontDescriptor's `/Ascent` (else `/CapHeight`, else 800 per mille) and
+`descent` its `/Descent` (else -200 per mille), both scaled by the effective
+size. `descent` is zero or negative, the way `/Descent` is. The box is a
+font metric rather than glyph ink: a span of digits does not reach the
+descent and a span of capitals does not reach the ascent. Horizontally the
+box runs from the origin to the advance after the last glyph.
+
+Vertical writing (`vertical`) takes the advance as its vertical extent, so
+`ascent` and `descent` are the advance's extents above and below the origin,
+and the box spans half the size to each side of the baseline.
+
+The decoration flags below are judged in this frame: a ruling is an
+underline or a strikethrough by where it crosses the box, and a highlight
+band by how much of the box it covers.
+
+## Decorations
+
+PDF has no underline, strikethrough or highlight attribute in its text
+state. The flags come from two places:
+
+- **What the page draws.** A horizontal ruling (a stroked line or a thin
+  filled bar) is an underline when it sits between 0.3 of the size below the
+  baseline (or a tenth of the size under the box bottom, for a font whose
+  descent reaches deeper) and 0.05 of the size above it, and a strikethrough
+  when it crosses the x-height band, 0.15 to 0.6 of the size above the
+  baseline. A filled rectangle about a line tall is a highlight when it is
+  painted before the text, has a hue (white and gray bands are backgrounds,
+  knockouts and cell fills), is lighter than the text's color, and covers at
+  least half the box; `highlight_color` is its fill color, read the way
+  `color` is. In every case the decoration must cover at least 60% of the
+  span's width and stop within an em of the text it covers on both ends.
+  That last rule is what separates decorations from table borders and
+  paragraph shading, which run to the cell edge or the margin rather than to
+  the text; bands that tile one shaded area (same color, same extent, one
+  above the other) are judged together, so a shaded row whose text happens
+  to fill it does not count when its neighbours overhang theirs. A cell
+  border that ends where the cell's text ends, or shading whose every line
+  is filled with text, still reads as an underline or a highlight. Coverage
+  is judged per span: a mark over one word of a span that is a whole line
+  covers too little of it to count.
+- **Text markup annotations.** `/Highlight`, `/Underline`, `/Squiggly` and
+  `/StrikeOut` annotations (ISO 32000-1 §12.5.6.10) set the flags on every
+  span their `/QuadPoints` quadrilaterals cover by 60% of the width and half
+  the box height; a squiggly underline counts as an underline, and
+  `highlight_color` is the annotation's `/C` (or `None` without one).
+  Annotations flagged Hidden or NoView, or hidden by their `/OC` entry, mark
+  nothing. Authored markup is taken as such: no color, paint order or extent
+  test applies to it.
+
+Vertical writing is left unmarked: its decorations are vertical lines beside
+the text, indistinguishable from column rules.
 
 ## Python
 
@@ -98,9 +152,9 @@ doc.spans()`, described in [Async and remote documents](./async.md).
 
 `pdfboss_text::extract_spans` returns a `Vec<TextSpan>` carrying the same
 fields as the Python `Span` (as plain struct fields: `text`, `x`, `y`,
-`end_x`, `size`, `font`, `font_name`, `page`, `bbox`, `bold`, `italic`,
-`monospace`, `serif`, `rise`, `vertical`, `invisible`, `color`, `underline`,
-`strikethrough`):
+`end_x`, `size`, `font`, `font_name`, `page`, `bbox`, `ascent`, `descent`,
+`bold`, `italic`, `monospace`, `serif`, `rise`, `vertical`, `invisible`,
+`color`, `underline`, `strikethrough`, `highlight`, `highlight_color`):
 
 ```rust,no_run
 use pdfboss_core::Document;
