@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.3.0](https://github.com/4thel00z/pdfboss/compare/v2.2.0...v2.3.0) (2026-09-10)
+
+
+### Features
+
+* read interactive forms: the AcroForm dictionary, the field tree and every field type ([#173](https://github.com/4thel00z/pdfboss/issues/173)) ([9be3123](https://github.com/4thel00z/pdfboss/commit/9be3123f70467601d4997f797d877af78488b7b3))
+* **render:** annotation appearances without /AP, flags and link borders (ISO 32000 rows 12.5.x) ([#175](https://github.com/4thel00z/pdfboss/issues/175)) ([31f0ffa](https://github.com/4thel00z/pdfboss/commit/31f0ffad7e14d5fbb9087496d928a5cdd342036f))
+
+
+### Documentation
+
+* **failure-modes:** name the annotation evidence after its squash hash 31f0ffa ([#178](https://github.com/4thel00z/pdfboss/issues/178)) ([eaa766d](https://github.com/4thel00z/pdfboss/commit/eaa766d69ef2ff8e519d68ef68806ea561896aec))
+
 ## [2.2.0](https://github.com/4thel00z/pdfboss/compare/v2.1.0...v2.2.0) (2026-09-10)
 
 
