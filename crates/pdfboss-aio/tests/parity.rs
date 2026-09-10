@@ -49,10 +49,15 @@ fn outline_doc() -> Vec<u8> {
          /AcroForm << /Fields [9 0 R] /NeedAppearances true /SigFlags 1 /DA (/Helv 0 Tf 0 g) /Q 2 >> \
          /OutputIntents [ << /Type /OutputIntent /S /GTS_PDFA1 \
          /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
+         /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
-    b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> >>",
+    );
     b.object(5, "<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 2 >>");
     b.object(
         6,
@@ -236,6 +241,29 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             assert_eq!(intents.len(), 1, "{name}: output intents");
             assert_eq!(intents[0].subtype, "GTS_PDFA1");
             assert_eq!(intents[0].info.as_deref(), Some("sRGB"));
+        }
+        // Covers ISO 32000-1 §14.5.
+        assert_eq!(
+            doc.piece_info().await,
+            sync_doc.piece_info(),
+            "{name}: piece info"
+        );
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.page_piece_info(&page).await,
+                sync_doc.page_piece_info(&sync_page),
+                "{name}: page {index} piece info"
+            );
+        }
+        if name == "outline" {
+            let pieces = sync_doc.piece_info();
+            assert_eq!(pieces.len(), 1, "{name}: piece info");
+            assert_eq!(pieces[0].product, "Illustrator");
+            let page_pieces = sync_doc.page_piece_info(&sync_doc.page(0).unwrap());
+            assert_eq!(page_pieces.len(), 1, "{name}: page piece info");
+            assert_eq!(page_pieces[0].product, "Scanner");
         }
         for index in 0..=doc.page_count() {
             assert_eq!(

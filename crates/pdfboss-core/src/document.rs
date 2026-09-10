@@ -669,6 +669,24 @@ impl Document {
         ))
     }
 
+    /// The catalog's page-piece dictionary (ISO 32000-1 §14.5): one record
+    /// per product, empty without `/PieceInfo`.
+    pub fn piece_info(&self) -> Vec<crate::piece_info::PagePiece> {
+        block_on(crate::piece_info::document_piece_info_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// A page's page-piece dictionary (ISO 32000-1 §14.5): one record per
+    /// product, empty without `/PieceInfo` on the page.
+    pub fn page_piece_info(&self, page: &Page) -> Vec<crate::piece_info::PagePiece> {
+        block_on(crate::piece_info::piece_info_with(
+            &Immediate(self),
+            page.dict(),
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

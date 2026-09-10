@@ -1525,6 +1525,18 @@ impl AsyncDocument {
         pdfboss_core::output_intents_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The catalog's page-piece dictionary (ISO 32000-1 §14.5): the async
+    /// twin of the sync document's `piece_info`.
+    pub async fn piece_info(&self) -> Vec<pdfboss_core::PagePiece> {
+        pdfboss_core::document_piece_info_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// A page's page-piece dictionary (ISO 32000-1 §14.5): the async twin
+    /// of the sync document's `page_piece_info`.
+    pub async fn page_piece_info(&self, page: &Page) -> Vec<pdfboss_core::PagePiece> {
+        pdfboss_core::piece_info_with(self, page.dict()).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

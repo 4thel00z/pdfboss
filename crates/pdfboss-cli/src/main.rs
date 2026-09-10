@@ -673,9 +673,25 @@ fn main() {
 fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
     match Document::open_with_password(file, password) {
         Ok(doc) => {
-            let sizes: Vec<Option<(f32, f32)>> = (0..doc.page_count())
-                .map(|i| doc.page(i).ok().map(|p| p.size()))
+            let mut sizes: Vec<Option<(f32, f32)>> = Vec::new();
+            let mut pieces: Vec<String> = doc
+                .piece_info()
+                .into_iter()
+                .map(|piece| piece.product)
                 .collect();
+            for index in 0..doc.page_count() {
+                let page = doc.page(index).ok();
+                sizes.push(page.as_ref().map(|page| page.size()));
+                if let Some(page) = &page {
+                    pieces.extend(
+                        doc.page_piece_info(page)
+                            .into_iter()
+                            .map(|piece| piece.product),
+                    );
+                }
+            }
+            pieces.sort();
+            pieces.dedup();
             let linearization = doc.linearization();
             print!(
                 "{}",
@@ -687,6 +703,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     extensions: &doc.extensions(),
                     output_intents: &doc.output_intents(),
                     fields: &doc.form_fields(),
+                    pieces: &pieces,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -718,9 +735,11 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// a page failed to load); `None` for the whole slice means the page count
 /// is unknown (encrypted document). `meta` is `None` when the document could
 /// not be opened. `fields` are the interactive form's fields, counted by
-/// type. `linearization` is the linearization parameter dictionary as
-/// written, paired with the file's actual length, so a dictionary an
-/// appended update left behind prints as not linearized.
+/// type. `pieces` are the products that left page-piece data on the catalog
+/// or a page, sorted and without repeats. `linearization` is the
+/// linearization parameter dictionary as written, paired with the file's
+/// actual length, so a dictionary an appended update left behind prints as
+/// not linearized.
 #[derive(Default)]
 struct Info<'a> {
     version: Option<(u8, u8)>,
@@ -730,6 +749,7 @@ struct Info<'a> {
     extensions: &'a [pdfboss_core::DeveloperExtension],
     output_intents: &'a [pdfboss_core::OutputIntent],
     fields: &'a [pdfboss_core::FormField],
+    pieces: &'a [String],
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -839,6 +859,11 @@ fn info_text(info: &Info) -> String {
             terminal.len(),
             breakdown.join(", ")
         );
+    }
+    // The products that left private data on the catalog or a page (ISO
+    // 32000-1 §14.5).
+    if !info.pieces.is_empty() {
+        let _ = writeln!(out, "pieces:    {}", info.pieces.join(", "));
     }
     // A date that parses (ISO 32000-1 §7.9.4) prints as ISO 8601; one that
     // does not prints as written.
@@ -1493,6 +1518,24 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("output intents"));
+    }
+
+    /// The products with page-piece data print as one line after the pages
+    /// and fields; none prints no line.
+    // Covers ISO 32000-1 §14.5.
+    #[test]
+    fn info_text_lists_page_piece_products() {
+        let pieces = ["Illustrator".to_string(), "Photoshop".to_string()];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            pieces: &pieces,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("pages:     unknown\npieces:    Illustrator, Photoshop\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("pieces"));
     }
 
     /// A linearized file prints its first page object after the encryption
