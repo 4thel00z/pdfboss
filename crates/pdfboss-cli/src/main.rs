@@ -684,6 +684,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     Some(&sizes),
                     &doc.metadata(),
                     &doc.extensions(),
+                    &doc.form_fields(),
                 )
             );
             Ok(())
@@ -692,7 +693,14 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let data = std::fs::read(file).map_err(|e| e.to_string())?;
             print!(
                 "{}",
-                info_text(scan_version(&data), true, None, &Metadata::default(), &[])
+                info_text(
+                    scan_version(&data),
+                    true,
+                    None,
+                    &Metadata::default(),
+                    &[],
+                    &[]
+                )
             );
             Ok(())
         }
@@ -702,13 +710,15 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 
 /// Renders the `info` report. `sizes` is one entry per page (`None` when a
 /// page failed to load); `None` for the whole slice means the page count is
-/// unknown (encrypted document).
+/// unknown (encrypted document). `fields` are the interactive form's
+/// fields, counted by type.
 fn info_text(
     version: Option<(u8, u8)>,
     encrypted: bool,
     sizes: Option<&[Option<(f32, f32)>]>,
     meta: &Metadata,
     extensions: &[pdfboss_core::DeveloperExtension],
+    fields: &[pdfboss_core::FormField],
 ) -> String {
     let mut out = String::new();
     match version {
@@ -747,6 +757,40 @@ fn info_text(
         None => {
             let _ = writeln!(out, "pages:     unknown");
         }
+    }
+    // Only terminal fields hold values; a field with child fields is a
+    // container for inheritable entries (ISO 32000-1 §12.7.3).
+    let terminal: Vec<&pdfboss_core::FormField> = fields
+        .iter()
+        .filter(|field| field.kids.is_empty())
+        .collect();
+    if !terminal.is_empty() {
+        use pdfboss_core::FieldType;
+        let groups = [
+            (Some(FieldType::Button), "Btn"),
+            (Some(FieldType::Text), "Tx"),
+            (Some(FieldType::Choice), "Ch"),
+            (Some(FieldType::Signature), "Sig"),
+            (None, "untyped"),
+        ];
+        let breakdown: Vec<String> = groups
+            .iter()
+            .map(|(field_type, label)| {
+                let count = terminal
+                    .iter()
+                    .filter(|field| field.field_type == *field_type)
+                    .count();
+                (count, label)
+            })
+            .filter(|(count, _)| *count > 0)
+            .map(|(count, label)| format!("{label} {count}"))
+            .collect();
+        let _ = writeln!(
+            out,
+            "fields:    {} ({})",
+            terminal.len(),
+            breakdown.join(", ")
+        );
     }
     // A date that parses (ISO 32000-1 §7.9.4) prints as ISO 8601; one that
     // does not prints as written.
@@ -1322,7 +1366,7 @@ mod tests {
             title: Some("Demo".to_string()),
             ..Metadata::default()
         };
-        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[]);
+        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[], &[]);
         assert!(report.contains("version:   1.7"));
         assert!(report.contains("encrypted: false"));
         assert!(report.contains("pages:     1"));
@@ -1341,18 +1385,93 @@ mod tests {
             base_version: "1.7".to_string(),
             extension_level: 3,
         }];
-        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &extensions);
+        let report = info_text(
+            Some((1, 7)),
+            false,
+            None,
+            &Metadata::default(),
+            &extensions,
+            &[],
+        );
         assert!(
             report.contains("version:   1.7\nextensions:\n  ADBE      1.7 level 3\n"),
             "{report}"
         );
-        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &[]);
+        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &[], &[]);
         assert!(!report.contains("extensions"), "{report}");
+    }
+
+    /// The interactive form's terminal fields print after the pages as one
+    /// count with a breakdown by field type; a non-terminal field is only a
+    /// container and is not counted, and a document without fields prints
+    /// no line.
+    // Covers ISO 32000-1 §12.7.3.
+    #[test]
+    fn info_text_counts_form_fields_by_type() {
+        use pdfboss_core::{FieldFlags, FieldType, FormField, ObjRef};
+        fn field(field_type: Option<FieldType>, kids: Vec<ObjRef>) -> FormField {
+            FormField {
+                object: ObjRef { num: 1, gen: 0 },
+                parent: None,
+                kids,
+                widgets: Vec::new(),
+                field_type,
+                partial_name: None,
+                name: String::new(),
+                alternate_name: None,
+                mapping_name: None,
+                flags: FieldFlags::default(),
+                value: None,
+                default_value: None,
+                max_len: None,
+                options: Vec::new(),
+                top_index: 0,
+                selected_indices: Vec::new(),
+                additional_actions: None,
+                lock: None,
+                seed_value: None,
+            }
+        }
+        let fields = [
+            field(Some(FieldType::Text), vec![ObjRef { num: 2, gen: 0 }]),
+            field(Some(FieldType::Text), Vec::new()),
+            field(Some(FieldType::Text), Vec::new()),
+            field(Some(FieldType::Button), Vec::new()),
+            field(Some(FieldType::Choice), Vec::new()),
+            field(Some(FieldType::Signature), Vec::new()),
+            field(None, Vec::new()),
+        ];
+        let sizes = [Some((612.0, 792.0))];
+        let report = info_text(
+            Some((1, 7)),
+            false,
+            Some(&sizes),
+            &Metadata::default(),
+            &[],
+            &fields,
+        );
+        assert!(
+            report.contains(
+                "  page 1: 612 x 792 pt
+fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
+"
+            ),
+            "{report}"
+        );
+        let report = info_text(
+            Some((1, 7)),
+            false,
+            Some(&sizes),
+            &Metadata::default(),
+            &[],
+            &[],
+        );
+        assert!(!report.contains("fields"), "{report}");
     }
 
     #[test]
     fn info_text_encrypted_document() {
-        let report = info_text(Some((1, 4)), true, None, &Metadata::default(), &[]);
+        let report = info_text(Some((1, 4)), true, None, &Metadata::default(), &[], &[]);
         assert!(report.contains("encrypted: true"));
         assert!(report.contains("pages:     unknown"));
         assert!(!report.contains("metadata:"));
@@ -1361,7 +1480,7 @@ mod tests {
     #[test]
     fn info_text_unavailable_page() {
         let sizes = [None];
-        let report = info_text(None, false, Some(&sizes), &Metadata::default(), &[]);
+        let report = info_text(None, false, Some(&sizes), &Metadata::default(), &[], &[]);
         assert!(report.contains("version:   unknown"));
         assert!(report.contains("page 1: (unavailable)"));
     }

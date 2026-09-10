@@ -1484,6 +1484,18 @@ impl AsyncDocument {
         pdfboss_core::viewer_preferences_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The document's interactive form dictionary (ISO 32000-1 §12.7.2):
+    /// the async twin of the sync document's `interactive_form`.
+    pub async fn interactive_form(&self) -> Option<pdfboss_core::InteractiveForm> {
+        pdfboss_core::interactive_form_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// Every field of the document's interactive form (ISO 32000-1
+    /// §12.7.3): the async twin of the sync document's `form_fields`.
+    pub async fn form_fields(&self) -> Vec<pdfboss_core::FormField> {
+        pdfboss_core::form_fields_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

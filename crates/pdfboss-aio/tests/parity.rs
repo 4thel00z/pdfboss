@@ -46,6 +46,7 @@ fn outline_doc() -> Vec<u8> {
         "<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R /Lang (en-US) \
          /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> >> \
          /ViewerPreferences << /Direction /R2L /HideToolbar true /PrintPageRange [1 1] >> \
+         /AcroForm << /Fields [9 0 R] /NeedAppearances true /SigFlags 1 /DA (/Helv 0 Tf 0 g) /Q 2 >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -64,6 +65,8 @@ fn outline_doc() -> Vec<u8> {
         8,
         "<< /Title (Two) /Parent 5 0 R /Prev 6 0 R /Count -1 /C [0 0 1] /F 2 /Dest [3 0 R /FitB] >>",
     );
+    b.object(9, "<< /FT /Tx /T (name) /Ff 2 /V (Ada) /Kids [10 0 R] >>");
+    b.object(10, "<< /Subtype /Widget /Parent 9 0 R /Rect [0 0 10 10] >>");
     b.build(1)
 }
 
@@ -209,6 +212,16 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             doc.viewer_preferences().await,
             sync_doc.viewer_preferences(),
             "{name}: viewer preferences"
+        );
+        assert_eq!(
+            doc.interactive_form().await,
+            sync_doc.interactive_form(),
+            "{name}: interactive form"
+        );
+        assert_eq!(
+            doc.form_fields().await,
+            sync_doc.form_fields(),
+            "{name}: form fields"
         );
         for index in 0..=doc.page_count() {
             assert_eq!(
