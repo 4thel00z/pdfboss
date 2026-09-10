@@ -4539,6 +4539,27 @@ pub(crate) mod tests {
                 groups.len(),
                 claims.len()
             );
+            if std::env::var_os("PDFBOSS_PROBE_LINES").is_some() {
+                for (gi, group) in groups.iter().enumerate() {
+                    let (gx_lo, gx_hi) = x_bounds(&group.spans);
+                    let (run_end, lanes) = lane_run(&groups, gi);
+                    let text: String = group
+                        .spans
+                        .iter()
+                        .flat_map(|s| s.text.chars())
+                        .take(50)
+                        .collect();
+                    println!(
+                        "  line {gi:3}: y {:6.1} x {gx_lo:5.0}..{gx_hi:5.0} run {}..{} lanes {}  {:?}",
+                        group.y,
+                        gi,
+                        run_end,
+                        lanes.len(),
+                        text
+                    );
+                }
+                println!("  table_band: {}", table_band(&groups).is_some());
+            }
             for grid in &grids {
                 let Some(lo) = groups.iter().position(|g| grid.holds(g.y)) else {
                     continue;
