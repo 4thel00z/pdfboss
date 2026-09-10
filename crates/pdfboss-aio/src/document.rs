@@ -1537,6 +1537,12 @@ impl AsyncDocument {
         pdfboss_core::piece_info_with(self, page.dict()).await
     }
 
+    /// A page's thumbnail image (ISO 32000-1 §12.3.4): the async twin of
+    /// the sync document's `thumbnail`.
+    pub async fn thumbnail(&self, page: &Page) -> Option<pdfboss_core::Thumbnail> {
+        pdfboss_core::thumbnail_with(self, page).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

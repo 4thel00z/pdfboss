@@ -51,7 +51,9 @@ use std::sync::Arc;
 
 use pdfboss_core::{AsyncObjectSource, Document, Error, OcState, Page, Result};
 
-pub use extract::{extract_page_images, extract_page_images_with};
+pub use extract::{
+    extract_page_images, extract_page_images_with, page_thumbnail, page_thumbnail_with,
+};
 
 /// An RGBA8 raster image with straight (non-premultiplied) alpha, row-major
 /// from the top-left.

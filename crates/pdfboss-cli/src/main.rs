@@ -290,6 +290,10 @@ enum Command {
         /// PNG compression: encode time against file size, same pixels.
         #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
         png_compression: PngCompressionArg,
+        /// Write each page's thumbnail image (page-N-thumb.png) instead of
+        /// the images the page draws; pages without one are skipped.
+        #[arg(long)]
+        thumbnails: bool,
     },
     /// Pretty-print a single object.
     Obj {
@@ -603,7 +607,9 @@ fn main() {
             out,
             password,
             png_compression,
-        } => cmd_images(&file, page, out, &password, png_compression).map_err(Failure::from),
+            thumbnails,
+        } => cmd_images(&file, page, out, &password, png_compression, thumbnails)
+            .map_err(Failure::from),
         Command::Obj {
             file,
             num,
@@ -679,6 +685,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 .into_iter()
                 .map(|piece| piece.product)
                 .collect();
+            let mut thumbnails = 0usize;
             for index in 0..doc.page_count() {
                 let page = doc.page(index).ok();
                 sizes.push(page.as_ref().map(|page| page.size()));
@@ -688,6 +695,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                             .into_iter()
                             .map(|piece| piece.product),
                     );
+                    thumbnails += usize::from(doc.thumbnail(page).is_some());
                 }
             }
             pieces.sort();
@@ -704,6 +712,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     output_intents: &doc.output_intents(),
                     fields: &doc.form_fields(),
                     pieces: &pieces,
+                    thumbnails,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -736,7 +745,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// is unknown (encrypted document). `meta` is `None` when the document could
 /// not be opened. `fields` are the interactive form's fields, counted by
 /// type. `pieces` are the products that left page-piece data on the catalog
-/// or a page, sorted and without repeats. `linearization` is the
+/// or a page, sorted and without repeats. `thumbnails` counts the pages
+/// that carry a thumbnail image. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
 /// not linearized.
@@ -750,6 +760,7 @@ struct Info<'a> {
     output_intents: &'a [pdfboss_core::OutputIntent],
     fields: &'a [pdfboss_core::FormField],
     pieces: &'a [String],
+    thumbnails: usize,
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -824,6 +835,11 @@ fn info_text(info: &Info) -> String {
         None => {
             let _ = writeln!(out, "pages:     unknown");
         }
+    }
+    // Pages carrying a /Thumb image (ISO 32000-1 §12.3.4).
+    if info.thumbnails > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(out, "thumbs:    {} of {pages} pages", info.thumbnails);
     }
     // Only terminal fields hold values; a field with child fields is a
     // container for inheritable entries (ISO 32000-1 §12.7.3).
@@ -1104,6 +1120,7 @@ fn cmd_images(
     out: Option<PathBuf>,
     password: &str,
     png_compression: PngCompressionArg,
+    thumbnails: bool,
 ) -> Result<(), String> {
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let pages = match page {
@@ -1114,9 +1131,23 @@ fn cmd_images(
     let mut written = 0usize;
     for index in pages {
         let p = doc.page(index).map_err(|e| e.to_string())?;
-        let images = pdfboss_render::extract_page_images(&doc, &p).map_err(|e| e.to_string())?;
-        for (i, pix) in images.iter().enumerate() {
-            let path = dir.join(format!("page-{}-image-{}.png", index + 1, i + 1));
+        // A page's thumbnail (ISO 32000-1 §12.3.4) is one image outside the
+        // content stream, so the flag swaps what the page contributes.
+        let (images, names): (Vec<pdfboss_render::Pixmap>, Vec<String>) = if thumbnails {
+            match pdfboss_render::page_thumbnail(&doc, &p) {
+                Some(pix) => (vec![pix], vec![format!("page-{}-thumb.png", index + 1)]),
+                None => (Vec::new(), Vec::new()),
+            }
+        } else {
+            let images =
+                pdfboss_render::extract_page_images(&doc, &p).map_err(|e| e.to_string())?;
+            let names = (1..=images.len())
+                .map(|i| format!("page-{}-image-{i}.png", index + 1))
+                .collect();
+            (images, names)
+        };
+        for (pix, name) in images.iter().zip(names) {
+            let path = dir.join(name);
             let png = pix
                 .encode_png_with(png_compression.to_compression())
                 .map_err(|e| e.to_string())?;
@@ -1130,9 +1161,10 @@ fn cmd_images(
             written += 1;
         }
     }
+    let noun = if thumbnails { "thumbnail" } else { "image" };
     match written {
-        1 => println!("extracted 1 image"),
-        n => println!("extracted {n} images"),
+        1 => println!("extracted 1 {noun}"),
+        n => println!("extracted {n} {noun}s"),
     }
     Ok(())
 }
@@ -1538,6 +1570,25 @@ mod tests {
         assert!(!info_text(&Info::default()).contains("pieces"));
     }
 
+    /// Pages with a thumbnail print as one count after the pages; none
+    /// prints no line.
+    // Covers ISO 32000-1 §12.3.4.
+    #[test]
+    fn info_text_counts_pages_with_thumbnails() {
+        let sizes = [Some((612.0, 792.0)), Some((612.0, 792.0))];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            thumbnails: 1,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 2: 612 x 792 pt\nthumbs:    1 of 2 pages\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("thumbs"));
+    }
+
     /// A linearized file prints its first page object after the encryption
     /// line; a dictionary whose `/L` no longer names the file's length
     /// prints as not linearized, and a file without one prints no line.
@@ -1932,12 +1983,51 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
             Some(dir.clone()),
             "",
             PngCompressionArg::Default,
+            false,
         )
         .expect("extract");
         for name in ["page-1-image-1.png", "page-1-image-2.png"] {
             let png = std::fs::read(dir.join(name)).expect(name);
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{name} is a PNG");
         }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// With `--thumbnails`, `images` writes each page's thumbnail instead
+    /// of the drawn images, skipping pages without one.
+    // Covers ISO 32000-1 §12.3.4.
+    #[test]
+    fn cmd_images_writes_thumbnails_with_the_flag() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Thumb 5 0 R >>",
+        );
+        b.stream(
+            5,
+            "/Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+            &[255, 0, 0, 0, 0, 255],
+        );
+        b.object(6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let dir = std::env::temp_dir().join(format!("pdfboss-thumbs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pdf = dir.join("thumbs.pdf");
+        std::fs::write(&pdf, b.build(1)).expect("fixture");
+        cmd_images(
+            &pdf,
+            None,
+            Some(dir.clone()),
+            "",
+            PngCompressionArg::Default,
+            true,
+        )
+        .expect("extract");
+        let png = std::fs::read(dir.join("page-1-thumb.png")).expect("page-1-thumb.png");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(!dir.join("page-2-thumb.png").exists());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

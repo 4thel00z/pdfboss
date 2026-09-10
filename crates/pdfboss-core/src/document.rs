@@ -687,6 +687,12 @@ impl Document {
         ))
     }
 
+    /// A page's thumbnail image (ISO 32000-1 §12.3.4), `None` when the
+    /// page has no `/Thumb` stream.
+    pub fn thumbnail(&self, page: &Page) -> Option<crate::thumbnail::Thumbnail> {
+        block_on(crate::thumbnail::thumbnail_with(&Immediate(self), page))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

@@ -56,7 +56,12 @@ fn outline_doc() -> Vec<u8> {
     b.object(
         3,
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-         /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> >>",
+         /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> /Thumb 12 0 R >>",
+    );
+    b.stream(
+        12,
+        "/Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[255, 0, 0, 0, 0, 255],
     );
     b.object(5, "<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 2 >>");
     b.object(
@@ -264,6 +269,20 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             let page_pieces = sync_doc.page_piece_info(&sync_doc.page(0).unwrap());
             assert_eq!(page_pieces.len(), 1, "{name}: page piece info");
             assert_eq!(page_pieces[0].product, "Scanner");
+        }
+        // Covers ISO 32000-1 §12.3.4.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.thumbnail(&page).await,
+                sync_doc.thumbnail(&sync_page),
+                "{name}: page {index} thumbnail"
+            );
+        }
+        if name == "outline" {
+            let thumbnail = sync_doc.thumbnail(&sync_doc.page(0).unwrap()).unwrap();
+            assert_eq!((thumbnail.width, thumbnail.height), (2, 1));
         }
         for index in 0..=doc.page_count() {
             assert_eq!(

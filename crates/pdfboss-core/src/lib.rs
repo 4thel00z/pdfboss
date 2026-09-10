@@ -32,6 +32,7 @@ pub mod piece_info;
 pub mod pretty;
 pub mod source;
 pub mod structure;
+pub mod thumbnail;
 pub mod tree;
 pub mod viewer_preferences;
 pub mod xref;
@@ -80,6 +81,7 @@ pub use structure::{
     AttributeObject, MarkedContentId, Placement, StandardKind, StandardOwner, StandardType,
     StructureElement, StructureTree,
 };
+pub use thumbnail::{thumbnail_with, Thumbnail};
 pub use viewer_preferences::{
     viewer_preferences_with, Direction, Duplex, NonFullScreenPageMode, PageBoundary, PrintScaling,
     ViewerPreferences,
