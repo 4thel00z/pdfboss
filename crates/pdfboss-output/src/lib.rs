@@ -1422,6 +1422,31 @@ mod tests {
         assert!(md.ends_with("\n\n24"), "md: {md}");
     }
 
+    /// A page footer populating two of the grid's columns far below it is
+    /// not a row: the grid ends at the last evenly pitched row and the
+    /// footer reads as prose. Modeled on a 10-K statement page whose
+    /// "Form 10-K  41" footer used to void the whole statement.
+    #[test]
+    fn a_far_footer_row_does_not_void_the_grid() {
+        let md = markdown_of(&structure::tests::grid_with_far_footer_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+        assert!(!md.contains("| Form 10-K |"), "footer is not a row: {md}");
+        assert!(md.ends_with("\n\nForm 10-K 41"), "md: {md}");
+    }
+
+    /// A second grid below the first, in the same segment, is a second
+    /// table: the stretch below a table gets the same attempt.
+    #[test]
+    fn a_second_grid_below_the_first_is_a_second_table() {
+        let md = markdown_of(&structure::tests::two_grids_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r2c0 | r2c1 | r2c2 |"), "md: {md}");
+        assert!(md.contains("| s0c0 | s0c1 | s0c2 |"), "md: {md}");
+        assert!(md.contains("| s2c0 | s2c1 | s2c2 |"), "md: {md}");
+        assert_eq!(md.matches("| --- | --- | --- |").count(), 2, "two tables: {md}");
+    }
+
     /// A lane held open by a page number out in the margin is not a cell
     /// column: hoisting the number empties it, and two columns of rows are a
     /// layout. Modeled on a bench page whose two-column pitch read as a

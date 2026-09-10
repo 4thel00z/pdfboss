@@ -760,16 +760,25 @@ fn push_segment_blocks(
 /// The lane path: one [`table_band`] attempt over the segment's line
 /// groups, else prose. The groups are built once and feed both paths.
 fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+    if groups.is_empty() {
+        return;
+    }
     let Some(band) = table_band(groups) else {
         push_blocks(groups.iter().map(assembled).collect(), stats, out);
         return;
     };
-    push_blocks(band.above, stats, out);
+    push_blocks(
+        groups[..band.span.start].iter().map(assembled).collect(),
+        stats,
+        out,
+    );
     out.push(Block::Table {
         bbox: table_bbox(&band.rows),
         rows: band.rows,
     });
-    push_blocks(band.below, stats, out);
+    // What stands below the grid gets the same attempt: a page's second
+    // table is as much a table as its first.
+    push_lane_blocks(&groups[band.span.end..], stats, out);
 }
 
 /// A remainder stretch between grid claims, through the same lane attempt
@@ -1864,9 +1873,10 @@ fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
 /// populated row and below the last are a caption, a running header or a page
 /// number, not rows.
 struct TableBand {
-    above: Vec<Assembled>,
     rows: Vec<Vec<Cell>>,
-    below: Vec<Assembled>,
+    /// The segment's groups the rows came from, so the caller lays out what
+    /// stands above and below.
+    span: std::ops::Range<usize>,
 }
 
 /// A lattice of drawn rulings: the x positions of its vertical lines and the
@@ -2761,28 +2771,104 @@ fn grid(
         populated.push(cells >= TABLE_MIN_ROW_CELLS);
         rows.push(row);
     }
-    let first = populated.iter().position(|filled| *filled)?;
-    let last = populated.iter().rposition(|filled| *filled)?;
-    let baselines: Vec<f32> = inside[first..=last]
-        .iter()
-        .zip(&populated[first..=last])
-        .filter(|(_, filled)| **filled)
-        .map(|(group, _)| group.y)
+    let filled: Vec<usize> = (0..populated.len())
+        .filter(|index| populated[*index])
         .collect();
-    if baselines.len() < TABLE_MIN_ROWS {
+    let (first, last) = even_stretch(inside, &filled)?;
+    let stretch = lo + first..lo + last + 1;
+    let rows = match own_rows(groups, start..end, stretch.clone()) {
+        Some(rows) => rows,
+        None => {
+            if populated_columns(&rows[first..=last], columns.len()) < TABLE_MIN_LANES + 1 {
+                return None;
+            }
+            rows.truncate(last + 1);
+            rows.drain(..first);
+            rows
+        }
+    };
+    Some(TableBand { rows, span: stretch })
+}
+
+/// The stretch's rows over the columns its own run lines leave. The run's
+/// lanes were cut by everything else the run held — a page number far
+/// below, a note — and a lane only those lines opened would be an empty
+/// column in the grid. The lanes come from the run lines inside the stretch
+/// alone, never from a row `merged_edges` added, since a header or total
+/// row spanning a lane is a row of the grid precisely because it does not
+/// cut the lane. `None` sends the caller back to the run's own columns.
+fn own_rows(
+    groups: &[Group],
+    run: std::ops::Range<usize>,
+    stretch: std::ops::Range<usize>,
+) -> Option<Vec<Vec<Cell>>> {
+    let core = run.start.max(stretch.start)..run.end.min(stretch.end);
+    if core.start >= core.end {
         return None;
     }
-    if !even_rows(&baselines) {
+    let lanes = lanes_of(&groups[core]);
+    if lanes.len() < TABLE_MIN_LANES {
         return None;
     }
-    if populated_columns(&rows[first..=last], columns.len()) < TABLE_MIN_LANES + 1 {
+    let spans: Vec<&TextSpan> = groups[stretch.clone()]
+        .iter()
+        .flat_map(|group| group.spans.iter().copied())
+        .collect();
+    let columns = cell_columns(&spans, &lanes);
+    let rows: Vec<Vec<Cell>> = groups[stretch]
+        .iter()
+        .map(|group| table_row(group, &columns))
+        .collect::<Option<_>>()?;
+    (populated_columns(&rows, columns.len()) >= TABLE_MIN_LANES + 1).then_some(rows)
+}
+
+/// The longest run of populated rows whose neighbouring baselines never
+/// step more than [`TABLE_ROW_GAP`] times the median step, as the first and
+/// last index into `inside` it covers. The step is what separates one grid
+/// from two blocks that happen to share columns, or from a page number
+/// standing far below; only populated rows are measured, so a wrapped cell
+/// standing alone in a hole cannot halve a step. The topmost run wins a
+/// tie. `None` when no run holds [`TABLE_MIN_ROWS`] rows, and when the
+/// baselines do not move at all.
+fn even_stretch(inside: &[Group], filled: &[usize]) -> Option<(usize, usize)> {
+    if filled.len() < TABLE_MIN_ROWS {
         return None;
     }
-    let above = groups[..lo + first].iter().map(assembled).collect();
-    let below = groups[lo + last + 1..].iter().map(assembled).collect();
-    rows.truncate(last + 1);
-    rows.drain(..first);
-    Some(TableBand { above, rows, below })
+    let steps: Vec<f32> = filled
+        .windows(2)
+        .map(|pair| inside[pair[0]].y - inside[pair[1]].y)
+        .collect();
+    let limit = TABLE_ROW_GAP * median(steps.clone());
+    if limit <= 0.0 {
+        return None;
+    }
+    let longer = |best: Option<(usize, usize)>, candidate: (usize, usize)| match best {
+        Some((a, b)) if b - a >= candidate.1 - candidate.0 => Some((a, b)),
+        _ => Some(candidate),
+    };
+    let mut best = None;
+    let mut run_start = 0;
+    for (index, step) in steps.iter().enumerate() {
+        if *step <= limit {
+            continue;
+        }
+        best = longer(best, (run_start, index));
+        run_start = index + 1;
+    }
+    best = longer(best, (run_start, filled.len() - 1));
+    let (a, b) = best?;
+    (b - a + 1 >= TABLE_MIN_ROWS).then(|| (filled[a], filled[b]))
+}
+
+/// The lanes a set of lines leaves between their ink, left to right.
+fn lanes_of(groups: &[Group]) -> Vec<std::ops::Range<f32>> {
+    let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
+    for group in groups {
+        for span in &group.spans {
+            add_ink(&mut occupied, span.x.min(span.end_x)..span.x.max(span.end_x));
+        }
+    }
+    ink_gaps(&occupied)
 }
 
 /// The stretch `start..end` grown over the neighbouring lines that still sit
@@ -2859,23 +2945,6 @@ fn cell_columns(spans: &[&TextSpan], lanes: &[std::ops::Range<f32>]) -> Vec<std:
     }
     columns.push(start..hi);
     columns
-}
-
-/// True when no step between neighbouring row baselines, top of page first,
-/// exceeds [`TABLE_ROW_GAP`] times the median — what separates one grid from
-/// two blocks that happen to share columns. Only populated rows are measured,
-/// so a wrapped cell standing alone in a hole cannot halve it into two steps
-/// small enough to pass.
-fn even_rows(baselines: &[f32]) -> bool {
-    let steps: Vec<f32> = baselines.windows(2).map(|pair| pair[0] - pair[1]).collect();
-    if steps.is_empty() {
-        return true;
-    }
-    let limit = TABLE_ROW_GAP * median(steps.clone());
-    if limit <= 0.0 {
-        return false;
-    }
-    steps.iter().all(|step| *step <= limit)
 }
 
 /// One row's cells, left to right, with a lineless cell for every column
@@ -4893,6 +4962,35 @@ pub(crate) mod tests {
             }
         }
         content += "1 0 0 1 72 600 Tm (24) Tj ET";
+        content
+    }
+
+    /// [`lane_grid_content`] with a page footer far below it that populates
+    /// two of the grid's columns — a form title and a page number — the way
+    /// a 10-K page ends. The footer is a populated row a hundred points off
+    /// the grid's pitch; the grid must survive it as prose below.
+    pub(crate) fn grid_with_far_footer_content() -> String {
+        let mut content = lane_grid_content();
+        content.truncate(content.len() - "ET".len());
+        content += "1 0 0 1 72 520 Tm (Form 10-K) Tj 1 0 0 1 430 520 Tm (41) Tj ET";
+        content
+    }
+
+    /// Two lane grids of three rows each, one well below the other, with
+    /// no prose between them: one segment, two tables.
+    pub(crate) fn two_grids_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        for (row, y) in [(0, 500.0), (1, 480.0), (2, 460.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (s{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
         content
     }
 
