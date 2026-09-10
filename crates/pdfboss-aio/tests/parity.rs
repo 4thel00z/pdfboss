@@ -47,6 +47,8 @@ fn outline_doc() -> Vec<u8> {
          /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> >> \
          /ViewerPreferences << /Direction /R2L /HideToolbar true /PrintPageRange [1 1] >> \
          /AcroForm << /Fields [9 0 R] /NeedAppearances true /SigFlags 1 /DA (/Helv 0 Tf 0 g) /Q 2 >> \
+         /OutputIntents [ << /Type /OutputIntent /S /GTS_PDFA1 \
+         /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -223,6 +225,18 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             sync_doc.form_fields(),
             "{name}: form fields"
         );
+        // Covers ISO 32000-1 §14.11.5.
+        assert_eq!(
+            doc.output_intents().await,
+            sync_doc.output_intents(),
+            "{name}: output intents"
+        );
+        if name == "outline" {
+            let intents = sync_doc.output_intents();
+            assert_eq!(intents.len(), 1, "{name}: output intents");
+            assert_eq!(intents[0].subtype, "GTS_PDFA1");
+            assert_eq!(intents[0].info.as_deref(), Some("sRGB"));
+        }
         for index in 0..=doc.page_count() {
             assert_eq!(
                 doc.page_label(index).await,

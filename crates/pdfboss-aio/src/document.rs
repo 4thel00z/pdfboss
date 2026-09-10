@@ -1519,6 +1519,12 @@ impl AsyncDocument {
         pdfboss_core::form_fields_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The catalog's output intents (ISO 32000-1 §14.11.5): the async twin
+    /// of the sync document's `output_intents`.
+    pub async fn output_intents(&self) -> Vec<pdfboss_core::OutputIntent> {
+        pdfboss_core::output_intents_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

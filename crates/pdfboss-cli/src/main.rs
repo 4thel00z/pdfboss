@@ -679,17 +679,18 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let linearization = doc.linearization();
             print!(
                 "{}",
-                info_text(
-                    Some(doc.version()),
-                    false,
-                    Some(&sizes),
-                    &doc.metadata(),
-                    &doc.extensions(),
-                    &doc.form_fields(),
-                    linearization
+                info_text(&Info {
+                    version: Some(doc.version()),
+                    encrypted: false,
+                    sizes: Some(&sizes),
+                    meta: Some(&doc.metadata()),
+                    extensions: &doc.extensions(),
+                    output_intents: &doc.output_intents(),
+                    fields: &doc.form_fields(),
+                    linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
-                )
+                })
             );
             Ok(())
         }
@@ -698,17 +699,14 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let linearization = pdfboss_core::linearization_dictionary(&data);
             print!(
                 "{}",
-                info_text(
-                    scan_version(&data),
-                    true,
-                    None,
-                    &Metadata::default(),
-                    &[],
-                    &[],
-                    linearization
+                info_text(&Info {
+                    version: scan_version(&data),
+                    encrypted: true,
+                    linearization: linearization
                         .as_ref()
                         .map(|record| (record, data.len() as u64)),
-                )
+                    ..Info::default()
+                })
             );
             Ok(())
         }
@@ -716,23 +714,29 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
     }
 }
 
-/// Renders the `info` report. `sizes` is one entry per page (`None` when a
-/// page failed to load); `None` for the whole slice means the page count is
-/// unknown (encrypted document). `fields` are the interactive form's
-/// fields, counted by type. `linearization` is the linearization parameter
-/// dictionary as written, paired with the file's actual length, so a
-/// dictionary an appended update left behind prints as not linearized.
-fn info_text(
+/// What the `info` report shows. `sizes` is one entry per page (`None` when
+/// a page failed to load); `None` for the whole slice means the page count
+/// is unknown (encrypted document). `meta` is `None` when the document could
+/// not be opened. `fields` are the interactive form's fields, counted by
+/// type. `linearization` is the linearization parameter dictionary as
+/// written, paired with the file's actual length, so a dictionary an
+/// appended update left behind prints as not linearized.
+#[derive(Default)]
+struct Info<'a> {
     version: Option<(u8, u8)>,
     encrypted: bool,
-    sizes: Option<&[Option<(f32, f32)>]>,
-    meta: &Metadata,
-    extensions: &[pdfboss_core::DeveloperExtension],
-    fields: &[pdfboss_core::FormField],
-    linearization: Option<(&pdfboss_core::Linearization, u64)>,
-) -> String {
+    sizes: Option<&'a [Option<(f32, f32)>]>,
+    meta: Option<&'a Metadata>,
+    extensions: &'a [pdfboss_core::DeveloperExtension],
+    output_intents: &'a [pdfboss_core::OutputIntent],
+    fields: &'a [pdfboss_core::FormField],
+    linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
+}
+
+/// Renders the `info` report.
+fn info_text(info: &Info) -> String {
     let mut out = String::new();
-    match version {
+    match info.version {
         Some((major, minor)) => {
             let _ = writeln!(out, "version:   {major}.{minor}");
         }
@@ -740,9 +744,9 @@ fn info_text(
             let _ = writeln!(out, "version:   unknown");
         }
     }
-    if !extensions.is_empty() {
+    if !info.extensions.is_empty() {
         let _ = writeln!(out, "extensions:");
-        for extension in extensions {
+        for extension in info.extensions {
             let _ = writeln!(
                 out,
                 "  {:<9} {} level {}",
@@ -750,10 +754,25 @@ fn info_text(
             );
         }
     }
-    let _ = writeln!(out, "encrypted: {encrypted}");
+    // An intent names its condition by identifier, else in words, else in
+    // its info text (ISO 32000-1 §14.11.5, Table 365).
+    if !info.output_intents.is_empty() {
+        let _ = writeln!(out, "output intents:");
+        for intent in info.output_intents {
+            let condition = intent
+                .output_condition_identifier
+                .as_deref()
+                .or(intent.output_condition.as_deref())
+                .or(intent.info.as_deref())
+                .unwrap_or("");
+            let line = format!("  {:<9} {condition}", intent.subtype);
+            let _ = writeln!(out, "{}", line.trim_end());
+        }
+    }
+    let _ = writeln!(out, "encrypted: {}", info.encrypted);
     // A file is linearized only while /L names its actual length (ISO
     // 32000-1 Annex F.3, Table F.1).
-    if let Some((record, file_length)) = linearization {
+    if let Some((record, file_length)) = info.linearization {
         if record.is_current(file_length) {
             let _ = writeln!(
                 out,
@@ -768,7 +787,7 @@ fn info_text(
             );
         }
     }
-    match sizes {
+    match info.sizes {
         Some(sizes) => {
             let _ = writeln!(out, "pages:     {}", sizes.len());
             for (i, size) in sizes.iter().enumerate() {
@@ -788,7 +807,8 @@ fn info_text(
     }
     // Only terminal fields hold values; a field with child fields is a
     // container for inheritable entries (ISO 32000-1 §12.7.3).
-    let terminal: Vec<&pdfboss_core::FormField> = fields
+    let terminal: Vec<&pdfboss_core::FormField> = info
+        .fields
         .iter()
         .filter(|field| field.kids.is_empty())
         .collect();
@@ -822,6 +842,8 @@ fn info_text(
     }
     // A date that parses (ISO 32000-1 §7.9.4) prints as ISO 8601; one that
     // does not prints as written.
+    let none = Metadata::default();
+    let meta = info.meta.unwrap_or(&none);
     let created = meta
         .creation_date_parsed()
         .map(|d| d.to_iso8601())
@@ -1394,7 +1416,12 @@ mod tests {
             title: Some("Demo".to_string()),
             ..Metadata::default()
         };
-        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[], &[], None);
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            meta: Some(&meta),
+            ..Info::default()
+        });
         assert!(report.contains("version:   1.7"));
         assert!(report.contains("encrypted: false"));
         assert!(report.contains("pages:     1"));
@@ -1413,29 +1440,59 @@ mod tests {
             base_version: "1.7".to_string(),
             extension_level: 3,
         }];
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            None,
-            &Metadata::default(),
-            &extensions,
-            &[],
-            None,
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            extensions: &extensions,
+            ..Info::default()
+        });
         assert!(
             report.contains("version:   1.7\nextensions:\n  ADBE      1.7 level 3\n"),
             "{report}"
         );
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            None,
-            &Metadata::default(),
-            &[],
-            &[],
-            None,
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            ..Info::default()
+        });
         assert!(!report.contains("extensions"), "{report}");
+    }
+
+    /// The catalog's output intents print after the extensions, one per
+    /// line with the subtype and the condition identifier, or the condition
+    /// in words when the identifier is missing; none prints no block.
+    // Covers ISO 32000-1 §14.11.5.
+    #[test]
+    fn info_text_lists_output_intents() {
+        use pdfboss_core::OutputIntent;
+        let intents = [
+            OutputIntent {
+                subtype: "GTS_PDFA1".to_string(),
+                output_condition: None,
+                output_condition_identifier: Some("sRGB IEC61966-2.1".to_string()),
+                registry_name: None,
+                info: None,
+                destination_profile: None,
+            },
+            OutputIntent {
+                subtype: "GTS_PDFX".to_string(),
+                output_condition: Some("CGATS TR 001 (SWOP)".to_string()),
+                output_condition_identifier: None,
+                registry_name: None,
+                info: None,
+                destination_profile: None,
+            },
+        ];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            output_intents: &intents,
+            ..Info::default()
+        });
+        assert!(
+            report.contains(
+                "version:   1.7\noutput intents:\n  GTS_PDFA1 sRGB IEC61966-2.1\n  GTS_PDFX  CGATS TR 001 (SWOP)\nencrypted: false\n"
+            ),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("output intents"));
     }
 
     /// A linearized file prints its first page object after the encryption
@@ -1455,15 +1512,11 @@ mod tests {
             first_page: 0,
         };
         let report = |linearization| {
-            info_text(
-                Some((1, 7)),
-                false,
-                None,
-                &Metadata::default(),
-                &[],
-                &[],
+            info_text(&Info {
+                version: Some((1, 7)),
                 linearization,
-            )
+                ..Info::default()
+            })
         };
         let current = report(Some((&record, 12345)));
         assert!(
@@ -1519,15 +1572,12 @@ mod tests {
             field(None, Vec::new()),
         ];
         let sizes = [Some((612.0, 792.0))];
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            Some(&sizes),
-            &Metadata::default(),
-            &[],
-            &fields,
-            None,
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            fields: &fields,
+            ..Info::default()
+        });
         assert!(
             report.contains(
                 "  page 1: 612 x 792 pt
@@ -1536,29 +1586,21 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
             ),
             "{report}"
         );
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            Some(&sizes),
-            &Metadata::default(),
-            &[],
-            &[],
-            None,
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            ..Info::default()
+        });
         assert!(!report.contains("fields"), "{report}");
     }
 
     #[test]
     fn info_text_encrypted_document() {
-        let report = info_text(
-            Some((1, 4)),
-            true,
-            None,
-            &Metadata::default(),
-            &[],
-            &[],
-            None,
-        );
+        let report = info_text(&Info {
+            version: Some((1, 4)),
+            encrypted: true,
+            ..Info::default()
+        });
         assert!(report.contains("encrypted: true"));
         assert!(report.contains("pages:     unknown"));
         assert!(!report.contains("metadata:"));
@@ -1567,15 +1609,10 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
     #[test]
     fn info_text_unavailable_page() {
         let sizes = [None];
-        let report = info_text(
-            None,
-            false,
-            Some(&sizes),
-            &Metadata::default(),
-            &[],
-            &[],
-            None,
-        );
+        let report = info_text(&Info {
+            sizes: Some(&sizes),
+            ..Info::default()
+        });
         assert!(report.contains("version:   unknown"));
         assert!(report.contains("page 1: (unavailable)"));
     }

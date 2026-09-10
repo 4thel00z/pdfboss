@@ -660,6 +660,15 @@ impl Document {
             .is_some_and(|record| record.is_current(self.data.len() as u64))
     }
 
+    /// The catalog's output intents (ISO 32000-1 §14.11.5) in array order,
+    /// empty without `/OutputIntents`.
+    pub fn output_intents(&self) -> Vec<crate::output_intent::OutputIntent> {
+        block_on(crate::output_intent::output_intents_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

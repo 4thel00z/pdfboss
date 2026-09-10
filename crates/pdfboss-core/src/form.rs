@@ -722,7 +722,7 @@ async fn read_field<S: AsyncObjectSource>(
             )
         })
         .unwrap_or_default();
-    let partial_name = text_string(&entries, "T").await;
+    let partial_name = entries.text("T").await;
     let name = qualified_name(&inherited.name, partial_name.as_deref());
     let additional_actions = match dict.get("AA") {
         Some(entry) => resolved_dict(src, entry).await,
@@ -772,8 +772,8 @@ async fn read_field<S: AsyncObjectSource>(
         field_type,
         partial_name,
         name,
-        alternate_name: text_string(&entries, "TU").await,
-        mapping_name: text_string(&entries, "TM").await,
+        alternate_name: entries.text("TU").await,
+        mapping_name: entries.text("TM").await,
         flags,
         value,
         default_value,
@@ -895,9 +895,9 @@ async fn characteristics<S: AsyncObjectSource>(
     let entries = Entries { src, dict: &mk };
     let reference = |key: &str| mk.get(key).and_then(Object::as_ref);
     Some(AppearanceCharacteristics {
-        caption: text_string(&entries, "CA").await,
-        rollover_caption: text_string(&entries, "RC").await,
-        alternate_caption: text_string(&entries, "AC").await,
+        caption: entries.text("CA").await,
+        rollover_caption: entries.text("RC").await,
+        alternate_caption: entries.text("AC").await,
         icon: reference("I"),
         rollover_icon: reference("RI"),
         alternate_icon: reference("IX"),
@@ -929,14 +929,6 @@ async fn on_state<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Option<String> 
 fn is_widget(dict: &Dict) -> bool {
     dict.get_name("Subtype")
         .is_some_and(|subtype| subtype.0 == "Widget")
-}
-
-/// The text string under `key`, decoded (§7.9.2.2); `None` when absent or
-/// not a string.
-async fn text_string<S: AsyncObjectSource>(entries: &Entries<'_, S>, key: &str) -> Option<String> {
-    Some(decode_text_string(
-        entries.value(key).await?.as_str_bytes()?,
-    ))
 }
 
 /// The references an array holds, anything else in it skipped; empty for a
