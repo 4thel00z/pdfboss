@@ -50,13 +50,20 @@ fn outline_doc() -> Vec<u8> {
          /OutputIntents [ << /Type /OutputIntent /S /GTS_PDFA1 \
          /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
          /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
+         /Threads [13 0 R] \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     b.object(
         3,
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
-         /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> /Thumb 12 0 R >>",
+         /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> /Thumb 12 0 R \
+         /B [14 0 R] >>",
+    );
+    b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
+    b.object(
+        14,
+        "<< /T 13 0 R /N 14 0 R /V 14 0 R /P 3 0 R /R [0 0 10 10] >>",
     );
     b.stream(
         12,
@@ -283,6 +290,28 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
         if name == "outline" {
             let thumbnail = sync_doc.thumbnail(&sync_doc.page(0).unwrap()).unwrap();
             assert_eq!((thumbnail.width, thumbnail.height), (2, 1));
+        }
+        // Covers ISO 32000-1 §12.4.3.
+        assert_eq!(
+            doc.articles().await,
+            sync_doc.articles(),
+            "{name}: articles"
+        );
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.page_beads(&page).await,
+                sync_doc.page_beads(&sync_page),
+                "{name}: page {index} beads"
+            );
+        }
+        if name == "outline" {
+            let threads = sync_doc.articles();
+            assert_eq!(threads.len(), 1, "{name}: articles");
+            assert_eq!(threads[0].info.title.as_deref(), Some("Story"));
+            assert_eq!(threads[0].beads.len(), 1);
+            assert_eq!(sync_doc.page_beads(&sync_doc.page(0).unwrap()).len(), 1);
         }
         for index in 0..=doc.page_count() {
             assert_eq!(

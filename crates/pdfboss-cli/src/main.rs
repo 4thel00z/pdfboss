@@ -700,6 +700,11 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             }
             pieces.sort();
             pieces.dedup();
+            let threads = doc.articles();
+            let articles = (
+                threads.len(),
+                threads.iter().map(|thread| thread.beads.len()).sum(),
+            );
             let linearization = doc.linearization();
             print!(
                 "{}",
@@ -713,6 +718,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     fields: &doc.form_fields(),
                     pieces: &pieces,
                     thumbnails,
+                    articles,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -746,7 +752,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// not be opened. `fields` are the interactive form's fields, counted by
 /// type. `pieces` are the products that left page-piece data on the catalog
 /// or a page, sorted and without repeats. `thumbnails` counts the pages
-/// that carry a thumbnail image. `linearization` is the
+/// that carry a thumbnail image. `articles` counts the article threads and
+/// their beads. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
 /// not linearized.
@@ -761,6 +768,7 @@ struct Info<'a> {
     fields: &'a [pdfboss_core::FormField],
     pieces: &'a [String],
     thumbnails: usize,
+    articles: (usize, usize),
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -840,6 +848,11 @@ fn info_text(info: &Info) -> String {
     if info.thumbnails > 0 {
         let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
         let _ = writeln!(out, "thumbs:    {} of {pages} pages", info.thumbnails);
+    }
+    // Article threads and the beads they chain (ISO 32000-1 §12.4.3).
+    let (threads, beads) = info.articles;
+    if threads > 0 {
+        let _ = writeln!(out, "articles:  {threads} ({beads} beads)");
     }
     // Only terminal fields hold values; a field with child fields is a
     // container for inheritable entries (ISO 32000-1 §12.7.3).
@@ -1587,6 +1600,23 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("thumbs"));
+    }
+
+    /// Article threads print as one count with their bead total after the
+    /// pages; none prints no line.
+    // Covers ISO 32000-1 §12.4.3.
+    #[test]
+    fn info_text_counts_article_threads() {
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            articles: (2, 7),
+            ..Info::default()
+        });
+        assert!(
+            report.contains("pages:     unknown\narticles:  2 (7 beads)\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("articles"));
     }
 
     /// A linearized file prints its first page object after the encryption

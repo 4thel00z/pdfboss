@@ -3,6 +3,7 @@
 //! byte spans plus logical document structure), implemented from the PDF
 //! specification (ISO 32000).
 
+pub mod article;
 pub mod cmap;
 pub mod content;
 pub mod crypt;
@@ -37,6 +38,7 @@ pub mod tree;
 pub mod viewer_preferences;
 pub mod xref;
 
+pub use article::{articles_with, page_beads_with, ArticleThread, Bead};
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
 pub use crypt::{
     crypt_filter_refs, direct_crypt_filters, Decryptor, Encryptor, Permissions, PERMISSION_NAMES,

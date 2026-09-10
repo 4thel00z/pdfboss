@@ -1543,6 +1543,18 @@ impl AsyncDocument {
         pdfboss_core::thumbnail_with(self, page).await
     }
 
+    /// The catalog's article threads (ISO 32000-1 §12.4.3): the async twin
+    /// of the sync document's `articles`.
+    pub async fn articles(&self) -> Vec<pdfboss_core::ArticleThread> {
+        pdfboss_core::articles_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The beads on a page in drawing order (ISO 32000-1 §12.4.3): the
+    /// async twin of the sync document's `page_beads`.
+    pub async fn page_beads(&self, page: &Page) -> Vec<ObjRef> {
+        pdfboss_core::page_beads_with(self, page).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

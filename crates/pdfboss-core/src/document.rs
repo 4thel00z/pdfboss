@@ -14,10 +14,11 @@ use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::geom::Rect;
-use crate::object::{decode_text_string, Dict, ObjRef, Object, Stream};
+use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::objstm;
 use crate::parser::{Parser, Resolve};
 use crate::source::{block_on, AsyncObjectSource, Immediate};
+use crate::tree::Entries;
 use crate::xref::{load_xref, Xref, XrefEntry};
 
 /// Page-tree traversal depth cap.
@@ -495,7 +496,7 @@ impl Document {
     ///
     /// Covers ISO 32000-1 §14.3.3, §7.9.4 and §8.11.4.3.
     pub fn metadata(&self) -> Metadata {
-        let mut meta = Metadata::default();
+        let meta = Metadata::default();
         let Some(info) = self.xref.trailer.get("Info") else {
             return meta;
         };
@@ -505,15 +506,7 @@ impl Document {
         let Some(dict) = info.as_dict() else {
             return meta;
         };
-        meta.title = self.meta_string(dict, "Title");
-        meta.author = self.meta_string(dict, "Author");
-        meta.subject = self.meta_string(dict, "Subject");
-        meta.keywords = self.meta_string(dict, "Keywords");
-        meta.creator = self.meta_string(dict, "Creator");
-        meta.producer = self.meta_string(dict, "Producer");
-        meta.creation_date = self.meta_string(dict, "CreationDate");
-        meta.mod_date = self.meta_string(dict, "ModDate");
-        meta
+        block_on(metadata_with(&Immediate(self), dict))
     }
 
     /// The document's optional-content visibility under its default
@@ -693,6 +686,21 @@ impl Document {
         block_on(crate::thumbnail::thumbnail_with(&Immediate(self), page))
     }
 
+    /// The catalog's article threads (ISO 32000-1 §12.4.3) in array order,
+    /// empty without `/Threads`.
+    pub fn articles(&self) -> Vec<crate::article::ArticleThread> {
+        block_on(crate::article::articles_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The beads on a page in drawing order (ISO 32000-1 §12.4.3), empty
+    /// without `/B`.
+    pub fn page_beads(&self, page: &Page) -> Vec<ObjRef> {
+        block_on(crate::article::page_beads_with(&Immediate(self), page))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {
@@ -741,14 +749,6 @@ impl Document {
             &Immediate(self),
             file,
         ))
-    }
-
-    /// Reads `key` from an info dictionary as a decoded text string.
-    ///
-    /// Covers ISO 32000-1 §7.9.2.2.
-    fn meta_string(&self, dict: &Dict, key: &str) -> Option<String> {
-        let value = self.resolve(dict.get(key)?).ok()?;
-        Some(decode_text_string(value.as_str_bytes()?))
     }
 
     /// Flattens the page tree by iterative depth-first traversal of `/Kids`
@@ -1051,6 +1051,25 @@ pub struct Metadata {
     pub producer: Option<String>,
     pub creation_date: Option<String>,
     pub mod_date: Option<String>,
+}
+
+/// The document information entries `dict` holds (ISO 32000-1 §14.3.3,
+/// Table 317), each decoded as a text string. The same reader serves the
+/// trailer's `/Info` dictionary and an article thread's `/I` (§12.4.3).
+///
+/// Covers ISO 32000-1 §7.9.2.2 and §14.3.3.
+pub async fn metadata_with<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Metadata {
+    let entries = Entries { src, dict };
+    Metadata {
+        title: entries.text("Title").await,
+        author: entries.text("Author").await,
+        subject: entries.text("Subject").await,
+        keywords: entries.text("Keywords").await,
+        creator: entries.text("Creator").await,
+        producer: entries.text("Producer").await,
+        creation_date: entries.text("CreationDate").await,
+        mod_date: entries.text("ModDate").await,
+    }
 }
 
 impl Metadata {
