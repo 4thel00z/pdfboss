@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.2.0](https://github.com/4thel00z/pdfboss/compare/v2.1.0...v2.2.0) (2026-09-10)
+
+
+### Features
+
+* tagged-text rows, ledger corrections, catalog extensions and viewer preferences ([#170](https://github.com/4thel00z/pdfboss/issues/170)) ([086a793](https://github.com/4thel00z/pdfboss/commit/086a793bff010a962e7e43b6ac64bb646dd310ae))
+* **text:** highlight flag, text markup annotations and box metrics on spans ([#176](https://github.com/4thel00z/pdfboss/issues/176)) ([7fcf37a](https://github.com/4thel00z/pdfboss/commit/7fcf37a1563c489fd853e828a0e48e4a17b5ca05))
+
+
+### Documentation
+
+* **failure-modes:** name the cmap-selection evidence after its squash hash b0cb5d3 ([#171](https://github.com/4thel00z/pdfboss/issues/171)) ([7dad97a](https://github.com/4thel00z/pdfboss/commit/7dad97a6fecd833c8b9d07439a7c7d919da7dd59))
+
 ## [2.1.0](https://github.com/4thel00z/pdfboss/compare/v2.0.0...v2.1.0) (2026-09-08)
 
 
