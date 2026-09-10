@@ -23,6 +23,7 @@
 
 // The rasterizer modules are consumed by the content-stream executor; the
 // `dead_code` allowances below disappear once it is wired up.
+mod annot;
 mod cff;
 #[allow(dead_code)]
 mod color;

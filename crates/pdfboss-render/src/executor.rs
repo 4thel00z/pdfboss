@@ -16,6 +16,7 @@ use pdfboss_core::{
     Error, Immediate, Name, Object, Page, Result, Stream,
 };
 
+use crate::annot;
 use crate::color::{self, ColorSpace};
 use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
@@ -609,7 +610,47 @@ pub(crate) async fn render_page_reporting_with<S: AsyncObjectSource>(
 /// The `/F` flag bits whose annotations are not displayed even by a renderer
 /// that paints appearance streams: Hidden (bit 2) and NoView (bit 6),
 /// ISO 32000-1 §12.5.3.
-const INVISIBLE_ANNOTS: i64 = (1 << 1) | (1 << 5);
+const HIDDEN_ANNOTS: i64 = (1 << 1) | (1 << 5);
+
+/// The Invisible flag (bit 1): an annotation outside Table 169's standard
+/// types is not displayed when it is set, ISO 32000-1 §12.5.3.
+const INVISIBLE_FLAG: i64 = 1;
+
+/// The NoRotate flag (bit 5): the annotation keeps its orientation on a page
+/// with `/Rotate`, pivoting about the upper-left corner of its `/Rect`,
+/// ISO 32000-1 §12.5.3.
+const NO_ROTATE_FLAG: i64 = 1 << 4;
+
+/// Table 169's standard annotation types, which the Invisible flag leaves
+/// alone.
+const STANDARD_ANNOTS: [&str; 26] = [
+    "Text",
+    "Link",
+    "FreeText",
+    "Line",
+    "Square",
+    "Circle",
+    "Polygon",
+    "PolyLine",
+    "Highlight",
+    "Underline",
+    "Squiggly",
+    "StrikeOut",
+    "Stamp",
+    "Caret",
+    "Ink",
+    "Popup",
+    "FileAttachment",
+    "Sound",
+    "Movie",
+    "Widget",
+    "Screen",
+    "PrinterMark",
+    "TrapNet",
+    "Watermark",
+    "3D",
+    "Redact",
+];
 
 /// Upper bound on distinct parsed CharProcs kept per page render. A real
 /// Type3 font has at most 256 mapped codes, so this is never approached
@@ -2960,18 +3001,18 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
 }
 
 /// Resolves an object to a finite `f32`.
-async fn num_f32<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<f32> {
+pub(crate) async fn num_f32<S: AsyncObjectSource>(src: &S, obj: &Object) -> Option<f32> {
     let v = src.resolve(obj).await.ok()?.as_f64()? as f32;
     v.is_finite().then_some(v)
 }
 
 /// Resolves `dict[key]` to a finite `f32`.
-async fn dict_f32<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<f32> {
+pub(crate) async fn dict_f32<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<f32> {
     num_f32(src, dict.get(key)?).await
 }
 
 /// Reads the first `n` finite numbers of a (possibly indirect) array.
-async fn floats_from<S: AsyncObjectSource>(
+pub(crate) async fn floats_from<S: AsyncObjectSource>(
     src: &S,
     obj: Option<&Object>,
     n: usize,
@@ -3195,12 +3236,23 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// content (ISO 32000-1 §12.5.5). Each appearance is a form XObject
     /// whose `/BBox`, transformed by its `/Matrix`, is fitted onto the
     /// annotation's `/Rect` and then run like any other form, in default
-    /// user space. Annotations flagged Hidden or NoView (§12.5.3), `/Popup`
-    /// annotations (a viewer-UI artifact), and annotations with no usable
-    /// normal appearance paint nothing and report nothing; an appearance
-    /// that exists but cannot be read or placed reports as a dropped
-    /// annotation, so a page whose visible content is a stamp or a filled
-    /// form field never rasterizes blank without saying why.
+    /// user space. Annotations flagged Hidden or NoView (§12.5.3), an
+    /// annotation of a non-standard subtype flagged Invisible, and `/Popup`
+    /// annotations (a viewer-UI artifact) paint nothing and report nothing;
+    /// one flagged NoRotate on a page with `/Rotate` is turned back about
+    /// the upper-left corner of its `/Rect` so it stays upright where the
+    /// page rotation put that corner. An annotation with no `/AP` at all
+    /// gets the appearance its own entries describe when its subtype has
+    /// one (Line, §12.5.6.7;
+    /// Square and Circle, §12.5.6.8; Polygon and PolyLine, §12.5.6.9; the
+    /// text markups, §12.5.6.10; Ink, §12.5.6.13; a Link's declared border,
+    /// §12.5.4); other annotations without
+    /// a usable normal appearance paint nothing and report nothing. An
+    /// appearance
+    /// that exists but
+    /// cannot be read or placed reports as a dropped annotation, so a page
+    /// whose visible content is a stamp or a filled form field never
+    /// rasterizes blank without saying why.
     ///
     /// Covers ISO 32000-1 §12.5.2, §12.5.3, §12.5.5, §12.5.6, §12.5.6.10, §12.5.6.11, §12.5.6.12, §12.5.6.13, §12.5.6.14, §12.5.6.15, §12.5.6.16, §12.5.6.17, §12.5.6.18, §12.5.6.20, §12.5.6.21, §12.5.6.22, §12.5.6.23, §12.5.6.4, §12.5.6.6, §12.5.6.7, §12.5.6.8, §12.5.6.9 and §8.11.3.3.
     async fn paint_annotations(&mut self, page: &Page, base: Matrix) {
@@ -3218,7 +3270,14 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             let Some(dict) = resolved.as_dict() else {
                 continue;
             };
-            if dict.get_int("F").unwrap_or(0) & INVISIBLE_ANNOTS != 0 {
+            let flags = dict.get_int("F").unwrap_or(0);
+            if flags & HIDDEN_ANNOTS != 0 {
+                continue;
+            }
+            let standard = dict
+                .get_name("Subtype")
+                .is_some_and(|n| STANDARD_ANNOTS.contains(&n.0.as_str()));
+            if flags & INVISIBLE_FLAG != 0 && !standard {
                 continue;
             }
             // An `/OC` entry hides the annotation exactly like the Hidden
@@ -3232,10 +3291,41 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             if dict.get_name("Subtype").is_some_and(|n| n.0 == "Popup") {
                 continue;
             }
-            let Some(stream) = self.normal_appearance(dict).await else {
-                continue;
+            let (stream, fit) = match self.normal_appearance(dict).await {
+                Some(stream) => {
+                    let Some(rect) = floats_from(self.src, dict.get("Rect"), 4).await else {
+                        self.skip(SkippedKind::Annotation, SkipReason::Missing);
+                        continue;
+                    };
+                    (stream, Some([rect[0], rect[1], rect[2], rect[3]]))
+                }
+                // An annotation declaring no /AP at all gets the appearance
+                // its own entries describe (§12.5.6.7, §12.5.6.8), already in
+                // default user space so nothing is fitted; a declared
+                // appearance that could not be read was reported and is not
+                // replaced.
+                None if dict.get("AP").is_none() => {
+                    match annot::synthesized(self.src, dict).await {
+                        Some(stream) => (stream, None),
+                        None => continue,
+                    }
+                }
+                None => continue,
             };
-            if let Some(frame) = self.appearance_frame(&stream, dict, &chain, base).await {
+            let upright = match page.rotate {
+                0 => None,
+                rotate if flags & NO_ROTATE_FLAG != 0 => {
+                    floats_from(self.src, dict.get("Rect"), 4).await.map(|r| {
+                        let (x0, y1) = (r[0].min(r[2]), r[1].max(r[3]));
+                        Matrix::translate(-x0, -y1)
+                            .concat(Matrix::rotate_deg(rotate as f32))
+                            .concat(Matrix::translate(x0, y1))
+                    })
+                }
+                _ => None,
+            };
+            let base = upright.map_or(base, |m| m.concat(base));
+            if let Some(frame) = self.appearance_frame(&stream, fit, &chain, base).await {
                 self.run(frame).await;
             }
         }
@@ -3291,9 +3381,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
 
     /// Builds the frame that paints one appearance stream: the form's
     /// `/BBox` corners are transformed by its `/Matrix`, their bounding box
-    /// is fitted onto the annotation's normalized `/Rect` (§12.5.5's
+    /// is fitted onto `fit`, the annotation's normalized `/Rect` (§12.5.5's
     /// appearance algorithm), and the form runs under `Matrix ∘ fit ∘ base`
-    /// with the untransformed `/BBox` as its clip. `None` reports the
+    /// with the untransformed `/BBox` as its clip. Without `fit` the
+    /// transformed box is left where it is, which is how a synthesized
+    /// appearance drawn in default user space is placed. `None` reports the
     /// annotation as dropped — every bail-out here loses a declared
     /// appearance.
     ///
@@ -3301,14 +3393,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     async fn appearance_frame(
         &mut self,
         stream: &Stream,
-        annot: &Dict,
+        fit: Option<[f32; 4]>,
         chain: &[Arc<Dict>],
         base: Matrix,
     ) -> Option<Frame> {
-        let Some(rect) = floats_from(self.src, annot.get("Rect"), 4).await else {
-            self.skip(SkippedKind::Annotation, SkipReason::Missing);
-            return None;
-        };
         let data = match content_stream_data_with(self.src, stream).await {
             Ok(data) => data,
             Err(e) => {
@@ -3357,6 +3445,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             .iter()
             .map(|p| p.y)
             .fold(f32::NEG_INFINITY, f32::max);
+        let rect = fit.unwrap_or([tx0, ty0, tx1, ty1]);
         let (rx0, rx1) = (rect[0].min(rect[2]), rect[0].max(rect[2]));
         let (ry0, ry1) = (rect[1].min(rect[3]), rect[1].max(rect[3]));
         // A degenerate transformed box cannot be fitted by scaling; §12.5.5
@@ -6947,6 +7036,24 @@ mod tests {
     /// object bodies added from object number 10 up) — the appearance
     /// streams they reference are given as `(num, dict_extra, content)`.
     fn annots_doc(annots: &[&str], streams: &[(u32, &str, &[u8])]) -> Vec<u8> {
+        annots_doc_over(b"", annots, streams)
+    }
+
+    /// A one-page document whose page content is `content`, carrying the
+    /// annotation dictionaries `annots` as objects 10, 11, ... and the extra
+    /// `streams`.
+    fn annots_doc_over(content: &[u8], annots: &[&str], streams: &[(u32, &str, &[u8])]) -> Vec<u8> {
+        annots_doc_page("", content, annots, streams)
+    }
+
+    /// [`annots_doc_over`] with `page_extra` spliced into the page
+    /// dictionary, for a `/Rotate` or other page-level entry.
+    fn annots_doc_page(
+        page_extra: &str,
+        content: &[u8],
+        annots: &[&str],
+        streams: &[(u32, &str, &[u8])],
+    ) -> Vec<u8> {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -6957,11 +7064,11 @@ mod tests {
             3,
             &format!(
                 "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R \
-                 /Annots [{}] >>",
+                 {page_extra} /Annots [{}] >>",
                 refs.join(" ")
             ),
         );
-        b.stream(4, "", b"");
+        b.stream(4, "", content);
         for (i, body) in annots.iter().enumerate() {
             b.object(10 + i as u32, body);
         }
@@ -6991,6 +7098,362 @@ mod tests {
         let (pix, report) = render_reporting(bytes);
         assert_eq!(px(&pix, 40, 60), WHITE, "nothing may paint");
         assert!(report.is_empty(), "none of these is a drop");
+    }
+
+    // Covers ISO 32000-1 §12.5.6.8.
+    #[test]
+    fn square_and_circle_annotations_without_appearance_are_drawn() {
+        // A Square with a red 4-unit /Border and a blue /IC: the border band
+        // lies inside the Rect (user x 10..14), the interior is blue, the
+        // page outside stays white. A Circle inscribes its ellipse in the
+        // Rect: the centre is blue, the Rect's corner stays white, and the
+        // 2-unit /BS border band at the bottom edge is red. Neither is a
+        // drop: the appearance comes from the annotation's own entries.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Square /Rect [10 10 50 50] /C [1 0 0] /IC [0 0 1] \
+                 /Border [0 0 4] >>",
+                "<< /Type /Annot /Subtype /Circle /Rect [60 60 90 90] /C [1 0 0] /IC [0 0 1] \
+                 /BS << /W 2 >> >>",
+            ],
+            &[],
+        );
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 30, 70), BLUE, "square interior");
+        assert_eq!(px(&pix, 12, 70), RED, "square border band inside the rect");
+        assert_eq!(px(&pix, 5, 70), WHITE, "outside the square's rect");
+        assert_eq!(px(&pix, 75, 25), BLUE, "circle centre");
+        assert_eq!(
+            px(&pix, 62, 38),
+            WHITE,
+            "the ellipse leaves the rect corner clear"
+        );
+        assert_eq!(
+            px(&pix, 75, 39),
+            RED,
+            "circle border band at the bottom edge"
+        );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.7.
+    #[test]
+    fn line_annotations_without_appearance_are_drawn() {
+        // Top: a red 4-unit line along user y 20 paints its band and nothing
+        // above it. Middle: a 2-unit line whose /LE ends in a ClosedArrow
+        // filled with /IC has a blue interior near the tip and clear page
+        // beside the arrow. Bottom: a producer wrote /Rect [0 0 0 0] (pdf.js
+        // annotation-line-without-appearance-empty-Rect.pdf); the line is
+        // still drawn where /L puts it.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Line /Rect [0 0 100 100] /L [10 20 90 20] /C [1 0 0] \
+                 /Border [0 0 4] >>",
+                "<< /Type /Annot /Subtype /Line /Rect [0 0 100 100] /L [10 60 90 60] /C [1 0 0] \
+                 /IC [0 0 1] /BS << /W 2 >> /LE [/None /ClosedArrow] >>",
+                "<< /Type /Annot /Subtype /Line /Rect [0 0 0 0] /L [10 90 90 90] /C [0 0 1] \
+                 /Border [0 0 4] >>",
+            ],
+            &[],
+        );
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 80), RED, "the line's band");
+        assert_eq!(px(&pix, 50, 74), WHITE, "above the band");
+        assert_eq!(px(&pix, 80, 40), BLUE, "inside the closed arrowhead");
+        assert_eq!(px(&pix, 84, 33), WHITE, "beside the arrowhead");
+        assert_eq!(
+            px(&pix, 50, 10),
+            BLUE,
+            "a line with an empty /Rect still paints"
+        );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.9.
+    #[test]
+    fn polygon_and_polyline_annotations_without_appearance_are_drawn() {
+        // Left: a Polygon whose /Vertices give a triangle, red 2-unit border,
+        // blue /IC interior: the centroid is blue, the closing edge from the
+        // last vertex back to the first is red, the page beside it white.
+        // Right: a PolyLine through three points with /LE [/None /Square]
+        // and no /IC: its second segment paints red, the square ending at
+        // the last vertex is outlined, and nothing closes it back to the
+        // start.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Polygon /Rect [0 0 50 100] /Vertices [10 10 40 10 25 40] \
+                 /C [1 0 0] /IC [0 0 1] /BS << /W 2 >> >>",
+                "<< /Type /Annot /Subtype /PolyLine /Rect [50 0 100 100] \
+                 /Vertices [60 60 60 90 90 90] /C [1 0 0] /BS << /W 2 >> /LE [/None /Square] >>",
+            ],
+            &[],
+        );
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 25, 80), BLUE, "polygon interior");
+        assert_eq!(px(&pix, 25, 90), RED, "the closing edge along y 10");
+        assert_eq!(px(&pix, 45, 75), WHITE, "beside the polygon");
+        assert_eq!(
+            px(&pix, 75, 10),
+            RED,
+            "the polyline's second segment along y 90"
+        );
+        assert_eq!(px(&pix, 75, 25), WHITE, "the polyline is not closed");
+        assert_eq!(
+            px(&pix, 96, 10),
+            RED,
+            "the square ending's right edge at the last vertex"
+        );
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.13.
+    #[test]
+    fn ink_annotations_without_appearance_are_drawn() {
+        // Three paths in one /InkList: a horizontal stroke along user y 30,
+        // one bent like an L, and a single point; the strokes paint in /C at
+        // the /BS width, the point becomes a round dot of that width, the
+        // page between them stays white, and an unnormalized /Rect (pdf.js
+        // annotation-ink-without-appearance.pdf writes x1 < x0) does not
+        // matter because the appearance is placed by its own box.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Ink /Rect [90 90 10 10] /C [1 0 0] /BS << /W 4 >> \
+                 /InkList [[10 30 50 30] [60 60 60 90 90 90] [20 80]] >>",
+            ],
+            &[],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 30, 70), RED, "the horizontal stroke along y 30");
+        assert_eq!(px(&pix, 60, 25), RED, "the L's vertical leg along x 60");
+        assert_eq!(px(&pix, 75, 10), RED, "the L's horizontal leg along y 90");
+        assert_eq!(px(&pix, 20, 20), RED, "the single point as a dot");
+        assert_eq!(px(&pix, 30, 50), WHITE, "between the strokes");
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.10.
+    #[test]
+    fn text_markup_annotations_without_appearance_are_drawn() {
+        // Four markups on separate lines of the page, each one /QuadPoints
+        // quadrilateral written upper edge first as writers emit it: the
+        // Highlight fills its quad in yellow and multiplies over the black
+        // page content under it, the Underline strokes along the bottom edge
+        // of its quad, the StrikeOut through its middle, the Squiggly
+        // zigzags along its bottom; where nothing is drawn the quads stay
+        // white.
+        let bytes = annots_doc_over(
+            b"0 g 20 82 5 6 re f",
+            &[
+                "<< /Type /Annot /Subtype /Highlight /Rect [10 80 40 90] /C [1 1 0] \
+                 /QuadPoints [10 90 40 90 10 80 40 80] >>",
+                "<< /Type /Annot /Subtype /Underline /Rect [10 60 40 70] /C [0 0 1] \
+                 /QuadPoints [10 70 40 70 10 60 40 60] >>",
+                "<< /Type /Annot /Subtype /StrikeOut /Rect [10 40 40 49] /C [1 0 0] \
+                 /QuadPoints [10 49 40 49 10 40 40 40] >>",
+                "<< /Type /Annot /Subtype /Squiggly /Rect [10 20 40 30] /C [0 1 0] \
+                 /QuadPoints [10 30 40 30 10 20 40 20] >>",
+            ],
+            &[],
+        );
+        const YELLOW: [u8; 4] = [255, 255, 0, 255];
+        const BLACK: [u8; 4] = [0, 0, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 15, 15), YELLOW, "the highlight over white");
+        assert_eq!(
+            px(&pix, 22, 15),
+            BLACK,
+            "the highlight multiplies over the page content"
+        );
+        assert_eq!(
+            px(&pix, 25, 39),
+            BLUE,
+            "the underline along the quad's bottom edge"
+        );
+        assert_eq!(px(&pix, 25, 35), WHITE, "the underlined quad's middle");
+        assert_eq!(px(&pix, 25, 55), RED, "the strike-out through the middle");
+        assert_eq!(px(&pix, 25, 58), WHITE, "below the strike-out");
+        assert_ne!(px(&pix, 11, 78), WHITE, "the squiggle along the bottom");
+        assert_eq!(px(&pix, 25, 75), WHITE, "the squiggly quad's middle");
+        assert!(
+            report.is_empty(),
+            "a synthesized appearance is not a drop: {:?}",
+            report.warnings()
+        );
+    }
+
+    // Covers ISO 32000-1 §12.5.6.2.
+    #[test]
+    fn constant_opacity_applies_to_synthesized_appearances_only() {
+        // Table 170's /CA is folded into an appearance pdfboss builds from
+        // the annotation's own entries: the borderless red Square without
+        // /AP blends half-way into the white page. It shall not be used when
+        // the annotation carries an appearance stream, so the Square whose
+        // /AP paints solid red stays solid red.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Square /Rect [10 10 40 40] /IC [1 0 0] \
+                 /Border [0 0 0] /CA 0.5 >>",
+                "<< /Type /Annot /Subtype /Square /Rect [60 60 90 90] /IC [1 0 0] \
+                 /Border [0 0 0] /CA 0.5 /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 30 30]",
+                b"1 0 0 rg 0 0 30 30 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        let blended = px(&pix, 25, 75);
+        assert_eq!(blended[0], 255, "the synthesized square keeps full red");
+        assert!(
+            (120..=135).contains(&blended[1]) && blended[1] == blended[2],
+            "the synthesized square is half transparent: {blended:?}"
+        );
+        assert_eq!(px(&pix, 75, 25), RED, "the /AP appearance ignores /CA");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
+    // Covers ISO 32000-1 §12.5.3.
+    #[test]
+    fn invisible_flag_hides_only_unknown_annotation_types() {
+        // Table 165 bit 1 applies to annotations outside the standard types:
+        // the /Foo with Invisible set paints nothing, the /Foo without it
+        // paints its appearance, and a standard /Stamp paints despite the
+        // bit. None is a drop.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Foo /Rect [10 10 30 30] /F 1 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Foo /Rect [60 60 80 80] /F 0 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Stamp /Rect [10 60 30 80] /F 1 /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 20]",
+                b"1 0 0 rg 0 0 20 20 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 20, 80),
+            WHITE,
+            "an unknown type with Invisible set"
+        );
+        assert_eq!(
+            px(&pix, 70, 30),
+            RED,
+            "an unknown type with Invisible clear"
+        );
+        assert_eq!(px(&pix, 20, 30), RED, "a standard type ignores Invisible");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
+    // Covers ISO 32000-1 §12.5.3.
+    #[test]
+    fn no_rotate_annotations_stay_upright_on_a_rotated_page() {
+        // A /Rotate 90 page turns clockwise, so user (x, y) lands at device
+        // (y, x). Both annotations use an appearance that paints only the
+        // upper half of its box red. The one with NoRotate (bit 5) keeps its
+        // upper-left corner, user (10, 80), at device (80, 10) and stands
+        // upright there: red in device x 80..100, y 10..30, nothing below,
+        // and nothing where the page rotation would have put it. The one
+        // without the flag turns with the page: its red half lies at device
+        // x 60..80, y 50..70.
+        let bytes = annots_doc_page(
+            "/Rotate 90",
+            b"",
+            &[
+                "<< /Type /Annot /Subtype /Stamp /Rect [10 40 30 80] /F 16 /AP << /N 20 0 R >> >>",
+                "<< /Type /Annot /Subtype /Stamp /Rect [50 40 70 80] /AP << /N 20 0 R >> >>",
+            ],
+            &[(
+                20,
+                "/Type /XObject /Subtype /Form /BBox [0 0 20 40]",
+                b"1 0 0 rg 0 20 20 20 re f",
+            )],
+        );
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 90, 20),
+            RED,
+            "the NoRotate appearance stands upright"
+        );
+        assert_eq!(px(&pix, 90, 40), WHITE, "its lower half is unpainted");
+        assert_eq!(px(&pix, 70, 20), WHITE, "it did not turn with the page");
+        assert_eq!(
+            px(&pix, 70, 60),
+            RED,
+            "the plain annotation turned with the page"
+        );
+        assert_eq!(px(&pix, 50, 60), WHITE, "its lower half is unpainted");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
+    }
+
+    // Covers ISO 32000-1 §12.5.4 and §12.5.6.5.
+    #[test]
+    fn link_borders_without_appearance_follow_the_border_style() {
+        // Links carry no appearance of their own; their border comes from
+        // /Border or /BS in the /C colour, drawn inside /Rect. Top-left: a
+        // 2-unit solid red band inside the rect, white interior. Top-right:
+        // /C with neither /Border nor /BS paints nothing, as Acrobat and
+        // pdf.js do. Bottom-left: /BS style U is a 2-unit line along the
+        // bottom edge and nothing up the sides. Bottom-right: a /Border width
+        // wider than half the rect falls back to 1 unit. Middle: the /Border
+        // corner radii round the corner away while the edge stays.
+        let bytes = annots_doc(
+            &[
+                "<< /Type /Annot /Subtype /Link /Rect [10 60 40 90] /C [1 0 0] /Border [0 0 2] >>",
+                "<< /Type /Annot /Subtype /Link /Rect [60 60 90 90] /C [0 0 1] >>",
+                "<< /Type /Annot /Subtype /Link /Rect [10 10 40 40] /C [0 1 0] /BS << /W 2 /S /U >> >>",
+                "<< /Type /Annot /Subtype /Link /Rect [60 10 90 40] /C [0 0 1] /Border [0 0 112] >>",
+                "<< /Type /Annot /Subtype /Link /Rect [42 44 58 56] /C [1 0 0] /Border [5 5 2] >>",
+            ],
+            &[],
+        );
+        const GREEN: [u8; 4] = [0, 255, 0, 255];
+        const BLUE: [u8; 4] = [0, 0, 255, 255];
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(
+            px(&pix, 11, 25),
+            RED,
+            "the solid border band inside the rect"
+        );
+        assert_eq!(px(&pix, 25, 25), WHITE, "the solid border's interior");
+        assert_eq!(px(&pix, 61, 25), WHITE, "no border entry, no border");
+        assert_eq!(px(&pix, 25, 89), GREEN, "the U style along the bottom edge");
+        assert_eq!(
+            px(&pix, 11, 75),
+            WHITE,
+            "the U style leaves the sides clear"
+        );
+        assert_eq!(
+            px(&pix, 60, 75),
+            BLUE,
+            "an oversized width falls back to 1 unit"
+        );
+        assert_eq!(px(&pix, 75, 75), WHITE, "and leaves the interior clear");
+        assert_eq!(px(&pix, 42, 55), WHITE, "the rounded corner is cut away");
+        assert_eq!(px(&pix, 50, 55), RED, "the edge between the corners stays");
+        assert!(report.is_empty(), "no drop: {:?}", report.warnings());
     }
 
     // Covers ISO 32000-1 §12.5.5, §12.5.6, §12.5.6.19, §12.7.4, §12.7.4.2, §12.7.4.2.3 and §12.7.4.2.4.
