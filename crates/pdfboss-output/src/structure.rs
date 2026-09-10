@@ -2050,10 +2050,10 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
     }
     horizontals.sort_by(|a, b| a.0.total_cmp(&b.0));
     // Every candidate region is a y-range query over the page's inked
-    // spans; one ascending sort here serves them all, and a whitespace-only
-    // span is out of every region before any candidate looks.
-    let mut inked: Vec<&TextSpan> = spans.iter().filter(|s| !blank(&s.text)).collect();
-    inked.sort_by(|a, b| a.y.total_cmp(&b.y));
+    // spans; one ascending sort serves them all, built the first time a
+    // cluster asks for it, and a whitespace-only span is out of every
+    // region before any candidate looks.
+    let mut inked: Option<Vec<&TextSpan>> = None;
 
     let mut grids: Vec<RuledGrid> = Vec::new();
     let mut used = vec![false; horizontals.len()];
@@ -2079,7 +2079,12 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
         if even_stack(&ys) {
             continue;
         }
-        open_ruled_split(&inked, &ys, seed_x0, seed_x1, taken, &mut grids);
+        let inked = inked.get_or_insert_with(|| {
+            let mut inked: Vec<&TextSpan> = spans.iter().filter(|s| !blank(&s.text)).collect();
+            inked.sort_by(|a, b| a.y.total_cmp(&b.y));
+            inked
+        });
+        open_ruled_split(inked, &ys, seed_x0, seed_x1, taken, &mut grids);
     }
     grids
 }
@@ -3525,6 +3530,14 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
         chars: usize,
     }
 
+    /// Whether `a` lies entirely above `b` while sharing at least
+    /// [`VISUAL_ORDER_MIN_X_OVERLAP`] of the narrower one's width.
+    fn lies_above(a: &Extent, b: &Extent) -> bool {
+        let overlap = a.right.min(b.right) - a.left.max(b.left);
+        let narrower = (a.right - a.left).min(b.right - b.left);
+        narrower > 0.0 && overlap >= VISUAL_ORDER_MIN_X_OVERLAP * narrower && a.bottom > b.top
+    }
+
     let n = flows.len();
     if !(2..=VISUAL_ORDER_MAX_FLOWS).contains(&n) {
         return None;
@@ -3556,6 +3569,18 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
     if movers < 2 {
         return None;
     }
+    // A stream whose later flows never lie above an earlier one keeps its
+    // order under the sort below; the common page leaves here.
+    let ordered = (0..n).all(|a| {
+        (a + 1..n).all(|b| {
+            extents[a].chars < VISUAL_ORDER_MIN_CHARS
+                || extents[b].chars < VISUAL_ORDER_MIN_CHARS
+                || !lies_above(&extents[b], &extents[a])
+        })
+    });
+    if ordered {
+        return None;
+    }
     let mut above: Vec<Vec<usize>> = vec![Vec::new(); n];
     let mut blockers = vec![0usize; n];
     for a in 0..n {
@@ -3566,14 +3591,7 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
             if a == b || extents[b].chars < VISUAL_ORDER_MIN_CHARS {
                 continue;
             }
-            let overlap =
-                extents[a].right.min(extents[b].right) - extents[a].left.max(extents[b].left);
-            let narrower =
-                (extents[a].right - extents[a].left).min(extents[b].right - extents[b].left);
-            if narrower <= 0.0 || overlap < VISUAL_ORDER_MIN_X_OVERLAP * narrower {
-                continue;
-            }
-            if extents[a].bottom > extents[b].top {
+            if lies_above(&extents[a], &extents[b]) {
                 above[a].push(b);
                 blockers[b] += 1;
             }
