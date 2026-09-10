@@ -575,6 +575,24 @@ mod tests {
         assert!(report.is_complete());
     }
 
+    /// A table border drawn as a thin filled bar with beveled (mitered)
+    /// ends: two axis-aligned long edges, two slanted short ones. The bar's
+    /// box is thin, so it reads as a ruling along its centerline exactly
+    /// like a rectangular one.
+    #[test]
+    fn beveled_filled_bar_reads_as_a_ruling() {
+        let doc = Document::load(pdfboss_testkit::doc_with_graphics(
+            "70.87 594.07 m 541.13 594.07 l 540.38 593.32 l 71.62 593.32 l h f",
+        ))
+        .unwrap();
+        let page = doc.page(0).unwrap();
+        let (_, rulings, _) =
+            extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
+        assert_eq!(rulings.len(), 1, "the beveled bar is one ruling");
+        assert!((rulings[0].start.y - 593.7).abs() < 0.5);
+        assert!((rulings[0].end.x - rulings[0].start.x - 470.0).abs() < 2.0);
+    }
+
     #[test]
     fn extract_spans_ordering_multi_line() {
         let doc = Document::load(pdfboss_testkit::doc_with_graphics(
@@ -1812,6 +1830,85 @@ mod tests {
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].bold, "StemV 140 is a bold stem");
         assert!(!spans[1].bold, "StemV 85 is a regular stem");
+    }
+
+    /// A face whose name says Regular (or Light, Thin, Book) is not bold,
+    /// whatever `/StemV` claims: design-tool exports write junk stem widths,
+    /// and an explicit weight name outranks a derived one. An explicit
+    /// `/FontWeight` still wins over the name.
+    #[test]
+    fn weight_name_vetoes_thick_stem() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (a) Tj /F2 12 Tf (b) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+NeueMachina-Regular \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /AAAAAA+NeueMachina-Regular /Flags 4 /StemV 172 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /BBBBBB+NeueMachina-Light \
+             /Encoding /WinAnsiEncoding /FontDescriptor 8 0 R >>",
+        );
+        b.object(
+            8,
+            "<< /Type /FontDescriptor /FontName /BBBBBB+NeueMachina-Light /Flags 4 \
+             /StemV 172 /FontWeight 700 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(
+            !spans[0].bold,
+            "a Regular-named face is not bold, whatever StemV claims"
+        );
+        assert!(
+            spans[1].bold,
+            "an explicit FontWeight 700 outranks the Light name"
+        );
+    }
+
+    /// The weight words match whole name parts, not substrings: Bookman is
+    /// a family name, not the Book weight, so a Demi face whose only bold
+    /// evidence is its thick stem keeps that evidence.
+    #[test]
+    fn family_name_containing_a_weight_word_is_not_a_veto() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (a) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Bookman-Demi \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Bookman-Demi /Flags 4 /StemV 167 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(
+            spans[0].bold,
+            "Bookman-Demi's thick stem still marks it bold"
+        );
     }
 
     /// BaseFont-name fallback when no descriptor exists, and ItalicAngle.
