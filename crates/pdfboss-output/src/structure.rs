@@ -1403,6 +1403,13 @@ fn clamped_level(rank: usize) -> u8 {
 
 /// A size as its half-point bucket. Halves are exact in binary, so bucket
 /// equality is exact too.
+/// Whether a span's text paints nothing: whitespace only, or empty. The
+/// same answer as `text.trim().is_empty()`, found at the first inked
+/// character instead of scanning both ends.
+fn blank(text: &str) -> bool {
+    text.chars().all(char::is_whitespace)
+}
+
 fn half_points(size: f32) -> i32 {
     (size * 2.0).round() as i32
 }
@@ -1571,7 +1578,7 @@ fn is_bold_title(line: &Line) -> bool {
     let mut visible = line
         .inlines
         .iter()
-        .filter(|inline| !inline.text.trim().is_empty());
+        .filter(|inline| !blank(&inline.text));
     let mut any = false;
     for inline in visible.by_ref() {
         any = true;
@@ -2027,10 +2034,15 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
             })
         })
         .collect();
-    if horizontals.len() > OPEN_RULED_MAX_RULES {
+    if horizontals.len() < 2 || horizontals.len() > OPEN_RULED_MAX_RULES {
         return Vec::new();
     }
     horizontals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Every candidate region is a y-range query over the page's inked
+    // spans; one ascending sort here serves them all, and a whitespace-only
+    // span is out of every region before any candidate looks.
+    let mut inked: Vec<&TextSpan> = spans.iter().filter(|s| !blank(&s.text)).collect();
+    inked.sort_by(|a, b| a.y.total_cmp(&b.y));
 
     let mut grids: Vec<RuledGrid> = Vec::new();
     let mut used = vec![false; horizontals.len()];
@@ -2056,7 +2068,7 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
         if even_stack(&ys) {
             continue;
         }
-        open_ruled_split(spans, &ys, seed_x0, seed_x1, taken, &mut grids);
+        open_ruled_split(&inked, &ys, seed_x0, seed_x1, taken, &mut grids);
     }
     grids
 }
@@ -2074,9 +2086,10 @@ fn even_stack(ys: &[f32]) -> bool {
 }
 
 /// One rule cluster as a table candidate, splitting at the largest rule
-/// gap when the gates reject it whole.
+/// gap when the gates reject it whole. `inked` is the page's inked spans in
+/// ascending y.
 fn open_ruled_split(
-    spans: &[TextSpan],
+    inked: &[&TextSpan],
     ys: &[f32],
     x0: f32,
     x1: f32,
@@ -2086,31 +2099,33 @@ fn open_ruled_split(
     if ys.len() < 2 {
         return;
     }
-    if let Some(grid) = open_ruled_candidate(spans, ys, x0, x1, taken) {
+    if let Some(grid) = open_ruled_candidate(inked, ys, x0, x1, taken) {
         out.push(grid);
         return;
     }
     let widest = (1..ys.len())
         .max_by(|&a, &b| (ys[a] - ys[a - 1]).total_cmp(&(ys[b] - ys[b - 1])))
         .expect("two rules have a gap");
-    open_ruled_split(spans, &ys[..widest], x0, x1, taken, out);
-    open_ruled_split(spans, &ys[widest..], x0, x1, taken, out);
+    open_ruled_split(inked, &ys[..widest], x0, x1, taken, out);
+    open_ruled_split(inked, &ys[widest..], x0, x1, taken, out);
 }
 
 /// The gates and column inference for one bracketed region; `None` sends
-/// the cluster to the split.
+/// the cluster to the split. `inked` is the page's inked spans in ascending
+/// y, so the region between two rules is one binary-searched slice.
 fn open_ruled_candidate(
-    spans: &[TextSpan],
+    inked: &[&TextSpan],
     ys: &[f32],
     x0: f32,
     x1: f32,
     taken: &[RuledGrid],
 ) -> Option<RuledGrid> {
     let (y_lo, y_hi) = (ys[0], ys[ys.len() - 1]);
-    let region: Vec<&TextSpan> = spans
+    let from = inked.partition_point(|s| s.y < y_lo);
+    let to = inked.partition_point(|s| s.y < y_hi);
+    let region: Vec<&TextSpan> = inked[from..to.max(from)]
         .iter()
-        .filter(|s| !s.text.trim().is_empty())
-        .filter(|s| s.y >= y_lo && s.y < y_hi)
+        .copied()
         .filter(|s| s.bbox.x1 >= x0 - OPEN_RULED_ALIGN && s.bbox.x0 <= x1 + OPEN_RULED_ALIGN)
         .collect();
     if region.is_empty() {
@@ -2461,7 +2476,7 @@ fn open_columns(groups: &[Group], grid: &RuledGrid) -> Vec<std::ops::Range<f32>>
     let spans: Vec<&TextSpan> = groups
         .iter()
         .flat_map(|group| group.spans.iter().copied())
-        .filter(|span| !span.text.trim().is_empty())
+        .filter(|span| !blank(&span.text))
         .collect();
     let (x_lo, x_hi) = x_bounds(&spans);
     let mut columns = grid.columns();
@@ -2878,7 +2893,7 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         // other, so a cell keeps its spacing; one running outside them —
         // a producer's padding past the grid's edge — paints nothing and
         // is skipped rather than disqualifying the whole row.
-        let whitespace = span.text.trim().is_empty();
+        let whitespace = blank(&span.text);
         let lo = span.x.min(span.end_x);
         let hi = span.x.max(span.end_x);
         let Some(start) = columns.iter().rposition(|column| column.start <= lo) else {
@@ -2967,7 +2982,7 @@ fn mixed_rank_size(spans: &[&TextSpan]) -> f32 {
     let mut max_size = f32::MIN;
     let mut lowercase = false;
     for span in spans {
-        if span.text.trim().is_empty() {
+        if blank(&span.text) {
             continue;
         }
         max_size = max_size.max(span.size);
@@ -2996,7 +3011,7 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
     let mut inlines: Vec<Inline> = Vec::with_capacity(1);
     let mut prev_end: Option<f32> = None;
     let mut prev_size = 0.0f32;
-    let mut first_bucket: Option<f32> = None;
+    let mut first_bucket: Option<(f32, i32)> = None;
     let mut mixed = false;
     for span in spans {
         let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
@@ -3006,18 +3021,18 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
         // A whitespace-only span has no visible size, so it has no vote in
         // the line's size rank: a producer's stray body-size separator on a
         // heading's baseline must not fold the heading into the paragraph.
-        if span.text.trim().is_empty() {
+        if blank(&span.text) {
             continue;
         }
         match first_bucket {
-            None => first_bucket = Some(span.size),
-            Some(first) if half_points(first) != half_points(span.size) => mixed = true,
+            None => first_bucket = Some((span.size, half_points(span.size))),
+            Some((_, bucket)) if bucket != half_points(span.size) => mixed = true,
             _ => {}
         }
     }
     let rank_size = match (first_bucket, mixed) {
         (None, _) => size,
-        (Some(first), false) => first,
+        (Some((first, _)), false) => first,
         (Some(_), true) => mixed_rank_size(spans),
     };
     Assembled {
