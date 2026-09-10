@@ -643,6 +643,23 @@ impl Document {
         ))
     }
 
+    /// The linearization parameter dictionary (ISO 32000-1 Annex F.3) as
+    /// written, `None` when the file's first object is not one. It may be
+    /// stale after an appended update; [`Document::is_linearized`] tells.
+    pub fn linearization(&self) -> Option<crate::linearization::Linearization> {
+        crate::linearization::linearization_dictionary(&self.data)
+    }
+
+    /// Whether the file is linearized and its parameter dictionary still
+    /// applies, which Table F.1 ties to `/L` naming the file's actual
+    /// length.
+    ///
+    /// Covers ISO 32000-1 Annex F.3.
+    pub fn is_linearized(&self) -> bool {
+        self.linearization()
+            .is_some_and(|record| record.is_current(self.data.len() as u64))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

@@ -593,6 +593,9 @@ pub(crate) struct DocumentInner {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) file_len: u64,
     pub(crate) version: (u8, u8),
+    /// The linearization parameter dictionary read from the header window
+    /// at open, as written (ISO 32000-1 Annex F.3).
+    pub(crate) linearization: Option<pdfboss_core::Linearization>,
     /// Span of the `%PDF-` header run; `None` when the first 1 KiB holds
     /// no header (the Header element is then omitted, adopted rule 1).
     /// Exposed by a `header_span()` accessor consumed by the element
@@ -728,12 +731,14 @@ impl AsyncDocument {
         let head = fetcher.window(0, 1024).await?;
         let version = parse_version(&head);
         let header_span = header_span_in(&head);
+        let linearization = pdfboss_core::linearization_dictionary(&head);
         let (startxref, eof_span) = find_tail(&fetcher).await?;
         let (xref, sections) = load_xref_chain(&fetcher, startxref.offset).await?;
         let inner = DocumentInner {
             backend,
             file_len,
             version,
+            linearization,
             header_span,
             xref,
             sections,
@@ -830,6 +835,24 @@ impl AsyncDocument {
     /// The PDF version from the header, e.g. `(1, 7)`.
     pub fn version(&self) -> (u8, u8) {
         self.inner.version
+    }
+
+    /// The linearization parameter dictionary (ISO 32000-1 Annex F.3) as
+    /// written, read from the header window at open: the sync document's
+    /// `linearization`, without another fetch.
+    pub fn linearization(&self) -> Option<pdfboss_core::Linearization> {
+        self.inner.linearization.clone()
+    }
+
+    /// Whether the file is linearized and `/L` names its actual length: the
+    /// sync document's `is_linearized`.
+    ///
+    /// Covers ISO 32000-1 Annex F.3.
+    pub fn is_linearized(&self) -> bool {
+        self.inner
+            .linearization
+            .as_ref()
+            .is_some_and(|record| record.is_current(self.inner.file_len))
     }
 
     /// A fetch helper bound to this document's backend.

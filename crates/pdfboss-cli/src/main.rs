@@ -676,6 +676,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let sizes: Vec<Option<(f32, f32)>> = (0..doc.page_count())
                 .map(|i| doc.page(i).ok().map(|p| p.size()))
                 .collect();
+            let linearization = doc.linearization();
             print!(
                 "{}",
                 info_text(
@@ -685,12 +686,16 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     &doc.metadata(),
                     &doc.extensions(),
                     &doc.form_fields(),
+                    linearization
+                        .as_ref()
+                        .map(|record| (record, doc.bytes().len() as u64)),
                 )
             );
             Ok(())
         }
         Err(Error::Encrypted) => {
             let data = std::fs::read(file).map_err(|e| e.to_string())?;
+            let linearization = pdfboss_core::linearization_dictionary(&data);
             print!(
                 "{}",
                 info_text(
@@ -699,7 +704,10 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     None,
                     &Metadata::default(),
                     &[],
-                    &[]
+                    &[],
+                    linearization
+                        .as_ref()
+                        .map(|record| (record, data.len() as u64)),
                 )
             );
             Ok(())
@@ -711,7 +719,9 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// Renders the `info` report. `sizes` is one entry per page (`None` when a
 /// page failed to load); `None` for the whole slice means the page count is
 /// unknown (encrypted document). `fields` are the interactive form's
-/// fields, counted by type.
+/// fields, counted by type. `linearization` is the linearization parameter
+/// dictionary as written, paired with the file's actual length, so a
+/// dictionary an appended update left behind prints as not linearized.
 fn info_text(
     version: Option<(u8, u8)>,
     encrypted: bool,
@@ -719,6 +729,7 @@ fn info_text(
     meta: &Metadata,
     extensions: &[pdfboss_core::DeveloperExtension],
     fields: &[pdfboss_core::FormField],
+    linearization: Option<(&pdfboss_core::Linearization, u64)>,
 ) -> String {
     let mut out = String::new();
     match version {
@@ -740,6 +751,23 @@ fn info_text(
         }
     }
     let _ = writeln!(out, "encrypted: {encrypted}");
+    // A file is linearized only while /L names its actual length (ISO
+    // 32000-1 Annex F.3, Table F.1).
+    if let Some((record, file_length)) = linearization {
+        if record.is_current(file_length) {
+            let _ = writeln!(
+                out,
+                "linearized: yes (first page object {})",
+                record.first_page_object
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "linearized: no (/L {} does not match the {file_length}-byte file)",
+                record.file_length
+            );
+        }
+    }
     match sizes {
         Some(sizes) => {
             let _ = writeln!(out, "pages:     {}", sizes.len());
@@ -1366,7 +1394,7 @@ mod tests {
             title: Some("Demo".to_string()),
             ..Metadata::default()
         };
-        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[], &[]);
+        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[], &[], None);
         assert!(report.contains("version:   1.7"));
         assert!(report.contains("encrypted: false"));
         assert!(report.contains("pages:     1"));
@@ -1392,13 +1420,62 @@ mod tests {
             &Metadata::default(),
             &extensions,
             &[],
+            None,
         );
         assert!(
             report.contains("version:   1.7\nextensions:\n  ADBE      1.7 level 3\n"),
             "{report}"
         );
-        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &[], &[]);
+        let report = info_text(
+            Some((1, 7)),
+            false,
+            None,
+            &Metadata::default(),
+            &[],
+            &[],
+            None,
+        );
         assert!(!report.contains("extensions"), "{report}");
+    }
+
+    /// A linearized file prints its first page object after the encryption
+    /// line; a dictionary whose `/L` no longer names the file's length
+    /// prints as not linearized, and a file without one prints no line.
+    // Covers ISO 32000-1 Annex F.3.
+    #[test]
+    fn info_text_reports_linearization() {
+        let record = pdfboss_core::Linearization {
+            version: 1.0,
+            file_length: 12345,
+            hint_streams: vec![(500, 200)],
+            first_page_object: 45,
+            first_page_end: 3000,
+            page_count: 3,
+            main_xref_offset: 11000,
+            first_page: 0,
+        };
+        let report = |linearization| {
+            info_text(
+                Some((1, 7)),
+                false,
+                None,
+                &Metadata::default(),
+                &[],
+                &[],
+                linearization,
+            )
+        };
+        let current = report(Some((&record, 12345)));
+        assert!(
+            current.contains("encrypted: false\nlinearized: yes (first page object 45)\n"),
+            "{current}"
+        );
+        let updated = report(Some((&record, 13000)));
+        assert!(
+            updated.contains("linearized: no (/L 12345 does not match the 13000-byte file)\n"),
+            "{updated}"
+        );
+        assert!(!report(None).contains("linearized"));
     }
 
     /// The interactive form's terminal fields print after the pages as one
@@ -1449,6 +1526,7 @@ mod tests {
             &Metadata::default(),
             &[],
             &fields,
+            None,
         );
         assert!(
             report.contains(
@@ -1465,13 +1543,22 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
             &Metadata::default(),
             &[],
             &[],
+            None,
         );
         assert!(!report.contains("fields"), "{report}");
     }
 
     #[test]
     fn info_text_encrypted_document() {
-        let report = info_text(Some((1, 4)), true, None, &Metadata::default(), &[], &[]);
+        let report = info_text(
+            Some((1, 4)),
+            true,
+            None,
+            &Metadata::default(),
+            &[],
+            &[],
+            None,
+        );
         assert!(report.contains("encrypted: true"));
         assert!(report.contains("pages:     unknown"));
         assert!(!report.contains("metadata:"));
@@ -1480,7 +1567,15 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
     #[test]
     fn info_text_unavailable_page() {
         let sizes = [None];
-        let report = info_text(None, false, Some(&sizes), &Metadata::default(), &[], &[]);
+        let report = info_text(
+            None,
+            false,
+            Some(&sizes),
+            &Metadata::default(),
+            &[],
+            &[],
+            None,
+        );
         assert!(report.contains("version:   unknown"));
         assert!(report.contains("page 1: (unavailable)"));
     }

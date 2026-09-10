@@ -266,6 +266,38 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
     }
 }
 
+/// The linearization parameter dictionary reads the same on both sides,
+/// and both apply Table F.1's rule that `/L` must name the actual length.
+// Covers ISO 32000-1 Annex F.3.
+#[tokio::test]
+async fn linearization_dictionaries_agree() {
+    let mut b = PdfBuilder::new();
+    b.object(
+        43,
+        "<< /Linearized 1 /L 0000000000 /H [ 0 0 ] /O 46 /E 0 /N 1 /T 0 >>",
+    );
+    b.object(44, "<< /Type /Catalog /Pages 45 0 R >>");
+    b.object(45, "<< /Type /Pages /Kids [46 0 R] /Count 1 >>");
+    b.object(46, "<< /Type /Page /Parent 45 0 R /MediaBox [0 0 10 10] >>");
+    let mut current = b.build(44);
+    let length = format!("{:010}", current.len());
+    let at = current
+        .windows(10)
+        .position(|w| w == b"0000000000")
+        .unwrap();
+    current[at..at + 10].copy_from_slice(length.as_bytes());
+    let mut updated = current.clone();
+    updated.extend_from_slice(b"%appended update\n");
+    for (data, linearized) in [(current, true), (updated, false)] {
+        let sync_doc = Document::load(data.clone()).unwrap();
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        assert_eq!(doc.linearization(), sync_doc.linearization());
+        assert_eq!(doc.linearization().unwrap().first_page_object, 46);
+        assert_eq!(doc.is_linearized(), linearized);
+        assert_eq!(sync_doc.is_linearized(), linearized);
+    }
+}
+
 #[tokio::test]
 async fn full_element_sequences_are_identical() {
     let all = ElementOpts {

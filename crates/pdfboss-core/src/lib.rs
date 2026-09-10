@@ -19,6 +19,7 @@ pub mod geom;
 pub mod hash;
 pub mod language;
 pub mod lexer;
+pub mod linearization;
 pub mod names;
 pub mod object;
 pub mod objstm;
@@ -61,6 +62,7 @@ pub use form::{
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use language::{language_with, LanguageTag};
+pub use linearization::{linearization_dictionary, Linearization};
 pub use names::{name_tree_root_with, named_with, names_with, NameTree};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
 pub use oc::OcState;
