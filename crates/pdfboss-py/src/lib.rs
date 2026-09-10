@@ -963,8 +963,9 @@ impl Page {
 }
 
 /// One styled text span: a positioned run of text with everything the
-/// file states about how it is shown — font, size, weight and slant,
-/// drawn underline/strikethrough, fill color, visibility, writing mode.
+/// file states about how it is shown: font, size, weight and slant, box
+/// metrics, drawn or annotated underline/strikethrough/highlight, fill
+/// color, visibility, writing mode.
 #[pyclass(frozen)]
 struct Span {
     inner: TextSpan,
@@ -1029,6 +1030,21 @@ impl Span {
         rect_tuple(self.inner.bbox)
     }
 
+    /// Height of the box above the baseline, in device units: bbox y1
+    /// minus y. For horizontal text the font's /Ascent scaled by the size.
+    #[getter]
+    fn ascent(&self) -> f32 {
+        self.inner.ascent
+    }
+
+    /// Depth of the box below the baseline, in device units, zero or
+    /// negative: bbox y0 minus y. For horizontal text the font's /Descent
+    /// scaled by the size.
+    #[getter]
+    fn descent(&self) -> f32 {
+        self.inner.descent
+    }
+
     /// Bold, from FontDescriptor evidence with BaseFont-name fallback.
     #[getter]
     fn bold(&self) -> bool {
@@ -1053,20 +1069,41 @@ impl Span {
         self.inner.serif
     }
 
-    /// A drawn ruling sits just below the baseline covering most of the
-    /// span. Read from the page's geometry — PDF has no underline
-    /// attribute — so a table border hugging a cell's text can read as
-    /// one.
+    /// A drawn ruling sits just below the baseline, covers most of the
+    /// span and stops within an em of the text it covers, or an /Underline
+    /// or /Squiggly annotation covers the span. PDF has no underline
+    /// attribute: the drawn case is read from the page's geometry, so a
+    /// cell border that ends where the cell's text ends can read as one.
     #[getter]
     fn underline(&self) -> bool {
         self.inner.underline
     }
 
-    /// A drawn ruling crosses the span's x-height band — geometry-read,
-    /// like `underline`.
+    /// A drawn ruling crosses the span's x-height band under the same
+    /// coverage rules as `underline`, or a /StrikeOut annotation covers
+    /// the span.
     #[getter]
     fn strikethrough(&self) -> bool {
         self.inner.strikethrough
+    }
+
+    /// A filled rectangle about a line tall lies behind the span: painted
+    /// before it, colored (white and gray bands are backgrounds), lighter
+    /// than its text, covering most of it and stopping within an em of the
+    /// text it covers. Paragraph shading and cell backgrounds run to their
+    /// box edges and do not count. A /Highlight annotation covering the
+    /// span sets it too.
+    #[getter]
+    fn highlight(&self) -> bool {
+        self.inner.highlight
+    }
+
+    /// The highlight's color as RGB in [0, 1]: the rectangle's fill color,
+    /// read the way `color` is, or the annotation's /C; None without a
+    /// highlight, and for an annotation without a color.
+    #[getter]
+    fn highlight_color(&self) -> Option<(f32, f32, f32)> {
+        self.inner.highlight_color
     }
 
     /// The text rise (Ts) the span was shown under: positive above the

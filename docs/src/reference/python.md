@@ -14,7 +14,7 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | `Element` | One physical or logical element of a PDF (`kind`, `span`, `ref`, `page`, lazy `value()`), yielded by `elements` |
 | `ElementIter` | Lazy sync iterator over elements; each step releases the GIL |
 | `AsyncElementIter` | Async iterator over elements; each step is a coroutine |
-| `Span` | One styled text span: text, position, bbox, font identity, bold/italic/monospace/serif, underline/strikethrough, rise, vertical, invisible, color |
+| `Span` | One styled text span: text, position, bbox with ascent/descent, font identity, bold/italic/monospace/serif, underline/strikethrough/highlight with highlight color, rise, vertical, invisible, color |
 | `SpanIter` | Lazy sync iterator over a document's spans, buffering one page at a time |
 | `AsyncSpanIter` | Async iterator over a document's spans |
 | `PageImage` | One embedded image extracted from a page: native `width`/`height` and PNG-encoded `data` |

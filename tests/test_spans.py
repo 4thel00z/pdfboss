@@ -41,6 +41,31 @@ def stream(dict_body: bytes, data: bytes) -> bytes:
     )
 
 
+def page_doc(content: bytes, annots: bytes = b"") -> bytes:
+    """One page showing ``content`` with Helvetica as ``/F1``; ``annots`` is
+    the body of the page's ``/Annots`` array, annotation dictionaries
+    written inline."""
+    return build_pdf(
+        {
+            1: b"<< /Type /Catalog /Pages 2 0 R >>",
+            2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: (
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R "
+                b"/Annots [%s] >>" % annots
+            ),
+            4: stream(b"", content),
+            5: (
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                b"/Encoding /WinAnsiEncoding >>"
+            ),
+        }
+    )
+
+
+HELLO = b"BT /F1 12 Tf 72 720 Td (Hello) Tj ET"
+
+
 @pytest.fixture
 def styled_pdf() -> bytes:
     """One page exercising every style channel: a bold-italic descriptor
@@ -111,11 +136,24 @@ class TestPageSpans:
         assert styled.bold and styled.italic
         assert styled.serif and not styled.monospace
         assert styled.underline and not styled.strikethrough
+        assert not styled.highlight and styled.highlight_color is None
         assert styled.color == pytest.approx((1.0, 0.0, 0.0))
         assert not styled.vertical
         assert styled.rise == 0.0
 
         assert ocr.invisible
+
+    # Covers ISO 32000-1 §9.8.1.
+    def test_box_metrics_are_offsets_from_the_baseline(
+        self, styled_pdf: bytes
+    ) -> None:
+        plain, styled, _ = Document(data=styled_pdf)[0].spans()
+        assert plain.ascent > 0.0 > plain.descent
+        x0, y0, x1, y1 = plain.bbox
+        assert y1 == pytest.approx(plain.y + plain.ascent)
+        assert y0 == pytest.approx(plain.y + plain.descent)
+        assert styled.ascent == pytest.approx(12.0 * 0.718, abs=1e-3)
+        assert styled.descent == pytest.approx(-12.0 * 0.207, abs=1e-3)
 
     def test_hidden_layers_are_excluded(self) -> None:
         data = build_pdf(
@@ -143,6 +181,47 @@ class TestPageSpans:
         )
         doc = Document(data=data)
         assert [s.text for s in doc[0].spans()] == ["kept"]
+
+
+class TestDecorations:
+    def test_fill_behind_the_text_is_a_highlight(self) -> None:
+        data = page_doc(b"1 1 0 rg 70 717 32 13 re f 0 g " + HELLO)
+        (span,) = Document(data=data)[0].spans()
+        assert span.highlight
+        assert span.highlight_color == pytest.approx((1.0, 1.0, 0.0))
+        assert not span.underline and not span.strikethrough
+
+    def test_shading_past_the_text_is_not_a_highlight(self) -> None:
+        data = page_doc(b"1 1 0 rg 60 717 480 13 re f 0 g " + HELLO)
+        (span,) = Document(data=data)[0].spans()
+        assert not span.highlight
+        assert span.highlight_color is None
+
+    def test_border_past_the_text_is_not_an_underline(self) -> None:
+        data = page_doc(HELLO + b" 60 718.5 m 300 718.5 l S")
+        (span,) = Document(data=data)[0].spans()
+        assert not span.underline
+
+    # Covers ISO 32000-1 §12.5.6.10.
+    def test_highlight_annotation_sets_the_flag(self) -> None:
+        data = page_doc(
+            HELLO,
+            b"<< /Type /Annot /Subtype /Highlight /Rect [70 716 102 731] "
+            b"/C [0 1 1] /QuadPoints [70 731 102 731 70 716 102 716] >>",
+        )
+        (span,) = Document(data=data)[0].spans()
+        assert span.highlight
+        assert span.highlight_color == pytest.approx((0.0, 1.0, 1.0))
+
+    # Covers ISO 32000-1 §12.5.6.10.
+    def test_strikeout_annotation_sets_the_flag(self) -> None:
+        data = page_doc(
+            HELLO,
+            b"<< /Type /Annot /Subtype /StrikeOut /Rect [70 716 102 731] "
+            b"/QuadPoints [70 731 102 731 70 716 102 716] >>",
+        )
+        (span,) = Document(data=data)[0].spans()
+        assert span.strikethrough and not span.underline
 
 
 class TestDocumentSpans:
