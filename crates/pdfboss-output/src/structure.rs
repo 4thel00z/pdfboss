@@ -562,7 +562,10 @@ fn block_bbox(block: &Block) -> &BBox {
 /// tagged, so a repeated running header is already out of candidacy on
 /// documents long enough to tag one.
 fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats) {
-    if blocks.iter().any(|block| matches!(block, Block::Heading { .. })) {
+    if blocks
+        .iter()
+        .any(|block| matches!(block, Block::Heading { .. }))
+    {
         return;
     }
     let is_edge = |block: &Block| {
@@ -683,9 +686,10 @@ const HEADING_RUN_MAX: usize = 3;
 /// while staying visibly distinct.
 fn demote_heading_runs(blocks: &mut [Block]) {
     let level_of = |block: &Block| match block {
-        Block::Heading { level, lines, .. } => {
-            Some((*level, half_points(lines.first().map_or(0.0, |line| line.size))))
-        }
+        Block::Heading { level, lines, .. } => Some((
+            *level,
+            half_points(lines.first().map_or(0.0, |line| line.size)),
+        )),
         _ => None,
     };
     let mut index = 0;
@@ -1584,10 +1588,7 @@ fn continues_heading(prev: &Assembled, next: &Assembled, stats: &SizeStats, leve
 fn is_bold_title(line: &Line) -> bool {
     // Whitespace-only inlines carry no visible weight: a regular-face space
     // between bold words does not stop the line being a bold title.
-    let mut visible = line
-        .inlines
-        .iter()
-        .filter(|inline| !blank(&inline.text));
+    let mut visible = line.inlines.iter().filter(|inline| !blank(&inline.text));
     let mut any = false;
     for inline in visible.by_ref() {
         any = true;
@@ -2152,9 +2153,7 @@ fn open_ruled_candidate(
     let mut lines: Vec<Vec<&TextSpan>> = Vec::new();
     for span in by_y {
         match lines.last_mut() {
-            Some(line)
-                if (line[0].y - span.y).abs() <= 0.5 * line[0].size.max(span.size) =>
-            {
+            Some(line) if (line[0].y - span.y).abs() <= 0.5 * line[0].size.max(span.size) => {
                 line.push(span)
             }
             _ => lines.push(vec![span]),
@@ -2787,7 +2786,10 @@ fn grid(
             rows
         }
     };
-    Some(TableBand { rows, span: stretch })
+    Some(TableBand {
+        rows,
+        span: stretch,
+    })
 }
 
 /// The stretch's rows over the columns its own run lines leave. The run's
@@ -2819,7 +2821,7 @@ fn own_rows(
         .iter()
         .map(|group| table_row(group, &columns))
         .collect::<Option<_>>()?;
-    (populated_columns(&rows, columns.len()) >= TABLE_MIN_LANES + 1).then_some(rows)
+    (populated_columns(&rows, columns.len()) > TABLE_MIN_LANES).then_some(rows)
 }
 
 /// The longest run of populated rows whose neighbouring baselines never
@@ -2865,7 +2867,10 @@ fn lanes_of(groups: &[Group]) -> Vec<std::ops::Range<f32>> {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     for group in groups {
         for span in &group.spans {
-            add_ink(&mut occupied, span.x.min(span.end_x)..span.x.max(span.end_x));
+            add_ink(
+                &mut occupied,
+                span.x.min(span.end_x)..span.x.max(span.end_x),
+            );
         }
     }
     ink_gaps(&occupied)
@@ -3561,10 +3566,10 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
             if a == b || extents[b].chars < VISUAL_ORDER_MIN_CHARS {
                 continue;
             }
-            let overlap = extents[a].right.min(extents[b].right)
-                - extents[a].left.max(extents[b].left);
-            let narrower = (extents[a].right - extents[a].left)
-                .min(extents[b].right - extents[b].left);
+            let overlap =
+                extents[a].right.min(extents[b].right) - extents[a].left.max(extents[b].left);
+            let narrower =
+                (extents[a].right - extents[a].left).min(extents[b].right - extents[b].left);
             if narrower <= 0.0 || overlap < VISUAL_ORDER_MIN_X_OVERLAP * narrower {
                 continue;
             }
@@ -3574,10 +3579,8 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
             }
         }
     }
-    let mut ready: BinaryHeap<Reverse<usize>> = (0..n)
-        .filter(|&i| blockers[i] == 0)
-        .map(Reverse)
-        .collect();
+    let mut ready: BinaryHeap<Reverse<usize>> =
+        (0..n).filter(|&i| blockers[i] == 0).map(Reverse).collect();
     let mut order = Vec::with_capacity(n);
     while let Some(Reverse(i)) = ready.pop() {
         order.push(i);
@@ -3592,7 +3595,11 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
         // Degenerate boxes can relate two flows both ways; keep the stream.
         return None;
     }
-    if order.iter().enumerate().all(|(position, &flow)| position == flow) {
+    if order
+        .iter()
+        .enumerate()
+        .all(|(position, &flow)| position == flow)
+    {
         return None;
     }
     // A page that is already essentially in reading order stays in the
@@ -3779,10 +3786,8 @@ fn split_at_gutter<'s>(
     let mut left_groups: Vec<Group<'s>> = Vec::new();
     let mut right_groups: Vec<Group<'s>> = Vec::new();
     for line in &columns {
-        let (l, r): (Vec<&TextSpan>, Vec<&TextSpan>) = line
-            .spans
-            .iter()
-            .partition(|s| s.x.max(s.end_x) <= cut);
+        let (l, r): (Vec<&TextSpan>, Vec<&TextSpan>) =
+            line.spans.iter().partition(|s| s.x.max(s.end_x) <= cut);
         if !l.is_empty() {
             left_groups.push(Group {
                 y: line.y,
@@ -3854,7 +3859,13 @@ fn split_at_gutter<'s>(
         ));
         top = sep_y;
     }
-    push_band(&left_groups, &right_groups, top, f32::NEG_INFINITY, &mut out);
+    push_band(
+        &left_groups,
+        &right_groups,
+        top,
+        f32::NEG_INFINITY,
+        &mut out,
+    );
     Some((out, cut))
 }
 
@@ -4138,7 +4149,9 @@ pub(crate) mod tests {
     /// well a subcluster's rules hug the labels.
     #[test]
     fn an_even_rule_stack_reads_as_a_plot_grid_not_a_table() {
-        let ys = [582.6, 602.0, 622.3, 641.7, 662.0, 681.4, 701.7, 722.0, 741.4];
+        let ys = [
+            582.6, 602.0, 622.3, 641.7, 662.0, 681.4, 701.7, 722.0, 741.4,
+        ];
         let rulings: Vec<Ruling> = ys.iter().map(|&y| hrule(y, 125.4, 488.8)).collect();
         let mut spans = Vec::new();
         for (y, xs) in [
@@ -4272,7 +4285,10 @@ pub(crate) mod tests {
         }
         let layout = page_layout(&spans, ReadingOrder::Content);
         let Block::Heading { level, lines, .. } = &layout.blocks[0] else {
-            panic!("the isolated top line is the page's title, got {:?}", layout.blocks[0]);
+            panic!(
+                "the isolated top line is the page's title, got {:?}",
+                layout.blocks[0]
+            );
         };
         assert_eq!(*level, 1);
         assert_eq!(line_text(&lines[0]).trim(), "Print against Digital");
@@ -4322,7 +4338,10 @@ pub(crate) mod tests {
         }
         let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
-            !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Heading { .. })),
             "a sub-body top line never promotes"
         );
     }
@@ -4343,7 +4362,10 @@ pub(crate) mod tests {
         }
         let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
-            !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Heading { .. })),
             "a numbered top line never promotes"
         );
     }
@@ -4370,7 +4392,10 @@ pub(crate) mod tests {
         }
         let layout = page_layout(&spans, ReadingOrder::Content);
         assert!(
-            !layout.blocks.iter().any(|b| matches!(b, Block::Heading { .. })),
+            !layout
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::Heading { .. })),
             "a full-measure top line never promotes"
         );
     }
@@ -4437,9 +4462,11 @@ pub(crate) mod tests {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
             for index in 0..doc.page_count() {
                 let Ok(page) = doc.page(index) else { continue };
-                let Ok((mut spans, rulings, _)) =
-                    pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content)
-                else {
+                let Ok((mut spans, rulings, _)) = pdfboss_text::extract_spans_and_rulings_reporting(
+                    &doc,
+                    &page,
+                    ReadingOrder::Content,
+                ) else {
                     continue;
                 };
                 crate::retain_spans_on_page(&mut spans, &page);
@@ -4457,7 +4484,10 @@ pub(crate) mod tests {
                         out,
                         "{}[{},{},{},{}]",
                         if i > 0 { "," } else { "" },
-                        b.x0, b.y0, b.x1, b.y1
+                        b.x0,
+                        b.y0,
+                        b.x1,
+                        b.y1
                     )
                     .unwrap();
                 }
@@ -4483,7 +4513,13 @@ pub(crate) mod tests {
                     let head: String = s
                         .text
                         .chars()
-                        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+                        .map(|c| {
+                            if c.is_ascii_graphic() || c == ' ' {
+                                c
+                            } else {
+                                '?'
+                            }
+                        })
                         .take(12)
                         .collect();
                     write!(
@@ -4515,8 +4551,13 @@ pub(crate) mod tests {
         let doc = Document::load(std::fs::read(&path).unwrap()).unwrap();
         let page = doc.page(0).unwrap();
         let (spans, rulings, report) =
-            pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content).unwrap();
-        println!("rulings: {} (report complete: {})", rulings.len(), report.is_complete());
+            pdfboss_text::extract_spans_and_rulings_reporting(&doc, &page, ReadingOrder::Content)
+                .unwrap();
+        println!(
+            "rulings: {} (report complete: {})",
+            rulings.len(),
+            report.is_complete()
+        );
         for r in rulings.iter().take(60) {
             println!(
                 "  ({:7.1},{:7.1}) -> ({:7.1},{:7.1}) w={:.2}",
@@ -4526,7 +4567,12 @@ pub(crate) mod tests {
         let grids = ruled_grids(&rulings);
         println!("grids: {}", grids.len());
         for grid in &grids {
-            println!("  xs {:?} ys {} boxed {}", grid.xs, grid.ys.len(), grid.boxed);
+            println!(
+                "  xs {:?} ys {} boxed {}",
+                grid.xs,
+                grid.ys.len(),
+                grid.boxed
+            );
         }
         let open = open_ruled_grids(&spans, &rulings, &grids);
         println!("open grids: {}", open.len());
@@ -4548,8 +4594,7 @@ pub(crate) mod tests {
                 }
             }
             let allowed = (GUTTER_MAX_CROSSING * lines.len() as f32) as usize;
-            let occupied: [bool; GUTTER_BINS] =
-                std::array::from_fn(|bin| coverage[bin] > allowed);
+            let occupied: [bool; GUTTER_BINS] = std::array::from_fn(|bin| coverage[bin] > allowed);
             let gaps = wide_gaps(&occupied, scale);
             println!(
                 "page-level: {} lines, allowed {}, gaps {:?} (band {:?})",
@@ -4681,7 +4726,8 @@ pub(crate) mod tests {
             let name = path.file_stem().unwrap().to_string_lossy().to_string();
             for index in 0..doc.page_count() {
                 let Ok(page) = doc.page(index) else { continue };
-                let Ok((mut spans, _)) = pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content)
+                let Ok((mut spans, _)) =
+                    pdfboss_text::extract_spans_reporting(&doc, &page, ReadingOrder::Content)
                 else {
                     continue;
                 };
@@ -4703,7 +4749,13 @@ pub(crate) mod tests {
                     let mut head: String = flow
                         .iter()
                         .flat_map(|s| s.text.chars().chain(std::iter::once(' ')))
-                        .map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '?' })
+                        .map(|c| {
+                            if c.is_ascii_graphic() || c == ' ' {
+                                c
+                            } else {
+                                '?'
+                            }
+                        })
                         .take(48)
                         .collect();
                     head = head.trim().to_string();
@@ -5057,7 +5109,10 @@ pub(crate) mod tests {
             "BT /F1 12 Tf 72 40 Td (Contact us at the office) Tj \
              72 720 Td (Annual Report) Tj 0 -20 Td (Prepared in June) Tj ET",
         );
-        assert_eq!(text, "Annual Report\nPrepared in June\nContact us at the office");
+        assert_eq!(
+            text,
+            "Annual Report\nPrepared in June\nContact us at the office"
+        );
     }
 
     /// Two side-by-side columns overlap vertically, so their stream order

@@ -1444,7 +1444,11 @@ mod tests {
         assert!(md.contains("| r2c0 | r2c1 | r2c2 |"), "md: {md}");
         assert!(md.contains("| s0c0 | s0c1 | s0c2 |"), "md: {md}");
         assert!(md.contains("| s2c0 | s2c1 | s2c2 |"), "md: {md}");
-        assert_eq!(md.matches("| --- | --- | --- |").count(), 2, "two tables: {md}");
+        assert_eq!(
+            md.matches("| --- | --- | --- |").count(),
+            2,
+            "two tables: {md}"
+        );
     }
 
     /// A lane held open by a page number out in the margin is not a cell
@@ -1574,8 +1578,7 @@ mod tests {
             "both stacked tables detected: {md:?}"
         );
         assert!(
-            md.contains("Prose between the two tables sits here")
-                && !md.contains("| Prose"),
+            md.contains("Prose between the two tables sits here") && !md.contains("| Prose"),
             "the prose between them stays prose: {md:?}"
         );
     }
@@ -2491,10 +2494,7 @@ mod tests {
             "",
             b"BT /F1 12 Tf 50 100 Td (inside) Tj 600 0 Td (pasteboard) Tj ET",
         );
-        b.object(
-            5,
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        );
+        b.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
         Document::load(b.build(1)).unwrap()
     }
 
@@ -2504,7 +2504,10 @@ mod tests {
         assert_eq!(page_text(&doc, 0), "inside");
         let md = extract_markdown(&doc, ReadingOrder::Content).unwrap();
         assert!(md.contains("inside"), "markdown lost page text: {md:?}");
-        assert!(!md.contains("pasteboard"), "markdown kept off-page text: {md:?}");
+        assert!(
+            !md.contains("pasteboard"),
+            "markdown kept off-page text: {md:?}"
+        );
     }
 
     /// A body-size space span drawn on the heading's baseline (a producer's
@@ -2572,6 +2575,9 @@ mod tests {
             extract_text_reporting_opts(&doc, &page, ReadingOrder::Content, opts).unwrap();
         assert_eq!(text, "inside pasteboard");
         let md = extract_markdown_opts(&doc, ReadingOrder::Content, opts).unwrap();
-        assert!(md.contains("pasteboard"), "flag dropped off-page text: {md:?}");
+        assert!(
+            md.contains("pasteboard"),
+            "flag dropped off-page text: {md:?}"
+        );
     }
 }

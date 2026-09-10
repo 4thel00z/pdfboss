@@ -581,16 +581,28 @@ fn main() {
             password,
             reading_order,
             invisible_text,
-        } => cmd_text(&file, page, &password, reading_order.to_order(), invisible_text)
-            .map_err(Failure::from),
+        } => cmd_text(
+            &file,
+            page,
+            &password,
+            reading_order.to_order(),
+            invisible_text,
+        )
+        .map_err(Failure::from),
         Command::Md {
             file,
             page,
             password,
             reading_order,
             invisible_text,
-        } => cmd_md(&file, page, &password, reading_order.to_order(), invisible_text)
-            .map_err(Failure::from),
+        } => cmd_md(
+            &file,
+            page,
+            &password,
+            reading_order.to_order(),
+            invisible_text,
+        )
+        .map_err(Failure::from),
         Command::Render {
             file,
             page,
