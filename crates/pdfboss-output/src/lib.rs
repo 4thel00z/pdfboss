@@ -1472,6 +1472,16 @@ mod tests {
         assert!(!md.contains("| $ |"), "no sign column: {md}");
     }
 
+    /// A euro sign after its amount stays there: "7 723 €" is how most of
+    /// Europe writes it, and the sign is not the next cell's. Modeled on a
+    /// ParseBench page where "€" jumped onto the rate beside it.
+    #[test]
+    fn a_trailing_euro_stays_with_its_amount() {
+        let md = markdown_of(&structure::tests::euro_suffix_content());
+        assert!(md.contains("| Nord | 7 723 € | 51,4% |"), "md: {md}");
+        assert!(md.contains("| Est | 6 734 € | 50,7% |"), "md: {md}");
+    }
+
     /// A ")" or "%" set apart from its amount, in the next cell or a word
     /// gap away, closes the amount: "(1,234)", "(5)" and "12%".
     #[test]

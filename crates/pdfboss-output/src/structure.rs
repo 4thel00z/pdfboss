@@ -2617,7 +2617,7 @@ fn figure_cell(cell: &Cell) -> bool {
     cell_text(cell).trim_start().starts_with(|c: char| {
         c.is_ascii_digit()
             || AMOUNT_SIGNS.contains(&c)
-            || matches!(c, '(' | '-' | '\u{2013}' | '\u{2014}')
+            || matches!(c, '€' | '(' | '-' | '\u{2013}' | '\u{2014}')
     })
 }
 
@@ -3127,9 +3127,11 @@ fn populated_cells(row: &[Cell]) -> usize {
     row.iter().filter(|cell| cell.line.is_some()).count()
 }
 
-/// Currency signs a producer sets left-aligned in a column of their own,
-/// ahead of the right-aligned amounts they belong to.
-const AMOUNT_SIGNS: [char; 4] = ['$', '€', '£', '¥'];
+/// Currency signs written ahead of their amount in every locale, which a
+/// producer sets left-aligned in a column of their own ahead of the
+/// right-aligned amounts they belong to. The euro follows its amount in
+/// most of Europe ("7 723 €") and stays where the page put it.
+const AMOUNT_SIGNS: [char; 3] = ['$', '£', '¥'];
 /// Closers a producer sets at a fixed position after the amount: the ")"
 /// of a negative "(1,234" and the "%" of a rate.
 const AMOUNT_CLOSERS: [char; 2] = [')', '%'];
@@ -5451,6 +5453,25 @@ pub(crate) mod tests {
              1 0 0 1 80 625 Tm (2:54) Tj 1 0 0 1 160 625 Tm (2:58) Tj 1 0 0 1 260 625 Tm (3:11) Tj \
              1 0 0 1 80 605 Tm (3:00) Tj 1 0 0 1 160 605 Tm (3:04) Tj 1 0 0 1 260 605 Tm (3:17) Tj ET",
         )
+    }
+
+    /// French amounts: the euro sign a word gap after its figure, and a
+    /// rate with its percent sign a word gap after. The sign follows its
+    /// amount here and must not jump onto the rate.
+    pub(crate) fn euro_suffix_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (label, y, amount, rate) in [
+            ("Nord", 700.0, "7 723", "51,4"),
+            ("Sud", 680.0, "7 193", "51,7"),
+            ("Est", 660.0, "6 734", "50,7"),
+        ] {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm ({label}) Tj 1 0 0 1 275 {y} Tm ({amount}) Tj \
+                 1 0 0 1 303 {y} Tm (\\200) Tj 1 0 0 1 330 {y} Tm ({rate}) Tj 1 0 0 1 352 {y} Tm (%) Tj "
+            );
+        }
+        content += "ET";
+        content
     }
 
     /// Two lane grids of three rows each, one well below the other, with
