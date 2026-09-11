@@ -201,8 +201,8 @@ def chapter12 : List Feature := [
     note := "The /Legal attestation dictionary is never read or written (Legal in the code is a page size)." },
   { ref := .clause [12, 9], title := "Measurement Properties", status := .notImplemented,
     note := "Viewport (/VP), /Measure and number-format dictionaries are never read or written." },
-  { ref := .clause [12, 10, 1], title := "General", status := .notImplemented,
-    note := "The catalog /Requirements array and requirement dictionaries (Table 266) are never read or written." },
+  { ref := .clause [12, 10, 1], title := "General", status := .incomplete,
+    note := "crates/pdfboss-core/src/requirement.rs requirements_with reads the catalog's /Requirements array (Table 266) into Requirement records carrying the /S type, in array order, skipping an entry that is no dictionary or has no /S name; Document::requirements and AsyncDocument::requirements expose them and pdfboss info prints the types (tests requirement.rs reads_the_requirements_in_order and missing_or_malformed_requirements_read_as_none, crates/pdfboss-aio/tests/parity.rs, crates/pdfboss-cli/src/main.rs info_text_lists_requirements). The /RH requirement handlers are not read (12.10.2) and nothing writes a requirement." },
   { ref := .clause [12, 10, 2], title := "Requirement Handlers", status := .notImplemented,
     note := "Requirement handler dictionaries (/S /JS, /S /NoOp) are never read or written." }
 ]

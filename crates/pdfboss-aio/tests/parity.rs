@@ -51,6 +51,7 @@ fn outline_doc() -> Vec<u8> {
          /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
          /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
          /Threads [13 0 R] /Perms << /DocMDP 15 0 R >> \
+         /Requirements [ << /Type /Requirement /S /EnableJavaScripts >> ] \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -364,6 +365,17 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                 Some("Certifier")
             );
             assert_eq!(handlers.usage_rights, None);
+        }
+        // Covers ISO 32000-1 §12.10.1.
+        assert_eq!(
+            doc.requirements().await,
+            sync_doc.requirements(),
+            "{name}: requirements"
+        );
+        if name == "outline" {
+            let requirements = sync_doc.requirements();
+            assert_eq!(requirements.len(), 1, "{name}: requirements");
+            assert_eq!(requirements[0].kind, "EnableJavaScripts");
         }
         for index in 0..=doc.page_count() {
             assert_eq!(
