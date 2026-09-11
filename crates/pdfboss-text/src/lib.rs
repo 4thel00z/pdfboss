@@ -1879,6 +1879,63 @@ mod tests {
         );
     }
 
+    /// A stated `/FontWeight` outranks the stem in both directions: a face
+    /// declared 400 is regular whatever junk `/StemV` carries. So is a face
+    /// named Roman, and a face whose stem is too thick to be a stem at all:
+    /// producers write 346 on Arial and 900 on unnamed CID fonts, and a
+    /// page set in such a face is not a page of bold lines.
+    #[test]
+    fn stated_weight_roman_name_and_implausible_stem_are_not_bold() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 7 0 R /F3 9 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf 72 720 Td (a) Tj /F2 12 Tf (b) Tj /F3 12 Tf (c) Tj ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /AAXXEC+ArialMT \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /AAXXEC+ArialMT /Flags 4 \
+             /FontWeight 400 /StemV 346 >>",
+        );
+        b.object(
+            7,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /AAADVG+HelveticaLTStd-Roman \
+             /Encoding /WinAnsiEncoding /FontDescriptor 8 0 R >>",
+        );
+        b.object(
+            8,
+            "<< /Type /FontDescriptor /FontName /AAADVG+HelveticaLTStd-Roman /Flags 4 \
+             /StemV 151 >>",
+        );
+        b.object(
+            9,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /CIDFont+F1 \
+             /Encoding /WinAnsiEncoding /FontDescriptor 10 0 R >>",
+        );
+        b.object(
+            10,
+            "<< /Type /FontDescriptor /FontName /CIDFont+F1 /Flags 6 /StemV 889 >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(!spans[0].bold, "FontWeight 400 outranks StemV 346");
+        assert!(!spans[1].bold, "a Roman-named face is regular");
+        assert!(!spans[2].bold, "StemV 889 is not a stem width");
+    }
+
     /// The weight words match whole name parts, not substrings: Bookman is
     /// a family name, not the Book weight, so a Demi face whose only bold
     /// evidence is its thick stem keeps that evidence.

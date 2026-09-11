@@ -61,6 +61,11 @@ impl Iterator for Codes<'_> {
 /// bold. Regular text faces report dominant vertical stems up to ~110 and
 /// bold faces from ~140, so the cut sits in the gap between the clusters.
 const BOLD_STEM_WIDTH: f64 = 120.0;
+/// The `/StemV` beyond which the value is not a stem width at all. The
+/// blackest display faces stay under ~250; producers that write 346 on
+/// Arial or 900 on an unnamed CID font wrote a number, not a measurement,
+/// and it says nothing about weight.
+const BOLD_STEM_MAX: f64 = 300.0;
 
 /// A loaded font: everything needed to decode show-string bytes to
 /// Unicode and to advance the text position.
@@ -587,33 +592,35 @@ impl Font {
             style.monospace = flags & 1 != 0; // Table 123 bit 1: FixedPitch
             style.serif = flags & 2 != 0; // Table 123 bit 2: Serif
         }
-        if let Some(weight) = rv(src, &descriptor, "FontWeight")
+        let weight = rv(src, &descriptor, "FontWeight")
             .await
-            .and_then(|o| o.as_f64())
-        {
+            .and_then(|o| o.as_f64());
+        if let Some(weight) = weight {
             bold = bold || weight >= 600.0;
         }
         // Table 122: StemV is the thickness of the dominant vertical stems.
         // Text faces stay under ~110 glyph-space units and bold faces start
         // around 140, so a thick stem marks bold fonts whose descriptors
         // carry neither a weight nor a telling name (URW's -Medi faces).
-        // A name that states a non-bold weight outranks the stem: design
-        // tools export junk stem widths on faces named Regular. The word
-        // must end where the match ends — a following lowercase letter
+        // A stated weight or a name that states a non-bold weight outranks
+        // the stem: design tools export junk stem widths on faces named
+        // Regular or Roman, and on faces whose descriptor says 400. The
+        // word must end where the match ends — a following lowercase letter
         // means a family name (Bookman), not the weight.
-        let name_says_regular =
-            ["Regular", "Light", "Thin", "Book", "Hairline"]
-                .iter()
-                .any(|marker| {
-                    style.name.match_indices(marker).any(|(at, _)| {
-                        style.name[at + marker.len()..]
-                            .chars()
-                            .next()
-                            .is_none_or(|c| !c.is_lowercase())
-                    })
-                });
-        if let Some(stem) = rv(src, &descriptor, "StemV").await.and_then(|o| o.as_f64()) {
-            bold = bold || (stem >= BOLD_STEM_WIDTH && !name_says_regular);
+        let name_says_regular = ["Regular", "Light", "Thin", "Book", "Hairline", "Roman"]
+            .iter()
+            .any(|marker| {
+                style.name.match_indices(marker).any(|(at, _)| {
+                    style.name[at + marker.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_lowercase())
+                })
+            });
+        if weight.is_none() && !name_says_regular {
+            if let Some(stem) = rv(src, &descriptor, "StemV").await.and_then(|o| o.as_f64()) {
+                bold = bold || (BOLD_STEM_WIDTH..BOLD_STEM_MAX).contains(&stem);
+            }
         }
         if let Some(angle) = rv(src, &descriptor, "ItalicAngle")
             .await
