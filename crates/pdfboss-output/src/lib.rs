@@ -1823,6 +1823,25 @@ mod tests {
         );
     }
 
+    /// An open lattice whose first row is a title over both columns keeps
+    /// its claim, the title a spanning cell and every line below it a row.
+    #[test]
+    fn a_title_atop_an_open_lattice_keeps_the_claim() {
+        let md = markdown_of_drawn(&structure::tests::titled_open_lattice_content());
+        assert!(
+            md.contains("<td colspan=\"2\">Fish species on IUCN Red List</td>"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("<tr><td>Potosi Pupfish</td><td>Cyprinodon alvarezi</td></tr>"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("<tr><td>Golden Skiffia</td><td>Skiffia francesae</td></tr>"),
+            "md: {md}"
+        );
+    }
+
     /// Two tables ruled across the full width with a line of prose between
     /// them chain into one open lattice; the prose reads as one cell over
     /// every column, which makes the lattice two tables with prose between.

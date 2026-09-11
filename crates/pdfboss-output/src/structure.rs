@@ -2799,17 +2799,23 @@ fn grid_claim(
     rows.retain(|row| row.iter().any(inked_cell));
     // An open lattice chains the rules of two tables set to the same
     // columns, and the prose between the tables lies inside the drawn
-    // width and reads as one cell over every column. A row like that is
-    // prose, and the lattice is two tables the lane attempt reads apart; a
-    // section label populates the first column, a spanning note some of
-    // the columns.
-    if grid.open
-        && columns.len() >= TABLE_MIN_LANES
-        && rows
+    // width and reads as one cell over every column. A row like that
+    // between two records is prose, and the lattice is two tables the lane
+    // attempt reads apart. At the top or the bottom it is the table's own
+    // title or note; a section label populates the first column and a
+    // spanning note some of the columns.
+    if grid.open && columns.len() >= TABLE_MIN_LANES {
+        let spanning: Vec<bool> = rows
             .iter()
-            .any(|row| spans_every_column(row, columns.len()))
-    {
-        return None;
+            .map(|row| spans_every_column(row, columns.len()))
+            .collect();
+        let first = spanning.iter().position(|spans| !spans);
+        let last = spanning.iter().rposition(|spans| !spans);
+        if let (Some(first), Some(last)) = (first, last) {
+            if spanning[first..=last].iter().any(|spans| *spans) {
+                return None;
+            }
+        }
     }
     if rows.len() < TABLE_MIN_ROWS
         && !((grid.boxed || grid.open) && rows.len() >= RULED_BOXED_MIN_ROWS)
@@ -6608,6 +6614,26 @@ pub(crate) mod tests {
                 content += &format!("290 {y} m 420 {y} l S ");
             }
         }
+        content
+    }
+
+    /// A two-column list of fish ruled above its title and below its last
+    /// row: an open lattice whose first row, the title, spans both
+    /// columns, and whose sections between the rules are its rows.
+    pub(crate) fn titled_open_lattice_content() -> String {
+        let mut content = String::from(
+            "55 665 m 290 665 l S 55 580 m 290 580 l S \
+             BT /F1 10 Tf 1 0 0 1 60 651 Tm (Fish species on IUCN Red List) Tj ",
+        );
+        for (y, common, latin) in [
+            (635.0, "Potosi Pupfish", "Cyprinodon alvarezi"),
+            (619.0, "La Palma Pupfish", "Cyprinodon longidorsalis"),
+            (603.0, "Butterfly Splitfin", "Ameca splendens"),
+            (587.0, "Golden Skiffia", "Skiffia francesae"),
+        ] {
+            content += &format!("1 0 0 1 60 {y} Tm ({common}) Tj 1 0 0 1 160 {y} Tm ({latin}) Tj ");
+        }
+        content += "ET";
         content
     }
 
