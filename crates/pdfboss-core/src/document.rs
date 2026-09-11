@@ -719,6 +719,15 @@ impl Document {
         ))
     }
 
+    /// The requirements the catalog's `/Requirements` array lists (ISO
+    /// 32000-1 §12.10.1), empty without one.
+    pub fn requirements(&self) -> Vec<crate::requirement::Requirement> {
+        block_on(crate::requirement::requirements_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

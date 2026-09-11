@@ -731,6 +731,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     slides,
                     articles,
                     perms: &perms,
+                    requirements: &doc.requirements(),
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -767,7 +768,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// that carry a thumbnail image. `slides` counts the pages with a display
 /// duration or a transition. `articles` counts the article threads and
 /// their beads. `perms` names the permission handlers the catalog's
-/// `/Perms` dictionary carries. `linearization` is the
+/// `/Perms` dictionary carries. `requirements` are the catalog's
+/// `/Requirements` entries, printed by type. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
 /// not linearized.
@@ -785,6 +787,7 @@ struct Info<'a> {
     slides: usize,
     articles: (usize, usize),
     perms: &'a [&'a str],
+    requirements: &'a [pdfboss_core::Requirement],
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -846,6 +849,16 @@ fn info_text(info: &Info) -> String {
     // 32000-1 §12.8.4): read, neither verified nor enforced.
     if !info.perms.is_empty() {
         let _ = writeln!(out, "perms:     {}", info.perms.join(", "));
+    }
+    // The features the catalog's /Requirements array asks a reader for (ISO
+    // 32000-1 §12.10.1), by their /S type.
+    if !info.requirements.is_empty() {
+        let kinds: Vec<&str> = info
+            .requirements
+            .iter()
+            .map(|requirement| requirement.kind.as_str())
+            .collect();
+        let _ = writeln!(out, "requirements: {}", kinds.join(", "));
     }
     match info.sizes {
         Some(sizes) => {
@@ -1686,6 +1699,31 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("perms"));
+    }
+
+    /// The catalog's requirements print as one line after the permission
+    /// handlers, each by its `/S` name; none prints no line.
+    // Covers ISO 32000-1 §12.10.1.
+    #[test]
+    fn info_text_lists_requirements() {
+        let requirements = [
+            pdfboss_core::Requirement {
+                kind: "EnableJavaScripts".into(),
+            },
+            pdfboss_core::Requirement {
+                kind: "Custom".into(),
+            },
+        ];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            requirements: &requirements,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("encrypted: false\nrequirements: EnableJavaScripts, Custom\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("requirements"));
     }
 
     /// A linearized file prints its first page object after the encryption

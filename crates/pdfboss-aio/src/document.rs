@@ -1568,6 +1568,13 @@ impl AsyncDocument {
         pdfboss_core::permission_handlers_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The requirements the catalog's `/Requirements` array lists (ISO
+    /// 32000-1 §12.10.1): the async twin of the sync document's
+    /// `requirements`.
+    pub async fn requirements(&self) -> Vec<pdfboss_core::Requirement> {
+        pdfboss_core::requirements_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {
