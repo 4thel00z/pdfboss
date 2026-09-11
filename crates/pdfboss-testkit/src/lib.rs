@@ -211,6 +211,11 @@ impl Default for PdfBuilder {
 const CATALOG: &str = "<< /Type /Catalog /Pages 2 0 R >>";
 const FONT_HELVETICA: &str =
     "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>";
+/// The `/F1` of [`doc_with_graphics`]: a Type 1 face outside the standard
+/// 14 with no `/Widths`, so every code advances by the flat default of 500
+/// and positions in geometry tests stay simple arithmetic.
+const FONT_FLAT_WIDTHS: &str =
+    "<< /Type /Font /Subtype /Type1 /BaseFont /Custom /Encoding /WinAnsiEncoding >>";
 
 /// Page dictionary body: US-Letter media box, one `/F1` font resource.
 fn page_body(parent: u32, contents: u32, font: u32) -> String {
@@ -241,14 +246,21 @@ fn escape_text(text: &str) -> String {
     out
 }
 
-/// Catalog(1) → Pages(2) → Page(3) with content stream (4) and font (5).
+/// Catalog(1) → Pages(2) → Page(3) with content stream (4) and Helvetica
+/// as font (5).
 fn single_page_builder(content: &[u8]) -> PdfBuilder {
+    single_page_builder_with_font(content, FONT_HELVETICA)
+}
+
+/// Catalog(1) → Pages(2) → Page(3) with content stream (4) and the font
+/// dictionary `font` as `/F1` (5).
+fn single_page_builder_with_font(content: &[u8], font: &str) -> PdfBuilder {
     let mut b = PdfBuilder::new();
     b.object(1, CATALOG);
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
     b.object(3, &page_body(2, 4, 5));
     b.stream(4, "", content);
-    b.object(5, FONT_HELVETICA);
+    b.object(5, font);
     b
 }
 
@@ -343,10 +355,12 @@ pub fn tagged_two_column_doc() -> Vec<u8> {
 }
 
 /// One-call fixture: a single page whose content stream is `content`
-/// verbatim (raw operators). The page still carries the `/F1` Helvetica
-/// resource so text operators work too.
+/// verbatim (raw operators). The page still carries an `/F1` resource so
+/// text operators work too: a face outside the standard 14 with no
+/// `/Widths`, so every code advances by the flat default of 500 and the
+/// positions a test computes stay simple arithmetic.
 pub fn doc_with_graphics(content: &str) -> Vec<u8> {
-    single_page_builder(content.as_bytes()).build(1)
+    single_page_builder_with_font(content.as_bytes(), FONT_FLAT_WIDTHS).build(1)
 }
 
 /// A complete one-page document whose catalog (1), page tree (2), and page
