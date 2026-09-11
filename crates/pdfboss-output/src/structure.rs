@@ -2607,16 +2607,18 @@ fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize, open: bool) -> Vec<Vec<C
 }
 
 /// True when a band's lines are each a record in their own right: every
-/// line populates at least half the columns, and at least half of all the
-/// populated cells open as figures. A timetable or a rate table rules
-/// every few rows, and the lines between two rules are rows, not one
-/// wrapped row; a header wrapped over two lines is words, and still merges.
+/// line populates at least three quarters of the columns, and at least
+/// half of all the populated cells open as figures. A timetable or a rate
+/// table rules every few rows, and the lines between two rules are rows,
+/// not one wrapped row. A header wrapped over two lines is words and still
+/// merges; so does a band of centered cells whose lines each fill half the
+/// columns, which is one record whose cells sit on different lines.
 fn figure_records(lines: &[Vec<Cell>], columns: usize) -> bool {
     let mut populated = 0usize;
     let mut figures = 0usize;
     for line in lines {
         let cells: Vec<&Cell> = line.iter().filter(|cell| cell.line.is_some()).collect();
-        if 2 * cells.len() < columns {
+        if 4 * cells.len() < 3 * columns {
             return false;
         }
         populated += cells.len();
