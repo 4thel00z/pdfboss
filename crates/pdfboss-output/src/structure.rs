@@ -2690,7 +2690,15 @@ fn grid_claim(
     let stack = stack_lines(groups, grid, hulls).unwrap_or(lo..hi);
     let mut columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[stack]);
     let top = header_reach(groups, lo, hi, grid, grids, &columns);
-    let end = if grid.open {
+    // A claim grows only from lines its drawn columns already read as
+    // rows: the grown claim's columns come from the lanes of the whole,
+    // and lanes must not admit what the rules refused. The double rules
+    // under two tables' totals pair up as one open lattice spanning both,
+    // and the lines it holds run across its two drawn columns.
+    let rows_under_rules = groups[lo..hi]
+        .iter()
+        .all(|group| table_row(group, &columns).is_some());
+    let end = if grid.open && rows_under_rules {
         open_reach(groups, lo, hi, grid, grids)
     } else {
         hi
@@ -6195,6 +6203,34 @@ pub(crate) mod tests {
              1 0 0 1 80 675 Tm ( ) Tj \
              1 0 0 1 80 655 Tm (a2) Tj 1 0 0 1 260 655 Tm (b2) Tj ET",
         )
+    }
+
+    /// Two lane tables of three columns, each with a rule under its header
+    /// and a double rule under its total drawn under the amount columns
+    /// alone: the rules of the two tables pair up into open lattices
+    /// spanning both, whose lines run across the two drawn columns.
+    pub(crate) fn two_tables_sharing_an_open_lattice_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for top in [700.0, 620.0] {
+            for (offset, label, a, b) in [
+                (0.0, "Year Ended", "2024", "2023"),
+                (14.0, "Concentrate", "59", "58"),
+                (28.0, "Finished", "41", "42"),
+                (42.0, "Total", "100", "100"),
+            ] {
+                let y = top - offset;
+                content += &format!(
+                    "1 0 0 1 72 {y} Tm ({label}) Tj 1 0 0 1 300 {y} Tm ({a}) Tj 1 0 0 1 380 {y} Tm ({b}) Tj "
+                );
+            }
+        }
+        content += "ET ";
+        for top in [700.0, 620.0] {
+            for y in [top - 4.0, top - 46.0, top - 47.5] {
+                content += &format!("290 {y} m 420 {y} l S ");
+            }
+        }
+        content
     }
 
     /// [`ruled_grid_content`] with the first column's text starting four

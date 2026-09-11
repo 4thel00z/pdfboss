@@ -1711,6 +1711,25 @@ mod tests {
         );
     }
 
+    /// Two three-column tables whose header rules and total rules pair up
+    /// into open lattices spanning both stay two tables of three columns: a
+    /// lattice grows over unruled lines only from lines its own rules
+    /// already read as rows.
+    #[test]
+    fn two_tables_sharing_an_open_lattice_stay_two() {
+        let md = markdown_of_drawn(&structure::tests::two_tables_sharing_an_open_lattice_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert_eq!(
+            md.matches("| Concentrate | 59 | 58 |").count(),
+            2,
+            "md: {md}"
+        );
+    }
+
     /// Two stacked open-ruled tables share their x-extent; the cluster
     /// splits at the largest rule gap and each table comes out whole.
     #[test]
