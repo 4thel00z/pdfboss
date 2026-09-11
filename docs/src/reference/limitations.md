@@ -11,7 +11,7 @@ Clause by clause, the [ISO 32000 conformance](iso32000.md) chapter lists every p
 Glyph painting is staged in tiers (`embedded-only`, `all-embedded`, `full`) selected with `--fonts` (CLI), the `fonts` parameter (Python) or `RenderOptions::glyph_painting` (Rust); the tiers are described in [Rendering pages](../guide/rendering.md#font-tiers). What stays limited:
 
 - `full` substitutes only **non-embedded simple** fonts, and a bold *sans* substitute is not visually distinct from regular weight.
-- Standard-14 advance widths come from the Adobe Core-14 AFM tables when a substitute is used, behind the PDF's own `/Widths`.
+- Standard-14 advance widths come from the Adobe Core-14 AFM tables, behind the PDF's own `/Widths`, both when a substitute is painted and when text extraction reports a span's `end_x` and `bbox`.
 
 ## CMaps and CID fonts
 
