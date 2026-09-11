@@ -1731,7 +1731,7 @@ mod tests {
     // Covers ISO 32000-1 §12.7.3.
     #[test]
     fn info_text_counts_form_fields_by_type() {
-        use pdfboss_core::{FieldFlags, FieldType, FormField, ObjRef};
+        use pdfboss_core::{FieldFlags, FieldType, FormField, ObjRef, Quadding};
         fn field(field_type: Option<FieldType>, kids: Vec<ObjRef>) -> FormField {
             FormField {
                 object: ObjRef { num: 1, gen: 0 },
@@ -1746,6 +1746,10 @@ mod tests {
                 flags: FieldFlags::default(),
                 value: None,
                 default_value: None,
+                default_appearance: None,
+                quadding: Quadding::Left,
+                default_style: None,
+                rich_text: None,
                 max_len: None,
                 options: Vec::new(),
                 top_index: 0,

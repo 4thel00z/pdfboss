@@ -6,7 +6,7 @@ use flate2::Compression;
 use futures_util::StreamExt;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::ElementOpts;
-use pdfboss_core::{Document, NameTree, ObjRef};
+use pdfboss_core::{Document, NameTree, ObjRef, Quadding};
 use pdfboss_output::ReadingOrder;
 use pdfboss_testkit::{hybrid_doc, multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
 use std::io::Write;
@@ -89,7 +89,11 @@ fn outline_doc() -> Vec<u8> {
         8,
         "<< /Title (Two) /Parent 5 0 R /Prev 6 0 R /Count -1 /C [0 0 1] /F 2 /Dest [3 0 R /FitB] >>",
     );
-    b.object(9, "<< /FT /Tx /T (name) /Ff 2 /V (Ada) /Kids [10 0 R] >>");
+    b.object(
+        9,
+        "<< /FT /Tx /T (name) /Ff 2 /V (Ada) /Kids [10 0 R] \
+         /DA (/TiRo 12 Tf 0 0 1 rg) /Q 1 /DS (font: Times) /RV (<p>Ada</p>) >>",
+    );
     b.object(10, "<< /Subtype /Widget /Parent 9 0 R /Rect [0 0 10 10] >>");
     b.build(1)
 }
@@ -247,6 +251,17 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             sync_doc.form_fields(),
             "{name}: form fields"
         );
+        // Covers ISO 32000-1 §12.7.3.3.
+        if name == "outline" {
+            let fields = sync_doc.form_fields();
+            assert_eq!(
+                fields[0].default_appearance.as_deref(),
+                Some("/TiRo 12 Tf 0 0 1 rg")
+            );
+            assert_eq!(fields[0].quadding, Quadding::Centered);
+            assert_eq!(fields[0].default_style.as_deref(), Some("font: Times"));
+            assert_eq!(fields[0].rich_text.as_deref(), Some("<p>Ada</p>"));
+        }
         // Covers ISO 32000-1 §14.11.5.
         assert_eq!(
             doc.output_intents().await,
