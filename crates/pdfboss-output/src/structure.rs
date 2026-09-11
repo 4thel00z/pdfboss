@@ -2092,11 +2092,17 @@ fn stacked(
     }
     // A section opening with the column heads of the one above it is a
     // table of its own: a rate table repeats its heads over every section,
-    // a statement's sections never do.
+    // a statement's sections never do. A head wrapped onto two lines in one
+    // box and set on one in the other spells the same words.
     let heads = |claim: &GridClaim| -> Vec<String> {
         claim.rows.first().map_or_else(Vec::new, |row| {
             row.iter()
-                .map(|cell| cell_text(cell).trim().to_string())
+                .map(|cell| {
+                    cell_text(cell)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .collect()
         })
     };
@@ -6578,6 +6584,30 @@ pub(crate) mod tests {
                 );
             }
         }
+        content
+    }
+
+    /// Two boxed grids ten points apart on the same verticals, each opening
+    /// with the heads "Area" and "Trading Symbol", the lower box wrapping
+    /// its second head onto two lines.
+    pub(crate) fn boxes_with_wrapped_repeated_heads_content() -> String {
+        let mut content = String::new();
+        for (bottom, top) in [(620.0, 680.0), (550.0, 610.0)] {
+            for x in [70.0, 250.0, 430.0] {
+                content += &format!("{x} {bottom} m {x} {top} l S ");
+            }
+            for y in [bottom, bottom + 20.0, bottom + 40.0, top] {
+                content += &format!("70 {y} m 430 {y} l S ");
+            }
+        }
+        content +=
+            "BT /F1 10 Tf 1 0 0 1 75 668 Tm (Area) Tj 1 0 0 1 260 668 Tm (Trading Symbol) Tj \
+                    1 0 0 1 75 648 Tm (Alpha) Tj 1 0 0 1 260 648 Tm (0.70) Tj \
+                    1 0 0 1 75 628 Tm (Beta) Tj 1 0 0 1 260 628 Tm (0.70) Tj \
+                    1 0 0 1 75 604 Tm (Area) Tj 1 0 0 1 260 604 Tm (Trading ) Tj \
+                    1 0 0 1 260 596 Tm (Symbol) Tj \
+                    1 0 0 1 75 578 Tm (Gamma) Tj 1 0 0 1 260 578 Tm (0.70) Tj \
+                    1 0 0 1 75 558 Tm (Delta) Tj 1 0 0 1 260 558 Tm (0.70) Tj ET";
         content
     }
 

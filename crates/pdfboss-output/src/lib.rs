@@ -2047,6 +2047,19 @@ mod tests {
         );
     }
 
+    /// A lower box whose head wraps a word onto a second line still repeats
+    /// the head of the box above it, and the two stay two tables.
+    #[test]
+    fn a_wrapped_repeated_head_still_keeps_two_boxes_apart() {
+        let md = markdown_of_drawn(&structure::tests::boxes_with_wrapped_repeated_heads_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert_eq!(md.matches("| Area | Trading").count(), 2, "md: {md}");
+    }
+
     /// A ruled band holding only a whitespace span is the page's padding:
     /// no row of blank cells appears between the two rows around it.
     #[test]
