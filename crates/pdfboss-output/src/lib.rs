@@ -1493,6 +1493,18 @@ mod tests {
         assert!(md.contains("| --- | --- | --- |"), "three columns: {md}");
     }
 
+    /// A whitespace span standing in a gutter is padding, not a column:
+    /// the grid keeps its three columns and no empty one appears between
+    /// them. Modeled on filing and 10-K pages whose padding spans opened an
+    /// empty column beside every value.
+    #[test]
+    fn padding_in_a_gutter_opens_no_column() {
+        let md = markdown_of(&structure::tests::padded_gutter_grid_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| --- | --- | --- |\n"), "three columns: {md}");
+        assert!(!md.contains("|  |"), "no empty column: {md}");
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]

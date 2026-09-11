@@ -2779,13 +2779,15 @@ fn table_band(groups: &[Group]) -> Option<TableBand> {
 /// The stretch starting at `start` that keeps at least [`TABLE_MIN_LANES`]
 /// lanes, as an exclusive end and the lanes the whole stretch leaves. Ink is
 /// tracked as exact intervals, not histogram bins: a column gap of a few
-/// points is real table structure that bin rounding swallows.
+/// points is real table structure that bin rounding swallows. A
+/// whitespace-only span paints nothing: a producer's padding standing in a
+/// gutter neither closes the lane nor opens a column of its own.
 fn lane_run(groups: &[Group], start: usize) -> (usize, Vec<std::ops::Range<f32>>) {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     let mut lanes = Vec::new();
     for (offset, group) in groups[start..].iter().enumerate() {
         let mut next = occupied.clone();
-        for span in &group.spans {
+        for span in group.spans.iter().filter(|span| !blank(&span.text)) {
             add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
         }
         let gaps = ink_gaps(&next);
@@ -2955,7 +2957,7 @@ fn even_stretch(inside: &[Group], filled: &[usize]) -> Option<(usize, usize)> {
 fn lanes_of(groups: &[Group]) -> Vec<std::ops::Range<f32>> {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     for group in groups {
-        for span in &group.spans {
+        for span in group.spans.iter().filter(|span| !blank(&span.text)) {
             add_ink(
                 &mut occupied,
                 span.x.min(span.end_x)..span.x.max(span.end_x),
@@ -5507,6 +5509,21 @@ pub(crate) mod tests {
              1 0 0 1 80 675 Tm ( ) Tj \
              1 0 0 1 80 655 Tm (a2) Tj 1 0 0 1 260 655 Tm (b2) Tj ET",
         )
+    }
+
+    /// [`lane_grid_content`] with a whitespace span standing in the first
+    /// gutter of every row, a lane's width clear of the text on both sides:
+    /// a producer's padding, which paints nothing.
+    pub(crate) fn padded_gutter_grid_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+            content += &format!("1 0 0 1 160 {y} Tm (   ) Tj ");
+        }
+        content += "ET";
+        content
     }
 
     /// Two lane grids of three rows each, one well below the other, with
