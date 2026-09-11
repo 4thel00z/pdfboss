@@ -198,7 +198,7 @@ impl Image {
     ) -> PyResult<Image> {
         let source = if let Ok(path) = data.extract::<String>() {
             ImageSource::Path(path)
-        } else if let Ok(bytes) = data.extract::<Vec<u8>>() {
+        } else if let Ok(bytes) = crate::byte_arg(data) {
             ImageSource::Bytes(bytes)
         } else {
             return Err(PyTypeError::new_err(format!(
@@ -489,16 +489,16 @@ impl Attachment {
     #[pyo3(signature = (name, data, mime=None, description=None))]
     fn new(
         name: String,
-        data: Vec<u8>,
+        data: &Bound<'_, PyAny>,
         mime: Option<String>,
         description: Option<String>,
-    ) -> Attachment {
-        Attachment {
+    ) -> PyResult<Attachment> {
+        Ok(Attachment {
             name,
-            data,
+            data: crate::byte_arg(data)?,
             mime,
             description,
-        }
+        })
     }
 }
 
@@ -1198,11 +1198,13 @@ fn merge_metadata_field(field: &mut Option<String>, value: Option<String>) {
 #[pyo3(signature = (data, overlay, *, rewrite=false, under=false))]
 fn watermark<'py>(
     py: Python<'py>,
-    data: Vec<u8>,
-    overlay: Vec<u8>,
+    data: &Bound<'py, PyAny>,
+    overlay: &Bound<'py, PyAny>,
     rewrite: bool,
     under: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
+    let data = crate::byte_arg(data)?;
+    let overlay = crate::byte_arg(overlay)?;
     let bytes = py.allow_threads(|| {
         let base = pdfboss_core::Document::load(data).map_err(crate::pdf_err)?;
         let mark = pdfboss_core::Document::load(overlay).map_err(crate::pdf_err)?;
@@ -1221,10 +1223,11 @@ fn watermark<'py>(
 /// Extracts one `merge` input: raw bytes selecting every page, or a
 /// `(bytes, list[int])` tuple selecting specific 0-based pages.
 fn extract_merge_input(item: &Bound<'_, PyAny>) -> PyResult<(Vec<u8>, Option<Vec<usize>>)> {
-    if let Ok(data) = item.extract::<Vec<u8>>() {
+    if let Ok(data) = crate::byte_arg(item) {
         return Ok((data, None));
     }
-    if let Ok((data, pages)) = item.extract::<(Vec<u8>, Vec<i64>)>() {
+    if let Ok((data, pages)) = item.extract::<(Bound<'_, PyAny>, Vec<i64>)>() {
+        let data = crate::byte_arg(&data)?;
         if let Some(bad) = pages.iter().find(|&&p| usize::try_from(p).is_err()) {
             return Err(PyValueError::new_err(format!(
                 "merge page indices must be non-negative, got {bad}"
@@ -1268,7 +1271,12 @@ fn merge<'py>(py: Python<'py>, inputs: Vec<Py<PyAny>>) -> PyResult<Bound<'py, Py
 /// carrying whatever remains. Releases the GIL while the input is parsed
 /// and the parts are built.
 #[pyfunction]
-fn split<'py>(py: Python<'py>, data: Vec<u8>, every: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+fn split<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    every: usize,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let data = crate::byte_arg(data)?;
     let parts = py.allow_threads(|| {
         let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
         pdfboss_write::split_document(&doc, every, pdfboss_write::WriteOptions::default())
@@ -1291,7 +1299,7 @@ fn split<'py>(py: Python<'py>, data: Vec<u8>, every: usize) -> PyResult<Vec<Boun
 #[pyo3(signature = (data, by, pages=None, rewrite=false))]
 fn rotate<'py>(
     py: Python<'py>,
-    data: Vec<u8>,
+    data: &Bound<'py, PyAny>,
     by: i32,
     pages: Option<Vec<usize>>,
     rewrite: bool,
@@ -1301,6 +1309,7 @@ fn rotate<'py>(
             "by must be 90, 180 or 270, got {by}"
         )));
     }
+    let data = crate::byte_arg(data)?;
     let bytes = py.allow_threads(|| {
         let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
         let indices = pages.unwrap_or_else(|| (0..doc.page_count()).collect());
@@ -1324,7 +1333,8 @@ fn rotate<'py>(
 /// options, unreachable objects and earlier update sections left behind.
 /// Releases the GIL while the input is parsed and the result is built.
 #[pyfunction]
-fn rewrite<'py>(py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyBytes>> {
+fn rewrite<'py>(py: Python<'py>, data: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    let data = crate::byte_arg(data)?;
     let bytes = py.allow_threads(|| {
         let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
         pdfboss_write::rewrite_document(&doc, pdfboss_write::WriteOptions::default())
@@ -1358,7 +1368,7 @@ fn parse_allow(allow: Option<Vec<String>>) -> PyResult<Permissions> {
 #[pyo3(signature = (data, *, user_password=String::new(), owner_password=String::new(), allow=None))]
 fn encrypt<'py>(
     py: Python<'py>,
-    data: Vec<u8>,
+    data: &Bound<'py, PyAny>,
     user_password: String,
     owner_password: String,
     allow: Option<Vec<String>>,
@@ -1369,6 +1379,7 @@ fn encrypt<'py>(
         ));
     }
     let permissions = parse_allow(allow)?;
+    let data = crate::byte_arg(data)?;
     let bytes = py.allow_threads(|| {
         let doc = pdfboss_core::Document::load(data).map_err(pdf_err)?;
         pdfboss_write::encrypt_document(
@@ -1389,7 +1400,12 @@ fn encrypt<'py>(
 /// password. Releases the GIL around the work.
 #[pyfunction]
 #[pyo3(signature = (data, *, password=String::new()))]
-fn decrypt<'py>(py: Python<'py>, data: Vec<u8>, password: String) -> PyResult<Bound<'py, PyBytes>> {
+fn decrypt<'py>(
+    py: Python<'py>,
+    data: &Bound<'py, PyAny>,
+    password: String,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let data = crate::byte_arg(data)?;
     let bytes = py.allow_threads(|| {
         let doc = pdfboss_core::Document::load_with_password(data, &password).map_err(pdf_err)?;
         pdfboss_write::decrypt_document(&doc, pdfboss_write::WriteOptions::default())
