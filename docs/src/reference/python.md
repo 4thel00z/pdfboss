@@ -1,8 +1,8 @@
 # Python API reference
 
-The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public surface is twelve top-level classes, the `md` and `write` submodules and the `__version__` string; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
+The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public API is twelve document, page and iteration classes, thirteen classes for the interactive form and the catalog's document-level structures, the `md` and `write` submodules and the `__version__` string; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
 
-## The twelve classes
+## The twelve document classes
 
 | Name | What it is |
 |---|---|
@@ -27,6 +27,44 @@ dictionary as a `dict[str, str]`, only keys present in the file included;
 indexes; subscription `doc[i]` accepts them) and `get_object(num, gen=0)`, a
 coroutine fetching one indirect object and returning it through the same
 plain-Python conversion as `Element.value()`.
+
+## The form and catalog classes
+
+Ten `Document` methods read the interactive form and the catalog's document-level structures, each with an `AsyncDocument` coroutine of the same name and result: `interactive_form()`, `form_fields()`, `outline()`, `named_destinations()`, `page_labels()`, `page_label(index)`, `embedded_files()`, `embedded_file_data(file)`, `viewer_preferences()` and `extensions()`. They return frozen instances of the classes below; every enumeration is a kebab-case string (`"check-box"`, `"roman-upper"`, `"fit-r"`), every object reference a `(num, gen)` tuple like `Element.ref`, and a field's `value` plain Python data through the `Element.value()` conversion. `form_fields`, `outline`, `named_destinations` and `embedded_file_data` release the GIL while they read.
+
+| Name | What it is |
+|---|---|
+| `InteractiveForm` | The form dictionary: root `fields`, `need_appearances`, `signatures_exist`, `append_only`, `calculation_order`, `default_resources`, `default_appearance`, `quadding`, `xfa` |
+| `FormField` | One field with inherited entries filled in: `ref`, `parent`, `kids`, `widgets`, `field_type`, `name` (fully qualified), `partial_name`, `alternate_name`, `mapping_name`, `flags`, `value`, `default_value`, `max_len`, `options`, `top_index`, `selected_indices`, `additional_actions`, `lock`, `seed_value`; the typed readers `text`, `button_kind`, `state`, `checked`, `on_widgets`, `signature`, `selected` |
+| `FieldFlags` | The flag word as `bits`, the set flags' `names`, and one boolean per flag (`read_only`, `required`, `multiline`, `combo`, `radio`, `pushbutton`, …) |
+| `Widget` | One widget annotation of a field: `ref`, `appearance_state`, `on_state`, `characteristics` |
+| `AppearanceCharacteristics` | A button widget's captions and icons: `caption`, `rollover_caption`, `alternate_caption`, `icon`, `rollover_icon`, `alternate_icon`, `caption_position` |
+| `ChoiceOption` | One choice option or button export value: `export_value`, `name` |
+| `Signature` | A signature dictionary read as data, nothing verified: `filter`, `sub_filter`, `byte_range`, `contents`, `name`, `signing_time`, `location`, `reason`, `contact_info` |
+| `OutlineItem` | One bookmark: `title`, `destination`, `page`, `open`, `color`, `italic`, `bold`, `structure_element`, nested `children` |
+| `Destination` | A page and how it is shown: `page` (0-based, resolved through the page tree), `page_ref`, `fit`, `left`, `top`, `right`, `bottom`, `zoom` |
+| `PageLabel` | One page-numbering range: `first_page`, `style`, `prefix`, `start_at`, `label(index)`; `write.PageLabel` takes the same fields |
+| `EmbeddedFile` | One attachment: `name`, `file_name`, `description`, `file_system`, `volatile`, `ref`, `mime`, `size`, `created`, `modified` (ISO 8601 strings), `checksum` |
+| `ViewerPreferences` | The catalog's viewer preferences with the standard's defaults filled in: the five hide/fit/center flags, `display_doc_title`, `non_full_screen_page_mode`, `direction`, the four view and print boxes, `print_scaling`, `duplex`, `pick_tray_by_pdf_size`, `print_page_range`, `num_copies` |
+| `DeveloperExtension` | One catalog extension: `prefix`, `base_version`, `extension_level` |
+
+```python
+import pdfboss
+
+doc = pdfboss.Document("form.pdf")
+for field in doc.form_fields():
+    if field.field_type == "text":
+        print(field.name, field.text)
+    elif field.button_kind == "check-box":
+        print(field.name, field.checked)
+    elif field.field_type == "choice":
+        print(field.name, field.selected)
+
+for item in doc.outline():
+    print(item.title, item.page)
+for attachment in doc.embedded_files():
+    open(attachment.name, "wb").write(doc.embedded_file_data(attachment))
+```
 
 Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Creating PDFs](../guide/creating.md), [Markdown to PDF](../guide/md-to-pdf.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md), [Editing PDFs](../guide/editing.md), [Assembling documents](../guide/assembling.md).
 
