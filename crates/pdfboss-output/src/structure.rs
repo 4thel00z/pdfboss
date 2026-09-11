@@ -102,7 +102,9 @@ const HEADING_MERGE_STEP: f32 = 1.8;
 
 /// The glyphs PDFs draw list bullets with: filled dot, hollow dot, square,
 /// en dash, hyphen, asterisk.
-const BULLETS: &[char] = &['\u{2022}', '\u{25E6}', '\u{25AA}', '\u{2013}', '-', '*'];
+const BULLETS: &[char] = &[
+    '\u{2022}', '\u{25CF}', '\u{25E6}', '\u{25AA}', '\u{2013}', '-', '*',
+];
 /// A candidate list must total at least this many lines — an item plus a
 /// second item, or an item plus one folded continuation — to become a
 /// [`Block::List`]. Below it, the lone marker line is a stray dash or
