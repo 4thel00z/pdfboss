@@ -2710,14 +2710,32 @@ fn grid_claim(
     };
     if end > hi {
         // A grown claim's verticals were inferred from one section's text;
-        // the columns of the whole are the lanes all its lines leave.
-        let spans: Vec<&TextSpan> = groups[top..end]
+        // the columns of the whole are the lanes its lines leave, counting
+        // only the lines that leave a lane of their own: a title set over
+        // two of the columns runs across the gap between them and reads as
+        // one cell over both, not as a reason to merge the columns under
+        // it, and the header lines above the top rule stay out likewise.
+        let spans: Vec<&TextSpan> = groups[lo..end]
             .iter()
             .flat_map(|group| group.spans.iter().copied())
             .filter(|span| !blank(&span.text))
             .collect();
-        let claimed = &groups[top..end];
-        columns = cell_columns(&spans, &lanes_of(claimed, gutter_min(claimed)));
+        let claimed = &groups[lo..end];
+        let min_gap = gutter_min(claimed);
+        let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
+        for group in claimed {
+            let mut own: Vec<std::ops::Range<f32>> = Vec::new();
+            for span in group.spans.iter().filter(|span| !blank(&span.text)) {
+                add_ink(&mut own, span.x.min(span.end_x)..span.x.max(span.end_x));
+            }
+            if ink_gaps(&own, min_gap).is_empty() {
+                continue;
+            }
+            for ink in own {
+                add_ink(&mut occupied, ink);
+            }
+        }
+        columns = cell_columns(&spans, &ink_gaps(&occupied, min_gap));
     }
     let mut rows = Vec::with_capacity(end - top);
     for group in &groups[top..lo] {
