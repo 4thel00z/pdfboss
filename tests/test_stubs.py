@@ -57,3 +57,33 @@ def test_stub_declares_the_form_and_catalog_methods() -> None:
     ):
         assert f"    {line}" in stub, f"missing sync stub: {line}"
         assert f"    async {line}" in stub, f"missing async stub: {line}"
+
+
+def test_stub_declares_the_document_and_page_structure_methods() -> None:
+    stub = STUB.read_text()
+    for line in (
+        "def output_intents(self) -> list[OutputIntent]",
+        "def piece_info(self) -> list[PagePiece]",
+        "def articles(self) -> list[ArticleThread]",
+        "def permission_handlers(self) -> PermissionHandlers | None",
+        "def thumbnail(self) -> Thumbnail | None",
+        'def thumbnail_image(self, compression: str = "default") -> PageImage | None',
+        "def beads(self) -> list[tuple[int, int]]",
+        "def presentation(self) -> Presentation | None",
+    ):
+        assert f"    {line}" in stub, f"missing sync stub: {line}"
+        assert f"    async {line}" in stub, f"missing async stub: {line}"
+    for line in (
+        "def linearization(self) -> Linearization | None",
+        "def is_linearized(self) -> bool",
+    ):
+        assert stub.count(f"    {line}") == 2, f"expected a plain stub on both documents: {line}"
+        assert f"    async {line}" not in stub, f"the aio reader is plain, not a coroutine: {line}"
+    for line in (
+        "default_appearance: str | None",
+        'quadding: Literal["left", "centered", "right"]',
+        "default_style: str | None",
+        "rich_text: str | None",
+        'def parse(da: str) -> "DefaultAppearance"',
+    ):
+        assert line in stub, f"missing stub: {line}"

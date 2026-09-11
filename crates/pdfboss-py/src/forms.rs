@@ -9,12 +9,15 @@ use pyo3::types::{PyBytes, PyDict};
 
 use pdfboss_core::{
     AppearanceCharacteristics as CoreCharacteristics, ButtonKind, CaptionPosition,
-    ChoiceOption as CoreChoiceOption, FieldFlags as CoreFieldFlags, FieldType,
-    FormField as CoreFormField, InteractiveForm as CoreInteractiveForm, Quadding,
-    Signature as CoreSignature, Widget as CoreWidget,
+    ChoiceOption as CoreChoiceOption, DefaultAppearance as CoreDefaultAppearance,
+    FieldFlags as CoreFieldFlags, FieldType, FormField as CoreFormField,
+    InteractiveForm as CoreInteractiveForm, Quadding, Signature as CoreSignature,
+    Widget as CoreWidget,
 };
 
-use crate::{dict_to_py, object_to_py, ref_tuple, repr_bool, repr_opt_str, repr_str};
+use crate::{
+    dict_to_py, object_to_py, ref_tuple, repr_bool, repr_opt_float, repr_opt_str, repr_str,
+};
 
 fn field_type_str(field_type: FieldType) -> &'static str {
     match field_type {
@@ -455,6 +458,12 @@ pub(crate) struct Signature {
     inner: CoreSignature,
 }
 
+impl From<CoreSignature> for Signature {
+    fn from(inner: CoreSignature) -> Signature {
+        Signature { inner }
+    }
+}
+
 #[pymethods]
 impl Signature {
     /// The name of the preferred signature handler.
@@ -629,6 +638,37 @@ impl FormField {
             .transpose()
     }
 
+    /// The default appearance string the field's variable text is drawn
+    /// with, a content fragment such as `/Helv 0 Tf 0 g`, as written:
+    /// the field's own, its nearest ancestor's, or the form's
+    /// document-wide one. `DefaultAppearance.parse` reads it.
+    #[getter]
+    fn default_appearance(&self) -> Option<&str> {
+        self.inner.default_appearance.as_deref()
+    }
+
+    /// The justification of the field's variable text: `"left"`,
+    /// `"centered"` or `"right"`; inherited like `default_appearance`,
+    /// `"left"` when nothing sets it.
+    #[getter]
+    fn quadding(&self) -> &'static str {
+        quadding_str(self.inner.quadding)
+    }
+
+    /// The default style string of a rich text field, a CSS fragment
+    /// as written.
+    #[getter]
+    fn default_style(&self) -> Option<&str> {
+        self.inner.default_style.as_deref()
+    }
+
+    /// The rich text value of a text field, an XHTML fragment; a value
+    /// written as a stream is read into the string.
+    #[getter]
+    fn rich_text(&self) -> Option<&str> {
+        self.inner.rich_text.as_deref()
+    }
+
     /// The most characters a text field's text may hold.
     #[getter]
     fn max_len(&self) -> Option<u32> {
@@ -744,8 +784,58 @@ impl FormField {
     }
 }
 
+/// The parts of a default appearance string that matter for drawing
+/// variable text: the font resource name and size from `Tf` and the
+/// fill colour from `g`, `rg` or `k`.
+#[pyclass(frozen)]
+pub(crate) struct DefaultAppearance {
+    inner: CoreDefaultAppearance,
+}
+
+#[pymethods]
+impl DefaultAppearance {
+    /// Reads a default appearance string such as `/Helv 12 Tf 0 g`;
+    /// every part the string leaves out or fails to parse is `None`.
+    #[staticmethod]
+    fn parse(da: &str) -> DefaultAppearance {
+        DefaultAppearance {
+            inner: CoreDefaultAppearance::parse(da),
+        }
+    }
+
+    /// The font resource name `Tf` selects, without the slash.
+    #[getter]
+    fn font(&self) -> Option<&str> {
+        self.inner.font.as_deref()
+    }
+
+    /// The font size `Tf` sets; 0 asks the viewer to fit the text to
+    /// the field.
+    #[getter]
+    fn font_size(&self) -> Option<f32> {
+        self.inner.font_size
+    }
+
+    /// The fill colour components: one for `g`, three for `rg`, four
+    /// for `k`.
+    #[getter]
+    fn fill_color(&self) -> Option<Vec<f32>> {
+        self.inner.fill_color.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DefaultAppearance(font={}, font_size={}, fill_color={})",
+            repr_opt_str(self.inner.font.as_deref()),
+            repr_opt_float(self.inner.font_size),
+            repr_opt_float(self.inner.fill_color.as_ref())
+        )
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<InteractiveForm>()?;
+    module.add_class::<DefaultAppearance>()?;
     module.add_class::<FormField>()?;
     module.add_class::<FieldFlags>()?;
     module.add_class::<Widget>()?;
