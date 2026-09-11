@@ -1591,6 +1591,20 @@ mod tests {
         assert!(md.contains("5. Item number 5 of the list"), "md: {md}");
     }
 
+    /// A table of contents whose front matter counts pages in roman
+    /// numerals and whose parts are headed by a line of words alone is
+    /// prose, not a two-column table.
+    #[test]
+    fn a_contents_list_with_front_matter_is_not_a_table() {
+        let md = markdown_of(&structure::tests::front_matter_contents_content());
+        assert!(!md.contains("| ---"), "md: {md}");
+        assert!(md.contains("About the Publisher vii"), "md: {md}");
+        assert!(
+            md.contains("Experiment 3: Energy Loss in Pipes 24"),
+            "md: {md}"
+        );
+    }
+
     /// Two columns of prose too short for the gutter pass share one lane;
     /// neither side is narrow, so they are not a two-column table.
     #[test]

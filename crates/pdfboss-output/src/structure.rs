@@ -3524,34 +3524,106 @@ fn grid(
     })
 }
 
-/// True when the rows read as a table of contents or an index: every row
-/// ends in a bare page number, the numbers never fall down the rows (two
-/// entries may share a page), and the cells before them carry words.
-/// Entry numbers, titles and page numbers line up in lanes like any grid,
-/// but the list is prose to the heading pass, not a table, and ground
-/// truth reads it so.
+/// True when the rows read as a table of contents or an index: at least
+/// [`TABLE_MIN_ROWS`] rows end in a page number, the numbers never fall
+/// down the rows (two entries may share a page), and words come before
+/// each number; a row populating one cell of words alone is a part
+/// heading between entries. Front matter counts its pages in roman
+/// numerals, which precede the arabic ones, and a page number may share
+/// its cell with the last word of a wrapped title. Entry numbers, titles
+/// and page numbers line up in lanes like any grid, but the list is prose
+/// to the heading pass, not a table, and ground truth reads it so.
 fn contents_list(rows: &[Vec<Cell>]) -> bool {
-    let mut last = 0u32;
+    let mut last = PageNumber::Roman(0);
+    let mut entries = 0usize;
     for row in rows {
         let filled: Vec<&Cell> = row.iter().filter(|cell| cell.line.is_some()).collect();
-        let Some((page, entry)) = filled.split_last() else {
+        let Some((tail, entry)) = filled.split_last() else {
             return false;
         };
-        let Ok(number) = cell_text(page).trim().parse::<u32>() else {
+        let text = cell_text(tail);
+        let text = text.trim();
+        let (head, token) = text.rsplit_once(char::is_whitespace).unwrap_or(("", text));
+        let Some(page) = page_number(token) else {
+            if filled.len() == 1 && text.chars().any(|c| c.is_alphabetic()) {
+                continue;
+            }
             return false;
         };
-        if number < last {
+        let worded = entry
+            .iter()
+            .map(|cell| cell_text(cell))
+            .chain(std::iter::once(head.to_string()))
+            .any(|words| words.chars().any(|c| c.is_alphabetic()));
+        if !worded || !last.precedes(page) {
             return false;
         }
-        last = number;
-        if !entry
-            .iter()
-            .any(|cell| cell_text(cell).chars().any(|c| c.is_alphabetic()))
-        {
-            return false;
+        last = page;
+        entries += 1;
+    }
+    entries >= TABLE_MIN_ROWS
+}
+
+/// A page number in a table of contents: the roman numerals of the front
+/// matter, or an arabic number.
+#[derive(Clone, Copy)]
+enum PageNumber {
+    Roman(u32),
+    Arabic(u32),
+}
+
+impl PageNumber {
+    /// True when `next` may follow `self` down a contents list: the
+    /// numbers never fall, and the arabic pages follow the roman ones.
+    fn precedes(self, next: PageNumber) -> bool {
+        match (self, next) {
+            (PageNumber::Roman(a), PageNumber::Roman(b))
+            | (PageNumber::Arabic(a), PageNumber::Arabic(b)) => a <= b,
+            (PageNumber::Roman(_), PageNumber::Arabic(_)) => true,
+            (PageNumber::Arabic(_), PageNumber::Roman(_)) => false,
         }
     }
-    true
+}
+
+/// The page number a token stands for, if any.
+fn page_number(token: &str) -> Option<PageNumber> {
+    if let Ok(number) = token.parse::<u32>() {
+        return Some(PageNumber::Arabic(number));
+    }
+    roman_numeral(token).map(PageNumber::Roman)
+}
+
+/// The value of a roman numeral in the letters i, v, x, l, c, d and m of
+/// either case, up to eight letters; `None` for anything else.
+fn roman_numeral(token: &str) -> Option<u32> {
+    if token.is_empty() || token.len() > 8 {
+        return None;
+    }
+    let values: Vec<i64> = token
+        .chars()
+        .map(|c| match c.to_ascii_lowercase() {
+            'i' => Some(1),
+            'v' => Some(5),
+            'x' => Some(10),
+            'l' => Some(50),
+            'c' => Some(100),
+            'd' => Some(500),
+            'm' => Some(1000),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let total: i64 = values
+        .iter()
+        .enumerate()
+        .map(|(index, &value)| {
+            if values.get(index + 1).is_some_and(|&next| next > value) {
+                -value
+            } else {
+                value
+            }
+        })
+        .sum();
+    u32::try_from(total).ok()
 }
 
 /// The stretch's rows over the columns its own run lines leave. The run's
@@ -6499,6 +6571,28 @@ pub(crate) mod tests {
                 content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
             }
             content += &format!("1 0 0 1 160 {y} Tm (   ) Tj ");
+        }
+        content += "ET";
+        content
+    }
+
+    /// A table of contents in two lanes: front matter paged in roman
+    /// numerals, a part heading on a line of its own, then arabic pages.
+    pub(crate) fn front_matter_contents_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (y, title, page) in [
+            (700.0, "About the Publisher", "vii"),
+            (686.0, "About This Project", "ix"),
+            (672.0, "LAB MANUAL", ""),
+            (658.0, "Experiment 1: Hydrostatic Pressure", "3"),
+            (644.0, "Experiment 2: Bernoulli's Theorem", "13"),
+            (630.0, "Experiment 3: Energy Loss in Pipes", "24"),
+            (616.0, "References", "101"),
+        ] {
+            content += &format!("1 0 0 1 72 {y} Tm ({title}) Tj ");
+            if !page.is_empty() {
+                content += &format!("1 0 0 1 430 {y} Tm ({page}) Tj ");
+            }
         }
         content += "ET";
         content
