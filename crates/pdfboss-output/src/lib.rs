@@ -1775,6 +1775,17 @@ mod tests {
         assert!(!md.contains("|  |  |"), "no blank row: {md}");
     }
 
+    /// Text starting a few points left of the left border rule is the first
+    /// column's, not a stray that fails the whole claim.
+    #[test]
+    fn text_overhanging_the_left_rule_keeps_the_claim() {
+        let md = markdown_of_drawn(&structure::tests::overhanging_ruled_content());
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |\n| a3 | b3 |"),
+            "md: {md}"
+        );
+    }
+
     #[test]
     fn a_ruled_grid_becomes_a_pipe_table() {
         let md = markdown_of_drawn(&structure::tests::ruled_grid_content());

@@ -3110,7 +3110,15 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         let whitespace = blank(&span.text);
         let lo = span.x.min(span.end_x);
         let hi = span.x.max(span.end_x);
-        let Some(start) = columns.iter().rposition(|column| column.start <= lo) else {
+        // A span starting a hair left of the first column belongs to it: a
+        // border rule is often drawn just inside the text's left edge.
+        let Some(start) = columns
+            .iter()
+            .rposition(|column| column.start <= lo)
+            .or_else(|| {
+                (!whitespace && columns[0].start - lo <= RULING_SNAP_TOLERANCE).then_some(0)
+            })
+        else {
             if whitespace {
                 continue;
             }
@@ -3122,12 +3130,10 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
             }
             return None;
         }
-        let Some(end) = columns.iter().rposition(|column| column.start <= hi) else {
-            if whitespace {
-                continue;
-            }
-            return None;
-        };
+        let end = columns
+            .iter()
+            .rposition(|column| column.start <= hi)
+            .map_or(start, |end| end.max(start));
         match claimed.last_mut() {
             Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
@@ -5564,6 +5570,17 @@ pub(crate) mod tests {
              BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
              1 0 0 1 80 675 Tm ( ) Tj \
              1 0 0 1 80 655 Tm (a2) Tj 1 0 0 1 260 655 Tm (b2) Tj ET",
+        )
+    }
+
+    /// [`ruled_grid_content`] with the first column's text starting four
+    /// points left of the left border rule.
+    pub(crate) fn overhanging_ruled_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 66 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 66 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj \
+             1 0 0 1 66 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj ET",
         )
     }
 
