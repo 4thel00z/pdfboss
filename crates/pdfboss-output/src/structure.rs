@@ -1452,19 +1452,21 @@ fn blank(text: &str) -> bool {
 }
 
 fn half_points(size: f32) -> i32 {
-    (size * 2.0).round() as i32
+    // Sizes are never negative, so adding a half and truncating rounds as
+    // `round` would, without the library call it compiles to.
+    (size * 2.0 + 0.5) as i32
 }
 
 /// The document's size statistics, weighted by characters shown: a title
 /// carries a handful, body text carries thousands.
 fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
     // A page holds a handful of distinct sizes, so a sorted vector beats a
-    // map; the weight counts scalar starts, which is the character count of
-    // valid UTF-8 without decoding it.
+    // map; the weight is the character count, which the standard library
+    // counts a machine word at a time.
     let mut weights: Vec<(i32, usize)> = Vec::new();
     for span in pages.iter().flat_map(|page| page.iter()) {
         let bucket = half_points(span.size);
-        let chars = span.text.bytes().filter(|b| (b & 0xC0) != 0x80).count();
+        let chars = span.text.chars().count();
         match weights.binary_search_by_key(&bucket, |(b, _)| *b) {
             Ok(index) => weights[index].1 += chars,
             Err(index) => weights.insert(index, (bucket, chars)),
