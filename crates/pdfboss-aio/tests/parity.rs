@@ -53,6 +53,7 @@ fn outline_doc() -> Vec<u8> {
          /Threads [13 0 R] /Perms << /DocMDP 15 0 R >> \
          /Requirements [ << /Type /Requirement /S /EnableJavaScripts \
          /RH << /Type /ReqHandler /S /NoOp >> >> ] \
+         /Legal << /URIActions 1 /Attestation (Checked) >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -420,6 +421,17 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                 .unwrap();
             assert_eq!(separation.device_colorant, "Cyan");
             assert_eq!(separation.pages, [pdfboss_core::ObjRef { num: 3, gen: 0 }]);
+        }
+        // Covers ISO 32000-1 §12.8.5.
+        assert_eq!(
+            doc.legal_attestation().await,
+            sync_doc.legal_attestation(),
+            "{name}: legal attestation"
+        );
+        if name == "outline" {
+            let legal = sync_doc.legal_attestation().unwrap();
+            assert_eq!(legal.uri_actions, 1);
+            assert_eq!(legal.attestation.as_deref(), Some("Checked"));
         }
         for index in 0..=doc.page_count() {
             assert_eq!(

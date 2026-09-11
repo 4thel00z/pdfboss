@@ -19,6 +19,7 @@ pub mod form;
 pub mod geom;
 pub mod hash;
 pub mod language;
+pub mod legal;
 pub mod lexer;
 pub mod linearization;
 pub mod measure;
@@ -72,6 +73,7 @@ pub use form::{
 pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use language::{language_with, LanguageTag};
+pub use legal::{legal_attestation_with, LegalAttestation};
 pub use linearization::{linearization_dictionary, Linearization};
 pub use measure::{
     measure_from, viewports_with, FractionFormat, LabelPosition, Measure, NumberFormat, Viewport,

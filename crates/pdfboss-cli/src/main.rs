@@ -768,6 +768,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     articles,
                     perms: &perms,
                     requirements: &doc.requirements(),
+                    legal: doc.legal_attestation().as_ref(),
                     viewports,
                     separation_pages,
                     colorants: &colorants,
@@ -808,7 +809,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// duration or a transition. `articles` counts the article threads and
 /// their beads. `perms` names the permission handlers the catalog's
 /// `/Perms` dictionary carries. `requirements` are the catalog's
-/// `/Requirements` entries, printed by type. `viewports` counts the `/VP`
+/// `/Requirements` entries, printed by type. `legal` is the catalog's
+/// `/Legal` attestation dictionary. `viewports` counts the `/VP`
 /// viewports and the pages that carry them. `separation_pages` counts the
 /// pages with a `/SeparationInfo` dictionary and `colorants` names, sorted
 /// and without repeats, the colorants they print. `linearization` is the
@@ -830,6 +832,7 @@ struct Info<'a> {
     articles: (usize, usize),
     perms: &'a [&'a str],
     requirements: &'a [pdfboss_core::Requirement],
+    legal: Option<&'a pdfboss_core::LegalAttestation>,
     viewports: (usize, usize),
     separation_pages: usize,
     colorants: &'a [String],
@@ -904,6 +907,46 @@ fn info_text(info: &Info) -> String {
             .map(|requirement| requirement.kind.as_str())
             .collect();
         let _ = writeln!(out, "requirements: {}", kinds.join(", "));
+    }
+    // The legal attestation (ISO 32000-1 §12.8.5): the non-zero Table 259
+    // counts by key, then whether the signer's statement is present.
+    if let Some(legal) = info.legal {
+        let counts: Vec<String> = [
+            ("JavaScriptActions", legal.java_script_actions),
+            ("LaunchActions", legal.launch_actions),
+            ("URIActions", legal.uri_actions),
+            ("MovieActions", legal.movie_actions),
+            ("SoundActions", legal.sound_actions),
+            ("HideAnnotationActions", legal.hide_annotation_actions),
+            ("GoToRemoteActions", legal.go_to_remote_actions),
+            ("AlternateImages", legal.alternate_images),
+            ("ExternalStreams", legal.external_streams),
+            ("TrueTypeFonts", legal.true_type_fonts),
+            ("ExternalRefXobjects", legal.external_ref_xobjects),
+            ("ExternalOPIdicts", legal.external_opi_dicts),
+            ("NonEmbeddedFonts", legal.non_embedded_fonts),
+            ("DevDepGS_OP", legal.dev_dep_gs_op),
+            ("DevDepGS_HT", legal.dev_dep_gs_ht),
+            ("DevDepGS_TR", legal.dev_dep_gs_tr),
+            ("DevDepGS_UCR", legal.dev_dep_gs_ucr),
+            ("DevDepGS_BG", legal.dev_dep_gs_bg),
+            ("DevDepGS_FL", legal.dev_dep_gs_fl),
+            ("Annotations", legal.annotations),
+            ("OptionalContent", legal.optional_content),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(key, count)| format!("{key} {count}"))
+        .collect();
+        let mut line = if counts.is_empty() {
+            "no counts".to_string()
+        } else {
+            counts.join(", ")
+        };
+        if legal.attestation.is_some() {
+            line.push_str("; attested");
+        }
+        let _ = writeln!(out, "legal:     {line}");
     }
     match info.sizes {
         Some(sizes) => {
@@ -1841,6 +1884,39 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("separations"));
+    }
+
+    /// The catalog's legal attestation prints as one line after the
+    /// requirements: the non-zero counts by their Table 259 keys, then
+    /// whether an attestation text is present; none prints no line.
+    // Covers ISO 32000-1 §12.8.5.
+    #[test]
+    fn info_text_lists_the_legal_attestation() {
+        let legal = pdfboss_core::LegalAttestation {
+            uri_actions: 3,
+            non_embedded_fonts: 1,
+            attestation: Some("Reviewed".into()),
+            ..pdfboss_core::LegalAttestation::default()
+        };
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            legal: Some(&legal),
+            ..Info::default()
+        });
+        assert!(
+            report.contains(
+                "encrypted: false\nlegal:     URIActions 3, NonEmbeddedFonts 1; attested\n"
+            ),
+            "{report}"
+        );
+        let empty = pdfboss_core::LegalAttestation::default();
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            legal: Some(&empty),
+            ..Info::default()
+        });
+        assert!(report.contains("\nlegal:     no counts\n"), "{report}");
+        assert!(!info_text(&Info::default()).contains("legal"));
     }
 
     /// A linearized file prints its first page object after the encryption

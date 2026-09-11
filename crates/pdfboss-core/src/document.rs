@@ -743,6 +743,15 @@ impl Document {
         ))
     }
 
+    /// The catalog's legal attestation dictionary (ISO 32000-1 §12.8.5),
+    /// `None` without one.
+    pub fn legal_attestation(&self) -> Option<crate::legal::LegalAttestation> {
+        block_on(crate::legal::legal_attestation_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

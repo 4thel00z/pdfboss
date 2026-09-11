@@ -1587,6 +1587,12 @@ impl AsyncDocument {
         pdfboss_core::requirements_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The catalog's legal attestation dictionary (ISO 32000-1 §12.8.5): the
+    /// async twin of the sync document's `legal_attestation`.
+    pub async fn legal_attestation(&self) -> Option<pdfboss_core::LegalAttestation> {
+        pdfboss_core::legal_attestation_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {
