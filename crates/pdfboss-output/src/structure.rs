@@ -126,6 +126,10 @@ const TABLE_ROW_GAP: f32 = 2.0;
 /// the side borders stopping five and a half points short of the next
 /// row's rule — the corners must still weld into one lattice.
 const RULING_SNAP_TOLERANCE: f32 = 6.0;
+/// The snap as a share of the page's body type size, where that is the
+/// smaller: two rulings closer than this are one line, farther apart are
+/// two rows' rules.
+const RULING_SNAP_OF_SIZE: f32 = 0.6;
 /// The narrowest lattice that reads as a ruled grid: two verticals and three
 /// horizontals are one boxed column of two cells. Lane-occupancy gates do not
 /// apply here — the structure is drawn, not implied by white space.
@@ -423,7 +427,7 @@ fn page_layout_with_stats(
     stats: &SizeStats,
     order: ReadingOrder,
 ) -> PageLayout {
-    let mut grids = ruled_grids(rulings);
+    let mut grids = ruled_grids(rulings, ruling_snap(spans, rulings));
     grids.extend(open_ruled_grids(spans, rulings, &grids));
     grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
     let mut blocks = Vec::new();
@@ -1946,7 +1950,7 @@ struct GridLine {
 /// [`RULED_GRID_MIN_HORIZONTALS`] horizontals kept, topmost first. A ruling
 /// is vertical when it runs farther in y than in x; extraction already
 /// snapped it exactly axis-aligned.
-fn ruled_grids(rulings: &[Ruling]) -> Vec<RuledGrid> {
+fn ruled_grids(rulings: &[Ruling], snap: f32) -> Vec<RuledGrid> {
     if rulings.is_empty() {
         return Vec::new();
     }
@@ -1956,12 +1960,14 @@ fn ruled_grids(rulings: &[Ruling]) -> Vec<RuledGrid> {
             .iter()
             .filter(vertical)
             .map(|r| (r.start.x, r.start.y..r.end.y)),
+        snap,
     );
     let horizontals = grid_lines(
         rulings
             .iter()
             .filter(|r| !vertical(r))
             .map(|r| (r.start.y, r.start.x..r.end.x)),
+        snap,
     );
     let mut parent: Vec<usize> = (0..verticals.len() + horizontals.len()).collect();
     for (v, vertical) in verticals.iter().enumerate() {
@@ -1988,7 +1994,7 @@ fn ruled_grids(rulings: &[Ruling]) -> Vec<RuledGrid> {
                 v_indices.iter().map(|&i| &verticals[i]).collect();
             let component_horizontals: Vec<&GridLine> =
                 h_indices.iter().map(|&i| &horizontals[i]).collect();
-            lattice(&component_verticals, &component_horizontals)
+            lattice(&component_verticals, &component_horizontals, snap)
         })
         .collect();
     grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
@@ -2250,19 +2256,37 @@ fn open_ruled_candidate(
     Some(grid)
 }
 
+/// How close two rulings may lie and still be one drawn line on this page:
+/// [`RULING_SNAP_TOLERANCE`], or less where the type is small enough that
+/// rows are ruled closer than that. A rate table set in 4-point type rules
+/// every row, 5.6 points apart; snapped at 6 the rules chain into three
+/// lines and the table folds into two rows.
+fn ruling_snap(spans: &[TextSpan], rulings: &[Ruling]) -> f32 {
+    if rulings.is_empty() {
+        return RULING_SNAP_TOLERANCE;
+    }
+    let body = size_stats(&[spans]).body;
+    if body <= 0.0 {
+        return RULING_SNAP_TOLERANCE;
+    }
+    RULING_SNAP_TOLERANCE.min(RULING_SNAP_OF_SIZE * body)
+}
+
 /// Rulings on one axis as drawn lines: grouped by their constant coordinate
-/// within [`RULING_SNAP_TOLERANCE`], each group's near-touching extents
-/// merged. Extents farther apart stay separate lines at the same position —
-/// the x two stacked tables' borders share must not weld them into one
-/// lattice.
-fn grid_lines(rulings: impl Iterator<Item = (f32, std::ops::Range<f32>)>) -> Vec<GridLine> {
+/// within `snap`, each group's near-touching extents merged. Extents
+/// farther apart stay separate lines at the same position — the x two
+/// stacked tables' borders share must not weld them into one lattice.
+fn grid_lines(
+    rulings: impl Iterator<Item = (f32, std::ops::Range<f32>)>,
+    snap: f32,
+) -> Vec<GridLine> {
     let mut all: Vec<(f32, std::ops::Range<f32>)> = rulings.collect();
     all.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut lines: Vec<GridLine> = Vec::new();
     let mut cluster: Vec<(f32, std::ops::Range<f32>)> = Vec::new();
     for line in all {
         if let Some(last) = cluster.last() {
-            if line.0 - last.0 > RULING_SNAP_TOLERANCE {
+            if line.0 - last.0 > snap {
                 lines.append(&mut merged_cluster(std::mem::take(&mut cluster)));
             }
         }
@@ -2326,9 +2350,9 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
 /// bounded above by nothing but its verticals, drawn one row box at a time.
 /// Where they reach beyond it, a synthetic boundary at their far end adds
 /// that band, so the rows it holds stay rows of this grid.
-fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGrid> {
-    let mut xs = distinct_positions(verticals);
-    let mut ys = distinct_positions(horizontals);
+fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine], snap: f32) -> Option<RuledGrid> {
+    let mut xs = distinct_positions(verticals, snap);
+    let mut ys = distinct_positions(horizontals, snap);
     if xs.len() < RULED_GRID_MIN_VERTICALS || ys.is_empty() {
         return None;
     }
@@ -2380,12 +2404,12 @@ fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine]) -> Option<RuledGr
     })
 }
 
-/// The lines' positions, ascending, neighbours within
-/// [`RULING_SNAP_TOLERANCE`] collapsed to the first.
-fn distinct_positions(lines: &[&GridLine]) -> Vec<f32> {
+/// The lines' positions, ascending, neighbours within `snap` collapsed to
+/// the first.
+fn distinct_positions(lines: &[&GridLine], snap: f32) -> Vec<f32> {
     let mut positions: Vec<f32> = lines.iter().map(|line| line.position).collect();
     positions.sort_by(f32::total_cmp);
-    positions.dedup_by(|next, kept| *next - *kept <= RULING_SNAP_TOLERANCE);
+    positions.dedup_by(|next, kept| *next - *kept <= snap);
     positions
 }
 
@@ -4793,7 +4817,7 @@ pub(crate) mod tests {
                 };
                 crate::retain_spans_on_page(&mut spans, &page);
                 let crop = page.crop_box;
-                let grids = ruled_grids(&rulings);
+                let grids = ruled_grids(&rulings, RULING_SNAP_TOLERANCE);
                 write!(
                     out,
                     "{{\"doc\":{:?},\"page\":{},\"crop\":[{},{},{},{}],\"grids\":[",
@@ -4886,7 +4910,7 @@ pub(crate) mod tests {
                 r.start.x, r.start.y, r.end.x, r.end.y, r.width
             );
         }
-        let grids = ruled_grids(&rulings);
+        let grids = ruled_grids(&rulings, RULING_SNAP_TOLERANCE);
         println!("grids: {}", grids.len());
         for grid in &grids {
             println!(
@@ -5911,6 +5935,31 @@ pub(crate) mod tests {
         assert!(rows[1][1].line.is_some(), "a blank cell stays a cell");
     }
 
+    /// Rules drawn every five points in a table set in 4-point type are one
+    /// line per row; at body size the snap stays six points.
+    #[test]
+    fn tight_rules_stay_separate_lines_when_the_type_is_small() {
+        let mut rulings = vec![
+            ruling(70.0, 600.0, 70.0, 650.0),
+            ruling(130.0, 600.0, 130.0, 650.0),
+        ];
+        for step in 0..=10 {
+            let y = 600.0 + 5.0 * step as f32;
+            rulings.push(ruling(70.0, y, 130.0, y));
+        }
+        let small: Vec<TextSpan> = (0..10)
+            .map(|step| span("12", 72.0, 78.0, 601.0 + 5.0 * step as f32, 4.0))
+            .collect();
+        let snap = ruling_snap(&small, &rulings);
+        assert!(snap < 5.0, "snap {snap}");
+        let grids = ruled_grids(&rulings, snap);
+        assert_eq!(grids.len(), 1);
+        assert_eq!(grids[0].ys.len(), 11, "ys {:?}", grids[0].ys);
+        let body = [span("body", 72.0, 100.0, 700.0, 10.0)];
+        assert_eq!(ruling_snap(&body, &rulings), RULING_SNAP_TOLERANCE);
+        assert_eq!(ruling_snap(&small, &[]), RULING_SNAP_TOLERANCE);
+    }
+
     fn ruling(x0: f32, y0: f32, x1: f32, y1: f32) -> Ruling {
         Ruling {
             start: pdfboss_text::Point { x: x0, y: y0 },
@@ -5934,7 +5983,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_boxed_lattice_clusters_into_one_grid() {
-        let grids = ruled_grids(&boxed_grid_rulings(70.0, 630.0, 430.0, 710.0));
+        let grids = ruled_grids(
+            &boxed_grid_rulings(70.0, 630.0, 430.0, 710.0),
+            RULING_SNAP_TOLERANCE,
+        );
         assert_eq!(grids.len(), 1);
         assert_eq!(grids[0].xs, vec![70.0, 430.0]);
         assert_eq!(grids[0].ys, vec![630.0, 670.0, 710.0]);
@@ -5947,7 +5999,7 @@ pub(crate) mod tests {
     fn stacked_boxes_sharing_their_x_stay_two_grids() {
         let mut rulings = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
         rulings.extend(boxed_grid_rulings(70.0, 300.0, 430.0, 380.0));
-        let grids = ruled_grids(&rulings);
+        let grids = ruled_grids(&rulings, RULING_SNAP_TOLERANCE);
         assert_eq!(grids.len(), 2);
         assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0], "topmost first");
         assert_eq!(grids[1].ys, vec![300.0, 340.0, 380.0]);
@@ -5964,7 +6016,7 @@ pub(crate) mod tests {
             ruling(70.0, 640.0, 330.0, 640.0),
             ruling(70.0, 700.0, 330.0, 700.0),
         ];
-        let grids = ruled_grids(&rulings);
+        let grids = ruled_grids(&rulings, RULING_SNAP_TOLERANCE);
         assert_eq!(grids.len(), 1);
         assert_eq!(grids[0].ys, vec![590.0, 600.0, 640.0, 700.0, 712.0]);
     }
@@ -5979,8 +6031,10 @@ pub(crate) mod tests {
             ruling(70.0, 630.0, 430.0, 630.0),
             ruling(70.0, 710.0, 430.0, 710.0),
         ];
-        assert!(ruled_grids(&rulings).is_empty());
-        assert!(ruled_grids(&[ruling(70.0, 400.0, 430.0, 400.0)]).is_empty());
+        assert!(ruled_grids(&rulings, RULING_SNAP_TOLERANCE).is_empty());
+        assert!(
+            ruled_grids(&[ruling(70.0, 400.0, 430.0, 400.0)], RULING_SNAP_TOLERANCE).is_empty()
+        );
     }
 
     /// A ruling that crosses nothing in the lattice — an underline elsewhere
@@ -5989,7 +6043,7 @@ pub(crate) mod tests {
     fn an_unconnected_ruling_stays_out_of_the_lattice() {
         let mut rulings = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
         rulings.push(ruling(70.0, 100.0, 200.0, 100.0));
-        let grids = ruled_grids(&rulings);
+        let grids = ruled_grids(&rulings, RULING_SNAP_TOLERANCE);
         assert_eq!(grids.len(), 1);
         assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0]);
     }
