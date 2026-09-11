@@ -3200,30 +3200,41 @@ fn merged_line(fragments: &[&Line]) -> Line {
 /// one column survives inside the stretch for free: it puts ink where that
 /// column already held some.
 fn table_band(groups: &[Group]) -> Option<TableBand> {
+    // The one-lane stretches long enough for a two-column table, kept for
+    // the second pass: one lane is weaker evidence, and a three-column
+    // table anywhere in the segment comes first.
+    let mut pairs: Vec<(usize, LaneRun, f32)> = Vec::new();
     for start in 0..groups.len() {
         // The lane width follows the type of the run's own first lines: a
         // statement's 7-point rows stand in a column of 10-point prose.
         let min_gap = gutter_min(&groups[start..(start + TABLE_MIN_ROWS).min(groups.len())]);
-        let (end, lanes) = lane_run(groups, start, min_gap, TABLE_MIN_LANES);
-        if end - start < TABLE_MIN_ROWS {
+        let (two, one) = lane_runs(groups, start, min_gap);
+        if one.end - start >= PAIR_MIN_ROWS {
+            pairs.push((start, one, min_gap));
+        }
+        if two.end - start < TABLE_MIN_ROWS {
             continue;
         }
-        if let Some(band) = grid(groups, start, end, &lanes, min_gap, TABLE_MIN_LANES) {
+        if let Some(band) = grid(groups, start, two.end, &two.lanes, min_gap, TABLE_MIN_LANES) {
             return Some(band);
         }
     }
     // No stretch keeps two lanes: a two-column table is looked for next,
-    // and one lane is weaker evidence, so [`pair_table`] asks more of it.
-    for start in 0..groups.len() {
-        let min_gap = gutter_min(&groups[start..(start + TABLE_MIN_ROWS).min(groups.len())]);
-        let (end, lanes) = lane_run(groups, start, min_gap, 1);
-        if end - start < PAIR_MIN_ROWS {
+    // and [`pair_table`] asks more of it. A one-lane stretch that is no
+    // table settles the starts inside it too: they read the same rows, and
+    // a page of indented paragraphs would otherwise pay a grid attempt per
+    // line.
+    let mut settled = 0usize;
+    for (start, run, min_gap) in pairs {
+        if start < settled {
             continue;
         }
-        if let Some(band) = grid(groups, start, end, &lanes, min_gap, 1) {
-            if pair_table(&band.rows) {
-                return Some(band);
-            }
+        settled = run.end;
+        let Some(band) = grid(groups, start, run.end, &run.lanes, min_gap, 1) else {
+            continue;
+        };
+        if pair_table(&band.rows) {
+            return Some(band);
         }
     }
     None
@@ -3324,33 +3335,50 @@ fn marker_cell(text: &str) -> bool {
     digits || letter
 }
 
-/// The stretch starting at `start` that keeps at least `min_lanes` lanes,
-/// as an exclusive end and the lanes the whole stretch leaves. Ink is
-/// tracked as exact intervals, not histogram bins: a column gap of a few
-/// points is real table structure that bin rounding swallows. A
-/// whitespace-only span paints nothing: a producer's padding standing in a
-/// gutter neither closes the lane nor opens a column of its own.
-fn lane_run(
-    groups: &[Group],
-    start: usize,
-    min_gap: f32,
-    min_lanes: usize,
-) -> (usize, Vec<std::ops::Range<f32>>) {
+/// A stretch of lines from one start that keeps some number of lanes: its
+/// exclusive end and the lanes the whole stretch leaves.
+struct LaneRun {
+    end: usize,
+    lanes: Vec<std::ops::Range<f32>>,
+}
+
+/// The stretches starting at `start` that keep [`TABLE_MIN_LANES`] lanes
+/// and one lane, from a single scan of the lines: the two-lane stretch
+/// ends where the lanes fall under two, the one-lane stretch where the
+/// last lane closes. Ink is tracked as exact intervals, not histogram
+/// bins: a column gap of a few points is real table structure that bin
+/// rounding swallows. A whitespace-only span paints nothing: a producer's
+/// padding standing in a gutter neither closes the lane nor opens a column
+/// of its own.
+fn lane_runs(groups: &[Group], start: usize, min_gap: f32) -> (LaneRun, LaneRun) {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
-    let mut lanes = Vec::new();
+    let mut lanes: Vec<std::ops::Range<f32>> = Vec::new();
+    let mut two: Option<LaneRun> = None;
+    let mut end = groups.len();
     for (offset, group) in groups[start..].iter().enumerate() {
         let mut next = occupied.clone();
         for span in group.spans.iter().filter(|span| !blank(&span.text)) {
             add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
         }
         let gaps = ink_gaps(&next, min_gap);
-        if gaps.len() < min_lanes {
-            return (start + offset, lanes);
+        if gaps.len() < TABLE_MIN_LANES && two.is_none() {
+            two = Some(LaneRun {
+                end: start + offset,
+                lanes: lanes.clone(),
+            });
+        }
+        if gaps.is_empty() {
+            end = start + offset;
+            break;
         }
         occupied = next;
         lanes = gaps;
     }
-    (groups.len(), lanes)
+    let two = two.unwrap_or_else(|| LaneRun {
+        end,
+        lanes: lanes.clone(),
+    });
+    (two, LaneRun { end, lanes })
 }
 
 /// Adds one span's extent to a sorted, disjoint interval set, merging every
@@ -5724,8 +5752,10 @@ pub(crate) mod tests {
             if std::env::var_os("PDFBOSS_PROBE_LINES").is_some() {
                 for (gi, group) in groups.iter().enumerate() {
                     let (gx_lo, gx_hi) = x_bounds(&group.spans);
-                    let (run_end, lanes) =
-                        lane_run(&groups, gi, gutter_min(&groups), TABLE_MIN_LANES);
+                    let LaneRun {
+                        end: run_end,
+                        lanes,
+                    } = lane_runs(&groups, gi, gutter_min(&groups)).0;
                     let text: String = group
                         .spans
                         .iter()
