@@ -1561,11 +1561,30 @@ impl AsyncDocument {
         pdfboss_core::presentation_with(self, page).await
     }
 
+    /// The viewports of a page's `/VP` array (ISO 32000-1 §12.9): the async
+    /// twin of the sync document's `viewports`.
+    pub async fn viewports(&self, page: &Page) -> Vec<pdfboss_core::Viewport> {
+        pdfboss_core::viewports_with(self, page).await
+    }
+
+    /// A page's separation dictionary (ISO 32000-1 §14.11.4): the async twin
+    /// of the sync document's `separation_info`.
+    pub async fn separation_info(&self, page: &Page) -> Option<pdfboss_core::SeparationInfo> {
+        pdfboss_core::separation_info_with(self, page).await
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4): the async twin of the sync document's
     /// `permission_handlers`.
     pub async fn permission_handlers(&self) -> Option<pdfboss_core::PermissionHandlers> {
         pdfboss_core::permission_handlers_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The requirements the catalog's `/Requirements` array lists (ISO
+    /// 32000-1 §12.10.1): the async twin of the sync document's
+    /// `requirements`.
+    pub async fn requirements(&self) -> Vec<pdfboss_core::Requirement> {
+        pdfboss_core::requirements_with(self, &self.inner.xref.trailer).await
     }
 
     /// The label the page at `index` shows: the async twin of the sync

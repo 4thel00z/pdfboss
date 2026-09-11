@@ -51,6 +51,8 @@ fn outline_doc() -> Vec<u8> {
          /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
          /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
          /Threads [13 0 R] /Perms << /DocMDP 15 0 R >> \
+         /Requirements [ << /Type /Requirement /S /EnableJavaScripts \
+         /RH << /Type /ReqHandler /S /NoOp >> >> ] \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -58,7 +60,11 @@ fn outline_doc() -> Vec<u8> {
         3,
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
          /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> /Thumb 12 0 R \
-         /B [14 0 R] /Dur 5 /Trans << /S /Split /Dm /V /M /O /D 3.5 >> >>",
+         /B [14 0 R] /Dur 5 /Trans << /S /Split /Dm /V /M /O /D 3.5 >> \
+         /VP [ << /Type /Viewport /BBox [0 0 612 792] /Name (Map) \
+         /Measure << /Subtype /RL /R (1in = 1ft) /X [ << /U (ft) /C 0.0139 >> ] \
+         /D [ << /U (ft) /C 1 >> ] /A [ << /U (sq ft) /C 1 >> ] >> >> ] \
+         /SeparationInfo << /Pages [3 0 R] /DeviceColorant /Cyan >> >>",
     );
     b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
     b.object(
@@ -364,6 +370,56 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                 Some("Certifier")
             );
             assert_eq!(handlers.usage_rights, None);
+        }
+        // Covers ISO 32000-1 §12.10.1.
+        assert_eq!(
+            doc.requirements().await,
+            sync_doc.requirements(),
+            "{name}: requirements"
+        );
+        if name == "outline" {
+            let requirements = sync_doc.requirements();
+            assert_eq!(requirements.len(), 1, "{name}: requirements");
+            assert_eq!(requirements[0].kind, "EnableJavaScripts");
+            // Covers ISO 32000-1 §12.10.2.
+            assert_eq!(requirements[0].handlers.len(), 1, "{name}: handlers");
+            assert_eq!(requirements[0].handlers[0].kind, "NoOp");
+            assert_eq!(requirements[0].handlers[0].script, None);
+        }
+        // Covers ISO 32000-1 §12.9.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.viewports(&page).await,
+                sync_doc.viewports(&sync_page),
+                "{name}: page {index} viewports"
+            );
+        }
+        if name == "outline" {
+            let viewports = sync_doc.viewports(&sync_doc.page(0).unwrap());
+            assert_eq!(viewports.len(), 1, "{name}: viewports");
+            assert_eq!(viewports[0].name.as_deref(), Some("Map"));
+            let measure = viewports[0].measure.as_ref().unwrap();
+            assert_eq!(measure.scale_ratio.as_deref(), Some("1in = 1ft"));
+            assert_eq!(measure.x[0].conversion, 0.0139);
+        }
+        // Covers ISO 32000-1 §14.11.4.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.separation_info(&page).await,
+                sync_doc.separation_info(&sync_page),
+                "{name}: page {index} separation info"
+            );
+        }
+        if name == "outline" {
+            let separation = sync_doc
+                .separation_info(&sync_doc.page(0).unwrap())
+                .unwrap();
+            assert_eq!(separation.device_colorant, "Cyan");
+            assert_eq!(separation.pages, [pdfboss_core::ObjRef { num: 3, gen: 0 }]);
         }
         for index in 0..=doc.page_count() {
             assert_eq!(

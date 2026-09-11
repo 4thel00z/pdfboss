@@ -687,6 +687,9 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 .collect();
             let mut thumbnails = 0usize;
             let mut slides = 0usize;
+            let mut viewports = (0usize, 0usize);
+            let mut separation_pages = 0usize;
+            let mut colorants: Vec<String> = Vec::new();
             for index in 0..doc.page_count() {
                 let page = doc.page(index).ok();
                 sizes.push(page.as_ref().map(|page| page.size()));
@@ -698,10 +701,19 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     );
                     thumbnails += usize::from(doc.thumbnail(page).is_some());
                     slides += usize::from(doc.presentation(page).is_some());
+                    let page_viewports = doc.viewports(page).len();
+                    viewports.0 += page_viewports;
+                    viewports.1 += usize::from(page_viewports > 0);
+                    if let Some(separation) = doc.separation_info(page) {
+                        separation_pages += 1;
+                        colorants.push(separation.device_colorant);
+                    }
                 }
             }
             pieces.sort();
             pieces.dedup();
+            colorants.sort();
+            colorants.dedup();
             let threads = doc.articles();
             let articles = (
                 threads.len(),
@@ -731,6 +743,10 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     slides,
                     articles,
                     perms: &perms,
+                    requirements: &doc.requirements(),
+                    viewports,
+                    separation_pages,
+                    colorants: &colorants,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -767,7 +783,11 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// that carry a thumbnail image. `slides` counts the pages with a display
 /// duration or a transition. `articles` counts the article threads and
 /// their beads. `perms` names the permission handlers the catalog's
-/// `/Perms` dictionary carries. `linearization` is the
+/// `/Perms` dictionary carries. `requirements` are the catalog's
+/// `/Requirements` entries, printed by type. `viewports` counts the `/VP`
+/// viewports and the pages that carry them. `separation_pages` counts the
+/// pages with a `/SeparationInfo` dictionary and `colorants` names, sorted
+/// and without repeats, the colorants they print. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
 /// not linearized.
@@ -785,6 +805,10 @@ struct Info<'a> {
     slides: usize,
     articles: (usize, usize),
     perms: &'a [&'a str],
+    requirements: &'a [pdfboss_core::Requirement],
+    viewports: (usize, usize),
+    separation_pages: usize,
+    colorants: &'a [String],
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -847,6 +871,16 @@ fn info_text(info: &Info) -> String {
     if !info.perms.is_empty() {
         let _ = writeln!(out, "perms:     {}", info.perms.join(", "));
     }
+    // The features the catalog's /Requirements array asks a reader for (ISO
+    // 32000-1 §12.10.1), by their /S type.
+    if !info.requirements.is_empty() {
+        let kinds: Vec<&str> = info
+            .requirements
+            .iter()
+            .map(|requirement| requirement.kind.as_str())
+            .collect();
+        let _ = writeln!(out, "requirements: {}", kinds.join(", "));
+    }
     match info.sizes {
         Some(sizes) => {
             let _ = writeln!(out, "pages:     {}", sizes.len());
@@ -875,6 +909,27 @@ fn info_text(info: &Info) -> String {
     if info.slides > 0 {
         let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
         let _ = writeln!(out, "slides:    {} of {pages} pages", info.slides);
+    }
+    // Viewports with their own measurement scale (ISO 32000-1 §12.9) and
+    // the pages that carry them.
+    let (viewports, viewport_pages) = info.viewports;
+    if viewports > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(
+            out,
+            "viewports: {viewports} on {viewport_pages} of {pages} pages"
+        );
+    }
+    // Pre-separated pages (ISO 32000-1 §14.11.4) and the colorants they
+    // print.
+    if info.separation_pages > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(
+            out,
+            "separations: {} of {pages} pages ({})",
+            info.separation_pages,
+            info.colorants.join(", ")
+        );
     }
     // Article threads and the beads they chain (ISO 32000-1 §12.4.3).
     let (threads, beads) = info.articles;
@@ -1686,6 +1741,73 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("perms"));
+    }
+
+    /// The catalog's requirements print as one line after the permission
+    /// handlers, each by its `/S` name; none prints no line.
+    // Covers ISO 32000-1 §12.10.1.
+    #[test]
+    fn info_text_lists_requirements() {
+        let requirements = [
+            pdfboss_core::Requirement {
+                kind: "EnableJavaScripts".into(),
+                handlers: Vec::new(),
+            },
+            pdfboss_core::Requirement {
+                kind: "Custom".into(),
+                handlers: Vec::new(),
+            },
+        ];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            requirements: &requirements,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("encrypted: false\nrequirements: EnableJavaScripts, Custom\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("requirements"));
+    }
+
+    /// Pages carrying `/VP` viewports print as one line with the viewport
+    /// count and the pages that hold them; none prints no line.
+    // Covers ISO 32000-1 §12.9.
+    #[test]
+    fn info_text_counts_viewports() {
+        let sizes = [Some((612.0, 792.0)); 5];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            viewports: (3, 2),
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 5: 612 x 792 pt\nviewports: 3 on 2 of 5 pages\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("viewports"));
+    }
+
+    /// Pre-separated pages print as one line with the page count and the
+    /// colorants they print; none prints no line.
+    // Covers ISO 32000-1 §14.11.4.
+    #[test]
+    fn info_text_counts_separations() {
+        let sizes = [Some((612.0, 792.0)); 4];
+        let colorants = ["Black".to_string(), "Cyan".to_string()];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            separation_pages: 4,
+            colorants: &colorants,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 4: 612 x 792 pt\nseparations: 4 of 4 pages (Black, Cyan)\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("separations"));
     }
 
     /// A linearized file prints its first page object after the encryption

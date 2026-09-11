@@ -710,10 +710,34 @@ impl Document {
         ))
     }
 
+    /// The viewports of a page's `/VP` array (ISO 32000-1 §12.9), empty
+    /// without one.
+    pub fn viewports(&self, page: &Page) -> Vec<crate::measure::Viewport> {
+        block_on(crate::measure::viewports_with(&Immediate(self), page))
+    }
+
+    /// A page's separation dictionary (ISO 32000-1 §14.11.4), `None` when
+    /// the page has no `/SeparationInfo` naming a colorant.
+    pub fn separation_info(&self, page: &Page) -> Option<crate::separation_info::SeparationInfo> {
+        block_on(crate::separation_info::separation_info_with(
+            &Immediate(self),
+            page,
+        ))
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4), `None` without one.
     pub fn permission_handlers(&self) -> Option<crate::permission::PermissionHandlers> {
         block_on(crate::permission::permission_handlers_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The requirements the catalog's `/Requirements` array lists (ISO
+    /// 32000-1 §12.10.1), empty without one.
+    pub fn requirements(&self) -> Vec<crate::requirement::Requirement> {
+        block_on(crate::requirement::requirements_with(
             &Immediate(self),
             &self.xref.trailer,
         ))

@@ -21,6 +21,7 @@ pub mod hash;
 pub mod language;
 pub mod lexer;
 pub mod linearization;
+pub mod measure;
 pub mod names;
 pub mod object;
 pub mod objstm;
@@ -33,6 +34,8 @@ pub mod permission;
 pub mod piece_info;
 pub mod presentation;
 pub mod pretty;
+pub mod requirement;
+pub mod separation_info;
 pub mod source;
 pub mod structure;
 pub mod thumbnail;
@@ -70,6 +73,9 @@ pub use geom::{Matrix, Point, Rect};
 pub use hash::{FastMap, FastSet, FxHasher};
 pub use language::{language_with, LanguageTag};
 pub use linearization::{linearization_dictionary, Linearization};
+pub use measure::{
+    measure_from, viewports_with, FractionFormat, LabelPosition, Measure, NumberFormat, Viewport,
+};
 pub use names::{name_tree_root_with, named_with, names_with, NameTree};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
 pub use oc::OcState;
@@ -82,6 +88,8 @@ pub use presentation::{
     presentation_with, Dimension, Motion, Presentation, Transition, TransitionDirection,
     TransitionStyle,
 };
+pub use requirement::{requirements_with, Requirement, RequirementHandler};
+pub use separation_info::{separation_info_with, SeparationInfo};
 pub use source::{
     block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
     ObjectSource, MAX_RESOLVE_DEPTH,
