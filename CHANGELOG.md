@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.4.0](https://github.com/4thel00z/pdfboss/compare/v2.3.0...v2.4.0) (2026-09-11)
+
+
+### Features
+
+* **py:** interactive forms and the catalog readers in the Python bindings ([#183](https://github.com/4thel00z/pdfboss/issues/183)) ([2f36672](https://github.com/4thel00z/pdfboss/commit/2f36672971dd098e5716ca22968b02d4cae98dc7))
+* read document-level structures and variable text fields (ISO 32000 batch 11) ([#179](https://github.com/4thel00z/pdfboss/issues/179)) ([9cd12fa](https://github.com/4thel00z/pdfboss/commit/9cd12fae26379f7c69a69da22266e441b4fc468c))
+
+
+### Bug Fixes
+
+* CFF built-in encodings, standard-14 span widths, FontBBox span boxes ([#185](https://github.com/4thel00z/pdfboss/issues/185)) ([2aba07c](https://github.com/4thel00z/pdfboss/commit/2aba07c27cc184538f504f78cc18343b9792d6a0))
+* **py:** copy bytes arguments as one buffer, not element by element ([#187](https://github.com/4thel00z/pdfboss/issues/187)) ([d778e24](https://github.com/4thel00z/pdfboss/commit/d778e246eb0b18a2f0f33a2356b1919e19317265))
+
 ## [2.3.0](https://github.com/4thel00z/pdfboss/compare/v2.2.0...v2.3.0) (2026-09-10)
 
 
