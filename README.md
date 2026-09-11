@@ -74,6 +74,7 @@ png  = doc[0].render(scale=2.0)            # PNG bytes; format="ppm"/"bmp" for r
 imgs = doc[0].extract_images()             # embedded images: .data (PNG), .width, .height
 fields = doc.form_fields()                 # interactive form: .name, .field_type, .text, .checked, .selected
 toc  = doc.outline()                       # bookmarks: .title, .page, .children; also page_labels(), embedded_files()
+intents = doc.output_intents()             # also is_linearized(), articles(), permission_handlers(), doc[0].thumbnail_image(), doc[0].presentation()
 pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```
 
