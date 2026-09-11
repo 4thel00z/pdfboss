@@ -1591,6 +1591,20 @@ mod tests {
         assert!(md.contains("5. Item number 5 of the list"), "md: {md}");
     }
 
+    /// A two-column table set inside a numbered item's one-lane stretch is
+    /// found on its own: the item's stretch settles only the starts that
+    /// leave the item's lane.
+    #[test]
+    fn a_two_column_table_inside_a_numbered_item_is_found() {
+        let md = markdown_of(&structure::tests::list_then_two_column_table_content());
+        assert!(md.contains("| Loss Costs | GL-2013-BGL1 |"), "md: {md}");
+        assert!(md.contains("| Loss Costs | CR-2007-RLA1 |"), "md: {md}");
+        assert!(
+            md.contains("1. Adopt the following reference filings:"),
+            "md: {md}"
+        );
+    }
+
     /// A table of contents whose front matter counts pages in roman
     /// numerals and whose parts are headed by a line of words alone is
     /// prose, not a two-column table.

@@ -3293,15 +3293,19 @@ fn table_band(groups: &[Group]) -> Option<TableBand> {
     }
     // No stretch keeps two lanes: a two-column table is looked for next,
     // and [`pair_table`] asks more of it. A one-lane stretch that is no
-    // table settles the starts inside it too: they read the same rows, and
-    // a page of indented paragraphs would otherwise pay a grid attempt per
-    // line.
-    let mut settled = 0usize;
+    // table settles the starts inside it that leave the same lane: they
+    // read the same rows, and a page of indented paragraphs would otherwise
+    // pay a grid attempt per line. A start leaving another lane, a table
+    // standing inside a numbered item's stretch, is tried on its own.
+    let mut settled: Option<(usize, Vec<std::ops::Range<f32>>)> = None;
     for (start, run, min_gap) in pairs {
-        if start < settled {
+        if settled
+            .as_ref()
+            .is_some_and(|(until, lanes)| start < *until && same_lanes(lanes, &run.lanes))
+        {
             continue;
         }
-        settled = run.end;
+        settled = Some((run.end, run.lanes.clone()));
         let Some(band) = grid(groups, start, run.end, &run.lanes, min_gap, 1) else {
             continue;
         };
@@ -3310,6 +3314,15 @@ fn table_band(groups: &[Group]) -> Option<TableBand> {
         }
     }
     None
+}
+
+/// True when two lane sets are the same lanes: as many, each pair of them
+/// overlapping.
+fn same_lanes(a: &[std::ops::Range<f32>], b: &[std::ops::Range<f32>]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.start < y.end && y.start < x.end)
 }
 
 /// The rows a two-column band must populate on both sides: one lane is
@@ -6836,6 +6849,36 @@ pub(crate) mod tests {
             );
         }
         content += "ET";
+        content
+    }
+
+    /// A numbered item whose marker stands a lane from its text, then a
+    /// two-column table set in from the margin, then a line of prose: the
+    /// marker's lane stays clear through the table, so the item's one-lane
+    /// stretch covers the table's, while the table's own lane lies
+    /// elsewhere.
+    pub(crate) fn list_then_two_column_table_content() -> String {
+        let mut content = String::from(
+            "BT /F1 10 Tf 1 0 0 1 54 700 Tm (1.) Tj 1 0 0 1 72 700 Tm (Adopt the following reference filings:) Tj \
+             1 0 0 1 90 680 Tm (Description) Tj 1 0 0 1 262 680 Tm (Number) Tj ",
+        );
+        for (index, code) in [
+            "GL-2013-BGL1",
+            "CF-2013-RLA1",
+            "CF-2012-RLA1",
+            "CF-2011-RLA1",
+            "CF-2010-RLA1",
+            "CR-2007-RLA1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 666.0 - 14.0 * index as f32;
+            content +=
+                &format!("1 0 0 1 90 {y} Tm (Loss Costs) Tj 1 0 0 1 230 {y} Tm ({code}) Tj ");
+        }
+        content +=
+            "1 0 0 1 54 560 Tm (Note that we have not written a full year of premium yet.) Tj ET";
         content
     }
 
