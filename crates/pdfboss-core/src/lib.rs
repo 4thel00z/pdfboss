@@ -29,6 +29,7 @@ pub mod outline;
 pub mod output_intent;
 pub mod page_label;
 pub mod parser;
+pub mod permission;
 pub mod piece_info;
 pub mod presentation;
 pub mod pretty;
@@ -75,6 +76,7 @@ pub use oc::OcState;
 pub use outline::{outline_with, OutlineItem};
 pub use output_intent::{output_intents_with, OutputIntent};
 pub use page_label::{page_label, page_labels_with, LabelStyle, PageLabel};
+pub use permission::{permission_handlers_with, PermissionHandlers};
 pub use piece_info::{document_piece_info_with, piece_info_with, PagePiece};
 pub use presentation::{
     presentation_with, Dimension, Motion, Presentation, Transition, TransitionDirection,

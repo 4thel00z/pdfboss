@@ -1561,6 +1561,13 @@ impl AsyncDocument {
         pdfboss_core::presentation_with(self, page).await
     }
 
+    /// The permission handlers of the catalog's `/Perms` dictionary (ISO
+    /// 32000-1 §12.8.4): the async twin of the sync document's
+    /// `permission_handlers`.
+    pub async fn permission_handlers(&self) -> Option<pdfboss_core::PermissionHandlers> {
+        pdfboss_core::permission_handlers_with(self, &self.inner.xref.trailer).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

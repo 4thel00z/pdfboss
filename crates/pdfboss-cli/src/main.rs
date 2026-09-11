@@ -708,6 +708,14 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 threads.iter().map(|thread| thread.beads.len()).sum(),
             );
             let linearization = doc.linearization();
+            let handlers = doc.permission_handlers();
+            let mut perms = Vec::new();
+            if handlers.as_ref().is_some_and(|h| h.doc_mdp.is_some()) {
+                perms.push("DocMDP");
+            }
+            if handlers.as_ref().is_some_and(|h| h.usage_rights.is_some()) {
+                perms.push("UR3");
+            }
             print!(
                 "{}",
                 info_text(&Info {
@@ -722,6 +730,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     thumbnails,
                     slides,
                     articles,
+                    perms: &perms,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -757,7 +766,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// or a page, sorted and without repeats. `thumbnails` counts the pages
 /// that carry a thumbnail image. `slides` counts the pages with a display
 /// duration or a transition. `articles` counts the article threads and
-/// their beads. `linearization` is the
+/// their beads. `perms` names the permission handlers the catalog's
+/// `/Perms` dictionary carries. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
 /// not linearized.
@@ -774,6 +784,7 @@ struct Info<'a> {
     thumbnails: usize,
     slides: usize,
     articles: (usize, usize),
+    perms: &'a [&'a str],
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -830,6 +841,11 @@ fn info_text(info: &Info) -> String {
                 record.file_length
             );
         }
+    }
+    // The permission handlers of the catalog's /Perms dictionary (ISO
+    // 32000-1 §12.8.4): read, neither verified nor enforced.
+    if !info.perms.is_empty() {
+        let _ = writeln!(out, "perms:     {}", info.perms.join(", "));
     }
     match info.sizes {
         Some(sizes) => {
@@ -1653,6 +1669,23 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("slides"));
+    }
+
+    /// The permission handlers of the catalog's `/Perms` dictionary print
+    /// as one line after the encryption line; none prints no line.
+    // Covers ISO 32000-1 §12.8.4.
+    #[test]
+    fn info_text_lists_permission_handlers() {
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            perms: &["DocMDP", "UR3"],
+            ..Info::default()
+        });
+        assert!(
+            report.contains("encrypted: false\nperms:     DocMDP, UR3\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("perms"));
     }
 
     /// A linearized file prints its first page object after the encryption

@@ -710,6 +710,15 @@ impl Document {
         ))
     }
 
+    /// The permission handlers of the catalog's `/Perms` dictionary (ISO
+    /// 32000-1 §12.8.4), `None` without one.
+    pub fn permission_handlers(&self) -> Option<crate::permission::PermissionHandlers> {
+        block_on(crate::permission::permission_handlers_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

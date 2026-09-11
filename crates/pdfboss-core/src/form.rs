@@ -411,6 +411,36 @@ pub struct Signature {
     pub contact_info: Option<String>,
 }
 
+impl Signature {
+    /// The Table 252 entries of a signature dictionary as data: the filter
+    /// and sub-filter names, the byte range pairs, the contents bytes, and
+    /// the signer's name, time, location, reason and contact information as
+    /// text strings. Nothing is verified. The same reader serves a signature
+    /// field's `/V` (§12.7.4.5) and the catalog's permission handlers
+    /// (§12.8.4).
+    ///
+    /// Covers ISO 32000-1 §12.8.1.
+    pub fn from_dict(dict: &Dict) -> Signature {
+        let text = |key: &str| Some(decode_text_string(dict.get(key)?.as_str_bytes()?));
+        let name = |key: &str| Some(dict.get_name(key)?.0.clone());
+        Signature {
+            filter: name("Filter"),
+            sub_filter: name("SubFilter"),
+            byte_range: byte_range(dict.get("ByteRange")),
+            contents: dict
+                .get("Contents")
+                .and_then(Object::as_str_bytes)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            name: text("Name"),
+            signing_time: text("M"),
+            location: text("Location"),
+            reason: text("Reason"),
+            contact_info: text("ContactInfo"),
+        }
+    }
+}
+
 /// One entry of a choice field's `/Opt` array (ISO 32000-1 §12.7.4.4,
 /// Table 231): the value exported for the option and the text shown for
 /// it. A lone text string in the array is both.
@@ -558,24 +588,7 @@ impl FormField {
         if self.field_type != Some(FieldType::Signature) {
             return None;
         }
-        let dict = self.value.as_ref()?.as_dict()?;
-        let text = |key: &str| Some(decode_text_string(dict.get(key)?.as_str_bytes()?));
-        let name = |key: &str| Some(dict.get_name(key)?.0.clone());
-        Some(Signature {
-            filter: name("Filter"),
-            sub_filter: name("SubFilter"),
-            byte_range: byte_range(dict.get("ByteRange")),
-            contents: dict
-                .get("Contents")
-                .and_then(Object::as_str_bytes)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default(),
-            name: text("Name"),
-            signing_time: text("M"),
-            location: text("Location"),
-            reason: text("Reason"),
-            contact_info: text("ContactInfo"),
-        })
+        Some(Signature::from_dict(self.value.as_ref()?.as_dict()?))
     }
 
     /// The names of a choice field's selected options (ISO 32000-1

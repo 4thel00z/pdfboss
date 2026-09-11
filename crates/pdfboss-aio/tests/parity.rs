@@ -50,7 +50,7 @@ fn outline_doc() -> Vec<u8> {
          /OutputIntents [ << /Type /OutputIntent /S /GTS_PDFA1 \
          /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
          /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
-         /Threads [13 0 R] \
+         /Threads [13 0 R] /Perms << /DocMDP 15 0 R >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -61,6 +61,11 @@ fn outline_doc() -> Vec<u8> {
          /B [14 0 R] /Dur 5 /Trans << /S /Split /Dm /V /M /O /D 3.5 >> >>",
     );
     b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
+    b.object(
+        15,
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached \
+         /ByteRange [0 10 20 30] /Contents <0102> /Name (Certifier) >>",
+    );
     b.object(
         14,
         "<< /T 13 0 R /N 14 0 R /V 14 0 R /P 3 0 R /R [0 0 10 10] >>",
@@ -330,6 +335,20 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                 shown.transition.map(|t| t.style),
                 Some(pdfboss_core::TransitionStyle::Split)
             );
+        }
+        // Covers ISO 32000-1 §12.8.4.
+        assert_eq!(
+            doc.permission_handlers().await,
+            sync_doc.permission_handlers(),
+            "{name}: permission handlers"
+        );
+        if name == "outline" {
+            let handlers = sync_doc.permission_handlers().unwrap();
+            assert_eq!(
+                handlers.doc_mdp.as_ref().and_then(|s| s.name.as_deref()),
+                Some("Certifier")
+            );
+            assert_eq!(handlers.usage_rights, None);
         }
         for index in 0..=doc.page_count() {
             assert_eq!(
