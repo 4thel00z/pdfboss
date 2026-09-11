@@ -1605,6 +1605,22 @@ mod tests {
         );
     }
 
+    /// A row repeating the head's years over a new first head opens a
+    /// second table: two tables at one pitch are two, not one.
+    #[test]
+    fn a_row_repeating_the_head_opens_a_second_table() {
+        let md = markdown_of(&structure::tests::two_tables_repeating_their_head_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert!(
+            md.contains("| At year end | 2018 | 2017 |\n| --- | --- | --- |\n| Total assets |"),
+            "md: {md}"
+        );
+    }
+
     /// A table of contents whose front matter counts pages in roman
     /// numerals and whose parts are headed by a line of words alone is
     /// prose, not a two-column table.

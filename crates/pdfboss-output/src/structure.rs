@@ -798,6 +798,20 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     let title = title_rows(groups, &band, stats);
     band.rows.drain(..title);
     band.span.start += title;
+    // A row repeating the band's head opens a second table: a report sets
+    // two tables one under the other, each headed by the same years, and
+    // one lane run holds both. The rows from the repeated head on go back
+    // to the attempt below, where the second table finds its own head.
+    if let Some(split) = repeated_head(&band.rows) {
+        let y = row_y(&band.rows[split]);
+        let cut = groups[band.span.clone()]
+            .iter()
+            .position(|group| group.y <= y + 0.5 * group.size);
+        if let Some(cut) = cut {
+            band.rows.truncate(split);
+            band.span.end = band.span.start + cut;
+        }
+    }
     // What stands below the grid gets the same attempt, as do the lines of
     // its own run the stretch trimmed off above it: a page's second table
     // is as much a table as its first, and the longest evenly pitched
@@ -811,6 +825,60 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
         rows: band.rows,
     });
     push_lane_blocks(&groups[band.span.end..], stats, out);
+}
+
+/// The index of the first row past the head that repeats it: two or more
+/// of its cells beyond the first column spell the head's cells at the same
+/// columns, and none spells anything else. The first table keeps at least
+/// [`TABLE_MIN_ROWS`] rows.
+fn repeated_head(rows: &[Vec<Cell>]) -> Option<usize> {
+    let head = column_texts(rows.first()?);
+    // The head's cells are its own: the first row below it spelling any of
+    // them in the same column must spell them all, and stand under three
+    // rows or more. A rate table whose every row repeats the same factors,
+    // or a vehicle list whose rows share a body type and a fuel, repeats
+    // data, not a head.
+    for (index, row) in rows.iter().enumerate().skip(1) {
+        let row = column_texts(row);
+        let pairs = head.iter().zip(&row).skip(1);
+        let matched = pairs.clone().filter(|(h, r)| h.is_some() && h == r).count();
+        if matched == 0 {
+            continue;
+        }
+        let repeats =
+            matched >= TABLE_MIN_ROW_CELLS && pairs.clone().all(|(h, r)| r.is_none() || h == r);
+        return (repeats && index >= TABLE_MIN_ROWS).then_some(index);
+    }
+    None
+}
+
+/// Each column's text in the row, whitespace collapsed; a spanning cell's
+/// text stands at its first column and the columns it covers hold none.
+fn column_texts(row: &[Cell]) -> Vec<Option<String>> {
+    let mut texts = Vec::with_capacity(row.len());
+    for cell in row {
+        let text = cell.line.as_ref().filter(|_| inked_cell(cell)).map(|line| {
+            line_text(line)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        texts.push(text);
+        for _ in 1..cell.colspan {
+            texts.push(None);
+        }
+    }
+    texts
+}
+
+/// The baseline of the row's first inked cell, or of its first cell with a
+/// line when none is inked.
+fn row_y(row: &[Cell]) -> f32 {
+    row.iter()
+        .find(|cell| inked_cell(cell))
+        .or_else(|| row.iter().find(|cell| cell.line.is_some()))
+        .and_then(|cell| cell.line.as_ref())
+        .map_or(f32::NEG_INFINITY, |line| line.y)
 }
 
 /// A remainder stretch between grid claims, through the same lane attempt
@@ -2894,6 +2962,23 @@ fn grid_claim(
     // A band holding nothing but whitespace spans is the page's padding,
     // not a row: a row of blank cells says nothing.
     rows.retain(|row| row.iter().any(inked_cell));
+    // A claim grown over unruled lines stops short of a line repeating its
+    // head: the second table under the same years is its own, and its rules
+    // claim it in turn.
+    let mut end = end;
+    if grid.open && end > hi {
+        if let Some(split) = repeated_head(&rows) {
+            let y = row_y(&rows[split]);
+            let cut = groups[top..end]
+                .iter()
+                .position(|group| group.y <= y + 0.5 * group.size)
+                .map(|cut| top + cut);
+            if let Some(cut) = cut.filter(|cut| *cut >= hi) {
+                rows.truncate(split);
+                end = cut;
+            }
+        }
+    }
     // An open lattice chains the rules of two tables set to the same
     // columns, and the prose between the tables lies inside the drawn
     // width and reads as one cell over every column. A row like that
@@ -7076,6 +7161,28 @@ pub(crate) mod tests {
         }
         content +=
             "1 0 0 1 54 560 Tm (Note that we have not written a full year of premium yet.) Tj ET";
+        content
+    }
+
+    /// Two three-column lane tables one under the other at one pitch, each
+    /// headed by the years 2018 and 2017 over a different first head.
+    pub(crate) fn two_tables_repeating_their_head_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (y, label, a, b) in [
+            (700.0, "Item", "2018", "2017"),
+            (686.0, "Revenue", "79,591", "79,139"),
+            (672.0, "Net income", "8,728", "5,753"),
+            (658.0, "Basic", "9.56", "6.17"),
+            (644.0, "At year end", "2018", "2017"),
+            (630.0, "Total assets", "123,382", "125,356"),
+            (616.0, "Total debt", "45,812", "46,824"),
+            (602.0, "Total equity", "16,929", "17,725"),
+        ] {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm ({label}) Tj 1 0 0 1 300 {y} Tm ({a}) Tj 1 0 0 1 380 {y} Tm ({b}) Tj "
+            );
+        }
+        content += "ET";
         content
     }
 
