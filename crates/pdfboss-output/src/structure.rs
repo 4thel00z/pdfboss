@@ -2236,7 +2236,7 @@ const OPEN_RULED_EVEN_STACK_RATIO: f32 = 1.15;
 /// and only splitting tells them apart. Rules inside a drawn lattice are
 /// the lattice's own and never seed a cluster.
 fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid]) -> Vec<RuledGrid> {
-    let mut horizontals: Vec<(f32, f32, f32)> = rulings
+    let horizontals: Vec<(f32, f32, f32)> = rulings
         .iter()
         .filter(|r| (r.end.x - r.start.x).abs() >= (r.end.y - r.start.y).abs())
         .map(|r| (r.start.y, r.start.x.min(r.end.x), r.start.x.max(r.end.x)))
@@ -2253,7 +2253,8 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
     if horizontals.len() < 2 || horizontals.len() > OPEN_RULED_MAX_RULES {
         return Vec::new();
     }
-    horizontals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Joined, and so sorted by y.
+    let horizontals = joined_rules(horizontals);
     // Every candidate region is a y-range query over the page's inked
     // spans; one ascending sort serves them all, built the first time a
     // cluster asks for it, and a whitespace-only span is out of every
@@ -2292,6 +2293,36 @@ fn open_ruled_grids(spans: &[TextSpan], rulings: &[Ruling], taken: &[RuledGrid])
         open_ruled_split(inked, &ys, seed_x0, seed_x1, taken, &mut grids);
     }
     grids
+}
+
+/// How far apart, in points, two collinear rule segments may end and begin
+/// and still be one drawn rule: a producer draws a table's rule cell by
+/// cell, each segment meeting the next end to end, where the underlines
+/// of separate column heads leave the gutter between them unruled.
+const RULE_JOIN_GAP: f32 = 1.0;
+
+/// `rules` as `(y, x0, x1)` with the segments of one drawn rule joined:
+/// collinear within [`RULE_JOIN_GAP`], each meeting the last within it.
+fn joined_rules(mut rules: Vec<(f32, f32, f32)>) -> Vec<(f32, f32, f32)> {
+    rules.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let mut joined: Vec<(f32, f32, f32)> = Vec::with_capacity(rules.len());
+    for rule in rules {
+        // The dots and dashes of a leader line meet end to end too, and
+        // are no rule joined: only a segment at least a snap long joins.
+        let segment = rule.2 - rule.1 >= RULING_SNAP_TOLERANCE;
+        match joined.last_mut() {
+            Some(last)
+                if segment
+                    && last.2 - last.1 >= RULING_SNAP_TOLERANCE
+                    && (rule.0 - last.0).abs() <= RULE_JOIN_GAP
+                    && rule.1 <= last.2 + RULE_JOIN_GAP =>
+            {
+                last.2 = last.2.max(rule.2);
+            }
+            _ => joined.push(rule),
+        }
+    }
+    joined
 }
 
 /// True for [`OPEN_RULED_EVEN_STACK`] or more rules at near-identical gaps:
@@ -5408,6 +5439,27 @@ pub(crate) mod tests {
             end: pdfboss_core::Point { x: x1, y },
             width: 0.5,
         }
+    }
+
+    /// A rule drawn in segments meeting end to end is one rule; the
+    /// underlines of two column heads, a gutter apart, stay two.
+    #[test]
+    fn rule_segments_meeting_end_to_end_join() {
+        let joined = joined_rules(vec![
+            (732.8, 495.0, 537.8),
+            (612.0, 100.0, 147.0),
+            (732.8, 324.0, 495.0),
+            (612.0, 10.0, 95.0),
+            (732.8, 537.8, 576.0),
+        ]);
+        assert_eq!(
+            joined,
+            vec![
+                (612.0, 10.0, 95.0),
+                (612.0, 100.0, 147.0),
+                (732.8, 324.0, 576.0)
+            ]
+        );
     }
 
     /// A page buried in stacked aligned rules — graph paper, a form's
