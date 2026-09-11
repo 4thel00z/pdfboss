@@ -752,9 +752,11 @@ fn push_segment_blocks(
     let mut next = 0usize;
     for claim in claims {
         push_stretch(&groups[next..claim.range.start], stats, order, out);
+        let mut rows = claim.rows;
+        tidy_amounts(&mut rows);
         out.push(Block::Table {
             bbox: claim.bbox,
-            rows: claim.rows,
+            rows,
         });
         next = claim.range.end;
     }
@@ -779,9 +781,11 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
         stats,
         out,
     );
+    let mut rows = band.rows;
+    tidy_amounts(&mut rows);
     out.push(Block::Table {
-        bbox: table_bbox(&band.rows),
-        rows: band.rows,
+        bbox: table_bbox(&rows),
+        rows,
     });
     // What stands below the grid gets the same attempt: a page's second
     // table is as much a table as its first.
@@ -3068,6 +3072,237 @@ fn populated_cells(row: &[Cell]) -> usize {
     row.iter().filter(|cell| cell.line.is_some()).count()
 }
 
+/// Currency signs a producer sets left-aligned in a column of their own,
+/// ahead of the right-aligned amounts they belong to.
+const AMOUNT_SIGNS: [char; 4] = ['$', '€', '£', '¥'];
+/// Closers a producer sets at a fixed position after the amount: the ")"
+/// of a negative "(1,234" and the "%" of a rate.
+const AMOUNT_CLOSERS: [char; 2] = [')', '%'];
+
+/// Rejoins amounts their producer split across cells. A sign standing alone
+/// in a cell or trailing the amount to its left moves onto the amount to
+/// its right, as "$1,824"; a closer opening a cell moves onto the amount to
+/// its left, as "(1,234)" and "12%"; and inside a cell the space before a
+/// closer goes. A column that held nothing but signs is then blank in every
+/// row, and is no column.
+fn tidy_amounts(rows: &mut Vec<Vec<Cell>>) {
+    let mut emptied: Vec<usize> = Vec::new();
+    for row in rows.iter_mut() {
+        let mut starts = Vec::with_capacity(row.len());
+        let mut column = 0usize;
+        for cell in row.iter() {
+            starts.push(column);
+            column += cell.colspan as usize;
+        }
+        let filled: Vec<usize> = (0..row.len())
+            .filter(|index| row[*index].line.is_some())
+            .collect();
+        for (k, &index) in filled.iter().enumerate() {
+            if k > 0 {
+                let left = filled[k - 1];
+                if let Some(closer) = opening_closer(&row[index]) {
+                    if ends_with_digit(&row[left]) {
+                        strip_leading(&mut row[index], closer);
+                        append_char(&mut row[left], closer);
+                    }
+                }
+            }
+            if k + 1 < filled.len() {
+                let right = filled[k + 1];
+                if let Some(sign) = trailing_sign(&row[index]) {
+                    if opens_amount(&row[right]) {
+                        strip_trailing(&mut row[index], sign);
+                        prepend_char(&mut row[right], sign);
+                    }
+                }
+            }
+            close_gaps(&mut row[index]);
+        }
+        for (index, cell) in row.iter_mut().enumerate() {
+            let Some(line) = &cell.line else {
+                continue;
+            };
+            if line.inlines.iter().all(|inline| blank(&inline.text)) {
+                cell.line = None;
+                emptied.push(starts[index]);
+            }
+        }
+    }
+    emptied.sort_unstable();
+    emptied.dedup();
+    for column in emptied.into_iter().rev() {
+        if column_is_blank(rows, column) {
+            remove_column(rows, column);
+        }
+    }
+}
+
+fn cell_text(cell: &Cell) -> String {
+    cell.line.as_ref().map(line_text).unwrap_or_default()
+}
+
+/// The closer a cell opens with, standing alone or a space ahead of the rest.
+fn opening_closer(cell: &Cell) -> Option<char> {
+    let text = cell_text(cell);
+    let text = text.trim_start();
+    AMOUNT_CLOSERS.into_iter().find(|closer| {
+        text.strip_prefix(*closer)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    })
+}
+
+/// The sign a cell ends with, standing alone or a space after the rest.
+fn trailing_sign(cell: &Cell) -> Option<char> {
+    let text = cell_text(cell);
+    let text = text.trim_end();
+    AMOUNT_SIGNS.into_iter().find(|sign| {
+        text.strip_suffix(*sign)
+            .is_some_and(|rest| rest.is_empty() || rest.ends_with(' '))
+    })
+}
+
+fn ends_with_digit(cell: &Cell) -> bool {
+    cell_text(cell)
+        .trim_end()
+        .ends_with(|c: char| c.is_ascii_digit())
+}
+
+/// True when the cell reads as an amount: a digit, an opening parenthesis,
+/// or a dash standing for nil.
+fn opens_amount(cell: &Cell) -> bool {
+    cell_text(cell).trim_start().starts_with(|c: char| {
+        c.is_ascii_digit() || matches!(c, '(' | '-' | '\u{2013}' | '\u{2014}')
+    })
+}
+
+/// Takes `token` and the space after it off the front of the cell's text.
+fn strip_leading(cell: &mut Cell, token: char) {
+    let Some(line) = cell.line.as_mut() else {
+        return;
+    };
+    let Some(index) = line.inlines.iter().position(|inline| !blank(&inline.text)) else {
+        return;
+    };
+    let text = line.inlines[index].text.trim_start();
+    let rest = text
+        .strip_prefix(token)
+        .unwrap_or(text)
+        .trim_start()
+        .to_string();
+    if rest.is_empty() {
+        line.inlines.remove(index);
+        return;
+    }
+    line.inlines[index].text = rest;
+}
+
+/// Takes `token` and the space before it off the end of the cell's text.
+fn strip_trailing(cell: &mut Cell, token: char) {
+    let Some(line) = cell.line.as_mut() else {
+        return;
+    };
+    let Some(index) = line.inlines.iter().rposition(|inline| !blank(&inline.text)) else {
+        return;
+    };
+    let text = line.inlines[index].text.trim_end();
+    let rest = text
+        .strip_suffix(token)
+        .unwrap_or(text)
+        .trim_end()
+        .to_string();
+    if rest.is_empty() {
+        line.inlines.remove(index);
+        return;
+    }
+    line.inlines[index].text = rest;
+}
+
+fn prepend_char(cell: &mut Cell, token: char) {
+    let Some(line) = cell.line.as_mut() else {
+        return;
+    };
+    let Some(inline) = line.inlines.iter_mut().find(|inline| !blank(&inline.text)) else {
+        return;
+    };
+    inline.text = format!("{token}{}", inline.text.trim_start());
+}
+
+fn append_char(cell: &mut Cell, token: char) {
+    let Some(line) = cell.line.as_mut() else {
+        return;
+    };
+    let Some(inline) = line.inlines.iter_mut().rfind(|inline| !blank(&inline.text)) else {
+        return;
+    };
+    let kept = inline.text.trim_end().len();
+    inline.text.truncate(kept);
+    inline.text.push(token);
+}
+
+/// Closes the space a producer set between an amount and its closer, so
+/// "(1,234 )" and "12 %" read "(1,234)" and "12%".
+fn close_gaps(cell: &mut Cell) {
+    let Some(line) = cell.line.as_mut() else {
+        return;
+    };
+    for inline in &mut line.inlines {
+        if !inline.text.contains(' ') {
+            continue;
+        }
+        let mut out = String::with_capacity(inline.text.len());
+        for c in inline.text.chars() {
+            if AMOUNT_CLOSERS.contains(&c) {
+                let kept = out.trim_end();
+                if kept.len() < out.len() && kept.ends_with(|d: char| d.is_ascii_digit()) {
+                    out.truncate(kept.len());
+                }
+            }
+            out.push(c);
+        }
+        inline.text = out;
+    }
+}
+
+/// True when no row puts ink in `column`: every cell starting there has no
+/// line, and a cell reaching over it from the left carries its text
+/// elsewhere.
+fn column_is_blank(rows: &[Vec<Cell>], column: usize) -> bool {
+    rows.iter().all(|row| {
+        let mut start = 0usize;
+        for cell in row {
+            let end = start + cell.colspan as usize;
+            if start == column {
+                return cell.line.is_none();
+            }
+            if start < column && column < end {
+                return true;
+            }
+            start = end;
+        }
+        true
+    })
+}
+
+/// Takes `column` out of every row: a cell standing in it alone goes, a
+/// cell reaching over it narrows by one.
+fn remove_column(rows: &mut [Vec<Cell>], column: usize) {
+    for row in rows.iter_mut() {
+        let mut start = 0usize;
+        for index in 0..row.len() {
+            let width = row[index].colspan as usize;
+            if start == column && width == 1 {
+                row.remove(index);
+                break;
+            }
+            if start <= column && column < start + width {
+                row[index].colspan -= 1;
+                break;
+            }
+            start += width;
+        }
+    }
+}
+
 /// The table's device-space box: every populated cell's line.
 fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
     bbox(rows.iter().flatten().filter_map(|cell| cell.line.as_ref()))
@@ -5095,6 +5330,46 @@ pub(crate) mod tests {
         }
         content += "ET";
         content
+    }
+
+    /// A financial statement's rows: a label, then each amount set as a
+    /// left-aligned "$" in a column of its own and the digits far to its
+    /// right, closer to the next "$" than to their own.
+    pub(crate) fn currency_columns_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        let rows = [
+            ("Gross", 700.0, ["1,824", "1,889", "1,978"]),
+            ("Net", 680.0, ["1,702", "1,777", "1,840"]),
+            ("Paid", 660.0, ["122", "112", "138"]),
+        ];
+        for (label, y, amounts) in rows {
+            content += &format!("1 0 0 1 72 {y} Tm ({label}) Tj ");
+            for (amount, (sign_x, amount_x)) in
+                amounts
+                    .iter()
+                    .zip([(250.0, 275.0), (303.0, 330.0), (358.0, 385.0)])
+            {
+                content += &format!(
+                    "1 0 0 1 {sign_x} {y} Tm ($) Tj 1 0 0 1 {amount_x} {y} Tm ({amount}) Tj "
+                );
+            }
+        }
+        content += "ET";
+        content
+    }
+
+    /// Negative amounts and a rate whose closers stand apart: a ")" a lane
+    /// away from its "(1,234", a ")" a word gap after its "(5", and a "%"
+    /// in the ")" column after "12".
+    pub(crate) fn split_closers_content() -> String {
+        String::from(
+            "BT /F1 10 Tf \
+             1 0 0 1 72 700 Tm (Loss) Tj 1 0 0 1 275 700 Tm (\\(1,234) Tj 1 0 0 1 312 700 Tm (\\)) Tj \
+             1 0 0 1 400 700 Tm (\\(5) Tj 1 0 0 1 412 700 Tm (\\)) Tj \
+             1 0 0 1 72 680 Tm (Gain) Tj 1 0 0 1 275 680 Tm (1,889) Tj 1 0 0 1 400 680 Tm (7) Tj \
+             1 0 0 1 72 660 Tm (Rate) Tj 1 0 0 1 275 660 Tm (12) Tj 1 0 0 1 312 660 Tm (%) Tj \
+             1 0 0 1 400 660 Tm (3) Tj ET",
+        )
     }
 
     /// Two lane grids of three rows each, one well below the other, with

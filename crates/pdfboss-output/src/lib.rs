@@ -1450,6 +1450,39 @@ mod tests {
         assert!(!md.contains("| Symbols |"), "title is not a row: {md}");
     }
 
+    /// A "$" set in its own column, left-aligned ahead of a right-aligned
+    /// amount, belongs to that amount: the cells read "$1,824", and the
+    /// column the signs stood in is gone.
+    #[test]
+    fn currency_signs_rejoin_their_amounts() {
+        let md = markdown_of(&structure::tests::currency_columns_content());
+        assert!(
+            md.contains("| Gross | $1,824 | $1,889 | $1,978 |"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("| Net | $1,702 | $1,777 | $1,840 |"),
+            "md: {md}"
+        );
+        assert!(md.contains("| Paid | $122 | $112 | $138 |"), "md: {md}");
+        assert!(
+            md.contains("| --- | --- | --- | --- |"),
+            "four columns: {md}"
+        );
+        assert!(!md.contains("| $ |"), "no sign column: {md}");
+    }
+
+    /// A ")" or "%" set apart from its amount, in the next cell or a word
+    /// gap away, closes the amount: "(1,234)", "(5)" and "12%".
+    #[test]
+    fn closers_rejoin_their_amounts() {
+        let md = markdown_of(&structure::tests::split_closers_content());
+        assert!(md.contains("| Loss | (1,234) | (5) |"), "md: {md}");
+        assert!(md.contains("| Gain | 1,889 | 7 |"), "md: {md}");
+        assert!(md.contains("| Rate | 12% | 3 |"), "md: {md}");
+        assert!(md.contains("| --- | --- | --- |"), "three columns: {md}");
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]
