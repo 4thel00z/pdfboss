@@ -2150,6 +2150,16 @@ mod tests {
         assert!(md.contains("<td>a3</td><td>b3</td>"), "md: {md}");
     }
 
+    /// A rule falling in the gap between two glyphs of one word leaves the
+    /// word one cell over both columns, as it does when it runs through a
+    /// glyph.
+    #[test]
+    fn a_rule_between_two_glyphs_of_a_word_keeps_the_word_whole() {
+        let md = markdown_of_drawn(&structure::tests::glyph_gap_on_rule_content());
+        assert!(md.contains("<td colspan=\"2\">swim</td>"), "md: {md}");
+        assert!(md.contains("<td>a3</td><td>b3</td>"), "md: {md}");
+    }
+
     /// A currency sign floating four points left of the vertical rule its
     /// amount stands behind belongs to the amount's column, not the label's.
     #[test]
@@ -2323,14 +2333,16 @@ mod tests {
         );
     }
 
-    /// A grid boundary inside a sub-word gap would split a word the flat
-    /// flow writes whole: the grid is rejected and the segment stays prose.
+    /// A grid boundary inside a sub-word gap never splits a word the flat
+    /// flow writes whole: the word is one cell over both columns.
     #[test]
-    fn a_ruling_inside_a_sub_word_gap_rejects_the_grid() {
+    fn a_ruling_inside_a_sub_word_gap_keeps_the_word_whole() {
         let md = markdown_of_drawn(&structure::tests::ruled_sub_word_gap_content());
-        assert!(!md.contains('|'), "no table: {md}");
-        assert!(!md.contains("<table>"), "no table: {md}");
-        assert!(md.contains("world"), "the word survives whole: {md}");
+        assert!(
+            md.contains("<td colspan=\"2\">world</td>"),
+            "one cell: {md}"
+        );
+        assert!(!md.contains("worl</td>"), "the word survives whole: {md}");
     }
 
     /// The spans-only entry points delegate with no rulings: a page whose

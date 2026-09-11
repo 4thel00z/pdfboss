@@ -20,6 +20,10 @@ const WORD_GAP: f32 = 0.15;
 /// word or a sentence: a floating currency sign stands an em or more from
 /// the label to its left, a word gap is a quarter of one.
 const CELL_GAP: f32 = 1.0;
+/// The widest run of whitespace, in multiples of the type size, that is a
+/// single space glyph gluing two words: a space is a quarter to a third of
+/// an em, and two of them are already a producer's padding.
+const GLUE_SPACE: f32 = 0.4;
 /// A span whose baseline falls outside the line's tolerance still joins the
 /// line when its nominal vertical extent overlaps the line's by this
 /// fraction of the smaller height: a superscript or subscript, never a
@@ -4153,6 +4157,9 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
     // opened by whitespace has none until ink joins it.
     let mut extents: Vec<Option<(f32, f32)>> = Vec::new();
     let mut inked_end: Option<f32> = None;
+    // Where a single space glyph ended, one a span closed with or one set
+    // as a span of its own: the word after it continues the same text.
+    let mut glue_end: Option<f32> = None;
     for (position, &span) in group.spans.iter().enumerate() {
         // A whitespace-only span that sits in the columns claims like any
         // other, so a cell keeps its spacing; one running outside them —
@@ -4195,6 +4202,24 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         // one cell over the columns it crosses.
         let crossing = start + 1 < columns.len() && hi > columns[start].end;
         let opens_cell = inked_end.is_none_or(|end| lo - end > CELL_GAP * span.size);
+        // A glyph within a word gap of the ink before it continues that
+        // ink's word wherever it lands: text set glyph by glyph puts a rule
+        // between two glyphs as readily as through one, and the word is
+        // one cell over both columns either way. So does a word set right
+        // after a single space: prose crossing a column boundary at a word
+        // gap is one run of text, one cell over the columns it crosses,
+        // where a run of spaces is a producer's padding between two cells.
+        let continues_word = !whitespace
+            && (inked_end.is_some_and(|end| lo - end <= WORD_GAP * span.size)
+                || glue_end.is_some_and(|end| lo - end <= WORD_GAP * span.size));
+        let raw_lo = span.x.min(span.end_x);
+        let raw_hi = span.x.max(span.end_x);
+        let trailing = if whitespace {
+            raw_hi - raw_lo
+        } else {
+            raw_hi - hi
+        };
+        glue_end = (trailing > 0.0 && trailing <= GLUE_SPACE * span.size).then_some(raw_hi);
         let start = if crossing
             && !whitespace
             && opens_cell
@@ -4220,7 +4245,7 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         };
         let ink = (!whitespace).then_some((lo, hi));
         match claimed.last_mut() {
-            Some(last) if start <= last.1 => {
+            Some(last) if start <= last.1 || continues_word => {
                 last.1 = last.1.max(end);
                 last.2.end = position + 1;
                 let extent = extents.last_mut().expect("a claim has an extent");
@@ -6526,8 +6551,8 @@ pub(crate) mod tests {
 
     /// [`ruled_grid_content`]'s lattice with one row's word split across the
     /// interior vertical at x=250 by a sub-word gap: "worl" ends at 249.4,
-    /// "d" starts at 250.5. Reading the rulings as columns would cut "world"
-    /// in two, so the grid must be rejected and the page must stay prose.
+    /// "d" starts at 250.5. The word is one cell over both columns, never
+    /// two cells.
     pub(crate) fn ruled_sub_word_gap_content() -> String {
         String::from(
             "70 670 360 40 re S 250 670 m 250 710 l S 70 690 m 430 690 l S \
@@ -7091,6 +7116,20 @@ pub(crate) mod tests {
              1 0 0 1 260 695 Tm (b1) Tj \
              1 0 0 1 234 675 Tm (s) Tj 1 0 0 1 238 675 Tm (w) Tj \
              1 0 0 1 242 675 Tm (i) Tj 1 0 0 1 245.5 675 Tm (m) Tj \
+             1 0 0 1 80 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj ET",
+        )
+    }
+
+    /// [`glyph_straddle_ruled_content`] with the rule at 250 falling in the
+    /// gap between two glyphs: the "i" ends a fifth of a point before it
+    /// and the "m" starts a tenth of a point past it.
+    pub(crate) fn glyph_gap_on_rule_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (the first cell of the top row) Tj \
+             1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 234.8 675 Tm (s) Tj 1 0 0 1 239.8 675 Tm (w) Tj \
+             1 0 0 1 244.8 675 Tm (i) Tj 1 0 0 1 250.1 675 Tm (m) Tj \
              1 0 0 1 80 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj ET",
         )
     }
