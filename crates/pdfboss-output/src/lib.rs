@@ -1947,6 +1947,19 @@ mod tests {
         );
     }
 
+    /// Two boxed grids ten points apart on the same verticals, each
+    /// opening with the same column heads, are two tables: a rate table
+    /// repeats its heads over every section, a statement's sections never do.
+    #[test]
+    fn boxes_repeating_their_heads_stay_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::boxes_with_repeated_heads_content());
+        assert_eq!(
+            md.matches("| Area | Factor |\n| --- | --- |").count(),
+            2,
+            "md: {md}"
+        );
+    }
+
     /// A ruled band holding only a whitespace span is the page's padding:
     /// no row of blank cells appears between the two rows around it.
     #[test]

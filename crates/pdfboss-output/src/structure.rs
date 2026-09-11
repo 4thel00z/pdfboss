@@ -2088,6 +2088,19 @@ fn stacked(
     if above.columns.len() != below.columns.len() {
         return None;
     }
+    // A section opening with the column heads of the one above it is a
+    // table of its own: a rate table repeats its heads over every section,
+    // a statement's sections never do.
+    let heads = |claim: &GridClaim| -> Vec<String> {
+        claim.rows.first().map_or_else(Vec::new, |row| {
+            row.iter()
+                .map(|cell| cell_text(cell).trim().to_string())
+                .collect()
+        })
+    };
+    if heads(above) == heads(below) {
+        return None;
+    }
     let inked = |group: &&Group| group.spans.iter().any(|span| !blank(&span.text));
     let top = below_grid.ys[below_grid.ys.len() - 1];
     let bottom = above_grid.ys[0];
@@ -6365,6 +6378,35 @@ pub(crate) mod tests {
     /// Two boxed grids with an empty gap of 220 points between them.
     pub(crate) fn boxes_far_apart_content() -> String {
         two_boxes_content([(650.0, 690.0), (390.0, 430.0)], "")
+    }
+
+    /// Two boxed three-row grids ten points apart on the same verticals,
+    /// each opening with the column heads "Area" and "Factor": the
+    /// sections of a rate table, each a table of its own.
+    pub(crate) fn boxes_with_repeated_heads_content() -> String {
+        let mut content = String::new();
+        for (bottom, top, labels) in [
+            (620.0, 680.0, ["Alpha", "Beta"]),
+            (550.0, 610.0, ["Gamma", "Delta"]),
+        ] {
+            for x in [70.0, 250.0, 430.0] {
+                content += &format!("{x} {bottom} m {x} {top} l S ");
+            }
+            for y in [bottom, bottom + 20.0, bottom + 40.0, top] {
+                content += &format!("70 {y} m 430 {y} l S ");
+            }
+            let head = top - 12.0;
+            content += &format!(
+                "BT /F1 10 Tf 1 0 0 1 75 {head} Tm (Area) Tj 1 0 0 1 260 {head} Tm (Factor) Tj ET "
+            );
+            for (row, label) in labels.iter().enumerate() {
+                let y = top - 32.0 - 20.0 * row as f32;
+                content += &format!(
+                    "BT /F1 10 Tf 1 0 0 1 75 {y} Tm ({label}) Tj 1 0 0 1 260 {y} Tm (0.70) Tj ET "
+                );
+            }
+        }
+        content
     }
 
     /// [`ruled_grid_content`] with a third band between the two rows that
