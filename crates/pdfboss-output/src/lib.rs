@@ -266,17 +266,20 @@ pub fn extract_markdown_reporting_opts(
             retain_spans_on_page(&mut spans, page);
             retain_rulings_on_page(&mut rulings, page);
         }
-        Ok((spans, rulings, report))
+        // The page's share of the size pass is counted here, on the
+        // worker, while its spans are still in cache.
+        let page = structure::ExtractedPage::new(spans, rulings, report.order);
+        Ok((page, report))
     });
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
     for outcome in per_page {
-        let (spans, rulings, report) = outcome?;
-        pages.push((spans, rulings, report.order));
+        let (page, report) = outcome?;
+        pages.push(page);
         reports.push(report);
     }
     Ok((
-        Markdown.render(&document_layout_with_rulings(&pages)),
+        Markdown.render(&structure::document_layout_extracted(&pages)),
         reports,
     ))
 }
@@ -1103,6 +1106,44 @@ mod tests {
             assert_eq!(tree, content);
             assert_eq!(report.order, ReadingOrder::Content);
         }
+    }
+
+    /// The layout over pages the extraction workers counted the size
+    /// weights of reads the same as the public document layout over the
+    /// same pages: a title page at one size, a ruled table at another and
+    /// a prose page rank against the same document-wide statistics.
+    #[test]
+    fn the_extracted_page_layout_matches_the_document_layout() {
+        let contents = [
+            "BT /F1 24 Tf 1 0 0 1 72 700 Tm (Annual Report) Tj ET".to_string(),
+            structure::tests::ruled_grid_content(),
+            structure::tests::two_tables_repeating_their_head_content(),
+        ];
+        let mut pages = Vec::new();
+        let mut extracted = Vec::new();
+        for content in &contents {
+            let doc = Document::load(doc_with_graphics(content)).unwrap();
+            let page = doc.page(0).unwrap();
+            let (spans, rulings, report) = pdfboss_text::extract_spans_and_rulings_reporting(
+                &doc,
+                &page,
+                ReadingOrder::Content,
+            )
+            .unwrap();
+            extracted.push(structure::ExtractedPage::new(
+                spans.clone(),
+                rulings.clone(),
+                report.order,
+            ));
+            pages.push((spans, rulings, report.order));
+        }
+        let expected = Markdown.render(&document_layout_with_rulings(&pages));
+        assert!(expected.contains("# Annual Report"), "md: {expected}");
+        assert!(expected.contains("| --- |"), "md: {expected}");
+        assert_eq!(
+            Markdown.render(&structure::document_layout_extracted(&extracted)),
+            expected
+        );
     }
 
     /// A document's pages each keep their own order: a tagged page reads by

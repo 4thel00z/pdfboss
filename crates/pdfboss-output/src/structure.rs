@@ -1584,37 +1584,117 @@ fn half_points(size: f32) -> i32 {
 /// The document's size statistics, weighted by characters shown: a title
 /// carries a handful, body text carries thousands.
 fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
-    // A page holds a handful of distinct sizes, so a sorted vector beats a
-    // map; the weight is the character count, which the standard library
-    // counts a machine word at a time.
-    let mut weights: Vec<(i32, usize)> = Vec::new();
-    for span in pages.iter().flat_map(|page| page.iter()) {
-        let bucket = half_points(span.size);
-        let chars = span.text.chars().count();
-        match weights.binary_search_by_key(&bucket, |(b, _)| *b) {
-            Ok(index) => weights[index].1 += chars,
-            Err(index) => weights.insert(index, (bucket, chars)),
+    let mut weights = SizeWeights::default();
+    for page in pages {
+        weights.count(page);
+    }
+    weights.stats()
+}
+
+/// The characters shown at each half-point size bucket, ascending by
+/// bucket. A page's weights are counted where its spans were extracted,
+/// while they are still in that worker's cache, and the document's are the
+/// pages' summed: the size pass over a whole document's spans on the
+/// calling thread was the longest single stretch of the Markdown path
+/// before any page could lay out.
+#[derive(Default)]
+pub(crate) struct SizeWeights(Vec<(i32, usize)>);
+
+impl SizeWeights {
+    /// The weights of one page's spans.
+    pub(crate) fn of(spans: &[TextSpan]) -> SizeWeights {
+        let mut weights = SizeWeights::default();
+        weights.count(spans);
+        weights
+    }
+
+    /// Adds every span's characters at its size bucket.
+    fn count(&mut self, spans: &[TextSpan]) {
+        // A page holds a handful of distinct sizes, so a sorted vector
+        // beats a map; the weight is the character count, which the
+        // standard library counts a machine word at a time.
+        for span in spans {
+            self.add(half_points(span.size), span.text.chars().count());
         }
     }
-    // Ties go to the smaller size: body text is what a document has most of
-    // and, at equal weight, the likelier of the two to be it.
-    let body = weights
-        .iter()
-        .min_by_key(|(bucket, weight)| (std::cmp::Reverse(*weight), *bucket))
-        .map(|(bucket, _)| *bucket as f32 / 2.0);
-    let Some(body) = body else {
-        return SizeStats {
-            body: 0.0,
-            ladder: Vec::new(),
+
+    fn add(&mut self, bucket: i32, chars: usize) {
+        match self.0.binary_search_by_key(&bucket, |(b, _)| *b) {
+            Ok(index) => self.0[index].1 += chars,
+            Err(index) => self.0.insert(index, (bucket, chars)),
+        }
+    }
+
+    /// Adds another page's weights.
+    fn merge(&mut self, other: &SizeWeights) {
+        for &(bucket, chars) in &other.0 {
+            self.add(bucket, chars);
+        }
+    }
+
+    /// The statistics the weights imply.
+    fn stats(&self) -> SizeStats {
+        // Ties go to the smaller size: body text is what a document has
+        // most of and, at equal weight, the likelier of the two to be it.
+        let body = self
+            .0
+            .iter()
+            .min_by_key(|(bucket, weight)| (std::cmp::Reverse(*weight), *bucket))
+            .map(|(bucket, _)| *bucket as f32 / 2.0);
+        let Some(body) = body else {
+            return SizeStats {
+                body: 0.0,
+                ladder: Vec::new(),
+            };
         };
-    };
-    let ladder: Vec<f32> = weights
-        .iter()
-        .rev()
-        .map(|(bucket, _)| *bucket as f32 / 2.0)
-        .filter(|size| *size >= body + HEADING_MIN_DELTA)
-        .collect();
-    SizeStats { body, ladder }
+        let ladder: Vec<f32> = self
+            .0
+            .iter()
+            .rev()
+            .map(|(bucket, _)| *bucket as f32 / 2.0)
+            .filter(|size| *size >= body + HEADING_MIN_DELTA)
+            .collect();
+        SizeStats { body, ladder }
+    }
+}
+
+/// One page as the extraction worker hands it to the document layout: its
+/// spans and rulings, the order they are in, and its size weights, counted
+/// there.
+pub(crate) struct ExtractedPage {
+    spans: Vec<TextSpan>,
+    rulings: Vec<Ruling>,
+    order: ReadingOrder,
+    weights: SizeWeights,
+}
+
+impl ExtractedPage {
+    pub(crate) fn new(spans: Vec<TextSpan>, rulings: Vec<Ruling>, order: ReadingOrder) -> Self {
+        let weights = SizeWeights::of(&spans);
+        ExtractedPage {
+            spans,
+            rulings,
+            order,
+            weights,
+        }
+    }
+}
+
+/// [`document_layout_with_rulings`] over pages whose size weights the
+/// extraction workers counted, so the calling thread sums a handful of
+/// buckets per page instead of reading every span of the document before
+/// the first page can lay out.
+pub(crate) fn document_layout_extracted(pages: &[ExtractedPage]) -> Vec<PageLayout> {
+    let mut weights = SizeWeights::default();
+    for page in pages {
+        weights.merge(&page.weights);
+    }
+    let stats = weights.stats();
+    let layouts = on_workers(pages.len(), |index| {
+        let page = &pages[index];
+        page_layout_with_stats(&page.spans, &page.rulings, &stats, page.order)
+    });
+    finished(layouts, &stats)
 }
 
 /// One assembled line and the size heading classification measures it by:
