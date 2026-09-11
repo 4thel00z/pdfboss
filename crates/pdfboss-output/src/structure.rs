@@ -5121,6 +5121,13 @@ pub(crate) mod tests {
                 }
             }
         }
+        if std::env::var_os("PDFBOSS_PROBE_MD").is_some() {
+            println!("---- markdown ----");
+            println!(
+                "{}",
+                crate::extract_markdown(&doc, ReadingOrder::Content).unwrap()
+            );
+        }
     }
 
     /// Local prototyping rig, never run in CI: dumps every page's flows —
