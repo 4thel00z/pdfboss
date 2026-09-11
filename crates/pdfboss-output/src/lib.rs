@@ -1646,6 +1646,16 @@ mod tests {
         );
     }
 
+    /// A table of contents ruled under each entry is prose under its rules
+    /// as under its lanes.
+    #[test]
+    fn a_contents_list_under_rules_is_prose() {
+        let md = markdown_of_drawn(&structure::tests::ruled_contents_content());
+        assert!(!md.contains("| ---"), "md: {md}");
+        assert!(!md.contains("<table>"), "md: {md}");
+        assert!(md.contains("Executive Summary 4"), "md: {md}");
+    }
+
     /// A last column ending in "ml" spells a roman numeral far past any
     /// front matter, and "llc" spells none in standard form: the volumes
     /// table stays a table.

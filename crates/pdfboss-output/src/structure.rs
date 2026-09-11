@@ -2966,6 +2966,11 @@ fn grid_claim(
     // A band holding nothing but whitespace spans is the page's padding,
     // not a row: a row of blank cells says nothing.
     rows.retain(|row| row.iter().any(inked_cell));
+    // A table of contents rules its entries as readily as it lines them
+    // up, and is prose under rules as under lanes.
+    if grid.open && contents_list(&rows) {
+        return None;
+    }
     // A claim grown over unruled lines stops short of a line repeating its
     // head: the second table under the same years is its own, and its rules
     // claim it in turn.
@@ -7197,6 +7202,26 @@ pub(crate) mod tests {
             }
         }
         content += "ET";
+        content
+    }
+
+    /// A table of contents whose four entries are each underlined by a rule
+    /// drawn in two segments meeting under the title, so the rules join and
+    /// bracket the entries as an open lattice.
+    pub(crate) fn ruled_contents_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (y, title, page) in [
+            (700.0, "Executive Summary", "4"),
+            (680.0, "Legal Framework", "6"),
+            (660.0, "Election Administration", "11"),
+            (640.0, "Civil Society Engagement", "15"),
+        ] {
+            content += &format!("1 0 0 1 72 {y} Tm ({title}) Tj 1 0 0 1 430 {y} Tm ({page}) Tj ");
+        }
+        content += "ET ";
+        for y in [696.0, 676.0, 656.0, 636.0] {
+            content += &format!("70 {y} m 250 {y} l S 250 {y} m 440 {y} l S ");
+        }
         content
     }
 
