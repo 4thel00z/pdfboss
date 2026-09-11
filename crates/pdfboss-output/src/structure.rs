@@ -3049,10 +3049,12 @@ fn spaced_cells(row: &[Cell], size: f32) -> bool {
 }
 
 /// Rows at the top of a lane band that are its title, not its header: set
-/// in a heading size and populating fewer cells than the row under them.
-/// A title standing over two side-by-side grids populates one cell per
-/// grid and stands a row's pitch above the header, so it passes every row
-/// gate; it belongs to the prose above, where the heading pass reads it.
+/// in a heading size and populating at most half the cells of the row under
+/// them. A title standing over two side-by-side grids populates one cell
+/// per grid and stands a row's pitch above the header, so it passes every
+/// row gate; it belongs to the prose above, where the heading pass reads
+/// it. A header set larger than its body still fills most of its columns,
+/// an empty label column aside, and stays the header.
 fn title_rows(groups: &[Group], band: &TableBand, stats: &SizeStats) -> usize {
     let mut count = 0;
     while band.rows.len() - count > TABLE_MIN_ROWS {
@@ -3060,7 +3062,7 @@ fn title_rows(groups: &[Group], band: &TableBand, stats: &SizeStats) -> usize {
         if stats.level(assembled(group).rank_size).is_none() {
             break;
         }
-        if populated_cells(&band.rows[count]) >= populated_cells(&band.rows[count + 1]) {
+        if 2 * populated_cells(&band.rows[count]) > populated_cells(&band.rows[count + 1]) {
             break;
         }
         count += 1;
@@ -3102,7 +3104,9 @@ fn tidy_amounts(rows: &mut Vec<Vec<Cell>>) {
                 let left = filled[k - 1];
                 if let Some(closer) = opening_closer(&row[index]) {
                     if ends_with_digit(&row[left]) {
-                        strip_leading(&mut row[index], closer);
+                        if strip_leading(&mut row[index], closer) {
+                            emptied.push(starts[index]);
+                        }
                         append_char(&mut row[left], closer);
                     }
                 }
@@ -3111,21 +3115,14 @@ fn tidy_amounts(rows: &mut Vec<Vec<Cell>>) {
                 let right = filled[k + 1];
                 if let Some(sign) = trailing_sign(&row[index]) {
                     if opens_amount(&row[right]) {
-                        strip_trailing(&mut row[index], sign);
+                        if strip_trailing(&mut row[index], sign) {
+                            emptied.push(starts[index]);
+                        }
                         prepend_char(&mut row[right], sign);
                     }
                 }
             }
             close_gaps(&mut row[index]);
-        }
-        for (index, cell) in row.iter_mut().enumerate() {
-            let Some(line) = &cell.line else {
-                continue;
-            };
-            if line.inlines.iter().all(|inline| blank(&inline.text)) {
-                cell.line = None;
-                emptied.push(starts[index]);
-            }
         }
     }
     emptied.sort_unstable();
@@ -3176,12 +3173,13 @@ fn opens_amount(cell: &Cell) -> bool {
 }
 
 /// Takes `token` and the space after it off the front of the cell's text.
-fn strip_leading(cell: &mut Cell, token: char) {
+/// True when the token was all the cell held, and the cell is now empty.
+fn strip_leading(cell: &mut Cell, token: char) -> bool {
     let Some(line) = cell.line.as_mut() else {
-        return;
+        return false;
     };
     let Some(index) = line.inlines.iter().position(|inline| !blank(&inline.text)) else {
-        return;
+        return false;
     };
     let text = line.inlines[index].text.trim_start();
     let rest = text
@@ -3189,20 +3187,26 @@ fn strip_leading(cell: &mut Cell, token: char) {
         .unwrap_or(text)
         .trim_start()
         .to_string();
-    if rest.is_empty() {
-        line.inlines.remove(index);
-        return;
+    if !rest.is_empty() {
+        line.inlines[index].text = rest;
+        return false;
     }
-    line.inlines[index].text = rest;
+    line.inlines.remove(index);
+    if line.inlines.iter().any(|inline| !blank(&inline.text)) {
+        return false;
+    }
+    cell.line = None;
+    true
 }
 
 /// Takes `token` and the space before it off the end of the cell's text.
-fn strip_trailing(cell: &mut Cell, token: char) {
+/// True when the token was all the cell held, and the cell is now empty.
+fn strip_trailing(cell: &mut Cell, token: char) -> bool {
     let Some(line) = cell.line.as_mut() else {
-        return;
+        return false;
     };
     let Some(index) = line.inlines.iter().rposition(|inline| !blank(&inline.text)) else {
-        return;
+        return false;
     };
     let text = line.inlines[index].text.trim_end();
     let rest = text
@@ -3210,11 +3214,16 @@ fn strip_trailing(cell: &mut Cell, token: char) {
         .unwrap_or(text)
         .trim_end()
         .to_string();
-    if rest.is_empty() {
-        line.inlines.remove(index);
-        return;
+    if !rest.is_empty() {
+        line.inlines[index].text = rest;
+        return false;
     }
-    line.inlines[index].text = rest;
+    line.inlines.remove(index);
+    if line.inlines.iter().any(|inline| !blank(&inline.text)) {
+        return false;
+    }
+    cell.line = None;
+    true
 }
 
 fn prepend_char(cell: &mut Cell, token: char) {
@@ -5817,6 +5826,41 @@ pub(crate) mod tests {
     }
 
     /// An already-normalized ruling, the shape extraction emits.
+    /// A fill-in table's blank body cells under a spanning header are its
+    /// structure: no sign moved, so no column goes.
+    #[test]
+    fn blank_cells_keep_their_column() {
+        let text = |t: &str| Cell {
+            line: Some(Line {
+                inlines: vec![Inline {
+                    text: t.to_string(),
+                    bold: false,
+                    italic: false,
+                    code: false,
+                }],
+                y: 0.0,
+                x: 0.0,
+                end_x: 10.0,
+                size: 10.0,
+            }),
+            colspan: 1,
+            rowspan: 1,
+        };
+        let header = vec![
+            empty_cell(),
+            Cell {
+                colspan: 2,
+                ..text("Mitosis Meiosis")
+            },
+        ];
+        let body = vec![text("purpose"), text(" "), text(" ")];
+        let mut rows = vec![header, body];
+        tidy_amounts(&mut rows);
+        assert_eq!(rows[0].iter().map(|c| c.colspan as usize).sum::<usize>(), 3);
+        assert_eq!(rows[1].len(), 3);
+        assert!(rows[1][1].line.is_some(), "a blank cell stays a cell");
+    }
+
     fn ruling(x0: f32, y0: f32, x1: f32, y1: f32) -> Ruling {
         Ruling {
             start: pdfboss_text::Point { x: x0, y: y0 },
