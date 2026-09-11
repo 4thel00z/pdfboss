@@ -428,9 +428,19 @@ fn page_layout_with_stats(
     order: ReadingOrder,
 ) -> PageLayout {
     let snap = ruling_snap(spans, rulings);
-    let mut grids = merge_stacked(ruled_grids(rulings, snap), spans, snap);
-    grids.extend(open_ruled_grids(spans, rulings, &grids));
-    grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
+    let ruled = ruled_grids(rulings, snap);
+    let open = open_ruled_grids(spans, rulings, &ruled);
+    let topmost_first =
+        |a: &RuledGrid, b: &RuledGrid| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]);
+    // Segmentation sees each stack of sections as one lattice, so a label
+    // between two sections joins their segment; the claims are read
+    // section by section and merge afterwards.
+    let mut hulls = stack_hulls(&ruled, spans, snap);
+    hulls.extend(open.iter().cloned());
+    hulls.sort_by(topmost_first);
+    let mut grids = ruled;
+    grids.extend(open);
+    grids.sort_by(topmost_first);
     let mut blocks = Vec::new();
     // Content the producer marked as pagination artifacts (running heads,
     // folios, watermarks) is laid out apart from the real content, so it
@@ -448,11 +458,11 @@ fn page_layout_with_stats(
         &body
     };
     let parts = match order {
-        ReadingOrder::Content => segments_with_grids(content, &grids),
+        ReadingOrder::Content => segments_with_grids(content, &hulls),
         _ => segments(content, order),
     };
     for segment in parts {
-        push_segment_blocks(segment, &grids, stats, order, &mut blocks);
+        push_segment_blocks(segment, &grids, &hulls, snap, stats, order, &mut blocks);
     }
     demote_heading_runs(&mut blocks);
     demote_contents_entries(&mut blocks);
@@ -731,6 +741,8 @@ fn demote_heading_runs(blocks: &mut [Block]) {
 fn push_segment_blocks(
     segment: Segment<'_>,
     grids: &[RuledGrid],
+    hulls: &[RuledGrid],
+    snap: f32,
     stats: &SizeStats,
     order: ReadingOrder,
     out: &mut Vec<Block>,
@@ -749,7 +761,7 @@ fn push_segment_blocks(
         push_lane_blocks(&groups, stats, out);
         return;
     }
-    let claims = grid_claims(&groups, grids);
+    let claims = grid_claims(&groups, grids, hulls, snap);
     if claims.is_empty() {
         push_lane_blocks(&groups, stats, out);
         return;
@@ -1956,37 +1968,13 @@ const STACKED_GRID_LINES: usize = 2;
 /// lines standing in it, beyond which they are two tables.
 const STACKED_GRID_GAP: f32 = 3.0;
 
-/// Grids stacked down the page on the same verticals merged into one
-/// lattice where the gap between them holds at most [`STACKED_GRID_LINES`]
-/// lines of text and is no taller than [`STACKED_GRID_GAP`] times their
-/// type size: the sections of a financial statement, ruled section by
-/// section with an unruled label row between them. The gap becomes a band
-/// of the merged lattice, so the label reads as a row. `grids` arrive
-/// topmost first and leave so; two boxes with an empty gap wider than the
-/// snap stay two tables.
-fn merge_stacked(grids: Vec<RuledGrid>, spans: &[TextSpan], snap: f32) -> Vec<RuledGrid> {
-    let mut merged: Vec<RuledGrid> = Vec::new();
-    for grid in grids {
-        let Some(above) = merged.last_mut() else {
-            merged.push(grid);
-            continue;
-        };
-        if !stacked(above, &grid, spans, snap) {
-            merged.push(grid);
-            continue;
-        }
-        let shared = above.ys[0] - grid.ys[grid.ys.len() - 1] <= snap;
-        let keep = grid.ys.len() - usize::from(shared);
-        above.ys.splice(0..0, grid.ys[..keep].iter().copied());
-        above.boxed = above.boxed && grid.boxed;
-    }
-    merged
-}
-
-/// True when `below` continues `above`: drawn verticals at the same x
-/// positions, and a gap between them short enough to hold a section label
-/// and nothing more.
-fn stacked(above: &RuledGrid, below: &RuledGrid, spans: &[TextSpan], snap: f32) -> bool {
+/// True when the gap between `above` and `below`, two grids on the same
+/// drawn verticals, is short enough to hold a section label and nothing
+/// more, with `lines` inked lines of type `size` standing in it: an empty
+/// gap may be twice the snap wide; a populated one holds at most
+/// [`STACKED_GRID_LINES`] lines and is no taller than [`STACKED_GRID_GAP`]
+/// times their type size.
+fn stacked_gap(above: &RuledGrid, below: &RuledGrid, lines: usize, size: f32, snap: f32) -> bool {
     if above.open || below.open || above.xs.len() != below.xs.len() {
         return false;
     }
@@ -1998,24 +1986,126 @@ fn stacked(above: &RuledGrid, below: &RuledGrid, spans: &[TextSpan], snap: f32) 
     {
         return false;
     }
-    let top = below.ys[below.ys.len() - 1];
-    let bottom = above.ys[0];
-    let gap = bottom - top;
+    let gap = above.ys[0] - below.ys[below.ys.len() - 1];
     if gap < -snap {
         return false;
     }
-    let between: Vec<&TextSpan> = spans
-        .iter()
-        .filter(|span| !blank(&span.text) && top < span.y && span.y < bottom)
-        .collect();
-    if between.is_empty() {
+    if lines == 0 {
         return gap <= 2.0 * snap;
     }
-    if baseline_count(&between) > STACKED_GRID_LINES {
-        return false;
+    lines <= STACKED_GRID_LINES && gap <= STACKED_GRID_GAP * size
+}
+
+/// The grids with each stack of sections on the same verticals folded into
+/// one lattice, for the segmentation alone: a flow standing between two
+/// sections of one statement belongs with them. The claims are read
+/// section by section and merged afterwards by [`merge_stacked`]. `grids`
+/// arrive topmost first and leave so.
+fn stack_hulls(grids: &[RuledGrid], spans: &[TextSpan], snap: f32) -> Vec<RuledGrid> {
+    let mut hulls: Vec<RuledGrid> = Vec::new();
+    for grid in grids {
+        let Some(above) = hulls.last_mut() else {
+            hulls.push(grid.clone());
+            continue;
+        };
+        let top = grid.ys[grid.ys.len() - 1];
+        let bottom = above.ys[0];
+        let between: Vec<&TextSpan> = spans
+            .iter()
+            .filter(|span| !blank(&span.text) && top < span.y && span.y < bottom)
+            .collect();
+        let size = median(between.iter().map(|span| span.size).collect());
+        if !stacked_gap(above, grid, baseline_count(&between), size, snap) {
+            hulls.push(grid.clone());
+            continue;
+        }
+        let shared = bottom - top <= snap;
+        let keep = grid.ys.len() - usize::from(shared);
+        above.ys.splice(0..0, grid.ys[..keep].iter().copied());
+        above.boxed = above.boxed && grid.boxed;
     }
-    let size = median(between.iter().map(|span| span.size).collect());
-    gap <= STACKED_GRID_GAP * size
+    hulls
+}
+
+/// Claims stacked down the page on the same drawn verticals merged into
+/// one table: the sections of a financial statement, ruled section by
+/// section with an unruled label between them. Each section's rows are
+/// read under its own rules first, so a header wrapped inside one box and
+/// a body band inferred from one section's lines come through the merge
+/// unchanged; the lines in the gap join as the label rows [`stacked`]
+/// reads them. `claims` arrive topmost first and leave so.
+fn merge_stacked(
+    claims: Vec<(GridClaim, &RuledGrid)>,
+    groups: &[Group],
+    snap: f32,
+) -> Vec<GridClaim> {
+    let mut merged: Vec<(GridClaim, &RuledGrid)> = Vec::new();
+    for (claim, grid) in claims {
+        let Some((above, above_grid)) = merged.last_mut() else {
+            merged.push((claim, grid));
+            continue;
+        };
+        let Some(labels) = stacked(above, above_grid, &claim, grid, groups, snap) else {
+            merged.push((claim, grid));
+            continue;
+        };
+        above.rows.extend(labels);
+        above.rows.extend(claim.rows);
+        above.range.end = claim.range.end;
+        // The next gap is measured from the lowest section merged so far.
+        *above_grid = grid;
+        above.bbox = BBox {
+            x0: above.bbox.x0.min(claim.bbox.x0),
+            y0: above.bbox.y0.min(claim.bbox.y0),
+            x1: above.bbox.x1.max(claim.bbox.x1),
+            y1: above.bbox.y1.max(claim.bbox.y1),
+        };
+    }
+    merged.into_iter().map(|(claim, _)| claim).collect()
+}
+
+/// The rows the gap between two claims adds when `below` continues
+/// `above`: the same number of columns, a gap between their rules that
+/// [`stacked_gap`] accepts, and every line in it that neither claim took
+/// a row under the columns populating its first cell alone. `None` when
+/// they are two tables, and when a line in the gap is no label: prose
+/// between two tables, not a section label inside one.
+fn stacked(
+    above: &GridClaim,
+    above_grid: &RuledGrid,
+    below: &GridClaim,
+    below_grid: &RuledGrid,
+    groups: &[Group],
+    snap: f32,
+) -> Option<Vec<Vec<Cell>>> {
+    if above.columns.len() != below.columns.len() {
+        return None;
+    }
+    let inked = |group: &&Group| group.spans.iter().any(|span| !blank(&span.text));
+    let top = below_grid.ys[below_grid.ys.len() - 1];
+    let bottom = above_grid.ys[0];
+    let between: Vec<&Group> = groups
+        .iter()
+        .filter(|group| top < group.y && group.y < bottom)
+        .filter(inked)
+        .collect();
+    let size = median(between.iter().map(|group| group.size).collect());
+    if !stacked_gap(above_grid, below_grid, between.len(), size, snap) {
+        return None;
+    }
+    let unclaimed: Vec<&Group> = groups[above.range.end..below.range.start]
+        .iter()
+        .filter(inked)
+        .collect();
+    let mut labels = Vec::with_capacity(unclaimed.len());
+    for group in unclaimed {
+        let row = table_row(group, &above.columns)?;
+        if !label_row(&row) {
+            return None;
+        }
+        labels.push(row);
+    }
+    Some(labels)
 }
 
 /// The page's ruled grids: vertical and horizontal rulings clustered into
@@ -2539,32 +2629,39 @@ fn covers(lines: &[&GridLine], position: f32, lo: f32, hi: f32) -> bool {
 /// into, and the grid's drawn border box.
 struct GridClaim {
     range: std::ops::Range<usize>,
+    columns: Vec<std::ops::Range<f32>>,
     rows: Vec<Vec<Cell>>,
     bbox: BBox,
 }
 
-/// Every grid's claim on the segment's lines, disjoint and top-down. Grids
-/// are tried topmost first, so of two lattices claiming the same lines the
-/// higher wins; a grid that fails its gates claims nothing and its lines
-/// stay available to the lane attempt. Lane-occupancy gates do not apply to
-/// a claim — a drawn single-column box is a table no lane could show — but
-/// every line still passes [`table_row`]'s word-gap cell gate.
-fn grid_claims(groups: &[Group], grids: &[RuledGrid]) -> Vec<GridClaim> {
-    let mut claims: Vec<GridClaim> = Vec::new();
+/// Every grid's claim on the segment's lines, disjoint and top-down, with
+/// stacked claims merged by [`merge_stacked`]. Grids are tried topmost
+/// first, so of two lattices claiming the same lines the higher wins; a
+/// grid that fails its gates claims nothing and its lines stay available
+/// to the lane attempt. Lane-occupancy gates do not apply to a claim — a
+/// drawn single-column box is a table no lane could show — but every line
+/// still passes [`table_row`]'s word-gap cell gate.
+fn grid_claims(
+    groups: &[Group],
+    grids: &[RuledGrid],
+    hulls: &[RuledGrid],
+    snap: f32,
+) -> Vec<GridClaim> {
+    let mut claims: Vec<(GridClaim, &RuledGrid)> = Vec::new();
     for grid in grids {
-        let Some(claim) = grid_claim(groups, grid) else {
+        let Some(claim) = grid_claim(groups, grid, grids, hulls) else {
             continue;
         };
-        let taken = claims
-            .iter()
-            .any(|held| held.range.start < claim.range.end && claim.range.start < held.range.end);
+        let taken = claims.iter().any(|(held, _)| {
+            held.range.start < claim.range.end && claim.range.start < held.range.end
+        });
         if taken {
             continue;
         }
-        claims.push(claim);
+        claims.push((claim, grid));
     }
-    claims.sort_by_key(|claim| claim.range.start);
-    claims
+    claims.sort_by_key(|(claim, _)| claim.range.start);
+    merge_stacked(claims, groups, snap)
 }
 
 /// `groups` against one grid: the contiguous stretch of lines whose
@@ -2578,17 +2675,23 @@ fn grid_claims(groups: &[Group], grids: &[RuledGrid]) -> Vec<GridClaim> {
 /// under [`TABLE_MIN_ROWS`], or under [`RULED_BOXED_MIN_ROWS`] for a grid
 /// with all four borders drawn. Every line passes [`table_row`] before any
 /// band's lines merge.
-fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
+fn grid_claim(
+    groups: &[Group],
+    grid: &RuledGrid,
+    grids: &[RuledGrid],
+    hulls: &[RuledGrid],
+) -> Option<GridClaim> {
     let lo = groups.iter().position(|group| grid.holds(group.y))?;
     let inside = groups[lo..]
         .iter()
         .take_while(|group| grid.holds(group.y))
         .count();
     let hi = lo + inside;
-    let mut columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[lo..hi]);
-    let top = header_reach(groups, lo, hi, grid, &columns);
+    let stack = stack_lines(groups, grid, hulls).unwrap_or(lo..hi);
+    let mut columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[stack]);
+    let top = header_reach(groups, lo, hi, grid, grids, &columns);
     let end = if grid.open {
-        open_reach(groups, lo, hi)
+        open_reach(groups, lo, hi, grid, grids)
     } else {
         hi
     };
@@ -2636,9 +2739,31 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
     }
     Some(GridClaim {
         range: top..end,
+        columns,
         rows,
         bbox: grid.bbox(),
     })
+}
+
+/// The lines the stack holding `grid` covers, `hulls` being the stacks
+/// [`stack_hulls`] folded. The sections of one statement split their drawn
+/// columns at the lanes all their lines leave, so every section reads
+/// under the same columns and their claims merge; a section read alone
+/// would split at the lanes its own few lines leave. `None` when no hull
+/// holds the grid.
+fn stack_lines(
+    groups: &[Group],
+    grid: &RuledGrid,
+    hulls: &[RuledGrid],
+) -> Option<std::ops::Range<usize>> {
+    let mid = (grid.ys[0] + grid.ys[grid.ys.len() - 1]) / 2.0;
+    let hull = hulls.iter().find(|hull| hull.holds(mid))?;
+    let start = groups.iter().position(|group| hull.holds(group.y))?;
+    let count = groups[start..]
+        .iter()
+        .take_while(|group| hull.holds(group.y))
+        .count();
+    Some(start..start + count)
 }
 
 /// The narrowest lane that splits a drawn column. A lane this wide, kept
@@ -2690,12 +2815,13 @@ const HEADER_REACH_LINES: usize = 6;
 /// lines down to the topmost one populating [`TABLE_MIN_ROW_CELLS`] cells.
 /// A statement rules its body and sets the column heads above the box; a
 /// caption or a paragraph above the box runs its words across the column
-/// boundaries and stays out.
+/// boundaries and stays out, and so does a line another grid holds.
 fn header_reach(
     groups: &[Group],
     lo: usize,
     hi: usize,
     grid: &RuledGrid,
+    grids: &[RuledGrid],
     columns: &[std::ops::Range<f32>],
 ) -> usize {
     if hi - lo < 2 {
@@ -2715,7 +2841,7 @@ fn header_reach(
     let mut top = lo;
     for index in (lo.saturating_sub(HEADER_REACH_LINES)..lo).rev() {
         let group = &groups[index];
-        if group.y - below > limit {
+        if group.y - below > limit || held_elsewhere(grids, grid, group.y) {
             break;
         }
         let Some(row) = table_row(group, columns) else {
@@ -2740,9 +2866,16 @@ fn header_reach(
 /// lanes, not the inferred verticals, are the test: a vertical inferred
 /// from one section's short labels lands inside the next section's longer
 /// ones, while a lane narrows and survives. A line running across a lane
-/// is prose and ends the growth; the lines at the end with a single cell
-/// are trimmed back off, so a note under the table does not join it.
-fn open_reach(groups: &[Group], lo: usize, hi: usize) -> usize {
+/// is prose and ends the growth, as does a line another grid holds; the
+/// lines at the end with a single cell are trimmed back off, so a note
+/// under the table does not join it.
+fn open_reach(
+    groups: &[Group],
+    lo: usize,
+    hi: usize,
+    grid: &RuledGrid,
+    grids: &[RuledGrid],
+) -> usize {
     if hi - lo < 2 {
         return hi;
     }
@@ -2773,7 +2906,7 @@ fn open_reach(groups: &[Group], lo: usize, hi: usize) -> usize {
     let mut above = groups[hi - 1].y;
     let mut last_record = hi;
     for (index, group) in groups.iter().enumerate().skip(hi) {
-        if above - group.y > limit {
+        if above - group.y > limit || held_elsewhere(grids, grid, group.y) {
             break;
         }
         let mut next = occupied.clone();
@@ -2793,6 +2926,19 @@ fn open_reach(groups: &[Group], lo: usize, hi: usize) -> usize {
         }
     }
     last_record
+}
+
+/// True when a drawn lattice other than `grid` holds the baseline `y`. A
+/// header above one box and the unruled lines under an open lattice never
+/// lie inside another box: a claim reaching into one would overlap its
+/// claim, and the lower of the two would be dropped. Open lattices do not
+/// count: an open-ruled statement brackets each section with its own
+/// rules, and growing over the next section's bracket is what the growth
+/// is for.
+fn held_elsewhere(grids: &[RuledGrid], grid: &RuledGrid, y: f32) -> bool {
+    grids
+        .iter()
+        .any(|other| !other.open && !std::ptr::eq(other, grid) && other.holds(y))
 }
 
 /// True when a line outside the rules reads as a row of the grid rather
@@ -5343,8 +5489,9 @@ pub(crate) mod tests {
                 r.start.x, r.start.y, r.end.x, r.end.y, r.width
             );
         }
-        let grids = ruled_grids(&rulings, RULING_SNAP_TOLERANCE);
-        println!("grids: {}", grids.len());
+        let snap = ruling_snap(&spans, &rulings);
+        let grids = ruled_grids(&rulings, snap);
+        println!("grids: {} (snap {snap})", grids.len());
         for grid in &grids {
             println!(
                 "  xs {:?} ys {} boxed {}",
@@ -5358,12 +5505,16 @@ pub(crate) mod tests {
         for grid in &open {
             println!("  xs {:?} ys {:?}", grid.xs, grid.ys);
         }
-        // The grid set the layout itself works with: stacked lattices
-        // merged, open grids appended, topmost first.
-        let mut grids = merge_stacked(grids, &spans, RULING_SNAP_TOLERANCE);
+        // The grid sets the layout itself works with: the stacks folded
+        // into hulls for the segmentation, every grid for the claims, open
+        // grids appended to both, topmost first.
+        let mut hulls = stack_hulls(&grids, &spans, snap);
+        hulls.extend(open.iter().cloned());
+        hulls.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
+        let mut grids = grids;
         grids.extend(open);
         grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
-        println!("layout grids: {}", grids.len());
+        println!("layout grids: {} in {} hulls", grids.len(), hulls.len());
         {
             let all: Vec<&TextSpan> = spans.iter().collect();
             let (x_min, x_max) = x_bounds(&all);
@@ -5427,12 +5578,12 @@ pub(crate) mod tests {
                 );
             }
         }
-        for (index, segment) in segments_with_grids(&spans, &grids).into_iter().enumerate() {
+        for (index, segment) in segments_with_grids(&spans, &hulls).into_iter().enumerate() {
             let (x_lo, x_hi) = x_bounds(&segment.spans);
             let y_hi = segment.spans.iter().map(|s| s.y).fold(f32::MIN, f32::max);
             let y_lo = segment.spans.iter().map(|s| s.y).fold(f32::MAX, f32::min);
             let groups = segment.into_groups();
-            let claims = grid_claims(&groups, &grids);
+            let claims = grid_claims(&groups, &grids, &hulls, snap);
             println!(
                 "segment {index}: {} groups, {} claims, x {x_lo:.0}..{x_hi:.0}, y {y_lo:.0}..{y_hi:.0}",
                 groups.len(),
@@ -5487,15 +5638,18 @@ pub(crate) mod tests {
                     groups.len(),
                     tail
                 );
-                let columns =
-                    lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[lo..hi]);
+                let columns = lane_split_columns(
+                    open_columns(&groups[lo..hi], grid),
+                    &groups[stack_lines(&groups, grid, &hulls).unwrap_or(lo..hi)],
+                );
+                println!(
+                    "  columns {:?} (drawn {:?}), header reach {}",
+                    columns,
+                    grid.columns(),
+                    header_reach(&groups, lo, hi, grid, &grids, &columns)
+                );
                 if grid.open {
-                    println!(
-                        "  open grid: columns {:?}, reach {}..{}",
-                        columns,
-                        header_reach(&groups, lo, hi, grid, &columns),
-                        open_reach(&groups, lo, hi)
-                    );
+                    println!("  open reach {}", open_reach(&groups, lo, hi, grid, &grids));
                 }
                 for (gi, group) in groups[lo..hi].iter().enumerate() {
                     if table_row(group, &columns).is_none() {
@@ -5988,6 +6142,48 @@ pub(crate) mod tests {
         }
         content += "1 0 0 1 75 637 Tm (Capital) Tj ET";
         content
+    }
+
+    /// Two boxed two-row grids on the verticals 70, 250 and 430 spanning
+    /// the y ranges given, each row a label and an amount in the two cells,
+    /// and `between` set as one line at y 638, under the upper box.
+    fn two_boxes_content(boxes: [(f32, f32); 2], between: &str) -> String {
+        let mut content = String::new();
+        for (bottom, top) in boxes {
+            let mid = (bottom + top) / 2.0;
+            for x in [70.0, 250.0, 430.0] {
+                content += &format!("{x} {bottom} m {x} {top} l S ");
+            }
+            for y in [bottom, mid, top] {
+                content += &format!("70 {y} m 430 {y} l S ");
+            }
+            for (y, label, amount) in [
+                (top - 12.0, "Deductible", "$500"),
+                (bottom + 8.0, "LEM 03", "$39.00"),
+            ] {
+                content += &format!(
+                    "BT /F1 10 Tf 1 0 0 1 75 {y} Tm ({label}) Tj 1 0 0 1 260 {y} Tm ({amount}) Tj ET "
+                );
+            }
+        }
+        if !between.is_empty() {
+            content += &format!("BT /F1 10 Tf 1 0 0 1 75 638 Tm ({between}) Tj ET");
+        }
+        content
+    }
+
+    /// Two boxed grids with a line of prose between them that runs across
+    /// the column rule: prose between two tables, not a label inside one.
+    pub(crate) fn boxes_with_prose_between_content() -> String {
+        two_boxes_content(
+            [(650.0, 690.0), (590.0, 630.0)],
+            "B. Premium if the endorsement is attached to the policy.",
+        )
+    }
+
+    /// Two boxed grids with an empty gap of 220 points between them.
+    pub(crate) fn boxes_far_apart_content() -> String {
+        two_boxes_content([(650.0, 690.0), (390.0, 430.0)], "")
     }
 
     /// [`ruled_grid_content`] with a third band between the two rows that
@@ -6715,49 +6911,6 @@ pub(crate) mod tests {
         assert_eq!(grids.len(), 2);
         assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0], "topmost first");
         assert_eq!(grids[1].ys, vec![300.0, 340.0, 380.0]);
-    }
-
-    /// Stacked boxes merge only across a gap holding a section label: an
-    /// empty gap wider than the snap, or a gap holding a paragraph, keeps
-    /// them two grids; one label line a row's height apart makes them one.
-    #[test]
-    fn stacked_boxes_merge_across_a_label_and_nothing_else() {
-        let mut rulings = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
-        rulings.extend(boxed_grid_rulings(70.0, 300.0, 430.0, 380.0));
-        let empty = merge_stacked(
-            ruled_grids(&rulings, RULING_SNAP_TOLERANCE),
-            &[],
-            RULING_SNAP_TOLERANCE,
-        );
-        assert_eq!(empty.len(), 2, "an empty 220-point gap is two tables");
-        let paragraph: Vec<TextSpan> = (0..3)
-            .map(|line| {
-                span(
-                    "prose between the boxes",
-                    72.0,
-                    300.0,
-                    560.0 - 12.0 * line as f32,
-                    10.0,
-                )
-            })
-            .collect();
-        let mut close = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
-        close.extend(boxed_grid_rulings(70.0, 500.0, 430.0, 580.0));
-        let prose = merge_stacked(
-            ruled_grids(&close, RULING_SNAP_TOLERANCE),
-            &paragraph,
-            RULING_SNAP_TOLERANCE,
-        );
-        assert_eq!(prose.len(), 2, "three lines of prose between them");
-        let label = [span("Capital", 72.0, 110.0, 588.0, 10.0)];
-        let merged = merge_stacked(
-            ruled_grids(&close, RULING_SNAP_TOLERANCE),
-            &label,
-            RULING_SNAP_TOLERANCE,
-        );
-        assert_eq!(merged.len(), 1, "one label line joins them");
-        assert_eq!(merged[0].ys, vec![500.0, 540.0, 580.0, 600.0, 640.0, 680.0]);
-        assert!(merged[0].boxed);
     }
 
     /// Column rules running past the outermost horizontals bound bands of

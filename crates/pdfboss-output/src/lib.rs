@@ -1854,6 +1854,37 @@ mod tests {
         );
     }
 
+    /// Two boxed grids on the same verticals with a line of prose between
+    /// them running across the column rule: two tables with the prose
+    /// between them, not one table with the prose as a row, and not none.
+    #[test]
+    fn prose_between_two_boxes_keeps_them_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::boxes_with_prose_between_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert_eq!(md.matches("| Deductible | $500 |").count(), 2, "md: {md}");
+        assert!(
+            md.contains("B. Premium if the endorsement is attached to the policy."),
+            "md: {md}"
+        );
+        assert!(!md.contains("| B. Premium"), "the prose is no row: {md}");
+    }
+
+    /// Two boxed grids on the same verticals with an empty gap of 220
+    /// points between them are two tables.
+    #[test]
+    fn boxes_far_apart_are_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::boxes_far_apart_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+    }
+
     /// A ruled band holding only a whitespace span is the page's padding:
     /// no row of blank cells appears between the two rows around it.
     #[test]
