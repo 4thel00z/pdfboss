@@ -1877,6 +1877,30 @@ mod tests {
         );
     }
 
+    /// A word set glyph by glyph running across a vertical rule is one cell
+    /// over both columns, and the grid keeps its claim.
+    #[test]
+    fn a_word_straddling_a_rule_glyph_by_glyph_keeps_the_claim() {
+        let md = markdown_of_drawn(&structure::tests::glyph_straddle_ruled_content());
+        assert!(md.contains("<td colspan=\"2\">swim</td>"), "md: {md}");
+        assert!(
+            md.contains("<td>the first cell of the top row</td><td>b1</td>"),
+            "md: {md}"
+        );
+        assert!(md.contains("<td>a3</td><td>b3</td>"), "md: {md}");
+    }
+
+    /// A currency sign floating four points left of the vertical rule its
+    /// amount stands behind belongs to the amount's column, not the label's.
+    #[test]
+    fn a_sign_a_hair_before_the_rule_belongs_to_its_amount() {
+        let md = markdown_of_drawn(&structure::tests::sign_before_rule_content());
+        assert!(
+            md.contains("| Cash | $1,000 |\n| Debt | $2,000 |"),
+            "md: {md}"
+        );
+    }
+
     #[test]
     fn a_ruled_grid_becomes_a_pipe_table() {
         let md = markdown_of_drawn(&structure::tests::ruled_grid_content());

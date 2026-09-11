@@ -3419,6 +3419,7 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
     // A span only ever extends the last claim, so each claim's spans are a
     // contiguous stretch of `group.spans` — held as a range, never copied.
     let mut claimed: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
+    let mut inked_end: Option<f32> = None;
     for (position, &span) in group.spans.iter().enumerate() {
         // A whitespace-only span that sits in the columns claims like any
         // other, so a cell keeps its spacing; one running outside them —
@@ -3447,22 +3448,30 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
             }
             return None;
         }
-        // A whitespace span crossing a boundary is the gap between two
-        // cells, not part of either. An inked span that starts a hair
-        // before a boundary and crosses it belongs to the column beyond: an
-        // inferred vertical lands a few points inside a floating currency
-        // sign, and a drawn one is never painted through a glyph. A span
-        // ending before the boundary keeps its column, so a right-aligned
-        // digit stays where it is.
+        // An inked span opening a word a hair before a boundary and
+        // crossing it belongs to the column beyond: an inferred vertical
+        // lands a few points inside a floating currency sign, and a drawn
+        // one is never painted through a glyph. A span ending before the
+        // boundary keeps its column, so a right-aligned digit stays where
+        // it is; a whitespace span keeps its column too, since moved, its
+        // start would stand in for the next cell's; and a span continuing
+        // a word, within a word gap of the ink before it, stays with that
+        // ink: text set glyph by glyph straddles a rule glyph by glyph, and
+        // the word is one cell over the columns it crosses.
         let crossing = start + 1 < columns.len() && hi > columns[start].end;
-        if crossing && whitespace {
-            continue;
-        }
-        let start = if crossing && columns[start].end - lo <= RULING_SNAP_TOLERANCE {
+        let opens_word = inked_end.is_none_or(|end| lo - end > WORD_GAP * span.size);
+        let start = if crossing
+            && !whitespace
+            && opens_word
+            && columns[start].end - lo <= RULING_SNAP_TOLERANCE
+        {
             start + 1
         } else {
             start
         };
+        if !whitespace {
+            inked_end = Some(hi);
+        }
         let end = columns
             .iter()
             .rposition(|column| column.start <= hi)
@@ -5487,6 +5496,15 @@ pub(crate) mod tests {
                             .take(60)
                             .collect();
                         println!("  table_row fails at line {}: {:?}", lo + gi, text);
+                        for span in &group.spans {
+                            println!(
+                                "      span x {:7.1}..{:7.1} size {:4.1} {:?}",
+                                span.x.min(span.end_x),
+                                span.x.max(span.end_x),
+                                span.size,
+                                span.text
+                            );
+                        }
                     }
                 }
             }
@@ -5496,6 +5514,13 @@ pub(crate) mod tests {
             println!(
                 "{}",
                 crate::extract_markdown(&doc, ReadingOrder::Content).unwrap()
+            );
+        }
+        if std::env::var_os("PDFBOSS_PROBE_TEXT").is_some() {
+            println!("---- text ----");
+            println!(
+                "{}",
+                crate::extract_text(&doc, &page, ReadingOrder::Content).unwrap()
             );
         }
     }
@@ -5974,6 +5999,36 @@ pub(crate) mod tests {
              BT /F1 10 Tf 1 0 0 1 66 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
              1 0 0 1 66 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj \
              1 0 0 1 66 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj ET",
+        )
+    }
+
+    /// [`ruled_grid_content`] with a third row, the middle row's text one
+    /// word set glyph by glyph running across the vertical rule at 250: the
+    /// "m" starts four and a half points before the rule and ends past it.
+    /// The top row's first cell runs to nine points short of the word, so
+    /// no lane wide enough to split the drawn column stays clear.
+    pub(crate) fn glyph_straddle_ruled_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (the first cell of the top row) Tj \
+             1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 234 675 Tm (s) Tj 1 0 0 1 238 675 Tm (w) Tj \
+             1 0 0 1 242 675 Tm (i) Tj 1 0 0 1 245.5 675 Tm (m) Tj \
+             1 0 0 1 80 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj ET",
+        )
+    }
+
+    /// [`ruled_grid_content`] with a third row, each amount's currency sign
+    /// floating four points left of the vertical rule its amount stands
+    /// behind. The header's first cell runs to six points short of the
+    /// signs, so no lane wide enough to split the drawn column stays clear.
+    pub(crate) fn sign_before_rule_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (Item description of the position) Tj \
+             1 0 0 1 260 695 Tm (2024) Tj \
+             1 0 0 1 80 675 Tm (Cash) Tj 1 0 0 1 246 675 Tm ($) Tj 1 0 0 1 252 675 Tm (1,000) Tj \
+             1 0 0 1 80 655 Tm (Debt) Tj 1 0 0 1 246 655 Tm ($) Tj 1 0 0 1 252 655 Tm (2,000) Tj ET",
         )
     }
 
