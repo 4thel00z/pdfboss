@@ -20,6 +20,7 @@ use pyo3::IntoPyObjectExt;
 
 use pdfboss_aio::{AsyncDocument as AioDocument, ElementStream};
 use pdfboss_core::elements::{Element as CoreElement, ElementOpts, Elements, XrefKind};
+use pdfboss_core::object::decode_text_string;
 use pdfboss_core::Document as CoreDocument;
 use pdfboss_core::Metadata as CoreMetadata;
 use pdfboss_core::Page as CorePage;
@@ -28,6 +29,8 @@ use pdfboss_output::Output;
 use pdfboss_render::RenderCache;
 use pdfboss_text::{FontCache, TextSpan};
 
+mod catalog;
+mod forms;
 mod write;
 
 create_exception!(
@@ -164,6 +167,68 @@ fn dict_to_py<'py>(py: Python<'py>, dict: &Dict) -> PyResult<Bound<'py, PyDict>>
         out.set_item(key.0.as_str(), object_to_py(py, value)?)?;
     }
     Ok(out)
+}
+
+/// An object reference as the `(num, gen)` tuple the Python API uses.
+pub(crate) fn ref_tuple(r: ObjRef) -> (u32, u16) {
+    (r.num, r.gen)
+}
+
+/// A `str` as Python's `repr` writes it: single-quoted, with Rust's debug
+/// escapes for anything unprintable.
+pub(crate) fn repr_str(value: &str) -> String {
+    format!("'{}'", value.escape_debug())
+}
+
+/// An optional `str` as Python's `repr` writes it.
+pub(crate) fn repr_opt_str(value: Option<&str>) -> String {
+    value.map_or_else(|| "None".to_owned(), repr_str)
+}
+
+/// An optional number as Python's `repr` writes it.
+pub(crate) fn repr_opt<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "None".to_owned(), |value| value.to_string())
+}
+
+/// A bool as Python's `repr` writes it.
+pub(crate) fn repr_bool(value: bool) -> &'static str {
+    if value {
+        return "True";
+    }
+    "False"
+}
+
+/// The page-reference index of a sync document, for resolving the pages
+/// destinations name.
+fn page_index_of(doc: &CoreDocument) -> catalog::PageIndex {
+    catalog::page_index(doc.page_count(), |index| {
+        doc.page(index).ok().and_then(|page| page.object_ref())
+    })
+}
+
+/// The page-reference index of an async document; the page tree was
+/// flattened at open, so no read happens here.
+fn aio_page_index(doc: &AioDocument) -> catalog::PageIndex {
+    catalog::page_index(doc.page_count(), |index| {
+        doc.page(index).ok().and_then(|page| page.object_ref())
+    })
+}
+
+/// Decodes each named destination's name as a text string and resolves
+/// its page through `pages`.
+fn named_destination_pairs(
+    found: Vec<(Vec<u8>, pdfboss_core::Destination)>,
+    pages: &catalog::PageIndex,
+) -> Vec<(String, catalog::Destination)> {
+    found
+        .into_iter()
+        .map(|(name, destination)| {
+            (
+                decode_text_string(&name),
+                catalog::Destination::new(destination, pages),
+            )
+        })
+        .collect()
 }
 
 /// Normalizes a possibly-negative sequence index against `count`.
@@ -644,6 +709,116 @@ impl Document {
                 buffer: Vec::new().into_iter(),
             }),
         })
+    }
+
+    /// The interactive form dictionary: the root fields and the defaults
+    /// their widgets are drawn with. `None` for a document without a form.
+    fn interactive_form(&self) -> Option<forms::InteractiveForm> {
+        self.inner
+            .lock()
+            .interactive_form()
+            .map(forms::InteractiveForm::from)
+    }
+
+    /// Every field of the interactive form, depth first from the root
+    /// fields in the order written, each with the inheritable entries
+    /// taken from the nearest ancestor that has them. Empty without a
+    /// form. Releases the GIL while the field tree is read.
+    fn form_fields(&self, py: Python<'_>) -> Vec<forms::FormField> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || inner.lock().form_fields())
+            .into_iter()
+            .map(forms::FormField::from)
+            .collect()
+    }
+
+    /// The outline, the bookmark panel: the top-level items with their
+    /// children in panel order, each destination's page resolved to its
+    /// 0-based index. Empty without one. Releases the GIL.
+    fn outline(&self, py: Python<'_>) -> Vec<catalog::OutlineItem> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || {
+            let doc = inner.lock();
+            let pages = page_index_of(&doc);
+            catalog::outline_items(doc.outline(), &pages)
+        })
+    }
+
+    /// The named destinations from the catalog's `/Dests` dictionary and
+    /// its `/Names` tree, as a dict from the decoded name to its
+    /// destination. Releases the GIL while they are read.
+    fn named_destinations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let inner = Arc::clone(&self.inner);
+        let found = py.allow_threads(move || {
+            let doc = inner.lock();
+            let pages = page_index_of(&doc);
+            named_destination_pairs(doc.named_destinations(), &pages)
+        });
+        let out = PyDict::new(py);
+        for (name, destination) in found {
+            out.set_item(name, destination)?;
+        }
+        Ok(out)
+    }
+
+    /// The page-numbering ranges, sorted by first page; `None` when the
+    /// document defines none.
+    fn page_labels(&self) -> Option<Vec<catalog::PageLabel>> {
+        let ranges = self.inner.lock().page_labels()?;
+        Some(ranges.into_iter().map(catalog::PageLabel::from).collect())
+    }
+
+    /// The label the page at 0-based `index` shows, such as `"iv"` or
+    /// `"A-3"`; `None` when the document defines no page labels or has no
+    /// such page.
+    fn page_label(&self, index: usize) -> Option<String> {
+        self.inner.lock().page_label(index)
+    }
+
+    /// The files embedded at document level, the attachments, in the
+    /// order of the catalog's name tree; `embedded_file_data` reads one.
+    fn embedded_files(&self) -> Vec<catalog::EmbeddedFile> {
+        self.inner
+            .lock()
+            .embedded_files()
+            .into_iter()
+            .map(catalog::EmbeddedFile::from)
+            .collect()
+    }
+
+    /// The decoded bytes of an embedded file. Releases the GIL. Raises
+    /// `PdfError` when the specification embeds no stream or the stream
+    /// will not decode.
+    fn embedded_file_data<'py>(
+        &self,
+        py: Python<'py>,
+        file: PyRef<'py, catalog::EmbeddedFile>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let inner = Arc::clone(&self.inner);
+        let spec = file.inner.clone();
+        let bytes = py
+            .allow_threads(move || inner.lock().embedded_file_data(&spec))
+            .map_err(pdf_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The viewer preferences the catalog declares; `None` without the
+    /// dictionary.
+    fn viewer_preferences(&self) -> Option<catalog::ViewerPreferences> {
+        self.inner
+            .lock()
+            .viewer_preferences()
+            .map(catalog::ViewerPreferences::from)
+    }
+
+    /// The developer extensions the catalog declares, sorted by prefix.
+    fn extensions(&self) -> Vec<catalog::DeveloperExtension> {
+        self.inner
+            .lock()
+            .extensions()
+            .into_iter()
+            .map(catalog::DeveloperExtension::from)
+            .collect()
     }
 }
 
@@ -1791,6 +1966,141 @@ impl AsyncDocument {
             })),
         })
     }
+
+    /// The interactive form dictionary, the async twin of
+    /// `Document.interactive_form`; coroutine resolving to an
+    /// `InteractiveForm` or None.
+    fn interactive_form<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<forms::InteractiveForm>, PyErr>(
+                inner
+                    .interactive_form()
+                    .await
+                    .map(forms::InteractiveForm::from),
+            )
+        })
+    }
+
+    /// Every field of the interactive form, the async twin of
+    /// `Document.form_fields`; coroutine resolving to a list.
+    fn form_fields<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let fields = inner.form_fields().await;
+            Ok::<Vec<forms::FormField>, PyErr>(
+                fields.into_iter().map(forms::FormField::from).collect(),
+            )
+        })
+    }
+
+    /// The outline, the async twin of `Document.outline`; coroutine
+    /// resolving to the list of top-level items.
+    fn outline<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&inner);
+            let items = inner.outline().await;
+            Ok::<Vec<catalog::OutlineItem>, PyErr>(catalog::outline_items(items, &pages))
+        })
+    }
+
+    /// The named destinations, the async twin of
+    /// `Document.named_destinations`; coroutine resolving to a dict.
+    fn named_destinations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&inner);
+            let found = named_destination_pairs(inner.named_destinations().await, &pages);
+            Python::with_gil(|py| {
+                let out = PyDict::new(py);
+                for (name, destination) in found {
+                    out.set_item(name, destination)?;
+                }
+                Ok::<Py<PyAny>, PyErr>(out.into_any().unbind())
+            })
+        })
+    }
+
+    /// The page-numbering ranges, the async twin of
+    /// `Document.page_labels`; coroutine resolving to a list or None.
+    fn page_labels<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let ranges = inner.page_labels().await;
+            Ok::<Option<Vec<catalog::PageLabel>>, PyErr>(
+                ranges.map(|ranges| ranges.into_iter().map(catalog::PageLabel::from).collect()),
+            )
+        })
+    }
+
+    /// The label of the page at 0-based `index`, the async twin of
+    /// `Document.page_label`; coroutine resolving to a str or None.
+    fn page_label<'py>(&self, py: Python<'py>, index: usize) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<String>, PyErr>(inner.page_label(index).await)
+        })
+    }
+
+    /// The embedded files, the async twin of `Document.embedded_files`;
+    /// coroutine resolving to a list.
+    fn embedded_files<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let files = inner.embedded_files().await;
+            Ok::<Vec<catalog::EmbeddedFile>, PyErr>(
+                files.into_iter().map(catalog::EmbeddedFile::from).collect(),
+            )
+        })
+    }
+
+    /// The decoded bytes of an embedded file, the async twin of
+    /// `Document.embedded_file_data`; coroutine resolving to bytes.
+    fn embedded_file_data<'py>(
+        &self,
+        py: Python<'py>,
+        file: PyRef<'py, catalog::EmbeddedFile>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let spec = file.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bytes = inner.embedded_file_data(&spec).await.map_err(aio_err)?;
+            Python::with_gil(|py| {
+                Ok::<Py<PyAny>, PyErr>(PyBytes::new(py, &bytes).into_any().unbind())
+            })
+        })
+    }
+
+    /// The viewer preferences, the async twin of
+    /// `Document.viewer_preferences`; coroutine resolving to
+    /// `ViewerPreferences` or None.
+    fn viewer_preferences<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<catalog::ViewerPreferences>, PyErr>(
+                inner
+                    .viewer_preferences()
+                    .await
+                    .map(catalog::ViewerPreferences::from),
+            )
+        })
+    }
+
+    /// The developer extensions, the async twin of `Document.extensions`;
+    /// coroutine resolving to a list.
+    fn extensions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let extensions = inner.extensions().await;
+            Ok::<Vec<catalog::DeveloperExtension>, PyErr>(
+                extensions
+                    .into_iter()
+                    .map(catalog::DeveloperExtension::from)
+                    .collect(),
+            )
+        })
+    }
 }
 
 /// A single page of an async document. Attributes are synchronous — the
@@ -2190,6 +2500,8 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsyncSpanIter>()?;
     m.add_class::<PageImage>()?;
     m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
+    forms::register(m)?;
+    catalog::register(m)?;
     write::register(m.py(), m)?;
     Ok(())
 }

@@ -358,6 +358,56 @@ class Document:
         given. Each step releases the GIL and shares one font cache
         across the walk."""
 
+    def interactive_form(self) -> InteractiveForm | None:
+        """The interactive form dictionary (ISO 32000-1 12.7.2): the root
+        fields and the defaults their widgets are drawn with; ``None`` for
+        a document without a form."""
+
+    def form_fields(self) -> list[FormField]:
+        """Every field of the interactive form (ISO 32000-1 12.7.3), depth
+        first from the root fields in the order written, each with the
+        inheritable entries taken from the nearest ancestor that has them.
+        Empty without a form. Releases the GIL while the tree is read."""
+
+    def outline(self) -> list[OutlineItem]:
+        """The outline, the bookmark panel (ISO 32000-1 12.3.3): the
+        top-level items with their children in panel order, each
+        destination's page resolved to its 0-based index. Empty without
+        one. Releases the GIL."""
+
+    def named_destinations(self) -> dict[str, Destination]:
+        """The named destinations (ISO 32000-1 12.3.2.3) from the
+        catalog's ``/Dests`` dictionary and its ``/Names`` tree, keyed by
+        the decoded name; a name in both takes the tree's. Releases the
+        GIL while they are read."""
+
+    def page_labels(self) -> list[PageLabel] | None:
+        """The page-numbering ranges (ISO 32000-1 12.4.2), sorted by first
+        page; ``None`` when the document defines none."""
+
+    def page_label(self, index: int) -> str | None:
+        """The label the page at 0-based ``index`` shows, such as ``"iv"``
+        or ``"A-3"``; ``None`` when the document defines no page labels
+        or has no such page."""
+
+    def embedded_files(self) -> list[EmbeddedFile]:
+        """The files embedded at document level (ISO 32000-1 7.11.4), the
+        attachments, in the order of the catalog's name tree;
+        ``embedded_file_data`` reads one."""
+
+    def embedded_file_data(self, file: EmbeddedFile) -> bytes:
+        """The decoded bytes of an embedded file. Releases the GIL. Raises
+        ``PdfError`` when the specification embeds no stream or the stream
+        will not decode."""
+
+    def viewer_preferences(self) -> ViewerPreferences | None:
+        """The viewer preferences the catalog declares (ISO 32000-1 12.2);
+        ``None`` without the dictionary."""
+
+    def extensions(self) -> list[DeveloperExtension]:
+        """The developer extensions the catalog declares (ISO 32000-1
+        7.12), sorted by prefix."""
+
 class Page:
     """A single page of a document.
 
@@ -505,6 +555,460 @@ class PageImage:
     def data(self) -> bytes:
         """The image re-encoded as PNG (RGBA8)."""
 
+class InteractiveForm:
+    """The interactive form dictionary (ISO 32000-1 12.7.2, Table 218):
+    the root fields and the defaults their widgets are drawn with,
+    returned by ``Document.interactive_form``.
+    """
+
+    fields: list[tuple[int, int]]
+    """The root fields, those with no parent, as ``(num, gen)`` references."""
+
+    need_appearances: bool
+    """Whether a reader should build the widgets' appearance streams itself."""
+
+    signatures_exist: bool
+    """Whether the document carries at least one signature field with a
+    signature."""
+
+    append_only: bool
+    """Whether the document may only be saved as incremental updates, so
+    its signatures stay valid."""
+
+    calculation_order: list[tuple[int, int]]
+    """The fields with calculation actions, in the order their values are
+    recalculated, as ``(num, gen)`` references."""
+
+    default_resources: dict[str, object] | None
+    """The default resources for the fields' appearance streams, as a plain
+    dict through the ``Element.value()`` conversion; ``None`` when the form
+    names none."""
+
+    default_appearance: str | None
+    """The document-wide default appearance string for variable text, a
+    content fragment such as ``"/Helv 0 Tf 0 g"``, as written."""
+
+    quadding: Literal["left", "centered", "right"] | None
+    """The document-wide default justification of variable text; ``None``
+    when the form sets none."""
+
+    xfa: bool
+    """Whether the form carries an XFA resource."""
+
+class FieldFlags:
+    """A field's flag word (ISO 32000-1 Tables 221, 226, 228 and 230) with
+    one boolean per flag the standard defines; which flags mean anything
+    depends on the field's type. ``int(flags)`` is the raw word.
+    """
+
+    bits: int
+    """The raw flag word."""
+
+    names: list[str]
+    """The names of the flags that are set, in bit order, each also
+    available as a boolean attribute of the same name."""
+
+    read_only: bool
+    required: bool
+    no_export: bool
+    multiline: bool
+    password: bool
+    file_select: bool
+    do_not_spell_check: bool
+    do_not_scroll: bool
+    comb: bool
+    rich_text: bool
+    combo: bool
+    edit: bool
+    sort: bool
+    multi_select: bool
+    commit_on_sel_change: bool
+    no_toggle_to_off: bool
+    radio: bool
+    pushbutton: bool
+    radios_in_unison: bool
+
+    def __int__(self) -> int:
+        """The raw flag word."""
+
+class AppearanceCharacteristics:
+    """The captions and icons a button widget is drawn with (ISO 32000-1
+    12.5.6.19, Table 189)."""
+
+    caption: str | None
+    """The caption shown while the button is at rest."""
+
+    rollover_caption: str | None
+    """The caption shown while the cursor is over the button."""
+
+    alternate_caption: str | None
+    """The caption shown while the mouse button is down."""
+
+    icon: tuple[int, int] | None
+    """The normal icon, a form XObject as a ``(num, gen)`` reference."""
+
+    rollover_icon: tuple[int, int] | None
+    """The rollover icon as a ``(num, gen)`` reference."""
+
+    alternate_icon: tuple[int, int] | None
+    """The alternate icon as a ``(num, gen)`` reference."""
+
+    caption_position: Literal[
+        "caption-only", "icon-only", "below", "above", "right", "left", "overlaid"
+    ]
+    """Where the caption sits relative to the icon; ``"caption-only"`` by
+    default."""
+
+class Widget:
+    """A widget annotation that draws a field (ISO 32000-1 12.5.6.19), as
+    far as the field's state needs it."""
+
+    ref: tuple[int, int]
+    """The annotation dictionary's ``(num, gen)`` reference; the field's
+    own for a field merged with its single widget."""
+
+    appearance_state: str | None
+    """The appearance state the widget shows."""
+
+    on_state: str | None
+    """The widget's on state: the one key of its normal appearance
+    dictionary other than ``Off``. ``None`` when the normal appearance is a
+    single stream or names no or several other states."""
+
+    characteristics: AppearanceCharacteristics | None
+    """The captions and icons a button widget is drawn with; ``None``
+    without the dictionary."""
+
+class ChoiceOption:
+    """One option of a choice field (ISO 32000-1 12.7.4.4), or one export
+    value of a check box or radio button."""
+
+    export_value: str
+    """The value exported for the option."""
+
+    name: str
+    """The text shown to the user; also what the field's value names when
+    the option is selected. A lone string in the file is both."""
+
+class Signature:
+    """A signature dictionary (ISO 32000-1 12.8.1, Table 252) as the value
+    of a signature field, read as data: nothing here is verified."""
+
+    filter: str | None
+    """The name of the preferred signature handler."""
+
+    sub_filter: str | None
+    """The encoding of the signature value, such as ``adbe.pkcs7.detached``."""
+
+    byte_range: list[tuple[int, int]]
+    """The ``(offset, length)`` pairs of the file bytes the signature covers."""
+
+    contents: bytes
+    """The signature value as stored, usually DER-encoded PKCS#7."""
+
+    name: str | None
+    """The name of the person or authority signing."""
+
+    signing_time: str | None
+    """The time of signing as the PDF date string written."""
+
+    location: str | None
+    """The CPU host name or physical location of the signing."""
+
+    reason: str | None
+    """The reason for the signing."""
+
+    contact_info: str | None
+    """How to contact the signer to verify the signature."""
+
+class FormField:
+    """One field of the interactive form (ISO 32000-1 12.7.3, Table 220)
+    with the inheritable entries taken from the nearest ancestor that has
+    them, yielded by ``Document.form_fields``. The typed readers ``text``,
+    ``button_kind``, ``state``, ``checked``, ``on_widgets``, ``signature``
+    and ``selected`` interpret ``value`` by field type.
+    """
+
+    ref: tuple[int, int]
+    """The field dictionary's own ``(num, gen)`` reference."""
+
+    parent: tuple[int, int] | None
+    """The parent field's ``(num, gen)`` reference; ``None`` for a root field."""
+
+    kids: list[tuple[int, int]]
+    """The child fields as ``(num, gen)`` references, in the order written."""
+
+    widgets: list[Widget]
+    """The widget annotations that draw this field: the kids that are
+    widgets without a name of their own, or the field itself when its
+    single widget is merged into it."""
+
+    field_type: Literal["button", "text", "choice", "signature"] | None
+    """The field's type, inherited; ``None`` for a field that names no
+    type, such as a container of other fields."""
+
+    partial_name: str | None
+    """The field's own partial name."""
+
+    name: str
+    """The fully qualified name: the partial names from the root field
+    down, joined by periods. A field without a partial name shares its
+    parent's name; an unnamed root has the empty name."""
+
+    alternate_name: str | None
+    """The name shown to the user in place of the field name."""
+
+    mapping_name: str | None
+    """The name used when the field's data is exported."""
+
+    flags: FieldFlags
+    """The field's flags, inherited."""
+
+    value: object
+    """The field's value, inherited, as plain Python data through the
+    ``Element.value()`` conversion, in the format of the field's type;
+    ``None`` without one."""
+
+    default_value: object
+    """The value a reset-form action restores, as plain Python data."""
+
+    max_len: int | None
+    """The most characters a text field's text may hold."""
+
+    options: list[ChoiceOption]
+    """The options of a choice field, or the export values of a check box
+    or radio button, one per widget."""
+
+    top_index: int
+    """The index into ``options`` of the first option a scrollable list box
+    shows; 0 by default."""
+
+    selected_indices: list[int]
+    """The indices into ``options`` of a multi-select choice field's
+    selected options, as written."""
+
+    additional_actions: dict[str, object] | None
+    """The field's additional-actions dictionary as a plain dict, as
+    written; ``None`` without one."""
+
+    lock: tuple[int, int] | None
+    """The signature field lock dictionary as a ``(num, gen)`` reference."""
+
+    seed_value: tuple[int, int] | None
+    """The seed value dictionary as a ``(num, gen)`` reference."""
+
+    text: str | None
+    """The text of a text field; ``None`` for another type or no value."""
+
+    button_kind: Literal["push-button", "check-box", "radio-buttons"] | None
+    """Which kind of button a button field is; ``None`` for another type."""
+
+    state: str | None
+    """The appearance state a check box or radio button field is in, the
+    name its widgets key their on and off appearances by; ``"Off"``
+    without a value. ``None`` for a push button or another type."""
+
+    checked: bool | None
+    """Whether a check box is checked; ``None`` for a field that is no
+    check box."""
+
+    on_widgets: list[int]
+    """The indices into ``widgets`` of the widgets in the on state; the
+    same indices pick the export values out of ``options``. Empty for a
+    field in the off state, a push button, or another type."""
+
+    signature: Signature | None
+    """The signature a signature field holds; ``None`` for another type or
+    an unsigned field."""
+
+    selected: list[str]
+    """The names of a choice field's selected options; empty for another
+    type or no value."""
+
+class Destination:
+    """One explicit destination (ISO 32000-1 12.3.2.2): a page and how the
+    viewer shows it, as an outline item's target or a named destination."""
+
+    page: int | None
+    """The 0-based index of the page shown: the page the destination's
+    reference names, or the page number a remote destination gives.
+    ``None`` when the reference names no page of this document."""
+
+    page_ref: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the page shown; ``None`` when the
+    destination gives a page number instead."""
+
+    fit: Literal["xyz", "fit", "fit-h", "fit-v", "fit-r", "fit-b", "fit-bh", "fit-bv"]
+    """How the page is shown. ``"xyz"`` takes ``left``, ``top`` and
+    ``zoom``; ``"fit-h"`` and ``"fit-bh"`` take ``top``; ``"fit-v"`` and
+    ``"fit-bv"`` take ``left``; ``"fit-r"`` takes all four edges. A
+    coordinate the kind does not take, or that the viewer keeps, is
+    ``None``."""
+
+    left: float | None
+    top: float | None
+    right: float | None
+    bottom: float | None
+    zoom: float | None
+
+class OutlineItem:
+    """One entry of the outline, the bookmark panel (ISO 32000-1 12.3.3,
+    Table 153), with its children; returned by ``Document.outline``."""
+
+    title: str
+    """The title shown in the panel."""
+
+    destination: Destination | None
+    """Where activating the item goes; ``None`` for an item whose action
+    is not a go-to within the document."""
+
+    page: int | None
+    """The 0-based index of the destination's page, a shortcut for
+    ``destination.page``; ``None`` without one."""
+
+    open: bool
+    """Whether the item shows its children."""
+
+    color: tuple[float, float, float]
+    """The title's ``(r, g, b)`` colour in 0 to 1; black by default."""
+
+    italic: bool
+    bold: bool
+
+    structure_element: tuple[int, int] | None
+    """The structure element the item refers to as a ``(num, gen)``
+    reference."""
+
+    children: list[OutlineItem]
+    """The item's children, in panel order."""
+
+class PageLabel:
+    """One page-numbering range (ISO 32000-1 12.4.2): how the pages from
+    ``first_page`` on are labelled until the next range starts; returned
+    by ``Document.page_labels``. The write-side ``write.PageLabel`` takes
+    the same fields."""
+
+    first_page: int
+    """The 0-based index of the first page the range labels."""
+
+    style: Literal["decimal", "roman-upper", "roman-lower", "letters-upper", "letters-lower"] | None
+    """The numbering style; ``None`` for labels that are the prefix alone."""
+
+    prefix: str | None
+    """The text put before each label's number."""
+
+    start_at: int
+    """The number the range's first page gets."""
+
+    def label(self, index: int) -> str:
+        """The label of the page at 0-based ``index``, which must be in the
+        range."""
+
+class EmbeddedFile:
+    """One file embedded at document level (ISO 32000-1 7.11.4), an
+    attachment; returned by ``Document.embedded_files`` and read by
+    ``Document.embedded_file_data``."""
+
+    name: str
+    """The name the document files the attachment under."""
+
+    file_name: str
+    """The file name the specification gives, which may differ from
+    ``name``; empty when it gives none."""
+
+    description: str | None
+    """The description shown next to the file."""
+
+    file_system: str | None
+    """The file system that interprets the specification, ``URL`` being
+    the one the standard defines."""
+
+    volatile: bool
+    """Whether the file changes often enough that it must not be cached."""
+
+    ref: tuple[int, int] | None
+    """The embedded file stream's ``(num, gen)`` reference; ``None`` when
+    the specification embeds no stream."""
+
+    mime: str | None
+    """The file's MIME type."""
+
+    size: int | None
+    """The uncompressed size in bytes, as declared."""
+
+    created: str | None
+    """The creation date as an ISO 8601 string, ``YYYY-MM-DDTHH:MM:SS``
+    followed by ``Z`` or a ``+HH:MM`` offset."""
+
+    modified: str | None
+    """The modification date as an ISO 8601 string."""
+
+    checksum: bytes | None
+    """The MD5 digest of the uncompressed bytes, as stored."""
+
+class ViewerPreferences:
+    """The viewer preferences the catalog declares (ISO 32000-1 12.2,
+    Table 150); every entry a missing one defaults holds its default.
+    Returned by ``Document.viewer_preferences``."""
+
+    hide_toolbar: bool
+    hide_menubar: bool
+    hide_window_ui: bool
+    fit_window: bool
+    center_window: bool
+
+    display_doc_title: bool
+    """Whether the window title shows the document's title rather than its
+    file name."""
+
+    non_full_screen_page_mode: Literal["use-none", "use-outlines", "use-thumbs", "use-oc"]
+    """The panel shown on leaving full-screen mode."""
+
+    direction: Literal["left-to-right", "right-to-left"]
+    """The reading order that places pages shown side by side."""
+
+    view_area: Literal["media-box", "crop-box", "bleed-box", "trim-box", "art-box"]
+    """The page box shown on screen; ``"crop-box"`` by default."""
+
+    view_clip: Literal["media-box", "crop-box", "bleed-box", "trim-box", "art-box"]
+    """The page box the screen view is clipped to."""
+
+    print_area: Literal["media-box", "crop-box", "bleed-box", "trim-box", "art-box"]
+    """The page box printed."""
+
+    print_clip: Literal["media-box", "crop-box", "bleed-box", "trim-box", "art-box"]
+    """The page box printing is clipped to."""
+
+    print_scaling: Literal["none", "app-default"]
+    """The page scaling the print dialog starts with."""
+
+    duplex: Literal["simplex", "duplex-flip-short-edge", "duplex-flip-long-edge"] | None
+    """The paper handling the print dialog starts with; ``None`` when left
+    to the viewer."""
+
+    pick_tray_by_pdf_size: bool | None
+    """Whether the printer picks the paper tray by the page size."""
+
+    print_page_range: list[tuple[int, int]]
+    """The ``(first, last)`` 1-based page ranges the print dialog starts
+    with."""
+
+    num_copies: int | None
+    """The number of copies the print dialog starts with."""
+
+class DeveloperExtension:
+    """One developer extension the catalog declares (ISO 32000-1 7.12);
+    returned by ``Document.extensions``."""
+
+    prefix: str
+    """The developer's registered prefix, such as ``"ADBE"``."""
+
+    base_version: str
+    """The PDF version the extension builds on, such as ``"1.7"``."""
+
+    extension_level: int
+    """The developer's extension level."""
+
 class AsyncDocument:
     """A PDF document opened for async I/O.
 
@@ -617,6 +1121,45 @@ class AsyncDocument:
         """Streams the document's styled text spans page by page — the
         async twin of ``Document.spans``, over range-fetching reads; use
         with ``async for``."""
+
+    async def interactive_form(self) -> InteractiveForm | None:
+        """The interactive form dictionary, the async twin of
+        ``Document.interactive_form``."""
+
+    async def form_fields(self) -> list[FormField]:
+        """Every field of the interactive form, the async twin of
+        ``Document.form_fields``."""
+
+    async def outline(self) -> list[OutlineItem]:
+        """The outline, the async twin of ``Document.outline``."""
+
+    async def named_destinations(self) -> dict[str, Destination]:
+        """The named destinations, the async twin of
+        ``Document.named_destinations``."""
+
+    async def page_labels(self) -> list[PageLabel] | None:
+        """The page-numbering ranges, the async twin of
+        ``Document.page_labels``."""
+
+    async def page_label(self, index: int) -> str | None:
+        """The label of the page at 0-based ``index``, the async twin of
+        ``Document.page_label``."""
+
+    async def embedded_files(self) -> list[EmbeddedFile]:
+        """The embedded files, the async twin of
+        ``Document.embedded_files``."""
+
+    async def embedded_file_data(self, file: EmbeddedFile) -> bytes:
+        """The decoded bytes of an embedded file, the async twin of
+        ``Document.embedded_file_data``."""
+
+    async def viewer_preferences(self) -> ViewerPreferences | None:
+        """The viewer preferences, the async twin of
+        ``Document.viewer_preferences``."""
+
+    async def extensions(self) -> list[DeveloperExtension]:
+        """The developer extensions, the async twin of
+        ``Document.extensions``."""
 
 class AsyncPage:
     """A single page of an async document.

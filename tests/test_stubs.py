@@ -39,3 +39,21 @@ def test_stub_declares_the_element_and_async_surface() -> None:
     assert "async def get_object(self, num: int, gen: int = 0)" in stub
     assert "Iterator[Element]" in stub
     assert "AsyncIterator[Element]" in stub
+
+
+def test_stub_declares_the_form_and_catalog_methods() -> None:
+    stub = STUB.read_text()
+    for line in (
+        "def interactive_form(self) -> InteractiveForm | None",
+        "def form_fields(self) -> list[FormField]",
+        "def outline(self) -> list[OutlineItem]",
+        "def named_destinations(self) -> dict[str, Destination]",
+        "def page_labels(self) -> list[PageLabel] | None",
+        "def page_label(self, index: int) -> str | None",
+        "def embedded_files(self) -> list[EmbeddedFile]",
+        "def embedded_file_data(self, file: EmbeddedFile) -> bytes",
+        "def viewer_preferences(self) -> ViewerPreferences | None",
+        "def extensions(self) -> list[DeveloperExtension]",
+    ):
+        assert f"    {line}" in stub, f"missing sync stub: {line}"
+        assert f"    async {line}" in stub, f"missing async stub: {line}"

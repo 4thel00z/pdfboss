@@ -75,6 +75,8 @@ png  = doc[0].render(scale=2.0)               # PNG bytes; format="ppm"/"bmp" fo
 png, warnings = doc[0].render_reporting()     # warnings list every drop or approximation
 images = doc[0].extract_images()              # each: .data (PNG bytes), .width, .height
 spans  = list(doc.spans())                    # styled spans: font, weight, color, position
+fields = doc.form_fields()                    # interactive form: .name, .field_type, .text, .checked, .selected
+toc    = doc.outline()                        # bookmarks: .title, .page, .children; also page_labels(), embedded_files(), named_destinations()
 
 # async, over files or HTTP, range-fetched
 doc = await pdfboss.AsyncDocument.open_url("https://example.com/doc.pdf")
