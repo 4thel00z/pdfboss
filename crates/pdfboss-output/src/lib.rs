@@ -1435,6 +1435,21 @@ mod tests {
         assert!(md.ends_with("\n\nForm 10-K 41"), "md: {md}");
     }
 
+    /// A title set in a heading size over two side-by-side grids is not
+    /// the table's first row: it leaves as the heading it is, and the grid
+    /// starts at its header. Modeled on a rate manual whose "Symbols" title
+    /// became a header row and lost every column match.
+    #[test]
+    fn a_title_over_side_by_side_grids_is_a_heading_not_a_row() {
+        let md = markdown_of(&structure::tests::titled_side_by_side_grids_content());
+        assert!(md.contains("# Symbols Symbols"), "md: {md}");
+        assert!(
+            md.contains("| r0c0 | r0c1 | r0c2 | r0c3 | r0c4 | r0c5 |"),
+            "md: {md}"
+        );
+        assert!(!md.contains("| Symbols |"), "title is not a row: {md}");
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]

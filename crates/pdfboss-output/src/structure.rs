@@ -767,10 +767,13 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     if groups.is_empty() {
         return;
     }
-    let Some(band) = table_band(groups) else {
+    let Some(mut band) = table_band(groups) else {
         push_blocks(groups.iter().map(assembled).collect(), stats, out);
         return;
     };
+    let title = title_rows(groups, &band, stats);
+    band.rows.drain(..title);
+    band.span.start += title;
     push_blocks(
         groups[..band.span.start].iter().map(assembled).collect(),
         stats,
@@ -3041,6 +3044,30 @@ fn spaced_cells(row: &[Cell], size: f32) -> bool {
         .all(|pair| pair[1].x - pair[0].end_x > WORD_GAP * size)
 }
 
+/// Rows at the top of a lane band that are its title, not its header: set
+/// in a heading size and populating fewer cells than the row under them.
+/// A title standing over two side-by-side grids populates one cell per
+/// grid and stands a row's pitch above the header, so it passes every row
+/// gate; it belongs to the prose above, where the heading pass reads it.
+fn title_rows(groups: &[Group], band: &TableBand, stats: &SizeStats) -> usize {
+    let mut count = 0;
+    while band.rows.len() - count > TABLE_MIN_ROWS {
+        let group = &groups[band.span.start + count];
+        if stats.level(assembled(group).rank_size).is_none() {
+            break;
+        }
+        if populated_cells(&band.rows[count]) >= populated_cells(&band.rows[count + 1]) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn populated_cells(row: &[Cell]) -> usize {
+    row.iter().filter(|cell| cell.line.is_some()).count()
+}
+
 /// The table's device-space box: every populated cell's line.
 fn table_bbox(rows: &[Vec<Cell>]) -> BBox {
     bbox(rows.iter().flatten().filter_map(|cell| cell.line.as_ref()))
@@ -5043,6 +5070,30 @@ pub(crate) mod tests {
         let mut content = lane_grid_content();
         content.truncate(content.len() - "ET".len());
         content += "1 0 0 1 72 520 Tm (Form 10-K) Tj 1 0 0 1 430 520 Tm (41) Tj ET";
+        content
+    }
+
+    /// Two three-column grids side by side under one title set in a
+    /// heading size, the way a rate manual sets "Symbols" over its proposed
+    /// and current tables. The title populates one cell per grid and stands
+    /// a row's pitch above the header, so it passes every row gate.
+    pub(crate) fn titled_side_by_side_grids_content() -> String {
+        let mut content = String::from(
+            "BT /F1 16 Tf 1 0 0 1 72 720 Tm (Symbols) Tj 1 0 0 1 330 720 Tm (Symbols) Tj /F1 10 Tf ",
+        );
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0), (3, 640.0)] {
+            for (col, x) in [
+                (0, 72.0),
+                (1, 150.0),
+                (2, 230.0),
+                (3, 330.0),
+                (4, 410.0),
+                (5, 490.0),
+            ] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
         content
     }
 
