@@ -2725,11 +2725,14 @@ fn grid_claim(
     };
     if end > hi {
         // A grown claim's verticals were inferred from one section's text;
-        // the columns of the whole are the lanes its lines leave, counting
-        // only the lines that leave a lane of their own: a title set over
+        // the columns of the whole are the lanes its lines leave. The lines
+        // leaving a lane of their own vote first; a one-run line then joins
+        // unless its run covers one of their lanes whole. A title set over
         // two of the columns runs across the gap between them and reads as
         // one cell over both, not as a reason to merge the columns under
-        // it, and the header lines above the top rule stay out likewise.
+        // it; a header word starting inside a lane narrows the lane and
+        // keeps a column to start in. The header lines above the top rule
+        // stay out likewise.
         let spans: Vec<&TextSpan> = groups[lo..end]
             .iter()
             .flat_map(|group| group.spans.iter().copied())
@@ -2738,17 +2741,29 @@ fn grid_claim(
         let claimed = &groups[lo..end];
         let min_gap = gutter_min(claimed);
         let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
+        let mut single_runs: Vec<std::ops::Range<f32>> = Vec::new();
         for group in claimed {
             let mut own: Vec<std::ops::Range<f32>> = Vec::new();
             for span in group.spans.iter().filter(|span| !blank(&span.text)) {
                 add_ink(&mut own, span.x.min(span.end_x)..span.x.max(span.end_x));
             }
             if ink_gaps(&own, min_gap).is_empty() {
+                single_runs.extend(own);
                 continue;
             }
             for ink in own {
                 add_ink(&mut occupied, ink);
             }
+        }
+        let voted = ink_gaps(&occupied, min_gap);
+        for run in single_runs {
+            if voted
+                .iter()
+                .any(|lane| run.start <= lane.start && lane.end <= run.end)
+            {
+                continue;
+            }
+            add_ink(&mut occupied, run);
         }
         columns = cell_columns(&spans, &ink_gaps(&occupied, min_gap));
     }
