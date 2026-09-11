@@ -427,7 +427,8 @@ fn page_layout_with_stats(
     stats: &SizeStats,
     order: ReadingOrder,
 ) -> PageLayout {
-    let mut grids = ruled_grids(rulings, ruling_snap(spans, rulings));
+    let snap = ruling_snap(spans, rulings);
+    let mut grids = merge_stacked(ruled_grids(rulings, snap), spans, snap);
     grids.extend(open_ruled_grids(spans, rulings, &grids));
     grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
     let mut blocks = Vec::new();
@@ -1938,6 +1939,77 @@ impl RuledGrid {
 struct GridLine {
     position: f32,
     extent: std::ops::Range<f32>,
+}
+
+/// The most lines of text that may stand between two stacked grids for
+/// them to be one table: a statement rules each section's rows and leaves
+/// the section label between two sections unruled, and a label wraps to
+/// two lines at most.
+const STACKED_GRID_LINES: usize = 2;
+/// The gap between two stacked grids, in multiples of the type size of the
+/// lines standing in it, beyond which they are two tables.
+const STACKED_GRID_GAP: f32 = 3.0;
+
+/// Grids stacked down the page on the same verticals merged into one
+/// lattice where the gap between them holds at most [`STACKED_GRID_LINES`]
+/// lines of text and is no taller than [`STACKED_GRID_GAP`] times their
+/// type size: the sections of a financial statement, ruled section by
+/// section with an unruled label row between them. The gap becomes a band
+/// of the merged lattice, so the label reads as a row. `grids` arrive
+/// topmost first and leave so; two boxes with an empty gap wider than the
+/// snap stay two tables.
+fn merge_stacked(grids: Vec<RuledGrid>, spans: &[TextSpan], snap: f32) -> Vec<RuledGrid> {
+    let mut merged: Vec<RuledGrid> = Vec::new();
+    for grid in grids {
+        let Some(above) = merged.last_mut() else {
+            merged.push(grid);
+            continue;
+        };
+        if !stacked(above, &grid, spans, snap) {
+            merged.push(grid);
+            continue;
+        }
+        let shared = above.ys[0] - grid.ys[grid.ys.len() - 1] <= snap;
+        let keep = grid.ys.len() - usize::from(shared);
+        above.ys.splice(0..0, grid.ys[..keep].iter().copied());
+        above.boxed = above.boxed && grid.boxed;
+    }
+    merged
+}
+
+/// True when `below` continues `above`: drawn verticals at the same x
+/// positions, and a gap between them short enough to hold a section label
+/// and nothing more.
+fn stacked(above: &RuledGrid, below: &RuledGrid, spans: &[TextSpan], snap: f32) -> bool {
+    if above.open || below.open || above.xs.len() != below.xs.len() {
+        return false;
+    }
+    if above
+        .xs
+        .iter()
+        .zip(&below.xs)
+        .any(|(a, b)| (a - b).abs() > snap)
+    {
+        return false;
+    }
+    let top = below.ys[below.ys.len() - 1];
+    let bottom = above.ys[0];
+    let gap = bottom - top;
+    if gap < -snap {
+        return false;
+    }
+    let between: Vec<&TextSpan> = spans
+        .iter()
+        .filter(|span| !blank(&span.text) && top < span.y && span.y < bottom)
+        .collect();
+    if between.is_empty() {
+        return gap <= 2.0 * snap;
+    }
+    if baseline_count(&between) > STACKED_GRID_LINES {
+        return false;
+    }
+    let size = median(between.iter().map(|span| span.size).collect());
+    gap <= STACKED_GRID_GAP * size
 }
 
 /// The page's ruled grids: vertical and horizontal rulings clustered into
@@ -6182,6 +6254,49 @@ pub(crate) mod tests {
         assert_eq!(grids.len(), 2);
         assert_eq!(grids[0].ys, vec![600.0, 640.0, 680.0], "topmost first");
         assert_eq!(grids[1].ys, vec![300.0, 340.0, 380.0]);
+    }
+
+    /// Stacked boxes merge only across a gap holding a section label: an
+    /// empty gap wider than the snap, or a gap holding a paragraph, keeps
+    /// them two grids; one label line a row's height apart makes them one.
+    #[test]
+    fn stacked_boxes_merge_across_a_label_and_nothing_else() {
+        let mut rulings = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
+        rulings.extend(boxed_grid_rulings(70.0, 300.0, 430.0, 380.0));
+        let empty = merge_stacked(
+            ruled_grids(&rulings, RULING_SNAP_TOLERANCE),
+            &[],
+            RULING_SNAP_TOLERANCE,
+        );
+        assert_eq!(empty.len(), 2, "an empty 220-point gap is two tables");
+        let paragraph: Vec<TextSpan> = (0..3)
+            .map(|line| {
+                span(
+                    "prose between the boxes",
+                    72.0,
+                    300.0,
+                    560.0 - 12.0 * line as f32,
+                    10.0,
+                )
+            })
+            .collect();
+        let mut close = boxed_grid_rulings(70.0, 600.0, 430.0, 680.0);
+        close.extend(boxed_grid_rulings(70.0, 500.0, 430.0, 580.0));
+        let prose = merge_stacked(
+            ruled_grids(&close, RULING_SNAP_TOLERANCE),
+            &paragraph,
+            RULING_SNAP_TOLERANCE,
+        );
+        assert_eq!(prose.len(), 2, "three lines of prose between them");
+        let label = [span("Capital", 72.0, 110.0, 588.0, 10.0)];
+        let merged = merge_stacked(
+            ruled_grids(&close, RULING_SNAP_TOLERANCE),
+            &label,
+            RULING_SNAP_TOLERANCE,
+        );
+        assert_eq!(merged.len(), 1, "one label line joins them");
+        assert_eq!(merged[0].ys, vec![500.0, 540.0, 580.0, 600.0, 640.0, 680.0]);
+        assert!(merged[0].boxed);
     }
 
     /// Column rules running past the outermost horizontals bound bands of
