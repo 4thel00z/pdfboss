@@ -2887,10 +2887,11 @@ fn grid(
 }
 
 /// True when the rows read as a table of contents or an index: every row
-/// ends in a bare page number, the numbers climb down the rows, and the
-/// cells before them carry words. Entry numbers, titles and page numbers
-/// line up in lanes like any grid, but the list is prose to the heading
-/// pass, not a table, and ground truth reads it so.
+/// ends in a bare page number, the numbers never fall down the rows (two
+/// entries may share a page), and the cells before them carry words.
+/// Entry numbers, titles and page numbers line up in lanes like any grid,
+/// but the list is prose to the heading pass, not a table, and ground
+/// truth reads it so.
 fn contents_list(rows: &[Vec<Cell>]) -> bool {
     let mut last = 0u32;
     for row in rows {
@@ -2901,7 +2902,7 @@ fn contents_list(rows: &[Vec<Cell>]) -> bool {
         let Ok(number) = cell_text(page).trim().parse::<u32>() else {
             return false;
         };
-        if number <= last {
+        if number < last {
             return false;
         }
         last = number;
@@ -5559,13 +5560,13 @@ pub(crate) mod tests {
     }
 
     /// A table of contents set in three lanes: entry number, title, page
-    /// number climbing down the list.
+    /// number climbing down the list, two entries sharing a page.
     pub(crate) fn contents_list_content() -> String {
         let mut content = String::from("BT /F1 10 Tf ");
         for (number, y, title, page) in [
             ("1.", 700.0, "Front Matter", "1"),
             ("2.", 680.0, "Researching Wicked Problems", "3"),
-            ("3.", 660.0, "Our Mental Shortcuts", "13"),
+            ("3.", 660.0, "Our Mental Shortcuts", "3"),
             ("4.", 640.0, "Identifying a Topic", "25"),
         ] {
             content += &format!(
