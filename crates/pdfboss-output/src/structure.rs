@@ -230,15 +230,67 @@ pub fn document_layout_with_rulings(
 fn layouts_of(pages: &[(&[TextSpan], &[Ruling], ReadingOrder)]) -> Vec<PageLayout> {
     let borrowed: Vec<&[TextSpan]> = pages.iter().map(|(spans, _, _)| *spans).collect();
     let stats = size_stats(&borrowed);
-    let mut layouts: Vec<PageLayout> = pages
-        .iter()
-        .map(|(spans, rulings, order)| page_layout_with_stats(spans, rulings, &stats, *order))
-        .collect();
+    let layouts = on_workers(pages.len(), |index| {
+        let (spans, rulings, order) = pages[index];
+        page_layout_with_stats(spans, rulings, &stats, order)
+    });
+    finished(layouts, &stats)
+}
+
+/// The page layouts with the document-wide passes applied: the page roles
+/// tagged across pages, and each page's title promoted.
+fn finished(mut layouts: Vec<PageLayout>, stats: &SizeStats) -> Vec<PageLayout> {
     tag_page_roles(&mut layouts);
     for layout in &mut layouts {
-        promote_page_title(&mut layout.blocks, &stats);
+        promote_page_title(&mut layout.blocks, stats);
     }
     layouts
+}
+
+/// `work` over every index below `count`, the results in index order, run
+/// on as many worker threads as the machine has cores. A page's layout
+/// depends on its own spans and the document's size statistics alone, and
+/// the plain-text path already lays each page out on the extraction worker
+/// that read it; the document-wide path lays its pages out the same way
+/// once the size pass over every page is done. Workers take indexes from
+/// a shared counter rather than a stride, since pages vary in cost. One
+/// index, or one core, runs on the calling thread with no thread spawned,
+/// which also keeps the crate on targets without threads.
+fn on_workers<T: Send + Sync>(count: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(count);
+    if workers <= 1 {
+        return (0..count).map(work).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::OnceLock<T>> =
+        (0..count).map(|_| std::sync::OnceLock::new()).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let (next, slots, work) = (&next, &slots, &work);
+            scope.spawn(move || loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if index >= count {
+                    break;
+                }
+                // Each index is handed to exactly one worker, so its slot
+                // is empty; a filled one would mean the counter repeated
+                // an index, which is worth crashing over.
+                if slots[index].set(work(index)).is_err() {
+                    unreachable!("index {index} was dispatched twice");
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("every index below the count was dispatched")
+        })
+        .collect()
 }
 
 /// Tags page headers and footers: a page's first or last line, repeated near-verbatim
@@ -5758,6 +5810,16 @@ pub(crate) mod tests {
             lang: None,
             expansion: None,
         }
+    }
+
+    /// Work spread over the worker threads comes back one result per
+    /// index, in index order, however many indexes there are.
+    #[test]
+    fn work_on_workers_comes_back_in_index_order() {
+        let squares = on_workers(257, |index| index * index);
+        assert_eq!(squares, (0..257).map(|i| i * i).collect::<Vec<_>>());
+        assert_eq!(on_workers(1, |index| index + 1), vec![1]);
+        assert_eq!(on_workers(0, |index| index), Vec::<usize>::new());
     }
 
     /// A synthetic horizontal ruling.
