@@ -686,6 +686,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 .map(|piece| piece.product)
                 .collect();
             let mut thumbnails = 0usize;
+            let mut slides = 0usize;
             for index in 0..doc.page_count() {
                 let page = doc.page(index).ok();
                 sizes.push(page.as_ref().map(|page| page.size()));
@@ -696,6 +697,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                             .map(|piece| piece.product),
                     );
                     thumbnails += usize::from(doc.thumbnail(page).is_some());
+                    slides += usize::from(doc.presentation(page).is_some());
                 }
             }
             pieces.sort();
@@ -718,6 +720,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     fields: &doc.form_fields(),
                     pieces: &pieces,
                     thumbnails,
+                    slides,
                     articles,
                     linearization: linearization
                         .as_ref()
@@ -752,7 +755,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// not be opened. `fields` are the interactive form's fields, counted by
 /// type. `pieces` are the products that left page-piece data on the catalog
 /// or a page, sorted and without repeats. `thumbnails` counts the pages
-/// that carry a thumbnail image. `articles` counts the article threads and
+/// that carry a thumbnail image. `slides` counts the pages with a display
+/// duration or a transition. `articles` counts the article threads and
 /// their beads. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
@@ -768,6 +772,7 @@ struct Info<'a> {
     fields: &'a [pdfboss_core::FormField],
     pieces: &'a [String],
     thumbnails: usize,
+    slides: usize,
     articles: (usize, usize),
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
@@ -849,10 +854,17 @@ fn info_text(info: &Info) -> String {
         let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
         let _ = writeln!(out, "thumbs:    {} of {pages} pages", info.thumbnails);
     }
+    // Pages shown as slides: a display duration or a transition (ISO
+    // 32000-1 §12.4.4).
+    if info.slides > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(out, "slides:    {} of {pages} pages", info.slides);
+    }
     // Article threads and the beads they chain (ISO 32000-1 §12.4.3).
     let (threads, beads) = info.articles;
     if threads > 0 {
-        let _ = writeln!(out, "articles:  {threads} ({beads} beads)");
+        let plural = if beads == 1 { "" } else { "s" };
+        let _ = writeln!(out, "articles:  {threads} ({beads} bead{plural})");
     }
     // Only terminal fields hold values; a field with child fields is a
     // container for inheritable entries (ISO 32000-1 §12.7.3).
@@ -1616,7 +1628,31 @@ mod tests {
             report.contains("pages:     unknown\narticles:  2 (7 beads)\n"),
             "{report}"
         );
+        let single = info_text(&Info {
+            articles: (1, 1),
+            ..Info::default()
+        });
+        assert!(single.contains("articles:  1 (1 bead)\n"), "{single}");
         assert!(!info_text(&Info::default()).contains("articles"));
+    }
+
+    /// Pages with a display duration or a transition print as one count
+    /// after the pages; none prints no line.
+    // Covers ISO 32000-1 §12.4.4.
+    #[test]
+    fn info_text_counts_slide_pages() {
+        let sizes = [Some((612.0, 792.0)); 5];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            slides: 4,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 5: 612 x 792 pt\nslides:    4 of 5 pages\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("slides"));
     }
 
     /// A linearized file prints its first page object after the encryption

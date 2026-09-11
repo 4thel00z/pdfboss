@@ -701,6 +701,15 @@ impl Document {
         block_on(crate::article::page_beads_with(&Immediate(self), page))
     }
 
+    /// A page's presentation entries (ISO 32000-1 §12.4.4), `None` when
+    /// the page has neither `/Dur` nor a `/Trans` dictionary.
+    pub fn presentation(&self, page: &Page) -> Option<crate::presentation::Presentation> {
+        block_on(crate::presentation::presentation_with(
+            &Immediate(self),
+            page,
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {

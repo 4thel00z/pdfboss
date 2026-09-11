@@ -1555,6 +1555,12 @@ impl AsyncDocument {
         pdfboss_core::page_beads_with(self, page).await
     }
 
+    /// A page's presentation entries (ISO 32000-1 §12.4.4): the async twin
+    /// of the sync document's `presentation`.
+    pub async fn presentation(&self, page: &Page) -> Option<pdfboss_core::Presentation> {
+        pdfboss_core::presentation_with(self, page).await
+    }
+
     /// The label the page at `index` shows: the async twin of the sync
     /// document's `page_label`.
     pub async fn page_label(&self, index: usize) -> Option<String> {

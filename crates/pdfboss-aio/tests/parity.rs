@@ -58,7 +58,7 @@ fn outline_doc() -> Vec<u8> {
         3,
         "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
          /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> /Thumb 12 0 R \
-         /B [14 0 R] >>",
+         /B [14 0 R] /Dur 5 /Trans << /S /Split /Dm /V /M /O /D 3.5 >> >>",
     );
     b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
     b.object(
@@ -312,6 +312,24 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             assert_eq!(threads[0].info.title.as_deref(), Some("Story"));
             assert_eq!(threads[0].beads.len(), 1);
             assert_eq!(sync_doc.page_beads(&sync_doc.page(0).unwrap()).len(), 1);
+        }
+        // Covers ISO 32000-1 §12.4.4.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.presentation(&page).await,
+                sync_doc.presentation(&sync_page),
+                "{name}: page {index} presentation"
+            );
+        }
+        if name == "outline" {
+            let shown = sync_doc.presentation(&sync_doc.page(0).unwrap()).unwrap();
+            assert_eq!(shown.duration, Some(5.0));
+            assert_eq!(
+                shown.transition.map(|t| t.style),
+                Some(pdfboss_core::TransitionStyle::Split)
+            );
         }
         for index in 0..=doc.page_count() {
             assert_eq!(

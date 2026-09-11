@@ -30,6 +30,7 @@ pub mod output_intent;
 pub mod page_label;
 pub mod parser;
 pub mod piece_info;
+pub mod presentation;
 pub mod pretty;
 pub mod source;
 pub mod structure;
@@ -75,6 +76,10 @@ pub use outline::{outline_with, OutlineItem};
 pub use output_intent::{output_intents_with, OutputIntent};
 pub use page_label::{page_label, page_labels_with, LabelStyle, PageLabel};
 pub use piece_info::{document_piece_info_with, piece_info_with, PagePiece};
+pub use presentation::{
+    presentation_with, Dimension, Motion, Presentation, Transition, TransitionDirection,
+    TransitionStyle,
+};
 pub use source::{
     block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
     ObjectSource, MAX_RESOLVE_DEPTH,
