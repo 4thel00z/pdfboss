@@ -1742,9 +1742,11 @@ mod tests {
         let requirements = [
             pdfboss_core::Requirement {
                 kind: "EnableJavaScripts".into(),
+                handlers: Vec::new(),
             },
             pdfboss_core::Requirement {
                 kind: "Custom".into(),
+                handlers: Vec::new(),
             },
         ];
         let report = info_text(&Info {

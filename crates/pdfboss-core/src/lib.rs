@@ -83,7 +83,7 @@ pub use presentation::{
     presentation_with, Dimension, Motion, Presentation, Transition, TransitionDirection,
     TransitionStyle,
 };
-pub use requirement::{requirements_with, Requirement};
+pub use requirement::{requirements_with, Requirement, RequirementHandler};
 pub use source::{
     block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
     ObjectSource, MAX_RESOLVE_DEPTH,

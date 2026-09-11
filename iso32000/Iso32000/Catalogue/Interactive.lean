@@ -201,10 +201,10 @@ def chapter12 : List Feature := [
     note := "The /Legal attestation dictionary is never read or written (Legal in the code is a page size)." },
   { ref := .clause [12, 9], title := "Measurement Properties", status := .notImplemented,
     note := "Viewport (/VP), /Measure and number-format dictionaries are never read or written." },
-  { ref := .clause [12, 10, 1], title := "General", status := .incomplete,
-    note := "crates/pdfboss-core/src/requirement.rs requirements_with reads the catalog's /Requirements array (Table 266) into Requirement records carrying the /S type, in array order, skipping an entry that is no dictionary or has no /S name; Document::requirements and AsyncDocument::requirements expose them and pdfboss info prints the types (tests requirement.rs reads_the_requirements_in_order and missing_or_malformed_requirements_read_as_none, crates/pdfboss-aio/tests/parity.rs, crates/pdfboss-cli/src/main.rs info_text_lists_requirements). The /RH requirement handlers are not read (12.10.2) and nothing writes a requirement." },
-  { ref := .clause [12, 10, 2], title := "Requirement Handlers", status := .notImplemented,
-    note := "Requirement handler dictionaries (/S /JS, /S /NoOp) are never read or written." }
+  { ref := .clause [12, 10, 1], title := "General", status := .implemented,
+    note := "crates/pdfboss-core/src/requirement.rs requirements_with reads the catalog's /Requirements array (Table 266) into Requirement records carrying the /S type and the /RH handlers (12.10.2), in array order, skipping an entry that is no dictionary or has no /S name; Document::requirements and AsyncDocument::requirements expose them and pdfboss info prints the types (tests requirement.rs reads_the_requirements_in_order and missing_or_malformed_requirements_read_as_none, crates/pdfboss-aio/tests/parity.rs, crates/pdfboss-cli/src/main.rs info_text_lists_requirements). Whether the reader meets a requirement is the consumer's call; pdfboss-write emits no /Requirements, which the clause does not ask of a writer." },
+  { ref := .clause [12, 10, 2], title := "Requirement Handlers", status := .implemented,
+    note := "crates/pdfboss-core/src/requirement.rs handlers_with reads a requirement's /RH entry, one handler dictionary or an array of them (Table 267), into RequirementHandler records with the /S kind (JS or NoOp, other names kept as written) and the /Script name of the document-level JavaScript, skipping a handler that is no dictionary or has no /S (tests requirement.rs reads_the_requirement_handlers and missing_or_malformed_handlers_read_as_none, crates/pdfboss-aio/tests/parity.rs). The handler is data: pdfboss has no JavaScript engine, so running the named script is viewer behavior." }
 ]
 
 end Iso32000.Catalogue
