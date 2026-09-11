@@ -1738,6 +1738,18 @@ mod tests {
 
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
+    /// A ruled band holding only a whitespace span is the page's padding:
+    /// no row of blank cells appears between the two rows around it.
+    #[test]
+    fn a_blank_ruled_band_is_not_a_row() {
+        let md = markdown_of_drawn(&structure::tests::ruled_blank_band_content());
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "md: {md}"
+        );
+        assert!(!md.contains("|  |  |"), "no blank row: {md}");
+    }
+
     #[test]
     fn a_ruled_grid_becomes_a_pipe_table() {
         let md = markdown_of_drawn(&structure::tests::ruled_grid_content());

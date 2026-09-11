@@ -2498,6 +2498,9 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         }
         rows.push(logical_row(lines, columns.len()));
     }
+    // A band holding nothing but whitespace spans is the page's padding,
+    // not a row: a row of blank cells says nothing.
+    rows.retain(|row| row.iter().any(inked_cell));
     if rows.len() < TABLE_MIN_ROWS
         && !((grid.boxed || grid.open) && rows.len() >= RULED_BOXED_MIN_ROWS)
     {
@@ -2619,6 +2622,14 @@ fn figure_cell(cell: &Cell) -> bool {
             || AMOUNT_SIGNS.contains(&c)
             || matches!(c, '€' | '(' | '-' | '\u{2013}' | '\u{2014}')
     })
+}
+
+/// True when the cell carries text that paints: not a lineless cell, and
+/// not one holding whitespace spans alone.
+fn inked_cell(cell: &Cell) -> bool {
+    cell.line
+        .as_ref()
+        .is_some_and(|line| line.inlines.iter().any(|inline| !blank(&inline.text)))
 }
 
 /// True when the row's cell covering `column` carries a line.
@@ -5472,6 +5483,17 @@ pub(crate) mod tests {
         }
         content += "ET";
         content
+    }
+
+    /// [`ruled_grid_content`] with a third band between the two rows that
+    /// holds one whitespace span: the page's padding, not a row.
+    pub(crate) fn ruled_blank_band_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 80 675 Tm ( ) Tj \
+             1 0 0 1 80 655 Tm (a2) Tj 1 0 0 1 260 655 Tm (b2) Tj ET",
+        )
     }
 
     /// Two lane grids of three rows each, one well below the other, with
