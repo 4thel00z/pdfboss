@@ -2253,10 +2253,14 @@ fn open_ruled_candidate(
 }
 
 /// How close two rulings may lie and still be one drawn line on this page:
-/// [`RULING_SNAP_TOLERANCE`], or less where the type is small enough that
-/// rows are ruled closer than that. A rate table set in 4-point type rules
-/// every row, 5.6 points apart; snapped at 6 the rules chain into three
-/// lines and the table folds into two rows.
+/// [`RULING_SNAP_TOLERANCE`], or less where the type the close rules
+/// bracket is small enough that rows are ruled closer than that. A rate
+/// table set in 4-point type rules every row, 5.6 points apart; snapped at
+/// 6 the rules chain into three lines and the table folds into two rows.
+/// The type is measured between the close rules themselves, so a small
+/// table under a page of large body text keeps its rows, and a caption in
+/// small type beside a table in large type does not tighten that table's
+/// rules.
 fn ruling_snap(spans: &[TextSpan], rulings: &[Ruling]) -> f32 {
     // The size pass over the page's spans is paid only where the answer
     // can differ: two horizontal rules within the snap of each other.
@@ -2266,13 +2270,25 @@ fn ruling_snap(spans: &[TextSpan], rulings: &[Ruling]) -> f32 {
         .map(|r| r.start.y)
         .collect();
     ys.sort_by(f32::total_cmp);
-    if !ys
+    let close: Vec<&[f32]> = ys
         .windows(2)
-        .any(|pair| pair[1] - pair[0] <= RULING_SNAP_TOLERANCE)
-    {
+        .filter(|pair| pair[1] - pair[0] <= RULING_SNAP_TOLERANCE)
+        .collect();
+    if close.is_empty() {
         return RULING_SNAP_TOLERANCE;
     }
-    let body = size_stats(&[spans]).body;
+    let lo = close.iter().map(|pair| pair[0]).fold(f32::MAX, f32::min);
+    let hi = close.iter().map(|pair| pair[1]).fold(f32::MIN, f32::max);
+    let sizes: Vec<f32> = spans
+        .iter()
+        .filter(|span| !blank(&span.text) && (lo..=hi).contains(&span.y))
+        .map(|span| span.size)
+        .collect();
+    let body = if sizes.is_empty() {
+        size_stats(&[spans]).body
+    } else {
+        median(sizes)
+    };
     if body <= 0.0 {
         return RULING_SNAP_TOLERANCE;
     }
@@ -6058,7 +6074,9 @@ pub(crate) mod tests {
     }
 
     /// Rules drawn every five points in a table set in 4-point type are one
-    /// line per row; at body size the snap stays six points.
+    /// line per row; at body size the snap stays six points. The type that
+    /// counts is the type between the close rules: a page of large body
+    /// text around the small table does not fold its rows.
     #[test]
     fn tight_rules_stay_separate_lines_when_the_type_is_small() {
         let mut rulings = vec![
@@ -6080,6 +6098,21 @@ pub(crate) mod tests {
         let body = [span("body", 72.0, 100.0, 700.0, 10.0)];
         assert_eq!(ruling_snap(&body, &rulings), RULING_SNAP_TOLERANCE);
         assert_eq!(ruling_snap(&small, &[]), RULING_SNAP_TOLERANCE);
+        let mut page = small.clone();
+        page.extend((0..20).map(|line| {
+            span(
+                "a paragraph of body text far below",
+                72.0,
+                300.0,
+                400.0 - 12.0 * line as f32,
+                10.0,
+            )
+        }));
+        let snap = ruling_snap(&page, &rulings);
+        assert!(
+            snap < 5.0,
+            "the body text outside the rules has no say: {snap}"
+        );
     }
 
     fn ruling(x0: f32, y0: f32, x1: f32, y1: f32) -> Ruling {
