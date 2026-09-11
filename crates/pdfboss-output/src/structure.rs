@@ -2793,6 +2793,20 @@ fn grid_claim(
     // A band holding nothing but whitespace spans is the page's padding,
     // not a row: a row of blank cells says nothing.
     rows.retain(|row| row.iter().any(inked_cell));
+    // An open lattice chains the rules of two tables set to the same
+    // columns, and the prose between the tables lies inside the drawn
+    // width and reads as one cell over every column. A row like that is
+    // prose, and the lattice is two tables the lane attempt reads apart; a
+    // section label populates the first column, a spanning note some of
+    // the columns.
+    if grid.open
+        && columns.len() >= TABLE_MIN_LANES
+        && rows
+            .iter()
+            .any(|row| spans_every_column(row, columns.len()))
+    {
+        return None;
+    }
     if rows.len() < TABLE_MIN_ROWS
         && !((grid.boxed || grid.open) && rows.len() >= RULED_BOXED_MIN_ROWS)
     {
@@ -2804,6 +2818,11 @@ fn grid_claim(
         rows,
         bbox: grid.bbox(),
     })
+}
+
+/// True when the row is one inked cell over all `columns` columns.
+fn spans_every_column(row: &[Cell], columns: usize) -> bool {
+    row.len() == 1 && row[0].colspan as usize == columns && inked_cell(&row[0])
 }
 
 /// The lines the stack holding `grid` covers, `hulls` being the stacks
@@ -6530,6 +6549,34 @@ pub(crate) mod tests {
         for top in [700.0, 620.0] {
             for y in [top - 4.0, top - 46.0, top - 47.5] {
                 content += &format!("290 {y} m 420 {y} l S ");
+            }
+        }
+        content
+    }
+
+    /// Two three-column tables set to the same columns with a line of prose
+    /// between them, each ruled under its header and its total across the
+    /// full width: the rules chain into one open lattice, and the prose
+    /// inside it reads as one cell over every column.
+    pub(crate) fn two_tables_in_one_open_lattice_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for top in [700.0, 610.0] {
+            for (offset, label, a, b) in [
+                (0.0, "in millions", "2024", "2023"),
+                (14.0, "Cash", "36,364", "48,677"),
+                (28.0, "Loans", "46,694", "45,866"),
+                (42.0, "Total", "83,058", "94,543"),
+            ] {
+                let y = top - offset;
+                content += &format!(
+                    "1 0 0 1 72 {y} Tm ({label}) Tj 1 0 0 1 220 {y} Tm ({a}) Tj 1 0 0 1 320 {y} Tm ({b}) Tj "
+                );
+            }
+        }
+        content += "1 0 0 1 72 632 Tm (The table below presents details about our loans.) Tj ET ";
+        for top in [700.0, 610.0] {
+            for y in [top - 4.0, top - 46.0, top - 47.5] {
+                content += &format!("70 {y} m 380 {y} l S ");
             }
         }
         content

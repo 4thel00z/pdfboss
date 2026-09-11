@@ -1787,6 +1787,24 @@ mod tests {
         );
     }
 
+    /// Two tables ruled across the full width with a line of prose between
+    /// them chain into one open lattice; the prose reads as one cell over
+    /// every column, which makes the lattice two tables with prose between.
+    #[test]
+    fn prose_inside_an_open_lattice_splits_it_into_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::two_tables_in_one_open_lattice_content());
+        assert!(!md.contains("<table>"), "no merged table: {md}");
+        assert_eq!(
+            md.matches("| Cash | 36,364 | 48,677 |").count(),
+            2,
+            "md: {md}"
+        );
+        assert!(
+            md.contains("\nThe table below presents details about our loans.\n"),
+            "md: {md}"
+        );
+    }
+
     /// Two stacked open-ruled tables share their x-extent; the cluster
     /// splits at the largest rule gap and each table comes out whole.
     #[test]
