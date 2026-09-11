@@ -1921,6 +1921,10 @@ struct TableBand {
 struct RuledGrid {
     xs: Vec<f32>,
     ys: Vec<f32>,
+    /// The x extent the horizontal rules at each of `ys` are drawn over,
+    /// one per entry: a rule the verticals' reach implied rather than one
+    /// drawn spans the grid's width.
+    reach: Vec<std::ops::Range<f32>>,
     /// Whether all four outer borders are drawn end to end.
     boxed: bool,
     /// Whether the verticals are inferred from the text rather than drawn:
@@ -1948,6 +1952,34 @@ impl RuledGrid {
     /// baseline at `y` falls in; callers check [`RuledGrid::holds`] first.
     fn band_of(&self, y: f32) -> usize {
         self.ys.partition_point(|ruling_y| *ruling_y <= y) - 1
+    }
+
+    /// True when the line's ink overlaps the drawn extent of the rules
+    /// above and below its band. A chart's frame and the table beneath it
+    /// weld into one lattice through a shared vertical, and the axis labels
+    /// left of the frame fall in its bands with no rule over them: they are
+    /// no rows of the lattice.
+    fn under_rules(&self, group: &Group) -> bool {
+        let inked: Vec<&TextSpan> = group
+            .spans
+            .iter()
+            .filter(|span| !blank(&span.text))
+            .copied()
+            .collect();
+        if inked.is_empty() {
+            return true;
+        }
+        let (x0, x1) = x_bounds(&inked);
+        // Some rule above the line and some rule at or below it are drawn
+        // over its ink: the nearest rules need not be, since an underline
+        // inside a cell joins the lattice as a rule of its own with the
+        // reach of that cell alone.
+        let over = |reach: &std::ops::Range<f32>| {
+            x0 < reach.end + RULING_SNAP_TOLERANCE && x1 > reach.start - RULING_SNAP_TOLERANCE
+        };
+        let rules = self.ys.iter().zip(&self.reach);
+        rules.clone().any(|(&y, reach)| y > group.y && over(reach))
+            && rules.clone().any(|(&y, reach)| y <= group.y && over(reach))
     }
 
     /// The grid's drawn border box.
@@ -2031,6 +2063,7 @@ fn stack_hulls(grids: &[RuledGrid], spans: &[TextSpan], snap: f32) -> Vec<RuledG
         let shared = bottom - top <= snap;
         let keep = grid.ys.len() - usize::from(shared);
         above.ys.splice(0..0, grid.ys[..keep].iter().copied());
+        above.reach.splice(0..0, grid.reach[..keep].iter().cloned());
         above.boxed = above.boxed && grid.boxed;
     }
     hulls
@@ -2460,9 +2493,11 @@ fn open_ruled_candidate(
     xs.push(x0.min(text_lo) - 1.0);
     xs.extend(boundaries);
     xs.push(x1.max(text_hi) + 1.0);
+    let reach = vec![xs[0]..xs[xs.len() - 1]; ys.len()];
     let grid = RuledGrid {
         xs,
         ys: ys.to_vec(),
+        reach,
         boxed: false,
         open: true,
     };
@@ -2646,9 +2681,26 @@ fn lattice(verticals: &[&GridLine], horizontals: &[&GridLine], snap: f32) -> Opt
     if ys.len() < RULED_GRID_MIN_HORIZONTALS {
         return None;
     }
+    let width = xs[0]..xs[xs.len() - 1];
+    let reach = ys
+        .iter()
+        .map(|&y| {
+            let drawn = horizontals
+                .iter()
+                .filter(|line| (line.position - y).abs() <= snap)
+                .fold(None::<std::ops::Range<f32>>, |reach, line| match reach {
+                    Some(reach) => {
+                        Some(reach.start.min(line.extent.start)..reach.end.max(line.extent.end))
+                    }
+                    None => Some(line.extent.clone()),
+                });
+            drawn.unwrap_or_else(|| width.clone())
+        })
+        .collect();
     Some(RuledGrid {
         xs,
         ys,
+        reach,
         boxed,
         open: false,
     })
@@ -2746,6 +2798,12 @@ fn grid_claim(
         .take_while(|group| grid.holds(group.y))
         .count();
     let hi = lo + inside;
+    // A drawn lattice's rows lie under its rules; a line inside its bands
+    // with no rule drawn over it belongs to something the lattice welded
+    // onto, a chart's frame or a form's margin, and the lattice is no table.
+    if !grid.open && groups[lo..hi].iter().any(|group| !grid.under_rules(group)) {
+        return None;
+    }
     let stack = stack_lines(groups, grid, hulls).unwrap_or(lo..hi);
     let mut columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[stack]);
     let top = header_reach(groups, lo, hi, grid, grids, &columns);
@@ -5537,6 +5595,7 @@ pub(crate) mod tests {
         RuledGrid {
             xs: vec![76.0, 180.0, 284.0],
             ys: vec![186.0, 254.0],
+            reach: vec![76.0..284.0, 76.0..284.0],
             boxed: true,
             open: false,
         }
@@ -6720,6 +6779,24 @@ pub(crate) mod tests {
         }
         content += "ET";
         content
+    }
+
+    /// A chart frame with four gridlines standing on a three-column table,
+    /// the frame's verticals running down into the table's rules so the
+    /// two weld into one lattice, and the chart's axis labels set left of
+    /// the frame inside the lattice's bands.
+    pub(crate) fn chart_over_table_content() -> String {
+        String::from(
+            "112 123 m 112 169 l S 190 123 m 190 411 l S 254 123 m 254 169 l S 317 123 m 317 411 l S \
+             190 200 m 317 200 l S 190 250 m 317 250 l S 190 300 m 317 300 l S 190 350 m 317 350 l S \
+             190 411 m 317 411 l S \
+             112 123 m 317 123 l S 112 138 m 317 138 l S 112 153 m 317 153 l S 112 169 m 317 169 l S \
+             BT /F1 8 Tf 1 0 0 1 160 305 Tm (90%) Tj 1 0 0 1 160 255 Tm (80%) Tj \
+             1 0 0 1 160 205 Tm (70%) Tj \
+             1 0 0 1 116 158 Tm (Rate) Tj 1 0 0 1 195 158 Tm (2024) Tj 1 0 0 1 259 158 Tm (2023) Tj \
+             1 0 0 1 116 143 Tm (PIF) Tj 1 0 0 1 195 143 Tm (0.1%) Tj 1 0 0 1 259 143 Tm (6.9%) Tj \
+             1 0 0 1 116 128 Tm (Total) Tj 1 0 0 1 195 128 Tm (1,461) Tj 1 0 0 1 259 128 Tm (95,491) Tj ET",
+        )
     }
 
     /// Two three-column tables set to the same columns with a line of prose

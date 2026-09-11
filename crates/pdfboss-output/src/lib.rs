@@ -1842,6 +1842,19 @@ mod tests {
         );
     }
 
+    /// A chart frame welded onto a table through a shared vertical is no
+    /// table of the axis labels beside it: the lattice claims nothing and
+    /// the table comes out of the lanes.
+    #[test]
+    fn a_chart_frame_welded_onto_a_table_claims_no_rows() {
+        let md = markdown_of_drawn(&structure::tests::chart_over_table_content());
+        assert!(!md.contains("<table>"), "md: {md}");
+        assert!(
+            md.contains("| Rate | 2024 | 2023 |\n| --- | --- | --- |\n| PIF | 0.1% | 6.9% |"),
+            "md: {md}"
+        );
+    }
+
     /// Two tables ruled across the full width with a line of prose between
     /// them chain into one open lattice; the prose reads as one cell over
     /// every column, which makes the lattice two tables with prose between.
