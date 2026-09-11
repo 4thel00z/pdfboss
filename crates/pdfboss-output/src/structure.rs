@@ -2884,9 +2884,29 @@ fn grid_claim(
     // and lanes must not admit what the rules refused. The double rules
     // under two tables' totals pair up as one open lattice spanning both,
     // and the lines it holds run across its two drawn columns.
-    let rows_under_rules = groups[lo..hi]
+    let ruled_rows: Option<Vec<Vec<Cell>>> = groups[lo..hi]
         .iter()
-        .all(|group| table_row(group, &columns).is_some());
+        .map(|group| table_row(group, &columns))
+        .collect();
+    let rows_under_rules = ruled_rows.is_some();
+    // Prose between two tables runs from the first drawn column of the
+    // open lattice their rules chain into across the next; read under
+    // those columns, before the lanes of the grown claim redraw them, it is
+    // one cell over two columns or more standing between two records, and
+    // a sentence stops short of the last column as readily as it reaches
+    // it. Such a lattice is two tables.
+    if grid.open && columns.len() >= TABLE_MIN_LANES {
+        if let Some(ruled_rows) = &ruled_rows {
+            let spanning: Vec<bool> = ruled_rows.iter().map(|row| prose_row(row)).collect();
+            let first = spanning.iter().position(|spans| !spans);
+            let last = spanning.iter().rposition(|spans| !spans);
+            if let (Some(first), Some(last)) = (first, last) {
+                if spanning[first..=last].iter().any(|spans| *spans) {
+                    return None;
+                }
+            }
+        }
+    }
     let end = if grid.open && rows_under_rules {
         open_reach(groups, lo, hi, grid, grids)
     } else {
@@ -3024,6 +3044,16 @@ fn grid_claim(
 /// True when the row is one inked cell over all `columns` columns.
 fn spans_every_column(row: &[Cell], columns: usize) -> bool {
     row.len() == 1 && row[0].colspan as usize == columns && inked_cell(&row[0])
+}
+
+/// True when the row's only inked cell opens in the first column and
+/// spans two columns or more: a line of prose set from the left margin,
+/// not a section label, which keeps to the first column.
+fn prose_row(row: &[Cell]) -> bool {
+    let Some(first) = row.first() else {
+        return false;
+    };
+    first.colspan >= 2 && inked_cell(first) && row[1..].iter().all(|cell| !inked_cell(cell))
 }
 
 /// The lines the stack holding `grid` covers, `hulls` being the stacks
@@ -7074,6 +7104,33 @@ pub(crate) mod tests {
             }
         }
         content += "1 0 0 1 72 632 Tm (The table below presents details about our loans.) Tj ET ";
+        for top in [700.0, 610.0] {
+            for y in [top - 4.0, top - 46.0, top - 47.5] {
+                content += &format!("70 {y} m 380 {y} l S ");
+            }
+        }
+        content
+    }
+
+    /// [`two_tables_in_one_open_lattice_content`] with a shorter line of
+    /// prose between the tables, one that runs from the first column across
+    /// the second and stops short of the third.
+    pub(crate) fn two_tables_with_a_short_note_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for top in [700.0, 610.0] {
+            for (offset, label, a, b) in [
+                (0.0, "in millions", "2024", "2023"),
+                (14.0, "Cash", "36,364", "48,677"),
+                (28.0, "Loans", "46,694", "45,866"),
+                (42.0, "Total", "83,058", "94,543"),
+            ] {
+                let y = top - offset;
+                content += &format!(
+                    "1 0 0 1 72 {y} Tm ({label}) Tj 1 0 0 1 220 {y} Tm ({a}) Tj 1 0 0 1 320 {y} Tm ({b}) Tj "
+                );
+            }
+        }
+        content += "1 0 0 1 72 632 Tm (The table below presents our loans.) Tj ET ";
         for top in [700.0, 610.0] {
             for y in [top - 4.0, top - 46.0, top - 47.5] {
                 content += &format!("70 {y} m 380 {y} l S ");

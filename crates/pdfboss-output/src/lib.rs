@@ -1924,6 +1924,24 @@ mod tests {
         );
     }
 
+    /// A line of prose between the tables that stops short of the last
+    /// column still runs from the first column across the second, and
+    /// still parts the lattice into two tables.
+    #[test]
+    fn a_short_note_inside_an_open_lattice_splits_it_into_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::two_tables_with_a_short_note_content());
+        assert!(!md.contains("<table>"), "no merged table: {md}");
+        assert_eq!(
+            md.matches("| Cash | 36,364 | 48,677 |").count(),
+            2,
+            "md: {md}"
+        );
+        assert!(
+            md.contains("\nThe table below presents our loans.\n"),
+            "md: {md}"
+        );
+    }
+
     /// Two stacked open-ruled tables share their x-extent; the cluster
     /// splits at the largest rule gap and each table comes out whole.
     #[test]
