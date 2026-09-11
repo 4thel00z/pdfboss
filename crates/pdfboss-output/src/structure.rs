@@ -756,11 +756,9 @@ fn push_segment_blocks(
     let mut next = 0usize;
     for claim in claims {
         push_stretch(&groups[next..claim.range.start], stats, order, out);
-        let mut rows = claim.rows;
-        tidy_amounts(&mut rows);
         out.push(Block::Table {
             bbox: claim.bbox,
-            rows,
+            rows: claim.rows,
         });
         next = claim.range.end;
     }
@@ -785,11 +783,9 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
         stats,
         out,
     );
-    let mut rows = band.rows;
-    tidy_amounts(&mut rows);
     out.push(Block::Table {
-        bbox: table_bbox(&rows),
-        rows,
+        bbox: table_bbox(&band.rows),
+        rows: band.rows,
     });
     // What stands below the grid gets the same attempt: a page's second
     // table is as much a table as its first.
@@ -3143,8 +3139,10 @@ const AMOUNT_CLOSERS: [char; 2] = [')', '%'];
 /// its right, as "$1,824"; a closer opening a cell moves onto the amount to
 /// its left, as "(1,234)" and "12%"; and inside a cell the space before a
 /// closer goes. A column that held nothing but signs is then blank in every
-/// row, and is no column.
-fn tidy_amounts(rows: &mut Vec<Vec<Cell>>) {
+/// row, and is no column. The Markdown adapter calls this on the rows it
+/// renders; the layout itself keeps every token where the page put it, so
+/// the Text adapter reads the page as written.
+pub(crate) fn tidy_amounts(rows: &mut [Vec<Cell>]) {
     let mut emptied: Vec<usize> = Vec::new();
     for row in rows.iter_mut() {
         let mut starts = Vec::with_capacity(row.len());

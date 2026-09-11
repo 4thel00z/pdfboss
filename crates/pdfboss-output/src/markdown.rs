@@ -143,16 +143,19 @@ fn strip_marker(line: &Line, chars: usize) -> Vec<Inline> {
 /// and an evaluator reading a merged cell reads it off that attribute.
 ///
 /// Cells carry no emphasis. A table's markers are pure edit distance against
-/// ground truth that carries none, exactly as in a heading.
+/// ground truth that carries none, exactly as in a heading. Amounts the
+/// producer split across cells rejoin first, on a copy of the rows.
 fn table(rows: &[Vec<Cell>]) -> String {
+    let mut rows = rows.to_vec();
+    crate::structure::tidy_amounts(&mut rows);
     if rows
         .iter()
         .flatten()
         .any(|cell| cell.colspan > 1 || cell.rowspan > 1)
     {
-        return html_table(rows);
+        return html_table(&rows);
     }
-    pipe_table(rows)
+    pipe_table(&rows)
 }
 
 /// GFM: the first row is the header, and the delimiter row that follows it
