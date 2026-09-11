@@ -4,7 +4,7 @@
 //! whole tree, or every pair listed leaf by leaf.
 
 use crate::hash::FastSet;
-use crate::object::{Dict, ObjRef, Object};
+use crate::object::{decode_text_string, Dict, ObjRef, Object};
 use crate::source::AsyncObjectSource;
 
 /// Maximum nodes visited in one walk: past it the walk gives up, so a
@@ -220,6 +220,12 @@ impl<S: AsyncObjectSource> Entries<'_, S> {
     /// The name under `key` mapped through `from_name`.
     pub(crate) async fn named<T>(&self, key: &str, from_name: fn(&str) -> Option<T>) -> Option<T> {
         from_name(&self.value(key).await?.as_name()?.0)
+    }
+
+    /// The text string under `key`, decoded (§7.9.2.2); `None` when absent
+    /// or not a string.
+    pub(crate) async fn text(&self, key: &str) -> Option<String> {
+        Some(decode_text_string(self.value(key).await?.as_str_bytes()?))
     }
 }
 

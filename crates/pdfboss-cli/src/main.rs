@@ -290,6 +290,10 @@ enum Command {
         /// PNG compression: encode time against file size, same pixels.
         #[arg(long, value_enum, default_value_t = PngCompressionArg::Default)]
         png_compression: PngCompressionArg,
+        /// Write each page's thumbnail image (page-N-thumb.png) instead of
+        /// the images the page draws; pages without one are skipped.
+        #[arg(long)]
+        thumbnails: bool,
     },
     /// Pretty-print a single object.
     Obj {
@@ -603,7 +607,9 @@ fn main() {
             out,
             password,
             png_compression,
-        } => cmd_images(&file, page, out, &password, png_compression).map_err(Failure::from),
+            thumbnails,
+        } => cmd_images(&file, page, out, &password, png_compression, thumbnails)
+            .map_err(Failure::from),
         Command::Obj {
             file,
             num,
@@ -673,34 +679,78 @@ fn main() {
 fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
     match Document::open_with_password(file, password) {
         Ok(doc) => {
-            let sizes: Vec<Option<(f32, f32)>> = (0..doc.page_count())
-                .map(|i| doc.page(i).ok().map(|p| p.size()))
+            let mut sizes: Vec<Option<(f32, f32)>> = Vec::new();
+            let mut pieces: Vec<String> = doc
+                .piece_info()
+                .into_iter()
+                .map(|piece| piece.product)
                 .collect();
+            let mut thumbnails = 0usize;
+            let mut slides = 0usize;
+            for index in 0..doc.page_count() {
+                let page = doc.page(index).ok();
+                sizes.push(page.as_ref().map(|page| page.size()));
+                if let Some(page) = &page {
+                    pieces.extend(
+                        doc.page_piece_info(page)
+                            .into_iter()
+                            .map(|piece| piece.product),
+                    );
+                    thumbnails += usize::from(doc.thumbnail(page).is_some());
+                    slides += usize::from(doc.presentation(page).is_some());
+                }
+            }
+            pieces.sort();
+            pieces.dedup();
+            let threads = doc.articles();
+            let articles = (
+                threads.len(),
+                threads.iter().map(|thread| thread.beads.len()).sum(),
+            );
+            let linearization = doc.linearization();
+            let handlers = doc.permission_handlers();
+            let mut perms = Vec::new();
+            if handlers.as_ref().is_some_and(|h| h.doc_mdp.is_some()) {
+                perms.push("DocMDP");
+            }
+            if handlers.as_ref().is_some_and(|h| h.usage_rights.is_some()) {
+                perms.push("UR3");
+            }
             print!(
                 "{}",
-                info_text(
-                    Some(doc.version()),
-                    false,
-                    Some(&sizes),
-                    &doc.metadata(),
-                    &doc.extensions(),
-                    &doc.form_fields(),
-                )
+                info_text(&Info {
+                    version: Some(doc.version()),
+                    encrypted: false,
+                    sizes: Some(&sizes),
+                    meta: Some(&doc.metadata()),
+                    extensions: &doc.extensions(),
+                    output_intents: &doc.output_intents(),
+                    fields: &doc.form_fields(),
+                    pieces: &pieces,
+                    thumbnails,
+                    slides,
+                    articles,
+                    perms: &perms,
+                    linearization: linearization
+                        .as_ref()
+                        .map(|record| (record, doc.bytes().len() as u64)),
+                })
             );
             Ok(())
         }
         Err(Error::Encrypted) => {
             let data = std::fs::read(file).map_err(|e| e.to_string())?;
+            let linearization = pdfboss_core::linearization_dictionary(&data);
             print!(
                 "{}",
-                info_text(
-                    scan_version(&data),
-                    true,
-                    None,
-                    &Metadata::default(),
-                    &[],
-                    &[]
-                )
+                info_text(&Info {
+                    version: scan_version(&data),
+                    encrypted: true,
+                    linearization: linearization
+                        .as_ref()
+                        .map(|record| (record, data.len() as u64)),
+                    ..Info::default()
+                })
             );
             Ok(())
         }
@@ -708,20 +758,40 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
     }
 }
 
-/// Renders the `info` report. `sizes` is one entry per page (`None` when a
-/// page failed to load); `None` for the whole slice means the page count is
-/// unknown (encrypted document). `fields` are the interactive form's
-/// fields, counted by type.
-fn info_text(
+/// What the `info` report shows. `sizes` is one entry per page (`None` when
+/// a page failed to load); `None` for the whole slice means the page count
+/// is unknown (encrypted document). `meta` is `None` when the document could
+/// not be opened. `fields` are the interactive form's fields, counted by
+/// type. `pieces` are the products that left page-piece data on the catalog
+/// or a page, sorted and without repeats. `thumbnails` counts the pages
+/// that carry a thumbnail image. `slides` counts the pages with a display
+/// duration or a transition. `articles` counts the article threads and
+/// their beads. `perms` names the permission handlers the catalog's
+/// `/Perms` dictionary carries. `linearization` is the
+/// linearization parameter dictionary as written, paired with the file's
+/// actual length, so a dictionary an appended update left behind prints as
+/// not linearized.
+#[derive(Default)]
+struct Info<'a> {
     version: Option<(u8, u8)>,
     encrypted: bool,
-    sizes: Option<&[Option<(f32, f32)>]>,
-    meta: &Metadata,
-    extensions: &[pdfboss_core::DeveloperExtension],
-    fields: &[pdfboss_core::FormField],
-) -> String {
+    sizes: Option<&'a [Option<(f32, f32)>]>,
+    meta: Option<&'a Metadata>,
+    extensions: &'a [pdfboss_core::DeveloperExtension],
+    output_intents: &'a [pdfboss_core::OutputIntent],
+    fields: &'a [pdfboss_core::FormField],
+    pieces: &'a [String],
+    thumbnails: usize,
+    slides: usize,
+    articles: (usize, usize),
+    perms: &'a [&'a str],
+    linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
+}
+
+/// Renders the `info` report.
+fn info_text(info: &Info) -> String {
     let mut out = String::new();
-    match version {
+    match info.version {
         Some((major, minor)) => {
             let _ = writeln!(out, "version:   {major}.{minor}");
         }
@@ -729,9 +799,9 @@ fn info_text(
             let _ = writeln!(out, "version:   unknown");
         }
     }
-    if !extensions.is_empty() {
+    if !info.extensions.is_empty() {
         let _ = writeln!(out, "extensions:");
-        for extension in extensions {
+        for extension in info.extensions {
             let _ = writeln!(
                 out,
                 "  {:<9} {} level {}",
@@ -739,8 +809,45 @@ fn info_text(
             );
         }
     }
-    let _ = writeln!(out, "encrypted: {encrypted}");
-    match sizes {
+    // An intent names its condition by identifier, else in words, else in
+    // its info text (ISO 32000-1 §14.11.5, Table 365).
+    if !info.output_intents.is_empty() {
+        let _ = writeln!(out, "output intents:");
+        for intent in info.output_intents {
+            let condition = intent
+                .output_condition_identifier
+                .as_deref()
+                .or(intent.output_condition.as_deref())
+                .or(intent.info.as_deref())
+                .unwrap_or("");
+            let line = format!("  {:<9} {condition}", intent.subtype);
+            let _ = writeln!(out, "{}", line.trim_end());
+        }
+    }
+    let _ = writeln!(out, "encrypted: {}", info.encrypted);
+    // A file is linearized only while /L names its actual length (ISO
+    // 32000-1 Annex F.3, Table F.1).
+    if let Some((record, file_length)) = info.linearization {
+        if record.is_current(file_length) {
+            let _ = writeln!(
+                out,
+                "linearized: yes (first page object {})",
+                record.first_page_object
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "linearized: no (/L {} does not match the {file_length}-byte file)",
+                record.file_length
+            );
+        }
+    }
+    // The permission handlers of the catalog's /Perms dictionary (ISO
+    // 32000-1 §12.8.4): read, neither verified nor enforced.
+    if !info.perms.is_empty() {
+        let _ = writeln!(out, "perms:     {}", info.perms.join(", "));
+    }
+    match info.sizes {
         Some(sizes) => {
             let _ = writeln!(out, "pages:     {}", sizes.len());
             for (i, size) in sizes.iter().enumerate() {
@@ -758,9 +865,27 @@ fn info_text(
             let _ = writeln!(out, "pages:     unknown");
         }
     }
+    // Pages carrying a /Thumb image (ISO 32000-1 §12.3.4).
+    if info.thumbnails > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(out, "thumbs:    {} of {pages} pages", info.thumbnails);
+    }
+    // Pages shown as slides: a display duration or a transition (ISO
+    // 32000-1 §12.4.4).
+    if info.slides > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(out, "slides:    {} of {pages} pages", info.slides);
+    }
+    // Article threads and the beads they chain (ISO 32000-1 §12.4.3).
+    let (threads, beads) = info.articles;
+    if threads > 0 {
+        let plural = if beads == 1 { "" } else { "s" };
+        let _ = writeln!(out, "articles:  {threads} ({beads} bead{plural})");
+    }
     // Only terminal fields hold values; a field with child fields is a
     // container for inheritable entries (ISO 32000-1 §12.7.3).
-    let terminal: Vec<&pdfboss_core::FormField> = fields
+    let terminal: Vec<&pdfboss_core::FormField> = info
+        .fields
         .iter()
         .filter(|field| field.kids.is_empty())
         .collect();
@@ -792,8 +917,15 @@ fn info_text(
             breakdown.join(", ")
         );
     }
+    // The products that left private data on the catalog or a page (ISO
+    // 32000-1 §14.5).
+    if !info.pieces.is_empty() {
+        let _ = writeln!(out, "pieces:    {}", info.pieces.join(", "));
+    }
     // A date that parses (ISO 32000-1 §7.9.4) prints as ISO 8601; one that
     // does not prints as written.
+    let none = Metadata::default();
+    let meta = info.meta.unwrap_or(&none);
     let created = meta
         .creation_date_parsed()
         .map(|d| d.to_iso8601())
@@ -1029,6 +1161,7 @@ fn cmd_images(
     out: Option<PathBuf>,
     password: &str,
     png_compression: PngCompressionArg,
+    thumbnails: bool,
 ) -> Result<(), String> {
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
     let pages = match page {
@@ -1039,9 +1172,23 @@ fn cmd_images(
     let mut written = 0usize;
     for index in pages {
         let p = doc.page(index).map_err(|e| e.to_string())?;
-        let images = pdfboss_render::extract_page_images(&doc, &p).map_err(|e| e.to_string())?;
-        for (i, pix) in images.iter().enumerate() {
-            let path = dir.join(format!("page-{}-image-{}.png", index + 1, i + 1));
+        // A page's thumbnail (ISO 32000-1 §12.3.4) is one image outside the
+        // content stream, so the flag swaps what the page contributes.
+        let (images, names): (Vec<pdfboss_render::Pixmap>, Vec<String>) = if thumbnails {
+            match pdfboss_render::page_thumbnail(&doc, &p) {
+                Some(pix) => (vec![pix], vec![format!("page-{}-thumb.png", index + 1)]),
+                None => (Vec::new(), Vec::new()),
+            }
+        } else {
+            let images =
+                pdfboss_render::extract_page_images(&doc, &p).map_err(|e| e.to_string())?;
+            let names = (1..=images.len())
+                .map(|i| format!("page-{}-image-{i}.png", index + 1))
+                .collect();
+            (images, names)
+        };
+        for (pix, name) in images.iter().zip(names) {
+            let path = dir.join(name);
             let png = pix
                 .encode_png_with(png_compression.to_compression())
                 .map_err(|e| e.to_string())?;
@@ -1055,9 +1202,10 @@ fn cmd_images(
             written += 1;
         }
     }
+    let noun = if thumbnails { "thumbnail" } else { "image" };
     match written {
-        1 => println!("extracted 1 image"),
-        n => println!("extracted {n} images"),
+        1 => println!("extracted 1 {noun}"),
+        n => println!("extracted {n} {noun}s"),
     }
     Ok(())
 }
@@ -1366,7 +1514,12 @@ mod tests {
             title: Some("Demo".to_string()),
             ..Metadata::default()
         };
-        let report = info_text(Some((1, 7)), false, Some(&sizes), &meta, &[], &[]);
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            meta: Some(&meta),
+            ..Info::default()
+        });
         assert!(report.contains("version:   1.7"));
         assert!(report.contains("encrypted: false"));
         assert!(report.contains("pages:     1"));
@@ -1385,20 +1538,190 @@ mod tests {
             base_version: "1.7".to_string(),
             extension_level: 3,
         }];
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            None,
-            &Metadata::default(),
-            &extensions,
-            &[],
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            extensions: &extensions,
+            ..Info::default()
+        });
         assert!(
             report.contains("version:   1.7\nextensions:\n  ADBE      1.7 level 3\n"),
             "{report}"
         );
-        let report = info_text(Some((1, 7)), false, None, &Metadata::default(), &[], &[]);
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            ..Info::default()
+        });
         assert!(!report.contains("extensions"), "{report}");
+    }
+
+    /// The catalog's output intents print after the extensions, one per
+    /// line with the subtype and the condition identifier, or the condition
+    /// in words when the identifier is missing; none prints no block.
+    // Covers ISO 32000-1 §14.11.5.
+    #[test]
+    fn info_text_lists_output_intents() {
+        use pdfboss_core::OutputIntent;
+        let intents = [
+            OutputIntent {
+                subtype: "GTS_PDFA1".to_string(),
+                output_condition: None,
+                output_condition_identifier: Some("sRGB IEC61966-2.1".to_string()),
+                registry_name: None,
+                info: None,
+                destination_profile: None,
+            },
+            OutputIntent {
+                subtype: "GTS_PDFX".to_string(),
+                output_condition: Some("CGATS TR 001 (SWOP)".to_string()),
+                output_condition_identifier: None,
+                registry_name: None,
+                info: None,
+                destination_profile: None,
+            },
+        ];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            output_intents: &intents,
+            ..Info::default()
+        });
+        assert!(
+            report.contains(
+                "version:   1.7\noutput intents:\n  GTS_PDFA1 sRGB IEC61966-2.1\n  GTS_PDFX  CGATS TR 001 (SWOP)\nencrypted: false\n"
+            ),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("output intents"));
+    }
+
+    /// The products with page-piece data print as one line after the pages
+    /// and fields; none prints no line.
+    // Covers ISO 32000-1 §14.5.
+    #[test]
+    fn info_text_lists_page_piece_products() {
+        let pieces = ["Illustrator".to_string(), "Photoshop".to_string()];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            pieces: &pieces,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("pages:     unknown\npieces:    Illustrator, Photoshop\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("pieces"));
+    }
+
+    /// Pages with a thumbnail print as one count after the pages; none
+    /// prints no line.
+    // Covers ISO 32000-1 §12.3.4.
+    #[test]
+    fn info_text_counts_pages_with_thumbnails() {
+        let sizes = [Some((612.0, 792.0)), Some((612.0, 792.0))];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            thumbnails: 1,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 2: 612 x 792 pt\nthumbs:    1 of 2 pages\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("thumbs"));
+    }
+
+    /// Article threads print as one count with their bead total after the
+    /// pages; none prints no line.
+    // Covers ISO 32000-1 §12.4.3.
+    #[test]
+    fn info_text_counts_article_threads() {
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            articles: (2, 7),
+            ..Info::default()
+        });
+        assert!(
+            report.contains("pages:     unknown\narticles:  2 (7 beads)\n"),
+            "{report}"
+        );
+        let single = info_text(&Info {
+            articles: (1, 1),
+            ..Info::default()
+        });
+        assert!(single.contains("articles:  1 (1 bead)\n"), "{single}");
+        assert!(!info_text(&Info::default()).contains("articles"));
+    }
+
+    /// Pages with a display duration or a transition print as one count
+    /// after the pages; none prints no line.
+    // Covers ISO 32000-1 §12.4.4.
+    #[test]
+    fn info_text_counts_slide_pages() {
+        let sizes = [Some((612.0, 792.0)); 5];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            slides: 4,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 5: 612 x 792 pt\nslides:    4 of 5 pages\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("slides"));
+    }
+
+    /// The permission handlers of the catalog's `/Perms` dictionary print
+    /// as one line after the encryption line; none prints no line.
+    // Covers ISO 32000-1 §12.8.4.
+    #[test]
+    fn info_text_lists_permission_handlers() {
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            perms: &["DocMDP", "UR3"],
+            ..Info::default()
+        });
+        assert!(
+            report.contains("encrypted: false\nperms:     DocMDP, UR3\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("perms"));
+    }
+
+    /// A linearized file prints its first page object after the encryption
+    /// line; a dictionary whose `/L` no longer names the file's length
+    /// prints as not linearized, and a file without one prints no line.
+    // Covers ISO 32000-1 Annex F.3.
+    #[test]
+    fn info_text_reports_linearization() {
+        let record = pdfboss_core::Linearization {
+            version: 1.0,
+            file_length: 12345,
+            hint_streams: vec![(500, 200)],
+            first_page_object: 45,
+            first_page_end: 3000,
+            page_count: 3,
+            main_xref_offset: 11000,
+            first_page: 0,
+        };
+        let report = |linearization| {
+            info_text(&Info {
+                version: Some((1, 7)),
+                linearization,
+                ..Info::default()
+            })
+        };
+        let current = report(Some((&record, 12345)));
+        assert!(
+            current.contains("encrypted: false\nlinearized: yes (first page object 45)\n"),
+            "{current}"
+        );
+        let updated = report(Some((&record, 13000)));
+        assert!(
+            updated.contains("linearized: no (/L 12345 does not match the 13000-byte file)\n"),
+            "{updated}"
+        );
+        assert!(!report(None).contains("linearized"));
     }
 
     /// The interactive form's terminal fields print after the pages as one
@@ -1408,7 +1731,7 @@ mod tests {
     // Covers ISO 32000-1 §12.7.3.
     #[test]
     fn info_text_counts_form_fields_by_type() {
-        use pdfboss_core::{FieldFlags, FieldType, FormField, ObjRef};
+        use pdfboss_core::{FieldFlags, FieldType, FormField, ObjRef, Quadding};
         fn field(field_type: Option<FieldType>, kids: Vec<ObjRef>) -> FormField {
             FormField {
                 object: ObjRef { num: 1, gen: 0 },
@@ -1423,6 +1746,10 @@ mod tests {
                 flags: FieldFlags::default(),
                 value: None,
                 default_value: None,
+                default_appearance: None,
+                quadding: Quadding::Left,
+                default_style: None,
+                rich_text: None,
                 max_len: None,
                 options: Vec::new(),
                 top_index: 0,
@@ -1442,14 +1769,12 @@ mod tests {
             field(None, Vec::new()),
         ];
         let sizes = [Some((612.0, 792.0))];
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            Some(&sizes),
-            &Metadata::default(),
-            &[],
-            &fields,
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            fields: &fields,
+            ..Info::default()
+        });
         assert!(
             report.contains(
                 "  page 1: 612 x 792 pt
@@ -1458,20 +1783,21 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
             ),
             "{report}"
         );
-        let report = info_text(
-            Some((1, 7)),
-            false,
-            Some(&sizes),
-            &Metadata::default(),
-            &[],
-            &[],
-        );
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            ..Info::default()
+        });
         assert!(!report.contains("fields"), "{report}");
     }
 
     #[test]
     fn info_text_encrypted_document() {
-        let report = info_text(Some((1, 4)), true, None, &Metadata::default(), &[], &[]);
+        let report = info_text(&Info {
+            version: Some((1, 4)),
+            encrypted: true,
+            ..Info::default()
+        });
         assert!(report.contains("encrypted: true"));
         assert!(report.contains("pages:     unknown"));
         assert!(!report.contains("metadata:"));
@@ -1480,7 +1806,10 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
     #[test]
     fn info_text_unavailable_page() {
         let sizes = [None];
-        let report = info_text(None, false, Some(&sizes), &Metadata::default(), &[], &[]);
+        let report = info_text(&Info {
+            sizes: Some(&sizes),
+            ..Info::default()
+        });
         assert!(report.contains("version:   unknown"));
         assert!(report.contains("page 1: (unavailable)"));
     }
@@ -1757,12 +2086,51 @@ fields:    6 (Btn 1, Tx 2, Ch 1, Sig 1, untyped 1)
             Some(dir.clone()),
             "",
             PngCompressionArg::Default,
+            false,
         )
         .expect("extract");
         for name in ["page-1-image-1.png", "page-1-image-2.png"] {
             let png = std::fs::read(dir.join(name)).expect(name);
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{name} is a PNG");
         }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// With `--thumbnails`, `images` writes each page's thumbnail instead
+    /// of the drawn images, skipping pages without one.
+    // Covers ISO 32000-1 §12.3.4.
+    #[test]
+    fn cmd_images_writes_thumbnails_with_the_flag() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Thumb 5 0 R >>",
+        );
+        b.stream(
+            5,
+            "/Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+            &[255, 0, 0, 0, 0, 255],
+        );
+        b.object(6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let dir = std::env::temp_dir().join(format!("pdfboss-thumbs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pdf = dir.join("thumbs.pdf");
+        std::fs::write(&pdf, b.build(1)).expect("fixture");
+        cmd_images(
+            &pdf,
+            None,
+            Some(dir.clone()),
+            "",
+            PngCompressionArg::Default,
+            true,
+        )
+        .expect("extract");
+        let png = std::fs::read(dir.join("page-1-thumb.png")).expect("page-1-thumb.png");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(!dir.join("page-2-thumb.png").exists());
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 

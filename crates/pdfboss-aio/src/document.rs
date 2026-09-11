@@ -593,6 +593,9 @@ pub(crate) struct DocumentInner {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) file_len: u64,
     pub(crate) version: (u8, u8),
+    /// The linearization parameter dictionary read from the header window
+    /// at open, as written (ISO 32000-1 Annex F.3).
+    pub(crate) linearization: Option<pdfboss_core::Linearization>,
     /// Span of the `%PDF-` header run; `None` when the first 1 KiB holds
     /// no header (the Header element is then omitted, adopted rule 1).
     /// Exposed by a `header_span()` accessor consumed by the element
@@ -728,12 +731,14 @@ impl AsyncDocument {
         let head = fetcher.window(0, 1024).await?;
         let version = parse_version(&head);
         let header_span = header_span_in(&head);
+        let linearization = pdfboss_core::linearization_dictionary(&head);
         let (startxref, eof_span) = find_tail(&fetcher).await?;
         let (xref, sections) = load_xref_chain(&fetcher, startxref.offset).await?;
         let inner = DocumentInner {
             backend,
             file_len,
             version,
+            linearization,
             header_span,
             xref,
             sections,
@@ -830,6 +835,24 @@ impl AsyncDocument {
     /// The PDF version from the header, e.g. `(1, 7)`.
     pub fn version(&self) -> (u8, u8) {
         self.inner.version
+    }
+
+    /// The linearization parameter dictionary (ISO 32000-1 Annex F.3) as
+    /// written, read from the header window at open: the sync document's
+    /// `linearization`, without another fetch.
+    pub fn linearization(&self) -> Option<pdfboss_core::Linearization> {
+        self.inner.linearization.clone()
+    }
+
+    /// Whether the file is linearized and `/L` names its actual length: the
+    /// sync document's `is_linearized`.
+    ///
+    /// Covers ISO 32000-1 Annex F.3.
+    pub fn is_linearized(&self) -> bool {
+        self.inner
+            .linearization
+            .as_ref()
+            .is_some_and(|record| record.is_current(self.inner.file_len))
     }
 
     /// A fetch helper bound to this document's backend.
@@ -1494,6 +1517,55 @@ impl AsyncDocument {
     /// §12.7.3): the async twin of the sync document's `form_fields`.
     pub async fn form_fields(&self) -> Vec<pdfboss_core::FormField> {
         pdfboss_core::form_fields_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The catalog's output intents (ISO 32000-1 §14.11.5): the async twin
+    /// of the sync document's `output_intents`.
+    pub async fn output_intents(&self) -> Vec<pdfboss_core::OutputIntent> {
+        pdfboss_core::output_intents_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The catalog's page-piece dictionary (ISO 32000-1 §14.5): the async
+    /// twin of the sync document's `piece_info`.
+    pub async fn piece_info(&self) -> Vec<pdfboss_core::PagePiece> {
+        pdfboss_core::document_piece_info_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// A page's page-piece dictionary (ISO 32000-1 §14.5): the async twin
+    /// of the sync document's `page_piece_info`.
+    pub async fn page_piece_info(&self, page: &Page) -> Vec<pdfboss_core::PagePiece> {
+        pdfboss_core::piece_info_with(self, page.dict()).await
+    }
+
+    /// A page's thumbnail image (ISO 32000-1 §12.3.4): the async twin of
+    /// the sync document's `thumbnail`.
+    pub async fn thumbnail(&self, page: &Page) -> Option<pdfboss_core::Thumbnail> {
+        pdfboss_core::thumbnail_with(self, page).await
+    }
+
+    /// The catalog's article threads (ISO 32000-1 §12.4.3): the async twin
+    /// of the sync document's `articles`.
+    pub async fn articles(&self) -> Vec<pdfboss_core::ArticleThread> {
+        pdfboss_core::articles_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The beads on a page in drawing order (ISO 32000-1 §12.4.3): the
+    /// async twin of the sync document's `page_beads`.
+    pub async fn page_beads(&self, page: &Page) -> Vec<ObjRef> {
+        pdfboss_core::page_beads_with(self, page).await
+    }
+
+    /// A page's presentation entries (ISO 32000-1 §12.4.4): the async twin
+    /// of the sync document's `presentation`.
+    pub async fn presentation(&self, page: &Page) -> Option<pdfboss_core::Presentation> {
+        pdfboss_core::presentation_with(self, page).await
+    }
+
+    /// The permission handlers of the catalog's `/Perms` dictionary (ISO
+    /// 32000-1 §12.8.4): the async twin of the sync document's
+    /// `permission_handlers`.
+    pub async fn permission_handlers(&self) -> Option<pdfboss_core::PermissionHandlers> {
+        pdfboss_core::permission_handlers_with(self, &self.inner.xref.trailer).await
     }
 
     /// The label the page at `index` shows: the async twin of the sync

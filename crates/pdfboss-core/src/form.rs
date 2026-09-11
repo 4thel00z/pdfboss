@@ -2,6 +2,7 @@
 //! `/AcroForm` dictionary, which names the root fields and carries the
 //! defaults their widgets are drawn with.
 
+use crate::content::{parse_content, Op};
 use crate::hash::FastSet;
 use crate::object::{decode_text_string, Dict, ObjRef, Object};
 use crate::source::AsyncObjectSource;
@@ -35,9 +36,10 @@ impl SignatureFlags {
 
 /// The quadding of variable text (`/Q`, §12.7.3.3): how the text of a field
 /// is justified within its widget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Quadding {
-    /// 0: left-justified.
+    /// 0: left-justified, the default.
+    #[default]
     Left,
     /// 1: centred.
     Centered,
@@ -54,6 +56,47 @@ impl Quadding {
             2 => Some(Quadding::Right),
             _ => None,
         }
+    }
+}
+
+/// What a default appearance string (`/DA`, ISO 32000-1 §12.7.3.3) sets: the
+/// font resource name and size of its `Tf` operator and the fill colour of
+/// its last `g`, `rg` or `k` operator. Any other operator is ignored.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DefaultAppearance {
+    /// The `Tf` font resource name, a key of the form's `/DR` `/Font`
+    /// dictionary.
+    pub font: Option<String>,
+    /// The `Tf` size as written; 0 means the text is sized to fit its widget.
+    pub font_size: Option<f32>,
+    /// The fill colour components of the last `g`, `rg` or `k` operator:
+    /// one gray, three RGB or four CMYK components.
+    pub fill_color: Option<Vec<f32>>,
+}
+
+impl DefaultAppearance {
+    /// Reads a `/DA` string as content stream operators; a string the
+    /// content parser rejects sets nothing.
+    ///
+    /// Covers ISO 32000-1 §12.7.3.3.
+    pub fn parse(da: &str) -> DefaultAppearance {
+        let mut appearance = DefaultAppearance::default();
+        let Ok(ops) = parse_content(da.as_bytes()) else {
+            return appearance;
+        };
+        for op in ops {
+            match op {
+                Op::SetFont(name, size) => {
+                    appearance.font = Some(name.0);
+                    appearance.font_size = Some(size);
+                }
+                Op::SetFillGray(g) => appearance.fill_color = Some(vec![g]),
+                Op::SetFillRGB(r, g, b) => appearance.fill_color = Some(vec![r, g, b]),
+                Op::SetFillCMYK(c, m, y, k) => appearance.fill_color = Some(vec![c, m, y, k]),
+                _ => {}
+            }
+        }
+        appearance
     }
 }
 
@@ -411,6 +454,36 @@ pub struct Signature {
     pub contact_info: Option<String>,
 }
 
+impl Signature {
+    /// The Table 252 entries of a signature dictionary as data: the filter
+    /// and sub-filter names, the byte range pairs, the contents bytes, and
+    /// the signer's name, time, location, reason and contact information as
+    /// text strings. Nothing is verified. The same reader serves a signature
+    /// field's `/V` (§12.7.4.5) and the catalog's permission handlers
+    /// (§12.8.4).
+    ///
+    /// Covers ISO 32000-1 §12.8.1.
+    pub fn from_dict(dict: &Dict) -> Signature {
+        let text = |key: &str| Some(decode_text_string(dict.get(key)?.as_str_bytes()?));
+        let name = |key: &str| Some(dict.get_name(key)?.0.clone());
+        Signature {
+            filter: name("Filter"),
+            sub_filter: name("SubFilter"),
+            byte_range: byte_range(dict.get("ByteRange")),
+            contents: dict
+                .get("Contents")
+                .and_then(Object::as_str_bytes)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default(),
+            name: text("Name"),
+            signing_time: text("M"),
+            location: text("Location"),
+            reason: text("Reason"),
+            contact_info: text("ContactInfo"),
+        }
+    }
+}
+
 /// One entry of a choice field's `/Opt` array (ISO 32000-1 §12.7.4.4,
 /// Table 231): the value exported for the option and the text shown for
 /// it. A lone text string in the array is both.
@@ -459,6 +532,22 @@ pub struct FormField {
     /// `/DV`, inherited, resolved one level: the value a reset-form action
     /// restores.
     pub default_value: Option<Object>,
+    /// `/DA`, inherited (§12.7.3.3, Table 222): the default appearance
+    /// string of a variable text field, the interactive form's document-wide
+    /// `/DA` when neither the field nor an ancestor has one; what it sets
+    /// reads through [`DefaultAppearance::parse`].
+    pub default_appearance: Option<String>,
+    /// `/Q`, inherited (§12.7.3.3, Table 222): how a variable text field's
+    /// text is justified, the interactive form's document-wide `/Q` when
+    /// neither the field nor an ancestor has one, left-justified when none
+    /// does or the value is not 0, 1 or 2.
+    pub quadding: Quadding,
+    /// `/DS` (§12.7.3.3, Table 222): the default style string rich text is
+    /// laid out with (§12.7.3.4).
+    pub default_style: Option<String>,
+    /// `/RV` (§12.7.3.3, Table 222): the rich text value as text, a text
+    /// stream read into a string; its markup is not parsed (§12.7.3.4).
+    pub rich_text: Option<String>,
     /// `/MaxLen`, inherited (§12.7.4.3, Table 229): the most characters a
     /// text field's text may hold.
     pub max_len: Option<u32>,
@@ -558,24 +647,7 @@ impl FormField {
         if self.field_type != Some(FieldType::Signature) {
             return None;
         }
-        let dict = self.value.as_ref()?.as_dict()?;
-        let text = |key: &str| Some(decode_text_string(dict.get(key)?.as_str_bytes()?));
-        let name = |key: &str| Some(dict.get_name(key)?.0.clone());
-        Some(Signature {
-            filter: name("Filter"),
-            sub_filter: name("SubFilter"),
-            byte_range: byte_range(dict.get("ByteRange")),
-            contents: dict
-                .get("Contents")
-                .and_then(Object::as_str_bytes)
-                .map(<[u8]>::to_vec)
-                .unwrap_or_default(),
-            name: text("Name"),
-            signing_time: text("M"),
-            location: text("Location"),
-            reason: text("Reason"),
-            contact_info: text("ContactInfo"),
-        })
+        Some(Signature::from_dict(self.value.as_ref()?.as_dict()?))
     }
 
     /// The names of a choice field's selected options (ISO 32000-1
@@ -612,13 +684,21 @@ pub async fn form_fields_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> 
     };
     let mut visited: FastSet<ObjRef> = FastSet::default();
     let mut stack = Vec::new();
+    // The form's /DA and /Q are the document-wide defaults of every
+    // variable text field (Table 218), so the root fields start from them.
+    // Covers ISO 32000-1 §12.7.3.3.
+    let defaults = Inherited {
+        default_appearance: form.default_appearance,
+        quadding: form.quadding,
+        ..Inherited::default()
+    };
     for object in form.fields.into_iter().rev() {
         if let Some(dict) = field_dict(src, object).await {
             stack.push(Pending {
                 object,
                 dict,
                 parent: None,
-                inherited: Inherited::default(),
+                inherited: defaults.clone(),
                 depth: 0,
             });
         }
@@ -643,6 +723,8 @@ struct Inherited {
     flags: Option<FieldFlags>,
     value: Option<Object>,
     default_value: Option<Object>,
+    default_appearance: Option<String>,
+    quadding: Option<Quadding>,
     name: String,
     max_len: Option<u32>,
     options: Vec<ChoiceOption>,
@@ -695,6 +777,27 @@ async fn read_field<S: AsyncObjectSource>(
         value => value,
     };
     let default_value = entries.value("DV").await.or(inherited.default_value);
+    let default_appearance = entries
+        .value("DA")
+        .await
+        .and_then(|da| Some(String::from_utf8_lossy(da.as_str_bytes()?).into_owned()))
+        .or(inherited.default_appearance);
+    let quadding = entries
+        .value("Q")
+        .await
+        .and_then(|q| Quadding::from_int(q.as_int()?))
+        .or(inherited.quadding);
+    let default_style = entries.text("DS").await;
+    let rich_text = match entries.value("RV").await {
+        // A rich text value may be a text stream since PDF 1.5 (§12.7.3.3).
+        Some(Object::Stream(stream)) => src
+            .stream_data(&stream)
+            .await
+            .ok()
+            .map(|data| decode_text_string(&data)),
+        Some(value) => value.as_str_bytes().map(decode_text_string),
+        None => None,
+    };
     let max_len = entries
         .value("MaxLen")
         .await
@@ -722,7 +825,7 @@ async fn read_field<S: AsyncObjectSource>(
             )
         })
         .unwrap_or_default();
-    let partial_name = text_string(&entries, "T").await;
+    let partial_name = entries.text("T").await;
     let name = qualified_name(&inherited.name, partial_name.as_deref());
     let additional_actions = match dict.get("AA") {
         Some(entry) => resolved_dict(src, entry).await,
@@ -756,6 +859,8 @@ async fn read_field<S: AsyncObjectSource>(
                     flags: Some(flags),
                     value: value.clone(),
                     default_value: default_value.clone(),
+                    default_appearance: default_appearance.clone(),
+                    quadding,
                     name: name.clone(),
                     max_len,
                     options: options.clone(),
@@ -772,11 +877,15 @@ async fn read_field<S: AsyncObjectSource>(
         field_type,
         partial_name,
         name,
-        alternate_name: text_string(&entries, "TU").await,
-        mapping_name: text_string(&entries, "TM").await,
+        alternate_name: entries.text("TU").await,
+        mapping_name: entries.text("TM").await,
         flags,
         value,
         default_value,
+        default_appearance,
+        quadding: quadding.unwrap_or_default(),
+        default_style,
+        rich_text,
         max_len,
         options,
         top_index,
@@ -895,9 +1004,9 @@ async fn characteristics<S: AsyncObjectSource>(
     let entries = Entries { src, dict: &mk };
     let reference = |key: &str| mk.get(key).and_then(Object::as_ref);
     Some(AppearanceCharacteristics {
-        caption: text_string(&entries, "CA").await,
-        rollover_caption: text_string(&entries, "RC").await,
-        alternate_caption: text_string(&entries, "AC").await,
+        caption: entries.text("CA").await,
+        rollover_caption: entries.text("RC").await,
+        alternate_caption: entries.text("AC").await,
         icon: reference("I"),
         rollover_icon: reference("RI"),
         alternate_icon: reference("IX"),
@@ -931,14 +1040,6 @@ fn is_widget(dict: &Dict) -> bool {
         .is_some_and(|subtype| subtype.0 == "Widget")
 }
 
-/// The text string under `key`, decoded (§7.9.2.2); `None` when absent or
-/// not a string.
-async fn text_string<S: AsyncObjectSource>(entries: &Entries<'_, S>, key: &str) -> Option<String> {
-    Some(decode_text_string(
-        entries.value(key).await?.as_str_bytes()?,
-    ))
-}
-
 /// The references an array holds, anything else in it skipped; empty for a
 /// value that is no array.
 fn references(value: Option<&Object>) -> Vec<ObjRef> {
@@ -951,8 +1052,9 @@ fn references(value: Option<&Object>) -> Vec<ObjRef> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppearanceCharacteristics, ButtonKind, CaptionPosition, ChoiceOption, FieldFlags,
-        FieldType, FormField, InteractiveForm, Quadding, Signature, SignatureFlags, Widget,
+        AppearanceCharacteristics, ButtonKind, CaptionPosition, ChoiceOption, DefaultAppearance,
+        FieldFlags, FieldType, FormField, InteractiveForm, Quadding, Signature, SignatureFlags,
+        Widget,
     };
     use crate::object::{Name, ObjRef, Object};
     use crate::Document;
@@ -998,6 +1100,99 @@ mod tests {
         }
         b.stream(stream.0, stream.1, stream.2);
         Document::load(b.build(1)).unwrap()
+    }
+
+    /// A field's `/DA` and `/Q` come from its own dictionary, then the
+    /// nearest ancestor, then the interactive form's document-wide defaults;
+    /// the quadding is left when none of them says otherwise, as is a `/Q`
+    /// outside 0 to 2. `/DS` and `/RV` are the field's own.
+    // Covers ISO 32000-1 §12.7.3.3.
+    #[test]
+    fn variable_text_entries_inherit_and_fall_back_to_the_form() {
+        let document = doc(
+            "/AcroForm << /Fields [20 0 R 23 0 R] /DA (/Helv 0 Tf 0 g) /Q 1 >>",
+            &[
+                (
+                    20,
+                    "<< /T (parent) /FT /Tx /DA (/TiRo 12 Tf 1 0 0 rg) /Kids [21 0 R 22 0 R] >>",
+                ),
+                (21, "<< /T (plain) /Parent 20 0 R >>"),
+                (
+                    22,
+                    "<< /T (styled) /Parent 20 0 R /Q 2 /DS (font: Arial) /RV (<p>Ada</p>) >>",
+                ),
+                (23, "<< /T (bare) /FT /Tx >>"),
+            ],
+        );
+        let fields = document.form_fields();
+        let by_name = |name: &str| fields.iter().find(|field| field.name == name).unwrap();
+        let parent = by_name("parent");
+        assert_eq!(
+            parent.default_appearance.as_deref(),
+            Some("/TiRo 12 Tf 1 0 0 rg")
+        );
+        assert_eq!(parent.quadding, Quadding::Centered);
+        let plain = by_name("parent.plain");
+        assert_eq!(
+            plain.default_appearance.as_deref(),
+            Some("/TiRo 12 Tf 1 0 0 rg")
+        );
+        assert_eq!(plain.quadding, Quadding::Centered);
+        assert_eq!(plain.default_style, None);
+        assert_eq!(plain.rich_text, None);
+        let styled = by_name("parent.styled");
+        assert_eq!(styled.quadding, Quadding::Right);
+        assert_eq!(styled.default_style.as_deref(), Some("font: Arial"));
+        assert_eq!(styled.rich_text.as_deref(), Some("<p>Ada</p>"));
+        let bare = by_name("bare");
+        assert_eq!(bare.default_appearance.as_deref(), Some("/Helv 0 Tf 0 g"));
+        assert_eq!(bare.quadding, Quadding::Centered);
+
+        let unstyled = doc(
+            "/AcroForm << /Fields [23 0 R 24 0 R] >>",
+            &[
+                (23, "<< /T (bare) /FT /Tx >>"),
+                (24, "<< /T (odd) /FT /Tx /Q 7 >>"),
+            ],
+        );
+        for field in unstyled.form_fields() {
+            assert_eq!(field.default_appearance, None, "{}", field.name);
+            assert_eq!(field.quadding, Quadding::Left, "{}", field.name);
+        }
+    }
+
+    /// A `/RV` text stream (PDF 1.5) reads as its decoded data.
+    // Covers ISO 32000-1 §12.7.3.3.
+    #[test]
+    fn rich_text_stream_reads_as_text() {
+        let document = doc_with_stream(
+            "/AcroForm << /Fields [20 0 R] >>",
+            &[(20, "<< /T (rich) /FT /Tx /RV 21 0 R >>")],
+            (21, "", b"<p>Ada</p>"),
+        );
+        let fields = document.form_fields();
+        assert_eq!(fields[0].rich_text.as_deref(), Some("<p>Ada</p>"));
+    }
+
+    /// The `/DA` string's `Tf` names the font resource and size, 0 meaning
+    /// auto-size, and its last `g`, `rg` or `k` sets the fill colour; a
+    /// string without them, or a `Tf` short of an operand, sets nothing.
+    // Covers ISO 32000-1 §12.7.3.3.
+    #[test]
+    fn default_appearance_reads_font_size_and_fill_colour() {
+        let da = DefaultAppearance::parse("/Helv 0 Tf 0 g");
+        assert_eq!(da.font.as_deref(), Some("Helv"));
+        assert_eq!(da.font_size, Some(0.0));
+        assert_eq!(da.fill_color, Some(vec![0.0]));
+        let da = DefaultAppearance::parse("0 0 1 rg /TiRo 12 Tf 0 0 0 1 k");
+        assert_eq!(da.font.as_deref(), Some("TiRo"));
+        assert_eq!(da.font_size, Some(12.0));
+        assert_eq!(da.fill_color, Some(vec![0.0, 0.0, 0.0, 1.0]));
+        assert_eq!(DefaultAppearance::parse(""), DefaultAppearance::default());
+        assert_eq!(
+            DefaultAppearance::parse("/Helv Tf"),
+            DefaultAppearance::default()
+        );
     }
 
     /// Every entry of Table 218 set, the dictionary itself and its flags

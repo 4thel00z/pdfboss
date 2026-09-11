@@ -6,7 +6,7 @@ use flate2::Compression;
 use futures_util::StreamExt;
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::elements::ElementOpts;
-use pdfboss_core::{Document, NameTree, ObjRef};
+use pdfboss_core::{Document, NameTree, ObjRef, Quadding};
 use pdfboss_output::ReadingOrder;
 use pdfboss_testkit::{hybrid_doc, multi_page_doc, objstm_payload, simple_doc, PdfBuilder};
 use std::io::Write;
@@ -47,10 +47,34 @@ fn outline_doc() -> Vec<u8> {
          /Extensions << /ADBE << /BaseVersion /1.7 /ExtensionLevel 3 >> >> \
          /ViewerPreferences << /Direction /R2L /HideToolbar true /PrintPageRange [1 1] >> \
          /AcroForm << /Fields [9 0 R] /NeedAppearances true /SigFlags 1 /DA (/Helv 0 Tf 0 g) /Q 2 >> \
+         /OutputIntents [ << /Type /OutputIntent /S /GTS_PDFA1 \
+         /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
+         /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
+         /Threads [13 0 R] /Perms << /DocMDP 15 0 R >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
-    b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>");
+    b.object(
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /PieceInfo << /Scanner << /LastModified (D:20230601120000Z) >> >> /Thumb 12 0 R \
+         /B [14 0 R] /Dur 5 /Trans << /S /Split /Dm /V /M /O /D 3.5 >> >>",
+    );
+    b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
+    b.object(
+        15,
+        "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached \
+         /ByteRange [0 10 20 30] /Contents <0102> /Name (Certifier) >>",
+    );
+    b.object(
+        14,
+        "<< /T 13 0 R /N 14 0 R /V 14 0 R /P 3 0 R /R [0 0 10 10] >>",
+    );
+    b.stream(
+        12,
+        "/Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+        &[255, 0, 0, 0, 0, 255],
+    );
     b.object(5, "<< /Type /Outlines /First 6 0 R /Last 8 0 R /Count 2 >>");
     b.object(
         6,
@@ -65,7 +89,11 @@ fn outline_doc() -> Vec<u8> {
         8,
         "<< /Title (Two) /Parent 5 0 R /Prev 6 0 R /Count -1 /C [0 0 1] /F 2 /Dest [3 0 R /FitB] >>",
     );
-    b.object(9, "<< /FT /Tx /T (name) /Ff 2 /V (Ada) /Kids [10 0 R] >>");
+    b.object(
+        9,
+        "<< /FT /Tx /T (name) /Ff 2 /V (Ada) /Kids [10 0 R] \
+         /DA (/TiRo 12 Tf 0 0 1 rg) /Q 1 /DS (font: Times) /RV (<p>Ada</p>) >>",
+    );
     b.object(10, "<< /Subtype /Widget /Parent 9 0 R /Rect [0 0 10 10] >>");
     b.build(1)
 }
@@ -223,6 +251,120 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             sync_doc.form_fields(),
             "{name}: form fields"
         );
+        // Covers ISO 32000-1 §12.7.3.3.
+        if name == "outline" {
+            let fields = sync_doc.form_fields();
+            assert_eq!(
+                fields[0].default_appearance.as_deref(),
+                Some("/TiRo 12 Tf 0 0 1 rg")
+            );
+            assert_eq!(fields[0].quadding, Quadding::Centered);
+            assert_eq!(fields[0].default_style.as_deref(), Some("font: Times"));
+            assert_eq!(fields[0].rich_text.as_deref(), Some("<p>Ada</p>"));
+        }
+        // Covers ISO 32000-1 §14.11.5.
+        assert_eq!(
+            doc.output_intents().await,
+            sync_doc.output_intents(),
+            "{name}: output intents"
+        );
+        if name == "outline" {
+            let intents = sync_doc.output_intents();
+            assert_eq!(intents.len(), 1, "{name}: output intents");
+            assert_eq!(intents[0].subtype, "GTS_PDFA1");
+            assert_eq!(intents[0].info.as_deref(), Some("sRGB"));
+        }
+        // Covers ISO 32000-1 §14.5.
+        assert_eq!(
+            doc.piece_info().await,
+            sync_doc.piece_info(),
+            "{name}: piece info"
+        );
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.page_piece_info(&page).await,
+                sync_doc.page_piece_info(&sync_page),
+                "{name}: page {index} piece info"
+            );
+        }
+        if name == "outline" {
+            let pieces = sync_doc.piece_info();
+            assert_eq!(pieces.len(), 1, "{name}: piece info");
+            assert_eq!(pieces[0].product, "Illustrator");
+            let page_pieces = sync_doc.page_piece_info(&sync_doc.page(0).unwrap());
+            assert_eq!(page_pieces.len(), 1, "{name}: page piece info");
+            assert_eq!(page_pieces[0].product, "Scanner");
+        }
+        // Covers ISO 32000-1 §12.3.4.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.thumbnail(&page).await,
+                sync_doc.thumbnail(&sync_page),
+                "{name}: page {index} thumbnail"
+            );
+        }
+        if name == "outline" {
+            let thumbnail = sync_doc.thumbnail(&sync_doc.page(0).unwrap()).unwrap();
+            assert_eq!((thumbnail.width, thumbnail.height), (2, 1));
+        }
+        // Covers ISO 32000-1 §12.4.3.
+        assert_eq!(
+            doc.articles().await,
+            sync_doc.articles(),
+            "{name}: articles"
+        );
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.page_beads(&page).await,
+                sync_doc.page_beads(&sync_page),
+                "{name}: page {index} beads"
+            );
+        }
+        if name == "outline" {
+            let threads = sync_doc.articles();
+            assert_eq!(threads.len(), 1, "{name}: articles");
+            assert_eq!(threads[0].info.title.as_deref(), Some("Story"));
+            assert_eq!(threads[0].beads.len(), 1);
+            assert_eq!(sync_doc.page_beads(&sync_doc.page(0).unwrap()).len(), 1);
+        }
+        // Covers ISO 32000-1 §12.4.4.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.presentation(&page).await,
+                sync_doc.presentation(&sync_page),
+                "{name}: page {index} presentation"
+            );
+        }
+        if name == "outline" {
+            let shown = sync_doc.presentation(&sync_doc.page(0).unwrap()).unwrap();
+            assert_eq!(shown.duration, Some(5.0));
+            assert_eq!(
+                shown.transition.map(|t| t.style),
+                Some(pdfboss_core::TransitionStyle::Split)
+            );
+        }
+        // Covers ISO 32000-1 §12.8.4.
+        assert_eq!(
+            doc.permission_handlers().await,
+            sync_doc.permission_handlers(),
+            "{name}: permission handlers"
+        );
+        if name == "outline" {
+            let handlers = sync_doc.permission_handlers().unwrap();
+            assert_eq!(
+                handlers.doc_mdp.as_ref().and_then(|s| s.name.as_deref()),
+                Some("Certifier")
+            );
+            assert_eq!(handlers.usage_rights, None);
+        }
         for index in 0..=doc.page_count() {
             assert_eq!(
                 doc.page_label(index).await,
@@ -263,6 +405,38 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                 ),
             }
         }
+    }
+}
+
+/// The linearization parameter dictionary reads the same on both sides,
+/// and both apply Table F.1's rule that `/L` must name the actual length.
+// Covers ISO 32000-1 Annex F.3.
+#[tokio::test]
+async fn linearization_dictionaries_agree() {
+    let mut b = PdfBuilder::new();
+    b.object(
+        43,
+        "<< /Linearized 1 /L 0000000000 /H [ 0 0 ] /O 46 /E 0 /N 1 /T 0 >>",
+    );
+    b.object(44, "<< /Type /Catalog /Pages 45 0 R >>");
+    b.object(45, "<< /Type /Pages /Kids [46 0 R] /Count 1 >>");
+    b.object(46, "<< /Type /Page /Parent 45 0 R /MediaBox [0 0 10 10] >>");
+    let mut current = b.build(44);
+    let length = format!("{:010}", current.len());
+    let at = current
+        .windows(10)
+        .position(|w| w == b"0000000000")
+        .unwrap();
+    current[at..at + 10].copy_from_slice(length.as_bytes());
+    let mut updated = current.clone();
+    updated.extend_from_slice(b"%appended update\n");
+    for (data, linearized) in [(current, true), (updated, false)] {
+        let sync_doc = Document::load(data.clone()).unwrap();
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        assert_eq!(doc.linearization(), sync_doc.linearization());
+        assert_eq!(doc.linearization().unwrap().first_page_object, 46);
+        assert_eq!(doc.is_linearized(), linearized);
+        assert_eq!(sync_doc.is_linearized(), linearized);
     }
 }
 

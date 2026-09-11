@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use pdfboss_core::content::{parse_content, Op};
 use pdfboss_core::{
-    block_on, content_stream_data_with, page_content_with, AsyncObjectSource, Dict, Document,
-    Immediate, Object, Page, Result, Stream,
+    block_on, content_stream_data_with, page_content_with, thumbnail_with, AsyncObjectSource, Dict,
+    Document, Immediate, Object, Page, Result, Stream,
 };
 
 use crate::color::IccCache;
@@ -44,6 +44,27 @@ pub async fn extract_page_images_with<S: AsyncObjectSource>(
     let mut out = Vec::new();
     walk(&src, ops, chain, &icc, &mut out).await;
     Ok(out)
+}
+
+/// The page's thumbnail image (ISO 32000-1 §12.3.4) decoded at its own
+/// size: `None` when the page has no `/Thumb` stream or the image does not
+/// decode. The clause limits the colour space to DeviceGray, DeviceRGB or
+/// an Indexed space over one of them; this decodes whatever the image
+/// decoder accepts.
+pub fn page_thumbnail(doc: &Document, page: &Page) -> Option<Pixmap> {
+    block_on(page_thumbnail_with(Immediate(doc), page))
+}
+
+/// Decodes like [`page_thumbnail`] against any object source.
+///
+/// Covers ISO 32000-1 §12.3.4.
+pub async fn page_thumbnail_with<S: AsyncObjectSource>(src: S, page: &Page) -> Option<Pixmap> {
+    let thumbnail = thumbnail_with(&src, page).await?;
+    let chain: Vec<Arc<Dict>> = vec![Arc::new(page.resources.clone())];
+    let icc = IccCache::default();
+    let mut out = Vec::new();
+    collect_image(&src, &thumbnail.stream, &chain, &icc, &mut out).await;
+    out.pop()
 }
 
 /// One operator list mid-walk: the page's, or a form's. The walk keeps
@@ -392,5 +413,31 @@ mod tests {
         assert_eq!(px(img, 1, 0), [0, 255, 0, 255]);
         assert_eq!(px(img, 0, 1), [0, 0, 255, 255]);
         assert_eq!(px(img, 1, 1), [255, 255, 0, 255]);
+    }
+
+    /// The page's `/Thumb` image decodes at its own size; a page without
+    /// one has no thumbnail.
+    // Covers ISO 32000-1 §12.3.4.
+    #[test]
+    fn page_thumbnail_decodes_the_thumb_image_at_its_own_size() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 6 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Thumb 5 0 R >>",
+        );
+        b.stream(
+            5,
+            "/Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8",
+            &[255, 0, 0, 0, 0, 255],
+        );
+        b.object(6, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = Document::load(b.build(1)).expect("load");
+        let thumb = page_thumbnail(&doc, &doc.page(0).expect("page")).expect("thumbnail");
+        assert_eq!((thumb.width, thumb.height), (2, 1));
+        assert_eq!(px(&thumb, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(px(&thumb, 1, 0), [0, 0, 255, 255]);
+        assert!(page_thumbnail(&doc, &doc.page(1).expect("page")).is_none());
     }
 }

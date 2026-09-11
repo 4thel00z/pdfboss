@@ -14,10 +14,11 @@ use crate::elements::Span;
 use crate::error::{Error, Result};
 use crate::filters;
 use crate::geom::Rect;
-use crate::object::{decode_text_string, Dict, ObjRef, Object, Stream};
+use crate::object::{Dict, ObjRef, Object, Stream};
 use crate::objstm;
 use crate::parser::{Parser, Resolve};
 use crate::source::{block_on, AsyncObjectSource, Immediate};
+use crate::tree::Entries;
 use crate::xref::{load_xref, Xref, XrefEntry};
 
 /// Page-tree traversal depth cap.
@@ -495,7 +496,7 @@ impl Document {
     ///
     /// Covers ISO 32000-1 §14.3.3, §7.9.4 and §8.11.4.3.
     pub fn metadata(&self) -> Metadata {
-        let mut meta = Metadata::default();
+        let meta = Metadata::default();
         let Some(info) = self.xref.trailer.get("Info") else {
             return meta;
         };
@@ -505,15 +506,7 @@ impl Document {
         let Some(dict) = info.as_dict() else {
             return meta;
         };
-        meta.title = self.meta_string(dict, "Title");
-        meta.author = self.meta_string(dict, "Author");
-        meta.subject = self.meta_string(dict, "Subject");
-        meta.keywords = self.meta_string(dict, "Keywords");
-        meta.creator = self.meta_string(dict, "Creator");
-        meta.producer = self.meta_string(dict, "Producer");
-        meta.creation_date = self.meta_string(dict, "CreationDate");
-        meta.mod_date = self.meta_string(dict, "ModDate");
-        meta
+        block_on(metadata_with(&Immediate(self), dict))
     }
 
     /// The document's optional-content visibility under its default
@@ -643,6 +636,89 @@ impl Document {
         ))
     }
 
+    /// The linearization parameter dictionary (ISO 32000-1 Annex F.3) as
+    /// written, `None` when the file's first object is not one. It may be
+    /// stale after an appended update; [`Document::is_linearized`] tells.
+    pub fn linearization(&self) -> Option<crate::linearization::Linearization> {
+        crate::linearization::linearization_dictionary(&self.data)
+    }
+
+    /// Whether the file is linearized and its parameter dictionary still
+    /// applies, which Table F.1 ties to `/L` naming the file's actual
+    /// length.
+    ///
+    /// Covers ISO 32000-1 Annex F.3.
+    pub fn is_linearized(&self) -> bool {
+        self.linearization()
+            .is_some_and(|record| record.is_current(self.data.len() as u64))
+    }
+
+    /// The catalog's output intents (ISO 32000-1 §14.11.5) in array order,
+    /// empty without `/OutputIntents`.
+    pub fn output_intents(&self) -> Vec<crate::output_intent::OutputIntent> {
+        block_on(crate::output_intent::output_intents_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The catalog's page-piece dictionary (ISO 32000-1 §14.5): one record
+    /// per product, empty without `/PieceInfo`.
+    pub fn piece_info(&self) -> Vec<crate::piece_info::PagePiece> {
+        block_on(crate::piece_info::document_piece_info_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// A page's page-piece dictionary (ISO 32000-1 §14.5): one record per
+    /// product, empty without `/PieceInfo` on the page.
+    pub fn page_piece_info(&self, page: &Page) -> Vec<crate::piece_info::PagePiece> {
+        block_on(crate::piece_info::piece_info_with(
+            &Immediate(self),
+            page.dict(),
+        ))
+    }
+
+    /// A page's thumbnail image (ISO 32000-1 §12.3.4), `None` when the
+    /// page has no `/Thumb` stream.
+    pub fn thumbnail(&self, page: &Page) -> Option<crate::thumbnail::Thumbnail> {
+        block_on(crate::thumbnail::thumbnail_with(&Immediate(self), page))
+    }
+
+    /// The catalog's article threads (ISO 32000-1 §12.4.3) in array order,
+    /// empty without `/Threads`.
+    pub fn articles(&self) -> Vec<crate::article::ArticleThread> {
+        block_on(crate::article::articles_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The beads on a page in drawing order (ISO 32000-1 §12.4.3), empty
+    /// without `/B`.
+    pub fn page_beads(&self, page: &Page) -> Vec<ObjRef> {
+        block_on(crate::article::page_beads_with(&Immediate(self), page))
+    }
+
+    /// A page's presentation entries (ISO 32000-1 §12.4.4), `None` when
+    /// the page has neither `/Dur` nor a `/Trans` dictionary.
+    pub fn presentation(&self, page: &Page) -> Option<crate::presentation::Presentation> {
+        block_on(crate::presentation::presentation_with(
+            &Immediate(self),
+            page,
+        ))
+    }
+
+    /// The permission handlers of the catalog's `/Perms` dictionary (ISO
+    /// 32000-1 §12.8.4), `None` without one.
+    pub fn permission_handlers(&self) -> Option<crate::permission::PermissionHandlers> {
+        block_on(crate::permission::permission_handlers_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
     /// The document's interactive form dictionary (ISO 32000-1 §12.7.2),
     /// `None` when the catalog has no `/AcroForm`.
     pub fn interactive_form(&self) -> Option<crate::form::InteractiveForm> {
@@ -691,14 +767,6 @@ impl Document {
             &Immediate(self),
             file,
         ))
-    }
-
-    /// Reads `key` from an info dictionary as a decoded text string.
-    ///
-    /// Covers ISO 32000-1 §7.9.2.2.
-    fn meta_string(&self, dict: &Dict, key: &str) -> Option<String> {
-        let value = self.resolve(dict.get(key)?).ok()?;
-        Some(decode_text_string(value.as_str_bytes()?))
     }
 
     /// Flattens the page tree by iterative depth-first traversal of `/Kids`
@@ -1001,6 +1069,25 @@ pub struct Metadata {
     pub producer: Option<String>,
     pub creation_date: Option<String>,
     pub mod_date: Option<String>,
+}
+
+/// The document information entries `dict` holds (ISO 32000-1 §14.3.3,
+/// Table 317), each decoded as a text string. The same reader serves the
+/// trailer's `/Info` dictionary and an article thread's `/I` (§12.4.3).
+///
+/// Covers ISO 32000-1 §7.9.2.2 and §14.3.3.
+pub async fn metadata_with<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Metadata {
+    let entries = Entries { src, dict };
+    Metadata {
+        title: entries.text("Title").await,
+        author: entries.text("Author").await,
+        subject: entries.text("Subject").await,
+        keywords: entries.text("Keywords").await,
+        creator: entries.text("Creator").await,
+        producer: entries.text("Producer").await,
+        creation_date: entries.text("CreationDate").await,
+        mod_date: entries.text("ModDate").await,
+    }
 }
 
 impl Metadata {
