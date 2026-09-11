@@ -2161,6 +2161,18 @@ mod tests {
         );
     }
 
+    /// The no-break spaces a producer pads a label with claim no column:
+    /// the label's ink stops before the rule, and the amount behind the
+    /// rule is its own cell.
+    #[test]
+    fn padding_inside_a_span_claims_no_column() {
+        let md = markdown_of_drawn(&structure::tests::padded_label_ruled_content());
+        assert!(
+            md.contains("| Cash | 1,000 |\n| Debt | 2,000 |"),
+            "md: {md}"
+        );
+    }
+
     #[test]
     fn a_ruled_grid_becomes_a_pipe_table() {
         let md = markdown_of_drawn(&structure::tests::ruled_grid_content());

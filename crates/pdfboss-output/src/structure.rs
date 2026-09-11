@@ -4149,15 +4149,19 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
     // A span only ever extends the last claim, so each claim's spans are a
     // contiguous stretch of `group.spans` — held as a range, never copied.
     let mut claimed: Vec<(usize, usize, std::ops::Range<usize>)> = Vec::new();
+    // Each claim's inked extent, for the gap test between cells; a claim
+    // opened by whitespace has none until ink joins it.
+    let mut extents: Vec<Option<(f32, f32)>> = Vec::new();
     let mut inked_end: Option<f32> = None;
     for (position, &span) in group.spans.iter().enumerate() {
         // A whitespace-only span that sits in the columns claims like any
         // other, so a cell keeps its spacing; one running outside them —
         // a producer's padding past the grid's edge — paints nothing and
-        // is skipped rather than disqualifying the whole row.
+        // is skipped rather than disqualifying the whole row. The padding
+        // inside an inked span, the spaces a producer sets after a sign or
+        // before an amount, paints nothing either and claims no column.
         let whitespace = blank(&span.text);
-        let lo = span.x.min(span.end_x);
-        let hi = span.x.max(span.end_x);
+        let (lo, hi) = inked_extent(span);
         // A span starting a hair left of the first column belongs to it: a
         // border rule is often drawn just inside the text's left edge.
         let Some(start) = columns
@@ -4203,16 +4207,33 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
         if !whitespace {
             inked_end = Some(hi);
         }
-        let end = columns
-            .iter()
-            .rposition(|column| column.start <= hi)
-            .map_or(start, |end| end.max(start));
+        // A whitespace span's advance past a boundary is padding, not a
+        // claim on the column beyond: the cell it pads ends where its ink
+        // does.
+        let end = if whitespace {
+            start
+        } else {
+            columns
+                .iter()
+                .rposition(|column| column.start <= hi)
+                .map_or(start, |end| end.max(start))
+        };
+        let ink = (!whitespace).then_some((lo, hi));
         match claimed.last_mut() {
             Some(last) if start <= last.1 => {
                 last.1 = last.1.max(end);
                 last.2.end = position + 1;
+                let extent = extents.last_mut().expect("a claim has an extent");
+                *extent = match (*extent, ink) {
+                    (Some(held), Some((lo, hi))) => Some((held.0.min(lo), held.1.max(hi))),
+                    (held, None) => held,
+                    (None, ink) => ink,
+                };
             }
-            _ => claimed.push((start, end, position..position + 1)),
+            _ => {
+                claimed.push((start, end, position..position + 1));
+                extents.push(ink);
+            }
         }
     }
     // `next` counts columns, `row` counts cells: a colspan cell is one cell
@@ -4233,7 +4254,7 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
     for _ in next..columns.len() {
         row.push(empty_cell());
     }
-    spaced_cells(&row, group.size).then_some(row)
+    spaced_cells(&extents, group.size).then_some(row)
 }
 
 fn empty_cell() -> Cell {
@@ -4270,15 +4291,16 @@ fn inked_extent(span: &TextSpan) -> (f32, f32) {
     )
 }
 
-/// True when neighbouring cells stand more than a word gap apart at the
-/// row's largest size — the gap the flat flow turned into the single space
-/// the [`Text`] adapter puts between cells. Below it the flow ran two cells
-/// into one word, and reading them as cells would change what the page says.
-fn spaced_cells(row: &[Cell], size: f32) -> bool {
-    let lines: Vec<&Line> = row.iter().filter_map(|cell| cell.line.as_ref()).collect();
-    lines
+/// True when neighbouring cells' ink stands more than a word gap apart at
+/// the row's largest size — the gap the flat flow turned into the single
+/// space the [`Text`] adapter puts between cells. Below it the flow ran two
+/// cells into one word, and reading them as cells would change what the
+/// page says. Cells holding whitespace alone stand between no ink.
+fn spaced_cells(extents: &[Option<(f32, f32)>], size: f32) -> bool {
+    let inked: Vec<(f32, f32)> = extents.iter().flatten().copied().collect();
+    inked
         .windows(2)
-        .all(|pair| pair[1].x - pair[0].end_x > WORD_GAP * size)
+        .all(|pair| pair[1].0 - pair[0].1 > WORD_GAP * size)
 }
 
 /// Rows at the top of a lane band that are its title, not its header: set
@@ -7084,6 +7106,21 @@ pub(crate) mod tests {
              1 0 0 1 260 695 Tm (2024) Tj \
              1 0 0 1 80 675 Tm (Cash) Tj 1 0 0 1 246 675 Tm ($) Tj 1 0 0 1 252 675 Tm (1,000) Tj \
              1 0 0 1 80 655 Tm (Debt) Tj 1 0 0 1 246 655 Tm ($) Tj 1 0 0 1 252 655 Tm (2,000) Tj ET",
+        )
+    }
+
+    /// [`ruled_grid_content`] with a third row, each label set with twelve
+    /// no-break spaces of padding behind it in the same string, so the
+    /// span's advance runs past the vertical rule at 250 while its ink
+    /// stops well short of it.
+    pub(crate) fn padded_label_ruled_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 200 695 Tm (Item) Tj 1 0 0 1 300 695 Tm (2024) Tj \
+             1 0 0 1 200 675 Tm (Cash\\240\\240\\240\\240\\240\\240\\240\\240\\240\\240\\240\\240) Tj \
+             1 0 0 1 300 675 Tm (1,000) Tj \
+             1 0 0 1 200 655 Tm (Debt\\240\\240\\240\\240\\240\\240\\240\\240\\240\\240\\240\\240) Tj \
+             1 0 0 1 300 655 Tm (2,000) Tj ET",
         )
     }
 
