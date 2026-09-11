@@ -2258,7 +2258,18 @@ fn open_ruled_candidate(
 /// every row, 5.6 points apart; snapped at 6 the rules chain into three
 /// lines and the table folds into two rows.
 fn ruling_snap(spans: &[TextSpan], rulings: &[Ruling]) -> f32 {
-    if rulings.is_empty() {
+    // The size pass over the page's spans is paid only where the answer
+    // can differ: two horizontal rules within the snap of each other.
+    let mut ys: Vec<f32> = rulings
+        .iter()
+        .filter(|r| r.end.x - r.start.x >= r.end.y - r.start.y)
+        .map(|r| r.start.y)
+        .collect();
+    ys.sort_by(f32::total_cmp);
+    if !ys
+        .windows(2)
+        .any(|pair| pair[1] - pair[0] <= RULING_SNAP_TOLERANCE)
+    {
         return RULING_SNAP_TOLERANCE;
     }
     let body = size_stats(&[spans]).body;
