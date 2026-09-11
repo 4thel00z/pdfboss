@@ -3046,7 +3046,12 @@ const RULED_LANE_MIN_WIDTH: f32 = 2.0 * GUTTER_MIN_WIDTH;
 
 /// `columns` with each drawn column split at the lanes the claim's lines
 /// leave clear inside it, a snap's width in from either rule so a lane
-/// hugging a rule is that rule's own margin.
+/// hugging a rule is that rule's own margin. A lane splits a column only
+/// where some line sets ink on both sides of it, and that ink is more than
+/// a currency sign: a column whose head is set flush left and whose amounts
+/// flush right leaves a lane between the two that no line crosses, and a
+/// column of amounts whose signs are set flush left leaves one that every
+/// line crosses with its sign alone; either is one column all the same.
 fn lane_split_columns(
     columns: Vec<std::ops::Range<f32>>,
     groups: &[Group],
@@ -3064,6 +3069,7 @@ fn lane_split_columns(
         for lane in lanes.iter().filter(|lane| {
             lane.start > column.start + RULING_SNAP_TOLERANCE
                 && lane.end < column.end - RULING_SNAP_TOLERANCE
+                && column_boundary(lane, &column, groups)
         }) {
             out.push(start..lane.start);
             start = lane.end;
@@ -3071,6 +3077,32 @@ fn lane_split_columns(
         out.push(start..column.end);
     }
     out
+}
+
+/// True when some line inks both sides of `lane` inside `column` with more
+/// than a lone currency sign on the left: the lane parts two cells, not a
+/// sign from its amount.
+fn column_boundary(
+    lane: &std::ops::Range<f32>,
+    column: &std::ops::Range<f32>,
+    groups: &[Group],
+) -> bool {
+    groups.iter().any(|group| {
+        let mut left: Vec<&TextSpan> = Vec::new();
+        let mut right = false;
+        for span in group.spans.iter().filter(|span| !blank(&span.text)) {
+            let (lo, hi) = inked_extent(span);
+            if hi > column.start && lo < lane.start {
+                left.push(span);
+            }
+            right |= lo < column.end && hi > lane.end;
+        }
+        let sign_alone = left.len() == 1 && {
+            let mut chars = left[0].text.trim().chars();
+            chars.next().is_some_and(|c| AMOUNT_SIGNS.contains(&c)) && chars.next().is_none()
+        };
+        !left.is_empty() && right && !sign_alone
+    })
 }
 
 /// How far above a grid's top rule its header may stand, in multiples of
@@ -4210,6 +4242,32 @@ fn empty_cell() -> Cell {
         colspan: 1,
         rowspan: 1,
     }
+}
+
+/// The extent of a span's ink: its origin to its advance, less the
+/// whitespace it opens or closes with, each blank taken at the span's mean
+/// glyph advance. A producer padding a cell with spaces sets them inside
+/// the amount's span, and the advance runs past the ink into the next
+/// column.
+fn inked_extent(span: &TextSpan) -> (f32, f32) {
+    let lo = span.x.min(span.end_x);
+    let hi = span.x.max(span.end_x);
+    let chars = span.text.chars().count();
+    let leading = span.text.chars().take_while(|c| c.is_whitespace()).count();
+    let trailing = span
+        .text
+        .chars()
+        .rev()
+        .take_while(|c| c.is_whitespace())
+        .count();
+    if leading + trailing == 0 || leading + trailing >= chars {
+        return (lo, hi);
+    }
+    let advance = (hi - lo) / chars as f32;
+    (
+        lo + leading as f32 * advance,
+        hi - trailing as f32 * advance,
+    )
 }
 
 /// True when neighbouring cells stand more than a word gap apart at the
@@ -6863,6 +6921,21 @@ pub(crate) mod tests {
         )
     }
 
+    /// A boxed two-column grid of four rows whose second column sets its
+    /// head flush left and its amounts flush right: a lane over a hundred
+    /// points wide stays clear between them in every line, and no line
+    /// inks both sides of it.
+    pub(crate) fn flush_head_flush_amount_ruled_content() -> String {
+        String::from(
+            "70 630 360 80 re S 250 630 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             70 650 m 430 650 l S \
+             BT /F1 10 Tf 1 0 0 1 80 698 Tm (Item) Tj 1 0 0 1 258 698 Tm (ALL) Tj \
+             1 0 0 1 80 678 Tm (Cash) Tj 1 0 0 1 394 678 Tm ($37.43) Tj \
+             1 0 0 1 80 658 Tm (Debt) Tj 1 0 0 1 394 658 Tm ($12.10) Tj \
+             1 0 0 1 80 638 Tm (Fees) Tj 1 0 0 1 394 638 Tm ($99.00) Tj ET",
+        )
+    }
+
     /// Two lane tables of three columns, each with a rule under its header
     /// and a double rule under its total drawn under the amount columns
     /// alone: the rules of the two tables pair up into open lattices
@@ -6965,6 +7038,22 @@ pub(crate) mod tests {
              BT /F1 10 Tf 1 0 0 1 66 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
              1 0 0 1 66 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj \
              1 0 0 1 66 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj ET",
+        )
+    }
+
+    /// A boxed two-column grid of three rows whose second column sets its
+    /// head flush left, each amount's sign flush left under it, and the
+    /// amount itself flush right behind eight no-break spaces of padding: a
+    /// lane forty points wide stays clear between sign and amount in every
+    /// row, and every row crosses it with its sign alone.
+    pub(crate) fn sign_padded_amount_ruled_content() -> String {
+        String::from(
+            "70 650 360 60 re S 250 650 m 250 710 l S 70 690 m 430 690 l S 70 670 m 430 670 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (Item) Tj 1 0 0 1 258 695 Tm (Amount) Tj \
+             1 0 0 1 80 675 Tm (Cash) Tj 1 0 0 1 260 675 Tm ($) Tj \
+             1 0 0 1 265 675 Tm (\\240\\240\\240\\240\\240\\240\\240\\240) Tj 1 0 0 1 305 675 Tm (1,414.00) Tj \
+             1 0 0 1 80 655 Tm (Debt) Tj 1 0 0 1 260 655 Tm ($) Tj \
+             1 0 0 1 265 655 Tm (\\240\\240\\240\\240\\240\\240\\240\\240) Tj 1 0 0 1 305 655 Tm (2,120.50) Tj ET",
         )
     }
 

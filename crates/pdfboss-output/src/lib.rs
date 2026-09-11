@@ -1850,6 +1850,20 @@ mod tests {
         );
     }
 
+    /// A lane every row crosses with a currency sign alone parts no cells:
+    /// the sign and its padded amount are one cell, and the Markdown reads
+    /// them closed up.
+    #[test]
+    fn a_lane_crossed_by_signs_alone_splits_no_drawn_column() {
+        let md = markdown_of_drawn(&structure::tests::sign_padded_amount_ruled_content());
+        assert!(
+            md.contains(
+                "| Item | Amount |\n| --- | --- |\n| Cash | $1,414.00 |\n| Debt | $2,120.50 |"
+            ),
+            "md: {md}"
+        );
+    }
+
     /// An open lattice whose first row is a title over both columns keeps
     /// its claim, the title a spanning cell and every line below it a row.
     #[test]
@@ -2152,6 +2166,18 @@ mod tests {
         let md = markdown_of_drawn(&structure::tests::ruled_grid_content());
         assert!(
             md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "md: {md}"
+        );
+    }
+
+    /// A column whose head is set flush left and whose amounts flush right
+    /// is one column: the lane between them is crossed by no line and
+    /// splits nothing.
+    #[test]
+    fn a_lane_no_line_crosses_splits_no_drawn_column() {
+        let md = markdown_of_drawn(&structure::tests::flush_head_flush_amount_ruled_content());
+        assert!(
+            md.contains("| Item | ALL |\n| --- | --- |\n| Cash | $37.43 |\n| Debt | $12.10 |"),
             "md: {md}"
         );
     }
