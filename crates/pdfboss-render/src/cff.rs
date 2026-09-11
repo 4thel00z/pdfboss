@@ -22,6 +22,7 @@ type Dict = FastMap<u16, Vec<f64>>;
 
 // --- Top DICT operator keys -------------------------------------------------
 const CHARSET_OP: u16 = 15;
+const ENCODING_OP: u16 = 16;
 const CHARSTRINGS_OP: u16 = 17;
 const PRIVATE_OP: u16 = 18; // also the Private key inside a Font DICT
 const FONT_MATRIX_OP: u16 = 0x0c00 | 7;
@@ -106,6 +107,9 @@ pub(crate) struct CffFont {
     /// The CFF String INDEX, for resolving custom glyph names (SID >= 391).
     strings: Index,
     charset: Charset,
+    /// Non-CID: the font's built-in code-to-glyph table (Top DICT
+    /// `Encoding`). Empty for CID-keyed fonts, whose codes a PDF CMap maps.
+    encoding: Encoding,
     is_cid: bool,
     /// Non-CID: the font's single Private DICT (local subrs + widths).
     private: Option<Private>,
@@ -155,6 +159,12 @@ impl CffFont {
 
         let charset_off = first_num(&top, CHARSET_OP).unwrap_or(0.0) as usize;
         let charset = Charset::parse(&data, charset_off, num_glyphs)?;
+        let encoding = if is_cid {
+            Encoding::empty()
+        } else {
+            let encoding_off = first_num(&top, ENCODING_OP).unwrap_or(0.0) as usize;
+            Encoding::parse(&data, encoding_off, &charset, num_glyphs)
+        };
 
         let (private, fd_array, fd_select) = if is_cid {
             let fd_array_off = first_num(&top, FDARRAY_OP)? as usize;
@@ -176,12 +186,22 @@ impl CffFont {
             global_subrs,
             strings,
             charset,
+            encoding,
             is_cid,
             private,
             fd_array,
             fd_select,
             units_per_em,
         })
+    }
+
+    /// The glyph index the font's own built-in encoding assigns to `code`
+    /// (Top DICT `Encoding`): what a PDF falls back to when it states no
+    /// `/Encoding` for an embedded font (ISO 32000-1 §9.6.6.2). `None` for
+    /// an unassigned code, for `.notdef`, and for CID-keyed fonts.
+    pub(crate) fn builtin_gid(&self, code: u8) -> Option<u16> {
+        let gid = self.encoding.gids[usize::from(code)];
+        (gid != 0).then_some(gid)
     }
 
     /// Number of glyphs (the CharStrings INDEX's object count).
@@ -1172,6 +1192,133 @@ impl Charset {
     }
 }
 
+/// A non-CID font's built-in encoding (Tech Note 5176 §12): the code-to-glyph
+/// table the font itself ships. Offset 0 (the operand's default) is the
+/// standard encoding, 1 the expert encoding, anything else a custom table
+/// in format 0 (one code per glyph) or 1 (code ranges), either optionally
+/// followed by a supplement block that maps further codes to glyphs by SID.
+struct Encoding {
+    /// `gids[code]` is the glyph index for that code; 0 means unassigned.
+    gids: Box<[u16; 256]>,
+}
+
+impl Encoding {
+    /// The empty table: every code unassigned.
+    fn empty() -> Encoding {
+        Encoding {
+            gids: Box::new([0u16; 256]),
+        }
+    }
+
+    /// The standard encoding resolved against `charset`: each code's
+    /// StandardEncoding glyph name is a standard string, so its SID needs no
+    /// String INDEX, and the charset turns the SID into a glyph index.
+    fn standard(charset: &Charset) -> Encoding {
+        let mut encoding = Encoding::empty();
+        for (code, slot) in encoding.gids.iter_mut().enumerate() {
+            let Some(name) = pdfboss_encoding::standard_encoding_name(code as u8) else {
+                continue;
+            };
+            let Some(sid) = STANDARD_STRINGS.iter().position(|&s| s == name) else {
+                continue;
+            };
+            if let Some(gid) = charset.gid_for_code(sid as u16) {
+                *slot = gid;
+            }
+        }
+        encoding
+    }
+
+    /// Reads the table selected by the Top DICT `Encoding` operand `offset`
+    /// for a font with `num_glyphs` glyphs. Lenient where the charset parser
+    /// is strict: a table that cannot be read yields the empty table rather
+    /// than failing the font, since `/Differences` and a stated `/Encoding`
+    /// may still reach every glyph the page uses.
+    fn parse(data: &[u8], offset: usize, charset: &Charset, num_glyphs: usize) -> Encoding {
+        match offset {
+            0 => Encoding::standard(charset),
+            // The predefined expert encoding (Tech Note 5176 Appendix B) is
+            // not bundled, like the expert charset: an empty table maps
+            // nothing rather than something wrong.
+            1 => Encoding::empty(),
+            _ => {
+                Encoding::custom(data, offset, charset, num_glyphs).unwrap_or_else(Encoding::empty)
+            }
+        }
+    }
+
+    /// Reads a custom table at `offset`: the format byte's low bits select
+    /// format 0 or 1, its high bit announces a supplement block after the
+    /// format's own data. A code assigned twice keeps its first glyph; a
+    /// supplement overrides both.
+    fn custom(
+        data: &[u8],
+        offset: usize,
+        charset: &Charset,
+        num_glyphs: usize,
+    ) -> Option<Encoding> {
+        let mut encoding = Encoding::empty();
+        let format = *data.get(offset)?;
+        let mut p = offset.checked_add(1)?;
+        match format & 0x7f {
+            0 => {
+                let n_codes = usize::from(*data.get(p)?);
+                p = p.checked_add(1)?;
+                for gid in 1..=n_codes {
+                    let code = *data.get(p)?;
+                    p = p.checked_add(1)?;
+                    if gid < num_glyphs {
+                        encoding.assign(code, gid as u16);
+                    }
+                }
+            }
+            1 => {
+                let n_ranges = usize::from(*data.get(p)?);
+                p = p.checked_add(1)?;
+                let mut gid = 1usize;
+                for _ in 0..n_ranges {
+                    let first = *data.get(p)?;
+                    let n_left = *data.get(p.checked_add(1)?)?;
+                    p = p.checked_add(2)?;
+                    for k in 0..=n_left {
+                        // A malformed range may run past code 255; the codes
+                        // beyond exist for no glyph, so they are skipped
+                        // while the gids they would have taken still count.
+                        if let Some(code) = first.checked_add(k) {
+                            if gid < num_glyphs {
+                                encoding.assign(code, gid as u16);
+                            }
+                        }
+                        gid += 1;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        if format & 0x80 != 0 {
+            let n_sups = usize::from(*data.get(p)?);
+            p = p.checked_add(1)?;
+            for _ in 0..n_sups {
+                let code = *data.get(p)?;
+                let sid = be16(data, p.checked_add(1)?)?;
+                p = p.checked_add(3)?;
+                if let Some(gid) = charset.gid_for_code(sid) {
+                    encoding.gids[usize::from(code)] = gid;
+                }
+            }
+        }
+        Some(encoding)
+    }
+
+    /// Assigns `gid` to `code` unless the code already has a glyph.
+    fn assign(&mut self, code: u8, gid: u16) {
+        let slot = &mut self.gids[usize::from(code)];
+        if *slot == 0 {
+            *slot = gid;
+        }
+    }
+}
+
 /// CID-keyed fonts' `FDSelect`: maps a glyph index to the index of its font
 /// DICT in `FDArray` (each font DICT has its own Private DICT, hence its own
 /// local Subrs and `nominalWidthX`).
@@ -1388,14 +1535,38 @@ pub(crate) mod tests {
     }
 
     /// Builds a non-CID Top DICT's bytes: charset(15), CharStrings(17),
-    /// Private(18, `[size, offset]`).
+    /// Private(18, `[size, offset]`), and no `Encoding` operator (so the
+    /// standard encoding, the CFF default).
     fn build_top_dict(
         charstrings_off: i32,
         charset_off: i32,
         private_size: i32,
         private_off: i32,
     ) -> Vec<u8> {
+        build_top_dict_encoded(
+            charstrings_off,
+            charset_off,
+            None,
+            private_size,
+            private_off,
+        )
+    }
+
+    /// `build_top_dict` with an `Encoding`(16) operand when `encoding_off`
+    /// is given: 1 selects the predefined expert encoding, anything larger
+    /// is the byte offset of a custom table.
+    fn build_top_dict_encoded(
+        charstrings_off: i32,
+        charset_off: i32,
+        encoding_off: Option<i32>,
+        private_size: i32,
+        private_off: i32,
+    ) -> Vec<u8> {
         let mut d = Vec::new();
+        if let Some(off) = encoding_off {
+            dict_int_operand(&mut d, off);
+            dict_operator(&mut d, ENCODING_OP);
+        }
         dict_int_operand(&mut d, charset_off);
         dict_operator(&mut d, CHARSET_OP);
         dict_int_operand(&mut d, charstrings_off);
@@ -1859,20 +2030,108 @@ pub(crate) mod tests {
     /// Builds a minimal non-CID CFF font: gid 0 is `.notdef`; gid 1 is the
     /// box glyph from `box_glyph_charstring`, named `glyph_name` via a custom
     /// String INDEX entry (mirrors `build_fixture`'s charset/String-INDEX
-    /// layout, but with a real outline instead of a bare `endchar`).
+    /// layout, but with a real outline instead of a bare `endchar`). No
+    /// `Encoding` operator, so the built-in encoding is the standard one.
     pub(crate) fn build_box_glyph_fixture(glyph_name: &str) -> Vec<u8> {
+        build_box_glyph_fixture_with(BoxGlyphName::Custom(glyph_name), FixtureEncoding::Absent)
+    }
+
+    /// `build_box_glyph_fixture` with a custom built-in encoding table
+    /// (`encoding_format0`/`encoding_format1`, optionally `with_supplements`).
+    pub(crate) fn build_box_glyph_fixture_encoded(glyph_name: &str, encoding: &[u8]) -> Vec<u8> {
+        build_box_glyph_fixture_with(
+            BoxGlyphName::Custom(glyph_name),
+            FixtureEncoding::Custom(encoding),
+        )
+    }
+
+    /// How gid 1 of a box-glyph fixture is named: through the font's own
+    /// String INDEX (SID 391), or by one of the bundled standard strings.
+    pub(crate) enum BoxGlyphName<'a> {
+        Custom(&'a str),
+        Standard(&'a str),
+    }
+
+    /// The Top DICT `Encoding` operand a fixture states: absent (the CFF
+    /// default, the standard encoding), the predefined expert encoding, or a
+    /// custom table laid out right after the charset.
+    pub(crate) enum FixtureEncoding<'a> {
+        Absent,
+        Expert,
+        Custom(&'a [u8]),
+    }
+
+    /// The SID of a bundled standard string.
+    pub(crate) fn standard_sid(name: &str) -> u16 {
+        STANDARD_STRINGS
+            .iter()
+            .position(|&s| s == name)
+            .expect("a standard string") as u16
+    }
+
+    /// A format-0 built-in encoding: `codes[i]` is the code of gid `i + 1`.
+    pub(crate) fn encoding_format0(codes: &[u8]) -> Vec<u8> {
+        let mut e = vec![0u8, codes.len() as u8];
+        e.extend_from_slice(codes);
+        e
+    }
+
+    /// A format-1 built-in encoding: each `(first, n_left)` range hands
+    /// `n_left + 1` consecutive codes to consecutive gids from 1.
+    pub(crate) fn encoding_format1(ranges: &[(u8, u8)]) -> Vec<u8> {
+        let mut e = vec![1u8, ranges.len() as u8];
+        for &(first, n_left) in ranges {
+            e.push(first);
+            e.push(n_left);
+        }
+        e
+    }
+
+    /// Appends a supplement block (`code -> SID`) to a built-in encoding and
+    /// raises the format byte's high bit that announces it.
+    pub(crate) fn with_supplements(mut encoding: Vec<u8>, supplements: &[(u8, u16)]) -> Vec<u8> {
+        encoding[0] |= 0x80;
+        encoding.push(supplements.len() as u8);
+        for &(code, sid) in supplements {
+            encoding.push(code);
+            encoding.extend_from_slice(&u16be(sid));
+        }
+        encoding
+    }
+
+    /// The general box-glyph fixture: `name` decides gid 1's charset entry
+    /// (and whether the String INDEX holds an entry), `encoding` the Top
+    /// DICT's `Encoding` operand and the custom table bytes, laid out between
+    /// the charset and the Private DICT.
+    pub(crate) fn build_box_glyph_fixture_with(
+        name: BoxGlyphName,
+        encoding: FixtureEncoding,
+    ) -> Vec<u8> {
         let cs = box_glyph_charstring();
         let notdef: &[u8] = &[ENDCHAR];
 
         let header = vec![1u8, 0, 4, 4];
         let name_index = build_index(&[b"Synthetic"]);
-        let string_index = build_index(&[glyph_name.as_bytes()]);
+        let (string_index, glyph_sid) = match name {
+            BoxGlyphName::Custom(glyph_name) => (build_index(&[glyph_name.as_bytes()]), 391),
+            BoxGlyphName::Standard(glyph_name) => (build_index(&[]), standard_sid(glyph_name)),
+        };
         let global_subr_index = build_index(&[]);
         let charstrings_index = build_index(&[notdef, &cs]);
-        let charset = charset_format0(&[391]); // gid 1 -> SID 391 (glyph_name)
+        let charset = charset_format0(&[glyph_sid]); // gid 1 -> glyph_sid
+        let encoding_bytes: &[u8] = match encoding {
+            FixtureEncoding::Custom(bytes) => bytes,
+            FixtureEncoding::Absent | FixtureEncoding::Expert => &[],
+        };
         let private = build_private_dict(0, 0);
 
-        let placeholder_top = build_top_dict(0, 0, private.len() as i32, 0);
+        let encoding_operand = |encoding_off: i32| match encoding {
+            FixtureEncoding::Absent => None,
+            FixtureEncoding::Expert => Some(1),
+            FixtureEncoding::Custom(_) => Some(encoding_off),
+        };
+        let placeholder_top =
+            build_top_dict_encoded(0, 0, encoding_operand(0), private.len() as i32, 0);
         let top_dict_index_len = build_index(&[&placeholder_top]).len();
 
         let prefix_len = header.len()
@@ -1882,12 +2141,14 @@ pub(crate) mod tests {
             + global_subr_index.len();
 
         let charset_off = prefix_len as i32;
-        let private_off = charset_off + charset.len() as i32;
+        let encoding_off = charset_off + charset.len() as i32;
+        let private_off = encoding_off + encoding_bytes.len() as i32;
         let charstrings_off = private_off + private.len() as i32;
 
-        let top_dict = build_top_dict(
+        let top_dict = build_top_dict_encoded(
             charstrings_off,
             charset_off,
+            encoding_operand(encoding_off),
             private.len() as i32,
             private_off,
         );
@@ -1901,9 +2162,96 @@ pub(crate) mod tests {
         out.extend_from_slice(&string_index);
         out.extend_from_slice(&global_subr_index);
         out.extend_from_slice(&charset);
+        out.extend_from_slice(encoding_bytes);
         out.extend_from_slice(&private);
         out.extend_from_slice(&charstrings_index);
         out
+    }
+
+    /// A Top DICT without an `Encoding` operator means the standard encoding
+    /// (Tech Note 5176 §12, operand default 0): code 65 reaches the glyph
+    /// the charset names `A`, and a code the standard encoding leaves
+    /// unassigned reaches nothing.
+    #[test]
+    fn builtin_encoding_defaults_to_standard() {
+        let font = CffFont::parse(build_box_glyph_fixture_with(
+            BoxGlyphName::Standard("A"),
+            FixtureEncoding::Absent,
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.builtin_gid(65), Some(1));
+        assert_eq!(font.builtin_gid(66), None);
+        assert_eq!(font.builtin_gid(0x80), None);
+    }
+
+    /// Format 0 lists one code per glyph, gid 1 first.
+    #[test]
+    fn builtin_encoding_format0_lists_one_code_per_glyph() {
+        let font = CffFont::parse(build_box_glyph_fixture_encoded(
+            "theboxglyphname",
+            &encoding_format0(&[200]),
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.builtin_gid(200), Some(1));
+        assert_eq!(font.builtin_gid(65), None);
+    }
+
+    /// A format-1 range hands consecutive codes to consecutive gids and
+    /// stops at the font's last glyph instead of inventing gids.
+    #[test]
+    fn builtin_encoding_format1_ranges_stop_at_the_last_glyph() {
+        let font = CffFont::parse(build_box_glyph_fixture_encoded(
+            "theboxglyphname",
+            &encoding_format1(&[(65, 3)]),
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.builtin_gid(65), Some(1));
+        assert_eq!(font.builtin_gid(66), None);
+        assert_eq!(font.builtin_gid(68), None);
+    }
+
+    /// A supplement maps an extra code to a glyph by SID, on top of the
+    /// format table.
+    #[test]
+    fn builtin_encoding_supplements_add_codes_by_sid() {
+        let font = CffFont::parse(build_box_glyph_fixture_encoded(
+            "theboxglyphname",
+            &with_supplements(encoding_format0(&[200]), &[(66, 391)]),
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.builtin_gid(200), Some(1));
+        assert_eq!(font.builtin_gid(66), Some(1));
+    }
+
+    /// The predefined expert encoding is not bundled (as with the expert
+    /// charset), so it maps nothing rather than something wrong.
+    #[test]
+    fn expert_builtin_encoding_maps_nothing() {
+        let font = CffFont::parse(build_box_glyph_fixture_with(
+            BoxGlyphName::Standard("A"),
+            FixtureEncoding::Expert,
+        ))
+        .expect("fixture parses");
+        assert!((0..=255u8).all(|code| font.builtin_gid(code).is_none()));
+    }
+
+    /// A CID-keyed font has no built-in encoding: its charset maps CIDs, and
+    /// the PDF's CMap does the code mapping.
+    #[test]
+    fn cid_keyed_font_has_no_builtin_encoding() {
+        let font = CffFont::parse(build_box_glyph_fixture_cid(5)).expect("fixture parses");
+        assert!((0..=255u8).all(|code| font.builtin_gid(code).is_none()));
+    }
+
+    /// An unreadable custom table (unknown format byte) leaves the font
+    /// usable through its names and `/Differences`; only the built-in
+    /// mapping is empty.
+    #[test]
+    fn malformed_builtin_encoding_leaves_the_font_usable() {
+        let font = CffFont::parse(build_box_glyph_fixture_encoded("theboxglyphname", &[7u8]))
+            .expect("fixture parses");
+        assert_eq!(font.gid_for_name("theboxglyphname"), Some(1));
+        assert!((0..=255u8).all(|code| font.builtin_gid(code).is_none()));
     }
 
     /// Builds a minimal CID-keyed CFF font: gid 0 is `.notdef`; gid 1 is the

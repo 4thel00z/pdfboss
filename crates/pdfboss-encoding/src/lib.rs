@@ -246,6 +246,49 @@ pub fn mac_roman(code: u8) -> Option<char> {
     }
 }
 
+/// MacRomanEncoding glyph names for codes `0x80..=0xFF` (ISO 32000-1
+/// Annex D.2 "MacRomanEncoding" column), in code order (index `0` is code
+/// `0x80`). Names are paired with [`MAC_ROMAN_HIGH`] entry for entry: `0xCA`
+/// carries `space` (the nonbreaking space draws as the space glyph) and
+/// `0xDB` carries `Euro`, which is what that table holds for the code.
+#[rustfmt::skip]
+const MAC_ROMAN_HIGH_NAMES: [&str; 128] = [
+    "Adieresis", "Aring", "Ccedilla", "Eacute", "Ntilde", "Odieresis", "Udieresis", "aacute",
+    "agrave", "acircumflex", "adieresis", "atilde", "aring", "ccedilla", "eacute", "egrave",
+    "ecircumflex", "edieresis", "iacute", "igrave", "icircumflex", "idieresis", "ntilde", "oacute",
+    "ograve", "ocircumflex", "odieresis", "otilde", "uacute", "ugrave", "ucircumflex", "udieresis",
+    "dagger", "degree", "cent", "sterling", "section", "bullet", "paragraph", "germandbls",
+    "registered", "copyright", "trademark", "acute", "dieresis", "notequal", "AE", "Oslash",
+    "infinity", "plusminus", "lessequal", "greaterequal", "yen", "mu", "partialdiff", "summation",
+    "product", "pi", "integral", "ordfeminine", "ordmasculine", "Omega", "ae", "oslash",
+    "questiondown", "exclamdown", "logicalnot", "radical", "florin", "approxequal", "Delta", "guillemotleft",
+    "guillemotright", "ellipsis", "space", "Agrave", "Atilde", "Otilde", "OE", "oe",
+    "endash", "emdash", "quotedblleft", "quotedblright", "quoteleft", "quoteright", "divide", "lozenge",
+    "ydieresis", "Ydieresis", "fraction", "Euro", "guilsinglleft", "guilsinglright", "fi", "fl",
+    "daggerdbl", "periodcentered", "quotesinglbase", "quotedblbase", "perthousand", "Acircumflex", "Ecircumflex", "Aacute",
+    "Edieresis", "Egrave", "Iacute", "Icircumflex", "Idieresis", "Igrave", "Oacute", "Ocircumflex",
+    "apple", "Ograve", "Uacute", "Ucircumflex", "Ugrave", "dotlessi", "circumflex", "tilde",
+    "macron", "breve", "dotaccent", "ring", "cedilla", "hungarumlaut", "ogonek", "caron",
+];
+
+/// MacRomanEncoding glyph name for `code` (ISO 32000-1 Annex D.2
+/// "MacRomanEncoding" column). `None` for exactly the codes [`mac_roman`]
+/// leaves unassigned. As in WinAnsi, `0x27` is `quotesingle` and `0x60` is
+/// `grave`, and `0xCA` renders the space glyph for the nonbreaking space.
+/// See the self-verifying `mac_roman_glyph_name_matches_mac_roman_table`
+/// test below.
+///
+/// Covers ISO 32000-1 Annex D.2.
+pub fn mac_roman_glyph_name(code: u8) -> Option<&'static str> {
+    match code {
+        0x27 => Some("quotesingle"),
+        0x60 => Some("grave"),
+        0x20..=0x7E => Some(STANDARD_ASCII_NAMES[(code - 0x20) as usize]),
+        0x80..=0xFF => Some(MAC_ROMAN_HIGH_NAMES[(code - 0x80) as usize]),
+        _ => None,
+    }
+}
+
 /// StandardEncoding codes above 0x7E that are assigned (sparse).
 const STANDARD_HIGH: &[(u8, char)] = &[
     (0xA1, '\u{A1}'),
@@ -996,6 +1039,41 @@ mod tests {
     /// Unicode value — with exactly two documented exceptions, codes that
     /// render an existing glyph rather than owning one: `0xA0` (nonbreaking
     /// space, drawn by `space`) and `0xAD` (soft hyphen, drawn by `hyphen`).
+    /// The MacRoman name table is tied to the MacRoman value table the same
+    /// way: same domain, every name resolving to the code's value, with two
+    /// exceptions: `0xCA` (nonbreaking space, drawn by `space`) and `0xBD`,
+    /// whose name `Omega` the glyph list gives the Ohm sign U+2126 while the
+    /// value table holds the Greek capital U+03A9 (the same letter).
+    // Covers ISO 32000-1 Annex D.2.
+    #[test]
+    fn mac_roman_glyph_name_matches_mac_roman_table() {
+        assert_eq!(mac_roman_glyph_name(0xCA), Some("space"));
+        assert_eq!(mac_roman_glyph_name(0xBD), Some("Omega"));
+        assert_eq!(mac_roman_glyph_name(0xA5), Some("bullet"));
+        assert_eq!(mac_roman_glyph_name(0xDE), Some("fi"));
+        for code in 0u16..=255 {
+            let code = code as u8;
+            assert_eq!(
+                mac_roman_glyph_name(code).is_some(),
+                mac_roman(code).is_some(),
+                "code {code:#04x}: mac_roman_glyph_name/mac_roman domain mismatch"
+            );
+            let Some(name) = mac_roman_glyph_name(code) else {
+                continue;
+            };
+            let expected = match code {
+                0xCA => ' ',
+                0xBD => '\u{2126}',
+                _ => mac_roman(code).unwrap(),
+            };
+            assert_eq!(
+                glyph_to_unicode(name),
+                Some(expected),
+                "code {code:#04x} name {name:?}: glyph_to_unicode disagrees with mac_roman"
+            );
+        }
+    }
+
     // Covers ISO 32000-1 Annex D.2.
     #[test]
     fn win_ansi_glyph_name_matches_win_ansi_table() {

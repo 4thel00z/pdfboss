@@ -705,13 +705,18 @@ async fn simple_widths<S: AsyncObjectSource>(src: &S, font: &Dict) -> WidthMap {
 /// `FontFile` instead (a raw Type1 charstring program, not CFF) goes to
 /// `load_type1_simple`.
 ///
-/// Builds its 256-entry code-to-glyph table from two sources, in priority
+/// Builds its 256-entry code-to-glyph table from three sources, in priority
 /// order: a `/Differences` glyph name, resolved directly through the CFF's
 /// own charset (`gid_for_name`); then the base `/Encoding` character, looked
 /// up in a `unicode -> gid` map built once by walking every glyph's charset
-/// name through the Adobe Glyph List. CFF has no `cmap`, so unlike the
-/// TrueType loader there is no raw-byte/symbol-range fallback: an unresolved
-/// code is left at `.notdef` (gid 0).
+/// name through the Adobe Glyph List; then the program's own built-in
+/// encoding (the CFF `Encoding` table, `CffFont::builtin_gid`), which is
+/// the whole mapping for a font the PDF states no `/Encoding` for
+/// (ISO 32000-1 §9.6.6.2) -- XeTeX and tectonic embed Computer Modern this
+/// way, with glyph names like `integraldisplay` that reach no Unicode. CFF
+/// has no `cmap`, so unlike the TrueType loader there is no
+/// raw-byte/symbol-range fallback: an unresolved code is left at `.notdef`
+/// (gid 0).
 async fn load_cff_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
@@ -747,7 +752,13 @@ async fn load_cff_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<G
         if let Some(ch) = base.and_then(|f| f(code)) {
             if let Some(&gid) = by_unicode.get(&ch) {
                 *slot = gid;
+                continue;
             }
+        }
+        // 3. The program's own built-in encoding, for a font the PDF gives
+        // no /Encoding (or one that leaves this code without a glyph).
+        if let Some(gid) = cff.builtin_gid(code) {
+            *slot = gid;
         }
     }
     Some(GlyphFont {
@@ -789,11 +800,11 @@ async fn load_simple_type1_or_cff<S: AsyncObjectSource>(src: &S, font: &Dict) ->
 /// looked up in a `unicode -> gid` map built once by walking every glyph
 /// name through the Adobe Glyph List (mirrors `load_cff_simple`'s
 /// `by_unicode` construction exactly, just sourced from `Type1Font::
-/// name_for_gid` instead of `CffFont::name_for_gid`); then -- a tier
-/// `load_cff_simple` has no counterpart for, since CFF's charset carries no
-/// separate built-in encoding -- the font's own built-in `/Encoding` array
-/// (`builtin_name`), for a font that ships its own encoding and the PDF
-/// gives none. Type1 has no `cmap`, so as with CFF an unresolved code is
+/// name_for_gid` instead of `CffFont::name_for_gid`); then the font's own
+/// built-in `/Encoding` array (`builtin_name`), for a font that ships its
+/// own encoding and the PDF gives none (the counterpart of
+/// `load_cff_simple`'s CFF `Encoding` tier). Type1 has no `cmap`, so as
+/// with CFF an unresolved code is
 /// left at `.notdef` (gid 0). `Type1Font::parse` guarantees gid 0 IS
 /// `.notdef` (synthesizing an empty one when the program lists a real glyph
 /// first), so the `g != 0` filters below never discard a resolved glyph.
@@ -835,9 +846,8 @@ async fn load_type1_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option
                 continue;
             }
         }
-        // 3. The font's own built-in /Encoding -- Type1-specific: a font
-        // that ships its own /Encoding and gets no PDF /Encoding at all
-        // still maps, unlike CFF (which has no built-in encoding concept).
+        // 3. The font's own built-in /Encoding: a font that ships its own
+        // /Encoding and gets no PDF /Encoding at all still maps.
         if let Some(name) = t1.builtin_name(code) {
             if let Some(gid) = t1.gid_for_name(name).filter(|&g| g != 0) {
                 *slot = gid;
@@ -1502,7 +1512,9 @@ mod tests {
     use pdfboss_testkit::PdfBuilder;
 
     use crate::cff::tests::{
-        build_box_glyph_fixture, build_box_glyph_fixture_cid, wrap_in_opentype,
+        build_box_glyph_fixture, build_box_glyph_fixture_cid, build_box_glyph_fixture_encoded,
+        build_box_glyph_fixture_with, encoding_format0, wrap_in_opentype, BoxGlyphName,
+        FixtureEncoding,
     };
     use crate::truetype::tests::build_font;
     use crate::type1::tests::{
@@ -1832,6 +1844,15 @@ mod tests {
     /// `/Type1` font whose `FontDescriptor` carries an embedded CFF program
     /// via `FontFile3` (rather than a `FontFile2` TrueType program).
     fn simple_cff_font_doc(encoding: &str, content: &[u8]) -> Vec<u8> {
+        simple_cff_font_doc_with(
+            &build_box_glyph_fixture("theboxglyphname"),
+            encoding,
+            content,
+        )
+    }
+
+    /// [`simple_cff_font_doc`] with the CFF program of the caller's choosing.
+    fn simple_cff_font_doc_with(program: &[u8], encoding: &str, content: &[u8]) -> Vec<u8> {
         let mut b = PdfBuilder::new().version(1, 5);
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -1852,8 +1873,66 @@ mod tests {
             6,
             "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile3 7 0 R >>",
         );
-        b.stream(7, "", &build_box_glyph_fixture("theboxglyphname"));
+        b.stream(7, "", program);
         b.build(1)
+    }
+
+    /// A simple font with an embedded CFF program and no `/Encoding` at all
+    /// maps codes through the program's own built-in encoding: the
+    /// XeTeX/tectonic Computer Modern case, where the glyph names carry no
+    /// Unicode and nothing but the CFF `Encoding` table says which code
+    /// draws which glyph.
+    // Covers ISO 32000-1 §9.6.6.2.
+    #[test]
+    fn cff_builtin_encoding_paints_when_the_pdf_states_no_encoding() {
+        let program = build_box_glyph_fixture_encoded("theboxglyphname", &encoding_format0(&[65]));
+        let bytes = simple_cff_font_doc_with(&program, "", b"BT /F0 100 Tf 20 50 Td <41> Tj ET");
+        let pix = render_at_tier(&bytes, GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "code 65 should reach glyph 1 through the CFF built-in encoding"
+        );
+    }
+
+    /// A stated `/Encoding` takes precedence over the built-in table, which
+    /// only fills the codes the stated encoding leaves without a glyph: with
+    /// `/WinAnsiEncoding`, code 0x41 reaches the glyph named `A` through
+    /// Unicode, and code 0xC8 (`Egrave`, which the font lacks) reaches the
+    /// same glyph only because the CFF encoding assigns it there.
+    // Covers ISO 32000-1 §9.6.6.2.
+    #[test]
+    fn cff_builtin_encoding_fills_only_codes_the_pdf_encoding_leaves_unmapped() {
+        let program = build_box_glyph_fixture_with(
+            BoxGlyphName::Standard("A"),
+            FixtureEncoding::Custom(&encoding_format0(&[200])),
+        );
+        let doc = |content: &[u8]| {
+            simple_cff_font_doc_with(&program, "/Encoding /WinAnsiEncoding", content)
+        };
+        let via_unicode = render_at_tier(
+            &doc(b"BT /F0 100 Tf 20 50 Td <41> Tj ET"),
+            GlyphPainting::AllEmbedded,
+        );
+        assert!(
+            dark_pixel_at(&via_unicode, 55, 115),
+            "0x41 -> A via WinAnsi"
+        );
+        let via_builtin = render_at_tier(
+            &doc(b"BT /F0 100 Tf 20 50 Td <C8> Tj ET"),
+            GlyphPainting::AllEmbedded,
+        );
+        assert!(
+            dark_pixel_at(&via_builtin, 55, 115),
+            "0xC8 -> gid 1 via the CFF encoding"
+        );
+        let unmapped = render_at_tier(
+            &doc(b"BT /F0 100 Tf 20 50 Td <42> Tj ET"),
+            GlyphPainting::AllEmbedded,
+        );
+        assert!(
+            !dark_pixel_at(&unmapped, 55, 115),
+            "0x42 (B) has no glyph anywhere"
+        );
     }
 
     /// Renders page 0 of `bytes` at the given glyph-painting tier.

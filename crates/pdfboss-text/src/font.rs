@@ -112,11 +112,11 @@ pub struct Font {
     /// `/BaseFont` verbatim — subset prefix included — falling back to the
     /// FontDescriptor's `/FontName`; empty when the file states neither.
     pub base_name: String,
-    /// Upper edge of the em box in per-mille units: `/Ascent`, else
-    /// `/CapHeight`, else 800.
+    /// Upper edge of the em box in per-mille units: `/Ascent`, else the
+    /// `/FontBBox` top, else `/CapHeight`, else 800.
     pub ascent: f32,
     /// Lower edge of the em box in per-mille units, never positive:
-    /// `/Descent`, else -200.
+    /// `/Descent`, else the `/FontBBox` bottom, else -200.
     pub descent: f32,
     /// FontDescriptor `/Flags` FixedPitch (ISO 32000-1 Table 123 bit 1).
     pub monospace: bool,
@@ -530,27 +530,54 @@ impl Font {
                 .and_then(|o| o.as_name().map(|n| n.0.clone()))
                 .unwrap_or_default();
         }
+        // A stated, nonzero /Ascent or /Descent wins. Without one, the
+        // /FontBBox (Table 122: the smallest box enclosing every glyph)
+        // gives an edge every glyph stays inside, which /CapHeight does not:
+        // the math extension fonts of tectonic documents state /Ascent 0
+        // /Descent 0, and their display integrals hang two em below the
+        // baseline. A Type 3 font's box is in its own /FontMatrix glyph
+        // space, which this crate does not read, so it is no evidence there.
+        let type3 = rv(src, dict, "Subtype")
+            .await
+            .and_then(|o| o.as_name().map(|n| n.0 == "Type3"))
+            .unwrap_or(false);
+        let bbox = if type3 {
+            None
+        } else {
+            Font::font_bbox_vertical(src, &descriptor).await
+        };
         let ascent = match rv(src, &descriptor, "Ascent")
             .await
             .and_then(|o| o.as_f64())
         {
-            Some(a) if a != 0.0 => Some(a),
-            _ => rv(src, &descriptor, "CapHeight")
+            Some(a) if a != 0.0 => Some(a as f32),
+            _ => bbox.map(|(_, top)| top).filter(|top| *top > 0.0),
+        };
+        let ascent = match ascent {
+            Some(a) => Some(a),
+            None => rv(src, &descriptor, "CapHeight")
                 .await
                 .and_then(|o| o.as_f64())
-                .filter(|c| *c != 0.0),
+                .filter(|c| *c != 0.0)
+                .map(|c| c as f32),
         };
         if let Some(a) = ascent {
-            style.ascent = a as f32;
+            style.ascent = a;
         }
-        if let Some(d) = rv(src, &descriptor, "Descent")
+        let descent = match rv(src, &descriptor, "Descent")
             .await
             .and_then(|o| o.as_f64())
             .filter(|d| *d != 0.0)
         {
             // Stated as negative (ISO 32000-1 Table 122); some producers
             // write the magnitude.
-            style.descent = -(d as f32).abs();
+            Some(d) => Some(-(d as f32).abs()),
+            None => bbox
+                .map(|(bottom, _)| bottom)
+                .filter(|bottom| *bottom <= 0.0),
+        };
+        if let Some(d) = descent {
+            style.descent = d;
         }
         let mut bold = style.bold;
         let mut italic = style.italic;
@@ -584,16 +611,47 @@ impl Font {
         style
     }
 
-    /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
-    /// plus `/Differences`, widths from `/FirstChar` + `/Widths`.
+    /// The vertical extent of the descriptor's `/FontBBox` as `(bottom,
+    /// top)` in glyph-space units (ISO 32000-1 Table 122), when the array
+    /// holds four finite numbers enclosing a positive height. An all-zero
+    /// placeholder box, which some producers write, is no evidence and
+    /// yields `None`.
     ///
-    /// Covers ISO 32000-1 §9.6.2.1.
+    /// Covers ISO 32000-1 §9.8.1.
+    async fn font_bbox_vertical<S: AsyncObjectSource>(
+        src: &S,
+        descriptor: &Dict,
+    ) -> Option<(f32, f32)> {
+        let Some(Object::Array(items)) = rv(src, descriptor, "FontBBox").await else {
+            return None;
+        };
+        if items.len() != 4 {
+            return None;
+        }
+        let mut edges = [0f64; 4];
+        for (edge, item) in edges.iter_mut().zip(&items) {
+            *edge = src.resolve(item).await.ok()?.as_f64()?;
+        }
+        if edges.iter().any(|edge| !edge.is_finite()) {
+            return None;
+        }
+        let (bottom, top) = (edges[1].min(edges[3]), edges[1].max(edges[3]));
+        (top > bottom).then_some((bottom as f32, top as f32))
+    }
+
+    /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base
+    /// plus `/Differences`, widths from `/FirstChar` + `/Widths`, or, for a
+    /// standard-14 face that declares no `/Widths` (ISO 32000-1 §9.6.2.2
+    /// lets those fourteen omit them), from the Adobe Core-14 AFM tables.
+    ///
+    /// Covers ISO 32000-1 §9.6.2.1 and §9.6.2.2.
     async fn load_simple<S: AsyncObjectSource>(
         src: &S,
         dict: &Dict,
         to_unicode: Option<ToUnicode>,
     ) -> Font {
         let encoding = Font::load_encoding(src, dict).await;
+        let style = Font::style(src, dict, dict).await;
 
         let mut widths = FastMap::default();
         let first = rv(src, dict, "FirstChar")
@@ -601,7 +659,9 @@ impl Font {
             .and_then(|o| o.as_int())
             .unwrap_or(0)
             .max(0) as u32;
+        let mut declared = false;
         if let Some(Object::Array(items)) = rv(src, dict, "Widths").await {
+            declared = true;
             for (i, item) in items.iter().enumerate() {
                 let Some(code) = first.checked_add(i as u32) else {
                     break; // /FirstChar so large the codes overflow u32
@@ -610,6 +670,9 @@ impl Font {
                     widths.insert(code, w as f32);
                 }
             }
+        }
+        if !declared && encodings::is_standard_14(&style.name) {
+            Font::fill_standard_14_widths(src, dict, &style.name, &mut widths).await;
         }
         let descriptor = rv(src, dict, "FontDescriptor")
             .await
@@ -625,7 +688,6 @@ impl Font {
         // Only a font that states no `/Encoding` has anything to gain here, and
         // only then is the embedded program worth inflating.
         let winansi_high_codes = encoding.is_none() && Font::built_for_windows(src, dict).await;
-        let style = Font::style(src, dict, dict).await;
 
         Font {
             simple: true,
@@ -712,6 +774,97 @@ impl Font {
         decoded_stream_data_with(src, obj.as_stream()?).await.ok()
     }
 
+    /// Fills `widths` for a standard-14 face from the Adobe Core-14 AFM
+    /// tables, for every code that has no entry yet: a code's glyph name is
+    /// its `/Differences` entry, else the base encoding's name for the code
+    /// (WinAnsi, MacRoman, or Standard, the text faces' built-in encoding
+    /// and so the answer when the PDF states no `/Encoding`). Codes whose
+    /// name the face has no metric for keep the caller's default. This is
+    /// the advance the rasterizer paints such a face with, so the extracted
+    /// `end_x` stops where the ink does. A subset-tagged name (an embedded
+    /// clone of a standard face) qualifies too, the clones being metric-
+    /// compatible.
+    ///
+    /// Covers ISO 32000-1 §9.6.2.2.
+    async fn fill_standard_14_widths<S: AsyncObjectSource>(
+        src: &S,
+        dict: &Dict,
+        base_font: &str,
+        widths: &mut FastMap<u32, f32>,
+    ) {
+        let enc = rv(src, dict, "Encoding").await;
+        let base_glyph_name: fn(u8) -> Option<&'static str> =
+            match Font::base_encoding_name(src, enc.as_ref()).await.as_deref() {
+                Some("WinAnsiEncoding") => encodings::win_ansi_glyph_name,
+                Some("MacRomanEncoding") => encodings::mac_roman_glyph_name,
+                _ => encodings::standard_encoding_name,
+            };
+        let differences = Font::differences_names(src, enc.as_ref()).await;
+        for code in 0u8..=255 {
+            if widths.contains_key(&u32::from(code)) {
+                continue;
+            }
+            let name = differences
+                .iter()
+                .rev()
+                .find(|(c, _)| *c == code)
+                .map(|(_, name)| name.as_str())
+                .or_else(|| base_glyph_name(code));
+            let Some(name) = name else {
+                continue;
+            };
+            if let Some(width) = encodings::standard_14_width(base_font, name) {
+                widths.insert(u32::from(code), width);
+            }
+        }
+    }
+
+    /// The base encoding a font's `/Encoding` names: the name itself, or a
+    /// dictionary's `/BaseEncoding`. `None` when it names neither.
+    async fn base_encoding_name<S: AsyncObjectSource>(
+        src: &S,
+        enc: Option<&Object>,
+    ) -> Option<String> {
+        match enc {
+            Some(Object::Name(n)) => Some(n.0.clone()),
+            Some(Object::Dict(d)) => rv(src, d, "BaseEncoding")
+                .await
+                .and_then(|o| o.as_name().map(|n| n.0.clone())),
+            _ => None,
+        }
+    }
+
+    /// `/Encoding /Differences` as `(code, glyph name)` pairs in array order:
+    /// each number restarts the code, each name takes the current code and
+    /// advances it (ISO 32000-1 §9.6.6.1). Codes past 255 are dropped.
+    async fn differences_names<S: AsyncObjectSource>(
+        src: &S,
+        enc: Option<&Object>,
+    ) -> Vec<(u8, String)> {
+        let mut out = Vec::new();
+        let Some(Object::Dict(d)) = enc else {
+            return out;
+        };
+        let Some(Object::Array(diffs)) = rv(src, d, "Differences").await else {
+            return out;
+        };
+        let mut code: u32 = 0;
+        for item in &diffs {
+            match src.resolve(item).await.ok() {
+                Some(Object::Int(n)) => code = n.max(0) as u32,
+                Some(Object::Real(n)) => code = n.max(0.0) as u32,
+                Some(Object::Name(name)) => {
+                    if let Ok(code) = u8::try_from(code) {
+                        out.push((code, name.0));
+                    }
+                    code = code.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// The built-in encoding of the font's embedded Type 1 program
     /// (`/FontFile`), code to glyph name, when it embeds one that states an
     /// `/Encoding`.
@@ -741,13 +894,7 @@ impl Font {
         dict: &Dict,
     ) -> Option<Box<[Option<Decoded>; 256]>> {
         let enc = rv(src, dict, "Encoding").await;
-        let base_name = match &enc {
-            Some(Object::Name(n)) => Some(n.0.clone()),
-            Some(Object::Dict(d)) => rv(src, d, "BaseEncoding")
-                .await
-                .and_then(|o| o.as_name().map(|n| n.0.clone())),
-            _ => None,
-        };
+        let base_name = Font::base_encoding_name(src, enc.as_ref()).await;
         let program = match base_name {
             Some(_) => None,
             None => Font::program_encoding(src, dict).await,
@@ -777,24 +924,8 @@ impl Font {
                 }
             }
         }
-        if let Some(Object::Dict(d)) = &enc {
-            if let Some(Object::Array(diffs)) = rv(src, d, "Differences").await {
-                let mut code: u32 = 0;
-                for item in &diffs {
-                    match src.resolve(item).await.ok() {
-                        Some(Object::Int(n)) => code = n.max(0) as u32,
-                        Some(Object::Real(n)) => code = n.max(0.0) as u32,
-                        Some(Object::Name(name)) => {
-                            if code < 256 {
-                                table[code as usize] =
-                                    encodings::glyph_to_text(&name.0).map(Decoded::from_text);
-                            }
-                            code = code.saturating_add(1);
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        for (code, name) in Font::differences_names(src, enc.as_ref()).await {
+            table[usize::from(code)] = encodings::glyph_to_text(&name).map(Decoded::from_text);
         }
         Some(table)
     }
@@ -1049,10 +1180,123 @@ mod tests {
         assert!(f.simple);
         assert_eq!(f.decode(65), "A");
         assert_eq!(f.decode(0x93), "\u{201C}");
-        assert_eq!(f.width(one(65)), 500.0);
+        assert_eq!(f.width(one(65)), 667.0); // Helvetica A, from the AFM table
         assert!(f.is_space(one(32)));
         assert!(!f.is_space(one(65)));
         assert_eq!(f.codes(b"AB"), vec![one(65), one(66)]);
+    }
+
+    /// A standard-14 face with no `/Widths` advances by the AFM metrics of
+    /// each code's glyph, not by a flat 500: Times `A` is 722, its space
+    /// 250, and Courier is 600 throughout.
+    // Covers ISO 32000-1 §9.6.2.2.
+    #[test]
+    fn standard_14_font_without_widths_uses_afm_metrics() {
+        let times = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman \
+             /Encoding /WinAnsiEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(times.width(one(65)), 722.0);
+        assert_eq!(times.width(one(32)), 250.0);
+        let courier = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Courier \
+             /Encoding /WinAnsiEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(courier.width(one(65)), 600.0);
+        assert_eq!(courier.width(one(105)), 600.0);
+        let bold = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold \
+             /Encoding /WinAnsiEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(bold.width(one(65)), 722.0);
+    }
+
+    /// The AFM lookup goes by glyph name, so a `/Differences` entry decides
+    /// the width of its code: Helvetica `W` is 944 where `A` is 667.
+    // Covers ISO 32000-1 §9.6.2.2 and §9.6.6.1.
+    #[test]
+    fn standard_14_widths_follow_differences_names() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /W] >> >>",
+            &[],
+            &[],
+        );
+        assert_eq!(f.width(one(65)), 944.0);
+        assert_eq!(f.width(one(66)), 667.0);
+    }
+
+    /// With no `/Encoding` the text faces use StandardEncoding, whose 0xAA
+    /// is `quotedblleft` (Times 444), not WinAnsi's `ordfeminine` (276);
+    /// a stated `/MacRomanEncoding` names 0xA5 `bullet` (Times 350).
+    // Covers ISO 32000-1 §9.6.2.2 and §9.6.6.2.
+    #[test]
+    fn standard_14_widths_follow_the_base_encoding() {
+        let standard = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>",
+            &[],
+            &[],
+        );
+        assert_eq!(standard.width(one(0xAA)), 444.0);
+        let win = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman \
+             /Encoding /WinAnsiEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(win.width(one(0xAA)), 276.0);
+        let mac = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman \
+             /Encoding /MacRomanEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(mac.width(one(0xA5)), 350.0);
+        assert_eq!(mac.width(one(0x8E)), 444.0); // eacute
+    }
+
+    /// A declared `/Widths` array is authoritative even for a standard-14
+    /// face: its entries win, and codes it leaves out take `/MissingWidth`
+    /// rather than the AFM metric.
+    // Covers ISO 32000-1 §9.6.2.2 and §9.8.1.
+    #[test]
+    fn declared_widths_beat_afm_metrics_on_a_standard_14_face() {
+        let f = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding /FirstChar 65 /Widths [100] \
+             /FontDescriptor << /Type /FontDescriptor /MissingWidth 300 >> >>",
+            &[],
+            &[],
+        );
+        assert_eq!(f.width(one(65)), 100.0);
+        assert_eq!(f.width(one(66)), 300.0);
+    }
+
+    /// A subset-tagged name still selects the AFM table (`is_standard_14`
+    /// strips the tag), and a face outside the fourteen keeps the flat
+    /// default.
+    #[test]
+    fn afm_widths_apply_to_aliases_only() {
+        let tagged = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+Arial-BoldMT \
+             /Encoding /WinAnsiEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(tagged.width(one(65)), 722.0);
+        let other = font_from(
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Garamond \
+             /Encoding /WinAnsiEncoding >>",
+            &[],
+            &[],
+        );
+        assert_eq!(other.width(one(65)), 500.0);
     }
 
     /// A minimal sfnt whose `cmap` advertises exactly `platforms`. Enough for
@@ -1591,7 +1835,7 @@ mod tests {
     fn huge_first_char_widths_do_not_overflow() {
         // /FirstChar u32::MAX: the second /Widths entry would overflow.
         let f = font_from(
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Custom \
              /FirstChar 4294967295 /Widths [600 700] >>",
             &[],
             &[],

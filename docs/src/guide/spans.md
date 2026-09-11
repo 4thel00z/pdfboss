@@ -41,12 +41,17 @@ Two of these deserve a note up front:
 
 `y` is the baseline. The box is the em box the font declares, placed on
 it: `bbox[1] == y + descent` and `bbox[3] == y + ascent`, where `ascent` is
-the FontDescriptor's `/Ascent` (else `/CapHeight`, else 800 per mille) and
-`descent` its `/Descent` (else -200 per mille), both scaled by the effective
-size. `descent` is zero or negative, the way `/Descent` is. The box is a
-font metric rather than glyph ink: a span of digits does not reach the
-descent and a span of capitals does not reach the ascent. Horizontally the
-box runs from the origin to the advance after the last glyph.
+the FontDescriptor's `/Ascent` (else the `/FontBBox` top, else `/CapHeight`,
+else 800 per mille) and `descent` its `/Descent` (else the `/FontBBox`
+bottom, else -200 per mille), both scaled by the effective size. `descent`
+is zero or negative, the way `/Descent` is. The box is a font metric rather
+than glyph ink: a span of digits does not reach the descent and a span of
+capitals does not reach the ascent. A font whose descriptor states zero
+metrics, as the math extension fonts of tectonic documents do, takes its
+`/FontBBox` extent, so a display integral hanging two em below the baseline
+sits inside its span box, which then stands well clear of the ink of the
+smaller glyphs in that font. Horizontally the box runs from the origin to
+the advance after the last glyph.
 
 Vertical writing (`vertical`) takes the advance as its vertical extent, so
 `ascent` and `descent` are the advance's extents above and below the origin,
