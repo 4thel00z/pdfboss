@@ -2776,8 +2776,12 @@ fn grid_claim(
         for group in band {
             lines.push(table_row(group, &columns)?);
         }
+        // An open lattice's rules bracket its sections, so every band of
+        // two lines or more is a section whose lines are rows; a drawn
+        // lattice infers rows only in the band holding most of its lines,
+        // the others being wrapped single rows.
         let infer_floor = if grid.open { 2 } else { BAND_INFER_MIN_LINES };
-        if lines.len() >= infer_floor && 2 * lines.len() > hi - lo {
+        if lines.len() >= infer_floor && (grid.open || 2 * lines.len() > hi - lo) {
             rows.append(&mut anchored_rows(lines, columns.len(), grid.open));
             continue;
         }
