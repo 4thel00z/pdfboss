@@ -710,6 +710,12 @@ impl Document {
         ))
     }
 
+    /// The viewports of a page's `/VP` array (ISO 32000-1 §12.9), empty
+    /// without one.
+    pub fn viewports(&self, page: &Page) -> Vec<crate::measure::Viewport> {
+        block_on(crate::measure::viewports_with(&Immediate(self), page))
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4), `None` without one.
     pub fn permission_handlers(&self) -> Option<crate::permission::PermissionHandlers> {

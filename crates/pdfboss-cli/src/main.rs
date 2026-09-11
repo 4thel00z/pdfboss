@@ -687,6 +687,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 .collect();
             let mut thumbnails = 0usize;
             let mut slides = 0usize;
+            let mut viewports = (0usize, 0usize);
             for index in 0..doc.page_count() {
                 let page = doc.page(index).ok();
                 sizes.push(page.as_ref().map(|page| page.size()));
@@ -698,6 +699,9 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     );
                     thumbnails += usize::from(doc.thumbnail(page).is_some());
                     slides += usize::from(doc.presentation(page).is_some());
+                    let page_viewports = doc.viewports(page).len();
+                    viewports.0 += page_viewports;
+                    viewports.1 += usize::from(page_viewports > 0);
                 }
             }
             pieces.sort();
@@ -732,6 +736,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     articles,
                     perms: &perms,
                     requirements: &doc.requirements(),
+                    viewports,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -769,7 +774,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
 /// duration or a transition. `articles` counts the article threads and
 /// their beads. `perms` names the permission handlers the catalog's
 /// `/Perms` dictionary carries. `requirements` are the catalog's
-/// `/Requirements` entries, printed by type. `linearization` is the
+/// `/Requirements` entries, printed by type. `viewports` counts the `/VP`
+/// viewports and the pages that carry them. `linearization` is the
 /// linearization parameter dictionary as written, paired with the file's
 /// actual length, so a dictionary an appended update left behind prints as
 /// not linearized.
@@ -788,6 +794,7 @@ struct Info<'a> {
     articles: (usize, usize),
     perms: &'a [&'a str],
     requirements: &'a [pdfboss_core::Requirement],
+    viewports: (usize, usize),
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -888,6 +895,16 @@ fn info_text(info: &Info) -> String {
     if info.slides > 0 {
         let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
         let _ = writeln!(out, "slides:    {} of {pages} pages", info.slides);
+    }
+    // Viewports with their own measurement scale (ISO 32000-1 §12.9) and
+    // the pages that carry them.
+    let (viewports, viewport_pages) = info.viewports;
+    if viewports > 0 {
+        let pages = info.sizes.map_or(0, <[Option<(f32, f32)>]>::len);
+        let _ = writeln!(
+            out,
+            "viewports: {viewports} on {viewport_pages} of {pages} pages"
+        );
     }
     // Article threads and the beads they chain (ISO 32000-1 §12.4.3).
     let (threads, beads) = info.articles;
@@ -1726,6 +1743,25 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("requirements"));
+    }
+
+    /// Pages carrying `/VP` viewports print as one line with the viewport
+    /// count and the pages that hold them; none prints no line.
+    // Covers ISO 32000-1 §12.9.
+    #[test]
+    fn info_text_counts_viewports() {
+        let sizes = [Some((612.0, 792.0)); 5];
+        let report = info_text(&Info {
+            version: Some((1, 7)),
+            sizes: Some(&sizes),
+            viewports: (3, 2),
+            ..Info::default()
+        });
+        assert!(
+            report.contains("  page 5: 612 x 792 pt\nviewports: 3 on 2 of 5 pages\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("viewports"));
     }
 
     /// A linearized file prints its first page object after the encryption
