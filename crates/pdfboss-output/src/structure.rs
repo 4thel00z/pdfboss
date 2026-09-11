@@ -3458,11 +3458,13 @@ fn lane_runs(groups: &[Group], start: usize, min_gap: f32) -> (LaneRun, LaneRun)
     let mut two: Option<LaneRun> = None;
     let mut end = groups.len();
     for (offset, group) in groups[start..].iter().enumerate() {
-        let mut next = occupied.clone();
         for span in group.spans.iter().filter(|span| !blank(&span.text)) {
-            add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
+            add_ink(
+                &mut occupied,
+                span.x.min(span.end_x)..span.x.max(span.end_x),
+            );
         }
-        let gaps = ink_gaps(&next, min_gap);
+        let gaps = ink_gaps(&occupied, min_gap);
         if gaps.len() < TABLE_MIN_LANES && two.is_none() {
             two = Some(LaneRun {
                 end: start + offset,
@@ -3473,7 +3475,6 @@ fn lane_runs(groups: &[Group], start: usize, min_gap: f32) -> (LaneRun, LaneRun)
             end = start + offset;
             break;
         }
-        occupied = next;
         lanes = gaps;
     }
     let two = two.unwrap_or_else(|| LaneRun {
