@@ -1683,15 +1683,29 @@ impl ExtractedPage {
 /// [`document_layout_with_rulings`] over pages whose size weights the
 /// extraction workers counted, so the calling thread sums a handful of
 /// buckets per page instead of reading every span of the document before
-/// the first page can lay out.
-pub(crate) fn document_layout_extracted(pages: &[ExtractedPage]) -> Vec<PageLayout> {
+/// the first page can lay out. The pages are taken over: each is freed on
+/// the worker that laid it out, since a span carries its text and two font
+/// names on the heap and a layout owns its own text, so freeing a
+/// document's worth of spans on the calling thread once every layout was
+/// in was a stretch of the path as long as the size pass.
+pub(crate) fn document_layout_extracted(pages: Vec<ExtractedPage>) -> Vec<PageLayout> {
     let mut weights = SizeWeights::default();
-    for page in pages {
+    for page in &pages {
         weights.merge(&page.weights);
     }
     let stats = weights.stats();
-    let layouts = on_workers(pages.len(), |index| {
-        let page = &pages[index];
+    // One uncontended lock per page hands it to the one worker that takes
+    // its index; the page drops at the end of that worker's turn.
+    let handed: Vec<std::sync::Mutex<Option<ExtractedPage>>> = pages
+        .into_iter()
+        .map(|page| std::sync::Mutex::new(Some(page)))
+        .collect();
+    let layouts = on_workers(handed.len(), |index| {
+        let page = handed[index]
+            .lock()
+            .expect("no worker panicked holding a page")
+            .take()
+            .expect("each page is taken once");
         page_layout_with_stats(&page.spans, &page.rulings, &stats, page.order)
     });
     finished(layouts, &stats)

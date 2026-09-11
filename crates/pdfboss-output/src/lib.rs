@@ -279,7 +279,7 @@ pub fn extract_markdown_reporting_opts(
         reports.push(report);
     }
     Ok((
-        Markdown.render(&structure::document_layout_extracted(&pages)),
+        Markdown.render(&structure::document_layout_extracted(pages)),
         reports,
     ))
 }
@@ -1141,7 +1141,7 @@ mod tests {
         assert!(expected.contains("# Annual Report"), "md: {expected}");
         assert!(expected.contains("| --- |"), "md: {expected}");
         assert_eq!(
-            Markdown.render(&structure::document_layout_extracted(&extracted)),
+            Markdown.render(&structure::document_layout_extracted(extracted)),
             expected
         );
     }
