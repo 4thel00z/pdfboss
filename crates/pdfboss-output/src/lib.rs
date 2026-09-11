@@ -1605,6 +1605,16 @@ mod tests {
         );
     }
 
+    /// A last column ending in "ml" spells a roman numeral far past any
+    /// front matter, and "llc" spells none in standard form: the volumes
+    /// table stays a table.
+    #[test]
+    fn a_table_of_volumes_is_not_a_contents_list() {
+        let md = markdown_of(&structure::tests::volumes_table_content());
+        assert!(md.contains("| 2 | 24 ml | 0 ml | 4 ml |"), "md: {md}");
+        assert!(md.contains("| 4 | 4 ml | 12 ml | 12 ml |"), "md: {md}");
+    }
+
     /// Two columns of prose too short for the gutter pass share one lane;
     /// neither side is narrow, so they are not a two-column table.
     #[test]

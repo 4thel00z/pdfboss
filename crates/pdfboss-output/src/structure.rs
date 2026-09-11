@@ -3627,15 +3627,22 @@ fn page_number(token: &str) -> Option<PageNumber> {
     roman_numeral(token).map(PageNumber::Roman)
 }
 
-/// The value of a roman numeral in the letters i, v, x, l, c, d and m of
-/// either case, up to eight letters; `None` for anything else.
+/// The highest page roman-numbered front matter reaches. A preface or an
+/// index runs to a few dozen pages; the words that happen to spell a
+/// roman numeral, "ml", "mix", "dim", spell far larger ones.
+const ROMAN_PAGE_MAX: u32 = 100;
+
+/// The value of a token that spells a roman numeral in its standard form,
+/// in either case, from one to [`ROMAN_PAGE_MAX`]; `None` for anything
+/// else, "llc" and "ml" included.
 fn roman_numeral(token: &str) -> Option<u32> {
     if token.is_empty() || token.len() > 8 {
         return None;
     }
-    let values: Vec<i64> = token
+    let lower = token.to_ascii_lowercase();
+    let values: Vec<i64> = lower
         .chars()
-        .map(|c| match c.to_ascii_lowercase() {
+        .map(|c| match c {
             'i' => Some(1),
             'v' => Some(5),
             'x' => Some(10),
@@ -3657,7 +3664,35 @@ fn roman_numeral(token: &str) -> Option<u32> {
             }
         })
         .sum();
-    u32::try_from(total).ok()
+    let value = u32::try_from(total).ok()?;
+    ((1..=ROMAN_PAGE_MAX).contains(&value) && roman_of(value) == lower).then_some(value)
+}
+
+/// `value` written as a roman numeral in lowercase letters.
+fn roman_of(mut value: u32) -> String {
+    const STEPS: [(u32, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut out = String::new();
+    for (step, letters) in STEPS {
+        while value >= step {
+            out.push_str(letters);
+            value -= step;
+        }
+    }
+    out
 }
 
 /// The stretch's rows over the columns its own run lines leave. The run's
@@ -6655,6 +6690,25 @@ pub(crate) mod tests {
             if !page.is_empty() {
                 content += &format!("1 0 0 1 430 {y} Tm ({page}) Tj ");
             }
+        }
+        content += "ET";
+        content
+    }
+
+    /// A four-lane table of volumes whose last column ends in "ml", the
+    /// letters of a roman numeral: a contents list it is not.
+    pub(crate) fn volumes_table_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (y, tube, water, glucose, yeast) in [
+            (700.0, "Tube", "DI Water", "Glucose", "Yeast"),
+            (686.0, "2", "24 ml", "0 ml", "4 ml"),
+            (672.0, "3", "12 ml", "12 ml", "4 ml"),
+            (658.0, "4", "4 ml", "12 ml", "12 ml"),
+        ] {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm ({tube}) Tj 1 0 0 1 130 {y} Tm ({water}) Tj \
+                 1 0 0 1 230 {y} Tm ({glucose}) Tj 1 0 0 1 330 {y} Tm ({yeast}) Tj "
+            );
         }
         content += "ET";
         content
