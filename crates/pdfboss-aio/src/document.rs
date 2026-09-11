@@ -1561,6 +1561,12 @@ impl AsyncDocument {
         pdfboss_core::presentation_with(self, page).await
     }
 
+    /// The viewports of a page's `/VP` array (ISO 32000-1 §12.9): the async
+    /// twin of the sync document's `viewports`.
+    pub async fn viewports(&self, page: &Page) -> Vec<pdfboss_core::Viewport> {
+        pdfboss_core::viewports_with(self, page).await
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4): the async twin of the sync document's
     /// `permission_handlers`.
