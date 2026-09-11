@@ -15,6 +15,11 @@ use pdfboss_text::{
 /// kerns, which stay under 0.1 em; 0.25 em sat exactly on the nominal
 /// Times space width and swallowed every shrunk line's spaces.
 const WORD_GAP: f32 = 0.15;
+/// The gap, in multiples of the type size, from the ink before a span
+/// beyond which the span opens a cell of its own rather than continuing a
+/// word or a sentence: a floating currency sign stands an em or more from
+/// the label to its left, a word gap is a quarter of one.
+const CELL_GAP: f32 = 1.0;
 /// A span whose baseline falls outside the line's tolerance still joins the
 /// line when its nominal vertical extent overlaps the line's by this
 /// fraction of the smaller height: a superscript or subscript, never a
@@ -3756,21 +3761,22 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
             }
             return None;
         }
-        // An inked span opening a word a hair before a boundary and
+        // An inked span opening a cell a hair before a boundary and
         // crossing it belongs to the column beyond: an inferred vertical
         // lands a few points inside a floating currency sign, and a drawn
         // one is never painted through a glyph. A span ending before the
         // boundary keeps its column, so a right-aligned digit stays where
         // it is; a whitespace span keeps its column too, since moved, its
-        // start would stand in for the next cell's; and a span continuing
-        // a word, within a word gap of the ink before it, stays with that
-        // ink: text set glyph by glyph straddles a rule glyph by glyph, and
-        // the word is one cell over the columns it crosses.
+        // start would stand in for the next cell's; and a span within
+        // [`CELL_GAP`] of the ink before it continues that ink's cell: text
+        // set glyph by glyph straddles a rule glyph by glyph, a sentence
+        // spanning the columns crosses a rule at a word gap, and either is
+        // one cell over the columns it crosses.
         let crossing = start + 1 < columns.len() && hi > columns[start].end;
-        let opens_word = inked_end.is_none_or(|end| lo - end > WORD_GAP * span.size);
+        let opens_cell = inked_end.is_none_or(|end| lo - end > CELL_GAP * span.size);
         let start = if crossing
             && !whitespace
-            && opens_word
+            && opens_cell
             && columns[start].end - lo <= RULING_SNAP_TOLERANCE
         {
             start + 1
