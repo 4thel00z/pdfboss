@@ -4302,6 +4302,7 @@ pub(crate) fn tidy_amounts(rows: &mut [Vec<Cell>]) {
                 }
             }
             close_gaps(&mut row[index]);
+            close_sign_gap(&mut row[index]);
         }
     }
     emptied.sort_unstable();
@@ -4449,6 +4450,50 @@ fn close_gaps(cell: &mut Cell) {
         }
         inline.text = out;
     }
+}
+
+/// Closes the padding a producer set between a sign opening a cell and the
+/// amount after it, so "$    1,414.00" reads "$1,414.00", whether the sign
+/// and the amount share an inline or the padding stands in inlines of its
+/// own between them.
+fn close_sign_gap(cell: &mut Cell) {
+    let Some(line) = cell.line.as_mut() else {
+        return;
+    };
+    let Some(first) = line.inlines.iter().position(|inline| !blank(&inline.text)) else {
+        return;
+    };
+    let text = line.inlines[first].text.trim_start();
+    let mut chars = text.chars();
+    let Some(sign) = chars.next().filter(|c| AMOUNT_SIGNS.contains(c)) else {
+        return;
+    };
+    let rest = chars.as_str();
+    let amount = rest.trim_start();
+    if amount.starts_with(|c: char| c.is_ascii_digit()) {
+        if amount.len() < rest.len() {
+            line.inlines[first].text = format!("{sign}{amount}");
+        }
+        return;
+    }
+    if !amount.is_empty() {
+        return;
+    }
+    let Some(next) = line
+        .inlines
+        .iter()
+        .skip(first + 1)
+        .position(|inline| !blank(&inline.text))
+        .map(|offset| first + 1 + offset)
+    else {
+        return;
+    };
+    let amount = line.inlines[next].text.trim_start();
+    if !amount.starts_with(|c: char| c.is_ascii_digit()) {
+        return;
+    }
+    line.inlines[next].text = format!("{sign}{amount}");
+    line.inlines.drain(first..next);
 }
 
 /// True when no row puts ink in `column`: every cell starting there has no
@@ -7114,6 +7159,24 @@ pub(crate) mod tests {
             (630.0, "Board", "Board of Governors of the Postal Service"),
         ] {
             content += &format!("1 0 0 1 72 {y} Tm ({term}) Tj 1 0 0 1 160 {y} Tm ({meaning}) Tj ");
+        }
+        content += "ET";
+        content
+    }
+
+    /// A three-column lane table whose amounts are set as one string each,
+    /// the sign, three no-break spaces of padding and the digits.
+    pub(crate) fn padded_sign_amount_lane_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (y, label, amount, rate) in [
+            (700.0, "Item", "Amount", "Rate"),
+            (686.0, "Cash", "$\\240\\240\\2401,414.00", "10%"),
+            (672.0, "Debt", "$\\240\\240\\2402,120.50", "9%"),
+            (658.0, "Fees", "$\\240\\240\\240310.00", "9%"),
+        ] {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm ({label}) Tj 1 0 0 1 300 {y} Tm ({amount}) Tj 1 0 0 1 420 {y} Tm ({rate}) Tj "
+            );
         }
         content += "ET";
         content

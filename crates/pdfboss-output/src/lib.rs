@@ -1581,6 +1581,17 @@ mod tests {
         );
     }
 
+    /// A sign opening a cell closes up to the amount after its padding in
+    /// the Markdown: "$   1,414.00" reads "$1,414.00".
+    #[test]
+    fn a_padded_sign_closes_up_to_its_amount() {
+        let md = markdown_of(&structure::tests::padded_sign_amount_lane_content());
+        assert!(
+            md.contains("| Cash | $1,414.00 | 10% |\n| Debt | $2,120.50 | 9% |"),
+            "md: {md}"
+        );
+    }
+
     /// Markers a lane's width from their text are a list, not a two-column
     /// table.
     #[test]
