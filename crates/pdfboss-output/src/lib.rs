@@ -1505,6 +1505,17 @@ mod tests {
         assert!(!md.contains("|  |"), "no empty column: {md}");
     }
 
+    /// Entry numbers, titles and climbing page numbers in three lanes are a
+    /// table of contents, which reads as prose lines, not as a grid.
+    /// Modeled on an odl page whose contents list became a table.
+    #[test]
+    fn a_contents_list_is_not_a_table() {
+        let md = markdown_of(&structure::tests::contents_list_content());
+        assert!(!md.contains("| --- |"), "no table: {md}");
+        assert!(md.contains("1. Front Matter 1"), "md: {md}");
+        assert!(md.contains("4. Identifying a Topic 25"), "md: {md}");
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]

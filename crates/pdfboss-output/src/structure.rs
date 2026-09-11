@@ -2877,10 +2877,42 @@ fn grid(
             rows
         }
     };
+    if contents_list(&rows) {
+        return None;
+    }
     Some(TableBand {
         rows,
         span: stretch,
     })
+}
+
+/// True when the rows read as a table of contents or an index: every row
+/// ends in a bare page number, the numbers climb down the rows, and the
+/// cells before them carry words. Entry numbers, titles and page numbers
+/// line up in lanes like any grid, but the list is prose to the heading
+/// pass, not a table, and ground truth reads it so.
+fn contents_list(rows: &[Vec<Cell>]) -> bool {
+    let mut last = 0u32;
+    for row in rows {
+        let filled: Vec<&Cell> = row.iter().filter(|cell| cell.line.is_some()).collect();
+        let Some((page, entry)) = filled.split_last() else {
+            return false;
+        };
+        let Ok(number) = cell_text(page).trim().parse::<u32>() else {
+            return false;
+        };
+        if number <= last {
+            return false;
+        }
+        last = number;
+        if !entry
+            .iter()
+            .any(|cell| cell_text(cell).chars().any(|c| c.is_alphabetic()))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// The stretch's rows over the columns its own run lines leave. The run's
@@ -5521,6 +5553,24 @@ pub(crate) mod tests {
                 content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
             }
             content += &format!("1 0 0 1 160 {y} Tm (   ) Tj ");
+        }
+        content += "ET";
+        content
+    }
+
+    /// A table of contents set in three lanes: entry number, title, page
+    /// number climbing down the list.
+    pub(crate) fn contents_list_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (number, y, title, page) in [
+            ("1.", 700.0, "Front Matter", "1"),
+            ("2.", 680.0, "Researching Wicked Problems", "3"),
+            ("3.", 660.0, "Our Mental Shortcuts", "13"),
+            ("4.", 640.0, "Identifying a Topic", "25"),
+        ] {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm ({number}) Tj 1 0 0 1 100 {y} Tm ({title}) Tj 1 0 0 1 430 {y} Tm ({page}) Tj "
+            );
         }
         content += "ET";
         content
