@@ -2472,6 +2472,10 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
             rows.append(&mut anchored_rows(lines, columns.len(), grid.open));
             continue;
         }
+        if lines.len() >= 2 && figure_records(&lines, columns.len()) {
+            rows.append(&mut lines);
+            continue;
+        }
         rows.push(logical_row(lines, columns.len()));
     }
     if rows.len() < TABLE_MIN_ROWS
@@ -2566,6 +2570,35 @@ fn anchored_rows(lines: Vec<Vec<Cell>>, columns: usize, open: bool) -> Vec<Vec<C
         rows.push(logical_row(group, columns));
     }
     rows
+}
+
+/// True when a band's lines are each a record in their own right: every
+/// line populates at least half the columns, and at least half of all the
+/// populated cells open as figures. A timetable or a rate table rules
+/// every few rows, and the lines between two rules are rows, not one
+/// wrapped row; a header wrapped over two lines is words, and still merges.
+fn figure_records(lines: &[Vec<Cell>], columns: usize) -> bool {
+    let mut populated = 0usize;
+    let mut figures = 0usize;
+    for line in lines {
+        let cells: Vec<&Cell> = line.iter().filter(|cell| cell.line.is_some()).collect();
+        if 2 * cells.len() < columns {
+            return false;
+        }
+        populated += cells.len();
+        figures += cells.iter().filter(|cell| figure_cell(cell)).count();
+    }
+    2 * figures >= populated
+}
+
+/// True when a cell opens as a figure: a digit, a currency sign, a
+/// parenthesis or a dash standing for nil.
+fn figure_cell(cell: &Cell) -> bool {
+    cell_text(cell).trim_start().starts_with(|c: char| {
+        c.is_ascii_digit()
+            || AMOUNT_SIGNS.contains(&c)
+            || matches!(c, '(' | '-' | '\u{2013}' | '\u{2014}')
+    })
 }
 
 /// True when the row's cell covering `column` carries a line.
@@ -5378,6 +5411,23 @@ pub(crate) mod tests {
              1 0 0 1 72 680 Tm (Gain) Tj 1 0 0 1 275 680 Tm (1,889) Tj 1 0 0 1 400 680 Tm (7) Tj \
              1 0 0 1 72 660 Tm (Rate) Tj 1 0 0 1 275 660 Tm (12) Tj 1 0 0 1 312 660 Tm (%) Tj \
              1 0 0 1 400 660 Tm (3) Tj ET",
+        )
+    }
+
+    /// A timetable's lattice: a header band, then a rule every two rows.
+    /// The two-line bands hold a minority of the claim's lines, so no rows
+    /// are inferred in them; each line is still a record of figures.
+    pub(crate) fn ruled_banded_records_content() -> String {
+        String::from(
+            "70 600 260 112 re S 150 600 m 150 712 l S 250 600 m 250 712 l S \
+             70 700 m 330 700 l S 70 660 m 330 660 l S 70 620 m 330 620 l S \
+             BT /F1 10 Tf 1 0 0 1 80 703 Tm (South) Tj 1 0 0 1 160 703 Tm (Times) Tj \
+             1 0 0 1 260 703 Tm (Bronx) Tj \
+             1 0 0 1 80 685 Tm (12:00) Tj 1 0 0 1 160 685 Tm (12:04) Tj 1 0 0 1 260 685 Tm (12:17) Tj \
+             1 0 0 1 80 665 Tm (12:32) Tj 1 0 0 1 160 665 Tm (12:36) Tj 1 0 0 1 260 665 Tm (12:49) Tj \
+             1 0 0 1 80 645 Tm (1:14) Tj 1 0 0 1 160 645 Tm (1:18) Tj 1 0 0 1 260 645 Tm (1:31) Tj \
+             1 0 0 1 80 625 Tm (2:54) Tj 1 0 0 1 160 625 Tm (2:58) Tj 1 0 0 1 260 625 Tm (3:11) Tj \
+             1 0 0 1 80 605 Tm (3:00) Tj 1 0 0 1 160 605 Tm (3:04) Tj 1 0 0 1 260 605 Tm (3:17) Tj ET",
         )
     }
 

@@ -1802,6 +1802,22 @@ mod tests {
         );
     }
 
+    /// A band between two rules whose lines are all figure records holds
+    /// one row per line, however few lines the band has next to the whole
+    /// claim: a timetable rules every few rows, not every row.
+    #[test]
+    fn banded_figure_records_are_rows() {
+        let md = markdown_of_drawn(&structure::tests::ruled_banded_records_content());
+        assert!(
+            md.contains(
+                "| South | Times | Bronx |\n| --- | --- | --- |\n\
+                 | 12:00 | 12:04 | 12:17 |\n| 12:32 | 12:36 | 12:49 |\n\
+                 | 1:14 | 1:18 | 1:31 |\n| 2:54 | 2:58 | 3:11 |\n| 3:00 | 3:04 | 3:17 |"
+            ),
+            "md: {md}"
+        );
+    }
+
     /// A rule-less band whose first line populates a single cell holds one
     /// vertically centered record: it merges whole instead of shattering at
     /// its anchor column.
