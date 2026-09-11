@@ -3396,7 +3396,8 @@ fn pair_table(rows: &[Vec<Cell>]) -> bool {
 }
 
 /// True when a cell holds nothing but a list marker: a bullet, one to three
-/// digits or a single letter closed by `.` or `)`, or a number in brackets.
+/// digits or a single letter closed by `.` or `)`, or one to three digits
+/// in brackets or parentheses.
 fn marker_cell(text: &str) -> bool {
     let text = text.trim();
     let mut chars = text.chars();
@@ -3406,11 +3407,15 @@ fn marker_cell(text: &str) -> bool {
     if chars.as_str().is_empty() && BULLETS.contains(&first) {
         return true;
     }
-    if let Some(inner) = text
+    let bracketed = text
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
-    {
-        return !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit());
+        .or_else(|| {
+            text.strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(')'))
+        });
+    if let Some(inner) = bracketed {
+        return (1..=3).contains(&inner.len()) && inner.chars().all(|c| c.is_ascii_digit());
     }
     let Some(body) = text.strip_suffix(['.', ')']) else {
         return false;
@@ -6890,6 +6895,21 @@ pub(crate) mod tests {
             content += &format!(
                 "1 0 0 1 72 {y} Tm (The left column runs its text to) Tj \
                  1 0 0 1 300 {y} Tm (and the right column does the same) Tj "
+            );
+        }
+        content += "ET";
+        content
+    }
+
+    /// Five references marked with numbers in parentheses, a lane from
+    /// their text: a bibliography, not a two-column table.
+    pub(crate) fn bracketed_reference_list_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (index, y) in [700.0, 686.0, 672.0, 658.0, 644.0].into_iter().enumerate() {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm (({})) Tj 1 0 0 1 100 {y} Tm (Handbook of Chemistry, edition {}) Tj ",
+                index + 10,
+                index + 10
             );
         }
         content += "ET";

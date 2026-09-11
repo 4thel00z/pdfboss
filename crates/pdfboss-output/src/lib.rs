@@ -1641,6 +1641,18 @@ mod tests {
         );
     }
 
+    /// References marked "(10)" to "(14)" a lane from their text are a
+    /// bibliography, not a two-column table.
+    #[test]
+    fn a_bibliography_in_lanes_is_not_a_table() {
+        let md = markdown_of(&structure::tests::bracketed_reference_list_content());
+        assert!(!md.contains("| ---"), "no table: {md}");
+        assert!(
+            md.contains("(10) Handbook of Chemistry, edition 10"),
+            "md: {md}"
+        );
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]
