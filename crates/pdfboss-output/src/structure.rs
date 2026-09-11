@@ -4446,69 +4446,21 @@ fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
 /// figure's scattered labels or a two-line caption, stays in content order
 /// rather than sorting by height.
 fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
-    let sparse = |flow: &[&TextSpan]| !column_shaped(flow);
-    let table_column = |flow: &[&TextSpan]| sparse(flow) && baseline_count(flow) >= TABLE_MIN_ROWS;
-    // Each merged flow with whether it has absorbed a neighbour: a table
-    // written cell by cell grows past the span and line counts of a text
-    // column as its rows join, and stays a table all the same.
-    let mut merged: Vec<(Vec<&TextSpan>, bool)> = Vec::new();
+    let table_column =
+        |flow: &[&TextSpan]| !column_shaped(flow) && baseline_count(flow) >= TABLE_MIN_ROWS;
+    let mut merged: Vec<Vec<&TextSpan>> = Vec::new();
     for flow in flows {
-        let Some((prev, joined)) = merged.last_mut() else {
-            merged.push((flow, false));
+        let Some(prev) = merged.last_mut() else {
+            merged.push(flow);
             continue;
         };
-        // A table written cell by cell opens a flow at every row's right
-        // cells: either they open on a line the flow before them just
-        // wrote, or, when that flow holds one row, one side being long
-        // enough is the evidence, so long as both are sparse and overlap.
-        if continues_a_line(prev, &flow) {
-            prev.extend(flow);
-            *joined = true;
-            continue;
-        }
-        if !(*joined || sparse(prev)) || !sparse(&flow) || !y_overlaps(prev, &flow) {
-            merged.push((flow, false));
-            continue;
-        }
-        if !(*joined || table_column(prev)) && !table_column(&flow) {
-            merged.push((flow, false));
+        if !table_column(prev) || !table_column(&flow) || !y_overlaps(prev, &flow) {
+            merged.push(flow);
             continue;
         }
         prev.extend(flow);
-        *joined = true;
     }
-    merged.into_iter().map(|(flow, _)| flow).collect()
-}
-
-/// How many line sizes above the flow's last baseline a line may stand
-/// and still be one of the lines it just wrote.
-const CONTINUED_LINE_REACH: f32 = 3.0;
-
-/// True when `flow` opens with [`TABLE_MIN_ROW_CELLS`] spans or more on
-/// one baseline that `prev` holds a span on, to their left, among the
-/// lines it wrote last: the right-hand cells of a row whose wrapped first
-/// cell the stream wrote first. A column written whole before the next
-/// begins opens on the page's top line, far above the first column's
-/// end, and stays its own flow.
-fn continues_a_line(prev: &[&TextSpan], flow: &[&TextSpan]) -> bool {
-    let Some(first) = flow.first() else {
-        return false;
-    };
-    let tolerance = 0.5 * first.size;
-    let on_baseline = flow
-        .iter()
-        .take_while(|span| (span.y - first.y).abs() <= tolerance)
-        .count();
-    if on_baseline < TABLE_MIN_ROW_CELLS {
-        return false;
-    }
-    let bottom = prev.iter().map(|span| span.y).fold(f32::INFINITY, f32::min);
-    let left = first.x.min(first.end_x);
-    prev.iter().any(|span| {
-        (span.y - first.y).abs() <= tolerance
-            && span.x.max(span.end_x) <= left
-            && span.y - bottom <= CONTINUED_LINE_REACH * first.size
-    })
+    merged
 }
 
 /// True when the baseline ranges of two span sets overlap.
@@ -6091,23 +6043,6 @@ pub(crate) mod tests {
             for (col, x) in [(0, 72.0), (1, 92.0), (2, 112.0)] {
                 content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
             }
-        }
-        content += "ET";
-        content
-    }
-
-    /// An exhibits table written cell by cell: each row's number and
-    /// two-line description, then its form, exhibit and date cells back up
-    /// at the first line, so every row's right cells open a new flow.
-    pub(crate) fn cell_by_cell_flows_content() -> String {
-        let mut content = String::from("BT /F1 10 Tf ");
-        for (row, y) in [(1, 700.0), (2, 670.0), (3, 640.0), (4, 610.0)] {
-            let below = y - 12.0;
-            content += &format!(
-                "1 0 0 1 52 {y} Tm (3.{row}) Tj 1 0 0 1 80 {y} Tm (Restated Articles of Incorporation) Tj \
-                 1 0 0 1 80 {below} Tm (of the Registrant) Tj \
-                 1 0 0 1 440 {y} Tm (8-K) Tj 1 0 0 1 480 {y} Tm (3.{row}) Tj 1 0 0 1 520 {y} Tm (8/7/20) Tj "
-            );
         }
         content += "ET";
         content

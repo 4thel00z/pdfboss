@@ -1548,26 +1548,6 @@ mod tests {
         );
     }
 
-    /// A table written cell by cell opens a flow at every row's right
-    /// cells; the flows merge back into one segment, and the table is one.
-    #[test]
-    fn a_table_written_cell_by_cell_is_one_table() {
-        let md = markdown_of(&structure::tests::cell_by_cell_flows_content());
-        assert_eq!(
-            md.lines().filter(|line| line.starts_with("| ---")).count(),
-            1,
-            "one table: {md}"
-        );
-        for row in 1..=4 {
-            assert!(
-                md.contains(&format!(
-                    "| 3.{row} | Restated Articles of Incorporation | 8-K | 3.{row} | 8/7/20 |"
-                )),
-                "row {row}: {md}"
-            );
-        }
-    }
-
     /// A short grid above the run's longest stretch is a table too: the
     /// lines above the band get the same attempt as the lines below it.
     #[test]
