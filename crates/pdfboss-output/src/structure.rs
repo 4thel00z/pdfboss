@@ -779,17 +779,14 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     let title = title_rows(groups, &band, stats);
     band.rows.drain(..title);
     band.span.start += title;
-    push_blocks(
-        groups[..band.span.start].iter().map(assembled).collect(),
-        stats,
-        out,
-    );
+    // What stands above and below the grid gets the same attempt: a page's
+    // second table is as much a table as its first, and the longest evenly
+    // pitched stretch of a run is not the only grid in it.
+    push_lane_blocks(&groups[..band.span.start], stats, out);
     out.push(Block::Table {
         bbox: table_bbox(&band.rows),
         rows: band.rows,
     });
-    // What stands below the grid gets the same attempt: a page's second
-    // table is as much a table as its first.
     push_lane_blocks(&groups[band.span.end..], stats, out);
 }
 
@@ -2579,9 +2576,25 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         .take_while(|group| grid.holds(group.y))
         .count();
     let hi = lo + inside;
-    let columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[lo..hi]);
+    let mut columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[lo..hi]);
     let top = header_reach(groups, lo, hi, grid, &columns);
-    let mut rows = Vec::with_capacity(hi - top);
+    let end = if grid.open {
+        open_reach(groups, lo, hi)
+    } else {
+        hi
+    };
+    if end > hi {
+        // A grown claim's verticals were inferred from one section's text;
+        // the columns of the whole are the lanes all its lines leave.
+        let spans: Vec<&TextSpan> = groups[top..end]
+            .iter()
+            .flat_map(|group| group.spans.iter().copied())
+            .filter(|span| !blank(&span.text))
+            .collect();
+        let claimed = &groups[top..end];
+        columns = cell_columns(&spans, &lanes_of(claimed, gutter_min(claimed)));
+    }
+    let mut rows = Vec::with_capacity(end - top);
     for group in &groups[top..lo] {
         rows.push(table_row(group, &columns)?);
     }
@@ -2601,6 +2614,9 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         }
         rows.push(logical_row(lines, columns.len()));
     }
+    for group in &groups[hi..end] {
+        rows.push(table_row(group, &columns)?);
+    }
     // A band holding nothing but whitespace spans is the page's padding,
     // not a row: a row of blank cells says nothing.
     rows.retain(|row| row.iter().any(inked_cell));
@@ -2610,7 +2626,7 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         return None;
     }
     Some(GridClaim {
-        range: top..hi,
+        range: top..end,
         rows,
         bbox: grid.bbox(),
     })
@@ -2629,7 +2645,7 @@ fn lane_split_columns(
     columns: Vec<std::ops::Range<f32>>,
     groups: &[Group],
 ) -> Vec<std::ops::Range<f32>> {
-    let lanes: Vec<std::ops::Range<f32>> = lanes_of(groups)
+    let lanes: Vec<std::ops::Range<f32>> = lanes_of(groups, gutter_min(groups))
         .into_iter()
         .filter(|lane| lane.end - lane.start >= RULED_LANE_MIN_WIDTH)
         .collect();
@@ -2654,15 +2670,18 @@ fn lane_split_columns(
 /// How far above a grid's top rule its header may stand, in multiples of
 /// the row pitch inside the grid.
 const HEADER_REACH: f32 = 2.5;
+/// The most lines a header above the top rule may run to.
+const HEADER_REACH_LINES: usize = 6;
 
 /// The index of the topmost header line above the grid, or `lo` when the
 /// header is inside the box. Lines are walked upward from the top rule,
-/// each within [`HEADER_REACH`] row pitches of the line below it and
-/// sitting in the columns, and the walk keeps the lines down to the
-/// topmost one populating [`TABLE_MIN_ROW_CELLS`] cells: a statement
-/// rules its body and sets the column heads above the box, while a
-/// caption or a paragraph above the box populates one cell per line and
-/// stays out.
+/// each within [`HEADER_REACH`] row pitches of the line below it, and each
+/// reading as a header line: its cells one column wide each, either two
+/// or more of them or a single one in the first column. The walk keeps the
+/// lines down to the topmost one populating [`TABLE_MIN_ROW_CELLS`] cells.
+/// A statement rules its body and sets the column heads above the box; a
+/// caption or a paragraph above the box runs its words across the column
+/// boundaries and stays out.
 fn header_reach(
     groups: &[Group],
     lo: usize,
@@ -2685,7 +2704,7 @@ fn header_reach(
     let limit = HEADER_REACH * pitch;
     let mut below = grid.ys[grid.ys.len() - 1];
     let mut top = lo;
-    for index in (0..lo).rev() {
+    for index in (lo.saturating_sub(HEADER_REACH_LINES)..lo).rev() {
         let group = &groups[index];
         if group.y - below > limit {
             break;
@@ -2693,12 +2712,89 @@ fn header_reach(
         let Some(row) = table_row(group, columns) else {
             break;
         };
+        if !header_line(&row) {
+            break;
+        }
         below = group.y;
         if populated_cells(&row) >= TABLE_MIN_ROW_CELLS {
             top = index;
         }
     }
     top
+}
+
+/// The end of an open-ruled claim grown downward over the lines below its
+/// closing rule that keep every lane its own lines leave, each within
+/// [`TABLE_LABEL_GAP`] row pitches of the line above it: an open-ruled
+/// statement underlines its header and each section's total, so its rules
+/// bracket one section at a time while the sections share the columns. The
+/// lanes, not the inferred verticals, are the test: a vertical inferred
+/// from one section's short labels lands inside the next section's longer
+/// ones, while a lane narrows and survives. A line running across a lane
+/// is prose and ends the growth; the lines at the end with a single cell
+/// are trimmed back off, so a note under the table does not join it.
+fn open_reach(groups: &[Group], lo: usize, hi: usize) -> usize {
+    if hi - lo < 2 {
+        return hi;
+    }
+    let pitch = median(
+        groups[lo..hi]
+            .windows(2)
+            .map(|pair| pair[0].y - pair[1].y)
+            .collect(),
+    );
+    if pitch <= 0.0 {
+        return hi;
+    }
+    let limit = TABLE_LABEL_GAP * pitch;
+    let min_gap = gutter_min(&groups[lo..hi]);
+    let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
+    for group in &groups[lo..hi] {
+        for span in group.spans.iter().filter(|span| !blank(&span.text)) {
+            add_ink(
+                &mut occupied,
+                span.x.min(span.end_x)..span.x.max(span.end_x),
+            );
+        }
+    }
+    let lanes = ink_gaps(&occupied, min_gap).len();
+    if lanes == 0 {
+        return hi;
+    }
+    let mut above = groups[hi - 1].y;
+    let mut last_record = hi;
+    for (index, group) in groups.iter().enumerate().skip(hi) {
+        if above - group.y > limit {
+            break;
+        }
+        let mut next = occupied.clone();
+        let mut own: Vec<std::ops::Range<f32>> = Vec::new();
+        for span in group.spans.iter().filter(|span| !blank(&span.text)) {
+            let ink = span.x.min(span.end_x)..span.x.max(span.end_x);
+            add_ink(&mut next, ink.clone());
+            add_ink(&mut own, ink);
+        }
+        if ink_gaps(&next, min_gap).len() < lanes {
+            break;
+        }
+        occupied = next;
+        above = group.y;
+        if !ink_gaps(&own, min_gap).is_empty() {
+            last_record = index + 1;
+        }
+    }
+    last_record
+}
+
+/// True when a line outside the rules reads as a row of the grid rather
+/// than prose running across it: every populated cell is one column wide,
+/// and the row populates two cells or more, or the first cell alone.
+fn header_line(row: &[Cell]) -> bool {
+    let populated: Vec<&Cell> = row.iter().filter(|cell| cell.line.is_some()).collect();
+    if populated.iter().any(|cell| cell.colspan > 1) {
+        return false;
+    }
+    populated.len() >= TABLE_MIN_ROW_CELLS || label_row(row)
 }
 
 /// The grid's columns, with an open outer column on each side the claimed
@@ -2942,11 +3038,14 @@ fn merged_line(fragments: &[&Line]) -> Line {
 /// column already held some.
 fn table_band(groups: &[Group]) -> Option<TableBand> {
     for start in 0..groups.len() {
-        let (end, lanes) = lane_run(groups, start);
+        // The lane width follows the type of the run's own first lines: a
+        // statement's 7-point rows stand in a column of 10-point prose.
+        let min_gap = gutter_min(&groups[start..(start + TABLE_MIN_ROWS).min(groups.len())]);
+        let (end, lanes) = lane_run(groups, start, min_gap);
         if end - start < TABLE_MIN_ROWS {
             continue;
         }
-        if let Some(band) = grid(groups, start, end, &lanes) {
+        if let Some(band) = grid(groups, start, end, &lanes, min_gap) {
             return Some(band);
         }
     }
@@ -2959,7 +3058,7 @@ fn table_band(groups: &[Group]) -> Option<TableBand> {
 /// points is real table structure that bin rounding swallows. A
 /// whitespace-only span paints nothing: a producer's padding standing in a
 /// gutter neither closes the lane nor opens a column of its own.
-fn lane_run(groups: &[Group], start: usize) -> (usize, Vec<std::ops::Range<f32>>) {
+fn lane_run(groups: &[Group], start: usize, min_gap: f32) -> (usize, Vec<std::ops::Range<f32>>) {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     let mut lanes = Vec::new();
     for (offset, group) in groups[start..].iter().enumerate() {
@@ -2967,7 +3066,7 @@ fn lane_run(groups: &[Group], start: usize) -> (usize, Vec<std::ops::Range<f32>>
         for span in group.spans.iter().filter(|span| !blank(&span.text)) {
             add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
         }
-        let gaps = ink_gaps(&next);
+        let gaps = ink_gaps(&next, min_gap);
         if gaps.len() < TABLE_MIN_LANES {
             return (start + offset, lanes);
         }
@@ -2990,15 +3089,31 @@ fn add_ink(occupied: &mut Vec<std::ops::Range<f32>>, ink: std::ops::Range<f32>) 
     occupied.insert(at, merged);
 }
 
-/// The gaps between consecutive ink intervals at least [`GUTTER_MIN_WIDTH`]
-/// wide — interior by construction: whatever lies beyond the outermost ink
+/// The gaps between consecutive ink intervals at least `min_gap` wide, the
+/// interior ones by construction: whatever lies beyond the outermost ink
 /// is margin, not lane.
-fn ink_gaps(occupied: &[std::ops::Range<f32>]) -> Vec<std::ops::Range<f32>> {
+fn ink_gaps(occupied: &[std::ops::Range<f32>], min_gap: f32) -> Vec<std::ops::Range<f32>> {
     occupied
         .windows(2)
-        .filter(|pair| pair[1].start - pair[0].end >= GUTTER_MIN_WIDTH)
+        .filter(|pair| pair[1].start - pair[0].end >= min_gap)
         .map(|pair| pair[0].end..pair[1].start)
         .collect()
+}
+
+/// The narrowest lane as a share of the type size, where the type is small
+/// enough that [`GUTTER_MIN_WIDTH`] would swallow a column gap: a statement
+/// set in 7-point type separates its columns by six points, and a word
+/// space there is under two.
+const GUTTER_OF_SIZE: f32 = 0.7;
+
+/// The narrowest lane between these lines' cells: [`GUTTER_MIN_WIDTH`], or
+/// less in proportion where their type is small.
+fn gutter_min(groups: &[Group]) -> f32 {
+    let size = median(groups.iter().map(|group| group.size).collect());
+    if size <= 0.0 {
+        return GUTTER_MIN_WIDTH;
+    }
+    GUTTER_MIN_WIDTH.min(GUTTER_OF_SIZE * size)
 }
 
 /// `groups[start..end]` as a table band, or `None` when it fails a gate.
@@ -3020,6 +3135,7 @@ fn grid(
     start: usize,
     end: usize,
     lanes: &[std::ops::Range<f32>],
+    min_gap: f32,
 ) -> Option<TableBand> {
     let spans: Vec<&TextSpan> = groups[start..end]
         .iter()
@@ -3041,9 +3157,9 @@ fn grid(
     let filled: Vec<usize> = (0..populated.len())
         .filter(|index| populated[*index])
         .collect();
-    let (first, last) = even_stretch(inside, &filled)?;
+    let (first, last) = even_stretch(inside, &rows, &filled)?;
     let stretch = lo + first..lo + last + 1;
-    let rows = match own_rows(groups, start..end, stretch.clone()) {
+    let rows = match own_rows(groups, start..end, stretch.clone(), min_gap) {
         Some(rows) => rows,
         None => {
             if populated_columns(&rows[first..=last], columns.len()) < TABLE_MIN_LANES + 1 {
@@ -3104,12 +3220,13 @@ fn own_rows(
     groups: &[Group],
     run: std::ops::Range<usize>,
     stretch: std::ops::Range<usize>,
+    min_gap: f32,
 ) -> Option<Vec<Vec<Cell>>> {
     let core = run.start.max(stretch.start)..run.end.min(stretch.end);
     if core.start >= core.end {
         return None;
     }
-    let lanes = lanes_of(&groups[core]);
+    let lanes = lanes_of(&groups[core], min_gap);
     if lanes.len() < TABLE_MIN_LANES {
         return None;
     }
@@ -3133,7 +3250,7 @@ fn own_rows(
 /// standing alone in a hole cannot halve a step. The topmost run wins a
 /// tie. `None` when no run holds [`TABLE_MIN_ROWS`] rows, and when the
 /// baselines do not move at all.
-fn even_stretch(inside: &[Group], filled: &[usize]) -> Option<(usize, usize)> {
+fn even_stretch(inside: &[Group], rows: &[Vec<Cell>], filled: &[usize]) -> Option<(usize, usize)> {
     if filled.len() < TABLE_MIN_ROWS {
         return None;
     }
@@ -3141,7 +3258,8 @@ fn even_stretch(inside: &[Group], filled: &[usize]) -> Option<(usize, usize)> {
         .windows(2)
         .map(|pair| inside[pair[0]].y - inside[pair[1]].y)
         .collect();
-    let limit = TABLE_ROW_GAP * median(steps.clone());
+    let pitch = median(steps.clone());
+    let limit = TABLE_ROW_GAP * pitch;
     if limit <= 0.0 {
         return None;
     }
@@ -3152,7 +3270,7 @@ fn even_stretch(inside: &[Group], filled: &[usize]) -> Option<(usize, usize)> {
     let mut best = None;
     let mut run_start = 0;
     for (index, step) in steps.iter().enumerate() {
-        if *step <= limit {
+        if *step <= limit || labels_between(inside, rows, filled[index], filled[index + 1], pitch) {
             continue;
         }
         best = longer(best, (run_start, index));
@@ -3163,8 +3281,46 @@ fn even_stretch(inside: &[Group], filled: &[usize]) -> Option<(usize, usize)> {
     (b - a + 1 >= TABLE_MIN_ROWS).then(|| (filled[a], filled[b]))
 }
 
-/// The lanes a set of lines leaves between their ink, left to right.
-fn lanes_of(groups: &[Group]) -> Vec<std::ops::Range<f32>> {
+/// How far, in row pitches, a section label may stand below the row above
+/// it and stay inside the table: a statement leaves a blank line above
+/// each section's label.
+const TABLE_LABEL_GAP: f32 = 2.5;
+/// How far, in row pitches, the first row of a section may stand below
+/// its label: the label heads its rows directly, where a caption between
+/// two tables leaves a blank line on both sides.
+const TABLE_LABEL_BELOW: f32 = 1.5;
+
+/// True when every line between the populated rows `a` and `b` is a
+/// section label, a line populating the first cell alone, no step from one
+/// line to the next across them exceeds [`TABLE_LABEL_GAP`] row pitches,
+/// and the step from the last label down to `b` stays within
+/// [`TABLE_LABEL_BELOW`]. The step from `a` to `b` itself exceeds the row
+/// gap, or the question would not arise.
+fn labels_between(inside: &[Group], rows: &[Vec<Cell>], a: usize, b: usize, pitch: f32) -> bool {
+    if b - a < 2 {
+        return false;
+    }
+    if inside[b - 1].y - inside[b].y > TABLE_LABEL_BELOW * pitch {
+        return false;
+    }
+    let limit = TABLE_LABEL_GAP * pitch;
+    (a + 1..b).all(|index| label_row(&rows[index]))
+        && (a..b).all(|index| inside[index].y - inside[index + 1].y <= limit)
+}
+
+/// True when the row populates its first cell alone, a cell one column
+/// wide: the section label of a statement, not a caption spanning the
+/// columns.
+fn label_row(row: &[Cell]) -> bool {
+    let Some((first, rest)) = row.split_first() else {
+        return false;
+    };
+    first.colspan == 1 && inked_cell(first) && rest.iter().all(|cell| !inked_cell(cell))
+}
+
+/// The lanes a set of lines leaves between their ink, left to right, a lane
+/// being at least `min_gap` wide.
+fn lanes_of(groups: &[Group], min_gap: f32) -> Vec<std::ops::Range<f32>> {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     for group in groups {
         for span in group.spans.iter().filter(|span| !blank(&span.text)) {
@@ -3174,7 +3330,7 @@ fn lanes_of(groups: &[Group]) -> Vec<std::ops::Range<f32>> {
             );
         }
     }
-    ink_gaps(&occupied)
+    ink_gaps(&occupied, min_gap)
 }
 
 /// The stretch `start..end` grown over the neighbouring lines that still sit
@@ -3291,6 +3447,22 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
             }
             return None;
         }
+        // A whitespace span crossing a boundary is the gap between two
+        // cells, not part of either. An inked span that starts a hair
+        // before a boundary and crosses it belongs to the column beyond: an
+        // inferred vertical lands a few points inside a floating currency
+        // sign, and a drawn one is never painted through a glyph. A span
+        // ending before the boundary keeps its column, so a right-aligned
+        // digit stays where it is.
+        let crossing = start + 1 < columns.len() && hi > columns[start].end;
+        if crossing && whitespace {
+            continue;
+        }
+        let start = if crossing && columns[start].end - lo <= RULING_SNAP_TOLERANCE {
+            start + 1
+        } else {
+            start
+        };
         let end = columns
             .iter()
             .rposition(|column| column.start <= hi)
@@ -4274,21 +4446,69 @@ fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
 /// figure's scattered labels or a two-line caption, stays in content order
 /// rather than sorting by height.
 fn merge_sparse_neighbours(flows: Vec<Vec<&TextSpan>>) -> Vec<Vec<&TextSpan>> {
-    let table_column =
-        |flow: &[&TextSpan]| !column_shaped(flow) && baseline_count(flow) >= TABLE_MIN_ROWS;
-    let mut merged: Vec<Vec<&TextSpan>> = Vec::new();
+    let sparse = |flow: &[&TextSpan]| !column_shaped(flow);
+    let table_column = |flow: &[&TextSpan]| sparse(flow) && baseline_count(flow) >= TABLE_MIN_ROWS;
+    // Each merged flow with whether it has absorbed a neighbour: a table
+    // written cell by cell grows past the span and line counts of a text
+    // column as its rows join, and stays a table all the same.
+    let mut merged: Vec<(Vec<&TextSpan>, bool)> = Vec::new();
     for flow in flows {
-        let Some(prev) = merged.last_mut() else {
-            merged.push(flow);
+        let Some((prev, joined)) = merged.last_mut() else {
+            merged.push((flow, false));
             continue;
         };
-        if !table_column(prev) || !table_column(&flow) || !y_overlaps(prev, &flow) {
-            merged.push(flow);
+        // A table written cell by cell opens a flow at every row's right
+        // cells: either they open on a line the flow before them just
+        // wrote, or, when that flow holds one row, one side being long
+        // enough is the evidence, so long as both are sparse and overlap.
+        if continues_a_line(prev, &flow) {
+            prev.extend(flow);
+            *joined = true;
+            continue;
+        }
+        if !(*joined || sparse(prev)) || !sparse(&flow) || !y_overlaps(prev, &flow) {
+            merged.push((flow, false));
+            continue;
+        }
+        if !(*joined || table_column(prev)) && !table_column(&flow) {
+            merged.push((flow, false));
             continue;
         }
         prev.extend(flow);
+        *joined = true;
     }
-    merged
+    merged.into_iter().map(|(flow, _)| flow).collect()
+}
+
+/// How many line sizes above the flow's last baseline a line may stand
+/// and still be one of the lines it just wrote.
+const CONTINUED_LINE_REACH: f32 = 3.0;
+
+/// True when `flow` opens with [`TABLE_MIN_ROW_CELLS`] spans or more on
+/// one baseline that `prev` holds a span on, to their left, among the
+/// lines it wrote last: the right-hand cells of a row whose wrapped first
+/// cell the stream wrote first. A column written whole before the next
+/// begins opens on the page's top line, far above the first column's
+/// end, and stays its own flow.
+fn continues_a_line(prev: &[&TextSpan], flow: &[&TextSpan]) -> bool {
+    let Some(first) = flow.first() else {
+        return false;
+    };
+    let tolerance = 0.5 * first.size;
+    let on_baseline = flow
+        .iter()
+        .take_while(|span| (span.y - first.y).abs() <= tolerance)
+        .count();
+    if on_baseline < TABLE_MIN_ROW_CELLS {
+        return false;
+    }
+    let bottom = prev.iter().map(|span| span.y).fold(f32::INFINITY, f32::min);
+    let left = first.x.min(first.end_x);
+    prev.iter().any(|span| {
+        (span.y - first.y).abs() <= tolerance
+            && span.x.max(span.end_x) <= left
+            && span.y - bottom <= CONTINUED_LINE_REACH * first.size
+    })
 }
 
 /// True when the baseline ranges of two span sets overlap.
@@ -5167,6 +5387,12 @@ pub(crate) mod tests {
         for grid in &open {
             println!("  xs {:?} ys {:?}", grid.xs, grid.ys);
         }
+        // The grid set the layout itself works with: stacked lattices
+        // merged, open grids appended, topmost first.
+        let mut grids = merge_stacked(grids, &spans, RULING_SNAP_TOLERANCE);
+        grids.extend(open);
+        grids.sort_by(|a, b| b.ys[b.ys.len() - 1].total_cmp(&a.ys[a.ys.len() - 1]));
+        println!("layout grids: {}", grids.len());
         {
             let all: Vec<&TextSpan> = spans.iter().collect();
             let (x_min, x_max) = x_bounds(&all);
@@ -5241,10 +5467,18 @@ pub(crate) mod tests {
                 groups.len(),
                 claims.len()
             );
+            for claim in &claims {
+                println!(
+                    "  claim {:?}: {} rows of {} columns",
+                    claim.range,
+                    claim.rows.len(),
+                    claim.rows.first().map_or(0, |row| row.len())
+                );
+            }
             if std::env::var_os("PDFBOSS_PROBE_LINES").is_some() {
                 for (gi, group) in groups.iter().enumerate() {
                     let (gx_lo, gx_hi) = x_bounds(&group.spans);
-                    let (run_end, lanes) = lane_run(&groups, gi);
+                    let (run_end, lanes) = lane_run(&groups, gi, gutter_min(&groups));
                     let text: String = group
                         .spans
                         .iter()
@@ -5260,7 +5494,15 @@ pub(crate) mod tests {
                         text
                     );
                 }
-                println!("  table_band: {}", table_band(&groups).is_some());
+                match table_band(&groups) {
+                    Some(band) => println!(
+                        "  table_band: span {:?}, {} rows of {} columns",
+                        band.span,
+                        band.rows.len(),
+                        band.rows.first().map_or(0, |row| row.len())
+                    ),
+                    None => println!("  table_band: none"),
+                }
             }
             for grid in &grids {
                 let Some(lo) = groups.iter().position(|g| grid.holds(g.y)) else {
@@ -5274,7 +5516,16 @@ pub(crate) mod tests {
                     groups.len(),
                     tail
                 );
-                let columns = open_columns(&groups[lo..hi], grid);
+                let columns =
+                    lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[lo..hi]);
+                if grid.open {
+                    println!(
+                        "  open grid: columns {:?}, reach {}..{}",
+                        columns,
+                        header_reach(&groups, lo, hi, grid, &columns),
+                        open_reach(&groups, lo, hi)
+                    );
+                }
                 for (gi, group) in groups[lo..hi].iter().enumerate() {
                     if table_row(group, &columns).is_none() {
                         let text: String = group
@@ -5805,6 +6056,98 @@ pub(crate) mod tests {
         }
         content += "ET";
         content
+    }
+
+    /// A statement in lanes: a header, three rows, the section label
+    /// "Paid-in Capital:" a blank line below them, and three more rows.
+    pub(crate) fn sectioned_lane_table_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        content += "1 0 0 1 72 700 Tm (Item) Tj 1 0 0 1 250 700 Tm (2024) Tj 1 0 0 1 430 700 Tm (2023) Tj ";
+        for (row, y) in [
+            (0, 688.0),
+            (1, 676.0),
+            (2, 664.0),
+            (3, 626.0),
+            (4, 614.0),
+            (5, 602.0),
+        ] {
+            if row == 3 {
+                content += "1 0 0 1 72 638 Tm (Paid-in Capital:) Tj ";
+            }
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
+    }
+
+    /// Three columns of 7-point type five points apart, four rows: the
+    /// gaps are under the six-point gutter minimum and over two thirds of
+    /// the type size.
+    pub(crate) fn tight_lane_grid_content() -> String {
+        let mut content = String::from("BT /F1 7 Tf ");
+        for (row, y) in [(0, 700.0), (1, 690.0), (2, 680.0), (3, 670.0)] {
+            for (col, x) in [(0, 72.0), (1, 92.0), (2, 112.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
+    }
+
+    /// An exhibits table written cell by cell: each row's number and
+    /// two-line description, then its form, exhibit and date cells back up
+    /// at the first line, so every row's right cells open a new flow.
+    pub(crate) fn cell_by_cell_flows_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(1, 700.0), (2, 670.0), (3, 640.0), (4, 610.0)] {
+            let below = y - 12.0;
+            content += &format!(
+                "1 0 0 1 52 {y} Tm (3.{row}) Tj 1 0 0 1 80 {y} Tm (Restated Articles of Incorporation) Tj \
+                 1 0 0 1 80 {below} Tm (of the Registrant) Tj \
+                 1 0 0 1 440 {y} Tm (8-K) Tj 1 0 0 1 480 {y} Tm (3.{row}) Tj 1 0 0 1 520 {y} Tm (8/7/20) Tj "
+            );
+        }
+        content += "ET";
+        content
+    }
+
+    /// A three-row lane grid, a prose line well below it, and a five-row
+    /// grid below that: the longer grid is not the only one in the run.
+    pub(crate) fn grid_above_a_longer_grid_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (row, y) in [(0, 700.0), (1, 680.0), (2, 660.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (r{row}c{col}) Tj ");
+            }
+        }
+        content += "1 0 0 1 72 615 Tm (Prose between the two grids.) Tj ";
+        for (row, y) in [(0, 570.0), (1, 550.0), (2, 530.0), (3, 510.0), (4, 490.0)] {
+            for (col, x) in [(0, 72.0), (1, 250.0), (2, 430.0)] {
+                content += &format!("1 0 0 1 {x} {y} Tm (s{row}c{col}) Tj ");
+            }
+        }
+        content += "ET";
+        content
+    }
+
+    /// An open-ruled statement: rules over and under the header and under
+    /// the first section's last row, then the label "Asset Class" and three
+    /// unruled rows in the same columns, then a note and a line of prose.
+    pub(crate) fn open_ruled_sections_content() -> String {
+        String::from(
+            "70 710 m 430 710 l S 70 688 m 430 688 l S 70 648 m 430 648 l S \
+             BT /F1 10 Tf 1 0 0 1 72 700 Tm (Name) Tj 1 0 0 1 260 700 Tm (Kind) Tj \
+             1 0 0 1 72 676 Tm (Pupfish) Tj 1 0 0 1 260 676 Tm (alvarezi) Tj \
+             1 0 0 1 72 656 Tm (Skiffia) Tj 1 0 0 1 260 656 Tm (francesae) Tj \
+             1 0 0 1 72 632 Tm (Asset Class) Tj \
+             1 0 0 1 72 620 Tm (Goodeid) Tj 1 0 0 1 260 620 Tm (atripinnis) Tj \
+             1 0 0 1 72 600 Tm (Splitfin) Tj 1 0 0 1 260 600 Tm (multiradiatus) Tj \
+             1 0 0 1 72 580 Tm (Total) Tj 1 0 0 1 260 580 Tm (five) Tj \
+             1 0 0 1 72 560 Tm (In the table above:) Tj \
+             1 0 0 1 72 540 Tm (The species are listed by the year of their description.) Tj ET",
+        )
     }
 
     /// Two lane grids of three rows each, one well below the other, with

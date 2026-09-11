@@ -1518,6 +1518,71 @@ mod tests {
         assert!(md.contains("4. Identifying a Topic 25"), "md: {md}");
     }
 
+    /// A section label standing a blank line above its rows, populating the
+    /// first cell alone, is a row of the table around it, not the end of
+    /// one table and the start of another.
+    #[test]
+    fn a_section_label_stays_inside_the_lane_table() {
+        let md = markdown_of(&structure::tests::sectioned_lane_table_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        assert!(
+            md.contains(
+                "| r2c0 | r2c1 | r2c2 |\n| Paid-in Capital: |  |  |\n| r3c0 | r3c1 | r3c2 |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// Column gaps of five points in 7-point type are lanes: the gutter
+    /// minimum scales down with small type.
+    #[test]
+    fn narrow_gaps_in_small_type_are_lanes() {
+        let md = markdown_of(&structure::tests::tight_lane_grid_content());
+        assert!(
+            md.contains("| r0c0 | r0c1 | r0c2 |\n| --- | --- | --- |\n| r1c0 | r1c1 | r1c2 |"),
+            "md: {md}"
+        );
+    }
+
+    /// A table written cell by cell opens a flow at every row's right
+    /// cells; the flows merge back into one segment, and the table is one.
+    #[test]
+    fn a_table_written_cell_by_cell_is_one_table() {
+        let md = markdown_of(&structure::tests::cell_by_cell_flows_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        for row in 1..=4 {
+            assert!(
+                md.contains(&format!(
+                    "| 3.{row} | Restated Articles of Incorporation | 8-K | 3.{row} | 8/7/20 |"
+                )),
+                "row {row}: {md}"
+            );
+        }
+    }
+
+    /// A short grid above the run's longest stretch is a table too: the
+    /// lines above the band get the same attempt as the lines below it.
+    #[test]
+    fn a_short_grid_above_a_longer_one_is_a_table_too() {
+        let md = markdown_of(&structure::tests::grid_above_a_longer_grid_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert!(md.contains("| r1c0 | r1c1 | r1c2 |"), "md: {md}");
+        assert!(md.contains("| s4c0 | s4c1 | s4c2 |"), "md: {md}");
+        assert!(md.contains("Prose between the two grids."), "md: {md}");
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]
@@ -1638,6 +1703,31 @@ mod tests {
         assert!(
             md.contains("| K+ | slow |") && md.contains("| Check | none |"),
             "body rows read as rows: {md:?}"
+        );
+    }
+
+    /// An open-ruled statement rules its header and its first section's
+    /// last row and leaves the sections below unruled: the claim grows over
+    /// every line that keeps the lanes, the section label a row of it, and
+    /// stops at the note and the prose under the table.
+    #[test]
+    fn an_open_ruled_claim_grows_over_the_unruled_sections() {
+        let md = markdown_of_drawn(&structure::tests::open_ruled_sections_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        assert!(
+            md.contains(
+                "| Skiffia | francesae |\n| Asset Class |  |\n| Goodeid | atripinnis |\n\
+                 | Splitfin | multiradiatus |\n| Total | five |"
+            ),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("In the table above:") && !md.contains("| In the table"),
+            "the note stays prose: {md}"
         );
     }
 
