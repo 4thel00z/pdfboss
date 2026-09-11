@@ -2579,8 +2579,12 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         .take_while(|group| grid.holds(group.y))
         .count();
     let hi = lo + inside;
-    let columns = open_columns(&groups[lo..hi], grid);
-    let mut rows = Vec::new();
+    let columns = lane_split_columns(open_columns(&groups[lo..hi], grid), &groups[lo..hi]);
+    let top = header_reach(groups, lo, hi, grid, &columns);
+    let mut rows = Vec::with_capacity(hi - top);
+    for group in &groups[top..lo] {
+        rows.push(table_row(group, &columns)?);
+    }
     for band in groups[lo..hi].chunk_by(|a, b| grid.band_of(a.y) == grid.band_of(b.y)) {
         let mut lines = Vec::with_capacity(band.len());
         for group in band {
@@ -2606,10 +2610,95 @@ fn grid_claim(groups: &[Group], grid: &RuledGrid) -> Option<GridClaim> {
         return None;
     }
     Some(GridClaim {
-        range: lo..hi,
+        range: top..hi,
         rows,
         bbox: grid.bbox(),
     })
+}
+
+/// The narrowest lane that splits a drawn column. A lane this wide, kept
+/// clear by every line of the claim, is a column boundary the producer
+/// left unruled: a statement rules its year columns and sets the label,
+/// the currency sign and the amount in the first box.
+const RULED_LANE_MIN_WIDTH: f32 = 2.0 * GUTTER_MIN_WIDTH;
+
+/// `columns` with each drawn column split at the lanes the claim's lines
+/// leave clear inside it, a snap's width in from either rule so a lane
+/// hugging a rule is that rule's own margin.
+fn lane_split_columns(
+    columns: Vec<std::ops::Range<f32>>,
+    groups: &[Group],
+) -> Vec<std::ops::Range<f32>> {
+    let lanes: Vec<std::ops::Range<f32>> = lanes_of(groups)
+        .into_iter()
+        .filter(|lane| lane.end - lane.start >= RULED_LANE_MIN_WIDTH)
+        .collect();
+    if lanes.is_empty() {
+        return columns;
+    }
+    let mut out = Vec::with_capacity(columns.len() + lanes.len());
+    for column in columns {
+        let mut start = column.start;
+        for lane in lanes.iter().filter(|lane| {
+            lane.start > column.start + RULING_SNAP_TOLERANCE
+                && lane.end < column.end - RULING_SNAP_TOLERANCE
+        }) {
+            out.push(start..lane.start);
+            start = lane.end;
+        }
+        out.push(start..column.end);
+    }
+    out
+}
+
+/// How far above a grid's top rule its header may stand, in multiples of
+/// the row pitch inside the grid.
+const HEADER_REACH: f32 = 2.5;
+
+/// The index of the topmost header line above the grid, or `lo` when the
+/// header is inside the box. Lines are walked upward from the top rule,
+/// each within [`HEADER_REACH`] row pitches of the line below it and
+/// sitting in the columns, and the walk keeps the lines down to the
+/// topmost one populating [`TABLE_MIN_ROW_CELLS`] cells: a statement
+/// rules its body and sets the column heads above the box, while a
+/// caption or a paragraph above the box populates one cell per line and
+/// stays out.
+fn header_reach(
+    groups: &[Group],
+    lo: usize,
+    hi: usize,
+    grid: &RuledGrid,
+    columns: &[std::ops::Range<f32>],
+) -> usize {
+    if hi - lo < 2 {
+        return lo;
+    }
+    let pitch = median(
+        groups[lo..hi]
+            .windows(2)
+            .map(|pair| pair[0].y - pair[1].y)
+            .collect(),
+    );
+    if pitch <= 0.0 {
+        return lo;
+    }
+    let limit = HEADER_REACH * pitch;
+    let mut below = grid.ys[grid.ys.len() - 1];
+    let mut top = lo;
+    for index in (0..lo).rev() {
+        let group = &groups[index];
+        if group.y - below > limit {
+            break;
+        }
+        let Some(row) = table_row(group, columns) else {
+            break;
+        };
+        below = group.y;
+        if populated_cells(&row) >= TABLE_MIN_ROW_CELLS {
+            top = index;
+        }
+    }
+    top
 }
 
 /// The grid's columns, with an open outer column on each side the claimed
@@ -3483,15 +3572,15 @@ fn close_gaps(cell: &mut Cell) {
 }
 
 /// True when no row puts ink in `column`: every cell starting there has no
-/// line, and a cell reaching over it from the left carries its text
-/// elsewhere.
+/// line or holds whitespace alone, and a cell reaching over it from the
+/// left carries its text elsewhere.
 fn column_is_blank(rows: &[Vec<Cell>], column: usize) -> bool {
     rows.iter().all(|row| {
         let mut start = 0usize;
         for cell in row {
             let end = start + cell.colspan as usize;
             if start == column {
-                return cell.line.is_none();
+                return !inked_cell(cell);
             }
             if start < column && column < end {
                 return true;
@@ -5631,6 +5720,35 @@ pub(crate) mod tests {
             );
         }
         content += "ET";
+        content
+    }
+
+    /// A statement's two ruled sections on the same verticals, the section
+    /// label "Capital" unruled between them, the column heads above the
+    /// top rule, and each row's label and amount both inside the first box.
+    pub(crate) fn stacked_statement_content() -> String {
+        let mut content = String::new();
+        for (bottom, top) in [(650.0, 690.0), (590.0, 630.0)] {
+            let mid = (bottom + top) / 2.0;
+            for x in [70.0, 300.0, 430.0] {
+                content += &format!("{x} {bottom} m {x} {top} l S ");
+            }
+            for y in [bottom, mid, top] {
+                content += &format!("70 {y} m 430 {y} l S ");
+            }
+        }
+        content += "BT /F1 10 Tf 1 0 0 1 75 700 Tm (Item) Tj 1 0 0 1 310 700 Tm (2024) Tj ";
+        for (y, label, amount, value) in [
+            (678.0, "Cash", "1,000", "5"),
+            (658.0, "Debt", "2,000", "6"),
+            (618.0, "Stock", "3,000", "7"),
+            (598.0, "Total", "6,000", "18"),
+        ] {
+            content += &format!(
+                "1 0 0 1 75 {y} Tm ({label}) Tj 1 0 0 1 250 {y} Tm ({amount}) Tj 1 0 0 1 310 {y} Tm ({value}) Tj "
+            );
+        }
+        content += "1 0 0 1 75 637 Tm (Capital) Tj ET";
         content
     }
 

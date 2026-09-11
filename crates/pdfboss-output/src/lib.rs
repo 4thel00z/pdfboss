@@ -1763,6 +1763,27 @@ mod tests {
 
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
+    /// A statement rules each section's rows and leaves the section label
+    /// between them unruled: the stacked boxes are one table, the label a
+    /// row of it, the column heads above the top rule its header row, and
+    /// the label and the amount sharing the first box two columns.
+    #[test]
+    fn stacked_section_boxes_are_one_table_with_their_header() {
+        let md = markdown_of_drawn(&structure::tests::stacked_statement_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        assert!(
+            md.contains(
+                "| Item |  | 2024 |\n| --- | --- | --- |\n| Cash | 1,000 | 5 |\n| Debt | 2,000 | 6 |\n\
+                 | Capital |  |  |\n| Stock | 3,000 | 7 |\n| Total | 6,000 | 18 |"
+            ),
+            "md: {md}"
+        );
+    }
+
     /// A ruled band holding only a whitespace span is the page's padding:
     /// no row of blank cells appears between the two rows around it.
     #[test]
