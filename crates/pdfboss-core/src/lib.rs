@@ -35,6 +35,7 @@ pub mod piece_info;
 pub mod presentation;
 pub mod pretty;
 pub mod requirement;
+pub mod separation_info;
 pub mod source;
 pub mod structure;
 pub mod thumbnail;
@@ -88,6 +89,7 @@ pub use presentation::{
     TransitionStyle,
 };
 pub use requirement::{requirements_with, Requirement, RequirementHandler};
+pub use separation_info::{separation_info_with, SeparationInfo};
 pub use source::{
     block_on, resolve_sync_with, resolve_with, AsyncObjectSource, BoxFuture, Immediate,
     ObjectSource, MAX_RESOLVE_DEPTH,

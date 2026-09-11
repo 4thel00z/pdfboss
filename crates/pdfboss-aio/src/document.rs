@@ -1567,6 +1567,12 @@ impl AsyncDocument {
         pdfboss_core::viewports_with(self, page).await
     }
 
+    /// A page's separation dictionary (ISO 32000-1 §14.11.4): the async twin
+    /// of the sync document's `separation_info`.
+    pub async fn separation_info(&self, page: &Page) -> Option<pdfboss_core::SeparationInfo> {
+        pdfboss_core::separation_info_with(self, page).await
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4): the async twin of the sync document's
     /// `permission_handlers`.

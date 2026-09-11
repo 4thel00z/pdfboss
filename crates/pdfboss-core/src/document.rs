@@ -716,6 +716,15 @@ impl Document {
         block_on(crate::measure::viewports_with(&Immediate(self), page))
     }
 
+    /// A page's separation dictionary (ISO 32000-1 §14.11.4), `None` when
+    /// the page has no `/SeparationInfo` naming a colorant.
+    pub fn separation_info(&self, page: &Page) -> Option<crate::separation_info::SeparationInfo> {
+        block_on(crate::separation_info::separation_info_with(
+            &Immediate(self),
+            page,
+        ))
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4), `None` without one.
     pub fn permission_handlers(&self) -> Option<crate::permission::PermissionHandlers> {
