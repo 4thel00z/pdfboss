@@ -51,7 +51,8 @@ fn outline_doc() -> Vec<u8> {
          /OutputConditionIdentifier (sRGB IEC61966-2.1) /Info (sRGB) >> ] \
          /PieceInfo << /Illustrator << /LastModified (D:20240102030405Z) /Private << /Version 28 >> >> >> \
          /Threads [13 0 R] /Perms << /DocMDP 15 0 R >> \
-         /Requirements [ << /Type /Requirement /S /EnableJavaScripts >> ] \
+         /Requirements [ << /Type /Requirement /S /EnableJavaScripts \
+         /RH << /Type /ReqHandler /S /NoOp >> >> ] \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -376,6 +377,10 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             let requirements = sync_doc.requirements();
             assert_eq!(requirements.len(), 1, "{name}: requirements");
             assert_eq!(requirements[0].kind, "EnableJavaScripts");
+            // Covers ISO 32000-1 §12.10.2.
+            assert_eq!(requirements[0].handlers.len(), 1, "{name}: handlers");
+            assert_eq!(requirements[0].handlers[0].kind, "NoOp");
+            assert_eq!(requirements[0].handlers[0].script, None);
         }
         for index in 0..=doc.page_count() {
             assert_eq!(
