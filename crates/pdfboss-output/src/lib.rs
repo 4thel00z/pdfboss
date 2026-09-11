@@ -1563,6 +1563,46 @@ mod tests {
         assert!(md.contains("Prose between the two grids."), "md: {md}");
     }
 
+    /// Two lanes of short terms and definitions are a table: a glossary,
+    /// a subsidiary list, a rate factor table.
+    #[test]
+    fn a_two_column_glossary_is_a_table() {
+        let md = markdown_of(&structure::tests::glossary_content());
+        assert!(
+            md.contains(
+                "| Term | Definition |\n| --- | --- |\n| AED | Advanced Electronic Data |\n\
+                 | AFC | Audit and Finance Committee of the Board |"
+            ),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("| Board | Board of Governors of the Postal Service |"),
+            "md: {md}"
+        );
+    }
+
+    /// Markers a lane's width from their text are a list, not a two-column
+    /// table.
+    #[test]
+    fn a_numbered_list_in_lanes_is_not_a_table() {
+        let md = markdown_of(&structure::tests::numbered_lane_list_content());
+        assert!(!md.contains("| ---"), "no table: {md}");
+        assert!(md.contains("1. Item number 1 of the list"), "md: {md}");
+        assert!(md.contains("5. Item number 5 of the list"), "md: {md}");
+    }
+
+    /// Two columns of prose too short for the gutter pass share one lane;
+    /// neither side is narrow, so they are not a two-column table.
+    #[test]
+    fn two_prose_columns_are_not_a_table() {
+        let md = markdown_of(&structure::tests::two_prose_columns_content());
+        assert!(!md.contains("| ---"), "no table: {md}");
+        assert!(
+            md.contains("The left column runs its text to and the right column does the same"),
+            "md: {md}"
+        );
+    }
+
     /// A second grid below the first, in the same segment, is a second
     /// table: the stretch below a table gets the same attempt.
     #[test]
@@ -1580,15 +1620,18 @@ mod tests {
     }
 
     /// A lane held open by a page number out in the margin is not a cell
-    /// column: hoisting the number empties it, and two columns of rows are a
-    /// layout. Modeled on a bench page whose two-column pitch read as a
-    /// three-column table with an empty third cell in every row.
+    /// column: hoisting the number empties it, and the four rows of short
+    /// cells are a two-column table with no third cell. Modeled on a bench
+    /// page whose two-column pitch read as a three-column table with an
+    /// empty third cell in every row.
     #[test]
     fn a_margin_page_number_does_not_manufacture_a_column() {
         let md = markdown_of(&structure::tests::margin_number_grid_content());
-        assert!(!md.contains('|'), "two columns are not a table: {md}");
-        assert!(!md.contains("<table>"), "two columns are not a table: {md}");
-        assert!(md.contains("r0c0 r0c1"), "rows still read as prose: {md}");
+        assert!(
+            md.contains("| r0c0 | r0c1 |\n| --- | --- |\n| r1c0 | r1c1 |"),
+            "two columns, no third: {md}"
+        );
+        assert!(!md.contains("| --- | --- | --- |"), "no third column: {md}");
         assert!(md.ends_with("\n\n3"), "the page number survives: {md}");
     }
 

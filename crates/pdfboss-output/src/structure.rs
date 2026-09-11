@@ -3204,24 +3204,138 @@ fn table_band(groups: &[Group]) -> Option<TableBand> {
         // The lane width follows the type of the run's own first lines: a
         // statement's 7-point rows stand in a column of 10-point prose.
         let min_gap = gutter_min(&groups[start..(start + TABLE_MIN_ROWS).min(groups.len())]);
-        let (end, lanes) = lane_run(groups, start, min_gap);
+        let (end, lanes) = lane_run(groups, start, min_gap, TABLE_MIN_LANES);
         if end - start < TABLE_MIN_ROWS {
             continue;
         }
-        if let Some(band) = grid(groups, start, end, &lanes, min_gap) {
+        if let Some(band) = grid(groups, start, end, &lanes, min_gap, TABLE_MIN_LANES) {
             return Some(band);
+        }
+    }
+    // No stretch keeps two lanes: a two-column table is looked for next,
+    // and one lane is weaker evidence, so [`pair_table`] asks more of it.
+    for start in 0..groups.len() {
+        let min_gap = gutter_min(&groups[start..(start + TABLE_MIN_ROWS).min(groups.len())]);
+        let (end, lanes) = lane_run(groups, start, min_gap, 1);
+        if end - start < PAIR_MIN_ROWS {
+            continue;
+        }
+        if let Some(band) = grid(groups, start, end, &lanes, min_gap, 1) {
+            if pair_table(&band.rows) {
+                return Some(band);
+            }
         }
     }
     None
 }
 
-/// The stretch starting at `start` that keeps at least [`TABLE_MIN_LANES`]
-/// lanes, as an exclusive end and the lanes the whole stretch leaves. Ink is
+/// The rows a two-column band must populate on both sides: one lane is
+/// what a list's markers or a form's labels leave too, and three rows of
+/// it are not a table.
+const PAIR_MIN_ROWS: usize = 4;
+/// The widest the narrower column of a two-column band may run, as a share
+/// of the band's width. A glossary's terms, a subsidiary list's
+/// jurisdictions and a rate table's factors take a third of the width at
+/// most; two columns of prose take near half each.
+const PAIR_NARROW_SHARE: f32 = 1.0 / 3.0;
+
+/// The gates a two-column band passes beyond a grid's: at least
+/// [`PAIR_MIN_ROWS`] rows populating both cells; a first column that is
+/// not mostly list markers, which would make the band a numbered or
+/// bulleted list, and not mostly labels ending in a colon, which would
+/// make it a form or a block of metadata; and a narrower column within
+/// [`PAIR_NARROW_SHARE`] of the band's width, which two columns of prose
+/// never are.
+fn pair_table(rows: &[Vec<Cell>]) -> bool {
+    if rows.iter().any(|row| row.len() > 2) {
+        return false;
+    }
+    let records: Vec<&Vec<Cell>> = rows
+        .iter()
+        .filter(|row| row.iter().filter(|cell| inked_cell(cell)).count() >= 2)
+        .collect();
+    if records.len() < PAIR_MIN_ROWS {
+        return false;
+    }
+    let firsts: Vec<String> = records
+        .iter()
+        .filter_map(|row| row.iter().find(|cell| inked_cell(cell)))
+        .map(cell_text)
+        .collect();
+    if 2 * firsts.iter().filter(|text| marker_cell(text)).count() > firsts.len() {
+        return false;
+    }
+    if 2 * firsts
+        .iter()
+        .filter(|text| text.trim_end().ends_with(':'))
+        .count()
+        > firsts.len()
+    {
+        return false;
+    }
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    let mut widths: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+    for row in &records {
+        for (side, cell) in row
+            .iter()
+            .filter(|cell| inked_cell(cell))
+            .take(2)
+            .enumerate()
+        {
+            let Some(line) = cell.line.as_ref() else {
+                continue;
+            };
+            lo = lo.min(line.x);
+            hi = hi.max(line.end_x);
+            widths[side].push(line.end_x - line.x);
+        }
+    }
+    let width = hi - lo;
+    if width <= 0.0 {
+        return false;
+    }
+    let narrower = median(widths[0].clone()).min(median(widths[1].clone()));
+    narrower <= PAIR_NARROW_SHARE * width
+}
+
+/// True when a cell holds nothing but a list marker: a bullet, one to three
+/// digits or a single letter closed by `.` or `)`, or a number in brackets.
+fn marker_cell(text: &str) -> bool {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if chars.as_str().is_empty() && BULLETS.contains(&first) {
+        return true;
+    }
+    if let Some(inner) = text
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit());
+    }
+    let Some(body) = text.strip_suffix(['.', ')']) else {
+        return false;
+    };
+    let digits = body.chars().all(|c| c.is_ascii_digit()) && (1..=3).contains(&body.len());
+    let letter = body.chars().count() == 1 && body.chars().all(|c| c.is_ascii_alphabetic());
+    digits || letter
+}
+
+/// The stretch starting at `start` that keeps at least `min_lanes` lanes,
+/// as an exclusive end and the lanes the whole stretch leaves. Ink is
 /// tracked as exact intervals, not histogram bins: a column gap of a few
 /// points is real table structure that bin rounding swallows. A
 /// whitespace-only span paints nothing: a producer's padding standing in a
 /// gutter neither closes the lane nor opens a column of its own.
-fn lane_run(groups: &[Group], start: usize, min_gap: f32) -> (usize, Vec<std::ops::Range<f32>>) {
+fn lane_run(
+    groups: &[Group],
+    start: usize,
+    min_gap: f32,
+    min_lanes: usize,
+) -> (usize, Vec<std::ops::Range<f32>>) {
     let mut occupied: Vec<std::ops::Range<f32>> = Vec::new();
     let mut lanes = Vec::new();
     for (offset, group) in groups[start..].iter().enumerate() {
@@ -3230,7 +3344,7 @@ fn lane_run(groups: &[Group], start: usize, min_gap: f32) -> (usize, Vec<std::op
             add_ink(&mut next, span.x.min(span.end_x)..span.x.max(span.end_x));
         }
         let gaps = ink_gaps(&next, min_gap);
-        if gaps.len() < TABLE_MIN_LANES {
+        if gaps.len() < min_lanes {
             return (start + offset, lanes);
         }
         occupied = next;
@@ -3299,6 +3413,7 @@ fn grid(
     end: usize,
     lanes: &[std::ops::Range<f32>],
     min_gap: f32,
+    min_lanes: usize,
 ) -> Option<TableBand> {
     let spans: Vec<&TextSpan> = groups[start..end]
         .iter()
@@ -3322,10 +3437,10 @@ fn grid(
         .collect();
     let (first, last) = even_stretch(inside, &rows, &filled)?;
     let stretch = lo + first..lo + last + 1;
-    let rows = match own_rows(groups, start..end, stretch.clone(), min_gap) {
+    let rows = match own_rows(groups, start..end, stretch.clone(), min_gap, min_lanes) {
         Some(rows) => rows,
         None => {
-            if populated_columns(&rows[first..=last], columns.len()) < TABLE_MIN_LANES + 1 {
+            if populated_columns(&rows[first..=last], columns.len()) < min_lanes + 1 {
                 return None;
             }
             rows.truncate(last + 1);
@@ -3385,13 +3500,14 @@ fn own_rows(
     run: std::ops::Range<usize>,
     stretch: std::ops::Range<usize>,
     min_gap: f32,
+    min_lanes: usize,
 ) -> Option<Vec<Vec<Cell>>> {
     let core = run.start.max(stretch.start)..run.end.min(stretch.end);
     if core.start >= core.end {
         return None;
     }
     let lanes = lanes_of(&groups[core], min_gap);
-    if lanes.len() < TABLE_MIN_LANES {
+    if lanes.len() < min_lanes {
         return None;
     }
     let spans: Vec<&TextSpan> = groups[stretch.clone()]
@@ -3403,7 +3519,7 @@ fn own_rows(
         .iter()
         .map(|group| table_row(group, &columns))
         .collect::<Option<_>>()?;
-    (populated_columns(&rows, columns.len()) > TABLE_MIN_LANES).then_some(rows)
+    (populated_columns(&rows, columns.len()) > min_lanes).then_some(rows)
 }
 
 /// The longest run of populated rows whose neighbouring baselines never
@@ -5608,7 +5724,8 @@ pub(crate) mod tests {
             if std::env::var_os("PDFBOSS_PROBE_LINES").is_some() {
                 for (gi, group) in groups.iter().enumerate() {
                     let (gx_lo, gx_hi) = x_bounds(&group.spans);
-                    let (run_end, lanes) = lane_run(&groups, gi, gutter_min(&groups));
+                    let (run_end, lanes) =
+                        lane_run(&groups, gi, gutter_min(&groups), TABLE_MIN_LANES);
                     let text: String = group
                         .spans
                         .iter()
@@ -6380,6 +6497,52 @@ pub(crate) mod tests {
              1 0 0 1 72 560 Tm (In the table above:) Tj \
              1 0 0 1 72 540 Tm (The species are listed by the year of their description.) Tj ET",
         )
+    }
+
+    /// A glossary in two lanes: six short terms and their definitions.
+    pub(crate) fn glossary_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (y, term, meaning) in [
+            (700.0, "Term", "Definition"),
+            (686.0, "AED", "Advanced Electronic Data"),
+            (672.0, "AFC", "Audit and Finance Committee of the Board"),
+            (658.0, "APWU", "American Postal Workers Union"),
+            (644.0, "ASC", "Accounting Standards Codification"),
+            (630.0, "Board", "Board of Governors of the Postal Service"),
+        ] {
+            content += &format!("1 0 0 1 72 {y} Tm ({term}) Tj 1 0 0 1 160 {y} Tm ({meaning}) Tj ");
+        }
+        content += "ET";
+        content
+    }
+
+    /// Five numbered items whose markers stand a lane's width from their
+    /// text: a list, whatever the lane says.
+    pub(crate) fn numbered_lane_list_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for (index, y) in [700.0, 686.0, 672.0, 658.0, 644.0].into_iter().enumerate() {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm ({}.) Tj 1 0 0 1 92 {y} Tm (Item number {} of the list) Tj ",
+                index + 1,
+                index + 1
+            );
+        }
+        content += "ET";
+        content
+    }
+
+    /// Five lines of prose set in two columns too short for the gutter
+    /// pass: each side takes near half the width.
+    pub(crate) fn two_prose_columns_content() -> String {
+        let mut content = String::from("BT /F1 10 Tf ");
+        for y in [700.0, 686.0, 672.0, 658.0, 644.0] {
+            content += &format!(
+                "1 0 0 1 72 {y} Tm (The left column runs its text to) Tj \
+                 1 0 0 1 300 {y} Tm (and the right column does the same) Tj "
+            );
+        }
+        content += "ET";
+        content
     }
 
     /// Two lane grids of three rows each, one well below the other, with
