@@ -112,11 +112,11 @@ pub struct Font {
     /// `/BaseFont` verbatim — subset prefix included — falling back to the
     /// FontDescriptor's `/FontName`; empty when the file states neither.
     pub base_name: String,
-    /// Upper edge of the em box in per-mille units: `/Ascent`, else
-    /// `/CapHeight`, else 800.
+    /// Upper edge of the em box in per-mille units: `/Ascent`, else the
+    /// `/FontBBox` top, else `/CapHeight`, else 800.
     pub ascent: f32,
     /// Lower edge of the em box in per-mille units, never positive:
-    /// `/Descent`, else -200.
+    /// `/Descent`, else the `/FontBBox` bottom, else -200.
     pub descent: f32,
     /// FontDescriptor `/Flags` FixedPitch (ISO 32000-1 Table 123 bit 1).
     pub monospace: bool,
@@ -530,27 +530,54 @@ impl Font {
                 .and_then(|o| o.as_name().map(|n| n.0.clone()))
                 .unwrap_or_default();
         }
+        // A stated, nonzero /Ascent or /Descent wins. Without one, the
+        // /FontBBox (Table 122: the smallest box enclosing every glyph)
+        // gives an edge every glyph stays inside, which /CapHeight does not:
+        // the math extension fonts of tectonic documents state /Ascent 0
+        // /Descent 0, and their display integrals hang two em below the
+        // baseline. A Type 3 font's box is in its own /FontMatrix glyph
+        // space, which this crate does not read, so it is no evidence there.
+        let type3 = rv(src, dict, "Subtype")
+            .await
+            .and_then(|o| o.as_name().map(|n| n.0 == "Type3"))
+            .unwrap_or(false);
+        let bbox = if type3 {
+            None
+        } else {
+            Font::font_bbox_vertical(src, &descriptor).await
+        };
         let ascent = match rv(src, &descriptor, "Ascent")
             .await
             .and_then(|o| o.as_f64())
         {
-            Some(a) if a != 0.0 => Some(a),
-            _ => rv(src, &descriptor, "CapHeight")
+            Some(a) if a != 0.0 => Some(a as f32),
+            _ => bbox.map(|(_, top)| top).filter(|top| *top > 0.0),
+        };
+        let ascent = match ascent {
+            Some(a) => Some(a),
+            None => rv(src, &descriptor, "CapHeight")
                 .await
                 .and_then(|o| o.as_f64())
-                .filter(|c| *c != 0.0),
+                .filter(|c| *c != 0.0)
+                .map(|c| c as f32),
         };
         if let Some(a) = ascent {
-            style.ascent = a as f32;
+            style.ascent = a;
         }
-        if let Some(d) = rv(src, &descriptor, "Descent")
+        let descent = match rv(src, &descriptor, "Descent")
             .await
             .and_then(|o| o.as_f64())
             .filter(|d| *d != 0.0)
         {
             // Stated as negative (ISO 32000-1 Table 122); some producers
             // write the magnitude.
-            style.descent = -(d as f32).abs();
+            Some(d) => Some(-(d as f32).abs()),
+            None => bbox
+                .map(|(bottom, _)| bottom)
+                .filter(|bottom| *bottom <= 0.0),
+        };
+        if let Some(d) = descent {
+            style.descent = d;
         }
         let mut bold = style.bold;
         let mut italic = style.italic;
@@ -582,6 +609,34 @@ impl Font {
         style.bold = bold;
         style.italic = italic;
         style
+    }
+
+    /// The vertical extent of the descriptor's `/FontBBox` as `(bottom,
+    /// top)` in glyph-space units (ISO 32000-1 Table 122), when the array
+    /// holds four finite numbers enclosing a positive height. An all-zero
+    /// placeholder box, which some producers write, is no evidence and
+    /// yields `None`.
+    ///
+    /// Covers ISO 32000-1 §9.8.1.
+    async fn font_bbox_vertical<S: AsyncObjectSource>(
+        src: &S,
+        descriptor: &Dict,
+    ) -> Option<(f32, f32)> {
+        let Some(Object::Array(items)) = rv(src, descriptor, "FontBBox").await else {
+            return None;
+        };
+        if items.len() != 4 {
+            return None;
+        }
+        let mut edges = [0f64; 4];
+        for (edge, item) in edges.iter_mut().zip(&items) {
+            *edge = src.resolve(item).await.ok()?.as_f64()?;
+        }
+        if edges.iter().any(|edge| !edge.is_finite()) {
+            return None;
+        }
+        let (bottom, top) = (edges[1].min(edges[3]), edges[1].max(edges[3]));
+        (top > bottom).then_some((bottom as f32, top as f32))
     }
 
     /// Loads a Type1/TrueType/Type3 font: 1-byte codes, `/Encoding` base

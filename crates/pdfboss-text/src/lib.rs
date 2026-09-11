@@ -160,20 +160,25 @@ pub struct TextSpan {
     /// 0-based index of the page the span came from.
     pub page: usize,
     /// Device-space box: origin to advance horizontally, the font's
-    /// `/Descent`..`/Ascent` (per-mille of the effective size) vertically.
-    /// Exact for unrotated horizontal text, an approximation under rotated
-    /// matrices; vertical writing takes the advance as its vertical extent
-    /// and half the size to each side of the baseline.
+    /// `/Descent`..`/Ascent` (per-mille of the effective size) vertically,
+    /// with the `/FontBBox` extent standing in for whichever of the two the
+    /// descriptor leaves out or states as zero. A font-wide box, not the
+    /// glyphs' own: it contains the ink the font program declares, and can
+    /// stand well clear of it. Exact for unrotated horizontal text, an
+    /// approximation under rotated matrices; vertical writing takes the
+    /// advance as its vertical extent and half the size to each side of the
+    /// baseline.
     pub bbox: Rect,
     /// Height of the box above the baseline, in device units: `bbox.y1 - y`.
-    /// For horizontal text the font's `/Ascent` (else `/CapHeight`, else
-    /// 800 per mille) scaled by the effective size; for vertical writing
-    /// the advance's extent above the origin.
+    /// For horizontal text the font's `/Ascent` (else the `/FontBBox` top,
+    /// else `/CapHeight`, else 800 per mille) scaled by the effective size;
+    /// for vertical writing the advance's extent above the origin.
     pub ascent: f32,
     /// Depth of the box below the baseline, in device units, zero or
     /// negative: `bbox.y0 - y`. For horizontal text the font's `/Descent`
-    /// (else -200 per mille) scaled by the effective size; for vertical
-    /// writing the advance's extent below the origin.
+    /// (else the `/FontBBox` bottom, else -200 per mille) scaled by the
+    /// effective size; for vertical writing the advance's extent below the
+    /// origin.
     pub descent: f32,
     /// Whether the font that produced this span is bold: FontDescriptor
     /// `/FontWeight` >= 600, `/Flags` ForceBold, or a `/StemV` in bold
@@ -746,6 +751,156 @@ mod tests {
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!((spans[0].bbox.y1 - (720.0 + 0.7 * 12.0)).abs() < 1e-3);
         assert!((spans[0].bbox.y0 - (720.0 - 0.2 * 12.0)).abs() < 1e-3);
+    }
+
+    /// One page showing `Hi` in a 12 pt font whose descriptor is `descriptor`.
+    fn span_with_descriptor(descriptor: &str) -> TextSpan {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            &format!("<< /Type /FontDescriptor /FontName /Helvetica {descriptor} >>"),
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        extract_spans(&doc, &page, ReadingOrder::Content)
+            .unwrap()
+            .remove(0)
+    }
+
+    /// A descriptor whose `/Ascent` and `/Descent` are zero (the math
+    /// extension fonts of tectonic documents state exactly that) takes the
+    /// vertical extent of its `/FontBBox`, the box every glyph fits in
+    /// (ISO 32000-1 Table 122): a display integral whose ink hangs 2.2 em
+    /// below the baseline is inside the span box instead of far above it.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn span_bbox_falls_back_to_font_bbox_when_ascent_and_descent_are_zero() {
+        let s = span_with_descriptor(
+            "/CapHeight 0 /Ascent 0 /Descent 0 /FontBBox [-24 -2960 1454 772]",
+        );
+        assert!(
+            (s.bbox.y0 - (720.0 - 2.96 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y0
+        );
+        assert!(
+            (s.bbox.y1 - (720.0 + 0.772 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y1
+        );
+    }
+
+    /// `/FontBBox` outranks `/CapHeight` as the upper-edge fallback: the
+    /// box top covers ascenders, the cap height does not.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn span_bbox_prefers_font_bbox_over_cap_height() {
+        let s = span_with_descriptor("/CapHeight 700 /FontBBox [0 -250 1000 900]");
+        assert!(
+            (s.bbox.y1 - (720.0 + 0.9 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y1
+        );
+        assert!(
+            (s.bbox.y0 - (720.0 - 0.25 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y0
+        );
+    }
+
+    /// Stated `/Ascent` and `/Descent` still win over a (typically wider)
+    /// `/FontBBox`.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn span_bbox_keeps_stated_ascent_and_descent_over_font_bbox() {
+        let s = span_with_descriptor("/Ascent 718 /Descent -207 /FontBBox [-166 -225 1000 931]");
+        assert!(
+            (s.bbox.y1 - (720.0 + 0.718 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y1
+        );
+        assert!(
+            (s.bbox.y0 - (720.0 - 0.207 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y0
+        );
+    }
+
+    /// A degenerate `/FontBBox` (all zeros, a common producer placeholder)
+    /// says nothing and leaves the em-fraction defaults in place.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn span_bbox_ignores_a_degenerate_font_bbox() {
+        let s = span_with_descriptor("/FontBBox [0 0 0 0]");
+        assert!(
+            (s.bbox.y1 - (720.0 + 0.8 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y1
+        );
+        assert!(
+            (s.bbox.y0 - (720.0 - 0.2 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y0
+        );
+    }
+
+    /// A Type 3 font's descriptor values are in its own `/FontMatrix` glyph
+    /// space, which this crate does not read, so its `/FontBBox` is no
+    /// evidence: the em-fraction defaults stay.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn span_bbox_ignores_the_font_bbox_of_a_type3_font() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 12 Tf 72 720 Td (H) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1 1] \
+             /FontMatrix [1 0 0 1 0 0] /CharProcs << /box 7 0 R >> \
+             /Encoding << /Type /Encoding /Differences [72 /box] >> \
+             /FirstChar 72 /LastChar 72 /Widths [1] /Resources << >> \
+             /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Boxes /Flags 4 /FontBBox [0 0 1 1] \
+             /ItalicAngle 0 /Ascent 0 /Descent 0 /CapHeight 0 /StemV 0 >>",
+        );
+        b.stream(7, "", b"1 0 d0 0 0 1 1 re f");
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let s = extract_spans(&doc, &page, ReadingOrder::Content)
+            .unwrap()
+            .remove(0);
+        assert!(
+            (s.bbox.y1 - (720.0 + 0.8 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y1
+        );
+        assert!(
+            (s.bbox.y0 - (720.0 - 0.2 * 12.0)).abs() < 1e-3,
+            "{}",
+            s.bbox.y0
+        );
     }
 
     /// Table 123 bit 1 (FixedPitch) surfaces as `monospace`.

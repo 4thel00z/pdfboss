@@ -118,19 +118,22 @@ class Span:
     @property
     def bbox(self) -> tuple[float, float, float, float]:
         """Device-space box ``(x0, y0, x1, y1)``, y-up: origin to advance
-        horizontally, the font's descent..ascent vertically."""
+        horizontally, the font's descent..ascent vertically, with the
+        ``/FontBBox`` extent standing in for whichever of the two the
+        descriptor leaves out or states as zero. A font-wide box, not the
+        glyphs' own."""
 
     @property
     def ascent(self) -> float:
         """Height of the box above the baseline, in device units:
-        ``bbox[3] - y``. For horizontal text the font's ``/Ascent`` scaled
-        by the size."""
+        ``bbox[3] - y``. For horizontal text the font's ``/Ascent`` (else
+        the ``/FontBBox`` top) scaled by the size."""
 
     @property
     def descent(self) -> float:
         """Depth of the box below the baseline, in device units, zero or
         negative: ``bbox[1] - y``. For horizontal text the font's
-        ``/Descent`` scaled by the size."""
+        ``/Descent`` (else the ``/FontBBox`` bottom) scaled by the size."""
 
     @property
     def bold(self) -> bool:
