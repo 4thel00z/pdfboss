@@ -63,7 +63,8 @@ fn outline_doc() -> Vec<u8> {
          /B [14 0 R] /Dur 5 /Trans << /S /Split /Dm /V /M /O /D 3.5 >> \
          /VP [ << /Type /Viewport /BBox [0 0 612 792] /Name (Map) \
          /Measure << /Subtype /RL /R (1in = 1ft) /X [ << /U (ft) /C 0.0139 >> ] \
-         /D [ << /U (ft) /C 1 >> ] /A [ << /U (sq ft) /C 1 >> ] >> >> ] >>",
+         /D [ << /U (ft) /C 1 >> ] /A [ << /U (sq ft) /C 1 >> ] >> >> ] \
+         /SeparationInfo << /Pages [3 0 R] /DeviceColorant /Cyan >> >>",
     );
     b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
     b.object(
@@ -402,6 +403,23 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
             let measure = viewports[0].measure.as_ref().unwrap();
             assert_eq!(measure.scale_ratio.as_deref(), Some("1in = 1ft"));
             assert_eq!(measure.x[0].conversion, 0.0139);
+        }
+        // Covers ISO 32000-1 §14.11.4.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.separation_info(&page).await,
+                sync_doc.separation_info(&sync_page),
+                "{name}: page {index} separation info"
+            );
+        }
+        if name == "outline" {
+            let separation = sync_doc
+                .separation_info(&sync_doc.page(0).unwrap())
+                .unwrap();
+            assert_eq!(separation.device_colorant, "Cyan");
+            assert_eq!(separation.pages, [pdfboss_core::ObjRef { num: 3, gen: 0 }]);
         }
         for index in 0..=doc.page_count() {
             assert_eq!(
