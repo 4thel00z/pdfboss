@@ -314,24 +314,24 @@ Numbers are machine-dependent; reproduce with [`benchmarks/bench.py`](benchmarks
 
 ### Extraction quality
 
-On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons), pdfboss reads the whole corpus in 0.15 seconds, about 3× faster than the fastest competing Markdown engine, with a mid-field reading-order score (**NID**, higher is better):
+On [opendataloader-bench](https://github.com/opendataloader-project/opendataloader-bench) (the 200-PDF corpus PDF-to-Markdown engines use for their published comparisons), pdfboss reads the whole corpus in 0.15 seconds, about 3× faster than the fastest competing Markdown engine, with a reading-order score (**NID**, higher is better) within 0.01 of the leaders:
 
 | Engine | Reading order (NID) | Output | Time (200 docs) |
 |---|--:|---|--:|
 | pdf-inspector 0.2.6 | 0.915 | Markdown | 0.44s |
 | liteparse 2.10.1 | 0.913 | Markdown | 0.75s |
+| **pdfboss** (`md`) | **0.906** | Markdown | **0.15s** |
 | opendataloader 2.2.1 | 0.902 | Markdown | 2.57s |
+| **pdfboss** | **0.896** | plain text | **0.15s** |
 | pymupdf4llm 0.2.0 | 0.886 | Markdown | 17.12s |
-| **pdfboss** (`md`) | **0.883** | Markdown | **0.15s** |
-| **pdfboss** | **0.873** | plain text | **0.15s** |
 | markitdown 0.1.5 | 0.844 | Markdown | 16.17s |
 
 <details>
 <summary><strong>What the score is made of, and how it was measured</strong></summary>
 
-Per document, the plain-text output beats pdf-inspector's NID on 92 of the 200 files, ties on 15 and loses on 93 (at the table's three-decimal precision). The losses concentrate in table regions, where structured output matches the ground truth more closely than flowed text can. On the benchmark's combined metric the Markdown adapter scores 0.810 (reading order 0.883, headings and lists 0.709, table structure 0.494). It detects tables from column gaps and from drawn borders, so bordered grids and boxed lists without column gaps are found too. Two-column layouts are read column-major. Three reading orders are selectable on every extraction call: content order (the default), the structure tree of a tagged PDF, or geometric position. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
+Per document, the plain-text output beats pdf-inspector's NID on 109 of the 200 files, ties on 11 and loses on 80; the Markdown output beats it on 73, ties on 16 and loses on 111 (both at the table's three-decimal precision). On the benchmark's combined metric the Markdown adapter scores 0.873 (reading order 0.906, headings and lists 0.796, table structure 0.824). Scored through the same evaluator from their published outputs, pdf-inspector reaches 0.875 (0.915, 0.788, 0.814), liteparse 0.873 (0.913, 0.811, 0.693) and opendataloader 0.831 (0.902, 0.740, 0.489). Tables are read from column gaps, from drawn borders and from the horizontal rules of an open lattice: a ruled statement's stacked sections merge into one table, a report's two tables headed by the same years stay two, a wide cell keeps its columns as a colspan, and amounts rejoin their currency signs and closers in the Markdown cells. A contents list, a form's label column and a bulleted list stay the prose they are. Two-column layouts are read column-major. Three reading orders are selectable on every extraction call: content order (the default), the structure tree of a tagged PDF, or geometric position. Justified text keeps its word spacing. Ligatures and small-caps variants decode through the full Adobe Glyph List conventions.
 
-Quality rows come from the benchmark's own evaluator over all 200 documents. The two pdfboss timings were measured together in one session on an Apple M3 Pro under the benchmark's protocol: median of five single-process runs after a warm-up, wheel built from main. pdf-inspector was measured the same way on the same machine in an earlier session. The other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro. Read them as order-of-magnitude context, not a same-machine race.
+Quality rows come from the benchmark's own evaluator over all 200 documents; the combined scores quoted above for pdf-inspector, liteparse and opendataloader are their published outputs scored through that evaluator. The two pdfboss timings were measured together in one session on an Apple M3 Pro under the benchmark's protocol: median of five single-process runs after a warm-up, wheel built from main before this table reading was added. Against that wheel, on a paired run over a 259-file corpus on a 32-core node, this build reads the Markdown in 31% less time (4,622 against 3,183 pages a second), since the layout of a document's pages now runs on worker threads, and the plain text 3% slower; pinned to one core, where the table reading's own cost shows, it reads the Markdown 6% slower and the plain text 5% slower. pdf-inspector was measured the same way on the same machine in an earlier session. The other engines' timings are the ones [published with the corpus](https://github.com/firecrawl/opendataloader-bench/tree/abi/pdf-parser-benchmark-results) from an Apple M4 Pro. Read them as order-of-magnitude context, not a same-machine race.
 
 </details>
 

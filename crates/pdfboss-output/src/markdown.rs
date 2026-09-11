@@ -1,7 +1,9 @@
 //! The Markdown adapter: the layout IR as CommonMark.
 
+use std::fmt::Write as _;
+
 use crate::ir::{Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
-use crate::output::{line_text, Output};
+use crate::output::{push_line, Output};
 
 /// Markdown: ATX headings ranked by font size, one output line per source
 /// line, and emphasis around each run of styled text. Blocks — across pages
@@ -9,30 +11,39 @@ use crate::output::{line_text, Output};
 pub struct Markdown;
 
 impl Output for Markdown {
+    /// One buffer for the document, every block written into it in place.
+    /// A block that contributes no text, a page header or footer or a block
+    /// whose lines are all blank, is cut back out together with the blank
+    /// line that opened it, so the blocks that remain are separated by
+    /// exactly one.
     fn render(&self, pages: &[PageLayout]) -> String {
-        pages
-            .iter()
-            .flat_map(|page| page.blocks.iter())
-            .filter_map(render_block)
-            .collect::<Vec<String>>()
-            .join("\n\n")
+        let mut out = String::new();
+        for block in pages.iter().flat_map(|page| page.blocks.iter()) {
+            let start = out.len();
+            if start > 0 {
+                out.push_str("\n\n");
+            }
+            let opened = out.len();
+            push_block(&mut out, block);
+            if out[opened..].trim().is_empty() {
+                out.truncate(start);
+            }
+        }
+        out
     }
 }
 
-/// One block's Markdown, or nothing when it contributes no text — a page
-/// header or footer, or a block whose lines are all blank.
-fn render_block(block: &Block) -> Option<String> {
-    let rendered = match block {
-        Block::Heading { level, lines, .. } => heading(*level, lines)?,
+fn push_block(out: &mut String, block: &Block) {
+    match block {
+        Block::Heading { level, lines, .. } => push_heading(out, *level, lines),
         Block::Paragraph { lines, role, .. } => match role {
-            Role::Body => paragraph(lines),
-            Role::Quote => quote(lines),
-            Role::PageHeader | Role::PageFooter => return None,
+            Role::Body => push_paragraph(out, lines),
+            Role::Quote => push_quote(out, lines),
+            Role::PageHeader | Role::PageFooter => {}
         },
-        Block::List { items, .. } => list(items),
-        Block::Table { rows, .. } => table(rows),
-    };
-    (!rendered.trim().is_empty()).then_some(rendered)
+        Block::List { items, .. } => push_list(out, items),
+        Block::Table { rows, .. } => push_table(out, rows),
+    }
 }
 
 /// `#` per level and the heading's lines as one line, or nothing when those
@@ -40,38 +51,49 @@ fn render_block(block: &Block) -> Option<String> {
 /// before, or a blank line at heading size renders as a bare `#`. Emphasis is
 /// dropped: a heading is already the strongest thing on the page, and ground
 /// truth never carries `**` inside one.
-fn heading(level: u8, lines: &[Line]) -> Option<String> {
-    let text = lines
-        .iter()
-        .map(line_text)
-        .collect::<Vec<String>>()
-        .join(" ");
+fn push_heading(out: &mut String, level: u8, lines: &[Line]) {
+    let mut text = String::new();
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            text.push(' ');
+        }
+        push_line(&mut text, line);
+    }
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return None;
+        return;
     }
-    Some(format!("{} {}", "#".repeat(level as usize), trimmed))
+    for _ in 0..level {
+        out.push('#');
+    }
+    out.push(' ');
+    out.push_str(trimmed);
 }
 
 /// One output line per source line: hard line breaks are what the extracted
 /// geometry actually knows.
-fn paragraph(lines: &[Line]) -> String {
-    lines
-        .iter()
-        .map(emphasized)
-        .collect::<Vec<String>>()
-        .join("\n")
+fn push_paragraph(out: &mut String, lines: &[Line]) {
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        push_emphasized(out, line);
+    }
 }
 
 /// A block quotation: the paragraph's lines, each opened with `> `.
 ///
 /// Covers ISO 32000-1 §14.8.4.2.
-fn quote(lines: &[Line]) -> String {
-    paragraph(lines)
-        .lines()
-        .map(|line| format!("> {line}"))
-        .collect::<Vec<String>>()
-        .join("\n")
+fn push_quote(out: &mut String, lines: &[Line]) {
+    let mut paragraph = String::new();
+    push_paragraph(&mut paragraph, lines);
+    for (index, line) in paragraph.lines().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str("> ");
+        out.push_str(line);
+    }
 }
 
 /// Canonical bullets and numbers: `- ` regardless of the source glyph, and
@@ -81,39 +103,49 @@ fn quote(lines: &[Line]) -> String {
 /// nothing but the marker (a tagged item's label on a line of its own)
 /// leaves nothing to open the item with, so the item opens on the line
 /// after it.
-fn list(items: &[ListItem]) -> String {
-    items
-        .iter()
-        .map(list_item)
-        .collect::<Vec<String>>()
-        .join("\n")
+fn push_list(out: &mut String, items: &[ListItem]) {
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        push_list_item(out, item);
+    }
 }
 
-fn list_item(item: &ListItem) -> String {
-    let prefix = match &item.marker {
-        Marker::Bullet => "- ".to_string(),
-        Marker::Number(n) => format!("{n}. "),
-    };
+fn push_list_item(out: &mut String, item: &ListItem) {
     let Some((first, rest)) = item.lines.split_first() else {
-        return String::new();
+        return;
     };
-    let mut head = Line {
+    let stripped = Line {
         inlines: strip_marker(first, item.marker_len),
-        ..first.clone()
+        y: first.y,
+        x: first.x,
+        end_x: first.end_x,
+        size: first.size,
     };
+    let mut head = &stripped;
     let mut rest = rest;
-    if line_text(&head).trim().is_empty() {
+    if head
+        .inlines
+        .iter()
+        .all(|inline| inline.text.trim().is_empty())
+    {
         if let Some((next, after)) = rest.split_first() {
-            head = next.clone();
+            head = next;
             rest = after;
         }
     }
-    let mut out = format!("{prefix}{}", emphasized(&head));
+    match &item.marker {
+        Marker::Bullet => out.push_str("- "),
+        Marker::Number(n) => {
+            let _ = write!(out, "{n}. ");
+        }
+    }
+    push_emphasized(out, head);
     for line in rest {
         out.push('\n');
-        out.push_str(&emphasized(line));
+        push_emphasized(out, line);
     }
-    out
 }
 
 /// `line`'s inlines with `chars` characters removed from the front — the
@@ -143,96 +175,117 @@ fn strip_marker(line: &Line, chars: usize) -> Vec<Inline> {
 /// and an evaluator reading a merged cell reads it off that attribute.
 ///
 /// Cells carry no emphasis. A table's markers are pure edit distance against
-/// ground truth that carries none, exactly as in a heading.
-fn table(rows: &[Vec<Cell>]) -> String {
+/// ground truth that carries none, exactly as in a heading. Amounts the
+/// producer split across cells rejoin first, on a copy of the rows.
+fn push_table(out: &mut String, rows: &[Vec<Cell>]) {
+    let mut rows = rows.to_vec();
+    crate::structure::tidy_amounts(&mut rows);
     if rows
         .iter()
         .flatten()
         .any(|cell| cell.colspan > 1 || cell.rowspan > 1)
     {
-        return html_table(rows);
+        push_html_table(out, &rows);
+        return;
     }
-    pipe_table(rows)
+    push_pipe_table(out, &rows);
 }
 
 /// GFM: the first row is the header, and the delimiter row that follows it
 /// carries one `---` per column.
-fn pipe_table(rows: &[Vec<Cell>]) -> String {
+fn push_pipe_table(out: &mut String, rows: &[Vec<Cell>]) {
     let Some((header, body)) = rows.split_first() else {
-        return String::new();
+        return;
     };
-    let mut out = pipe_row(header);
+    // One scratch string holds each cell's text in turn.
+    let mut text = String::new();
+    push_pipe_row(out, header, &mut text);
     out.push('\n');
-    out.push_str(&pipe_join(&vec!["---".to_string(); header.len()]));
+    out.push_str("| ");
+    for index in 0..header.len() {
+        if index > 0 {
+            out.push_str(" | ");
+        }
+        out.push_str("---");
+    }
+    out.push_str(" |");
     for row in body {
         out.push('\n');
-        out.push_str(&pipe_row(row));
+        push_pipe_row(out, row, &mut text);
     }
-    out
 }
 
-fn pipe_row(row: &[Cell]) -> String {
-    let cells: Vec<String> = row
-        .iter()
-        .map(|cell| cell_text(cell).replace('|', "\\|"))
-        .collect();
-    pipe_join(&cells)
-}
-
-fn pipe_join(cells: &[String]) -> String {
-    format!("| {} |", cells.join(" | "))
+/// `| a | b |`: each cell's trimmed text with its pipes escaped.
+fn push_pipe_row(out: &mut String, row: &[Cell], text: &mut String) {
+    out.push_str("| ");
+    for (index, cell) in row.iter().enumerate() {
+        if index > 0 {
+            out.push_str(" | ");
+        }
+        for (part, piece) in cell_text(cell, text).split('|').enumerate() {
+            if part > 0 {
+                out.push_str("\\|");
+            }
+            out.push_str(piece);
+        }
+    }
+    out.push_str(" |");
 }
 
 /// One row per line, so the block stays a readable HTML block: CommonMark
 /// ends one at a blank line, and blocks are joined by exactly one.
-fn html_table(rows: &[Vec<Cell>]) -> String {
-    let mut out = String::from("<table>");
+fn push_html_table(out: &mut String, rows: &[Vec<Cell>]) {
+    let mut text = String::new();
+    out.push_str("<table>");
     for row in rows {
         out.push_str("\n<tr>");
         for cell in row {
-            out.push_str(&html_cell(cell));
+            push_html_cell(out, cell, &mut text);
         }
         out.push_str("</tr>");
     }
     out.push_str("\n</table>");
-    out
 }
 
-fn html_cell(cell: &Cell) -> String {
-    let text = html_escape(&cell_text(cell));
-    let mut attributes = String::new();
+fn push_html_cell(out: &mut String, cell: &Cell, text: &mut String) {
+    out.push_str("<td");
     if cell.colspan > 1 {
-        attributes.push_str(&format!(" colspan=\"{}\"", cell.colspan));
+        let _ = write!(out, " colspan=\"{}\"", cell.colspan);
     }
     if cell.rowspan > 1 {
-        attributes.push_str(&format!(" rowspan=\"{}\"", cell.rowspan));
+        let _ = write!(out, " rowspan=\"{}\"", cell.rowspan);
     }
-    format!("<td{attributes}>{text}</td>")
+    out.push('>');
+    // The three characters that would otherwise open markup of their own.
+    for c in cell_text(cell, text).chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out.push_str("</td>");
 }
 
-/// The three characters that would otherwise open markup of their own.
-fn html_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// A cell's text, or the empty string for a cell nothing was drawn in.
-fn cell_text(cell: &Cell) -> String {
-    cell.line
-        .as_ref()
-        .map(|line| line_text(line).trim().to_string())
-        .unwrap_or_default()
+/// A cell's trimmed text, written into `text` and borrowed from it, or the
+/// empty string for a cell nothing was drawn in.
+fn cell_text<'t>(cell: &Cell, text: &'t mut String) -> &'t str {
+    text.clear();
+    if let Some(line) = &cell.line {
+        push_line(text, line);
+    }
+    text.trim()
 }
 
 /// A line with its emphasis markers. Line assembly already merged
 /// same-styled neighbours, so every inline is a maximal run.
-fn emphasized(line: &Line) -> String {
-    let mut out = String::new();
+fn push_emphasized(out: &mut String, line: &Line) {
+    let start = out.len();
     for inline in &line.inlines {
-        push_inline(&mut out, inline);
+        push_inline(out, inline);
     }
-    escape_leading_hash(out)
+    escape_leading_hash(out, start);
 }
 
 /// The run's text with its markers around the trimmed middle only, so a run
@@ -259,10 +312,17 @@ fn push_inline(out: &mut String, inline: &Inline) {
         (false, true) => "*",
         (false, false) => "",
     };
-    let text = inline.text.replace('|', "\\|");
+    // A run holding a pipe is escaped on a copy; the rest, nearly every
+    // run, is written as it is.
+    let escaped: std::borrow::Cow<str> = if inline.text.contains('|') {
+        inline.text.replace('|', "\\|").into()
+    } else {
+        inline.text.as_str().into()
+    };
+    let text: &str = &escaped;
     let trimmed = text.trim();
     if marker.is_empty() || !trimmed.chars().any(char::is_alphanumeric) {
-        out.push_str(&text);
+        out.push_str(text);
         return;
     }
     let lead = text.len() - text.trim_start().len();
@@ -296,13 +356,15 @@ fn push_code(out: &mut String, text: &str) {
     out.push_str(&text[tail..]);
 }
 
-/// A body line opening with `#` would read as a heading. Nothing else is
+/// A body line opening with `#` would read as a heading: the line written
+/// from `start` on gets a backslash before its first `#`. Nothing else is
 /// escaped: every escape costs edit distance against ground truth that
 /// carries none.
-fn escape_leading_hash(line: String) -> String {
+fn escape_leading_hash(out: &mut String, start: usize) {
+    let line = &out[start..];
     let indent = line.len() - line.trim_start().len();
     if !line[indent..].starts_with('#') {
-        return line;
+        return;
     }
-    format!("{}\\{}", &line[..indent], &line[indent..])
+    out.insert(start + indent, '\\');
 }
