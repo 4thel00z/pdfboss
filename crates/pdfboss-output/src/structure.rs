@@ -779,10 +779,14 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     let title = title_rows(groups, &band, stats);
     band.rows.drain(..title);
     band.span.start += title;
-    // What stands above and below the grid gets the same attempt: a page's
-    // second table is as much a table as its first, and the longest evenly
-    // pitched stretch of a run is not the only grid in it.
-    push_lane_blocks(&groups[..band.span.start], stats, out);
+    // What stands below the grid gets the same attempt, as do the lines of
+    // its own run the stretch trimmed off above it: a page's second table
+    // is as much a table as its first, and the longest evenly pitched
+    // stretch of a run is not the only grid in it. The lines above the run
+    // were tried as run starts already and are prose.
+    let above = band.run_start.min(band.span.start);
+    push_blocks(groups[..above].iter().map(assembled).collect(), stats, out);
+    push_lane_blocks(&groups[above..band.span.start], stats, out);
     out.push(Block::Table {
         bbox: table_bbox(&band.rows),
         rows: band.rows,
@@ -1883,11 +1887,16 @@ struct TableBand {
     /// The segment's groups the rows came from, so the caller lays out what
     /// stands above and below.
     span: std::ops::Range<usize>,
+    /// The first group of the lane run the band was cut from: the lines
+    /// above it were tried as run starts and failed, so only the run's own
+    /// trimmed lines get another attempt.
+    run_start: usize,
 }
 
 /// A lattice of drawn rulings: the x positions of its vertical lines and the
 /// y positions of its horizontal lines, ascending, joined by their crossings
 /// into one connected region. Built by [`ruled_grids`].
+#[derive(Clone)]
 struct RuledGrid {
     xs: Vec<f32>,
     ys: Vec<f32>,
@@ -3176,6 +3185,7 @@ fn grid(
     Some(TableBand {
         rows,
         span: stretch,
+        run_start: start,
     })
 }
 
