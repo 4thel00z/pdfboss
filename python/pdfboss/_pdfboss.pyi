@@ -411,6 +411,36 @@ class Document:
         """The developer extensions the catalog declares (ISO 32000-1
         7.12), sorted by prefix."""
 
+    def linearization(self) -> Linearization | None:
+        """The linearization parameter dictionary (ISO 32000-1 Annex F.3),
+        the first object of a linearized file, as written; ``None`` when
+        the file has none."""
+
+    def is_linearized(self) -> bool:
+        """Whether the file is linearized and its parameter dictionary
+        still describes it (ISO 32000-1 Annex F.3): a declared length
+        that no longer matches the file, after an appended update, makes
+        the file ordinary PDF."""
+
+    def output_intents(self) -> list[OutputIntent]:
+        """The output intents the catalog declares (ISO 32000-1 14.11.5),
+        in array order. Releases the GIL while they are read."""
+
+    def piece_info(self) -> list[PagePiece]:
+        """The page-piece data the catalog carries (ISO 32000-1 14.5), one
+        entry per product sorted by product name; ``Page.piece_info``
+        reads a page's. Releases the GIL."""
+
+    def articles(self) -> list[ArticleThread]:
+        """The article threads the catalog declares (ISO 32000-1 12.4.3),
+        each with its beads in reading order and their pages resolved to
+        0-based indices. Releases the GIL."""
+
+    def permission_handlers(self) -> PermissionHandlers | None:
+        """The catalog's permission handlers (ISO 32000-1 12.8.4), the
+        certifying and usage rights signatures read as data and not
+        verified; ``None`` without the dictionary."""
+
 class Page:
     """A single page of a document.
 
@@ -540,6 +570,32 @@ class Page:
         as in ``render``. Lenient like rendering: content that cannot be
         read or decoded contributes nothing rather than raising.
         """
+
+    def piece_info(self) -> list[PagePiece]:
+        """The page-piece data the page carries (ISO 32000-1 14.5), one
+        entry per product sorted by product name. Releases the GIL."""
+
+    def thumbnail(self) -> Thumbnail | None:
+        """The page's thumbnail image (ISO 32000-1 12.3.4) as written: its
+        size, bit depth, colour space and decode array; ``None`` for a
+        page without one. ``thumbnail_image`` decodes it. Releases the
+        GIL."""
+
+    def thumbnail_image(self, compression: str = "default") -> PageImage | None:
+        """The page's thumbnail (ISO 32000-1 12.3.4) decoded at its own
+        size and PNG-encoded; ``None`` for a page without one or whose
+        thumbnail will not decode. ``compression`` trades encode time
+        against size as in ``extract_images``. Releases the GIL."""
+
+    def beads(self) -> list[tuple[int, int]]:
+        """The beads of article threads on the page (ISO 32000-1 12.4.3)
+        as ``(num, gen)`` references, in the order written;
+        ``Document.articles`` reads the threads. Releases the GIL."""
+
+    def presentation(self) -> Presentation | None:
+        """How the page is shown in a presentation (ISO 32000-1 12.4.4),
+        its display duration and transition; ``None`` when the page sets
+        neither. Releases the GIL."""
 
 class PageImage:
     """One embedded image extracted from a page: PNG-encoded pixels at
@@ -724,6 +780,28 @@ class Signature:
     contact_info: str | None
     """How to contact the signer to verify the signature."""
 
+class DefaultAppearance:
+    """The parts of a default appearance string (ISO 32000-1 12.7.3.3)
+    that matter for drawing variable text: the font resource name and
+    size from ``Tf`` and the fill colour from ``g``, ``rg`` or ``k``."""
+
+    @staticmethod
+    def parse(da: str) -> "DefaultAppearance":
+        """Reads a default appearance string such as ``"/Helv 12 Tf 0
+        g"``; every part the string leaves out or fails to parse is
+        ``None``."""
+
+    font: str | None
+    """The font resource name ``Tf`` selects, without the slash."""
+
+    font_size: float | None
+    """The font size ``Tf`` sets; 0 asks the viewer to fit the text to the
+    field."""
+
+    fill_color: list[float] | None
+    """The fill colour components: one for ``g``, three for ``rg``, four
+    for ``k``."""
+
 class FormField:
     """One field of the interactive form (ISO 32000-1 12.7.3, Table 220)
     with the inheritable entries taken from the nearest ancestor that has
@@ -774,6 +852,26 @@ class FormField:
 
     default_value: object
     """The value a reset-form action restores, as plain Python data."""
+
+    default_appearance: str | None
+    """The default appearance string the field's variable text is drawn
+    with (ISO 32000-1 12.7.3.3), a content fragment such as ``"/Helv 0
+    Tf 0 g"``, as written: the field's own, its nearest ancestor's, or
+    the form's document-wide one. ``DefaultAppearance.parse`` reads it."""
+
+    quadding: Literal["left", "centered", "right"]
+    """The justification of the field's variable text (ISO 32000-1
+    12.7.3.3), inherited like ``default_appearance``; ``"left"`` when
+    nothing sets it."""
+
+    default_style: str | None
+    """The default style string of a rich text field (ISO 32000-1
+    12.7.3.4), a CSS fragment as written."""
+
+    rich_text: str | None
+    """The rich text value of a text field (ISO 32000-1 12.7.3.4), an
+    XHTML fragment; a value written as a stream is read into the
+    string."""
 
     max_len: int | None
     """The most characters a text field's text may hold."""
@@ -1012,6 +1110,197 @@ class DeveloperExtension:
     extension_level: int
     """The developer's extension level."""
 
+class Linearization:
+    """The linearization parameter dictionary (ISO 32000-1 Annex F.3,
+    Table F.1), the first object of a linearized file, as written;
+    returned by ``Document.linearization``."""
+
+    version: float
+    """The version of the linearization scheme, ``/Linearized``."""
+
+    file_length: int
+    """The file length the dictionary declares, ``/L``; a file whose real
+    length differs has been updated since and is ordinary PDF."""
+
+    hint_streams: list[tuple[int, int]]
+    """The ``(offset, length)`` of each hint stream, ``/H``."""
+
+    first_page_object: int
+    """The object number of the first page's page object, ``/O``."""
+
+    first_page_end: int
+    """The offset of the end of the first page, ``/E``."""
+
+    page_count: int
+    """The number of pages, ``/N``."""
+
+    main_xref_offset: int
+    """The offset of the main cross-reference table, ``/T``."""
+
+    first_page: int
+    """The 0-based index of the page a viewer opens first, ``/P``; 0 when
+    absent."""
+
+class OutputIntent:
+    """One output intent (ISO 32000-1 14.11.5, Table 365): the colour
+    characteristics of the device the document was prepared for;
+    returned by ``Document.output_intents``."""
+
+    subtype: str
+    """The intent's subtype, such as ``"GTS_PDFA1"`` or ``"GTS_PDFX"``."""
+
+    output_condition: str | None
+    """The human-readable name of the output condition."""
+
+    output_condition_identifier: str | None
+    """The registry's identifier of the output condition, or
+    ``"Custom"``."""
+
+    registry_name: str | None
+    """The URI of the registry the identifier comes from."""
+
+    info: str | None
+    """The human-readable description of the intended device."""
+
+    destination_profile: tuple[int, int] | None
+    """The ICC profile stream's ``(num, gen)`` reference."""
+
+class PagePiece:
+    """One product's private data in a page-piece dictionary (ISO 32000-1
+    14.5, Table 349); returned by ``Document.piece_info`` and
+    ``Page.piece_info``."""
+
+    product: str
+    """The name of the product that owns the data."""
+
+    last_modified: str | None
+    """When the product last changed the data, as an ISO 8601 string;
+    ``None`` when absent or unreadable."""
+
+    private: object
+    """The product's private data as plain Python data, as written;
+    ``None`` without any."""
+
+class Thumbnail:
+    """A page's thumbnail image (ISO 32000-1 12.3.4) as written; returned
+    by ``Page.thumbnail``, decoded by ``Page.thumbnail_image``."""
+
+    width: int
+    """The image width in samples."""
+
+    height: int
+    """The image height in samples."""
+
+    bits_per_component: int | None
+    """The bits per colour component."""
+
+    color_space: object
+    """The colour space as plain Python data: a name such as
+    ``"DeviceRGB"``, or an array; ``None`` when the image names none."""
+
+    decode: list[float] | None
+    """The decode array mapping sample values to colour components."""
+
+class Bead:
+    """One bead of an article thread (ISO 32000-1 12.4.3, Table 161): a
+    rectangle on a page."""
+
+    ref: tuple[int, int]
+    """The bead dictionary's ``(num, gen)`` reference."""
+
+    page: int | None
+    """The 0-based index of the page the bead is on; ``None`` when its
+    reference names no page of this document."""
+
+    page_ref: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the page the bead names, as
+    written."""
+
+    rect: tuple[float, float, float, float] | None
+    """The bead's rectangle on its page, ``(x0, y0, x1, y1)``."""
+
+class ArticleThread:
+    """One article thread (ISO 32000-1 12.4.3, Table 160): its information
+    dictionary and its beads in reading order; returned by
+    ``Document.articles``."""
+
+    ref: tuple[int, int] | None
+    """The thread dictionary's ``(num, gen)`` reference; ``None`` for a
+    thread written directly into the catalog's array."""
+
+    info: dict[str, str]
+    """The thread's information dictionary with the keys of
+    ``Document.metadata``; only the entries present are included."""
+
+    beads: list[Bead]
+    """The beads in reading order, from the first bead along each
+    ``/N``."""
+
+class Transition:
+    """A page's transition in a presentation (ISO 32000-1 12.4.4, Table
+    162), with the table's defaults filled in for the entries the page
+    leaves out."""
+
+    style: Literal[
+        "split",
+        "blinds",
+        "box",
+        "wipe",
+        "dissolve",
+        "glitter",
+        "replace",
+        "fly",
+        "push",
+        "cover",
+        "uncover",
+        "fade",
+    ]
+    """The transition style; ``"replace"`` when absent."""
+
+    duration: float
+    """The effect's duration in seconds; 1 when absent."""
+
+    dimension: Literal["horizontal", "vertical"]
+    """The dimension a split or blinds effect moves in."""
+
+    motion: Literal["inward", "outward"]
+    """The direction of motion of a split or box effect."""
+
+    direction: int | None
+    """The direction of motion in degrees counterclockwise from left to
+    right; ``None`` when the page names no direction, ``/None``."""
+
+    scale: float
+    """The starting or ending scale of a fly effect."""
+
+    opaque: bool
+    """Whether a fly effect's area is rectangular and opaque."""
+
+class Presentation:
+    """How a page is shown in a presentation (ISO 32000-1 12.4.4): its
+    display duration and its transition; returned by
+    ``Page.presentation``."""
+
+    duration: float | None
+    """How long the page is displayed in seconds before the presentation
+    advances; ``None`` when the page sets no duration."""
+
+    transition: Transition | None
+    """The transition the page is reached through; ``None`` when the page
+    sets none."""
+
+class PermissionHandlers:
+    """The catalog's permission handlers (ISO 32000-1 12.8.4, Table 258):
+    the signatures that certify the document and grant usage rights,
+    read as data and not verified; returned by
+    ``Document.permission_handlers``."""
+
+    doc_mdp: Signature | None
+    """The certifying signature, ``/DocMDP``; ``None`` without one."""
+
+    usage_rights: Signature | None
+    """The usage rights signature, ``/UR3``; ``None`` without one."""
+
 class AsyncDocument:
     """A PDF document opened for async I/O.
 
@@ -1164,6 +1453,30 @@ class AsyncDocument:
         """The developer extensions, the async twin of
         ``Document.extensions``."""
 
+    def linearization(self) -> Linearization | None:
+        """The linearization parameter dictionary, as
+        ``Document.linearization``; plain, not a coroutine: the file head
+        was read at open."""
+
+    def is_linearized(self) -> bool:
+        """Whether the file is linearized, as ``Document.is_linearized``;
+        plain, not a coroutine."""
+
+    async def output_intents(self) -> list[OutputIntent]:
+        """The output intents, the async twin of
+        ``Document.output_intents``."""
+
+    async def piece_info(self) -> list[PagePiece]:
+        """The catalog's page-piece data, the async twin of
+        ``Document.piece_info``."""
+
+    async def articles(self) -> list[ArticleThread]:
+        """The article threads, the async twin of ``Document.articles``."""
+
+    async def permission_handlers(self) -> PermissionHandlers | None:
+        """The permission handlers, the async twin of
+        ``Document.permission_handlers``."""
+
 class AsyncPage:
     """A single page of an async document.
 
@@ -1259,6 +1572,24 @@ class AsyncPage:
         """Every image the page draws, as PNG-encoded ``PageImage``
         entries — the async twin of ``Page.extract_images``, with the
         same drawing-order, native-size and leniency semantics."""
+
+    async def piece_info(self) -> list[PagePiece]:
+        """The page's page-piece data, the async twin of
+        ``Page.piece_info``."""
+
+    async def thumbnail(self) -> Thumbnail | None:
+        """The thumbnail as written, the async twin of ``Page.thumbnail``."""
+
+    async def thumbnail_image(self, compression: str = "default") -> PageImage | None:
+        """The decoded thumbnail, the async twin of
+        ``Page.thumbnail_image``."""
+
+    async def beads(self) -> list[tuple[int, int]]:
+        """The beads on the page, the async twin of ``Page.beads``."""
+
+    async def presentation(self) -> Presentation | None:
+        """The presentation entries, the async twin of
+        ``Page.presentation``."""
 
 def md_to_pdf(
     markdown: str,

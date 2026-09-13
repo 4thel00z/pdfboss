@@ -32,6 +32,7 @@ use pdfboss_render::RenderCache;
 use pdfboss_text::{FontCache, TextSpan};
 
 mod catalog;
+mod document;
 mod forms;
 mod write;
 
@@ -207,6 +208,12 @@ pub(crate) fn repr_opt_str(value: Option<&str>) -> String {
 /// An optional number as Python's `repr` writes it.
 pub(crate) fn repr_opt<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "None".to_owned(), |value| value.to_string())
+}
+
+/// An optional float, or list of floats, as Python's `repr` writes it:
+/// `5.0` rather than `5`, `[1.0, 0.0]` rather than `[1, 0]`.
+pub(crate) fn repr_opt_float<T: std::fmt::Debug>(value: Option<T>) -> String {
+    value.map_or_else(|| "None".to_owned(), |value| format!("{value:?}"))
 }
 
 /// A bool as Python's `repr` writes it.
@@ -845,6 +852,64 @@ impl Document {
             .map(catalog::DeveloperExtension::from)
             .collect()
     }
+
+    /// The linearization parameter dictionary, the first object of a
+    /// linearized file, as written; `None` when the file has none.
+    fn linearization(&self) -> Option<document::Linearization> {
+        self.inner
+            .lock()
+            .linearization()
+            .map(document::Linearization::from)
+    }
+
+    /// Whether the file is linearized and its parameter dictionary still
+    /// describes it: a stale declared length after an appended update
+    /// makes the file ordinary PDF.
+    fn is_linearized(&self) -> bool {
+        self.inner.lock().is_linearized()
+    }
+
+    /// The output intents the catalog declares, in array order. Releases
+    /// the GIL while they are read.
+    fn output_intents(&self, py: Python<'_>) -> Vec<document::OutputIntent> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || inner.lock().output_intents())
+            .into_iter()
+            .map(document::OutputIntent::from)
+            .collect()
+    }
+
+    /// The page-piece data the catalog carries, one entry per product
+    /// sorted by product name; `Page.piece_info` reads a page's. Releases
+    /// the GIL while it is read.
+    fn piece_info(&self, py: Python<'_>) -> Vec<document::PagePiece> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || inner.lock().piece_info())
+            .into_iter()
+            .map(document::PagePiece::from)
+            .collect()
+    }
+
+    /// The article threads the catalog declares, each with its beads in
+    /// reading order and their pages resolved to 0-based indices.
+    /// Releases the GIL while they are read.
+    fn articles(&self, py: Python<'_>) -> Vec<document::ArticleThread> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || {
+            let doc = inner.lock();
+            let pages = page_index_of(&doc);
+            document::article_threads(doc.articles(), &pages)
+        })
+    }
+
+    /// The catalog's permission handlers, the certifying and usage
+    /// rights signatures read as data; `None` without the dictionary.
+    fn permission_handlers(&self) -> Option<document::PermissionHandlers> {
+        self.inner
+            .lock()
+            .permission_handlers()
+            .map(document::PermissionHandlers::from)
+    }
 }
 
 impl Document {
@@ -1159,6 +1224,72 @@ impl Page {
             encode_page_images(pixmaps, compression)
         })?;
         page_images_from(py, rows)
+    }
+
+    /// The page-piece data the page carries, one entry per product sorted
+    /// by product name. Releases the GIL.
+    fn piece_info(&self, py: Python<'_>) -> Vec<document::PagePiece> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            doc.page_piece_info(&self.page)
+        })
+        .into_iter()
+        .map(document::PagePiece::from)
+        .collect()
+    }
+
+    /// The page's thumbnail image as written: its size, bit depth, colour
+    /// space and decode array; `None` for a page without one.
+    /// `thumbnail_image` decodes it. Releases the GIL.
+    fn thumbnail(&self, py: Python<'_>) -> Option<document::Thumbnail> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            doc.thumbnail(&self.page)
+        })
+        .map(document::Thumbnail::from)
+    }
+
+    /// The page's thumbnail decoded at its own size and PNG-encoded;
+    /// `None` for a page without one or whose thumbnail will not decode.
+    /// `compression` trades encode time against size as in
+    /// `extract_images`. Releases the GIL.
+    #[pyo3(signature = (compression="default"))]
+    fn thumbnail_image(
+        &self,
+        py: Python<'_>,
+        compression: &str,
+    ) -> PyResult<Option<Py<PageImage>>> {
+        let compression = png_compression_from_str(compression)?;
+        let rows = py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            let pixmaps = pdfboss_render::page_thumbnail(&doc, &self.page)
+                .into_iter()
+                .collect();
+            encode_page_images(pixmaps, compression)
+        })?;
+        Ok(page_images_from(py, rows)?.pop())
+    }
+
+    /// The beads of article threads on the page as `(num, gen)`
+    /// references, in the order written. Releases the GIL.
+    fn beads(&self, py: Python<'_>) -> Vec<(u32, u16)> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            doc.page_beads(&self.page)
+        })
+        .into_iter()
+        .map(ref_tuple)
+        .collect()
+    }
+
+    /// How the page is shown in a presentation, its display duration and
+    /// transition; `None` when the page sets neither. Releases the GIL.
+    fn presentation(&self, py: Python<'_>) -> Option<document::Presentation> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            doc.presentation(&self.page)
+        })
+        .map(document::Presentation::from)
     }
 }
 
@@ -2131,6 +2262,64 @@ impl AsyncDocument {
             )
         })
     }
+
+    /// The linearization parameter dictionary, as `Document.linearization`;
+    /// plain, not a coroutine: the file head was read at open.
+    fn linearization(&self) -> Option<document::Linearization> {
+        self.inner
+            .linearization()
+            .map(document::Linearization::from)
+    }
+
+    /// Whether the file is linearized, as `Document.is_linearized`; plain,
+    /// not a coroutine.
+    fn is_linearized(&self) -> bool {
+        self.inner.is_linearized()
+    }
+
+    fn output_intents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let intents = inner.output_intents().await;
+            Ok::<Vec<document::OutputIntent>, PyErr>(
+                intents
+                    .into_iter()
+                    .map(document::OutputIntent::from)
+                    .collect(),
+            )
+        })
+    }
+
+    fn piece_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pieces = inner.piece_info().await;
+            Ok::<Vec<document::PagePiece>, PyErr>(
+                pieces.into_iter().map(document::PagePiece::from).collect(),
+            )
+        })
+    }
+
+    fn articles<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&inner);
+            let threads = inner.articles().await;
+            Ok::<Vec<document::ArticleThread>, PyErr>(document::article_threads(threads, &pages))
+        })
+    }
+
+    fn permission_handlers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<document::PermissionHandlers>, PyErr>(
+                inner
+                    .permission_handlers()
+                    .await
+                    .map(document::PermissionHandlers::from),
+            )
+        })
+    }
 }
 
 /// A single page of an async document. Attributes are synchronous — the
@@ -2356,6 +2545,69 @@ impl AsyncPage {
             Python::with_gil(|py| page_images_from(py, rows))
         })
     }
+
+    fn piece_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pieces = doc.page_piece_info(&page).await;
+            Ok::<Vec<document::PagePiece>, PyErr>(
+                pieces.into_iter().map(document::PagePiece::from).collect(),
+            )
+        })
+    }
+
+    fn thumbnail<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<document::Thumbnail>, PyErr>(
+                doc.thumbnail(&page).await.map(document::Thumbnail::from),
+            )
+        })
+    }
+
+    #[pyo3(signature = (compression="default"))]
+    fn thumbnail_image<'py>(
+        &self,
+        py: Python<'py>,
+        compression: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let compression = png_compression_from_str(compression)?;
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pixmaps = pdfboss_render::page_thumbnail_with(doc, &page)
+                .await
+                .into_iter()
+                .collect();
+            let rows = encode_page_images(pixmaps, compression)?;
+            Python::with_gil(|py| {
+                Ok::<Option<Py<PageImage>>, PyErr>(page_images_from(py, rows)?.pop())
+            })
+        })
+    }
+
+    fn beads<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let beads = doc.page_beads(&page).await;
+            Ok::<Vec<(u32, u16)>, PyErr>(beads.into_iter().map(ref_tuple).collect())
+        })
+    }
+
+    fn presentation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<document::Presentation>, PyErr>(
+                doc.presentation(&page)
+                    .await
+                    .map(document::Presentation::from),
+            )
+        })
+    }
 }
 
 /// Async iterator over a document's elements, returned by
@@ -2532,6 +2784,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
     forms::register(m)?;
     catalog::register(m)?;
+    document::register(m)?;
     write::register(m.py(), m)?;
     Ok(())
 }
@@ -2593,6 +2846,16 @@ mod tests {
         assert_send_sync::<super::Span>();
         assert_send_sync::<super::SpanIter>();
         assert_send_sync::<super::AsyncSpanIter>();
+        assert_send_sync::<super::document::Linearization>();
+        assert_send_sync::<super::document::OutputIntent>();
+        assert_send_sync::<super::document::PagePiece>();
+        assert_send_sync::<super::document::Thumbnail>();
+        assert_send_sync::<super::document::Bead>();
+        assert_send_sync::<super::document::ArticleThread>();
+        assert_send_sync::<super::document::Transition>();
+        assert_send_sync::<super::document::Presentation>();
+        assert_send_sync::<super::document::PermissionHandlers>();
+        assert_send_sync::<super::forms::DefaultAppearance>();
     }
 
     #[test]
