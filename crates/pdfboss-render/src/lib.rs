@@ -432,6 +432,10 @@ pub enum SkippedKind {
     /// joined the clipping path. They do now, so no render produces this
     /// kind any more; it stays so callers matching on it keep compiling.
     TextClip,
+    /// A transparency group XObject with `/K true` painted as an ordinary
+    /// (non-knockout) group: its members composite over each other
+    /// instead of replacing each other's contribution.
+    Knockout,
 }
 
 impl SkippedKind {
@@ -462,6 +466,8 @@ impl SkippedKind {
             SkippedKind::Glyph => "glyphs",
             SkippedKind::TextClip if one => "text clip",
             SkippedKind::TextClip => "text clips",
+            SkippedKind::Knockout if one => "knockout group",
+            SkippedKind::Knockout => "knockout groups",
         }
     }
 }
