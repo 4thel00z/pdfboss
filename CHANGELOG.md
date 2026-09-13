@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.5.0](https://github.com/4thel00z/pdfboss/compare/v2.4.0...v2.5.0) (2026-09-13)
+
+
+### Features
+
+* **py:** document and page structure readers in the Python bindings ([#189](https://github.com/4thel00z/pdfboss/issues/189)) ([14955be](https://github.com/4thel00z/pdfboss/commit/14955beb35e1d57cbc44654c90186a5519baa838))
+
+
+### Bug Fixes
+
+* **render:** composite transparency group XObjects as one object ([#190](https://github.com/4thel00z/pdfboss/issues/190)) ([51748fe](https://github.com/4thel00z/pdfboss/commit/51748fec35a0f3b0f8fa8c59e08aff57d3563fd4))
+
 ## [2.4.0](https://github.com/4thel00z/pdfboss/compare/v2.3.0...v2.4.0) (2026-09-11)
 
 
