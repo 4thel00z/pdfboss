@@ -22,8 +22,8 @@ use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
 use crate::raster::{
-    capture_spans, composite_group, fill_path, fill_spans, BlendMode, FillRule, Mask,
-    RasterScratch, SpanSet,
+    capture_spans, composite_group, copy_region, fill_path, fill_spans, mix_group, BlendMode,
+    FillRule, Mask, RasterScratch, SpanSet,
 };
 use crate::shading::{load_functions, Functions, Shading, MAX_COMPS};
 use crate::stroke::{stroke_path, LineCap, LineJoin, StrokeStyle};
@@ -862,6 +862,13 @@ struct PlacedOutline {
     at: (f32, f32),
 }
 
+/// The `/I` and `/K` flags of a transparency group attributes dictionary
+/// (ISO 32000-1 §11.6.6, Table 147).
+struct GroupAttrs {
+    isolated: bool,
+    knockout: bool,
+}
+
 /// What kind of content stream a [`Frame`] is running, and therefore what
 /// its pop restores.
 ///
@@ -896,17 +903,21 @@ enum FrameKind {
         transfer: Option<Box<[u8; 256]>>,
     },
     /// A transparency group XObject (`/Group /S /Transparency`, §11.6.6).
-    /// Its content paints offscreen onto a transparent backdrop, from a
-    /// graphics state whose constant alphas are 1, blend mode Normal and
-    /// soft mask none; the pop swaps the page back and composites the
-    /// group once, as a single object, with the alpha, blend mode and soft
-    /// mask that were in force at its `Do` (§11.6.4.4). Rendering onto a
-    /// transparent backdrop is the isolated (`/I true`) behaviour; a
-    /// non-isolated group differs only under non-Normal blend modes inside
-    /// it, and `/K true` (knockout) is not honoured and is reported.
+    /// Its content paints offscreen from a graphics state whose constant
+    /// alphas are 1, blend mode Normal and soft mask none; the pop swaps
+    /// the page back and composites the group once, as a single object,
+    /// with the alpha, blend mode and soft mask that were in force at its
+    /// `Do` (§11.6.4.4). An isolated group paints onto a transparent
+    /// backdrop; a non-isolated one onto a copy of the page it sits on, so
+    /// blend modes inside it see the real backdrop (§11.4.7). `/K true`
+    /// (knockout) is not honoured and is reported.
     TransparencyGroup {
         /// The real page while the group paints; `None` until first entry.
         saved: Option<Pixmap>,
+        /// Whether the group starts from a transparent backdrop: `/I true`,
+        /// or a non-Normal blend mode at the `Do`, whose group compositing
+        /// needs the group's own alpha and so its isolated render.
+        isolated: bool,
         /// The nonstroking constant alpha at the `Do`.
         alpha: f32,
         /// The blend mode at the `Do`.
@@ -981,10 +992,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // (an annotation appearance) is covered too.
             if let FrameKind::TransparencyGroup {
                 saved: saved @ None,
+                isolated,
+                region,
                 ..
             } = &mut frame.kind
             {
                 let mut offscreen = Pixmap::new(self.pix.width, self.pix.height);
+                if !*isolated {
+                    copy_region(&mut offscreen, &self.pix, region.as_deref());
+                }
                 std::mem::swap(&mut self.pix, &mut offscreen);
                 *saved = Some(offscreen);
             }
@@ -1332,6 +1348,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 }
                 FrameKind::TransparencyGroup {
                     saved: Some(mut saved),
+                    isolated,
                     alpha,
                     blend,
                     soft_mask,
@@ -1339,14 +1356,24 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 } => {
                     std::mem::swap(&mut self.pix, &mut saved);
                     // `saved` now holds the group's own render.
-                    composite_group(
-                        &mut self.pix,
-                        &saved,
-                        alpha,
-                        blend,
-                        soft_mask.as_deref(),
-                        region.as_deref(),
-                    );
+                    if isolated {
+                        composite_group(
+                            &mut self.pix,
+                            &saved,
+                            alpha,
+                            blend,
+                            soft_mask.as_deref(),
+                            region.as_deref(),
+                        );
+                    } else {
+                        mix_group(
+                            &mut self.pix,
+                            &saved,
+                            alpha,
+                            soft_mask.as_deref(),
+                            region.as_deref(),
+                        );
+                    }
                 }
                 FrameKind::SoftMaskGroup { saved: None, .. }
                 | FrameKind::TransparencyGroup { saved: None, .. }
@@ -3536,6 +3563,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         let mut pb = PathBuilder::new(ctm);
         pb.rect(bx0, by0, bx1 - bx0, by1 - by0);
         gs.clip = Some(self.rasterize_clip(&pb.finish(), FillRule::NonZero));
+        let kind = self.group_kind(&stream.dict, &mut gs).await;
 
         let own_res = match stream.dict.get("Resources") {
             Some(o) => match self.src.resolve(o).await {
@@ -3549,13 +3577,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             inner_chain.push(Arc::new(d));
         }
         inner_chain.extend_from_slice(chain);
-        Some(Frame::new(
-            ops.into(),
-            inner_chain,
-            gs,
-            0,
-            FrameKind::PageOrForm,
-        ))
+        Some(Frame::new(ops.into(), inner_chain, gs, 0, kind))
     }
 
     /// Paints the `sh` operator (§8.7.4.2): the named shading fills the
@@ -3710,14 +3732,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     ///
     /// Covers ISO 32000-1 §11.6.6 and §11.6.4.4.
     async fn group_kind(&mut self, dict: &Dict, inner: &mut GState) -> FrameKind {
-        let Some(knockout) = self.transparency_group(dict).await else {
+        let Some(group) = self.transparency_group(dict).await else {
             return FrameKind::PageOrForm;
         };
-        if knockout {
+        if group.knockout {
             self.skip(SkippedKind::Knockout, SkipReason::Unsupported);
         }
         let kind = FrameKind::TransparencyGroup {
             saved: None,
+            isolated: group.isolated || inner.blend_mode != BlendMode::Normal,
             alpha: inner.fill_alpha,
             blend: inner.blend_mode,
             soft_mask: inner.soft_mask.take(),
@@ -3730,11 +3753,11 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     }
 
     /// Whether the form's `/Group` names a transparency group, and if so
-    /// whether it asks for knockout (`/K true`). Every entry may be
-    /// indirect.
+    /// its `/I` and `/K` flags (false when absent or unreadable). Every
+    /// entry may be indirect.
     ///
     /// Covers ISO 32000-1 §11.6.6.
-    async fn transparency_group(&self, dict: &Dict) -> Option<bool> {
+    async fn transparency_group(&self, dict: &Dict) -> Option<GroupAttrs> {
         let Ok(Object::Dict(group)) = self.src.resolve(dict.get("Group")?).await else {
             return None;
         };
@@ -3742,11 +3765,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         if subtype.as_name()?.0 != "Transparency" {
             return None;
         }
-        let knockout = match group.get("K") {
-            Some(k) => self.src.resolve(k).await.ok()?.as_bool() == Some(true),
+        Some(GroupAttrs {
+            isolated: self.group_flag(&group, "I").await,
+            knockout: self.group_flag(&group, "K").await,
+        })
+    }
+
+    /// A boolean entry of a group attributes dictionary, false unless it
+    /// resolves to `true`.
+    async fn group_flag(&self, group: &Dict, key: &str) -> bool {
+        match group.get(key) {
+            Some(flag) => matches!(self.src.resolve(flag).await, Ok(Object::Bool(true))),
             None => false,
-        };
-        Some(knockout)
+        }
     }
 
     /// Records one piece of content this render could not reproduce.
@@ -6949,12 +6980,79 @@ mod tests {
         });
         let (pix, report) = render_reporting(bytes);
         assert!(report.is_empty(), "{:?}", report.warnings());
-        assert_eq!(px(&pix, 50, 50), [191, 191, 191, 255]);
+        let [r, g, b, a] = px(&pix, 50, 50);
+        assert!((191..=192).contains(&r), "red {r}");
+        assert_eq!([g, b, a], [r, r, 255]);
+    }
+
+    /// A non-isolated group blends against the page it sits on: a Multiply
+    /// inside it over the page's blue paints black. An isolated group
+    /// starts from a transparent backdrop and passes the yellow through.
+    // Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.3.5.
+    #[test]
+    fn non_isolated_group_blends_with_the_page_and_isolated_does_not() {
+        let doc = |group: &str| {
+            small_doc(
+                "/XObject << /Fx 5 0 R >>",
+                b"0 0 1 rg 0 0 100 100 re f /Fx Do",
+                |b| {
+                    b.stream(
+                        5,
+                        &format!(
+                            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                             /Group << /S /Transparency {group} >> \
+                             /Resources << /ExtGState << /GM << /BM /Multiply >> >> >>"
+                        ),
+                        b"/GM gs 1 1 0 rg 0 0 100 100 re f",
+                    );
+                },
+            )
+        };
+        let (pix, report) = render_reporting(doc(""));
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), BLACK, "multiplied against the page");
+        let (pix, report) = render_reporting(doc("/I true"));
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(
+            px(&pix, 50, 50),
+            [255, 255, 0, 255],
+            "nothing to multiply against"
+        );
+    }
+
+    /// An annotation appearance stream with `/Group` is a transparency
+    /// group too, non-isolated over the page: its Multiply sees the page.
+    // Covers ISO 32000-1 §11.6.6 and §12.5.5.
+    #[test]
+    fn annotation_appearance_group_blends_with_the_page() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Contents 4 0 R /Annots [10 0 R] >>",
+        );
+        b.stream(4, "", b"0 0 1 rg 0 0 100 100 re f");
+        b.object(
+            10,
+            "<< /Type /Annot /Subtype /Stamp /Rect [0 0 100 100] /AP << /N 20 0 R >> >>",
+        );
+        b.stream(
+            20,
+            "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+             /Group << /S /Transparency >> \
+             /Resources << /ExtGState << /GM << /BM /Multiply >> >> >>",
+            b"/GM gs 1 1 0 rg 0 0 100 100 re f",
+        );
+        let (pix, report) = render_reporting(b.build(1));
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), BLACK);
     }
 
     /// `/K true` is not implemented: the group paints as a plain group and
-    /// the report says so. `/I true` is exact here (the group renders onto
-    /// a transparent backdrop) and reports nothing.
+    /// the report says so. `/I true` is exact (the group renders onto a
+    /// transparent backdrop) and reports nothing.
     // Covers ISO 32000-1 §11.6.6.
     #[test]
     fn knockout_group_reports_and_isolated_group_does_not() {

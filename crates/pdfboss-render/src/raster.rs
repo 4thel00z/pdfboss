@@ -1239,12 +1239,12 @@ fn blended(blend: BlendMode, dst: &[u8], rgb: [u8; 3]) -> [u8; 3] {
     [mix(rgb[0], b[0]), mix(rgb[1], b[1]), mix(rgb[2], b[2])]
 }
 
-/// Composites a transparency group's offscreen render `src` onto `dst` as
-/// one object: each group pixel's alpha, scaled by the constant `alpha`
-/// and the `soft_mask` coverage, is the source alpha, and its color blends
-/// against the backdrop through `blend`. Only `region`'s bounding box is
-/// visited (the group's clip: it painted nowhere else); `None` is the
-/// whole page.
+/// Composites an isolated transparency group's offscreen render `src`
+/// onto `dst` as one object: each group pixel's alpha, scaled by the
+/// constant `alpha` and the `soft_mask` coverage, is the source alpha, and
+/// its color blends against the backdrop through `blend`. Only `region`'s
+/// bounding box is visited (the group's clip: it painted nowhere else);
+/// `None` is the whole page.
 ///
 /// Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.6.4.4.
 pub(crate) fn composite_group(
@@ -1263,14 +1263,9 @@ pub(crate) fn composite_group(
     if alpha <= 0.0 {
         return;
     }
-    let (x0, y0, x1, y1) = match region {
-        Some(m) => (m.x0, m.y0, m.x0 + m.bbox_w, m.y0 + m.bbox_h),
-        None => (0, 0, dst.width, dst.height),
-    };
-    let (x1, y1) = (x1.min(dst.width), y1.min(dst.height));
-    if x1 <= x0 || y1 <= y0 {
+    let Some((x0, y0, x1, y1)) = region_bounds(dst, region) else {
         return;
-    }
+    };
     let stride = dst.width as usize;
     for y in y0..y1 {
         let row = y as usize * stride;
@@ -1296,6 +1291,102 @@ pub(crate) fn composite_group(
             composite_over(d, rgb, a);
         }
     }
+}
+
+/// Composites a non-isolated transparency group rendered over a copy of
+/// its backdrop (see [`copy_region`]) back onto that backdrop `dst`. With
+/// the backdrop's contribution removed and the group re-composited at the
+/// constant `alpha` (§11.4.7), the result reduces to a mix of backdrop and
+/// group render weighted by `alpha` and the `soft_mask` coverage: a pixel
+/// the group never touched is unchanged, and a Normal outer blend mode is
+/// assumed. Only `region`'s bounding box is visited.
+///
+/// Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.6.4.4.
+pub(crate) fn mix_group(
+    dst: &mut Pixmap,
+    src: &Pixmap,
+    alpha: f32,
+    soft_mask: Option<&Mask>,
+    region: Option<&Mask>,
+) {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if alpha <= 0.0 {
+        return;
+    }
+    let Some((x0, y0, x1, y1)) = region_bounds(dst, region) else {
+        return;
+    };
+    let stride = dst.width as usize;
+    for y in y0..y1 {
+        let row = y as usize * stride;
+        for x in x0..x1 {
+            let i = (row + x as usize) * 4;
+            let s = &src.data[i..i + 4];
+            let d = &mut dst.data[i..i + 4];
+            if s == d {
+                continue;
+            }
+            let cover = match soft_mask {
+                Some(m) => UNIT[m.coverage(x, y) as usize],
+                None => 1.0,
+            };
+            let w = alpha * cover;
+            if w <= 0.0 {
+                continue;
+            }
+            if w >= 1.0 {
+                d.copy_from_slice(s);
+                continue;
+            }
+            let (da, sa) = (UNIT[d[3] as usize], UNIT[s[3] as usize]);
+            let oa = da + (sa - da) * w;
+            if oa <= 0.0 {
+                d.copy_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            for c in 0..3 {
+                let pd = d[c] as f32 * da;
+                let ps = s[c] as f32 * sa;
+                d[c] = ((pd + (ps - pd) * w) / oa + 0.5) as u8;
+            }
+            d[3] = (oa * 255.0 + 0.5) as u8;
+        }
+    }
+}
+
+/// Copies `region`'s bounding box of `src` into `dst` (the whole page for
+/// `None`): the backdrop a non-isolated group starts from.
+///
+/// Covers ISO 32000-1 §11.4.7.
+pub(crate) fn copy_region(dst: &mut Pixmap, src: &Pixmap, region: Option<&Mask>) {
+    let Some((x0, y0, x1, y1)) = region_bounds(dst, region) else {
+        return;
+    };
+    let stride = dst.width as usize * 4;
+    for y in y0..y1 {
+        let from = y as usize * stride + x0 as usize * 4;
+        let to = y as usize * stride + x1 as usize * 4;
+        dst.data[from..to].copy_from_slice(&src.data[from..to]);
+    }
+}
+
+/// The device-pixel box `[x0, x1) x [y0, y1)` a group composite visits:
+/// the clip mask's stored bbox clamped to the page, or the whole page
+/// without a mask; `None` when nothing is inside.
+fn region_bounds(pix: &Pixmap, region: Option<&Mask>) -> Option<(u32, u32, u32, u32)> {
+    let (x0, y0, x1, y1) = match region {
+        Some(m) => (m.x0, m.y0, m.x0 + m.bbox_w, m.y0 + m.bbox_h),
+        None => (0, 0, pix.width, pix.height),
+    };
+    let (x1, y1) = (x1.min(pix.width), y1.min(pix.height));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    Some((x0, y0, x1, y1))
 }
 
 #[cfg(test)]
