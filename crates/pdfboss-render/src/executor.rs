@@ -22,7 +22,8 @@ use crate::glyph::{GlyphFallback, GlyphFont};
 use crate::image::{self, DrawParams};
 use crate::path::{PathBuilder, Subpath};
 use crate::raster::{
-    capture_spans, fill_path, fill_spans, BlendMode, FillRule, Mask, RasterScratch, SpanSet,
+    capture_spans, composite_group, fill_path, fill_spans, BlendMode, FillRule, Mask,
+    RasterScratch, SpanSet,
 };
 use crate::shading::{load_functions, Functions, Shading, MAX_COMPS};
 use crate::stroke::{stroke_path, LineCap, LineJoin, StrokeStyle};
@@ -894,6 +895,28 @@ enum FrameKind {
         /// remaps every mask byte through; `None` is identity.
         transfer: Option<Box<[u8; 256]>>,
     },
+    /// A transparency group XObject (`/Group /S /Transparency`, §11.6.6).
+    /// Its content paints offscreen onto a transparent backdrop, from a
+    /// graphics state whose constant alphas are 1, blend mode Normal and
+    /// soft mask none; the pop swaps the page back and composites the
+    /// group once, as a single object, with the alpha, blend mode and soft
+    /// mask that were in force at its `Do` (§11.6.4.4). Rendering onto a
+    /// transparent backdrop is the isolated (`/I true`) behaviour; a
+    /// non-isolated group differs only under non-Normal blend modes inside
+    /// it, and `/K true` (knockout) is not honoured and is reported.
+    TransparencyGroup {
+        /// The real page while the group paints; `None` until first entry.
+        saved: Option<Pixmap>,
+        /// The nonstroking constant alpha at the `Do`.
+        alpha: f32,
+        /// The blend mode at the `Do`.
+        blend: BlendMode,
+        /// The graphics-state soft mask at the `Do`.
+        soft_mask: Option<Arc<Mask>>,
+        /// The group's clip (`/BBox` under the invoking clip): the only
+        /// region the group can have painted, so the only one composited.
+        region: Option<Arc<Mask>>,
+    },
 }
 
 impl Frame {
@@ -951,6 +974,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     async fn run(&mut self, root: Frame) {
         let mut frames = vec![root];
         'frames: while let Some(mut frame) = frames.pop() {
+            // A transparency group entered for the first time swaps the
+            // page out for a transparent buffer; `saved` stays `Some` for
+            // the rest of the frame's life, however often a child suspends
+            // it. Keyed here rather than at any push site so a group root
+            // (an annotation appearance) is covered too.
+            if let FrameKind::TransparencyGroup {
+                saved: saved @ None,
+                ..
+            } = &mut frame.kind
+            {
+                let mut offscreen = Pixmap::new(self.pix.width, self.pix.height);
+                std::mem::swap(&mut self.pix, &mut offscreen);
+                *saved = Some(offscreen);
+            }
             // A planned soft-mask group renders offscreen before the next
             // operator: swap the page out, let the group paint onto its
             // backdrop, and let the group frame's pop swap it back and
@@ -1293,7 +1330,27 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                         parent.gs.soft_mask = Some(Arc::new(mask));
                     }
                 }
-                FrameKind::SoftMaskGroup { saved: None, .. } | FrameKind::PageOrForm => {}
+                FrameKind::TransparencyGroup {
+                    saved: Some(mut saved),
+                    alpha,
+                    blend,
+                    soft_mask,
+                    region,
+                } => {
+                    std::mem::swap(&mut self.pix, &mut saved);
+                    // `saved` now holds the group's own render.
+                    composite_group(
+                        &mut self.pix,
+                        &saved,
+                        alpha,
+                        blend,
+                        soft_mask.as_deref(),
+                        region.as_deref(),
+                    );
+                }
+                FrameKind::SoftMaskGroup { saved: None, .. }
+                | FrameKind::TransparencyGroup { saved: None, .. }
+                | FrameKind::PageOrForm => {}
             }
         }
     }
@@ -3641,13 +3698,55 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             inner_chain.push(Arc::new(d));
         }
         inner_chain.extend_from_slice(chain);
-        Some(Frame::new(
-            ops.into(),
-            inner_chain,
-            inner,
-            depth + 1,
-            FrameKind::PageOrForm,
-        ))
+        let kind = self.group_kind(&stream.dict, &mut inner).await;
+        Some(Frame::new(ops.into(), inner_chain, inner, depth + 1, kind))
+    }
+
+    /// The frame kind a form's `/Group` entry asks for. A transparency
+    /// group takes the alpha, blend mode and soft mask out of `inner` for
+    /// its composite and resets them for its content (§11.6.6); anything
+    /// else is a plain form whose content inherits the state as it stands.
+    /// `/K true` is not honoured and is reported.
+    ///
+    /// Covers ISO 32000-1 §11.6.6 and §11.6.4.4.
+    async fn group_kind(&mut self, dict: &Dict, inner: &mut GState) -> FrameKind {
+        let Some(knockout) = self.transparency_group(dict).await else {
+            return FrameKind::PageOrForm;
+        };
+        if knockout {
+            self.skip(SkippedKind::Knockout, SkipReason::Unsupported);
+        }
+        let kind = FrameKind::TransparencyGroup {
+            saved: None,
+            alpha: inner.fill_alpha,
+            blend: inner.blend_mode,
+            soft_mask: inner.soft_mask.take(),
+            region: inner.clip.clone(),
+        };
+        inner.fill_alpha = 1.0;
+        inner.stroke_alpha = 1.0;
+        inner.blend_mode = BlendMode::Normal;
+        kind
+    }
+
+    /// Whether the form's `/Group` names a transparency group, and if so
+    /// whether it asks for knockout (`/K true`). Every entry may be
+    /// indirect.
+    ///
+    /// Covers ISO 32000-1 §11.6.6.
+    async fn transparency_group(&self, dict: &Dict) -> Option<bool> {
+        let Ok(Object::Dict(group)) = self.src.resolve(dict.get("Group")?).await else {
+            return None;
+        };
+        let subtype = self.src.resolve(group.get("S")?).await.ok()?;
+        if subtype.as_name()?.0 != "Transparency" {
+            return None;
+        }
+        let knockout = match group.get("K") {
+            Some(k) => self.src.resolve(k).await.ok()?.as_bool() == Some(true),
+            None => false,
+        };
+        Some(knockout)
     }
 
     /// Records one piece of content this render could not reproduce.
@@ -6783,6 +6882,113 @@ mod tests {
         let (pix, report) = render_reporting(bytes);
         assert!(report.is_empty());
         assert_eq!(px(&pix, 75, 50), [0, 0, 0, 255], "Q drops the mask");
+    }
+
+    /// A page painting form 5 under `/ca <outer>`; the form is a
+    /// transparency group with the given extra `/Group` entries and its
+    /// own `/GS0` (`/ca 1 /CA 1`) resource.
+    fn group_doc(outer: &str, group: &str, content: &[u8]) -> Vec<u8> {
+        let resources = format!("/ExtGState << /GO << /ca {outer} >> >> /XObject << /Fx 5 0 R >>");
+        small_doc(&resources, b"/GO gs /Fx Do", |b| {
+            b.stream(
+                5,
+                &format!(
+                    "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Group << /S /Transparency /CS /DeviceRGB {group} >> \
+                     /Resources << /ExtGState << /GS0 << /ca 1 /CA 1 >> >> >>"
+                ),
+                content,
+            );
+        })
+    }
+
+    /// The group's own `gs` starts from alpha 1 (§11.6.6) and the `/ca` in
+    /// force at the `Do` applies once to the composited group (§11.6.4.4):
+    /// black at a quarter over white is 191.
+    // Covers ISO 32000-1 §11.6.6, §11.6.4.4 and §11.4.7.
+    #[test]
+    fn transparency_group_composites_with_the_outer_alpha() {
+        let bytes = group_doc("0.25", "", b"/GS0 gs 0 g 0 0 100 100 re f");
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), [191, 191, 191, 255]);
+    }
+
+    // Covers ISO 32000-1 §11.6.6 and §11.6.4.4.
+    #[test]
+    fn transparency_group_under_zero_alpha_paints_nothing() {
+        let bytes = group_doc("0", "", b"/GS0 gs 0 g 0 0 100 100 re f");
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), WHITE);
+    }
+
+    /// Nested groups: the inner group's own alpha reset does not undo the
+    /// alpha its enclosing group was painted with, and the inner `/ca`
+    /// applies to the inner group: black at 0.5 x 0.5 over white is 191.
+    // Covers ISO 32000-1 §11.6.6 and §11.6.4.4.
+    #[test]
+    fn nested_transparency_groups_multiply_their_alphas() {
+        let resources = "/ExtGState << /GO << /ca 0.5 >> >> /XObject << /Fx 5 0 R >>";
+        let bytes = small_doc(resources, b"/GO gs /Fx Do", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Group << /S /Transparency /CS /DeviceRGB >> \
+                 /Resources << /ExtGState << /GI << /ca 0.5 >> >> \
+                 /XObject << /Fy 6 0 R >> >>",
+                b"/GI gs /Fy Do",
+            );
+            b.stream(
+                6,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Group << /S /Transparency /CS /DeviceRGB >> \
+                 /Resources << /ExtGState << /GS0 << /ca 1 >> >> >>",
+                b"/GS0 gs 0 g 0 0 100 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), [191, 191, 191, 255]);
+    }
+
+    /// `/K true` is not implemented: the group paints as a plain group and
+    /// the report says so. `/I true` is exact here (the group renders onto
+    /// a transparent backdrop) and reports nothing.
+    // Covers ISO 32000-1 §11.6.6.
+    #[test]
+    fn knockout_group_reports_and_isolated_group_does_not() {
+        let bytes = group_doc("1", "/K true", b"0 g 0 0 100 100 re f");
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), BLACK);
+        assert_eq!(
+            drops(&report),
+            vec![(SkippedKind::Knockout, SkipReason::Unsupported, 1)]
+        );
+
+        let bytes = group_doc("1", "/I true", b"0 g 0 0 100 100 re f");
+        let (pix, report) = render_reporting(bytes);
+        assert_eq!(px(&pix, 50, 50), BLACK);
+        assert!(report.is_empty(), "{:?}", report.warnings());
+    }
+
+    /// A form without `/Group` is not a group: alpha stays per primitive,
+    /// so its own `gs` back to 1 paints solid.
+    // Covers ISO 32000-1 §11.6.4.4.
+    #[test]
+    fn plain_form_keeps_alpha_per_primitive() {
+        let resources = "/ExtGState << /GO << /ca 0.25 >> >> /XObject << /Fx 5 0 R >>";
+        let bytes = small_doc(resources, b"/GO gs /Fx Do", |b| {
+            b.stream(
+                5,
+                "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                 /Resources << /ExtGState << /GS0 << /ca 1 >> >> >>",
+                b"/GS0 gs 0 g 0 0 100 100 re f",
+            );
+        });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), BLACK);
     }
 
     /// A Luminosity group painting white over the left half of the page
