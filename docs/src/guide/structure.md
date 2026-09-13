@@ -63,4 +63,12 @@ The same readers exist as free functions over any async object source, named wit
 
 ## CLI
 
-The command line has no dedicated command for these structures. `pdfboss json` and `pdfboss q` expose the raw catalog objects (`/AcroForm`, `/Outlines`, `/PageLabels`, `/Names`) through the element tree; see [Exploring PDF internals](./explorer.md).
+The command line has no dedicated command for these structures, but `pdfboss q` reaches the raw catalog dictionary through the object tree: the trailer's `Root` is a reference, objects are keyed by number, and a reference prints as `{"_r": [number, generation]}`.
+
+```bash
+pdfboss q form.pdf '.trailer.value.Root'              # {"_r": [131, 0]}
+pdfboss q form.pdf '.objects["131"].value | keys'     # ["AcroForm", "Names", "Pages", ...]
+pdfboss q form.pdf '.objects["131"].value.AcroForm'   # {"_r": [132, 0]}
+```
+
+See [Exploring PDF internals](./explorer.md) for the tree and the query language.
