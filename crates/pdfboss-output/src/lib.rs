@@ -19,6 +19,63 @@ pub use structure::{
     document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
 };
 
+/// What extraction keeps beyond the visible page.
+///
+/// By default the `extract_*` entries read what a viewer shows: spans and
+/// rulings lying entirely outside the page's crop box are dropped before
+/// layout. A page cropped out of a larger document often keeps its
+/// neighbors' content in the stream — pasteboard text no viewer renders —
+/// and `invisible_text: true` extracts it too.
+///
+/// Text drawn with render mode 3 (an OCR layer over a scan) is on the page,
+/// selectable in a viewer, and always extracted; this option is only about
+/// content outside the page box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextOptions {
+    /// Keep content outside the page's crop box.
+    pub invisible_text: bool,
+}
+
+/// The overlap window of `page`'s crop box, one point of tolerance to each
+/// side so a glyph overhanging the margin stays on the page.
+fn page_window(page: &Page) -> (f32, f32, f32, f32) {
+    const TOLERANCE: f32 = 1.0;
+    let crop = page.crop_box;
+    (
+        crop.x0.min(crop.x1) - TOLERANCE,
+        crop.x0.max(crop.x1) + TOLERANCE,
+        crop.y0.min(crop.y1) - TOLERANCE,
+        crop.y0.max(crop.y1) + TOLERANCE,
+    )
+}
+
+/// Drops the spans that lie entirely outside `page`'s crop box (overlap
+/// test, a point of tolerance). This is what the `extract_*` entries apply
+/// by default; a caller composing an extraction from raw spans — the
+/// document-level asynchronous Markdown path — applies it to match them.
+pub fn retain_spans_on_page(spans: &mut Vec<TextSpan>, page: &Page) {
+    let (x0, x1, y0, y1) = page_window(page);
+    spans.retain(|s| {
+        s.bbox.x1.max(s.bbox.x0) >= x0
+            && s.bbox.x0.min(s.bbox.x1) <= x1
+            && s.bbox.y1.max(s.bbox.y0) >= y0
+            && s.bbox.y0.min(s.bbox.y1) <= y1
+    });
+}
+
+/// [`retain_spans_on_page`] for rulings: drops the segments that lie
+/// entirely outside `page`'s crop box, so an off-page grid cannot become a
+/// table.
+pub fn retain_rulings_on_page(rulings: &mut Vec<Ruling>, page: &Page) {
+    let (x0, x1, y0, y1) = page_window(page);
+    rulings.retain(|r| {
+        r.start.x.max(r.end.x) >= x0
+            && r.start.x.min(r.end.x) <= x1
+            && r.start.y.max(r.end.y) >= y0
+            && r.start.y.min(r.end.y) <= y1
+    });
+}
+
 /// Extracts the page's text with layout applied: spans grouped into lines,
 /// lines in the [`ReadingOrder`] given and joined with `\n`, spaces
 /// inserted at horizontal gaps. [`ReadingOrder::Content`] is the default
@@ -67,13 +124,29 @@ pub async fn extract_text_with<S: AsyncObjectSource>(
 /// [`ExtractReport`] whose entries name each skipped stream and why —
 /// unsupported filters (the passthrough image codecs included), undecodable
 /// bytes, unparseable content, missing resources, exhausted form limits.
-/// An empty text with an empty report really is an empty page.
+/// An empty text with an empty report is a page a viewer shows as empty —
+/// either truly empty, or holding only off-page content, which
+/// [`TextOptions::invisible_text`] recovers.
 pub fn extract_text_reporting(
     doc: &Document,
     page: &Page,
     order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting(doc, page, order)?;
+    extract_text_reporting_opts(doc, page, order, TextOptions::default())
+}
+
+/// [`extract_text_reporting`] with [`TextOptions`]: `invisible_text` keeps
+/// the content outside the page box that the default drops.
+pub fn extract_text_reporting_opts(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) = pdfboss_text::extract_spans_reporting(doc, page, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
     Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
@@ -86,8 +159,24 @@ pub async fn extract_text_reporting_with<S: AsyncObjectSource>(
     structure: Option<&StructureTree>,
     order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) =
+    extract_text_reporting_with_opts(src, page, oc, structure, order, TextOptions::default()).await
+}
+
+/// [`extract_text_reporting_with`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside the page box that the default drops.
+pub async fn extract_text_reporting_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) =
         pdfboss_text::extract_spans_reporting_with(src, page, oc, structure, order).await?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
     Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
@@ -105,7 +194,23 @@ pub fn extract_text_reporting_cached(
     fonts: &FontCache,
     order: ReadingOrder,
 ) -> Result<(String, ExtractReport)> {
-    let (spans, report) = pdfboss_text::extract_spans_reporting_cached(doc, page, fonts, order)?;
+    extract_text_reporting_cached_opts(doc, page, fonts, order, TextOptions::default())
+}
+
+/// [`extract_text_reporting_cached`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside the page box that the default drops.
+pub fn extract_text_reporting_cached_opts(
+    doc: &Document,
+    page: &Page,
+    fonts: &FontCache,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) =
+        pdfboss_text::extract_spans_reporting_cached(doc, page, fonts, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
     Ok((Text.render(&[page_layout(&spans, report.order)]), report))
 }
 
@@ -124,6 +229,17 @@ pub fn extract_markdown(doc: &Document, order: ReadingOrder) -> Result<String> {
     Ok(markdown)
 }
 
+/// [`extract_markdown`] with [`TextOptions`]: `invisible_text` keeps the
+/// content outside each page's box that the default drops.
+pub fn extract_markdown_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<String> {
+    let (markdown, _) = extract_markdown_reporting_opts(doc, order, opts)?;
+    Ok(markdown)
+}
+
 /// [`extract_markdown`] with one [`ExtractReport`] per page, in page order.
 ///
 /// Each page's rulings ride along with its spans: a table whose structure is
@@ -132,19 +248,38 @@ pub fn extract_markdown_reporting(
     doc: &Document,
     order: ReadingOrder,
 ) -> Result<(String, Vec<ExtractReport>)> {
+    extract_markdown_reporting_opts(doc, order, TextOptions::default())
+}
+
+/// [`extract_markdown_reporting`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside each page's box that the default drops.
+pub fn extract_markdown_reporting_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
     let per_page = pdfboss_core::map_pages(doc, |doc: &Document, page: &Page| {
-        pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts, order)
+        let (mut spans, mut rulings, report) =
+            pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts, order)?;
+        if !opts.invisible_text {
+            retain_spans_on_page(&mut spans, page);
+            retain_rulings_on_page(&mut rulings, page);
+        }
+        // The page's share of the size pass is counted here, on the
+        // worker, while its spans are still in cache.
+        let page = structure::ExtractedPage::new(spans, rulings, report.order);
+        Ok((page, report))
     });
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
     for outcome in per_page {
-        let (spans, rulings, report) = outcome?;
-        pages.push((spans, rulings, report.order));
+        let (page, report) = outcome?;
+        pages.push(page);
         reports.push(report);
     }
     Ok((
-        Markdown.render(&document_layout_with_rulings(&pages)),
+        Markdown.render(&structure::document_layout_extracted(pages)),
         reports,
     ))
 }
@@ -153,8 +288,23 @@ pub fn extract_markdown_reporting(
 /// [`extract_markdown`] is the better answer whenever the document is at
 /// hand — a page whose text is all one size has no heading to find.
 pub fn extract_page_markdown(doc: &Document, page: &Page, order: ReadingOrder) -> Result<String> {
-    let (spans, rulings, report) =
+    extract_page_markdown_opts(doc, page, order, TextOptions::default())
+}
+
+/// [`extract_page_markdown`] with [`TextOptions`]: `invisible_text` keeps
+/// the content outside the page box that the default drops.
+pub fn extract_page_markdown_opts(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<String> {
+    let (mut spans, mut rulings, report) =
         pdfboss_text::extract_spans_and_rulings_reporting(doc, page, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
 }
 
@@ -173,9 +323,26 @@ pub async fn extract_page_markdown_with<S: AsyncObjectSource>(
     structure: Option<&StructureTree>,
     order: ReadingOrder,
 ) -> Result<String> {
-    let (spans, rulings, report) =
+    extract_page_markdown_with_opts(src, page, oc, structure, order, TextOptions::default()).await
+}
+
+/// [`extract_page_markdown_with`] with [`TextOptions`]: `invisible_text`
+/// keeps the content outside the page box that the default drops.
+pub async fn extract_page_markdown_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<String> {
+    let (mut spans, mut rulings, report) =
         pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc, structure, order)
             .await?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
 }
 
@@ -941,6 +1108,44 @@ mod tests {
         }
     }
 
+    /// The layout over pages the extraction workers counted the size
+    /// weights of reads the same as the public document layout over the
+    /// same pages: a title page at one size, a ruled table at another and
+    /// a prose page rank against the same document-wide statistics.
+    #[test]
+    fn the_extracted_page_layout_matches_the_document_layout() {
+        let contents = [
+            "BT /F1 24 Tf 1 0 0 1 72 700 Tm (Annual Report) Tj ET".to_string(),
+            structure::tests::ruled_grid_content(),
+            structure::tests::two_tables_repeating_their_head_content(),
+        ];
+        let mut pages = Vec::new();
+        let mut extracted = Vec::new();
+        for content in &contents {
+            let doc = Document::load(doc_with_graphics(content)).unwrap();
+            let page = doc.page(0).unwrap();
+            let (spans, rulings, report) = pdfboss_text::extract_spans_and_rulings_reporting(
+                &doc,
+                &page,
+                ReadingOrder::Content,
+            )
+            .unwrap();
+            extracted.push(structure::ExtractedPage::new(
+                spans.clone(),
+                rulings.clone(),
+                report.order,
+            ));
+            pages.push((spans, rulings, report.order));
+        }
+        let expected = Markdown.render(&document_layout_with_rulings(&pages));
+        assert!(expected.contains("# Annual Report"), "md: {expected}");
+        assert!(expected.contains("| --- |"), "md: {expected}");
+        assert_eq!(
+            Markdown.render(&structure::document_layout_extracted(extracted)),
+            expected
+        );
+    }
+
     /// A document's pages each keep their own order: a tagged page reads by
     /// its tree while an untagged neighbour reads its stream, in one layout.
     #[test]
@@ -1258,16 +1463,303 @@ mod tests {
         assert!(md.ends_with("\n\n24"), "md: {md}");
     }
 
+    /// A page footer populating two of the grid's columns far below it is
+    /// not a row: the grid ends at the last evenly pitched row and the
+    /// footer reads as prose. Modeled on a 10-K statement page whose
+    /// "Form 10-K  41" footer used to void the whole statement.
+    #[test]
+    fn a_far_footer_row_does_not_void_the_grid() {
+        let md = markdown_of(&structure::tests::grid_with_far_footer_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r3c0 | r3c1 | r3c2 |"), "md: {md}");
+        assert!(!md.contains("| Form 10-K |"), "footer is not a row: {md}");
+        assert!(md.ends_with("\n\nForm 10-K 41"), "md: {md}");
+    }
+
+    /// A title set in a heading size over two side-by-side grids is not
+    /// the table's first row: it leaves as the heading it is, and the grid
+    /// starts at its header. Modeled on a rate manual whose "Symbols" title
+    /// became a header row and lost every column match.
+    #[test]
+    fn a_title_over_side_by_side_grids_is_a_heading_not_a_row() {
+        let md = markdown_of(&structure::tests::titled_side_by_side_grids_content());
+        assert!(md.contains("# Symbols Symbols"), "md: {md}");
+        assert!(
+            md.contains("| r0c0 | r0c1 | r0c2 | r0c3 | r0c4 | r0c5 |"),
+            "md: {md}"
+        );
+        assert!(!md.contains("| Symbols |"), "title is not a row: {md}");
+    }
+
+    /// A "$" set in its own column, left-aligned ahead of a right-aligned
+    /// amount, belongs to that amount: the cells read "$1,824", and the
+    /// column the signs stood in is gone.
+    #[test]
+    fn currency_signs_rejoin_their_amounts() {
+        let md = markdown_of(&structure::tests::currency_columns_content());
+        assert!(
+            md.contains("| Gross | $1,824 | $1,889 | $1,978 |"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("| Net | $1,702 | $1,777 | $1,840 |"),
+            "md: {md}"
+        );
+        assert!(md.contains("| Paid | $122 | $112 | $138 |"), "md: {md}");
+        assert!(
+            md.contains("| --- | --- | --- | --- |"),
+            "four columns: {md}"
+        );
+        assert!(!md.contains("| $ |"), "no sign column: {md}");
+    }
+
+    /// A euro sign after its amount stays there: "7 723 €" is how most of
+    /// Europe writes it, and the sign is not the next cell's. Modeled on a
+    /// ParseBench page where "€" jumped onto the rate beside it.
+    #[test]
+    fn a_trailing_euro_stays_with_its_amount() {
+        let md = markdown_of(&structure::tests::euro_suffix_content());
+        assert!(md.contains("| Nord | 7 723 € | 51,4% |"), "md: {md}");
+        assert!(md.contains("| Est | 6 734 € | 50,7% |"), "md: {md}");
+    }
+
+    /// A ")" or "%" set apart from its amount, in the next cell or a word
+    /// gap away, closes the amount: "(1,234)", "(5)" and "12%".
+    #[test]
+    fn closers_rejoin_their_amounts() {
+        let md = markdown_of(&structure::tests::split_closers_content());
+        assert!(md.contains("| Loss | (1,234) | (5) |"), "md: {md}");
+        assert!(md.contains("| Gain | 1,889 | 7 |"), "md: {md}");
+        assert!(md.contains("| Rate | 12% | 3 |"), "md: {md}");
+        assert!(md.contains("| --- | --- | --- |"), "three columns: {md}");
+    }
+
+    /// A whitespace span standing in a gutter is padding, not a column:
+    /// the grid keeps its three columns and no empty one appears between
+    /// them. Modeled on filing and 10-K pages whose padding spans opened an
+    /// empty column beside every value.
+    #[test]
+    fn padding_in_a_gutter_opens_no_column() {
+        let md = markdown_of(&structure::tests::padded_gutter_grid_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| --- | --- | --- |\n"), "three columns: {md}");
+        assert!(!md.contains("|  |"), "no empty column: {md}");
+    }
+
+    /// Entry numbers, titles and climbing page numbers in three lanes are a
+    /// table of contents, which reads as prose lines, not as a grid. Two
+    /// entries sharing a page keep it a list. Modeled on an odl page whose
+    /// contents list became a table.
+    #[test]
+    fn a_contents_list_is_not_a_table() {
+        let md = markdown_of(&structure::tests::contents_list_content());
+        assert!(!md.contains("| --- |"), "no table: {md}");
+        assert!(md.contains("1. Front Matter 1"), "md: {md}");
+        assert!(md.contains("3. Our Mental Shortcuts 3"), "md: {md}");
+        assert!(md.contains("4. Identifying a Topic 25"), "md: {md}");
+    }
+
+    /// A section label standing a blank line above its rows, populating the
+    /// first cell alone, is a row of the table around it, not the end of
+    /// one table and the start of another.
+    #[test]
+    fn a_section_label_stays_inside_the_lane_table() {
+        let md = markdown_of(&structure::tests::sectioned_lane_table_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        assert!(
+            md.contains(
+                "| r2c0 | r2c1 | r2c2 |\n| Paid-in Capital: |  |  |\n| r3c0 | r3c1 | r3c2 |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// Column gaps of five points in 7-point type are lanes: the gutter
+    /// minimum scales down with small type.
+    #[test]
+    fn narrow_gaps_in_small_type_are_lanes() {
+        let md = markdown_of(&structure::tests::tight_lane_grid_content());
+        assert!(
+            md.contains("| r0c0 | r0c1 | r0c2 |\n| --- | --- | --- |\n| r1c0 | r1c1 | r1c2 |"),
+            "md: {md}"
+        );
+    }
+
+    /// A short grid above the run's longest stretch is a table too: the
+    /// lines above the band get the same attempt as the lines below it.
+    #[test]
+    fn a_short_grid_above_a_longer_one_is_a_table_too() {
+        let md = markdown_of(&structure::tests::grid_above_a_longer_grid_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert!(md.contains("| r1c0 | r1c1 | r1c2 |"), "md: {md}");
+        assert!(md.contains("| s4c0 | s4c1 | s4c2 |"), "md: {md}");
+        assert!(md.contains("Prose between the two grids."), "md: {md}");
+    }
+
+    /// Two lanes of short terms and definitions are a table: a glossary,
+    /// a subsidiary list, a rate factor table.
+    #[test]
+    fn a_two_column_glossary_is_a_table() {
+        let md = markdown_of(&structure::tests::glossary_content());
+        assert!(
+            md.contains(
+                "| Term | Definition |\n| --- | --- |\n| AED | Advanced Electronic Data |\n\
+                 | AFC | Audit and Finance Committee of the Board |"
+            ),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("| Board | Board of Governors of the Postal Service |"),
+            "md: {md}"
+        );
+    }
+
+    /// A sign opening a cell closes up to the amount after its padding in
+    /// the Markdown: "$   1,414.00" reads "$1,414.00".
+    #[test]
+    fn a_padded_sign_closes_up_to_its_amount() {
+        let md = markdown_of(&structure::tests::padded_sign_amount_lane_content());
+        assert!(
+            md.contains("| Cash | $1,414.00 | 10% |\n| Debt | $2,120.50 | 9% |"),
+            "md: {md}"
+        );
+    }
+
+    /// Markers a lane's width from their text are a list, not a two-column
+    /// table.
+    #[test]
+    fn a_numbered_list_in_lanes_is_not_a_table() {
+        let md = markdown_of(&structure::tests::numbered_lane_list_content());
+        assert!(!md.contains("| ---"), "no table: {md}");
+        assert!(md.contains("1. Item number 1 of the list"), "md: {md}");
+        assert!(md.contains("5. Item number 5 of the list"), "md: {md}");
+    }
+
+    /// A two-column table set inside a numbered item's one-lane stretch is
+    /// found on its own: the item's stretch settles only the starts that
+    /// leave the item's lane.
+    #[test]
+    fn a_two_column_table_inside_a_numbered_item_is_found() {
+        let md = markdown_of(&structure::tests::list_then_two_column_table_content());
+        assert!(md.contains("| Loss Costs | GL-2013-BGL1 |"), "md: {md}");
+        assert!(md.contains("| Loss Costs | CR-2007-RLA1 |"), "md: {md}");
+        assert!(
+            md.contains("1. Adopt the following reference filings:"),
+            "md: {md}"
+        );
+    }
+
+    /// A row repeating the head's years over a new first head opens a
+    /// second table: two tables at one pitch are two, not one.
+    #[test]
+    fn a_row_repeating_the_head_opens_a_second_table() {
+        let md = markdown_of(&structure::tests::two_tables_repeating_their_head_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert!(
+            md.contains("| At year end | 2018 | 2017 |\n| --- | --- | --- |\n| Total assets |"),
+            "md: {md}"
+        );
+    }
+
+    /// A table of contents whose front matter counts pages in roman
+    /// numerals and whose parts are headed by a line of words alone is
+    /// prose, not a two-column table.
+    #[test]
+    fn a_contents_list_with_front_matter_is_not_a_table() {
+        let md = markdown_of(&structure::tests::front_matter_contents_content());
+        assert!(!md.contains("| ---"), "md: {md}");
+        assert!(md.contains("About the Publisher vii"), "md: {md}");
+        assert!(
+            md.contains("Experiment 3: Energy Loss in Pipes 24"),
+            "md: {md}"
+        );
+    }
+
+    /// A table of contents ruled under each entry is prose under its rules
+    /// as under its lanes.
+    #[test]
+    fn a_contents_list_under_rules_is_prose() {
+        let md = markdown_of_drawn(&structure::tests::ruled_contents_content());
+        assert!(!md.contains("| ---"), "md: {md}");
+        assert!(!md.contains("<table>"), "md: {md}");
+        assert!(md.contains("Executive Summary 4"), "md: {md}");
+    }
+
+    /// A last column ending in "ml" spells a roman numeral far past any
+    /// front matter, and "llc" spells none in standard form: the volumes
+    /// table stays a table.
+    #[test]
+    fn a_table_of_volumes_is_not_a_contents_list() {
+        let md = markdown_of(&structure::tests::volumes_table_content());
+        assert!(md.contains("| 2 | 24 ml | 0 ml | 4 ml |"), "md: {md}");
+        assert!(md.contains("| 4 | 4 ml | 12 ml | 12 ml |"), "md: {md}");
+    }
+
+    /// Two columns of prose too short for the gutter pass share one lane;
+    /// neither side is narrow, so they are not a two-column table.
+    #[test]
+    fn two_prose_columns_are_not_a_table() {
+        let md = markdown_of(&structure::tests::two_prose_columns_content());
+        assert!(!md.contains("| ---"), "no table: {md}");
+        assert!(
+            md.contains("The left column runs its text to and the right column does the same"),
+            "md: {md}"
+        );
+    }
+
+    /// References marked "(10)" to "(14)" a lane from their text are a
+    /// bibliography, not a two-column table.
+    #[test]
+    fn a_bibliography_in_lanes_is_not_a_table() {
+        let md = markdown_of(&structure::tests::bracketed_reference_list_content());
+        assert!(!md.contains("| ---"), "no table: {md}");
+        assert!(
+            md.contains("(10) Handbook of Chemistry, edition 10"),
+            "md: {md}"
+        );
+    }
+
+    /// A second grid below the first, in the same segment, is a second
+    /// table: the stretch below a table gets the same attempt.
+    #[test]
+    fn a_second_grid_below_the_first_is_a_second_table() {
+        let md = markdown_of(&structure::tests::two_grids_content());
+        assert!(md.contains("| r0c0 | r0c1 | r0c2 |"), "md: {md}");
+        assert!(md.contains("| r2c0 | r2c1 | r2c2 |"), "md: {md}");
+        assert!(md.contains("| s0c0 | s0c1 | s0c2 |"), "md: {md}");
+        assert!(md.contains("| s2c0 | s2c1 | s2c2 |"), "md: {md}");
+        assert_eq!(
+            md.matches("| --- | --- | --- |").count(),
+            2,
+            "two tables: {md}"
+        );
+    }
+
     /// A lane held open by a page number out in the margin is not a cell
-    /// column: hoisting the number empties it, and two columns of rows are a
-    /// layout. Modeled on a bench page whose two-column pitch read as a
-    /// three-column table with an empty third cell in every row.
+    /// column: hoisting the number empties it, and the four rows of short
+    /// cells are a two-column table with no third cell. Modeled on a bench
+    /// page whose two-column pitch read as a three-column table with an
+    /// empty third cell in every row.
     #[test]
     fn a_margin_page_number_does_not_manufacture_a_column() {
         let md = markdown_of(&structure::tests::margin_number_grid_content());
-        assert!(!md.contains('|'), "two columns are not a table: {md}");
-        assert!(!md.contains("<table>"), "two columns are not a table: {md}");
-        assert!(md.contains("r0c0 r0c1"), "rows still read as prose: {md}");
+        assert!(
+            md.contains("| r0c0 | r0c1 |\n| --- | --- |\n| r1c0 | r1c1 |"),
+            "two columns, no third: {md}"
+        );
+        assert!(!md.contains("| --- | --- | --- |"), "no third column: {md}");
         assert!(md.ends_with("\n\n3"), "the page number survives: {md}");
     }
 
@@ -1300,13 +1792,483 @@ mod tests {
         extract_markdown(&doc, ReadingOrder::Content).unwrap()
     }
 
+    /// One drawn grid whose cell text arrives as two flows (the bottom rows
+    /// written before the top ones) is still one table: flows sharing a
+    /// grid merge before segmentation, so the grid cannot fragment into a
+    /// table per flow.
+    #[test]
+    fn a_grid_written_in_two_flows_is_one_table() {
+        let md = markdown_of_drawn(
+            "70 630 360 80 re S 250 630 m 250 710 l S \
+             70 690 m 430 690 l S 70 670 m 430 670 l S 70 650 m 430 650 l S \
+             BT /F1 10 Tf 1 0 0 1 80 655 Tm (a3) Tj 1 0 0 1 260 655 Tm (b3) Tj \
+             1 0 0 1 80 635 Tm (a4) Tj 1 0 0 1 260 635 Tm (b4) Tj \
+             1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 80 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj ET",
+        );
+        assert_eq!(
+            md.matches("| --- | --- |").count(),
+            1,
+            "one grid must be one table: {md:?}"
+        );
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |\n| a3 | b3 |\n| a4 | b4 |"),
+            "rows read top to bottom in one table: {md:?}"
+        );
+    }
+
+    /// A trailing whitespace-only span running past the grid's right edge —
+    /// a producer's padding — paints nothing and must not disqualify the
+    /// row, and with it the whole grid's claim.
+    #[test]
+    fn trailing_space_span_does_not_fail_a_grid_row() {
+        let md = markdown_of_drawn(
+            "70 670 360 40 re S 250 670 m 250 710 l S 70 690 m 430 690 l S \
+             BT /F1 10 Tf 1 0 0 1 80 695 Tm (a1) Tj 1 0 0 1 260 695 Tm (b1) Tj \
+             1 0 0 1 80 675 Tm (a2) Tj 1 0 0 1 260 675 Tm (b2) Tj \
+             1 0 0 1 480 675 Tm (                    ) Tj ET",
+        );
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "the padded row still rows: {md:?}"
+        );
+    }
+
+    /// A table ruled only horizontally — top rule, one under the header,
+    /// bottom rule, no verticals — with its columns readable from the text:
+    /// the open-ruled species most tables in print actually are.
+    #[test]
+    fn a_horizontally_ruled_table_becomes_a_table() {
+        let md = markdown_of_drawn(
+            "70 710 m 430 710 l S 70 688 m 430 688 l S 70 610 m 430 610 l S \
+             BT /F1 10 Tf 1 0 0 1 72 700 Tm (Added cation) Tj 1 0 0 1 260 700 Tm (Relative rates) Tj \
+             1 0 0 1 72 676 Tm (K+) Tj 1 0 0 1 260 676 Tm (slow) Tj \
+             1 0 0 1 72 656 Tm (Na+) Tj 1 0 0 1 260 656 Tm (medium) Tj \
+             1 0 0 1 72 636 Tm (Ca2+) Tj 1 0 0 1 260 636 Tm (fast) Tj \
+             1 0 0 1 72 616 Tm (Check) Tj 1 0 0 1 260 616 Tm (none) Tj ET",
+        );
+        assert!(
+            md.contains("| Added cation | Relative rates |"),
+            "the header row rows: {md:?}"
+        );
+        assert!(
+            md.contains("| K+ | slow |") && md.contains("| Check | none |"),
+            "body rows read as rows: {md:?}"
+        );
+    }
+
+    /// An open-ruled statement rules its header and its first section's
+    /// last row and leaves the sections below unruled: the claim grows over
+    /// every line that keeps the lanes, the section label a row of it, and
+    /// stops at the note and the prose under the table.
+    #[test]
+    fn an_open_ruled_claim_grows_over_the_unruled_sections() {
+        let md = markdown_of_drawn(&structure::tests::open_ruled_sections_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        assert!(
+            md.contains(
+                "| Skiffia | francesae |\n| Asset Class |  |\n| Goodeid | atripinnis |\n\
+                 | Splitfin | multiradiatus |\n| Total | five |"
+            ),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("In the table above:") && !md.contains("| In the table"),
+            "the note stays prose: {md}"
+        );
+    }
+
+    /// Two three-column tables whose header rules and total rules pair up
+    /// into open lattices spanning both stay two tables of three columns: a
+    /// lattice grows over unruled lines only from lines its own rules
+    /// already read as rows.
+    #[test]
+    fn two_tables_sharing_an_open_lattice_stay_two() {
+        let md = markdown_of_drawn(&structure::tests::two_tables_sharing_an_open_lattice_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert_eq!(
+            md.matches("| Concentrate | 59 | 58 |").count(),
+            2,
+            "md: {md}"
+        );
+    }
+
+    /// A lane every row crosses with a currency sign alone parts no cells:
+    /// the sign and its padded amount are one cell, and the Markdown reads
+    /// them closed up.
+    #[test]
+    fn a_lane_crossed_by_signs_alone_splits_no_drawn_column() {
+        let md = markdown_of_drawn(&structure::tests::sign_padded_amount_ruled_content());
+        assert!(
+            md.contains(
+                "| Item | Amount |\n| --- | --- |\n| Cash | $1,414.00 |\n| Debt | $2,120.50 |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// An open lattice whose first row is a title over both columns keeps
+    /// its claim, the title a spanning cell and every line below it a row.
+    #[test]
+    fn a_title_atop_an_open_lattice_keeps_the_claim() {
+        let md = markdown_of_drawn(&structure::tests::titled_open_lattice_content());
+        assert!(
+            md.contains("<td colspan=\"2\">Fish species on IUCN Red List</td>"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("<tr><td>Potosi Pupfish</td><td>Cyprinodon alvarezi</td></tr>"),
+            "md: {md}"
+        );
+        assert!(
+            md.contains("<tr><td>Golden Skiffia</td><td>Skiffia francesae</td></tr>"),
+            "md: {md}"
+        );
+    }
+
+    /// A chart frame welded onto a table through a shared vertical is no
+    /// table of the axis labels beside it: the lattice claims nothing and
+    /// the table comes out of the lanes.
+    #[test]
+    fn a_chart_frame_welded_onto_a_table_claims_no_rows() {
+        let md = markdown_of_drawn(&structure::tests::chart_over_table_content());
+        assert!(!md.contains("<table>"), "md: {md}");
+        assert!(
+            md.contains("| Rate | 2024 | 2023 |\n| --- | --- | --- |\n| PIF | 0.1% | 6.9% |"),
+            "md: {md}"
+        );
+    }
+
+    /// Two tables ruled across the full width with a line of prose between
+    /// them chain into one open lattice; the prose reads as one cell over
+    /// every column, which makes the lattice two tables with prose between.
+    #[test]
+    fn prose_inside_an_open_lattice_splits_it_into_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::two_tables_in_one_open_lattice_content());
+        assert!(!md.contains("<table>"), "no merged table: {md}");
+        assert_eq!(
+            md.matches("| Cash | 36,364 | 48,677 |").count(),
+            2,
+            "md: {md}"
+        );
+        assert!(
+            md.contains("\nThe table below presents details about our loans.\n"),
+            "md: {md}"
+        );
+    }
+
+    /// A line of prose between the tables that stops short of the last
+    /// column still runs from the first column across the second, and
+    /// still parts the lattice into two tables.
+    #[test]
+    fn a_short_note_inside_an_open_lattice_splits_it_into_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::two_tables_with_a_short_note_content());
+        assert!(!md.contains("<table>"), "no merged table: {md}");
+        assert_eq!(
+            md.matches("| Cash | 36,364 | 48,677 |").count(),
+            2,
+            "md: {md}"
+        );
+        assert!(
+            md.contains("\nThe table below presents our loans.\n"),
+            "md: {md}"
+        );
+    }
+
+    /// Two stacked open-ruled tables share their x-extent; the cluster
+    /// splits at the largest rule gap and each table comes out whole.
+    #[test]
+    fn stacked_open_ruled_tables_split_apart() {
+        let md = markdown_of_drawn(
+            "70 710 m 430 710 l S 70 688 m 430 688 l S 70 648 m 430 648 l S \
+             70 470 m 430 470 l S 70 448 m 430 448 l S 70 408 m 430 408 l S \
+             BT /F1 10 Tf 1 0 0 1 72 700 Tm (Name) Tj 1 0 0 1 260 700 Tm (Kind) Tj \
+             1 0 0 1 72 676 Tm (Pupfish) Tj 1 0 0 1 260 676 Tm (alvarezi) Tj \
+             1 0 0 1 72 656 Tm (Skiffia) Tj 1 0 0 1 260 656 Tm (francesae) Tj \
+             1 0 0 1 72 560 Tm (Prose between the two tables sits here) Tj \
+             1 0 0 1 72 460 Tm (Year) Tj 1 0 0 1 260 460 Tm (Event) Tj \
+             1 0 0 1 72 436 Tm (2019) Tj 1 0 0 1 260 436 Tm (survey) Tj \
+             1 0 0 1 72 416 Tm (2020) Tj 1 0 0 1 260 416 Tm (recovery) Tj ET",
+        );
+        assert!(
+            md.contains("| Name | Kind |") && md.contains("| Year | Event |"),
+            "both stacked tables detected: {md:?}"
+        );
+        assert!(
+            md.contains("Prose between the two tables sits here") && !md.contains("| Prose"),
+            "the prose between them stays prose: {md:?}"
+        );
+    }
+
+    /// A lattice whose outer frame never made it into the rulings — only
+    /// the interior verticals and the row rules are there. The rules'
+    /// extents say where the frame was: the horizontals span the table's
+    /// width, the verticals its height, and the outer columns and bands
+    /// they imply hold the outer cells.
+    #[test]
+    fn interior_lattice_infers_its_outer_edges() {
+        let md = markdown_of_drawn(
+            "180 610 m 180 710 l S 258 610 m 258 710 l S \
+             70 688 m 540 688 l S 70 648 m 540 648 l S \
+             BT /F1 10 Tf 1 0 0 1 74 696 Tm (Channel) Tj 1 0 0 1 186 696 Tm (Medium) Tj 1 0 0 1 264 696 Tm (Examples) Tj \
+             1 0 0 1 74 664 Tm (Direct) Tj 1 0 0 1 186 664 Tm (Physical) Tj 1 0 0 1 264 664 Tm (meetings) Tj \
+             1 0 0 1 74 624 Tm (Indirect) Tj 1 0 0 1 186 624 Tm (Digital) Tj 1 0 0 1 264 624 Tm (websites) Tj ET",
+        );
+        assert!(
+            md.contains("| Channel | Medium | Examples |"),
+            "outer cells sit in inferred outer columns: {md:?}"
+        );
+        assert!(
+            md.contains("| Direct | Physical | meetings |")
+                && md.contains("| Indirect | Digital | websites |"),
+            "all three bands row: {md:?}"
+        );
+    }
+
+    /// A figure caption set larger than body text is a caption, not a
+    /// heading: the marker word and number say so.
+    #[test]
+    fn a_large_figure_caption_is_not_a_heading() {
+        let md = markdown_of(
+            "BT /F1 13 Tf 72 700 Td (Figure 4.5. Breakdown of fuel by source) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            !md.contains("# Figure"),
+            "a caption stays a caption: {md:?}"
+        );
+        assert!(md.contains("Figure 4.5. Breakdown of fuel by source"));
+    }
+
+    /// A table of contents sets every entry in heading-sized type; a run of
+    /// same-level heading blocks with nothing between them is a list of
+    /// entries, not document structure, and reads as plain text.
+    #[test]
+    fn a_run_of_same_level_headings_is_not_structure() {
+        let entries: String = (1..=6)
+            .map(|i| {
+                format!(
+                    "BT /F1 14 Tf 72 {} Td (Part {i}: A chapter title entry) Tj ET ",
+                    720 - i * 40
+                )
+            })
+            .collect();
+        let body: String = (0..10)
+            .map(|i| {
+                format!(
+                    "BT /F1 10 Tf 72 {} Td (A good long body line of ordinary prose text number {i}) Tj ET ",
+                    440 - i * 12
+                )
+            })
+            .collect();
+        let md = markdown_of(&format!("{entries}{body}"));
+        assert!(
+            !md.contains("# Part 1"),
+            "TOC entries are not headings: {md:?}"
+        );
+        assert!(md.contains("Part 1: A chapter title entry"));
+    }
+
+    /// A page whose first heading announces a table of contents keeps that
+    /// one heading; the part titles below it are entries, however large
+    /// they are set, even with numbered chapter lists between them.
+    #[test]
+    fn contents_page_part_titles_are_entries() {
+        let md = markdown_of(
+            "BT /F1 22 Tf 72 740 Td (Table of contents) Tj ET \
+             BT /F1 14 Tf 72 700 Td (Part I: Different Toys 21) Tj ET \
+             BT /F1 10 Tf 72 676 Td (3. The Child as Consumer 26) Tj \
+             0 -14 Td (4. Domesticating Play 30) Tj 0 -14 Td (5. The Child in the City 35) Tj ET \
+             BT /F1 14 Tf 72 600 Td (Part II: Networked Play 45) Tj ET \
+             BT /F1 10 Tf 72 576 Td (7. LEGO Toys: from Blocks to Bricks 50) Tj \
+             0 -14 Td (8. Brand Extension 58) Tj 0 -14 Td (9. Bringing the Fans in 62) Tj ET",
+        );
+        assert!(
+            md.contains("# Table of contents"),
+            "the page title stays a heading: {md:?}"
+        );
+        assert!(
+            !md.contains("# Part I") && !md.contains("# Part II"),
+            "entries are not headings: {md:?}"
+        );
+    }
+
     /// A drawn 2x2 grid leaves one lane, which the lane gates can never
     /// admit; the rulings alone make it a table.
+    /// A statement rules each section's rows and leaves the section label
+    /// between them unruled: the stacked boxes are one table, the label a
+    /// row of it, the column heads above the top rule its header row, and
+    /// the label and the amount sharing the first box two columns.
+    #[test]
+    fn stacked_section_boxes_are_one_table_with_their_header() {
+        let md = markdown_of_drawn(&structure::tests::stacked_statement_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            1,
+            "one table: {md}"
+        );
+        assert!(
+            md.contains(
+                "| Item |  | 2024 |\n| --- | --- | --- |\n| Cash | 1,000 | 5 |\n| Debt | 2,000 | 6 |\n\
+                 | Capital |  |  |\n| Stock | 3,000 | 7 |\n| Total | 6,000 | 18 |"
+            ),
+            "md: {md}"
+        );
+    }
+
+    /// Two boxed grids on the same verticals with a line of prose between
+    /// them running across the column rule: two tables with the prose
+    /// between them, not one table with the prose as a row, and not none.
+    #[test]
+    fn prose_between_two_boxes_keeps_them_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::boxes_with_prose_between_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert_eq!(md.matches("| Deductible | $500 |").count(), 2, "md: {md}");
+        assert!(
+            md.contains("B. Premium if the endorsement is attached to the policy."),
+            "md: {md}"
+        );
+        assert!(!md.contains("| B. Premium"), "the prose is no row: {md}");
+    }
+
+    /// Two boxed grids on the same verticals with an empty gap of 220
+    /// points between them are two tables.
+    #[test]
+    fn boxes_far_apart_are_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::boxes_far_apart_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+    }
+
+    /// Two boxed grids ten points apart on the same verticals, each
+    /// opening with the same column heads, are two tables: a rate table
+    /// repeats its heads over every section, a statement's sections never do.
+    #[test]
+    fn boxes_repeating_their_heads_stay_two_tables() {
+        let md = markdown_of_drawn(&structure::tests::boxes_with_repeated_heads_content());
+        assert_eq!(
+            md.matches("| Area | Factor |\n| --- | --- |").count(),
+            2,
+            "md: {md}"
+        );
+    }
+
+    /// A lower box whose head wraps a word onto a second line still repeats
+    /// the head of the box above it, and the two stay two tables.
+    #[test]
+    fn a_wrapped_repeated_head_still_keeps_two_boxes_apart() {
+        let md = markdown_of_drawn(&structure::tests::boxes_with_wrapped_repeated_heads_content());
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("| ---")).count(),
+            2,
+            "two tables: {md}"
+        );
+        assert_eq!(md.matches("| Area | Trading").count(), 2, "md: {md}");
+    }
+
+    /// A ruled band holding only a whitespace span is the page's padding:
+    /// no row of blank cells appears between the two rows around it.
+    #[test]
+    fn a_blank_ruled_band_is_not_a_row() {
+        let md = markdown_of_drawn(&structure::tests::ruled_blank_band_content());
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "md: {md}"
+        );
+        assert!(!md.contains("|  |  |"), "no blank row: {md}");
+    }
+
+    /// Text starting a few points left of the left border rule is the first
+    /// column's, not a stray that fails the whole claim.
+    #[test]
+    fn text_overhanging_the_left_rule_keeps_the_claim() {
+        let md = markdown_of_drawn(&structure::tests::overhanging_ruled_content());
+        assert!(
+            md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |\n| a3 | b3 |"),
+            "md: {md}"
+        );
+    }
+
+    /// A word set glyph by glyph running across a vertical rule is one cell
+    /// over both columns, and the grid keeps its claim.
+    #[test]
+    fn a_word_straddling_a_rule_glyph_by_glyph_keeps_the_claim() {
+        let md = markdown_of_drawn(&structure::tests::glyph_straddle_ruled_content());
+        assert!(md.contains("<td colspan=\"2\">swim</td>"), "md: {md}");
+        assert!(
+            md.contains("<td>the first cell of the top row</td><td>b1</td>"),
+            "md: {md}"
+        );
+        assert!(md.contains("<td>a3</td><td>b3</td>"), "md: {md}");
+    }
+
+    /// A rule falling in the gap between two glyphs of one word leaves the
+    /// word one cell over both columns, as it does when it runs through a
+    /// glyph.
+    #[test]
+    fn a_rule_between_two_glyphs_of_a_word_keeps_the_word_whole() {
+        let md = markdown_of_drawn(&structure::tests::glyph_gap_on_rule_content());
+        assert!(md.contains("<td colspan=\"2\">swim</td>"), "md: {md}");
+        assert!(md.contains("<td>a3</td><td>b3</td>"), "md: {md}");
+    }
+
+    /// A currency sign floating four points left of the vertical rule its
+    /// amount stands behind belongs to the amount's column, not the label's.
+    #[test]
+    fn a_sign_a_hair_before_the_rule_belongs_to_its_amount() {
+        let md = markdown_of_drawn(&structure::tests::sign_before_rule_content());
+        assert!(
+            md.contains("| Cash | $1,000 |\n| Debt | $2,000 |"),
+            "md: {md}"
+        );
+    }
+
+    /// The no-break spaces a producer pads a label with claim no column:
+    /// the label's ink stops before the rule, and the amount behind the
+    /// rule is its own cell.
+    #[test]
+    fn padding_inside_a_span_claims_no_column() {
+        let md = markdown_of_drawn(&structure::tests::padded_label_ruled_content());
+        assert!(
+            md.contains("| Cash | 1,000 |\n| Debt | 2,000 |"),
+            "md: {md}"
+        );
+    }
+
     #[test]
     fn a_ruled_grid_becomes_a_pipe_table() {
         let md = markdown_of_drawn(&structure::tests::ruled_grid_content());
         assert!(
             md.contains("| a1 | b1 |\n| --- | --- |\n| a2 | b2 |"),
+            "md: {md}"
+        );
+    }
+
+    /// A column whose head is set flush left and whose amounts flush right
+    /// is one column: the lane between them is crossed by no line and
+    /// splits nothing.
+    #[test]
+    fn a_lane_no_line_crosses_splits_no_drawn_column() {
+        let md = markdown_of_drawn(&structure::tests::flush_head_flush_amount_ruled_content());
+        assert!(
+            md.contains("| Item | ALL |\n| --- | --- |\n| Cash | $37.43 |\n| Debt | $12.10 |"),
             "md: {md}"
         );
     }
@@ -1376,6 +2338,22 @@ mod tests {
         );
     }
 
+    /// A band between two rules whose lines are all figure records holds
+    /// one row per line, however few lines the band has next to the whole
+    /// claim: a timetable rules every few rows, not every row.
+    #[test]
+    fn banded_figure_records_are_rows() {
+        let md = markdown_of_drawn(&structure::tests::ruled_banded_records_content());
+        assert!(
+            md.contains(
+                "| South | Times | Bronx |\n| --- | --- | --- |\n\
+                 | 12:00 | 12:04 | 12:17 |\n| 12:32 | 12:36 | 12:49 |\n\
+                 | 1:14 | 1:18 | 1:31 |\n| 2:54 | 2:58 | 3:11 |\n| 3:00 | 3:04 | 3:17 |"
+            ),
+            "md: {md}"
+        );
+    }
+
     /// A rule-less band whose first line populates a single cell holds one
     /// vertically centered record: it merges whole instead of shattering at
     /// its anchor column.
@@ -1424,14 +2402,16 @@ mod tests {
         );
     }
 
-    /// A grid boundary inside a sub-word gap would split a word the flat
-    /// flow writes whole: the grid is rejected and the segment stays prose.
+    /// A grid boundary inside a sub-word gap never splits a word the flat
+    /// flow writes whole: the word is one cell over both columns.
     #[test]
-    fn a_ruling_inside_a_sub_word_gap_rejects_the_grid() {
+    fn a_ruling_inside_a_sub_word_gap_keeps_the_word_whole() {
         let md = markdown_of_drawn(&structure::tests::ruled_sub_word_gap_content());
-        assert!(!md.contains('|'), "no table: {md}");
-        assert!(!md.contains("<table>"), "no table: {md}");
-        assert!(md.contains("world"), "the word survives whole: {md}");
+        assert!(
+            md.contains("<td colspan=\"2\">world</td>"),
+            "one cell: {md}"
+        );
+        assert!(!md.contains("worl</td>"), "the word survives whole: {md}");
     }
 
     /// The spans-only entry points delegate with no rulings: a page whose
@@ -2097,5 +3077,109 @@ mod tests {
         let xs = std::fs::read(format!("{dir}/xref-stream.pdf")).unwrap();
         let doc = Document::load(xs).unwrap();
         assert_eq!(page_text(&doc, 0), "Hello, world!");
+    }
+
+    /// A 300 by 200 page whose content stream also draws text far to the
+    /// right of the page box — the pasteboard leftovers a cropped export
+    /// keeps. `(inside)` sits on the page; `(pasteboard)` starts at x=650.
+    fn pasteboard_doc() -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf 50 100 Td (inside) Tj 600 0 Td (pasteboard) Tj ET",
+        );
+        b.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        Document::load(b.build(1)).unwrap()
+    }
+
+    #[test]
+    fn extraction_clips_to_the_page_box() {
+        let doc = pasteboard_doc();
+        assert_eq!(page_text(&doc, 0), "inside");
+        let md = extract_markdown(&doc, ReadingOrder::Content).unwrap();
+        assert!(md.contains("inside"), "markdown lost page text: {md:?}");
+        assert!(
+            !md.contains("pasteboard"),
+            "markdown kept off-page text: {md:?}"
+        );
+    }
+
+    /// A body-size space span drawn on the heading's baseline (a producer's
+    /// stray separator) must not drag the line's size rank down to body: a
+    /// space has no visible size, so it has no vote.
+    #[test]
+    fn stray_space_span_does_not_unrank_a_heading() {
+        let md = markdown_of(
+            "BT /F1 16 Tf 72 700 Td (Chapter One) Tj /F1 12 Tf ( ) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            md.contains("# Chapter One"),
+            "heading lost to a stray space span: {md:?}"
+        );
+    }
+
+    /// A small-caps heading sets word-initial capitals large and the rest
+    /// of the capitals below body size. The line is all capitals in exactly
+    /// two sizes — that is the small-caps signature — so it measures by its
+    /// capital size, not by the small caps that would otherwise disqualify
+    /// it.
+    #[test]
+    fn small_caps_heading_measures_by_its_capitals() {
+        let md = markdown_of(
+            "BT /F1 14 Tf 72 700 Td (R) Tj /F1 11 Tf (ECOLLECTION) Tj \
+             /F1 14 Tf ( N) Tj /F1 11 Tf (OTES) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            md.contains("# R"),
+            "small-caps heading lost its rank: {md:?}"
+        );
+    }
+
+    /// Three sizes on one all-caps line is not small caps: it ranks by its
+    /// smallest text like any other line (and must not panic, which the
+    /// first cut of the two-bucket scan did on exactly this shape).
+    #[test]
+    fn three_sizes_on_a_line_rank_by_the_smallest() {
+        let md = markdown_of(
+            "BT /F1 14 Tf 72 700 Td (A) Tj /F1 11 Tf (BC) Tj /F1 12 Tf (DE) Tj /F1 11 Tf (FG) Tj ET \
+             BT /F1 12 Tf 72 660 Td (Body text line one here for mass) Tj \
+             0 -14 Td (Body text line two here for mass) Tj \
+             0 -14 Td (Body text line three here for mass) Tj ET",
+        );
+        assert!(
+            !md.contains("# A"),
+            "a three-size line is not a small-caps heading: {md:?}"
+        );
+    }
+
+    #[test]
+    fn invisible_text_keeps_off_page_content() {
+        let doc = pasteboard_doc();
+        let page = doc.page(0).unwrap();
+        let opts = TextOptions {
+            invisible_text: true,
+        };
+        let (text, _) =
+            extract_text_reporting_opts(&doc, &page, ReadingOrder::Content, opts).unwrap();
+        assert_eq!(text, "inside pasteboard");
+        let md = extract_markdown_opts(&doc, ReadingOrder::Content, opts).unwrap();
+        assert!(
+            md.contains("pasteboard"),
+            "flag dropped off-page text: {md:?}"
+        );
     }
 }

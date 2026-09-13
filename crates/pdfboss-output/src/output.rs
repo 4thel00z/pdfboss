@@ -65,7 +65,7 @@ pub(crate) fn line_text(line: &Line) -> String {
 
 /// A line's inline runs concatenated; the runs already carry the spaces the
 /// word-gap rule inserted.
-fn push_line(out: &mut String, line: &Line) {
+pub(crate) fn push_line(out: &mut String, line: &Line) {
     for inline in &line.inlines {
         out.push_str(&inline.text);
     }
