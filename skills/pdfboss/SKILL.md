@@ -77,6 +77,8 @@ images = doc[0].extract_images()              # each: .data (PNG bytes), .width,
 spans  = list(doc.spans())                    # styled spans: font, weight, color, position
 fields = doc.form_fields()                    # interactive form: .name, .field_type, .text, .checked, .selected
 toc    = doc.outline()                        # bookmarks: .title, .page, .children; also page_labels(), embedded_files(), named_destinations()
+intents = doc.output_intents()                # .subtype, .output_condition_identifier; also is_linearized(), articles(), piece_info(), permission_handlers()
+thumb  = doc[0].thumbnail_image()             # PageImage or None; also doc[0].presentation() (.duration, .transition.style), .beads(), .piece_info()
 
 # async, over files or HTTP, range-fetched
 doc = await pdfboss.AsyncDocument.open_url("https://example.com/doc.pdf")

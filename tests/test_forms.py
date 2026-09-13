@@ -280,3 +280,12 @@ class TestAsync:
             return await doc.interactive_form(), await doc.form_fields()
 
         assert asyncio.run(run()) == (None, [])
+
+
+class TestVariableText:
+    def test_the_forms_defaults_reach_every_field(self, fields: dict[str, FormField]) -> None:
+        first = fields["person.first"]
+        assert first.default_appearance == "/Helv 0 Tf 0 g"
+        assert first.quadding == "centered"
+        assert first.default_style is None
+        assert first.rich_text is None

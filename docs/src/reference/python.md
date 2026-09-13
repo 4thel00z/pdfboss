@@ -6,8 +6,8 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 
 | Name | What it is |
 |---|---|
-| `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans` |
-| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `render`, `render_reporting`, `extract_images` |
+| `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans`, plus the form, catalog and document structure readers below |
+| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation` |
 | `ReadingOrder` | `CONTENT`, `STRUCTURE_TREE`, `GEOMETRIC`: the `reading_order` keyword every extraction method takes, as the enum or its string value |
 | `AsyncDocument` | The async twin of `Document`, opened from a path, bytes, or an HTTP URL via range requests; data-fetching methods are coroutines |
 | `AsyncPage` | The async twin of `Page`; attributes are synchronous, extraction and rendering are coroutines |
@@ -35,12 +35,13 @@ Ten `Document` methods read the interactive form and the catalog's document-leve
 | Name | What it is |
 |---|---|
 | `InteractiveForm` | The form dictionary: root `fields`, `need_appearances`, `signatures_exist`, `append_only`, `calculation_order`, `default_resources`, `default_appearance`, `quadding`, `xfa` |
-| `FormField` | One field with inherited entries filled in: `ref`, `parent`, `kids`, `widgets`, `field_type`, `name` (fully qualified), `partial_name`, `alternate_name`, `mapping_name`, `flags`, `value`, `default_value`, `max_len`, `options`, `top_index`, `selected_indices`, `additional_actions`, `lock`, `seed_value`; the typed readers `text`, `button_kind`, `state`, `checked`, `on_widgets`, `signature`, `selected` |
+| `FormField` | One field with inherited entries filled in: `ref`, `parent`, `kids`, `widgets`, `field_type`, `name` (fully qualified), `partial_name`, `alternate_name`, `mapping_name`, `flags`, `value`, `default_value`, `default_appearance`, `quadding`, `default_style`, `rich_text`, `max_len`, `options`, `top_index`, `selected_indices`, `additional_actions`, `lock`, `seed_value`; the typed readers `text`, `button_kind`, `state`, `checked`, `on_widgets`, `signature`, `selected` |
 | `FieldFlags` | The flag word as `bits`, the set flags' `names`, and one boolean per flag (`read_only`, `required`, `multiline`, `combo`, `radio`, `pushbutton`, …) |
 | `Widget` | One widget annotation of a field: `ref`, `appearance_state`, `on_state`, `characteristics` |
 | `AppearanceCharacteristics` | A button widget's captions and icons: `caption`, `rollover_caption`, `alternate_caption`, `icon`, `rollover_icon`, `alternate_icon`, `caption_position` |
 | `ChoiceOption` | One choice option or button export value: `export_value`, `name` |
 | `Signature` | A signature dictionary read as data, nothing verified: `filter`, `sub_filter`, `byte_range`, `contents`, `name`, `signing_time`, `location`, `reason`, `contact_info` |
+| `DefaultAppearance` | A parsed default appearance string, from `DefaultAppearance.parse(da)`: `font`, `font_size`, `fill_color` |
 | `OutlineItem` | One bookmark: `title`, `destination`, `page`, `open`, `color`, `italic`, `bold`, `structure_element`, nested `children` |
 | `Destination` | A page and how it is shown: `page` (0-based, resolved through the page tree), `page_ref`, `fit`, `left`, `top`, `right`, `bottom`, `zoom` |
 | `PageLabel` | One page-numbering range: `first_page`, `style`, `prefix`, `start_at`, `label(index)`; `write.PageLabel` takes the same fields |
@@ -67,6 +68,39 @@ for attachment in doc.embedded_files():
 ```
 
 Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Creating PDFs](../guide/creating.md), [Markdown to PDF](../guide/md-to-pdf.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md), [Editing PDFs](../guide/editing.md), [Assembling documents](../guide/assembling.md).
+
+## The document and page structure classes
+
+Six more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `piece_info()`, `articles()` and `permission_handlers()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Five `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()` and `presentation()`. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
+
+| Name | What it is |
+|---|---|
+| `Linearization` | The linearization parameter dictionary as written: `version`, `file_length`, `hint_streams`, `first_page_object`, `first_page_end`, `page_count`, `main_xref_offset`, `first_page`; `Document.is_linearized()` applies the length rule |
+| `OutputIntent` | One output intent: `subtype`, `output_condition`, `output_condition_identifier`, `registry_name`, `info`, `destination_profile` (a reference) |
+| `PagePiece` | One product's entry in a page-piece dictionary: `product`, `last_modified` (ISO 8601), `private` (plain Python data) |
+| `Thumbnail` | A page's thumbnail as written: `width`, `height`, `bits_per_component`, `color_space`, `decode`; `Page.thumbnail_image()` decodes it to a `PageImage` |
+| `ArticleThread` | One article thread: `ref`, `info` (the keys of `Document.metadata`), `beads` in reading order |
+| `Bead` | One bead: `ref`, `page` (0-based, resolved through the page tree), `page_ref`, `rect` |
+| `Presentation` | A page's display in a presentation: `duration`, `transition` |
+| `Transition` | A page transition with the standard's defaults filled in: `style`, `duration`, `dimension`, `motion`, `direction` (degrees or `None`), `scale`, `opaque` |
+| `PermissionHandlers` | The catalog's certifying and usage rights signatures, read as data: `doc_mdp`, `usage_rights` (each a `Signature` or `None`) |
+
+```python
+import pdfboss
+
+doc = pdfboss.Document("slides.pdf")
+print(doc.is_linearized(), [intent.subtype for intent in doc.output_intents()])
+for thread in doc.articles():
+    print(thread.info.get("title"), [(bead.page, bead.rect) for bead in thread.beads])
+
+page = doc[0]
+shown = page.presentation()
+if shown and shown.transition:
+    print(shown.duration, shown.transition.style)
+thumb = page.thumbnail_image()
+if thumb:
+    open("thumb.png", "wb").write(thumb.data)
+```
 
 ## The md submodule
 

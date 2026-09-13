@@ -1215,7 +1215,7 @@ pub(crate) fn paint_pixel<const NORMAL: bool>(
     }
     // A non-Normal blend derives the effective source color from the
     // backdrop pixel, so neither branch below may shortcut it.
-    let rgb = blend.blend([dst[0], dst[1], dst[2]], rgb);
+    let rgb = blended(blend, dst, rgb);
     if a >= 1.0 {
         dst.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
     } else {
@@ -1223,9 +1223,128 @@ pub(crate) fn paint_pixel<const NORMAL: bool>(
     }
 }
 
+/// The source color a non-Normal blend paints with: `B(Cb, Cs)` weighted
+/// by the backdrop alpha, so a transparent backdrop (a group's fresh
+/// buffer) passes the source color through unchanged and an opaque one
+/// (the page) blends fully.
+///
+/// Covers ISO 32000-1 §11.3.8.
+fn blended(blend: BlendMode, dst: &[u8], rgb: [u8; 3]) -> [u8; 3] {
+    let b = blend.blend([dst[0], dst[1], dst[2]], rgb);
+    let ab = UNIT[dst[3] as usize];
+    if ab >= 1.0 {
+        return b;
+    }
+    let mix = |s: u8, t: u8| ((1.0 - ab) * s as f32 + ab * t as f32 + 0.5) as u8;
+    [mix(rgb[0], b[0]), mix(rgb[1], b[1]), mix(rgb[2], b[2])]
+}
+
+/// Composites a transparency group's offscreen render `src` onto `dst` as
+/// one object: each group pixel's alpha, scaled by the constant `alpha`
+/// and the `soft_mask` coverage, is the source alpha, and its color blends
+/// against the backdrop through `blend`. Only `region`'s bounding box is
+/// visited (the group's clip: it painted nowhere else); `None` is the
+/// whole page.
+///
+/// Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.6.4.4.
+pub(crate) fn composite_group(
+    dst: &mut Pixmap,
+    src: &Pixmap,
+    alpha: f32,
+    blend: BlendMode,
+    soft_mask: Option<&Mask>,
+    region: Option<&Mask>,
+) {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if alpha <= 0.0 {
+        return;
+    }
+    let (x0, y0, x1, y1) = match region {
+        Some(m) => (m.x0, m.y0, m.x0 + m.bbox_w, m.y0 + m.bbox_h),
+        None => (0, 0, dst.width, dst.height),
+    };
+    let (x1, y1) = (x1.min(dst.width), y1.min(dst.height));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let stride = dst.width as usize;
+    for y in y0..y1 {
+        let row = y as usize * stride;
+        for x in x0..x1 {
+            let i = (row + x as usize) * 4;
+            let s = &src.data[i..i + 4];
+            if s[3] == 0 {
+                continue;
+            }
+            let cover = match soft_mask {
+                Some(m) => UNIT[m.coverage(x, y) as usize],
+                None => 1.0,
+            };
+            let a = UNIT[s[3] as usize] * alpha * cover;
+            if a <= 0.0 {
+                continue;
+            }
+            let d = &mut dst.data[i..i + 4];
+            let rgb = match blend {
+                BlendMode::Normal => [s[0], s[1], s[2]],
+                _ => blended(blend, d, [s[0], s[1], s[2]]),
+            };
+            composite_over(d, rgb, a);
+        }
+    }
+}
+
 #[cfg(test)]
 mod blend_hw_tests {
     use super::*;
+
+    /// Over a transparent backdrop the blend function contributes nothing:
+    /// a Multiply of red onto transparent black paints red, not black, and
+    /// onto an opaque backdrop it multiplies as before.
+    // Covers ISO 32000-1 §11.3.3 and §11.3.8.
+    #[test]
+    fn blend_over_a_transparent_backdrop_passes_the_source_through() {
+        let mut clear = [0u8, 0, 0, 0];
+        paint_pixel::<false>(
+            &mut clear,
+            1.0,
+            [255, 0, 0],
+            [255, 0, 0, 255],
+            BlendMode::Multiply,
+        );
+        assert_eq!(clear, [255, 0, 0, 255]);
+        let mut white = [255u8, 255, 255, 255];
+        paint_pixel::<false>(
+            &mut white,
+            1.0,
+            [255, 0, 0],
+            [255, 0, 0, 255],
+            BlendMode::Multiply,
+        );
+        assert_eq!(white, [255, 0, 0, 255]);
+        let mut grey = [128u8, 128, 128, 255];
+        paint_pixel::<false>(
+            &mut grey,
+            1.0,
+            [255, 255, 255],
+            [255, 255, 255, 255],
+            BlendMode::Multiply,
+        );
+        assert_eq!(grey, [128, 128, 128, 255]);
+        let mut half = [0u8, 0, 0, 128];
+        paint_pixel::<false>(
+            &mut half,
+            1.0,
+            [200, 200, 200],
+            [200, 200, 200, 255],
+            BlendMode::Multiply,
+        );
+        assert_eq!(half, [100, 100, 100, 255]);
+    }
 
     /// The vector composite must be byte-identical to four scalar
     /// [`paint_pixel`] calls across every lane-shortcut combination:
