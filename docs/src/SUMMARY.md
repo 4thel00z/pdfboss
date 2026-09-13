@@ -14,6 +14,7 @@
 - [Styled spans](guide/spans.md)
 - [Rendering PDF pages to PNG](guide/rendering.md)
 - [Extracting images from PDFs](guide/images.md)
+- [Reading forms, bookmarks and attachments](guide/structure.md)
 - [Creating PDFs](guide/creating.md)
 - [Editing PDFs](guide/editing.md)
 - [Assembling documents](guide/assembling.md)

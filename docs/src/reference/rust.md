@@ -30,5 +30,8 @@ A further workspace member, `pdfboss-testkit`, is an internal PDF fixture builde
 - Composing Markdown: `pdfboss_markdown::to_pdf` with a `pdfboss_style::Theme`; see [Markdown to PDF](../guide/md-to-pdf.md).
 - Async and HTTP sources: `pdfboss_aio::AsyncDocument` (`open`, `open_url`, `from_bytes`); see [Async and remote documents](../guide/async.md).
 - Element iteration: `pdfboss_core::Document::elements(ElementOpts)`, a lazy iterator over physical and logical elements, and the async `AsyncDocument::elements`, which returns an `ElementStream`; see [Exploring PDF internals](../guide/explorer.md).
+- Forms, bookmarks and attachments: `Document::{interactive_form, form_fields, outline, named_destinations, page_labels, embedded_files, embedded_file_data, viewer_preferences}`, each with a `*_with(src, trailer)` twin for an async source (`pdfboss_core::{form_fields_with, outline_with, ...}`); see [Reading forms, bookmarks and attachments](../guide/structure.md).
+- Document-level structures: `pdfboss_core::{linearization_dictionary, output_intents_with, articles_with, page_beads_with}` and the page thumbnail, piece-info and presentation readers under the same naming.
+- Editing existing files: `pdfboss_write::{merge_documents, split_document, rotate_rewrite, rewrite_document, encrypt_document, decrypt_document}` for a fresh document through the `Importer`, and `pdfboss_write::{Update, rotate_pages, set_metadata_with, watermark}` for an incremental update; see [Editing PDFs](../guide/editing.md), [Assembling documents](../guide/assembling.md) and [Encrypted PDFs](../guide/encryption.md).
 
 The guide chapters carry compiled examples for each of these; the [Quickstart](../quickstart.md) has the shortest end-to-end one.
