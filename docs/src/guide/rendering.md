@@ -93,6 +93,24 @@ content in optional-content layers (PDF layers) the document's default
 configuration turns off. The latter is counted separately, on the report's
 `hidden` counter in Rust.
 
+## Annotations and transparency groups
+
+Annotations paint after the page content. An annotation with an appearance
+stream (`/AP` `/N`, with `/AS` choosing the state) runs that stream fitted to
+its `/Rect`. Square, Circle, Line, Polygon, PolyLine, Ink and text markup
+annotations without one get an appearance built from their own entries
+(colour, border width and dash, interior colour, opacity), and a Link with
+`/Border` or `/BS` gets its border. The Hidden, NoView, Invisible and
+NoRotate flags are honoured. A widget without an appearance stream paints
+nothing: field values are read (see [Reading forms, bookmarks and
+attachments](./structure.md)) but never turned into pixels.
+
+A form XObject with `/Group /S /Transparency` is composited as one object:
+its content runs from constant alpha 1, blend mode Normal and no soft mask,
+renders offscreen, and the result is composited once with the alpha, blend
+mode and soft mask in force at its `Do`. A group with `/K true` paints as an
+ordinary group and reports `knockout group skipped: not supported yet`.
+
 ## Python
 
 `Page.render` returns PNG bytes. `scale` must be positive and finite

@@ -37,6 +37,14 @@ ICC profiles embedded in the JPEG 2000 container are interpreted through the sam
 
 Part 2 (ISO/IEC 15444-2) extensions are tolerated in the container but not decoded. Every output sample is normalized to 8 bits per channel with round-to-nearest, so sources deeper than 8 bits (the spec allows up to 38) still land on an 8-bit output grid.
 
+## Annotations
+
+Appearance streams paint as the file carries them, and Square, Circle, Line, Polygon, PolyLine, Ink, text markup and Link annotations get an appearance built from their entries when they have none. A widget annotation without an appearance stream paints nothing: form field values are read through `form_fields()` but not rendered. Annotations are never written.
+
+## Transparency groups
+
+A transparency group composites as one object with the alpha, blend mode and soft mask at its `Do`. Every group renders isolated (`/I` is not consulted); `/K true` is not honoured and is reported as a skipped knockout group; the group colour space `/CS` is never read, so blending stays in device RGB.
+
 ## Optional content
 
 Optional content groups (PDF layers, ISO 32000 §8.11) are honored per the document's default configuration: rendering and text extraction skip layers it turns off, counting them on the reports' `hidden` counters.

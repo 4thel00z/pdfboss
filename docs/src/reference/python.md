@@ -67,7 +67,7 @@ for attachment in doc.embedded_files():
     open(attachment.name, "wb").write(doc.embedded_file_data(attachment))
 ```
 
-Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Creating PDFs](../guide/creating.md), [Markdown to PDF](../guide/md-to-pdf.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md), [Editing PDFs](../guide/editing.md), [Assembling documents](../guide/assembling.md).
+Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Markdown output](../guide/markdown.md), [Styled spans](../guide/spans.md), [Rendering pages](../guide/rendering.md), [Extracting images](../guide/images.md), [Reading forms, bookmarks and attachments](../guide/structure.md), [Creating PDFs](../guide/creating.md), [Markdown to PDF](../guide/md-to-pdf.md), [Async and remote documents](../guide/async.md), [Encrypted documents](../guide/encryption.md), [Editing PDFs](../guide/editing.md), [Assembling documents](../guide/assembling.md).
 
 ## The document and page structure classes
 
