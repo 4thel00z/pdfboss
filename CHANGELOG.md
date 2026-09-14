@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.6.0](https://github.com/4thel00z/pdfboss/compare/v2.5.0...v2.6.0) (2026-09-14)
+
+
+### Features
+
+* **output:** table structure from lane bands, drawn lattices and open rules ([#188](https://github.com/4thel00z/pdfboss/issues/188)) ([552a8b6](https://github.com/4thel00z/pdfboss/commit/552a8b668f0b2878ac5afd591126061f96dfac79))
+
+
+### Documentation
+
+* forms, bookmarks and attachments chapter; annotations and transparency groups in the guide ([#193](https://github.com/4thel00z/pdfboss/issues/193)) ([dd7218f](https://github.com/4thel00z/pdfboss/commit/dd7218ffe16ff8e67f5220d987243da9e6cf3acf))
+
 ## [2.5.0](https://github.com/4thel00z/pdfboss/compare/v2.4.0...v2.5.0) (2026-09-13)
 
 
