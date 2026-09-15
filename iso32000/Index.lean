@@ -194,9 +194,6 @@ def collectFiles (root : FilePath) : IO (Array FilePath) := do
     files := files ++ walked.filter isSourceFile
   return files
 
-def orderCitations (a b : Citation) : Bool :=
-  a.file < b.file || (a.file == b.file && a.line < b.line)
-
 def renderNat? : Option Nat → String
   | some n => s!"some {n}"
   | none => "none"
@@ -214,6 +211,14 @@ def renderRef? : Option Ref → String
 
 def renderCitation (c : Citation) : String :=
   s!"  ⟨{renderNat? c.part}, {renderRef? c.ref}, {c.file.quote}, {c.line}, {c.inTest}⟩"
+
+/-- A total order on citations: by file, then line, then the rendered row.
+`qsort` is not stable, so two mentions on one source line would otherwise
+come out in whatever order the sort left them, and that order differed
+between machines; the third key makes the index reproducible. -/
+def orderCitations (a b : Citation) : Bool :=
+  a.file < b.file || (a.file == b.file && (a.line < b.line ||
+    (a.line == b.line && renderCitation a < renderCitation b)))
 
 /-- Rows per generated list literal. Lean elaborates a list literal one
 element per recursion step, so a single literal of every citation trips
