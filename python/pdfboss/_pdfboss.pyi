@@ -511,6 +511,16 @@ class Page:
         GIL like ``extract_text``, and is lenient the same way:
         unreadable content yields no spans rather than raising."""
 
+    def images(self) -> list[PlacedImage]:
+        """Every image the page draws, where it draws it: one
+        ``PlacedImage`` per draw in drawing order, with the device-space
+        box of the image's unit square under the CTM at its ``Do`` (or
+        ``BI``), its native size and its stencil flag; no pixel is
+        decoded. Images in optional-content layers the document turns off
+        are excluded, like text; stencil masks are included, unlike
+        ``extract_images``. Releases the GIL like ``spans`` and is lenient
+        the same way."""
+
     def render(
         self,
         scale: float = 1.0,
@@ -621,6 +631,45 @@ class PageImage:
     @property
     def data(self) -> bytes:
         """The image re-encoded as PNG (RGBA8)."""
+
+class PlacedImage:
+    """One image a page draws, where it is drawn, yielded by
+    ``Page.images``: the device-space box of image space's unit square
+    under the CTM at its ``Do`` (or ``BI``), plus the native size and
+    stencil flag its dictionary states. Placement, not pixels:
+    ``Page.extract_images`` decodes the content."""
+
+    @property
+    def page(self) -> int:
+        """0-based index of the page the image is drawn on."""
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """Device-space box ``(x0, y0, x1, y1)``, y-up and normalized:
+        the box around the image's four corners under the CTM, so a
+        rotated image reports the box around its outline. The same space
+        as ``media_box`` (unrotated user space); unclipped to the page's
+        boxes."""
+
+    @property
+    def width(self) -> int:
+        """Native pixel width (``/Width``); 0 when the dictionary states
+        none."""
+
+    @property
+    def height(self) -> int:
+        """Native pixel height (``/Height``); 0 when the dictionary
+        states none."""
+
+    @property
+    def stencil(self) -> bool:
+        """``/ImageMask true``: a 1-bit stencil painting the fill color,
+        which ``extract_images`` skips."""
+
+    @property
+    def inline(self) -> bool:
+        """Drawn by an inline ``BI … ID … EI`` sequence rather than a
+        ``Do``."""
 
 class InteractiveForm:
     """The interactive form dictionary (ISO 32000-1 12.7.2, Table 218):
@@ -1557,6 +1606,10 @@ class AsyncPage:
     async def spans(self, *, reading_order: str = "content") -> list[Span]:
         """The page's styled text spans — the async twin of
         ``Page.spans``."""
+
+    async def images(self) -> list[PlacedImage]:
+        """Every image the page draws, where it draws it — the async
+        twin of ``Page.images``."""
 
     async def render(
         self,

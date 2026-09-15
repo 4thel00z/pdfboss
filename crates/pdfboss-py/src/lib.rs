@@ -975,6 +975,65 @@ impl PageImage {
     }
 }
 
+/// One image a page draws, where it is drawn: the device-space box of
+/// image space's unit square under the CTM at its `Do` (or `BI`), plus the
+/// native size and stencil flag its dictionary states. Placement, not
+/// pixels: `Page.extract_images` decodes the content.
+#[pyclass(frozen)]
+struct PlacedImage {
+    inner: pdfboss_text::PlacedImage,
+}
+
+#[pymethods]
+impl PlacedImage {
+    /// 0-based index of the page the image is drawn on.
+    #[getter]
+    fn page(&self) -> usize {
+        self.inner.page
+    }
+
+    /// Device-space box `(x0, y0, x1, y1)`, y-up and normalized: the box
+    /// around the image's four corners under the CTM, so a rotated image
+    /// reports the box around its outline. Unclipped to the page's boxes.
+    #[getter]
+    fn bbox(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.inner.bbox)
+    }
+
+    /// Native pixel width (`/Width`); 0 when the dictionary states none.
+    #[getter]
+    fn width(&self) -> u32 {
+        self.inner.width
+    }
+
+    /// Native pixel height (`/Height`); 0 when the dictionary states none.
+    #[getter]
+    fn height(&self) -> u32 {
+        self.inner.height
+    }
+
+    /// `/ImageMask true`: a 1-bit stencil painting the fill color, which
+    /// `extract_images` skips.
+    #[getter]
+    fn stencil(&self) -> bool {
+        self.inner.stencil
+    }
+
+    /// Drawn by an inline `BI … ID … EI` sequence rather than a `Do`.
+    #[getter]
+    fn inline(&self) -> bool {
+        self.inner.inline
+    }
+
+    fn __repr__(&self) -> String {
+        let (x0, y0, x1, y1) = rect_tuple(self.inner.bbox);
+        format!(
+            "PlacedImage(page={}, bbox=({x0}, {y0}, {x1}, {y1}), width={}, height={})",
+            self.inner.page, self.inner.width, self.inner.height
+        )
+    }
+}
+
 /// Builds the `PageImage` list from encoded `(width, height, png)` rows;
 /// the shared shape of the sync and async extraction returns.
 fn page_images_from(
@@ -1155,6 +1214,27 @@ impl Page {
             )
             .map_err(pdf_err)?;
             Ok(spans.into_iter().map(|inner| Span { inner }).collect())
+        })
+    }
+
+    /// Every image the page draws, where it draws it: one `PlacedImage` per
+    /// draw in drawing order, each with the device-space box of the image's
+    /// unit square under the CTM at its `Do` (or `BI`), its native size and
+    /// its stencil flag — no pixel decoded. Images in optional-content
+    /// layers the document turns off are excluded, like text; stencil masks
+    /// are included, unlike `extract_images`. Releases the GIL and runs on a
+    /// private materialization of the document, like `spans`; lenient the
+    /// same way.
+    fn images(&self, py: Python<'_>) -> PyResult<Vec<PlacedImage>> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            let (images, _) =
+                pdfboss_text::placed_images_reporting_cached(&doc, &self.page, &self.text_cache)
+                    .map_err(pdf_err)?;
+            Ok(images
+                .into_iter()
+                .map(|inner| PlacedImage { inner })
+                .collect())
         })
     }
 
@@ -2527,6 +2607,23 @@ impl AsyncPage {
         })
     }
 
+    /// Every image the page draws, where it draws it — the async twin of
+    /// `Page.images`. Coroutine resolving to a list of `PlacedImage`.
+    fn images<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let oc = doc.oc_state().await;
+            let images = pdfboss_text::placed_images_with(&doc, &page, oc.as_ref())
+                .await
+                .map_err(pdf_err)?;
+            Ok(images
+                .into_iter()
+                .map(|inner| PlacedImage { inner })
+                .collect::<Vec<PlacedImage>>())
+        })
+    }
+
     /// Renders the page and resolves to the encoded image (PNG unless
     /// `format` says otherwise); same arguments and leniency as the sync
     /// `Page.render`. Coroutine.
@@ -2845,6 +2942,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpanIter>()?;
     m.add_class::<AsyncSpanIter>()?;
     m.add_class::<PageImage>()?;
+    m.add_class::<PlacedImage>()?;
     m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
     forms::register(m)?;
     catalog::register(m)?;

@@ -7,7 +7,7 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | Name | What it is |
 |---|---|
 | `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans`, plus the form, catalog and document structure readers below |
-| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation` |
+| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `images`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation` |
 | `ReadingOrder` | `CONTENT`, `STRUCTURE_TREE`, `GEOMETRIC`: the `reading_order` keyword every extraction method takes, as the enum or its string value |
 | `AsyncDocument` | The async twin of `Document`, opened from a path, bytes, or an HTTP URL via range requests; data-fetching methods are coroutines |
 | `AsyncPage` | The async twin of `Page`; attributes are synchronous, extraction and rendering are coroutines |
@@ -18,6 +18,7 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | `SpanIter` | Lazy sync iterator over a document's spans, buffering one page at a time |
 | `AsyncSpanIter` | Async iterator over a document's spans |
 | `PageImage` | One embedded image extracted from a page: native `width`/`height` and PNG-encoded `data` |
+| `PlacedImage` | One image a page draws, where it is drawn: `page`, device-space `bbox`, native `width`/`height`, `stencil`, `inline`; yielded by `Page.images` without decoding pixels |
 | `PdfError` | The exception type for any PDF processing error |
 
 `Document.metadata` is a property returning the document information
