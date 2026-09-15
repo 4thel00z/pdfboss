@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.0](https://github.com/4thel00z/pdfboss/compare/v2.6.1...v2.7.0) (2026-09-15)
+
+
+### Features
+
+* **text:** place every drawn image without decoding it ([#196](https://github.com/4thel00z/pdfboss/issues/196)) ([dd42270](https://github.com/4thel00z/pdfboss/commit/dd422704ff80fbe452766e659acafb8dd232bbcf))
+
 ## [2.6.1](https://github.com/4thel00z/pdfboss/compare/v2.6.0...v2.6.1) (2026-09-14)
 
 
