@@ -3,7 +3,7 @@
 
 use crate::decorations::{self, Band};
 use crate::font::Font;
-use crate::{Artifact, ArtifactKind, ReadingOrder, Ruling, Structure, TextSpan};
+use crate::{Artifact, ArtifactKind, PlacedImage, ReadingOrder, Ruling, Structure, TextSpan};
 use pdfboss_core::content::{ContentOps, Op, TextItem};
 use pdfboss_core::{
     content_stream_data_with, page_content_with, AsyncObjectSource, Dict, FastMap, MarkedContentId,
@@ -48,8 +48,8 @@ pub struct ExtractReport {
     pub skipped: Vec<SkippedText>,
     /// Content the document's optional-content configuration turns off
     /// (ISO 32000-1 §8.11): one count per `BDC /OC` span whose own
-    /// membership evaluated hidden and per form XObject with a hidden
-    /// `/OC` entry — a counter rather than entries, so a layer-heavy page
+    /// membership evaluated hidden and per form or image XObject with a
+    /// hidden `/OC` entry — a counter rather than entries, so a layer-heavy page
     /// cannot balloon `skipped`. Configured behavior, not a loss:
     /// [`ExtractReport::is_complete`] ignores it.
     pub hidden: u64,
@@ -220,7 +220,7 @@ async fn content_order_with<S: AsyncObjectSource>(
     fonts: Option<&FontCache>,
     oc: Option<&OcState>,
 ) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
-    let (spans, rulings, report, Ignored) =
+    let (spans, rulings, _, report, Ignored) =
         walk_with::<S, Ignored>(&src, page, fonts, oc, ReadingOrder::Content).await;
     (spans, rulings, report)
 }
@@ -234,7 +234,7 @@ async fn geometric_order_with<S: AsyncObjectSource>(
     fonts: Option<&FontCache>,
     oc: Option<&OcState>,
 ) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport) {
-    let (spans, rulings, report, Ignored) =
+    let (spans, rulings, _, report, Ignored) =
         walk_with::<S, Ignored>(&src, page, fonts, oc, ReadingOrder::Geometric).await;
     (spans, rulings, report)
 }
@@ -253,12 +253,28 @@ async fn structure_tree_order_with<S: AsyncObjectSource>(
     let Some(tree) = structure else {
         return content_order_with(src, page, fonts, oc).await;
     };
-    let (mut spans, rulings, mut report, recorded) =
+    let (mut spans, rulings, _, mut report, recorded) =
         walk_with::<S, Recorded>(&src, page, fonts, oc, ReadingOrder::Content).await;
     if structure_order(&src, tree, page, &mut spans, &recorded.ids).await {
         report.order = ReadingOrder::StructureTree;
     }
     (spans, rulings, report)
+}
+
+/// Runs the page's content stream (and any form XObjects) and collects
+/// every image it draws as a [`PlacedImage`], in drawing order, along with
+/// the report of what could not be read. The same walk as
+/// [`page_spans_and_rulings_with`] — text is executed for its state and
+/// discarded — so the two agree on every form limit and hidden layer.
+pub async fn page_images_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: Option<&FontCache>,
+    oc: Option<&OcState>,
+) -> (Vec<PlacedImage>, ExtractReport) {
+    let (_, _, images, report, Ignored) =
+        walk_with::<S, Ignored>(&src, page, fonts, oc, ReadingOrder::Content).await;
+    (images, report)
 }
 
 /// One page walk, compiled once per [`MarkedContent`] strategy: the
@@ -271,7 +287,13 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
     fonts: Option<&FontCache>,
     oc: Option<&OcState>,
     order: ReadingOrder,
-) -> (Vec<TextSpan>, Vec<Ruling>, ExtractReport, M) {
+) -> (
+    Vec<TextSpan>,
+    Vec<Ruling>,
+    Vec<PlacedImage>,
+    ExtractReport,
+    M,
+) {
     let mut report = ExtractReport {
         order,
         ..ExtractReport::default()
@@ -288,6 +310,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         spans: Vec::new(),
         rulings: Vec::new(),
         bands: Vec::new(),
+        images: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
         report,
@@ -302,7 +325,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         vec![Arc::new(page.resources.clone())],
         GState::new(),
         0,
-        (0, 0, 0),
+        (0, 0, 0, 0),
         M::parents_of(page.dict()),
     );
     exec.run(root).await;
@@ -310,12 +333,16 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
     for span in &mut spans {
         span.page = page.index;
     }
+    let mut images = exec.images;
+    for image in &mut images {
+        image.page = page.index;
+    }
     decorations::mark_drawn(&mut spans, &exec.rulings, &exec.bands);
     if !spans.is_empty() {
         let markups = decorations::markup_annotations(src, page, oc).await;
         decorations::mark_annotated(&mut spans, &markups);
     }
-    (spans, exec.rulings, exec.report, exec.marks)
+    (spans, exec.rulings, images, exec.report, exec.marks)
 }
 
 /// What a page walk does with marked content, fixed when the walk is
@@ -677,13 +704,14 @@ struct Frame {
     /// Byte offset of the next operator: the pull parser's whole state at
     /// an operator boundary, so a suspended frame resumes from it exactly.
     pos: usize,
-    /// Lengths of the executor's spans, rulings and bands when this frame
-    /// was created. A stream that stops parsing mid-way contributes nothing,
-    /// exactly as it contributed nothing when the whole stream was parsed
-    /// up front, so its error truncates all three back to these marks.
+    /// Lengths of the executor's spans, rulings, bands and images when this
+    /// frame was created. A stream that stops parsing mid-way contributes
+    /// nothing, exactly as it contributed nothing when the whole stream was
+    /// parsed up front, so its error truncates all four back to these marks.
     spans_mark: usize,
     rulings_mark: usize,
     bands_mark: usize,
+    images_mark: usize,
     /// Form-XObject nesting depth, checked against `MAX_FORM_DEPTH`.
     depth: usize,
     gs: GState,
@@ -744,7 +772,7 @@ impl Frame {
         chain: Vec<Arc<Dict>>,
         gs: GState,
         depth: usize,
-        (spans_mark, rulings_mark, bands_mark): (usize, usize, usize),
+        (spans_mark, rulings_mark, bands_mark, images_mark): (usize, usize, usize, usize),
         parents: Option<u32>,
     ) -> Frame {
         Frame {
@@ -754,6 +782,7 @@ impl Frame {
             spans_mark,
             rulings_mark,
             bands_mark,
+            images_mark,
             depth,
             gs,
             saved: Vec::new(),
@@ -846,6 +875,9 @@ struct Executor<'a, S, M> {
     /// Filled rectangles too thick to be rulings, in paint order: the
     /// highlight candidates the decoration pass weighs against the spans.
     bands: Vec<Band>,
+    /// Every image drawn so far, in drawing order, at the place the CTM put
+    /// it — image XObjects through every form, and inline images.
+    images: Vec<PlacedImage>,
     fallback: Arc<Font>,
     /// Form-XObject invocations so far, checked against
     /// `MAX_FORM_INVOCATIONS`.
@@ -1072,6 +1104,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                         self.marks.truncate(frame.spans_mark);
                         self.rulings.truncate(frame.rulings_mark);
                         self.bands.truncate(frame.bands_mark);
+                        self.images.truncate(frame.images_mark);
                         let kind = if frame.depth == 0 {
                             SkippedTextKind::PageContents
                         } else {
@@ -1100,7 +1133,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                             continue;
                         }
                         let entered = self
-                            .form_frame(
+                            .do_xobject(
                                 &name.0,
                                 &frame.chain,
                                 &frame.gs,
@@ -1117,6 +1150,13 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                             frames.push(frame);
                             frames.push(child);
                             continue 'frames;
+                        }
+                    }
+                    Op::InlineImage(image) => {
+                        // Inside a hidden span the image is part of the
+                        // span: drawn nowhere, placed nowhere.
+                        if !frame.suppressed() {
+                            self.place_image(&image.dict, &frame.gs, true).await;
                         }
                     }
                     Op::BeginMarkedContentProps(tag, props) => {
@@ -1635,19 +1675,22 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         })
     }
 
-    /// Builds the frame for a form XObject invocation: its content stream, its
-    /// own `/Resources` **prepended to** the caller's chain, and `/Matrix`
-    /// prepended to the CTM — under a depth cap and a total-invocation budget.
+    /// Executes `Do`: records where an image XObject is drawn, or builds
+    /// the frame for a form XObject invocation — its content stream, its own
+    /// `/Resources` **prepended to** the caller's chain, and `/Matrix`
+    /// prepended to the CTM — under a depth cap and a total-invocation
+    /// budget that images share with forms.
     ///
-    /// `None` on five ways out, each reported except the one that is normal:
-    /// depth or budget exhausted (`LimitExceeded`); no such resource, or one
-    /// that is not a stream (`Missing`); not a form — images and other
-    /// XObjects carry no text, so this is silent; a fetch the chokepoint
-    /// refuses (`UnsupportedFilter`, image codecs included) or that fails to
-    /// decode (`Unreadable`); and content that will not parse (`Parse`). The
+    /// `None` on every way out but the form's, each reported except the ones
+    /// that are normal: depth or budget exhausted (`LimitExceeded`); no such
+    /// resource, or one that is not a stream (`Missing`); an image, placed
+    /// and done; an XObject of another subtype (`/PS`), which carries no
+    /// text and no picture, silent; a fetch the chokepoint refuses
+    /// (`UnsupportedFilter`, image codecs included) or that fails to decode
+    /// (`Unreadable`); and content that will not parse (`Parse`). The
     /// invocation is counted before any of those checks, so a page of
     /// unreadable forms still exhausts its budget.
-    async fn form_frame(
+    async fn do_xobject(
         &mut self,
         name: &str,
         chain: &[Arc<Dict>],
@@ -1673,27 +1716,33 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         };
         // `/Subtype` may be indirect like any dictionary value (ISO 32000-1
         // 7.3.8.1): a direct name answers on the spot, a reference resolves.
-        let is_form = match stream.dict.get("Subtype") {
-            Some(Object::Name(n)) => n.0 == "Form",
+        let subtype = match stream.dict.get("Subtype") {
+            Some(Object::Name(n)) => Some(n.0.clone()),
             Some(indirect @ Object::Ref(_)) => self
                 .src
                 .resolve(indirect)
                 .await
                 .ok()
-                .and_then(|o| o.as_name().map(|n| n.0 == "Form"))
-                .unwrap_or(false),
-            _ => false,
+                .and_then(|o| o.as_name().map(|n| n.0.clone())),
+            _ => None,
         };
-        if !is_form {
-            return None; // images and other XObjects carry no text
-        }
-        // A form with a hidden `/OC` entry is configured away with its
-        // whole subtree: counted on the dedicated counter, never a skip.
+        let is_image = match subtype.as_deref() {
+            Some("Form") => false,
+            Some("Image") => true,
+            _ => return None, // a `/PS` XObject: no text, no picture
+        };
+        // An XObject with a hidden `/OC` entry is configured away — a form
+        // with its whole subtree, an image with its placement: counted on
+        // the dedicated counter, never a skip.
         if let (Some(oc), Some(gate)) = (self.oc, stream.dict.get("OC")) {
             if !oc.visible_with(self.src, gate).await {
                 self.report.hidden += 1;
                 return None;
             }
+        }
+        if is_image {
+            self.place_image(&stream.dict, gs, false).await;
+            return None;
         }
         // Through the content chokepoint, not raw stream_data: a form whose
         // trailing /Filter is an image codec holds passthrough bytes, not
@@ -1729,9 +1778,59 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             inner_chain,
             inner,
             depth + 1,
-            (self.spans.len(), self.rulings.len(), self.bands.len()),
+            (
+                self.spans.len(),
+                self.rulings.len(),
+                self.bands.len(),
+                self.images.len(),
+            ),
             M::parents_of(&stream.dict).or(parents),
         ))
+    }
+
+    /// Records where an image is drawn: image space's unit square under the
+    /// CTM in force at its `Do` (or `BI`), as a normalized device-space box,
+    /// with the native size and stencil flag its dictionary states. No
+    /// pixel is decoded — placement, not content.
+    ///
+    /// Covers ISO 32000-1 §8.9.4.
+    async fn place_image(&mut self, dict: &Dict, gs: &GState, inline: bool) {
+        let width = self.image_dimension(dict, "Width").await;
+        let height = self.image_dimension(dict, "Height").await;
+        let stencil = self.image_flag(dict, "ImageMask").await;
+        self.images.push(PlacedImage {
+            page: 0,
+            bbox: Rect::new(0.0, 0.0, 1.0, 1.0).transform(gs.ctm),
+            width,
+            height,
+            stencil,
+            inline,
+        });
+    }
+
+    /// A `/Width` or `/Height` entry, resolved: 0 when absent, unresolvable
+    /// or not a positive number.
+    async fn image_dimension(&self, dict: &Dict, key: &str) -> u32 {
+        let Some(obj) = dict.get(key) else {
+            return 0;
+        };
+        match self.src.resolve(obj).await.ok().and_then(|o| o.as_f64()) {
+            Some(v) if v.is_finite() && v > 0.0 => v as u32,
+            _ => 0,
+        }
+    }
+
+    /// A boolean entry such as `/ImageMask`, resolved: false when absent.
+    async fn image_flag(&self, dict: &Dict, key: &str) -> bool {
+        let Some(obj) = dict.get(key) else {
+            return false;
+        };
+        self.src
+            .resolve(obj)
+            .await
+            .ok()
+            .and_then(|o| o.as_bool())
+            .unwrap_or(false)
     }
 
     /// A stream dictionary's own `/Resources`, when it has a usable one.
@@ -1933,6 +2032,198 @@ mod tests {
         let doc = Document::load(doc_with_graphics(content)).unwrap();
         let page = doc.page(0).unwrap();
         page_spans(&doc, &page)
+    }
+
+    /// A 200 × 100 page drawing `content`, with `/Im1` a 2 × 2 gray image
+    /// XObject, `/St` a 4 × 4 stencil mask and `/F1` Helvetica; `xobjects`
+    /// adds entries to the page's `/XObject` dictionary and the returned
+    /// builder takes their objects (numbers from 8 up).
+    fn image_page(content: &str, xobjects: &str) -> pdfboss_testkit::PdfBuilder {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            &format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+                 /Resources << /Font << /F1 5 0 R >> \
+                 /XObject << /Im1 6 0 R /St 7 0 R {xobjects} >> >> /Contents 4 0 R >>"
+            ),
+        );
+        b.stream(4, "", content.as_bytes());
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0, 85, 170, 255],
+        );
+        b.stream(
+            7,
+            "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
+             /ImageMask true /BitsPerComponent 1",
+            &[0xF0, 0x0F, 0xF0, 0x0F],
+        );
+        b
+    }
+
+    /// The placements of a built document's only page, asserted complete.
+    fn placements(b: &pdfboss_testkit::PdfBuilder) -> Vec<PlacedImage> {
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let (images, report) = block_on(page_images_with(Immediate(&doc), &page, None, None));
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        images
+    }
+
+    fn images_of(content: &str) -> Vec<PlacedImage> {
+        placements(&image_page(content, ""))
+    }
+
+    #[track_caller]
+    fn assert_box(image: &PlacedImage, x0: f32, y0: f32, x1: f32, y1: f32) {
+        let b = image.bbox;
+        let close = (b.x0 - x0).abs() < 1e-3
+            && (b.y0 - y0).abs() < 1e-3
+            && (b.x1 - x1).abs() < 1e-3
+            && (b.y1 - y1).abs() < 1e-3;
+        assert!(close, "{b:?} is not ({x0},{y0})-({x1},{y1})");
+    }
+
+    // Covers ISO 32000-1 §8.9.4.
+    #[test]
+    fn image_is_placed_by_the_ctm() {
+        let images = images_of("q 50 0 0 50 10 10 cm /Im1 Do Q");
+        assert_eq!(images.len(), 1);
+        assert_box(&images[0], 10.0, 10.0, 60.0, 60.0);
+        assert_eq!((images[0].width, images[0].height), (2, 2));
+        assert!(!images[0].stencil);
+        assert!(!images[0].inline);
+    }
+
+    #[test]
+    fn each_draw_is_one_placement_in_drawing_order() {
+        let images = images_of("q 50 0 0 50 0 0 cm /Im1 Do Q q 20 0 0 10 100 50 cm /Im1 Do Q");
+        assert_eq!(images.len(), 2);
+        assert_box(&images[0], 0.0, 0.0, 50.0, 50.0);
+        assert_box(&images[1], 100.0, 50.0, 120.0, 60.0);
+    }
+
+    #[test]
+    fn rotated_image_reports_the_box_around_its_outline() {
+        let images = images_of("q 0 50 -50 0 60 10 cm /Im1 Do Q");
+        assert_eq!(images.len(), 1);
+        assert_box(&images[0], 10.0, 10.0, 60.0, 60.0);
+    }
+
+    #[test]
+    fn form_matrix_composes_with_the_callers_ctm() {
+        let mut b = image_page("q 1 0 0 1 100 0 cm /Fx Do Q", "/Fx 8 0 R");
+        b.stream(
+            8,
+            "/Type /XObject /Subtype /Form /Matrix [2 0 0 2 0 0] \
+             /Resources << /XObject << /Im1 6 0 R >> >>",
+            b"q 10 0 0 10 5 5 cm /Im1 Do Q",
+        );
+        let images = placements(&b);
+        assert_eq!(images.len(), 1);
+        assert_box(&images[0], 110.0, 10.0, 130.0, 30.0);
+    }
+
+    #[test]
+    fn stencil_masks_are_placed_and_flagged() {
+        let images = images_of("q 20 0 0 20 0 0 cm /St Do Q");
+        assert_eq!(images.len(), 1);
+        assert_box(&images[0], 0.0, 0.0, 20.0, 20.0);
+        assert!(images[0].stencil);
+        assert_eq!((images[0].width, images[0].height), (4, 4));
+    }
+
+    // Covers ISO 32000-1 §8.9.7.
+    #[test]
+    fn inline_images_are_placed() {
+        let images =
+            images_of("q 30 0 0 20 10 70 cm BI /W 2 /H 1 /BPC 8 /CS /G /F /AHx ID 00FF> EI Q");
+        assert_eq!(images.len(), 1);
+        assert_box(&images[0], 10.0, 70.0, 40.0, 90.0);
+        assert!(images[0].inline);
+        assert_eq!((images[0].width, images[0].height), (2, 1));
+    }
+
+    #[test]
+    fn other_xobject_subtypes_place_nothing() {
+        let mut b = image_page("/Ps Do", "/Ps 8 0 R");
+        b.stream(8, "/Type /XObject /Subtype /PS", b"0 0 moveto");
+        assert!(placements(&b).is_empty());
+    }
+
+    /// Hidden optional content excludes an image both ways it can be
+    /// gated: inside a `BDC /OC` span and by the XObject's own `/OC` entry,
+    /// each counted on `hidden` like text.
+    #[test]
+    fn hidden_optional_content_excludes_the_image() {
+        let mut b = pdfboss_testkit::PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R \
+             /OCProperties << /OCGs [9 0 R] /D << /OFF [9 0 R] >> >> >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] \
+             /Resources << /XObject << /Im1 6 0 R /Gated 10 0 R >> \
+             /Properties << /H 9 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"/OC /H BDC q 50 0 0 50 0 0 cm /Im1 Do Q EMC \
+              q 30 0 0 30 100 0 cm /Gated Do Q \
+              q 10 0 0 10 0 0 cm /Im1 Do Q",
+        );
+        b.stream(
+            6,
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8",
+            &[0, 85, 170, 255],
+        );
+        b.object(9, "<< /Type /OCG /Name (hidden) >>");
+        b.stream(
+            10,
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /ColorSpace /DeviceGray /BitsPerComponent 8 /OC 9 0 R",
+            &[0, 85, 170, 255],
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let oc = doc.oc_state();
+        let (images, report) =
+            block_on(page_images_with(Immediate(&doc), &page, None, oc.as_ref()));
+        assert!(report.is_complete(), "unexpected skips: {report:?}");
+        assert_eq!(images.len(), 1);
+        assert_box(&images[0], 0.0, 0.0, 10.0, 10.0);
+        assert_eq!(report.hidden, 2, "the hidden span and the gated XObject");
+    }
+
+    /// Spans and placements come out of one walk in one device frame, so a
+    /// caller can measure text against pictures on the same page.
+    #[test]
+    fn spans_and_images_share_the_device_frame() {
+        let content = "q 1 0 0 1 100 0 cm BT /F1 12 Tf 0 20 Td (X) Tj ET \
+                       30 0 0 30 0 0 cm /Im1 Do Q";
+        let b = image_page(content, "");
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let spans = page_spans(&doc, &page);
+        let images = placements(&b);
+        assert_eq!((spans.len(), images.len()), (1, 1));
+        assert!((spans[0].x - 100.0).abs() < 1e-3);
+        assert_box(&images[0], 100.0, 0.0, 130.0, 30.0);
     }
 
     /// Raw rulings of a one-page document with `content` as its raw content
