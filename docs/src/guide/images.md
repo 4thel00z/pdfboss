@@ -44,6 +44,73 @@ its native width and height, so callers apply their own threshold: the
 synchronous Python and Rust examples below skip anything under 100 × 100
 pixels.
 
+## Where an image is drawn
+
+`extract_images` answers *what* a page draws. `Page.images` answers *where*,
+without decoding a pixel: one `PlacedImage` per draw, in the same drawing
+order, each carrying the device-space box the image occupies. It comes from
+the same content-stream walk that produces [styled spans](./spans.md), so a
+span's `bbox` and an image's `bbox` share one frame and can be compared
+directly. Use it to tell a scanned page from a born-digital one, to find the
+figure regions of a mixed page, or to measure how much of a page is picture
+before deciding whether a vision model needs to see it.
+
+```python
+import pdfboss
+
+doc = pdfboss.Document("report.pdf")
+for number, page in enumerate(doc, start=1):
+    mx0, my0, mx1, my1 = page.media_box
+    area = (mx1 - mx0) * (my1 - my0)
+    covered = 0.0
+    for image in page.images():
+        x0, y0, x1, y1 = image.bbox
+        x0, y0 = max(x0, mx0), max(y0, my0)
+        x1, y1 = min(x1, mx1), min(y1, my1)
+        covered += max(x1 - x0, 0.0) * max(y1 - y0, 0.0)
+    print(f"page {number}: {covered / area:.0%} covered by images")
+```
+
+What a `PlacedImage` carries:
+
+| Property | Meaning |
+|---|---|
+| `page` | 0-based index of the page the image is drawn on. |
+| `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up and normalized: the box around the image's four corners under the CTM. |
+| `width`, `height` | Native pixel size from `/Width` and `/Height`; 0 when the dictionary states none. |
+| `stencil` | `/ImageMask true`: a 1-bit stencil painting the fill color. |
+| `inline` | Drawn by a `BI … ID … EI` sequence rather than a `Do`. |
+
+The box is image space's unit square mapped through the CTM in force at the
+`Do` (or `BI`), including every enclosing form's `/Matrix`, so a rotated or
+skewed image reports the axis-aligned box around its outline. It is in the
+same space as `media_box`: unrotated PDF user space, before any `/Rotate`,
+which is why the example measures against `media_box` and not against
+`width` and `height` (those are after rotation). It is not clipped: an image
+the content places partly off the page reports the box the content gave it,
+and intersecting with `media_box` or `crop_box` is the caller's decision, as
+the example does.
+
+Placement differs from extraction on two points, both deliberate:
+
+- **Stencil masks are placed.** A 1-bit fax scan is often an `/ImageMask`
+  stencil, and for the question "how much of this page is picture" it is
+  the page. `extract_images` skips stencils because they carry no pixels of
+  their own, so when a page draws one the two lists do not align index for
+  index; the `stencil` flag says which entries `extract_images` left out.
+- **Hidden optional content is excluded.** Like text, an image inside a
+  `BDC /OC` span the document's default configuration turns off, or an
+  XObject with a hidden `/OC` entry, is drawn nowhere and placed nowhere.
+  `extract_images` embeds it anyway, because the bytes are in the file.
+
+Otherwise the two agree: occurrence-based, drawing order, form XObjects
+followed to the same bounded depth, inline images included, lenient about
+content that will not read. `AsyncPage.images` is the async twin.
+
+In Rust the same walk is `pdfboss_text::placed_images` (and
+`placed_images_with` over any `AsyncObjectSource`), returning
+`Vec<PlacedImage>` with the fields above and `bbox` as a `Rect`.
+
 ## CLI
 
 `pdfboss images` writes every image the selected pages draw as a PNG named

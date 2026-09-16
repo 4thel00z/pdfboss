@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.7.0](https://github.com/4thel00z/pdfboss/compare/v2.6.1...v2.7.0) (2026-09-15)
+
+
+### Features
+
+* **text:** place every drawn image without decoding it ([#196](https://github.com/4thel00z/pdfboss/issues/196)) ([dd42270](https://github.com/4thel00z/pdfboss/commit/dd422704ff80fbe452766e659acafb8dd232bbcf))
+
+## [2.6.1](https://github.com/4thel00z/pdfboss/compare/v2.6.0...v2.6.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* **render:** non-isolated groups render over their backdrop; annotation appearances are groups ([#194](https://github.com/4thel00z/pdfboss/issues/194)) ([ec99251](https://github.com/4thel00z/pdfboss/commit/ec9925119fb20eb610cde6588a2b03316a8c310f))
+
 ## [2.6.0](https://github.com/4thel00z/pdfboss/compare/v2.5.0...v2.6.0) (2026-09-14)
 
 

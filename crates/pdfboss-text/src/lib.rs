@@ -282,6 +282,79 @@ pub struct Ruling {
     pub width: f32,
 }
 
+/// One image a page draws, where it is drawn: image space's unit square
+/// mapped through the CTM in force at its `Do` (or `BI`), as an
+/// axis-aligned device-space box, with the native size and stencil flag its
+/// dictionary states. Recorded without decoding a pixel — placement, not
+/// content; `pdfboss_render::extract_page_images` has the pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedImage {
+    /// 0-based index of the page the image is drawn on.
+    pub page: usize,
+    /// Device-space box `(x0, y0, x1, y1)`, y-up and normalized: the box
+    /// around the image's four corners under the CTM, so a rotated image
+    /// reports the box around its rotated outline. The same space as the
+    /// page's media box (unrotated user space). Unclipped: an image the
+    /// content places partly off the page reports the box the content gave
+    /// it; intersecting with the page's boxes is the caller's decision.
+    pub bbox: Rect,
+    /// Native pixel width (`/Width`); 0 when the dictionary states none.
+    pub width: u32,
+    /// Native pixel height (`/Height`); 0 when the dictionary states none.
+    pub height: u32,
+    /// `/ImageMask true`: a 1-bit stencil that paints the fill color and
+    /// carries no pixels of its own, which `extract_page_images` skips.
+    pub stencil: bool,
+    /// Drawn by an inline `BI … ID … EI` sequence rather than a `Do`.
+    pub inline: bool,
+}
+
+/// Every image the page draws, where it draws it, in drawing order: image
+/// XObjects reached through the page and every form it invokes, and inline
+/// images. Images in optional-content layers the document's default
+/// configuration turns off are excluded and counted in the report's
+/// `hidden`, like text. Lenient like [`extract_spans`]: content that will
+/// not read contributes nothing.
+pub fn placed_images(doc: &Document, page: &Page) -> Result<Vec<PlacedImage>> {
+    let oc = doc.oc_state();
+    let (images, _) = block_on(extract::page_images_with(
+        Immediate(doc),
+        page,
+        None,
+        oc.as_ref(),
+    ));
+    Ok(images)
+}
+
+/// [`placed_images`] against any object source, `oc` gating hidden layers
+/// as in [`extract_spans_with`], signed the same way for the same reasons.
+pub async fn placed_images_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+) -> Result<Vec<PlacedImage>> {
+    let (images, _) = extract::page_images_with(src, page, None, oc).await;
+    Ok(images)
+}
+
+/// [`placed_images`] with the report of what could not be read, sharing
+/// `fonts` across pages: the walk executes the page's text to keep its
+/// state exact, so a caller placing the images of every page loads each
+/// font once.
+pub fn placed_images_reporting_cached(
+    doc: &Document,
+    page: &Page,
+    fonts: &FontCache,
+) -> Result<(Vec<PlacedImage>, ExtractReport)> {
+    let oc = doc.oc_state();
+    Ok(block_on(extract::page_images_with(
+        Immediate(doc),
+        page,
+        Some(fonts),
+        oc.as_ref(),
+    )))
+}
+
 /// Extracts the page's raw text spans (position, size and font per span) in
 /// the given [`ReadingOrder`]: as the content stream emits them for
 /// [`ReadingOrder::Content`] and [`ReadingOrder::Geometric`] (position
