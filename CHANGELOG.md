@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.0](https://github.com/4thel00z/pdfboss/compare/v2.7.0...v2.8.0) (2026-09-17)
+
+
+### Features
+
+* read catalog-level structures (ISO 32000 batch 12) ([#184](https://github.com/4thel00z/pdfboss/issues/184)) ([97e409a](https://github.com/4thel00z/pdfboss/commit/97e409aff8cc5dabae8342e3be492f70c54c85a6))
+
 ## [2.7.0](https://github.com/4thel00z/pdfboss/compare/v2.6.1...v2.7.0) (2026-09-15)
 
 
