@@ -7,7 +7,7 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | Name | What it is |
 |---|---|
 | `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans`, plus the form, catalog and document structure readers below |
-| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `images`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation` |
+| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `images`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation`, `viewports`, `separation_info` |
 | `ReadingOrder` | `CONTENT`, `STRUCTURE_TREE`, `GEOMETRIC`: the `reading_order` keyword every extraction method takes, as the enum or its string value |
 | `AsyncDocument` | The async twin of `Document`, opened from a path, bytes, or an HTTP URL via range requests; data-fetching methods are coroutines |
 | `AsyncPage` | The async twin of `Page`; attributes are synchronous, extraction and rendering are coroutines |
@@ -72,7 +72,7 @@ Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Mar
 
 ## The document and page structure classes
 
-Six more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `piece_info()`, `articles()` and `permission_handlers()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Five `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()` and `presentation()`. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
+Eight more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `piece_info()`, `articles()`, `permission_handlers()`, `requirements()` and `legal_attestation()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Seven `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()`, `presentation()`, `viewports()` and `separation_info()`. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
 
 | Name | What it is |
 |---|---|
@@ -85,6 +85,13 @@ Six more `Document` methods read structures beyond the catalog readers above: `l
 | `Presentation` | A page's display in a presentation: `duration`, `transition` |
 | `Transition` | A page transition with the standard's defaults filled in: `style`, `duration`, `dimension`, `motion`, `direction` (degrees or `None`), `scale`, `opaque` |
 | `PermissionHandlers` | The catalog's certifying and usage rights signatures, read as data: `doc_mdp`, `usage_rights` (each a `Signature` or `None`) |
+| `Requirement` | One entry of the catalog's requirements array, a feature a reader needs to show the document as intended: `kind` (`"EnableJavaScripts"` or the name as written), `handlers` |
+| `RequirementHandler` | One handler for a reader that lacks the feature, reported and never run: `kind` (`"JS"`, `"NoOp"` or the name as written), `script` |
+| `LegalAttestation` | The catalog's legal attestation: one integer attribute per count in Table 259 (`java_script_actions`, `uri_actions`, `non_embedded_fonts`, ...), `attestation`, and `counts()` for the whole table as a `dict` |
+| `Viewport` | One measurement viewport of a page: `bbox`, `name`, `measure` |
+| `Measure` | How a viewport's coordinates convert to real-world units, with the standard's defaults filled in: `subtype`, `scale_ratio`, the number-format chains `x`, `y`, `distance`, `area`, `angle`, `slope`, plus `origin` and `y_to_x` |
+| `NumberFormat` | One unit of a chain: `unit`, `conversion`, `fraction` (`"decimal"`, `"fraction"`, `"round"`, `"truncate"`), `precision`, `fixed_denominator`, `thousands`, `radix`, `prefix_spacing`, `suffix_spacing`, `label` (`"suffix"` or `"prefix"`) |
+| `SeparationInfo` | A pre-separated page's separation dictionary: `pages` (0-based, `None` where the reference names no page), `page_refs`, `device_colorant`, `color_space` (plain Python data) |
 
 ```python
 import pdfboss
@@ -101,6 +108,19 @@ if shown and shown.transition:
 thumb = page.thumbnail_image()
 if thumb:
     open("thumb.png", "wb").write(thumb.data)
+
+for viewport in page.viewports():
+    scale = viewport.measure
+    if scale:
+        print(viewport.name, scale.scale_ratio, [f.unit for f in scale.distance])
+separation = page.separation_info()
+if separation:
+    print(separation.device_colorant, separation.pages)
+for requirement in doc.requirements():
+    print(requirement.kind, [handler.kind for handler in requirement.handlers])
+legal = doc.legal_attestation()
+if legal:
+    print(legal.attestation, legal.counts())
 ```
 
 ## The md submodule

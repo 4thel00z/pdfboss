@@ -445,6 +445,18 @@ class Document:
         certifying and usage rights signatures read as data and not
         verified; ``None`` without the dictionary."""
 
+    def requirements(self) -> list[Requirement]:
+        """The requirements the catalog lists (ISO 32000-1 12.10.1), in
+        order: the features a reader needs to show the document as
+        intended, each with the handlers (12.10.2) for a reader that lacks
+        it. Releases the GIL while they are read."""
+
+    def legal_attestation(self) -> LegalAttestation | None:
+        """The catalog's legal attestation (ISO 32000-1 12.8.5): the counts
+        of content a certifying signature cannot vouch for and the
+        signer's statement about it; ``None`` without the dictionary.
+        Releases the GIL."""
+
 class Page:
     """A single page of a document.
 
@@ -614,6 +626,17 @@ class Page:
         """How the page is shown in a presentation (ISO 32000-1 12.4.4),
         its display duration and transition; ``None`` when the page sets
         neither. Releases the GIL."""
+
+    def viewports(self) -> list[Viewport]:
+        """The page's measurement viewports (ISO 32000-1 12.9), in order:
+        each a rectangle with the scale that maps it to real-world units;
+        empty for a page without any. Releases the GIL."""
+
+    def separation_info(self) -> SeparationInfo | None:
+        """The page's separation dictionary (ISO 32000-1 14.11.4): the
+        colorant a pre-separated page prints and the pages of its
+        separation set, resolved to 0-based indices; ``None`` for a page
+        without one. Releases the GIL."""
 
 class PageImage:
     """One embedded image extracted from a page: PNG-encoded pixels at
@@ -1358,6 +1381,186 @@ class PermissionHandlers:
     usage_rights: Signature | None
     """The usage rights signature, ``/UR3``; ``None`` without one."""
 
+class Requirement:
+    """One entry of the catalog's requirements array (ISO 32000-1 12.10.1,
+    Table 266): a feature a reader needs to show the document as
+    intended; returned by ``Document.requirements``."""
+
+    kind: str
+    """The requirement type, ``/S``: ``"EnableJavaScripts"`` is the one the
+    standard defines; any other name is kept as written."""
+
+    handlers: list[RequirementHandler]
+    """The handlers a reader that does not meet the requirement runs,
+    ``/RH``, in order."""
+
+class RequirementHandler:
+    """One requirement handler (ISO 32000-1 12.10.2, Table 267), read as
+    data: pdfboss runs no JavaScript, so the handler is reported, not
+    invoked."""
+
+    kind: str
+    """The handler type, ``/S``: ``"JS"`` runs a document-level JavaScript,
+    ``"NoOp"`` does nothing; any other name is kept as written."""
+
+    script: str | None
+    """The name of the document-level JavaScript a ``"JS"`` handler runs,
+    ``/Script``, as the catalog's name tree lists it."""
+
+class LegalAttestation:
+    """The catalog's legal attestation (ISO 32000-1 12.8.5, Table 259):
+    how much content of each kind that a certifying signature cannot
+    vouch for the document holds, and the signer's statement about it.
+    Every count is read as written, an absent one as 0; nothing is
+    recounted. Returned by ``Document.legal_attestation``."""
+
+    java_script_actions: int
+    launch_actions: int
+    uri_actions: int
+    movie_actions: int
+    sound_actions: int
+    hide_annotation_actions: int
+    go_to_remote_actions: int
+    alternate_images: int
+    external_streams: int
+    true_type_fonts: int
+    external_ref_xobjects: int
+    external_opi_dicts: int
+    non_embedded_fonts: int
+    dev_dep_gs_op: int
+    dev_dep_gs_ht: int
+    dev_dep_gs_tr: int
+    dev_dep_gs_ucr: int
+    dev_dep_gs_bg: int
+    dev_dep_gs_fl: int
+    annotations: int
+    optional_content: int
+
+    attestation: str | None
+    """The signer's statement about the counted content, ``/Attestation``."""
+
+    def counts(self) -> dict[str, int]:
+        """Every count keyed by its attribute name, for callers that want
+        the whole table at once."""
+
+class Viewport:
+    """A viewport (ISO 32000-1 12.9, Table 260): a page rectangle with its
+    own measurement scale; returned by ``Page.viewports``. Where viewports
+    overlap, the last one in the list whose box contains a point applies
+    to it."""
+
+    bbox: tuple[float, float, float, float]
+    """The rectangle in default user space, ``/BBox``, as
+    ``(x0, y0, x1, y1)``."""
+
+    name: str | None
+    """A descriptive title, ``/Name``."""
+
+    measure: Measure | None
+    """The units of the viewport's coordinate system, ``/Measure``;
+    ``None`` without one."""
+
+class Measure:
+    """A measure dictionary (ISO 32000-1 12.9, Tables 261 and 262): how
+    distances, areas and angles in a viewport convert to real-world
+    units. Each axis is a chain of number formats from the coarsest unit
+    to the finest, with the tables' defaults filled in."""
+
+    subtype: str
+    """``/Subtype``: ``"RL"``, rectilinear, the one kind the standard
+    defines and the default; any other name is kept as written."""
+
+    scale_ratio: str | None
+    """The scale ratio as text, ``/R``, in the ``1in = 0.1 mi`` style."""
+
+    x: list[NumberFormat]
+    """The number formats for x distances, ``/X``."""
+
+    y: list[NumberFormat]
+    """The formats for y distances, ``/Y``; empty when they share ``x``'s."""
+
+    distance: list[NumberFormat]
+    """The formats for distances, ``/D``."""
+
+    area: list[NumberFormat]
+    """The formats for areas, ``/A``."""
+
+    angle: list[NumberFormat]
+    """The formats for angles, ``/T``."""
+
+    slope: list[NumberFormat]
+    """The formats for slopes, ``/S``."""
+
+    origin: tuple[float, float]
+    """The origin of the measurement coordinate system in default user
+    space, ``/O``; ``(0.0, 0.0)`` when absent."""
+
+    y_to_x: float | None
+    """The factor that converts y units to x units when the two differ,
+    ``/CYX``."""
+
+class NumberFormat:
+    """A number format (ISO 32000-1 12.9, Table 263): one unit of a
+    measurement chain and how its value is shown."""
+
+    unit: str
+    """The unit label, ``/U``."""
+
+    conversion: float
+    """The factor that converts the previous unit in the chain to this
+    one, ``/C``."""
+
+    fraction: Literal["decimal", "fraction", "round", "truncate"]
+    """How the fractional part is shown, ``/F``."""
+
+    precision: int
+    """The precision or denominator, ``/D``, as the fraction format reads
+    it."""
+
+    fixed_denominator: bool
+    """Whether a fraction keeps the denominator as written instead of
+    reducing it, ``/FD``."""
+
+    thousands: str
+    """The thousands separator, ``/RT``."""
+
+    radix: str
+    """The decimal point, ``/RD``."""
+
+    prefix_spacing: str
+    """The text between the label and the value when the label precedes,
+    ``/PS``."""
+
+    suffix_spacing: str
+    """The text between the value and the label when the label follows,
+    ``/SS``."""
+
+    label: Literal["suffix", "prefix"]
+    """Where the label goes, ``/O``."""
+
+class SeparationInfo:
+    """A page's separation dictionary (ISO 32000-1 14.11.4, Table 364):
+    what a page that is one colour separation of a composite page prints,
+    and the other pages of the same separation set; returned by
+    ``Page.separation_info``."""
+
+    pages: list[int | None]
+    """The 0-based indices of the pages in the separation set, this page
+    among them, in the order written; ``None`` for a reference that names
+    no page of this document."""
+
+    page_refs: list[tuple[int, int]]
+    """The ``(num, gen)`` references of the pages in the separation set, as
+    written."""
+
+    device_colorant: str
+    """The colorant this page prints, ``/DeviceColorant``."""
+
+    color_space: object
+    """The Separation or DeviceN colour space array whose tint transform
+    approximates the colorant on a display, ``/ColorSpace``, as plain
+    Python data; ``None`` without one."""
+
 class AsyncDocument:
     """A PDF document opened for async I/O.
 
@@ -1538,6 +1741,13 @@ class AsyncDocument:
         """The permission handlers, the async twin of
         ``Document.permission_handlers``."""
 
+    async def requirements(self) -> list[Requirement]:
+        """The requirements, the async twin of ``Document.requirements``."""
+
+    async def legal_attestation(self) -> LegalAttestation | None:
+        """The legal attestation, the async twin of
+        ``Document.legal_attestation``."""
+
 class AsyncPage:
     """A single page of an async document.
 
@@ -1659,6 +1869,13 @@ class AsyncPage:
     async def presentation(self) -> Presentation | None:
         """The presentation entries, the async twin of
         ``Page.presentation``."""
+
+    async def viewports(self) -> list[Viewport]:
+        """The measurement viewports, the async twin of ``Page.viewports``."""
+
+    async def separation_info(self) -> SeparationInfo | None:
+        """The separation dictionary, the async twin of
+        ``Page.separation_info``."""
 
 def md_to_pdf(
     markdown: str,
