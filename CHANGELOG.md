@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.9.0](https://github.com/4thel00z/pdfboss/compare/v2.8.0...v2.9.0) (2026-09-17)
+
+
+### Features
+
+* **py:** requirement, legal, viewport and separation readers in the Python bindings ([#200](https://github.com/4thel00z/pdfboss/issues/200)) ([117ed40](https://github.com/4thel00z/pdfboss/commit/117ed40f95ea8487731940c7c7d15edb431d4553))
+
+
+### Documentation
+
+* **failure-modes:** name the group blend evidence after its squash hash ec99251 ([#199](https://github.com/4thel00z/pdfboss/issues/199)) ([e5a9f7a](https://github.com/4thel00z/pdfboss/commit/e5a9f7a92a6368a00942b5af092fbecc7922a265))
+
 ## [2.8.0](https://github.com/4thel00z/pdfboss/compare/v2.7.0...v2.8.0) (2026-09-17)
 
 
