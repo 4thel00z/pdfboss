@@ -87,3 +87,26 @@ def test_stub_declares_the_document_and_page_structure_methods() -> None:
         'def parse(da: str) -> "DefaultAppearance"',
     ):
         assert line in stub, f"missing stub: {line}"
+
+
+def test_stub_declares_the_catalog_structure_readers() -> None:
+    stub = STUB.read_text()
+    for line in (
+        "def requirements(self) -> list[Requirement]",
+        "def legal_attestation(self) -> LegalAttestation | None",
+        "def viewports(self) -> list[Viewport]",
+        "def separation_info(self) -> SeparationInfo | None",
+    ):
+        assert f"    {line}" in stub, f"missing sync stub: {line}"
+        assert f"    async {line}" in stub, f"missing async stub: {line}"
+    for line in (
+        "handlers: list[RequirementHandler]",
+        "def counts(self) -> dict[str, int]",
+        "measure: Measure | None",
+        "x: list[NumberFormat]",
+        'fraction: Literal["decimal", "fraction", "round", "truncate"]',
+        'label: Literal["suffix", "prefix"]',
+        "pages: list[int | None]",
+        "page_refs: list[tuple[int, int]]",
+    ):
+        assert line in stub, f"missing stub: {line}"

@@ -928,6 +928,26 @@ impl Document {
             .permission_handlers()
             .map(document::PermissionHandlers::from)
     }
+
+    /// The requirements the catalog lists, in order: the features a reader
+    /// needs to show the document as intended, each with the handlers for
+    /// a reader that lacks it. Releases the GIL while they are read.
+    fn requirements(&self, py: Python<'_>) -> Vec<document::Requirement> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || inner.lock().requirements())
+            .into_iter()
+            .map(document::Requirement::from)
+            .collect()
+    }
+
+    /// The catalog's legal attestation: the counts of content a certifying
+    /// signature cannot vouch for and the signer's statement about it;
+    /// `None` without the dictionary. Releases the GIL.
+    fn legal_attestation(&self, py: Python<'_>) -> Option<document::LegalAttestation> {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || inner.lock().legal_attestation())
+            .map(document::LegalAttestation::from)
+    }
 }
 
 impl Document {
@@ -1407,6 +1427,31 @@ impl Page {
             doc.presentation(&self.page)
         })
         .map(document::Presentation::from)
+    }
+
+    /// The page's measurement viewports, in order: each a rectangle with
+    /// the scale that maps it to real-world units; empty for a page
+    /// without any. Releases the GIL.
+    fn viewports(&self, py: Python<'_>) -> Vec<document::Viewport> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            doc.viewports(&self.page)
+        })
+        .into_iter()
+        .map(document::Viewport::from)
+        .collect()
+    }
+
+    /// The page's separation dictionary: the colorant a pre-separated page
+    /// prints and the pages of its separation set, resolved to 0-based
+    /// indices; `None` for a page without one. Releases the GIL.
+    fn separation_info(&self, py: Python<'_>) -> Option<document::SeparationInfo> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            let info = doc.separation_info(&self.page)?;
+            let pages = page_index_of(&doc);
+            Some(document::SeparationInfo::new(info, &pages))
+        })
     }
 }
 
@@ -2449,6 +2494,31 @@ impl AsyncDocument {
             )
         })
     }
+
+    fn requirements<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let requirements = inner.requirements().await;
+            Ok::<Vec<document::Requirement>, PyErr>(
+                requirements
+                    .into_iter()
+                    .map(document::Requirement::from)
+                    .collect(),
+            )
+        })
+    }
+
+    fn legal_attestation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok::<Option<document::LegalAttestation>, PyErr>(
+                inner
+                    .legal_attestation()
+                    .await
+                    .map(document::LegalAttestation::from),
+            )
+        })
+    }
 }
 
 /// A single page of an async document. Attributes are synchronous — the
@@ -2766,6 +2836,33 @@ impl AsyncPage {
                 doc.presentation(&page)
                     .await
                     .map(document::Presentation::from),
+            )
+        })
+    }
+
+    fn viewports<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let viewports = doc.viewports(&page).await;
+            Ok::<Vec<document::Viewport>, PyErr>(
+                viewports
+                    .into_iter()
+                    .map(document::Viewport::from)
+                    .collect(),
+            )
+        })
+    }
+
+    fn separation_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&doc);
+            Ok::<Option<document::SeparationInfo>, PyErr>(
+                doc.separation_info(&page)
+                    .await
+                    .map(|info| document::SeparationInfo::new(info, &pages)),
             )
         })
     }

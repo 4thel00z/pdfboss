@@ -1,18 +1,23 @@
 //! Document- and page-level structures as Python sees them: the
 //! linearization parameter dictionary, output intents, page-piece data,
-//! thumbnails, article threads, presentations and permission handlers, as
-//! frozen classes over the core types. Enumerations are kebab-case strings
-//! and object references `(num, gen)` tuples.
+//! thumbnails, article threads, presentations, permission handlers,
+//! requirements, the legal attestation, measurement viewports and
+//! separation dictionaries, as frozen classes over the core types.
+//! Enumerations are kebab-case strings and object references `(num, gen)`
+//! tuples.
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use pdfboss_core::{
-    ArticleThread as CoreArticleThread, Bead as CoreBead, Dimension,
-    Linearization as CoreLinearization, Motion, OutputIntent as CoreOutputIntent,
-    PagePiece as CorePagePiece, PermissionHandlers as CorePermissionHandlers,
-    Presentation as CorePresentation, Thumbnail as CoreThumbnail, Transition as CoreTransition,
-    TransitionDirection, TransitionStyle,
+    ArticleThread as CoreArticleThread, Bead as CoreBead, Dimension, FractionFormat, LabelPosition,
+    LegalAttestation as CoreLegalAttestation, Linearization as CoreLinearization,
+    Measure as CoreMeasure, Motion, NumberFormat as CoreNumberFormat, Object,
+    OutputIntent as CoreOutputIntent, PagePiece as CorePagePiece,
+    PermissionHandlers as CorePermissionHandlers, Presentation as CorePresentation,
+    Requirement as CoreRequirement, RequirementHandler as CoreRequirementHandler,
+    SeparationInfo as CoreSeparationInfo, Thumbnail as CoreThumbnail, Transition as CoreTransition,
+    TransitionDirection, TransitionStyle, Viewport as CoreViewport,
 };
 
 use crate::catalog::PageIndex;
@@ -565,6 +570,589 @@ impl PermissionHandlers {
     }
 }
 
+fn fraction_format_str(format: FractionFormat) -> &'static str {
+    match format {
+        FractionFormat::Decimal => "decimal",
+        FractionFormat::Fraction => "fraction",
+        FractionFormat::Round => "round",
+        FractionFormat::Truncate => "truncate",
+    }
+}
+
+fn label_position_str(position: LabelPosition) -> &'static str {
+    match position {
+        LabelPosition::Suffix => "suffix",
+        LabelPosition::Prefix => "prefix",
+    }
+}
+
+/// One requirement the catalog lists: a feature a reader needs to show
+/// the document as intended, with the handlers for a reader that lacks it.
+#[pyclass(frozen)]
+#[derive(Clone)]
+pub(crate) struct Requirement {
+    inner: CoreRequirement,
+}
+
+impl From<CoreRequirement> for Requirement {
+    fn from(inner: CoreRequirement) -> Requirement {
+        Requirement { inner }
+    }
+}
+
+#[pymethods]
+impl Requirement {
+    /// The requirement type, `/S`: `"EnableJavaScripts"` is the one the
+    /// standard defines; any other name is kept as written.
+    #[getter]
+    fn kind(&self) -> &str {
+        &self.inner.kind
+    }
+
+    /// The handlers a reader that does not meet the requirement runs,
+    /// `/RH`, in order.
+    #[getter]
+    fn handlers(&self) -> Vec<RequirementHandler> {
+        self.inner
+            .handlers
+            .iter()
+            .cloned()
+            .map(RequirementHandler::from)
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Requirement(kind={}, handlers={})",
+            repr_str(&self.inner.kind),
+            self.inner.handlers.len()
+        )
+    }
+}
+
+/// One requirement handler, read as data: pdfboss runs no JavaScript, so
+/// the handler is reported, not invoked.
+#[pyclass(frozen)]
+#[derive(Clone)]
+pub(crate) struct RequirementHandler {
+    inner: CoreRequirementHandler,
+}
+
+impl From<CoreRequirementHandler> for RequirementHandler {
+    fn from(inner: CoreRequirementHandler) -> RequirementHandler {
+        RequirementHandler { inner }
+    }
+}
+
+#[pymethods]
+impl RequirementHandler {
+    /// The handler type, `/S`: `"JS"` runs a document-level JavaScript,
+    /// `"NoOp"` does nothing; any other name is kept as written.
+    #[getter]
+    fn kind(&self) -> &str {
+        &self.inner.kind
+    }
+
+    /// The name of the document-level JavaScript a `"JS"` handler runs,
+    /// `/Script`, as the catalog's name tree lists it.
+    #[getter]
+    fn script(&self) -> Option<&str> {
+        self.inner.script.as_deref()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RequirementHandler(kind={}, script={})",
+            repr_str(&self.inner.kind),
+            repr_opt_str(self.inner.script.as_deref())
+        )
+    }
+}
+
+/// The catalog's legal attestation: how much content of each kind that a
+/// certifying signature cannot vouch for the document holds, and the
+/// signer's statement about it. Every count is read as written, an absent
+/// one as 0; nothing is recounted.
+#[pyclass(frozen)]
+pub(crate) struct LegalAttestation {
+    inner: CoreLegalAttestation,
+}
+
+impl From<CoreLegalAttestation> for LegalAttestation {
+    fn from(inner: CoreLegalAttestation) -> LegalAttestation {
+        LegalAttestation { inner }
+    }
+}
+
+#[pymethods]
+impl LegalAttestation {
+    /// JavaScript actions, `/JavaScriptActions`.
+    #[getter]
+    fn java_script_actions(&self) -> u32 {
+        self.inner.java_script_actions
+    }
+
+    /// Launch actions, `/LaunchActions`.
+    #[getter]
+    fn launch_actions(&self) -> u32 {
+        self.inner.launch_actions
+    }
+
+    /// URI actions, `/URIActions`.
+    #[getter]
+    fn uri_actions(&self) -> u32 {
+        self.inner.uri_actions
+    }
+
+    /// Movie actions, `/MovieActions`.
+    #[getter]
+    fn movie_actions(&self) -> u32 {
+        self.inner.movie_actions
+    }
+
+    /// Sound actions, `/SoundActions`.
+    #[getter]
+    fn sound_actions(&self) -> u32 {
+        self.inner.sound_actions
+    }
+
+    /// Hide actions, `/HideAnnotationActions`.
+    #[getter]
+    fn hide_annotation_actions(&self) -> u32 {
+        self.inner.hide_annotation_actions
+    }
+
+    /// Remote go-to actions, `/GoToRemoteActions`.
+    #[getter]
+    fn go_to_remote_actions(&self) -> u32 {
+        self.inner.go_to_remote_actions
+    }
+
+    /// Alternate images, `/AlternateImages`.
+    #[getter]
+    fn alternate_images(&self) -> u32 {
+        self.inner.alternate_images
+    }
+
+    /// Streams read from outside the file, `/ExternalStreams`.
+    #[getter]
+    fn external_streams(&self) -> u32 {
+        self.inner.external_streams
+    }
+
+    /// TrueType fonts, `/TrueTypeFonts`.
+    #[getter]
+    fn true_type_fonts(&self) -> u32 {
+        self.inner.true_type_fonts
+    }
+
+    /// Reference XObjects, `/ExternalRefXobjects`.
+    #[getter]
+    fn external_ref_xobjects(&self) -> u32 {
+        self.inner.external_ref_xobjects
+    }
+
+    /// OPI dictionaries, `/ExternalOPIdicts`.
+    #[getter]
+    fn external_opi_dicts(&self) -> u32 {
+        self.inner.external_opi_dicts
+    }
+
+    /// Fonts without an embedded program, `/NonEmbeddedFonts`.
+    #[getter]
+    fn non_embedded_fonts(&self) -> u32 {
+        self.inner.non_embedded_fonts
+    }
+
+    /// Graphics state parameter dictionaries setting overprint,
+    /// `/DevDepGS_OP`.
+    #[getter]
+    fn dev_dep_gs_op(&self) -> u32 {
+        self.inner.dev_dep_gs_op
+    }
+
+    /// Graphics state parameter dictionaries with a halftone, `/DevDepGS_HT`.
+    #[getter]
+    fn dev_dep_gs_ht(&self) -> u32 {
+        self.inner.dev_dep_gs_ht
+    }
+
+    /// Graphics state parameter dictionaries with a transfer function,
+    /// `/DevDepGS_TR`.
+    #[getter]
+    fn dev_dep_gs_tr(&self) -> u32 {
+        self.inner.dev_dep_gs_tr
+    }
+
+    /// Graphics state parameter dictionaries with undercolour removal,
+    /// `/DevDepGS_UCR`.
+    #[getter]
+    fn dev_dep_gs_ucr(&self) -> u32 {
+        self.inner.dev_dep_gs_ucr
+    }
+
+    /// Graphics state parameter dictionaries with black generation,
+    /// `/DevDepGS_BG`.
+    #[getter]
+    fn dev_dep_gs_bg(&self) -> u32 {
+        self.inner.dev_dep_gs_bg
+    }
+
+    /// Graphics state parameter dictionaries with a flatness tolerance,
+    /// `/DevDepGS_FL`.
+    #[getter]
+    fn dev_dep_gs_fl(&self) -> u32 {
+        self.inner.dev_dep_gs_fl
+    }
+
+    /// Annotations, `/Annotations`.
+    #[getter]
+    fn annotations(&self) -> u32 {
+        self.inner.annotations
+    }
+
+    /// Optional content groups, `/OptionalContent`.
+    #[getter]
+    fn optional_content(&self) -> u32 {
+        self.inner.optional_content
+    }
+
+    /// The signer's statement about the counted content, `/Attestation`.
+    #[getter]
+    fn attestation(&self) -> Option<&str> {
+        self.inner.attestation.as_deref()
+    }
+
+    /// Every count keyed by its Python attribute name, for callers that
+    /// want the whole table at once.
+    fn counts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        let legal = &self.inner;
+        for (name, count) in [
+            ("java_script_actions", legal.java_script_actions),
+            ("launch_actions", legal.launch_actions),
+            ("uri_actions", legal.uri_actions),
+            ("movie_actions", legal.movie_actions),
+            ("sound_actions", legal.sound_actions),
+            ("hide_annotation_actions", legal.hide_annotation_actions),
+            ("go_to_remote_actions", legal.go_to_remote_actions),
+            ("alternate_images", legal.alternate_images),
+            ("external_streams", legal.external_streams),
+            ("true_type_fonts", legal.true_type_fonts),
+            ("external_ref_xobjects", legal.external_ref_xobjects),
+            ("external_opi_dicts", legal.external_opi_dicts),
+            ("non_embedded_fonts", legal.non_embedded_fonts),
+            ("dev_dep_gs_op", legal.dev_dep_gs_op),
+            ("dev_dep_gs_ht", legal.dev_dep_gs_ht),
+            ("dev_dep_gs_tr", legal.dev_dep_gs_tr),
+            ("dev_dep_gs_ucr", legal.dev_dep_gs_ucr),
+            ("dev_dep_gs_bg", legal.dev_dep_gs_bg),
+            ("dev_dep_gs_fl", legal.dev_dep_gs_fl),
+            ("annotations", legal.annotations),
+            ("optional_content", legal.optional_content),
+        ] {
+            dict.set_item(name, count)?;
+        }
+        Ok(dict)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "LegalAttestation(attestation={})",
+            repr_opt_str(self.inner.attestation.as_deref())
+        )
+    }
+}
+
+/// A viewport: a page rectangle with its own measurement scale. Where
+/// viewports overlap, the last one in the array whose box contains a
+/// point applies to it.
+#[pyclass(frozen)]
+pub(crate) struct Viewport {
+    inner: CoreViewport,
+}
+
+impl From<CoreViewport> for Viewport {
+    fn from(inner: CoreViewport) -> Viewport {
+        Viewport { inner }
+    }
+}
+
+#[pymethods]
+impl Viewport {
+    /// The rectangle in default user space, `/BBox`, as `(x0, y0, x1, y1)`.
+    #[getter]
+    fn bbox(&self) -> (f32, f32, f32, f32) {
+        rect_tuple(self.inner.bbox)
+    }
+
+    /// A descriptive title, `/Name`.
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    /// The units of the viewport's coordinate system, `/Measure`; `None`
+    /// without one.
+    #[getter]
+    fn measure(&self) -> Option<Measure> {
+        self.inner.measure.clone().map(Measure::from)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Viewport(bbox={:?}, name={})",
+            rect_tuple(self.inner.bbox),
+            repr_opt_str(self.inner.name.as_deref())
+        )
+    }
+}
+
+/// A measure dictionary: how distances, areas and angles in a viewport
+/// convert to real-world units. Each axis is a chain of number formats
+/// from the coarsest unit to the finest.
+#[pyclass(frozen)]
+pub(crate) struct Measure {
+    inner: CoreMeasure,
+}
+
+impl From<CoreMeasure> for Measure {
+    fn from(inner: CoreMeasure) -> Measure {
+        Measure { inner }
+    }
+}
+
+fn number_formats(formats: &[CoreNumberFormat]) -> Vec<NumberFormat> {
+    formats.iter().cloned().map(NumberFormat::from).collect()
+}
+
+#[pymethods]
+impl Measure {
+    /// `/Subtype`: `"RL"`, rectilinear, the one kind the standard defines
+    /// and the default; any other name is kept as written.
+    #[getter]
+    fn subtype(&self) -> &str {
+        &self.inner.subtype
+    }
+
+    /// The scale ratio as text, `/R`, in the `1in = 0.1 mi` style.
+    #[getter]
+    fn scale_ratio(&self) -> Option<&str> {
+        self.inner.scale_ratio.as_deref()
+    }
+
+    /// The number formats for x distances, `/X`.
+    #[getter]
+    fn x(&self) -> Vec<NumberFormat> {
+        number_formats(&self.inner.x)
+    }
+
+    /// The formats for y distances, `/Y`; empty when they share `x`'s.
+    #[getter]
+    fn y(&self) -> Vec<NumberFormat> {
+        number_formats(&self.inner.y)
+    }
+
+    /// The formats for distances, `/D`.
+    #[getter]
+    fn distance(&self) -> Vec<NumberFormat> {
+        number_formats(&self.inner.distance)
+    }
+
+    /// The formats for areas, `/A`.
+    #[getter]
+    fn area(&self) -> Vec<NumberFormat> {
+        number_formats(&self.inner.area)
+    }
+
+    /// The formats for angles, `/T`.
+    #[getter]
+    fn angle(&self) -> Vec<NumberFormat> {
+        number_formats(&self.inner.angle)
+    }
+
+    /// The formats for slopes, `/S`.
+    #[getter]
+    fn slope(&self) -> Vec<NumberFormat> {
+        number_formats(&self.inner.slope)
+    }
+
+    /// The origin of the measurement coordinate system in default user
+    /// space, `/O`; `(0.0, 0.0)` when absent.
+    #[getter]
+    fn origin(&self) -> (f64, f64) {
+        self.inner.origin
+    }
+
+    /// The factor that converts y units to x units when the two differ,
+    /// `/CYX`.
+    #[getter]
+    fn y_to_x(&self) -> Option<f64> {
+        self.inner.y_to_x
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Measure(subtype={}, scale_ratio={})",
+            repr_str(&self.inner.subtype),
+            repr_opt_str(self.inner.scale_ratio.as_deref())
+        )
+    }
+}
+
+/// One unit of a measurement chain and how its value is shown.
+#[pyclass(frozen)]
+#[derive(Clone)]
+pub(crate) struct NumberFormat {
+    inner: CoreNumberFormat,
+}
+
+impl From<CoreNumberFormat> for NumberFormat {
+    fn from(inner: CoreNumberFormat) -> NumberFormat {
+        NumberFormat { inner }
+    }
+}
+
+#[pymethods]
+impl NumberFormat {
+    /// The unit label, `/U`.
+    #[getter]
+    fn unit(&self) -> &str {
+        &self.inner.unit
+    }
+
+    /// The factor that converts the previous unit in the chain to this
+    /// one, `/C`.
+    #[getter]
+    fn conversion(&self) -> f64 {
+        self.inner.conversion
+    }
+
+    /// How the fractional part is shown, `/F`: `"decimal"`, `"fraction"`,
+    /// `"round"` or `"truncate"`.
+    #[getter]
+    fn fraction(&self) -> &'static str {
+        fraction_format_str(self.inner.fraction)
+    }
+
+    /// The precision or denominator, `/D`, as the fraction format reads it.
+    #[getter]
+    fn precision(&self) -> u32 {
+        self.inner.precision
+    }
+
+    /// Whether a fraction keeps the denominator as written instead of
+    /// reducing it, `/FD`.
+    #[getter]
+    fn fixed_denominator(&self) -> bool {
+        self.inner.fixed_denominator
+    }
+
+    /// The thousands separator, `/RT`.
+    #[getter]
+    fn thousands(&self) -> &str {
+        &self.inner.thousands
+    }
+
+    /// The decimal point, `/RD`.
+    #[getter]
+    fn radix(&self) -> &str {
+        &self.inner.radix
+    }
+
+    /// The text between the label and the value when the label precedes,
+    /// `/PS`.
+    #[getter]
+    fn prefix_spacing(&self) -> &str {
+        &self.inner.prefix_spacing
+    }
+
+    /// The text between the value and the label when the label follows,
+    /// `/SS`.
+    #[getter]
+    fn suffix_spacing(&self) -> &str {
+        &self.inner.suffix_spacing
+    }
+
+    /// Where the label goes, `/O`: `"suffix"` or `"prefix"`.
+    #[getter]
+    fn label(&self) -> &'static str {
+        label_position_str(self.inner.label)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "NumberFormat(unit={}, conversion={:?})",
+            repr_str(&self.inner.unit),
+            self.inner.conversion
+        )
+    }
+}
+
+/// A page's separation dictionary: what a page that is one colour
+/// separation of a composite page prints, and the other pages of the same
+/// separation set.
+#[pyclass(frozen)]
+pub(crate) struct SeparationInfo {
+    inner: CoreSeparationInfo,
+    pages: Vec<Option<usize>>,
+}
+
+impl SeparationInfo {
+    pub(crate) fn new(inner: CoreSeparationInfo, index: &PageIndex) -> SeparationInfo {
+        let pages = inner
+            .pages
+            .iter()
+            .map(|page_ref| index.get(page_ref).copied())
+            .collect();
+        SeparationInfo { inner, pages }
+    }
+}
+
+#[pymethods]
+impl SeparationInfo {
+    /// The 0-based indices of the pages in the separation set, this page
+    /// among them, in the order written; `None` for a reference that names
+    /// no page of this document.
+    #[getter]
+    fn pages(&self) -> Vec<Option<usize>> {
+        self.pages.clone()
+    }
+
+    /// The `(num, gen)` references of the pages in the separation set, as
+    /// written.
+    #[getter]
+    fn page_refs(&self) -> Vec<(u32, u16)> {
+        self.inner.pages.iter().copied().map(ref_tuple).collect()
+    }
+
+    /// The colorant this page prints, `/DeviceColorant`.
+    #[getter]
+    fn device_colorant(&self) -> &str {
+        &self.inner.device_colorant
+    }
+
+    /// The Separation or DeviceN colour space array whose tint transform
+    /// approximates the colorant on a display, `/ColorSpace`, as plain
+    /// Python data; `None` without one.
+    #[getter]
+    fn color_space<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.inner
+            .color_space
+            .as_ref()
+            .map(|items| object_to_py(py, &Object::Array(items.clone())))
+            .transpose()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "SeparationInfo(device_colorant={}, pages={})",
+            repr_str(&self.inner.device_colorant),
+            self.inner.pages.len()
+        )
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Linearization>()?;
     module.add_class::<OutputIntent>()?;
@@ -575,6 +1163,13 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Transition>()?;
     module.add_class::<Presentation>()?;
     module.add_class::<PermissionHandlers>()?;
+    module.add_class::<Requirement>()?;
+    module.add_class::<RequirementHandler>()?;
+    module.add_class::<LegalAttestation>()?;
+    module.add_class::<Viewport>()?;
+    module.add_class::<Measure>()?;
+    module.add_class::<NumberFormat>()?;
+    module.add_class::<SeparationInfo>()?;
     Ok(())
 }
 

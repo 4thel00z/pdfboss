@@ -79,6 +79,7 @@ fields = doc.form_fields()                    # interactive form: .name, .field_
 toc    = doc.outline()                        # bookmarks: .title, .page, .children; also page_labels(), embedded_files(), named_destinations()
 intents = doc.output_intents()                # .subtype, .output_condition_identifier; also is_linearized(), articles(), piece_info(), permission_handlers()
 thumb  = doc[0].thumbnail_image()             # PageImage or None; also doc[0].presentation() (.duration, .transition.style), .beads(), .piece_info()
+scales = doc[0].viewports()                   # measurement viewports: .bbox, .measure.distance; also doc[0].separation_info(), doc.requirements(), doc.legal_attestation()
 
 # async, over files or HTTP, range-fetched
 doc = await pdfboss.AsyncDocument.open_url("https://example.com/doc.pdf")
