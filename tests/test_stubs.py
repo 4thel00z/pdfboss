@@ -110,3 +110,39 @@ def test_stub_declares_the_catalog_structure_readers() -> None:
         "page_refs: list[tuple[int, int]]",
     ):
         assert line in stub, f"missing stub: {line}"
+
+
+def test_stub_declares_the_annotation_readers() -> None:
+    stub = STUB.read_text()
+    for line in (
+        "def annotations(self) -> list[Annotation]",
+        "def additional_actions(self) -> list[TriggeredAction]",
+        "def file_spec_data(self, spec: FileSpec) -> bytes",
+    ):
+        assert f"    {line}" in stub, f"missing sync stub: {line}"
+        assert f"    async {line}" in stub, f"missing async stub: {line}"
+    assert stub.count("    def additional_actions(self) -> list[TriggeredAction]") == 2
+    assert stub.count("    async def additional_actions(self) -> list[TriggeredAction]") == 2
+    for line in (
+        "class Annotation:",
+        "class AnnotationFlags:",
+        "class Border:",
+        "class Markup:",
+        "class FileSpec:",
+        "class Action:",
+        "class Target:",
+        "class WindowsLaunch:",
+        "class TriggeredAction:",
+        "flags: AnnotationFlags",
+        "markup: Markup | None",
+        "state_model: str | None",
+        "destination: Destination | None",
+        "additional_actions: list[TriggeredAction]",
+        'reply_type: Literal["reply", "group"]',
+        "named_destination: bytes | None",
+        "entries: dict[str, object] | None",
+        "next: list[Action]",
+        'relationship: Literal["parent", "child"]',
+        "url: str | None",
+    ):
+        assert line in stub, f"missing stub: {line}"
