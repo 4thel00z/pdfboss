@@ -5,7 +5,9 @@
 
 use std::io::Write as _;
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use flate2::{write::ZlibEncoder, Compression};
 use pdfboss_core::{Document, ObjRef};
 use pdfboss_testkit::{multi_page_doc, PdfBuilder};
