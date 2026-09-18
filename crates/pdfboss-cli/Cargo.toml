@@ -25,7 +25,7 @@ toml = "0.8"
 base64 = "0.23"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 futures-core = "0.3"
-jaq-core = "2"
+jaq-core = "3"
 jaq-std = "2"
 jaq-json = { version = "1", features = ["serde_json"] }
 
