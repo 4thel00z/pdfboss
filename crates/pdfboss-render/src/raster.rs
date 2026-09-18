@@ -1279,9 +1279,11 @@ fn blended(blend: BlendMode, dst: &[u8], rgb: [u8; 3]) -> [u8; 3] {
 /// constant `alpha` and the `soft_mask` coverage, is the source alpha, and
 /// its color blends against the backdrop through `blend`. Only `region`'s
 /// bounding box is visited (the group's clip: it painted nowhere else);
-/// `None` is the whole page.
+/// `None` is the whole page. This is the isolated case of the group
+/// compositing formulas: with a transparent initial backdrop the group's
+/// result is its own render, and the mask and constant alpha apply once.
 ///
-/// Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.6.4.4.
+/// Covers ISO 32000-1 §11.6.6, §11.4.7, §11.6.4.4, §11.4.4, §11.4.5 and §11.4.8.
 pub(crate) fn composite_group(
     dst: &mut Pixmap,
     src: &Pixmap,
@@ -1336,7 +1338,7 @@ pub(crate) fn composite_group(
 /// the group never touched is unchanged, and a Normal outer blend mode is
 /// assumed. Only `region`'s bounding box is visited.
 ///
-/// Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.6.4.4.
+/// Covers ISO 32000-1 §11.6.6, §11.4.7, §11.6.4.4, §11.4.2 and §11.4.4.
 pub(crate) fn mix_group(
     dst: &mut Pixmap,
     src: &Pixmap,
@@ -1394,9 +1396,9 @@ pub(crate) fn mix_group(
 }
 
 /// Copies `region`'s bounding box of `src` into `dst` (the whole page for
-/// `None`): the backdrop a non-isolated group starts from.
+/// `None`): the group backdrop a non-isolated group starts from.
 ///
-/// Covers ISO 32000-1 §11.4.7.
+/// Covers ISO 32000-1 §11.4.7 and §11.4.3.
 pub(crate) fn copy_region(dst: &mut Pixmap, src: &Pixmap, region: Option<&Mask>) {
     let Some((x0, y0, x1, y1)) = region_bounds(dst, region) else {
         return;
