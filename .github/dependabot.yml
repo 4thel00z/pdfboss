@@ -1,0 +1,40 @@
+version: 2
+updates:
+  # The Cargo workspace. Patch and minor updates arrive as two grouped PRs so
+  # a single CI run covers them; majors come in one PR each, since they need
+  # a look at the changelog anyway.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      patch-updates:
+        update-types: ["patch"]
+      minor-updates:
+        update-types: ["minor"]
+
+  # Actions are pinned by tag across the four workflows, so this keeps
+  # checkout/setup-python/maturin-action and the rest current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+        update-types: ["minor", "patch"]
