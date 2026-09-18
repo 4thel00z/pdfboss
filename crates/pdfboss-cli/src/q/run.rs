@@ -5,9 +5,10 @@
 use std::fmt::Write as _;
 use std::io::Write as _;
 
+use jaq_core::data::JustLut;
 use jaq_core::load::{Arena, File, Loader};
-use jaq_core::{Compiler, Ctx, RcIter};
-use jaq_json::Val;
+use jaq_core::{Compiler, Ctx, Vars};
+use jaq_json::{Num, Val};
 use pdfboss_core::elements::Span;
 use pdfboss_core::Stream;
 use serde_json::Value;
@@ -20,7 +21,7 @@ use crate::Failure;
 
 /// A compiled jq program, ready to run over any number of inputs.
 pub struct Program {
-    filter: jaq_core::Filter<jaq_core::Native<Val>>,
+    filter: jaq_core::Filter<JustLut<Val>>,
 }
 
 impl std::fmt::Debug for Program {
@@ -32,13 +33,19 @@ impl std::fmt::Debug for Program {
 /// Compiles `code` against the jq standard library, reporting lex/parse/
 /// compile errors with byte positions.
 pub fn compile_program(code: &str) -> Result<Program, String> {
-    let loader = Loader::new(jaq_std::defs().chain(jaq_json::defs()));
+    let defs = jaq_core::defs()
+        .chain(jaq_std::defs())
+        .chain(jaq_json::defs());
+    let funs = jaq_core::funs()
+        .chain(jaq_std::funs())
+        .chain(jaq_json::funs());
+    let loader = Loader::new(defs);
     let arena = Arena::default();
     let modules = loader
         .load(&arena, File { path: (), code })
         .map_err(|errors| describe_load_errors(code, errors))?;
     let filter = Compiler::default()
-        .with_funs(jaq_std::funs().chain(jaq_json::funs()))
+        .with_funs(funs)
         .compile(modules)
         .map_err(|errors| describe_compile_errors(code, errors))?;
     Ok(Program { filter })
@@ -47,12 +54,68 @@ pub fn compile_program(code: &str) -> Result<Program, String> {
 /// Runs the program over one input value, collecting every output in order.
 /// Runtime errors (e.g. `error("boom")`) come back as `Err` items.
 pub fn run_program(program: &Program, input: Value) -> Vec<Result<Value, String>> {
-    let inputs = RcIter::new(core::iter::empty());
+    let input = match serde_json::from_value::<Val>(input) {
+        Ok(val) => val,
+        Err(e) => return vec![Err(format!("{e}"))],
+    };
+    let ctx = Ctx::<JustLut<Val>>::new(&program.filter.lut, Vars::new([]));
     program
         .filter
-        .run((Ctx::new([], &inputs), Val::from(input)))
-        .map(|item| item.map(Value::from).map_err(|e| format!("{e}")))
+        .id
+        .run((ctx, input))
+        .map(|item| {
+            item.map(|val| json_value(&val))
+                .map_err(|exn| match exn.get_err() {
+                    Ok(error) => format!("{error}"),
+                    Err(exn) => match exn.get_halt() {
+                        Ok(code) => format!("halt({code})"),
+                        Err(_) => "jq: filter interrupted".to_string(),
+                    },
+                })
+        })
         .collect()
+}
+
+/// The JSON value a jaq value denotes. Floats without a JSON representation
+/// (infinities, NaN) become `null`, as stock jq prints them; byte strings
+/// and non-string object keys are rendered as text.
+fn json_value(val: &Val) -> Value {
+    match val {
+        Val::Null => Value::Null,
+        Val::Bool(b) => Value::Bool(*b),
+        Val::Num(num) => json_number(num),
+        Val::TStr(bytes) | Val::BStr(bytes) => {
+            Value::String(String::from_utf8_lossy(bytes).into_owned())
+        }
+        Val::Arr(items) => Value::Array(items.iter().map(json_value).collect()),
+        Val::Obj(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (json_key(key), json_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn json_key(key: &Val) -> String {
+    match json_value(key) {
+        Value::String(text) => text,
+        other => other.to_string(),
+    }
+}
+
+fn json_number(num: &Num) -> Value {
+    match num {
+        Num::Int(i) => Value::from(*i as i64),
+        Num::Float(f) => serde_json::Number::from_f64(*f).map_or(Value::Null, Value::Number),
+        Num::BigInt(big) => big
+            .to_string()
+            .parse::<serde_json::Number>()
+            .map_or(Value::Null, Value::Number),
+        Num::Dec(text) => text
+            .parse::<serde_json::Number>()
+            .map_or(Value::Null, Value::Number),
+    }
 }
 
 /// Byte offset of `part` (a slice borrowed from `code`) within `code`.
@@ -134,12 +197,10 @@ fn push_error(out: &mut String, message: &str) {
 /// [--pages ..]`: run a jq program over the value tree. Compile errors exit
 /// 2; PDF/IO and jq runtime errors exit 1.
 ///
-/// `run_program` may yield a runtime `error(...)` as an `Err` item followed
-/// by further `Ok` items (jaq-std's `error(msgs)` definition uses
-/// non-short-circuiting `,`, so the erroring branch's `empty` is followed by
-/// the unchanged input as a second output). This loop stops at the first
-/// `Err`, rendering nothing after it, matching stock jq's behavior of
-/// aborting the whole pipeline on a runtime error.
+/// `run_program` may yield a runtime `error(...)` as an `Err` item among
+/// `Ok` items (a program such as `(1, error("x"), 2)` produces all three).
+/// This loop stops at the first `Err`, rendering nothing after it, matching
+/// stock jq's behavior of aborting the whole pipeline on a runtime error.
 ///
 /// Also note: jaq follows IEEE 754 float semantics, so `1/0` evaluates to
 /// `Float(inf)`, which `serde_json` has no representation for and which
@@ -288,17 +349,34 @@ mod tests {
     fn runtime_errors_come_back_as_err_items() {
         let program = compile_program(r#"error("boom")"#).expect("compiles");
         let out = run_program(&program, json!(null));
-        // jaq-std 2.1.2 defines `error(msgs)` as
-        // `((msgs | error) as $x | empty), .`: the error is one stream item,
-        // but `,` does not short-circuit on an upstream error (unlike stock
-        // jq's C implementation aborting the whole pipeline), so the
-        // unchanged input follows as a second item. Task 7's CLI wiring
-        // stops rendering after the first `Err` to match jq's observable
-        // exit-1 behavior; `run_program` itself reports every stream item.
-        assert_eq!(out.len(), 2);
+        // jaq-std 3 defines `error(msgs)` as `(msgs | error_empty) as $x | .`,
+        // so the error is the only stream item, as in stock jq.
+        assert_eq!(out.len(), 1);
         let err = out[0].as_ref().expect_err("runtime error expected");
         assert!(err.contains("boom"), "message lost: {err}");
-        assert_eq!(out[1], Ok(json!(null)));
+    }
+
+    #[test]
+    fn outputs_before_a_runtime_error_are_kept() {
+        let program = compile_program(r#"(1, error("x"), 2)"#).expect("compiles");
+        let out = run_program(&program, json!(null));
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], Ok(json!(1)));
+        assert!(out[1].is_err());
+        assert_eq!(out[2], Ok(json!(2)));
+    }
+
+    #[test]
+    fn values_round_trip_through_jaq() {
+        let program = compile_program(".").expect("compiles");
+        let input = json!({"n": 1, "f": 1.5, "s": "text", "b": true, "z": null, "a": [1, [2]]});
+        assert_eq!(run_program(&program, input.clone()), vec![Ok(input)]);
+    }
+
+    #[test]
+    fn infinities_print_as_null_like_jq() {
+        let program = compile_program("1 / 0").expect("compiles");
+        assert_eq!(run_program(&program, json!(null)), vec![Ok(json!(null))]);
     }
 
     #[test]
