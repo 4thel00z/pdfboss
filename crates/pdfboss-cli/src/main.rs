@@ -714,6 +714,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let mut viewports = (0usize, 0usize);
             let mut separation_pages = 0usize;
             let mut colorants: Vec<String> = Vec::new();
+            let mut annotation_counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
             for index in 0..doc.page_count() {
                 let page = doc.page(index).ok();
                 sizes.push(page.as_ref().map(|page| page.size()));
@@ -732,8 +734,13 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                         separation_pages += 1;
                         colorants.push(separation.device_colorant);
                     }
+                    for annotation in doc.annotations(page) {
+                        *annotation_counts.entry(annotation.subtype).or_default() += 1;
+                    }
                 }
             }
+            let mut annotations: Vec<(String, usize)> = annotation_counts.into_iter().collect();
+            annotations.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             pieces.sort();
             pieces.dedup();
             colorants.sort();
@@ -772,6 +779,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     viewports,
                     separation_pages,
                     colorants: &colorants,
+                    annotations: &annotations,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -836,6 +844,9 @@ struct Info<'a> {
     viewports: (usize, usize),
     separation_pages: usize,
     colorants: &'a [String],
+    /// Annotation subtypes over every page with their counts, most
+    /// frequent first.
+    annotations: &'a [(String, usize)],
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -1038,6 +1049,16 @@ fn info_text(info: &Info) -> String {
             terminal.len(),
             breakdown.join(", ")
         );
+    }
+    // Annotations by subtype (ISO 32000-1 §12.5.2), most frequent first.
+    if !info.annotations.is_empty() {
+        let total: usize = info.annotations.iter().map(|(_, count)| count).sum();
+        let breakdown: Vec<String> = info
+            .annotations
+            .iter()
+            .map(|(subtype, count)| format!("{subtype} {count}"))
+            .collect();
+        let _ = writeln!(out, "annots:    {total} ({})", breakdown.join(", "));
     }
     // The products that left private data on the catalog or a page (ISO
     // 32000-1 §14.5).
@@ -1657,6 +1678,24 @@ mod tests {
         assert!(report.contains("page 1: 612 x 792 pt"));
         assert!(report.contains("title"));
         assert!(report.contains("Demo"));
+    }
+
+    /// Annotations print as one line with the total and a per-subtype
+    /// breakdown, most frequent first; a document without any prints no
+    /// line.
+    // Covers ISO 32000-1 §12.5.2.
+    #[test]
+    fn info_text_counts_annotations_by_subtype() {
+        let annotations = [("Link".to_string(), 12), ("Widget".to_string(), 3)];
+        let report = info_text(&Info {
+            annotations: &annotations,
+            ..Info::default()
+        });
+        assert!(
+            report.contains("annots:    15 (Link 12, Widget 3)\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("annots"));
     }
 
     /// The catalog's developer extensions print after the version, one
