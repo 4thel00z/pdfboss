@@ -7461,10 +7461,17 @@ mod tests {
             "the ellipse leaves the rect corner clear"
         );
         assert_eq!(
-            px(&pix, 75, 39),
+            px(&pix, 75, 38),
             RED,
             "circle border band at the bottom edge"
         );
+        // The band's outer boundary runs through this pixel. The ellipse
+        // reaches the rasterizer as the chords `flatten_cubic` produced, and
+        // a chord across a near-horizontal arc lies above it, so a sliver of
+        // page is left uncovered and shows through the red.
+        let [r, g, b, _] = px(&pix, 75, 39);
+        assert_eq!(r, 255, "the band's outer pixel is still red");
+        assert!(g < 32 && b < 32, "only a sliver of page shows: {g}, {b}");
         assert!(
             report.is_empty(),
             "a synthesized appearance is not a drop: {:?}",
