@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.9.1](https://github.com/4thel00z/pdfboss/compare/v2.9.0...v2.9.1) (2026-09-18)
+
+
+### Performance Improvements
+
+* **render:** order scanline crossings with an insertion pass ([#213](https://github.com/4thel00z/pdfboss/issues/213)) ([25f47d0](https://github.com/4thel00z/pdfboss/commit/25f47d015027303b81ad8fac74677cba69ff0253))
+
 ## [2.9.0](https://github.com/4thel00z/pdfboss/compare/v2.8.0...v2.9.0) (2026-09-17)
 
 
