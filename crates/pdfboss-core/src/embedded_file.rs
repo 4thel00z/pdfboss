@@ -44,6 +44,41 @@ impl FileSpec {
             .or_else(|| self.file.as_deref().map(decode_text_string))
             .unwrap_or_default()
     }
+
+    /// The URL a specification whose `/FS` is `URL` names: its `/F` read
+    /// as 7-bit ASCII, which the clause requires (a byte outside ASCII is
+    /// kept through PDFDocEncoding). `None` for any other file system.
+    ///
+    /// Covers ISO 32000-1 §7.11.5.
+    pub fn url(&self) -> Option<String> {
+        if self.file_system.as_deref() != Some("URL") {
+            return None;
+        }
+        self.file.as_deref().map(decode_text_string)
+    }
+}
+
+/// The decoded bytes of the stream a file specification embeds.
+///
+/// # Errors
+///
+/// `MissingKey("EF")` when the specification embeds no stream, a type
+/// mismatch when the reference is not a stream, and the stream's own
+/// decoding errors.
+///
+/// Covers ISO 32000-1 §7.11.4.
+pub async fn file_spec_data_with<S: AsyncObjectSource>(
+    src: &S,
+    spec: &FileSpec,
+) -> Result<Vec<u8>> {
+    let r = spec.embedded.ok_or(Error::MissingKey("EF"))?;
+    match src.get(r).await? {
+        Object::Stream(stream) => src.stream_data(&stream).await,
+        other => Err(Error::TypeMismatch {
+            expected: "stream",
+            found: crate::document::type_name(&other),
+        }),
+    }
 }
 
 /// The components of a file specification string (§7.11.2.1): the string
@@ -116,7 +151,11 @@ pub async fn file_spec_with<S: AsyncObjectSource>(src: &S, object: &Object) -> O
 }
 
 /// A string entry's bytes, resolving an indirect one.
-async fn bytes_entry<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Vec<u8>> {
+pub(crate) async fn bytes_entry<S: AsyncObjectSource>(
+    src: &S,
+    dict: &Dict,
+    key: &str,
+) -> Option<Vec<u8>> {
     let value = src.resolve(dict.get(key)?).await.ok()?;
     value.as_str_bytes().map(<[u8]>::to_vec)
 }
@@ -224,14 +263,7 @@ pub async fn embedded_file_data_with<S: AsyncObjectSource>(
     src: &S,
     file: &EmbeddedFile,
 ) -> Result<Vec<u8>> {
-    let r = file.spec.embedded.ok_or(Error::MissingKey("EF"))?;
-    match src.get(r).await? {
-        Object::Stream(stream) => src.stream_data(&stream).await,
-        other => Err(Error::TypeMismatch {
-            expected: "stream",
-            found: crate::document::type_name(&other),
-        }),
-    }
+    file_spec_data_with(src, &file.spec).await
 }
 
 #[cfg(test)]
@@ -257,6 +289,37 @@ mod tests {
             b.stream(*num, dict, data);
         }
         Document::load(b.build(1)).expect("load")
+    }
+
+    /// A specification whose `/FS` is `URL` names a URL in `/F`; any other
+    /// file system, or none, names no URL.
+    // Covers ISO 32000-1 §7.11.5.
+    #[test]
+    fn url_specifications_name_a_url() {
+        let url = FileSpec {
+            file: Some(b"ftp://www.beatles.com/Movies/AbbeyRoad.mov".to_vec()),
+            file_system: Some("URL".to_string()),
+            ..FileSpec::default()
+        };
+        assert_eq!(
+            url.url().as_deref(),
+            Some("ftp://www.beatles.com/Movies/AbbeyRoad.mov")
+        );
+        let plain = FileSpec {
+            file: Some(b"notes.txt".to_vec()),
+            ..FileSpec::default()
+        };
+        assert_eq!(plain.url(), None);
+        let doc = doc(
+            &[(
+                10,
+                "<< /Names [(site) << /FS /URL /F (http://x.example/a) >>] >>",
+            )],
+            &[],
+        );
+        let files = doc.embedded_files();
+        assert_eq!(files[0].spec.url().as_deref(), Some("http://x.example/a"));
+        assert!(doc.embedded_file_data(&files[0]).is_err());
     }
 
     // Covers ISO 32000-1 §7.11.4 and §7.11.3.

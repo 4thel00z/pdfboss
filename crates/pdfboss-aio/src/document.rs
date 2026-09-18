@@ -1573,6 +1573,31 @@ impl AsyncDocument {
         pdfboss_core::separation_info_with(self, page).await
     }
 
+    /// The annotations of a page's `/Annots` array (ISO 32000-1 §12.5.2):
+    /// the async twin of the sync document's `annotations`.
+    pub async fn annotations(&self, page: &Page) -> Vec<pdfboss_core::Annotation> {
+        pdfboss_core::annotations_with(self, &self.inner.xref.trailer, page).await
+    }
+
+    /// The actions a page's `/AA` dictionary fires (ISO 32000-1 §12.6.3):
+    /// the async twin of the sync document's `page_additional_actions`.
+    pub async fn page_additional_actions(&self, page: &Page) -> Vec<pdfboss_core::TriggeredAction> {
+        pdfboss_core::page_additional_actions_with(self, &self.inner.xref.trailer, page).await
+    }
+
+    /// The actions the catalog's `/AA` dictionary fires (ISO 32000-1
+    /// §12.6.3): the async twin of the sync document's
+    /// `additional_actions`.
+    pub async fn additional_actions(&self) -> Vec<pdfboss_core::TriggeredAction> {
+        pdfboss_core::document_additional_actions_with(self, &self.inner.xref.trailer).await
+    }
+
+    /// The action an `/A` or `/AA` value holds (ISO 32000-1 §12.6.2): the
+    /// async twin of the sync document's `action`.
+    pub async fn action(&self, value: &Object) -> Option<pdfboss_core::Action> {
+        pdfboss_core::action_with(self, &self.inner.xref.trailer, value).await
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4): the async twin of the sync document's
     /// `permission_handlers`.
@@ -1618,6 +1643,17 @@ impl AsyncDocument {
     /// and the stream's own decoding errors.
     pub async fn embedded_file_data(&self, file: &pdfboss_core::EmbeddedFile) -> Result<Vec<u8>> {
         Ok(pdfboss_core::embedded_file_data_with(self, file).await?)
+    }
+
+    /// The decoded bytes of the stream a file specification embeds: the
+    /// async twin of the sync document's `file_spec_data`.
+    ///
+    /// # Errors
+    ///
+    /// `MissingKey("EF")` when the specification embeds no stream, and the
+    /// stream's own decoding errors.
+    pub async fn file_spec_data(&self, spec: &pdfboss_core::FileSpec) -> Result<Vec<u8>> {
+        Ok(pdfboss_core::file_spec_data_with(self, spec).await?)
     }
 
     /// Number of pages: the flattened page tree's length. The tree is
