@@ -859,6 +859,86 @@ fn decode_stencil(
     }
 }
 
+/// The opaque RGBA one tuple of raw samples decodes to: `/Decode` maps each
+/// raw value into its component range, then the color space converts.
+fn sample_rgba(cs: &ColorSpace, raws: &[u32], ranges: &[(f32, f32)], max: f32) -> [u8; 4] {
+    let mut comps = [0.0f32; 8];
+    for (c, comp) in comps.iter_mut().enumerate().take(raws.len()) {
+        let (d0, d1) = ranges[c];
+        *comp = d0 + raws[c] as f32 * (d1 - d0) / max;
+    }
+    let rgb = cs.to_rgb(&comps[..raws.len()]);
+    let mut px = [0u8, 0, 0, 255];
+    for (slot, v) in px.iter_mut().zip(rgb) {
+        *slot = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    }
+    px
+}
+
+/// Whether a [`ColorMemo`] pays for itself on these samples: the conversion
+/// has to be expensive enough to be worth remembering, and the tuple has to
+/// fit a `u64` key with [`ColorMemo::VACANT`] left unreachable.
+fn memo_applies(cs: &ColorSpace, ncomp: usize, bpc: usize) -> bool {
+    !cs.conversion_is_cheap() && ncomp * bpc < 64
+}
+
+/// Remembers the pixel a raw sample tuple converts to, keyed by the packed
+/// raw bits. Direct-mapped and exact: every slot keeps the key it was
+/// filled from, so a collision recomputes instead of answering with another
+/// tuple's color. The most recent answer is held separately because runs of
+/// one color are common.
+///
+/// The key packs `ncomp * bpc` bits, so callers use this only below 64 of
+/// them; `VACANT` is then unreachable as a real key.
+struct ColorMemo {
+    slots: Box<[(u64, [u8; 4])]>,
+    last: (u64, [u8; 4]),
+}
+
+impl ColorMemo {
+    const VACANT: u64 = u64::MAX;
+
+    /// Sized from the pixel count so a small image does not pay for a large
+    /// table, and capped so a large one does not leave the caches. Every
+    /// count is a power of two, which makes the index a mask.
+    fn for_pixels(pixels: usize) -> ColorMemo {
+        let slots = pixels.next_power_of_two().clamp(256, 1 << 15);
+        ColorMemo::with_slots(slots)
+    }
+
+    fn with_slots(slots: usize) -> ColorMemo {
+        let slots = slots.next_power_of_two().max(1);
+        ColorMemo {
+            slots: vec![(ColorMemo::VACANT, [0; 4]); slots].into_boxed_slice(),
+            last: (ColorMemo::VACANT, [0; 4]),
+        }
+    }
+
+    /// The pixel for `key`, calling `convert` only when this tuple is not
+    /// already remembered.
+    fn rgba(&mut self, key: u64, convert: impl FnOnce() -> [u8; 4]) -> [u8; 4] {
+        if key == self.last.0 {
+            return self.last.1;
+        }
+        let index = (ColorMemo::scatter(key) as usize) & (self.slots.len() - 1);
+        let slot = &mut self.slots[index];
+        if slot.0 != key {
+            *slot = (key, convert());
+        }
+        self.last = *slot;
+        self.last.1
+    }
+
+    /// Spreads keys across slots: neighbouring colors differ in their low
+    /// bits only, which would pile them into one slot unmixed.
+    fn scatter(key: u64) -> u64 {
+        let mut x = key ^ (key >> 33);
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x
+    }
+}
+
 /// Decodes packed samples: per component, the raw `bpc`-bit value is mapped
 /// through its `/Decode` range (default `[0 1]`, or `[0 2^bpc-1]` for
 /// Indexed) and the results converted to RGB via the color space. Rows are
@@ -903,21 +983,27 @@ fn decode_samples<'a>(
         };
     }
     let mut out = vec![0u8; width * height * 4];
-    let mut comps = [0.0f32; 8];
+    // A tuple of raw samples always decodes to the same pixel, and images
+    // repeat their tuples heavily, so an expensive space converts each one
+    // once. The one-component case above is the same idea with an
+    // exhaustive table; here the tuple space is too large to enumerate.
+    let mut memo = memo_applies(cs, ncomp, bpc).then(|| ColorMemo::for_pixels(width * height));
+    let mut raws = [0u32; 8];
     for y in 0..height {
         for x in 0..width {
             let bit0 = y * stride_bits + x * ncomp * bpc;
-            for (c, comp) in comps.iter_mut().enumerate().take(ncomp) {
-                let raw = sample_bits(data, bit0 + c * bpc, bpc) as f32;
-                let (d0, d1) = ranges[c];
-                *comp = d0 + raw * (d1 - d0) / max;
+            let mut key = 0u64;
+            for (c, raw) in raws.iter_mut().enumerate().take(ncomp) {
+                *raw = sample_bits(data, bit0 + c * bpc, bpc);
+                key = (key << bpc) | u64::from(*raw);
             }
-            let rgb = cs.to_rgb(&comps[..ncomp]);
+            let convert = || sample_rgba(cs, &raws[..ncomp], &ranges, max);
+            let px = match memo.as_mut() {
+                Some(memo) => memo.rgba(key, convert),
+                None => convert(),
+            };
             let off = (y * width + x) * 4;
-            for (i, v) in rgb.iter().enumerate() {
-                out[off + i] = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-            }
-            out[off + 3] = 255;
+            out[off..off + 4].copy_from_slice(&px);
         }
     }
     Rgba {
@@ -1678,6 +1764,100 @@ mod tests {
         fill_rgb: [u8; 3],
     ) -> Option<Rgba<'a>> {
         super::decode_rgba(&ImageMeta::read(doc, dict, cs_obj), data, fill_rgb)
+    }
+
+    /// Every pixel of a multi-component image in an expensive space decodes
+    /// to what per-sample conversion gives, memo or no memo: the table only
+    /// remembers answers, it never changes one.
+    #[test]
+    fn memoized_samples_match_per_sample_conversion() {
+        let cs = ColorSpace::CalRgb {
+            gamma: [1.8, 2.2, 2.4],
+            m: [[0.6, 0.2, 0.2], [0.3, 0.6, 0.1], [0.1, 0.1, 0.9]],
+        };
+        assert!(!cs.conversion_is_cheap());
+        let (width, height) = (37usize, 11usize);
+        // Distinct tuples well past the smallest table, plus long runs of
+        // one color and a repeat of an earlier tuple after many others.
+        let data: Vec<u8> = (0..width * height * 3)
+            .map(|i| match i % 97 {
+                0..=20 => 7u8,
+                n => ((i / 3) as u8).wrapping_mul(13).wrapping_add(n as u8),
+            })
+            .collect();
+        let ranges = [(0.0f32, 1.0f32); 3];
+        let got = decode_samples(width, height, &data, &cs, 8, None);
+        for y in 0..height {
+            for x in 0..width {
+                let base = (y * width + x) * 3;
+                let raws = [
+                    u32::from(data[base]),
+                    u32::from(data[base + 1]),
+                    u32::from(data[base + 2]),
+                ];
+                let want = sample_rgba(&cs, &raws, &ranges, 255.0);
+                assert_eq!(got.at(x, y), want, "at ({x},{y})");
+            }
+        }
+    }
+
+    /// The memo is for expensive spaces whose tuple fits a `u64` key. A
+    /// device space repeats its cheap arithmetic instead, and four
+    /// sixteen-bit components fill the key, so both decode without it.
+    #[test]
+    fn the_memo_covers_expensive_spaces_with_a_key_that_fits() {
+        let expensive = ColorSpace::CalRgb {
+            gamma: [2.2, 2.2, 2.2],
+            m: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        };
+        assert!(memo_applies(&expensive, 3, 8));
+        assert!(memo_applies(&expensive, 3, 16));
+        assert!(!memo_applies(&ColorSpace::DeviceRGB, 3, 8));
+        assert!(!memo_applies(&ColorSpace::DeviceCMYK, 4, 8));
+        // Four sixteen-bit components are exactly 64 key bits, one too many.
+        assert!(!memo_applies(&expensive, 4, 16));
+        assert!(memo_applies(&expensive, 4, 15));
+    }
+
+    /// A slot holds one tuple, so a colliding key recomputes rather than
+    /// inheriting the resident color. Two slots force collisions on every
+    /// third key.
+    #[test]
+    fn colliding_keys_recompute_instead_of_answering_wrong() {
+        let mut memo = ColorMemo::with_slots(2);
+        let color = |key: u64| [key as u8, (key >> 8) as u8, (key >> 16) as u8, 255];
+        let keys: Vec<u64> = (0..64).map(|i| i * 7 + 1).collect();
+        for pass in 0..3 {
+            for &key in &keys {
+                let got = memo.rgba(key, || color(key));
+                assert_eq!(got, color(key), "pass {pass} key {key}");
+            }
+        }
+    }
+
+    /// The memo calls the conversion once per distinct tuple in a run and
+    /// not once per sample, which is the whole point of holding it.
+    #[test]
+    fn repeated_tuples_convert_once() {
+        let mut memo = ColorMemo::with_slots(256);
+        let mut calls = 0usize;
+        for _ in 0..1000 {
+            memo.rgba(42, || {
+                calls += 1;
+                [1, 2, 3, 255]
+            });
+        }
+        assert_eq!(calls, 1);
+        // Alternating between two tuples still converts each one once: the
+        // most-recent slot misses but the table holds both.
+        let mut calls = 0usize;
+        for i in 0..1000 {
+            memo.rgba(100 + i % 2, || {
+                calls += 1;
+                [4, 5, 6, 255]
+            });
+        }
+        assert_eq!(calls, 2);
     }
 
     // Covers ISO 32000-1 §8.9.3.

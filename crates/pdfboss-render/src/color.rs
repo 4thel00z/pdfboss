@@ -147,6 +147,22 @@ impl ColorSpace {
         }
     }
 
+    /// Whether `to_rgb` is a few arithmetic operations, so remembering its
+    /// answer per sample would cost more than repeating it. The calibrated
+    /// and profile-driven spaces evaluate a tone curve per input component
+    /// and an sRGB encode per output one; the device spaces do not.
+    pub(crate) fn conversion_is_cheap(&self) -> bool {
+        match self {
+            ColorSpace::DeviceGray
+            | ColorSpace::DeviceRGB
+            | ColorSpace::DeviceCMYK
+            | ColorSpace::SeparationAll
+            | ColorSpace::SeparationNone => true,
+            ColorSpace::Indexed { base, .. } => base.conversion_is_cheap(),
+            _ => false,
+        }
+    }
+
     /// The default per-component sample range: `/Decode` defaults for
     /// images, and the range `/Indexed` palette bytes rescale into. `max`
     /// is the largest raw sample value.
