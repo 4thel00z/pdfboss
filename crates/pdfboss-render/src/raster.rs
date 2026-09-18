@@ -143,10 +143,10 @@ impl Mask {
         };
         let bw = bbox_w as usize;
         sweep_rows(scratch, width, height, rule, |y, row, lo, hi| {
-            // A path running off the right of the page has not closed inside
-            // it, so the sweep carries its coverage out to the page edge,
-            // past the bbox `xmax` fixed. Clamping here keeps the write
-            // inside the stored region.
+            // The sweep hands out one column past the last an edge wrote
+            // to, which for an edge on the bbox's right lies outside the
+            // stored region; a path open at the right page edge carries its
+            // coverage there too. Clamping keeps the write inside the box.
             let base = (y - by0) as usize * bw;
             let local_lo = lo.max(bx0 as usize) - bx0 as usize;
             let local_hi = hi.min(bx1 as usize).max(bx0 as usize) - bx0 as usize;
@@ -1796,6 +1796,52 @@ mod tests {
                         (got - want).abs() <= 1.0 / 255.0,
                         "{name} at ({x},{y}): got {got:.4}, area is {want:.4}"
                     );
+                }
+            }
+        }
+    }
+
+    /// A capture replayed at a horizontal offset paints the area the
+    /// offset shape cuts out of each pixel, including where the offset
+    /// pushes it off either side of the page. A rectangle cannot show this:
+    /// its vertical edges enter and leave a row at the same x, so an edge
+    /// that straddles x = 0 is never split between the first column and the
+    /// page outside it.
+    ///
+    /// Covers ISO 32000-1 §10.6.4.
+    #[test]
+    fn a_replayed_capture_paints_the_area_of_the_shape_it_is_offset_to() {
+        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+            for dx in [-6.0f32, 0.0, 8.0] {
+                let pts = poly(&[(2.0, 1.5), (9.5, 4.0), (3.5, 10.5)]);
+                let polys = [Subpath {
+                    points: pts.clone(),
+                    closed: true,
+                }];
+                let mut scratch = RasterScratch::default();
+                let set = super::capture_spans(&mut scratch, &polys, rule).expect("captured");
+                let mut pix = Pixmap::new(12, 12);
+                super::fill_spans(
+                    &mut pix,
+                    &mut scratch,
+                    &set,
+                    dx,
+                    0,
+                    [0, 0, 0, 255],
+                    1.0,
+                    None,
+                    BlendMode::Normal,
+                );
+                let moved: Vec<Point> = pts.iter().map(|q| Point::new(q.x + dx, q.y)).collect();
+                for y in 0..12 {
+                    for x in 0..12 {
+                        let want = cell_area(&moved, x, y);
+                        let got = alpha_at(&pix, x, y) as f64 / 255.0;
+                        assert!(
+                            (got - want).abs() <= 1.0 / 255.0,
+                            "{rule:?} dx {dx} at ({x},{y}): got {got:.4}, area is {want:.4}"
+                        );
+                    }
                 }
             }
         }
