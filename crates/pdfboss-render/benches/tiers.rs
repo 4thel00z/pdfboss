@@ -21,7 +21,9 @@
 
 use std::path::PathBuf;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use pdfboss_core::{Document, Page};
 use pdfboss_render::{render_page_with_options, GlyphPainting, RenderOptions, SubstituteSource};
 use pdfboss_testkit::PdfBuilder;

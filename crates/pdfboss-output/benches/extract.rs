@@ -2,7 +2,9 @@
 //!
 //! Run with `cargo bench -p pdfboss-output`.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use pdfboss_core::Document;
 use pdfboss_output::{extract_text, ReadingOrder};
 use pdfboss_testkit::doc_with_graphics;

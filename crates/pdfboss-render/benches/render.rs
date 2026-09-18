@@ -2,7 +2,9 @@
 //!
 //! Run with `cargo bench -p pdfboss-render`.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion};
 use pdfboss_core::Document;
 use pdfboss_render::render_page;
 use pdfboss_testkit::doc_with_graphics;
