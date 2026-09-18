@@ -281,6 +281,41 @@ fn prepare_edges(edges: &mut Vec<Edge>, polys: &[Subpath]) {
     edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 }
 
+/// Above this many crossings a scanline is wide enough that the general
+/// sort is the safer cost: an insertion pass is linear only while its input
+/// is nearly ordered, which a wide row of interleaved edges need not be.
+const INSERTION_CROSSINGS: usize = 32;
+
+/// Orders one scanline's crossings by x.
+///
+/// A scanline carries a handful of crossings, and consecutive subsamples
+/// move each one by a fraction of a pixel, so the list arrives ordered or
+/// close to it and an insertion pass confirms that in one comparison per
+/// crossing. A general sort pays its setup on every scanline of every
+/// subsample instead, which is where most of the sweep's time went.
+///
+/// The ordering is the same one a stable sort produces: `total_cmp` is a
+/// total order over every `f32` including signed zeros, and insertion never
+/// moves a crossing past an equal one, so crossings sharing an x keep the
+/// order the active-edge list generated them in. That order decides how
+/// coincident spans split, and a capture replayed by [`fill_spans`] has to
+/// split them the same way a direct fill does.
+fn sort_crossings(crossings: &mut [(f32, i32)]) {
+    if crossings.len() > INSERTION_CROSSINGS {
+        crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+        return;
+    }
+    for i in 1..crossings.len() {
+        let item = crossings[i];
+        let mut j = i;
+        while j > 0 && crossings[j - 1].0.total_cmp(&item.0).is_gt() {
+            crossings[j] = crossings[j - 1];
+            j -= 1;
+        }
+        crossings[j] = item;
+    }
+}
+
 /// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
 /// `weight`, to a row buffer, and widens `[dirty_lo, dirty_hi)` to cover the
 /// pixels it wrote so the caller can restrict its work to the touched extent.
@@ -399,7 +434,7 @@ fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
             if crossings.len() < 2 {
                 continue;
             }
-            crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+            sort_crossings(crossings);
             let mut wind = 0i32;
             let mut span_start = 0.0f32;
             for &(x, dir) in crossings.iter() {
@@ -519,7 +554,7 @@ pub(crate) fn capture_spans(
                 crossings.push((edges[i].x_at(ys), edges[i].dir));
             }
             if crossings.len() >= 2 {
-                crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+                sort_crossings(crossings);
                 let mut wind = 0i32;
                 let mut span_start = 0.0f32;
                 for &(x, dir) in crossings.iter() {
@@ -1493,6 +1528,52 @@ mod blend_hw_tests {
 mod tests {
     use super::*;
     use pdfboss_core::geom::Point;
+
+    /// [`sort_crossings`] orders crossings exactly as the stable sort it
+    /// replaces does, on both sides of the size where it stops inserting
+    /// and on the inputs that make orderings differ: repeated x values
+    /// (whose relative order has to survive), signed zeros, and a reversed
+    /// list.
+    #[test]
+    fn crossings_order_as_a_stable_sort_orders_them() {
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in 0..=64usize {
+            for trial in 0..24 {
+                let input: Vec<(f32, i32)> = (0..len)
+                    .map(|i| {
+                        let r = next();
+                        let x = match trial % 4 {
+                            // Few distinct values, so equal keys are common
+                            // and their relative order is what is tested.
+                            0 => (r % 3) as f32,
+                            1 => (r % 64) as f32 / 8.0 - 4.0,
+                            // Already ordered, and ordered backwards.
+                            2 => i as f32,
+                            _ => (len - i) as f32,
+                        };
+                        let x = if r % 17 == 0 { -0.0 } else { x };
+                        (x, if r % 2 == 0 { 1 } else { -1 })
+                    })
+                    .collect();
+                let mut want = input.clone();
+                want.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut got = input.clone();
+                sort_crossings(&mut got);
+                assert_eq!(
+                    got.iter().map(|c| c.0.to_bits()).collect::<Vec<_>>(),
+                    want.iter().map(|c| c.0.to_bits()).collect::<Vec<_>>(),
+                    "len {len} trial {trial}"
+                );
+                assert_eq!(got, want, "len {len} trial {trial}");
+            }
+        }
+    }
 
     /// Shadows the crate fn with a fresh-scratch wrapper so the tests stay
     /// focused on rasterization behavior, not buffer plumbing.
