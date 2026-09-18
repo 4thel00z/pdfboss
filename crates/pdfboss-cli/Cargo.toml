@@ -25,9 +25,9 @@ toml = "1.1"
 base64 = "0.23"
 tokio = { version = "1", features = ["rt", "net", "time"] }
 futures-core = "0.3"
-jaq-core = "2"
-jaq-std = "2"
-jaq-json = { version = "1", features = ["serde_json"] }
+jaq-core = "3"
+jaq-std = "3"
+jaq-json = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
