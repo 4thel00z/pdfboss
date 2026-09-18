@@ -989,7 +989,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // page out for a transparent buffer; `saved` stays `Some` for
             // the rest of the frame's life, however often a child suspends
             // it. Keyed here rather than at any push site so a group root
-            // (an annotation appearance) is covered too.
+            // (an annotation appearance) is covered too. The buffer starts
+            // as a copy of the group backdrop, or transparent for an
+            // isolated group.
+            // Covers ISO 32000-1 §11.4.3 and §11.4.5.
             if let FrameKind::TransparencyGroup {
                 saved: saved @ None,
                 isolated,
@@ -3730,7 +3733,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// else is a plain form whose content inherits the state as it stands.
     /// `/K true` is not honoured and is reported.
     ///
-    /// Covers ISO 32000-1 §11.6.6 and §11.6.4.4.
+    /// Covers ISO 32000-1 §11.6.6, §11.6.4.4, §11.4.4, §11.4.5 and §11.4.6.
     async fn group_kind(&mut self, dict: &Dict, inner: &mut GState) -> FrameKind {
         let Some(group) = self.transparency_group(dict).await else {
             return FrameKind::PageOrForm;
@@ -3754,9 +3757,9 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
 
     /// Whether the form's `/Group` names a transparency group, and if so
     /// its `/I` and `/K` flags (false when absent or unreadable). Every
-    /// entry may be indirect.
+    /// entry may be indirect. Any other group subtype is a plain form.
     ///
-    /// Covers ISO 32000-1 §11.6.6.
+    /// Covers ISO 32000-1 §11.6.6, §8.10.3 and §11.4.3.
     async fn transparency_group(&self, dict: &Dict) -> Option<GroupAttrs> {
         let Ok(Object::Dict(group)) = self.src.resolve(dict.get("Group")?).await else {
             return None;
@@ -6936,7 +6939,7 @@ mod tests {
     /// The group's own `gs` starts from alpha 1 (§11.6.6) and the `/ca` in
     /// force at the `Do` applies once to the composited group (§11.6.4.4):
     /// black at a quarter over white is 191.
-    // Covers ISO 32000-1 §11.6.6, §11.6.4.4 and §11.4.7.
+    // Covers ISO 32000-1 §11.6.6, §11.6.4.4, §11.4.7 and §11.4.4.
     #[test]
     fn transparency_group_composites_with_the_outer_alpha() {
         let bytes = group_doc("0.25", "", b"/GS0 gs 0 g 0 0 100 100 re f");
@@ -6957,7 +6960,7 @@ mod tests {
     /// Nested groups: the inner group's own alpha reset does not undo the
     /// alpha its enclosing group was painted with, and the inner `/ca`
     /// applies to the inner group: black at 0.5 x 0.5 over white is 191.
-    // Covers ISO 32000-1 §11.6.6 and §11.6.4.4.
+    // Covers ISO 32000-1 §11.6.6, §11.6.4.4 and §11.4.3.
     #[test]
     fn nested_transparency_groups_multiply_their_alphas() {
         let resources = "/ExtGState << /GO << /ca 0.5 >> >> /XObject << /Fx 5 0 R >>";
@@ -6988,7 +6991,7 @@ mod tests {
     /// A non-isolated group blends against the page it sits on: a Multiply
     /// inside it over the page's blue paints black. An isolated group
     /// starts from a transparent backdrop and passes the yellow through.
-    // Covers ISO 32000-1 §11.6.6, §11.4.7 and §11.3.5.
+    // Covers ISO 32000-1 §11.6.6, §11.4.7, §11.3.5, §11.4.4, §11.4.5 and §8.10.3.
     #[test]
     fn non_isolated_group_blends_with_the_page_and_isolated_does_not() {
         let doc = |group: &str| {
@@ -7053,7 +7056,7 @@ mod tests {
     /// `/K true` is not implemented: the group paints as a plain group and
     /// the report says so. `/I true` is exact (the group renders onto a
     /// transparent backdrop) and reports nothing.
-    // Covers ISO 32000-1 §11.6.6.
+    // Covers ISO 32000-1 §11.6.6, §11.4.6 and §11.4.5.
     #[test]
     fn knockout_group_reports_and_isolated_group_does_not() {
         let bytes = group_doc("1", "/K true", b"0 g 0 0 100 100 re f");
@@ -7084,6 +7087,30 @@ mod tests {
                 b"/GS0 gs 0 g 0 0 100 100 re f",
             );
         });
+        let (pix, report) = render_reporting(bytes);
+        assert!(report.is_empty(), "{:?}", report.warnings());
+        assert_eq!(px(&pix, 50, 50), BLACK);
+    }
+
+    /// Only the Transparency group subtype is defined: a `/Group` whose
+    /// `/S` names anything else is a plain form, so the outer `/ca 0.25`
+    /// is overridden per primitive by the form's own `gs` back to 1.
+    // Covers ISO 32000-1 §8.10.3.
+    #[test]
+    fn group_with_an_unknown_subtype_is_a_plain_form() {
+        let bytes = small_doc(
+            "/ExtGState << /GO << /ca 0.25 >> >> /XObject << /Fx 5 0 R >>",
+            b"/GO gs /Fx Do",
+            |b| {
+                b.stream(
+                    5,
+                    "/Type /XObject /Subtype /Form /BBox [0 0 100 100] \
+                     /Group << /S /Other >> \
+                     /Resources << /ExtGState << /GS0 << /ca 1 >> >> >>",
+                    b"/GS0 gs 0 g 0 0 100 100 re f",
+                );
+            },
+        );
         let (pix, report) = render_reporting(bytes);
         assert!(report.is_empty(), "{:?}", report.warnings());
         assert_eq!(px(&pix, 50, 50), BLACK);
