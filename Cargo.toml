@@ -44,7 +44,7 @@ pdfboss-tui = { path = "crates/pdfboss-tui", version = "2.9.1" } # x-release-ple
 pdfboss-write = { path = "crates/pdfboss-write", version = "2.9.1" } # x-release-please-version
 pdfboss-style = { path = "crates/pdfboss-style", version = "2.9.1" } # x-release-please-version
 pdfboss-markdown = { path = "crates/pdfboss-markdown", version = "2.9.1" } # x-release-please-version
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "fs", "sync", "io-util"] }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
