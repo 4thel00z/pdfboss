@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.9.2](https://github.com/4thel00z/pdfboss/compare/v2.9.1...v2.9.2) (2026-09-19)
+
+
+### Performance Improvements
+
+* **render:** take coverage from each edge's area, not four sampled heights ([#218](https://github.com/4thel00z/pdfboss/issues/218)) ([fbdc6d1](https://github.com/4thel00z/pdfboss/commit/fbdc6d135cfba95c77ddc64810a29c09dd731ea9))
+
+
+### Documentation
+
+* **iso32000:** correct the transparency group rows after the group compositing fix ([#215](https://github.com/4thel00z/pdfboss/issues/215)) ([100c855](https://github.com/4thel00z/pdfboss/commit/100c8553f1e4748bb71e7d138198f43544d587ad))
+
 ## [2.9.1](https://github.com/4thel00z/pdfboss/compare/v2.9.0...v2.9.1) (2026-09-18)
 
 
