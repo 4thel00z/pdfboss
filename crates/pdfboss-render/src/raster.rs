@@ -1,37 +1,38 @@
-//! Scanline coverage rasterizer: per-pixel coverage accumulation from
-//! polygon edges, nonzero and even-odd fill rules, and coverage-mask
-//! clipping.
+//! Coverage rasterizer: per-pixel coverage from the signed area each
+//! polygon edge cuts out of the pixels it crosses, nonzero and even-odd
+//! fill rules, and coverage-mask clipping.
 
 use crate::path::Subpath;
 use crate::Pixmap;
 
-/// Vertical subsamples per pixel row; horizontal coverage is analytic.
-const SUBSAMPLES: u32 = 4;
-
 /// Which interior rule decides what a path encloses.
 ///
 /// Covers ISO 32000-1 §8.5.3.3.2 and §8.5.3.3.3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum FillRule {
     /// Nonzero winding number.
+    #[default]
     NonZero,
     /// Even-odd (parity) rule.
     EvenOdd,
 }
 
 /// Reusable rasterizer buffers, owned by the caller so a page of fills does
-/// not re-allocate (and re-zero) them on every call. `row` is all-zero
-/// between calls; the sweep clears exactly the slots it dirtied.
+/// not re-allocate (and re-zero) them on every call.
 #[derive(Debug, Default)]
 pub(crate) struct RasterScratch {
-    /// Per-row coverage accumulator, at least page-width long.
+    /// Per-row coverage, at least page-width long. Every column the sweep
+    /// hands out is written before it is read, so it needs no clearing
+    /// between rows the way `acc` does.
     row: Vec<f32>,
     /// Edge list of the path being rasterized.
     edges: Vec<Edge>,
-    /// Active-edge indices for the current scanline.
+    /// Active-edge indices for the current pixel row.
     active: Vec<usize>,
-    /// Scanline crossings as `(x, winding direction)`.
-    crossings: Vec<(f32, i32)>,
+    /// Per-row difference array the sweep accumulates signed area into, two
+    /// slots longer than the page because an edge in the last column hands
+    /// a share to the column past it. All-zero between rows.
+    acc: Vec<f32>,
 }
 
 /// A per-pixel coverage mask (0 = fully clipped out, 255 = fully visible)
@@ -142,14 +143,21 @@ impl Mask {
         };
         let bw = bbox_w as usize;
         sweep_rows(scratch, width, height, rule, |y, row, lo, hi| {
-            // `lo`/`hi` are columns touched on this row, which `coverage_rows`
-            // only ever derives from crossings between edges already bounded
-            // by `[xmin, xmax]` — so they always fall within `[bx0, bx1)`.
+            // The sweep hands out one column past the last an edge wrote
+            // to, which for an edge on the bbox's right lies outside the
+            // stored region; a path open at the right page edge carries its
+            // coverage there too. Clamping keeps the write inside the box.
             let base = (y - by0) as usize * bw;
-            let local_lo = lo - bx0 as usize;
-            let local_hi = hi - bx0 as usize;
+            let local_lo = lo.max(bx0 as usize) - bx0 as usize;
+            let local_hi = hi.min(bx1 as usize).max(bx0 as usize) - bx0 as usize;
+            if local_hi <= local_lo {
+                return;
+            }
             let dst = &mut mask.data[base + local_lo..base + local_hi];
-            for (cov, out) in row[lo..hi].iter().zip(dst.iter_mut()) {
+            for (cov, out) in row[local_lo + bx0 as usize..local_hi + bx0 as usize]
+                .iter()
+                .zip(dst.iter_mut())
+            {
                 *out = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         });
@@ -232,13 +240,31 @@ struct Edge {
     y1: f32,
     /// +1 if the original edge pointed downward (increasing y), else -1.
     dir: i32,
+    /// Horizontal movement per unit of y, so walking the edge down a row
+    /// costs a multiply instead of a divide.
+    dxdy: f32,
 }
 
 impl Edge {
     /// X coordinate where the edge crosses the horizontal line `y`
-    /// (requires `y0 <= y < y1`).
-    fn x_at(&self, y: f32) -> f32 {
-        self.x0 + (y - self.y0) * (self.x1 - self.x0) / (self.y1 - self.y0)
+    /// (requires `y0 <= y <= y1`).
+    #[inline]
+    fn x_on(&self, y: f32) -> f32 {
+        self.x0 + (y - self.y0) * self.dxdy
+    }
+
+    /// The part of this edge inside the pixel row starting at `ytop`, as
+    /// `(x where it enters, x where it leaves, signed height)`; `None` when
+    /// the edge misses the row. The height carries the winding direction,
+    /// so summing pieces across edges sums winding.
+    #[inline]
+    fn piece_in_row(&self, ytop: f32) -> Option<(f32, f32, f32)> {
+        let ya = self.y0.max(ytop);
+        let yb = self.y1.min(ytop + 1.0);
+        if yb <= ya {
+            return None;
+        }
+        Some((self.x_on(ya), self.x_on(yb), (yb - ya) * self.dir as f32))
     }
 }
 
@@ -249,9 +275,9 @@ impl Edge {
 /// Edges with non-finite vertices are skipped.
 ///
 /// The sort must stay STABLE: equal-`y0` ties keep build order, which fixes
-/// the order crossings enter the scanline sort, which in turn fixes how
-/// coincident crossings split spans — and span splits change the f32
-/// accumulation order, i.e. the output bytes.
+/// the order edges enter the active list, which fixes the order their areas
+/// are summed into a row. f32 addition is not associative, so that order
+/// decides the output bytes.
 fn prepare_edges(edges: &mut Vec<Edge>, polys: &[Subpath]) {
     edges.clear();
     for sub in polys {
@@ -275,107 +301,267 @@ fn prepare_edges(edges: &mut Vec<Edge>, polys: &[Subpath]) {
                 x1: bot.x,
                 y1: bot.y,
                 dir,
+                dxdy: (bot.x - top.x) / (bot.y - top.y),
             });
         }
     }
     edges.sort_by(|a, b| a.y0.total_cmp(&b.y0));
 }
 
-/// Above this many crossings a scanline is wide enough that the general
-/// sort is the safer cost: an insertion pass is linear only while its input
-/// is nearly ordered, which a wide row of interleaved edges need not be.
-const INSERTION_CROSSINGS: usize = 32;
-
-/// Orders one scanline's crossings by x.
+/// Adds one edge's crossing of a single pixel row to that row's difference
+/// array. `dy` is the signed height the edge covers inside the row (positive
+/// for a downward edge, negative for an upward one) and `x0`/`x1` are where
+/// it enters and leaves the row band. Running the array up from the left
+/// gives, at each pixel, the winding number weighted by how much of that
+/// pixel lies to the right of every edge crossing it, which is the pixel's
+/// signed covered area.
 ///
-/// A scanline carries a handful of crossings, and consecutive subsamples
-/// move each one by a fraction of a pixel, so the list arrives ordered or
-/// close to it and an insertion pass confirms that in one comparison per
-/// crossing. A general sort pays its setup on every scanline of every
-/// subsample instead, which is where most of the sweep's time went.
-///
-/// The ordering is the same one a stable sort produces: `total_cmp` is a
-/// total order over every `f32` including signed zeros, and insertion never
-/// moves a crossing past an equal one, so crossings sharing an x keep the
-/// order the active-edge list generated them in. That order decides how
-/// coincident spans split, and a capture replayed by [`fill_spans`] has to
-/// split them the same way a direct fill does.
-fn sort_crossings(crossings: &mut [(f32, i32)]) {
-    if crossings.len() > INSERTION_CROSSINGS {
-        crossings.sort_by(|a, b| a.0.total_cmp(&b.0));
+/// x moves linearly with y along an edge, so the share of `dy` falling in a
+/// pixel column is the share of the x interval inside that column, and the
+/// midpoint of the piece says how the column splits its own share with its
+/// right neighbour.
+fn accumulate(acc: &mut [f32], x0: f32, x1: f32, dy: f32, lo: &mut usize, hi: &mut usize) {
+    let (mut xl, mut xr) = if x0 <= x1 { (x0, x1) } else { (x1, x0) };
+    let right = (acc.len() - 2) as f32;
+    // A piece of the edge left of the page still separates what is inside
+    // the path from what is outside, so its whole height belongs to the
+    // first column. Moving the endpoint alone would hand that height to
+    // whatever columns the rest of the edge crosses instead.
+    let mut dy = dy;
+    if xr <= 0.0 {
+        *lo = 0;
+        *hi = (*hi).max(2);
+        acc[0] += dy;
         return;
     }
-    for i in 1..crossings.len() {
-        let item = crossings[i];
-        let mut j = i;
-        while j > 0 && crossings[j - 1].0.total_cmp(&item.0).is_gt() {
-            crossings[j] = crossings[j - 1];
-            j -= 1;
+    if xl >= right {
+        // Only columns right of this edge see its winding, and the page has
+        // none. It leaves the path open at the right edge, which the walk
+        // reads off the running sum rather than from any column here.
+        return;
+    }
+    if xl < 0.0 {
+        let outside = -xl / (xr - xl);
+        *lo = 0;
+        *hi = (*hi).max(2);
+        acc[0] += dy * outside;
+        dy -= dy * outside;
+        xl = 0.0;
+    }
+    if xr > right {
+        dy *= (right - xl) / (xr - xl);
+        xr = right;
+    }
+    let first = xl as usize;
+    let last = xr as usize;
+    *lo = (*lo).min(first);
+    *hi = (*hi).max((last + 2).min(acc.len()));
+    if first == last {
+        let frac = (xl + xr) * 0.5 - first as f32;
+        acc[first] += dy * (1.0 - frac);
+        acc[first + 1] += dy * frac;
+        return;
+    }
+    let span = xr - xl;
+    for c in first..=last {
+        let l = xl.max(c as f32);
+        let r = xr.min(c as f32 + 1.0);
+        if r <= l {
+            continue;
         }
-        crossings[j] = item;
+        let part = dy * (r - l) / span;
+        let frac = (l + r) * 0.5 - c as f32;
+        acc[c] += part * (1.0 - frac);
+        acc[c + 1] += part * frac;
     }
 }
 
-/// Adds the analytic horizontal coverage of the span `[x0, x1]`, scaled by
-/// `weight`, to a row buffer, and widens `[dirty_lo, dirty_hi)` to cover the
-/// pixels it wrote so the caller can restrict its work to the touched extent.
+/// Columns the coverage walk tests for emptiness in one go.
+const COVERAGE_BLOCK: usize = 64;
+
+/// Coverage below half of one 8-bit step, which every consumer rounds to
+/// nothing. Winding that should cancel exactly can leave a residue this
+/// small behind, and treating it as coverage would carry a row out to the
+/// page edge for no visible pixel.
+const QUANTUM: f32 = 0.5 / 255.0;
+
+/// Coverage at least this close to full counts as full. A pixel the path
+/// covers completely accumulates to one only up to the rounding of the f32
+/// sum of its edges' areas, and the residue is many times smaller than this
+/// gap, which is itself an eighth of one 8-bit step. Recovering the exact
+/// one matters because the row painter fills a run of fully covered pixels
+/// with the source color instead of blending each one.
+const FULL: f32 = 1.0 - 1.0 / 2048.0;
+
+/// Turns a running signed area into the coverage its fill rule asks for.
 ///
-/// Covers ISO 32000-1 §10.6.4.
-fn add_span(
+/// Nonzero keeps any winding at all, so the magnitude saturates at one
+/// pixel. Even-odd alternates, so the magnitude folds back on itself: a
+/// winding of two covers nothing, three covers everything again, and the
+/// fractional area in between interpolates the same way.
+///
+/// Covers ISO 32000-1 §8.5.3.3.2 and §8.5.3.3.3.
+#[inline(always)]
+fn coverage_of<const EVEN_ODD: bool>(sum: f32) -> f32 {
+    let a = sum.abs();
+    if !EVEN_ODD {
+        return saturate(a);
+    }
+    let m = a % 2.0;
+    if m > 1.0 {
+        return saturate(2.0 - m);
+    }
+    saturate(m)
+}
+
+/// Whether a block of the difference array holds nothing at all. Folding
+/// the magnitudes together with a bitwise or asks the question without a
+/// branch per column, which is what lets the compiler answer it several
+/// columns at a time; a short-circuiting test cannot be vectorized and the
+/// blocks it walks are mostly empty.
+#[inline(always)]
+fn all_zero(block: &[f32]) -> bool {
+    block
+        .iter()
+        .fold(0u32, |a, &c| a | (c.to_bits() & 0x7fff_ffff))
+        == 0
+}
+
+/// One pixel of area at most, and exactly one for anything within [`FULL`].
+#[inline(always)]
+fn saturate(area: f32) -> f32 {
+    if area >= FULL {
+        return 1.0;
+    }
+    area
+}
+
+/// Runs one row's difference array up from the left into coverage under the
+/// fill rule, and returns the column range it wrote. `acc` comes back
+/// all-zero, ready for the next row.
+///
+/// Coverage only bends at a column an edge wrote to, and most columns of a
+/// wide row have nothing written, so the walk asks a whole block of the
+/// difference array at once whether anything did: an empty block repeats
+/// the coverage the running sum already holds.
+fn resolve_row<const EVEN_ODD: bool>(
+    acc: &mut [f32],
     row: &mut [f32],
-    x0: f32,
-    x1: f32,
-    weight: f32,
-    dirty_lo: &mut usize,
-    dirty_hi: &mut usize,
-) {
-    let w = row.len() as f32;
-    let x0 = x0.max(0.0);
-    let x1 = x1.min(w);
-    if x1 <= x0 {
-        return;
+    lo: usize,
+    hi: usize,
+) -> (usize, usize) {
+    let full = row.len();
+    let end = hi.min(full);
+    // The walk stops at the page edge; anything an edge wrote past it still
+    // has to go back to zero for the next row.
+    acc[end..hi].fill(0.0);
+    if lo >= end {
+        return (0, 0);
     }
-    let first = x0.floor() as usize;
-    let last = (x1.ceil() as usize).min(row.len());
-    *dirty_lo = (*dirty_lo).min(first);
-    *dirty_hi = (*dirty_hi).max(last);
-    if last == first + 1 {
-        row[first] += (x1.min(first as f32 + 1.0) - x0) * weight;
-        return;
+    let mut sum = 0.0f32;
+    let mut x = lo;
+    let mut start = lo;
+    let mut finish = lo;
+    while x < end {
+        let stop = (x + COVERAGE_BLOCK).min(end);
+        if !all_zero(&acc[x..stop]) {
+            for slot in x..stop {
+                sum += acc[slot];
+                acc[slot] = 0.0;
+                row[slot] = coverage_of::<EVEN_ODD>(sum);
+            }
+            finish = stop;
+            x = stop;
+            continue;
+        }
+        let cov = coverage_of::<EVEN_ODD>(sum);
+        // Nothing visible here. A subpath that falls entirely outside the
+        // page still pulls the row's column range out to meet it, and a
+        // winding that cancels shows nothing across the gap, so ahead of
+        // the row's first painted column this moves its start. Past that
+        // column the coverage still has to be written, because a later
+        // column may be painted and would otherwise be handed this row's
+        // predecessor, but the row need not carry on beyond it.
+        if cov < QUANTUM {
+            if start == x {
+                start = stop;
+                x = stop;
+                continue;
+            }
+            row[x..stop].fill(cov);
+            x = stop;
+            continue;
+        }
+        row[x..stop].fill(cov);
+        finish = stop;
+        x = stop;
     }
-    row[first] += (first as f32 + 1.0 - x0) * weight;
-    // Interior pixels are fully covered: the old per-pixel min/max produced
-    // exactly `(r - l) == 1.0` there, so this adds the identical value.
-    for slot in &mut row[first + 1..last - 1] {
-        *slot += weight;
+    // Past the last column an edge wrote to, coverage no longer changes. A
+    // path that closed inside the page leaves a winding of zero there and
+    // the row ends; one that ran off the right is still open, and carries
+    // its coverage to the page edge.
+    let tail = coverage_of::<EVEN_ODD>(sum);
+    if tail >= QUANTUM {
+        row[end..full].fill(tail);
+        finish = full;
     }
-    row[last - 1] += (x1 - (last - 1) as f32) * weight;
+    if start >= finish {
+        return (0, 0);
+    }
+    (start, finish)
 }
 
-/// Computes per-row anti-aliased coverage of the prepared `scratch.edges`
-/// under `rule` and invokes `emit(y, row, x_lo, x_hi)` for every pixel row
-/// the path touches, where `[x_lo, x_hi)` bounds the columns that received
-/// coverage. Rows the path does not reach are never emitted (their coverage
-/// is zero), and columns outside `[x_lo, x_hi)` in an emitted row are
-/// guaranteed zero. The caller runs [`prepare_edges`] first; on return,
-/// `scratch.row` is all-zero again.
-///
-/// Covers ISO 32000-1 §10.6.4 and §11.6.4.2.
+/// Brings into `active` every edge whose top lies above the bottom of the
+/// row starting at `ytop`, and drops every edge that ended above its top,
+/// so `active` holds exactly the edges crossing the row. `next` walks the
+/// y-sorted edge list forward only, so a whole sweep costs one pass.
+fn advance_active(edges: &[Edge], active: &mut Vec<usize>, next: &mut usize, ytop: f32) {
+    let ybot = ytop + 1.0;
+    while *next < edges.len() && edges[*next].y0 < ybot {
+        active.push(*next);
+        *next += 1;
+    }
+    active.retain(|&i| edges[i].y1 > ytop);
+}
+
+/// [`sweep_rows_with`] with the fill rule chosen once for the whole sweep
+/// instead of per pixel.
 fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
     scratch: &mut RasterScratch,
     width: u32,
     height: u32,
     rule: FillRule,
+    emit: F,
+) {
+    if rule == FillRule::EvenOdd {
+        sweep_rows_with::<F, true>(scratch, width, height, emit);
+        return;
+    }
+    sweep_rows_with::<F, false>(scratch, width, height, emit);
+}
+
+/// Computes per-row anti-aliased coverage of the prepared `scratch.edges`
+/// and invokes `emit(y, row, x_lo, x_hi)` for every pixel row the path
+/// touches, where `[x_lo, x_hi)` bounds the columns whose coverage the row
+/// buffer holds. Columns outside it are not written and must not be read.
+/// The caller runs [`prepare_edges`] first.
+///
+/// Covers ISO 32000-1 §10.6.4 and §11.6.4.2.
+fn sweep_rows_with<F: FnMut(u32, &[f32], usize, usize), const EVEN_ODD: bool>(
+    scratch: &mut RasterScratch,
+    width: u32,
+    height: u32,
     mut emit: F,
 ) {
     if width == 0 || height == 0 {
         return;
     }
     let RasterScratch {
-        row,
         edges,
         active,
-        crossings,
+        acc,
+        row,
+        ..
     } = scratch;
     if edges.is_empty() {
         return;
@@ -386,131 +572,90 @@ fn sweep_rows<F: FnMut(u32, &[f32], usize, usize)>(
         ymin = ymin.min(e.y0);
         ymax = ymax.max(e.y1);
     }
-
     let row_start = ymin.floor().max(0.0) as u32;
     let row_end = (ymax.ceil().max(0.0) as u32).min(height);
     let full = width as usize;
     if row.len() < full {
         row.resize(full, 0.0);
     }
-    // `add_span` clamps against the slice length, so hand it exactly the
-    // page width even when the reused buffer is longer.
+    if acc.len() < full + 2 {
+        acc.resize(full + 2, 0.0);
+    }
     let row = &mut row[..full];
-    // Active-edge table: indices into `edges` for the edges that straddle the
-    // current scanline. `ys` increases monotonically across the whole sweep
-    // (rows outer, subsamples inner), so `next` only ever advances and expired
-    // edges are dropped once and never revisited — turning the per-scanline
-    // cost from O(all edges) into O(edges crossing this row). Activation in
-    // index order plus order-preserving `retain` fixes the order crossings
-    // are generated in, which the byte-identity of coincident-crossing span
-    // splits depends on (see `prepare_edges`).
+    let acc = &mut acc[..full + 2];
     active.clear();
     let mut next = 0usize;
-    let weight = 1.0 / SUBSAMPLES as f32;
-    // `[dirty_lo, dirty_hi)` is the range of `row` written for the row being
-    // built; it is used both to bound `emit` and to clear only the touched
-    // slice before the next row instead of re-zeroing the full width.
-    let mut dirty_lo = full;
-    let mut dirty_hi = 0usize;
     for y in row_start..row_end {
-        if dirty_lo < dirty_hi {
-            row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
-        }
-        dirty_lo = full;
-        dirty_hi = 0;
-        for s in 0..SUBSAMPLES {
-            let ys = y as f32 + (s as f32 + 0.5) / SUBSAMPLES as f32;
-            while next < edges.len() && edges[next].y0 <= ys {
-                active.push(next);
-                next += 1;
-            }
-            active.retain(|&i| edges[i].y1 > ys);
-            crossings.clear();
-            for &i in active.iter() {
-                // By construction `y0 <= ys` (activation) and `ys < y1`
-                // (retain), so this edge genuinely crosses the scanline.
-                crossings.push((edges[i].x_at(ys), edges[i].dir));
-            }
-            if crossings.len() < 2 {
+        let ytop = y as f32;
+        advance_active(edges, active, &mut next, ytop);
+        let mut lo = acc.len();
+        let mut hi = 0usize;
+        for &i in active.iter() {
+            // Unclamped: `accumulate` needs to know where the edge leaves
+            // the page to know how much of its height belongs to the first
+            // column.
+            let Some((xa, xb, dy)) = edges[i].piece_in_row(ytop) else {
                 continue;
-            }
-            sort_crossings(crossings);
-            let mut wind = 0i32;
-            let mut span_start = 0.0f32;
-            for &(x, dir) in crossings.iter() {
-                let was_inside = inside(wind, rule);
-                wind += dir;
-                let is_inside = inside(wind, rule);
-                if !was_inside && is_inside {
-                    span_start = x;
-                } else if was_inside && !is_inside {
-                    add_span(row, span_start, x, weight, &mut dirty_lo, &mut dirty_hi);
-                }
-            }
+            };
+            accumulate(acc, xa, xb, dy, &mut lo, &mut hi);
         }
-        if dirty_lo < dirty_hi {
-            emit(y, row, dirty_lo, dirty_hi);
+        let (lo, end) = resolve_row::<EVEN_ODD>(acc, row, lo, hi);
+        if lo >= end {
+            continue;
         }
-    }
-    // Restore the all-zero invariant for the next caller.
-    if dirty_lo < dirty_hi {
-        row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
+        emit(y, row, lo, end);
     }
 }
 
-/// Anti-aliased coverage of one path, captured as per-subsample span lists
-/// instead of painted pixels, so a glyph repeated along a baseline sweeps
-/// its edges once: a repeat replays the recorded spans shifted by its own
-/// device offset, skipping edge preparation, the active-edge walk, per-
-/// crossing interpolation and the per-subsample sort. Coordinates are the
-/// swept geometry's own (unclamped by any page); the pixel-row index `r`
-/// maps to device row `y0 + r + iy` at fill time.
+/// Anti-aliased coverage of one path, captured as the per-row edge pieces
+/// the sweep cuts out of it instead of painted pixels, so a glyph repeated
+/// along a baseline sweeps its edges once: a repeat replays the recorded
+/// pieces shifted by its own device offset, skipping edge preparation, the
+/// active-edge walk and the row clipping. Coordinates are the swept
+/// geometry's own (unclamped by any page); the pixel-row index `r` maps to
+/// device row `y0 + r + iy` at fill time.
+///
+/// A piece's signed height is fixed by which pixel row it falls in, so a
+/// replay may shift the capture horizontally by any amount and vertically
+/// by whole rows only. The horizontal shift is exact: [`accumulate`] reads
+/// x positions and nothing else.
 #[derive(Debug, Default)]
 pub(crate) struct SpanSet {
     /// Topmost pixel row the geometry touches, in its own frame.
     y0: i64,
     /// Number of pixel rows captured.
     rows: usize,
-    /// Prefix offsets into `spans`, one slot per `(row, subsample)` pair
-    /// plus a terminator: row `r`, subsample `s` owns
-    /// `spans[offs[r * SUBSAMPLES + s]..offs[r * SUBSAMPLES + s + 1]]`.
+    /// Which interior rule the replay resolves the accumulated area under.
+    /// Winding is still summed at fill time, so the capture itself holds
+    /// for either rule.
+    rule: FillRule,
+    /// Prefix offsets into `pieces`, one slot per row plus a terminator:
+    /// row `r` owns `pieces[offs[r]..offs[r + 1]]`.
     offs: Vec<u32>,
-    /// `(x0, x1)` span endpoints, each contributing one subsample's weight.
-    spans: Vec<(f32, f32)>,
+    /// `(x where the edge enters the row, x where it leaves, signed
+    /// height)` per edge piece, in the order the sweep accumulated them.
+    pieces: Vec<(f32, f32, f32)>,
 }
 
-impl SpanSet {
-    /// How many spans the capture recorded — the cache's size measure.
-    pub(crate) fn span_count(&self) -> usize {
-        self.spans.len()
-    }
-}
-
-/// Row-count and span-count bounds on a capture: geometry taller or busier
+/// Row-count and piece-count bounds on a capture: geometry taller or busier
 /// than any honest glyph refuses to be captured (the caller falls back to a
 /// direct fill, which page bounds keep proportional), so a hostile stream
 /// cannot mint an arbitrarily large [`SpanSet`].
 const MAX_CAPTURE_ROWS: i64 = 8192;
-const MAX_CAPTURE_SPANS: usize = 1 << 16;
+const MAX_CAPTURE_PIECES: usize = 1 << 16;
 
-/// Sweeps `polys` under `rule` with the same edge preparation, activation
-/// order, crossing sort and winding pairing as [`fill_path`]'s rasterizer,
-/// recording the resulting spans instead of painting them. No page clamps
-/// apply: the capture is in the geometry's own frame, and [`fill_spans`]
-/// clamps to the page it paints — analytic coverage distributes per column,
-/// so clamping late lands on the same in-page values a clamped sweep
-/// produces. `None` means the geometry exceeded a capture bound.
+/// Sweeps `polys` with the same edge preparation, activation order and row
+/// clipping as [`fill_path`]'s rasterizer, recording each edge's piece of
+/// each row instead of resolving it into coverage. No page clamps apply:
+/// the capture is in the geometry's own frame, and [`fill_spans`] clamps to
+/// the page it paints, which is where [`accumulate`] wants the clamping
+/// anyway. `None` means the geometry exceeded a capture bound.
 pub(crate) fn capture_spans(
     scratch: &mut RasterScratch,
     polys: &[Subpath],
     rule: FillRule,
 ) -> Option<SpanSet> {
-    let RasterScratch {
-        edges,
-        active,
-        crossings,
-        ..
-    } = scratch;
+    let RasterScratch { edges, active, .. } = scratch;
     prepare_edges(edges, polys);
     if edges.is_empty() {
         return Some(SpanSet::default());
@@ -534,58 +679,58 @@ pub(crate) fn capture_spans(
     let mut set = SpanSet {
         y0: row_start,
         rows,
-        offs: Vec::with_capacity(rows * SUBSAMPLES as usize + 1),
-        spans: Vec::new(),
+        rule,
+        offs: Vec::with_capacity(rows + 1),
+        pieces: Vec::new(),
     };
     set.offs.push(0);
     active.clear();
     let mut next = 0usize;
     for r in 0..rows {
-        let y = row_start + r as i64;
-        for s in 0..SUBSAMPLES {
-            let ys = y as f32 + (s as f32 + 0.5) / SUBSAMPLES as f32;
-            while next < edges.len() && edges[next].y0 <= ys {
-                active.push(next);
-                next += 1;
-            }
-            active.retain(|&i| edges[i].y1 > ys);
-            crossings.clear();
-            for &i in active.iter() {
-                crossings.push((edges[i].x_at(ys), edges[i].dir));
-            }
-            if crossings.len() >= 2 {
-                sort_crossings(crossings);
-                let mut wind = 0i32;
-                let mut span_start = 0.0f32;
-                for &(x, dir) in crossings.iter() {
-                    let was_inside = inside(wind, rule);
-                    wind += dir;
-                    let is_inside = inside(wind, rule);
-                    if !was_inside && is_inside {
-                        span_start = x;
-                    } else if was_inside && !is_inside && x > span_start {
-                        // A zero-width span adds no coverage, so only real
-                        // extents are recorded.
-                        set.spans.push((span_start, x));
-                    }
-                }
-            }
-            if set.spans.len() > MAX_CAPTURE_SPANS {
-                return None;
-            }
-            set.offs.push(set.spans.len() as u32);
+        let ytop = (row_start + r as i64) as f32;
+        advance_active(edges, active, &mut next, ytop);
+        for &i in active.iter() {
+            let Some(piece) = edges[i].piece_in_row(ytop) else {
+                continue;
+            };
+            set.pieces.push(piece);
         }
+        if set.pieces.len() > MAX_CAPTURE_PIECES {
+            return None;
+        }
+        set.offs.push(set.pieces.len() as u32);
     }
     Some(set)
 }
 
 /// Paints a captured [`SpanSet`] onto `pix` at horizontal offset `dx` and
 /// integer row offset `iy`, with the color, alpha, clip and blend semantics
-/// of [`fill_path`] — the coverage accumulation and row painting are the
-/// same code paths, so a capture-and-fill of a path is bit-identical to a
-/// direct fill of it.
+/// of [`fill_path`]. The area accumulation, the coverage walk and the row
+/// painting are the same code, so a capture-and-fill of a path gives the
+/// same pixels as a direct fill of it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_spans(
+    pix: &mut Pixmap,
+    scratch: &mut RasterScratch,
+    set: &SpanSet,
+    dx: f32,
+    iy: i64,
+    rgba: [u8; 4],
+    alpha: f32,
+    clip: Option<&Mask>,
+    blend: BlendMode,
+) {
+    if set.rule == FillRule::EvenOdd {
+        fill_spans_with::<true>(pix, scratch, set, dx, iy, rgba, alpha, clip, blend);
+        return;
+    }
+    fill_spans_with::<false>(pix, scratch, set, dx, iy, rgba, alpha, clip, blend);
+}
+
+/// [`fill_spans`] with the fill rule chosen once for the whole replay
+/// instead of per pixel.
+#[allow(clippy::too_many_arguments)]
+fn fill_spans_with<const EVEN_ODD: bool>(
     pix: &mut Pixmap,
     scratch: &mut RasterScratch,
     set: &SpanSet,
@@ -610,47 +755,28 @@ pub(crate) fn fill_spans(
     if scratch.row.len() < full {
         scratch.row.resize(full, 0.0);
     }
+    if scratch.acc.len() < full + 2 {
+        scratch.acc.resize(full + 2, 0.0);
+    }
     let row = &mut scratch.row[..full];
-    let weight = 1.0 / SUBSAMPLES as f32;
-    let subs = SUBSAMPLES as usize;
+    let acc = &mut scratch.acc[..full + 2];
     for r in 0..set.rows {
         let page_y = set.y0 + r as i64 + iy;
         if page_y < 0 || page_y >= pix.height as i64 {
             continue;
         }
-        let mut dirty_lo = full;
-        let mut dirty_hi = 0usize;
-        for s in 0..subs {
-            let slot = r * subs + s;
-            let from = set.offs[slot] as usize;
-            let to = set.offs[slot + 1] as usize;
-            for &(x0, x1) in &set.spans[from..to] {
-                add_span(row, x0 + dx, x1 + dx, weight, &mut dirty_lo, &mut dirty_hi);
-            }
+        let mut lo = acc.len();
+        let mut hi = 0usize;
+        let from = set.offs[r] as usize;
+        let to = set.offs[r + 1] as usize;
+        for &(xa, xb, dy) in &set.pieces[from..to] {
+            accumulate(acc, xa + dx, xb + dx, dy, &mut lo, &mut hi);
         }
-        if dirty_lo < dirty_hi {
-            paint_row(
-                pix,
-                page_y as u32,
-                row,
-                dirty_lo,
-                dirty_hi,
-                clip,
-                base_a,
-                rgb,
-                blend,
-            );
-            // Restore the all-zero invariant `RasterScratch::row` promises.
-            row[dirty_lo..dirty_hi].iter_mut().for_each(|c| *c = 0.0);
+        let (lo, end) = resolve_row::<EVEN_ODD>(acc, row, lo, hi);
+        if lo >= end {
+            continue;
         }
-    }
-}
-
-/// Whether a winding count is "inside" under `rule`.
-fn inside(wind: i32, rule: FillRule) -> bool {
-    match rule {
-        FillRule::NonZero => wind != 0,
-        FillRule::EvenOdd => wind % 2 != 0,
+        paint_row(pix, page_y as u32, row, lo, end, clip, base_a, rgb, blend);
     }
 }
 
@@ -1531,52 +1657,6 @@ mod tests {
     use super::*;
     use pdfboss_core::geom::Point;
 
-    /// [`sort_crossings`] orders crossings exactly as the stable sort it
-    /// replaces does, on both sides of the size where it stops inserting
-    /// and on the inputs that make orderings differ: repeated x values
-    /// (whose relative order has to survive), signed zeros, and a reversed
-    /// list.
-    #[test]
-    fn crossings_order_as_a_stable_sort_orders_them() {
-        let mut state = 0x243f_6a88_85a3_08d3u64;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        for len in 0..=64usize {
-            for trial in 0..24 {
-                let input: Vec<(f32, i32)> = (0..len)
-                    .map(|i| {
-                        let r = next();
-                        let x = match trial % 4 {
-                            // Few distinct values, so equal keys are common
-                            // and their relative order is what is tested.
-                            0 => (r % 3) as f32,
-                            1 => (r % 64) as f32 / 8.0 - 4.0,
-                            // Already ordered, and ordered backwards.
-                            2 => i as f32,
-                            _ => (len - i) as f32,
-                        };
-                        let x = if r % 17 == 0 { -0.0 } else { x };
-                        (x, if r % 2 == 0 { 1 } else { -1 })
-                    })
-                    .collect();
-                let mut want = input.clone();
-                want.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let mut got = input.clone();
-                sort_crossings(&mut got);
-                assert_eq!(
-                    got.iter().map(|c| c.0.to_bits()).collect::<Vec<_>>(),
-                    want.iter().map(|c| c.0.to_bits()).collect::<Vec<_>>(),
-                    "len {len} trial {trial}"
-                );
-                assert_eq!(got, want, "len {len} trial {trial}");
-            }
-        }
-    }
-
     /// Shadows the crate fn with a fresh-scratch wrapper so the tests stay
     /// focused on rasterization behavior, not buffer plumbing.
     fn fill_path(
@@ -1623,6 +1703,230 @@ mod tests {
     fn rgba_at(pix: &Pixmap, x: u32, y: u32) -> [u8; 4] {
         let off = ((y * pix.width + x) * 4) as usize;
         pix.data[off..off + 4].try_into().unwrap()
+    }
+
+    /// Clips `poly` to the half-plane where `keep` is non-negative,
+    /// interpolating the crossings. Sutherland-Hodgman, and exact for the
+    /// convex subjects this reference clips.
+    fn clip_half(poly: &[(f64, f64)], keep: impl Fn((f64, f64)) -> f64) -> Vec<(f64, f64)> {
+        let mut out = Vec::new();
+        for i in 0..poly.len() {
+            let a = poly[i];
+            let b = poly[(i + 1) % poly.len()];
+            let (da, db) = (keep(a), keep(b));
+            if da >= 0.0 {
+                out.push(a);
+            }
+            if (da >= 0.0) == (db >= 0.0) {
+                continue;
+            }
+            let t = da / (da - db);
+            out.push((a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t));
+        }
+        out
+    }
+
+    /// The exact area a convex `poly` cuts out of the pixel square at
+    /// `(x, y)`: clip to the square, then the shoelace formula. This is the
+    /// quantity the sweep claims to compute, worked out independently.
+    fn cell_area(poly: &[Point], x: u32, y: u32) -> f64 {
+        let (lx, ly) = (x as f64, y as f64);
+        let mut p: Vec<(f64, f64)> = poly.iter().map(|q| (q.x as f64, q.y as f64)).collect();
+        p = clip_half(&p, |v| v.0 - lx);
+        p = clip_half(&p, |v| lx + 1.0 - v.0);
+        p = clip_half(&p, |v| v.1 - ly);
+        p = clip_half(&p, |v| ly + 1.0 - v.1);
+        if p.len() < 3 {
+            return 0.0;
+        }
+        let mut twice = 0.0;
+        for i in 0..p.len() {
+            let a = p[i];
+            let b = p[(i + 1) % p.len()];
+            twice += a.0 * b.1 - b.0 * a.1;
+        }
+        twice.abs() * 0.5
+    }
+
+    fn poly(pts: &[(f32, f32)]) -> Vec<Point> {
+        pts.iter().map(|&(x, y)| Point::new(x, y)).collect()
+    }
+
+    /// Every pixel's coverage is the area the path cuts out of it, to
+    /// within the mask's own rounding: a slanted edge, a wedge whose edges
+    /// are nearly horizontal, a rectangle on fractional coordinates, and a
+    /// diamond whose vertices fall inside rows. Sampling a row at fixed
+    /// heights integrates the covered width exactly only while that width
+    /// runs linearly down the row, which any row holding a vertex or an
+    /// edge endpoint breaks, and flattened curves and glyph outlines are
+    /// mostly such rows.
+    ///
+    /// Covers ISO 32000-1 §10.6.4.
+    #[test]
+    fn coverage_is_the_area_the_path_cuts_from_each_pixel() {
+        let shapes = [
+            (
+                "slanted triangle",
+                poly(&[(2.0, 2.0), (9.5, 3.5), (3.5, 9.0)]),
+            ),
+            (
+                "near-horizontal wedge",
+                poly(&[(1.0, 4.0), (11.0, 4.2), (11.0, 4.9)]),
+            ),
+            (
+                "fractional rect",
+                poly(&[(1.3, 2.7), (8.6, 2.7), (8.6, 9.1), (1.3, 9.1)]),
+            ),
+            (
+                "diamond",
+                poly(&[(6.0, 1.5), (10.5, 6.0), (6.0, 10.5), (1.5, 6.0)]),
+            ),
+        ];
+        for (name, pts) in shapes {
+            let polys = [Subpath {
+                points: pts.clone(),
+                closed: true,
+            }];
+            let mask = mask_from_path(12, 12, &polys, FillRule::NonZero);
+            for y in 0..12 {
+                for x in 0..12 {
+                    let want = cell_area(&pts, x, y);
+                    let got = mask.coverage(x, y) as f64 / 255.0;
+                    assert!(
+                        (got - want).abs() <= 1.0 / 255.0,
+                        "{name} at ({x},{y}): got {got:.4}, area is {want:.4}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A capture replayed at a horizontal offset paints the area the
+    /// offset shape cuts out of each pixel, including where the offset
+    /// pushes it off either side of the page. A rectangle cannot show this:
+    /// its vertical edges enter and leave a row at the same x, so an edge
+    /// that straddles x = 0 is never split between the first column and the
+    /// page outside it.
+    ///
+    /// Covers ISO 32000-1 §10.6.4.
+    #[test]
+    fn a_replayed_capture_paints_the_area_of_the_shape_it_is_offset_to() {
+        for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+            for dx in [-6.0f32, 0.0, 8.0] {
+                let pts = poly(&[(2.0, 1.5), (9.5, 4.0), (3.5, 10.5)]);
+                let polys = [Subpath {
+                    points: pts.clone(),
+                    closed: true,
+                }];
+                let mut scratch = RasterScratch::default();
+                let set = super::capture_spans(&mut scratch, &polys, rule).expect("captured");
+                let mut pix = Pixmap::new(12, 12);
+                super::fill_spans(
+                    &mut pix,
+                    &mut scratch,
+                    &set,
+                    dx,
+                    0,
+                    [0, 0, 0, 255],
+                    1.0,
+                    None,
+                    BlendMode::Normal,
+                );
+                let moved: Vec<Point> = pts.iter().map(|q| Point::new(q.x + dx, q.y)).collect();
+                for y in 0..12 {
+                    for x in 0..12 {
+                        let want = cell_area(&moved, x, y);
+                        let got = alpha_at(&pix, x, y) as f64 / 255.0;
+                        assert!(
+                            (got - want).abs() <= 1.0 / 255.0,
+                            "{rule:?} dx {dx} at ({x},{y}): got {got:.4}, area is {want:.4}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two shapes far apart in one path, each row's gap between them
+    /// wider than the block the coverage walk skips in one go. The gap
+    /// carries no coverage, and the shapes narrow at different rates, so a
+    /// row that took its gap from the row before it would show the earlier
+    /// row's edges. Coverage is the sum of the two shapes' areas because
+    /// they never overlap.
+    ///
+    /// Covers ISO 32000-1 §10.6.4.
+    #[test]
+    fn a_gap_between_two_shapes_carries_no_coverage_from_the_row_above() {
+        let left = poly(&[(1.0, 1.0), (9.0, 1.0), (2.0, 19.0)]);
+        let right = poly(&[(191.0, 1.0), (199.0, 1.0), (199.0, 19.0)]);
+        let polys = [
+            Subpath {
+                points: left.clone(),
+                closed: true,
+            },
+            Subpath {
+                points: right.clone(),
+                closed: true,
+            },
+        ];
+        let mask = mask_from_path(200, 20, &polys, FillRule::NonZero);
+        for y in 0..20 {
+            for x in 0..200 {
+                let want = cell_area(&left, x, y) + cell_area(&right, x, y);
+                let got = mask.coverage(x, y) as f64 / 255.0;
+                assert!(
+                    (got - want).abs() <= 1.0 / 255.0,
+                    "({x},{y}): got {got:.4}, area is {want:.4}"
+                );
+            }
+        }
+    }
+
+    /// The same exactness where the path leaves the page. An edge crossing
+    /// x = 0 inside a row gives the first column the height it cuts off
+    /// there, not the height its clamped endpoint would suggest; a path
+    /// running off the right has not closed inside the page, so its
+    /// coverage has to reach the last column.
+    ///
+    /// Covers ISO 32000-1 §10.6.4.
+    #[test]
+    fn coverage_is_exact_where_the_path_leaves_the_page() {
+        let shapes = [
+            (
+                "off the left",
+                poly(&[(-6.0, 1.0), (7.5, 3.0), (-6.0, 10.0)]),
+            ),
+            (
+                "off the right",
+                poly(&[(18.0, 1.0), (4.5, 3.0), (18.0, 10.0)]),
+            ),
+            ("off the top", poly(&[(2.0, -6.0), (9.0, -6.0), (5.5, 7.5)])),
+            (
+                "off the bottom",
+                poly(&[(2.0, 18.0), (9.0, 18.0), (5.5, 4.5)]),
+            ),
+            (
+                "wider than the page",
+                poly(&[(-9.0, 2.5), (21.0, 3.5), (21.0, 8.5), (-9.0, 9.5)]),
+            ),
+        ];
+        for (name, pts) in shapes {
+            let polys = [Subpath {
+                points: pts.clone(),
+                closed: true,
+            }];
+            let mask = mask_from_path(12, 12, &polys, FillRule::NonZero);
+            for y in 0..12 {
+                for x in 0..12 {
+                    let want = cell_area(&pts, x, y);
+                    let got = mask.coverage(x, y) as f64 / 255.0;
+                    assert!(
+                        (got - want).abs() <= 1.0 / 255.0,
+                        "{name} at ({x},{y}): got {got:.4}, area is {want:.4}"
+                    );
+                }
+            }
+        }
     }
 
     const RED: [u8; 4] = [255, 0, 0, 255];

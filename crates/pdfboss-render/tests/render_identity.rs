@@ -380,7 +380,10 @@ fn cases() -> Vec<Case> {
             .expect("committed fixture"),
             scale: 1.5,
             tier: GlyphPainting::AllEmbedded,
-            digest: "35d8396cb3f40e47",
+            // The only case here with edges that are neither horizontal nor
+            // vertical, so the only one whose pixels move when coverage
+            // comes from an edge's area instead of four sampled heights.
+            digest: "17a0746d2653a00f",
         },
     ]
 }
