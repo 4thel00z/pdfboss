@@ -1,6 +1,11 @@
 # Changelog
 
-## [2.9.2](https://github.com/4thel00z/pdfboss/compare/v2.9.1...v2.9.2) (2026-09-19)
+## [2.10.0](https://github.com/4thel00z/pdfboss/compare/v2.9.1...v2.10.0) (2026-09-19)
+
+
+### Features
+
+* read annotations and actions as data (ISO 32000 batch 13) ([#216](https://github.com/4thel00z/pdfboss/issues/216)) ([a684471](https://github.com/4thel00z/pdfboss/commit/a684471fa92cd43ce3d8433f201330b9feadafb1))
 
 
 ### Performance Improvements
