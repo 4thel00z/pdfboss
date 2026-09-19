@@ -31,6 +31,7 @@ use pdfboss_output::Output;
 use pdfboss_render::RenderCache;
 use pdfboss_text::{FontCache, TextSpan};
 
+mod annotations;
 mod catalog;
 mod document;
 mod forms;
@@ -852,6 +853,35 @@ impl Document {
         Ok(PyBytes::new(py, &bytes))
     }
 
+    /// The decoded bytes of the stream a file specification embeds, such
+    /// as a file attachment annotation's `file`. Releases the GIL. Raises
+    /// `PdfError` when the specification embeds no stream or the stream
+    /// will not decode.
+    fn file_spec_data<'py>(
+        &self,
+        py: Python<'py>,
+        spec: PyRef<'py, annotations::FileSpec>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let inner = Arc::clone(&self.inner);
+        let spec = spec.inner.clone();
+        let bytes = py
+            .allow_threads(move || inner.lock().file_spec_data(&spec))
+            .map_err(pdf_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The actions the catalog's `/AA` dictionary fires around closing,
+    /// saving and printing the document, in table order; empty without
+    /// one. Releases the GIL while they are read.
+    fn additional_actions(&self, py: Python<'_>) -> PyResult<Vec<annotations::TriggeredAction>> {
+        let inner = Arc::clone(&self.inner);
+        let (found, pages) = py.allow_threads(move || {
+            let doc = inner.lock();
+            (doc.additional_actions(), page_index_of(&doc))
+        });
+        annotations::triggered_actions(py, found, &pages)
+    }
+
     /// The viewer preferences the catalog declares; `None` without the
     /// dictionary.
     fn viewer_preferences(&self) -> Option<catalog::ViewerPreferences> {
@@ -1452,6 +1482,29 @@ impl Page {
             let pages = page_index_of(&doc);
             Some(document::SeparationInfo::new(info, &pages))
         })
+    }
+
+    /// The page's annotations in the order of its `/Annots` array, each
+    /// with its markup entries, reply state, link destination, attached
+    /// file and actions read as data; empty for a page without any.
+    /// Releases the GIL while they are read.
+    fn annotations(&self, py: Python<'_>) -> PyResult<Vec<annotations::Annotation>> {
+        let (found, pages) = py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            (doc.annotations(&self.page), page_index_of(&doc))
+        });
+        annotations::annotations(py, found, &pages)
+    }
+
+    /// The actions the page's `/AA` dictionary fires when the page opens
+    /// and closes, in that order; empty without one. Releases the GIL
+    /// while they are read.
+    fn additional_actions(&self, py: Python<'_>) -> PyResult<Vec<annotations::TriggeredAction>> {
+        let (found, pages) = py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            (doc.page_additional_actions(&self.page), page_index_of(&doc))
+        });
+        annotations::triggered_actions(py, found, &pages)
     }
 }
 
@@ -2407,6 +2460,35 @@ impl AsyncDocument {
         })
     }
 
+    /// The decoded bytes of the stream a file specification embeds, the
+    /// async twin of `Document.file_spec_data`; coroutine resolving to
+    /// bytes.
+    fn file_spec_data<'py>(
+        &self,
+        py: Python<'py>,
+        spec: PyRef<'py, annotations::FileSpec>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let spec = spec.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bytes = inner.file_spec_data(&spec).await.map_err(aio_err)?;
+            Python::with_gil(|py| {
+                Ok::<Py<PyAny>, PyErr>(PyBytes::new(py, &bytes).into_any().unbind())
+            })
+        })
+    }
+
+    /// The document's additional actions, the async twin of
+    /// `Document.additional_actions`; coroutine resolving to a list.
+    fn additional_actions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&inner);
+            let found = inner.additional_actions().await;
+            Python::with_gil(|py| annotations::triggered_actions(py, found, &pages))
+        })
+    }
+
     /// The viewer preferences, the async twin of
     /// `Document.viewer_preferences`; coroutine resolving to
     /// `ViewerPreferences` or None.
@@ -2866,6 +2948,30 @@ impl AsyncPage {
             )
         })
     }
+
+    /// The annotations, the async twin of `Page.annotations`; coroutine
+    /// resolving to a list.
+    fn annotations<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&doc);
+            let found = doc.annotations(&page).await;
+            Python::with_gil(|py| annotations::annotations(py, found, &pages))
+        })
+    }
+
+    /// The page's additional actions, the async twin of
+    /// `Page.additional_actions`; coroutine resolving to a list.
+    fn additional_actions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pages = aio_page_index(&doc);
+            let found = doc.page_additional_actions(&page).await;
+            Python::with_gil(|py| annotations::triggered_actions(py, found, &pages))
+        })
+    }
 }
 
 /// Async iterator over a document's elements, returned by
@@ -3043,6 +3149,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(md_to_pdf, m)?)?;
     forms::register(m)?;
     catalog::register(m)?;
+    annotations::register(m)?;
     document::register(m)?;
     write::register(m.py(), m)?;
     Ok(())

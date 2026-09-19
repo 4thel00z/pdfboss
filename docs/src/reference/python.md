@@ -72,7 +72,7 @@ Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Mar
 
 ## The document and page structure classes
 
-Eight more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `piece_info()`, `articles()`, `permission_handlers()`, `requirements()` and `legal_attestation()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Seven `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()`, `presentation()`, `viewports()` and `separation_info()`. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
+Eight more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `piece_info()`, `articles()`, `permission_handlers()`, `requirements()` and `legal_attestation()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Nine `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()`, `presentation()`, `viewports()`, `separation_info()`, `annotations()` and `additional_actions()`. `Document.additional_actions()` reads the catalog's trigger events and `Document.file_spec_data(spec)` decodes the file a `FileSpec` embeds, both with `AsyncDocument` twins. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
 
 | Name | What it is |
 |---|---|
@@ -92,6 +92,15 @@ Eight more `Document` methods read structures beyond the catalog readers above: 
 | `Measure` | How a viewport's coordinates convert to real-world units, with the standard's defaults filled in: `subtype`, `scale_ratio`, the number-format chains `x`, `y`, `distance`, `area`, `angle`, `slope`, plus `origin` and `y_to_x` |
 | `NumberFormat` | One unit of a chain: `unit`, `conversion`, `fraction` (`"decimal"`, `"fraction"`, `"round"`, `"truncate"`), `precision`, `fixed_denominator`, `thousands`, `radix`, `prefix_spacing`, `suffix_spacing`, `label` (`"suffix"` or `"prefix"`) |
 | `SeparationInfo` | A pre-separated page's separation dictionary: `pages` (0-based, `None` where the reference names no page), `page_refs`, `device_colorant`, `color_space` (plain Python data) |
+| `Annotation` | One annotation of a page, Table 164 read as data: `ref`, `subtype`, `rect`, `contents`, `name`, `modified` and `modified_date`, `flags`, `has_appearance`, `appearance_state`, `border`, `color`, `struct_parent`, `optional_content`; then `markup`, `state` and `state_model`, `open`, `icon`, `parent`, `file`, `destination` (a link's `/Dest`), `action` and `additional_actions` |
+| `AnnotationFlags` | The `/F` word with one boolean per flag: `invisible`, `hidden`, `print`, `no_zoom`, `no_rotate`, `no_view`, `read_only`, `locked`, `toggle_no_view`, `locked_contents`, plus `value` |
+| `Border` | The `/Border` array: `horizontal_radius`, `vertical_radius`, `width`, `dash` |
+| `Markup` | The Table 170 entries of a markup annotation: `title`, `popup`, `opacity`, `rich_contents`, `created`, `in_reply_to`, `subject`, `reply_type` (`"reply"` or `"group"`), `intent` |
+| `FileSpec` | A file specification: `name`, `file`, `unicode_file`, `description`, `file_system`, `url` (for `/FS /URL`), `volatile`, `ref` (the embedded stream, decoded by `Document.file_spec_data`) |
+| `Action` | One action dictionary, never executed: `kind` (the `/S` name as written), `destination` and `named_destination` for the go-to family, `file` and `new_window`, `target` for an embedded go-to, `windows` for a launch, `uri` and `is_map`, `name` for a named action, `script` for JavaScript, `entries` (the whole dictionary) for any other kind, and `next` (the `/Next` chain) |
+| `Target` | One step of an embedded go-to action's path: `relationship`, `name`, `page`, `annotation`, `next` |
+| `WindowsLaunch` | A launch action's Windows parameters: `file`, `directory`, `operation`, `parameters` |
+| `TriggeredAction` | One entry of an additional-actions dictionary: `trigger` (kebab-case, `"cursor-enter"`, `"page-open"`, `"will-close"` and the rest of Tables 194 to 197) and `action` |
 
 ```python
 import pdfboss
@@ -121,6 +130,19 @@ for requirement in doc.requirements():
 legal = doc.legal_attestation()
 if legal:
     print(legal.attestation, legal.counts())
+
+for annotation in page.annotations():
+    action = annotation.action
+    if annotation.subtype == "Link" and action and action.kind == "URI":
+        print(annotation.rect, action.uri)
+    elif annotation.destination:
+        print(annotation.rect, "-> page", annotation.destination.page)
+    if annotation.markup:
+        print(annotation.markup.title, annotation.contents, annotation.state)
+    if annotation.file and annotation.file.ref:
+        open(annotation.file.name, "wb").write(doc.file_spec_data(annotation.file))
+for triggered in page.additional_actions() + doc.additional_actions():
+    print(triggered.trigger, triggered.action.kind)
 ```
 
 ## The md submodule

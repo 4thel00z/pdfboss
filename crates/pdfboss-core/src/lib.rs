@@ -3,6 +3,7 @@
 //! byte spans plus logical document structure), implemented from the PDF
 //! specification (ISO 32000).
 
+pub mod annotation;
 pub mod article;
 pub mod cmap;
 pub mod content;
@@ -44,6 +45,12 @@ pub mod tree;
 pub mod viewer_preferences;
 pub mod xref;
 
+pub use annotation::{
+    action_with, annotations_with, document_additional_actions_with, page_additional_actions_with,
+    Action, ActionKind, Annotation, AnnotationFlags, AnnotationState, Border, Markup, Relationship,
+    ReplyType, Target, TargetAnnotation, TargetPage, Trigger, TriggeredAction, WindowsLaunch,
+    MAX_ACTIONS, MAX_TARGET_DEPTH,
+};
 pub use article::{articles_with, page_beads_with, ArticleThread, Bead};
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
 pub use crypt::{
@@ -60,8 +67,8 @@ pub use document::{
 };
 pub use elements::{Element, ElementOpts, Span, XrefKind};
 pub use embedded_file::{
-    embedded_file_data_with, embedded_files_with, file_spec_with, spec_components, EmbeddedFile,
-    FileSpec,
+    embedded_file_data_with, embedded_files_with, file_spec_data_with, file_spec_with,
+    spec_components, EmbeddedFile, FileSpec,
 };
 pub use error::{Error, Result};
 pub use extension::{extensions_with, DeveloperExtension};

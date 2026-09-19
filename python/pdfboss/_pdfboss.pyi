@@ -407,6 +407,18 @@ class Document:
         ``PdfError`` when the specification embeds no stream or the stream
         will not decode."""
 
+    def file_spec_data(self, spec: FileSpec) -> bytes:
+        """The decoded bytes of the stream a file specification embeds
+        (ISO 32000-1 7.11.4), such as a file attachment annotation's
+        ``file``. Releases the GIL. Raises ``PdfError`` when the
+        specification embeds no stream or the stream will not decode."""
+
+    def additional_actions(self) -> list[TriggeredAction]:
+        """The actions the catalog's additional-actions dictionary fires
+        around closing, saving and printing the document (ISO 32000-1
+        12.6.3, Table 197), in table order; empty without one. Read as
+        data, never run. Releases the GIL."""
+
     def viewer_preferences(self) -> ViewerPreferences | None:
         """The viewer preferences the catalog declares (ISO 32000-1 12.2);
         ``None`` without the dictionary."""
@@ -637,6 +649,17 @@ class Page:
         colorant a pre-separated page prints and the pages of its
         separation set, resolved to 0-based indices; ``None`` for a page
         without one. Releases the GIL."""
+
+    def annotations(self) -> list[Annotation]:
+        """The page's annotations (ISO 32000-1 12.5.2) in the order of its
+        ``/Annots`` array, each with its markup entries, reply state, link
+        destination, attached file and actions read as data; empty for a
+        page without any. Releases the GIL."""
+
+    def additional_actions(self) -> list[TriggeredAction]:
+        """The actions the page's additional-actions dictionary fires when
+        the page opens and closes (ISO 32000-1 12.6.3, Table 195), in that
+        order; empty without one. Releases the GIL."""
 
 class PageImage:
     """One embedded image extracted from a page: PNG-encoded pixels at
@@ -1561,6 +1584,333 @@ class SeparationInfo:
     approximates the colorant on a display, ``/ColorSpace``, as plain
     Python data; ``None`` without one."""
 
+class FileSpec:
+    """A file specification (ISO 32000-1 7.11.3, Table 44): the file an
+    action or a file attachment annotation names, embedded or external;
+    ``Document.file_spec_data`` decodes an embedded one."""
+
+    name: str
+    """The name to show: the Unicode file name, else the specification
+    string decoded; empty when the specification gives none."""
+
+    file: bytes | None
+    """The file specification string as written, ``/F``, or the whole
+    specification when it was a bare string."""
+
+    unicode_file: str | None
+    """The Unicode form of the specification, ``/UF``."""
+
+    description: str | None
+    """The description shown next to the file, ``/Desc``."""
+
+    file_system: str | None
+    """The file system that interprets the specification, ``URL`` being
+    the one the standard defines."""
+
+    url: str | None
+    """The URL a ``URL`` specification names (ISO 32000-1 7.11.5);
+    ``None`` for any other file system."""
+
+    volatile: bool
+    """Whether the file changes often enough that it must not be cached."""
+
+    ref: tuple[int, int] | None
+    """The embedded file stream's ``(num, gen)`` reference; ``None`` when
+    the specification embeds no stream."""
+
+class AnnotationFlags:
+    """The ``/F`` flag word of an annotation (ISO 32000-1 12.5.3, Table
+    165), one boolean per flag."""
+
+    value: int
+    """The flag word as written, 0 when absent."""
+
+    invisible: bool
+    hidden: bool
+    print: bool
+    no_zoom: bool
+    no_rotate: bool
+    no_view: bool
+    read_only: bool
+    locked: bool
+    toggle_no_view: bool
+    locked_contents: bool
+
+class Border:
+    """An annotation's ``/Border`` array (ISO 32000-1 12.5.2, Table 164):
+    the corner radii and width of the border, with its dash array."""
+
+    horizontal_radius: float
+    vertical_radius: float
+    width: float
+    dash: list[float] | None
+    """The dash array in the graphics state's form; ``None`` for a solid
+    border."""
+
+class Markup:
+    """The entries every markup annotation may carry (ISO 32000-1
+    12.5.6.2, Table 170); ``Annotation.markup``."""
+
+    title: str | None
+    """The pop-up window's title, by convention the author, ``/T``."""
+
+    popup: tuple[int, int] | None
+    """The pop-up annotation's ``(num, gen)`` reference, ``/Popup``."""
+
+    opacity: float
+    """The constant opacity an appearance pdfboss builds is painted with,
+    ``/CA``; 1 by default."""
+
+    rich_contents: str | None
+    """The rich text shown in the pop-up window, ``/RC``, decoded."""
+
+    created: str | None
+    """The creation date as an ISO 8601 string."""
+
+    in_reply_to: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the annotation this one replies to,
+    ``/IRT``."""
+
+    subject: str | None
+    """A short description of the subject, ``/Subj``."""
+
+    reply_type: Literal["reply", "group"]
+    """How this annotation relates to the one it replies to, ``/RT``."""
+
+    intent: str | None
+    """The intent that refines the subtype's behaviour, ``/IT``, as
+    written."""
+
+class WindowsLaunch:
+    """The Windows launch parameters of a launch action (ISO 32000-1
+    12.6.4.5, Table 204)."""
+
+    file: bytes
+    """The application or document, a plain Windows path."""
+
+    directory: bytes | None
+    """The default directory."""
+
+    operation: str
+    """``"open"`` (the default) or ``"print"``."""
+
+    parameters: bytes | None
+    """The parameter string passed to the application."""
+
+class Target:
+    """One step of the path an embedded go-to action follows to its target
+    document (ISO 32000-1 12.6.4.4, Table 202)."""
+
+    relationship: Literal["parent", "child"]
+    """Which way this step goes, ``/R``."""
+
+    name: bytes | None
+    """The child's name in the embedded files name tree, ``/N``."""
+
+    page: int | bytes | None
+    """The page whose file attachment annotation holds the child, ``/P``:
+    a 0-based page number, or the bytes of a named destination."""
+
+    annotation: int | str | None
+    """Which annotation of that page holds the child, ``/A``: its 0-based
+    index in the page's annotations, or its name."""
+
+    next: Target | None
+    """The next step; ``None`` when this step's document is the target."""
+
+class Action:
+    """One action dictionary (ISO 32000-1 12.6.2, Table 193) with the
+    actions its ``/Next`` entry chains after it. ``kind`` is the ``/S``
+    name as written; the go-to family, launch, URI, named and JavaScript
+    actions fill their own attributes, every other kind keeps its
+    dictionary in ``entries``. No action is ever executed."""
+
+    ref: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the action dictionary; ``None`` for
+    a direct dictionary."""
+
+    kind: str
+    """``"GoTo"``, ``"GoToR"``, ``"GoToE"``, ``"Launch"``, ``"URI"``,
+    ``"Named"``, ``"JavaScript"``, or any other ``/S`` name such as
+    ``"SubmitForm"``."""
+
+    destination: Destination | None
+    """The explicit destination of a go-to action (ISO 32000-1 12.6.4.2);
+    for a remote or embedded one (12.6.4.3, 12.6.4.4) its page is a
+    number in the other document."""
+
+    named_destination: bytes | None
+    """The name or string a go-to action's ``/D`` gives; for a ``GoTo`` it
+    is looked up into ``destination`` as well."""
+
+    file: FileSpec | None
+    """The file a remote go-to, embedded go-to or launch action names."""
+
+    new_window: bool | None
+    """Whether the destination opens in a new window; ``None`` when the
+    action leaves it to the viewer."""
+
+    target: Target | None
+    """The path to an embedded go-to action's target document."""
+
+    windows: WindowsLaunch | None
+    """A launch action's Windows parameters (ISO 32000-1 12.6.4.5)."""
+
+    uri: str | None
+    """A URI action's URI (ISO 32000-1 12.6.4.7)."""
+
+    is_map: bool
+    """Whether a URI action appends the mouse position to its URI."""
+
+    name: str | None
+    """A named action's name (ISO 32000-1 12.6.4.11), such as
+    ``"NextPage"``."""
+
+    script: str | None
+    """A JavaScript action's script (ISO 32000-1 12.6.4.16), decoded and
+    never run."""
+
+    entries: dict[str, object] | None
+    """The whole dictionary of an action of any other kind, as plain
+    Python data; ``None`` for the typed kinds."""
+
+    next: list[Action]
+    """The actions performed after this one, in order, each with its own
+    chain."""
+
+class TriggeredAction:
+    """One entry of an additional-actions dictionary (ISO 32000-1 12.6.3):
+    the trigger event and the action it fires."""
+
+    trigger: Literal[
+        "cursor-enter",
+        "cursor-exit",
+        "mouse-down",
+        "mouse-up",
+        "focus",
+        "blur",
+        "page-open",
+        "page-close",
+        "page-visible",
+        "page-invisible",
+        "keystroke",
+        "format",
+        "validate",
+        "calculate",
+        "open",
+        "close",
+        "will-close",
+        "will-save",
+        "did-save",
+        "will-print",
+        "did-print",
+    ]
+    """The event: the annotation triggers of Tables 194 and 196, then the
+    page triggers of Table 195, then the document triggers of Table 197."""
+
+    action: Action
+    """The action the event fires."""
+
+class Annotation:
+    """One annotation of a page (ISO 32000-1 12.5.2, Table 164) with the
+    entries of the subtypes pdfboss reads beyond the common ones; returned
+    by ``Page.annotations``."""
+
+    ref: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the annotation dictionary; ``None``
+    for a direct dictionary in the page's ``/Annots``."""
+
+    subtype: str
+    """The annotation type as written, ``/Subtype``: ``"Link"``,
+    ``"Text"``, ``"Widget"``, ``"Highlight"`` and the rest of Table 169."""
+
+    rect: tuple[float, float, float, float] | None
+    """The annotation rectangle ``(x0, y0, x1, y1)`` in default user
+    space, normalized; ``None`` when missing or malformed."""
+
+    contents: str | None
+    """The annotation's text, or an alternate description, ``/Contents``."""
+
+    page_ref: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the page the annotation belongs to,
+    ``/P``."""
+
+    name: str | None
+    """The name unique among the page's annotations, ``/NM``."""
+
+    modified: str | None
+    """When the annotation last changed, ``/M``, as written."""
+
+    modified_date: str | None
+    """``/M`` as an ISO 8601 string when it parses as a date; ``None``
+    when it is in another format."""
+
+    flags: AnnotationFlags
+    """The flag word (ISO 32000-1 12.5.3), one boolean per flag."""
+
+    has_appearance: bool
+    """Whether an appearance dictionary with a normal appearance is
+    present, ``/AP /N``."""
+
+    appearance_state: str | None
+    """The appearance state that picks the appearance stream, ``/AS``."""
+
+    border: Border | None
+    """The border array as written; ``None`` when absent (the standard's
+    default is a 1-point solid border) or malformed."""
+
+    color: list[float] | None
+    """The colour of the icon background, pop-up title bar or link border,
+    ``/C``: 0 (transparent), 1, 3 or 4 components as written."""
+
+    struct_parent: int | None
+    """The key under which the structure tree's parent tree lists the
+    annotation, ``/StructParent``."""
+
+    optional_content: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the optional content group or
+    membership dictionary that controls visibility, ``/OC``."""
+
+    markup: Markup | None
+    """The markup entries (ISO 32000-1 12.5.6.2); ``None`` for a subtype
+    that is not a markup annotation (Link, Popup, Widget and the like)."""
+
+    state: str | None
+    """The state a text annotation sets on the annotation it replies to
+    (ISO 32000-1 12.5.6.3), or the state model's default; ``None`` when it
+    sets none."""
+
+    state_model: str | None
+    """The state model, ``"Marked"`` or ``"Review"`` as written."""
+
+    open: bool | None
+    """Whether a text or pop-up annotation starts open, ``/Open``."""
+
+    icon: str | None
+    """The icon an annotation shows without an appearance stream, ``/Name``
+    as written; text, file attachment and sound annotations name one."""
+
+    parent: tuple[int, int] | None
+    """The ``(num, gen)`` reference of the markup annotation a pop-up
+    belongs to, ``/Parent``."""
+
+    file: FileSpec | None
+    """The file a file attachment annotation carries (ISO 32000-1
+    12.5.6.15), ``/FS``; ``Document.file_spec_data`` decodes an embedded
+    one."""
+
+    destination: Destination | None
+    """A link's ``/Dest`` (ISO 32000-1 12.5.6.5), explicit or looked up by
+    name, with the page resolved to a 0-based index."""
+
+    action: Action | None
+    """The action performed when the annotation is activated, ``/A``, with
+    its ``/Next`` chain."""
+
+    additional_actions: list[TriggeredAction]
+    """The actions the annotation's trigger events fire, ``/AA``, in the
+    order of Tables 194 and 196."""
+
 class AsyncDocument:
     """A PDF document opened for async I/O.
 
@@ -1708,6 +2058,14 @@ class AsyncDocument:
     async def embedded_file_data(self, file: EmbeddedFile) -> bytes:
         """The decoded bytes of an embedded file, the async twin of
         ``Document.embedded_file_data``."""
+
+    async def file_spec_data(self, spec: FileSpec) -> bytes:
+        """The decoded bytes of the stream a file specification embeds,
+        the async twin of ``Document.file_spec_data``."""
+
+    async def additional_actions(self) -> list[TriggeredAction]:
+        """The document's additional actions, the async twin of
+        ``Document.additional_actions``."""
 
     async def viewer_preferences(self) -> ViewerPreferences | None:
         """The viewer preferences, the async twin of
@@ -1876,6 +2234,13 @@ class AsyncPage:
     async def separation_info(self) -> SeparationInfo | None:
         """The separation dictionary, the async twin of
         ``Page.separation_info``."""
+
+    async def annotations(self) -> list[Annotation]:
+        """The annotations, the async twin of ``Page.annotations``."""
+
+    async def additional_actions(self) -> list[TriggeredAction]:
+        """The page's additional actions, the async twin of
+        ``Page.additional_actions``."""
 
 def md_to_pdf(
     markdown: str,

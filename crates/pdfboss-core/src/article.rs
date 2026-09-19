@@ -126,7 +126,10 @@ async fn beads_from<S: AsyncObjectSource>(src: &S, first: ObjRef) -> Vec<Bead> {
 }
 
 /// A rectangle (§7.9.5): four numbers, each possibly indirect, normalized.
-async fn rectangle<S: AsyncObjectSource>(src: &S, value: Option<&Object>) -> Option<Rect> {
+pub(crate) async fn rectangle<S: AsyncObjectSource>(
+    src: &S,
+    value: Option<&Object>,
+) -> Option<Rect> {
     let array = src.resolve(value?).await.ok()?;
     let items = array.as_array()?;
     if items.len() != 4 {

@@ -725,6 +725,46 @@ impl Document {
         ))
     }
 
+    /// The annotations of a page's `/Annots` array (ISO 32000-1 §12.5.2),
+    /// in order, with their actions read as data.
+    pub fn annotations(&self, page: &Page) -> Vec<crate::annotation::Annotation> {
+        block_on(crate::annotation::annotations_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            page,
+        ))
+    }
+
+    /// The actions a page's `/AA` dictionary fires when it opens and closes
+    /// (ISO 32000-1 §12.6.3), empty without one.
+    pub fn page_additional_actions(&self, page: &Page) -> Vec<crate::annotation::TriggeredAction> {
+        block_on(crate::annotation::page_additional_actions_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            page,
+        ))
+    }
+
+    /// The actions the catalog's `/AA` dictionary fires around closing,
+    /// saving and printing (ISO 32000-1 §12.6.3), empty without one.
+    pub fn additional_actions(&self) -> Vec<crate::annotation::TriggeredAction> {
+        block_on(crate::annotation::document_additional_actions_with(
+            &Immediate(self),
+            &self.xref.trailer,
+        ))
+    }
+
+    /// The action an `/A` or `/AA` value holds, with its `/Next` chain
+    /// (ISO 32000-1 §12.6.2); `None` when the value is no action
+    /// dictionary.
+    pub fn action(&self, value: &Object) -> Option<crate::annotation::Action> {
+        block_on(crate::annotation::action_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            value,
+        ))
+    }
+
     /// The permission handlers of the catalog's `/Perms` dictionary (ISO
     /// 32000-1 §12.8.4), `None` without one.
     pub fn permission_handlers(&self) -> Option<crate::permission::PermissionHandlers> {
@@ -799,6 +839,20 @@ impl Document {
         block_on(crate::embedded_file::embedded_file_data_with(
             &Immediate(self),
             file,
+        ))
+    }
+
+    /// The decoded bytes of the stream a file specification embeds, such
+    /// as a file attachment annotation's (ISO 32000-1 §7.11.4).
+    ///
+    /// # Errors
+    ///
+    /// `MissingKey("EF")` when the specification embeds no stream, and the
+    /// stream's own decoding errors.
+    pub fn file_spec_data(&self, spec: &crate::embedded_file::FileSpec) -> Result<Vec<u8>> {
+        block_on(crate::embedded_file::file_spec_data_with(
+            &Immediate(self),
+            spec,
         ))
     }
 

@@ -54,6 +54,7 @@ fn outline_doc() -> Vec<u8> {
          /Requirements [ << /Type /Requirement /S /EnableJavaScripts \
          /RH << /Type /ReqHandler /S /NoOp >> >> ] \
          /Legal << /URIActions 1 /Attestation (Checked) >> \
+         /AA << /WC << /S /JavaScript /JS (bye) >> >> \
          /PageLabels << /Nums [0 << /S /R /P (p-) /St 3 >>] >> >>",
     );
     b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
@@ -65,7 +66,32 @@ fn outline_doc() -> Vec<u8> {
          /VP [ << /Type /Viewport /BBox [0 0 612 792] /Name (Map) \
          /Measure << /Subtype /RL /R (1in = 1ft) /X [ << /U (ft) /C 0.0139 >> ] \
          /D [ << /U (ft) /C 1 >> ] /A [ << /U (sq ft) /C 1 >> ] >> >> ] \
-         /SeparationInfo << /Pages [3 0 R] /DeviceColorant /Cyan >> >>",
+         /SeparationInfo << /Pages [3 0 R] /DeviceColorant /Cyan >> \
+         /Annots [16 0 R 17 0 R 18 0 R 21 0 R] /AA << /O << /S /Named /N /NextPage >> >> >>",
+    );
+    b.object(
+        16,
+        "<< /Type /Annot /Subtype /Link /Rect [10 10 100 30] /Border [0 0 1] \
+         /A << /S /GoTo /D [3 0 R /FitH 700] /Next << /S /URI /URI (http://x.example) >> >> >>",
+    );
+    b.object(
+        17,
+        "<< /Type /Annot /Subtype /Text /Rect [0 0 20 20] /IRT 21 0 R /T (Bob) \
+         /StateModel (Review) /State (Accepted) >>",
+    );
+    b.object(
+        18,
+        "<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 10 10] /FS 19 0 R /Name /Paperclip >>",
+    );
+    b.object(
+        19,
+        "<< /Type /Filespec /F (data.csv) /EF << /F 20 0 R >> >>",
+    );
+    b.stream(20, "/Type /EmbeddedFile", b"a,b\n");
+    b.object(
+        21,
+        "<< /Type /Annot /Subtype /Square /Rect [0 0 50 50] /T (Ada) /Contents (Check this) \
+         /C [1 0 0] /CA 0.5 /M (D:20240102030405Z) /NM (sq1) >>",
     );
     b.object(13, "<< /F 14 0 R /I << /Title (Story) >> >>");
     b.object(
@@ -421,6 +447,63 @@ async fn documents_agree_on_objects_streams_metadata_and_pages() {
                 .unwrap();
             assert_eq!(separation.device_colorant, "Cyan");
             assert_eq!(separation.pages, [pdfboss_core::ObjRef { num: 3, gen: 0 }]);
+        }
+        // Covers ISO 32000-1 §12.5.2 and §12.6.3.
+        for index in 0..doc.page_count() {
+            let page = doc.page(index).unwrap();
+            let sync_page = sync_doc.page(index).unwrap();
+            assert_eq!(
+                doc.annotations(&page).await,
+                sync_doc.annotations(&sync_page),
+                "{name}: page {index} annotations"
+            );
+            assert_eq!(
+                doc.page_additional_actions(&page).await,
+                sync_doc.page_additional_actions(&sync_page),
+                "{name}: page {index} additional actions"
+            );
+        }
+        assert_eq!(
+            doc.additional_actions().await,
+            sync_doc.additional_actions(),
+            "{name}: document additional actions"
+        );
+        if name == "outline" {
+            let page = sync_doc.page(0).unwrap();
+            let annotations = sync_doc.annotations(&page);
+            assert_eq!(annotations.len(), 4, "{name}: annotations");
+            assert_eq!(annotations[0].subtype, "Link");
+            let action = annotations[0].action.as_ref().unwrap();
+            assert!(
+                matches!(
+                    action.kind,
+                    pdfboss_core::ActionKind::GoTo {
+                        destination: Some(_),
+                        ..
+                    }
+                ),
+                "{:?}",
+                action.kind
+            );
+            assert_eq!(action.next.len(), 1);
+            let reply = &annotations[1];
+            assert_eq!(
+                reply.state.as_ref().map(|s| s.state.as_str()),
+                Some("Accepted")
+            );
+            assert_eq!(
+                reply.markup.as_ref().unwrap().in_reply_to,
+                Some(ObjRef { num: 21, gen: 0 })
+            );
+            let file = annotations[2].file.as_ref().unwrap();
+            assert_eq!(
+                doc.file_spec_data(file).await.unwrap(),
+                sync_doc.file_spec_data(file).unwrap()
+            );
+            assert_eq!(sync_doc.file_spec_data(file).unwrap(), b"a,b\n");
+            assert_eq!(annotations[3].markup.as_ref().unwrap().opacity, 0.5);
+            assert_eq!(sync_doc.page_additional_actions(&page).len(), 1);
+            assert_eq!(sync_doc.additional_actions().len(), 1);
         }
         // Covers ISO 32000-1 §12.8.5.
         assert_eq!(
