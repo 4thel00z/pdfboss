@@ -28,8 +28,9 @@ the count of PDFs whose extraction produced zero characters):
 - **`headers_footers` is all absence tests** — the engine is rewarded for
   *stripping* page headers, footers and page numbers. An empty output would
   pass them all, so read the number next to `baseline` (which requires
-  real content per PDF). pdfboss keeps page headers and
-  footers in its markdown today, and the low score reflects that choice.
+  real content per PDF). pdfboss markdown drops page headers, footers and
+  page numbers: `structure.rs` tags them `Role::PageHeader`/`Role::PageFooter`
+  and the Markdown adapter emits neither.
 - **Markdown tables cap the table score**: tests that hinge on rowspan or
   colspan structure only pass with HTML `<table>` output (stated in the
   benchmark's README). pdfboss emits pipe tables.
@@ -80,22 +81,22 @@ once and fast after.
 
 ## Results
 
-pdfboss 0.17.1, one repeat (extraction is deterministic), full 8-bucket run.
+pdfboss 2.10.0, one repeat (extraction is deterministic), full 8-bucket run.
 Pass rates are load-insensitive and reported as measured; raw numbers in
 [`../results-olmocr.json`](../results-olmocr.json).
 
 | Bucket | Pass rate | Tests |
 |---|--:|--:|
-| baseline | 87.3% | 1394 |
-| headers_footers | 35.0% | 760 |
-| table_tests | 30.0% | 1022 |
-| long_tiny_text | 22.2% | 442 |
-| multi_column | 18.9% | 884 |
+| baseline | 87.1% | 1394 |
+| table_tests | 53.2% | 1022 |
+| multi_column | 52.9% | 884 |
+| headers_footers | 48.2% | 760 |
+| long_tiny_text | 44.8% | 442 |
 | old_scans | 13.3% | 526 |
 | old_scans_math | 0.0% | 458 |
 | arxiv_math | 0.0% | 2927 |
-| **overall (macro over 8 buckets)** | **25.8% ± 0.9%** | 8413 |
-| **born-digital subset (baseline, tables, multi_column, headers_footers)** | **42.8%** | 4060 |
+| **overall (macro over 8 buckets)** | **37.4% ± 0.9%** | 8413 |
+| **born-digital subset (baseline, tables, multi_column, headers_footers)** | **60.4%** | 4060 |
 
 (A few jsonls carry baseline-type tests of their own, which is why the test
 counts differ slightly from the bucket sizes; the born-digital subset number
