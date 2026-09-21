@@ -1,0 +1,23 @@
+# Scope for the graphify knowledge graph (gitignore syntax).
+# Excluded here stays excluded even when git tracks the file.
+
+# Agent scaffolding, not this project's code
+.claude/
+.playwright-mcp/
+
+# Render evidence: before/after PNG pairs, no graph value
+failure-modes/
+
+# Binary test fixtures: expected renders and sample PDFs
+*.png
+*.jpg
+*.jpeg
+*.pdf
+
+# Not prose: golden output dumps, license copies, filter test vectors
+**/tests/golden/*.txt
+**/tests/vectors/**
+LICENSE*
+**/LICENSE*
+OFL.txt
+**/OFL.txt
