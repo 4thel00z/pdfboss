@@ -154,7 +154,8 @@ fn rewrite_into(mut writer: Writer, doc: &Document) -> Result<Vec<u8>> {
 /// raises. An already password-opened encrypted `doc` is fine: its
 /// content already reads as plaintext through `Document::get`, so it
 /// copies across like any unencrypted source and gets encrypted afresh
-/// under the new passwords.
+/// under the new passwords. Also fails when the operating system's random
+/// source cannot be read, the one way [`Encryptor::aes256`] itself fails.
 ///
 /// Not available on `wasm32-unknown-unknown`: it builds its `Encryptor`
 /// with [`Encryptor::aes256`], which needs the operating system's random
@@ -178,7 +179,8 @@ pub fn encrypt_document(
     } else {
         owner_password
     };
-    let (encryptor, encrypt_dict) = Encryptor::aes256(user_password, owner_password, permissions);
+    let (encryptor, encrypt_dict) =
+        Encryptor::aes256(user_password, owner_password, permissions).map_err(core_error)?;
     rewrite_into(Writer::new_encrypted(options, encryptor, encrypt_dict), doc)
 }
 
