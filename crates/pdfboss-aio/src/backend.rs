@@ -146,11 +146,14 @@ impl Backend for FileBackend {
 /// one-time fallback: that very response body is the whole resource, so it
 /// is collected into memory (capped at the declared length) and every read
 /// is served from it. Range-less servers cost one full download held
-/// resident instead of failing.
+/// resident instead of failing. Headers given to [`HttpBackend::with_headers`]
+/// go out on every request, the `HEAD` included, so a resource behind an
+/// `Authorization` header or a custom token is read like any other.
 #[cfg(feature = "http")]
 pub struct HttpBackend {
     client: reqwest::Client,
     url: reqwest::Url,
+    headers: reqwest::header::HeaderMap,
     len: u64,
     full: std::sync::OnceLock<Bytes>,
     progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
@@ -160,6 +163,16 @@ pub struct HttpBackend {
 impl HttpBackend {
     /// Issues a `HEAD` request to learn the resource length.
     pub async fn new(url: impl reqwest::IntoUrl) -> crate::Result<HttpBackend> {
+        HttpBackend::with_headers(url, reqwest::header::HeaderMap::new()).await
+    }
+
+    /// [`HttpBackend::new`] sending `headers` on every request: the `HEAD`
+    /// that learns the length and each ranged `GET` after it. The `Range`
+    /// header stays the backend's own; a `Range` given here is overridden.
+    pub async fn with_headers(
+        url: impl reqwest::IntoUrl,
+        headers: reqwest::header::HeaderMap,
+    ) -> crate::Result<HttpBackend> {
         let url = url.into_url().map_err(|err| crate::Error::Http {
             status: None,
             msg: err.to_string(),
@@ -167,6 +180,7 @@ impl HttpBackend {
         let client = reqwest::Client::new();
         let response = client
             .head(url.clone())
+            .headers(headers.clone())
             .send()
             .await
             .map_err(|err| crate::Error::Http {
@@ -191,6 +205,7 @@ impl HttpBackend {
         Ok(HttpBackend {
             client,
             url,
+            headers,
             len,
             full: std::sync::OnceLock::new(),
             progress: None,
@@ -279,6 +294,7 @@ impl Backend for HttpBackend {
                 let response = self
                     .client
                     .get(self.url.clone())
+                    .headers(self.headers.clone())
                     .header(reqwest::header::RANGE, format!("bytes={offset}-{last}"))
                     .send()
                     .await

@@ -21,6 +21,7 @@ pdfboss-text = { path = "../pdfboss-text" }
 pdfboss-write = { workspace = true }
 # `http` is enabled here so every wheel/sdist build ships open_url support.
 pdfboss-aio = { path = "../pdfboss-aio", features = ["http"] }
+reqwest = { workspace = true }
 pyo3 = { version = "0.25", features = ["abi3-py312"] }
 pyo3-async-runtimes = { version = "0.25", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["sync"] }

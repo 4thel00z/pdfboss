@@ -1929,12 +1929,17 @@ class AsyncDocument:
         or the owner password."""
 
     @staticmethod
-    async def open_url(url: str, *, password: str = "") -> "AsyncDocument":
+    async def open_url(
+        url: str, *, password: str = "", headers: dict[str, str] | None = None
+    ) -> "AsyncDocument":
         """Opens a PDF over HTTP using range requests; the whole file is
         never downloaded. The server must honor ``Range`` (a server that
         ignores it raises ``PdfError`` with an ``"http:"`` message).
         ``password`` opens an encrypted file, as either the user or the
-        owner password."""
+        owner password. ``headers`` go out on every request, the ``HEAD``
+        that learns the length included, so a URL behind an
+        ``Authorization`` header or a custom token opens like any other;
+        a name or value HTTP does not allow raises ``ValueError``."""
 
     @staticmethod
     async def from_bytes(data: bytes, *, password: str = "") -> "AsyncDocument":

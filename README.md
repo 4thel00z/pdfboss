@@ -163,6 +163,11 @@ for element in doc.elements():             # lazy: physical + logical, byte span
 doc = await pdfboss.AsyncDocument.open_url("https://example.com/report.pdf")
 async for element in doc.elements():
     print(element.kind, element.value())
+
+# Headers ride on every request, the HEAD included, for URLs behind a token.
+doc = await pdfboss.AsyncDocument.open_url(
+    "https://example.com/private/report.pdf", headers={"Authorization": "Bearer …"}
+)
 ```
 
 Rust: the library crates are on crates.io (`cargo add pdfboss-core pdfboss-text pdfboss-output pdfboss-render pdfboss-write pdfboss-markdown pdfboss-aio pdfboss-tui`):

@@ -9,7 +9,7 @@ Three constructors, all coroutines. Each takes `password=` for encrypted files (
 | Constructor | Source |
 |---|---|
 | `AsyncDocument.open(path)` | A local file, read in ranges |
-| `AsyncDocument.open_url(url)` | An http(s) URL, fetched via `Range` requests |
+| `AsyncDocument.open_url(url, headers=None)` | An http(s) URL, fetched via `Range` requests; `headers` go out on every request, the `HEAD` included |
 | `AsyncDocument.from_bytes(data)` | Bytes already in memory |
 
 What is sync and what is a coroutine follows from what the open flow already parsed. `page_count`, `version`, `len(doc)` and page access (`doc[i]`, `doc.page(i)` and every `AsyncPage` geometry property) are plain sync attributes: the xref chain and the page tree were parsed at open, so nothing there needs I/O. Everything that must read more of the file is a coroutine: `extract_text`, `extract_markdown`, `render_pages`, `metadata`, `get_object` on the document, and `extract_text`, `extract_markdown`, `render`, `render_reporting`, `extract_images` and `spans` on a page.
@@ -58,7 +58,7 @@ asyncio.run(main())
 
 ## Rust
 
-`pdfboss_aio::AsyncDocument` has the same constructors: `open`/`open_with_password`, `from_bytes`/`from_bytes_with_password` and, behind the crate's `http` feature, `open_url`/`open_url_with_password`. `with_backend` opens a document over any byte source you build yourself.
+`pdfboss_aio::AsyncDocument` has the same constructors: `open`/`open_with_password`, `from_bytes`/`from_bytes_with_password` and, behind the crate's `http` feature, `open_url`/`open_url_with_password`/`open_url_with_headers` (the last takes a `reqwest::header::HeaderMap` sent on every request). `with_backend` opens a document over any byte source you build yourself.
 
 ```rust,no_run
 use pdfboss_aio::AsyncDocument;

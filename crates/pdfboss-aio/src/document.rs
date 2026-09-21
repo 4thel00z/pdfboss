@@ -707,7 +707,20 @@ impl AsyncDocument {
         url: impl reqwest::IntoUrl,
         password: &str,
     ) -> Result<AsyncDocument> {
-        let backend = crate::backend::HttpBackend::new(url).await?;
+        AsyncDocument::open_url_with_headers(url, reqwest::header::HeaderMap::new(), password).await
+    }
+
+    /// [`AsyncDocument::open_url_with_password`] sending `headers` on every
+    /// request the backend makes, the `HEAD` included: an `Authorization`
+    /// header, a custom token, or anything else the server wants to see
+    /// before it serves a byte. The `Range` header stays the backend's own.
+    #[cfg(feature = "http")]
+    pub async fn open_url_with_headers(
+        url: impl reqwest::IntoUrl,
+        headers: reqwest::header::HeaderMap,
+        password: &str,
+    ) -> Result<AsyncDocument> {
+        let backend = crate::backend::HttpBackend::with_headers(url, headers).await?;
         AsyncDocument::from_arc(Arc::new(CachedBackend::new(backend)), password).await
     }
 
