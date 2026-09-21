@@ -180,7 +180,7 @@ impl Default for TextParams {
 impl std::fmt::Debug for TextParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TextParams")
-            .field("font", &self.font.as_ref().map(|(_, label, _)| label))
+            .field("font", &self.font.as_ref().map(|(_, label, _, _)| label))
             .field("type3", &self.type3.is_some())
             .field("size", &self.size)
             .field("char_spacing", &self.char_spacing)
@@ -268,7 +268,31 @@ impl GState {
 /// an embedded simple font at `Full` with a provider, see
 /// [`GlyphFont::fallback`]) — or `None` for a font whose glyphs cannot be
 /// drawn (the [`crate::GlyphPainting`] tier, or a load failure).
-type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>, Option<Arc<GlyphFallback>>)>;
+type LoadedFont = Option<(Arc<GlyphFont>, Arc<str>, Option<Arc<GlyphFallback>>, FaceId)>;
+
+/// Which face a glyph came from, for [`SpanKey`]. A font the resources
+/// reach through an object reference is the same face on every page and in
+/// every worker's copy of the document, so the reference names it and two
+/// copies of one font agree. A font written as a direct dictionary has no
+/// reference and takes a number unique within this process; only the one
+/// page that can see it ever compares that number.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum FaceId {
+    Ref(pdfboss_core::ObjRef),
+    Local(u64),
+}
+
+/// The next number for a face loaded from a direct dictionary.
+fn next_local_face() -> FaceId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    FaceId::Local(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The exact bits of a transform's linear part, which is all a flattened
+/// glyph outline depends on.
+fn linear_bits(m: Matrix) -> [u32; 4] {
+    [m.a.to_bits(), m.b.to_bits(), m.c.to_bits(), m.d.to_bits()]
+}
 
 /// [`LoadedFont`] as the cross-page [`crate::RenderCache`] stores it.
 pub(crate) type SharedGlyphFont = LoadedFont;
@@ -667,10 +691,23 @@ const MAX_CHARPROC_CACHE: usize = 1024;
 /// hundred spans), so the cap also bounds the cache's memory.
 const MAX_GLYPH_SPAN_CACHE: usize = 4096;
 
-/// One captured glyph in [`Executor::glyph_spans`]: the outline whose
-/// allocation the entry pins (its address is the cache key) and the span
-/// set swept from it.
-type CapturedGlyph = (Arc<Vec<Subpath>>, Arc<SpanSet>);
+/// What decides a glyph's swept coverage, and so what [`Executor::glyph_spans`]
+/// is keyed by: the face, the glyph in it, the linear map it was flattened
+/// under, and the exact bits of the device offset's fractional y. Text on
+/// one baseline repeats its fractional y while fractional x almost never
+/// repeats (measured 69.5% key repeats corpus-wide against 4.9% with
+/// fractional x in the key), and the replay shifts in x exactly, so x is
+/// not part of the key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct SpanKey {
+    face: FaceId,
+    /// Set for a glyph drawn from the per-glyph fallback face rather than
+    /// the primary one: two faces under one identity.
+    fallback: bool,
+    gid: u16,
+    linear: [u32; 4],
+    fy: u32,
+}
 
 /// Upper bound on once-sighted keys remembered per page render
 /// ([`Executor::glyph_seen`]); past it, further first sights paint direct
@@ -738,26 +775,18 @@ struct Executor<'a, S> {
     /// names through a reference — see [`CachedPattern`] and
     /// [`MAX_PATTERN_CACHE`].
     pattern_cache: FastMap<pdfboss_core::ObjRef, CachedPattern>,
-    /// Captured glyph coverage spans, keyed by the flattened outline's
-    /// allocation address plus the exact bits of the device offset's
-    /// fractional y — the pair that determines the sweep's output, since
-    /// text on one baseline repeats its fractional y while fractional x
-    /// almost never repeats (measured 69.5% key repeats corpus-wide against
-    /// 4.9% with fractional x in the key). The held [`Arc`] keeps the
-    /// outline allocation alive, so the address cannot be reused by another
-    /// outline while its entry exists. See [`MAX_GLYPH_SPAN_CACHE`].
-    glyph_spans: FastMap<(usize, u32), CapturedGlyph>,
+    /// Captured glyph coverage spans, keyed by what the sweep's output
+    /// depends on (see [`SpanKey`]). See [`MAX_GLYPH_SPAN_CACHE`].
+    glyph_spans: FastMap<SpanKey, Arc<SpanSet>>,
     /// How often each span-cache key has been sighted before admission.
     /// Admission to [`Executor::glyph_spans`] waits for the third sight: a
     /// capture costs a second coverage accumulation plus allocations, which
     /// a key seen once or twice can never pay back (measured 60-67%
     /// per-file regressions capturing on first sight, still 10-22% on
     /// second — page headers and folios repeat a glyph only once or twice
-    /// per page render), while body text repeats far past three. A stale
-    /// count (its outline dropped, the address reused) only admits a
-    /// genuine first sight early — the capture always sweeps the outline
-    /// actually being painted. See [`MAX_GLYPH_SEEN`].
-    glyph_seen: FastMap<(usize, u32), u8>,
+    /// per page render), while body text repeats far past three.
+    /// See [`MAX_GLYPH_SEEN`].
+    glyph_seen: FastMap<SpanKey, u8>,
     /// Content this render dropped rather than painted, accumulated across
     /// the page (forms and Type3 CharProcs included, since they run through
     /// the same [`Executor`]).
@@ -855,11 +884,16 @@ struct DefaultSpaces {
 }
 
 /// A glyph outline ready to paint: the flattened subpaths under the
-/// device transform's linear part, shared from the font's cache, and the
-/// device translation that places this occurrence.
+/// device transform's linear part, shared from the font's cache, the
+/// device translation that places this occurrence, and what names the
+/// outline to the span cache.
 struct PlacedOutline {
     polys: Arc<Vec<Subpath>>,
     at: (f32, f32),
+    face: FaceId,
+    fallback: bool,
+    gid: u16,
+    linear: [u32; 4],
 }
 
 /// The `/I` and `/K` flags of a transparency group attributes dictionary
@@ -2044,7 +2078,8 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                             .fallback(self.src, &d, self.painting, self.provider.as_deref())
                             .await
                             .map(Arc::new);
-                        Some((Arc::new(f), label, fallback))
+                        let face = font_ref.map_or_else(next_local_face, FaceId::Ref);
+                        Some((Arc::new(f), label, fallback, face))
                     }
                     None => None,
                 }
@@ -2099,18 +2134,19 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// back (measured 60-67% and 10-22% per-file regressions on first- and
     /// second-sight admission), so early sights paint the direct fused way and
     /// only count in [`Executor::glyph_seen`].
-    fn blit_glyph(
-        &mut self,
-        cached: &Arc<Vec<Subpath>>,
-        dx: f32,
-        dy: f32,
-        fill: [u8; 4],
-        gs: &GState,
-    ) {
+    fn blit_glyph(&mut self, placed: &PlacedOutline, fill: [u8; 4], gs: &GState) {
+        let cached = &placed.polys;
+        let (dx, dy) = placed.at;
         let iy = dy.floor();
         let fy = dy - iy;
-        let key = (Arc::as_ptr(cached) as usize, fy.to_bits());
-        if let Some((_, set)) = self.glyph_spans.get(&key) {
+        let key = SpanKey {
+            face: placed.face,
+            fallback: placed.fallback,
+            gid: placed.gid,
+            linear: placed.linear,
+            fy: fy.to_bits(),
+        };
+        if let Some(set) = self.glyph_spans.get(&key) {
             let set = Arc::clone(set);
             fill_spans(
                 &mut self.pix,
@@ -2149,8 +2185,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
             // it, kept proportional by the page bounds.
             if let Some(set) = captured {
                 let set = Arc::new(set);
-                self.glyph_spans
-                    .insert(key, (Arc::clone(cached), Arc::clone(&set)));
+                self.glyph_spans.insert(key, Arc::clone(&set));
                 fill_spans(
                     &mut self.pix,
                     &mut self.raster,
@@ -2213,6 +2248,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     fn fallback_outline(
         &mut self,
         fallback: Option<&GlyphFallback>,
+        face: FaceId,
         code: u32,
         params: Matrix,
         tm: Matrix,
@@ -2244,6 +2280,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         Some(PlacedOutline {
             polys: font.flattened(gid, linear),
             at: (to_device.e, to_device.f),
+            face,
+            fallback: true,
+            gid,
+            linear: linear_bits(linear),
         })
     }
 
@@ -2291,7 +2331,7 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
         let gs = &frame.gs;
         let text = &gs.text;
         let ts = &mut frame.ts;
-        let Some((font, label, fallback)) = text.font.clone() else {
+        let Some((font, label, fallback, face)) = text.font.clone() else {
             frame.text_clip = clip;
             return;
         };
@@ -2353,8 +2393,15 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 };
                 let polys = font.flattened(gid, linear);
                 if !polys.is_empty() {
-                    let at = (to_device.e, to_device.f);
-                    self.paint_glyph(&polys, at, gs, (fills, strokes), fill, &mut clip);
+                    let placed = PlacedOutline {
+                        polys,
+                        at: (to_device.e, to_device.f),
+                        face,
+                        fallback: false,
+                        gid,
+                        linear: linear_bits(linear),
+                    };
+                    self.paint_glyph(&placed, gs, (fills, strokes), fill, &mut clip);
                 }
             } else if gid == 0 && !(n == 1 && code == 32) {
                 // A loaded font with no glyph for this code: at `Full` with
@@ -2366,10 +2413,10 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
                 // is exempt because a space paints nothing whether or not
                 // the font maps it; a two-byte 0x20 is a real CID, not a
                 // space.
-                match self.fallback_outline(fallback.as_deref(), code, params, ts.tm, gs) {
-                    Some(PlacedOutline { polys, at }) => {
-                        if !polys.is_empty() {
-                            self.paint_glyph(&polys, at, gs, (fills, strokes), fill, &mut clip);
+                match self.fallback_outline(fallback.as_deref(), face, code, params, ts.tm, gs) {
+                    Some(placed) => {
+                        if !placed.polys.is_empty() {
+                            self.paint_glyph(&placed, gs, (fills, strokes), fill, &mut clip);
                         }
                     }
                     None => self.skip(
@@ -2418,21 +2465,20 @@ impl<S: AsyncObjectSource> Executor<'_, S> {
     /// Covers ISO 32000-1 §9.3.6.
     fn paint_glyph(
         &mut self,
-        polys: &Arc<Vec<Subpath>>,
-        at: (f32, f32),
+        glyph: &PlacedOutline,
         gs: &GState,
         (fills, strokes): (bool, bool),
         fill: [u8; 4],
         clip: &mut Option<Vec<Subpath>>,
     ) {
         if fills {
-            self.blit_glyph(polys, at.0, at.1, fill, gs);
+            self.blit_glyph(glyph, fill, gs);
         }
         if !strokes && clip.is_none() {
             return;
         }
-        self.translate_into_blit_scratch(polys, at.0, at.1);
-        let placed = &self.glyph_blit[..polys.len()];
+        self.translate_into_blit_scratch(&glyph.polys, glyph.at.0, glyph.at.1);
+        let placed = &self.glyph_blit[..glyph.polys.len()];
         if strokes {
             let quads = stroke_path(placed, gs.stroke_style(), gs.ctm, &gs.dash, gs.dash_phase);
             fill_path(
@@ -8829,6 +8875,77 @@ mod render_cache_tests {
         for (a, b) in cached.iter().zip(&uncached) {
             assert_eq!(a.data, b.data, "pixels must not depend on the cache");
         }
+    }
+
+    /// One page binding the same font dictionary under two resource names,
+    /// showing four glyphs on one baseline.
+    fn two_name_shared_font_doc() -> Vec<u8> {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F0 40 Tf 10 80.5 Td (AA) Tj /F1 40 Tf (AA) Tj ET",
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /Shared \
+             /FirstChar 65 /Widths [500] /Encoding /WinAnsiEncoding \
+             /FontDescriptor 6 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /Shared /Flags 32 \
+             /FontFile2 7 0 R >>",
+        );
+        b.stream(7, "", &crate::truetype::tests::build_font());
+        b.build(1)
+    }
+
+    /// A glyph's coverage is swept once and replayed from the third sight
+    /// on. Whether two resource names for one font dictionary yield one
+    /// loaded face or two is what a shared [`RenderCache`] decides, so a
+    /// span cache keyed by the outline's allocation counted the sights
+    /// differently with and without the cache, and the page came out
+    /// differently with it. Keyed by the font's reference, the glyph and
+    /// the transform, the sights are the same either way.
+    #[test]
+    fn glyph_span_reuse_does_not_depend_on_the_font_cache() {
+        let doc = Document::load(two_name_shared_font_doc()).expect("load");
+        let page = doc.page(0).expect("page");
+        let render = |cache: Option<Arc<RenderCache>>| {
+            let opts = RenderOptions {
+                cache,
+                ..Default::default()
+            };
+            let (pix, report) = block_on(render_page_reporting_with(
+                &Immediate(&doc),
+                &page,
+                1.0,
+                &opts,
+            ))
+            .expect("render");
+            assert!(report.warnings().is_empty(), "unexpected skips: {report:?}");
+            pix
+        };
+        let uncached = render(None);
+        let cached = render(Some(Arc::new(RenderCache::default())));
+        let differing = cached
+            .data
+            .iter()
+            .zip(&uncached.data)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(
+            differing, 0,
+            "the pixels must not depend on how the font happened to load"
+        );
     }
 
     /// Two pages whose content sets the same `ICCBased` space twice each:
