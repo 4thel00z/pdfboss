@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.11.0](https://github.com/4thel00z/pdfboss/compare/v2.10.0...v2.11.0) (2026-09-21)
+
+
+### Features
+
+* **aio:** send caller headers on every request of open_url ([#231](https://github.com/4thel00z/pdfboss/issues/231)) ([488a96f](https://github.com/4thel00z/pdfboss/commit/488a96f095146bc4f8e177318de192f36cd5c455))
+
+
+### Bug Fixes
+
+* **core:** report an unavailable OS random source instead of panicking ([#227](https://github.com/4thel00z/pdfboss/issues/227)) ([c7ca7f5](https://github.com/4thel00z/pdfboss/commit/c7ca7f5fc59a90f87ad3c6fb92246c3de7451d60))
+* **render:** key the glyph span cache by the glyph, and stop short-circuiting the coverage scans ([#225](https://github.com/4thel00z/pdfboss/issues/225)) ([ce44397](https://github.com/4thel00z/pdfboss/commit/ce4439703a2105532adbc120c5f18992c4921ace))
+
+
+### Documentation
+
+* **bench:** refresh olmOCR and diversity numbers at 2.10.0 ([#222](https://github.com/4thel00z/pdfboss/issues/222)) ([c6bb34a](https://github.com/4thel00z/pdfboss/commit/c6bb34a1c2650d6edb90bc5e01efdc4dedc225b6))
+* **failure-modes:** name the glyph span key evidence after its squash hash ce44397 ([#229](https://github.com/4thel00z/pdfboss/issues/229)) ([18f08d3](https://github.com/4thel00z/pdfboss/commit/18f08d319df39ff17a38a253e4a6e67bdcc6df8f))
+* **failure-modes:** name the shallow-edges evidence after its squash hash fbdc6d1 ([#224](https://github.com/4thel00z/pdfboss/issues/224)) ([ce00af5](https://github.com/4thel00z/pdfboss/commit/ce00af57956e5cc271c40584ace78bb7f9b63606))
+* **failure-modes:** rows for the two transparency group fixes ([#228](https://github.com/4thel00z/pdfboss/issues/228)) ([63ca374](https://github.com/4thel00z/pdfboss/commit/63ca37491e62eb79ff86efc91b13efb29fead5bc))
+* **iso32000:** say to re-index after every merge from main ([#221](https://github.com/4thel00z/pdfboss/issues/221)) ([40da75f](https://github.com/4thel00z/pdfboss/commit/40da75f0a3eaa9eecc67a8c79085d44f4ce1ca49))
+
 ## [2.10.0](https://github.com/4thel00z/pdfboss/compare/v2.9.1...v2.10.0) (2026-09-19)
 
 
