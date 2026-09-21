@@ -17,10 +17,10 @@ harness for that gap: per corpus directory it scores each engine on
 - **render page-1 non-blank rate** — the first page rasterizes with more
   than 0.1% dark pixels.
 
-pdfboss currently lacks predefined-CMap support, so Japanese documents of
-the 90ms-RKSJ era (the J-STAGE 2004-2006 slice) are EXPECTED to score
-poorly on text metrics. This bench exists to measure that gap and to catch
-the improvement when CMap support lands.
+pdfboss resolves predefined CMaps (``cmap::predefined`` in ``pdfboss-core``,
+the ISO 32000-1 Table 118 CJK set), so Japanese documents of the 90ms-RKSJ
+era (the J-STAGE 2004-2006 slice) decode through the named CMap instead of
+falling back. This bench measures the text metrics on that slice.
 
 Everything here is a quality metric, not a timing — results are
 load-insensitive and publishable as measured. The JSON records counts and

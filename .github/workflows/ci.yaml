@@ -79,4 +79,9 @@ jobs:
       - name: Regenerate the vectors and the book chapter
         run: make iso32000-vectors iso32000-report
       - name: Committed copies must match what the tree generates
-        run: git diff --exit-code -- iso32000/Iso32000/Generated.lean crates/pdfboss-core/tests/vectors/iso32000 docs/src/reference/iso32000.md
+        run: |
+          if git diff --exit-code -- iso32000/Iso32000/Generated.lean crates/pdfboss-core/tests/vectors/iso32000 docs/src/reference/iso32000.md; then
+            exit 0
+          fi
+          echo "::error::The committed ledger does not match what this tree generates. Run 'make iso32000-index iso32000-vectors iso32000-report' and commit the result. Do that after every merge from main, not only when you add a citation: Generated.lean is written in fixed-size chunks, so two branches that each regenerated it merge without a conflict into a file with the same citationsN defined twice."
+          exit 1
