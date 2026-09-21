@@ -161,7 +161,11 @@ impl Mask {
                 *out = (cov.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
             }
         });
-        mask.opaque = mask.data.iter().all(|&b| b == 255);
+        // Every byte is 255 exactly when every bit survives an AND over
+        // them all. Folding beats `all(|b| b == 255)`, whose short circuit
+        // costs one compare per byte on the masks that do turn out opaque,
+        // which are the ones that scan to the end.
+        mask.opaque = mask.data.iter().fold(0xffu8, |a, &b| a & b) == 0xff;
         mask
     }
 
@@ -1096,22 +1100,20 @@ fn blend_row<const NORMAL: bool>(
         None => {
             let mut x = 0;
             while x < n {
-                let cov = covs[x];
-                if solid_src && cov >= 1.0 {
-                    let start = x;
-                    x += 1;
-                    while x < n && covs[x] >= 1.0 {
-                        x += 1;
+                if solid_src {
+                    let run = full_run_len(&covs[x..]);
+                    if run > 0 {
+                        fill_run(&mut dst_row[x * 4..(x + run) * 4], opaque);
+                        x += run;
+                        continue;
                     }
-                    fill_run(&mut dst_row[start * 4..x * 4], opaque);
-                    continue;
                 }
                 // Anti-aliased stretches composite four pixels per step on
                 // vector lanes where the arithmetic is bit-identical to
                 // [`composite_over`]; lanes at full coverage or zero take
                 // the same shortcuts the scalar form takes.
                 if NORMAL {
-                    while x + 4 <= n && !(solid_src && covs[x..x + 4].iter().any(|&c| c >= 1.0)) {
+                    while x + 4 <= n && !(solid_src && any_full(&covs[x..x + 4])) {
                         blend_normal4(
                             &mut dst_row[x * 4..x * 4 + 16],
                             &covs[x..x + 4],
@@ -1133,7 +1135,7 @@ fn blend_row<const NORMAL: bool>(
                     x += 1;
                     continue;
                 }
-                let a = cov.clamp(0.0, 1.0) * base_a;
+                let a = covs[x].clamp(0.0, 1.0) * base_a;
                 paint_pixel::<NORMAL>(&mut dst_row[x * 4..(x + 1) * 4], a, rgb, opaque, blend);
                 x += 1;
             }
@@ -1340,6 +1342,42 @@ mod blend_hw {
         out = _mm_or_si128(_mm_and_si128(keep, px), _mm_andnot_si128(keep, out));
         _mm_storeu_si128(dst.as_mut_ptr().cast::<__m128i>(), out);
     }
+}
+
+/// Coverages tested per step by [`full_run_len`]. A solid fill at scale 4
+/// runs for thousands of pixels, and walking them one compare at a time is
+/// the whole cost of painting such a row.
+const SCAN_BLOCK: usize = 16;
+
+/// How many coverages from the front of `covs` are at full. The block test
+/// counts the per-lane compares and checks the total instead of stopping at
+/// the first lane that fails: a short-circuit forces one compare per
+/// iteration, while the count vectorizes. Only the block the run ends in is
+/// walked one at a time. A NaN coverage counts as not full, so a run stops
+/// there exactly as a scalar `>= 1.0` walk would.
+#[inline(always)]
+fn full_run_len(covs: &[f32]) -> usize {
+    let mut n = 0;
+    while n + SCAN_BLOCK <= covs.len() {
+        let full = covs[n..n + SCAN_BLOCK]
+            .iter()
+            .fold(0u32, |a, &c| a + u32::from(c >= 1.0));
+        if full != SCAN_BLOCK as u32 {
+            break;
+        }
+        n += SCAN_BLOCK;
+    }
+    while n < covs.len() && covs[n] >= 1.0 {
+        n += 1;
+    }
+    n
+}
+
+/// Whether any coverage in `covs` is at full, folded rather than
+/// short-circuited for the same reason as [`full_run_len`].
+#[inline(always)]
+fn any_full(covs: &[f32]) -> bool {
+    covs.iter().fold(0u32, |a, &c| a | u32::from(c >= 1.0)) != 0
 }
 
 /// Fills a run of pixels with one RGBA value (plain repeated 4-byte
