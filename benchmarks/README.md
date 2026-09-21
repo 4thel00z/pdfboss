@@ -318,11 +318,12 @@ published yet.
   proxy for an encoding gap. A doc that extracts *zero* characters
   is worse than one full of U+FFFD, so zero-text docs are tallied separately
   (`docs_with_zero_text`) and never score a flattering 0.0.
-- **pdfboss currently lacks predefined-CMap support**, so Japanese documents
-  from the 90ms-RKSJ era — the J-STAGE 2004-2006 slice the CJK fetch script
-  targets — are expected to score poorly on the text metrics. This bench
-  exists to measure that gap and to catch the improvement when CMap support
-  lands.
+- **pdfboss resolves predefined CMaps** (`cmap::predefined` in `pdfboss-core`,
+  the ISO 32000-1 Table 118 CJK set, behind the `predefined-cmaps` feature
+  that is on by default in the CLI and the wheel), so Japanese documents from
+  the 90ms-RKSJ era, the J-STAGE 2004-2006 slice the CJK fetch script targets,
+  decode through the named CMap instead of falling back. This bench measures
+  the text metrics on that slice.
 - All metrics are quality, not timing, so machine load cannot move them.
   The JSON records counts and rates only,
   never file names; per-file character and U+FFFD counts print to stdout.
@@ -353,12 +354,12 @@ measured slice 6 of 15 files carry RKSJ CMaps.
 
 Measured on the fetched slices (17 CJK, 10 RTL/Arabic, 15 academic files;
 see `results-diversity.json`): every engine opens, extracts and renders
-non-blank on 100% of all three corpora, and the U+FFFD rate lands on the
-encoding gap: pdfboss's mean per-doc rate is 35.9%
-on the CJK slice (9 of 17 docs affected, worst doc 96.1%) versus 0 for the
-other engines, 0 on the Arabic books, and 0.29% on the academic slice
-(9 of 15 docs, worst 1.24%). The CJK numbers are the baseline the
-predefined-CMap feature work will be measured against.
+non-blank on 100% of all three corpora. pdfboss's mean per-doc U+FFFD rate
+is 0 on the CJK slice and 0 on the Arabic books, matching the other three
+engines, and 0.0017% on the academic slice (2 of 15 docs, worst doc 0.016%)
+where the others are 0. One CJK document carries no text layer for any
+engine. Median character counts on the CJK slice: pdfboss 8,639, pdfplumber
+8,102, PyMuPDF 7,736, pypdfium2 6,155.
 
 ## Running
 
