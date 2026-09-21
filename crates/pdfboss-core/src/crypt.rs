@@ -1557,12 +1557,13 @@ pub(crate) fn r6_key_material(
     }
 }
 
-/// Fills `buf` with operating-system random bytes. Not available on
+/// Fills `buf` with operating-system random bytes, or reports the source as
+/// unavailable rather than panicking. Not available on
 /// `wasm32-unknown-unknown`, where `getrandom` is not a dependency at all;
 /// use [`Encryptor::aes256_with_rng`] there with a caller-supplied source.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) fn fill_os_random(buf: &mut [u8]) {
-    getrandom::fill(buf).expect("OS random number generator unavailable");
+pub(crate) fn fill_os_random(buf: &mut [u8]) -> crate::error::Result<()> {
+    getrandom::fill(buf).map_err(|e| crate::error::Error::RandomUnavailable(e.to_string()))
 }
 
 /// The eight standard-handler permission bits a document opened under the
@@ -1752,6 +1753,8 @@ impl Encryptor {
     /// random source (ISO 32000-2 §7.6.4.3). Returns the encryptor plus the
     /// complete `/Encrypt` dictionary to place in the trailer. Passwords
     /// encode as UTF-8 and are truncated to 127 bytes, matching the reader.
+    /// Fails with [`crate::Error::RandomUnavailable`] when the operating
+    /// system's random source cannot be read, rather than panicking.
     ///
     /// Not available on `wasm32-unknown-unknown`: there is no operating
     /// system random source to draw from there. Use
@@ -1762,13 +1765,22 @@ impl Encryptor {
         user_password: &str,
         owner_password: &str,
         permissions: Permissions,
-    ) -> (Encryptor, Dict) {
-        Encryptor::aes256_with_rng(
+    ) -> crate::error::Result<(Encryptor, Dict)> {
+        // The stored closure below is an infallible FnMut, reused for
+        // every later string and stream IV; this probe is where an
+        // unavailable source is reported as an error.
+        let mut probe = [0u8; 1];
+        fill_os_random(&mut probe)?;
+        Ok(Encryptor::aes256_with_rng(
             user_password,
             owner_password,
             permissions,
-            Box::new(fill_os_random),
-        )
+            Box::new(|buf: &mut [u8]| {
+                fill_os_random(buf).expect(
+                    "the OS random source was read successfully when this Encryptor was built",
+                )
+            }),
+        ))
     }
 
     /// [`Encryptor::aes256`] with a caller-supplied source of random bytes

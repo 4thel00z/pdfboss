@@ -45,6 +45,11 @@ pub enum Error {
     /// remainder into this one.
     #[error("transport: {0}")]
     Transport(String),
+    /// The operating system's random source could not be read, carrying
+    /// the underlying `getrandom` error's rendered message. Raised by
+    /// [`crate::Encryptor::aes256`], the only caller that draws on it.
+    #[error("random source unavailable: {0}")]
+    RandomUnavailable(String),
     #[error("{0}")]
     Other(String),
 }

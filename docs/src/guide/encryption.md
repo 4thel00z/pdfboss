@@ -222,6 +222,9 @@ directly; `merge`, `split`, `rewrite`, `meta --rewrite` and the
 `--rewrite` forms of `rotate`/`overlay` refuse every encrypted input at
 the CLI regardless of password, even though the `pdfboss_write`
 functions behind them would accept an already-opened one and carry its
-content across as plaintext. The `/Info` dictionary's strings and the XMP metadata stream, like every
-other string and stream in the file, are always encrypted along with
-the rest of the content.
+content across as plaintext. A file pdfboss writes always encrypts the
+`/Info` dictionary's strings and the XMP metadata stream, like every
+other string and stream in the file. Reading a third-party file is
+different when its `/Encrypt` dictionary carries `/EncryptMetadata
+false`: its metadata stream was stored in plaintext, and pdfboss leaves
+those bytes untouched rather than decrypting them.
