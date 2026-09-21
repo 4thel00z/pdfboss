@@ -19,10 +19,22 @@ use tokio::net::{TcpListener, TcpStream};
 /// slices or the full 200 body. The returned counter tracks GET requests
 /// (HEADs excluded).
 async fn spawn_server(data: Vec<u8>, honor_range: bool) -> (SocketAddr, Arc<AtomicUsize>) {
+    spawn_guarded_server(data, honor_range, None).await
+}
+
+/// [`spawn_server`] whose every request (HEAD included) must carry the
+/// `guard` header line, `"name: value"` compared case-insensitively on the
+/// name; a request without it is answered with 401 and no body.
+async fn spawn_guarded_server(
+    data: Vec<u8>,
+    honor_range: bool,
+    guard: Option<(&str, &str)>,
+) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let gets = Arc::new(AtomicUsize::new(0));
     let counter = Arc::clone(&gets);
+    let guard = guard.map(|(name, value)| (name.to_ascii_lowercase(), value.to_owned()));
     tokio::spawn(async move {
         loop {
             let Ok((socket, peer)) = listener.accept().await else {
@@ -30,8 +42,11 @@ async fn spawn_server(data: Vec<u8>, honor_range: bool) -> (SocketAddr, Arc<Atom
             };
             let payload = data.clone();
             let counter = Arc::clone(&counter);
+            let guard = guard.clone();
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(socket, payload, honor_range, counter).await {
+                if let Err(err) =
+                    handle_connection(socket, payload, honor_range, guard, counter).await
+                {
                     eprintln!("mock server, peer {peer}: {err}");
                 }
             });
@@ -40,10 +55,20 @@ async fn spawn_server(data: Vec<u8>, honor_range: bool) -> (SocketAddr, Arc<Atom
     (addr, gets)
 }
 
+/// True when `head` carries the `name: value` line the guard demands.
+fn carries_header(head: &str, guard: &(String, String)) -> bool {
+    head.lines().skip(1).any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case(&guard.0) && value.trim() == guard.1
+        })
+    })
+}
+
 async fn handle_connection(
     mut socket: TcpStream,
     data: Vec<u8>,
     honor_range: bool,
+    guard: Option<(String, String)>,
     gets: Arc<AtomicUsize>,
 ) -> std::io::Result<()> {
     loop {
@@ -51,6 +76,12 @@ async fn handle_connection(
             return Ok(()); // client closed the connection
         };
         let total = data.len();
+        if let Some(guard) = guard.as_ref().filter(|guard| !carries_header(&head, guard)) {
+            let _ = guard;
+            let response = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+            socket.write_all(response.as_bytes()).await?;
+            continue;
+        }
         if head.starts_with("HEAD ") {
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\n\r\n"
@@ -124,6 +155,44 @@ async fn open_url_works_against_a_range_honoring_server() {
     assert_eq!(doc.version(), sync_doc.version());
     assert_eq!(doc.page_count(), sync_doc.page_count());
     assert_eq!(doc.metadata().await.unwrap(), sync_doc.metadata());
+}
+
+#[tokio::test]
+async fn open_url_with_headers_sends_them_on_every_request() {
+    let data = simple_doc("guarded");
+    let sync_doc = pdfboss_core::Document::load(data.clone()).unwrap();
+    let (addr, gets) =
+        spawn_guarded_server(data, true, Some(("Authorization", "Bearer s3cret"))).await;
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        reqwest::header::HeaderValue::from_static("Bearer s3cret"),
+    );
+    let doc =
+        AsyncDocument::open_url_with_headers(format!("http://{addr}/guarded.pdf"), headers, "")
+            .await
+            .unwrap();
+    assert_eq!(doc.page_count(), sync_doc.page_count());
+    assert_eq!(doc.metadata().await.unwrap(), sync_doc.metadata());
+    assert!(
+        gets.load(Ordering::SeqCst) >= 1,
+        "the reads went through ranged GETs; the guard answered each one, so each carried the header"
+    );
+}
+
+#[tokio::test]
+async fn open_url_without_the_demanded_header_reports_the_status() {
+    let data = simple_doc("guarded");
+    let (addr, _) =
+        spawn_guarded_server(data, true, Some(("Authorization", "Bearer s3cret"))).await;
+    let err = AsyncDocument::open_url(format!("http://{addr}/guarded.pdf"))
+        .await
+        .err()
+        .expect("a 401 on the HEAD must fail the open");
+    match err {
+        pdfboss_aio::Error::Http { status, .. } => assert_eq!(status, Some(401)),
+        other => panic!("expected an http error, got {other:?}"),
+    }
 }
 
 #[tokio::test]

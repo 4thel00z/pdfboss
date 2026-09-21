@@ -9,6 +9,7 @@
 //! parallel instead of serializing on that lock.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -74,6 +75,21 @@ fn parse_err(e: pdfboss_core::Error) -> PyErr {
 
 /// Maps an aio error to [`PdfError`], prefixed by the layer it came from
 /// ("parse:", "io:" or "http:").
+/// A `HeaderMap` from the `headers` dict of `AsyncDocument.open_url`; a name
+/// or value that HTTP does not allow is a ValueError naming it.
+fn header_map(headers: HashMap<String, String>) -> PyResult<reqwest::header::HeaderMap> {
+    let mut map = reqwest::header::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| PyValueError::new_err(format!("invalid header name: {name:?}")))?;
+        let value = reqwest::header::HeaderValue::from_str(&value).map_err(|_| {
+            PyValueError::new_err(format!("invalid header value for {name}: {value:?}"))
+        })?;
+        map.insert(name, value);
+    }
+    Ok(map)
+}
+
 fn aio_err(e: pdfboss_aio::Error) -> PyErr {
     use pdfboss_aio::Error as AioError;
     let msg = match e {
@@ -2028,12 +2044,20 @@ impl AsyncDocument {
     /// never downloaded. The server must honor `Range` (a server that
     /// ignores it raises PdfError with an "http:" message). Coroutine
     /// resolving to an AsyncDocument. `password` opens an encrypted file,
-    /// as the user or the owner password.
+    /// as the user or the owner password. `headers` go out on every
+    /// request, the HEAD that learns the length included; a name or value
+    /// that is not a valid HTTP header raises ValueError.
     #[staticmethod]
-    #[pyo3(signature = (url, *, password=String::new()))]
-    fn open_url(py: Python<'_>, url: String, password: String) -> PyResult<Bound<'_, PyAny>> {
+    #[pyo3(signature = (url, *, password=String::new(), headers=None))]
+    fn open_url(
+        py: Python<'_>,
+        url: String,
+        password: String,
+        headers: Option<HashMap<String, String>>,
+    ) -> PyResult<Bound<'_, PyAny>> {
+        let headers = header_map(headers.unwrap_or_default())?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let inner = AioDocument::open_url_with_password(url, &password)
+            let inner = AioDocument::open_url_with_headers(url, headers, &password)
                 .await
                 .map_err(aio_err)?;
             Ok(AsyncDocument { inner })

@@ -280,6 +280,27 @@ class NoRangeRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
+class GuardedRangeRequestHandler(RangeRequestHandler):
+    """A range server that demands `Authorization: Bearer s3cret` on every
+    request, HEAD included, and answers 401 without it."""
+
+    def guard(self) -> bool:
+        if self.headers.get("Authorization") == "Bearer s3cret":
+            return True
+        self.send_response(401)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def do_HEAD(self) -> None:
+        if self.guard():
+            super().do_HEAD()
+
+    def do_GET(self) -> None:
+        if self.guard():
+            super().do_GET()
+
+
 def serve(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
     """Runs `handler` on a background ThreadingHTTPServer; yields the URL."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -315,6 +336,16 @@ def three_pages_range_server(three_pages_pdf: Path) -> Iterator[tuple[str, Path]
 
 
 @pytest.fixture
+def guarded_range_server(hello_pdf: Path) -> Iterator[str]:
+    handler = type(
+        "HelloGuardedRangeHandler",
+        (GuardedRangeRequestHandler,),
+        {"payload": hello_pdf.read_bytes()},
+    )
+    yield from serve(handler)
+
+
+@pytest.fixture
 def no_range_server(hello_pdf: Path) -> Iterator[str]:
     handler = type(
         "HelloNoRangeHandler",
@@ -332,6 +363,29 @@ class TestOpenUrl:
         doc = await AsyncDocument.open_url(range_server)
         assert doc.page_count == 1
         assert doc.version == Document(str(hello_pdf)).version
+
+    @pytest.mark.asyncio
+    async def test_open_url_sends_the_given_headers_on_every_request(
+        self, guarded_range_server: str, hello_pdf: Path
+    ) -> None:
+        doc = await AsyncDocument.open_url(
+            guarded_range_server, headers={"Authorization": "Bearer s3cret"}
+        )
+        assert doc.page_count == 1
+        assert doc.version == Document(str(hello_pdf)).version
+        assert (await doc[0].extract_text()).strip()
+
+    @pytest.mark.asyncio
+    async def test_open_url_without_the_demanded_header_raises(
+        self, guarded_range_server: str
+    ) -> None:
+        with pytest.raises(PdfError, match="http: 401"):
+            await AsyncDocument.open_url(guarded_range_server)
+
+    @pytest.mark.asyncio
+    async def test_open_url_rejects_a_malformed_header(self, range_server: str) -> None:
+        with pytest.raises(ValueError, match="header"):
+            await AsyncDocument.open_url(range_server, headers={"bad name": "x"})
 
     @pytest.mark.asyncio
     async def test_open_url_element_parity(
