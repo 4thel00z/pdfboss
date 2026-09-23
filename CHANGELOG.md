@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.12.0](https://github.com/4thel00z/pdfboss/compare/v2.11.0...v2.12.0) (2026-09-23)
+
+
+### Features
+
+* optional content usage, intent and the groups reader (ISO 32000 batch 14) ([#235](https://github.com/4thel00z/pdfboss/issues/235)) ([81f5275](https://github.com/4thel00z/pdfboss/commit/81f52758fed6c04d5925033c0a79bae0a6b8d247))
+
+
+### Documentation
+
+* **failure-modes:** name the optional content usage evidence after its squash hash 81f5275 ([#235](https://github.com/4thel00z/pdfboss/issues/235)) ([#237](https://github.com/4thel00z/pdfboss/issues/237)) ([ec3d0c7](https://github.com/4thel00z/pdfboss/commit/ec3d0c740920376d21a5b44eb718ca3b41d040c0))
+
 ## [2.11.0](https://github.com/4thel00z/pdfboss/compare/v2.10.0...v2.11.0) (2026-09-21)
 
 
