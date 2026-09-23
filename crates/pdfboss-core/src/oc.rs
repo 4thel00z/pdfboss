@@ -1,23 +1,76 @@
 //! Optional-content visibility (ISO 32000-1 §8.11): which optional content
-//! groups the document's default configuration turns off, and whether
-//! content gated by an `/OC` entry or a `BDC /OC` span is visible.
+//! groups the document's default configuration and its usage application
+//! dictionaries turn off, whether content gated by an `/OC` entry or a
+//! `BDC /OC` span is visible, and the groups themselves read as data.
 
 use std::sync::Arc;
 
 use crate::hash::FastSet;
-use crate::object::{Dict, ObjRef, Object};
+use crate::object::{decode_text_string, Dict, ObjRef, Object};
 use crate::source::AsyncObjectSource;
+use crate::tree::{resolved_dict, Entries};
 
 /// Maximum `/VE` visibility-expression nesting depth. Real expressions are
 /// one or two levels deep; past the cap the expression reads as malformed,
 /// and malformed means visible.
 const MAX_VE_DEPTH: u32 = 8;
 
+/// The intent every group and configuration has when it declares none.
+const DEFAULT_INTENT: &str = "View";
+
+/// A usage application event (ISO 32000-1 §8.11.4.4, Table 103): the
+/// situation a configuration's `/AS` usage application dictionaries apply
+/// under. Each event is also the usage category it reads from a group's
+/// `/Usage` dictionary: `/View /ViewState`, `/Print /PrintState` or
+/// `/Export /ExportState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OcEvent {
+    /// The document is opened on screen.
+    View,
+    /// The document is printed.
+    Print,
+    /// The document is exported to a format without optional content.
+    Export,
+}
+
+impl OcEvent {
+    /// The event an `/Event` or `/Category` name denotes; `None` for the
+    /// Zoom, Language and User categories and for any other name.
+    pub fn from_name(name: &str) -> Option<OcEvent> {
+        match name {
+            "View" => Some(OcEvent::View),
+            "Print" => Some(OcEvent::Print),
+            "Export" => Some(OcEvent::Export),
+            _ => None,
+        }
+    }
+
+    /// The name as written in the file, also the key of the matching
+    /// `/Usage` entry.
+    pub fn as_name(self) -> &'static str {
+        match self {
+            OcEvent::View => "View",
+            OcEvent::Print => "Print",
+            OcEvent::Export => "Export",
+        }
+    }
+
+    /// The key of the ON or OFF name inside the matching `/Usage` entry.
+    fn state_key(self) -> &'static str {
+        match self {
+            OcEvent::View => "ViewState",
+            OcEvent::Print => "PrintState",
+            OcEvent::Export => "ExportState",
+        }
+    }
+}
+
 /// The document's optional-content visibility under its default
-/// configuration (`/OCProperties` `/D`, ISO 32000-1 §8.11.4.3): the set of
-/// groups that configuration turns off. A group's identity is its indirect
-/// reference — groups are shared by reference between the configuration,
-/// marked-content properties, and `/OC` entries (§8.11.2.1).
+/// configuration (`/OCProperties` `/D`, ISO 32000-1 §8.11.4.3) and one
+/// usage application event: the set of groups that state turns off. A
+/// group's identity is its indirect reference — groups are shared by
+/// reference between the configuration, marked-content properties, and
+/// `/OC` entries (§8.11.2.1).
 ///
 /// Everything here is lenient: an entry that is missing, malformed, or will
 /// not resolve leaves content visible, never hidden.
@@ -27,44 +80,56 @@ pub struct OcState {
 }
 
 impl OcState {
+    /// The state a viewer shows on screen: [`OcState::load_for_with`] under
+    /// the [`OcEvent::View`] event, which is what pdfium and pdf.js render
+    /// by default.
+    ///
+    /// Covers ISO 32000-1 §8.11.4.5.
+    pub async fn load_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> Option<OcState> {
+        OcState::load_for_with(src, trailer, Some(OcEvent::View)).await
+    }
+
     /// Builds the state from the catalog's `/OCProperties`, or `None` when
     /// the document declares none — no optional content, everything
     /// visible. The default `/D` configuration is applied in specification
     /// order: `/BaseState` (default `ON`), then `/ON`, then `/OFF`, so a
-    /// group named in both `/ON` and `/OFF` ends up off.
+    /// group named in both `/ON` and `/OFF` ends up off. Then the
+    /// configuration's `/AS` usage application dictionaries whose `/Event`
+    /// is `event` adjust the groups they name from the groups' `/Usage`
+    /// dictionaries (§8.11.4.4). `None` applies no usage application: the
+    /// default configuration alone, which §8.11.4.5 prescribes for printing
+    /// and aggregating applications. Last, a group whose `/Intent` shares no
+    /// name with the configuration's `/Intent` has no effect on visibility
+    /// (§8.11.2.3) and leaves the off set.
     ///
-    /// Covers ISO 32000-1 §7.7.2, §8.11.2.1, §8.11.4.2, §8.11.4.3 and §8.11.4.5.
-    pub async fn load_with<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> Option<OcState> {
-        let root = trailer.get("Root")?;
-        let catalog = src.resolve(root).await.ok()?;
-        let props = src
-            .resolve(catalog.as_dict()?.get("OCProperties")?)
-            .await
-            .ok()?;
-        let props = props.as_dict()?;
+    /// Covers ISO 32000-1 §7.7.2, §8.11.2.1, §8.11.2.3, §8.11.4.2,
+    /// §8.11.4.3, §8.11.4.4 and §8.11.4.5.
+    pub async fn load_for_with<S: AsyncObjectSource>(
+        src: &S,
+        trailer: &Dict,
+        event: Option<OcEvent>,
+    ) -> Option<OcState> {
+        let props = properties(src, trailer).await?;
+        Some(OcState::from_properties(src, &props, event).await)
+    }
+
+    /// [`OcState::load_for_with`] over an already resolved `/OCProperties`
+    /// dictionary.
+    async fn from_properties<S: AsyncObjectSource>(
+        src: &S,
+        props: &Dict,
+        event: Option<OcEvent>,
+    ) -> OcState {
         let config = match props.get("D") {
-            Some(o) => src.resolve(o).await.ok(),
+            Some(o) => resolved_dict(src, o).await,
             None => None,
         };
-        let config = config.as_ref().and_then(Object::as_dict);
-        let base_off = match config.and_then(|d| d.get("BaseState")) {
-            Some(o) => matches!(
-                src.resolve(o).await.ok().as_ref().and_then(Object::as_name),
-                Some(n) if n.0 == "OFF"
-            ),
-            None => false,
-        };
-        let mut off: FastSet<ObjRef> = FastSet::default();
-        if base_off {
-            off.extend(group_refs(src, props.get("OCGs")).await);
+        let mut off = configured_off(src, props, config.as_ref()).await;
+        if let (Some(config), Some(event)) = (config.as_ref(), event) {
+            apply_usage(src, config, event, &mut off).await;
         }
-        if let Some(config) = config {
-            for group in group_refs(src, config.get("ON")).await {
-                off.remove(&group);
-            }
-            off.extend(group_refs(src, config.get("OFF")).await);
-        }
-        Some(OcState { off })
+        retain_matching_intents(src, config.as_ref(), &mut off).await;
+        OcState { off }
     }
 
     /// Whether the configuration turns `group` off.
@@ -173,7 +238,7 @@ impl OcState {
         }
     }
 
-    /// Evaluates a `/VE` array (§8.11.2.3): `[/And|/Or|/Not operands…]`,
+    /// Evaluates a `/VE` array (§8.11.2.2): `[/And|/Or|/Not operands…]`,
     /// each operand a group reference or a nested expression (directly, or
     /// behind a reference). `None` is malformed — an unknown operator, no
     /// operands, `/Not` with more than one, an operand that is neither
@@ -274,6 +339,345 @@ impl VeFrame {
     }
 }
 
+/// An optional content group (ISO 32000-1 §8.11.2.1, Table 98) read as
+/// data, with its state under the configuration and event the reader was
+/// asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcGroup {
+    /// The group's indirect reference: its identity in `/OC` entries,
+    /// `/OCGs` arrays and the configuration.
+    pub reference: ObjRef,
+    /// `/Name`, the group's name for a user interface. Required by the
+    /// table, `None` when missing.
+    pub name: Option<String>,
+    /// `/Intent`: the intent names, `View` and `Design` being the defined
+    /// ones; the default `View` when absent.
+    pub intent: Vec<String>,
+    /// `/Usage` (Table 102), every field empty when the entry is absent.
+    pub usage: OcUsage,
+    /// Whether the group is on under the state the reader built: the
+    /// default configuration, the usage application dictionaries for the
+    /// requested event, and the intent rule.
+    pub visible: bool,
+}
+
+/// An optional content usage dictionary (ISO 32000-1 §8.11.4.4, Table 102):
+/// what the group's content is for. Every field is `None`, `false` or empty
+/// when its entry is absent.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OcUsage {
+    /// `/View /ViewState`: whether the group should be on when the document
+    /// is opened on screen.
+    pub view: Option<bool>,
+    /// `/Print /PrintState`: whether the group should be on when printed.
+    pub print: Option<bool>,
+    /// `/Print /Subtype`: the kind of print content, such as `Trapping`,
+    /// `PrintersMarks` or `Watermark`.
+    pub print_subtype: Option<String>,
+    /// `/Export /ExportState`: whether the group should be on when exported
+    /// to a format without optional content.
+    pub export: Option<bool>,
+    /// `/Zoom /min`: the magnification the group is on from; the table's
+    /// default is 0.
+    pub zoom_min: Option<f64>,
+    /// `/Zoom /max`: the magnification below which the group is on; the
+    /// table's default is infinity.
+    pub zoom_max: Option<f64>,
+    /// `/Language /Lang`: the content's language tag, such as `es-MX`.
+    pub language: Option<String>,
+    /// `/Language /Preferred`: whether the group is preferred on a partial
+    /// language match; false by default.
+    pub language_preferred: bool,
+    /// `/PageElement /Subtype`: `HF` (header or footer), `FG` (foreground),
+    /// `BG` (background) or `L` (logo).
+    pub page_element: Option<String>,
+    /// `/CreatorInfo /Creator`: the application that created the group.
+    pub creator: Option<String>,
+    /// `/CreatorInfo /Subtype`: the kind of content, such as `Artwork` or
+    /// `Technical`.
+    pub creator_subtype: Option<String>,
+    /// `/User /Type`: `Ind` (individual), `Ttl` (title) or `Org`
+    /// (organization).
+    pub user_type: Option<String>,
+    /// `/User /Name`: the names, one string or an array of strings.
+    pub user_names: Vec<String>,
+}
+
+/// The document's optional content groups in `/OCProperties /OCGs` order,
+/// each with its state under `event` (see [`OcState::load_for_with`]);
+/// empty without `/OCProperties`. Entries that are not references to
+/// dictionaries are skipped.
+///
+/// Covers ISO 32000-1 §8.11.2.1, §8.11.2.3, §8.11.4.2 and §8.11.4.4.
+pub async fn optional_content_groups_with<S: AsyncObjectSource>(
+    src: &S,
+    trailer: &Dict,
+    event: Option<OcEvent>,
+) -> Vec<OcGroup> {
+    let Some(props) = properties(src, trailer).await else {
+        return Vec::new();
+    };
+    let state = OcState::from_properties(src, &props, event).await;
+    let mut groups = Vec::new();
+    for reference in group_refs(src, props.get("OCGs")).await {
+        let Some(dict) = resolved_dict(src, &Object::Ref(reference)).await else {
+            continue;
+        };
+        let usage = match sub_dict(src, &dict, "Usage").await {
+            Some(usage) => read_usage(src, &usage).await,
+            None => OcUsage::default(),
+        };
+        groups.push(OcGroup {
+            reference,
+            name: Entries { src, dict: &dict }.text("Name").await,
+            intent: intent_names(src, &dict).await,
+            usage,
+            visible: !state.hidden(reference),
+        });
+    }
+    groups
+}
+
+/// The catalog's `/OCProperties` dictionary (§8.11.4.2).
+async fn properties<S: AsyncObjectSource>(src: &S, trailer: &Dict) -> Option<Dict> {
+    let catalog = resolved_dict(src, trailer.get("Root")?).await?;
+    resolved_dict(src, catalog.get("OCProperties")?).await
+}
+
+/// The off set the default configuration alone prescribes (§8.11.4.3;
+/// §8.11.4.5 steps a and b): `/BaseState`, then `/ON`, then `/OFF`.
+async fn configured_off<S: AsyncObjectSource>(
+    src: &S,
+    props: &Dict,
+    config: Option<&Dict>,
+) -> FastSet<ObjRef> {
+    let mut off: FastSet<ObjRef> = FastSet::default();
+    let Some(config) = config else {
+        return off;
+    };
+    let base = Entries { src, dict: config }.value("BaseState").await;
+    if on_off(base.as_ref()) == Some(false) {
+        off.extend(group_refs(src, props.get("OCGs")).await);
+    }
+    for group in group_refs(src, config.get("ON")).await {
+        off.remove(&group);
+    }
+    off.extend(group_refs(src, config.get("OFF")).await);
+    off
+}
+
+/// Applies the usage application dictionaries of the configuration's `/AS`
+/// array whose `/Event` is `event`, in array order, later ones winning
+/// (§8.11.4.4, Table 103; §8.11.4.5). For each group in a dictionary's
+/// `/OCGs` and each name in its `/Category` that is View, Print or Export,
+/// the group's `/Usage` entry of that category sets the state: ON turns the
+/// group on, OFF off, and a missing or malformed entry leaves it unchanged.
+/// The Zoom, Language and User categories depend on a viewer's
+/// magnification, locale and user, which this library has none of, and
+/// leave the state unchanged.
+async fn apply_usage<S: AsyncObjectSource>(
+    src: &S,
+    config: &Dict,
+    event: OcEvent,
+    off: &mut FastSet<ObjRef>,
+) {
+    let Some(apps) = config.get("AS") else {
+        return;
+    };
+    let Ok(Object::Array(apps)) = src.resolve(apps).await else {
+        return;
+    };
+    for app in &apps {
+        let Some(app) = resolved_dict(src, app).await else {
+            continue;
+        };
+        let entries = Entries { src, dict: &app };
+        if entries.named("Event", OcEvent::from_name).await != Some(event) {
+            continue;
+        }
+        let categories: Vec<OcEvent> = names(src, app.get("Category"))
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| OcEvent::from_name(name))
+            .collect();
+        if categories.is_empty() {
+            continue;
+        }
+        for group in group_refs(src, app.get("OCGs")).await {
+            let Some(dict) = resolved_dict(src, &Object::Ref(group)).await else {
+                continue;
+            };
+            let Some(usage) = sub_dict(src, &dict, "Usage").await else {
+                continue;
+            };
+            for category in &categories {
+                match usage_state(src, &usage, *category).await {
+                    Some(true) => {
+                        off.remove(&group);
+                    }
+                    Some(false) => {
+                        off.insert(group);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+}
+
+/// Keeps in `off` only the groups whose `/Intent` shares a name with the
+/// configuration's `/Intent` (§8.11.2.3): a group whose intent does not
+/// match has no effect on visibility, so it can never hide content. Both
+/// default to View; a configuration naming `All` matches every group; an
+/// empty configuration array matches none, so nothing is hidden.
+async fn retain_matching_intents<S: AsyncObjectSource>(
+    src: &S,
+    config: Option<&Dict>,
+    off: &mut FastSet<ObjRef>,
+) {
+    if off.is_empty() {
+        return;
+    }
+    let config_intents = match config {
+        Some(config) => intent_names(src, config).await,
+        None => vec![DEFAULT_INTENT.to_string()],
+    };
+    if config_intents.iter().any(|name| name == "All") {
+        return;
+    }
+    let groups: Vec<ObjRef> = off.iter().copied().collect();
+    for group in groups {
+        let group_intents = match resolved_dict(src, &Object::Ref(group)).await {
+            Some(dict) => intent_names(src, &dict).await,
+            None => vec![DEFAULT_INTENT.to_string()],
+        };
+        if group_intents
+            .iter()
+            .any(|name| config_intents.contains(name))
+        {
+            continue;
+        }
+        off.remove(&group);
+    }
+}
+
+/// The names a dictionary's `/Intent` entry carries, a single name or an
+/// array of names; absent or malformed reads as the default View.
+async fn intent_names<S: AsyncObjectSource>(src: &S, dict: &Dict) -> Vec<String> {
+    names(src, dict.get("Intent"))
+        .await
+        .unwrap_or_else(|| vec![DEFAULT_INTENT.to_string()])
+}
+
+/// The names in a value that is one name or an array of names, resolved;
+/// `None` when absent or neither.
+async fn names<S: AsyncObjectSource>(src: &S, value: Option<&Object>) -> Option<Vec<String>> {
+    match src.resolve(value?).await.ok()? {
+        Object::Name(name) => Some(vec![name.0]),
+        Object::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_name().map(|name| name.0.clone()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The dictionary under `key`, resolved; `None` when absent or not one.
+async fn sub_dict<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<Dict> {
+    resolved_dict(src, dict.get(key)?).await
+}
+
+/// The state a usage dictionary's `category` entry names: `Some(true)` for
+/// ON, `Some(false)` for OFF, `None` when absent or neither.
+async fn usage_state<S: AsyncObjectSource>(
+    src: &S,
+    usage: &Dict,
+    category: OcEvent,
+) -> Option<bool> {
+    let entry = sub_dict(src, usage, category.as_name()).await?;
+    on_off(
+        Entries { src, dict: &entry }
+            .value(category.state_key())
+            .await
+            .as_ref(),
+    )
+}
+
+/// `Some(true)` for the name ON, `Some(false)` for OFF, `None` otherwise.
+fn on_off(value: Option<&Object>) -> Option<bool> {
+    match value?.as_name()?.0.as_str() {
+        "ON" => Some(true),
+        "OFF" => Some(false),
+        _ => None,
+    }
+}
+
+/// A usage dictionary's entries (Table 102) as data.
+async fn read_usage<S: AsyncObjectSource>(src: &S, usage: &Dict) -> OcUsage {
+    let mut out = OcUsage {
+        view: usage_state(src, usage, OcEvent::View).await,
+        print: usage_state(src, usage, OcEvent::Print).await,
+        export: usage_state(src, usage, OcEvent::Export).await,
+        ..OcUsage::default()
+    };
+    if let Some(print) = sub_dict(src, usage, "Print").await {
+        out.print_subtype = name_entry(src, &print, "Subtype").await;
+    }
+    if let Some(zoom) = sub_dict(src, usage, "Zoom").await {
+        let entries = Entries { src, dict: &zoom };
+        out.zoom_min = entries.value("min").await.and_then(|o| o.as_f64());
+        out.zoom_max = entries.value("max").await.and_then(|o| o.as_f64());
+    }
+    if let Some(language) = sub_dict(src, usage, "Language").await {
+        let entries = Entries {
+            src,
+            dict: &language,
+        };
+        out.language = entries.text("Lang").await;
+        out.language_preferred = on_off(entries.value("Preferred").await.as_ref()) == Some(true);
+    }
+    if let Some(element) = sub_dict(src, usage, "PageElement").await {
+        out.page_element = name_entry(src, &element, "Subtype").await;
+    }
+    if let Some(creator) = sub_dict(src, usage, "CreatorInfo").await {
+        let entries = Entries {
+            src,
+            dict: &creator,
+        };
+        out.creator = entries.text("Creator").await;
+        out.creator_subtype = name_entry(src, &creator, "Subtype").await;
+    }
+    if let Some(user) = sub_dict(src, usage, "User").await {
+        let entries = Entries { src, dict: &user };
+        out.user_type = name_entry(src, &user, "Type").await;
+        out.user_names = match entries.value("Name").await {
+            Some(Object::Array(items)) => items
+                .iter()
+                .filter_map(|item| item.as_str_bytes().map(decode_text_string))
+                .collect(),
+            Some(single) => single
+                .as_str_bytes()
+                .map(decode_text_string)
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
+        };
+    }
+    out
+}
+
+/// The name under `key` as a string, resolved; `None` when absent or not a
+/// name.
+async fn name_entry<S: AsyncObjectSource>(src: &S, dict: &Dict, key: &str) -> Option<String> {
+    Entries { src, dict }
+        .value(key)
+        .await
+        .and_then(|o| o.as_name().map(|name| name.0.clone()))
+}
+
 /// Whether a dictionary reached through an `/OC`-shaped value is a
 /// membership dictionary rather than a group: `/Type /OCMD` says so, and a
 /// dictionary with no `/Type` carrying `/OCGs` or `/VE` is read as one too —
@@ -354,6 +758,10 @@ mod tests {
 
     fn visible(doc: &Document, state: &OcState, value: &Object) -> bool {
         block_on(state.visible_with(&Immediate(doc), value))
+    }
+
+    fn state_for(doc: &Document, event: Option<OcEvent>) -> OcState {
+        doc.oc_state_for(event).expect("state")
     }
 
     // Covers ISO 32000-1 §8.11.4.2.
@@ -567,6 +975,252 @@ mod tests {
         assert!(
             block_on(state.props_visible_with(&src, &chain, &named("Nope"))),
             "an unresolvable name stays visible"
+        );
+    }
+
+    /// Objects 12 and 13 are two more groups: 12 carries a `/Usage` with a
+    /// View state of OFF and a Print state of ON; 13 an Export state of OFF
+    /// and a Zoom range. `config` is the `/D` configuration.
+    fn usage_doc(config: &str) -> Document {
+        doc_with_oc(
+            &format!("<< /OCGs [10 0 R 11 0 R 12 0 R 13 0 R] /D {config} >>"),
+            |b| {
+                b.object(
+                    12,
+                    "<< /Type /OCG /Name (print only) /Usage << /View << /ViewState /OFF >> \
+                     /Print << /PrintState /ON /Subtype /Watermark >> >> >>",
+                );
+                b.object(
+                    13,
+                    "<< /Type /OCG /Name (screen only) /Usage << /Export << /ExportState /OFF >> \
+                     /Zoom << /min 2 >> >> >>",
+                );
+            },
+        )
+    }
+
+    /// The default state is the viewer's: the View event's usage
+    /// application dictionaries apply, so a group whose `/ViewState` is OFF
+    /// is hidden although the configuration's `/OFF` array does not name it,
+    /// and the Export event's dictionaries do not apply.
+    // Covers ISO 32000-1 §8.11.4.4 and §8.11.4.5.
+    #[test]
+    fn view_usage_application_hides_a_view_state_off_group() {
+        let doc = usage_doc(
+            "<< /AS [ << /Event /View /OCGs [12 0 R 13 0 R] /Category [/View] >> \
+             << /Event /Export /OCGs [13 0 R] /Category [/Export] >> ] >>",
+        );
+        let state = doc.oc_state().expect("state");
+        assert!(state.hidden(gref(12)), "ViewState OFF under the View event");
+        assert!(
+            !state.hidden(gref(13)),
+            "the Export dictionary is not applied"
+        );
+        assert!(
+            !state.hidden(gref(10)),
+            "a group without /Usage is unchanged"
+        );
+    }
+
+    /// Each event applies only the dictionaries carrying its `/Event`, and
+    /// `None` applies none: the state printing and aggregating applications
+    /// use, the default configuration alone.
+    // Covers ISO 32000-1 §8.11.4.4 and §8.11.4.5.
+    #[test]
+    fn each_event_applies_its_own_dictionaries() {
+        let doc = usage_doc(
+            "<< /OFF [12 0 R] /AS [ << /Event /View /OCGs [12 0 R 13 0 R] /Category [/View] >> \
+             << /Event /Print /OCGs [12 0 R] /Category [/Print] >> \
+             << /Event /Export /OCGs [13 0 R] /Category [/Export] >> ] >>",
+        );
+        let print = state_for(&doc, Some(OcEvent::Print));
+        assert!(
+            !print.hidden(gref(12)),
+            "PrintState ON turns the /OFF group on"
+        );
+        assert!(!print.hidden(gref(13)));
+        let export = state_for(&doc, Some(OcEvent::Export));
+        assert!(export.hidden(gref(12)), "the /OFF array still applies");
+        assert!(
+            export.hidden(gref(13)),
+            "ExportState OFF under the Export event"
+        );
+        let none = state_for(&doc, None);
+        assert!(none.hidden(gref(12)));
+        assert!(!none.hidden(gref(13)), "no usage application at all");
+    }
+
+    /// Without `/AS` the usage dictionaries are information only: a
+    /// `/ViewState` of OFF hides nothing. A dictionary naming a category
+    /// the group's `/Usage` lacks, or only the Zoom, Language or User
+    /// categories, leaves the state unchanged; later dictionaries win over
+    /// earlier ones.
+    // Covers ISO 32000-1 §8.11.4.4.
+    #[test]
+    fn usage_without_application_or_category_changes_nothing() {
+        let doc = usage_doc("<< >>");
+        assert!(!doc.oc_state().expect("state").hidden(gref(12)), "no /AS");
+        let doc =
+            usage_doc("<< /AS [ << /Event /View /OCGs [12 0 R] /Category [/Export /Zoom] >> ] >>");
+        assert!(
+            !doc.oc_state().expect("state").hidden(gref(12)),
+            "categories the group has no usage entry for"
+        );
+        let doc = usage_doc(
+            "<< /AS [ << /Event /View /OCGs [12 0 R] /Category [/View] >> \
+             << /Event /View /OCGs [12 0 R] /Category [/Print] >> ] >>",
+        );
+        assert!(
+            !doc.oc_state().expect("state").hidden(gref(12)),
+            "the later dictionary's Print category (ON) wins"
+        );
+        let doc = usage_doc("<< /AS [ << /Event /View /Category [/View] >> ] >>");
+        assert!(
+            !doc.oc_state().expect("state").hidden(gref(12)),
+            "no /OCGs means no groups are affected"
+        );
+    }
+
+    /// Objects 14 and 15 are groups with `/Intent /Design` and
+    /// `/Intent [/Design /View]`; `config` is the `/D` configuration.
+    fn intent_doc(config: &str) -> Document {
+        doc_with_oc(
+            &format!("<< /OCGs [10 0 R 11 0 R 14 0 R 15 0 R] /D {config} >>"),
+            |b| {
+                b.object(14, "<< /Type /OCG /Name (guides) /Intent /Design >>");
+                b.object(15, "<< /Type /OCG /Name (both) /Intent [/Design /View] >>");
+            },
+        )
+    }
+
+    /// A group whose intent shares no name with the configuration's (both
+    /// default to View) has no effect on visibility: turned off, it still
+    /// hides nothing. An intent array matches on any of its names.
+    // Covers ISO 32000-1 §8.11.2.3.
+    #[test]
+    fn a_group_of_another_intent_never_hides_content() {
+        let doc = intent_doc("<< /OFF [11 0 R 14 0 R 15 0 R] >>");
+        let state = doc.oc_state().expect("state");
+        assert!(state.hidden(gref(11)), "default intents match");
+        assert!(
+            !state.hidden(gref(14)),
+            "Design against a View configuration"
+        );
+        assert!(state.hidden(gref(15)), "[/Design /View] shares View");
+        assert!(
+            visible(&doc, &state, &Object::Ref(gref(14))),
+            "content in the Design group paints"
+        );
+    }
+
+    /// The configuration's own `/Intent` selects the groups it controls:
+    /// `/Design` controls only Design groups, `/All` every group, and an
+    /// empty array none, so everything is visible.
+    // Covers ISO 32000-1 §8.11.2.3 and §8.11.4.3.
+    #[test]
+    fn the_configuration_intent_selects_the_groups_it_controls() {
+        let design = intent_doc("<< /Intent /Design /OFF [11 0 R 14 0 R 15 0 R] >>");
+        let state = design.oc_state().expect("state");
+        assert!(
+            !state.hidden(gref(11)),
+            "a View group under a Design configuration"
+        );
+        assert!(state.hidden(gref(14)));
+        assert!(state.hidden(gref(15)));
+        let all = intent_doc("<< /Intent [/All] /OFF [11 0 R 14 0 R] >>");
+        let state = all.oc_state().expect("state");
+        assert!(state.hidden(gref(11)));
+        assert!(state.hidden(gref(14)));
+        let none = intent_doc("<< /Intent [] /OFF [11 0 R 14 0 R] >>");
+        let state = none.oc_state().expect("state");
+        assert!(!state.hidden(gref(11)), "an empty intent controls nothing");
+        assert!(!state.hidden(gref(14)));
+    }
+
+    /// The intent rule is applied after the usage application: a Design
+    /// group the View usage turns off still hides nothing.
+    // Covers ISO 32000-1 §8.11.2.3 and §8.11.4.5.
+    #[test]
+    fn the_intent_rule_applies_after_usage() {
+        let doc = doc_with_oc(
+            "<< /OCGs [10 0 R 16 0 R] /D << /AS [ << /Event /View /OCGs [16 0 R] /Category [/View] >> ] >> >>",
+            |b| {
+                b.object(
+                    16,
+                    "<< /Type /OCG /Name (design, view off) /Intent /Design \
+                     /Usage << /View << /ViewState /OFF >> >> >>",
+                );
+            },
+        );
+        assert!(!doc.oc_state().expect("state").hidden(gref(16)));
+    }
+
+    /// Every group in `/OCGs` order with its name, intents, usage entries
+    /// and state; the state follows the event asked for.
+    // Covers ISO 32000-1 §8.11.2.1, §8.11.2.3 and §8.11.4.4.
+    #[test]
+    fn groups_read_as_data() {
+        let doc = doc_with_oc(
+            "<< /OCGs [10 0 R 17 0 R 999 0 R] /D << /OFF [17 0 R] \
+             /AS [ << /Event /Print /OCGs [17 0 R] /Category [/Print] >> ] >> >>",
+            |b| {
+                b.object(
+                    17,
+                    "<< /Type /OCG /Name <FEFF00450073> /Intent [/Design /View] /Usage << \
+                     /CreatorInfo << /Creator (CAD) /Subtype /Technical >> \
+                     /Language << /Lang (es-MX) /Preferred /ON >> \
+                     /Export << /ExportState /OFF >> \
+                     /Zoom << /min 0.5 /max 4 >> \
+                     /Print << /Subtype /Watermark /PrintState /ON >> \
+                     /View << /ViewState /OFF >> \
+                     /User << /Type /Org /Name [(Acme) (Globex)] >> \
+                     /PageElement << /Subtype /HF >> >> >>",
+                );
+            },
+        );
+        let groups = doc.optional_content_groups(Some(OcEvent::View));
+        assert_eq!(groups.len(), 2, "a dangling reference is skipped");
+        assert_eq!(
+            groups[0],
+            OcGroup {
+                reference: gref(10),
+                name: Some("one".to_string()),
+                intent: vec!["View".to_string()],
+                usage: OcUsage::default(),
+                visible: true,
+            }
+        );
+        assert_eq!(
+            groups[1],
+            OcGroup {
+                reference: gref(17),
+                name: Some("Es".to_string()),
+                intent: vec!["Design".to_string(), "View".to_string()],
+                usage: OcUsage {
+                    view: Some(false),
+                    print: Some(true),
+                    print_subtype: Some("Watermark".to_string()),
+                    export: Some(false),
+                    zoom_min: Some(0.5),
+                    zoom_max: Some(4.0),
+                    language: Some("es-MX".to_string()),
+                    language_preferred: true,
+                    page_element: Some("HF".to_string()),
+                    creator: Some("CAD".to_string()),
+                    creator_subtype: Some("Technical".to_string()),
+                    user_type: Some("Org".to_string()),
+                    user_names: vec!["Acme".to_string(), "Globex".to_string()],
+                },
+                visible: false,
+            }
+        );
+        let printed = doc.optional_content_groups(Some(OcEvent::Print));
+        assert!(printed[1].visible, "PrintState ON under the Print event");
+        assert!(
+            doc_with_oc("", |_| {})
+                .optional_content_groups(None)
+                .is_empty(),
+            "no /OCProperties, no groups"
         );
     }
 }

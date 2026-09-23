@@ -509,9 +509,10 @@ impl Document {
         block_on(metadata_with(&Immediate(self), dict))
     }
 
-    /// The document's optional-content visibility under its default
-    /// configuration (ISO 32000-1 §8.11.4.3), or `None` when the catalog
-    /// declares no `/OCProperties` — no optional content, everything
+    /// The document's optional-content visibility as a viewer shows it on
+    /// screen: the default configuration (ISO 32000-1 §8.11.4.3) with the
+    /// View usage application (§8.11.4.4) applied, or `None` when the
+    /// catalog declares no `/OCProperties` — no optional content, everything
     /// visible. Computed per call from a handful of object reads.
     ///
     /// Covers ISO 32000-1 §8.11.4.2.
@@ -519,6 +520,36 @@ impl Document {
         block_on(crate::oc::OcState::load_with(
             &Immediate(self),
             &self.xref.trailer,
+        ))
+    }
+
+    /// The document's optional-content visibility under one usage
+    /// application event (ISO 32000-1 §8.11.4.4), or under the default
+    /// configuration alone for `None`; `None` in the result when the catalog
+    /// declares no `/OCProperties`. See [`crate::OcState::load_for_with`].
+    ///
+    /// Covers ISO 32000-1 §8.11.4.5.
+    pub fn oc_state_for(&self, event: Option<crate::oc::OcEvent>) -> Option<crate::oc::OcState> {
+        block_on(crate::oc::OcState::load_for_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            event,
+        ))
+    }
+
+    /// The document's optional content groups (ISO 32000-1 §8.11.2.1) in
+    /// `/OCGs` order, each with its state under `event`; empty without
+    /// `/OCProperties`.
+    ///
+    /// Covers ISO 32000-1 §8.11.4.2.
+    pub fn optional_content_groups(
+        &self,
+        event: Option<crate::oc::OcEvent>,
+    ) -> Vec<crate::oc::OcGroup> {
+        block_on(crate::oc::optional_content_groups_with(
+            &Immediate(self),
+            &self.xref.trailer,
+            event,
         ))
     }
 

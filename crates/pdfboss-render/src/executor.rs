@@ -4512,6 +4512,62 @@ mod tests {
         assert_eq!(report.hidden, 0);
     }
 
+    /// The default render is the viewer's state: a print-only layer, whose
+    /// `/Usage` View state the configuration's `/AS` array applies, does not
+    /// paint, while a Design-intent group the `/OFF` array names paints
+    /// anyway, having no effect on visibility under a View configuration.
+    /// A state built for the Print event paints the print-only layer.
+    // Covers ISO 32000-1 §8.11.2.3, §8.11.4.4 and §8.11.4.5.
+    #[test]
+    fn usage_application_and_intent_decide_what_paints() {
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties \
+             << /OCGs [8 0 R 9 0 R] /D << /OFF [9 0 R] \
+             /AS [ << /Event /View /OCGs [8 0 R] /Category [/View] >> \
+             << /Event /Print /OCGs [8 0 R] /Category [/Print] >> ] >> >> >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] \
+             /Resources << /Properties << /P 8 0 R /D 9 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"1 0 0 rg /OC /P BDC 10 10 30 30 re f EMC /OC /D BDC 60 60 30 30 re f EMC",
+        );
+        b.object(
+            8,
+            "<< /Type /OCG /Name (print only) \
+             /Usage << /View << /ViewState /OFF >> /Print << /PrintState /ON >> >> >>",
+        );
+        b.object(9, "<< /Type /OCG /Name (guides) /Intent /Design >>");
+        let bytes = b.build(1);
+        let (pix, report) = render_reporting(bytes.clone());
+        assert_eq!(
+            px(&pix, 25, 75),
+            WHITE,
+            "the print-only layer is off on screen"
+        );
+        assert_eq!(px(&pix, 75, 25), RED, "a Design group cannot hide content");
+        assert_eq!(report.hidden, 1);
+
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page 0");
+        let opts = RenderOptions {
+            oc: doc
+                .oc_state_for(Some(pdfboss_core::OcEvent::Print))
+                .map(Arc::new),
+            ..RenderOptions::default()
+        };
+        let (pix, report) = render_page_reporting(&doc, &page, 1.0, &opts).expect("render");
+        assert_eq!(px(&pix, 25, 75), RED, "the print-only layer prints");
+        assert_eq!(report.hidden, 0);
+    }
+
     /// An inline image inside a hidden span is a mark like any other.
     // Covers ISO 32000-1 §8.11.3.2.
     #[test]

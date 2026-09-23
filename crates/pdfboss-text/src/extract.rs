@@ -1975,6 +1975,59 @@ mod tests {
         assert!(report.is_complete());
     }
 
+    /// Text extraction reads the viewer's state: a layer whose `/Usage`
+    /// View state is OFF under the configuration's `/AS` array is excluded,
+    /// and a state built for the Print event includes it.
+    // Covers ISO 32000-1 §8.11.4.4 and §8.11.4.5.
+    #[test]
+    fn usage_application_decides_which_layers_are_extracted() {
+        use pdfboss_testkit::PdfBuilder;
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [8 0 R] /D << \
+             /AS [ << /Event /View /OCGs [8 0 R] /Category [/View] >> \
+             << /Event /Print /OCGs [8 0 R] /Category [/Print] >> ] >> >> >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> /Properties << /P 8 0 R >> >> \
+             /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            b"BT /F1 12 Tf 72 720 Td (body) Tj /OC /P BDC ( print only) Tj EMC ET",
+        );
+        b.object(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.object(
+            8,
+            "<< /Type /OCG /Name (print only) \
+             /Usage << /View << /ViewState /OFF >> /Print << /PrintState /ON >> >> >>",
+        );
+        let doc = Document::load(b.build(1)).expect("load");
+        let page = doc.page(0).unwrap();
+        let (spans, _, report) = extract_all(&doc, &page);
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["body"]);
+        assert_eq!(report.hidden, 1);
+
+        let printed = doc.oc_state_for(Some(pdfboss_core::OcEvent::Print));
+        let (spans, _, report) = block_on(page_spans_and_rulings_with(
+            Immediate(&doc),
+            &page,
+            None,
+            printed.as_ref(),
+            None,
+            ReadingOrder::Content,
+        ));
+        let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, ["body", " print only"]);
+        assert_eq!(report.hidden, 0);
+    }
+
     /// `3 Tr` text is a viewer-invisible layer the document still shows —
     /// searchable-scan OCR — and stays extracted; an off optional-content
     /// layer is declared off by the document itself and is excluded. The
