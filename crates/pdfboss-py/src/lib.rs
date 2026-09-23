@@ -933,6 +933,27 @@ impl Document {
         self.inner.lock().is_linearized()
     }
 
+    /// The optional content groups (PDF layers) the catalog declares, in
+    /// `/OCGs` order, each with its state under `event`: `"view"` (the
+    /// default, what a viewer shows on screen and what text extraction and
+    /// rendering use), `"print"`, `"export"`, or `None` for the default
+    /// configuration alone, without any usage application. Releases the
+    /// GIL while they are read.
+    #[pyo3(signature = (event="view"))]
+    fn optional_content_groups(
+        &self,
+        py: Python<'_>,
+        event: Option<&str>,
+    ) -> PyResult<Vec<document::OptionalContentGroup>> {
+        let event = document::event_from_py(event)?;
+        let inner = Arc::clone(&self.inner);
+        Ok(py
+            .allow_threads(move || inner.lock().optional_content_groups(event))
+            .into_iter()
+            .map(document::OptionalContentGroup::from)
+            .collect())
+    }
+
     /// The output intents the catalog declares, in array order. Releases
     /// the GIL while they are read.
     fn output_intents(&self, py: Python<'_>) -> Vec<document::OutputIntent> {
@@ -2557,6 +2578,27 @@ impl AsyncDocument {
         self.inner.is_linearized()
     }
 
+    /// The optional content groups with their state under `event`, the
+    /// async twin of `Document.optional_content_groups`.
+    #[pyo3(signature = (event="view"))]
+    fn optional_content_groups<'py>(
+        &self,
+        py: Python<'py>,
+        event: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let event = document::event_from_py(event)?;
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let groups = inner.optional_content_groups(event).await;
+            Ok::<Vec<document::OptionalContentGroup>, PyErr>(
+                groups
+                    .into_iter()
+                    .map(document::OptionalContentGroup::from)
+                    .collect(),
+            )
+        })
+    }
+
     fn output_intents<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -3238,6 +3280,8 @@ mod tests {
         assert_send_sync::<super::AsyncSpanIter>();
         assert_send_sync::<super::document::Linearization>();
         assert_send_sync::<super::document::OutputIntent>();
+        assert_send_sync::<super::document::OptionalContentGroup>();
+        assert_send_sync::<super::document::OptionalContentUsage>();
         assert_send_sync::<super::document::PagePiece>();
         assert_send_sync::<super::document::Thumbnail>();
         assert_send_sync::<super::document::Bead>();

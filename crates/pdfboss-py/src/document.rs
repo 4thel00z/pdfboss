@@ -6,18 +6,20 @@
 //! Enumerations are kebab-case strings and object references `(num, gen)`
 //! tuples.
 
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use pdfboss_core::{
     ArticleThread as CoreArticleThread, Bead as CoreBead, Dimension, FractionFormat, LabelPosition,
     LegalAttestation as CoreLegalAttestation, Linearization as CoreLinearization,
-    Measure as CoreMeasure, Motion, NumberFormat as CoreNumberFormat, Object,
-    OutputIntent as CoreOutputIntent, PagePiece as CorePagePiece,
-    PermissionHandlers as CorePermissionHandlers, Presentation as CorePresentation,
-    Requirement as CoreRequirement, RequirementHandler as CoreRequirementHandler,
-    SeparationInfo as CoreSeparationInfo, Thumbnail as CoreThumbnail, Transition as CoreTransition,
-    TransitionDirection, TransitionStyle, Viewport as CoreViewport,
+    Measure as CoreMeasure, Motion, NumberFormat as CoreNumberFormat, Object, OcEvent,
+    OcGroup as CoreOcGroup, OcUsage as CoreOcUsage, OutputIntent as CoreOutputIntent,
+    PagePiece as CorePagePiece, PermissionHandlers as CorePermissionHandlers,
+    Presentation as CorePresentation, Requirement as CoreRequirement,
+    RequirementHandler as CoreRequirementHandler, SeparationInfo as CoreSeparationInfo,
+    Thumbnail as CoreThumbnail, Transition as CoreTransition, TransitionDirection, TransitionStyle,
+    Viewport as CoreViewport,
 };
 
 use crate::catalog::PageIndex;
@@ -1153,9 +1155,194 @@ impl SeparationInfo {
     }
 }
 
+/// The usage application event a Python string names: `"view"`,
+/// `"print"` or `"export"`, or `None` for the default configuration alone.
+pub(crate) fn event_from_py(event: Option<&str>) -> PyResult<Option<OcEvent>> {
+    match event {
+        None => Ok(None),
+        Some("view") => Ok(Some(OcEvent::View)),
+        Some("print") => Ok(Some(OcEvent::Print)),
+        Some("export") => Ok(Some(OcEvent::Export)),
+        Some(other) => Err(PyValueError::new_err(format!(
+            "event must be \"view\", \"print\", \"export\" or None, not {other:?}"
+        ))),
+    }
+}
+
+/// One optional content group (a PDF layer) with its state under the
+/// usage application event it was read for.
+#[pyclass(frozen)]
+pub(crate) struct OptionalContentGroup {
+    inner: CoreOcGroup,
+}
+
+impl From<CoreOcGroup> for OptionalContentGroup {
+    fn from(inner: CoreOcGroup) -> OptionalContentGroup {
+        OptionalContentGroup { inner }
+    }
+}
+
+#[pymethods]
+impl OptionalContentGroup {
+    /// The group dictionary's `(num, gen)` reference, its identity in
+    /// `/OC` entries and the configuration.
+    #[getter]
+    #[pyo3(name = "ref")]
+    fn object_ref(&self) -> (u32, u16) {
+        ref_tuple(self.inner.reference)
+    }
+
+    /// The group's name for a user interface, `/Name`.
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    /// The group's intents, `/Intent`: `"View"`, `"Design"`, or names an
+    /// extension defines; `["View"]` when absent.
+    #[getter]
+    fn intent(&self) -> Vec<String> {
+        self.inner.intent.clone()
+    }
+
+    /// The group's usage dictionary, every field `None` when absent.
+    #[getter]
+    fn usage(&self) -> OptionalContentUsage {
+        OptionalContentUsage {
+            inner: self.inner.usage.clone(),
+        }
+    }
+
+    /// Whether the group is on under the state it was read for.
+    #[getter]
+    fn visible(&self) -> bool {
+        self.inner.visible
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OptionalContentGroup(name={}, visible={})",
+            repr_opt_str(self.inner.name.as_deref()),
+            repr_bool(self.inner.visible)
+        )
+    }
+}
+
+/// An optional content usage dictionary: what a group's content is for.
+#[pyclass(frozen)]
+pub(crate) struct OptionalContentUsage {
+    inner: CoreOcUsage,
+}
+
+/// An optional bool as Python's `repr` writes it.
+fn repr_opt_bool(value: Option<bool>) -> &'static str {
+    match value {
+        Some(value) => repr_bool(value),
+        None => "None",
+    }
+}
+
+#[pymethods]
+impl OptionalContentUsage {
+    /// `/View /ViewState`: whether the group should be on when the
+    /// document is opened on screen.
+    #[getter]
+    fn view(&self) -> Option<bool> {
+        self.inner.view
+    }
+
+    /// `/Print /PrintState`: whether the group should be on when printed.
+    #[getter]
+    fn print(&self) -> Option<bool> {
+        self.inner.print
+    }
+
+    /// `/Print /Subtype`: the kind of print content, such as
+    /// `"Watermark"`, `"Trapping"` or `"PrintersMarks"`.
+    #[getter]
+    fn print_subtype(&self) -> Option<&str> {
+        self.inner.print_subtype.as_deref()
+    }
+
+    /// `/Export /ExportState`: whether the group should be on when
+    /// exported to a format without optional content.
+    #[getter]
+    fn export(&self) -> Option<bool> {
+        self.inner.export
+    }
+
+    /// `/Zoom /min`: the magnification the group is on from.
+    #[getter]
+    fn zoom_min(&self) -> Option<f64> {
+        self.inner.zoom_min
+    }
+
+    /// `/Zoom /max`: the magnification below which the group is on.
+    #[getter]
+    fn zoom_max(&self) -> Option<f64> {
+        self.inner.zoom_max
+    }
+
+    /// `/Language /Lang`: the content's language tag, such as `"es-MX"`.
+    #[getter]
+    fn language(&self) -> Option<&str> {
+        self.inner.language.as_deref()
+    }
+
+    /// `/Language /Preferred`: whether the group is preferred on a partial
+    /// language match.
+    #[getter]
+    fn language_preferred(&self) -> bool {
+        self.inner.language_preferred
+    }
+
+    /// `/PageElement /Subtype`: `"HF"` (header or footer), `"FG"`, `"BG"`
+    /// or `"L"` (logo).
+    #[getter]
+    fn page_element(&self) -> Option<&str> {
+        self.inner.page_element.as_deref()
+    }
+
+    /// `/CreatorInfo /Creator`: the application that created the group.
+    #[getter]
+    fn creator(&self) -> Option<&str> {
+        self.inner.creator.as_deref()
+    }
+
+    /// `/CreatorInfo /Subtype`: the kind of content, such as `"Artwork"`
+    /// or `"Technical"`.
+    #[getter]
+    fn creator_subtype(&self) -> Option<&str> {
+        self.inner.creator_subtype.as_deref()
+    }
+
+    /// `/User /Type`: `"Ind"`, `"Ttl"` or `"Org"`.
+    #[getter]
+    fn user_type(&self) -> Option<&str> {
+        self.inner.user_type.as_deref()
+    }
+
+    /// `/User /Name`: the individuals, titles or organizations named.
+    #[getter]
+    fn user_names(&self) -> Vec<String> {
+        self.inner.user_names.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "OptionalContentUsage(view={}, print={}, export={})",
+            repr_opt_bool(self.inner.view),
+            repr_opt_bool(self.inner.print),
+            repr_opt_bool(self.inner.export)
+        )
+    }
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Linearization>()?;
     module.add_class::<OutputIntent>()?;
+    module.add_class::<OptionalContentGroup>()?;
+    module.add_class::<OptionalContentUsage>()?;
     module.add_class::<PagePiece>()?;
     module.add_class::<Thumbnail>()?;
     module.add_class::<Bead>()?;

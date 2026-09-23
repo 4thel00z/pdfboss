@@ -78,6 +78,7 @@ spans  = list(doc.spans())                    # styled spans: font, weight, colo
 fields = doc.form_fields()                    # interactive form: .name, .field_type, .text, .checked, .selected
 toc    = doc.outline()                        # bookmarks: .title, .page, .children; also page_labels(), embedded_files(), named_destinations()
 intents = doc.output_intents()                # .subtype, .output_condition_identifier; also is_linearized(), articles(), piece_info(), permission_handlers()
+layers = doc.optional_content_groups()        # PDF layers: .name, .intent, .usage.print, .visible on screen; event="print" | "export" | None
 thumb  = doc[0].thumbnail_image()             # PageImage or None; also doc[0].presentation() (.duration, .transition.style), .beads(), .piece_info()
 scales = doc[0].viewports()                   # measurement viewports: .bbox, .measure.distance; also doc[0].separation_info(), doc.requirements(), doc.legal_attestation()
 notes  = doc[0].annotations()                 # annotations: .subtype, .rect, .contents, .markup.title, .destination.page, .action.uri; also .additional_actions()

@@ -89,9 +89,19 @@ page rasterized exactly as it describes itself.
 
 Two things are deliberately not reported, because they are configured behavior
 rather than a failure: text left unpainted by the requested font tier, and
-content in optional-content layers (PDF layers) the document's default
-configuration turns off. The latter is counted separately, on the report's
-`hidden` counter in Rust.
+content in optional-content layers (PDF layers) the document turns off. The
+latter is counted separately, on the report's `hidden` counter in Rust.
+
+The layers that are off are the ones a viewer hides on screen: the default
+configuration's `/BaseState`, `/ON` and `/OFF`, then the usage application
+dictionaries for the View event (a layer whose usage says `/ViewState /OFF`,
+such as a print-only notice, does not paint), and a group whose `/Intent` does
+not match the configuration's never hides anything. That is the state
+`Document::oc_state()` builds and pdfium and pdf.js render by default.
+`Document::oc_state_for(Some(OcEvent::Print))` builds the printed state and
+`oc_state_for(None)` the default configuration alone, without any usage
+application, which ISO 32000-1 prescribes for printing and aggregating
+applications; pass either through `RenderOptions::oc`.
 
 ## Annotations and transparency groups
 

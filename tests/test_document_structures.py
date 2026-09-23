@@ -19,6 +19,8 @@ from pdfboss import (
     DefaultAppearance,
     Document,
     Linearization,
+    OptionalContentGroup,
+    OptionalContentUsage,
     OutputIntent,
     PageImage,
     PagePiece,
@@ -192,6 +194,98 @@ class TestOutputIntents:
 
     def test_a_document_without_intents(self, hello_pdf: Path) -> None:
         assert Document(hello_pdf).output_intents() == []
+
+
+def layers_pdf() -> bytes:
+    """One page with three optional content groups: a body layer, a
+    print-only notice whose ``/Usage`` View state the configuration's
+    ``/AS`` array applies, and a Design-intent group the ``/OFF`` array
+    names."""
+    content = (
+        b"/OC /Body BDC BT /F1 18 Tf 20 120 Td (Body text) Tj ET EMC "
+        b"/OC /PrintOnly BDC BT /F1 16 Tf 30 38 Td (PRINT ONLY) Tj ET EMC "
+        b"/OC /Design BDC BT /F1 12 Tf 20 90 Td (guide) Tj ET EMC"
+    )
+    return build_pdf(
+        {
+            1: (
+                b"<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [6 0 R 7 0 R 8 0 R] "
+                b"/D << /OFF [8 0 R] /AS [ << /Event /View /OCGs [7 0 R] /Category [/View] >> "
+                b"<< /Event /Print /OCGs [7 0 R] /Category [/Print] >> ] >> >> >>"
+            ),
+             2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: (
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 160] /Contents 4 0 R "
+                b"/Resources << /Font << /F1 5 0 R >> "
+                b"/Properties << /Body 6 0 R /PrintOnly 7 0 R /Design 8 0 R >> >> >>"
+            ),
+            4: stream(b"", content),
+            5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            6: b"<< /Type /OCG /Name (Body) >>",
+            7: (
+                b"<< /Type /OCG /Name (Print only) /Usage << /View << /ViewState /OFF >> "
+                b"/Print << /PrintState /ON /Subtype /Watermark >> /Zoom << /min 0.5 /max 4 >> "
+                b"/Language << /Lang (es-MX) /Preferred /ON >> /PageElement << /Subtype /HF >> "
+                b"/CreatorInfo << /Creator (CAD) /Subtype /Technical >> "
+                b"/User << /Type /Org /Name [(Acme) (Globex)] >> >> >>"
+            ),
+            8: b"<< /Type /OCG /Name (Design guides) /Intent [/Design] >>",
+        }
+    )
+
+
+class TestOptionalContent:
+    def test_groups_read_in_order_with_their_view_state(self) -> None:
+        groups = Document(data=layers_pdf()).optional_content_groups()
+        assert [group.name for group in groups] == ["Body", "Print only", "Design guides"]
+        assert [group.ref for group in groups] == [(6, 0), (7, 0), (8, 0)]
+        body, print_only, design = groups
+        assert isinstance(body, OptionalContentGroup)
+        assert body.visible is True
+        assert body.intent == ["View"]
+        assert body.usage.view is None
+        assert print_only.visible is False, "ViewState OFF under the View event"
+        assert design.visible is True, "a Design group never hides content"
+        assert design.intent == ["Design"]
+        assert repr(print_only) == "OptionalContentGroup(name='Print only', visible=False)"
+
+    def test_usage_dictionary_reads_every_entry(self) -> None:
+        usage = Document(data=layers_pdf()).optional_content_groups()[1].usage
+        assert isinstance(usage, OptionalContentUsage)
+        assert usage.view is False
+        assert usage.print is True
+        assert usage.print_subtype == "Watermark"
+        assert usage.export is None
+        assert usage.zoom_min == 0.5
+        assert usage.zoom_max == 4.0
+        assert usage.language == "es-MX"
+        assert usage.language_preferred is True
+        assert usage.page_element == "HF"
+        assert usage.creator == "CAD"
+        assert usage.creator_subtype == "Technical"
+        assert usage.user_type == "Org"
+        assert usage.user_names == ["Acme", "Globex"]
+        assert repr(usage) == "OptionalContentUsage(view=False, print=True, export=None)"
+
+    def test_each_event_builds_its_own_state(self) -> None:
+        doc = Document(data=layers_pdf())
+        visible = lambda event: [g.visible for g in doc.optional_content_groups(event)]  # noqa: E731
+        assert visible("view") == [True, False, True]
+        assert visible("print") == [True, True, True]
+        assert visible("export") == [True, True, True]
+        assert visible(None) == [True, True, True], "no usage application at all"
+        with pytest.raises(ValueError, match="view"):
+            doc.optional_content_groups("screen")
+
+    def test_text_extraction_and_rendering_use_the_view_state(self) -> None:
+        doc = Document(data=layers_pdf())
+        text = doc.extract_text()
+        assert "Body text" in text
+        assert "guide" in text, "the Design group's text is extracted"
+        assert "PRINT ONLY" not in text, "the print-only layer is off on screen"
+
+    def test_a_document_without_layers(self, hello_pdf: Path) -> None:
+        assert Document(hello_pdf).optional_content_groups() == []
 
 
 class TestPieceInfo:
@@ -370,6 +464,11 @@ class TestAsyncTwins:
             assert doc.is_linearized() is False
             intents = await doc.output_intents()
             assert [intent.subtype for intent in intents] == ["GTS_PDFX", "GTS_PDFA1"]
+            layers = await AsyncDocument.from_bytes(layers_pdf())
+            groups = await layers.optional_content_groups()
+            assert [group.visible for group in groups] == [True, False, True]
+            printed = await layers.optional_content_groups("print")
+            assert [group.visible for group in printed] == [True, True, True]
             pieces = await doc.piece_info()
             assert [piece.product for piece in pieces] == ["Illustrator", "Photoshop"]
             threads = await doc.articles()

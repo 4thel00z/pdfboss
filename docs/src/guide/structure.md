@@ -55,6 +55,15 @@ if legal:
     print(legal.counts()["non_embedded_fonts"], legal.attestation)
 ```
 
+`optional_content_groups(event)` lists the document's optional content groups, the PDF layers, in the order the catalog declares them. Each has its `name`, its `intent` names, its `usage` dictionary (`view`, `print`, `export` states, `print_subtype`, `zoom_min`, `zoom_max`, `language`, `page_element`, `creator` and the `user` entries) and `visible`, the group's state under the event asked for. The default `"view"` is the state a viewer shows on screen and the one text extraction and rendering use: the default configuration's on and off lists, then the usage application dictionaries for the View event, while a group whose intent does not match the configuration's never hides content. `"print"` and `"export"` apply that event's dictionaries instead, and `None` applies none, which is the state the standard prescribes for printing and aggregating applications.
+
+```python
+for layer in doc.optional_content_groups():
+    print(layer.name, layer.visible, layer.usage.print_subtype)
+
+printed = {layer.name: layer.visible for layer in doc.optional_content_groups("print")}
+```
+
 ## Annotations, links and actions
 
 `annotations()` on a page returns its annotation dictionaries in `/Annots` order, each read as data: the common entries of every annotation (`subtype`, `rect`, `contents`, `name`, `modified`, `flags`, `border`, `color`, `struct_parent`, `optional_content`, whether an appearance stream is present), the markup entries in `markup` (`title`, `subject`, `opacity`, `in_reply_to`, `reply_type`, `intent`, `created`, `rich_contents`, `popup`), and the entries of the subtypes pdfboss reads further: a link's `destination` (explicit or looked up by name, the page resolved to a 0-based index), a text reply's `state` and `state_model`, a text or pop-up annotation's `open` and `icon`, a pop-up's `parent`, and a file attachment's `file`. `file_spec_data(spec)` on the document decodes the stream a `FileSpec` embeds; a specification whose file system is `URL` exposes the address as `url` instead.
@@ -101,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The same readers exist as free functions over any async object source, named with a `_with` suffix and taking the source and the trailer dictionary: `pdfboss_core::{form_fields_with, interactive_form_with, outline_with, named_destinations_with, page_labels_with, embedded_files_with, embedded_file_data_with, file_spec_data_with, viewer_preferences_with, requirements_with, legal_attestation_with, viewports_with, separation_info_with, annotations_with, action_with, page_additional_actions_with, document_additional_actions_with}`. `pdfboss_aio::AsyncDocument` exposes them as methods, and `Document::{requirements, legal_attestation, viewports, separation_info, annotations, action, page_additional_actions, additional_actions, file_spec_data}` are the sync forms of the last nine.
+The same readers exist as free functions over any async object source, named with a `_with` suffix and taking the source and the trailer dictionary: `pdfboss_core::{form_fields_with, interactive_form_with, outline_with, named_destinations_with, page_labels_with, embedded_files_with, embedded_file_data_with, file_spec_data_with, viewer_preferences_with, requirements_with, legal_attestation_with, viewports_with, separation_info_with, annotations_with, action_with, page_additional_actions_with, document_additional_actions_with, optional_content_groups_with}`. `pdfboss_aio::AsyncDocument` exposes them as methods, and `Document::{requirements, legal_attestation, viewports, separation_info, annotations, action, page_additional_actions, additional_actions, file_spec_data, optional_content_groups}` are the sync forms of the last ten. The groups reader takes an `Option<OcEvent>`, the same value `Document::oc_state_for` builds a visibility state from.
 
 ## CLI
 
