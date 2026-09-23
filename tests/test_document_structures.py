@@ -213,7 +213,7 @@ def layers_pdf() -> bytes:
                 b"/D << /OFF [8 0 R] /AS [ << /Event /View /OCGs [7 0 R] /Category [/View] >> "
                 b"<< /Event /Print /OCGs [7 0 R] /Category [/Print] >> ] >> >> >>"
             ),
-             2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             3: (
                 b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 160] /Contents 4 0 R "
                 b"/Resources << /Font << /F1 5 0 R >> "
