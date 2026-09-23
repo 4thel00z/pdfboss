@@ -99,8 +99,9 @@ Placement differs from extraction on two points, both deliberate:
   their own, so when a page draws one the two lists do not align index for
   index; the `stencil` flag says which entries `extract_images` left out.
 - **Hidden optional content is excluded.** Like text, an image inside a
-  `BDC /OC` span the document's default configuration turns off, or an
-  XObject with a hidden `/OC` entry, is drawn nowhere and placed nowhere.
+  `BDC /OC` span the document turns off on screen (the default configuration
+  with the View usage application applied), or an XObject with a hidden `/OC`
+  entry, is drawn nowhere and placed nowhere.
   `extract_images` embeds it anyway, because the bytes are in the file.
 
 Otherwise the two agree: occurrence-based, drawing order, form XObjects

@@ -1453,7 +1453,7 @@ impl AsyncDocument {
 
     /// The document's optional-content visibility under one usage
     /// application event, or under the default configuration alone for
-    /// `None` — the async twin of the sync document's `oc_state_for`.
+    /// `None`; the async twin of the sync document's `oc_state_for`.
     pub async fn oc_state_for(
         &self,
         event: Option<pdfboss_core::OcEvent>,
@@ -1462,7 +1462,7 @@ impl AsyncDocument {
     }
 
     /// The document's optional content groups in `/OCGs` order, each with
-    /// its state under `event` — the async twin of the sync document's
+    /// its state under `event`; the async twin of the sync document's
     /// `optional_content_groups`.
     pub async fn optional_content_groups(
         &self,
