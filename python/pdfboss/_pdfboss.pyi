@@ -442,6 +442,15 @@ class Document:
         """The output intents the catalog declares (ISO 32000-1 14.11.5),
         in array order. Releases the GIL while they are read."""
 
+    def optional_content_groups(self, event: str | None = "view") -> list[OptionalContentGroup]:
+        """The optional content groups (PDF layers) the catalog declares
+        (ISO 32000-1 8.11.2.1), in ``/OCGs`` order, each with its state
+        under ``event``: ``"view"`` (the default, what a viewer shows on
+        screen and what text extraction and rendering use), ``"print"``,
+        ``"export"``, or ``None`` for the default configuration alone,
+        without any usage application (8.11.4.4). Releases the GIL while
+        they are read."""
+
     def piece_info(self) -> list[PagePiece]:
         """The page-piece data the catalog carries (ISO 32000-1 14.5), one
         entry per product sorted by product name; ``Page.piece_info``
@@ -1268,6 +1277,84 @@ class OutputIntent:
     destination_profile: tuple[int, int] | None
     """The ICC profile stream's ``(num, gen)`` reference."""
 
+class OptionalContentGroup:
+    """One optional content group, a PDF layer (ISO 32000-1 8.11.2.1,
+    Table 98), with its state under the usage application event it was
+    read for; returned by ``Document.optional_content_groups``."""
+
+    ref: tuple[int, int]
+    """The group dictionary's ``(num, gen)`` reference, its identity in
+    ``/OC`` entries and the configuration."""
+
+    name: str | None
+    """The group's name for a user interface, ``/Name``."""
+
+    intent: list[str]
+    """The group's intents, ``/Intent``: ``"View"``, ``"Design"``, or names
+    an extension defines; ``["View"]`` when absent. A group whose intents
+    share no name with the configuration's never hides content
+    (8.11.2.3)."""
+
+    usage: OptionalContentUsage
+    """The group's usage dictionary, every field ``None`` when absent."""
+
+    visible: bool
+    """Whether the group is on under the state it was read for."""
+
+class OptionalContentUsage:
+    """An optional content usage dictionary (ISO 32000-1 8.11.4.4, Table
+    102): what a group's content is for. The configuration's usage
+    application dictionaries decide which of these entries set the
+    group's state under each event."""
+
+    view: bool | None
+    """``/View /ViewState``: whether the group should be on when the
+    document is opened on screen."""
+
+    print: bool | None
+    """``/Print /PrintState``: whether the group should be on when
+    printed."""
+
+    print_subtype: str | None
+    """``/Print /Subtype``: the kind of print content, such as
+    ``"Watermark"``, ``"Trapping"`` or ``"PrintersMarks"``."""
+
+    export: bool | None
+    """``/Export /ExportState``: whether the group should be on when
+    exported to a format without optional content."""
+
+    zoom_min: float | None
+    """``/Zoom /min``: the magnification the group is on from."""
+
+    zoom_max: float | None
+    """``/Zoom /max``: the magnification below which the group is on."""
+
+    language: str | None
+    """``/Language /Lang``: the content's language tag, such as
+    ``"es-MX"``."""
+
+    language_preferred: bool
+    """``/Language /Preferred``: whether the group is preferred on a
+    partial language match."""
+
+    page_element: str | None
+    """``/PageElement /Subtype``: ``"HF"`` (header or footer), ``"FG"``,
+    ``"BG"`` or ``"L"`` (logo)."""
+
+    creator: str | None
+    """``/CreatorInfo /Creator``: the application that created the
+    group."""
+
+    creator_subtype: str | None
+    """``/CreatorInfo /Subtype``: the kind of content, such as
+    ``"Artwork"`` or ``"Technical"``."""
+
+    user_type: str | None
+    """``/User /Type``: ``"Ind"``, ``"Ttl"`` or ``"Org"``."""
+
+    user_names: list[str]
+    """``/User /Name``: the individuals, titles or organizations named."""
+
 class PagePiece:
     """One product's private data in a page-piece dictionary (ISO 32000-1
     14.5, Table 349); returned by ``Document.piece_info`` and
@@ -2092,6 +2179,10 @@ class AsyncDocument:
     async def output_intents(self) -> list[OutputIntent]:
         """The output intents, the async twin of
         ``Document.output_intents``."""
+
+    async def optional_content_groups(self, event: str | None = "view") -> list[OptionalContentGroup]:
+        """The optional content groups with their state under ``event``,
+        the async twin of ``Document.optional_content_groups``."""
 
     async def piece_info(self) -> list[PagePiece]:
         """The catalog's page-piece data, the async twin of

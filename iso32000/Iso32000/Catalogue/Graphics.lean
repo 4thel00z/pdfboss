@@ -162,23 +162,23 @@ def chapter8 : List Feature := [
   { ref := .clause [8, 10, 4, 3], title := "Special Considerations", status := .outOfScope,
     note := "The guidance on /Page and /ID matching against the referenced file does not apply while /Ref is not consulted." },
   { ref := .clause [8, 11, 2, 1], title := "General", status := .implemented,
-    note := "A group is identified by its indirect reference and is off when the default configuration says so; /Name, /Intent and /Usage are not read." },
+    note := "A group is identified by its indirect reference and is off when the configuration's state says so; /Name, /Intent and /Usage are read as data by optional_content_groups_with (crates/pdfboss-core/src/oc.rs, test oc.rs groups_read_as_data), with Python and async twins." },
   { ref := .clause [8, 11, 2, 2], title := "Optional Content Membership Dictionaries", status := .implemented, ref2 := some (.clause [8, 11, 2, 3]),
-    note := "/OCGs (single or array, null entries ignored) under /P AnyOn, AllOn, AnyOff, AllOff and /VE And/Or/Not expressions with nesting all evaluate, /VE taking precedence; oc.rs cites the visibility expression as §8.11.2.3." },
-  { ref := .clause [8, 11, 2, 3], title := "Intent", status := .notImplemented,
-    note := "No code reads /Intent on groups or configurations, so /Design groups are treated like /View groups." },
+    note := "/OCGs (single or array, null entries ignored) under /P AnyOn, AllOn, AnyOff, AllOff and /VE And/Or/Not expressions with nesting all evaluate, /VE taking precedence." },
+  { ref := .clause [8, 11, 2, 3], title := "Intent", status := .implemented,
+    note := "A group's /Intent (a name or an array, default View) must share a name with the configuration's /Intent (default View, All matching every group) for its state to affect visibility, so an off Design group under a View configuration still paints, and an empty configuration array hides nothing (oc.rs retain_matching_intents; tests oc.rs a_group_of_another_intent_never_hides_content, the_configuration_intent_selects_the_groups_it_controls and executor.rs usage_application_and_intent_decide_what_paints)." },
   { ref := .clause [8, 11, 3, 2], title := "Optional Content in Content Streams", status := .implemented,
     note := "BDC /OC with a named /Properties resource or an inline dictionary opens a span whose painting is suppressed while graphics state, text position and clipping still take effect, spans nest and EMC balances; text extraction applies the same gating." },
   { ref := .clause [8, 11, 3, 3], title := "Optional Content in XObjects and Annotations", status := .implemented,
     note := "An /OC entry on an image or form XObject or on an annotation dictionary hides it (counted, not reported as a drop); the code cites this as §8.11.3.5, which is not the -1 number." },
   { ref := .clause [8, 11, 4, 2], title := "Optional Content Properties Dictionary", status := .implemented,
     note := "/OCGs and the default /D configuration are read from the catalog; /Configs alternates are ignored because only /D applies when a document opens." },
-  { ref := .clause [8, 11, 4, 3], title := "Optional Content Configuration Dictionaries", status := .incomplete,
-    note := "/BaseState, /ON and /OFF apply in specification order, while /Intent and /AS are ignored and /Name /Creator /Order /ListMode /RBGroups /Locked are viewer UI entries with no rendering effect." },
-  { ref := .clause [8, 11, 4, 4], title := "Usage and Usage Application Dictionaries", status := .notImplemented,
-    note := "No code reads a group's /Usage dictionary or the configuration's /AS array, so View, Print, Export and Zoom usage never changes a group's state." },
-  { ref := .clause [8, 11, 4, 5], title := "Determining the State of Optional Content Groups", status := .incomplete,
-    note := "The state comes from /BaseState then /ON then /OFF of the default configuration and a document without /OCProperties shows everything, but the usage application step (/AS with the View event) is skipped." }
+  { ref := .clause [8, 11, 4, 3], title := "Optional Content Configuration Dictionaries", status := .implemented,
+    note := "/BaseState, /ON and /OFF apply in specification order, /Intent selects the groups the configuration controls and /AS applies the usage application dictionaries of the requested event (oc.rs configured_off, apply_usage); /Name, /Creator, /Order, /ListMode, /RBGroups and /Locked are viewer UI entries with no rendering effect, and /Configs alternates are not read because only /D applies when a document opens (8.11.4.2)." },
+  { ref := .clause [8, 11, 4, 4], title := "Usage and Usage Application Dictionaries", status := .implemented,
+    note := "The configuration's /AS dictionaries whose /Event is the requested event set each group in their /OCGs from the View, Print or Export entry of its /Usage that the /Category array names, ON turning the group on and OFF off, in array order with later dictionaries winning (oc.rs apply_usage; tests oc.rs view_usage_application_hides_a_view_state_off_group, each_event_applies_its_own_dictionaries, usage_without_application_or_category_changes_nothing). The Zoom, Language and User categories depend on a viewer's magnification, locale and user, which pdfboss has none of, and leave the state unchanged. Every Table 102 entry is read as data (oc.rs read_usage, test oc.rs groups_read_as_data)." },
+  { ref := .clause [8, 11, 4, 5], title := "Determining the State of Optional Content Groups", status := .implemented,
+    note := "The state comes from /BaseState then /ON then /OFF of the default configuration, then the /AS dictionaries of one event, then the intent rule; a document without /OCProperties shows everything. Document::oc_state, which rendering and text extraction use, is the View event's state a viewer shows on screen (pdfium and pdf.js render the same), while oc_state_for(None) is the default configuration alone that the clause prescribes for printing and aggregating applications, and oc_state_for(Some(Print)) the printed state (tests executor.rs usage_application_and_intent_decide_what_paints, extract.rs usage_application_decides_which_layers_are_extracted, parity.rs optional_content_states_and_groups_agree)." }
 ]
 
 end Iso32000.Catalogue

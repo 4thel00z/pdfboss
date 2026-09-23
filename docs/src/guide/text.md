@@ -180,8 +180,12 @@ parse, a missing resource, an exhausted form nesting or invocation limit).
 content the document's optional-content configuration turns off; that is configured
 behavior, not a loss, so `report.is_complete()` ignores it and is true exactly when
 nothing was left out. An empty text with an empty report really is an empty page.
-The CLI warnings above are this report, printed. Layers the document's default
-optional-content configuration disables are excluded from the text.
+The CLI warnings above are this report, printed. Layers the document turns off
+on screen are excluded from the text: the default optional-content
+configuration with the View usage application applied, so a print-only layer
+is left out while a group of another `/Intent` is kept. The Rust `_with`
+entries take the state explicitly, so `doc.oc_state_for(Some(OcEvent::Print))`
+extracts the text as printed.
 
 ## Encodings
 

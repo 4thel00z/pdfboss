@@ -1451,6 +1451,26 @@ impl AsyncDocument {
         pdfboss_core::OcState::load_with(self, &self.inner.xref.trailer).await
     }
 
+    /// The document's optional-content visibility under one usage
+    /// application event, or under the default configuration alone for
+    /// `None`; the async twin of the sync document's `oc_state_for`.
+    pub async fn oc_state_for(
+        &self,
+        event: Option<pdfboss_core::OcEvent>,
+    ) -> Option<pdfboss_core::OcState> {
+        pdfboss_core::OcState::load_for_with(self, &self.inner.xref.trailer, event).await
+    }
+
+    /// The document's optional content groups in `/OCGs` order, each with
+    /// its state under `event`; the async twin of the sync document's
+    /// `optional_content_groups`.
+    pub async fn optional_content_groups(
+        &self,
+        event: Option<pdfboss_core::OcEvent>,
+    ) -> Vec<pdfboss_core::OcGroup> {
+        pdfboss_core::optional_content_groups_with(self, &self.inner.xref.trailer, event).await
+    }
+
     /// The document's structure tree (ISO 32000-1 §14.7), or `None` when the
     /// catalog names no `/StructTreeRoot`: the async twin of the sync
     /// document's `structure_tree()`, read over range fetches. Pass it to

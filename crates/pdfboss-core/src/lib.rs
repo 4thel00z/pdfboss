@@ -87,7 +87,7 @@ pub use measure::{
 };
 pub use names::{name_tree_root_with, named_with, names_with, NameTree};
 pub use object::{Dict, Name, ObjRef, Object, Stream};
-pub use oc::OcState;
+pub use oc::{optional_content_groups_with, OcEvent, OcGroup, OcState, OcUsage};
 pub use outline::{outline_with, OutlineItem};
 pub use output_intent::{output_intents_with, OutputIntent};
 pub use page_label::{page_label, page_labels_with, LabelStyle, PageLabel};

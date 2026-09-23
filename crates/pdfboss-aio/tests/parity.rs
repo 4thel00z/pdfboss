@@ -922,6 +922,69 @@ async fn optional_content_renders_identically() {
     );
 }
 
+/// Both documents build the same state for every usage application event
+/// and read the same groups: a print-only layer is off under View, on
+/// under Print, and untouched by the default configuration alone.
+// Covers ISO 32000-1 §8.11.4.4 and §8.11.4.5.
+#[tokio::test]
+async fn optional_content_states_and_groups_agree() {
+    use pdfboss_core::OcEvent;
+    let mut b = PdfBuilder::new();
+    b.object(
+        1,
+        "<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [8 0 R 9 0 R] \
+         /D << /OFF [9 0 R] /AS [ << /Event /View /OCGs [8 0 R] /Category [/View] >> \
+         << /Event /Print /OCGs [8 0 R] /Category [/Print] >> ] >> >> >>",
+    );
+    b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+    b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+    b.object(
+        8,
+        "<< /Type /OCG /Name (print only) /Usage << /View << /ViewState /OFF >> \
+         /Print << /PrintState /ON /Subtype /Watermark >> >> >>",
+    );
+    b.object(9, "<< /Type /OCG /Name (guides) /Intent /Design >>");
+    let bytes = b.build(1);
+    let sync_doc = Document::load(bytes.clone()).expect("sync load");
+    let async_doc = AsyncDocument::from_bytes(bytes).await.expect("async open");
+    let print_only = pdfboss_core::ObjRef { num: 8, gen: 0 };
+    for event in [
+        Some(OcEvent::View),
+        Some(OcEvent::Print),
+        Some(OcEvent::Export),
+        None,
+    ] {
+        let sync_state = sync_doc.oc_state_for(event).expect("sync state");
+        let async_state = async_doc.oc_state_for(event).await.expect("async state");
+        assert_eq!(sync_state, async_state, "{event:?}: state");
+        assert_eq!(
+            sync_state.hidden(print_only),
+            event == Some(OcEvent::View),
+            "{event:?}: the print-only layer is off on screen only"
+        );
+        let sync_groups = sync_doc.optional_content_groups(event);
+        assert_eq!(
+            sync_groups,
+            async_doc.optional_content_groups(event).await,
+            "{event:?}: groups"
+        );
+        assert_eq!(sync_groups.len(), 2);
+        assert_eq!(
+            sync_groups[0].usage.print_subtype.as_deref(),
+            Some("Watermark")
+        );
+        assert!(
+            sync_groups[1].visible,
+            "a Design group under a View configuration"
+        );
+    }
+    assert_eq!(
+        async_doc.oc_state().await,
+        async_doc.oc_state_for(Some(OcEvent::View)).await,
+        "the default state is the View event's"
+    );
+}
+
 /// An encryption dictionary whose `/CF` is an indirect object is followed by
 /// both readers, so the file opens and decrypts the same way on each side.
 // Covers ISO 32000-1 §7.6.3.2 and §7.6.5.

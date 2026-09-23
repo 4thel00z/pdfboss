@@ -66,6 +66,7 @@ def test_stub_declares_the_document_and_page_structure_methods() -> None:
     stub = STUB.read_text()
     for line in (
         "def output_intents(self) -> list[OutputIntent]",
+        'def optional_content_groups(self, event: str | None = "view") -> list[OptionalContentGroup]',
         "def piece_info(self) -> list[PagePiece]",
         "def articles(self) -> list[ArticleThread]",
         "def permission_handlers(self) -> PermissionHandlers | None",
