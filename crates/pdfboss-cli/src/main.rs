@@ -751,6 +751,15 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                 threads.iter().map(|thread| thread.beads.len()).sum(),
             );
             let linearization = doc.linearization();
+            // Optional content groups under the viewer's state (ISO 32000-1
+            // §8.11.4.5): the count the catalog declares and how many are off.
+            let groups = doc.optional_content_groups(Some(pdfboss_core::OcEvent::View));
+            let layers = doc.oc_state().map(|_| {
+                (
+                    groups.len(),
+                    groups.iter().filter(|group| !group.visible).count(),
+                )
+            });
             let handlers = doc.permission_handlers();
             let mut perms = Vec::new();
             if handlers.as_ref().is_some_and(|h| h.doc_mdp.is_some()) {
@@ -780,6 +789,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     separation_pages,
                     colorants: &colorants,
                     annotations: &annotations,
+                    layers,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -847,6 +857,9 @@ struct Info<'a> {
     /// Annotation subtypes over every page with their counts, most
     /// frequent first.
     annotations: &'a [(String, usize)],
+    /// Optional content groups: how many the catalog declares and how many
+    /// are off on screen; `None` without `/OCProperties`.
+    layers: Option<(usize, usize)>,
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -1059,6 +1072,11 @@ fn info_text(info: &Info) -> String {
             .map(|(subtype, count)| format!("{subtype} {count}"))
             .collect();
         let _ = writeln!(out, "annots:    {total} ({})", breakdown.join(", "));
+    }
+    // Optional content groups (ISO 32000-1 §8.11.2.1) and how many the
+    // viewer's state turns off (§8.11.4.5).
+    if let Some((total, off)) = info.layers {
+        let _ = writeln!(out, "layers:    {total} ({off} off)");
     }
     // The products that left private data on the catalog or a page (ISO
     // 32000-1 §14.5).
@@ -1696,6 +1714,20 @@ mod tests {
             "{report}"
         );
         assert!(!info_text(&Info::default()).contains("annots"));
+    }
+
+    /// Optional content prints as the declared group count and how many
+    /// are off on screen; a document without `/OCProperties` prints no
+    /// line.
+    // Covers ISO 32000-1 §8.11.2.1 and §8.11.4.5.
+    #[test]
+    fn info_text_counts_optional_content_groups() {
+        let report = info_text(&Info {
+            layers: Some((3, 1)),
+            ..Info::default()
+        });
+        assert!(report.contains("layers:    3 (1 off)\n"), "{report}");
+        assert!(!info_text(&Info::default()).contains("layers"));
     }
 
     /// The catalog's developer extensions print after the version, one
