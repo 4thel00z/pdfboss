@@ -1,0 +1,51 @@
+%PDF-1.7
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R /OCProperties << /OCGs [10 0 R 11 0 R 12 0 R] /D << /OFF [12 0 R] /Order [10 0 R 11 0 R 12 0 R] /AS [ << /Event /View /OCGs [11 0 R] /Category [/View] >> << /Event /Print /OCGs [11 0 R] /Category [/Print] >> ] >> >> >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 240 160] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /Properties << /Body 10 0 R /PrintOnly 11 0 R /Design 12 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 230 >>
+stream
+/OC /Body BDC BT /F1 18 Tf 20 120 Td (Body text) Tj ET EMC
+/OC /PrintOnly BDC 0.9 0.1 0.1 rg 20 20 200 50 re f BT 1 1 1 rg /F1 16 Tf 30 38 Td (PRINT ONLY NOTICE) Tj ET EMC
+/OC /Design BDC 0.1 0.3 0.9 RG 2 w 20 90 m 220 90 l S EMC
+
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+10 0 obj
+<< /Type /OCG /Name (Body) >>
+endobj
+11 0 obj
+<< /Type /OCG /Name (Print only) /Usage << /View << /ViewState /OFF >> /Print << /PrintState /ON >> >> >>
+endobj
+12 0 obj
+<< /Type /OCG /Name (Design guides) /Intent /Design >>
+endobj
+xref
+0 13
+0000000000 65535 f 
+0000000009 00000 n 
+0000000274 00000 n 
+0000000331 00000 n 
+0000000521 00000 n 
+0000000802 00000 n 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000872 00000 n 
+0000000918 00000 n 
+0000001040 00000 n 
+trailer
+<< /Size 13 /Root 1 0 R >>
+startxref
+1111
+%%EOF
