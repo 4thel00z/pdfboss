@@ -78,6 +78,7 @@ intents = doc.output_intents()             # also is_linearized(), articles(), p
 layers = doc.optional_content_groups()     # PDF layers: .name, .intent, .usage.print, .visible on screen; event="print" | "export" | None
 scales = doc[0].viewports()                # measurement viewports: .bbox, .measure.distance; also doc[0].separation_info(), doc.requirements(), doc.legal_attestation()
 notes  = doc[0].annotations()              # annotations: .subtype, .rect, .contents, .markup.title, .destination.page, .action.uri; also .additional_actions()
+items  = doc[0].content_items()            # tagged page in structure-tree order: .kind ("sequence"/"object"), .mcid, .ref, .rank, .standard_type
 pdf  = pdfboss.md.to_pdf(open("notes.md").read())  # markdown -> themed PDF bytes
 ```
 
