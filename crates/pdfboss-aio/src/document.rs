@@ -1479,6 +1479,16 @@ impl AsyncDocument {
         pdfboss_core::StructureTree::load_with(self, &self.inner.xref.trailer).await
     }
 
+    /// A page's content items in structure-tree order (ISO 32000-1
+    /// §14.7.4), sequences and annotations ranked together: the async twin
+    /// of the sync document's `content_items`.
+    pub async fn content_items(&self, page: &Page) -> Vec<pdfboss_core::PlacedItem> {
+        let Some(tree) = self.structure_tree().await else {
+            return Vec::new();
+        };
+        tree.content_items_with(self, page).await
+    }
+
     /// The object that `key` names in the catalog's `tree` (ISO 32000-1
     /// §7.7.4), resolved: the async twin of the sync document's `named`.
     pub async fn named(&self, tree: pdfboss_core::NameTree, key: &[u8]) -> Option<Object> {

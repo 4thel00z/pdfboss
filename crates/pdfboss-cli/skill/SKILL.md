@@ -82,6 +82,7 @@ layers = doc.optional_content_groups()        # PDF layers: .name, .intent, .usa
 thumb  = doc[0].thumbnail_image()             # PageImage or None; also doc[0].presentation() (.duration, .transition.style), .beads(), .piece_info()
 scales = doc[0].viewports()                   # measurement viewports: .bbox, .measure.distance; also doc[0].separation_info(), doc.requirements(), doc.legal_attestation()
 notes  = doc[0].annotations()                 # annotations: .subtype, .rect, .contents, .markup.title, .destination.page, .action.uri; also .additional_actions()
+items  = doc[0].content_items()               # tagged page in structure-tree order: .kind ("sequence"/"object"), .mcid, .ref, .rank, .standard_type
 
 # async, over files or HTTP, range-fetched
 doc = await pdfboss.AsyncDocument.open_url("https://example.com/doc.pdf")

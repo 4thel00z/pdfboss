@@ -1543,6 +1543,21 @@ impl Page {
         });
         annotations::triggered_actions(py, found, &pages)
     }
+
+    /// The page's content items in structure-tree order: the
+    /// marked-content sequences of its content stream and the annotations
+    /// the tree holds through object references, ranked together, so each
+    /// annotation sits where the standard puts it in the page's content
+    /// order. Empty for a page the tree does not reach. Releases the GIL.
+    fn content_items(&self, py: Python<'_>) -> Vec<document::ContentItem> {
+        py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            doc.content_items(&self.page)
+        })
+        .into_iter()
+        .map(document::ContentItem::from)
+        .collect()
+    }
 }
 
 /// One styled text span: a positioned run of text with everything the
@@ -3036,6 +3051,19 @@ impl AsyncPage {
             let pages = aio_page_index(&doc);
             let found = doc.page_additional_actions(&page).await;
             Python::with_gil(|py| annotations::triggered_actions(py, found, &pages))
+        })
+    }
+
+    /// The page's content items in structure-tree order, the async twin
+    /// of `Page.content_items`; coroutine resolving to a list.
+    fn content_items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let found = doc.content_items(&page).await;
+            Ok::<Vec<document::ContentItem>, PyErr>(
+                found.into_iter().map(document::ContentItem::from).collect(),
+            )
         })
     }
 }

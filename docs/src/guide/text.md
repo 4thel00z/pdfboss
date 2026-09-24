@@ -58,6 +58,38 @@ requested, or `Content` when the structure tree was asked for and the page has n
 entry in it. The content-order walk is compiled without the marked-content
 bookkeeping the structure-tree walk needs, so the default costs nothing extra.
 
+### Annotations in the reading order
+
+Annotations live in the page's `/Annots` array, not in the content stream, so
+their place in the reading order comes from the structure tree alone (ISO 32000-1
+14.8.2.3.2): a Link, Form or Annot element holds the annotation through an object
+reference (`/Type /OBJR`, 14.7.4.3), and the annotation precedes or follows the
+marked-content sequences its element sits between. `Page.content_items()` returns
+the page's content items in that order, sequences and annotations ranked
+together, each with the element holding it. Text extraction returns no annotation
+text, so this is where an annotation's slot among the text is read off:
+
+```python
+page = doc[0]
+annotations = {a.ref: a for a in page.annotations()}
+for item in page.content_items():
+    if item.kind == "object":
+        print(item.rank, item.standard_type, annotations[item.ref].subtype)
+    else:
+        print(item.rank, item.standard_type, "marked content", item.mcid)
+```
+
+In Rust `Document::content_items(&page)` returns the same list as `PlacedItem`
+records, and `StructureTree::place_items_with` places any set of `ContentItem`s
+(sequences by their `/StructParents` key and MCID, objects by reference) in one
+shared rank space; the spans of `pdfboss_text` under structure-tree order carry
+the holding element in `structure.path`, which is how a span and an item of the
+same Link element are matched. Only the page's own content stream and its
+`/Annots` are enumerated: the sequences of a form XObject with its own
+`/StructParents` are placed when handed in. The Python spans expose the
+element's description and language but not its reference, so in Python the match
+between a span and an item goes through the annotation's rectangle.
+
 ## CLI
 
 ```bash

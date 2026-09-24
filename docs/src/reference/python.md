@@ -72,7 +72,7 @@ Guide chapters with runnable examples: [Extracting text](../guide/text.md), [Mar
 
 ## The document and page structure classes
 
-Nine more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `optional_content_groups(event)`, `piece_info()`, `articles()`, `permission_handlers()`, `requirements()` and `legal_attestation()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Nine `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()`, `presentation()`, `viewports()`, `separation_info()`, `annotations()` and `additional_actions()`. `Document.additional_actions()` reads the catalog's trigger events and `Document.file_spec_data(spec)` decodes the file a `FileSpec` embeds, both with `AsyncDocument` twins. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
+Nine more `Document` methods read structures beyond the catalog readers above: `linearization()`, `is_linearized()`, `output_intents()`, `optional_content_groups(event)`, `piece_info()`, `articles()`, `permission_handlers()`, `requirements()` and `legal_attestation()`. `AsyncDocument` has each under the same name; the first two are plain calls there too, since the file head is read at open, the rest are coroutines. Ten `Page` methods read a page's own structures, each with an `AsyncPage` coroutine twin: `piece_info()`, `thumbnail()`, `thumbnail_image(compression)`, `beads()`, `presentation()`, `viewports()`, `separation_info()`, `annotations()`, `additional_actions()` and `content_items()`. `Document.additional_actions()` reads the catalog's trigger events and `Document.file_spec_data(spec)` decodes the file a `FileSpec` embeds, both with `AsyncDocument` twins. The conventions above hold: enumerations are kebab-case strings, object references `(num, gen)` tuples, dates ISO 8601 strings, and every reader that resolves objects releases the GIL.
 
 | Name | What it is |
 |---|---|
@@ -103,6 +103,7 @@ Nine more `Document` methods read structures beyond the catalog readers above: `
 | `Target` | One step of an embedded go-to action's path: `relationship`, `name`, `page`, `annotation`, `next` |
 | `WindowsLaunch` | A launch action's Windows parameters: `file`, `directory`, `operation`, `parameters` |
 | `TriggeredAction` | One entry of an additional-actions dictionary: `trigger` (kebab-case, `"cursor-enter"`, `"page-open"`, `"will-close"` and the rest of Tables 194 to 197) and `action` |
+| `ContentItem` | One content item of a page in structure-tree order (14.7.4), returned by `Page.content_items()`: `kind` (`"sequence"` or `"object"`), `mcid` and `struct_parents` for a marked-content sequence, `ref` for an annotation the tree holds through an object reference (14.7.4.3), `rank`, the holding element's `structure_type`, `mapped_type`, `standard_type` and `path`, plus `alt`, `lang`, `expansion` |
 
 ```python
 import pdfboss
@@ -145,6 +146,8 @@ for annotation in page.annotations():
         open(annotation.file.name, "wb").write(doc.file_spec_data(annotation.file))
 for triggered in page.additional_actions() + doc.additional_actions():
     print(triggered.trigger, triggered.action.kind)
+for item in page.content_items():
+    print(item.rank, item.standard_type, item.ref if item.kind == "object" else item.mcid)
 ```
 
 ## The md submodule
