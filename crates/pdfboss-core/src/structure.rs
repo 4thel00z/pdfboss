@@ -2049,10 +2049,7 @@ mod tests {
     }
 
     fn items_of(placed: &[PlacedItem]) -> Vec<(ContentItem, u32)> {
-        placed
-            .iter()
-            .map(|p| (p.item, p.placement.rank))
-            .collect()
+        placed.iter().map(|p| (p.item, p.placement.rank)).collect()
     }
 
     /// A page with two paragraphs and a link between them: paragraph 13
