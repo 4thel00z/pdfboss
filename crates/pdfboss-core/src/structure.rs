@@ -24,6 +24,27 @@ pub struct MarkedContentId {
     pub mcid: u32,
 }
 
+/// One content item of a structure element (§14.7.4): a marked-content
+/// sequence of a content stream, or a whole object, an annotation or an
+/// XObject, that the element holds through an object reference dictionary
+/// (`/Type /OBJR`, §14.7.4.3).
+///
+/// Covers ISO 32000-1 §14.7.4 and §14.7.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentItem {
+    Sequence(MarkedContentId),
+    Object(ObjRef),
+}
+
+/// A content item with its place in the structure tree.
+///
+/// Covers ISO 32000-1 §14.7.4.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedItem {
+    pub item: ContentItem,
+    pub placement: Placement,
+}
+
 /// The four groups §14.8.4 sorts the standard structure types into, one per
 /// clause that defines them; the block-level and inline-level ones are the
 /// two the basic layout model of §14.8.3 lays out.
@@ -537,14 +558,109 @@ impl StructureTree {
         page: &Page,
         ids: &[MarkedContentId],
     ) -> FastMap<MarkedContentId, Placement> {
-        let mut placed: FastMap<MarkedContentId, Placement> = FastMap::default();
-        let Some(parent_tree) = self.root.get("ParentTree") else {
-            return placed;
+        let items: Vec<ContentItem> = ids.iter().copied().map(ContentItem::Sequence).collect();
+        self.place_items_with(src, page, &items)
+            .await
+            .into_iter()
+            .filter_map(|(item, placement)| match item {
+                ContentItem::Sequence(id) => Some((id, placement)),
+                ContentItem::Object(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every content item of `page` the tree reaches, in the tree's
+    /// depth-first order: the marked-content sequences of the page's own
+    /// content stream (every entry of the parent tree's array under the
+    /// page's `/StructParents`) and the annotations of its `/Annots` that
+    /// carry a `/StructParent`. Ranks are shared, so an annotation's place
+    /// among the sequences is the place §14.8.2.3.2 gives it: right before
+    /// the sequence that follows it in the tree. The sequences of a form
+    /// XObject with its own `/StructParents` are not enumerated here; pass
+    /// them to [`StructureTree::place_items_with`] when a walk of the page
+    /// content has found them.
+    ///
+    /// Covers ISO 32000-1 §14.7.4, §14.7.4.3, §14.7.4.4 and §14.8.2.3.2.
+    pub async fn content_items_with<S: AsyncObjectSource>(
+        &self,
+        src: &S,
+        page: &Page,
+    ) -> Vec<PlacedItem> {
+        let Some((parent_tree, mut walk)) = self.walk(src, page).await else {
+            return Vec::new();
         };
-        let Some(parent_tree) = resolved_dict(src, parent_tree).await else {
-            return placed;
+        let mut items: Vec<ContentItem> = Vec::new();
+        let page_dict = page.dict();
+        let parents = page_dict
+            .get_int("StructParents")
+            .and_then(|n| u32::try_from(n).ok());
+        if let Some(parents) = parents {
+            if let Some(entries) = walk.parent_array(&parent_tree, parents).await {
+                items.extend(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| entry.as_ref().is_some())
+                        .map(|(mcid, _)| {
+                            ContentItem::Sequence(MarkedContentId {
+                                parents,
+                                mcid: mcid as u32,
+                            })
+                        }),
+                );
+            }
+        }
+        for r in annotation_refs(src, &page_dict).await {
+            let Some(dict) = walk.dict(r).await else {
+                continue;
+            };
+            if dict.get("StructParent").is_some() {
+                items.push(ContentItem::Object(r));
+            }
+        }
+        let mut placed: Vec<PlacedItem> = walk
+            .place(&parent_tree, self, &items)
+            .await
+            .into_iter()
+            .map(|(item, placement)| PlacedItem { item, placement })
+            .collect();
+        placed.sort_by_key(|placed| placed.placement.rank);
+        placed
+    }
+
+    /// Places `items`, content items of `page`, in the tree: each gets its
+    /// rank in the tree's depth-first order among the items given (0 for
+    /// the first the tree reaches, and so on) and the structure type of the
+    /// element holding it. A sequence is found through the parent tree's
+    /// array under its `/StructParents` key, an object through the parent
+    /// tree's entry under the object's own `/StructParent` (§14.7.4.4) and
+    /// then the object reference among the element's kids (§14.7.4.3). An
+    /// item the tree never reaches is absent.
+    ///
+    /// Covers ISO 32000-1 §14.7.4, §14.7.4.3 and §14.7.4.4.
+    pub async fn place_items_with<S: AsyncObjectSource>(
+        &self,
+        src: &S,
+        page: &Page,
+        items: &[ContentItem],
+    ) -> FastMap<ContentItem, Placement> {
+        let Some((parent_tree, mut walk)) = self.walk(src, page).await else {
+            return FastMap::default();
         };
-        let mut walk = Walk {
+        walk.place(&parent_tree, self, items).await
+    }
+
+    /// The resolved parent tree and a fresh walk of `page`, or `None` when
+    /// the root names no readable `/ParentTree`, which leaves every content
+    /// item unplaced.
+    async fn walk<'a, S: AsyncObjectSource>(
+        &'a self,
+        src: &'a S,
+        page: &Page,
+    ) -> Option<(Dict, Walk<'a, S>)> {
+        let parent_tree = self.root.get("ParentTree")?;
+        let parent_tree = resolved_dict(src, parent_tree).await?;
+        let walk = Walk {
             src,
             page_ref: page.object_ref(),
             root_ref: self.root_ref,
@@ -552,28 +668,49 @@ impl StructureTree {
             dicts: FastMap::default(),
             paths: FastMap::default(),
             parents: FastMap::default(),
+            parent_elements: FastMap::default(),
         };
-        let mut keyed: Vec<(MarkedContentId, Vec<u32>, Ancestry)> = Vec::new();
-        let mut seen: FastSet<MarkedContentId> = FastSet::default();
-        for id in ids {
-            if !seen.insert(*id) {
+        Some((parent_tree, walk))
+    }
+}
+
+impl<S: AsyncObjectSource> Walk<'_, S> {
+    /// [`StructureTree::place_items_with`] over this walk: the sort keys of
+    /// every item the tree reaches, then ranks by key order.
+    ///
+    /// Covers ISO 32000-1 §14.7.3, §14.8.2 and §14.8.2.3.
+    async fn place(
+        &mut self,
+        parent_tree: &Dict,
+        tree: &StructureTree,
+        items: &[ContentItem],
+    ) -> FastMap<ContentItem, Placement> {
+        let mut placed: FastMap<ContentItem, Placement> = FastMap::default();
+        let mut keyed: Vec<(ContentItem, Vec<u32>, Ancestry)> = Vec::new();
+        let mut seen: FastSet<ContentItem> = FastSet::default();
+        for item in items {
+            if !seen.insert(*item) {
                 continue;
             }
-            let Some((key, ancestry)) = walk.key_of(&parent_tree, *id).await else {
+            let found = match item {
+                ContentItem::Sequence(id) => self.key_of(parent_tree, *id).await,
+                ContentItem::Object(r) => self.object_key_of(parent_tree, *r).await,
+            };
+            let Some((key, ancestry)) = found else {
                 continue;
             };
-            keyed.push((*id, key, ancestry));
+            keyed.push((*item, key, ancestry));
         }
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
         for (rank, (id, _, ancestry)) in keyed.into_iter().enumerate() {
             let structure_type = ancestry.last().and_then(|a| a.structure_type.clone());
-            let mapped_type = structure_type.as_deref().map(|s| self.mapped_type(s));
+            let mapped_type = structure_type.as_deref().map(|s| tree.mapped_type(s));
             let standard_type = mapped_type.as_deref().and_then(StandardType::from_name);
             let path = ancestry
                 .iter()
                 .filter_map(|ancestor| {
                     let name = ancestor.structure_type.as_deref()?;
-                    let standard_type = StandardType::from_name(&self.mapped_type(name))?;
+                    let standard_type = StandardType::from_name(&tree.mapped_type(name))?;
                     Some(StructureElement {
                         standard_type,
                         object: ancestor.object,
@@ -682,6 +819,8 @@ struct Walk<'a, S> {
     paths: FastMap<ObjRef, Option<Arc<Vec<u32>>>>,
     /// The parent tree's array for each `/StructParents` key seen.
     parents: FastMap<u32, Option<Arc<Vec<Object>>>>,
+    /// The parent tree's element for each `/StructParent` key seen.
+    parent_elements: FastMap<u32, Option<ObjRef>>,
 }
 
 impl<S: AsyncObjectSource> Walk<'_, S> {
@@ -697,11 +836,115 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         let element = elements.get(id.mcid as usize)?.as_ref()?;
         let path = self.path_of(element).await?;
         let dict = self.dict(element).await?;
-        let index = self.mcid_index(&dict, id.mcid).await?;
+        let index = self.mcid_index(&dict, id).await?;
         let mut key = Vec::with_capacity(path.len() + 1);
         key.extend_from_slice(&path);
         key.push(index);
         Some((key, self.ancestry(element).await))
+    }
+
+    /// The sort key of one whole object, an annotation or an XObject: the
+    /// parent tree's entry under the object's own `/StructParent` is its
+    /// element (§14.7.4.4), and the object reference dictionary naming it
+    /// among the element's kids gives its index (§14.7.4.3).
+    ///
+    /// Covers ISO 32000-1 §14.7.4.3 and §14.7.4.4.
+    async fn object_key_of(
+        &mut self,
+        parent_tree: &Dict,
+        object: ObjRef,
+    ) -> Option<(Vec<u32>, Ancestry)> {
+        let dict = self.dict(object).await?;
+        let key = u32::try_from(dict.get_int("StructParent")?).ok()?;
+        let element = self.parent_element(parent_tree, key).await?;
+        let path = self.path_of(element).await?;
+        let dict = self.dict(element).await?;
+        let index = self.object_index(&dict, object).await?;
+        let mut key = Vec::with_capacity(path.len() + 1);
+        key.extend_from_slice(&path);
+        key.push(index);
+        Some((key, self.ancestry(element).await))
+    }
+
+    /// The parent tree's entry for a `/StructParent` key: a reference to
+    /// the element holding the object as a content item. An array there
+    /// (a `/StructParents` entry named by mistake) is no element.
+    ///
+    /// Covers ISO 32000-1 §14.7.4.4.
+    async fn parent_element(&mut self, parent_tree: &Dict, key: u32) -> Option<ObjRef> {
+        if let Some(cached) = self.parent_elements.get(&key) {
+            return *cached;
+        }
+        let found = crate::tree::lookup(self.src, parent_tree, &i64::from(key))
+            .await
+            .and_then(|entry| entry.as_ref());
+        self.parent_elements.insert(key, found);
+        found
+    }
+
+    /// The index among `element`'s kids of the object reference dictionary
+    /// (§14.7.4.3, Table 325) whose `/Obj` is `object` and whose page is
+    /// this one: the dictionary's own `/Pg`, or the element's when it has
+    /// none. A direct dictionary is taken first; only when there is none
+    /// are the indirect kids read.
+    ///
+    /// Covers ISO 32000-1 §14.7.4.3.
+    async fn object_index(&mut self, element: &Dict, object: ObjRef) -> Option<u32> {
+        let kids = kids_of(element);
+        let page_ref = self.page_ref;
+        let element_page = element.get_ref("Pg");
+        let refers = |d: &Dict| {
+            d.get_ref("Obj") == Some(object) && on_page(d.get_ref("Pg").or(element_page), page_ref)
+        };
+        let direct = kids.iter().position(|kid| match kid {
+            Object::Dict(d) => refers(d),
+            _ => false,
+        });
+        if let Some(index) = direct {
+            return u32::try_from(index).ok();
+        }
+        for (index, kid) in kids.iter().enumerate() {
+            let Some(r) = kid.as_ref() else {
+                continue;
+            };
+            let Some(dict) = self.dict(r).await else {
+                continue;
+            };
+            if refers(&dict) {
+                return u32::try_from(index).ok();
+            }
+        }
+        None
+    }
+
+    /// Whether a marked-content reference dictionary (§14.7.4.2, Table 324)
+    /// is the one for `id`: its `/MCID` matches, its page (its own `/Pg`,
+    /// or the element's when it has none) is this one, and when it names
+    /// the content stream the sequence sits in (`/Stm`), that stream's
+    /// `/StructParents` is the key the sequence was filed under, so a
+    /// form's sequence and the page's cannot stand in for each other. A
+    /// stream without the key is not held against the match.
+    ///
+    /// Covers ISO 32000-1 §14.7.4.2.
+    async fn is_reference_for(
+        &mut self,
+        dict: &Dict,
+        id: MarkedContentId,
+        element_page: Option<ObjRef>,
+    ) -> bool {
+        if !is_mcr(dict, id.mcid) || !on_page(dict.get_ref("Pg").or(element_page), self.page_ref) {
+            return false;
+        }
+        let Some(stream) = dict.get_ref("Stm") else {
+            return true;
+        };
+        let Some(stream) = self.dict(stream).await else {
+            return true;
+        };
+        match stream.get_int("StructParents") {
+            Some(parents) => u32::try_from(parents).is_ok_and(|p| p == id.parents),
+            None => true,
+        }
     }
 
     /// The element and its ancestors up to the root, the root's child first
@@ -982,19 +1225,21 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// indirect kids read, in case the reference dictionary is one of them.
     ///
     /// Covers ISO 32000-1 §14.7.4 and §14.7.4.2.
-    async fn mcid_index(&mut self, element: &Dict, mcid: u32) -> Option<u32> {
+    async fn mcid_index(&mut self, element: &Dict, id: MarkedContentId) -> Option<u32> {
         let kids = kids_of(element);
         let page_ref = self.page_ref;
         let element_page = element.get_ref("Pg");
-        let direct = kids.iter().position(|kid| match kid {
-            Object::Int(n) => {
-                u32::try_from(*n).is_ok_and(|n| n == mcid) && on_page(element_page, page_ref)
+        for (index, kid) in kids.iter().enumerate() {
+            let found = match kid {
+                Object::Int(n) => {
+                    u32::try_from(*n).is_ok_and(|n| n == id.mcid) && on_page(element_page, page_ref)
+                }
+                Object::Dict(d) => self.is_reference_for(d, id, element_page).await,
+                _ => false,
+            };
+            if found {
+                return u32::try_from(index).ok();
             }
-            Object::Dict(d) => is_mcr(d, mcid) && on_page(d.get_ref("Pg"), page_ref),
-            _ => false,
-        });
-        if let Some(index) = direct {
-            return u32::try_from(index).ok();
         }
         for (index, kid) in kids.iter().enumerate() {
             let Some(r) = kid.as_ref() else {
@@ -1003,12 +1248,25 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
             let Some(dict) = self.dict(r).await else {
                 continue;
             };
-            if is_mcr(&dict, mcid) && on_page(dict.get_ref("Pg"), page_ref) {
+            if self.is_reference_for(&dict, id, element_page).await {
                 return u32::try_from(index).ok();
             }
         }
         None
     }
+}
+
+/// The indirect references in a page's `/Annots`, in order. A direct
+/// annotation dictionary has no reference an object reference dictionary
+/// could name, so it is skipped.
+async fn annotation_refs<S: AsyncObjectSource>(src: &S, page: &Dict) -> Vec<ObjRef> {
+    let Some(annots) = page.get("Annots") else {
+        return Vec::new();
+    };
+    let Ok(Object::Array(items)) = src.resolve(annots).await else {
+        return Vec::new();
+    };
+    items.iter().filter_map(Object::as_ref).collect()
 }
 
 /// Whether a kid's `/Pg` names this page. Either side unknown reads as a
@@ -1704,9 +1962,10 @@ mod tests {
             dicts: FastMap::default(),
             paths: FastMap::default(),
             parents: FastMap::default(),
+            parent_elements: FastMap::default(),
         };
         let element = block_on(walk.dict(ObjRef { num: 11, gen: 0 })).unwrap();
-        assert_eq!(block_on(walk.mcid_index(&element, 0)), Some(1));
+        assert_eq!(block_on(walk.mcid_index(&element, id(0, 0))), Some(1));
         drop(tree);
     }
 
@@ -1777,5 +2036,297 @@ mod tests {
             ],
         );
         assert_eq!(ranks(&doc, &[id(0, 0)])[&id(0, 0)], 0);
+    }
+
+    fn r(num: u32) -> ObjRef {
+        ObjRef { num, gen: 0 }
+    }
+
+    fn content_items(doc: &Document) -> Vec<PlacedItem> {
+        let tree = doc.structure_tree().expect("tree");
+        let page = doc.page(0).unwrap();
+        block_on(tree.content_items_with(&Immediate(doc), &page))
+    }
+
+    fn items_of(placed: &[PlacedItem]) -> Vec<(ContentItem, u32)> {
+        placed
+            .iter()
+            .map(|p| (p.item.clone(), p.placement.rank))
+            .collect()
+    }
+
+    /// A page with two paragraphs and a link between them: paragraph 13
+    /// holds sequence 0, the Link element 14 holds the annotation 20 through
+    /// `objr` (its `/K`), paragraph 15 holds sequence 1. The annotation
+    /// carries `/StructParent 1`, the parent tree maps 0 to the page's array
+    /// and 1 to the Link element.
+    fn linked_doc(objr: &str, extra: &[(u32, &str)]) -> Document {
+        let mut objects = vec![
+            (
+                10,
+                "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+            ),
+            (
+                11,
+                "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 14 0 R 15 0 R] >>",
+            ),
+            (12, "<< /Nums [0 [13 0 R 15 0 R] 1 14 0 R] >>"),
+            (
+                13,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0] >>",
+            ),
+            (
+                15,
+                "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [1] >>",
+            ),
+            (
+                20,
+                "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /StructParent 1 >>",
+            ),
+        ];
+        let link = format!("<< /Type /StructElem /S /Link /P 11 0 R /Pg 3 0 R /K {objr} >>");
+        objects.push((14, link.as_str()));
+        objects.extend_from_slice(extra);
+        tagged_doc("/StructParents 0 /Annots [20 0 R]", &objects)
+    }
+
+    // Covers ISO 32000-1 §14.7.4.3, §14.7.4.4 and §14.8.2.3.2.
+    #[test]
+    fn an_annotation_takes_its_place_between_the_sequences() {
+        let doc = linked_doc("[<< /Type /OBJR /Obj 20 0 R >>]", &[]);
+        let placed = content_items(&doc);
+        assert_eq!(
+            items_of(&placed),
+            vec![
+                (ContentItem::Sequence(id(0, 0)), 0),
+                (ContentItem::Object(r(20)), 1),
+                (ContentItem::Sequence(id(0, 1)), 2),
+            ]
+        );
+        let link = &placed[1].placement;
+        assert_eq!(link.structure_type.as_deref(), Some("Link"));
+        assert_eq!(link.standard_type, Some(StandardType::Link));
+        assert_eq!(
+            link.path
+                .iter()
+                .map(|e| e.standard_type)
+                .collect::<Vec<_>>(),
+            vec![StandardType::Document, StandardType::Link]
+        );
+    }
+
+    // Covers ISO 32000-1 §14.7.4.3.
+    #[test]
+    fn an_indirect_object_reference_is_read_after_the_direct_kids() {
+        let doc = linked_doc(
+            "[21 0 R]",
+            &[(21, "<< /Type /OBJR /Obj 20 0 R /Pg 3 0 R >>")],
+        );
+        let placed = content_items(&doc);
+        assert_eq!(items_of(&placed)[1], (ContentItem::Object(r(20)), 1));
+    }
+
+    // Covers ISO 32000-1 §14.7.4.3.
+    #[test]
+    fn the_object_reference_page_overrides_the_elements() {
+        // The Link element sits on page 99; only its object reference says
+        // this page, which is what counts.
+        let doc = tagged_doc(
+            "/StructParents 0 /Annots [20 0 R]",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Link /P 10 0 R /Pg 99 0 R \
+                     /K [<< /Type /OBJR /Obj 20 0 R /Pg 3 0 R >>] >>",
+                ),
+                (12, "<< /Nums [1 11 0 R] >>"),
+                (20, "<< /Type /Annot /Subtype /Link /StructParent 1 >>"),
+            ],
+        );
+        assert_eq!(
+            items_of(&content_items(&doc)),
+            vec![(ContentItem::Object(r(20)), 0)]
+        );
+        // Without its own page the reference inherits the element's, and
+        // page 99 is not this page.
+        let doc = tagged_doc(
+            "/StructParents 0 /Annots [20 0 R]",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Link /P 10 0 R /Pg 99 0 R \
+                     /K [<< /Type /OBJR /Obj 20 0 R >>] >>",
+                ),
+                (12, "<< /Nums [1 11 0 R] >>"),
+                (20, "<< /Type /Annot /Subtype /Link /StructParent 1 >>"),
+            ],
+        );
+        assert!(content_items(&doc).is_empty());
+    }
+
+    // Covers ISO 32000-1 §14.7.4.3 and §14.7.4.4.
+    #[test]
+    fn an_annotation_the_tree_does_not_hold_is_no_content_item() {
+        // 21 has no /StructParent, 22's key is missing from the parent
+        // tree, 23's element has no reference naming it, and the direct
+        // dictionary has no reference to name.
+        let doc = tagged_doc(
+            "/StructParents 0 /Annots [20 0 R 21 0 R 22 0 R 23 0 R << /Subtype /Link /StructParent 1 >>]",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Link /P 10 0 R /Pg 3 0 R \
+                     /K [<< /Type /OBJR /Obj 20 0 R >>] >>",
+                ),
+                (12, "<< /Nums [1 11 0 R 3 11 0 R] >>"),
+                (20, "<< /Type /Annot /Subtype /Link /StructParent 1 >>"),
+                (21, "<< /Type /Annot /Subtype /Link >>"),
+                (22, "<< /Type /Annot /Subtype /Link /StructParent 2 >>"),
+                (23, "<< /Type /Annot /Subtype /Link /StructParent 3 >>"),
+            ],
+        );
+        assert_eq!(
+            items_of(&content_items(&doc)),
+            vec![(ContentItem::Object(r(20)), 0)]
+        );
+    }
+
+    // Covers ISO 32000-1 §14.7.4.3 and §14.8.2.3.2.
+    #[test]
+    fn a_link_element_orders_its_sequence_and_annotation_by_kid_index() {
+        let doc = tagged_doc(
+            "/StructParents 0 /Annots [20 0 R]",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Link /P 10 0 R /Pg 3 0 R \
+                     /K [<< /Type /OBJR /Obj 20 0 R >> << /Type /MCR /MCID 0 >>] >>",
+                ),
+                (12, "<< /Nums [0 [11 0 R] 1 11 0 R] >>"),
+                (20, "<< /Type /Annot /Subtype /Link /StructParent 1 >>"),
+            ],
+        );
+        assert_eq!(
+            items_of(&content_items(&doc)),
+            vec![
+                (ContentItem::Object(r(20)), 0),
+                (ContentItem::Sequence(id(0, 0)), 1),
+            ]
+        );
+    }
+
+    // Covers ISO 32000-1 §14.7.4.3.
+    #[test]
+    fn a_form_xobject_is_placed_when_handed_in() {
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Figure /P 10 0 R /Pg 3 0 R \
+                     /K [<< /Type /OBJR /Obj 30 0 R >>] >>",
+                ),
+                (12, "<< /Nums [5 11 0 R] >>"),
+                (
+                    30,
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /StructParent 5 /Length 0 >>\nstream\n\nendstream",
+                ),
+            ],
+        );
+        let tree = doc.structure_tree().unwrap();
+        let page = doc.page(0).unwrap();
+        let placed = block_on(tree.place_items_with(
+            &Immediate(&doc),
+            &page,
+            &[ContentItem::Object(r(30)), ContentItem::Object(r(30))],
+        ));
+        assert_eq!(placed.len(), 1);
+        assert_eq!(
+            placed[&ContentItem::Object(r(30))].standard_type,
+            Some(StandardType::Figure)
+        );
+        // Not in /Annots, so the page enumeration does not find it.
+        assert!(content_items(&doc).is_empty());
+    }
+
+    // Covers ISO 32000-1 §14.7.4.2.
+    #[test]
+    fn a_reference_naming_a_stream_matches_only_that_streams_sequence() {
+        // The element holds the form's sequence 0 (kid 0, an MCR naming the
+        // form) and the page's sequence 0 (kid 1, a bare integer). Both are
+        // numbered 0; the MCR's /Stm tells them apart.
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R \
+                     /K [<< /Type /MCR /Stm 30 0 R /MCID 0 >> 0] >>",
+                ),
+                (12, "<< /Nums [0 [11 0 R] 1 [11 0 R]] >>"),
+                (
+                    30,
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 1 1] /StructParents 1 /Length 0 >>\nstream\n\nendstream",
+                ),
+            ],
+        );
+        let ranks = ranks(&doc, &[id(0, 0), id(1, 0)]);
+        assert_eq!(ranks[&id(1, 0)], 0);
+        assert_eq!(ranks[&id(0, 0)], 1);
+    }
+
+    // Covers ISO 32000-1 §14.7.4 and §14.7.4.4.
+    #[test]
+    fn the_page_enumeration_skips_null_entries_and_needs_a_parent_tree() {
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /P /P 10 0 R /Pg 3 0 R /K [0 2] >>",
+                ),
+                (12, "<< /Nums [0 [11 0 R null 11 0 R]] >>"),
+            ],
+        );
+        assert_eq!(
+            items_of(&content_items(&doc)),
+            vec![
+                (ContentItem::Sequence(id(0, 0)), 0),
+                (ContentItem::Sequence(id(0, 2)), 1),
+            ]
+        );
+        let doc = tagged_doc(
+            "/StructParents 0",
+            &[(10, "<< /Type /StructTreeRoot /K [] >>")],
+        );
+        assert!(content_items(&doc).is_empty());
     }
 }

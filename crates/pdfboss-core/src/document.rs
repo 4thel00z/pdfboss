@@ -563,6 +563,19 @@ impl Document {
         ))
     }
 
+    /// A page's content items in structure-tree order (ISO 32000-1
+    /// §14.7.4): the marked-content sequences of its content stream and
+    /// the annotations the tree holds through object references, ranked
+    /// together, so each annotation sits where §14.8.2.3.2 puts it in the
+    /// page's content order. Empty for a page the tree does not reach, or
+    /// a document without a tree.
+    pub fn content_items(&self, page: &Page) -> Vec<crate::structure::PlacedItem> {
+        let Some(tree) = self.structure_tree() else {
+            return Vec::new();
+        };
+        block_on(tree.content_items_with(&Immediate(self), page))
+    }
+
     /// The object that `key` names in the catalog's `tree` (ISO 32000-1
     /// §7.7.4), resolved: a destination for `NameTree::Dests`, a file
     /// specification for `NameTree::EmbeddedFiles`. `None` when the
