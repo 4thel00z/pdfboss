@@ -716,6 +716,8 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
             let mut colorants: Vec<String> = Vec::new();
             let mut annotation_counts: std::collections::BTreeMap<String, usize> =
                 std::collections::BTreeMap::new();
+            let mut tagged = (0usize, 0usize);
+            let structure = doc.structure_tree();
             for index in 0..doc.page_count() {
                 let page = doc.page(index).ok();
                 sizes.push(page.as_ref().map(|page| page.size()));
@@ -736,6 +738,17 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     }
                     for annotation in doc.annotations(page) {
                         *annotation_counts.entry(annotation.subtype).or_default() += 1;
+                    }
+                    if let Some(tree) = &structure {
+                        let items = pdfboss_core::block_on(
+                            tree.content_items_with(&pdfboss_core::Immediate(&doc), page),
+                        );
+                        for item in items {
+                            match item.item {
+                                pdfboss_core::ContentItem::Sequence(_) => tagged.0 += 1,
+                                pdfboss_core::ContentItem::Object(_) => tagged.1 += 1,
+                            }
+                        }
                     }
                 }
             }
@@ -790,6 +803,7 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                     colorants: &colorants,
                     annotations: &annotations,
                     layers,
+                    tagged,
                     linearization: linearization
                         .as_ref()
                         .map(|record| (record, doc.bytes().len() as u64)),
@@ -860,6 +874,9 @@ struct Info<'a> {
     /// Optional content groups: how many the catalog declares and how many
     /// are off on screen; `None` without `/OCProperties`.
     layers: Option<(usize, usize)>,
+    /// Content items the structure tree reaches over every page: how many
+    /// marked-content sequences and how many annotations.
+    tagged: (usize, usize),
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
 
@@ -1077,6 +1094,17 @@ fn info_text(info: &Info) -> String {
     // viewer's state turns off (§8.11.4.5).
     if let Some((total, off)) = info.layers {
         let _ = writeln!(out, "layers:    {total} ({off} off)");
+    }
+    // Content items the structure tree reaches (ISO 32000-1 §14.7.4):
+    // marked-content sequences and the annotations held through object
+    // references (§14.7.4.3).
+    let (sequences, objects) = info.tagged;
+    if sequences + objects > 0 {
+        let _ = writeln!(
+            out,
+            "tagged:    {} ({sequences} sequences, {objects} annotations)",
+            sequences + objects
+        );
     }
     // The products that left private data on the catalog or a page (ISO
     // 32000-1 §14.5).
@@ -1728,6 +1756,23 @@ mod tests {
         });
         assert!(report.contains("layers:    3 (1 off)\n"), "{report}");
         assert!(!info_text(&Info::default()).contains("layers"));
+    }
+
+    /// Content items the structure tree reaches print as one line with the
+    /// total, the sequences and the annotations; a document whose tree
+    /// reaches nothing prints no line.
+    // Covers ISO 32000-1 §14.7.4 and §14.7.4.3.
+    #[test]
+    fn info_text_counts_tagged_content_items() {
+        let report = info_text(&Info {
+            tagged: (10, 2),
+            ..Info::default()
+        });
+        assert!(
+            report.contains("tagged:    12 (10 sequences, 2 annotations)\n"),
+            "{report}"
+        );
+        assert!(!info_text(&Info::default()).contains("tagged"));
     }
 
     /// The catalog's developer extensions print after the version, one
