@@ -3,7 +3,7 @@
 //! tagged page can be read in the order its author declared, and which
 //! structure type the element holding each sequence declares (§14.7.3).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::document::Page;
 use crate::hash::{FastMap, FastSet};
@@ -463,16 +463,51 @@ impl Placement {
 /// document and asked per page where that page's marked content sits in
 /// the tree. `/MarkInfo` is never consulted: a tree with leaves counts,
 /// whatever the file says about itself.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct StructureTree {
     root: Dict,
     root_ref: Option<ObjRef>,
+    /// What the page walks have read so far: element dictionaries, paths
+    /// and ancestries are the same for every page, so a walk takes them
+    /// over and hands them back when it is done.
+    caches: Mutex<Caches>,
     /// The root's `/RoleMap`: structure type names to the names they stand
     /// for (§14.7.3), entries whose value is not a name dropped.
     role_map: FastMap<String, String>,
     /// The root's `/ClassMap`: attribute class names to their attribute
     /// objects, as written (§14.7.5.2).
     class_map: FastMap<String, Object>,
+    /// Every entry of the root's `/ParentTree` (§14.7.4.4) by key, values
+    /// as written: an array of element references for a `/StructParents`
+    /// key, one element reference for a `/StructParent` key. Read once, so
+    /// no page searches the number tree again.
+    parent_entries: FastMap<i64, Object>,
+}
+
+impl Clone for StructureTree {
+    /// The same tree over an empty cache; the copy fills its own.
+    fn clone(&self) -> StructureTree {
+        StructureTree {
+            root: self.root.clone(),
+            root_ref: self.root_ref,
+            caches: Mutex::new(Caches::default()),
+            role_map: self.role_map.clone(),
+            class_map: self.class_map.clone(),
+            parent_entries: self.parent_entries.clone(),
+        }
+    }
+}
+
+impl PartialEq for StructureTree {
+    /// Two trees are equal when they were read from the same root, whatever
+    /// either has cached since.
+    fn eq(&self, other: &StructureTree) -> bool {
+        self.root == other.root
+            && self.root_ref == other.root_ref
+            && self.role_map == other.role_map
+            && self.class_map == other.class_map
+            && self.parent_entries == other.parent_entries
+    }
 }
 
 impl StructureTree {
@@ -496,11 +531,17 @@ impl StructureTree {
             Some(entry) => class_map_of(resolved_dict(src, entry).await),
             None => FastMap::default(),
         };
+        let parent_entries = match root.get("ParentTree") {
+            Some(entry) => parent_entries_of(src, resolved_dict(src, entry).await).await,
+            None => FastMap::default(),
+        };
         Some(StructureTree {
             root,
             root_ref,
+            caches: Mutex::new(Caches::default()),
             role_map,
             class_map,
+            parent_entries,
         })
     }
 
@@ -586,16 +627,14 @@ impl StructureTree {
         src: &S,
         page: &Page,
     ) -> Vec<PlacedItem> {
-        let Some((parent_tree, mut walk)) = self.walk(src, page).await else {
-            return Vec::new();
-        };
+        let mut walk = self.walk(src, page);
         let mut items: Vec<ContentItem> = Vec::new();
         let page_dict = page.dict();
         let parents = page_dict
             .get_int("StructParents")
             .and_then(|n| u32::try_from(n).ok());
         if let Some(parents) = parents {
-            if let Some(entries) = walk.parent_array(&parent_tree, parents).await {
+            if let Some(entries) = walk.parent_array(parents).await {
                 items.extend(
                     entries
                         .iter()
@@ -618,14 +657,52 @@ impl StructureTree {
                 items.push(ContentItem::Object(r));
             }
         }
-        let mut placed: Vec<PlacedItem> = walk
-            .place(&parent_tree, self, &items)
-            .await
+        let placed_items = walk.place(self, &items).await;
+        self.store(walk);
+        let mut placed: Vec<PlacedItem> = placed_items
             .into_iter()
             .map(|(item, placement)| PlacedItem { item, placement })
             .collect();
         placed.sort_by_key(|placed| placed.placement.rank);
         placed
+    }
+
+    /// How many content items the parent tree files for `page`: the
+    /// non-null entries of the array under the page's `/StructParents`, and
+    /// the annotations of `/Annots` whose `/StructParent` the tree has an
+    /// entry for. Read from the tree's entries alone, so no element is
+    /// parsed, which makes it a summary count rather than a placement: a
+    /// malformed file whose entries name elements that do not hold the
+    /// items counts higher here than [`StructureTree::content_items_with`]
+    /// lists.
+    ///
+    /// Covers ISO 32000-1 §14.7.4.4.
+    pub async fn content_item_counts_with<S: AsyncObjectSource>(
+        &self,
+        src: &S,
+        page: &Page,
+    ) -> (usize, usize) {
+        let page_dict = page.dict();
+        let mut sequences = 0;
+        let parents = page_dict
+            .get_int("StructParents")
+            .and_then(|key| self.parent_entries.get(&key));
+        if let Some(entry) = parents {
+            if let Ok(Object::Array(entries)) = src.resolve(entry).await {
+                sequences = entries.iter().filter(|e| e.as_ref().is_some()).count();
+            }
+        }
+        let mut objects = 0;
+        for r in annotation_refs(src, page_dict).await {
+            let Ok(Object::Dict(dict)) = src.get(r).await else {
+                continue;
+            };
+            let filed = dict
+                .get_int("StructParent")
+                .is_some_and(|key| self.parent_entries.contains_key(&key));
+            objects += usize::from(filed);
+        }
+        (sequences, objects)
     }
 
     /// Places `items`, content items of `page`, in the tree: each gets its
@@ -644,33 +721,38 @@ impl StructureTree {
         page: &Page,
         items: &[ContentItem],
     ) -> FastMap<ContentItem, Placement> {
-        let Some((parent_tree, mut walk)) = self.walk(src, page).await else {
-            return FastMap::default();
-        };
-        walk.place(&parent_tree, self, items).await
+        let mut walk = self.walk(src, page);
+        let placed = walk.place(self, items).await;
+        self.store(walk);
+        placed
     }
 
-    /// The resolved parent tree and a fresh walk of `page`, or `None` when
-    /// the root names no readable `/ParentTree`, which leaves every content
-    /// item unplaced.
-    async fn walk<'a, S: AsyncObjectSource>(
-        &'a self,
-        src: &'a S,
-        page: &Page,
-    ) -> Option<(Dict, Walk<'a, S>)> {
-        let parent_tree = self.root.get("ParentTree")?;
-        let parent_tree = resolved_dict(src, parent_tree).await?;
-        let walk = Walk {
+    /// A walk of `page` over this tree's parent entries, carrying what
+    /// earlier walks read; [`StructureTree::store`] hands that back.
+    fn walk<'a, S: AsyncObjectSource>(&'a self, src: &'a S, page: &Page) -> Walk<'a, S> {
+        let caches = std::mem::take(&mut *self.caches.lock().unwrap_or_else(|e| e.into_inner()));
+        Walk {
             src,
             page_ref: page.object_ref(),
             root_ref: self.root_ref,
             class_map: &self.class_map,
-            dicts: FastMap::default(),
-            paths: FastMap::default(),
-            parents: FastMap::default(),
-            parent_elements: FastMap::default(),
-        };
-        Some((parent_tree, walk))
+            parent_entries: &self.parent_entries,
+            caches,
+        }
+    }
+
+    /// Keeps what `walk` read for the pages that follow. A walk that ran
+    /// alongside another adds its entries to the ones already back.
+    fn store<S>(&self, walk: Walk<'_, S>) {
+        let mut caches = self.caches.lock().unwrap_or_else(|e| e.into_inner());
+        if caches.dicts.is_empty() {
+            *caches = walk.caches;
+            return;
+        }
+        caches.dicts.extend(walk.caches.dicts);
+        caches.paths.extend(walk.caches.paths);
+        caches.parents.extend(walk.caches.parents);
+        caches.ancestries.extend(walk.caches.ancestries);
     }
 }
 
@@ -681,20 +763,19 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// Covers ISO 32000-1 §14.7.3, §14.8.2 and §14.8.2.3.
     async fn place(
         &mut self,
-        parent_tree: &Dict,
         tree: &StructureTree,
         items: &[ContentItem],
     ) -> FastMap<ContentItem, Placement> {
         let mut placed: FastMap<ContentItem, Placement> = FastMap::default();
-        let mut keyed: Vec<(ContentItem, Vec<u32>, Ancestry)> = Vec::new();
+        let mut keyed: Vec<(ContentItem, Vec<u32>, Arc<Ancestry>)> = Vec::new();
         let mut seen: FastSet<ContentItem> = FastSet::default();
         for item in items {
             if !seen.insert(*item) {
                 continue;
             }
             let found = match item {
-                ContentItem::Sequence(id) => self.key_of(parent_tree, *id).await,
-                ContentItem::Object(r) => self.object_key_of(parent_tree, *r).await,
+                ContentItem::Sequence(id) => self.key_of(*id).await,
+                ContentItem::Object(r) => self.object_key_of(*r).await,
             };
             let Some((key, ancestry)) = found else {
                 continue;
@@ -722,8 +803,8 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
             let lang = ancestry.iter().rev().find_map(|a| a.lang.clone());
             let expansion = ancestry.iter().rev().find_map(|a| a.expansion.clone());
             let attributes = ancestry
-                .into_iter()
-                .flat_map(|ancestor| ancestor.attributes)
+                .iter()
+                .flat_map(|ancestor| ancestor.attributes.iter().cloned())
                 .collect();
             placed.insert(
                 id,
@@ -744,9 +825,28 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     }
 }
 
+/// What a walk reads that holds for every page of the document: element
+/// dictionaries, each element's kid-index path from the root, the parent
+/// tree's arrays by key, and each element's ancestry. Kept on the tree
+/// between walks, so the elements above a page's own (a document or a
+/// section, with kids by the thousand) are read once, not once per page.
+#[derive(Debug, Default)]
+struct Caches {
+    dicts: FastMap<ObjRef, Option<Arc<Dict>>>,
+    /// Each element's kid-index path from the root, or `None` once its
+    /// ancestry proved unwalkable.
+    paths: FastMap<ObjRef, Option<Arc<Vec<u32>>>>,
+    /// The parent tree's array for each `/StructParents` key seen.
+    parents: FastMap<u32, Option<Arc<Vec<Object>>>>,
+    /// Each element's ancestry, climbed once however many content items
+    /// the element holds.
+    ancestries: FastMap<ObjRef, Arc<Ancestry>>,
+}
+
 /// One element on the way from a marked-content sequence up to the root:
 /// its object, its `/S` as written, its `/Alt` and `/Lang` decoded, its
 /// `/R` and its attribute objects.
+#[derive(Debug)]
 struct Ancestor {
     object: ObjRef,
     structure_type: Option<String>,
@@ -792,6 +892,25 @@ fn attribute_object(element: ObjRef, entries: Dict) -> AttributeObject {
     }
 }
 
+/// Every entry of the parent tree by key, values as written; the first
+/// entry wins when a malformed tree repeats a key, as a search would find
+/// it first.
+///
+/// Covers ISO 32000-1 §14.7.4.4.
+async fn parent_entries_of<S: AsyncObjectSource>(
+    src: &S,
+    dict: Option<Dict>,
+) -> FastMap<i64, Object> {
+    let Some(dict) = dict else {
+        return FastMap::default();
+    };
+    let mut entries: FastMap<i64, Object> = FastMap::default();
+    for (key, value) in crate::tree::entries::<i64, S>(src, &dict).await {
+        entries.entry(key).or_insert(value);
+    }
+    entries
+}
+
 /// The `/RoleMap` dictionary as name-to-name pairs.
 ///
 /// Covers ISO 32000-1 §14.7.3.
@@ -813,26 +932,18 @@ struct Walk<'a, S> {
     root_ref: Option<ObjRef>,
     /// The root's `/ClassMap`, for elements that name attribute classes.
     class_map: &'a FastMap<String, Object>,
-    dicts: FastMap<ObjRef, Option<Arc<Dict>>>,
-    /// Each element's kid-index path from the root, or `None` once its
-    /// ancestry proved unwalkable.
-    paths: FastMap<ObjRef, Option<Arc<Vec<u32>>>>,
-    /// The parent tree's array for each `/StructParents` key seen.
-    parents: FastMap<u32, Option<Arc<Vec<Object>>>>,
-    /// The parent tree's element for each `/StructParent` key seen.
-    parent_elements: FastMap<u32, Option<ObjRef>>,
+    /// The parent tree's entries by key, as the tree read them once.
+    parent_entries: &'a FastMap<i64, Object>,
+    /// The tree's caches, taken over for the walk and handed back after.
+    caches: Caches,
 }
 
 impl<S: AsyncObjectSource> Walk<'_, S> {
     /// The sort key of one marked-content sequence, its element's path from
     /// the root then its own index among the element's kids, with the
     /// element's ancestry and its structure types (`/S`, §14.7.3).
-    async fn key_of(
-        &mut self,
-        parent_tree: &Dict,
-        id: MarkedContentId,
-    ) -> Option<(Vec<u32>, Ancestry)> {
-        let elements = self.parent_array(parent_tree, id.parents).await?;
+    async fn key_of(&mut self, id: MarkedContentId) -> Option<(Vec<u32>, Arc<Ancestry>)> {
+        let elements = self.parent_array(id.parents).await?;
         let element = elements.get(id.mcid as usize)?.as_ref()?;
         let path = self.path_of(element).await?;
         let dict = self.dict(element).await?;
@@ -849,14 +960,10 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// among the element's kids gives its index (§14.7.4.3).
     ///
     /// Covers ISO 32000-1 §14.7.4.3 and §14.7.4.4.
-    async fn object_key_of(
-        &mut self,
-        parent_tree: &Dict,
-        object: ObjRef,
-    ) -> Option<(Vec<u32>, Ancestry)> {
+    async fn object_key_of(&mut self, object: ObjRef) -> Option<(Vec<u32>, Arc<Ancestry>)> {
         let dict = self.dict(object).await?;
         let key = u32::try_from(dict.get_int("StructParent")?).ok()?;
-        let element = self.parent_element(parent_tree, key).await?;
+        let element = self.parent_element(key)?;
         let path = self.path_of(element).await?;
         let dict = self.dict(element).await?;
         let index = self.object_index(&dict, object).await?;
@@ -871,15 +978,10 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// (a `/StructParents` entry named by mistake) is no element.
     ///
     /// Covers ISO 32000-1 §14.7.4.4.
-    async fn parent_element(&mut self, parent_tree: &Dict, key: u32) -> Option<ObjRef> {
-        if let Some(cached) = self.parent_elements.get(&key) {
-            return *cached;
-        }
-        let found = crate::tree::lookup(self.src, parent_tree, &i64::from(key))
-            .await
-            .and_then(|entry| entry.as_ref());
-        self.parent_elements.insert(key, found);
-        found
+    fn parent_element(&self, key: u32) -> Option<ObjRef> {
+        self.parent_entries
+            .get(&i64::from(key))
+            .and_then(Object::as_ref)
     }
 
     /// The index among `element`'s kids of the object reference dictionary
@@ -957,7 +1059,17 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     ///
     /// Covers ISO 32000-1 §14.7.3, §14.7.5, §14.8.4.3, §14.9.2, §14.9.3 and
     /// §14.9.5.
-    async fn ancestry(&mut self, element: ObjRef) -> Ancestry {
+    async fn ancestry(&mut self, element: ObjRef) -> Arc<Ancestry> {
+        if let Some(cached) = self.caches.ancestries.get(&element) {
+            return cached.clone();
+        }
+        let chain = Arc::new(self.climb(element).await);
+        self.caches.ancestries.insert(element, chain.clone());
+        chain
+    }
+
+    /// [`Walk::ancestry`] without the cache: the climb itself.
+    async fn climb(&mut self, element: ObjRef) -> Ancestry {
         let mut chain: Ancestry = Vec::new();
         let mut current = element;
         for _ in 0..MAX_ELEMENT_DEPTH {
@@ -1105,23 +1217,23 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     /// index is a marked-content id and whose value is that id's element.
     ///
     /// Covers ISO 32000-1 §14.7.4.4.
-    async fn parent_array(&mut self, parent_tree: &Dict, key: u32) -> Option<Arc<Vec<Object>>> {
-        if let Some(cached) = self.parents.get(&key) {
+    async fn parent_array(&mut self, key: u32) -> Option<Arc<Vec<Object>>> {
+        if let Some(cached) = self.caches.parents.get(&key) {
             return cached.clone();
         }
-        let found = match crate::tree::lookup(self.src, parent_tree, &i64::from(key)).await {
-            Some(entry) => match self.src.resolve(&entry).await.ok()? {
+        let found = match self.parent_entries.get(&i64::from(key)) {
+            Some(entry) => match self.src.resolve(entry).await.ok()? {
                 Object::Array(items) => Some(Arc::new(items)),
                 _ => None,
             },
             None => None,
         };
-        self.parents.insert(key, found.clone());
+        self.caches.parents.insert(key, found.clone());
         found
     }
 
     async fn dict(&mut self, r: ObjRef) -> Option<Arc<Dict>> {
-        if let Some(cached) = self.dicts.get(&r) {
+        if let Some(cached) = self.caches.dicts.get(&r) {
             return cached.clone();
         }
         let loaded = match self.src.get(r).await.ok()? {
@@ -1129,7 +1241,7 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
             Object::Stream(stream) => Some(Arc::new(stream.dict)),
             _ => None,
         };
-        self.dicts.insert(r, loaded.clone());
+        self.caches.dicts.insert(r, loaded.clone());
         loaded
     }
 
@@ -1140,7 +1252,7 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
     ///
     /// Covers ISO 32000-1 §14.7.2.
     async fn path_of(&mut self, element: ObjRef) -> Option<Arc<Vec<u32>>> {
-        if let Some(cached) = self.paths.get(&element) {
+        if let Some(cached) = self.caches.paths.get(&element) {
             return cached.clone();
         }
         let mut chain: Vec<ObjRef> = vec![element];
@@ -1159,7 +1271,7 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
                 stop = Some((parent, true, Arc::new(Vec::new())));
                 break;
             }
-            if let Some(cached) = self.paths.get(&parent) {
+            if let Some(cached) = self.caches.paths.get(&parent) {
                 stop = cached.clone().map(|path| (parent, false, path));
                 break;
             }
@@ -1168,7 +1280,7 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
         }
         let Some((mut parent_ref, mut parent_is_root, known)) = stop else {
             for r in chain {
-                self.paths.insert(r, None);
+                self.caches.paths.insert(r, None);
             }
             return None;
         };
@@ -1185,12 +1297,12 @@ impl<S: AsyncObjectSource> Walk<'_, S> {
                 }
             };
             let Some(index) = index else {
-                self.paths.insert(child, None);
+                self.caches.paths.insert(child, None);
                 return None;
             };
             path.push(index);
             let shared = Arc::new(path.clone());
-            self.paths.insert(child, Some(shared.clone()));
+            self.caches.paths.insert(child, Some(shared.clone()));
             resolved = Some(shared);
             parent_ref = child;
             parent_is_root = false;
@@ -1291,11 +1403,11 @@ fn is_mcr(dict: &Dict, mcid: u32) -> bool {
 
 /// An element's `/K` as a list: a single kid stands alone, an array is its
 /// items, nothing is empty.
-fn kids_of(element: &Dict) -> Vec<Object> {
+fn kids_of(element: &Dict) -> &[Object] {
     match element.get("K") {
-        Some(Object::Array(items)) => items.clone(),
-        Some(single) => vec![single.clone()],
-        None => Vec::new(),
+        Some(Object::Array(items)) => items,
+        Some(single) => std::slice::from_ref(single),
+        None => &[],
     }
 }
 
@@ -1959,10 +2071,8 @@ mod tests {
             page_ref: page.object_ref(),
             root_ref: Some(ObjRef { num: 10, gen: 0 }),
             class_map: &tree.class_map,
-            dicts: FastMap::default(),
-            paths: FastMap::default(),
-            parents: FastMap::default(),
-            parent_elements: FastMap::default(),
+            parent_entries: &tree.parent_entries,
+            caches: Caches::default(),
         };
         let element = block_on(walk.dict(ObjRef { num: 11, gen: 0 })).unwrap();
         assert_eq!(block_on(walk.mcid_index(&element, id(0, 0))), Some(1));
@@ -2325,5 +2435,93 @@ mod tests {
             &[(10, "<< /Type /StructTreeRoot /K [] >>")],
         );
         assert!(content_items(&doc).is_empty());
+    }
+
+    fn counts(doc: &Document) -> (usize, usize) {
+        let tree = doc.structure_tree().expect("tree");
+        let page = doc.page(0).unwrap();
+        block_on(tree.content_item_counts_with(&Immediate(doc), &page))
+    }
+
+    // Covers ISO 32000-1 §14.7.4.4.
+    #[test]
+    fn the_counts_follow_the_parent_tree_without_reading_the_elements() {
+        // Two sequences and one filed annotation: the same as the placement.
+        let doc = linked_doc("[<< /Type /OBJR /Obj 20 0 R >>]", &[]);
+        assert_eq!(counts(&doc), (2, 1));
+        assert_eq!(content_items(&doc).len(), 3);
+        // 21 has no key and 22's key is missing from the tree, so neither is
+        // filed; 23's key names an element without a reference to it, which
+        // the count cannot see and the placement leaves out.
+        let doc = tagged_doc(
+            "/StructParents 0 /Annots [20 0 R 21 0 R 22 0 R 23 0 R]",
+            &[
+                (
+                    10,
+                    "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+                ),
+                (
+                    11,
+                    "<< /Type /StructElem /S /Link /P 10 0 R /Pg 3 0 R \
+                     /K [<< /Type /OBJR /Obj 20 0 R >>] >>",
+                ),
+                (12, "<< /Nums [0 [11 0 R null] 1 11 0 R 3 11 0 R] >>"),
+                (20, "<< /Type /Annot /Subtype /Link /StructParent 1 >>"),
+                (21, "<< /Type /Annot /Subtype /Link >>"),
+                (22, "<< /Type /Annot /Subtype /Link /StructParent 2 >>"),
+                (23, "<< /Type /Annot /Subtype /Link /StructParent 3 >>"),
+            ],
+        );
+        assert_eq!(counts(&doc), (1, 2));
+        assert_eq!(content_items(&doc).len(), 1);
+    }
+
+    // Covers ISO 32000-1 §14.7.2.
+    #[test]
+    fn a_second_page_reuses_what_the_first_walk_read() {
+        // Two pages under one Document element; the second walk finds the
+        // shared ancestor in the cache the first one stored.
+        let mut b = PdfBuilder::new();
+        b.object(
+            1,
+            "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 10 0 R >>",
+        );
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /StructParents 0 >>",
+        );
+        b.object(
+            4,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /StructParents 1 >>",
+        );
+        b.object(
+            10,
+            "<< /Type /StructTreeRoot /K [11 0 R] /ParentTree 12 0 R >>",
+        );
+        b.object(
+            11,
+            "<< /Type /StructElem /S /Document /P 10 0 R /K [13 0 R 14 0 R] >>",
+        );
+        b.object(12, "<< /Nums [0 [13 0 R] 1 [14 0 R]] >>");
+        b.object(
+            13,
+            "<< /Type /StructElem /S /P /P 11 0 R /Pg 3 0 R /K [0] >>",
+        );
+        b.object(
+            14,
+            "<< /Type /StructElem /S /P /P 11 0 R /Pg 4 0 R /K [0] >>",
+        );
+        let doc = Document::load(b.build(1)).expect("load");
+        let tree = doc.structure_tree().expect("tree");
+        let first = block_on(tree.content_items_with(&Immediate(&doc), &doc.page(0).unwrap()));
+        assert_eq!(first.len(), 1);
+        assert!(tree.caches.lock().unwrap().dicts.contains_key(&r(11)));
+        let second = block_on(tree.content_items_with(&Immediate(&doc), &doc.page(1).unwrap()));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].placement.path.len(), 2);
+        assert_eq!(second[0].placement.path[0].object, r(11));
+        assert_eq!(second[0].placement.path[1].object, r(14));
+        assert_eq!(tree.clone(), tree);
     }
 }

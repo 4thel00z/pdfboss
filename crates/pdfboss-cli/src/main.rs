@@ -740,15 +740,11 @@ fn cmd_info(file: &Path, password: &str) -> Result<(), String> {
                         *annotation_counts.entry(annotation.subtype).or_default() += 1;
                     }
                     if let Some(tree) = &structure {
-                        let items = pdfboss_core::block_on(
-                            tree.content_items_with(&pdfboss_core::Immediate(&doc), page),
+                        let (sequences, objects) = pdfboss_core::block_on(
+                            tree.content_item_counts_with(&pdfboss_core::Immediate(&doc), page),
                         );
-                        for item in items {
-                            match item.item {
-                                pdfboss_core::ContentItem::Sequence(_) => tagged.0 += 1,
-                                pdfboss_core::ContentItem::Object(_) => tagged.1 += 1,
-                            }
-                        }
+                        tagged.0 += sequences;
+                        tagged.1 += objects;
                     }
                 }
             }
@@ -874,8 +870,8 @@ struct Info<'a> {
     /// Optional content groups: how many the catalog declares and how many
     /// are off on screen; `None` without `/OCProperties`.
     layers: Option<(usize, usize)>,
-    /// Content items the structure tree reaches over every page: how many
-    /// marked-content sequences and how many annotations.
+    /// Content items the structure tree's parent tree files over every
+    /// page: how many marked-content sequences and how many annotations.
     tagged: (usize, usize),
     linearization: Option<(&'a pdfboss_core::Linearization, u64)>,
 }
@@ -1095,9 +1091,9 @@ fn info_text(info: &Info) -> String {
     if let Some((total, off)) = info.layers {
         let _ = writeln!(out, "layers:    {total} ({off} off)");
     }
-    // Content items the structure tree reaches (ISO 32000-1 §14.7.4):
-    // marked-content sequences and the annotations held through object
-    // references (§14.7.4.3).
+    // Content items the structure tree's parent tree files (ISO 32000-1
+    // §14.7.4.4): marked-content sequences and the annotations held through
+    // object references (§14.7.4.3).
     let (sequences, objects) = info.tagged;
     if sequences + objects > 0 {
         let _ = writeln!(
@@ -1758,10 +1754,10 @@ mod tests {
         assert!(!info_text(&Info::default()).contains("layers"));
     }
 
-    /// Content items the structure tree reaches print as one line with the
+    /// Content items the parent tree files print as one line with the
     /// total, the sequences and the annotations; a document whose tree
-    /// reaches nothing prints no line.
-    // Covers ISO 32000-1 §14.7.4 and §14.7.4.3.
+    /// files nothing prints no line.
+    // Covers ISO 32000-1 §14.7.4.3 and §14.7.4.4.
     #[test]
     fn info_text_counts_tagged_content_items() {
         let report = info_text(&Info {
