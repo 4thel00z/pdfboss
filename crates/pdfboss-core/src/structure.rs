@@ -610,7 +610,7 @@ impl StructureTree {
                 );
             }
         }
-        for r in annotation_refs(src, &page_dict).await {
+        for r in annotation_refs(src, page_dict).await {
             let Some(dict) = walk.dict(r).await else {
                 continue;
             };
@@ -2051,7 +2051,7 @@ mod tests {
     fn items_of(placed: &[PlacedItem]) -> Vec<(ContentItem, u32)> {
         placed
             .iter()
-            .map(|p| (p.item.clone(), p.placement.rank))
+            .map(|p| (p.item, p.placement.rank))
             .collect()
     }
 
