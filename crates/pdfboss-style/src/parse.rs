@@ -1,10 +1,14 @@
 //! Strict CSS-subset parser: element-type selectors and the fixed
 //! property set from `style.rs`, driven directly off `cssparser` tokens
 //! so every error carries a 1-indexed source location.
+//!
+//! cssparser's own errors carry neither a location nor the offending
+//! token, so every failure is raised here as a `Failure` at the location
+//! read from the parser just before the failing token was consumed.
 
 use std::fmt;
 
-use cssparser::{ParseError, ParseErrorKind, Parser, ParserInput, SourceLocation, Token};
+use cssparser::{ParseError, ParseErrorKind, Parser, SourceLocation, Token};
 use pdfboss_write::Color;
 
 use crate::style::{Align, Declared, Decoration, Element, FontFamily, FontSize};
@@ -35,14 +39,27 @@ pub(crate) struct Rule {
     pub declared: Declared,
 }
 
-type Failure<'i> = ParseError<'i, String>;
+/// A failure at the location of the token that caused it.
+#[derive(Clone, Debug, PartialEq)]
+struct Failure {
+    location: SourceLocation,
+    message: String,
+}
+
+impl Failure {
+    fn new(location: SourceLocation, message: impl Into<String>) -> Self {
+        Failure {
+            location,
+            message: message.into(),
+        }
+    }
+}
 
 /// Parses a stylesheet into its rules, in source order. Comments and
 /// whitespace are ignored; anything outside the supported selector,
 /// property, value and unit vocabulary is a located error.
 pub(crate) fn parse_sheet(css: &str) -> Result<Vec<Rule>, StyleError> {
-    let mut input = ParserInput::new(css);
-    let mut parser = Parser::new(&mut input);
+    let mut parser = Parser::new(css);
     let mut rules = Vec::new();
     loop {
         match next_rule(&mut parser) {
@@ -53,63 +70,97 @@ pub(crate) fn parse_sheet(css: &str) -> Result<Vec<Rule>, StyleError> {
     }
 }
 
-fn style_error(e: Failure<'_>) -> StyleError {
-    let message = match e.kind {
-        ParseErrorKind::Custom(message) => message,
-        ParseErrorKind::Basic(basic) => basic.to_string(),
-    };
+fn style_error(e: Failure) -> StyleError {
     StyleError {
         line: e.location.line + 1,
         column: e.location.column,
-        message,
+        message: e.message,
     }
 }
 
-fn next_rule<'i>(parser: &mut Parser<'i, '_>) -> Result<Option<Rule>, Failure<'i>> {
+/// Where the next token starts, past any whitespace and comments.
+fn token_location(parser: &mut Parser<'_>) -> SourceLocation {
+    parser.skip_whitespace();
+    parser.current_source_location()
+}
+
+/// The next token together with the location it starts at. Running out
+/// of input is a failure at that location.
+fn next_token<'i>(parser: &mut Parser<'i>) -> Result<(SourceLocation, Token<'i>), Failure> {
+    let location = token_location(parser);
+    let token = parser
+        .next()
+        .map_err(|e| Failure::new(location, e.kind.to_string()))?
+        .clone();
+    Ok((location, token))
+}
+
+/// Runs `parse` over the block or function whose opening token was just
+/// consumed. cssparser reports leftover input and the nesting limit
+/// without a location, so those are placed at `location`, the block's
+/// opening token.
+fn nested<'i, T>(
+    parser: &mut Parser<'i>,
+    location: SourceLocation,
+    parse: impl FnOnce(&mut Parser<'i>) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    parser
+        .parse_nested_block(|block| parse(block).map_err(ParseError::custom))
+        .map_err(|e| match e.kind {
+            ParseErrorKind::Custom(failure) => failure,
+            ParseErrorKind::Basic(kind) => Failure::new(location, kind.to_string()),
+        })
+}
+
+fn next_rule(parser: &mut Parser<'_>) -> Result<Option<Rule>, Failure> {
     let mut elements = Vec::new();
     loop {
-        let location = parser.current_source_location();
+        let location = token_location(parser);
         let token = match parser.next() {
             Ok(token) => token.clone(),
             Err(_) => {
                 if elements.is_empty() {
                     return Ok(None);
                 }
-                return Err(
-                    location.new_custom_error("selector list without a { } block".to_string())
-                );
+                return Err(Failure::new(location, "selector list without a { } block"));
             }
         };
         match token {
             Token::Ident(name) => {
                 let element = Element::from_name(&name.to_ascii_lowercase()).ok_or_else(|| {
-                    location.new_custom_error(format!(
-                        "unsupported selector {name:?}: only element type selectors are supported"
-                    ))
+                    Failure::new(
+                        location,
+                        format!(
+                            "unsupported selector {name:?}: only element type selectors are supported"
+                        ),
+                    )
                 })?;
                 elements.push(element);
             }
             Token::Comma => {}
             Token::CurlyBracketBlock => {
                 if elements.is_empty() {
-                    return Err(location.new_custom_error("rule has no selector".to_string()));
+                    return Err(Failure::new(location, "rule has no selector"));
                 }
-                let declared = parser.parse_nested_block(|block| declarations(block))?;
+                let declared = nested(parser, location, declarations)?;
                 return Ok(Some(Rule { elements, declared }));
             }
             other => {
-                return Err(location.new_custom_error(format!(
-                    "unsupported selector token {other:?}: only element type selectors are supported"
-                )));
+                return Err(Failure::new(
+                    location,
+                    format!(
+                        "unsupported selector token {other:?}: only element type selectors are supported"
+                    ),
+                ));
             }
         }
     }
 }
 
-fn declarations<'i>(parser: &mut Parser<'i, '_>) -> Result<Declared, Failure<'i>> {
+fn declarations(parser: &mut Parser<'_>) -> Result<Declared, Failure> {
     let mut declared = Declared::default();
     loop {
-        let location = parser.current_source_location();
+        let location = token_location(parser);
         let token = match parser.next() {
             Ok(token) => token.clone(),
             Err(_) => return Ok(declared),
@@ -118,22 +169,26 @@ fn declarations<'i>(parser: &mut Parser<'i, '_>) -> Result<Declared, Failure<'i>
             Token::Semicolon => continue,
             Token::Ident(name) => name.to_ascii_lowercase(),
             other => {
-                return Err(
-                    location.new_custom_error(format!("expected a property name, found {other:?}"))
-                )
+                return Err(Failure::new(
+                    location,
+                    format!("expected a property name, found {other:?}"),
+                ))
             }
         };
-        parser.expect_colon()?;
+        let colon = token_location(parser);
+        parser
+            .expect_colon()
+            .map_err(|_| Failure::new(colon, format!("expected ':' after property {name:?}")))?;
         declaration(parser, &name, &mut declared, location)?;
     }
 }
 
-fn declaration<'i>(
-    parser: &mut Parser<'i, '_>,
+fn declaration(
+    parser: &mut Parser<'_>,
     name: &str,
     declared: &mut Declared,
     location: SourceLocation,
-) -> Result<(), Failure<'i>> {
+) -> Result<(), Failure> {
     match name {
         "font-family" => declared.family = Some(font_family(parser)?),
         "font-size" => declared.size = Some(font_size(parser)?),
@@ -154,20 +209,25 @@ fn declaration<'i>(
         "line-height" => declared.line_height = Some(line_height(parser)?),
         "text-align" => declared.align = Some(text_align(parser)?),
         "text-decoration" => declared.decoration = Some(text_decoration(parser)?),
-        other => return Err(location.new_custom_error(format!("unsupported property {other:?}"))),
+        other => {
+            return Err(Failure::new(
+                location,
+                format!("unsupported property {other:?}"),
+            ))
+        }
     }
     finish(parser)
 }
 
-fn finish<'i>(parser: &mut Parser<'i, '_>) -> Result<(), Failure<'i>> {
-    let location = parser.current_source_location();
+fn finish(parser: &mut Parser<'_>) -> Result<(), Failure> {
+    let location = token_location(parser);
     match parser.next() {
         Err(_) => Ok(()),
         Ok(&Token::Semicolon) => Ok(()),
-        Ok(other) => Err(location.new_custom_error(format!(
-            "unexpected {} after the value",
-            render_token(other)
-        ))),
+        Ok(other) => Err(Failure::new(
+            location,
+            format!("unexpected {} after the value", render_token(other)),
+        )),
     }
 }
 
@@ -191,9 +251,8 @@ fn render_token(token: &Token) -> String {
     }
 }
 
-fn length<'i>(parser: &mut Parser<'i, '_>) -> Result<f32, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn length(parser: &mut Parser<'_>) -> Result<f32, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("pt") => Ok(*value),
         Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("mm") => {
@@ -204,16 +263,18 @@ fn length<'i>(parser: &mut Parser<'i, '_>) -> Result<f32, Failure<'i>> {
         }
         Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("in") => Ok(72.0 * value),
         Token::Number { value, .. } if *value == 0.0 => Ok(0.0),
-        _ => Err(location.new_custom_error(format!(
-            "length takes pt, mm, cm or in, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "length takes pt, mm, cm or in, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
-fn font_size<'i>(parser: &mut Parser<'i, '_>) -> Result<FontSize, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn font_size(parser: &mut Parser<'_>) -> Result<FontSize, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("pt") => {
             Ok(FontSize::Pt(*value))
@@ -221,14 +282,14 @@ fn font_size<'i>(parser: &mut Parser<'i, '_>) -> Result<FontSize, Failure<'i>> {
         Token::Dimension { value, unit, .. } if unit.eq_ignore_ascii_case("em") => {
             Ok(FontSize::Em(*value))
         }
-        _ => Err(location.new_custom_error(format!(
-            "font-size takes pt or em, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!("font-size takes pt or em, found {}", render_token(&token)),
+        )),
     }
 }
 
-fn edges<'i>(parser: &mut Parser<'i, '_>) -> Result<[Option<f32>; 4], Failure<'i>> {
+fn edges(parser: &mut Parser<'_>) -> Result<[Option<f32>; 4], Failure> {
     let mut values: Vec<f32> = Vec::new();
     while values.len() < 4 {
         match parser.try_parse(length) {
@@ -246,49 +307,56 @@ fn edges<'i>(parser: &mut Parser<'i, '_>) -> Result<[Option<f32>; 4], Failure<'i
     Ok(edges.map(Some))
 }
 
-fn shorthand_error<'i>(parser: &mut Parser<'i, '_>) -> Failure<'i> {
-    let location = parser.current_source_location();
+fn shorthand_error(parser: &mut Parser<'_>) -> Failure {
+    let location = token_location(parser);
     match parser.next() {
-        Ok(token) => location.new_custom_error(format!(
-            "margin/padding shorthand takes 1 to 4 lengths, found {}",
-            render_token(token)
-        )),
-        Err(_) => location.new_custom_error(
-            "margin/padding shorthand takes 1 to 4 lengths, found nothing".to_string(),
+        Ok(token) => Failure::new(
+            location,
+            format!(
+                "margin/padding shorthand takes 1 to 4 lengths, found {}",
+                render_token(token)
+            ),
+        ),
+        Err(_) => Failure::new(
+            location,
+            "margin/padding shorthand takes 1 to 4 lengths, found nothing",
         ),
     }
 }
 
-fn color<'i>(parser: &mut Parser<'i, '_>) -> Result<Color, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn color(parser: &mut Parser<'_>) -> Result<Color, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Hash(hex) | Token::IDHash(hex) => hex_color(location, hex),
         Token::Function(name) if name.eq_ignore_ascii_case("rgb") => {
-            parser.parse_nested_block(|block| rgb_components(block))
+            nested(parser, location, rgb_components)
         }
         Token::Ident(name) => named_color(location, name),
-        _ => Err(location.new_custom_error(format!(
-            "color takes a hex value, rgb() or a named color, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "color takes a hex value, rgb() or a named color, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
-fn hex_color<'i>(location: SourceLocation, hex: &str) -> Result<Color, Failure<'i>> {
+fn hex_color(location: SourceLocation, hex: &str) -> Result<Color, Failure> {
     let expanded = match hex.len() {
         3 => hex.chars().flat_map(|digit| [digit, digit]).collect(),
         6 => hex.to_string(),
         _ => {
-            return Err(
-                location.new_custom_error(format!("hex colors take 3 or 6 digits, found #{hex}"))
-            )
+            return Err(Failure::new(
+                location,
+                format!("hex colors take 3 or 6 digits, found #{hex}"),
+            ))
         }
     };
-    let channel = |slice: &str| -> Result<f32, Failure<'i>> {
+    let channel = |slice: &str| -> Result<f32, Failure> {
         u8::from_str_radix(slice, 16)
             .map(|byte| byte as f32 / 255.0)
-            .map_err(|_| location.new_custom_error(format!("invalid hex color, found #{hex}")))
+            .map_err(|_| Failure::new(location, format!("invalid hex color, found #{hex}")))
     };
     Ok(Color::Rgb(
         channel(&expanded[0..2])?,
@@ -297,7 +365,7 @@ fn hex_color<'i>(location: SourceLocation, hex: &str) -> Result<Color, Failure<'
     ))
 }
 
-fn named_color<'i>(location: SourceLocation, name: &str) -> Result<Color, Failure<'i>> {
+fn named_color(location: SourceLocation, name: &str) -> Result<Color, Failure> {
     let rgb = match name.to_ascii_lowercase().as_str() {
         "black" => (0, 0, 0),
         "white" => (255, 255, 255),
@@ -316,7 +384,7 @@ fn named_color<'i>(location: SourceLocation, name: &str) -> Result<Color, Failur
         "fuchsia" | "magenta" => (255, 0, 255),
         "lime" => (0, 255, 0),
         "olive" => (128, 128, 0),
-        _ => return Err(location.new_custom_error(format!("unknown color name {name}"))),
+        _ => return Err(Failure::new(location, format!("unknown color name {name}"))),
     };
     let (r, g, b) = rgb;
     Ok(Color::Rgb(
@@ -326,119 +394,144 @@ fn named_color<'i>(location: SourceLocation, name: &str) -> Result<Color, Failur
     ))
 }
 
-fn rgb_components<'i>(parser: &mut Parser<'i, '_>) -> Result<Color, Failure<'i>> {
+fn rgb_components(parser: &mut Parser<'_>) -> Result<Color, Failure> {
     let r = rgb_component(parser)?;
     parser.try_parse(Parser::expect_comma).ok();
     let g = rgb_component(parser)?;
     parser.try_parse(Parser::expect_comma).ok();
     let b = rgb_component(parser)?;
-    Ok(Color::Rgb(r, g, b))
-}
-
-fn rgb_component<'i>(parser: &mut Parser<'i, '_>) -> Result<f32, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
-    match &token {
-        Token::Number { value, .. } if (0.0..=255.0).contains(value) => Ok(value / 255.0),
-        _ => Err(location.new_custom_error(format!(
-            "rgb() takes three numbers 0-255, found {}",
-            render_token(&token)
-        ))),
+    parser.try_parse(Parser::expect_comma).ok();
+    let location = token_location(parser);
+    match parser.next() {
+        Err(_) => Ok(Color::Rgb(r, g, b)),
+        Ok(extra) => Err(Failure::new(
+            location,
+            format!(
+                "rgb() takes three components, found {}",
+                render_token(extra)
+            ),
+        )),
     }
 }
 
-fn font_family<'i>(parser: &mut Parser<'i, '_>) -> Result<FontFamily, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn rgb_component(parser: &mut Parser<'_>) -> Result<f32, Failure> {
+    let (location, token) = next_token(parser)?;
+    match &token {
+        Token::Number { value, .. } if (0.0..=255.0).contains(value) => Ok(value / 255.0),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "rgb() takes three numbers 0-255, found {}",
+                render_token(&token)
+            ),
+        )),
+    }
+}
+
+fn font_family(parser: &mut Parser<'_>) -> Result<FontFamily, Failure> {
+    let (location, token) = next_token(parser)?;
     let name = match &token {
         Token::Ident(name) => name.to_ascii_lowercase(),
         _ => {
-            return Err(location.new_custom_error(format!(
-                "font-family takes a family name, found {}",
-                render_token(&token)
-            )))
+            return Err(Failure::new(
+                location,
+                format!(
+                    "font-family takes a family name, found {}",
+                    render_token(&token)
+                ),
+            ))
         }
     };
     match name.as_str() {
         "helvetica" | "sans-serif" => Ok(FontFamily::Helvetica),
         "times" | "serif" => Ok(FontFamily::Times),
         "courier" | "monospace" => Ok(FontFamily::Courier),
-        _ => Err(location.new_custom_error(format!(
+        _ => Err(Failure::new(location, format!(
             "unknown font family {name:?}: helvetica, times and courier are available until font embedding lands"
         ))),
     }
 }
 
-fn font_weight<'i>(parser: &mut Parser<'i, '_>) -> Result<bool, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn font_weight(parser: &mut Parser<'_>) -> Result<bool, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(false),
         Token::Ident(name) if name.eq_ignore_ascii_case("bold") => Ok(true),
         Token::Number { value, .. } if *value == 400.0 => Ok(false),
         Token::Number { value, .. } if *value == 700.0 => Ok(true),
-        _ => Err(location.new_custom_error(format!(
-            "font-weight takes normal, bold, 400 or 700, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "font-weight takes normal, bold, 400 or 700, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
-fn font_style<'i>(parser: &mut Parser<'i, '_>) -> Result<bool, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn font_style(parser: &mut Parser<'_>) -> Result<bool, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Ident(name) if name.eq_ignore_ascii_case("normal") => Ok(false),
         Token::Ident(name) if name.eq_ignore_ascii_case("italic") => Ok(true),
-        _ => Err(location.new_custom_error(format!(
-            "font-style takes normal or italic, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "font-style takes normal or italic, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
-fn line_height<'i>(parser: &mut Parser<'i, '_>) -> Result<f32, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn line_height(parser: &mut Parser<'_>) -> Result<f32, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Number { value, .. } if *value > 0.0 => Ok(*value),
-        _ => Err(location.new_custom_error(format!(
-            "line-height takes a positive number, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "line-height takes a positive number, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
-fn text_align<'i>(parser: &mut Parser<'i, '_>) -> Result<Align, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn text_align(parser: &mut Parser<'_>) -> Result<Align, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Ident(name) if name.eq_ignore_ascii_case("left") => Ok(Align::Left),
         Token::Ident(name) if name.eq_ignore_ascii_case("center") => Ok(Align::Center),
         Token::Ident(name) if name.eq_ignore_ascii_case("right") => Ok(Align::Right),
         Token::Ident(name) if name.eq_ignore_ascii_case("justify") => {
-            Err(location.new_custom_error("justify is not supported".to_string()))
+            Err(Failure::new(location, "justify is not supported"))
         }
-        _ => Err(location.new_custom_error(format!(
-            "text-align takes left, center or right, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "text-align takes left, center or right, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
-fn text_decoration<'i>(parser: &mut Parser<'i, '_>) -> Result<Decoration, Failure<'i>> {
-    let location = parser.current_source_location();
-    let token = parser.next()?.clone();
+fn text_decoration(parser: &mut Parser<'_>) -> Result<Decoration, Failure> {
+    let (location, token) = next_token(parser)?;
     match &token {
         Token::Ident(name) if name.eq_ignore_ascii_case("none") => Ok(Decoration::None),
         Token::Ident(name) if name.eq_ignore_ascii_case("underline") => Ok(Decoration::Underline),
         Token::Ident(name) if name.eq_ignore_ascii_case("line-through") => {
             Ok(Decoration::LineThrough)
         }
-        _ => Err(location.new_custom_error(format!(
-            "text-decoration takes none, underline or line-through, found {}",
-            render_token(&token)
-        ))),
+        _ => Err(Failure::new(
+            location,
+            format!(
+                "text-decoration takes none, underline or line-through, found {}",
+                render_token(&token)
+            ),
+        )),
     }
 }
 
@@ -535,5 +628,26 @@ mod tests {
     fn rejects_rgb_components_outside_0_255() {
         let e = error("p { color: rgb(500, -10, 0); }");
         assert!(e.message.contains("500"));
+    }
+
+    #[test]
+    fn rejects_a_fourth_rgb_component_at_its_location() {
+        let e = error("p { color: rgb(1, 2, 3, 4); }");
+        assert_eq!((e.line, e.column), (1, 25));
+        assert!(e.message.contains("found 4"), "{}", e.message);
+    }
+
+    #[test]
+    fn missing_colon_names_the_property() {
+        let e = error("p { color #000; }");
+        assert_eq!((e.line, e.column), (1, 11));
+        assert!(e.message.contains("color"), "{}", e.message);
+    }
+
+    #[test]
+    fn unterminated_value_fails_at_the_end_of_input() {
+        let e = error("p { color:");
+        assert_eq!((e.line, e.column), (1, 11));
+        assert!(e.message.contains("end of input"), "{}", e.message);
     }
 }
