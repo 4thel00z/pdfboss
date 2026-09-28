@@ -104,8 +104,8 @@ pub use source::{
     ObjectSource, MAX_RESOLVE_DEPTH,
 };
 pub use structure::{
-    AttributeObject, MarkedContentId, Placement, StandardKind, StandardOwner, StandardType,
-    StructureElement, StructureTree,
+    AttributeObject, ContentItem, MarkedContentId, PlacedItem, Placement, StandardKind,
+    StandardOwner, StandardType, StructureElement, StructureTree,
 };
 pub use thumbnail::{thumbnail_with, Thumbnail};
 pub use viewer_preferences::{

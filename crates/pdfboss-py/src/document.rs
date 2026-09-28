@@ -11,11 +11,12 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use pdfboss_core::{
-    ArticleThread as CoreArticleThread, Bead as CoreBead, Dimension, FractionFormat, LabelPosition,
-    LegalAttestation as CoreLegalAttestation, Linearization as CoreLinearization,
-    Measure as CoreMeasure, Motion, NumberFormat as CoreNumberFormat, Object, OcEvent,
-    OcGroup as CoreOcGroup, OcUsage as CoreOcUsage, OutputIntent as CoreOutputIntent,
-    PagePiece as CorePagePiece, PermissionHandlers as CorePermissionHandlers,
+    ArticleThread as CoreArticleThread, Bead as CoreBead, ContentItem as CoreContentItem,
+    Dimension, FractionFormat, LabelPosition, LegalAttestation as CoreLegalAttestation,
+    Linearization as CoreLinearization, Measure as CoreMeasure, Motion,
+    NumberFormat as CoreNumberFormat, Object, OcEvent, OcGroup as CoreOcGroup,
+    OcUsage as CoreOcUsage, OutputIntent as CoreOutputIntent, PagePiece as CorePagePiece,
+    PermissionHandlers as CorePermissionHandlers, PlacedItem as CorePlacedItem,
     Presentation as CorePresentation, Requirement as CoreRequirement,
     RequirementHandler as CoreRequirementHandler, SeparationInfo as CoreSeparationInfo,
     Thumbnail as CoreThumbnail, Transition as CoreTransition, TransitionDirection, TransitionStyle,
@@ -1155,6 +1156,138 @@ impl SeparationInfo {
     }
 }
 
+/// One content item of a page placed in the structure tree (ISO 32000-1
+/// 14.7.4): a marked-content sequence of the page's content stream, or an
+/// annotation the tree holds through an object reference (14.7.4.3), with
+/// its rank in the tree's depth-first order and the element holding it.
+#[pyclass(frozen)]
+pub(crate) struct ContentItem {
+    inner: CorePlacedItem,
+}
+
+impl From<CorePlacedItem> for ContentItem {
+    fn from(inner: CorePlacedItem) -> ContentItem {
+        ContentItem { inner }
+    }
+}
+
+#[pymethods]
+impl ContentItem {
+    /// `"sequence"` for a marked-content sequence, `"object"` for an
+    /// annotation or another whole object.
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner.item {
+            CoreContentItem::Sequence(_) => "sequence",
+            CoreContentItem::Object(_) => "object",
+        }
+    }
+
+    /// A sequence's marked-content identifier, `/MCID`; `None` for an
+    /// object.
+    #[getter]
+    fn mcid(&self) -> Option<u32> {
+        match self.inner.item {
+            CoreContentItem::Sequence(id) => Some(id.mcid),
+            CoreContentItem::Object(_) => None,
+        }
+    }
+
+    /// The `/StructParents` key of the content stream a sequence sits in;
+    /// `None` for an object.
+    #[getter]
+    fn struct_parents(&self) -> Option<u32> {
+        match self.inner.item {
+            CoreContentItem::Sequence(id) => Some(id.parents),
+            CoreContentItem::Object(_) => None,
+        }
+    }
+
+    /// The `(num, gen)` reference of an object item, the annotation's
+    /// dictionary; `None` for a sequence.
+    #[getter]
+    #[pyo3(name = "ref")]
+    fn object_ref(&self) -> Option<(u32, u16)> {
+        match self.inner.item {
+            CoreContentItem::Sequence(_) => None,
+            CoreContentItem::Object(r) => Some(ref_tuple(r)),
+        }
+    }
+
+    /// The item's position in the tree's depth-first order among the
+    /// page's content items, 0 first.
+    #[getter]
+    fn rank(&self) -> u32 {
+        self.inner.placement.rank
+    }
+
+    /// The holding element's structure type as written, `/S`.
+    #[getter]
+    fn structure_type(&self) -> Option<&str> {
+        self.inner.placement.structure_type.as_deref()
+    }
+
+    /// `structure_type` followed through the role map (14.7.3).
+    #[getter]
+    fn mapped_type(&self) -> Option<&str> {
+        self.inner.placement.mapped_type.as_deref()
+    }
+
+    /// The standard structure type `mapped_type` names (14.8.4), `None`
+    /// when it names none.
+    #[getter]
+    fn standard_type(&self) -> Option<&'static str> {
+        self.inner.placement.standard_type.map(|t| t.name())
+    }
+
+    /// The standard-typed elements enclosing the item, outermost first and
+    /// the holding element last when it is standard, as `(standard_type,
+    /// (num, gen))` pairs.
+    #[getter]
+    fn path(&self) -> Vec<(&'static str, (u32, u16))> {
+        self.inner
+            .placement
+            .path
+            .iter()
+            .map(|e| (e.standard_type.name(), ref_tuple(e.object)))
+            .collect()
+    }
+
+    /// The alternate description of the holding element or its nearest
+    /// ancestor that has one, `/Alt` (14.9.3).
+    #[getter]
+    fn alt(&self) -> Option<&str> {
+        self.inner.placement.alt.as_deref()
+    }
+
+    /// The language of the holding element or its nearest ancestor that
+    /// declares one, `/Lang` (14.9.2).
+    #[getter]
+    fn lang(&self) -> Option<&str> {
+        self.inner.placement.lang.as_deref()
+    }
+
+    /// The expansion of the abbreviation the element's text is, `/E`
+    /// (14.9.5).
+    #[getter]
+    fn expansion(&self) -> Option<&str> {
+        self.inner.placement.expansion.as_deref()
+    }
+
+    fn __repr__(&self) -> String {
+        let what = match self.inner.item {
+            CoreContentItem::Sequence(id) => format!("mcid={}", id.mcid),
+            CoreContentItem::Object(r) => format!("ref={:?}", ref_tuple(r)),
+        };
+        format!(
+            "ContentItem(kind={}, {what}, rank={}, structure_type={})",
+            repr_str(self.kind()),
+            self.inner.placement.rank,
+            repr_opt_str(self.inner.placement.structure_type.as_deref())
+        )
+    }
+}
+
 /// The usage application event a Python string names: `"view"`,
 /// `"print"` or `"export"`, or `None` for the default configuration alone.
 pub(crate) fn event_from_py(event: Option<&str>) -> PyResult<Option<OcEvent>> {
@@ -1357,6 +1490,7 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Measure>()?;
     module.add_class::<NumberFormat>()?;
     module.add_class::<SeparationInfo>()?;
+    module.add_class::<ContentItem>()?;
     Ok(())
 }
 

@@ -670,6 +670,14 @@ class Page:
         the page opens and closes (ISO 32000-1 12.6.3, Table 195), in that
         order; empty without one. Releases the GIL."""
 
+    def content_items(self) -> list[ContentItem]:
+        """The page's content items in structure-tree order (ISO 32000-1
+        14.7.4): the marked-content sequences of its content stream and
+        the annotations the tree holds through object references
+        (14.7.4.3), ranked together, so each annotation sits where
+        14.8.2.3.2 puts it in the page's content order. Empty for a page
+        the tree does not reach. Releases the GIL."""
+
 class PageImage:
     """One embedded image extracted from a page: PNG-encoded pixels at
     the image's own native dimensions, straight alpha, ``/SMask``
@@ -1705,6 +1713,61 @@ class FileSpec:
     """The embedded file stream's ``(num, gen)`` reference; ``None`` when
     the specification embeds no stream."""
 
+class ContentItem:
+    """One content item of a page placed in the structure tree (ISO
+    32000-1 14.7.4): a marked-content sequence of the page's content
+    stream, or an annotation the tree holds through an object reference
+    (14.7.4.3); returned by ``Page.content_items`` in tree order."""
+
+    kind: str
+    """``"sequence"`` for a marked-content sequence, ``"object"`` for an
+    annotation or another whole object."""
+
+    mcid: int | None
+    """A sequence's marked-content identifier, ``/MCID``; ``None`` for an
+    object."""
+
+    struct_parents: int | None
+    """The ``/StructParents`` key of the content stream a sequence sits
+    in; ``None`` for an object."""
+
+    ref: tuple[int, int] | None
+    """The ``(num, gen)`` reference of an object item, the annotation's
+    dictionary (the same as ``Annotation.ref``); ``None`` for a
+    sequence."""
+
+    rank: int
+    """The item's position in the tree's depth-first order among the
+    page's content items, 0 first."""
+
+    structure_type: str | None
+    """The holding element's structure type as written, ``/S``."""
+
+    mapped_type: str | None
+    """``structure_type`` followed through the role map (14.7.3)."""
+
+    standard_type: str | None
+    """The standard structure type ``mapped_type`` names (14.8.4):
+    ``"P"``, ``"Link"``, ``"Form"``, ``"Figure"`` and the rest; ``None``
+    when it names none."""
+
+    path: list[tuple[str, tuple[int, int]]]
+    """The standard-typed elements enclosing the item, outermost first
+    and the holding element last when it is standard, as
+    ``(standard_type, (num, gen))`` pairs."""
+
+    alt: str | None
+    """The alternate description of the holding element or its nearest
+    ancestor that has one, ``/Alt`` (14.9.3)."""
+
+    lang: str | None
+    """The language of the holding element or its nearest ancestor that
+    declares one, ``/Lang`` (14.9.2)."""
+
+    expansion: str | None
+    """The expansion of the abbreviation the element's text is, ``/E``
+    (14.9.5)."""
+
 class AnnotationFlags:
     """The ``/F`` flag word of an annotation (ISO 32000-1 12.5.3, Table
     165), one boolean per flag."""
@@ -2337,6 +2400,10 @@ class AsyncPage:
     async def additional_actions(self) -> list[TriggeredAction]:
         """The page's additional actions, the async twin of
         ``Page.additional_actions``."""
+
+    async def content_items(self) -> list[ContentItem]:
+        """The page's content items in structure-tree order, the async
+        twin of ``Page.content_items``."""
 
 def md_to_pdf(
     markdown: str,
