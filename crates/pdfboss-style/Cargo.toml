@@ -11,4 +11,4 @@ categories = ["text-processing", "parser-implementations"]
 
 [dependencies]
 pdfboss-write = { workspace = true }
-cssparser = "0.35"
+cssparser = "0.38"
