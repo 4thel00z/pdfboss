@@ -309,30 +309,36 @@ pub fn extract_markdown_reporting_opts(
 ) -> Result<(String, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
     // The optional-content state and the structure tree load once for the
-    // document: the tree's parent entries are read here, not on every page,
-    // and its walk caches carry across the workers.
+    // document: the tree's parent entries are read here, not on every page.
+    // Each worker walks its pages over its own fork of the tree, so what
+    // one page read serves the pages that worker takes next and no worker
+    // waits on another.
     let oc = doc.oc_state();
     let structure = pdfboss_text::structure_for(doc, order);
-    let per_page = pdfboss_core::map_pages(doc, |doc: &Document, page: &Page| {
-        let (mut spans, mut rulings, report) = pdfboss_core::source::block_on(
-            pdfboss_text::extract_spans_and_rulings_reporting_cached_with(
-                Immediate(doc),
-                page,
-                &fonts,
-                oc.as_ref(),
-                structure.as_ref(),
-                order,
-            ),
-        )?;
-        if !opts.invisible_text {
-            retain_spans_on_page(&mut spans, page);
-            retain_rulings_on_page(&mut rulings, page);
-        }
-        // The page's share of the size pass is counted here, on the
-        // worker, while its spans are still in cache.
-        let page = structure::ExtractedPage::new(spans, rulings, report.order);
-        Ok((page, report))
-    });
+    let per_page = pdfboss_core::map_pages_forking(
+        doc,
+        || structure.clone(),
+        |structure: &Option<StructureTree>, doc: &Document, page: &Page| {
+            let (mut spans, mut rulings, report) = pdfboss_core::source::block_on(
+                pdfboss_text::extract_spans_and_rulings_reporting_cached_with(
+                    Immediate(doc),
+                    page,
+                    &fonts,
+                    oc.as_ref(),
+                    structure.as_ref(),
+                    order,
+                ),
+            )?;
+            if !opts.invisible_text {
+                retain_spans_on_page(&mut spans, page);
+                retain_rulings_on_page(&mut rulings, page);
+            }
+            // The page's share of the size pass is counted here, on the
+            // worker, while its spans are still in cache.
+            let page = structure::ExtractedPage::new(spans, rulings, report.order);
+            Ok((page, report))
+        },
+    );
     let mut pages = Vec::with_capacity(per_page.len());
     let mut reports = Vec::with_capacity(per_page.len());
     for outcome in per_page {

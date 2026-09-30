@@ -465,7 +465,8 @@ impl Placement {
 /// whatever the file says about itself.
 #[derive(Debug)]
 pub struct StructureTree {
-    root: Dict,
+    /// The root dictionary, shared by every fork of the tree.
+    root: Arc<Dict>,
     root_ref: Option<ObjRef>,
     /// What the page walks have read so far: element dictionaries, paths
     /// and ancestries are the same for every page, so a walk takes them
@@ -480,20 +481,23 @@ pub struct StructureTree {
     /// Every entry of the root's `/ParentTree` (§14.7.4.4) by key, values
     /// as written: an array of element references for a `/StructParents`
     /// key, one element reference for a `/StructParent` key. Read once, so
-    /// no page searches the number tree again.
-    parent_entries: FastMap<i64, Object>,
+    /// no page searches the number tree again; shared by every fork.
+    parent_entries: Arc<FastMap<i64, Object>>,
 }
 
 impl Clone for StructureTree {
-    /// The same tree over an empty cache; the copy fills its own.
+    /// A fork: the same tree over an empty cache, which the copy fills on
+    /// its own. The root and the parent entries are shared, not copied, so
+    /// a page walk fanned out over threads forks the tree once per worker
+    /// and the workers contend on nothing.
     fn clone(&self) -> StructureTree {
         StructureTree {
-            root: self.root.clone(),
+            root: Arc::clone(&self.root),
             root_ref: self.root_ref,
             caches: Mutex::new(Caches::default()),
             role_map: self.role_map.clone(),
             class_map: self.class_map.clone(),
-            parent_entries: self.parent_entries.clone(),
+            parent_entries: Arc::clone(&self.parent_entries),
         }
     }
 }
@@ -536,12 +540,12 @@ impl StructureTree {
             None => FastMap::default(),
         };
         Some(StructureTree {
-            root,
+            root: Arc::new(root),
             root_ref,
             caches: Mutex::new(Caches::default()),
             role_map,
             class_map,
-            parent_entries,
+            parent_entries: Arc::new(parent_entries),
         })
     }
 
