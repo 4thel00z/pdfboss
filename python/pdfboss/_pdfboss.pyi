@@ -153,6 +153,24 @@ class Span:
         """FontDescriptor ``/Flags`` Serif."""
 
     @property
+    def font_family(self) -> str:
+        """The font family the FontDescriptor ``/FontFamily`` states
+        (ISO 32000-1 Table 122); empty when it states none."""
+
+    @property
+    def font_stretch(self) -> str | None:
+        """The font width the FontDescriptor ``/FontStretch`` states, in
+        lower case with hyphens (``"ultra-condensed"`` to
+        ``"ultra-expanded"``); ``None`` when it states none or a name
+        outside Table 122."""
+
+    @property
+    def font_weight(self) -> float | None:
+        """The font weight the FontDescriptor ``/FontWeight`` states (100
+        to 900); ``None`` when it states none. ``bold`` is the reading of
+        it."""
+
+    @property
     def underline(self) -> bool:
         """A drawn ruling sits just below the baseline, covers most of the
         span and stops within an em of the text it covers, or an

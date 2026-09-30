@@ -22,6 +22,7 @@ layer from printed text, or feeding a layout analysis of your own.
 | `ascent`, `descent` | The box's offsets from the baseline in device units: `y + ascent` is the box top, `y + descent` (zero or negative) its bottom. See [Box and baseline](#box-and-baseline). |
 | `bold`, `italic` | From FontDescriptor evidence, falling back to the `/BaseFont` name. |
 | `monospace`, `serif` | FontDescriptor `/Flags` FixedPitch and Serif. |
+| `font_family`, `font_stretch`, `font_weight` | FontDescriptor `/FontFamily` (empty when absent), `/FontStretch` as `"ultra-condensed"` to `"ultra-expanded"` (`None` when absent) and `/FontWeight` as written (`None` when absent): the font characteristics ISO 32000-1 Table 122 keeps for tagged PDF. `bold` is the reading of the weight with the flags, stem width and name as further evidence. |
 | `underline`, `strikethrough` | A drawn ruling below the baseline / across the x-height band, or a text markup annotation over the span. See [Decorations](#decorations). |
 | `highlight`, `highlight_color` | A marker-style filled rectangle behind the span, or a `/Highlight` annotation over it, and its RGB color. See [Decorations](#decorations). |
 | `rise` | The text rise (`Ts`) the span was shown under: positive above the baseline, a superscript/subscript signal. |
@@ -158,7 +159,8 @@ doc.spans()`, described in [Async and remote documents](./async.md).
 `pdfboss_text::extract_spans` returns a `Vec<TextSpan>` carrying the same
 fields as the Python `Span` (as plain struct fields: `text`, `x`, `y`,
 `end_x`, `size`, `font`, `font_name`, `page`, `bbox`, `ascent`, `descent`,
-`bold`, `italic`, `monospace`, `serif`, `rise`, `vertical`, `invisible`,
+`bold`, `italic`, `monospace`, `serif`, `font_family`, `font_stretch`,
+`font_weight`, `rise`, `vertical`, `invisible`,
 `color`, `underline`, `strikethrough`, `highlight`, `highlight_color`):
 
 ```rust,no_run
