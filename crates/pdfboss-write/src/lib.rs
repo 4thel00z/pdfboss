@@ -40,7 +40,7 @@ mod xmp;
 pub use assemble::encrypt_document;
 pub use assemble::{
     copy_pages_with, decrypt_document, merge_documents, rewrite_document, rewrite_with_metadata,
-    rotate_rewrite, split_document,
+    rotate_rewrite, split_document, split_part, split_runs,
 };
 pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;

@@ -2,6 +2,8 @@
 //! selected pages from each source, gathered in argument order under a
 //! single new `/Pages` node.
 
+use std::ops::Range;
+
 use pdfboss_core::{
     block_on, AsyncObjectSource, Dict, Document, Immediate, Name, ObjRef, Object, Page,
 };
@@ -37,7 +39,7 @@ pub fn merge_documents(
         let mut importer = Importer::new(&mut writer, source)?;
         let indices: Vec<usize> = match selection {
             Some(indices) => indices.to_vec(),
-            None => (0..source.page_count()).collect(),
+            None => (0..source.flattened_page_count()).collect(),
         };
         for index in indices {
             kids.push(importer.page(index, pages_ref)?);
@@ -52,6 +54,7 @@ pub fn merge_documents(
 /// source, reading through any [`AsyncObjectSource`] and writing through
 /// any [`AsyncByteSink`], so a split can send each part on as soon as it
 /// is built. `src` must already decrypt: see [`Importer::with_source`].
+/// Every page must come from `src`; see [`Importer::page_with`].
 pub async fn copy_pages_with<S, K>(
     src: S,
     pages: Vec<Page>,
@@ -286,9 +289,20 @@ pub fn rewrite_with_metadata(
 
 /// Consecutive chunks of `every` pages, each a fresh document. `every` must
 /// be at least 1; the last chunk carries whatever remains, so no chunk is
-/// ever empty. Each part is built by [`copy_pages_with`]; call that
-/// directly to send parts on one at a time instead of collecting them.
+/// ever empty. Each part is [`split_part`] over one of [`split_runs`]; call
+/// those directly to build parts one at a time instead of collecting them.
 pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Result<Vec<Vec<u8>>> {
+    split_runs(doc, every)?
+        .into_iter()
+        .map(|run| split_part(doc, run, options))
+        .collect()
+}
+
+/// The runs of page indices [`split_document`] cuts `doc` into: `every`
+/// consecutive pages each, the last run carrying whatever remains. Counts
+/// the pages the page tree actually holds, not its declared `/Count`.
+/// Refuses `every` of 0 and a locked `doc`.
+pub fn split_runs(doc: &Document, every: usize) -> Result<Vec<Range<usize>>> {
     if every == 0 {
         return Err(Error::Other(
             "every must be at least 1 page per part".to_string(),
@@ -297,20 +311,23 @@ pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Re
     if doc.is_locked() {
         return Err(Error::EncryptedBase);
     }
-    let pages = (0..doc.page_count())
-        .map(|index| doc.page(index))
-        .collect::<pdfboss_core::Result<Vec<Page>>>()
-        .map_err(core_error)?;
-    pages
-        .chunks(every)
-        .map(|part| {
-            block_on(copy_pages_with(
-                Immediate(doc),
-                part.to_vec(),
-                options,
-                Vec::new(),
-            ))
-        })
+    let total = doc.flattened_page_count();
+    Ok((0..total)
+        .step_by(every)
+        .map(|start| start..(start + every).min(total))
+        .collect())
+}
+
+/// A fresh document holding the pages of `run`, in order: the synchronous
+/// counterpart of [`copy_pages_with`]. Only this run's pages are fetched.
+pub fn split_part(doc: &Document, run: Range<usize>, options: WriteOptions) -> Result<Vec<u8>> {
+    let pages = fetch_page_run(doc, run)?;
+    block_on(copy_pages_with(Immediate(doc), pages, options, Vec::new()))
+}
+
+/// The pages of `doc` at the indices in `run`, in order.
+pub(crate) fn fetch_page_run(doc: &Document, run: Range<usize>) -> Result<Vec<Page>> {
+    run.map(|index| doc.page(index).map_err(core_error))
         .collect()
 }
 
@@ -428,6 +445,70 @@ mod tests {
             })
             .collect();
         assert_eq!(parts, merged);
+    }
+
+    /// `multi_page_doc(pages)` with its declared `/Count` replaced by
+    /// `count`, a one-digit change that keeps every xref offset valid.
+    fn doc_with_wrong_count(pages: &[&str], count: usize) -> Document {
+        let bytes = multi_page_doc(pages);
+        let declared = format!("/Count {}", pages.len()).into_bytes();
+        let wrong = format!("/Count {count}").into_bytes();
+        let at = bytes
+            .windows(declared.len())
+            .position(|window| window == declared.as_slice())
+            .expect("the fixture declares its /Count");
+        let mut patched = bytes[..at].to_vec();
+        patched.extend_from_slice(&wrong);
+        patched.extend_from_slice(&bytes[at + declared.len()..]);
+        Document::load(patched).expect("the patched doc loads")
+    }
+
+    #[test]
+    fn split_counts_the_pages_the_tree_holds_when_count_is_too_high() {
+        let doc = doc_with_wrong_count(&["one", "two"], 3);
+        let parts = split_document(&doc, 1, WriteOptions::default()).expect("split succeeds");
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn split_counts_the_pages_the_tree_holds_when_count_is_too_low() {
+        let doc = doc_with_wrong_count(&["one", "two", "three"], 2);
+        let parts = split_document(&doc, 1, WriteOptions::default()).expect("split succeeds");
+        assert_eq!(parts.len(), 3);
+        let last = Document::load(parts[2].clone()).expect("last part loads");
+        let page = last.page(0).expect("page exists");
+        let text = extract_text(&last, &page, ReadingOrder::Content).expect("text extracts");
+        assert!(text.contains("three"), "last part: {text:?}");
+    }
+
+    #[test]
+    fn copy_pages_refuses_a_page_from_another_document() {
+        let a = Document::load(multi_page_doc(&["a1", "a2", "a3"])).expect("doc a loads");
+        let b = Document::load(multi_page_doc(&["b1"])).expect("doc b loads");
+        let foreign = a.page(2).expect("page exists");
+        let result = block_on(copy_pages_with(
+            Immediate(&b),
+            vec![foreign],
+            WriteOptions::default(),
+            Vec::new(),
+        ));
+        let Err(Error::Other(message)) = result else {
+            panic!("expected Error::Other, got {result:?}");
+        };
+        assert!(message.contains("does not come from"), "message: {message}");
+    }
+
+    #[test]
+    fn importer_keeps_its_two_lifetime_spelling() {
+        fn first_page(importer: &mut Importer<'_, '_>, parent: ObjRef) -> Result<ObjRef> {
+            importer.page(0, parent)
+        }
+
+        let doc = Document::load(multi_page_doc(&["one"])).expect("doc loads");
+        let mut writer = Writer::new(WriteOptions::default());
+        let parent = writer.reserve();
+        let mut importer = Importer::new(&mut writer, &doc).expect("importer opens");
+        first_page(&mut importer, parent).expect("page imports");
     }
 
     #[test]

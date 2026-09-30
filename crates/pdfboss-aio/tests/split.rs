@@ -1,14 +1,12 @@
-//! Async split parity: `copy_pages_with` over an `AsyncDocument` must emit
-//! exactly the parts the synchronous `split_document` emits for the same
-//! file, and its future must be `Send + 'static` so it can be spawned.
+//! `copy_pages_with` over an `AsyncDocument` emits the same parts the
+//! synchronous `split_document` emits for the same file, and runs as a
+//! spawned tokio task, so its future is `Send + 'static`.
 #![cfg(feature = "write")]
 
 use pdfboss_aio::AsyncDocument;
 use pdfboss_core::{Document, Page};
 use pdfboss_testkit::multi_page_doc;
 use pdfboss_write::{copy_pages_with, split_document, WriteOptions};
-
-fn assert_send_static<T: Send + 'static>(_: &T) {}
 
 #[tokio::test]
 async fn async_parts_match_sync_split() {
@@ -34,10 +32,8 @@ async fn async_parts_match_sync_split() {
             WriteOptions::default(),
             Vec::new(),
         );
-        assert_send_static(&future);
-        let spawned = tokio::spawn(future);
         async_parts.push(
-            spawned
+            tokio::spawn(future)
                 .await
                 .expect("the task completes")
                 .expect("async copy succeeds"),

@@ -3,6 +3,7 @@ rewrite. Thin bytes-in/bytes-out wrappers over the underlying library
 functions, with 0-based page lists throughout (the 1-based convention is
 CLI-only)."""
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
@@ -11,8 +12,10 @@ import pdfboss
 from pdfboss.write import (
     Page,
     Pdf,
+    SplitParts,
     Text,
     Update,
+    encrypt,
     merge,
     rewrite,
     rotate,
@@ -94,9 +97,13 @@ def test_split_parts_yields_the_same_parts_as_split() -> None:
     assert list(split_parts(data, 2)) == split(data, 2)
 
 
-def test_split_parts_rejects_zero_pages_per_part_immediately() -> None:
+@pytest.mark.parametrize("every", [0, -1])
+def test_split_and_split_parts_reject_every_below_one_with_value_error(every: int) -> None:
+    data = build_pdf("one")
     with pytest.raises(ValueError, match="every"):
-        split_parts(build_pdf("one"), 0)
+        split(data, every)
+    with pytest.raises(ValueError, match="every"):
+        split_parts(data, every)
 
 
 def test_split_parts_raises_pdf_error_from_the_first_part() -> None:
@@ -106,6 +113,33 @@ def test_split_parts_raises_pdf_error_from_the_first_part() -> None:
     assert list(parts) == []
 
 
+def test_split_parts_takes_password_by_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        split_parts(build_pdf("one"), 1, "secret")  # type: ignore[misc]
+
+
+def test_split_parts_reports_its_public_module() -> None:
+    assert SplitParts.__module__ == "pdfboss.write"
+
+
+def test_split_parts_opens_a_protected_input_and_yields_plain_parts() -> None:
+    data = build_pdf("one", "two", "three")
+    locked = encrypt(data, user_password="secret")
+    parts = list(split_parts(locked, 2, password="secret"))
+    assert [page_texts(part) for part in parts] == [page_texts(part) for part in split(data, 2)]
+    assert all(b"/Encrypt" not in part for part in parts)
+
+
+@pytest.mark.parametrize("password", ["wrong", ""])
+def test_split_parts_refuses_a_wrong_or_missing_password_from_the_first_part(
+    password: str,
+) -> None:
+    locked = encrypt(build_pdf("one"), user_password="secret")
+    parts = split_parts(locked, 1, password=password)
+    with pytest.raises(pdfboss.PdfError):
+        next(parts)
+
+
 @pytest.mark.asyncio
 async def test_split_parts_iterates_asynchronously() -> None:
     data = build_pdf("one", "two", "three")
@@ -113,9 +147,59 @@ async def test_split_parts_iterates_asynchronously() -> None:
     assert parts == split(data, 2)
 
 
+def many_pages() -> bytes:
+    return build_pdf(*[f"page{index}" for index in range(8)])
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_step_loses_no_part() -> None:
+    data = many_pages()
+    parts = split_parts(data, 1)
+    step = asyncio.ensure_future(anext(parts))
+    await asyncio.sleep(0)
+    step.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await step
+    assert [part async for part in parts] == split(data, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_step_loses_no_part() -> None:
+    data = many_pages()
+    parts = split_parts(data, 1)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(anext(parts), timeout=0)
+    assert [part async for part in parts] == split(data, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_step_never_awaited_takes_no_part() -> None:
+    data = many_pages()
+    parts = split_parts(data, 1)
+    anext(parts).close()
+    assert [part async for part in parts] == split(data, 1)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_steps_are_refused_so_parts_stay_in_order() -> None:
+    data = many_pages()
+    parts = split_parts(data, 1)
+    first = asyncio.ensure_future(anext(parts))
+    second = asyncio.ensure_future(anext(parts))
+    with pytest.raises(RuntimeError, match="already advancing"):
+        await second
+    assert await first == split(data, 1)[0]
+
+
 async def chunked(data: bytes, size: int) -> AsyncIterator[bytes]:
     for start in range(0, len(data), size):
         yield data[start : start + size]
+
+
+async def counted(data: bytes, pulled: list[int]) -> AsyncIterator[bytes]:
+    for start in range(0, len(data), 4):
+        pulled.append(start)
+        yield data[start : start + 4]
 
 
 @pytest.mark.asyncio
@@ -128,10 +212,26 @@ async def test_split_stream_matches_split_for_any_chunk_size(size: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_split_stream_rejects_zero_pages_per_part_before_reading() -> None:
-    with pytest.raises(ValueError, match="every"):
-        async for _ in split_stream(chunked(build_pdf("one"), 4), 0):
-            pass
+@pytest.mark.parametrize(
+    ("every", "password", "error"),
+    [(0, "", ValueError), (-1, "", ValueError), (2.0, "", TypeError), (1, None, TypeError)],
+)
+async def test_split_stream_checks_its_arguments_before_reading(
+    every: object, password: object, error: type[Exception]
+) -> None:
+    pulled: list[int] = []
+    stream = split_stream(counted(build_pdf("one"), pulled), every, password=password)  # type: ignore[arg-type]
+    with pytest.raises(error):
+        await anext(stream)
+    assert pulled == []
+
+
+@pytest.mark.asyncio
+async def test_split_stream_opens_a_protected_input_with_its_password() -> None:
+    data = build_pdf("one", "two", "three")
+    locked = encrypt(data, user_password="secret")
+    parts = [part async for part in split_stream(chunked(locked, 64), 2, password="secret")]
+    assert [page_texts(part) for part in parts] == [page_texts(part) for part in split(data, 2)]
 
 
 def test_rotate_append_prefixes_the_input_and_updates_rotation() -> None:

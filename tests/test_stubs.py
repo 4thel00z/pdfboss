@@ -21,9 +21,14 @@ def test_stub_declares_every_exported_class() -> None:
 
 
 def test_stub_declares_every_write_export() -> None:
+    """Every class the extension's ``write`` module exports has a stub. A
+    class defined in ``pdfboss/write.py`` (``SplitParts``) is its own
+    declaration and needs none."""
     stub = STUB.read_text()
     for name in pdfboss.write.__all__:
         if not inspect.isclass(getattr(pdfboss.write, name)):
+            continue
+        if not hasattr(pdfboss._pdfboss.write, name):
             continue
         assert f"\n    class {name}:" in stub, f"missing stub for pdfboss.write.{name}"
 

@@ -10,9 +10,7 @@ use flate2::Compression;
 use pdfboss_core::crypt::Sha256;
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::xref::{parse_section_at, startxref};
-use pdfboss_core::{
-    Dict, Document, FastMap, Immediate, Name, ObjRef, Object, Page, Stream, XrefKind,
-};
+use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Page, Stream, XrefKind};
 
 use crate::error::{Error, Result};
 use crate::importer::{rect_array, Importer};
@@ -75,9 +73,7 @@ fn xobject_name_taken(base: &Document, pages: &[Page], candidate: &str) -> Resul
 /// each page's effective resources only once per watermark construction
 /// rather than once for the probe and again for marking.
 fn fetch_pages(base: &Document) -> Result<Vec<Page>> {
-    (0..base.page_count())
-        .map(|index| base.page(index).map_err(core_error))
-        .collect()
+    crate::assemble::fetch_page_run(base, 0..base.flattened_page_count())
 }
 
 /// The content wrappers for one marked page: what precedes the page's own
@@ -175,7 +171,7 @@ pub fn watermark_under_with(
 /// /Page` guaranteed, its effective resources gaining the overlay form
 /// under `form_name`, and its content wrapped in `prefix` and `suffix`.
 fn marked_page_dict(
-    importer: &mut Importer<'_, Immediate<&Document>>,
+    importer: &mut Importer,
     base: &Document,
     page: &Page,
     form: ObjRef,

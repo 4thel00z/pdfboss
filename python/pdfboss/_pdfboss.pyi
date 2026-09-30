@@ -5,7 +5,7 @@ typed surface editors and type checkers see.
 """
 
 import os
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Iterator, Sequence
 from typing import Literal, Protocol, Self
 
 __version__: str
@@ -2453,35 +2453,34 @@ class write:
         password, copies across as plain, unencrypted bytes."""
 
     @staticmethod
-    def split(data: bytes, every: int) -> list[bytes]:
+    def split(data: bytes | bytearray | memoryview, every: int) -> list[bytes]:
         """Cuts ``data`` into consecutive parts of ``every`` pages each,
-        the last part carrying whatever remains. A ``data`` that cannot
+        the last part carrying whatever remains. ``every`` below 1 raises
+        ``ValueError``. A ``data`` that cannot
         be opened at all (encrypted with no working password) raises
         ``PdfError``; one that opens under its password, including the
         empty user password, copies across as plain, unencrypted
         bytes."""
 
-    @staticmethod
-    def split_parts(
-        data: bytes | bytearray | memoryview, every: int, password: str = ""
-    ) -> "write.SplitParts":
-        """The same parts as ``split``, built one at a time as the
-        iterator advances, so only one part is held besides the input.
-        Works with both ``for`` and ``async for``. The input is parsed on
-        the first advance, so an unreadable ``data`` raises ``PdfError``
-        from the first part; ``every`` below 1 raises ``ValueError``
-        immediately. A ``PdfError`` from any part ends the iteration."""
+    class PartBuilder:
+        """Builds the parts behind ``pdfboss.write.SplitParts`` one at a
+        time; use ``pdfboss.write.split_parts`` instead of this class. A
+        built part waits in a slot until ``take`` hands it out. The input
+        is parsed on the first build; ``every`` below 1 raises
+        ``ValueError`` here."""
 
-    class SplitParts:
-        """Iterator over the parts of a split, returned by
-        ``split_parts``. ``next()`` builds one part with the GIL
-        released; ``anext()`` builds one on a worker thread, so the event
-        loop keeps running."""
-
-        def __iter__(self) -> "write.SplitParts": ...
-        def __next__(self) -> bytes: ...
-        def __aiter__(self) -> "write.SplitParts": ...
-        async def __anext__(self) -> bytes: ...
+        def __init__(
+            self, data: bytes | bytearray | memoryview, every: int, *, password: str = ""
+        ) -> None: ...
+        def next_part(self) -> bytes | None:
+            """Builds the next part and hands it out; ``None`` once every
+            part is out."""
+        def build(self) -> Awaitable[None]:
+            """Builds the next part into the slot on a worker thread,
+            unless one is already waiting there."""
+        def take(self) -> bytes | None:
+            """Hands out the part waiting in the slot; ``None`` once every
+            part is out."""
 
     @staticmethod
     def rotate(

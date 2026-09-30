@@ -4,6 +4,8 @@
 //! long chain of references costs no stack, and a caller may substitute a
 //! translated body for any object before the drain reaches it.
 
+use std::marker::PhantomData;
+
 use pdfboss_core::{
     block_on, AsyncObjectSource, Dict, Document, FastMap, Immediate, Name, ObjRef, Object, Page,
     Rect, Stream,
@@ -19,21 +21,22 @@ use crate::writer::Writer;
 /// same source dedup by source object number: one `Importer` per source
 /// document, and one `Writer` accepts several `Importer`s in sequence.
 ///
-/// The source is any [`AsyncObjectSource`]. [`Importer::new`] opens a
-/// [`Document`] for the synchronous methods; [`Importer::with_source`] opens
-/// any other source, such as an asynchronous document reading over a
-/// network, for the `_with` methods, which are the one implementation both
-/// share.
-pub struct Importer<'w, S> {
+/// The source is any [`AsyncObjectSource`], a borrowed [`Document`] unless
+/// `S` says otherwise. [`Importer::new`] opens a [`Document`] for the
+/// synchronous methods; [`Importer::with_source`] opens any other source,
+/// such as an asynchronous document reading over a network, for the `_with`
+/// methods, which are the one implementation both share.
+pub struct Importer<'w, 's, S = Immediate<&'s Document>> {
     writer: &'w mut Writer,
     source: S,
     map: FastMap<ObjRef, ObjRef>,
     pending: Vec<ObjRef>,
     substitutions: FastMap<ObjRef, Object>,
     compress: bool,
+    borrow: PhantomData<&'s ()>,
 }
 
-impl<'w, 's> Importer<'w, Immediate<&'s Document>> {
+impl<'w, 's> Importer<'w, 's> {
     /// Opens `source` for import into `writer`. Refuses a locked source:
     /// `Document::get` only decrypts transparently once a working
     /// password configured a decryptor, so copying from a locked source
@@ -42,7 +45,7 @@ impl<'w, 's> Importer<'w, Immediate<&'s Document>> {
     /// content already reads as plaintext through `Document::get`, exactly
     /// what [`crate::encrypt_document`] relies on to re-encrypt it under
     /// new passwords.
-    pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Self> {
+    pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
         // The public load path already refuses a wrong or missing password
         // before any `Document` exists; this check is a second safeguard,
         // for a `Document` constructed some other way.
@@ -53,7 +56,8 @@ impl<'w, 's> Importer<'w, Immediate<&'s Document>> {
     }
 
     /// Drains the pending queue; called by `page`/`document` before
-    /// returning, public for callers that mixed `reference` in.
+    /// returning, public for callers that mixed `reference` in. Runs
+    /// [`Importer::finish_with`] over the borrowed document.
     pub fn finish(&mut self) -> Result<()> {
         block_on(self.finish_with())
     }
@@ -81,11 +85,11 @@ impl<'w, 's> Importer<'w, Immediate<&'s Document>> {
     }
 }
 
-impl<'w, S: AsyncObjectSource> Importer<'w, S> {
+impl<'w, 's, S: AsyncObjectSource> Importer<'w, 's, S> {
     /// Opens `source` for import into `writer`. A source has no way to
     /// report that it is locked, so the caller hands over one that already
     /// decrypts, as an opened asynchronous document does.
-    pub fn with_source(writer: &'w mut Writer, source: S) -> Importer<'w, S> {
+    pub fn with_source(writer: &'w mut Writer, source: S) -> Importer<'w, 's, S> {
         let compress = writer.compress();
         Importer {
             writer,
@@ -94,6 +98,7 @@ impl<'w, S: AsyncObjectSource> Importer<'w, S> {
             pending: Vec::new(),
             substitutions: FastMap::default(),
             compress,
+            borrow: PhantomData,
         }
     }
 
@@ -189,6 +194,13 @@ impl<'w, S: AsyncObjectSource> Importer<'w, S> {
     /// before translation, so none of the source's page tree (siblings,
     /// ancestors) rides along as unreachable objects in the target.
     ///
+    /// `page` must come from this importer's source, since its references
+    /// are resolved there. A page with an object of its own is checked
+    /// against the source's object of that number and refused when the
+    /// source has no such object or a different one there. The check
+    /// cannot tell apart two documents whose page dictionaries are
+    /// identical, and a page inlined into `/Kids` cannot be checked at all.
+    ///
     /// ISO 32000 gives a page exactly one parent, so every call gets its
     /// own page object: importing the same source page again (for a
     /// second parent, or a repeat in an assembled document) never reuses
@@ -200,6 +212,18 @@ impl<'w, S: AsyncObjectSource> Importer<'w, S> {
     /// this same object rather than a duplicate). Pages inlined into
     /// `/Kids` (no object of their own) always get a fresh object.
     pub async fn page_with(&mut self, page: &Page, parent: ObjRef) -> Result<ObjRef> {
+        if let Some(r) = page.object_ref() {
+            let own = self.source.get(r).await.ok();
+            if own.as_ref().and_then(Object::as_dict) != Some(page.dict()) {
+                return Err(Error::Other(format!(
+                    "page {} does not come from the source being copied: object {} {} R \
+                     there is a different object",
+                    page.index + 1,
+                    r.num,
+                    r.gen
+                )));
+            }
+        }
         let mut dict = page.dict().clone();
         dict.remove("Parent");
         dict.insert(name("Type"), Object::Name(name("Page")));
