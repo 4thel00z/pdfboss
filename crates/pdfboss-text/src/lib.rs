@@ -79,8 +79,12 @@ impl std::str::FromStr for ReadingOrder {
     }
 }
 
-/// The structure tree, loaded only when `order` reads by it.
-fn structure_for(doc: &Document, order: ReadingOrder) -> Option<StructureTree> {
+/// The document's structure tree, loaded only when `order` reads by it:
+/// `None` under content and geometric order, and for a document without
+/// a tree. A caller walking a whole document loads it once here and passes
+/// it to every page's `_with` twin, so the tree's parent entries are read
+/// once and the walk caches carry from page to page.
+pub fn structure_for(doc: &Document, order: ReadingOrder) -> Option<StructureTree> {
     match order {
         ReadingOrder::StructureTree => doc.structure_tree(),
         _ => None,
@@ -462,6 +466,12 @@ pub async fn extract_spans_reporting_with<S: AsyncObjectSource>(
 /// the cache is keyed by each font dictionary's object reference, never by
 /// its resource name, and a reference resolves to the same dictionary on
 /// every page of a document.
+///
+/// The optional-content state and the structure tree load per call. A
+/// whole-document walk loads them once ([`Document::oc_state`],
+/// [`structure_for`]) and passes them to
+/// [`extract_spans_reporting_cached_with`] over
+/// [`pdfboss_core::Immediate`] instead.
 pub fn extract_spans_reporting_cached(
     doc: &Document,
     page: &Page,
@@ -537,7 +547,9 @@ pub async fn extract_spans_and_rulings_reporting_with<S: AsyncObjectSource>(
 /// walking a whole document page by page. Spans, rulings, and report are
 /// identical to the uncached call's, for the same reason: the cache is keyed
 /// by each font dictionary's object reference, never by its resource name,
-/// and rulings never touch fonts at all.
+/// and rulings never touch fonts at all. The optional-content state and the
+/// structure tree load per call here too; a whole-document walk passes
+/// them to [`extract_spans_and_rulings_reporting_cached_with`].
 pub fn extract_spans_and_rulings_reporting_cached(
     doc: &Document,
     page: &Page,

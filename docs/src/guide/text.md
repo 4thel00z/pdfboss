@@ -177,6 +177,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Under `ReadingOrder::StructureTree` the `_cached` call still loads the structure tree
+on every page, and loading reads the whole parent tree. A document walk loads it once
+with `structure_for`, the optional-content state once with `oc_state`, and drives the
+`_with` twin over `Immediate` from each worker:
+
+```rust,no_run
+use pdfboss_core::{map_pages, source::block_on, Document, Immediate};
+use pdfboss_output::{structure_for, FontCache, ReadingOrder};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = Document::open("report.pdf")?;
+    let order = ReadingOrder::StructureTree;
+    let fonts = FontCache::default();
+    let oc = doc.oc_state();
+    let structure = structure_for(&doc, order);
+    let outcomes = map_pages(&doc, |doc, page| {
+        let (text, _) = block_on(pdfboss_output::extract_text_reporting_cached_with(
+            Immediate(doc),
+            page,
+            &fonts,
+            oc.as_ref(),
+            structure.as_ref(),
+            order,
+        ))?;
+        Ok(text)
+    });
+    let texts = outcomes.into_iter().collect::<Result<Vec<String>, _>>()?;
+    println!("{}", texts.join("\u{c}"));
+    Ok(())
+}
+```
+
 Asynchronous callers use `extract_text_with` against any object source. See
 [Async and remote documents](./async.md).
 

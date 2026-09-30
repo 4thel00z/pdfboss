@@ -593,10 +593,21 @@ impl Document {
             // flattened tree, not the declared `/Count`, which on a damaged
             // file can exceed (or fall short of) what the tree yields. The
             // document's font cache serves every worker, so a font loads
-            // once per document rather than once per page.
+            // once per document rather than once per page, and the
+            // optional-content state and the structure tree load once too.
+            let oc = doc.oc_state();
+            let structure = pdfboss_output::structure_for(&doc, order);
             let texts = pdfboss_core::map_pages(&doc, |doc, page| {
-                let (text, _) = pdfboss_output::extract_text_reporting_cached_opts(
-                    doc, page, &fonts, order, opts,
+                let (text, _) = pdfboss_core::source::block_on(
+                    pdfboss_output::extract_text_reporting_cached_with_opts(
+                        pdfboss_core::Immediate(doc),
+                        page,
+                        &fonts,
+                        oc.as_ref(),
+                        structure.as_ref(),
+                        order,
+                        opts,
+                    ),
                 )?;
                 Ok(text)
             });

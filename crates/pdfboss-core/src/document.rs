@@ -554,8 +554,10 @@ impl Document {
     }
 
     /// The document's structure tree (ISO 32000-1 §14.7), or `None` when the
-    /// catalog names no `/StructTreeRoot`. Loaded per call from a handful of
-    /// object reads; the tree ranks a page's marked content on request.
+    /// catalog names no `/StructTreeRoot`. Loaded per call: the root, its
+    /// role and class maps and every entry of its parent tree, so a caller
+    /// walking the pages loads it once and shares it; the tree ranks a
+    /// page's marked content on request and keeps what each walk read.
     pub fn structure_tree(&self) -> Option<crate::structure::StructureTree> {
         block_on(crate::structure::StructureTree::load_with(
             &Immediate(self),

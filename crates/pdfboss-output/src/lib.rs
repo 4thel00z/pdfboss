@@ -6,14 +6,14 @@ mod markdown;
 mod output;
 mod structure;
 
-use pdfboss_core::{AsyncObjectSource, Document, OcState, Page, Result, StructureTree};
+use pdfboss_core::{AsyncObjectSource, Document, Immediate, OcState, Page, Result, StructureTree};
 
 pub use ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 pub use markdown::Markdown;
 pub use output::{Output, Text};
 pub use pdfboss_text::{
-    ExtractReport, FontCache, MarkedContentId, ReadingOrder, Ruling, SkipCause, SkippedText,
-    SkippedTextKind, TextSpan,
+    structure_for, ExtractReport, FontCache, MarkedContentId, ReadingOrder, Ruling, SkipCause,
+    SkippedText, SkippedTextKind, TextSpan,
 };
 pub use structure::{
     document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
@@ -185,9 +185,12 @@ pub async fn extract_text_reporting_with_opts<S: AsyncObjectSource>(
 /// [`FontCache`] to every page and each font loads once for the document.
 /// The text is identical to the uncached call's, page for page.
 ///
-/// There is no `_with` twin: an asynchronous caller composes
-/// `pdfboss_text::extract_spans_reporting_cached_with` with the pure
-/// [`page_layout`] and [`Text`], exactly as this function does.
+/// The optional-content state and the structure tree load per call. A
+/// whole-document walk loads them once ([`Document::oc_state`],
+/// [`pdfboss_text::structure_for`]) and passes them to
+/// [`extract_text_reporting_cached_with`] over [`Immediate`], so the tree's
+/// parent entries are read once and its walk caches carry from page to
+/// page.
 pub fn extract_text_reporting_cached(
     doc: &Document,
     page: &Page,
@@ -208,6 +211,52 @@ pub fn extract_text_reporting_cached_opts(
 ) -> Result<(String, ExtractReport)> {
     let (mut spans, report) =
         pdfboss_text::extract_spans_reporting_cached(doc, page, fonts, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+    }
+    Ok((Text.render(&[page_layout(&spans, report.order)]), report))
+}
+
+/// [`extract_text_reporting_cached`] against any object source, with the
+/// document's optional-content state and structure tree loaded by the
+/// caller. Signed like [`extract_text_with`], for the same reasons. A
+/// synchronous document walk drives it with `pdfboss_core::source::block_on`
+/// over [`Immediate`], loading `oc` and `structure` once for the document.
+pub async fn extract_text_reporting_cached_with<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: &FontCache,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+) -> Result<(String, ExtractReport)> {
+    extract_text_reporting_cached_with_opts(
+        src,
+        page,
+        fonts,
+        oc,
+        structure,
+        order,
+        TextOptions::default(),
+    )
+    .await
+}
+
+/// [`extract_text_reporting_cached_with`] with [`TextOptions`]:
+/// `invisible_text` keeps the content outside the page box that the default
+/// drops.
+pub async fn extract_text_reporting_cached_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    fonts: &FontCache,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+) -> Result<(String, ExtractReport)> {
+    let (mut spans, report) =
+        pdfboss_text::extract_spans_reporting_cached_with(src, page, fonts, oc, structure, order)
+            .await?;
     if !opts.invisible_text {
         retain_spans_on_page(&mut spans, page);
     }
@@ -259,9 +308,22 @@ pub fn extract_markdown_reporting_opts(
     opts: TextOptions,
 ) -> Result<(String, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
+    // The optional-content state and the structure tree load once for the
+    // document: the tree's parent entries are read here, not on every page,
+    // and its walk caches carry across the workers.
+    let oc = doc.oc_state();
+    let structure = pdfboss_text::structure_for(doc, order);
     let per_page = pdfboss_core::map_pages(doc, |doc: &Document, page: &Page| {
-        let (mut spans, mut rulings, report) =
-            pdfboss_text::extract_spans_and_rulings_reporting_cached(doc, page, &fonts, order)?;
+        let (mut spans, mut rulings, report) = pdfboss_core::source::block_on(
+            pdfboss_text::extract_spans_and_rulings_reporting_cached_with(
+                Immediate(doc),
+                page,
+                &fonts,
+                oc.as_ref(),
+                structure.as_ref(),
+                order,
+            ),
+        )?;
         if !opts.invisible_text {
             retain_spans_on_page(&mut spans, page);
             retain_rulings_on_page(&mut rulings, page);
@@ -494,6 +556,52 @@ mod tests {
         );
         let text = extract_text(&doc, &page, ReadingOrder::StructureTree).unwrap();
         assert_eq!(text, "Title\nFirst\nSecond\n1. One\n2. Two\na b\nc d");
+    }
+
+    /// The cached `_with` twin over a tree the caller loaded once reads the
+    /// same text as the per-page call, on the tagged page and on a second
+    /// walk of it over the caches the first left behind; without a tree it
+    /// reads content order.
+    // Covers ISO 32000-1 §14.7.4.4 and §14.8.2.3.
+    #[test]
+    fn a_tree_loaded_once_serves_the_cached_with_twin_page_after_page() {
+        let doc = Document::load(tagged_blocks_doc()).unwrap();
+        let page = doc.page(0).unwrap();
+        let fonts = FontCache::default();
+        let oc = doc.oc_state();
+        let structure = structure_for(&doc, ReadingOrder::StructureTree);
+        assert!(structure.is_some());
+        let walk = || {
+            pdfboss_core::source::block_on(extract_text_reporting_cached_with(
+                Immediate(&doc),
+                &page,
+                &fonts,
+                oc.as_ref(),
+                structure.as_ref(),
+                ReadingOrder::StructureTree,
+            ))
+            .unwrap()
+        };
+        let (first, report) = walk();
+        assert_eq!(first, "Title\nFirst\nSecond\n1. One\n2. Two\na b\nc d");
+        assert_eq!(report.order, ReadingOrder::StructureTree);
+        let (second, _) = walk();
+        assert_eq!(second, first);
+        assert!(structure_for(&doc, ReadingOrder::Content).is_none());
+        let (content, report) = pdfboss_core::source::block_on(extract_text_reporting_cached_with(
+            Immediate(&doc),
+            &page,
+            &fonts,
+            oc.as_ref(),
+            None,
+            ReadingOrder::StructureTree,
+        ))
+        .unwrap();
+        assert_eq!(report.order, ReadingOrder::Content);
+        assert_eq!(
+            content,
+            extract_text(&doc, &page, ReadingOrder::Content).unwrap()
+        );
     }
 
     /// A tagged list whose items carry no Lbl element: the bullet glyph sits

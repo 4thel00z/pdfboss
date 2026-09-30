@@ -1183,10 +1183,23 @@ fn cmd_text(
             // flattened tree, not the declared `/Count`, which on a damaged
             // file may not match what the tree yields) and returns them in
             // page order. One font cache serves every worker, so a font
-            // loads once per document rather than once per page.
+            // loads once per document rather than once per page, and the
+            // optional-content state and the structure tree load once too.
             let fonts = pdfboss_output::FontCache::default();
+            let oc = doc.oc_state();
+            let structure = pdfboss_output::structure_for(&doc, order);
             let parts = pdfboss_core::map_pages(&doc, |doc, page| {
-                pdfboss_output::extract_text_reporting_cached_opts(doc, page, &fonts, order, opts)
+                pdfboss_core::source::block_on(
+                    pdfboss_output::extract_text_reporting_cached_with_opts(
+                        pdfboss_core::Immediate(doc),
+                        page,
+                        &fonts,
+                        oc.as_ref(),
+                        structure.as_ref(),
+                        order,
+                        opts,
+                    ),
+                )
             })
             .into_iter()
             .enumerate()
