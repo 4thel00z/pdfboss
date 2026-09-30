@@ -21,9 +21,9 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyStopAsyncIteration, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
 
@@ -1288,6 +1288,123 @@ fn split<'py>(
         .collect())
 }
 
+/// The same parts as `split`, built one at a time as the iterator
+/// advances, so only one part is ever held besides the input. Works with
+/// both `for` and `async for`. The input is parsed on the first advance,
+/// not here, so an unreadable `data` raises `PdfError` from the first
+/// part. `every` below 1 raises `ValueError` here.
+#[pyfunction]
+#[pyo3(signature = (data, every, password=String::new()))]
+fn split_parts(data: &Bound<'_, PyAny>, every: usize, password: String) -> PyResult<SplitParts> {
+    if every == 0 {
+        return Err(PyValueError::new_err(
+            "every must be at least 1 page per part",
+        ));
+    }
+    let data = crate::byte_arg(data)?;
+    Ok(SplitParts {
+        state: Arc::new(Mutex::new(SplitState::Unread { data, password })),
+        every,
+    })
+}
+
+/// Iterator over the parts of a split, returned by `split_parts`. Each
+/// `__next__` builds one part with the GIL released; each `__anext__`
+/// builds one on tokio's blocking pool, so the event loop keeps running.
+#[pyclass(frozen)]
+struct SplitParts {
+    state: Arc<Mutex<SplitState>>,
+    every: usize,
+}
+
+enum SplitState {
+    Unread {
+        data: Vec<u8>,
+        password: String,
+    },
+    Read {
+        doc: Arc<crate::SharedDocument>,
+        parts: std::vec::IntoIter<Vec<pdfboss_core::Page>>,
+    },
+    Done,
+}
+
+/// Parses `data` and cuts its pages into runs of `every`.
+fn open_split(data: Vec<u8>, password: &str, every: usize) -> PyResult<SplitState> {
+    let doc = CoreDocument::load_with_password(data, password).map_err(pdf_err)?;
+    let pages = (0..doc.page_count())
+        .map(|index| doc.page(index))
+        .collect::<pdfboss_core::Result<Vec<pdfboss_core::Page>>>()
+        .map_err(pdf_err)?;
+    let parts: Vec<Vec<pdfboss_core::Page>> = pages
+        .chunks(every)
+        .map(<[pdfboss_core::Page]>::to_vec)
+        .collect();
+    Ok(SplitState::Read {
+        doc: crate::SharedDocument::new(doc),
+        parts: parts.into_iter(),
+    })
+}
+
+/// Advances `state` by one part: opens the input on the first call, then
+/// builds the next run of pages into a fresh document. `None` once every
+/// part is out, or after an error ended the split.
+fn next_part(state: &Mutex<SplitState>, every: usize) -> PyResult<Option<Vec<u8>>> {
+    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    *state = match std::mem::replace(&mut *state, SplitState::Done) {
+        SplitState::Unread { data, password } => open_split(data, &password, every)?,
+        other => other,
+    };
+    let SplitState::Read { doc, parts } = &mut *state else {
+        return Ok(None);
+    };
+    let Some(pages) = parts.next() else {
+        return Ok(None);
+    };
+    let part = pdfboss_core::block_on(pdfboss_write::copy_pages_with(
+        pdfboss_core::Immediate(&*doc.lock()),
+        pages,
+        pdfboss_write::WriteOptions::default(),
+        Vec::new(),
+    ));
+    if part.is_err() {
+        *state = SplitState::Done;
+    }
+    part.map(Some).map_err(pdf_err)
+}
+
+#[pymethods]
+impl SplitParts {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let part = py.allow_threads(|| next_part(&self.state, self.every))?;
+        Ok(part.map(|part| PyBytes::new(py, &part)))
+    }
+
+    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// Coroutine resolving to the next part's bytes; raises
+    /// StopAsyncIteration once every part is out.
+    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let every = self.every;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let part = tokio::task::spawn_blocking(move || next_part(&state, every))
+                .await
+                .map_err(pdf_err)??;
+            let Some(part) = part else {
+                return Err(PyStopAsyncIteration::new_err("every part is out"));
+            };
+            Ok(Python::with_gil(|py| PyBytes::new(py, &part).unbind()))
+        })
+    }
+}
+
 /// Rotates `pages` (0-based; every page when omitted) of `data` by `by`
 /// degrees clockwise, restricted to 90, 180 or 270, else `ValueError`.
 /// Appends an incremental update by default; `rewrite=True` writes the
@@ -1419,6 +1536,8 @@ pub(crate) fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult
     module.add_function(wrap_pyfunction!(watermark, &module)?)?;
     module.add_function(wrap_pyfunction!(merge, &module)?)?;
     module.add_function(wrap_pyfunction!(split, &module)?)?;
+    module.add_function(wrap_pyfunction!(split_parts, &module)?)?;
+    module.add_class::<SplitParts>()?;
     module.add_function(wrap_pyfunction!(rotate, &module)?)?;
     module.add_function(wrap_pyfunction!(rewrite, &module)?)?;
     module.add_function(wrap_pyfunction!(encrypt, &module)?)?;

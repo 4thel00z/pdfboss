@@ -3,10 +3,23 @@ rewrite. Thin bytes-in/bytes-out wrappers over the underlying library
 functions, with 0-based page lists throughout (the 1-based convention is
 CLI-only)."""
 
+from collections.abc import AsyncIterator
+
 import pytest
 
 import pdfboss
-from pdfboss.write import Page, Pdf, Text, Update, merge, rewrite, rotate, split
+from pdfboss.write import (
+    Page,
+    Pdf,
+    Text,
+    Update,
+    merge,
+    rewrite,
+    rotate,
+    split,
+    split_parts,
+    split_stream,
+)
 
 
 def build_pdf(*texts: str) -> bytes:
@@ -74,6 +87,51 @@ def test_split_round_trips_page_counts() -> None:
     assert len(parts) == 2
     assert pdfboss.Document(data=parts[0]).page_count == 2
     assert pdfboss.Document(data=parts[1]).page_count == 1
+
+
+def test_split_parts_yields_the_same_parts_as_split() -> None:
+    data = build_pdf("one", "two", "three", "four", "five")
+    assert list(split_parts(data, 2)) == split(data, 2)
+
+
+def test_split_parts_rejects_zero_pages_per_part_immediately() -> None:
+    with pytest.raises(ValueError, match="every"):
+        split_parts(build_pdf("one"), 0)
+
+
+def test_split_parts_raises_pdf_error_from_the_first_part() -> None:
+    parts = split_parts(b"not a pdf", 1)
+    with pytest.raises(pdfboss.PdfError):
+        next(parts)
+    assert list(parts) == []
+
+
+@pytest.mark.asyncio
+async def test_split_parts_iterates_asynchronously() -> None:
+    data = build_pdf("one", "two", "three")
+    parts = [part async for part in split_parts(data, 2)]
+    assert parts == split(data, 2)
+
+
+async def chunked(data: bytes, size: int) -> AsyncIterator[bytes]:
+    for start in range(0, len(data), size):
+        yield data[start : start + size]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [1, 7, 4096, 1 << 20])
+async def test_split_stream_matches_split_for_any_chunk_size(size: int) -> None:
+    data = build_pdf("one", "two", "three", "four", "five")
+    parts = [part async for part in split_stream(chunked(data, size), 2)]
+    assert parts == split(data, 2)
+    assert "five" in page_texts(parts[2])[0]
+
+
+@pytest.mark.asyncio
+async def test_split_stream_rejects_zero_pages_per_part_before_reading() -> None:
+    with pytest.raises(ValueError, match="every"):
+        async for _ in split_stream(chunked(build_pdf("one"), 4), 0):
+            pass
 
 
 def test_rotate_append_prefixes_the_input_and_updates_rotation() -> None:

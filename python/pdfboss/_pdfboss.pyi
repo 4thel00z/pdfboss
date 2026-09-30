@@ -2462,6 +2462,28 @@ class write:
         bytes."""
 
     @staticmethod
+    def split_parts(
+        data: bytes | bytearray | memoryview, every: int, password: str = ""
+    ) -> "write.SplitParts":
+        """The same parts as ``split``, built one at a time as the
+        iterator advances, so only one part is held besides the input.
+        Works with both ``for`` and ``async for``. The input is parsed on
+        the first advance, so an unreadable ``data`` raises ``PdfError``
+        from the first part; ``every`` below 1 raises ``ValueError``
+        immediately. A ``PdfError`` from any part ends the iteration."""
+
+    class SplitParts:
+        """Iterator over the parts of a split, returned by
+        ``split_parts``. ``next()`` builds one part with the GIL
+        released; ``anext()`` builds one on a worker thread, so the event
+        loop keeps running."""
+
+        def __iter__(self) -> "write.SplitParts": ...
+        def __next__(self) -> bytes: ...
+        def __aiter__(self) -> "write.SplitParts": ...
+        async def __anext__(self) -> bytes: ...
+
+    @staticmethod
     def rotate(
         data: bytes, by: int, pages: list[int] | None = None, rewrite: bool = False
     ) -> bytes:

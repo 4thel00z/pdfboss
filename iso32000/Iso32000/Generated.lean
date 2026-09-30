@@ -1343,7 +1343,7 @@ def Generated.citations6 : List Citation := [
   ⟨some 1, some (.clause [14, 9, 3]), "crates/pdfboss-py/src/lib.rs", 1756, false⟩,
   ⟨some 1, some (.clause [14, 9, 2]), "crates/pdfboss-py/src/lib.rs", 1765, false⟩,
   ⟨some 1, some (.clause [7, 5, 6]), "crates/pdfboss-py/src/write.rs", 1074, false⟩,
-  ⟨some 2, some (.clause [7, 6, 4, 3]), "crates/pdfboss-py/src/write.rs", 1362, false⟩,
+  ⟨some 2, some (.clause [7, 6, 4, 3]), "crates/pdfboss-py/src/write.rs", 1478, false⟩,
   ⟨some 1, some (.clause [12, 5, 6]), "crates/pdfboss-render/src/annot.rs", 1, false⟩,
   ⟨some 1, some (.clause [12, 5, 4]), "crates/pdfboss-render/src/annot.rs", 30, false⟩,
   ⟨some 1, some (.clause [12, 5, 6, 10]), "crates/pdfboss-render/src/annot.rs", 30, false⟩,
@@ -2522,7 +2522,7 @@ def Generated.citations12 : List Citation := [
   ⟨some 1, some (.clause [9, 6, 6, 4]), "crates/pdfboss-text/src/sfnt.rs", 108, true⟩,
   ⟨none, none, "crates/pdfboss-tui/src/lib.rs", 2, false⟩,
   ⟨none, some (.clause [7, 7, 3]), "crates/pdfboss-write/src/assemble.rs", 1, false⟩,
-  ⟨some 2, some (.clause [7, 6, 4, 3]), "crates/pdfboss-write/src/assemble.rs", 148, false⟩,
+  ⟨some 2, some (.clause [7, 6, 4, 3]), "crates/pdfboss-write/src/assemble.rs", 183, false⟩,
   ⟨none, some (.clause [8, 4, 3, 3]), "crates/pdfboss-write/src/canvas.rs", 25, false⟩,
   ⟨none, some (.clause [8, 4, 3, 4]), "crates/pdfboss-write/src/canvas.rs", 37, false⟩,
   ⟨none, some (.clause [11, 3, 5]), "crates/pdfboss-write/src/canvas.rs", 58, false⟩,
@@ -2543,7 +2543,7 @@ def Generated.citations12 : List Citation := [
   ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-write/src/font.rs", 259, true⟩,
   ⟨some 1, some (.clause [9, 5]), "crates/pdfboss-write/src/font.rs", 291, true⟩,
   ⟨some 1, some (.clause [9, 6, 2, 1]), "crates/pdfboss-write/src/font.rs", 291, true⟩,
-  ⟨none, none, "crates/pdfboss-write/src/importer.rs", 160, false⟩,
+  ⟨none, none, "crates/pdfboss-write/src/importer.rs", 192, false⟩,
   ⟨none, some (.clause [12, 3, 2]), "crates/pdfboss-write/src/pdf.rs", 123, false⟩,
   ⟨none, some (.clause [12, 5, 6, 5]), "crates/pdfboss-write/src/pdf.rs", 123, false⟩,
   ⟨none, some (.clause [12, 6, 4, 7]), "crates/pdfboss-write/src/pdf.rs", 123, false⟩,
@@ -2647,7 +2647,7 @@ def Generated.citations12 : List Citation := [
 ]
 
 def Generated.citations13 : List Citation := [
-  ⟨some 1, some (.clause [9, 6, 2, 2]), "tests/test_write.py", 374, true⟩
+  ⟨some 1, some (.clause [9, 6, 2, 2]), "tests/test_write.py", 377, true⟩
 ]
 
 def Generated.citations : List Citation :=

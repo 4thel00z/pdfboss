@@ -10,7 +10,9 @@ use flate2::Compression;
 use pdfboss_core::crypt::Sha256;
 use pdfboss_core::object::decode_text_string;
 use pdfboss_core::xref::{parse_section_at, startxref};
-use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Page, Stream, XrefKind};
+use pdfboss_core::{
+    Dict, Document, FastMap, Immediate, Name, ObjRef, Object, Page, Stream, XrefKind,
+};
 
 use crate::error::{Error, Result};
 use crate::importer::{rect_array, Importer};
@@ -173,7 +175,7 @@ pub fn watermark_under_with(
 /// /Page` guaranteed, its effective resources gaining the overlay form
 /// under `form_name`, and its content wrapped in `prefix` and `suffix`.
 fn marked_page_dict(
-    importer: &mut Importer,
+    importer: &mut Importer<'_, Immediate<&Document>>,
     base: &Document,
     page: &Page,
     form: ObjRef,

@@ -357,6 +357,7 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
         "PageLabel",
         "Paragraph",
         "Pdf",
+        "SplitParts",
         "Standard14",
         "Text",
         "Update",
@@ -367,6 +368,8 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
         "rewrite",
         "rotate",
         "split",
+        "split_parts",
+        "split_stream",
         "watermark",
     ]
 

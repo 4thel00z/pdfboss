@@ -2,13 +2,16 @@
 //! selected pages from each source, gathered in argument order under a
 //! single new `/Pages` node.
 
-use pdfboss_core::{Dict, Document, Name, Object};
+use pdfboss_core::{
+    block_on, AsyncObjectSource, Dict, Document, Immediate, Name, ObjRef, Object, Page,
+};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use pdfboss_core::{Encryptor, Permissions};
 
 use crate::error::{Error, Result};
 use crate::importer::Importer;
 use crate::pdf::Metadata;
+use crate::sink::AsyncByteSink;
 use crate::update::{
     catalog_metadata_ref, core_error, merge_metadata, resolve_dict, xmp_metadata_stream,
 };
@@ -40,6 +43,39 @@ pub fn merge_documents(
             kids.push(importer.page(index, pages_ref)?);
         }
     }
+    let root = page_tree_catalog(&mut writer, pages_ref, &kids)?;
+    writer.finish(root)
+}
+
+/// A fresh document holding `pages` of `src`, in order, emitted into
+/// `sink`, which comes back unflushed. This is [`merge_documents`] over one
+/// source, reading through any [`AsyncObjectSource`] and writing through
+/// any [`AsyncByteSink`], so a split can send each part on as soon as it
+/// is built. `src` must already decrypt: see [`Importer::with_source`].
+pub async fn copy_pages_with<S, K>(
+    src: S,
+    pages: Vec<Page>,
+    options: WriteOptions,
+    sink: K,
+) -> Result<K>
+where
+    S: AsyncObjectSource,
+    K: AsyncByteSink,
+{
+    let mut writer = Writer::new(options);
+    let pages_ref = writer.reserve();
+    let mut kids = Vec::with_capacity(pages.len());
+    let mut importer = Importer::with_source(&mut writer, src);
+    for page in &pages {
+        kids.push(importer.page_with(page, pages_ref).await?);
+    }
+    let root = page_tree_catalog(&mut writer, pages_ref, &kids)?;
+    writer.finish_into_with(root, sink).await
+}
+
+/// Fills `pages_ref` with a `/Pages` node over `kids` and puts a catalog
+/// pointing at it, returning the catalog's ref. Refuses an empty `kids`.
+fn page_tree_catalog(writer: &mut Writer, pages_ref: ObjRef, kids: &[ObjRef]) -> Result<ObjRef> {
     if kids.is_empty() {
         return Err(Error::Other(
             "a document needs at least one page".to_string(),
@@ -56,8 +92,7 @@ pub fn merge_documents(
     let mut catalog = Dict::new();
     catalog.insert(name("Type"), Object::Name(name("Catalog")));
     catalog.insert(name("Pages"), Object::Ref(pages_ref));
-    let root = writer.put(Object::Dict(catalog));
-    writer.finish(root)
+    Ok(writer.put(Object::Dict(catalog)))
 }
 
 /// A `Name` from a string literal.
@@ -251,23 +286,32 @@ pub fn rewrite_with_metadata(
 
 /// Consecutive chunks of `every` pages, each a fresh document. `every` must
 /// be at least 1; the last chunk carries whatever remains, so no chunk is
-/// ever empty.
+/// ever empty. Each part is built by [`copy_pages_with`]; call that
+/// directly to send parts on one at a time instead of collecting them.
 pub fn split_document(doc: &Document, every: usize, options: WriteOptions) -> Result<Vec<Vec<u8>>> {
     if every == 0 {
         return Err(Error::Other(
             "every must be at least 1 page per part".to_string(),
         ));
     }
-    let total = doc.page_count();
-    let mut parts = Vec::new();
-    let mut start = 0;
-    while start < total {
-        let end = (start + every).min(total);
-        let indices: Vec<usize> = (start..end).collect();
-        parts.push(merge_documents(&[(doc, Some(&indices))], options)?);
-        start = end;
+    if doc.is_locked() {
+        return Err(Error::EncryptedBase);
     }
-    Ok(parts)
+    let pages = (0..doc.page_count())
+        .map(|index| doc.page(index))
+        .collect::<pdfboss_core::Result<Vec<Page>>>()
+        .map_err(core_error)?;
+    pages
+        .chunks(every)
+        .map(|part| {
+            block_on(copy_pages_with(
+                Immediate(doc),
+                part.to_vec(),
+                options,
+                Vec::new(),
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -370,6 +414,41 @@ mod tests {
         assert_eq!(parts.len(), 1);
         let only = Document::load(parts[0].clone()).expect("part loads");
         assert_eq!(only.page_count(), 3);
+    }
+
+    #[test]
+    fn split_parts_match_merging_each_page_range() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("doc loads");
+        let parts = split_document(&doc, 2, WriteOptions::default()).expect("split succeeds");
+        let merged: Vec<Vec<u8>> = [vec![0, 1], vec![2]]
+            .iter()
+            .map(|indices| {
+                merge_documents(&[(&doc, Some(indices.as_slice()))], WriteOptions::default())
+                    .expect("merge succeeds")
+            })
+            .collect();
+        assert_eq!(parts, merged);
+    }
+
+    #[test]
+    fn copy_pages_hands_the_sink_back_holding_the_part() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).expect("doc loads");
+        let pages = vec![
+            doc.page(2).expect("page exists"),
+            doc.page(0).expect("page exists"),
+        ];
+        let sink = block_on(copy_pages_with(
+            Immediate(&doc),
+            pages,
+            WriteOptions::default(),
+            Vec::new(),
+        ))
+        .expect("copy succeeds");
+        let part = Document::load(sink).expect("part loads");
+        assert_eq!(part.page_count(), 2);
+        let page = part.page(0).expect("page exists");
+        let text = extract_text(&part, &page, ReadingOrder::Content).expect("text extracts");
+        assert!(text.contains("three"), "page 0: {text:?}");
     }
 
     #[test]

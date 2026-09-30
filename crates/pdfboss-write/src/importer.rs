@@ -4,7 +4,10 @@
 //! long chain of references costs no stack, and a caller may substitute a
 //! translated body for any object before the drain reaches it.
 
-use pdfboss_core::{Dict, Document, FastMap, Name, ObjRef, Object, Rect, Stream};
+use pdfboss_core::{
+    block_on, AsyncObjectSource, Dict, Document, FastMap, Immediate, Name, ObjRef, Object, Page,
+    Rect, Stream,
+};
 
 use crate::error::{Error, Result};
 use crate::update::{core_error, deflate};
@@ -15,16 +18,22 @@ use crate::writer::Writer;
 /// is reserved a target number once and queued, so repeated imports from the
 /// same source dedup by source object number: one `Importer` per source
 /// document, and one `Writer` accepts several `Importer`s in sequence.
-pub struct Importer<'w, 's> {
+///
+/// The source is any [`AsyncObjectSource`]. [`Importer::new`] opens a
+/// [`Document`] for the synchronous methods; [`Importer::with_source`] opens
+/// any other source, such as an asynchronous document reading over a
+/// network, for the `_with` methods, which are the one implementation both
+/// share.
+pub struct Importer<'w, S> {
     writer: &'w mut Writer,
-    source: &'s Document,
+    source: S,
     map: FastMap<ObjRef, ObjRef>,
     pending: Vec<ObjRef>,
     substitutions: FastMap<ObjRef, Object>,
     compress: bool,
 }
 
-impl<'w, 's> Importer<'w, 's> {
+impl<'w, 's> Importer<'w, Immediate<&'s Document>> {
     /// Opens `source` for import into `writer`. Refuses a locked source:
     /// `Document::get` only decrypts transparently once a working
     /// password configured a decryptor, so copying from a locked source
@@ -33,22 +42,59 @@ impl<'w, 's> Importer<'w, 's> {
     /// content already reads as plaintext through `Document::get`, exactly
     /// what [`crate::encrypt_document`] relies on to re-encrypt it under
     /// new passwords.
-    pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Importer<'w, 's>> {
+    pub fn new(writer: &'w mut Writer, source: &'s Document) -> Result<Self> {
         // The public load path already refuses a wrong or missing password
         // before any `Document` exists; this check is a second safeguard,
         // for a `Document` constructed some other way.
         if source.is_locked() {
             return Err(Error::EncryptedBase);
         }
+        Ok(Importer::with_source(writer, Immediate(source)))
+    }
+
+    /// Drains the pending queue; called by `page`/`document` before
+    /// returning, public for callers that mixed `reference` in.
+    pub fn finish(&mut self) -> Result<()> {
+        block_on(self.finish_with())
+    }
+
+    /// The whole reachable graph from the source catalog; returns the
+    /// new root ref. Substitutions apply.
+    pub fn document(&mut self) -> Result<ObjRef> {
+        let root = self
+            .source
+            .0
+            .xref()
+            .trailer
+            .get_ref("Root")
+            .ok_or(Error::MissingRoot)?;
+        let new_root = self.reference(root);
+        self.finish()?;
+        Ok(new_root)
+    }
+
+    /// Page `index` of the source under `parent`, as
+    /// [`Importer::page_with`] describes.
+    pub fn page(&mut self, index: usize, parent: ObjRef) -> Result<ObjRef> {
+        let page = self.source.0.page(index).map_err(core_error)?;
+        block_on(self.page_with(&page, parent))
+    }
+}
+
+impl<'w, S: AsyncObjectSource> Importer<'w, S> {
+    /// Opens `source` for import into `writer`. A source has no way to
+    /// report that it is locked, so the caller hands over one that already
+    /// decrypts, as an opened asynchronous document does.
+    pub fn with_source(writer: &'w mut Writer, source: S) -> Importer<'w, S> {
         let compress = writer.compress();
-        Ok(Importer {
+        Importer {
             writer,
             source,
             map: FastMap::default(),
             pending: Vec::new(),
             substitutions: FastMap::default(),
             compress,
-        })
+        }
     }
 
     /// The target number for source reference `r`, reserved and queued on
@@ -118,14 +164,14 @@ impl<'w, 's> Importer<'w, 's> {
         self.substitutions.insert(r, body);
     }
 
-    /// Drains the pending queue; called by `page`/`document` before
-    /// returning, public for callers that mixed `reference` in.
-    pub fn finish(&mut self) -> Result<()> {
+    /// Drains the pending queue, fetching each queued object from the
+    /// source: the implementation behind [`Importer::finish`].
+    pub async fn finish_with(&mut self) -> Result<()> {
         while let Some(r) = self.pending.pop() {
             let target = self.map[&r];
             let body = match self.substitutions.remove(&r) {
                 Some(body) => body,
-                None => match self.source.get(r).map_err(core_error)? {
+                None => match self.source.get(r).await.map_err(core_error)? {
                     Object::Stream(s) => self.copy_stream(&s)?,
                     other => self.copy(&other)?,
                 },
@@ -135,21 +181,7 @@ impl<'w, 's> Importer<'w, 's> {
         Ok(())
     }
 
-    /// The whole reachable graph from the source catalog; returns the
-    /// new root ref. Substitutions apply.
-    pub fn document(&mut self) -> Result<ObjRef> {
-        let root = self
-            .source
-            .xref()
-            .trailer
-            .get_ref("Root")
-            .ok_or(Error::MissingRoot)?;
-        let new_root = self.reference(root);
-        self.finish()?;
-        Ok(new_root)
-    }
-
-    /// Page `index` as a self-contained object under `parent`
+    /// `page` as a self-contained object under `parent`
     /// (target-space): old `/Parent` replaced with `parent`, effective
     /// `/Resources` and `/MediaBox` materialized, `/Rotate` when non-zero,
     /// `/CropBox` when it differs from the media box, `/Type /Page` always
@@ -158,7 +190,7 @@ impl<'w, 's> Importer<'w, 's> {
     /// ancestors) rides along as unreachable objects in the target.
     ///
     /// ISO 32000 gives a page exactly one parent, so every call gets its
-    /// own page object: importing the same source index again (for a
+    /// own page object: importing the same source page again (for a
     /// second parent, or a repeat in an assembled document) never reuses
     /// an earlier call's object, even though the resources and content
     /// beneath keep deduping through this `Importer`'s map. The one
@@ -167,8 +199,7 @@ impl<'w, 's> Importer<'w, 's> {
     /// `/Annots` `/P` back-reference elsewhere in the graph resolves to
     /// this same object rather than a duplicate). Pages inlined into
     /// `/Kids` (no object of their own) always get a fresh object.
-    pub fn page(&mut self, index: usize, parent: ObjRef) -> Result<ObjRef> {
-        let page = self.source.page(index).map_err(core_error)?;
+    pub async fn page_with(&mut self, page: &Page, parent: ObjRef) -> Result<ObjRef> {
         let mut dict = page.dict().clone();
         dict.remove("Parent");
         dict.insert(name("Type"), Object::Name(name("Page")));
@@ -194,7 +225,7 @@ impl<'w, 's> Importer<'w, 's> {
                 target
             }
         };
-        self.finish()?;
+        self.finish_with().await?;
         Ok(target)
     }
 }

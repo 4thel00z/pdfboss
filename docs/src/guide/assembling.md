@@ -40,6 +40,49 @@ from pdfboss.write import split
 parts = split(report_bytes, every=10)
 ```
 
+### One part at a time
+
+`split` holds every part in memory at once. `split_parts(data, every, password="")` builds the same parts one at a time as you iterate, so only one part is held besides the input. It works with both `for` and `async for`; under `async for` each part is built on a worker thread, so the event loop keeps running. The input is parsed when the first part is requested, so an unreadable file raises `PdfError` there rather than at the call.
+
+`split_stream(stream, every, password="")` takes the PDF as an async iterable of bytes chunks, such as an upload body or an S3 object body, and yields the parts as they are built. A PDF's cross-reference table sits at the end of the file, so no page can be located before the last chunk arrives: `split_stream` collects the chunks in memory first, then splits. Memory holds the file plus one part, and briefly two copies of the file while it is handed to the parser.
+
+```python
+from pdfboss.write import split_stream
+
+async def split_upload(request, s3, bucket):
+    index = 0
+    async for part in split_stream(request.stream(), every=10):
+        index += 1
+        await s3.put_object(Bucket=bucket, Key=f"part-{index}.pdf", Body=part)
+```
+
+In Rust, `copy_pages_with(src, pages, options, sink)` builds one fresh document from `pages` of `src` and writes it into `sink`, handing the sink back so the caller can finish it (close a file, complete an upload) before building the next part. `src` is any `AsyncObjectSource`: a `Document` through `Immediate(&doc)`, or an `AsyncDocument` reading a file or a URL by range. `split_document` is this function called once per run of `every` pages into a `Vec<u8>`.
+
+```rust,no_run
+use pdfboss_aio::{AsyncDocument, TokioSink};
+use pdfboss_core::Page;
+use pdfboss_write::{copy_pages_with, WriteOptions};
+use tokio::io::AsyncWriteExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = AsyncDocument::open("report.pdf").await?;
+    let pages = (0..doc.page_count())
+        .map(|index| doc.page(index))
+        .collect::<Result<Vec<Page>, _>>()?;
+    for (index, part) in pages.chunks(10).enumerate() {
+        let file = tokio::fs::File::create(format!("part-{}.pdf", index + 1)).await?;
+        let sink = TokioSink(file);
+        let TokioSink(mut file) =
+            copy_pages_with(doc.clone(), part.to_vec(), WriteOptions::default(), sink).await?;
+        file.flush().await?;
+    }
+    Ok(())
+}
+```
+
+`TokioSink` needs `pdfboss-aio`'s `write` feature.
+
 ## Rotating
 
 `rotate` turns selected pages by 90, 180 or 270 degrees clockwise. By default it appends an incremental update, the same way `meta` does; `--rewrite` (`rewrite=True` in Python) writes the whole document fresh instead.
@@ -84,6 +127,8 @@ clean = rewrite(report_bytes)
 ## The Importer
 
 `Importer::new(writer, source)` opens one source document for copying into a `Writer`, refusing a locked source: one that is encrypted with no working decryptor. A source already opened under its password copies across as plaintext instead, the same way [`encrypt_document`](./encryption.md#encrypting-a-file) relies on it to re-encrypt a document under new passwords. `page(index, parent)` imports one page as a self-contained object under `parent`, translating its effective resources, media box and rotation and returning the page's new reference; it is what `merge_documents` calls once per selected page. `document()` instead walks the whole reachable graph from the source catalog and returns the new root reference; `rewrite_document` and `rotate_rewrite` build on it.
+
+`Importer::with_source(writer, source)` opens any `AsyncObjectSource` instead, such as an `AsyncDocument`, for the asynchronous twins: `page_with(&page, parent)` imports a `Page` the caller already holds, and `finish_with()` drains the queue, awaiting each fetch. The synchronous methods are these twins run over `Immediate(&doc)`. A source cannot report whether it is locked, so `with_source` trusts the caller to hand over one that already decrypts, as an opened `AsyncDocument` does.
 
 ```rust,no_run
 use pdfboss_core::{Dict, Document, Name, Object};

@@ -39,8 +39,8 @@ mod xmp;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use assemble::encrypt_document;
 pub use assemble::{
-    decrypt_document, merge_documents, rewrite_document, rewrite_with_metadata, rotate_rewrite,
-    split_document,
+    copy_pages_with, decrypt_document, merge_documents, rewrite_document, rewrite_with_metadata,
+    rotate_rewrite, split_document,
 };
 pub use canvas::{BlendMode, Canvas, CanvasParts, GroupHandle, ImageHandle, LineCap, LineJoin};
 pub use color::Color;
