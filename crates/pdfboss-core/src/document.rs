@@ -563,8 +563,11 @@ impl Document {
     }
 
     /// The document's structure tree (ISO 32000-1 §14.7), or `None` when the
-    /// catalog names no `/StructTreeRoot`. Loaded per call from a handful of
-    /// object reads; the tree ranks a page's marked content on request.
+    /// catalog names no `/StructTreeRoot`. Loaded per call: the root, its
+    /// role and class maps and every entry of its parent tree, so a caller
+    /// walking the pages loads it once and forks it per worker (its
+    /// `Clone`, see [`map_pages_forking`]); the tree ranks a page's marked
+    /// content on request and keeps what each walk read for the next.
     pub fn structure_tree(&self) -> Option<crate::structure::StructureTree> {
         block_on(crate::structure::StructureTree::load_with(
             &Immediate(self),
@@ -1062,14 +1065,31 @@ where
     T: Send + Sync,
     F: Fn(&Document, &Page) -> Result<T> + Send + Sync,
 {
+    map_pages_forking(doc, || (), |(), doc, page| work(doc, page))
+}
+
+/// [`map_pages`] with state forked once per worker: `fork` runs on each
+/// worker before its first page (on the calling thread when the work runs
+/// inline) and `work` gets that worker's copy with every page it handles.
+/// For state a page walk fills as it goes, such as a
+/// [`crate::StructureTree`], whose fork is the same tree over an empty
+/// cache, this keeps what one page read for the pages the same worker
+/// takes next, without the workers sharing a lock.
+pub fn map_pages_forking<W, T, K, F>(doc: &Document, fork: K, work: F) -> Vec<Result<T>>
+where
+    T: Send + Sync,
+    K: Fn() -> W + Sync,
+    F: Fn(&W, &Document, &Page) -> Result<T> + Send + Sync,
+{
     let count = doc.pages().len();
     let workers = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1)
         .min(count);
     if workers <= 1 {
+        let state = fork();
         return (0..count)
-            .map(|i| doc.page(i).and_then(|page| work(doc, &page)))
+            .map(|i| doc.page(i).and_then(|page| work(&state, doc, &page)))
             .collect();
     }
 
@@ -1080,19 +1100,22 @@ where
     std::thread::scope(|scope| {
         for _ in 0..workers {
             // The seed crosses the thread boundary; the document — whose
-            // caches are single-threaded by design — materializes inside.
+            // caches are single-threaded by design — materializes inside,
+            // and so does the worker's fork of the state.
             let seed = seed.clone();
             let next = &next;
             let slots = &slots;
+            let fork = &fork;
             let work = &work;
             scope.spawn(move || {
                 let worker = Document::from_seed(seed);
+                let state = fork();
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if i >= count {
                         break;
                     }
-                    let outcome = worker.page(i).and_then(|page| work(&worker, &page));
+                    let outcome = worker.page(i).and_then(|page| work(&state, &worker, &page));
                     // Each index is handed to exactly one worker, so the
                     // slot is always empty; a failed set would mean the
                     // counter duplicated an index, which is worth crashing
@@ -1679,6 +1702,27 @@ mod tests {
         assert!(texts[0].contains("(one)"), "{}", texts[0]);
         assert!(texts[1].contains("(two)"), "{}", texts[1]);
         assert!(texts[2].contains("(three)"), "{}", texts[2]);
+    }
+
+    /// The state is forked once per worker, never per page, and every page
+    /// sees a fork: over a three-page document the forks number at most
+    /// three and at least one, and each page's work reads the fork it got.
+    #[test]
+    fn map_pages_forking_forks_the_state_once_per_worker() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).unwrap();
+        let forks = std::sync::atomic::AtomicUsize::new(0);
+        let tags = map_pages_forking(
+            &doc,
+            || forks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+            |fork, doc, page| Ok((*fork, page.content(doc)?.len())),
+        );
+        let forked = forks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!((1..=3).contains(&forked), "{forked} forks for three pages");
+        for outcome in tags {
+            let (fork, len) = outcome.unwrap();
+            assert!((1..=forked).contains(&fork));
+            assert!(len > 0);
+        }
     }
 
     /// Replaces the first occurrence of `from` with `to`. Splicing happens
