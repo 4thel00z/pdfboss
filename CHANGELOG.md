@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.12.0](https://github.com/4thel00z/pdfboss/compare/v2.11.0...v2.12.0) (2026-10-01)
+
+
+### Features
+
+* optional content usage, intent and the groups reader (ISO 32000 batch 14) ([#235](https://github.com/4thel00z/pdfboss/issues/235)) ([81f5275](https://github.com/4thel00z/pdfboss/commit/81f52758fed6c04d5925033c0a79bae0a6b8d247))
+* split into parts one at a time, from bytes or an upload stream ([#242](https://github.com/4thel00z/pdfboss/issues/242)) ([3853b24](https://github.com/4thel00z/pdfboss/commit/3853b243e0d2c3081b7c44f5a3a34138f9abcd7e))
+* structure content items, OBJR annotations in the reading order (ISO 32000 batch 15) ([#238](https://github.com/4thel00z/pdfboss/issues/238)) ([69007ae](https://github.com/4thel00z/pdfboss/commit/69007aeb5ab06ed05eb919a545b2cc7722021c1b))
+* **text:** read the descriptor's font family, stretch and weight onto spans (ISO 32000 14.8.2.4.3) ([#240](https://github.com/4thel00z/pdfboss/issues/240)) ([629006e](https://github.com/4thel00z/pdfboss/commit/629006e04b5f6ea9363d036656b8e5682f042675))
+
+
+### Performance Improvements
+
+* **core:** load the structure tree once per document walk and fork it per worker ([#241](https://github.com/4thel00z/pdfboss/issues/241)) ([3eef92b](https://github.com/4thel00z/pdfboss/commit/3eef92b24b3204706afb546a0a9dc7894e3aa78e))
+
+
+### Documentation
+
+* **failure-modes:** name the optional content usage evidence after its squash hash 81f5275 ([#235](https://github.com/4thel00z/pdfboss/issues/235)) ([#237](https://github.com/4thel00z/pdfboss/issues/237)) ([ec3d0c7](https://github.com/4thel00z/pdfboss/commit/ec3d0c740920376d21a5b44eb718ca3b41d040c0))
+
 ## [2.11.0](https://github.com/4thel00z/pdfboss/compare/v2.10.0...v2.11.0) (2026-09-21)
 
 
