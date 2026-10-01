@@ -141,6 +141,8 @@ Seven more commands assemble or protect documents out of existing ones, each als
 
 `merge`, `split`, `rewrite`, `encrypt` and `decrypt` always run on `pdfboss_write::Importer`, which renumbers each source object once and copies it into the output; `rotate`'s and `overlay`'s `--rewrite` modes do too, but their defaults instead append through `Update`, the same way `meta` does. A merged document keeps only the pages it imports, so document-level trees carried by the inputs, such as outlines, name trees and optional content, are not part of the result. At the CLI, `merge`, `split`, `rotate`, `rewrite` and `overlay` refuse every encrypted input outright, whether or not the password opened it; `overlay` checks its base and its overlay file separately, so the error names whichever one is encrypted. `encrypt` and `decrypt` are the exception: `--password` opens an already-encrypted input, so `encrypt` re-protects it under new passwords and `decrypt` strips it.
 
+A split can also hand out its parts one at a time instead of all at once. In Python, `pdfboss.write.split_parts` yields each part as it is built, under `for` or `async for`, and `split_stream` does the same for a PDF arriving as an async iterable of chunks, such as an upload body. In Rust, `pdfboss_write::copy_pages_with` builds one part from any document, sync or async, into any byte sink. See [One part at a time](https://pdfboss.dev/docs/guide/assembling.html#one-part-at-a-time).
+
 <details>
 <summary><strong>More: explorer subcommands, async Python, Rust</strong></summary>
 
