@@ -114,6 +114,16 @@ parts    = split(doc_bytes, every=10)            # consecutive chunks, last one 
 rotated  = rotate(doc_bytes, 90, pages=[0])
 clean    = rewrite(doc_bytes)                    # recompressed, unreachable objects and old update sections dropped
 
+# the same parts one at a time: split_parts works with for and async for (async builds each
+# part on a worker thread); split_stream takes an async iterable of chunks (an upload body),
+# collects it, then yields parts; only one part is held at a time; password= (keyword only)
+# opens a protected input and the parts come out unencrypted
+from pdfboss.write import split_parts, split_stream
+for part in split_parts(doc_bytes, every=10):
+    save(part)
+async for part in split_stream(request.stream(), every=10):
+    await upload(part)
+
 # encrypt/decrypt: AES-256 (R6); owner_password defaults to user_password, both empty raises ValueError
 from pdfboss.write import encrypt, decrypt
 locked = encrypt(doc_bytes, user_password="X", allow=["print", "copy"])   # allow omitted grants everything

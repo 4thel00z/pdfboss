@@ -5,7 +5,7 @@ typed surface editors and type checkers see.
 """
 
 import os
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Iterator, Sequence
 from typing import Literal, Protocol, Self
 
 __version__: str
@@ -2453,13 +2453,36 @@ class write:
         password, copies across as plain, unencrypted bytes."""
 
     @staticmethod
-    def split(data: bytes, every: int) -> list[bytes]:
+    def split(data: bytes | bytearray | memoryview, every: int) -> list[bytes]:
         """Cuts ``data`` into consecutive parts of ``every`` pages each,
-        the last part carrying whatever remains. A ``data`` that cannot
+        the last part carrying whatever remains. ``every`` below 1 raises
+        ``ValueError``. A ``data`` that cannot
         be opened at all (encrypted with no working password) raises
         ``PdfError``; one that opens under its password, including the
         empty user password, copies across as plain, unencrypted
         bytes."""
+
+    class PartBuilder:
+        """Builds the parts behind ``pdfboss.write.SplitIterator`` one at
+        a time; use ``pdfboss.write.split_parts`` or ``split_stream``
+        instead of this class. The input arrives through ``push`` and is
+        parsed on the first build. A built part waits in a slot until
+        ``take`` hands it out. ``every`` below 1 raises ``ValueError``
+        here."""
+
+        def __init__(self, every: int, *, password: str = "") -> None: ...
+        def push(self, chunk: bytes | bytearray | memoryview) -> None:
+            """Appends ``chunk`` to the input; ``RuntimeError`` once the
+            first part has been built."""
+        def next_part(self) -> bytes | None:
+            """Builds the next part and hands it out; ``None`` once every
+            part is out."""
+        def build(self) -> Awaitable[None]:
+            """Builds the next part into the slot on a worker thread,
+            unless one is already waiting there."""
+        def take(self) -> bytes | None:
+            """Hands out the part waiting in the slot; ``None`` once every
+            part is out."""
 
     @staticmethod
     def rotate(

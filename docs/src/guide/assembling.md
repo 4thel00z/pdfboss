@@ -40,6 +40,49 @@ from pdfboss.write import split
 parts = split(report_bytes, every=10)
 ```
 
+### One part at a time
+
+`split` holds every part in memory at once. `split_parts(data, every, *, password="")` builds the same parts one at a time as you iterate, so only one part is held besides the input; each part reads the input afresh, so nothing cached for one part stays alive for the next. It works with both `for` and `async for`; under `async for` each part is built on a worker thread, so the event loop keeps running. A step that is cancelled or times out leaves its part for the next step, and awaiting a second step while one is pending raises `RuntimeError`, so parts always arrive complete and in order. The input is parsed when the first part is requested, so an unreadable file, or a wrong or missing `password`, raises `PdfError` there rather than at the call; `every` below 1 raises `ValueError` at the call. A protected input opened with `password` yields plain, unencrypted parts.
+
+`split_stream(stream, every, *, password="")` takes the PDF as an async iterable of bytes chunks, such as an upload body or an S3 object body, and yields the parts as they are built. `every` and `password` are checked before the first chunk is read. A PDF's cross-reference table sits at the end of the file, so no page can be located before the last chunk arrives: `split_stream` copies each chunk into the input as it arrives and parses once the stream ends. Memory holds the file plus one part.
+
+```python
+from pdfboss.write import split_stream
+
+async def split_upload(request, s3, bucket):
+    index = 0
+    async for part in split_stream(request.stream(), every=10):
+        index += 1
+        await s3.put_object(Bucket=bucket, Key=f"part-{index}.pdf", Body=part)
+```
+
+In Rust, `split_runs(doc, every)` gives the runs of page indices `split_document` cuts `doc` into, counting the pages the page tree actually holds rather than its declared `/Count`, and `split_part(doc, run, options)` builds one of them into a `Vec<u8>`; `split_document` is those two in a loop. `copy_pages_with(src, pages, options, sink)` is the asynchronous form: it builds one fresh document from `pages` of `src` and writes it into `sink`, handing the sink back so the caller can finish it (close a file, complete an upload) before building the next part. `src` is any `AsyncObjectSource`: a `Document` through `pdfboss_core::Immediate(&doc)` (not `pdfboss_write::Immediate`, which wraps a byte sink), or an `AsyncDocument` reading a file or a URL by range. Every page must come from `src`; a page whose object in `src` is missing or different is refused. Fetch each run's pages just before building its part, so only one run's pages are held at a time:
+
+```rust,no_run
+use pdfboss_aio::{AsyncDocument, TokioSink};
+use pdfboss_core::Page;
+use pdfboss_write::{copy_pages_with, WriteOptions};
+use tokio::io::AsyncWriteExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let doc = AsyncDocument::open("report.pdf").await?;
+    let total = doc.page_count();
+    for (index, start) in (0..total).step_by(10).enumerate() {
+        let pages = (start..(start + 10).min(total))
+            .map(|page| doc.page(page))
+            .collect::<Result<Vec<Page>, _>>()?;
+        let file = tokio::fs::File::create(format!("part-{}.pdf", index + 1)).await?;
+        let TokioSink(mut file) =
+            copy_pages_with(doc.clone(), pages, WriteOptions::default(), TokioSink(file)).await?;
+        file.flush().await?;
+    }
+    Ok(())
+}
+```
+
+`TokioSink` needs `pdfboss-aio`'s `write` feature. An `AsyncDocument` keeps every object it has read cached for as long as it lives, so over a long split its memory grows by the objects each part copies; open the document again for each part where that matters.
+
 ## Rotating
 
 `rotate` turns selected pages by 90, 180 or 270 degrees clockwise. By default it appends an incremental update, the same way `meta` does; `--rewrite` (`rewrite=True` in Python) writes the whole document fresh instead.
@@ -84,6 +127,8 @@ clean = rewrite(report_bytes)
 ## The Importer
 
 `Importer::new(writer, source)` opens one source document for copying into a `Writer`, refusing a locked source: one that is encrypted with no working decryptor. A source already opened under its password copies across as plaintext instead, the same way [`encrypt_document`](./encryption.md#encrypting-a-file) relies on it to re-encrypt a document under new passwords. `page(index, parent)` imports one page as a self-contained object under `parent`, translating its effective resources, media box and rotation and returning the page's new reference; it is what `merge_documents` calls once per selected page. `document()` instead walks the whole reachable graph from the source catalog and returns the new root reference; `rewrite_document` and `rotate_rewrite` build on it.
+
+`Importer::with_source(writer, source)` opens any `AsyncObjectSource` instead, such as an `AsyncDocument`, for the asynchronous twins: `page_with(&page, parent)` imports a `Page` the caller already holds, which must come from `source`, and `finish_with()` drains the queue, awaiting each fetch. The synchronous methods are these twins run over `pdfboss_core::Immediate(&doc)`, the source type `Importer` defaults to, so `Importer<'_, '_>` still names the importer over a borrowed `Document`. A source cannot report whether it is locked, so `with_source` trusts the caller to hand over one that already decrypts, as an opened `AsyncDocument` does.
 
 ```rust,no_run
 use pdfboss_core::{Dict, Document, Name, Object};

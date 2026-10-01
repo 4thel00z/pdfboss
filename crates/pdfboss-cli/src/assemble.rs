@@ -14,7 +14,7 @@ use std::path::Path;
 use pdfboss_core::{Document, Error as CoreError, Permissions};
 use pdfboss_write::{
     decrypt_document, encrypt_document, merge_documents, rewrite_document, rotate_pages,
-    rotate_rewrite, split_document, watermark, watermark_under, watermark_under_with,
+    rotate_rewrite, split_part, split_runs, watermark, watermark_under, watermark_under_with,
     watermark_with, Error as WriteError, Update, WriteOptions,
 };
 
@@ -65,13 +65,12 @@ pub fn cmd_split(file: &Path, out: &str, every: usize, password: &str) -> Result
     let doc = Document::open_with_password(file, password)
         .map_err(|e| format!("{}: {e}", file.display()))?;
     reject_encrypted(&doc, file)?;
-    let total = doc.page_count();
-    let parts = split_document(&doc, every, WriteOptions::default()).map_err(|e| e.to_string())?;
-    for (i, bytes) in parts.iter().enumerate() {
+    let runs = split_runs(&doc, every).map_err(|e| e.to_string())?;
+    for (i, run) in runs.into_iter().enumerate() {
+        let count = run.len();
+        let bytes = split_part(&doc, run, WriteOptions::default()).map_err(|e| e.to_string())?;
         let path = pattern_path(out, i + 1)?;
         std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        let start = i * every;
-        let count = (start + every).min(total) - start;
         let plural = if count == 1 { "" } else { "s" };
         println!("wrote {} ({count} page{plural})", path.display());
     }
