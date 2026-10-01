@@ -454,6 +454,15 @@ impl Document {
         self.pages().len()
     }
 
+    /// Number of pages the page tree actually holds: the flattened tree's
+    /// length, walking the tree on first use. This is the count
+    /// [`Document::page`] indexes into; it differs from
+    /// [`Document::page_count`] only while the tree is unwalked and its
+    /// declared `/Count` is wrong.
+    pub fn flattened_page_count(&self) -> usize {
+        self.pages().len()
+    }
+
     /// Reads the page tree root's `/Count` cheaply (Root → `/Pages` →
     /// `/Count`) without descending into `/Kids`. Returns `None` when the
     /// entry is missing, non-integer, negative, or larger than the file could
