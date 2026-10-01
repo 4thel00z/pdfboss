@@ -9,10 +9,11 @@ from collections.abc import AsyncIterator
 import pytest
 
 import pdfboss
+from pdfboss._pdfboss.write import PartBuilder
 from pdfboss.write import (
     Page,
     Pdf,
-    SplitParts,
+    SplitIterator,
     Text,
     Update,
     encrypt,
@@ -118,8 +119,16 @@ def test_split_parts_takes_password_by_keyword_only() -> None:
         split_parts(build_pdf("one"), 1, "secret")  # type: ignore[misc]
 
 
+def test_part_builder_refuses_input_after_the_first_part() -> None:
+    builder = PartBuilder(1)
+    builder.push(build_pdf("one", "two"))
+    assert builder.next_part() is not None
+    with pytest.raises(RuntimeError, match="after the first part"):
+        builder.push(b"more")
+
+
 def test_split_parts_reports_its_public_module() -> None:
-    assert SplitParts.__module__ == "pdfboss.write"
+    assert SplitIterator.__module__ == "pdfboss.write"
 
 
 def test_split_parts_opens_a_protected_input_and_yields_plain_parts() -> None:

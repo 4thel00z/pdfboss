@@ -1343,7 +1343,7 @@ def Generated.citations6 : List Citation := [
   ⟨some 1, some (.clause [14, 9, 3]), "crates/pdfboss-py/src/lib.rs", 1756, false⟩,
   ⟨some 1, some (.clause [14, 9, 2]), "crates/pdfboss-py/src/lib.rs", 1765, false⟩,
   ⟨some 1, some (.clause [7, 5, 6]), "crates/pdfboss-py/src/write.rs", 1077, false⟩,
-  ⟨some 2, some (.clause [7, 6, 4, 3]), "crates/pdfboss-py/src/write.rs", 1511, false⟩,
+  ⟨some 2, some (.clause [7, 6, 4, 3]), "crates/pdfboss-py/src/write.rs", 1532, false⟩,
   ⟨some 1, some (.clause [12, 5, 6]), "crates/pdfboss-render/src/annot.rs", 1, false⟩,
   ⟨some 1, some (.clause [12, 5, 4]), "crates/pdfboss-render/src/annot.rs", 30, false⟩,
   ⟨some 1, some (.clause [12, 5, 6, 10]), "crates/pdfboss-render/src/annot.rs", 30, false⟩,

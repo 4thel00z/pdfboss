@@ -357,7 +357,7 @@ def test_write_module_exports_full_vocabulary_sorted() -> None:
         "PageLabel",
         "Paragraph",
         "Pdf",
-        "SplitParts",
+        "SplitIterator",
         "Standard14",
         "Text",
         "Update",

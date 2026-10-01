@@ -25,7 +25,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::panic::PanicException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyModule};
@@ -1304,10 +1304,11 @@ fn split<'py>(
         .collect())
 }
 
-/// Builds the parts behind `pdfboss.write.SplitParts` one at a time. A
-/// built part waits in a slot until `take` hands it out, so an awaiting
-/// coroutine that is cancelled before taking it leaves it for the next
-/// step. The input is parsed on the first build, not here.
+/// Builds the parts behind `pdfboss.write.SplitIterator` one at a time.
+/// The input arrives through `push`, in as many chunks as the caller has;
+/// it is parsed on the first build. A built part waits in a slot until
+/// `take` hands it out, so an awaiting coroutine that is cancelled before
+/// taking it leaves it for the next step.
 #[pyclass(frozen, module = "pdfboss.write")]
 struct PartBuilder {
     state: Arc<Mutex<SplitState>>,
@@ -1316,17 +1317,37 @@ struct PartBuilder {
 #[pymethods]
 impl PartBuilder {
     #[new]
-    #[pyo3(signature = (data, every, *, password=String::new()))]
-    fn new(data: &Bound<'_, PyAny>, every: i64, password: String) -> PyResult<PartBuilder> {
+    #[pyo3(signature = (every, *, password=String::new()))]
+    fn new(every: i64, password: String) -> PyResult<PartBuilder> {
         let every = pages_per_part(every)?;
-        let data = crate::byte_arg(data)?;
         Ok(PartBuilder {
             state: Arc::new(Mutex::new(SplitState {
                 every,
-                input: SplitInput::Unread { data, password },
+                input: SplitInput::Unread {
+                    data: Vec::new(),
+                    password,
+                },
                 built: None,
             })),
         })
+    }
+
+    /// Appends `chunk` to the input. Raises `RuntimeError` once the first
+    /// part has been built, since the input has been parsed by then.
+    fn push(&self, chunk: &Bound<'_, PyAny>) -> PyResult<()> {
+        let chunk = crate::byte_arg(chunk)?;
+        let mut state = lock_split(&self.state);
+        let SplitInput::Unread { data, .. } = &mut state.input else {
+            return Err(PyRuntimeError::new_err(
+                "cannot add input after the first part has been built",
+            ));
+        };
+        if data.is_empty() {
+            *data = chunk;
+            return Ok(());
+        }
+        data.extend_from_slice(&chunk);
+        Ok(())
     }
 
     /// Builds the next part and hands it out with the GIL released:
