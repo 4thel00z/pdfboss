@@ -96,7 +96,8 @@ def styled_pdf() -> bytes:
             ),
             7: (
                 b"<< /Type /FontDescriptor /FontName /Custom-Face "
-                b"/Flags 66 /FontWeight 700 /Ascent 718 /Descent -207 >>"
+                b"/Flags 66 /FontWeight 700 /Ascent 718 /Descent -207 "
+                b"/FontFamily (Custom Family) /FontStretch /Condensed >>"
             ),
         }
     )
@@ -130,11 +131,16 @@ class TestPageSpans:
         assert not plain.underline and not plain.strikethrough
         assert plain.color == pytest.approx((0.0, 0.0, 0.0))
         assert not plain.invisible
+        assert plain.font_family == ""
+        assert plain.font_stretch is None and plain.font_weight is None
 
         assert styled.text == "styled"
         assert styled.font_name == "Custom-Face"
         assert styled.bold and styled.italic
         assert styled.serif and not styled.monospace
+        assert styled.font_family == "Custom Family"
+        assert styled.font_stretch == "condensed"
+        assert styled.font_weight == 700.0
         assert styled.underline and not styled.strikethrough
         assert not styled.highlight and styled.highlight_color is None
         assert styled.color == pytest.approx((1.0, 0.0, 0.0))

@@ -87,6 +87,83 @@ fn structure_for(doc: &Document, order: ReadingOrder) -> Option<StructureTree> {
     }
 }
 
+/// A font's width as its FontDescriptor `/FontStretch` states it (ISO
+/// 32000-1 Table 122): the nine names of the table, narrowest first.
+///
+/// Covers ISO 32000-1 §9.8.1 and §14.8.2.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FontStretch {
+    UltraCondensed,
+    ExtraCondensed,
+    Condensed,
+    SemiCondensed,
+    Normal,
+    SemiExpanded,
+    Expanded,
+    ExtraExpanded,
+    UltraExpanded,
+}
+
+impl FontStretch {
+    /// Every stretch, narrowest first.
+    pub const ALL: [FontStretch; 9] = [
+        FontStretch::UltraCondensed,
+        FontStretch::ExtraCondensed,
+        FontStretch::Condensed,
+        FontStretch::SemiCondensed,
+        FontStretch::Normal,
+        FontStretch::SemiExpanded,
+        FontStretch::Expanded,
+        FontStretch::ExtraExpanded,
+        FontStretch::UltraExpanded,
+    ];
+
+    /// The stretch a `/FontStretch` name of Table 122 stands for; `None`
+    /// for a name outside the table.
+    pub fn from_name(name: &str) -> Option<FontStretch> {
+        FontStretch::ALL
+            .into_iter()
+            .find(|stretch| stretch.name() == name)
+    }
+
+    /// The name Table 122 gives the stretch, as a descriptor writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            FontStretch::UltraCondensed => "UltraCondensed",
+            FontStretch::ExtraCondensed => "ExtraCondensed",
+            FontStretch::Condensed => "Condensed",
+            FontStretch::SemiCondensed => "SemiCondensed",
+            FontStretch::Normal => "Normal",
+            FontStretch::SemiExpanded => "SemiExpanded",
+            FontStretch::Expanded => "Expanded",
+            FontStretch::ExtraExpanded => "ExtraExpanded",
+            FontStretch::UltraExpanded => "UltraExpanded",
+        }
+    }
+
+    /// The stretch in lower case with hyphens, as CSS `font-stretch`
+    /// spells it: `"ultra-condensed"` to `"ultra-expanded"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FontStretch::UltraCondensed => "ultra-condensed",
+            FontStretch::ExtraCondensed => "extra-condensed",
+            FontStretch::Condensed => "condensed",
+            FontStretch::SemiCondensed => "semi-condensed",
+            FontStretch::Normal => "normal",
+            FontStretch::SemiExpanded => "semi-expanded",
+            FontStretch::Expanded => "expanded",
+            FontStretch::ExtraExpanded => "extra-expanded",
+            FontStretch::UltraExpanded => "ultra-expanded",
+        }
+    }
+}
+
+impl std::fmt::Display for FontStretch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The class of an artifact marked-content sequence (ISO 32000-1 Table
 /// 330, `/Type`): what a producer says a piece of content is there for.
 ///
@@ -193,6 +270,20 @@ pub struct TextSpan {
     pub monospace: bool,
     /// FontDescriptor `/Flags` Serif (ISO 32000-1 Table 123 bit 2).
     pub serif: bool,
+    /// The font's family as the FontDescriptor `/FontFamily` states it
+    /// (ISO 32000-1 Table 122, the font characteristics of §14.8.2.4.3):
+    /// a byte string, read as a text string; empty when the descriptor
+    /// states none.
+    pub font_family: String,
+    /// The font's width as the FontDescriptor `/FontStretch` states it
+    /// (ISO 32000-1 Table 122); `None` when the descriptor states none or
+    /// a name outside the table.
+    pub font_stretch: Option<FontStretch>,
+    /// The font's weight as the FontDescriptor `/FontWeight` states it
+    /// (ISO 32000-1 Table 122, 100 to 900); `None` when the descriptor
+    /// states none. [`TextSpan::bold`] is the reading of it, with the
+    /// flags, the stem width and the name as further evidence.
+    pub font_weight: Option<f32>,
     /// The text rise (`Ts`) the span was shown under, in unscaled text
     /// space: positive above the baseline — a superscript/subscript
     /// signal. The origin already includes the shift.
@@ -1863,6 +1954,53 @@ mod tests {
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         assert!(spans[0].italic, "Flags bit 7 (mask 64) is Italic");
         assert!(spans[0].bold, "FontWeight 700 >= 600 is bold");
+    }
+
+    /// Table 122's font characteristics reach the span as the descriptor
+    /// states them: the family decoded from its byte string, the stretch
+    /// by its table name, the weight as written.
+    // Covers ISO 32000-1 §9.8.1 and §14.8.2.4.3.
+    #[test]
+    fn descriptor_family_stretch_and_weight_reach_the_span() {
+        let s = span_with_descriptor(
+            "/FontFamily (Source Sans) /FontStretch /SemiCondensed /FontWeight 300",
+        );
+        assert_eq!(s.font_family, "Source Sans");
+        assert_eq!(s.font_stretch, Some(FontStretch::SemiCondensed));
+        assert_eq!(s.font_weight, Some(300.0));
+        assert!(!s.bold, "a stated weight of 300 is not bold");
+    }
+
+    /// A descriptor that states none of the three gives an empty family
+    /// and no stretch or weight, and a stretch name outside Table 122
+    /// gives no stretch.
+    // Covers ISO 32000-1 §9.8.1 and §14.8.2.4.3.
+    #[test]
+    fn descriptor_without_font_characteristics_gives_none() {
+        let s = span_with_descriptor("/Flags 32");
+        assert_eq!(s.font_family, "");
+        assert_eq!(s.font_stretch, None);
+        assert_eq!(s.font_weight, None);
+        let s = span_with_descriptor("/FontStretch /Narrow /FontFamily <FEFF00C9006D>");
+        assert_eq!(s.font_stretch, None, "Narrow is not a Table 122 name");
+        assert_eq!(
+            s.font_family, "Ém",
+            "a UTF-16BE family decodes as a text string"
+        );
+    }
+
+    /// The nine stretches round-trip through their table names and order
+    /// from the narrowest to the widest.
+    // Covers ISO 32000-1 §9.8.1.
+    #[test]
+    fn font_stretch_names_round_trip_in_table_order() {
+        for stretch in FontStretch::ALL {
+            assert_eq!(FontStretch::from_name(stretch.name()), Some(stretch));
+        }
+        assert!(FontStretch::UltraCondensed < FontStretch::Normal);
+        assert!(FontStretch::Normal < FontStretch::UltraExpanded);
+        assert_eq!(FontStretch::SemiExpanded.as_str(), "semi-expanded");
+        assert_eq!(FontStretch::from_name("Wide"), None);
     }
 
     /// Table 122 `/StemV`: a thick dominant vertical stem marks a bold face

@@ -1667,6 +1667,30 @@ impl Span {
         self.inner.serif
     }
 
+    /// The font family the FontDescriptor /FontFamily states (ISO 32000-1
+    /// Table 122); empty when it states none.
+    #[getter]
+    fn font_family(&self) -> &str {
+        &self.inner.font_family
+    }
+
+    /// The font width the FontDescriptor /FontStretch states, in lower
+    /// case with hyphens ("ultra-condensed" to "ultra-expanded"); None
+    /// when it states none or a name outside Table 122.
+    #[getter]
+    fn font_stretch(&self) -> Option<&'static str> {
+        self.inner
+            .font_stretch
+            .map(pdfboss_text::FontStretch::as_str)
+    }
+
+    /// The font weight the FontDescriptor /FontWeight states (100 to
+    /// 900); None when it states none. `bold` is the reading of it.
+    #[getter]
+    fn font_weight(&self) -> Option<f32> {
+        self.inner.font_weight
+    }
+
     /// A drawn ruling sits just below the baseline, covers most of the
     /// span and stops within an em of the text it covers, or an /Underline
     /// or /Squiggly annotation covers the span. PDF has no underline

@@ -6,6 +6,7 @@
 
 use crate::cmap::ToUnicode;
 use crate::sfnt;
+use crate::FontStretch;
 use pdfboss_core::cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode};
 use pdfboss_core::{decoded_stream_data_with, AsyncObjectSource, Dict, FastMap, Object};
 use pdfboss_encoding as encodings;
@@ -127,6 +128,15 @@ pub struct Font {
     pub monospace: bool,
     /// FontDescriptor `/Flags` Serif (ISO 32000-1 Table 123 bit 2).
     pub serif: bool,
+    /// FontDescriptor `/FontFamily` (ISO 32000-1 Table 122), a byte string
+    /// decoded as a text string; empty when absent.
+    pub family: String,
+    /// FontDescriptor `/FontStretch` (ISO 32000-1 Table 122); `None` when
+    /// absent or not one of the table's names.
+    pub stretch: Option<FontStretch>,
+    /// FontDescriptor `/FontWeight` (ISO 32000-1 Table 122) as written;
+    /// `None` when absent or not a number.
+    pub weight: Option<f32>,
 }
 
 /// Everything [`Font::style`] reads in one descriptor pass: the font's
@@ -140,6 +150,9 @@ struct Style {
     descent: f32,
     monospace: bool,
     serif: bool,
+    family: String,
+    stretch: Option<FontStretch>,
+    weight: Option<f32>,
 }
 
 /// One `/Encoding` table cell. Base-table entries and most `/Differences`
@@ -212,6 +225,9 @@ impl Font {
             descent: -200.0,
             monospace: false,
             serif: false,
+            family: String::new(),
+            stretch: None,
+            weight: None,
         }
     }
 
@@ -522,6 +538,9 @@ impl Font {
             descent: -200.0,
             monospace: false,
             serif: false,
+            family: String::new(),
+            stretch: None,
+            weight: None,
         };
         let Some(descriptor) = rv(src, descriptor_holder, "FontDescriptor")
             .await
@@ -598,6 +617,20 @@ impl Font {
         if let Some(weight) = weight {
             bold = bold || weight >= 600.0;
         }
+        // Table 122: the family, stretch and weight a tagged-PDF consumer
+        // reads off the descriptor (14.8.2.4.3); the family is a byte
+        // string, read as a text string.
+        style.weight = weight.map(|w| w as f32);
+        style.family = rv(src, &descriptor, "FontFamily")
+            .await
+            .and_then(|o| {
+                o.as_str_bytes()
+                    .map(pdfboss_core::object::decode_text_string)
+            })
+            .unwrap_or_default();
+        style.stretch = rv(src, &descriptor, "FontStretch")
+            .await
+            .and_then(|o| o.as_name().and_then(|n| FontStretch::from_name(&n.0)));
         // Table 122: StemV is the thickness of the dominant vertical stems.
         // Text faces stay under ~110 glyph-space units and bold faces start
         // around 140, so a thick stem marks bold fonts whose descriptors
@@ -732,6 +765,9 @@ impl Font {
             descent: style.descent,
             monospace: style.monospace,
             serif: style.serif,
+            family: style.family,
+            stretch: style.stretch,
+            weight: style.weight,
         }
     }
 
@@ -1035,6 +1071,9 @@ impl Font {
             descent: style.descent,
             monospace: style.monospace,
             serif: style.serif,
+            family: style.family,
+            stretch: style.stretch,
+            weight: style.weight,
         }
     }
 
