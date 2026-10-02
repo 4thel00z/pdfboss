@@ -223,8 +223,9 @@ pub struct Structure {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
     /// The decoded text, in drawing order: right-to-left text comes out
-    /// leftmost glyph first. `pdfboss-output` puts each line in reading
-    /// order when it assembles the line.
+    /// leftmost glyph first, except when `logical` is set, in which case
+    /// the text is already in reading order. `pdfboss-output` puts each
+    /// line in reading order when it assembles the line.
     pub text: String,
     /// `text` is already in reading order: it came from a `/ReversedChars`
     /// sequence (ISO 32000-1 §14.8.2.3.3) or an `/ActualText` replacement

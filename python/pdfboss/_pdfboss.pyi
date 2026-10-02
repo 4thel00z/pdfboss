@@ -84,8 +84,16 @@ class Span:
     @property
     def text(self) -> str:
         """The decoded text, in drawing order: right-to-left text comes out
-        leftmost glyph first. ``extract_text`` and the Markdown put each line
-        in reading order."""
+        leftmost glyph first, except when ``logical`` is true, in which case
+        the text is already in reading order. ``extract_text`` and the
+        Markdown put each line in reading order."""
+
+    @property
+    def logical(self) -> bool:
+        """Whether ``text`` is already in reading order: the span came from a
+        ``/ReversedChars`` sequence (ISO 32000-1 14.8.2.3.3) or an
+        ``/ActualText`` replacement (14.9.4). Such a span must not be
+        reversed again."""
 
     @property
     def x(self) -> float:
