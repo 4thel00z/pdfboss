@@ -14,7 +14,7 @@ pub(crate) struct LogicalText {
 }
 
 /// One unit the reordering moves as a whole: a letter with the combining
-/// marks drawn after it, or a whole [`LogicalText`].
+/// marks ([`is_mark`]) drawn after it, or a whole [`LogicalText`].
 struct Unit {
     inline: usize,
     bytes: Range<usize>,
@@ -25,6 +25,20 @@ struct Unit {
 /// Whether `c` is a strong right-to-left character (bidi class R or AL).
 fn is_rtl(c: char) -> bool {
     matches!(bidi_class(c), BidiClass::R | BidiClass::AL)
+}
+
+/// Whether `c` is a combining mark: bidi class NSM, or an Arabic mark in
+/// an isolated presentation form, which fonts often map their mark glyphs
+/// to: the shadda ligatures U+FC5E to U+FC63 and the isolated fathatan,
+/// dammatan, kasratan, fatha, damma, kasra, shadda and sukun at the even
+/// code points U+FE70 to U+FE7E. The odd code points there are medial
+/// forms on a tatweel, which has an advance of its own.
+pub(crate) fn is_mark(c: char) -> bool {
+    match c {
+        '\u{FC5E}'..='\u{FC63}' => true,
+        '\u{FE70}'..='\u{FE7E}' => (c as u32).is_multiple_of(2),
+        _ => bidi_class(c) == BidiClass::NSM,
+    }
 }
 
 /// Whether `text` holds a strong right-to-left character. Every such
@@ -122,7 +136,7 @@ fn units(inlines: &[Inline], logical: &[LogicalText]) -> Vec<Unit> {
                 continue;
             }
             let end = at + c.len_utf8();
-            if cluster_open && bidi_class(c) == BidiClass::NSM {
+            if cluster_open && is_mark(c) {
                 if let Some(last) = units.last_mut() {
                     last.bytes.end = end;
                 }

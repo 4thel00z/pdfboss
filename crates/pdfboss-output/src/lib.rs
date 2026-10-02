@@ -2760,7 +2760,8 @@ mod tests {
         );
         b.object(
             6,
-            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 >>",
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 \
+             /W [9 [0] 11 [0] 13 [0]] >>",
         );
         b.stream(
             7,
@@ -3299,8 +3300,10 @@ mod tests {
     }
 
     /// A page with `/F1`, a Type0 font whose ToUnicode maps codes 1 to 9 to
-    /// Arabic letters, a space and a kasra, and `/F2`, Helvetica, drawing
-    /// `content`.
+    /// Arabic letters, a space and a kasra, codes 10 to 12 to `e`, a
+    /// combining acute and `t`, code 13 to the isolated form of shadda, and
+    /// `/F2`, Helvetica, drawing `content`. The three marks have no advance,
+    /// like the marks of a real font.
     fn arabic_doc(content: &[u8]) -> Document {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -3318,15 +3321,17 @@ mod tests {
         );
         b.object(
             6,
-            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 >>",
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 \
+             /W [9 [0] 11 [0] 13 [0]] >>",
         );
         b.stream(
             7,
             "",
             b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
-              9 beginbfchar <0001> <0627> <0002> <0633> <0003> <0645> \
+              13 beginbfchar <0001> <0627> <0002> <0633> <0003> <0645> \
               <0004> <0644> <0005> <0639> <0006> <0626> <0007> <0629> \
-              <0008> <0020> <0009> <0650> endbfchar",
+              <0008> <0020> <0009> <0650> <000A> <0065> <000B> <0301> \
+              <000C> <0074> <000D> <FE7C> endbfchar",
         );
         b.object(
             8,
@@ -3390,6 +3395,75 @@ mod tests {
     fn a_combining_mark_stays_after_its_letter() {
         let doc = arabic_doc(b"BT /F1 12 Tf 72 720 Td <0003000200090001> Tj ET");
         assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{650}\u{645}");
+    }
+
+    /// A mark drawn as a glyph of its own, over the middle of its letter and
+    /// in a text object of its own, joins the word: the gap to the next
+    /// letter is measured from the letter the mark sits on, not from the
+    /// mark. Each glyph is shown on its own, and the mark may be drawn after
+    /// or before the letters.
+    #[test]
+    fn a_mark_drawn_apart_from_its_letter_opens_no_word_gap() {
+        let word = "\u{627}\u{633}\u{650}\u{645}";
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td [<0003> <0002> <0001>] TJ ET \
+              BT /F1 12 Tf 81 716 Td <0009> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), word);
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(md.contains(word), "markdown split the word: {md:?}");
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 81 716 Td <0009> Tj ET \
+              BT /F1 12 Tf 72 720 Td [<0003> <0002> <0001>] TJ ET",
+        );
+        assert_eq!(page_text(&doc, 0), word);
+    }
+
+    /// A font that maps its shadda glyph to the isolated presentation form
+    /// U+FE7C, a letter in Unicode's eyes, still has it read as a mark: it
+    /// joins the word and stays after the letter it sits on.
+    #[test]
+    fn an_isolated_form_mark_reads_as_a_mark() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td [<0003> <0002> <0001>] TJ ET \
+              BT /F1 12 Tf 81 726 Td <000D> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{FE7C}\u{645}");
+    }
+
+    /// A word gap next to a mark stays a space: after a mark on the last
+    /// letter of a word, and before a mark set just left of the first letter
+    /// of the next one.
+    #[test]
+    fn a_word_gap_next_to_a_mark_stays_a_space() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td [<0003> <0002> <0001>] TJ ET \
+              BT /F1 12 Tf 90 716 Td <0009> Tj ET \
+              BT /F1 12 Tf 110 720 Td [<0003> <0002> <0001>] TJ ET",
+        );
+        assert_eq!(
+            page_text(&doc, 0),
+            "\u{627}\u{633}\u{645} \u{627}\u{650}\u{633}\u{645}"
+        );
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td [<0003> <0002> <0001>] TJ ET \
+              BT /F1 12 Tf 109.5 716 Td <0009> Tj ET \
+              BT /F1 12 Tf 110 720 Td [<0003> <0002> <0001>] TJ ET",
+        );
+        assert_eq!(page_text(&doc, 0).matches(' ').count(), 1);
+    }
+
+    /// A combining accent drawn as a glyph of its own over a Latin letter
+    /// stays in its word, and the gap before the next word stays a space.
+    #[test]
+    fn a_combining_accent_drawn_apart_stays_in_its_word() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td [<000C> <000A> <000C>] TJ ET \
+              BT /F1 12 Tf 82 726 Td <000B> Tj ET \
+              BT /F1 12 Tf 110 720 Td [<000C> <000A>] TJ ET",
+        );
+        assert_eq!(page_text(&doc, 0), "te\u{301}t te");
     }
 
     /// Text that `/ReversedChars` or `/ActualText` already gave in logical
