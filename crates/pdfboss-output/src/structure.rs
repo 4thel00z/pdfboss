@@ -1,6 +1,7 @@
 //! Spans to the layout IR: line assembly, word gaps, the two-column gutter
 //! split, and the size statistics that rank headings.
 
+use crate::bidi::{reading_order, LogicalText};
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::{
@@ -4873,9 +4874,18 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
     let mut prev_size = 0.0f32;
     let mut first_bucket: Option<(f32, i32)> = None;
     let mut mixed = false;
+    let mut logical: Vec<LogicalText> = Vec::new();
     for span in spans {
         let spaced = prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
         push_span(&mut inlines, span, spaced, capacity);
+        if span.logical {
+            let inline = inlines.len() - 1;
+            let end = inlines[inline].text.len();
+            logical.push(LogicalText {
+                inline,
+                bytes: end - span.text.len()..end,
+            });
+        }
         prev_end = Some(span.end_x);
         prev_size = span.size;
         // A whitespace-only span has no visible size, so it has no vote in
@@ -4897,7 +4907,7 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
     };
     Assembled {
         line: Line {
-            inlines,
+            inlines: reading_order(inlines, &logical),
             y,
             x: spans.first().map_or(0.0, |span| span.x),
             end_x: spans.last().map_or(0.0, |span| span.end_x),
@@ -5871,6 +5881,7 @@ pub(crate) mod tests {
     fn span(text: &str, x: f32, end_x: f32, y: f32, size: f32) -> TextSpan {
         TextSpan {
             text: text.to_string(),
+            logical: false,
             x,
             y,
             end_x,

@@ -222,8 +222,14 @@ pub struct Structure {
 /// A positioned run of extracted text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
-    /// The decoded text.
+    /// The decoded text, in drawing order: right-to-left text comes out
+    /// leftmost glyph first. `pdfboss-output` puts each line in reading
+    /// order when it assembles the line.
     pub text: String,
+    /// `text` is already in reading order: it came from a `/ReversedChars`
+    /// sequence (ISO 32000-1 §14.8.2.3.3) or an `/ActualText` replacement
+    /// (§14.9.4), so line assembly keeps its characters as they are.
+    pub logical: bool,
     /// Device-space x coordinate of the span origin.
     pub x: f32,
     /// Device-space y coordinate of the span baseline.
@@ -2870,6 +2876,8 @@ mod tests {
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["world ", "hello", " abc", "kept", "xyz"]);
+        let logical: Vec<bool> = spans.iter().map(|s| s.logical).collect();
+        assert_eq!(logical, [true, true, true, true, false]);
     }
 
     #[test]

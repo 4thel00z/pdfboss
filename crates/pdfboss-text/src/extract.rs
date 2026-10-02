@@ -1484,6 +1484,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         span.expansion = frame.marks.iter().rev().find_map(|m| m.expansion.clone());
         if frame.marks.iter().any(|m| m.reversed) {
             span.text = reversed_chars(&span.text);
+            span.logical = true;
         }
         let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
             self.spans.push(span);
@@ -1497,6 +1498,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     return;
                 }
                 span.text.clone_from(&actual.text);
+                span.logical = true;
                 self.spans.push(span);
                 self.marks.record(frame);
             }
@@ -1645,6 +1647,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         };
         (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| TextSpan {
             text,
+            logical: false,
             x: origin.x,
             y: origin.y,
             end_x: end.x,

@@ -83,7 +83,9 @@ class Span:
 
     @property
     def text(self) -> str:
-        """The decoded text."""
+        """The decoded text, in drawing order: right-to-left text comes out
+        leftmost glyph first. ``extract_text`` and the Markdown put each line
+        in reading order."""
 
     @property
     def x(self) -> float:

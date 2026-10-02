@@ -1587,7 +1587,9 @@ struct Span {
 
 #[pymethods]
 impl Span {
-    /// The decoded text.
+    /// The decoded text, in drawing order: right-to-left text comes out
+    /// leftmost glyph first. `extract_text` and the Markdown put each line
+    /// in reading order.
     #[getter]
     fn text(&self) -> &str {
         &self.inner.text
