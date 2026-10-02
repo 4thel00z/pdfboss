@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.13.0](https://github.com/4thel00z/pdfboss/compare/v2.12.0...v2.13.0) (2026-10-02)
+
+
+### Features
+
+* **output:** put right-to-left lines in reading order ([#243](https://github.com/4thel00z/pdfboss/issues/243)) ([ebb5336](https://github.com/4thel00z/pdfboss/commit/ebb53361c8ee06bcb1d12a8eec7e4b18adb807da))
+
 ## [2.12.0](https://github.com/4thel00z/pdfboss/compare/v2.11.0...v2.12.0) (2026-10-01)
 
 
