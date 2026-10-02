@@ -1587,10 +1587,22 @@ struct Span {
 
 #[pymethods]
 impl Span {
-    /// The decoded text.
+    /// The decoded text, in drawing order: right-to-left text comes out
+    /// leftmost glyph first, except when `logical` is true, in which case
+    /// the text is already in reading order. `extract_text` and the
+    /// Markdown put each line in reading order.
     #[getter]
     fn text(&self) -> &str {
         &self.inner.text
+    }
+
+    /// Whether `text` is already in reading order: the span came from a
+    /// `/ReversedChars` sequence (ISO 32000-1 14.8.2.3.3) or an
+    /// `/ActualText` replacement (14.9.4). Such a span must not be
+    /// reversed again.
+    #[getter]
+    fn logical(&self) -> bool {
+        self.inner.logical
     }
 
     /// Device-space x coordinate of the span origin.

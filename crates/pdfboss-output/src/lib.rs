@@ -1,6 +1,7 @@
 //! Layout analysis and output rendering for pdfboss: turns `pdfboss-text`
 //! spans into a structured layout IR, and the IR into a document.
 
+mod bidi;
 mod ir;
 mod markdown;
 mod output;
@@ -3294,6 +3295,123 @@ mod tests {
         assert!(
             md.contains("pasteboard"),
             "flag dropped off-page text: {md:?}"
+        );
+    }
+
+    /// A page with `/F1`, a Type0 font whose ToUnicode maps codes 1 to 9 to
+    /// Arabic letters, a space and a kasra, and `/F2`, Helvetica, drawing
+    /// `content`.
+    fn arabic_doc(content: &[u8]) -> Document {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R /F2 8 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", content);
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>",
+        );
+        b.object(
+            6,
+            "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 >>",
+        );
+        b.stream(
+            7,
+            "",
+            b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
+              9 beginbfchar <0001> <0627> <0002> <0633> <0003> <0645> \
+              <0004> <0644> <0005> <0639> <0006> <0626> <0007> <0629> \
+              <0008> <0020> <0009> <0650> endbfchar",
+        );
+        b.object(
+            8,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        Document::load(b.build(1)).unwrap()
+    }
+
+    /// Arabic shown in drawing order, the leftmost glyph first, reads back
+    /// in logical order, in the text and in the Markdown.
+    #[test]
+    fn a_right_to_left_line_reads_in_logical_order() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td <00070004000600010005000400010008000300020001> Tj ET",
+        );
+        assert_eq!(
+            page_text(&doc, 0),
+            "\u{627}\u{633}\u{645} \u{627}\u{644}\u{639}\u{627}\u{626}\u{644}\u{629}"
+        );
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(
+            md.contains("\u{627}\u{633}\u{645} \u{627}\u{644}\u{639}"),
+            "markdown kept drawing order: {md:?}"
+        );
+    }
+
+    /// A right-to-left line mixing Arabic, Latin and digits: the runs come
+    /// in right-to-left order and each Latin or digit run keeps its own
+    /// left-to-right order.
+    #[test]
+    fn a_mixed_right_to_left_line_keeps_latin_and_digit_runs_in_order() {
+        let doc = arabic_doc(
+            b"BT /F2 12 Tf 72 720 Td (12) Tj ET \
+              BT /F2 12 Tf 100 720 Td (PDF) Tj ET \
+              BT /F1 12 Tf 140 720 Td <00070004000600010005000400010008000300020001> Tj ET",
+        );
+        assert_eq!(
+            page_text(&doc, 0),
+            "\u{627}\u{633}\u{645} \u{627}\u{644}\u{639}\u{627}\u{626}\u{644}\u{629} PDF 12"
+        );
+    }
+
+    /// A left-to-right line with one Arabic word reorders only that word.
+    #[test]
+    fn an_arabic_word_in_a_latin_line_reads_in_logical_order() {
+        let doc = arabic_doc(
+            b"BT /F2 12 Tf 72 720 Td (Name) Tj ET \
+              BT /F1 12 Tf 120 720 Td <000300020001> Tj ET \
+              BT /F2 12 Tf 160 720 Td (here and there) Tj ET",
+        );
+        assert_eq!(
+            page_text(&doc, 0),
+            "Name \u{627}\u{633}\u{645} here and there"
+        );
+    }
+
+    /// A combining mark stays after the letter it was drawn with.
+    #[test]
+    fn a_combining_mark_stays_after_its_letter() {
+        let doc = arabic_doc(b"BT /F1 12 Tf 72 720 Td <0003000200090001> Tj ET");
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{650}\u{645}");
+    }
+
+    /// Text that `/ReversedChars` or `/ActualText` already gave in logical
+    /// order is not reversed a second time, and still takes its place in
+    /// the line's right-to-left order.
+    // Covers ISO 32000-1 §14.8.2.3.3 and §14.9.4.
+    #[test]
+    fn reversed_chars_and_actual_text_are_not_reversed_twice() {
+        let doc = arabic_doc(b"BT /F1 12 Tf 72 720 Td /ReversedChars BMC <000300020001> Tj EMC ET");
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{645}");
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /ActualText <FEFF062706330645> >> BDC \
+              <000300020001> Tj EMC ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{645}");
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td /ReversedChars BMC <000300020001> Tj EMC ET \
+              BT /F1 12 Tf 120 720 Td <0007000400060001000500040001> Tj ET",
+        );
+        assert_eq!(
+            page_text(&doc, 0),
+            "\u{627}\u{644}\u{639}\u{627}\u{626}\u{644}\u{629} \u{627}\u{633}\u{645}"
         );
     }
 }

@@ -283,3 +283,73 @@ class TestAsyncSpans:
         assert [s.text for s in spans] == [s.text for s in sync_spans]
         assert [s.underline for s in spans] == [s.underline for s in sync_spans]
         assert [s.color for s in spans] == [s.color for s in sync_spans]
+
+
+ARABIC_TO_UNICODE = (
+    b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n"
+    b"9 beginbfchar <0001> <0627> <0002> <0633> <0003> <0645> "
+    b"<0004> <0644> <0005> <0639> <0006> <0626> <0007> <0629> "
+    b"<0008> <0020> <0009> <0650> endbfchar"
+)
+
+
+def arabic_doc(content: bytes) -> bytes:
+    """One page with ``/F1``, a Type0 font whose ToUnicode maps codes 1 to
+    9 to Arabic letters, a space and a kasra, and ``/F2``, Helvetica,
+    showing ``content``."""
+    return build_pdf(
+        {
+            1: b"<< /Type /Catalog /Pages 2 0 R >>",
+            2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            3: (
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R /F2 8 0 R >> >> /Contents 4 0 R >>"
+            ),
+            4: stream(b"", content),
+            5: (
+                b"<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H "
+                b"/DescendantFonts [6 0 R] /ToUnicode 7 0 R >>"
+            ),
+            6: b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X /DW 600 >>",
+            7: stream(b"", ARABIC_TO_UNICODE),
+            8: (
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                b"/Encoding /WinAnsiEncoding >>"
+            ),
+        }
+    )
+
+
+class TestRightToLeft:
+    def test_extract_text_reads_a_right_to_left_line_in_logical_order(self) -> None:
+        drawn = b"<00070004000600010005000400010008000300020001>"
+        data = arabic_doc(b"BT /F1 12 Tf 72 720 Td " + drawn + b" Tj ET")
+        page = Document(data=data)[0]
+        logical = "اسم العائلة"
+        assert page.extract_text() == logical
+        (span,) = page.spans()
+        assert span.text == logical[::-1]
+        assert span.logical is False
+
+    def test_a_mixed_line_keeps_latin_and_digit_runs_in_order(self) -> None:
+        data = arabic_doc(
+            b"BT /F2 12 Tf 72 720 Td (12) Tj ET "
+            b"BT /F2 12 Tf 100 720 Td (PDF) Tj ET "
+            b"BT /F1 12 Tf 140 720 Td <00070004000600010005000400010008000300020001> Tj ET"
+        )
+        assert (
+            Document(data=data)[0].extract_text()
+            == "اسم العائلة PDF 12"
+        )
+
+    # Covers ISO 32000-1 §14.8.2.3.3 and §14.9.4.
+    def test_reversed_chars_and_actual_text_spans_are_logical(self) -> None:
+        data = arabic_doc(
+            b"BT /F2 12 Tf 72 720 Td /ReversedChars BMC (olleh) Tj EMC ET "
+            b"BT /F2 12 Tf 140 720 Td /Span << /ActualText (world) >> BDC (wrld) Tj EMC ET "
+            b"BT /F2 12 Tf 200 720 Td (plain) Tj ET"
+        )
+        reversed_chars, actual, plain = Document(data=data)[0].spans()
+        assert (reversed_chars.text, reversed_chars.logical) == ("hello", True)
+        assert (actual.text, actual.logical) == ("world", True)
+        assert (plain.text, plain.logical) == ("plain", False)

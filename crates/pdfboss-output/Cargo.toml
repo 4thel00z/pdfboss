@@ -13,6 +13,7 @@ categories = ["text-processing"]
 pdfboss-core = { workspace = true }
 pdfboss-text = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+unicode-bidi = "0.3"
 
 [dev-dependencies]
 pdfboss-testkit = { path = "../pdfboss-testkit" }
