@@ -94,16 +94,18 @@ pub(crate) fn reading_order(inlines: Vec<Inline>, logical: &[LogicalText]) -> Ve
 }
 
 /// Right to left when the line has more strong right-to-left characters
-/// than strong left-to-right ones, else left to right.
+/// than strong left-to-right ones, else left to right. Marks do not count,
+/// though the Arabic presentation-form marks are classed as letters.
 fn paragraph_level(inlines: &[Inline]) -> Level {
-    let (rtl, ltr) = inlines.iter().flat_map(|inline| inline.text.chars()).fold(
-        (0usize, 0usize),
-        |(rtl, ltr), c| match bidi_class(c) {
+    let (rtl, ltr) = inlines
+        .iter()
+        .flat_map(|inline| inline.text.chars())
+        .filter(|&c| !is_mark(c))
+        .fold((0usize, 0usize), |(rtl, ltr), c| match bidi_class(c) {
             BidiClass::R | BidiClass::AL => (rtl + 1, ltr),
             BidiClass::L => (rtl, ltr + 1),
             _ => (rtl, ltr),
-        },
-    );
+        });
     if rtl > ltr {
         return Level::rtl();
     }
@@ -163,7 +165,26 @@ fn same_style(a: &Inline, b: &Inline) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::holds_rtl;
+    use super::{holds_rtl, paragraph_level};
+    use crate::ir::Inline;
+    use unicode_bidi::Level;
+
+    fn inline(text: &str) -> Inline {
+        Inline {
+            text: text.to_string(),
+            bold: false,
+            italic: false,
+            code: false,
+        }
+    }
+
+    #[test]
+    fn presentation_form_marks_do_not_decide_the_paragraph_direction() {
+        let line = [inline("ab \u{628}\u{FE7C}\u{FE7C}")];
+        assert_eq!(paragraph_level(&line), Level::ltr());
+        let line = [inline("a \u{628}\u{62A}\u{FE7C}")];
+        assert_eq!(paragraph_level(&line), Level::rtl());
+    }
 
     #[test]
     fn holds_rtl_sees_hebrew_and_arabic_and_nothing_below_them() {
