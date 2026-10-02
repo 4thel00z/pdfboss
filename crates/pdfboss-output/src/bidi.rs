@@ -27,6 +27,16 @@ fn is_rtl(c: char) -> bool {
     matches!(bidi_class(c), BidiClass::R | BidiClass::AL)
 }
 
+/// Whether `text` holds a strong right-to-left character. Every such
+/// character is U+0590 or above, so ASCII text and the Latin scripts below
+/// that point skip the class lookup.
+fn holds_rtl(text: &str) -> bool {
+    if text.is_ascii() {
+        return false;
+    }
+    text.chars().any(|c| c >= '\u{0590}' && is_rtl(c))
+}
+
 /// The line's runs in reading order. `inlines` holds the line in drawing
 /// order, leftmost glyph first. The line reads right to left when it has
 /// more strong right-to-left characters than strong left-to-right ones; the
@@ -37,7 +47,7 @@ fn is_rtl(c: char) -> bool {
 /// undoes that reversal. A line without a right-to-left character comes
 /// back unchanged.
 pub(crate) fn reading_order(inlines: Vec<Inline>, logical: &[LogicalText]) -> Vec<Inline> {
-    if !inlines.iter().any(|inline| inline.text.chars().any(is_rtl)) {
+    if !inlines.iter().any(|inline| holds_rtl(&inline.text)) {
         return inlines;
     }
     let units = units(&inlines, logical);
@@ -135,4 +145,18 @@ fn is_strong(c: char) -> bool {
 
 fn same_style(a: &Inline, b: &Inline) -> bool {
     a.bold == b.bold && a.italic == b.italic && a.code == b.code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::holds_rtl;
+
+    #[test]
+    fn holds_rtl_sees_hebrew_and_arabic_and_nothing_below_them() {
+        assert!(!holds_rtl("plain ascii 123"));
+        assert!(!holds_rtl("Größe – «quoted» €"));
+        assert!(holds_rtl("\u{5D0}"));
+        assert!(holds_rtl("word \u{627}\u{644} word"));
+        assert!(!holds_rtl("\u{660}\u{661}"));
+    }
 }
