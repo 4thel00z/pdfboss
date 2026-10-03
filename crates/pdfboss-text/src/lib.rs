@@ -79,6 +79,13 @@ impl std::str::FromStr for ReadingOrder {
     }
 }
 
+/// Whether a span with this text keeps [`TextSpan::glyph_x`]: true when the
+/// text has a character at U+0300 or above. Combining marks start at
+/// U+0300, so text below that point has no mark to place by glyph.
+pub fn keeps_glyph_x(text: &str) -> bool {
+    !text.is_ascii() && text.chars().any(|c| c >= '\u{0300}')
+}
+
 /// The document's structure tree, loaded only when `order` reads by it:
 /// `None` under content and geometric order, and for a document without
 /// a tree. A caller walking a whole document loads it once here and passes
@@ -237,6 +244,15 @@ pub struct TextSpan {
     pub y: f32,
     /// Device-space x after the last glyph's advance.
     pub end_x: f32,
+    /// Device-space x where each character's glyph starts, one entry per
+    /// character of `text` and in the same order: a code that decodes to
+    /// several characters repeats its glyph's x, and a `/ReversedChars`
+    /// span lists them reversed with its text. An `/ActualText`
+    /// replacement has no glyphs of its own, so each of its characters
+    /// takes the span origin `x`. Empty when the text has no character at
+    /// U+0300 or above ([`keeps_glyph_x`]): Latin text needs no glyph
+    /// positions, and leaving them out keeps such spans as small as before.
+    pub glyph_x: Box<[f32]>,
     /// Effective font size.
     pub size: f32,
     /// Font resource name.
@@ -1777,6 +1793,74 @@ mod tests {
         Document::load(b.build(1)).unwrap()
     }
 
+    /// Each character's glyph start moves by the advance of the glyphs
+    /// before it, `Tc` and `Tz` included; the two characters an underscore
+    /// ligature decodes to share their glyph's start; the last start plus
+    /// the last advance is `end_x`.
+    // Covers ISO 32000-1 §9.4.4.
+    #[test]
+    fn glyph_x_holds_one_start_per_character() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 10 Tf 2 Tc 50 Tz 72 720 Td (HAi\\225) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding \
+             << /BaseEncoding /WinAnsiEncoding /Differences [65 /f_i] >> >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let span = extract_spans(&doc, &page, ReadingOrder::Content)
+            .unwrap()
+            .remove(0);
+        assert_eq!(span.text, "Hfii\u{2022}");
+        let glyph_x = &span.glyph_x;
+        assert_eq!(glyph_x.len(), 5);
+        assert!((glyph_x[0] - 72.0).abs() < 1e-3);
+        assert!((glyph_x[1] - (72.0 + (7.22 + 2.0) * 0.5)).abs() < 1e-3);
+        assert_eq!(glyph_x[1], glyph_x[2]);
+        assert!(glyph_x[3] > glyph_x[2]);
+        assert!((glyph_x[4] - glyph_x[3] - (2.22 + 2.0) * 0.5).abs() < 1e-3);
+    }
+
+    /// A span whose text has no character at U+0300 or above, umlauts and
+    /// Latin Extended-A included, keeps no glyph starts.
+    #[test]
+    fn glyph_x_is_empty_below_u0300() {
+        assert!(!keeps_glyph_x("Hello"));
+        assert!(!keeps_glyph_x("Gr\u{FC}\u{DF}e \u{17D}"));
+        assert!(keeps_glyph_x("\u{2022}"));
+        assert!(keeps_glyph_x("a\u{301}"));
+        assert!(keeps_glyph_x("\u{627}"));
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+             /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F1 10 Tf 72 720 Td (Gr\\374\\337e) Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+             /Encoding /WinAnsiEncoding >>",
+        );
+        let doc = Document::load(b.build(1)).unwrap();
+        let page = doc.page(0).unwrap();
+        let span = extract_spans(&doc, &page, ReadingOrder::Content)
+            .unwrap()
+            .remove(0);
+        assert_eq!(span.text, "Gr\u{FC}\u{DF}e");
+        assert!(span.glyph_x.is_empty());
+    }
+
     /// A span inside an `/Artifact` sequence carries the sequence's class
     /// and subtype; a generic `BMC` artifact has neither; real content has
     /// no artifact at all.
@@ -2867,18 +2951,27 @@ mod tests {
     fn reversed_chars_sequences_put_their_strings_back_in_order() {
         let doc = marked_doc(
             b"BT /F1 12 Tf 72 720 Td \
-              /ReversedChars BMC (dlrow ) Tj (olleh) Tj EMC \
+              /ReversedChars BMC (\\225dlrow ) Tj (olleh) Tj EMC \
               /ReversedChars << /MCID 3 >> BDC ( cba) Tj EMC \
-              /ReversedChars << /ActualText (kept) >> BDC (tpek) Tj EMC \
+              /ReversedChars << /ActualText <FEFF006B0627> >> BDC (tpek) Tj EMC \
               (xyz) Tj ET",
             "",
         );
         let page = doc.page(0).unwrap();
         let spans = extract_spans(&doc, &page, ReadingOrder::Content).unwrap();
         let texts: Vec<&str> = spans.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(texts, ["world ", "hello", " abc", "kept", "xyz"]);
+        assert_eq!(
+            texts,
+            ["world\u{2022} ", "hello", " abc", "k\u{627}", "xyz"]
+        );
         let logical: Vec<bool> = spans.iter().map(|s| s.logical).collect();
         assert_eq!(logical, [true, true, true, true, false]);
+        let world = &spans[0].glyph_x;
+        assert_eq!(world.len(), 7);
+        assert!(world[..6].windows(2).all(|pair| pair[0] > pair[1]));
+        assert!(world[6] > world[0]);
+        assert!(spans[1].glyph_x.is_empty());
+        assert_eq!(*spans[3].glyph_x, [spans[3].x; 2]);
     }
 
     #[test]

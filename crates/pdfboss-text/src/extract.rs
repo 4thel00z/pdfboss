@@ -319,6 +319,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         oc,
         categories: FastMap::default(),
         marks: M::default(),
+        glyph_scratch: Vec::new(),
     };
     let root = Frame::new(
         Arc::new(content),
@@ -459,17 +460,23 @@ async fn structure_order<S: AsyncObjectSource>(
 /// order (ISO 32000-1 §14.8.2.3.3): its characters reversed, except that a
 /// space at the beginning or the end of the string stays where it was, since
 /// those spaces separate the string from its neighbours rather than belong
-/// to the reversed run.
+/// to the reversed run. The glyph starts are reversed with their characters.
 ///
 /// Covers ISO 32000-1 §14.8.2.3.3.
-fn reversed_chars(text: &str) -> String {
+fn reversed_chars(span: &mut TextSpan) {
+    let text = &span.text;
     let lead = text.len() - text.trim_start().len();
     let tail = text.trim_end().len().max(lead);
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..lead]);
     out.extend(text[lead..tail].chars().rev());
     out.push_str(&text[tail..]);
-    out
+    let first = text[..lead].chars().count();
+    let last = first + text[lead..tail].chars().count();
+    if let Some(run) = span.glyph_x.get_mut(first..last) {
+        run.reverse();
+    }
+    span.text = out;
 }
 
 /// The graphics-state parameters text extraction cares about. Saved and
@@ -870,6 +877,9 @@ impl Frame {
 
 struct Executor<'a, S, M> {
     src: &'a S,
+    /// Glyph starts of the string `show` decodes, reused from one string to
+    /// the next so a span copies them out only when it keeps them.
+    glyph_scratch: Vec<f32>,
     spans: Vec<TextSpan>,
     rulings: Vec<Ruling>,
     /// Filled rectangles too thick to be rulings, in paint order: the
@@ -1472,7 +1482,10 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// Covers ISO 32000-1 §14.8.2.4.2, §14.8.2.5 and §14.9.4.
     fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
         let suppressed = frame.suppressed();
-        let Some(mut span) = self.show(&frame.gs, &mut frame.tm, bytes) else {
+        let mut starts = std::mem::take(&mut self.glyph_scratch);
+        let shown = self.show(&frame.gs, &mut frame.tm, bytes, &mut starts);
+        self.glyph_scratch = starts;
+        let Some(mut span) = shown else {
             return;
         };
         if suppressed {
@@ -1483,7 +1496,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         span.lang = frame.marks.iter().rev().find_map(|m| m.lang.clone());
         span.expansion = frame.marks.iter().rev().find_map(|m| m.expansion.clone());
         if frame.marks.iter().any(|m| m.reversed) {
-            span.text = reversed_chars(&span.text);
+            reversed_chars(&mut span);
             span.logical = true;
         }
         let Some(actual) = frame.marks.iter_mut().rev().find_map(|m| m.actual.as_mut()) else {
@@ -1498,6 +1511,11 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     return;
                 }
                 span.text.clone_from(&actual.text);
+                span.glyph_x = if crate::keeps_glyph_x(&span.text) {
+                    vec![span.x; span.text.chars().count()].into_boxed_slice()
+                } else {
+                    Box::default()
+                };
                 span.logical = true;
                 self.spans.push(span);
                 self.marks.record(frame);
@@ -1594,7 +1612,13 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// holds `&mut self.spans`.
     ///
     /// Covers ISO 32000-1 §14.8.2.5, §9.2.4, §9.3.3, §9.3.4 and §9.3.7.
-    fn show(&self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) -> Option<TextSpan> {
+    fn show(
+        &self,
+        gs: &GState,
+        tm: &mut Matrix,
+        bytes: &[u8],
+        starts: &mut Vec<f32>,
+    ) -> Option<TextSpan> {
         let font: &Font = gs.font.as_deref().unwrap_or(&self.fallback);
         let start = tm.concat(gs.ctm);
         let origin = start.apply(Point { x: 0.0, y: gs.rise });
@@ -1604,8 +1628,22 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         // One byte per code is the floor on the decoded length, so this
         // reservation removes the per-glyph regrowth of typical text.
         let mut text = String::with_capacity(bytes.len());
+        starts.clear();
+        // Each translation adds to the text matrix, so a glyph's device x
+        // is the origin's plus the advances so far under Tm·CTM.
+        let (mut moved_x, mut moved_y) = (0.0f32, 0.0f32);
         for cc in font.codes_in(bytes) {
+            let decoded_from = text.len();
             font.decode_into(cc, &mut text);
+            let glyph_start = origin.x + start.a * moved_x + start.c * moved_y;
+            match text.len() - decoded_from {
+                0 => {}
+                1 => starts.push(glyph_start),
+                _ => {
+                    let decoded = text[decoded_from..].chars().count();
+                    starts.extend(std::iter::repeat_n(glyph_start, decoded));
+                }
+            }
             let word = if font.is_space(cc) {
                 gs.word_spacing
             } else {
@@ -1626,6 +1664,8 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     (adv, 0.0)
                 };
                 *tm = Matrix::translate(tx, ty).concat(*tm);
+                moved_x += tx;
+                moved_y += ty;
             }
         }
         let end = tm.concat(gs.ctm).apply(Point { x: 0.0, y: gs.rise });
@@ -1645,12 +1685,18 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 y1: origin.y + font.ascent / 1000.0 * size,
             }
         };
+        let glyph_x = if crate::keeps_glyph_x(&text) {
+            Box::from(&starts[..])
+        } else {
+            Box::default()
+        };
         (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| TextSpan {
             text,
             logical: false,
             x: origin.x,
             y: origin.y,
             end_x: end.x,
+            glyph_x,
             size,
             bbox,
             ascent: bbox.y1 - origin.y,
