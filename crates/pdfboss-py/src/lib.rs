@@ -1623,6 +1623,15 @@ impl Span {
         self.inner.end_x
     }
 
+    /// Device-space x where each character's glyph starts, one entry per
+    /// character of `text` and in the same order: a code that decodes to
+    /// several characters repeats its glyph's x. Each character of an
+    /// /ActualText replacement takes the span origin `x`.
+    #[getter]
+    fn glyph_x(&self) -> Vec<f32> {
+        self.inner.glyph_x.clone()
+    }
+
     /// Effective font size.
     #[getter]
     fn size(&self) -> f32 {

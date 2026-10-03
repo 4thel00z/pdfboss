@@ -5897,6 +5897,7 @@ pub(crate) mod tests {
             x,
             y,
             end_x,
+            glyph_x: even_glyph_x(text, x, end_x),
             size,
             font: "F1".to_string(),
             font_name: String::new(),
@@ -5930,6 +5931,13 @@ pub(crate) mod tests {
             lang: None,
             expansion: None,
         }
+    }
+
+    /// Glyph starts spread evenly over `x..end_x`, one per character.
+    fn even_glyph_x(text: &str, x: f32, end_x: f32) -> Vec<f32> {
+        let count = text.chars().count();
+        let advance = (end_x - x) / count.max(1) as f32;
+        (0..count).map(|index| x + advance * index as f32).collect()
     }
 
     /// Work spread over the worker threads comes back one result per
