@@ -3301,9 +3301,10 @@ mod tests {
 
     /// A page with `/F1`, a Type0 font whose ToUnicode maps codes 1 to 9 to
     /// Arabic letters, a space and a kasra, codes 10 to 12 to `e`, a
-    /// combining acute and `t`, code 13 to the isolated form of shadda, and
-    /// `/F2`, Helvetica, drawing `content`. The three marks have no advance,
-    /// like the marks of a real font.
+    /// combining acute and `t`, code 13 to the isolated form of shadda, code
+    /// 14 to lam and alef, one ligature glyph, code 15 to a fatha with an
+    /// advance of its own, and `/F2`, Helvetica, drawing `content`. The
+    /// other three marks have no advance, like the marks of most fonts.
     fn arabic_doc(content: &[u8]) -> Document {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
@@ -3328,10 +3329,10 @@ mod tests {
             7,
             "",
             b"1 begincodespacerange <0000> <FFFF> endcodespacerange\n\
-              13 beginbfchar <0001> <0627> <0002> <0633> <0003> <0645> \
+              15 beginbfchar <0001> <0627> <0002> <0633> <0003> <0645> \
               <0004> <0644> <0005> <0639> <0006> <0626> <0007> <0629> \
               <0008> <0020> <0009> <0650> <000A> <0065> <000B> <0301> \
-              <000C> <0074> <000D> <FE7C> endbfchar",
+              <000C> <0074> <000D> <FE7C> <000E> <06440627> <000F> <064E> endbfchar",
         );
         b.object(
             8,
@@ -3464,6 +3465,88 @@ mod tests {
               BT /F1 12 Tf 110 720 Td [<000C> <000A>] TJ ET",
         );
         assert_eq!(page_text(&doc, 0), "te\u{301}t te");
+    }
+
+    /// A mark drawn in a string of its own over a glyph inside a longer
+    /// string goes on that glyph, not on the string's last one: over the
+    /// first glyph drawn, the leftmost, it ends the word as read.
+    #[test]
+    fn a_mark_goes_on_the_glyph_under_it_inside_a_longer_string() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td <000300020001> Tj ET \
+              BT /F1 12 Tf 74 716 Td <0009> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{645}\u{650}");
+        let page = doc.page(0).unwrap();
+        let md = extract_page_markdown(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(md.contains("\u{627}\u{633}\u{645}\u{650}"), "{md:?}");
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td <000300020001> Tj ET \
+              BT /F1 12 Tf 81 716 Td <0009> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{650}\u{645}");
+    }
+
+    /// A string of marks that advance, each over its own letter, puts each
+    /// mark on the letter under it.
+    #[test]
+    fn each_mark_of_a_string_goes_on_its_own_letter() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td <000300020001> Tj ET \
+              BT /F1 12 Tf 74 716 Td <000F000F> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{64E}\u{645}\u{64E}");
+    }
+
+    /// A mark over the last glyph of a string, or past the string's end,
+    /// still follows the string, as it did before marks were placed by
+    /// glyph.
+    #[test]
+    fn a_mark_over_the_last_glyph_or_past_the_end_follows_the_string() {
+        for x in ["88", "95"] {
+            let content = format!(
+                "BT /F1 12 Tf 72 720 Td <000300020001> Tj ET \
+                 BT /F1 12 Tf {x} 716 Td <0009> Tj ET"
+            );
+            let doc = arabic_doc(content.as_bytes());
+            assert_eq!(page_text(&doc, 0), "\u{627}\u{650}\u{633}\u{645}", "x={x}");
+        }
+    }
+
+    /// Two marks drawn over one glyph both go on it, in the order they are
+    /// drawn.
+    #[test]
+    fn two_marks_over_one_glyph_keep_their_order() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td <000300020001> Tj ET \
+              BT /F1 12 Tf 81 716 Td <0009> Tj ET \
+              BT /F1 12 Tf 81 726 Td <000D> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{627}\u{633}\u{650}\u{FE7C}\u{645}");
+    }
+
+    /// A mark over a glyph that decodes to two characters goes after both,
+    /// so the glyph's characters stay together.
+    #[test]
+    fn a_mark_over_a_two_character_glyph_follows_both_characters() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td <000E0003> Tj ET \
+              BT /F1 12 Tf 74 716 Td <0009> Tj ET",
+        );
+        assert_eq!(page_text(&doc, 0), "\u{645}\u{627}\u{650}\u{644}");
+    }
+
+    /// An `/ActualText` replacement has no glyphs of its own, so a mark
+    /// drawn over it is not put inside it: the replacement stays whole.
+    #[test]
+    fn a_mark_over_an_actual_text_replacement_stays_out_of_it() {
+        let doc = arabic_doc(
+            b"BT /F1 12 Tf 72 720 Td /Span << /ActualText <FEFF062706330645> >> BDC \
+              <000300020001> Tj EMC ET \
+              BT /F1 12 Tf 74 716 Td <0009> Tj ET",
+        );
+        let text = page_text(&doc, 0);
+        assert!(text.contains("\u{627}\u{633}\u{645}"), "{text:?}");
     }
 
     /// Text that `/ReversedChars` or `/ActualText` already gave in logical
