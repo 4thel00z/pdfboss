@@ -14,7 +14,7 @@ pub(crate) struct LogicalText {
 }
 
 /// One unit the reordering moves as a whole: a letter with the combining
-/// marks drawn after it, or a whole [`LogicalText`].
+/// marks ([`is_mark`]) drawn after it, or a whole [`LogicalText`].
 struct Unit {
     inline: usize,
     bytes: Range<usize>,
@@ -25,6 +25,20 @@ struct Unit {
 /// Whether `c` is a strong right-to-left character (bidi class R or AL).
 fn is_rtl(c: char) -> bool {
     matches!(bidi_class(c), BidiClass::R | BidiClass::AL)
+}
+
+/// Whether `c` is a combining mark: bidi class NSM, or an Arabic mark in
+/// an isolated presentation form, which fonts often map their mark glyphs
+/// to: the shadda ligatures U+FC5E to U+FC63 and the isolated fathatan,
+/// dammatan, kasratan, fatha, damma, kasra, shadda and sukun at the even
+/// code points U+FE70 to U+FE7E. The odd code points there are medial
+/// forms on a tatweel, which has an advance of its own.
+pub(crate) fn is_mark(c: char) -> bool {
+    match c {
+        '\u{FC5E}'..='\u{FC63}' => true,
+        '\u{FE70}'..='\u{FE7E}' => (c as u32).is_multiple_of(2),
+        _ => bidi_class(c) == BidiClass::NSM,
+    }
 }
 
 /// Whether `text` holds a strong right-to-left character. Every such
@@ -80,16 +94,18 @@ pub(crate) fn reading_order(inlines: Vec<Inline>, logical: &[LogicalText]) -> Ve
 }
 
 /// Right to left when the line has more strong right-to-left characters
-/// than strong left-to-right ones, else left to right.
+/// than strong left-to-right ones, else left to right. Marks do not count,
+/// though the Arabic presentation-form marks are classed as letters.
 fn paragraph_level(inlines: &[Inline]) -> Level {
-    let (rtl, ltr) = inlines.iter().flat_map(|inline| inline.text.chars()).fold(
-        (0usize, 0usize),
-        |(rtl, ltr), c| match bidi_class(c) {
+    let (rtl, ltr) = inlines
+        .iter()
+        .flat_map(|inline| inline.text.chars())
+        .filter(|&c| !is_mark(c))
+        .fold((0usize, 0usize), |(rtl, ltr), c| match bidi_class(c) {
             BidiClass::R | BidiClass::AL => (rtl + 1, ltr),
             BidiClass::L => (rtl, ltr + 1),
             _ => (rtl, ltr),
-        },
-    );
+        });
     if rtl > ltr {
         return Level::rtl();
     }
@@ -122,7 +138,7 @@ fn units(inlines: &[Inline], logical: &[LogicalText]) -> Vec<Unit> {
                 continue;
             }
             let end = at + c.len_utf8();
-            if cluster_open && bidi_class(c) == BidiClass::NSM {
+            if cluster_open && is_mark(c) {
                 if let Some(last) = units.last_mut() {
                     last.bytes.end = end;
                 }
@@ -149,7 +165,26 @@ fn same_style(a: &Inline, b: &Inline) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::holds_rtl;
+    use super::{holds_rtl, paragraph_level};
+    use crate::ir::Inline;
+    use unicode_bidi::Level;
+
+    fn inline(text: &str) -> Inline {
+        Inline {
+            text: text.to_string(),
+            bold: false,
+            italic: false,
+            code: false,
+        }
+    }
+
+    #[test]
+    fn presentation_form_marks_do_not_decide_the_paragraph_direction() {
+        let line = [inline("ab \u{628}\u{FE7C}\u{FE7C}")];
+        assert_eq!(paragraph_level(&line), Level::ltr());
+        let line = [inline("a \u{628}\u{62A}\u{FE7C}")];
+        assert_eq!(paragraph_level(&line), Level::rtl());
+    }
 
     #[test]
     fn holds_rtl_sees_hebrew_and_arabic_and_nothing_below_them() {

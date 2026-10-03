@@ -1,7 +1,7 @@
 //! Spans to the layout IR: line assembly, word gaps, the two-column gutter
 //! split, and the size statistics that rank headings.
 
-use crate::bidi::{reading_order, LogicalText};
+use crate::bidi::{is_mark, reading_order, LogicalText};
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
 use pdfboss_text::{
@@ -4886,8 +4886,10 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
                 bytes: end - span.text.len()..end,
             });
         }
-        prev_end = Some(span.end_x);
-        prev_size = span.size;
+        if spaced || !marks_only(&span.text) {
+            prev_end = Some(span.end_x);
+            prev_size = span.size;
+        }
         // A whitespace-only span has no visible size, so it has no vote in
         // the line's size rank: a producer's stray body-size separator on a
         // heading's baseline must not fold the heading into the paragraph.
@@ -4915,6 +4917,14 @@ fn assemble_line(y: f32, size: f32, spans: &[&TextSpan]) -> Assembled {
         },
         rank_size,
     }
+}
+
+/// Whether `text` is combining marks only ([`is_mark`]): a mark drawn as a
+/// glyph of its own over a letter of a neighbouring span. A mark that opens
+/// no word gap sits on the letter before it, so the gap to the next span is
+/// measured from that letter, not from the mark.
+fn marks_only(text: &str) -> bool {
+    !text.is_ascii() && text.chars().all(is_mark)
 }
 
 /// Extends the run the span continues, or opens one when its style differs.
@@ -5856,13 +5866,15 @@ fn flow(spans: &[&TextSpan], order: ReadingOrder, out: &mut String) {
         let mut prev_end: Option<f32> = None;
         let mut prev_size = 0.0f32;
         for span in &line.spans {
-            if let Some(end) = prev_end {
-                let gap = span.x - end;
-                if gap > WORD_GAP * prev_size.max(span.size) {
-                    out.push(' ');
-                }
+            let spaced =
+                prev_end.is_some_and(|end| span.x - end > WORD_GAP * prev_size.max(span.size));
+            if spaced {
+                out.push(' ');
             }
             out.push_str(&span.text);
+            if !spaced && marks_only(&span.text) {
+                continue;
+            }
             prev_end = Some(span.end_x);
             prev_size = span.size;
         }
