@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.13.1](https://github.com/4thel00z/pdfboss/compare/v2.13.0...v2.13.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **output:** open no word gap at a mark drawn as its own glyph ([#245](https://github.com/4thel00z/pdfboss/issues/245)) ([ed30ed4](https://github.com/4thel00z/pdfboss/commit/ed30ed42be7080e1c7ac0b4263b65d83b89ca8f2))
+* **output:** put a mark on the glyph drawn under it ([#248](https://github.com/4thel00z/pdfboss/issues/248)) ([3fc322f](https://github.com/4thel00z/pdfboss/commit/3fc322f974f742de8a37370536d5cbf8996976dd))
+
 ## [2.13.0](https://github.com/4thel00z/pdfboss/compare/v2.12.0...v2.13.0) (2026-10-02)
 
 
