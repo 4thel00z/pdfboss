@@ -108,6 +108,14 @@ class Span:
         """Device-space x after the last glyph's advance."""
 
     @property
+    def glyph_x(self) -> list[float]:
+        """Device-space x where each character's glyph starts, one entry per
+        character of ``text`` and in the same order: a code that decodes to
+        several characters repeats its glyph's x. Each character of an
+        ``/ActualText`` replacement takes the span origin ``x``. Empty when
+        the text has no character at U+0300 or above."""
+
+    @property
     def size(self) -> float:
         """Effective font size."""
 

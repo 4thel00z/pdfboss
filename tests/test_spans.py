@@ -122,6 +122,18 @@ class TestPageSpans:
         assert span.font == "F1"
         assert span.font_name != ""
 
+    def test_glyph_x_has_one_start_per_character(self) -> None:
+        data = arabic_doc(b"BT /F1 12 Tf 72 720 Td <000300020001> Tj ET")
+        (span,) = Document(data=data)[0].spans()
+        assert len(span.glyph_x) == len(span.text)
+        assert span.glyph_x[0] == pytest.approx(span.x)
+        assert span.glyph_x == sorted(span.glyph_x)
+        assert span.glyph_x[-1] < span.end_x
+
+    def test_glyph_x_is_empty_for_latin_text(self, hello_pdf: Path) -> None:
+        (span,) = Document(str(hello_pdf))[0].spans()
+        assert span.glyph_x == []
+
     # Covers ISO 32000-1 §9.3.6 and §9.8.2.
     def test_style_attributes(self, styled_pdf: bytes) -> None:
         doc = Document(data=styled_pdf)
