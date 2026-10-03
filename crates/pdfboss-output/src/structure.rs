@@ -4948,11 +4948,13 @@ enum Attached {
 /// letter drawn inside the advance of a wide bracket gets the mark, not the
 /// bracket. A span holds one string's glyphs, so without this a mark
 /// drawn over a glyph inside a longer span follows the whole span and sits
-/// on its last glyph. Logical and vertical spans neither give nor take
-/// marks, and a mark no glyph lies under stays where it is. `None` when no
-/// mark moves.
+/// on its last glyph. Logical and vertical spans, and spans without glyph
+/// starts, neither give nor take marks, and a mark no glyph lies under
+/// stays where it is. `None` when no mark moves.
 fn attach_marks(spans: &[&TextSpan]) -> Option<Vec<Attached>> {
-    let loose = |span: &TextSpan| !span.logical && !span.vertical && marks_only(&span.text);
+    let loose = |span: &TextSpan| {
+        !span.glyph_x.is_empty() && !span.logical && !span.vertical && marks_only(&span.text)
+    };
     if !spans.iter().any(|span| loose(span)) {
         return None;
     }
@@ -4961,6 +4963,7 @@ fn attach_marks(spans: &[&TextSpan]) -> Option<Vec<Attached>> {
         .map(|span| {
             !span.logical
                 && !span.vertical
+                && !span.glyph_x.is_empty()
                 && !marks_only(&span.text)
                 && span.glyph_x.len() == span.text.chars().count()
         })
@@ -4973,7 +4976,7 @@ fn attach_marks(spans: &[&TextSpan]) -> Option<Vec<Attached>> {
         }
         let chars: Vec<char> = mark.text.chars().collect();
         let starts: Vec<f32> = if mark.glyph_x.len() == chars.len() {
-            mark.glyph_x.clone()
+            mark.glyph_x.to_vec()
         } else {
             vec![mark.x; chars.len()]
         };
@@ -4992,7 +4995,9 @@ fn attach_marks(spans: &[&TextSpan]) -> Option<Vec<Attached>> {
                 .filter_map(|host| {
                     let (text, glyph_x) = copies[host]
                         .as_ref()
-                        .map_or((&spans[host].text, &spans[host].glyph_x), |(t, xs)| (t, xs));
+                        .map_or((&spans[host].text, &spans[host].glyph_x[..]), |(t, xs)| {
+                            (t, &xs[..])
+                        });
                     let drawn_after = host > index;
                     let glyph = covering_glyph(text, glyph_x, spans[host].end_x, x, drawn_after)?;
                     Some((host, glyph, glyph_x[glyph]))
@@ -5010,7 +5015,7 @@ fn attach_marks(spans: &[&TextSpan]) -> Option<Vec<Attached>> {
             };
             let span = spans[host];
             let (text, glyph_x) =
-                copies[host].get_or_insert_with(|| (span.text.clone(), span.glyph_x.clone()));
+                copies[host].get_or_insert_with(|| (span.text.clone(), span.glyph_x.to_vec()));
             let mut count = glyph + 1;
             let mut at = text
                 .char_indices()
@@ -6053,7 +6058,7 @@ pub(crate) mod tests {
             x,
             y,
             end_x,
-            glyph_x: even_glyph_x(text, x, end_x),
+            glyph_x: even_glyph_x(text, x, end_x).into_boxed_slice(),
             size,
             font: "F1".to_string(),
             font_name: String::new(),
@@ -6099,7 +6104,7 @@ pub(crate) mod tests {
     /// A span from `span` with its glyph starts given.
     fn glyph_span(text: &str, glyph_x: &[f32], end_x: f32, y: f32) -> TextSpan {
         TextSpan {
-            glyph_x: glyph_x.to_vec(),
+            glyph_x: Box::from(glyph_x),
             ..span(text, glyph_x[0], end_x, y, 17.0)
         }
     }
@@ -6129,6 +6134,27 @@ pub(crate) mod tests {
             crate::output::line_text(&line),
             "\u{648}\u{FEF3}\u{64F}\u{FECC}\u{FEC8}\u{FC62}\u{FEE2} \
              \u{FED7}\u{FEAA}\u{652}\u{631}\u{64E}\u{647}"
+        );
+    }
+
+    /// A span without glyph starts takes no mark inside it: the mark goes
+    /// after the whole span and joins its last glyph, as it did before
+    /// marks were placed by glyph.
+    #[test]
+    fn a_span_without_glyph_starts_takes_no_marks() {
+        let spans = [
+            TextSpan {
+                glyph_x: Box::default(),
+                ..span("\u{645}\u{633}\u{627}", 10.0, 25.0, 0.0, 17.0)
+            },
+            glyph_span("\u{650}", &[12.0], 12.0, 0.0),
+        ];
+        let refs: Vec<&TextSpan> = spans.iter().collect();
+        assert!(attach_marks(&refs).is_none());
+        let line = assemble_line(0.0, 17.0, &refs).line;
+        assert_eq!(
+            crate::output::line_text(&line),
+            "\u{627}\u{650}\u{633}\u{645}"
         );
     }
 

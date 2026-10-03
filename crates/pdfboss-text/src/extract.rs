@@ -319,6 +319,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         oc,
         categories: FastMap::default(),
         marks: M::default(),
+        glyph_scratch: Vec::new(),
     };
     let root = Frame::new(
         Arc::new(content),
@@ -876,6 +877,9 @@ impl Frame {
 
 struct Executor<'a, S, M> {
     src: &'a S,
+    /// Glyph starts of the string `show` decodes, reused from one string to
+    /// the next so a span copies them out only when it keeps them.
+    glyph_scratch: Vec<f32>,
     spans: Vec<TextSpan>,
     rulings: Vec<Ruling>,
     /// Filled rectangles too thick to be rulings, in paint order: the
@@ -1478,7 +1482,10 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// Covers ISO 32000-1 §14.8.2.4.2, §14.8.2.5 and §14.9.4.
     fn emit(&mut self, frame: &mut Frame, bytes: &[u8]) {
         let suppressed = frame.suppressed();
-        let Some(mut span) = self.show(&frame.gs, &mut frame.tm, bytes) else {
+        let mut starts = std::mem::take(&mut self.glyph_scratch);
+        let shown = self.show(&frame.gs, &mut frame.tm, bytes, &mut starts);
+        self.glyph_scratch = starts;
+        let Some(mut span) = shown else {
             return;
         };
         if suppressed {
@@ -1504,7 +1511,11 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     return;
                 }
                 span.text.clone_from(&actual.text);
-                span.glyph_x = vec![span.x; span.text.chars().count()];
+                span.glyph_x = if crate::keeps_glyph_x(&span.text) {
+                    vec![span.x; span.text.chars().count()].into_boxed_slice()
+                } else {
+                    Box::default()
+                };
                 span.logical = true;
                 self.spans.push(span);
                 self.marks.record(frame);
@@ -1601,7 +1612,13 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
     /// holds `&mut self.spans`.
     ///
     /// Covers ISO 32000-1 §14.8.2.5, §9.2.4, §9.3.3, §9.3.4 and §9.3.7.
-    fn show(&self, gs: &GState, tm: &mut Matrix, bytes: &[u8]) -> Option<TextSpan> {
+    fn show(
+        &self,
+        gs: &GState,
+        tm: &mut Matrix,
+        bytes: &[u8],
+        starts: &mut Vec<f32>,
+    ) -> Option<TextSpan> {
         let font: &Font = gs.font.as_deref().unwrap_or(&self.fallback);
         let start = tm.concat(gs.ctm);
         let origin = start.apply(Point { x: 0.0, y: gs.rise });
@@ -1611,16 +1628,22 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         // One byte per code is the floor on the decoded length, so this
         // reservation removes the per-glyph regrowth of typical text.
         let mut text = String::with_capacity(bytes.len());
-        let mut glyph_x: Vec<f32> = Vec::with_capacity(bytes.len());
+        starts.clear();
         // Each translation adds to the text matrix, so a glyph's device x
         // is the origin's plus the advances so far under Tm·CTM.
         let (mut moved_x, mut moved_y) = (0.0f32, 0.0f32);
         for cc in font.codes_in(bytes) {
             let decoded_from = text.len();
             font.decode_into(cc, &mut text);
-            let starts = origin.x + start.a * moved_x + start.c * moved_y;
-            let decoded = text[decoded_from..].chars().count();
-            glyph_x.extend(std::iter::repeat_n(starts, decoded));
+            let glyph_start = origin.x + start.a * moved_x + start.c * moved_y;
+            match text.len() - decoded_from {
+                0 => {}
+                1 => starts.push(glyph_start),
+                _ => {
+                    let decoded = text[decoded_from..].chars().count();
+                    starts.extend(std::iter::repeat_n(glyph_start, decoded));
+                }
+            }
             let word = if font.is_space(cc) {
                 gs.word_spacing
             } else {
@@ -1661,6 +1684,11 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 x1: origin.x.max(end.x),
                 y1: origin.y + font.ascent / 1000.0 * size,
             }
+        };
+        let glyph_x = if crate::keeps_glyph_x(&text) {
+            Box::from(&starts[..])
+        } else {
+            Box::default()
         };
         (!text.is_empty() && origin.x.is_finite() && origin.y.is_finite()).then(|| TextSpan {
             text,

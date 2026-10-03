@@ -14,7 +14,7 @@ layer from printed text, or feeding a layout analysis of your own.
 | `text` | The decoded text. |
 | `x`, `y` | Device-space origin and baseline of the span. |
 | `end_x` | Device-space x after the last glyph's advance. |
-| `glyph_x` | Device-space x where each character's glyph starts, one entry per character of `text`; a code that decodes to several characters repeats its glyph's x. |
+| `glyph_x` | Device-space x where each character's glyph starts, one entry per character of `text`; a code that decodes to several characters repeats its glyph's x. Empty when the text has no character at U+0300 or above. |
 | `size` | Effective font size. |
 | `font` | Font resource name (e.g. `"F1"`). |
 | `font_name` | The font's `/BaseFont` name verbatim, subset prefix included (e.g. `"NZEVTB+Arial-BoldItalicMT"`); empty when the file names the font nowhere. |
