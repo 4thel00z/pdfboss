@@ -1524,6 +1524,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 if let Some(carrier) = self.spans.get_mut(index) {
                     if carrier.text == actual.text {
                         carrier.end_x = span.end_x;
+                        carrier.end_y = span.end_y;
                         carrier.bbox = carrier.bbox.union(span.bbox);
                         carrier.ascent = carrier.bbox.y1 - carrier.y;
                         carrier.descent = carrier.bbox.y0 - carrier.y;
@@ -1670,6 +1671,7 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
         }
         let end = tm.concat(gs.ctm).apply(Point { x: 0.0, y: gs.rise });
         let size = if size.is_finite() { size } else { 0.0 };
+        let rotate = quarter_turn(start);
         let bbox = if font.vertical {
             Rect {
                 x0: origin.x - size / 2.0,
@@ -1677,13 +1679,45 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 x1: origin.x + size / 2.0,
                 y1: origin.y.max(end.y),
             }
-        } else {
+        } else if rotate == 0 {
             Rect {
                 x0: origin.x.min(end.x),
                 y0: origin.y + font.descent / 1000.0 * size,
                 x1: origin.x.max(end.x),
                 y1: origin.y + font.ascent / 1000.0 * size,
             }
+        } else {
+            // The glyphs' up direction is text space's y axis under Tm·CTM.
+            let up = |extent: f32| {
+                let k = extent / 1000.0 * gs.size;
+                (start.c * k, start.d * k)
+            };
+            let (below, above) = (up(font.descent), up(font.ascent));
+            let corners = [
+                (origin.x + below.0, origin.y + below.1),
+                (origin.x + above.0, origin.y + above.1),
+                (end.x + below.0, end.y + below.1),
+                (end.x + above.0, end.y + above.1),
+            ];
+            corners.iter().fold(
+                Rect {
+                    x0: f32::INFINITY,
+                    y0: f32::INFINITY,
+                    x1: f32::NEG_INFINITY,
+                    y1: f32::NEG_INFINITY,
+                },
+                |r, &(x, y)| Rect {
+                    x0: r.x0.min(x),
+                    y0: r.y0.min(y),
+                    x1: r.x1.max(x),
+                    y1: r.y1.max(y),
+                },
+            )
+        };
+        let (ascent, descent) = if rotate == 0 || font.vertical {
+            (bbox.y1 - origin.y, bbox.y0 - origin.y)
+        } else {
+            (font.ascent / 1000.0 * size, font.descent / 1000.0 * size)
         };
         let glyph_x = if crate::keeps_glyph_x(&text) {
             Box::from(&starts[..])
@@ -1696,11 +1730,13 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             x: origin.x,
             y: origin.y,
             end_x: end.x,
+            end_y: end.y,
+            rotate,
             glyph_x,
             size,
             bbox,
-            ascent: bbox.y1 - origin.y,
-            descent: bbox.y0 - origin.y,
+            ascent,
+            descent,
             font: gs.font_name.clone(),
             font_name: font.base_name.clone(),
             page: 0,
@@ -1911,6 +1947,23 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
             f: v[5],
         };
         finite(&m).then_some(m)
+    }
+}
+
+/// The page `/Rotate` value that shows text drawn under `m` upright: the
+/// direction of text space's x axis, snapped to the nearest quarter turn
+/// and read clockwise, so text running bottom to top is 90.
+fn quarter_turn(m: Matrix) -> i32 {
+    if m.a.abs() >= m.b.abs() {
+        if m.a >= 0.0 {
+            0
+        } else {
+            180
+        }
+    } else if m.b > 0.0 {
+        90
+    } else {
+        270
     }
 }
 
@@ -2366,6 +2419,47 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert!((spans[0].x - 100.0).abs() < 1e-3);
         assert!((spans[1].x - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn upright_text_has_rotate_0_and_ends_on_its_baseline() {
+        let spans = spans_of("BT /F1 10 Tf 20 50 Td (AB) Tj ET");
+        assert_eq!(spans[0].rotate, 0);
+        assert!((spans[0].end_y - 50.0).abs() < 1e-3, "{:?}", spans[0]);
+    }
+
+    /// Text running bottom to top reads upright under `/Rotate 90`; its
+    /// box spans the advance along y and the font's extents along x, the
+    /// ascent toward smaller x.
+    #[test]
+    fn text_turned_a_quarter_records_its_rotate_end_and_box() {
+        let spans = spans_of("q 0 1 -1 0 150 10 cm BT /F1 10 Tf (AB) Tj ET Q");
+        let span = &spans[0];
+        let advance = 2.0 * 500.0 / 1000.0 * 10.0;
+        assert_eq!(span.rotate, 90);
+        assert!((span.end_x - 150.0).abs() < 1e-3, "{span:?}");
+        assert!((span.end_y - (10.0 + advance)).abs() < 1e-3, "{span:?}");
+        assert!((span.bbox.y0 - 10.0).abs() < 1e-3, "{span:?}");
+        assert!((span.bbox.y1 - span.end_y).abs() < 1e-3, "{span:?}");
+        assert!(
+            (span.bbox.x0 - (150.0 - span.ascent)).abs() < 1e-3,
+            "{span:?}"
+        );
+        assert!(
+            (span.bbox.x1 - (150.0 - span.descent)).abs() < 1e-3,
+            "{span:?}"
+        );
+        assert!(span.ascent > 0.0 && span.descent < 0.0, "{span:?}");
+    }
+
+    #[test]
+    fn rotate_snaps_the_baseline_to_the_nearest_quarter_turn() {
+        let rotate_under =
+            |cm: &str| spans_of(&format!("q {cm} cm BT /F1 10 Tf (A) Tj ET Q"))[0].rotate;
+        assert_eq!(rotate_under("-1 0 0 -1 150 90"), 180);
+        assert_eq!(rotate_under("0 -1 1 0 50 90"), 270);
+        assert_eq!(rotate_under("0.866 0.5 -0.5 0.866 50 50"), 0);
+        assert_eq!(rotate_under("0.5 0.866 -0.866 0.5 150 10"), 90);
     }
 
     // Covers ISO 32000-1 §9.3.4 and §9.4.4.

@@ -13,13 +13,14 @@ layer from printed text, or feeding a layout analysis of your own.
 |---|---|
 | `text` | The decoded text. |
 | `x`, `y` | Device-space origin and baseline of the span. |
-| `end_x` | Device-space x after the last glyph's advance. |
+| `end_x`, `end_y` | Device-space point after the last glyph's advance; `end_y` equals `y` for upright text. |
+| `rotation` | The page rotation (0, 90, 180 or 270, clockwise) under which the span reads upright: text running bottom to top is 90. Rust names the field `rotate`, like `Page::rotate`. |
 | `glyph_x` | Device-space x where each character's glyph starts, one entry per character of `text`; a code that decodes to several characters repeats its glyph's x. Empty when the text has no character at U+0300 or above. |
 | `size` | Effective font size. |
 | `font` | Font resource name (e.g. `"F1"`). |
 | `font_name` | The font's `/BaseFont` name verbatim, subset prefix included (e.g. `"NZEVTB+Arial-BoldItalicMT"`); empty when the file names the font nowhere. |
 | `page` | 0-based index of the page the span came from. |
-| `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up: origin to advance horizontally, the font's descent..ascent vertically. |
+| `bbox` | Device-space box `(x0, y0, x1, y1)`, y-up: origin to advance horizontally, the font's descent..ascent vertically; for text turned a quarter, the box around the turned run. |
 | `ascent`, `descent` | The box's offsets from the baseline in device units: `y + ascent` is the box top, `y + descent` (zero or negative) its bottom. See [Box and baseline](#box-and-baseline). |
 | `bold`, `italic` | From FontDescriptor evidence, falling back to the `/BaseFont` name. |
 | `monospace`, `serif` | FontDescriptor `/Flags` FixedPitch and Serif. |
@@ -159,7 +160,7 @@ doc.spans()`, described in [Async and remote documents](./async.md).
 
 `pdfboss_text::extract_spans` returns a `Vec<TextSpan>` carrying the same
 fields as the Python `Span` (as plain struct fields: `text`, `x`, `y`,
-`end_x`, `size`, `font`, `font_name`, `page`, `bbox`, `ascent`, `descent`,
+`end_x`, `end_y`, `rotate`, `size`, `font`, `font_name`, `page`, `bbox`, `ascent`, `descent`,
 `bold`, `italic`, `monospace`, `serif`, `font_family`, `font_stretch`,
 `font_weight`, `rise`, `vertical`, `invisible`,
 `color`, `underline`, `strikethrough`, `highlight`, `highlight_color`):

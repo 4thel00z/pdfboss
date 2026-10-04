@@ -108,6 +108,16 @@ class Span:
         """Device-space x after the last glyph's advance."""
 
     @property
+    def end_y(self) -> float:
+        """Device-space y after the last glyph's advance: ``y`` for upright
+        text, the far end of the run for text drawn turned a quarter."""
+
+    @property
+    def rotation(self) -> int:
+        """The page rotation (0, 90, 180 or 270, clockwise) under which the
+        span reads upright: text running bottom to top is 90."""
+
+    @property
     def glyph_x(self) -> list[float]:
         """Device-space x where each character's glyph starts, one entry per
         character of ``text`` and in the same order: a code that decodes to
