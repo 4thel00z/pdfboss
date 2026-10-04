@@ -19,6 +19,15 @@ Type0 `/Encoding` CMaps resolve: the predefined ISO 32000 Table 118 CJK set is c
 
 Deferred: vertical runs still extract as horizontal-schema spans, one per show operator, with x/y at the glyph origin.
 
+## Turned text
+
+Text drawn turned a quarter is grouped into lines in its own upright frame (see [Extracting text](../guide/text.md)). What stays limited:
+
+- Text at other angles is treated as the nearest quarter turn, so a line set at 30 degrees can still split.
+- Underline, strikethrough and highlight are judged in page space, so on turned text they are unreliable.
+- A turned span carries no `glyph_x`, so combining marks in turned non-Latin text are joined without glyph positions.
+- In layout output, the lines of a turned block keep the coordinates of their upright frame; the block's `bbox` is in page space.
+
 ## JBIG2
 
 `JBIG2Decode` covers the embedded stream format end to end: generic regions (all four templates, with TPGDON, arithmetic or MMR-coded), symbol dictionaries and text regions in both the arithmetic and the Huffman variant (refinement/aggregate-coded symbols and refined instance placements included), pattern dictionaries and halftone regions, generic refinement regions (both templates, with TPGRON) refining either the page or a retained intermediate region, intermediate regions of every type, and custom code table segments. Nothing in the standard's segment type table is refused; a malformed or truncated stream fails with a message naming what was wrong instead of rendering a blank.
