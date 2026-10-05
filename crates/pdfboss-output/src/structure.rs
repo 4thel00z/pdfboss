@@ -480,10 +480,6 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
     }
 }
 
-/// Quarter turns in the order a page's groups are laid out before they are
-/// sorted top to bottom.
-const QUARTER_TURNS: [i32; 4] = [0, 90, 180, 270];
-
 /// The page's blocks. Spans sharing a [`TextSpan::rotate`] are laid out
 /// together in the frame where they read upright, so a table or caption
 /// drawn turned a quarter reads as lines rather than one line per string;
@@ -499,27 +495,25 @@ fn page_layout_with_stats(
     if spans.iter().all(|span| span.rotate == 0) {
         return upright_page_layout(spans, rulings, stats, order);
     }
-    let areas: Vec<(i32, Rect)> = QUARTER_TURNS
-        .iter()
-        .filter_map(|&rotate| group_area(spans, rotate).map(|area| (rotate, area)))
-        .collect();
-    let mut groups: Vec<(f32, PageLayout)> = areas
-        .iter()
-        .map(|&(rotate, area)| {
-            let own: Vec<TextSpan> = spans
-                .iter()
-                .filter(|span| span.rotate == rotate)
-                .map(upright_span)
-                .collect();
-            let owned_by = |ruling: &Ruling| {
-                areas
-                    .iter()
-                    .find(|(other, area)| *other != 0 && inside(ruling, area))
-                    .map_or(0, |(other, _)| *other)
-            };
+    let TurnGroups {
+        spans: buckets,
+        areas,
+    } = turn_groups(spans);
+    let owned_by = |ruling: &Ruling| -> usize {
+        (1..4)
+            .find(|&turn| areas[turn].is_some_and(|area| inside(ruling, &area)))
+            .unwrap_or(0)
+    };
+    let mut groups: Vec<(f32, PageLayout)> = buckets
+        .into_iter()
+        .zip(areas)
+        .enumerate()
+        .filter_map(|(turn, (own, area))| Some((turn, own, area?)))
+        .map(|(turn, own, area)| {
+            let rotate = turn as i32 * 90;
             let lines: Vec<Ruling> = rulings
                 .iter()
-                .filter(|ruling| owned_by(ruling) == rotate)
+                .filter(|ruling| owned_by(ruling) == turn)
                 .map(|ruling| upright_ruling(ruling, rotate))
                 .collect();
             let mut layout = upright_page_layout(&own, &lines, stats, order);
@@ -539,21 +533,37 @@ fn page_layout_with_stats(
     }
 }
 
-/// The box around every span turned by `rotate`, padded by the largest of
-/// their sizes so a border drawn just outside the text counts as inside.
-/// `None` when no span is turned that way.
-fn group_area(spans: &[TextSpan], rotate: i32) -> Option<Rect> {
-    let mut group = spans.iter().filter(|span| span.rotate == rotate);
-    let first = group.next()?;
-    let (area, pad) = group.fold((first.bbox, first.size), |(area, pad), span| {
-        (area.union(span.bbox), pad.max(span.size))
-    });
-    Some(Rect {
-        x0: area.x0 - pad,
-        y0: area.y0 - pad,
-        x1: area.x1 + pad,
-        y1: area.y1 + pad,
-    })
+/// A page's spans split by quarter turn, indexed by `rotate / 90`: each
+/// group already in the frame where it reads upright, and the page-space
+/// box around it padded by its largest size, so a border drawn just
+/// outside the text counts as inside. `None` where no span turns that way.
+struct TurnGroups {
+    spans: [Vec<TextSpan>; 4],
+    areas: [Option<Rect>; 4],
+}
+
+/// [`TurnGroups`] in one pass over the spans.
+fn turn_groups(spans: &[TextSpan]) -> TurnGroups {
+    let mut buckets: [Vec<TextSpan>; 4] = Default::default();
+    let mut boxes: [Option<(Rect, f32)>; 4] = [None; 4];
+    for span in spans {
+        let turn = (span.rotate / 90) as usize & 3;
+        boxes[turn] = Some(boxes[turn].map_or((span.bbox, span.size), |(area, pad)| {
+            (area.union(span.bbox), pad.max(span.size))
+        }));
+        buckets[turn].push(upright_span(span));
+    }
+    TurnGroups {
+        spans: buckets,
+        areas: boxes.map(|found| {
+            found.map(|(area, pad)| Rect {
+                x0: area.x0 - pad,
+                y0: area.y0 - pad,
+                x1: area.x1 + pad,
+                y1: area.y1 + pad,
+            })
+        }),
+    }
 }
 
 /// Whether both ends of `ruling` lie in `area`.
@@ -6689,7 +6699,7 @@ pub(crate) mod tests {
             text.starts_with("Exhibit 5.2b\nYear Cash flow Rate\n"),
             "{text}"
         );
-        let area = group_area(&spans, 90).expect("the exhibit is turned");
+        let area = turn_groups(&spans).areas[1].expect("the exhibit is turned");
         for block in &page.blocks[1..] {
             let bbox = block_bbox(block);
             assert!(

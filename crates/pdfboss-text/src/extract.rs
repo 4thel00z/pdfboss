@@ -1521,15 +1521,20 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 self.marks.record(frame);
             }
             Some(index) => {
-                if let Some(carrier) = self.spans.get_mut(index) {
-                    if carrier.text == actual.text {
-                        carrier.end_x = span.end_x;
-                        carrier.end_y = span.end_y;
-                        carrier.bbox = carrier.bbox.union(span.bbox);
-                        carrier.ascent = carrier.bbox.y1 - carrier.y;
-                        carrier.descent = carrier.bbox.y0 - carrier.y;
-                    }
+                let Some(carrier) = self.spans.get_mut(index) else {
+                    return;
+                };
+                if carrier.text != actual.text {
+                    return;
                 }
+                carrier.end_x = span.end_x;
+                carrier.end_y = span.end_y;
+                carrier.bbox = carrier.bbox.union(span.bbox);
+                if carrier.rotate != 0 {
+                    return;
+                }
+                carrier.ascent = carrier.bbox.y1 - carrier.y;
+                carrier.descent = carrier.bbox.y0 - carrier.y;
             }
         }
     }
@@ -1687,12 +1692,11 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 y1: origin.y + font.ascent / 1000.0 * size,
             }
         } else {
-            // The glyphs' up direction is text space's y axis under Tm·CTM.
-            let up = |extent: f32| {
+            let offset_along_up = |extent: f32| {
                 let k = extent / 1000.0 * gs.size;
                 (start.c * k, start.d * k)
             };
-            let (below, above) = (up(font.descent), up(font.ascent));
+            let (below, above) = (offset_along_up(font.descent), offset_along_up(font.ascent));
             let corners = [
                 (origin.x + below.0, origin.y + below.1),
                 (origin.x + above.0, origin.y + above.1),
@@ -1954,17 +1958,9 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
 /// direction of text space's x axis, snapped to the nearest quarter turn
 /// and read clockwise, so text running bottom to top is 90.
 fn quarter_turn(m: Matrix) -> i32 {
-    if m.a.abs() >= m.b.abs() {
-        if m.a >= 0.0 {
-            0
-        } else {
-            180
-        }
-    } else if m.b > 0.0 {
-        90
-    } else {
-        270
-    }
+    let along_b = (m.b.abs() > m.a.abs()) as usize;
+    let negative = (if along_b == 1 { m.b <= 0.0 } else { m.a < 0.0 }) as usize;
+    [0, 180, 90, 270][along_b << 1 | negative]
 }
 
 #[cfg(test)]

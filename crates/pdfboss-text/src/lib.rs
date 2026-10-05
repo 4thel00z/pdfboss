@@ -1968,6 +1968,34 @@ mod tests {
         assert!(spans[1].x > spans[0].end_x + 12.0, "{:?}", spans[1]);
     }
 
+    /// A replacement shown turned a quarter keeps its font extents as
+    /// ascent and descent when later shows widen it, rather than offsets
+    /// measured along page y.
+    #[test]
+    fn a_turned_replacement_keeps_its_ascent_and_descent() {
+        let spans_of = |content: &[u8]| -> Vec<TextSpan> {
+            let doc = marked_doc(content, "");
+            let page = doc.page(0).unwrap();
+            extract_spans(&doc, &page, ReadingOrder::Content).unwrap()
+        };
+        let spans = spans_of(
+            b"q 0 1 -1 0 150 10 cm BT /F1 12 Tf /Span << /ActualText (fi) >> BDC (f) Tj (i) Tj EMC ET Q",
+        );
+        let single = spans_of(
+            b"q 0 1 -1 0 150 10 cm BT /F1 12 Tf /Span << /ActualText (f) >> BDC (f) Tj EMC ET Q",
+        )
+        .remove(0);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let carrier = &spans[0];
+        assert_eq!(carrier.rotate, 90);
+        assert!(carrier.end_y > single.end_y, "{carrier:?}");
+        assert!((carrier.ascent - single.ascent).abs() < 1e-3, "{carrier:?}");
+        assert!(
+            (carrier.descent - single.descent).abs() < 1e-3,
+            "{carrier:?}"
+        );
+    }
+
     /// A word break inside a replacement is a space in the text: words are
     /// found in the Unicode character stream, ActualText included, not in
     /// glyph positions, so two glyph runs shown as one word come out as two
