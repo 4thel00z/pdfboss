@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.13.2](https://github.com/4thel00z/pdfboss/compare/v2.13.1...v2.13.2) (2026-10-05)
+
+
+### Bug Fixes
+
+* **render:** paint CFF OpenType in FontFile2 and default CID widths to 1000 ([#249](https://github.com/4thel00z/pdfboss/issues/249)) ([f47cb0a](https://github.com/4thel00z/pdfboss/commit/f47cb0ab00dc7318ce1a0eb554f5475bc0d99b0c))
+
 ## [2.13.1](https://github.com/4thel00z/pdfboss/compare/v2.13.0...v2.13.1) (2026-10-03)
 
 
