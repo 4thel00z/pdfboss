@@ -106,7 +106,7 @@ def chapter9 : List Feature := [
   { ref := .clause [9, 8, 3, 3], title := "FD", status := .notImplemented,
     note := "The /FD dictionary of per-class descriptors is never read; only the top-level descriptor metrics apply." },
   { ref := .clause [9, 9], title := "Embedded Font Programs", status := .incomplete,
-    note := "FontFile (Type 1 as PFA or PFB, eexec decrypted), FontFile2 (TrueType) and FontFile3 as bare CFF (Type1C and CIDFontType0C) are parsed and painted; the FontFile3 /Subtype is never read, OpenType-wrapped programs (OTTO) are rejected by both parsers, Length1, Length2 and Length3 are not used, and the writer embeds no font programs." },
+    note := "FontFile (Type 1 as PFA or PFB, eexec decrypted), FontFile2 (TrueType) and FontFile3 as bare CFF (Type1C and CIDFontType0C) are parsed and painted; a CFF-flavoured OpenType program (OTTO) is read from its CFF table, in FontFile3 and in FontFile2 alike (cff.rs cff_table; glyph.rs load_simple and load_type0_truetype); the FontFile3 /Subtype is never read, Length1, Length2 and Length3 are not used, and the writer embeds no font programs." },
   { ref := .clause [9, 10, 2], title := "Mapping Character Codes to Unicode Values", status := .incomplete,
     note := "ToUnicode is consulted first, simple fonts then map through the encoding's glyph names (Adobe Glyph List, uniXXXX and uXXXX[XX] forms, underscore ligatures, period variants) and composite fonts through the collection's Uni*-UTF16-H inverse keyed by /Ordering, and a marked-content sequence's /ActualText replaces the mapped text of everything shown inside it (14.9.4, 14.8.2.4.2); gXX or cidXX style glyph names are not resolved." },
   { ref := .clause [9, 10, 3], title := "ToUnicode CMaps", status := .implemented,
