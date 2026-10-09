@@ -140,8 +140,9 @@ Path("page-1.png").write_bytes(png)
 `render` accepts `fonts=` (`"embedded-only"`, `"all-embedded"`, `"full"`),
 `font_dir=`, `compression=` (`"none"`, `"fast"`, `"default"`, `"best"`),
 `format=` (`"png"`, `"ppm"`, `"bmp"`, `"jpeg"`, see
-[Output formats](#output-formats)) and `quality=` (1 to 100, JPEG only),
-and releases the GIL while it runs. `fonts=` defaults to `None`, which
+[Output formats](#output-formats)), `quality=` (1 to 100, JPEG only) and
+`colorspace=` (`"rgba"`, `"rgb"`, `"gray"`, PNG only, see
+[Colorspace](#colorspace)), and releases the GIL while it runs. `fonts=` defaults to `None`, which
 resolves to `"full"` when `font_dir=` is given or the `pdfboss-fonts`
 package is importable, and to `"all-embedded"` otherwise. `Page.render_reporting` renders the same
 way and returns `(png, warnings)`:
@@ -162,9 +163,9 @@ first_two_reversed = doc.render_pages(pages=[1, 0])
 ```
 
 The full signature is `render_pages(pages=None, scale=1.0, fonts=None,
-font_dir=None, compression="default", format="png", quality=90)`; `fonts`,
-`font_dir`, `compression`, `format` and `quality` mean the same as on
-`Page.render`, applied to every page, and a `fonts` of `None` resolves the
+font_dir=None, compression="default", format="png", quality=90,
+colorspace="rgba")`; `fonts`, `font_dir`, `compression`, `format`,
+`quality` and `colorspace` mean the same as on `Page.render`, applied to every page, and a `fonts` of `None` resolves the
 same way. The stub file
 [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi)
 documents each parameter.
@@ -206,6 +207,24 @@ ppm = page.render(scale=2.0, format="ppm")
 bmp, warnings = page.render_reporting(scale=2.0, format="bmp")
 jpg = page.render(scale=2.0, format="jpeg", quality=80)
 ```
+
+## Colorspace
+
+A page renders onto an opaque white background, so the alpha channel of
+the default RGBA PNG carries nothing. `colorspace="rgb"` drops it (PNG
+color type 2) and `colorspace="gray"` keeps one Rec. 601 luma byte per
+pixel (color type 0, `0.299 R + 0.587 G + 0.114 B`, rounded), which halves
+the file and skips the color channels for consumers that only need ink.
+Both are lossless in the channels they keep. The option only shapes PNG:
+PPM, BMP and JPEG are RGB by nature, accept `"rgb"` as a no-op and raise
+`ValueError` for `"gray"`.
+
+```python
+rgb = page.render(scale=2.0, colorspace="rgb")
+gray = page.render(scale=2.0, colorspace="gray")
+```
+
+The CLI's `render` takes the same choice as `--colorspace rgba|rgb|gray`.
 
 ## PNG compression
 

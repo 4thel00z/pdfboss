@@ -2,7 +2,7 @@
 //! pass over the pixmap, so every test here parses the header back and
 //! compares each pixel with the pixmap it came from.
 
-use pdfboss_render::{ImageFormat, Pixmap, PngCompression};
+use pdfboss_render::{ImageFormat, Pixmap, PngColor, PngCompression};
 
 /// A two-axis gradient with an opaque square stamped on it, so rows and
 /// columns are distinguishable and a transposed or flipped encoder fails.
@@ -111,7 +111,11 @@ fn png_through_encode_is_byte_identical_to_encode_png_with() {
         PngCompression::Best,
     ] {
         assert_eq!(
-            pix.encode(ImageFormat::Png(level)).unwrap(),
+            pix.encode(ImageFormat::Png {
+                color: PngColor::Rgba,
+                compression: level
+            })
+            .unwrap(),
             pix.encode_png_with(level).unwrap(),
             "{level:?}"
         );
@@ -122,7 +126,10 @@ fn png_through_encode_is_byte_identical_to_encode_png_with() {
 fn from_name_accepts_the_three_formats_case_insensitively_and_rejects_others() {
     assert_eq!(
         ImageFormat::from_name("png"),
-        Some(ImageFormat::Png(PngCompression::default()))
+        Some(ImageFormat::Png {
+            color: PngColor::Rgba,
+            compression: PngCompression::default()
+        })
     );
     assert_eq!(ImageFormat::from_name("PNG"), ImageFormat::from_name("png"));
     assert_eq!(ImageFormat::from_name("ppm"), Some(ImageFormat::Ppm));

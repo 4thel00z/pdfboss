@@ -363,6 +363,7 @@ class Document:
         compression: str = "default",
         format: str = "png",
         quality: int = 90,
+        colorspace: str = "rgba",
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
         given) to image bytes (PNG unless ``format`` says otherwise), fanned
@@ -598,6 +599,7 @@ class Page:
         compression: str = "default",
         format: str = "png",
         quality: int = 90,
+        colorspace: str = "rgba",
     ) -> bytes:
         """Renders the page at ``scale`` and returns the encoded image: PNG
         unless ``format`` says otherwise.
@@ -621,7 +623,12 @@ class Page:
         ``compression`` trades PNG encode time against file size
         (``"none"``, ``"fast"``, ``"default"`` or ``"best"``) and only
         shapes PNG; ``quality`` (1 to 100) is the JPEG quality and only
-        shapes JPEG. Apart from JPEG, every choice produces the same pixels.
+        shapes JPEG. ``colorspace`` picks the channels a PNG keeps:
+        ``"rgba"``, ``"rgb"`` (alpha dropped; a page renders onto opaque
+        white, so nothing is lost) or ``"gray"`` (one Rec. 601 luma byte
+        per pixel); it only shapes PNG, and ``"gray"`` with another format
+        raises ``ValueError``. Apart from JPEG and ``"gray"``, every choice
+        produces the same pixels.
 
         Content pdfboss cannot read is skipped rather than raising, so a
         page can come out blank; ``render_reporting`` says what was lost.
@@ -635,6 +642,7 @@ class Page:
         compression: str = "default",
         format: str = "png",
         quality: int = 90,
+        colorspace: str = "rgba",
     ) -> tuple[bytes, list[str]]:
         """Renders the page like ``render``, returning ``(image, warnings)``.
 
@@ -2180,6 +2188,7 @@ class AsyncDocument:
         compression: str = "default",
         format: str = "png",
         quality: int = 90,
+        colorspace: str = "rgba",
     ) -> list[bytes]:
         """Renders every page (or the 0-based ``pages`` given, in the order
         given) to image bytes — the async twin of ``Document.render_pages``,
@@ -2382,6 +2391,7 @@ class AsyncPage:
         compression: str = "default",
         format: str = "png",
         quality: int = 90,
+        colorspace: str = "rgba",
     ) -> bytes:
         """Renders the page at ``scale`` and resolves to image bytes — the
         async twin of ``Page.render``, with the same arguments and the
@@ -2395,6 +2405,7 @@ class AsyncPage:
         compression: str = "default",
         format: str = "png",
         quality: int = 90,
+        colorspace: str = "rgba",
     ) -> tuple[bytes, list[str]]:
         """Renders the page like ``render``, resolving to
         ``(image, warnings)`` — the async twin of ``Page.render_reporting``,

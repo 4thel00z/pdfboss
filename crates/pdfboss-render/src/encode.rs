@@ -10,25 +10,56 @@
 //! capture at a fraction of the cost. Sizes land at general-zlib levels;
 //! encoding is several times faster.
 
-/// Bytes per pixel: this encoder writes the RGBA pixmaps the rasterizer
-/// produces.
-const BPP: usize = 4;
+/// Bytes per pixel of the RGBA pixmaps the rasterizer produces, which
+/// every writer here takes as input.
+const RGBA: usize = 4;
+
+/// PNG color type 6: RGBA, four bytes per pixel.
+const COLOR_RGBA: u8 = 6;
+/// PNG color type 2: RGB, three bytes per pixel.
+const COLOR_RGB: u8 = 2;
+/// PNG color type 0: grayscale, one byte per pixel.
+const COLOR_GRAY: u8 = 0;
 
 /// Encodes `rgba` (row-major, `width * height * 4` bytes) as a complete
-/// PNG file.
+/// PNG file, every channel kept.
 pub(crate) fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    encode_png::<RGBA, 4>(width, height, COLOR_RGBA, rgba)
+}
+
+/// Encodes `rgba` as an RGB PNG, alpha dropped.
+pub(crate) fn encode_rgb(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    encode_png::<3, 3>(width, height, COLOR_RGB, &pack_rgb_vec(rgba))
+}
+
+/// Encodes `rgba` as a grayscale PNG, each pixel its Rec. 601 luma, alpha
+/// dropped.
+pub(crate) fn encode_gray(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    encode_png::<1, 4>(width, height, COLOR_GRAY, &pack_gray_vec(rgba))
+}
+
+/// Encodes 8-bit `samples` (row-major, `BPP` bytes per pixel) as a
+/// complete PNG file of `color_type`. `MATCH` is the tokenizer's hash
+/// window and shortest match: a whole pixel for RGB, so one-pixel repeats
+/// hash to one slot, and four bytes otherwise.
+fn encode_png<const BPP: usize, const MATCH: usize>(
+    width: u32,
+    height: u32,
+    color_type: u8,
+    samples: &[u8],
+) -> Vec<u8> {
     let stride = width as usize * BPP;
     let mut filtered = vec![0u8; (stride + 1) * height as usize];
     let mut prev_row: &[u8] = &[];
-    for (row, out) in rgba
+    for (row, out) in samples
         .chunks_exact(stride)
         .zip(filtered.chunks_exact_mut(stride + 1))
     {
-        out[0] = choose_filter(row, prev_row, &mut out[1..]);
+        out[0] = choose_filter::<BPP>(row, prev_row, &mut out[1..]);
         prev_row = row;
     }
 
-    let deflated = deflate_filtered(&filtered);
+    let deflated = deflate_filtered::<MATCH>(&filtered);
 
     let mut zlib = Vec::with_capacity(deflated.len() + 6);
     // CMF/FLG: 32K window, deflate, no preset dictionary, FCHECK making
@@ -43,9 +74,8 @@ pub(crate) fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let mut ihdr = [0u8; 13];
     ihdr[..4].copy_from_slice(&width.to_be_bytes());
     ihdr[4..8].copy_from_slice(&height.to_be_bytes());
-    // Bit depth 8, color type 6 (RGBA), deflate, adaptive filtering,
-    // no interlace.
-    ihdr[8..13].copy_from_slice(&[8, 6, 0, 0, 0]);
+    // Bit depth 8, deflate, adaptive filtering, no interlace.
+    ihdr[8..13].copy_from_slice(&[8, color_type, 0, 0, 0]);
     push_chunk(&mut out, b"IHDR", &ihdr);
     push_chunk(&mut out, b"IDAT", &zlib);
     push_chunk(&mut out, b"IEND", &[]);
@@ -68,9 +98,33 @@ fn pack_rgb(rgb: &mut [u8], rgba: &[u8]) {
         .as_chunks_mut::<3>()
         .0
         .iter_mut()
-        .zip(rgba.as_chunks::<BPP>().0)
+        .zip(rgba.as_chunks::<RGBA>().0)
     {
         *dst = [src[0], src[1], src[2]];
+    }
+}
+
+/// `rgba` packed to RGB, as a fresh vector.
+pub(crate) fn pack_rgb_vec(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = vec![0u8; rgba.len() / RGBA * 3];
+    pack_rgb(&mut rgb, rgba);
+    rgb
+}
+
+/// `rgba` packed to luma, as a fresh vector.
+pub(crate) fn pack_gray_vec(rgba: &[u8]) -> Vec<u8> {
+    let mut gray = vec![0u8; rgba.len() / RGBA];
+    pack_gray(&mut gray, rgba);
+    gray
+}
+
+/// Packs RGBA pixels into `gray`, one byte per pixel: the Rec. 601 luma
+/// `0.299 R + 0.587 G + 0.114 B` in 8-bit fixed point, rounded. Alpha is
+/// dropped.
+fn pack_gray(gray: &mut [u8], rgba: &[u8]) {
+    for (dst, src) in gray.iter_mut().zip(rgba.as_chunks::<RGBA>().0) {
+        let luma = 77 * src[0] as u32 + 150 * src[1] as u32 + 29 * src[2] as u32;
+        *dst = ((luma + 128) >> 8) as u8;
     }
 }
 
@@ -81,7 +135,7 @@ fn pack_bgr(bgr: &mut [u8], rgba: &[u8]) {
         .as_chunks_mut::<3>()
         .0
         .iter_mut()
-        .zip(rgba.as_chunks::<BPP>().0)
+        .zip(rgba.as_chunks::<RGBA>().0)
     {
         *dst = [src[2], src[1], src[0]];
     }
@@ -111,7 +165,7 @@ pub(crate) fn encode_bmp(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     out.resize(HEADER + pixels, 0);
     for (dst_row, src_row) in out[HEADER..]
         .chunks_exact_mut(stride)
-        .zip(rgba.chunks_exact(width as usize * BPP).rev())
+        .zip(rgba.chunks_exact(width as usize * RGBA).rev())
     {
         pack_bgr(&mut dst_row[..row], src_row);
     }
@@ -122,35 +176,35 @@ pub(crate) fn encode_bmp(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
 /// specification's suggested heuristic) and leaves the filtered bytes in
 /// `scratch`; returns the filter id. The first row sees an all-zero
 /// previous row, exactly as the specification defines.
-fn choose_filter(row: &[u8], prev: &[u8], scratch: &mut [u8]) -> u8 {
+fn choose_filter<const BPP: usize>(row: &[u8], prev: &[u8], scratch: &mut [u8]) -> u8 {
     #[cfg(target_arch = "aarch64")]
     {
         // SAFETY: NEON is baseline on aarch64.
-        let sums = unsafe { filter_hw::residual_sums(row, prev) };
+        let sums = unsafe { filter_hw::residual_sums::<BPP>(row, prev) };
         let filter = (0..5).min_by_key(|&f| sums[f]).unwrap_or(0) as u8;
-        apply_filter(filter, row, prev, scratch);
+        apply_filter::<BPP>(filter, row, prev, scratch);
         return filter;
     }
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: SSE2 is baseline on x86_64.
-        let sums = unsafe { filter_hw::residual_sums(row, prev) };
+        let sums = unsafe { filter_hw::residual_sums::<BPP>(row, prev) };
         let filter = (0..5).min_by_key(|&f| sums[f]).unwrap_or(0) as u8;
-        apply_filter(filter, row, prev, scratch);
+        apply_filter::<BPP>(filter, row, prev, scratch);
         return filter;
     }
     #[allow(unreachable_code)]
     {
-        let sums = residual_sums_soft(row, prev);
+        let sums = residual_sums_soft::<BPP>(row, prev);
         let filter = (0..5).min_by_key(|&f| sums[f]).unwrap_or(0) as u8;
-        apply_filter(filter, row, prev, scratch);
+        apply_filter::<BPP>(filter, row, prev, scratch);
         filter
     }
 }
 
 /// The five filters' residual sums, portable form — and the reference the
 /// vector forms are held to in the tests.
-fn residual_sums_soft(row: &[u8], prev: &[u8]) -> [u64; 5] {
+fn residual_sums_soft<const BPP: usize>(row: &[u8], prev: &[u8]) -> [u64; 5] {
     let mut sums = [0u64; 5];
     if prev.is_empty() {
         // First row: the previous row is all zeros, so Up degenerates to
@@ -190,7 +244,7 @@ fn residual_sums_soft(row: &[u8], prev: &[u8]) -> [u64; 5] {
 }
 
 /// Writes `row` filtered by `filter` into `scratch`.
-fn apply_filter(filter: u8, row: &[u8], prev: &[u8], scratch: &mut [u8]) {
+fn apply_filter<const BPP: usize>(filter: u8, row: &[u8], prev: &[u8], scratch: &mut [u8]) {
     let head = BPP.min(row.len());
     match filter {
         0 => scratch[..row.len()].copy_from_slice(row),
@@ -312,17 +366,17 @@ mod filter_hw {
 
     /// # Safety
     /// NEON is baseline on aarch64; callers need no feature check.
-    pub unsafe fn residual_sums(row: &[u8], prev: &[u8]) -> [u64; 5] {
-        let mut sums = super::residual_sums_head(row, prev);
-        let start = super::BPP.min(row.len());
+    pub unsafe fn residual_sums<const BPP: usize>(row: &[u8], prev: &[u8]) -> [u64; 5] {
+        let mut sums = super::residual_sums_head::<BPP>(row, prev);
+        let start = BPP.min(row.len());
         let mut acc = [vdupq_n_u64(0); 5];
         let mut i = start;
         if !prev.is_empty() {
             while i + 16 <= row.len() {
                 let b = vld1q_u8(row.as_ptr().add(i));
-                let a = vld1q_u8(row.as_ptr().add(i - super::BPP));
+                let a = vld1q_u8(row.as_ptr().add(i - BPP));
                 let u = vld1q_u8(prev.as_ptr().add(i));
-                let c = vld1q_u8(prev.as_ptr().add(i - super::BPP));
+                let c = vld1q_u8(prev.as_ptr().add(i - BPP));
                 widen_accumulate(&mut acc[0], cost(b));
                 widen_accumulate(&mut acc[1], cost(vsubq_u8(b, a)));
                 widen_accumulate(&mut acc[2], cost(vsubq_u8(b, u)));
@@ -333,7 +387,7 @@ mod filter_hw {
         } else {
             while i + 16 <= row.len() {
                 let b = vld1q_u8(row.as_ptr().add(i));
-                let a = vld1q_u8(row.as_ptr().add(i - super::BPP));
+                let a = vld1q_u8(row.as_ptr().add(i - BPP));
                 let sub = cost(vsubq_u8(b, a));
                 widen_accumulate(&mut acc[0], cost(b));
                 widen_accumulate(&mut acc[1], sub);
@@ -346,7 +400,7 @@ mod filter_hw {
         for f in 0..5 {
             sums[f] += vaddvq_u64(acc[f]);
         }
-        super::residual_sums_tail(row, prev, i, &mut sums);
+        super::residual_sums_tail::<BPP>(row, prev, i, &mut sums);
         sums
     }
 }
@@ -419,17 +473,17 @@ mod filter_hw {
 
     /// # Safety
     /// SSE2 is baseline on x86_64; callers need no feature check.
-    pub unsafe fn residual_sums(row: &[u8], prev: &[u8]) -> [u64; 5] {
-        let mut sums = super::residual_sums_head(row, prev);
-        let start = super::BPP.min(row.len());
+    pub unsafe fn residual_sums<const BPP: usize>(row: &[u8], prev: &[u8]) -> [u64; 5] {
+        let mut sums = super::residual_sums_head::<BPP>(row, prev);
+        let start = BPP.min(row.len());
         let mut acc = [_mm_setzero_si128(); 5];
         let mut i = start;
         if !prev.is_empty() {
             while i + 16 <= row.len() {
                 let b = _mm_loadu_si128(row.as_ptr().add(i).cast());
-                let a = _mm_loadu_si128(row.as_ptr().add(i - super::BPP).cast());
+                let a = _mm_loadu_si128(row.as_ptr().add(i - BPP).cast());
                 let u = _mm_loadu_si128(prev.as_ptr().add(i).cast());
-                let c = _mm_loadu_si128(prev.as_ptr().add(i - super::BPP).cast());
+                let c = _mm_loadu_si128(prev.as_ptr().add(i - BPP).cast());
                 accumulate(&mut acc[0], cost(b));
                 accumulate(&mut acc[1], cost(_mm_sub_epi8(b, a)));
                 accumulate(&mut acc[2], cost(_mm_sub_epi8(b, u)));
@@ -440,7 +494,7 @@ mod filter_hw {
         } else {
             while i + 16 <= row.len() {
                 let b = _mm_loadu_si128(row.as_ptr().add(i).cast());
-                let a = _mm_loadu_si128(row.as_ptr().add(i - super::BPP).cast());
+                let a = _mm_loadu_si128(row.as_ptr().add(i - BPP).cast());
                 let sub = cost(_mm_sub_epi8(b, a));
                 accumulate(&mut acc[0], cost(b));
                 accumulate(&mut acc[1], sub);
@@ -456,14 +510,14 @@ mod filter_hw {
             core::arch::x86_64::_mm_storeu_si128(pair.as_mut_ptr().cast(), *lane);
             sums[f] += pair[0] + pair[1];
         }
-        super::residual_sums_tail(row, prev, i, &mut sums);
+        super::residual_sums_tail::<BPP>(row, prev, i, &mut sums);
         sums
     }
 }
 
 /// The first `BPP` bytes of a row (no left neighbour) under all five
 /// filters — the scalar head both vector forms start from.
-fn residual_sums_head(row: &[u8], prev: &[u8]) -> [u64; 5] {
+fn residual_sums_head<const BPP: usize>(row: &[u8], prev: &[u8]) -> [u64; 5] {
     let mut sums = [0u64; 5];
     for i in 0..BPP.min(row.len()) {
         let b = row[i];
@@ -478,7 +532,7 @@ fn residual_sums_head(row: &[u8], prev: &[u8]) -> [u64; 5] {
 }
 
 /// The scalar tail from byte `i` on, added into `sums`.
-fn residual_sums_tail(row: &[u8], prev: &[u8], i: usize, sums: &mut [u64; 5]) {
+fn residual_sums_tail<const BPP: usize>(row: &[u8], prev: &[u8], i: usize, sums: &mut [u64; 5]) {
     for i in i..row.len() {
         let b = row[i];
         let a = row[i - BPP];
@@ -648,12 +702,12 @@ const DISTANCE_ROWS: [(u16, u32, usize); 30] = [
     (29, 13, 24577),
 ];
 
-/// Greedy tokenizer state: a single-probe hash table over 4-byte windows,
-/// the cheap end of the zlib family's match search. One probe per input
-/// position finds the runs and repeats filtered scanlines actually
-/// contain, at a fraction of a chained lazy search's cost.
+/// Greedy tokenizer state: a single-probe hash table over `MATCH`-byte
+/// windows (three or four), the cheap end of the zlib family's match
+/// search. One probe per input position finds the runs and repeats
+/// filtered scanlines actually contain, at a fraction of a chained lazy
+/// search's cost.
 const HASH_BITS: u32 = 15;
-const MIN_MATCH: usize = 4;
 const WINDOW: usize = 32 * 1024;
 
 /// The tokenizer's hash table: one slot per [`HASH_BITS`]-bit hash. A
@@ -668,9 +722,12 @@ fn hash_table() -> Box<HashTable> {
         .expect("length matches by construction")
 }
 
+/// Hash of the `MATCH` bytes at `i`; the fourth byte is zero for a
+/// three-byte window.
 #[inline]
-fn hash4(data: &[u8], i: usize) -> usize {
-    let word = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+fn hash<const MATCH: usize>(data: &[u8], i: usize) -> usize {
+    let fourth = if MATCH == 4 { data[i + 3] } else { 0 };
+    let word = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], fourth]);
     (word.wrapping_mul(0x9e37_79b1) >> (32 - HASH_BITS)) as usize
 }
 
@@ -705,19 +762,24 @@ fn zero_run_end(data: &[u8], mut i: usize) -> usize {
 /// After repeated probe misses the scan accelerates LZ4-style, stepping
 /// further between probes so incompressible stretches cost a fraction of a
 /// probe per byte.
-fn tokenize(data: &[u8], table: &mut HashTable, mut emit: impl FnMut(Token<'_>)) {
+fn tokenize<const MATCH: usize>(
+    data: &[u8],
+    table: &mut HashTable,
+    mut emit: impl FnMut(Token<'_>),
+) {
+    const { assert!(MATCH == 3 || MATCH == 4) };
     table.fill(u32::MAX);
     let mut i = 0;
     let mut lit_start = 0;
     let mut misses = 0u32;
-    while i + MIN_MATCH <= data.len() {
+    while i + MATCH <= data.len() {
         // Zero-run fast path: the dominant token in filtered page renders.
-        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 0 && data[i + 3] == 0 {
-            let end = zero_run_end(data, i + 4);
+        if data[i..i + MATCH].iter().all(|&b| b == 0) {
+            let end = zero_run_end(data, i + MATCH);
             // Keep one literal zero ahead of the first match so distance 1
             // has a byte to point back into.
             let first = i + usize::from(i == 0 || data[i - 1] != 0);
-            if end - first < MIN_MATCH {
+            if end - first < MATCH {
                 misses += 1;
                 i += 1;
                 continue;
@@ -726,7 +788,7 @@ fn tokenize(data: &[u8], table: &mut HashTable, mut emit: impl FnMut(Token<'_>))
                 emit(Token::Literals(&data[lit_start..first]));
             }
             let mut run = end - first;
-            while run >= MIN_MATCH {
+            while run >= MATCH {
                 let piece = run.min(258);
                 emit(Token::Match {
                     len: piece,
@@ -739,17 +801,17 @@ fn tokenize(data: &[u8], table: &mut HashTable, mut emit: impl FnMut(Token<'_>))
             misses = 0;
             continue;
         }
-        let h = hash4(data, i);
+        let h = hash::<MATCH>(data, i);
         let candidate = table[h] as usize;
         table[h] = i as u32;
         if candidate != u32::MAX as usize
             && i - candidate <= WINDOW
-            && data[candidate..candidate + MIN_MATCH] == data[i..i + MIN_MATCH]
+            && data[candidate..candidate + MATCH] == data[i..i + MATCH]
         {
             // Word-wise extension: XOR eight bytes at a time and read the
             // first mismatch out of the trailing zeros — the same length
             // the byte loop finds, so the token stream is unchanged.
-            let mut len = MIN_MATCH;
+            let mut len = MATCH;
             let max = (data.len() - i).min(258);
             while len + 8 <= max {
                 let held = u64::from_le_bytes(
@@ -779,8 +841,8 @@ fn tokenize(data: &[u8], table: &mut HashTable, mut emit: impl FnMut(Token<'_>))
             // would cost more than the matches it finds.
             let mut j = i + 1;
             let end = i + len;
-            while j + MIN_MATCH <= data.len() && j < end {
-                table[hash4(data, j)] = j as u32;
+            while j + MATCH <= data.len() && j < end {
+                table[hash::<MATCH>(data, j)] = j as u32;
                 j += 7;
             }
             i = end;
@@ -811,11 +873,11 @@ struct BufferedToken {
 /// the same tokens under them. (The tables used to come from re-tokenizing
 /// a sample of the image — the buffer makes the second search unnecessary
 /// and the statistics exact, which also reads slightly smaller.)
-fn deflate_filtered(data: &[u8]) -> Vec<u8> {
+fn deflate_filtered<const MATCH: usize>(data: &[u8]) -> Vec<u8> {
     let mut table = hash_table();
     let mut tokens: Vec<BufferedToken> = Vec::new();
     let mut literals = 0u32;
-    tokenize(data, &mut table, |token| match token {
+    tokenize::<MATCH>(data, &mut table, |token| match token {
         Token::Literals(bytes) => literals += bytes.len() as u32,
         Token::Match { len, dist } => {
             tokens.push(BufferedToken {
@@ -1366,11 +1428,21 @@ mod tests {
     /// Decodes with the `png` crate — the independent implementation the
     /// rest of the codebase already trusts — and returns the RGBA pixels.
     fn round_trip(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-        let encoded = encode_rgba(width, height, rgba);
+        decode(
+            width,
+            height,
+            png::ColorType::Rgba,
+            encode_rgba(width, height, rgba),
+        )
+    }
+
+    fn decode(width: u32, height: u32, color: png::ColorType, encoded: Vec<u8>) -> Vec<u8> {
         let decoder = png::Decoder::new(std::io::Cursor::new(encoded));
         let mut reader = decoder.read_info().expect("decodable header");
         assert_eq!(reader.info().width, width);
         assert_eq!(reader.info().height, height);
+        assert_eq!(reader.info().color_type, color);
+        assert_eq!(reader.info().bit_depth, png::BitDepth::Eight);
         let mut buf = vec![0u8; reader.output_buffer_size().expect("sized")];
         let info = reader.next_frame(&mut buf).expect("decodable image");
         buf.truncate(info.buffer_size());
@@ -1398,12 +1470,7 @@ mod tests {
     #[test]
     fn gradient_round_trips() {
         let (w, h) = (61u32, 23u32);
-        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-        for y in 0..h {
-            for x in 0..w {
-                rgba.extend_from_slice(&[(x * 4) as u8, (y * 11) as u8, (x + y) as u8, 255]);
-            }
-        }
+        let rgba = gradient(w, h);
         assert_eq!(round_trip(w, h, &rgba), rgba);
     }
 
@@ -1436,26 +1503,99 @@ mod tests {
         assert_eq!(round_trip(w, h, &rgba), rgba);
     }
 
+    fn gradient(w: u32, h: u32) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x * 4) as u8, (y * 11) as u8, (x + y) as u8, 255]);
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn rgb_round_trips_without_alpha() {
+        let (w, h) = (61u32, 23u32);
+        let rgba = gradient(w, h);
+        let rgb: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|px| [px[0], px[1], px[2]])
+            .collect();
+        assert_eq!(
+            decode(w, h, png::ColorType::Rgb, encode_rgb(w, h, &rgba)),
+            rgb
+        );
+    }
+
+    #[test]
+    fn gray_round_trips_as_rec601_luma() {
+        let (w, h) = (61u32, 23u32);
+        let rgba = gradient(w, h);
+        let gray: Vec<u8> = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|px| {
+                let luma = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
+                luma.round() as u8
+            })
+            .collect();
+        let got = decode(w, h, png::ColorType::Grayscale, encode_gray(w, h, &rgba));
+        assert_eq!(got.len(), gray.len());
+        let off_by_more_than_one = got
+            .iter()
+            .zip(&gray)
+            .filter(|(a, b)| a.abs_diff(**b) > 1)
+            .count();
+        assert_eq!(off_by_more_than_one, 0);
+        assert_eq!(
+            decode(
+                1,
+                1,
+                png::ColorType::Grayscale,
+                encode_gray(1, 1, &[255, 255, 255, 255])
+            ),
+            [255]
+        );
+        assert_eq!(
+            decode(
+                1,
+                1,
+                png::ColorType::Grayscale,
+                encode_gray(1, 1, &[0, 0, 0, 255])
+            ),
+            [0]
+        );
+    }
+
     /// The vector residual sums must agree with the portable form byte
     /// for byte — a silent drift would still round-trip but quietly pick
     /// worse filters.
     #[test]
     fn vector_residual_sums_match_the_portable_form() {
+        vector_residual_sums_match::<4>();
+        vector_residual_sums_match::<3>();
+        vector_residual_sums_match::<1>();
+    }
+
+    fn vector_residual_sums_match<const BPP: usize>() {
         let mut state = 0xdeadbeefu32;
         let mut next = move || {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             (state >> 24) as u8
         };
-        for len in [4usize, 16, 20, 64, 100, 257] {
+        for len in [1usize, 3, 4, 16, 20, 64, 100, 257] {
             let row: Vec<u8> = (0..len).map(|_| next()).collect();
             let prev: Vec<u8> = (0..len).map(|_| next()).collect();
             for p in [&[][..], &prev[..]] {
-                let soft = residual_sums_soft(&row, p);
+                let soft = residual_sums_soft::<BPP>(&row, p);
                 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
                 {
                     // SAFETY: NEON/SSE2 are baseline on these targets.
-                    let hard = unsafe { filter_hw::residual_sums(&row, p) };
-                    assert_eq!(hard, soft, "len {len} prev? {}", !p.is_empty());
+                    let hard = unsafe { filter_hw::residual_sums::<BPP>(&row, p) };
+                    assert_eq!(hard, soft, "bpp {BPP} len {len} prev? {}", !p.is_empty());
                 }
             }
         }
@@ -1527,7 +1667,7 @@ mod stage_times {
                 .chunks_exact(stride)
                 .zip(filtered.chunks_exact_mut(stride + 1))
             {
-                out[0] = choose_filter(row, prev, &mut out[1..]);
+                out[0] = choose_filter::<RGBA>(row, prev, &mut out[1..]);
                 prev = row;
             }
         }
@@ -1536,7 +1676,7 @@ mod stage_times {
         let t0 = std::time::Instant::now();
         let mut out = Vec::new();
         for _ in 0..reps {
-            out = deflate_filtered(&filtered);
+            out = deflate_filtered::<4>(&filtered);
         }
         println!(
             "deflate:     {:?}/page ({} bytes)",

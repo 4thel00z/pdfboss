@@ -281,6 +281,11 @@ enum Command {
         /// JPEG quality, 1 to 100 (.jpg and .jpeg only).
         #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
         jpeg_quality: u8,
+        /// Channels a .png keeps: rgba, rgb (alpha dropped; a page renders
+        /// onto opaque white) or gray (Rec. 601 luma). The other formats are
+        /// RGB and refuse gray.
+        #[arg(long, value_enum, default_value_t = ColorspaceArg::Rgba)]
+        colorspace: ColorspaceArg,
     },
     /// Extract every image a page draws, each as a native-size PNG.
     Images {
@@ -484,6 +489,30 @@ impl PngCompressionArg {
     }
 }
 
+/// `--colorspace` choices for `render`, mapping to
+/// `pdfboss_render::PngColor`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum ColorspaceArg {
+    /// Red, green, blue and alpha (default).
+    #[default]
+    Rgba,
+    /// Red, green and blue; alpha dropped.
+    Rgb,
+    /// One Rec. 601 luma byte per pixel.
+    Gray,
+}
+
+impl ColorspaceArg {
+    fn to_color(self) -> pdfboss_render::PngColor {
+        use pdfboss_render::PngColor;
+        match self {
+            ColorspaceArg::Rgba => PngColor::Rgba,
+            ColorspaceArg::Rgb => PngColor::Rgb,
+            ColorspaceArg::Gray => PngColor::Gray,
+        }
+    }
+}
+
 /// `--reading-order` values for `text` and `md`, mapped onto
 /// `pdfboss_output::ReadingOrder`.
 #[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
@@ -613,6 +642,7 @@ fn main() {
             password,
             png_compression,
             jpeg_quality,
+            colorspace,
         } => cmd_render(
             &file,
             page,
@@ -623,6 +653,7 @@ fn main() {
             &password,
             png_compression,
             jpeg_quality,
+            colorspace,
         )
         .map_err(Failure::from),
         Command::Images {
@@ -1319,12 +1350,13 @@ fn cmd_render(
     password: &str,
     png_compression: PngCompressionArg,
     jpeg_quality: u8,
+    colorspace: ColorspaceArg,
 ) -> Result<(), String> {
     if !scale.is_finite() || scale <= 0.0 {
         return Err(format!("invalid scale {scale}: must be a positive number"));
     }
     let out = out.unwrap_or_else(|| default_out(page));
-    let format = output_format(&out, png_compression, jpeg_quality)?;
+    let format = output_format(&out, png_compression, jpeg_quality, colorspace)?;
     let fonts = fonts.unwrap_or_else(|| default_fonts(&font_dir));
     let substitutes = substitute_source(fonts, font_dir)?;
     let doc = Document::open_with_password(file, password).map_err(|e| e.to_string())?;
@@ -1509,16 +1541,26 @@ fn default_out(page: usize) -> PathBuf {
 }
 
 /// The image format `out`'s extension names, PNG carrying the requested
-/// compression level and JPEG the requested quality.
+/// compression level and colorspace and JPEG the requested quality.
 fn output_format(
     out: &Path,
     png_compression: PngCompressionArg,
     jpeg_quality: u8,
+    colorspace: ColorspaceArg,
 ) -> Result<pdfboss_render::ImageFormat, String> {
     use pdfboss_render::ImageFormat;
     let extension = out.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match ImageFormat::from_name(extension) {
-        Some(ImageFormat::Png(_)) => Ok(ImageFormat::Png(png_compression.to_compression())),
+    let format = ImageFormat::from_name(extension);
+    if colorspace == ColorspaceArg::Gray && !matches!(format, Some(ImageFormat::Png { .. })) {
+        return Err(format!(
+            "--colorspace gray is only available for .png output, not {extension:?}"
+        ));
+    }
+    match format {
+        Some(ImageFormat::Png { .. }) => Ok(ImageFormat::Png {
+            color: colorspace.to_color(),
+            compression: png_compression.to_compression(),
+        }),
         Some(ImageFormat::Jpeg { .. }) => Ok(ImageFormat::Jpeg {
             quality: jpeg_quality,
         }),

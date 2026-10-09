@@ -92,13 +92,45 @@ impl PngCompression {
     }
 }
 
-/// The file format [`Pixmap::encode`] writes. PNG keeps every channel and
-/// carries its compression level; PPM and BMP are a header plus one packing
-/// pass over the pixels, dropping alpha; JPEG is lossy at its quality.
+/// The channels a PNG carries. A page renders onto an opaque white
+/// background, so dropping alpha loses nothing; `Gray` keeps each pixel's
+/// Rec. 601 luma. Every choice is lossless in the channels it keeps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PngColor {
+    /// Color type 6: red, green, blue and alpha, four bytes per pixel.
+    #[default]
+    Rgba,
+    /// Color type 2: red, green and blue, three bytes per pixel.
+    Rgb,
+    /// Color type 0: one luma byte per pixel.
+    Gray,
+}
+
+impl PngColor {
+    /// The color a Python string names, case insensitively: `rgba`, `rgb`
+    /// or `gray` (`grey` is accepted too).
+    pub fn from_name(name: &str) -> Option<PngColor> {
+        match name.to_ascii_lowercase().as_str() {
+            "rgba" => Some(PngColor::Rgba),
+            "rgb" => Some(PngColor::Rgb),
+            "gray" | "grey" => Some(PngColor::Gray),
+            _ => None,
+        }
+    }
+}
+
+/// The file format [`Pixmap::encode`] writes. PNG carries its channels and
+/// compression level; PPM and BMP are a header plus one packing pass over
+/// the pixels, dropping alpha; JPEG is lossy at its quality.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
-    /// PNG, RGBA 8-bit, at the given compression level.
-    Png(PngCompression),
+    /// PNG, 8-bit, in `color` at `compression`.
+    Png {
+        /// Which channels the file keeps.
+        color: PngColor,
+        /// How hard the encoder works to shrink the file.
+        compression: PngCompression,
+    },
     /// Binary PPM (`P6`): RGB rows, top-down, no padding.
     Ppm,
     /// Windows BMP: 24-bit BGR rows, bottom-up, padded to four bytes.
@@ -120,7 +152,10 @@ impl ImageFormat {
     /// `bmp`, or `jpeg` / `jpg` (at [`ImageFormat::DEFAULT_JPEG_QUALITY`]).
     pub fn from_name(name: &str) -> Option<ImageFormat> {
         match name.to_ascii_lowercase().as_str() {
-            "png" => Some(ImageFormat::Png(PngCompression::default())),
+            "png" => Some(ImageFormat::Png {
+                color: PngColor::default(),
+                compression: PngCompression::default(),
+            }),
             "ppm" => Some(ImageFormat::Ppm),
             "bmp" => Some(ImageFormat::Bmp),
             "jpeg" | "jpg" => Some(ImageFormat::Jpeg {
@@ -153,21 +188,44 @@ impl Pixmap {
         self.encode_png_with(PngCompression::default())
     }
 
-    /// Encodes the pixmap as a PNG image at the given compression level.
+    /// Encodes the pixmap as an RGBA PNG image at the given compression level.
     pub fn encode_png_with(&self, compression: PngCompression) -> Result<Vec<u8>> {
+        self.encode_png_as(PngColor::Rgba, compression)
+    }
+
+    /// Encodes the pixmap as a PNG image in `color` at `compression`.
+    pub fn encode_png_as(&self, color: PngColor, compression: PngCompression) -> Result<Vec<u8>> {
         fn err(e: png::EncodingError) -> Error {
             Error::Other(format!("png encode: {e}"))
         }
         if compression == PngCompression::Balanced {
-            return Ok(encode::encode_rgba(self.width, self.height, &self.data));
+            return Ok(match color {
+                PngColor::Rgba => encode::encode_rgba(self.width, self.height, &self.data),
+                PngColor::Rgb => encode::encode_rgb(self.width, self.height, &self.data),
+                PngColor::Gray => encode::encode_gray(self.width, self.height, &self.data),
+            });
         }
+        let (color_type, samples) = match color {
+            PngColor::Rgba => (
+                png::ColorType::Rgba,
+                std::borrow::Cow::Borrowed(&self.data[..]),
+            ),
+            PngColor::Rgb => (
+                png::ColorType::Rgb,
+                std::borrow::Cow::Owned(encode::pack_rgb_vec(&self.data)),
+            ),
+            PngColor::Gray => (
+                png::ColorType::Grayscale,
+                std::borrow::Cow::Owned(encode::pack_gray_vec(&self.data)),
+            ),
+        };
         let mut out = Vec::new();
         let mut enc = png::Encoder::new(&mut out, self.width, self.height);
-        enc.set_color(png::ColorType::Rgba);
+        enc.set_color(color_type);
         enc.set_depth(png::BitDepth::Eight);
         enc.set_compression(compression.to_encoding());
         let mut writer = enc.write_header().map_err(err)?;
-        writer.write_image_data(&self.data).map_err(err)?;
+        writer.write_image_data(&samples).map_err(err)?;
         writer.finish().map_err(err)?;
         Ok(out)
     }
@@ -175,7 +233,7 @@ impl Pixmap {
     /// Encodes the pixmap in `format`.
     pub fn encode(&self, format: ImageFormat) -> Result<Vec<u8>> {
         match format {
-            ImageFormat::Png(compression) => self.encode_png_with(compression),
+            ImageFormat::Png { color, compression } => self.encode_png_as(color, compression),
             ImageFormat::Ppm => Ok(encode::encode_ppm(self.width, self.height, &self.data)),
             ImageFormat::Bmp => Ok(encode::encode_bmp(self.width, self.height, &self.data)),
             ImageFormat::Jpeg { quality } => {

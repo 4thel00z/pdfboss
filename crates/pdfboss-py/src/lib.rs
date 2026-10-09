@@ -334,23 +334,42 @@ fn png_compression_from_str(s: &str) -> PyResult<pdfboss_render::PngCompression>
     }
 }
 
-/// Maps the Python `format=`, `compression=` and `quality=` arguments to a
-/// [`pdfboss_render::ImageFormat`]; `compression` only shapes PNG and
-/// `quality` only shapes JPEG.
+/// Maps the Python `colorspace=` string to a [`pdfboss_render::PngColor`].
+fn png_color_from_str(s: &str) -> PyResult<pdfboss_render::PngColor> {
+    pdfboss_render::PngColor::from_name(s).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "unknown colorspace {s:?}: expected 'rgba', 'rgb' or 'gray'"
+        ))
+    })
+}
+
+/// Maps the Python `format=`, `compression=`, `quality=` and `colorspace=`
+/// arguments to a [`pdfboss_render::ImageFormat`]; `compression` and
+/// `colorspace` only shape PNG and `quality` only shapes JPEG. PPM, BMP and
+/// JPEG are RGB by nature, so `rgba` and `rgb` both pass and `gray` is
+/// refused for them.
 fn image_format_from_str(
     format: &str,
     compression: &str,
     quality: i64,
+    colorspace: &str,
 ) -> PyResult<pdfboss_render::ImageFormat> {
-    use pdfboss_render::ImageFormat;
+    use pdfboss_render::{ImageFormat, PngColor};
     let compression = png_compression_from_str(compression)?;
+    let color = png_color_from_str(colorspace)?;
     if !(1..=100).contains(&quality) {
         return Err(PyValueError::new_err(format!(
             "quality must be between 1 and 100, got {quality}"
         )));
     }
-    match ImageFormat::from_name(format) {
-        Some(ImageFormat::Png(_)) => Ok(ImageFormat::Png(compression)),
+    let parsed = ImageFormat::from_name(format);
+    if color == PngColor::Gray && !matches!(parsed, Some(ImageFormat::Png { .. })) {
+        return Err(PyValueError::new_err(format!(
+            "colorspace 'gray' is only available for format 'png', not {format:?}"
+        )));
+    }
+    match parsed {
+        Some(ImageFormat::Png { .. }) => Ok(ImageFormat::Png { color, compression }),
         Some(ImageFormat::Jpeg { .. }) => Ok(ImageFormat::Jpeg {
             quality: quality as u8,
         }),
@@ -656,7 +675,7 @@ impl Document {
     /// the convenient fast path: one call renders them all at once, where
     /// per-page `render` calls only parallelize if you run them from your
     /// own threads.
-    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90))]
+    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90, colorspace="rgba"))]
     #[allow(clippy::too_many_arguments)]
     fn render_pages<'py>(
         &self,
@@ -668,10 +687,11 @@ impl Document {
         compression: &str,
         format: &str,
         quality: i64,
+        colorspace: &str,
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
         opts.cache = Some(Arc::clone(&self.render_cache));
-        let format = image_format_from_str(format, compression, quality)?;
+        let format = image_format_from_str(format, compression, quality, colorspace)?;
         let inner = &self.inner;
         let images = py.allow_threads(move || {
             // The lock is held only long enough to seed; the fan-out runs
@@ -1360,12 +1380,15 @@ impl Page {
     /// are a header plus the pixels, dropping alpha; `compression` trades
     /// PNG encode time against file size: `"none"`, `"fast"`, `"default"`
     /// or `"best"`, and only shapes PNG; `quality` (1 to 100) is the JPEG
-    /// quality and only shapes JPEG. Apart from JPEG, every choice produces
-    /// the same pixels.
+    /// quality and only shapes JPEG. `colorspace` picks the channels a PNG
+    /// keeps: `"rgba"`, `"rgb"` (alpha dropped: a page renders onto opaque
+    /// white, so nothing is lost) or `"gray"` (one Rec. 601 luma byte per
+    /// pixel). Apart from JPEG and `gray`, every choice produces the same
+    /// pixels.
     ///
     /// Content pdfboss cannot read is skipped, so a page can come out blank
     /// without raising. Use `render_reporting` to see what was dropped.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90, colorspace="rgba"))]
     #[allow(clippy::too_many_arguments)]
     fn render<'py>(
         &self,
@@ -1376,9 +1399,18 @@ impl Page {
         compression: &str,
         format: &str,
         quality: i64,
+        colorspace: &str,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let rendered =
-            self.render_reporting(py, scale, fonts, font_dir, compression, format, quality)?;
+        let rendered = self.render_reporting(
+            py,
+            scale,
+            fonts,
+            font_dir,
+            compression,
+            format,
+            quality,
+            colorspace,
+        )?;
         Ok(rendered.0)
     }
 
@@ -1389,7 +1421,7 @@ impl Page {
     /// the data could not be interpreted"`. It is empty when the page
     /// rasterized exactly as it describes itself, so a blank page is never
     /// mistaken for a clean render.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90, colorspace="rgba"))]
     #[allow(clippy::too_many_arguments)]
     fn render_reporting<'py>(
         &self,
@@ -1400,10 +1432,11 @@ impl Page {
         compression: &str,
         format: &str,
         quality: i64,
+        colorspace: &str,
     ) -> PyResult<(Bound<'py, PyBytes>, Vec<String>)> {
         let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
         opts.cache = Some(Arc::clone(&self.render_cache));
-        let format = image_format_from_str(format, compression, quality)?;
+        let format = image_format_from_str(format, compression, quality, colorspace)?;
         let (image, warnings) = py.allow_threads(|| {
             // Uncontended, reuse the shared parsed document so fonts,
             // images and decoded streams carry across this document's
@@ -2310,7 +2343,7 @@ impl AsyncDocument {
     /// never idles the others — except the workers are tokio tasks, so the
     /// asyncio loop stays free and it works over any source, including
     /// `open_url` documents (each worker range-fetches what its page needs).
-    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90))]
+    #[pyo3(signature = (pages=None, scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90, colorspace="rgba"))]
     #[allow(clippy::too_many_arguments)]
     fn render_pages<'py>(
         &self,
@@ -2322,9 +2355,10 @@ impl AsyncDocument {
         compression: &str,
         format: &str,
         quality: i64,
+        colorspace: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
-        let format = image_format_from_str(format, compression, quality)?;
+        let format = image_format_from_str(format, compression, quality, colorspace)?;
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let selection: Arc<Vec<usize>> = Arc::new(match pages {
@@ -2922,7 +2956,7 @@ impl AsyncPage {
     /// Renders the page and resolves to the encoded image (PNG unless
     /// `format` says otherwise); same arguments and leniency as the sync
     /// `Page.render`. Coroutine.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90, colorspace="rgba"))]
     #[allow(clippy::too_many_arguments)]
     fn render<'py>(
         &self,
@@ -2933,9 +2967,10 @@ impl AsyncPage {
         compression: &str,
         format: &str,
         quality: i64,
+        colorspace: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
-        let format = image_format_from_str(format, compression, quality)?;
+        let format = image_format_from_str(format, compression, quality, colorspace)?;
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2952,7 +2987,7 @@ impl AsyncPage {
     /// Renders the page like `render`, resolving to `(png_bytes, warnings)`;
     /// same reporting semantics as the sync `Page.render_reporting`.
     /// Coroutine.
-    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90))]
+    #[pyo3(signature = (scale=1.0, fonts=None, font_dir=None, compression="default", format="png", quality=90, colorspace="rgba"))]
     #[allow(clippy::too_many_arguments)]
     fn render_reporting<'py>(
         &self,
@@ -2963,9 +2998,10 @@ impl AsyncPage {
         compression: &str,
         format: &str,
         quality: i64,
+        colorspace: &str,
     ) -> PyResult<Bound<'py, PyAny>> {
         let opts = resolve_render_options(py, scale, fonts, font_dir)?;
-        let format = image_format_from_str(format, compression, quality)?;
+        let format = image_format_from_str(format, compression, quality, colorspace)?;
         let doc = self.doc.clone();
         let page = self.page.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
