@@ -12,6 +12,8 @@ def to_pdf(
 ) -> bytes:
     """Composes CommonMark+GFM markdown into a PDF and returns the file bytes.
 
-    theme is CSS source text; base_dir anchors relative image paths.
+    theme is CSS source text; size is a page size name (a0 to a10, b0 to
+    b10, letter, legal, tabloid) or <width>x<height> in pt, mm, cm or in;
+    base_dir anchors relative image paths.
     """
     return md_to_pdf(markdown, theme, size, landscape, base_dir)

@@ -51,7 +51,7 @@ pdfboss create md notes.md -o notes.pdf --theme theme.css --size letter
 ```
 
 `--theme` takes a CSS file (omitted, the built-in default theme applies);
-`--size` is `a3`, `a4` (default), `a5`, `letter` or `legal`, and
+`--size` is a page size name (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`; default `a4`) or `<width>x<height>` in pt, mm, cm or in, and
 `--landscape` swaps width and height. Relative image paths in the markdown
 resolve against the input file's directory. The result round-trips
 immediately:

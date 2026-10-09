@@ -35,12 +35,12 @@ use pdfboss_write::{
     Attachment as CoreAttachment, Bookmark as CoreBookmark, Canvas as CoreCanvas, Color,
     Content as CoreContent, Draw, Image as CoreImage, ImageData, LabelStyle, Link as CoreLink,
     LinkTarget as CoreLinkTarget, Metadata as CoreMetadata, Outline as CoreOutline,
-    Page as CorePage, PageLabel as CorePageLabel, PageLayout, PageMode, Paragraph as CoreParagraph,
-    ParagraphAlign, Pdf as CorePdf, Standard14 as CoreStandard14, Text as CoreText,
-    Update as CoreUpdate, Viewer as CoreViewer,
+    Page as CorePage, PageLabel as CorePageLabel, PageLayout, PageMode, PageSize,
+    Paragraph as CoreParagraph, ParagraphAlign, Pdf as CorePdf, Standard14 as CoreStandard14,
+    Text as CoreText, Update as CoreUpdate, Viewer as CoreViewer,
 };
 
-use crate::{page_size_by_name, pdf_err, Document, PdfError};
+use crate::{page_size_from_str, pdf_err, Document, PdfError};
 
 std::thread_local! {
     /// Holds a Python exception raised inside a draw-object's `draw()`
@@ -826,25 +826,51 @@ fn has_callable_draw(obj: &Bound<'_, PyAny>) -> bool {
 }
 
 /// One page: its size and the content composed onto it with `|`. `size`
-/// is resolved case-insensitively at lowering, via the same
-/// `page_size_by_name` the markdown composer uses.
+/// is a name or `<width>x<height>` string, resolved at construction via
+/// the same `page_size_from_str` the markdown composer uses, or a
+/// `(width, height)` pair of points.
 #[pyclass(name = "Page", module = "pdfboss.write", frozen)]
 struct WritePage {
-    size: String,
+    size: PageSize,
     landscape: bool,
     content: Vec<Py<PyAny>>,
+}
+
+/// The `size=` argument of `Page`: a string for `page_size_from_str`, or
+/// two positive finite numbers of points.
+fn page_size_from_py(size: &Bound<'_, PyAny>) -> PyResult<PageSize> {
+    if let Ok(name) = size.extract::<&str>() {
+        return page_size_from_str(name);
+    }
+    let Ok((width, height)) = size.extract::<(f32, f32)>() else {
+        return Err(PyTypeError::new_err(format!(
+            "size must be a page size name, a '<width>x<height>' string or a \
+             (width, height) tuple of points, not {}",
+            size.get_type().name()?
+        )));
+    };
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return Err(PyValueError::new_err(format!(
+            "page size must be two positive numbers of points, got ({width}, {height})"
+        )));
+    }
+    Ok(PageSize::Custom { width, height })
 }
 
 #[pymethods]
 impl WritePage {
     #[new]
-    #[pyo3(signature = (size="a4", landscape=false))]
-    fn new(size: &str, landscape: bool) -> WritePage {
-        WritePage {
-            size: size.to_string(),
+    #[pyo3(signature = (size=None, landscape=false))]
+    fn new(size: Option<&Bound<'_, PyAny>>, landscape: bool) -> PyResult<WritePage> {
+        let size = match size {
+            None => PageSize::A4,
+            Some(size) => page_size_from_py(size)?,
+        };
+        Ok(WritePage {
+            size,
             landscape,
             content: Vec::new(),
-        }
+        })
     }
 
     /// Composes one more element onto the page: `Text`, `Image`, `Link`,
@@ -864,7 +890,7 @@ impl WritePage {
         let mut content = clone_py_vec(rhs.py(), &self.content);
         content.push(rhs.clone().unbind());
         Ok(WritePage {
-            size: self.size.clone(),
+            size: self.size,
             landscape: self.landscape,
             content,
         })
@@ -873,11 +899,10 @@ impl WritePage {
 
 impl WritePage {
     fn lower(&self, py: Python<'_>) -> PyResult<CorePage> {
-        let size = page_size_by_name(&self.size)?;
         let size = if self.landscape {
-            size.landscape()
+            self.size.landscape()
         } else {
-            size
+            self.size
         };
         let mut content = Vec::with_capacity(self.content.len());
         for item in &self.content {

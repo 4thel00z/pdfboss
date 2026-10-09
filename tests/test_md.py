@@ -21,8 +21,13 @@ def test_theme_errors_raise() -> None:
 
 
 def test_unknown_size_raises() -> None:
-    with pytest.raises(pdfboss.PdfError, match="tabloid"):
-        pdfboss.md.to_pdf("x\n", size="tabloid")
+    with pytest.raises(pdfboss.PdfError, match="poster"):
+        pdfboss.md.to_pdf("x\n", size="poster")
+
+
+def test_size_takes_every_name_and_explicit_dimensions() -> None:
+    for size in ("a1", "B5", "tabloid", "612x792", "210mmx297mm"):
+        assert pdfboss.md.to_pdf("x\n", size=size).startswith(b"%PDF-")
 
 
 def test_replacements_warn() -> None:

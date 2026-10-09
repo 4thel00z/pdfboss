@@ -159,14 +159,13 @@ fn to_page(page: ManifestPage, base_dir: &Path) -> Result<Page, String> {
 }
 
 /// A page's `size`/`landscape` pair resolved to a `PageSize`: an absent
-/// name defaults to A4, an unnamed size errors naming the size and the
-/// valid list.
+/// size defaults to A4, one `PageSize::parse` rejects errors naming the
+/// size and what is accepted.
 fn resolve_size(name: Option<&str>, landscape: bool) -> Result<PageSize, String> {
     let size = match name {
         None => PageSize::default(),
-        Some(name) => PageSize::by_name(name).ok_or_else(|| {
-            format!("unknown page size {name:?}: valid sizes are a3, a4, a5, letter, legal")
-        })?,
+        Some(name) => PageSize::parse(name)
+            .ok_or_else(|| format!("unknown page size {name:?}: {}", PageSize::ACCEPTED))?,
     };
     if !landscape {
         return Ok(size);

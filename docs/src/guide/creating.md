@@ -234,7 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Python: pdfboss.write
 
-`pdfboss.write` exposes the same vocabulary as frozen values joined with `|`. A `Page(size="a4", landscape=False)` composes `Text`, `Image`, `Link` and `Paragraph` elements; a `Pdf()` composes pages, `Attachment` and `PageLabel` values (each appended, in order) and the singleton `Metadata`, `Outline` and `Viewer` slots, where a second raises `TypeError`. Every `|` returns a new value and leaves the receiver unchanged, and copies are cheap handle clones: nothing is built until `save(path)` or `to_bytes()`, which lower the composition once and release the GIL to serialize. `to_bytes` may be called repeatedly.
+`pdfboss.write` exposes the same vocabulary as frozen values joined with `|`. A `Page(size="a4", landscape=False)` composes `Text`, `Image`, `Link` and `Paragraph` elements — `size` is a name (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`), a `"<width>x<height>"` string in pt, mm, cm or in, or a `(width, height)` tuple of points; a `Pdf()` composes pages, `Attachment` and `PageLabel` values (each appended, in order) and the singleton `Metadata`, `Outline` and `Viewer` slots, where a second raises `TypeError`. Every `|` returns a new value and leaves the receiver unchanged, and copies are cheap handle clones: nothing is built until `save(path)` or `to_bytes()`, which lower the composition once and release the GIL to serialize. `to_bytes` may be called repeatedly.
 
 ```python
 from pdfboss.write import (
@@ -371,7 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## CLI
 
-`pdfboss create` covers the common cases without writing Rust, plus [`create md`](./md-to-pdf.md#cli), which composes a Markdown file with a CSS theme and has its own chapter. Blank pages, with `--pages`, `--size` (`a3`, `a4`, `a5`, `letter`, `legal`) and `--landscape`:
+`pdfboss create` covers the common cases without writing Rust, plus [`create md`](./md-to-pdf.md#cli), which composes a Markdown file with a CSS theme and has its own chapter. Blank pages, with `--pages`, `--size` (a name from `a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`, or `<width>x<height>` in pt, mm, cm or in, e.g. `210mmx297mm`) and `--landscape`:
 
 ```bash
 pdfboss create blank --out blank.pdf --pages 3 --size a5 --landscape

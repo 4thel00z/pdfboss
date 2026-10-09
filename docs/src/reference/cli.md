@@ -169,7 +169,7 @@ Create a new PDF: blank pages, word-wrapped text, image pages, a themed Markdown
 pdfboss create <COMMAND>
 ```
 
-Five subcommands, each writing to `-o, --out <OUT>`. The first four share `--size a3|a4|a5|letter|legal` and `--landscape` (swap page width and height); `manifest` takes neither, since page size and orientation live per page inside the TOML. See [Creating PDFs](../guide/creating.md) and [Markdown to PDF](../guide/md-to-pdf.md).
+Five subcommands, each writing to `-o, --out <OUT>`. The first four share `--size <SIZE>` — a name (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`) or `<width>x<height>` with each length in points or suffixed `pt`, `mm`, `cm` or `in` (`612x792`, `210mmx297mm`) — and `--landscape` (swap page width and height); `manifest` takes neither, since page size and orientation live per page inside the TOML. See [Creating PDFs](../guide/creating.md) and [Markdown to PDF](../guide/md-to-pdf.md).
 
 ### create blank
 

@@ -59,19 +59,110 @@ impl PageSize {
         }
     }
 
-    /// Parses one of the five named sizes case-insensitively: `a3`, `a4`,
-    /// `a5`, `letter`, `legal`. `None` for anything else — a custom size
-    /// has no name to parse.
+    /// Parses a named size case-insensitively: ISO 216 `a0` to `a10` and
+    /// `b0` to `b10`, `letter`, `legal` or `tabloid`. `None` for anything
+    /// else; [`PageSize::parse`] also takes explicit dimensions.
     pub fn by_name(name: &str) -> Option<PageSize> {
-        match name.to_ascii_lowercase().as_str() {
-            "a3" => Some(PageSize::A3),
-            "a4" => Some(PageSize::A4),
-            "a5" => Some(PageSize::A5),
-            "letter" => Some(PageSize::Letter),
-            "legal" => Some(PageSize::Legal),
-            _ => None,
+        let name = name.to_ascii_lowercase();
+        match name.as_str() {
+            "a3" => return Some(PageSize::A3),
+            "a4" => return Some(PageSize::A4),
+            "a5" => return Some(PageSize::A5),
+            "letter" => return Some(PageSize::Letter),
+            "legal" => return Some(PageSize::Legal),
+            "tabloid" => {
+                return Some(PageSize::Custom {
+                    width: 792.0,
+                    height: 1224.0,
+                })
+            }
+            _ => {}
         }
+        let (table, index) = match (name.get(..1), name.get(1..)) {
+            (Some("a"), Some(index)) => (&A_SERIES_MM, index),
+            (Some("b"), Some(index)) => (&B_SERIES_MM, index),
+            _ => return None,
+        };
+        let index: usize = index.parse().ok()?;
+        let (width, height) = *table.get(index)?;
+        Some(PageSize::Custom {
+            width: points_from_mm(width),
+            height: points_from_mm(height),
+        })
     }
+
+    /// Parses a size: a name [`PageSize::by_name`] knows, or
+    /// `<width>x<height>` with each length a number in points or with a
+    /// `pt`, `mm`, `cm` or `in` suffix (`612x792`, `210mmx297mm`,
+    /// `8.5inx11in`). `None` for anything else.
+    pub fn parse(text: &str) -> Option<PageSize> {
+        let text = text.trim();
+        if let Some(size) = PageSize::by_name(text) {
+            return Some(size);
+        }
+        let (width, height) = text.split_once(['x', 'X'])?;
+        Some(PageSize::Custom {
+            width: parse_length(width)?,
+            height: parse_length(height)?,
+        })
+    }
+
+    /// What [`PageSize::parse`] accepts, for error messages.
+    pub const ACCEPTED: &'static str = "a name (a0 to a10, b0 to b10, letter, legal, tabloid) \
+        or <width>x<height> in pt, mm, cm or in";
+}
+
+/// ISO 216 A series, `a0` to `a10`, in millimetres.
+const A_SERIES_MM: [(f32, f32); 11] = [
+    (841.0, 1189.0),
+    (594.0, 841.0),
+    (420.0, 594.0),
+    (297.0, 420.0),
+    (210.0, 297.0),
+    (148.0, 210.0),
+    (105.0, 148.0),
+    (74.0, 105.0),
+    (52.0, 74.0),
+    (37.0, 52.0),
+    (26.0, 37.0),
+];
+
+/// ISO 216 B series, `b0` to `b10`, in millimetres.
+const B_SERIES_MM: [(f32, f32); 11] = [
+    (1000.0, 1414.0),
+    (707.0, 1000.0),
+    (500.0, 707.0),
+    (353.0, 500.0),
+    (250.0, 353.0),
+    (176.0, 250.0),
+    (125.0, 176.0),
+    (88.0, 125.0),
+    (62.0, 88.0),
+    (44.0, 62.0),
+    (31.0, 44.0),
+];
+
+fn points_from_mm(mm: f32) -> f32 {
+    mm * 72.0 / 25.4
+}
+
+/// A positive length in points: a bare number, or one suffixed `pt`, `mm`,
+/// `cm` or `in`.
+fn parse_length(text: &str) -> Option<f32> {
+    let text = text.trim();
+    let (number, points_per_unit) = if let Some(number) = text.strip_suffix("mm") {
+        (number, 72.0 / 25.4)
+    } else if let Some(number) = text.strip_suffix("cm") {
+        (number, 72.0 / 2.54)
+    } else if let Some(number) = text.strip_suffix("in") {
+        (number, 72.0)
+    } else if let Some(number) = text.strip_suffix("pt") {
+        (number, 1.0)
+    } else {
+        (text, 1.0)
+    };
+    let value: f32 = number.trim().parse().ok()?;
+    (value.is_finite() && value > 0.0).then_some(value * points_per_unit)
 }
 
 /// The date type of `/CreationDate` and `/ModDate`, shared with the reader
@@ -934,8 +1025,64 @@ mod tests {
 
     #[test]
     fn by_name_rejects_anything_else() {
-        assert_eq!(PageSize::by_name("tabloid"), None);
+        assert_eq!(PageSize::by_name("poster"), None);
         assert_eq!(PageSize::by_name(""), None);
+    }
+
+    fn dims(text: &str) -> (f32, f32) {
+        PageSize::parse(text).expect(text).dimensions()
+    }
+
+    fn close(got: (f32, f32), want: (f32, f32)) -> bool {
+        (got.0 - want.0).abs() < 0.01 && (got.1 - want.1).abs() < 0.01
+    }
+
+    #[test]
+    fn parse_keeps_the_named_variants_and_trims() {
+        assert_eq!(PageSize::parse("A4"), Some(PageSize::A4));
+        assert_eq!(PageSize::parse(" letter "), Some(PageSize::Letter));
+    }
+
+    #[test]
+    fn every_iso_216_size_parses_to_its_millimetres() {
+        assert!(close(dims("a0"), (2383.94, 3370.39)));
+        assert!(close(dims("a1"), (1683.78, 2383.94)));
+        assert!(close(dims("a2"), (1190.55, 1683.78)));
+        assert!(close(dims("a4"), (595.28, 841.89)));
+        assert!(close(dims("a10"), (73.70, 104.88)));
+        assert!(close(dims("b0"), (2834.65, 4008.19)));
+        assert!(close(dims("B5"), (498.90, 708.66)));
+        assert!(close(dims("b10"), (87.87, 124.72)));
+        assert!(close(dims("tabloid"), (792.0, 1224.0)));
+        assert_eq!(PageSize::parse("a11"), None);
+        assert_eq!(PageSize::parse("c4"), None);
+        assert_eq!(PageSize::parse("a"), None);
+    }
+
+    #[test]
+    fn dimensions_parse_in_points_and_with_units() {
+        assert!(close(dims("612x792"), (612.0, 792.0)));
+        assert!(close(dims("612pt X 792pt"), (612.0, 792.0)));
+        assert!(close(dims("210mmx297mm"), (595.28, 841.89)));
+        assert!(close(dims("21cmx29.7cm"), (595.28, 841.89)));
+        assert!(close(dims("8.5inx11in"), (612.0, 792.0)));
+        assert!(close(dims("100x5in"), (100.0, 360.0)));
+    }
+
+    #[test]
+    fn malformed_dimensions_do_not_parse() {
+        for text in [
+            "612",
+            "612x",
+            "x792",
+            "0x792",
+            "-1x5",
+            "ax5",
+            "infx5",
+            "612x792x1",
+        ] {
+            assert_eq!(PageSize::parse(text), None, "{text}");
+        }
     }
 
     #[test]

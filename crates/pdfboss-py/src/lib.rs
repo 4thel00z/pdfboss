@@ -3230,21 +3230,24 @@ impl AsyncSpanIter {
     }
 }
 
-/// Maps the Python `size=` string to a [`pdfboss_markdown::PageSize`],
-/// case-insensitively.
-fn page_size_by_name(size: &str) -> PyResult<pdfboss_markdown::PageSize> {
-    pdfboss_write::PageSize::by_name(size).ok_or_else(|| {
+/// Maps the Python `size=` string to a [`pdfboss_markdown::PageSize`]: a
+/// name (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`,
+/// case-insensitively) or `<width>x<height>` in pt, mm, cm or in.
+fn page_size_from_str(size: &str) -> PyResult<pdfboss_markdown::PageSize> {
+    pdfboss_write::PageSize::parse(size).ok_or_else(|| {
         PdfError::new_err(format!(
-            "unknown page size {size:?}: a3, a4, a5, letter or legal"
+            "unknown page size {size:?}: {}",
+            pdfboss_write::PageSize::ACCEPTED
         ))
     })
 }
 
 /// Composes CommonMark+GFM `markdown` into a themed PDF and returns the
 /// file bytes. `theme` is CSS source text (not a path); omitted, the
-/// built-in default theme applies. `size` names a page size
-/// case-insensitively: a3, a4, a5, letter or legal. `base_dir` anchors
-/// relative image paths and defaults to the current directory.
+/// built-in default theme applies. `size` is a page size name (`a0` to
+/// `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`, case-insensitively)
+/// or `<width>x<height>` in pt, mm, cm or in. `base_dir` anchors relative
+/// image paths and defaults to the current directory.
 ///
 /// Deterministic: the same arguments always produce the same bytes.
 ///
@@ -3265,7 +3268,7 @@ fn md_to_pdf<'py>(
         Some(css) => pdfboss_markdown::Theme::parse(css).map_err(pdf_err)?,
         None => pdfboss_markdown::Theme::default_theme(),
     };
-    let page_size = page_size_by_name(size)?;
+    let page_size = page_size_from_str(size)?;
     let page_size = if landscape {
         page_size.landscape()
     } else {

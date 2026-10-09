@@ -152,7 +152,7 @@ for item in page.content_items():
 
 ## The md submodule
 
-`pdfboss.md.to_pdf(markdown, theme=None, size="a4", landscape=False, base_dir=None)` composes CommonMark+GFM source into a themed PDF and returns the file bytes. `theme` is CSS source text, not a path; an unknown `size` raises `PdfError`; replaced characters and skipped raw HTML surface as one `UserWarning`. Details and examples in [Markdown to PDF](../guide/md-to-pdf.md).
+`pdfboss.md.to_pdf(markdown, theme=None, size="a4", landscape=False, base_dir=None)` composes CommonMark+GFM source into a themed PDF and returns the file bytes. `theme` is CSS source text, not a path; `size` is a page size name (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`) or `<width>x<height>` in pt, mm, cm or in, and an unknown one raises `PdfError`; replaced characters and skipped raw HTML surface as one `UserWarning`. Details and examples in [Markdown to PDF](../guide/md-to-pdf.md).
 
 Canvas-level and element-level creation from Python is the `write` submodule below.
 
