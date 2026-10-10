@@ -4,6 +4,7 @@
 use crate::bidi::{is_mark, reading_order, LogicalText};
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
+use pdfboss_core::{Point, Rect};
 use pdfboss_text::{
     ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardOwner, StandardType,
     StructureElement, TextSpan,
@@ -479,13 +480,183 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
     }
 }
 
+/// The page's blocks. Spans sharing a [`TextSpan::rotate`] are laid out
+/// together in the frame where they read upright, so a table or caption
+/// drawn turned a quarter reads as lines rather than one line per string;
+/// the groups follow one another top to bottom by where they sit on the
+/// page, and each block's box is mapped back to page space. A page without
+/// turned text goes straight to [`upright_page_layout`].
+fn page_layout_with_stats(
+    spans: &[TextSpan],
+    rulings: &[Ruling],
+    stats: &SizeStats,
+    order: ReadingOrder,
+) -> PageLayout {
+    if spans.iter().all(|span| span.rotate == 0) {
+        return upright_page_layout(spans, rulings, stats, order);
+    }
+    let TurnGroups {
+        spans: buckets,
+        areas,
+    } = turn_groups(spans);
+    let owned_by = |ruling: &Ruling| -> usize {
+        (1..4)
+            .find(|&turn| areas[turn].is_some_and(|area| inside(ruling, &area)))
+            .unwrap_or(0)
+    };
+    let mut groups: Vec<(f32, PageLayout)> = buckets
+        .into_iter()
+        .zip(areas)
+        .enumerate()
+        .filter_map(|(turn, (own, area))| Some((turn, own, area?)))
+        .map(|(turn, own, area)| {
+            let rotate = turn as i32 * 90;
+            let lines: Vec<Ruling> = rulings
+                .iter()
+                .filter(|ruling| owned_by(ruling) == turn)
+                .map(|ruling| upright_ruling(ruling, rotate))
+                .collect();
+            let mut layout = upright_page_layout(&own, &lines, stats, order);
+            for block in &mut layout.blocks {
+                let bbox = block_bbox_mut(block);
+                *bbox = page_bbox(bbox, rotate);
+            }
+            (area.y1, layout)
+        })
+        .collect();
+    groups.sort_by(|a, b| b.0.total_cmp(&a.0));
+    PageLayout {
+        blocks: groups
+            .into_iter()
+            .flat_map(|(_, layout)| layout.blocks)
+            .collect(),
+    }
+}
+
+/// A page's spans split by quarter turn, indexed by `rotate / 90`: each
+/// group already in the frame where it reads upright, and the page-space
+/// box around it padded by its largest size, so a border drawn just
+/// outside the text counts as inside. `None` where no span turns that way.
+struct TurnGroups {
+    spans: [Vec<TextSpan>; 4],
+    areas: [Option<Rect>; 4],
+}
+
+/// [`TurnGroups`] in one pass over the spans.
+fn turn_groups(spans: &[TextSpan]) -> TurnGroups {
+    let mut buckets: [Vec<TextSpan>; 4] = Default::default();
+    let mut boxes: [Option<(Rect, f32)>; 4] = [None; 4];
+    for span in spans {
+        let turn = (span.rotate / 90) as usize & 3;
+        boxes[turn] = Some(boxes[turn].map_or((span.bbox, span.size), |(area, pad)| {
+            (area.union(span.bbox), pad.max(span.size))
+        }));
+        buckets[turn].push(upright_span(span));
+    }
+    TurnGroups {
+        spans: buckets,
+        areas: boxes.map(|found| {
+            found.map(|(area, pad)| Rect {
+                x0: area.x0 - pad,
+                y0: area.y0 - pad,
+                x1: area.x1 + pad,
+                y1: area.y1 + pad,
+            })
+        }),
+    }
+}
+
+/// Whether both ends of `ruling` lie in `area`.
+fn inside(ruling: &Ruling, area: &Rect) -> bool {
+    [ruling.start, ruling.end]
+        .iter()
+        .all(|p| (area.x0..=area.x1).contains(&p.x) && (area.y0..=area.y1).contains(&p.y))
+}
+
+/// A page-space point in the frame where text turned by `rotate` reads
+/// upright.
+fn into_upright(rotate: i32, x: f32, y: f32) -> (f32, f32) {
+    match rotate {
+        90 => (y, -x),
+        180 => (-x, -y),
+        270 => (-y, x),
+        _ => (x, y),
+    }
+}
+
+/// A point of the frame [`into_upright`] maps to, back in page space.
+fn out_of_upright(rotate: i32, x: f32, y: f32) -> (f32, f32) {
+    into_upright((360 - rotate) % 360, x, y)
+}
+
+/// `span` in the frame where it reads upright: its baseline runs along x
+/// and its box is rebuilt from the advance and the font's extents. Glyph
+/// starts are page-space x, which a quarter turn does not carry, so a
+/// turned span leaves them out.
+fn upright_span(span: &TextSpan) -> TextSpan {
+    if span.rotate == 0 {
+        return span.clone();
+    }
+    let (x, y) = into_upright(span.rotate, span.x, span.y);
+    let (end_x, end_y) = into_upright(span.rotate, span.end_x, span.end_y);
+    TextSpan {
+        x,
+        y,
+        end_x,
+        end_y,
+        rotate: 0,
+        glyph_x: Box::default(),
+        bbox: Rect {
+            x0: x.min(end_x),
+            y0: y + span.descent,
+            x1: x.max(end_x),
+            y1: y + span.ascent,
+        },
+        ..span.clone()
+    }
+}
+
+/// `ruling` in the frame of text turned by `rotate`, its ends ordered the
+/// way [`Ruling`] states them.
+fn upright_ruling(ruling: &Ruling, rotate: i32) -> Ruling {
+    let (ax, ay) = into_upright(rotate, ruling.start.x, ruling.start.y);
+    let (bx, by) = into_upright(rotate, ruling.end.x, ruling.end.y);
+    Ruling {
+        start: Point::new(ax.min(bx), ay.min(by)),
+        end: Point::new(ax.max(bx), ay.max(by)),
+        width: ruling.width,
+    }
+}
+
+/// The box of a block laid out in the frame of text turned by `rotate`,
+/// back in page space.
+fn page_bbox(bbox: &BBox, rotate: i32) -> BBox {
+    let (ax, ay) = out_of_upright(rotate, bbox.x0, bbox.y0);
+    let (bx, by) = out_of_upright(rotate, bbox.x1, bbox.y1);
+    BBox {
+        x0: ax.min(bx),
+        y0: ay.min(by),
+        x1: ax.max(bx),
+        y1: ay.max(by),
+    }
+}
+
+fn block_bbox_mut(block: &mut Block) -> &mut BBox {
+    match block {
+        Block::Heading { bbox, .. }
+        | Block::Paragraph { bbox, .. }
+        | Block::List { bbox, .. }
+        | Block::Table { bbox, .. } => bbox,
+    }
+}
+
 /// The page's blocks: each reading-order segment's lines classified into
 /// headings and paragraph runs, in order. On a ruling-free layout the
 /// classification is a partition — no line is reordered, merged away, or
 /// dropped — which is what keeps the [`Text`] adapter byte-equal to
 /// positional extraction. A drawn grid's bands merge into logical rows,
 /// which preserves every token but reads cell-major.
-fn page_layout_with_stats(
+fn upright_page_layout(
     spans: &[TextSpan],
     rulings: &[Ruling],
     stats: &SizeStats,
@@ -6058,6 +6229,8 @@ pub(crate) mod tests {
             x,
             y,
             end_x,
+            end_y: y,
+            rotate: 0,
             glyph_x: even_glyph_x(text, x, end_x).into_boxed_slice(),
             size,
             font: "F1".to_string(),
@@ -6448,6 +6621,96 @@ pub(crate) mod tests {
         };
         assert_eq!(*level, 1);
         assert_eq!(line_text(&lines[0]).trim(), "Print against Digital");
+    }
+
+    /// `span`, drawn turned so that it reads upright under `/Rotate rotate`.
+    fn turned(span: TextSpan, rotate: i32) -> TextSpan {
+        let (x, y) = out_of_upright(rotate, span.x, span.y);
+        let (end_x, end_y) = out_of_upright(rotate, span.end_x, span.end_y);
+        let (ax, ay) = out_of_upright(rotate, span.bbox.x0, span.bbox.y0);
+        let (bx, by) = out_of_upright(rotate, span.bbox.x1, span.bbox.y1);
+        TextSpan {
+            x,
+            y,
+            end_x,
+            end_y,
+            rotate,
+            glyph_x: Box::default(),
+            bbox: Rect {
+                x0: ax.min(bx),
+                y0: ay.min(by),
+                x1: ax.max(bx),
+                y1: ay.max(by),
+            },
+            ..span
+        }
+    }
+
+    /// A short table whose cells are separate strings, as an exhibit drawn
+    /// turned on the page shows them.
+    fn exhibit_rows() -> Vec<TextSpan> {
+        let rows = [
+            ["Year", "Cash flow", "Rate"],
+            ["1", "-2,000", "10%"],
+            ["2", "450", "11%"],
+            ["3", "715", "12%"],
+        ];
+        rows.iter()
+            .enumerate()
+            .flat_map(|(row, cells)| {
+                let y = -100.0 - 14.0 * row as f32;
+                cells.iter().enumerate().map(move |(column, cell)| {
+                    let x = 100.0 + 120.0 * column as f32;
+                    span(cell, x, x + 6.0 * cell.len() as f32, y, 11.0)
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turned_text_reads_as_lines_in_its_own_frame() {
+        let upright = layout(&exhibit_rows(), ReadingOrder::Content);
+        for rotate in [90, 180, 270] {
+            let spans: Vec<TextSpan> = exhibit_rows()
+                .into_iter()
+                .map(|s| turned(s, rotate))
+                .collect();
+            assert_eq!(
+                layout(&spans, ReadingOrder::Content),
+                upright,
+                "rotate {rotate}"
+            );
+        }
+        assert!(
+            upright.starts_with("Year Cash flow Rate\n1 -2,000 10%"),
+            "{upright}"
+        );
+    }
+
+    /// An upright caption above a turned exhibit comes first; the
+    /// exhibit's block box is mapped back to where it sits on the page.
+    #[test]
+    fn turned_groups_follow_page_order_with_page_space_boxes() {
+        let mut spans = vec![span("Exhibit 5.2b", 72.0, 140.0, 740.0, 12.0)];
+        spans.extend(exhibit_rows().into_iter().map(|s| turned(s, 90)));
+        let page = page_layout(&spans, ReadingOrder::Content);
+        let text = Text.render(std::slice::from_ref(&page));
+        assert!(
+            text.starts_with("Exhibit 5.2b\nYear Cash flow Rate\n"),
+            "{text}"
+        );
+        let area = turn_groups(&spans).areas[1].expect("the exhibit is turned");
+        for block in &page.blocks[1..] {
+            let bbox = block_bbox(block);
+            assert!(
+                bbox.x0 >= area.x0 && bbox.x1 <= area.x1,
+                "{bbox:?} outside {area:?}"
+            );
+            assert!(
+                bbox.y0 >= area.y0 && bbox.y1 <= area.y1,
+                "{bbox:?} outside {area:?}"
+            );
+        }
     }
 
     /// A page whose stray far-down lines (a widowed word, a footer) skew

@@ -26,6 +26,8 @@ pub struct Inline {
 
 /// One visual line. The geometry travels with it because later structure
 /// passes — lists, tables, page headers and footers — classify lines by it.
+/// A line of text turned a quarter on the page keeps the coordinates of the
+/// frame where that text reads upright; its block's `bbox` is in page space.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Line {
     pub inlines: Vec<Inline>,
