@@ -1,8 +1,8 @@
 # Benchmarks
 
-Eight scripts, because opening, rendering, scanned PDFs, rendering
-*quality*, parallel throughput, malformed PDFs, memory and non-Latin corpora
-are different workloads — plus two
+Nine scripts, because opening, rendering, scanned PDFs, rendering
+*quality*, parallel throughput, malformed PDFs, memory, non-Latin corpora and
+async iteration are different workloads — plus two
 extraction-quality suites (`olmocr/`, `parsebench/`), because speed means
 nothing if the output is wrong.
 
@@ -59,6 +59,11 @@ benchmarks do not cover: CJK, Arabic and academic PDFs fetched by the scripts
 under `corpora/`. Per corpus and engine it records open rate, text-extraction
 non-crash rate, the per-document U+FFFD replacement-character rate, markdown
 non-crash rate and a first-page ink check.
+
+`bench_async_elements.py` measures what one `await` costs.
+`AsyncDocument.elements` and `AsyncDocument.spans` hand Python one item per
+`await`; the sync iterators hand it over with a plain call. The script walks
+the same generated document both ways and reports microseconds per item.
 
 ## Libraries
 
@@ -301,6 +306,24 @@ published yet.
   on a shared machine under concurrent load; co-resident processes can shift
   them a few percent through allocator and page-cache pressure.
 
+## Method — async iteration
+
+- One synthetic PDF built in-process with `pdfboss.write`: `--pages` pages
+  (default 500), each with a line of text, a 16 px image and `--links` link
+  annotations (default 60). No files are read or written.
+- The same document and the same 0-based `pages` list go to four walks:
+  `Document.elements(physical=False, pages=...)` with `for`,
+  `AsyncDocument.elements(...)` with `async for`, and the same pair for
+  `spans(pages)`. A fifth row awaits `asyncio.sleep(0)` as many times as the
+  async element walk yielded, which is the event loop's own cost per `await`
+  with no pdfboss work.
+- Each walk runs `--repeat` times (default 3) and the best time is kept. The
+  loop body only counts items, so the numbers are iteration cost, not the
+  cost of using an element.
+- `--json` prints the numbers instead of the table. Nothing is written to
+  `results-*.json`: the run is pdfboss against itself, not against other
+  engines.
+
 ## Method — diversity
 
 - Per corpus directory, every engine (pdfboss, PyMuPDF, pypdfium2,
@@ -378,6 +401,7 @@ python benchmarks/bench_parallel.py text /path/to/pdfs --sample 40 --repeat 3
 benchmarks/fetch_stress_corpus.sh /outside/repo/stress-corpus   # ~460 MB once
 python benchmarks/bench_robustness.py /outside/repo/stress-corpus --sample 2000
 python benchmarks/bench_memory.py     /path/to/pdfs --sample 40 --pages 10 --scale 2.0
+python benchmarks/bench_async_elements.py --pages 500 --links 60 --repeat 3
 
 # diversity corpora live OUTSIDE the repo; see the licensing tiers above
 benchmarks/corpora/fetch_cjk.sh      ~/corpora/cjk
