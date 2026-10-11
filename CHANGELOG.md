@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.14.0](https://github.com/4thel00z/pdfboss/compare/v2.13.2...v2.14.0) (2026-10-11)
+
+
+### Features
+
+* **layout:** expose layout blocks to Python with tunable thresholds ([#252](https://github.com/4thel00z/pdfboss/issues/252)) ([b3386ea](https://github.com/4thel00z/pdfboss/commit/b3386ea48223fd22d79224e0beef95c6d0ef152c))
+
+
+### Performance Improvements
+
+* **py:** batch async element and span iteration across the Rust boundary ([#255](https://github.com/4thel00z/pdfboss/issues/255)) ([eab6f6a](https://github.com/4thel00z/pdfboss/commit/eab6f6a66715a026a7fd0e6c0e4a86a754f58901))
+
 ## [2.13.2](https://github.com/4thel00z/pdfboss/compare/v2.13.1...v2.13.2) (2026-10-11)
 
 
