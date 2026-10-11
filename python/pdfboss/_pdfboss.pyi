@@ -65,8 +65,12 @@ class ElementIter:
         may be continued (salvage semantics)."""
 
 class AsyncElementIter:
-    """Async iterator over elements; each ``__anext__`` is a coroutine
-    driving the underlying stream, so the event loop is never blocked."""
+    """Async iterator over elements. The stream runs on a Rust runtime, so
+    the event loop is never blocked. Elements cross to Python in batches:
+    one refill takes the next element plus every further one the stream
+    has ready, and ``__anext__`` hands buffered elements over without
+    suspending. A cancelled ``__anext__`` takes nothing, so no element is
+    lost; an exhausted iterator keeps raising ``StopAsyncIteration``."""
 
     def __aiter__(self) -> "AsyncElementIter":
         """Returns the iterator itself."""
@@ -289,8 +293,11 @@ class SpanIter:
         exhausted, ``PdfError`` when a page cannot be materialized."""
 
 class AsyncSpanIter:
-    """Async iterator over a document's styled spans; each ``__anext__``
-    is a coroutine, so the event loop is never blocked."""
+    """Async iterator over a document's styled spans. Each refill extracts
+    one page on a Rust runtime, so the event loop is never blocked, and
+    ``__anext__`` hands that page's spans over without suspending. A
+    cancelled ``__anext__`` loses no span; an exhausted iterator keeps
+    raising ``StopAsyncIteration``."""
 
     def __aiter__(self) -> "AsyncSpanIter":
         """Returns the iterator itself."""
