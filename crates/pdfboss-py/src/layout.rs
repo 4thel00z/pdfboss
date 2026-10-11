@@ -140,8 +140,17 @@ impl LayoutListItem {
 
 impl LayoutListItem {
     fn of(item: &ListItem) -> LayoutListItem {
-        let mut lines = item.lines.iter().map(line_text);
-        let first = lines.next().unwrap_or_default();
+        let first: String = item
+            .lines
+            .first()
+            .map(|line| {
+                line.inlines
+                    .iter()
+                    .map(|inline| inline.text.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let lines = item.lines.iter().skip(1).map(line_text);
         let marker: String = first.chars().take(item.marker_len).collect();
         let rest: String = first.chars().skip(item.marker_len).collect();
         let text: Vec<String> = std::iter::once(rest.trim().to_string())
@@ -284,4 +293,43 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<LayoutListItem>()?;
     module.add_class::<LayoutCell>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LayoutListItem;
+    use pdfboss_output::{BBox, Inline, Line, ListItem, Marker};
+
+    fn line(text: &str) -> Line {
+        Line {
+            inlines: vec![Inline {
+                text: text.to_string(),
+                bold: false,
+                italic: false,
+                code: false,
+            }],
+            y: 0.0,
+            x: 0.0,
+            end_x: 0.0,
+            size: 10.0,
+        }
+    }
+
+    #[test]
+    fn an_indented_item_keeps_its_marker_and_text() {
+        let item = ListItem {
+            marker: Marker::Bullet,
+            marker_len: 4,
+            lines: vec![line("  - item"), line("   wrapped ")],
+            bbox: BBox {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 1.0,
+                y1: 1.0,
+            },
+        };
+        let python = LayoutListItem::of(&item);
+        assert_eq!(python.marker, "-");
+        assert_eq!(python.text, "item\nwrapped");
+    }
 }
