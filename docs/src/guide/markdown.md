@@ -99,6 +99,42 @@ page_md = doc[3].extract_markdown()     # one page, headings ranked per page
 `Document.extract_markdown` extracts the pages in parallel and releases the GIL,
 like `extract_text`.
 
+### Layout blocks
+
+`layout` returns the structure the Markdown is rendered from instead of the
+text: per page, a list of `LayoutBlock` objects in reading order, each with its
+`kind` (`"heading"`, `"paragraph"`, `"list"`, `"table"`), its `bbox` in PDF user
+space (y-up, like `Span.bbox`), its plain `text`, a heading's `level`, a
+paragraph's `role` (`"body"`, `"quote"`, `"page_header"`, `"page_footer"`), a
+list's `items` (each with its own `marker`, `text` and `bbox`) and a table's
+`rows` of cells.
+
+```python
+for page in doc.layout():               # every page, headings ranked globally
+    for block in page:
+        print(block.kind, block.bbox, block.text[:40])
+
+blocks = doc[3].layout()                # one page, headings ranked per page
+first_two = doc.layout(pages=[0, 1])    # document-wide ranking, two pages returned
+```
+
+The thresholds that cut the blocks are keyword arguments, defaulting to the
+values `extract_markdown` uses. Callers that need block boxes cut differently
+tune them per call:
+
+```python
+blocks = doc.layout(
+    paragraph_gap=1.6,                  # break paragraphs at 1.6 line pitches
+    paragraph_pitch="lower_half_median",  # pitch from the tighter half of the steps
+    header_footer_min_pages=2,
+)
+```
+
+The stubs list every keyword with its default and meaning. `AsyncDocument.layout`
+and `AsyncPage.layout` are the coroutine twins. In Rust the same blocks come from
+`extract_layout_opts` and `extract_page_layout_opts`, the thresholds from
+`LayoutOptions`.
+
 ## Rust
 
 Whole document, with `pdfboss_output::extract_markdown`:

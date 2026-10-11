@@ -4,10 +4,109 @@
 use crate::bidi::{is_mark, reading_order, LogicalText};
 use crate::ir::{BBox, Block, Cell, Inline, Line, ListItem, Marker, PageLayout, Role};
 use crate::output::{line_text, Output, Text};
+use pdfboss_core::{Point, Rect};
 use pdfboss_text::{
     ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardOwner, StandardType,
     StructureElement, TextSpan,
 };
+
+/// The thresholds the layout pass segments a page by. `Default` holds the
+/// values every `extract_*` entry uses; callers that need block boxes cut
+/// differently tune them through [`page_layout_opts`] and
+/// [`document_layout_opts`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayoutOptions {
+    /// A span whose baseline falls outside the line's tolerance still joins
+    /// the line when its nominal vertical extent overlaps the line's by this
+    /// fraction of the smaller height: a superscript or subscript, never a
+    /// fraction's numerator or denominator.
+    pub line_overlap: f32,
+    /// A baseline step beyond this multiple of a run's line pitch is white
+    /// space between paragraphs rather than leading inside one.
+    pub paragraph_gap: f32,
+    /// How a run's line pitch is measured for [`Self::paragraph_gap`].
+    pub paragraph_pitch: Pitch,
+    /// Downward steps [`Pitch::LowerHalfMedian`] needs before it measures
+    /// the pitch from them rather than from the median line size.
+    pub min_pitch_steps: usize,
+    /// A baseline rising by more than this multiple of the line size between
+    /// consecutive spans opens a new content-order flow: the jump from a
+    /// column's foot to the next column's head, never a fraction's numerator
+    /// a line above the text it follows.
+    pub flow_step_up: f32,
+    /// A baseline rising by more than this multiple of the line size also
+    /// opens a flow when the span lands more than [`Self::flow_step_aside`]
+    /// sizes to the side of the one before it: the first line of a caption
+    /// or column set beside the block just written, where a numerator or a
+    /// stacked limit stays over the text it belongs to.
+    pub flow_line_up: f32,
+    /// The sideways displacement, in line sizes, that [`Self::flow_line_up`]
+    /// pairs with.
+    pub flow_step_aside: f32,
+    /// How far above body size a size bucket must sit before it reads as a
+    /// heading rather than as emphasis or a stray measurement.
+    pub heading_min_delta: f32,
+    /// A heading names a section, so it is short. Past this many characters
+    /// the large type is a pull quote, a caption, or ordinary prose one
+    /// bucket up.
+    pub heading_max_chars: usize,
+    /// A wholly bold body-size line this short reads as a title; anything
+    /// longer is a sentence that happens to be bold.
+    pub bold_heading_max_chars: usize,
+    /// Consecutive heading lines of one size stay one heading while their
+    /// baseline step is within this multiple of the line size.
+    pub heading_merge_step: f32,
+    /// A candidate list must total at least this many lines to become a
+    /// [`Block::List`]. Below it, the lone marker line is a stray dash or
+    /// bullet-shaped glyph sitting in running prose.
+    pub list_min_lines: usize,
+    /// How far right of its item's marker line a following non-marker line
+    /// must start, in multiples of the item's size, to read as that item's
+    /// wrapped continuation rather than the next block.
+    pub list_continuation_indent: f32,
+    /// A lone top line set in the body's own type still reads as the page's
+    /// title when the gap under it reaches this multiple of the paragraph's
+    /// own line pitch.
+    pub page_title_min_gap: f32,
+    /// Minimum pages before a repeated edge line reads as a running header
+    /// or footer rather than coincidence.
+    pub header_footer_min_pages: usize,
+}
+
+impl Default for LayoutOptions {
+    fn default() -> Self {
+        LayoutOptions {
+            line_overlap: 0.5,
+            paragraph_gap: 1.8,
+            paragraph_pitch: Pitch::Median,
+            min_pitch_steps: 4,
+            flow_step_up: 2.0,
+            flow_line_up: 1.0,
+            flow_step_aside: 2.0,
+            heading_min_delta: 1.0,
+            heading_max_chars: 120,
+            bold_heading_max_chars: 72,
+            heading_merge_step: 1.8,
+            list_min_lines: 2,
+            list_continuation_indent: 0.5,
+            page_title_min_gap: 1.5,
+            header_footer_min_pages: 3,
+        }
+    }
+}
+
+/// How a paragraph run's line pitch is measured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pitch {
+    /// The median baseline step between consecutive lines.
+    #[default]
+    Median,
+    /// The median of the smaller half of the downward steps, so paragraph
+    /// breaks and column returns cannot pull it up on short or heavily
+    /// broken runs; the median line size when there are fewer than
+    /// [`LayoutOptions::min_pitch_steps`] steps.
+    LowerHalfMedian,
+}
 
 /// Fraction of the device font size a horizontal gap must exceed to read
 /// as a word break. The ceiling is justified LaTeX's shrunk inter-word
@@ -25,11 +124,6 @@ const CELL_GAP: f32 = 1.0;
 /// single space glyph gluing two words: a space is a quarter to a third of
 /// an em, and two of them are already a producer's padding.
 const GLUE_SPACE: f32 = 0.4;
-/// A span whose baseline falls outside the line's tolerance still joins the
-/// line when its nominal vertical extent overlaps the line's by this
-/// fraction of the smaller height: a superscript or subscript, never a
-/// fraction's numerator or denominator.
-const LINE_OVERLAP: f32 = 0.5;
 
 /// Minimum column-candidate spans on a page before a gutter is looked for.
 const COLUMN_MIN_SPANS: usize = 40;
@@ -59,66 +153,25 @@ const GUTTER_BINS: usize = 128;
 /// it a gutter: a running header, a page number, a heading over both
 /// columns.
 const GUTTER_MAX_CROSSING: f32 = 0.1;
-/// A baseline rising by more than this multiple of the line size between
-/// consecutive spans opens a new content-order flow: the jump from a
-/// column's foot to the next column's head, never a fraction's numerator a
-/// line above the text it follows.
-const FLOW_STEP_UP: f32 = 2.0;
-/// A baseline rising by more than this multiple of the line size also opens
-/// a flow when the span lands more than [`FLOW_STEP_ASIDE`] sizes to the
-/// side of the one before it: the first line of a caption or column set
-/// beside the block just written, where a numerator or a stacked limit
-/// stays over the text it belongs to.
-const FLOW_LINE_UP: f32 = 1.0;
-const FLOW_STEP_ASIDE: f32 = 2.0;
 /// When more than this fraction of a page's text sits in single-line flows,
 /// the stream was not written in reading order and the page is ordered by
 /// geometry alone.
 const FLOW_FRAGMENT_FRACTION: f32 = 0.5;
 
-/// How far above body size a size bucket must sit before it reads as a
-/// heading rather than as emphasis or a stray measurement.
-const HEADING_MIN_DELTA: f32 = 1.0;
 /// ATX headings stop at six `#`.
 const HEADING_MAX_LEVEL: u8 = 6;
-/// A wholly bold body-size line this short reads as a title; anything
-/// longer is a sentence that happens to be bold.
-const BOLD_HEADING_MAX_CHARS: usize = 72;
-/// A heading names a section, so it is short. Past this many characters the
-/// large type is a pull quote, a caption, or — on a page whose body size the
-/// character histogram read off a dense table — ordinary prose one bucket up.
-const HEADING_MAX_CHARS: usize = 120;
-/// A lone top line set in the body's own type still reads as the page's
-/// title when white space sets it apart: the gap under it must reach this
-/// multiple of the paragraph's own line pitch.
-const PAGE_TITLE_MIN_GAP: f32 = 1.5;
 /// ...and the line must stay narrower than this fraction of the page's
 /// text width — a full-measure line is prose, however isolated.
 const PAGE_TITLE_MAX_WIDTH: f32 = 0.7;
 /// Titles name, they do not explain: past this many words the line is a
 /// sentence set off for some other reason.
 const PAGE_TITLE_MAX_WORDS: usize = 10;
-/// A baseline step beyond this multiple of a run's median step is white
-/// space between paragraphs rather than leading inside one.
-const PARAGRAPH_GAP: f32 = 1.8;
-/// Consecutive heading lines of one size stay one heading while their
-/// baseline step is within this multiple of the line size.
-const HEADING_MERGE_STEP: f32 = 1.8;
 
 /// The glyphs PDFs draw list bullets with: filled dot, hollow dot, square,
 /// en dash, hyphen, asterisk.
 const BULLETS: &[char] = &[
     '\u{2022}', '\u{25CF}', '\u{25E6}', '\u{25AA}', '\u{2013}', '-', '*',
 ];
-/// A candidate list must total at least this many lines — an item plus a
-/// second item, or an item plus one folded continuation — to become a
-/// [`Block::List`]. Below it, the lone marker line is a stray dash or
-/// bullet-shaped glyph sitting in running prose.
-const LIST_MIN_LINES: usize = 2;
-/// How far right of its item's marker line a following non-marker line
-/// must start, in multiples of the item's size, to read as that item's
-/// wrapped continuation rather than the next block.
-const LIST_CONTINUATION_INDENT: f32 = 0.5;
 
 /// A grid needs a lane between every pair of cell columns, so two lanes —
 /// three cell columns — is the narrowest band that reads as a table. One
@@ -158,10 +211,6 @@ const BAND_INFER_MIN_LINES: usize = 4;
 /// than a drawn border box does.
 const RULED_BOXED_MIN_ROWS: usize = 2;
 
-/// Minimum pages before a repeated edge line reads as a running line rather than
-/// coincidence: two documents opening with the same word is unremarkable,
-/// three or more sharing a whole line is not.
-const HEADER_FOOTER_MIN_PAGES: usize = 3;
 /// How close two occurrences' baselines must sit to read as the same running
 /// line rather than two different ones that happen to match text.
 const HEADER_FOOTER_Y_TOLERANCE: f32 = 2.0;
@@ -197,9 +246,19 @@ pub fn page_layout_with_rulings(
     rulings: &[Ruling],
     order: ReadingOrder,
 ) -> PageLayout {
-    let stats = size_stats(&[spans]);
-    let mut layout = page_layout_with_stats(spans, rulings, &stats, order);
-    promote_page_title(&mut layout.blocks, &stats);
+    page_layout_opts(spans, rulings, order, &LayoutOptions::default())
+}
+
+/// [`page_layout_with_rulings`] under the thresholds `options` sets.
+pub fn page_layout_opts(
+    spans: &[TextSpan],
+    rulings: &[Ruling],
+    order: ReadingOrder,
+    options: &LayoutOptions,
+) -> PageLayout {
+    let stats = size_stats(&[spans], options);
+    let mut layout = page_layout_with_stats(spans, rulings, &stats, order, options);
+    promote_page_title(&mut layout.blocks, &stats, options);
     layout
 }
 
@@ -212,7 +271,7 @@ pub fn document_layout(pages: &[(Vec<TextSpan>, ReadingOrder)]) -> Vec<PageLayou
         .iter()
         .map(|(spans, order)| (spans.as_slice(), &[][..], *order))
         .collect();
-    layouts_of(&paired)
+    layouts_of(&paired, &LayoutOptions::default())
 }
 
 /// [`document_layout`] with each page's rulings, so drawn grids become
@@ -224,26 +283,45 @@ pub fn document_layout_with_rulings(
         .iter()
         .map(|(spans, rulings, order)| (spans.as_slice(), rulings.as_slice(), *order))
         .collect();
-    layouts_of(&paired)
+    layouts_of(&paired, &LayoutOptions::default())
+}
+
+/// [`document_layout_with_rulings`] under the thresholds `options` sets.
+pub fn document_layout_opts(
+    pages: &[(Vec<TextSpan>, Vec<Ruling>, ReadingOrder)],
+    options: &LayoutOptions,
+) -> Vec<PageLayout> {
+    let paired: Vec<(&[TextSpan], &[Ruling], ReadingOrder)> = pages
+        .iter()
+        .map(|(spans, rulings, order)| (spans.as_slice(), rulings.as_slice(), *order))
+        .collect();
+    layouts_of(&paired, options)
 }
 
 /// Every page's layout over shared document-wide size statistics.
-fn layouts_of(pages: &[(&[TextSpan], &[Ruling], ReadingOrder)]) -> Vec<PageLayout> {
+fn layouts_of(
+    pages: &[(&[TextSpan], &[Ruling], ReadingOrder)],
+    options: &LayoutOptions,
+) -> Vec<PageLayout> {
     let borrowed: Vec<&[TextSpan]> = pages.iter().map(|(spans, _, _)| *spans).collect();
-    let stats = size_stats(&borrowed);
+    let stats = size_stats(&borrowed, options);
     let layouts = on_workers(pages.len(), |index| {
         let (spans, rulings, order) = pages[index];
-        page_layout_with_stats(spans, rulings, &stats, order)
+        page_layout_with_stats(spans, rulings, &stats, order, options)
     });
-    finished(layouts, &stats)
+    finished(layouts, &stats, options)
 }
 
 /// The page layouts with the document-wide passes applied: the page roles
 /// tagged across pages, and each page's title promoted.
-fn finished(mut layouts: Vec<PageLayout>, stats: &SizeStats) -> Vec<PageLayout> {
-    tag_page_roles(&mut layouts);
+fn finished(
+    mut layouts: Vec<PageLayout>,
+    stats: &SizeStats,
+    options: &LayoutOptions,
+) -> Vec<PageLayout> {
+    tag_page_roles(&mut layouts, options);
     for layout in &mut layouts {
-        promote_page_title(&mut layout.blocks, stats);
+        promote_page_title(&mut layout.blocks, stats, options);
     }
     layouts
 }
@@ -294,14 +372,15 @@ fn on_workers<T: Send + Sync>(count: usize, work: impl Fn(usize) -> T + Sync) ->
         .collect()
 }
 
-/// Tags page headers and footers: a page's first or last line, repeated near-verbatim
-/// at the same baseline across enough pages, is split out of whatever
-/// paragraph it was assembled into and marked `PageHeader`/`PageFooter`; a
-/// line that is nothing but a page number is tagged on its own, with no
-/// repetition required. Needs at least [`HEADER_FOOTER_MIN_PAGES`] pages —
-/// below that, a repeat is coincidence as often as a real running line.
-fn tag_page_roles(layouts: &mut [PageLayout]) {
-    if layouts.len() < HEADER_FOOTER_MIN_PAGES {
+/// Tags page headers and footers: a page's first or last line, repeated
+/// near-verbatim at the same baseline across enough pages, is split out of
+/// whatever paragraph it was assembled into and marked
+/// `PageHeader`/`PageFooter`; a line that is nothing but a page number is
+/// tagged on its own, with no repetition required. Needs at least
+/// [`LayoutOptions::header_footer_min_pages`] pages — below that, a repeat is
+/// coincidence as often as a real running line.
+fn tag_page_roles(layouts: &mut [PageLayout], options: &LayoutOptions) {
+    if layouts.len() < options.header_footer_min_pages {
         return;
     }
     let top: Vec<Option<(String, f32)>> = layouts
@@ -312,8 +391,8 @@ fn tag_page_roles(layouts: &mut [PageLayout]) {
         .iter()
         .map(|layout| edge_line(layout, false))
         .collect();
-    let headers = header_footer_pages(&top);
-    let footers = header_footer_pages(&bottom);
+    let headers = header_footer_pages(&top, options);
+    let footers = header_footer_pages(&bottom, options);
     for (index, layout) in layouts.iter_mut().enumerate() {
         // Footer first: on a one-block page that qualifies as both, the
         // block can only be split once, and the first split wins.
@@ -348,10 +427,10 @@ fn edge_line(layout: &PageLayout, top: bool) -> Option<(String, f32)> {
 
 /// Which pages' edge-line candidates should be tagged header/footer: repetition
 /// of the same normalized text at a close enough baseline on at least
-/// `max(HEADER_FOOTER_MIN_PAGES, pages / 2)` pages, or — with no repetition
+/// `max(header_footer_min_pages, pages / 2)` pages, or — with no repetition
 /// required — a line that is nothing but a page number.
-fn header_footer_pages(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
-    let mut tagged = repeated_lines(candidates);
+fn header_footer_pages(candidates: &[Option<(String, f32)>], options: &LayoutOptions) -> Vec<bool> {
+    let mut tagged = repeated_lines(candidates, options);
     for (index, candidate) in candidates.iter().enumerate() {
         let Some((text, _)) = candidate else { continue };
         tagged[index] |= looks_like_page_number(text);
@@ -361,8 +440,8 @@ fn header_footer_pages(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
 
 /// Pages whose edge line's normalized text repeats, at a close enough
 /// baseline, on enough other pages.
-fn repeated_lines(candidates: &[Option<(String, f32)>]) -> Vec<bool> {
-    let threshold = (candidates.len() / 2).max(HEADER_FOOTER_MIN_PAGES);
+fn repeated_lines(candidates: &[Option<(String, f32)>], options: &LayoutOptions) -> Vec<bool> {
+    let threshold = (candidates.len() / 2).max(options.header_footer_min_pages);
     let mut groups: std::collections::BTreeMap<&str, Vec<(usize, f32)>> =
         std::collections::BTreeMap::new();
     for (index, candidate) in candidates.iter().enumerate() {
@@ -479,17 +558,194 @@ fn split_edge(layout: &mut PageLayout, top: bool, role: Role) {
     }
 }
 
+/// The page's blocks. Spans sharing a [`TextSpan::rotate`] are laid out
+/// together in the frame where they read upright, so a table or caption
+/// drawn turned a quarter reads as lines rather than one line per string;
+/// the groups follow one another top to bottom by where they sit on the
+/// page, and each block's box is mapped back to page space. A page without
+/// turned text goes straight to [`upright_page_layout`].
+fn page_layout_with_stats(
+    spans: &[TextSpan],
+    rulings: &[Ruling],
+    stats: &SizeStats,
+    order: ReadingOrder,
+    options: &LayoutOptions,
+) -> PageLayout {
+    if spans.iter().all(|span| span.rotate == 0) {
+        return upright_page_layout(spans, rulings, stats, order, options);
+    }
+    let TurnGroups {
+        spans: buckets,
+        areas,
+    } = turn_groups(spans);
+    let owned_by = |ruling: &Ruling| -> usize {
+        (1..4)
+            .find(|&turn| areas[turn].is_some_and(|area| inside(ruling, &area)))
+            .unwrap_or(0)
+    };
+    let mut groups: Vec<(f32, PageLayout)> = buckets
+        .into_iter()
+        .zip(areas)
+        .enumerate()
+        .filter_map(|(turn, (own, area))| Some((turn, own, area?)))
+        .map(|(turn, own, area)| {
+            let rotate = turn as i32 * 90;
+            let lines: Vec<Ruling> = rulings
+                .iter()
+                .filter(|ruling| owned_by(ruling) == turn)
+                .map(|ruling| upright_ruling(ruling, rotate))
+                .collect();
+            let mut layout = upright_page_layout(&own, &lines, stats, order, options);
+            for block in &mut layout.blocks {
+                if let Block::List { items, .. } = block {
+                    for item in items {
+                        item.bbox = page_bbox(&item.bbox, rotate);
+                    }
+                }
+                let bbox = block_bbox_mut(block);
+                *bbox = page_bbox(bbox, rotate);
+            }
+            (area.y1, layout)
+        })
+        .collect();
+    groups.sort_by(|a, b| b.0.total_cmp(&a.0));
+    PageLayout {
+        blocks: groups
+            .into_iter()
+            .flat_map(|(_, layout)| layout.blocks)
+            .collect(),
+    }
+}
+
+/// A page's spans split by quarter turn, indexed by `rotate / 90`: each
+/// group already in the frame where it reads upright, and the page-space
+/// box around it padded by its largest size, so a border drawn just
+/// outside the text counts as inside. `None` where no span turns that way.
+struct TurnGroups {
+    spans: [Vec<TextSpan>; 4],
+    areas: [Option<Rect>; 4],
+}
+
+/// [`TurnGroups`] in one pass over the spans.
+fn turn_groups(spans: &[TextSpan]) -> TurnGroups {
+    let mut buckets: [Vec<TextSpan>; 4] = Default::default();
+    let mut boxes: [Option<(Rect, f32)>; 4] = [None; 4];
+    for span in spans {
+        let turn = (span.rotate / 90) as usize & 3;
+        boxes[turn] = Some(boxes[turn].map_or((span.bbox, span.size), |(area, pad)| {
+            (area.union(span.bbox), pad.max(span.size))
+        }));
+        buckets[turn].push(upright_span(span));
+    }
+    TurnGroups {
+        spans: buckets,
+        areas: boxes.map(|found| {
+            found.map(|(area, pad)| Rect {
+                x0: area.x0 - pad,
+                y0: area.y0 - pad,
+                x1: area.x1 + pad,
+                y1: area.y1 + pad,
+            })
+        }),
+    }
+}
+
+/// Whether both ends of `ruling` lie in `area`.
+fn inside(ruling: &Ruling, area: &Rect) -> bool {
+    [ruling.start, ruling.end]
+        .iter()
+        .all(|p| (area.x0..=area.x1).contains(&p.x) && (area.y0..=area.y1).contains(&p.y))
+}
+
+/// A page-space point in the frame where text turned by `rotate` reads
+/// upright.
+fn into_upright(rotate: i32, x: f32, y: f32) -> (f32, f32) {
+    match rotate {
+        90 => (y, -x),
+        180 => (-x, -y),
+        270 => (-y, x),
+        _ => (x, y),
+    }
+}
+
+/// A point of the frame [`into_upright`] maps to, back in page space.
+fn out_of_upright(rotate: i32, x: f32, y: f32) -> (f32, f32) {
+    into_upright((360 - rotate) % 360, x, y)
+}
+
+/// `span` in the frame where it reads upright: its baseline runs along x
+/// and its box is rebuilt from the advance and the font's extents. Glyph
+/// starts are page-space x, which a quarter turn does not carry, so a
+/// turned span leaves them out.
+fn upright_span(span: &TextSpan) -> TextSpan {
+    if span.rotate == 0 {
+        return span.clone();
+    }
+    let (x, y) = into_upright(span.rotate, span.x, span.y);
+    let (end_x, end_y) = into_upright(span.rotate, span.end_x, span.end_y);
+    TextSpan {
+        x,
+        y,
+        end_x,
+        end_y,
+        rotate: 0,
+        glyph_x: Box::default(),
+        bbox: Rect {
+            x0: x.min(end_x),
+            y0: y + span.descent,
+            x1: x.max(end_x),
+            y1: y + span.ascent,
+        },
+        ..span.clone()
+    }
+}
+
+/// `ruling` in the frame of text turned by `rotate`, its ends ordered the
+/// way [`Ruling`] states them.
+fn upright_ruling(ruling: &Ruling, rotate: i32) -> Ruling {
+    let (ax, ay) = into_upright(rotate, ruling.start.x, ruling.start.y);
+    let (bx, by) = into_upright(rotate, ruling.end.x, ruling.end.y);
+    Ruling {
+        start: Point::new(ax.min(bx), ay.min(by)),
+        end: Point::new(ax.max(bx), ay.max(by)),
+        width: ruling.width,
+    }
+}
+
+/// The box of a block laid out in the frame of text turned by `rotate`,
+/// back in page space.
+fn page_bbox(bbox: &BBox, rotate: i32) -> BBox {
+    let (ax, ay) = out_of_upright(rotate, bbox.x0, bbox.y0);
+    let (bx, by) = out_of_upright(rotate, bbox.x1, bbox.y1);
+    BBox {
+        x0: ax.min(bx),
+        y0: ay.min(by),
+        x1: ax.max(bx),
+        y1: ay.max(by),
+    }
+}
+
+fn block_bbox_mut(block: &mut Block) -> &mut BBox {
+    match block {
+        Block::Heading { bbox, .. }
+        | Block::Paragraph { bbox, .. }
+        | Block::List { bbox, .. }
+        | Block::Table { bbox, .. } => bbox,
+    }
+}
+
 /// The page's blocks: each reading-order segment's lines classified into
 /// headings and paragraph runs, in order. On a ruling-free layout the
 /// classification is a partition — no line is reordered, merged away, or
 /// dropped — which is what keeps the [`Text`] adapter byte-equal to
 /// positional extraction. A drawn grid's bands merge into logical rows,
 /// which preserves every token but reads cell-major.
-fn page_layout_with_stats(
+fn upright_page_layout(
     spans: &[TextSpan],
     rulings: &[Ruling],
     stats: &SizeStats,
     order: ReadingOrder,
+    options: &LayoutOptions,
 ) -> PageLayout {
     let snap = ruling_snap(spans, rulings);
     let ruled = ruled_grids(rulings, snap);
@@ -522,16 +778,25 @@ fn page_layout_with_stats(
         &body
     };
     let parts = match order {
-        ReadingOrder::Content => segments_with_grids(content, &hulls),
-        _ => segments(content, order),
+        ReadingOrder::Content => segments_with_grids(content, &hulls, options),
+        _ => segments(content, order, options),
     };
     for segment in parts {
-        push_segment_blocks(segment, &grids, &hulls, snap, stats, order, &mut blocks);
+        push_segment_blocks(
+            segment,
+            &grids,
+            &hulls,
+            snap,
+            stats,
+            order,
+            options,
+            &mut blocks,
+        );
     }
     demote_heading_runs(&mut blocks);
     demote_contents_entries(&mut blocks);
     if !pagination.is_empty() {
-        attach_pagination_artifacts(spans, &pagination, order, &mut blocks);
+        attach_pagination_artifacts(spans, &pagination, order, options, &mut blocks);
     }
     PageLayout { blocks }
 }
@@ -553,6 +818,7 @@ fn attach_pagination_artifacts(
     all: &[TextSpan],
     pagination: &[TextSpan],
     order: ReadingOrder,
+    options: &LayoutOptions,
     blocks: &mut Vec<Block>,
 ) {
     let (lo, hi) = all
@@ -563,8 +829,8 @@ fn attach_pagination_artifacts(
     let mid = (lo + hi) / 2.0;
     let mut head = Vec::new();
     let mut foot = Vec::new();
-    for segment in segments(pagination, order) {
-        for group in segment.into_groups() {
+    for segment in segments(pagination, order, options) {
+        for group in segment.into_groups(options) {
             let line = assembled(&group).line;
             if line.y > mid {
                 head.push(line);
@@ -632,15 +898,15 @@ fn block_bbox(block: &Block) -> &BBox {
 
 /// Promotes an isolated top line to the page's title on a page whose type
 /// announced no heading at all: a lone line in exactly the body's type,
-/// standing [`PAGE_TITLE_MIN_GAP`] pitches above the paragraph under it,
-/// narrower than [`PAGE_TITLE_MAX_WIDTH`] of the page's text, short,
-/// starting uppercase, carrying no digit — a running header's usual tells
-/// all absent. The title may open a multi-line block: a page whose stray
-/// far-down lines skew the median step folds everything into one
-/// paragraph, and the title is carved out of it. Runs after page roles are
-/// tagged, so a repeated running header is already out of candidacy on
-/// documents long enough to tag one.
-fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats) {
+/// standing [`LayoutOptions::page_title_min_gap`] pitches above the paragraph
+/// under it, narrower than [`PAGE_TITLE_MAX_WIDTH`] of the page's text, short,
+/// starting uppercase, carrying no digit — a running header's usual tells all
+/// absent. The title may open a multi-line block: a page whose stray far-down
+/// lines skew the median step folds everything into one paragraph, and the
+/// title is carved out of it. Runs after page roles are tagged, so a repeated
+/// running header is already out of candidacy on documents long enough to tag
+/// one.
+fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats, options: &LayoutOptions) {
     if blocks
         .iter()
         .any(|block| matches!(block, Block::Heading { .. }))
@@ -682,7 +948,7 @@ fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats) {
     if text.chars().any(|c| c.is_ascii_digit()) || text.ends_with([',', ';', ':']) {
         return;
     }
-    if text.chars().count() > BOLD_HEADING_MAX_CHARS
+    if text.chars().count() > options.bold_heading_max_chars
         || text.split_whitespace().count() > PAGE_TITLE_MAX_WORDS
     {
         return;
@@ -712,7 +978,7 @@ fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats) {
     if pitch <= 0.0 {
         return;
     }
-    if title.y - first_below.y < PAGE_TITLE_MIN_GAP * pitch {
+    if title.y - first_below.y < options.page_title_min_gap * pitch {
         return;
     }
     let text_x0 = blocks[start..]
@@ -802,6 +1068,7 @@ fn demote_heading_runs(blocks: &mut [Block]) {
 /// Otherwise the segment is walked top-down: each claimed stretch becomes a
 /// table and every uncovered remainder stretch gets that same lane attempt,
 /// so a drawn grid and a whitespace-laned table can share a segment.
+#[allow(clippy::too_many_arguments)]
 fn push_segment_blocks(
     segment: Segment<'_>,
     grids: &[RuledGrid],
@@ -809,6 +1076,7 @@ fn push_segment_blocks(
     snap: f32,
     stats: &SizeStats,
     order: ReadingOrder,
+    options: &LayoutOptions,
     out: &mut Vec<Block>,
 ) {
     if order == ReadingOrder::StructureTree
@@ -817,39 +1085,44 @@ fn push_segment_blocks(
             .iter()
             .any(|span| run_of(span) != Run::Untagged)
     {
-        push_tagged_blocks(&segment.spans, stats, out);
+        push_tagged_blocks(&segment.spans, stats, options, out);
         return;
     }
-    let groups = segment.into_groups();
+    let groups = segment.into_groups(options);
     if grids.is_empty() {
-        push_lane_blocks(&groups, stats, out);
+        push_lane_blocks(&groups, stats, options, out);
         return;
     }
     let claims = grid_claims(&groups, grids, hulls, snap);
     if claims.is_empty() {
-        push_lane_blocks(&groups, stats, out);
+        push_lane_blocks(&groups, stats, options, out);
         return;
     }
     let mut next = 0usize;
     for claim in claims {
-        push_stretch(&groups[next..claim.range.start], stats, order, out);
+        push_stretch(&groups[next..claim.range.start], stats, order, options, out);
         out.push(Block::Table {
             bbox: claim.bbox,
             rows: claim.rows,
         });
         next = claim.range.end;
     }
-    push_stretch(&groups[next..], stats, order, out);
+    push_stretch(&groups[next..], stats, order, options, out);
 }
 
 /// The lane path: one [`table_band`] attempt over the segment's line
 /// groups, else prose. The groups are built once and feed both paths.
-fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
+fn push_lane_blocks(
+    groups: &[Group],
+    stats: &SizeStats,
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     if groups.is_empty() {
         return;
     }
     let Some(mut band) = table_band(groups) else {
-        push_blocks(groups.iter().map(assembled).collect(), stats, out);
+        push_blocks(groups.iter().map(assembled).collect(), stats, options, out);
         return;
     };
     let title = title_rows(groups, &band, stats);
@@ -875,13 +1148,18 @@ fn push_lane_blocks(groups: &[Group], stats: &SizeStats, out: &mut Vec<Block>) {
     // stretch of a run is not the only grid in it. The lines above the run
     // were tried as run starts already and are prose.
     let above = band.run_start.min(band.span.start);
-    push_blocks(groups[..above].iter().map(assembled).collect(), stats, out);
-    push_lane_blocks(&groups[above..band.span.start], stats, out);
+    push_blocks(
+        groups[..above].iter().map(assembled).collect(),
+        stats,
+        options,
+        out,
+    );
+    push_lane_blocks(&groups[above..band.span.start], stats, options, out);
     out.push(Block::Table {
         bbox: table_bbox(&band.rows),
         rows: band.rows,
     });
-    push_lane_blocks(&groups[band.span.end..], stats, out);
+    push_lane_blocks(&groups[band.span.end..], stats, options, out);
 }
 
 /// The index of the first row past the head that repeats it: two or more
@@ -943,19 +1221,25 @@ fn row_y(row: &[Cell]) -> f32 {
 /// the stretch goes back to spans and is regrouped, so lines the grid's
 /// rows once kept apart may join; under structure-tree order the groups
 /// stay the segment's own, so the lines stay where the tree put them.
-fn push_stretch(groups: &[Group], stats: &SizeStats, order: ReadingOrder, out: &mut Vec<Block>) {
+fn push_stretch(
+    groups: &[Group],
+    stats: &SizeStats,
+    order: ReadingOrder,
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     if groups.is_empty() {
         return;
     }
     if order == ReadingOrder::StructureTree {
-        push_lane_blocks(groups, stats, out);
+        push_lane_blocks(groups, stats, options, out);
         return;
     }
     let spans: Vec<&TextSpan> = groups
         .iter()
         .flat_map(|group| group.spans.iter().copied())
         .collect();
-    push_lane_blocks(&line_groups(&spans), stats, out);
+    push_lane_blocks(&line_groups(&spans, options), stats, options, out);
 }
 
 /// What a span belongs to under structure-tree order: the outermost
@@ -1038,13 +1322,21 @@ fn in_block_quote(span: &TextSpan) -> bool {
 /// their block's lines.
 ///
 /// Covers ISO 32000-1 §14.8.3, §14.8.4.2, §14.8.4.3 and §14.8.4.5.
-fn push_tagged_blocks(spans: &[&TextSpan], stats: &SizeStats, out: &mut Vec<Block>) {
+fn push_tagged_blocks(
+    spans: &[&TextSpan],
+    stats: &SizeStats,
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     for (run, spans) in stretches(spans, run_of) {
         match run {
-            Run::Block(element) => push_tagged_block(element, spans, out),
-            Run::Illustration | Run::Untagged => {
-                push_lane_blocks(&sequential_groups(spans.iter().copied()), stats, out)
-            }
+            Run::Block(element) => push_tagged_block(element, spans, options, out),
+            Run::Illustration | Run::Untagged => push_lane_blocks(
+                &sequential_groups(spans.iter().copied(), options),
+                stats,
+                options,
+                out,
+            ),
         }
     }
 }
@@ -1070,18 +1362,23 @@ fn stretches<'r, 's, K: PartialEq>(
 }
 
 /// One tagged block from its element's type.
-fn push_tagged_block(element: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+fn push_tagged_block(
+    element: StructureElement,
+    spans: &[&TextSpan],
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     match element.standard_type {
-        StandardType::H1 => push_tagged_heading(1, spans, out),
-        StandardType::H2 => push_tagged_heading(2, spans, out),
-        StandardType::H3 => push_tagged_heading(3, spans, out),
-        StandardType::H4 => push_tagged_heading(4, spans, out),
-        StandardType::H5 => push_tagged_heading(5, spans, out),
-        StandardType::H6 => push_tagged_heading(6, spans, out),
-        StandardType::H => push_tagged_heading(section_depth(spans[0]), spans, out),
-        StandardType::L => push_tagged_list(element, spans, out),
-        StandardType::Table => push_tagged_table(element, spans, out),
-        _ => push_tagged_paragraph(spans, out),
+        StandardType::H1 => push_tagged_heading(1, spans, options, out),
+        StandardType::H2 => push_tagged_heading(2, spans, options, out),
+        StandardType::H3 => push_tagged_heading(3, spans, options, out),
+        StandardType::H4 => push_tagged_heading(4, spans, options, out),
+        StandardType::H5 => push_tagged_heading(5, spans, options, out),
+        StandardType::H6 => push_tagged_heading(6, spans, options, out),
+        StandardType::H => push_tagged_heading(section_depth(spans[0]), spans, options, out),
+        StandardType::L => push_tagged_list(element, spans, options, out),
+        StandardType::Table => push_tagged_table(element, spans, options, out),
+        _ => push_tagged_paragraph(spans, options, out),
     }
 }
 
@@ -1105,15 +1402,20 @@ fn section_depth(span: &TextSpan) -> u8 {
 }
 
 /// The lines of a run of tagged spans, in the order they came.
-fn tagged_lines(spans: &[&TextSpan]) -> Vec<Line> {
-    sequential_groups(spans.iter().copied())
+fn tagged_lines(spans: &[&TextSpan], options: &LayoutOptions) -> Vec<Line> {
+    sequential_groups(spans.iter().copied(), options)
         .iter()
         .map(|group| assembled(group).line)
         .collect()
 }
 
-fn push_tagged_heading(level: u8, spans: &[&TextSpan], out: &mut Vec<Block>) {
-    let lines = tagged_lines(spans);
+fn push_tagged_heading(
+    level: u8,
+    spans: &[&TextSpan],
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
+    let lines = tagged_lines(spans, options);
     if lines.is_empty() {
         return;
     }
@@ -1124,8 +1426,8 @@ fn push_tagged_heading(level: u8, spans: &[&TextSpan], out: &mut Vec<Block>) {
     });
 }
 
-fn push_tagged_paragraph(spans: &[&TextSpan], out: &mut Vec<Block>) {
-    let lines = tagged_lines(spans);
+fn push_tagged_paragraph(spans: &[&TextSpan], options: &LayoutOptions, out: &mut Vec<Block>) {
+    let lines = tagged_lines(spans, options);
     if lines.is_empty() {
         return;
     }
@@ -1173,17 +1475,22 @@ fn descendant(
 /// numbered: an item by the number its label writes in that system, an
 /// unlabelled item by the number after the previous item's
 /// ([`numbered_marker`]).
-fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+fn push_tagged_list(
+    list: StructureElement,
+    spans: &[&TextSpan],
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     let numbering = spans.first().and_then(|span| list_numbering(span, list));
     let mut items: Vec<ListItem> = Vec::new();
     let mut next: u32 = 1;
     for (item, run) in stretches(spans, |span| descendant(span, list, &[StandardType::LI])) {
         let Some(item) = item else {
             push_tagged_list_items(&mut items, out);
-            push_tagged_paragraph(run, out);
+            push_tagged_paragraph(run, options, out);
             continue;
         };
-        let lines = tagged_lines(run);
+        let lines = tagged_lines(run, options);
         let Some(first) = lines.first() else {
             continue;
         };
@@ -1203,6 +1510,7 @@ fn push_tagged_list(list: StructureElement, spans: &[&TextSpan], out: &mut Vec<B
         items.push(ListItem {
             marker,
             marker_len,
+            bbox: bbox(&lines),
             lines,
         });
     }
@@ -1441,17 +1749,22 @@ fn label_marker(label: &str) -> Marker {
 /// elements, each cell one line spanning the columns and rows its `ColSpan`
 /// and `RowSpan` table attributes say (§14.8.5.7). Spans in the table but
 /// in no row (a caption) become a paragraph ahead of the table.
-fn push_tagged_table(table: StructureElement, spans: &[&TextSpan], out: &mut Vec<Block>) {
+fn push_tagged_table(
+    table: StructureElement,
+    spans: &[&TextSpan],
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     let mut rows: Vec<Vec<Cell>> = Vec::new();
     let mut aside: Vec<&TextSpan> = Vec::new();
     for (row, run) in stretches(spans, |span| descendant(span, table, &[StandardType::TR])) {
         match row {
             None => aside.extend(run),
-            Some(row) => rows.push(tagged_cells(row, run)),
+            Some(row) => rows.push(tagged_cells(row, run, options)),
         }
     }
     if !aside.is_empty() {
-        push_tagged_paragraph(&aside, out);
+        push_tagged_paragraph(&aside, options, out);
     }
     if rows.is_empty() {
         return;
@@ -1462,13 +1775,13 @@ fn push_tagged_table(table: StructureElement, spans: &[&TextSpan], out: &mut Vec
     });
 }
 
-fn tagged_cells(row: StructureElement, spans: &[&TextSpan]) -> Vec<Cell> {
+fn tagged_cells(row: StructureElement, spans: &[&TextSpan], options: &LayoutOptions) -> Vec<Cell> {
     stretches(spans, |span| {
         descendant(span, row, &[StandardType::TH, StandardType::TD])
     })
     .into_iter()
     .map(|(cell, run)| Cell {
-        line: joined_line(tagged_lines(run)),
+        line: joined_line(tagged_lines(run, options)),
         colspan: table_span(run[0], cell, "ColSpan"),
         rowspan: table_span(run[0], cell, "RowSpan"),
     })
@@ -1530,10 +1843,10 @@ fn joined_line(lines: Vec<Line>) -> Option<Line> {
 
 /// Character-weighted histogram of span sizes rounded to half a point. Body
 /// size is the mode; the ladder holds every distinct bucket at least
-/// [`HEADING_MIN_DELTA`] above it, largest first, so a bucket's position is
-/// its heading level. The ladder is not cut at six: the buckets nearest body
-/// size are the document's real section headings, so ranks past the sixth
-/// clamp to level six rather than dropping back to body text.
+/// [`LayoutOptions::heading_min_delta`] above it, largest first, so a bucket's
+/// position is its heading level. The ladder is not cut at six: the buckets
+/// nearest body size are the document's real section headings, so ranks past
+/// the sixth clamp to level six rather than dropping back to body text.
 struct SizeStats {
     body: f32,
     ladder: Vec<f32>,
@@ -1584,12 +1897,12 @@ fn half_points(size: f32) -> i32 {
 
 /// The document's size statistics, weighted by characters shown: a title
 /// carries a handful, body text carries thousands.
-fn size_stats(pages: &[&[TextSpan]]) -> SizeStats {
+fn size_stats(pages: &[&[TextSpan]], options: &LayoutOptions) -> SizeStats {
     let mut weights = SizeWeights::default();
     for page in pages {
         weights.count(page);
     }
-    weights.stats()
+    weights.stats(options)
 }
 
 /// The characters shown at each half-point size bucket, ascending by
@@ -1633,16 +1946,19 @@ impl SizeWeights {
         }
     }
 
-    /// The statistics the weights imply.
-    fn stats(&self) -> SizeStats {
+    /// The body size: the most-weighted bucket, or `None` with no text.
+    fn body(&self) -> Option<f32> {
         // Ties go to the smaller size: body text is what a document has
         // most of and, at equal weight, the likelier of the two to be it.
-        let body = self
-            .0
+        self.0
             .iter()
             .min_by_key(|(bucket, weight)| (std::cmp::Reverse(*weight), *bucket))
-            .map(|(bucket, _)| *bucket as f32 / 2.0);
-        let Some(body) = body else {
+            .map(|(bucket, _)| *bucket as f32 / 2.0)
+    }
+
+    /// The statistics the weights imply.
+    fn stats(&self, options: &LayoutOptions) -> SizeStats {
+        let Some(body) = self.body() else {
             return SizeStats {
                 body: 0.0,
                 ladder: Vec::new(),
@@ -1653,7 +1969,7 @@ impl SizeWeights {
             .iter()
             .rev()
             .map(|(bucket, _)| *bucket as f32 / 2.0)
-            .filter(|size| *size >= body + HEADING_MIN_DELTA)
+            .filter(|size| *size >= body + options.heading_min_delta)
             .collect();
         SizeStats { body, ladder }
     }
@@ -1689,12 +2005,15 @@ impl ExtractedPage {
 /// names on the heap and a layout owns its own text, so freeing a
 /// document's worth of spans on the calling thread once every layout was
 /// in was a stretch of the path as long as the size pass.
-pub(crate) fn document_layout_extracted(pages: Vec<ExtractedPage>) -> Vec<PageLayout> {
+pub(crate) fn document_layout_extracted(
+    pages: Vec<ExtractedPage>,
+    options: &LayoutOptions,
+) -> Vec<PageLayout> {
     let mut weights = SizeWeights::default();
     for page in &pages {
         weights.merge(&page.weights);
     }
-    let stats = weights.stats();
+    let stats = weights.stats(options);
     // One uncontended lock per page hands it to the one worker that takes
     // its index; the page drops at the end of that worker's turn.
     let handed: Vec<std::sync::Mutex<Option<ExtractedPage>>> = pages
@@ -1707,9 +2026,9 @@ pub(crate) fn document_layout_extracted(pages: Vec<ExtractedPage>) -> Vec<PageLa
             .expect("no worker panicked holding a page")
             .take()
             .expect("each page is taken once");
-        page_layout_with_stats(&page.spans, &page.rulings, &stats, page.order)
+        page_layout_with_stats(&page.spans, &page.rulings, &stats, page.order, options)
     });
-    finished(layouts, &stats)
+    finished(layouts, &stats, options)
 }
 
 /// One assembled line and the size heading classification measures it by:
@@ -1726,13 +2045,19 @@ struct Assembled {
 /// size with it. Classification walks the lines borrowed — stretches of
 /// (line count, heading level or `None` for a run) — and only then are the
 /// lines moved into their blocks, never cloned.
-fn push_blocks(lines: Vec<Assembled>, stats: &SizeStats, out: &mut Vec<Block>) {
+fn push_blocks(
+    lines: Vec<Assembled>,
+    stats: &SizeStats,
+    options: &LayoutOptions,
+    out: &mut Vec<Block>,
+) {
     let mut stretches: Vec<(usize, Option<u8>)> = Vec::new();
     let mut index = 0;
     while index < lines.len() {
-        let heading = heading_level(&lines[index], stats).map(|level| {
+        let heading = heading_level(&lines[index], stats, options).map(|level| {
             let mut end = index + 1;
-            while end < lines.len() && continues_heading(&lines[end - 1], &lines[end], stats, level)
+            while end < lines.len()
+                && continues_heading(&lines[end - 1], &lines[end], stats, level, options)
             {
                 end += 1;
             }
@@ -1742,7 +2067,7 @@ fn push_blocks(lines: Vec<Assembled>, stats: &SizeStats, out: &mut Vec<Block>) {
             None => 1,
             Some((end, level)) => {
                 let candidate = lines[index..end].iter().map(|a| &a.line);
-                if heading_chars(candidate) <= HEADING_MAX_CHARS {
+                if heading_chars(candidate) <= options.heading_max_chars {
                     stretches.push((end - index, Some(level)));
                     index = end;
                     continue;
@@ -1762,7 +2087,7 @@ fn push_blocks(lines: Vec<Assembled>, stats: &SizeStats, out: &mut Vec<Block>) {
     for (count, level) in stretches {
         let Some(level) = level else {
             run.extend(moved.by_ref().take(count).map(|a| a.line));
-            push_run(&mut run, out);
+            push_run(&mut run, options, out);
             continue;
         };
         let heading: Vec<Line> = moved.by_ref().take(count).map(|a| a.line).collect();
@@ -1790,11 +2115,11 @@ fn heading_chars<'l>(lines: impl Iterator<Item = &'l Line>) -> usize {
 /// The heading level of a line: its size's ladder rank, or — for a line at
 /// body size — the bold-title rank. A caption's lead never ranks: a figure
 /// caption set larger or bolder than body text is still a caption.
-fn heading_level(line: &Assembled, stats: &SizeStats) -> Option<u8> {
+fn heading_level(line: &Assembled, stats: &SizeStats, options: &LayoutOptions) -> Option<u8> {
     let level = match stats.level(line.rank_size) {
         Some(level) => level,
         None => {
-            if !stats.is_body(line.rank_size) || !is_bold_title(&line.line) {
+            if !stats.is_body(line.rank_size) || !is_bold_title(&line.line, options) {
                 return None;
             }
             stats.bold_level()
@@ -1822,19 +2147,25 @@ fn caption_lead(text: &str) -> bool {
 
 /// True when `next` is a wrapped continuation of the heading line `prev`:
 /// same size bucket, same level, and no more than a line of space between.
-fn continues_heading(prev: &Assembled, next: &Assembled, stats: &SizeStats, level: u8) -> bool {
-    if heading_level(next, stats) != Some(level) {
+fn continues_heading(
+    prev: &Assembled,
+    next: &Assembled,
+    stats: &SizeStats,
+    level: u8,
+    options: &LayoutOptions,
+) -> bool {
+    if heading_level(next, stats, options) != Some(level) {
         return false;
     }
     if half_points(prev.rank_size) != half_points(next.rank_size) {
         return false;
     }
-    prev.line.y - next.line.y <= HEADING_MERGE_STEP * next.line.size
+    prev.line.y - next.line.y <= options.heading_merge_step * next.line.size
 }
 
 /// True for a short, wholly bold line that does not end like a sentence —
 /// the run-in heading of a document that sets its headings in body size.
-fn is_bold_title(line: &Line) -> bool {
+fn is_bold_title(line: &Line, options: &LayoutOptions) -> bool {
     // Whitespace-only inlines carry no visible weight: a regular-face space
     // between bold words does not stop the line being a bold title.
     let mut visible = line.inlines.iter().filter(|inline| !blank(&inline.text));
@@ -1850,20 +2181,20 @@ fn is_bold_title(line: &Line) -> bool {
     }
     let text = line_text(line);
     let trimmed = text.trim();
-    if trimmed.is_empty() || trimmed.chars().count() > BOLD_HEADING_MAX_CHARS {
+    if trimmed.is_empty() || trimmed.chars().count() > options.bold_heading_max_chars {
         return false;
     }
     !trimmed.ends_with(['.', ',', ';'])
 }
 
 /// Splits a heading-free run into blocks: a stretch of marker lines — with
-/// hanging continuations folded into their item — becomes one
-/// [`Block::List`] once it reaches [`LIST_MIN_LINES`] lines; everything
-/// around and between list stretches still goes through [`push_paragraphs`]'
-/// gap-based splitting. Detection runs before that split, over the run's
-/// lines as assembled, so a list item is never cut into two paragraphs by
-/// its own leading.
-fn push_run(run: &mut Vec<Line>, out: &mut Vec<Block>) {
+/// hanging continuations folded into their item — becomes one [`Block::List`]
+/// once it reaches [`LayoutOptions::list_min_lines`] lines; everything around
+/// and between list stretches still goes through [`push_paragraphs`]' gap-based
+/// splitting. Detection runs before that split, over the run's lines as
+/// assembled, so a list item is never cut into two paragraphs by its own
+/// leading.
+fn push_run(run: &mut Vec<Line>, options: &LayoutOptions, out: &mut Vec<Block>) {
     let lines = std::mem::take(run);
     if lines.is_empty() {
         return;
@@ -1878,7 +2209,7 @@ fn push_run(run: &mut Vec<Line>, out: &mut Vec<Block>) {
     let mut prose_count = 0usize;
     let mut index = 0;
     while index < lines.len() {
-        let Some(items) = list_run(&lines[index..], &markers[index..]) else {
+        let Some(items) = list_run(&lines[index..], &markers[index..], options) else {
             prose_count += 1;
             index += 1;
             continue;
@@ -1891,13 +2222,17 @@ fn push_run(run: &mut Vec<Line>, out: &mut Vec<Block>) {
     let mut prose: Vec<Line> = Vec::new();
     for (count, items) in lists {
         prose.extend(moved.by_ref().take(count));
-        push_paragraphs(&mut prose, out);
+        push_paragraphs(&mut prose, options, out);
         let items: Vec<ListItem> = items
             .into_iter()
-            .map(|(marker, marker_len, count)| ListItem {
-                marker,
-                marker_len,
-                lines: moved.by_ref().take(count).collect(),
+            .map(|(marker, marker_len, count)| {
+                let lines: Vec<Line> = moved.by_ref().take(count).collect();
+                ListItem {
+                    marker,
+                    marker_len,
+                    bbox: bbox(&lines),
+                    lines,
+                }
             })
             .collect();
         out.push(Block::List {
@@ -1906,7 +2241,7 @@ fn push_run(run: &mut Vec<Line>, out: &mut Vec<Block>) {
         });
     }
     prose.extend(moved);
-    push_paragraphs(&mut prose, out);
+    push_paragraphs(&mut prose, options, out);
 }
 
 /// One item of a list found by [`list_run`]: its marker, the marker's
@@ -1915,10 +2250,14 @@ type ListRunItem = (Marker, usize, usize);
 
 /// The list opening at `lines[0]` as one [`ListRunItem`] per item, or `None`
 /// when that line does not open one or the candidate falls short of
-/// [`LIST_MIN_LINES`] — in which case the line is left for [`push_run`] to
-/// fold back into prose. `markers` carries every line's [`list_marker`],
-/// computed once for the whole run.
-fn list_run(lines: &[Line], markers: &[Option<(Marker, usize)>]) -> Option<Vec<ListRunItem>> {
+/// [`LayoutOptions::list_min_lines`] — in which case the line is left for
+/// [`push_run`] to fold back into prose. `markers` carries every line's
+/// [`list_marker`], computed once for the whole run.
+fn list_run(
+    lines: &[Line],
+    markers: &[Option<(Marker, usize)>],
+    options: &LayoutOptions,
+) -> Option<Vec<ListRunItem>> {
     let mut items = Vec::new();
     let mut consumed = 0usize;
     let mut index = 0;
@@ -1932,14 +2271,14 @@ fn list_run(lines: &[Line], markers: &[Option<(Marker, usize)>]) -> Option<Vec<L
         index += 1;
         while index < lines.len()
             && markers[index].is_none()
-            && lines[index].x > item_x + LIST_CONTINUATION_INDENT * item_size
+            && lines[index].x > item_x + options.list_continuation_indent * item_size
         {
             index += 1;
         }
         consumed += index - opened;
         items.push((marker, marker_len, index - opened));
     }
-    (consumed >= LIST_MIN_LINES).then_some(items)
+    (consumed >= options.list_min_lines).then_some(items)
 }
 
 /// Some(marker, marker_len) when `text` opens a list item: a bullet from
@@ -1988,14 +2327,15 @@ fn list_marker(text: &str) -> Option<(Marker, usize)> {
 }
 
 /// Drains a paragraph run into blocks, cutting it where a baseline step
-/// exceeds [`PARAGRAPH_GAP`] times the run's median step. The cuts are found
-/// first, borrowed; the lines then move into their paragraphs uncloned.
-fn push_paragraphs(run: &mut Vec<Line>, out: &mut Vec<Block>) {
+/// exceeds [`LayoutOptions::paragraph_gap`] times the run's line pitch. The
+/// cuts are found first, borrowed; the lines then move into their paragraphs
+/// uncloned.
+fn push_paragraphs(run: &mut Vec<Line>, options: &LayoutOptions, out: &mut Vec<Block>) {
     let lines = std::mem::take(run);
     if lines.is_empty() {
         return;
     }
-    let limit = PARAGRAPH_GAP * median_step(&lines);
+    let limit = options.paragraph_gap * line_pitch(&lines, options);
     let mut counts: Vec<usize> = Vec::new();
     let mut start = 0;
     for index in 1..lines.len() {
@@ -2015,6 +2355,30 @@ fn push_paragraphs(run: &mut Vec<Line>, out: &mut Vec<Block>) {
             role: Role::Body,
         });
     }
+}
+
+/// The run's line pitch as [`LayoutOptions::paragraph_pitch`] measures it.
+fn line_pitch(lines: &[Line], options: &LayoutOptions) -> f32 {
+    match options.paragraph_pitch {
+        Pitch::Median => median_step(lines),
+        Pitch::LowerHalfMedian => lower_half_step(lines, options.min_pitch_steps),
+    }
+}
+
+/// Median of the smaller half of the downward baseline steps, or the median
+/// line size when fewer than `min_steps` steps were measured.
+fn lower_half_step(lines: &[Line], min_steps: usize) -> f32 {
+    let mut steps: Vec<f32> = lines
+        .windows(2)
+        .map(|pair| pair[0].y - pair[1].y)
+        .filter(|step| *step > 0.0)
+        .collect();
+    if steps.len() < min_steps.max(1) {
+        return median(lines.iter().map(|line| line.size).collect());
+    }
+    steps.sort_by(f32::total_cmp);
+    steps.truncate((steps.len() / 2).max(1));
+    median(steps)
 }
 
 /// Median baseline step of consecutive lines, or zero when there is no step
@@ -2041,21 +2405,21 @@ struct Group<'s> {
     spans: Vec<&'s TextSpan>,
 }
 
-/// True when `span` belongs on the line at baseline `y` and size `size`:
-/// its baseline lies within `0.5 · size`, or its own vertical extent
-/// overlaps the line's by at least [`LINE_OVERLAP`] of the smaller height.
-/// The extents are the nominal ones a baseline and size imply, a quarter
-/// size below and three quarters above, so a raised superscript or a sunk
-/// subscript shares most of its height with the line while a fraction's
-/// numerator, a whole line up, shares little.
-fn same_line(y: f32, size: f32, span: &TextSpan) -> bool {
+/// True when `span` belongs on the line at baseline `y` and size `size`: its
+/// baseline lies within `0.5 · size`, or its own vertical extent overlaps the
+/// line's by at least [`LayoutOptions::line_overlap`] of the smaller height.
+/// The extents are the nominal ones a baseline and size imply, a quarter size
+/// below and three quarters above, so a raised superscript or a sunk subscript
+/// shares most of its height with the line while a fraction's numerator, a
+/// whole line up, shares little.
+fn same_line(y: f32, size: f32, span: &TextSpan, options: &LayoutOptions) -> bool {
     if (y - span.y).abs() <= 0.5 * size.max(span.size) {
         return true;
     }
     let line_extent = (y - 0.25 * size, y + 0.75 * size);
     let span_extent = (span.y - 0.25 * span.size, span.y + 0.75 * span.size);
     let overlap = line_extent.1.min(span_extent.1) - line_extent.0.max(span_extent.0);
-    overlap >= LINE_OVERLAP * size.min(span.size)
+    overlap >= options.line_overlap * size.min(span.size)
 }
 
 /// One reading-order segment's spans grouped into lines (see
@@ -2071,7 +2435,7 @@ fn same_line(y: f32, size: f32, span: &TextSpan) -> bool {
 /// baseline test only loosens as a line's size grows. Consecutive words of
 /// a typeset line share both values, so the scan runs once per line rather
 /// than once per word.
-fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
+fn line_groups<'s>(spans: &[&'s TextSpan], options: &LayoutOptions) -> Vec<Group<'s>> {
     let mut groups: Vec<Group> = Vec::new();
     let mut counts: Vec<usize> = Vec::new();
     let mut homes: Vec<usize> = Vec::with_capacity(spans.len());
@@ -2086,7 +2450,7 @@ fn line_groups<'s>(spans: &[&'s TextSpan]) -> Vec<Group<'s>> {
             Some((_, home)) => Some(home),
             None => groups
                 .iter()
-                .position(|group| same_line(group.y, group.size, span)),
+                .position(|group| same_line(group.y, group.size, span, options)),
         };
         last = Some((span, found.unwrap_or(groups.len())));
         match found {
@@ -2766,7 +3130,7 @@ fn ruling_snap(spans: &[TextSpan], rulings: &[Ruling]) -> f32 {
         .map(|span| span.size)
         .collect();
     let body = if sizes.is_empty() {
-        size_stats(&[spans]).body
+        SizeWeights::of(spans).body().unwrap_or(0.0)
     } else {
         median(sizes)
     };
@@ -5171,10 +5535,10 @@ impl<'s> Segment<'s> {
     }
 
     /// The segment's line groups, built now if the gutter search did not.
-    fn into_groups(self) -> Vec<Group<'s>> {
+    fn into_groups(self, options: &LayoutOptions) -> Vec<Group<'s>> {
         match self.groups {
             Some(groups) => groups,
-            None => line_groups(&self.spans),
+            None => line_groups(&self.spans, options),
         }
     }
 }
@@ -5186,11 +5550,15 @@ impl<'s> Segment<'s> {
 /// Lanes are not carried out: a table is looked for inside a segment, over
 /// its own rows, because a page's lanes are whatever every line on it leaves
 /// clear together, which is nothing as soon as one line runs the full width.
-fn segments(spans: &[TextSpan], order: ReadingOrder) -> Vec<Segment<'_>> {
+fn segments<'s>(
+    spans: &'s [TextSpan],
+    order: ReadingOrder,
+    options: &LayoutOptions,
+) -> Vec<Segment<'s>> {
     match order {
-        ReadingOrder::Content => content_segments(spans),
-        ReadingOrder::StructureTree => structure_segments(spans),
-        ReadingOrder::Geometric => geometric_segments(spans),
+        ReadingOrder::Content => content_segments(spans, options),
+        ReadingOrder::StructureTree => structure_segments(spans, options),
+        ReadingOrder::Geometric => geometric_segments(spans, options),
     }
 }
 
@@ -5202,8 +5570,8 @@ fn segments(spans: &[TextSpan], order: ReadingOrder) -> Vec<Segment<'_>> {
 /// begins. Geometry corrects the streams that write across two columns row
 /// by row, and takes over entirely when content order fragments into no
 /// order at all (see [`flows`]).
-fn content_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
-    segments_with_grids(spans, &[])
+fn content_segments<'s>(spans: &'s [TextSpan], options: &LayoutOptions) -> Vec<Segment<'s>> {
+    segments_with_grids(spans, &[], options)
 }
 
 /// [`content_segments`] with the page's ruled grids: flows whose boxes touch
@@ -5211,8 +5579,12 @@ fn content_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
 /// skip the gutter split — the grid owns its region, and a table's cell text
 /// arriving as several flows (or laned at its column gap) must not fragment
 /// one drawn grid into a table per piece.
-fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Segment<'s>> {
-    let raw = flows(spans);
+fn segments_with_grids<'s>(
+    spans: &'s [TextSpan],
+    grids: &[RuledGrid],
+    options: &LayoutOptions,
+) -> Vec<Segment<'s>> {
+    let raw = flows(spans, options);
     // The stream's own flow extents, kept before any reordering: whether
     // the producer interleaved the columns is a question about the stream.
     let raw_extents: Vec<(f32, f32)> = raw
@@ -5332,7 +5704,7 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
             if !width.is_finite() || width <= 0.0 {
                 return None;
             }
-            let lines = line_groups(&loose);
+            let lines = line_groups(&loose, options);
             let (bands, cut) = split_at_gutter(&lines, x_min, width)?;
             // An ordered stream writes its left column whole and crosses
             // the gutter once; only flows that alternate across it need
@@ -5383,7 +5755,7 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
     let mut emitted = vec![false; grids.len()];
     for (flow, assigned) in ordered.into_iter().zip(assignment) {
         let Some(grid) = assigned else {
-            out.extend(gutter_split(flow));
+            out.extend(gutter_split(flow, options));
             continue;
         };
         if !emitted[grid] {
@@ -5400,21 +5772,21 @@ fn segments_with_grids<'s>(spans: &'s [TextSpan], grids: &[RuledGrid]) -> Vec<Se
 /// extractor already put them in the tree's order; nothing here moves a
 /// line, so a column the tree reads whole stays whole however the page
 /// looks.
-fn structure_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
+fn structure_segments<'s>(spans: &'s [TextSpan], options: &LayoutOptions) -> Vec<Segment<'s>> {
     if spans.is_empty() {
         return Vec::new();
     }
     vec![Segment {
         spans: spans.iter().collect(),
-        groups: Some(sequential_groups(spans)),
+        groups: Some(sequential_groups(spans, options)),
     }]
 }
 
 /// Geometric order: the whole page as one flow split at its gutter, lines
 /// top to bottom inside each band: position alone, the order a content
 /// stream written in no order at all falls back to.
-fn geometric_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
-    gutter_split(spans.iter().collect())
+fn geometric_segments<'s>(spans: &'s [TextSpan], options: &LayoutOptions) -> Vec<Segment<'s>> {
+    gutter_split(spans.iter().collect(), options)
         .into_iter()
         .filter(|segment| !segment.spans.is_empty())
         .collect()
@@ -5424,11 +5796,14 @@ fn geometric_segments(spans: &[TextSpan]) -> Vec<Segment<'_>> {
 /// when it sits on that line (see [`same_line`]) and opens a new one
 /// otherwise, so lines stay in the order their first spans came. Spans
 /// sort left to right inside each line, as [`line_groups`] sorts them.
-fn sequential_groups<'s>(spans: impl IntoIterator<Item = &'s TextSpan>) -> Vec<Group<'s>> {
+fn sequential_groups<'s>(
+    spans: impl IntoIterator<Item = &'s TextSpan>,
+    options: &LayoutOptions,
+) -> Vec<Group<'s>> {
     let mut groups: Vec<Group> = Vec::new();
     for span in spans {
         match groups.last_mut() {
-            Some(line) if same_line(line.y, line.size, span) => {
+            Some(line) if same_line(line.y, line.size, span, options) => {
                 line.size = line.size.max(span.size);
                 line.spans.push(span);
             }
@@ -5609,22 +5984,28 @@ fn visual_flow_order(flows: &[Vec<&TextSpan>]) -> Option<Vec<usize>> {
     Some(order)
 }
 
-/// The content stream's flows: runs of consecutive spans whose baselines
-/// never step back up by more than [`FLOW_STEP_UP`] line sizes. A typeset
-/// column is one flow, and the jump from its foot to the next column's head
-/// opens another; a display fraction's numerator, a line above the baseline
-/// it follows, does not. Side-by-side flows too sparse to be text columns
-/// merge back into one, so a table written column by column still reaches
-/// the lane detector as rows. A page with more than
-/// [`FLOW_FRAGMENT_FRACTION`] of its text in single-line flows was not
-/// written in reading order at all, and is one flow ordered by geometry; a
-/// figure's scattered labels beside a body column are a sliver of the
-/// page's text and leave the column in content order.
-fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
+/// The content stream's flows: runs of consecutive spans whose baselines never
+/// step back up by more than [`LayoutOptions::flow_step_up`] line sizes. A
+/// typeset column is one flow, and the jump from its foot to the next column's
+/// head opens another; a display fraction's numerator, a line above the
+/// baseline it follows, does not. Side-by-side flows too sparse to be text
+/// columns merge back into one, so a table written column by column still
+/// reaches the lane detector as rows. A page with more than
+/// [`FLOW_FRAGMENT_FRACTION`] of its text in single-line flows was not written
+/// in reading order at all, and is one flow ordered by geometry; a figure's
+/// scattered labels beside a body column are a sliver of the page's text and
+/// leave the column in content order.
+fn flows<'s>(spans: &'s [TextSpan], options: &LayoutOptions) -> Vec<Vec<&'s TextSpan>> {
     let mut flows: Vec<Vec<&TextSpan>> = Vec::new();
     for span in spans {
         match flows.last_mut() {
-            Some(flow) if flow.last().is_some_and(|prev| !steps_up(prev, span)) => flow.push(span),
+            Some(flow)
+                if flow
+                    .last()
+                    .is_some_and(|prev| !steps_up(prev, span, options)) =>
+            {
+                flow.push(span)
+            }
             _ => flows.push(vec![span]),
         }
     }
@@ -5641,22 +6022,22 @@ fn flows(spans: &[TextSpan]) -> Vec<Vec<&TextSpan>> {
     merge_sparse_neighbours(flows)
 }
 
-/// True when `next` opens a new flow: it sits more than [`FLOW_STEP_UP`]
-/// line sizes above `prev`, or a full line above it and displaced sideways
-/// by more than [`FLOW_STEP_ASIDE`] sizes. A fraction's numerator is less
-/// than a line up and continues where the text left off; the first line of
-/// a caption set beside the one just written is a line up and far to the
-/// right.
-fn steps_up(prev: &TextSpan, next: &TextSpan) -> bool {
+/// True when `next` opens a new flow: it sits more than
+/// [`LayoutOptions::flow_step_up`] line sizes above `prev`, or a full line
+/// above it and displaced sideways by more than
+/// [`LayoutOptions::flow_step_aside`] sizes. A fraction's numerator is less
+/// than a line up and continues where the text left off; the first line of a
+/// caption set beside the one just written is a line up and far to the right.
+fn steps_up(prev: &TextSpan, next: &TextSpan, options: &LayoutOptions) -> bool {
     let size = prev.size.max(next.size);
     let rise = next.y - prev.y;
-    if rise > FLOW_STEP_UP * size {
+    if rise > options.flow_step_up * size {
         return true;
     }
     let (prev_lo, prev_hi) = (prev.x.min(prev.end_x), prev.x.max(prev.end_x));
-    let aside =
-        next.x > prev_hi + FLOW_STEP_ASIDE * size || next.x < prev_lo - FLOW_STEP_ASIDE * size;
-    rise > FLOW_LINE_UP * size && aside
+    let aside = next.x > prev_hi + options.flow_step_aside * size
+        || next.x < prev_lo - options.flow_step_aside * size;
+    rise > options.flow_line_up * size && aside
 }
 
 /// Merges a flow into the one before it when both hold at least
@@ -5701,7 +6082,7 @@ fn y_overlaps(a: &[&TextSpan], b: &[&TextSpan]) -> bool {
 /// only happens when both sides look like real columns (enough spans,
 /// enough distinct baselines, enough shared height); anything less reads
 /// top to bottom as one segment.
-fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Segment<'_>> {
+fn gutter_split<'s>(spans: Vec<&'s TextSpan>, options: &LayoutOptions) -> Vec<Segment<'s>> {
     if spans.len() < COLUMN_MIN_SPANS {
         return vec![Segment::ungrouped(spans)];
     }
@@ -5710,7 +6091,7 @@ fn gutter_split(spans: Vec<&TextSpan>) -> Vec<Segment<'_>> {
     if !width.is_finite() || width <= 0.0 {
         return vec![Segment::ungrouped(spans)];
     }
-    let lines = line_groups(&spans);
+    let lines = line_groups(&spans, options);
     match split_at_gutter(&lines, x_min, width) {
         Some((bands, _)) => bands,
         None => vec![Segment {
@@ -5972,7 +6353,7 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
 #[cfg(test)]
 pub(crate) fn layout_reference(spans: &[TextSpan], order: ReadingOrder) -> String {
     let mut out = String::new();
-    for segment in segments(spans, order) {
+    for segment in segments(spans, order, &LayoutOptions::default()) {
         if !out.is_empty() {
             out.push('\n');
         }
@@ -5998,11 +6379,11 @@ fn flow(spans: &[&TextSpan], order: ReadingOrder, out: &mut String) {
         let found = if sequential {
             lines
                 .last_mut()
-                .filter(|line| same_line(line.y, line.size, span))
+                .filter(|line| same_line(line.y, line.size, span, &LayoutOptions::default()))
         } else {
             lines
                 .iter_mut()
-                .find(|line| same_line(line.y, line.size, span))
+                .find(|line| same_line(line.y, line.size, span, &LayoutOptions::default()))
         };
         match found {
             Some(line) => {
@@ -6058,6 +6439,8 @@ pub(crate) mod tests {
             x,
             y,
             end_x,
+            end_y: y,
+            rotate: 0,
             glyph_x: even_glyph_x(text, x, end_x).into_boxed_slice(),
             size,
             font: "F1".to_string(),
@@ -6374,7 +6757,11 @@ pub(crate) mod tests {
         block("left two", 72.0, 160.0, 556.0, 10, &mut spans);
         block("right two", 200.0, 288.0, 484.0, 10, &mut spans);
         block("left three", 72.0, 160.0, 412.0, 10, &mut spans);
-        let segments = segments_with_grids(&spans, std::slice::from_ref(&grid));
+        let segments = segments_with_grids(
+            &spans,
+            std::slice::from_ref(&grid),
+            &LayoutOptions::default(),
+        );
         assert!(
             segments[0]
                 .spans
@@ -6406,7 +6793,11 @@ pub(crate) mod tests {
         block("right two", 200.0, 288.0, 628.0, 10, &mut spans);
         block("left one", 72.0, 160.0, 556.0, 16, &mut spans);
         block("right three", 200.0, 288.0, 412.0, 10, &mut spans);
-        let segments = segments_with_grids(&spans, std::slice::from_ref(&grid));
+        let segments = segments_with_grids(
+            &spans,
+            std::slice::from_ref(&grid),
+            &LayoutOptions::default(),
+        );
         let right_column = segments
             .iter()
             .find(|seg| {
@@ -6450,6 +6841,133 @@ pub(crate) mod tests {
         assert_eq!(line_text(&lines[0]).trim(), "Print against Digital");
     }
 
+    /// `span`, drawn turned so that it reads upright under `/Rotate rotate`.
+    fn turned(span: TextSpan, rotate: i32) -> TextSpan {
+        let (x, y) = out_of_upright(rotate, span.x, span.y);
+        let (end_x, end_y) = out_of_upright(rotate, span.end_x, span.end_y);
+        let (ax, ay) = out_of_upright(rotate, span.bbox.x0, span.bbox.y0);
+        let (bx, by) = out_of_upright(rotate, span.bbox.x1, span.bbox.y1);
+        TextSpan {
+            x,
+            y,
+            end_x,
+            end_y,
+            rotate,
+            glyph_x: Box::default(),
+            bbox: Rect {
+                x0: ax.min(bx),
+                y0: ay.min(by),
+                x1: ax.max(bx),
+                y1: ay.max(by),
+            },
+            ..span
+        }
+    }
+
+    /// A short table whose cells are separate strings, as an exhibit drawn
+    /// turned on the page shows them.
+    fn exhibit_rows() -> Vec<TextSpan> {
+        let rows = [
+            ["Year", "Cash flow", "Rate"],
+            ["1", "-2,000", "10%"],
+            ["2", "450", "11%"],
+            ["3", "715", "12%"],
+        ];
+        rows.iter()
+            .enumerate()
+            .flat_map(|(row, cells)| {
+                let y = -100.0 - 14.0 * row as f32;
+                cells.iter().enumerate().map(move |(column, cell)| {
+                    let x = 100.0 + 120.0 * column as f32;
+                    span(cell, x, x + 6.0 * cell.len() as f32, y, 11.0)
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turned_text_reads_as_lines_in_its_own_frame() {
+        let upright = layout(&exhibit_rows(), ReadingOrder::Content);
+        for rotate in [90, 180, 270] {
+            let spans: Vec<TextSpan> = exhibit_rows()
+                .into_iter()
+                .map(|s| turned(s, rotate))
+                .collect();
+            assert_eq!(
+                layout(&spans, ReadingOrder::Content),
+                upright,
+                "rotate {rotate}"
+            );
+        }
+        assert!(
+            upright.starts_with("Year Cash flow Rate\n1 -2,000 10%"),
+            "{upright}"
+        );
+    }
+
+    /// An upright caption above a turned exhibit comes first; the
+    /// exhibit's block box is mapped back to where it sits on the page.
+    #[test]
+    fn turned_groups_follow_page_order_with_page_space_boxes() {
+        let mut spans = vec![span("Exhibit 5.2b", 72.0, 140.0, 740.0, 12.0)];
+        spans.extend(exhibit_rows().into_iter().map(|s| turned(s, 90)));
+        let page = page_layout(&spans, ReadingOrder::Content);
+        let text = Text.render(std::slice::from_ref(&page));
+        assert!(
+            text.starts_with("Exhibit 5.2b\nYear Cash flow Rate\n"),
+            "{text}"
+        );
+        let area = turn_groups(&spans).areas[1].expect("the exhibit is turned");
+        for block in &page.blocks[1..] {
+            let bbox = block_bbox(block);
+            assert!(
+                bbox.x0 >= area.x0 && bbox.x1 <= area.x1,
+                "{bbox:?} outside {area:?}"
+            );
+            assert!(
+                bbox.y0 >= area.y0 && bbox.y1 <= area.y1,
+                "{bbox:?} outside {area:?}"
+            );
+        }
+    }
+
+    /// A list drawn turned keeps every item's box in page space, inside the
+    /// list's own box.
+    #[test]
+    fn turned_list_items_map_back_to_page_space() {
+        let items = [
+            "\u{2022} first item",
+            "\u{2022} second item",
+            "\u{2022} third item",
+        ];
+        let spans: Vec<TextSpan> = items
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                let y = -100.0 - 14.0 * row as f32;
+                turned(
+                    span(text, 100.0, 100.0 + 6.0 * text.len() as f32, y, 11.0),
+                    90,
+                )
+            })
+            .collect();
+        let page = page_layout(&spans, ReadingOrder::Content);
+        let Some(Block::List { items, bbox }) = page.blocks.first() else {
+            panic!("expected a list: {:?}", page.blocks);
+        };
+        assert_eq!(items.len(), 3);
+        for item in items {
+            assert!(
+                item.bbox.x0 >= bbox.x0 - 0.01
+                    && item.bbox.x1 <= bbox.x1 + 0.01
+                    && item.bbox.y0 >= bbox.y0 - 0.01
+                    && item.bbox.y1 <= bbox.y1 + 0.01,
+                "{:?} outside {bbox:?}",
+                item.bbox
+            );
+        }
+    }
+
     /// A page whose stray far-down lines (a widowed word, a footer) skew
     /// the median step folds everything into one paragraph block; the
     /// title is carved out of that block all the same.
@@ -6476,6 +6994,94 @@ pub(crate) mod tests {
             panic!("the body stays a paragraph, got {:?}", layout.blocks[1]);
         };
         assert!(line_text(&lines[0]).starts_with("why readers"));
+    }
+
+    /// Body lines at the baselines given, one span each.
+    fn body_lines(ys: &[f32]) -> Vec<TextSpan> {
+        ys.iter()
+            .map(|y| {
+                span(
+                    "lines of running prose set across the measure",
+                    54.0,
+                    558.0,
+                    *y,
+                    10.0,
+                )
+            })
+            .collect()
+    }
+
+    fn paragraph_count(layout: &PageLayout) -> usize {
+        layout
+            .blocks
+            .iter()
+            .filter(|block| matches!(block, Block::Paragraph { .. }))
+            .count()
+    }
+
+    /// A step 1.7 times the leading stays inside the paragraph by default and
+    /// breaks it once `paragraph_gap` drops below 1.7.
+    #[test]
+    fn paragraph_gap_sets_where_a_paragraph_breaks() {
+        let spans = body_lines(&[700.0, 688.0, 676.0, 664.0, 643.6, 631.6]);
+        let tight = LayoutOptions {
+            paragraph_gap: 1.6,
+            ..LayoutOptions::default()
+        };
+        let default = page_layout(&spans, ReadingOrder::Content);
+        let tuned = page_layout_opts(&spans, &[], ReadingOrder::Content, &tight);
+        assert_eq!(paragraph_count(&default), 1, "{:?}", default.blocks);
+        assert_eq!(paragraph_count(&tuned), 2, "{:?}", tuned.blocks);
+    }
+
+    /// With most steps wide, the plain median reads the wide step as leading;
+    /// the lower-half median measures the tight one and breaks at every wide
+    /// step.
+    #[test]
+    fn lower_half_median_pitch_ignores_wide_steps() {
+        let spans = body_lines(&[700.0, 688.0, 664.0, 652.0, 628.0, 604.0]);
+        let lower_half = LayoutOptions {
+            paragraph_pitch: Pitch::LowerHalfMedian,
+            ..LayoutOptions::default()
+        };
+        let default = page_layout(&spans, ReadingOrder::Content);
+        let tuned = page_layout_opts(&spans, &[], ReadingOrder::Content, &lower_half);
+        assert_eq!(paragraph_count(&default), 1, "{:?}", default.blocks);
+        assert_eq!(paragraph_count(&tuned), 4, "{:?}", tuned.blocks);
+    }
+
+    /// Too few steps to measure from: the lower-half median falls back to
+    /// the line size.
+    #[test]
+    fn lower_half_median_pitch_falls_back_to_line_size() {
+        let lines: Vec<Line> = [700.0, 688.0]
+            .iter()
+            .map(|y| Line {
+                inlines: Vec::new(),
+                y: *y,
+                x: 0.0,
+                end_x: 10.0,
+                size: 10.0,
+            })
+            .collect();
+        assert_eq!(lower_half_step(&lines, 4), 10.0);
+        assert_eq!(lower_half_step(&lines, 1), 12.0);
+    }
+
+    /// Each list item carries the box of its own lines.
+    #[test]
+    fn list_items_carry_their_own_box() {
+        let spans = vec![
+            span("- first item of the list", 72.0, 300.0, 700.0, 10.0),
+            span("- second item of the list", 72.0, 320.0, 688.0, 10.0),
+        ];
+        let layout = page_layout(&spans, ReadingOrder::Content);
+        let Some(Block::List { items, .. }) = layout.blocks.first() else {
+            panic!("a list, got {:?}", layout.blocks);
+        };
+        assert_eq!(items[0].bbox.y0, 700.0);
+        assert_eq!(items[1].bbox.y0, 688.0);
+        assert_eq!(items[1].bbox.x1, 320.0);
     }
 
     /// A top line set smaller than the body is a running header, however
@@ -6750,7 +7356,7 @@ pub(crate) mod tests {
             let all: Vec<&TextSpan> = spans.iter().collect();
             let (x_min, x_max) = x_bounds(&all);
             let width = x_max - x_min;
-            let lines = line_groups(&all);
+            let lines = line_groups(&all, &LayoutOptions::default());
             let scale = GUTTER_BINS as f32 / width;
             let mut coverage = [0usize; GUTTER_BINS];
             for line in &lines {
@@ -6809,11 +7415,14 @@ pub(crate) mod tests {
                 );
             }
         }
-        for (index, segment) in segments_with_grids(&spans, &hulls).into_iter().enumerate() {
+        for (index, segment) in segments_with_grids(&spans, &hulls, &LayoutOptions::default())
+            .into_iter()
+            .enumerate()
+        {
             let (x_lo, x_hi) = x_bounds(&segment.spans);
             let y_hi = segment.spans.iter().map(|s| s.y).fold(f32::MIN, f32::max);
             let y_lo = segment.spans.iter().map(|s| s.y).fold(f32::MAX, f32::min);
-            let groups = segment.into_groups();
+            let groups = segment.into_groups(&LayoutOptions::default());
             let claims = grid_claims(&groups, &grids, &hulls, snap);
             println!(
                 "segment {index}: {} groups, {} claims, x {x_lo:.0}..{x_hi:.0}, y {y_lo:.0}..{y_hi:.0}",
@@ -6953,7 +7562,7 @@ pub(crate) mod tests {
                     continue;
                 };
                 crate::retain_spans_on_page(&mut spans, &page);
-                let flows = flows(&spans);
+                let flows = flows(&spans, &LayoutOptions::default());
                 let crop = page.crop_box;
                 write!(
                     out,

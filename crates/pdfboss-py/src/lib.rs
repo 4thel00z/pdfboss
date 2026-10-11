@@ -38,6 +38,7 @@ mod annotations;
 mod catalog;
 mod document;
 mod forms;
+mod layout;
 mod write;
 
 /// The bytes of a buffer-like argument, copied once.
@@ -649,6 +650,32 @@ impl Document {
             let doc = CoreDocument::from_seed(inner.lock().seed());
             pdfboss_output::extract_markdown_opts(&doc, order, opts).map_err(pdf_err)
         })
+    }
+
+    /// The document's layout: per page, the headings, paragraphs, lists and
+    /// tables `extract_markdown` renders, each a `LayoutBlock` with its box.
+    /// Heading sizes and running headers and footers are judged across the
+    /// whole document; `pages` (0-based, negative from the end) picks which
+    /// pages are returned, in the order given. The keyword arguments past
+    /// `invisible_text` tune the thresholds the blocks are cut by.
+    #[pyo3(signature = (pages=None, *, reading_order = "content", invisible_text=false, **knobs))]
+    fn layout(
+        &self,
+        py: Python<'_>,
+        pages: Option<Vec<isize>>,
+        reading_order: &str,
+        invisible_text: bool,
+        knobs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<Vec<layout::LayoutBlock>>> {
+        let inner = &self.inner;
+        let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
+        let options = layout::layout_options(knobs)?;
+        let layouts = py.allow_threads(move || {
+            let doc = CoreDocument::from_seed(inner.lock().seed());
+            pdfboss_output::extract_layout_opts(&doc, order, opts, &options).map_err(pdf_err)
+        })?;
+        layout::selected_pages(&layouts, pages)
     }
 
     /// Renders every page (or the 0-based `pages` given, in the order given)
@@ -1301,6 +1328,28 @@ impl Page {
         })
     }
 
+    /// The page's layout blocks, ranking heading sizes against that page
+    /// alone; `Document.layout` is the better answer whenever the whole
+    /// document is at hand. Same keyword arguments as `Document.layout`.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false, **knobs))]
+    fn layout(
+        &self,
+        py: Python<'_>,
+        reading_order: &str,
+        invisible_text: bool,
+        knobs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<layout::LayoutBlock>> {
+        let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
+        let options = layout::layout_options(knobs)?;
+        let page_layout = py.allow_threads(|| {
+            let doc = CoreDocument::from_seed(self.seed.clone());
+            pdfboss_output::extract_page_layout_opts(&doc, &self.page, order, opts, &options)
+                .map_err(pdf_err)
+        })?;
+        Ok(layout::blocks_of(&page_layout))
+    }
+
     /// The page's styled text spans, in the `reading_order` given (the
     /// content stream's emission order by default). Releases the GIL and
     /// runs on a private materialization of the document, like
@@ -1623,6 +1672,20 @@ impl Span {
     #[getter]
     fn end_x(&self) -> f32 {
         self.inner.end_x
+    }
+
+    /// Device-space y after the last glyph's advance: `y` for upright
+    /// text, the far end of the run for text drawn turned a quarter.
+    #[getter]
+    fn end_y(&self) -> f32 {
+        self.inner.end_y
+    }
+
+    /// The page rotation (0, 90, 180 or 270, clockwise) under which the
+    /// span reads upright: text running bottom to top is 90.
+    #[getter]
+    fn rotation(&self) -> i32 {
+        self.inner.rotate
     }
 
     /// Device-space x where each character's glyph starts, one entry per
@@ -2302,6 +2365,48 @@ impl AsyncDocument {
         })
     }
 
+    /// The document's layout blocks per page, the async twin of
+    /// `Document.layout`, same arguments. Coroutine resolving to a list of
+    /// lists of `LayoutBlock`.
+    #[pyo3(signature = (pages=None, *, reading_order = "content", invisible_text=false, **knobs))]
+    fn layout<'py>(
+        &self,
+        py: Python<'py>,
+        pages: Option<Vec<isize>>,
+        reading_order: &str,
+        invisible_text: bool,
+        knobs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        let order = reading_order_from_str(reading_order)?;
+        let options = layout::layout_options(knobs)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let oc = inner.oc_state().await;
+            let structure = structure_for(&inner, order).await;
+            let mut extracted = Vec::new();
+            for i in 0..inner.page_count() {
+                let page = inner.page(i).map_err(aio_err)?;
+                let (mut spans, mut rulings, report) =
+                    pdfboss_text::extract_spans_and_rulings_reporting_with(
+                        inner.clone(),
+                        &page,
+                        oc.as_ref(),
+                        structure.as_ref(),
+                        order,
+                    )
+                    .await
+                    .map_err(pdf_err)?;
+                if !invisible_text {
+                    pdfboss_output::retain_spans_on_page(&mut spans, &page);
+                    pdfboss_output::retain_rulings_on_page(&mut rulings, &page);
+                }
+                extracted.push((spans, rulings, report.order));
+            }
+            let layouts = pdfboss_output::document_layout_opts(&extracted, &options);
+            layout::selected_pages(&layouts, pages)
+        })
+    }
+
     /// Renders every page (or the 0-based `pages` given, in the order given)
     /// to PNG bytes — the async twin of `Document.render_pages`, same
     /// arguments, same leniency, one PNG per page. Coroutine resolving to a
@@ -2880,6 +2985,39 @@ impl AsyncPage {
             )
             .await
             .map_err(pdf_err)
+        })
+    }
+
+    /// The page's layout blocks, the async twin of `Page.layout`, same
+    /// arguments. Coroutine resolving to a list of `LayoutBlock`.
+    #[pyo3(signature = (*, reading_order = "content", invisible_text=false, **knobs))]
+    fn layout<'py>(
+        &self,
+        py: Python<'py>,
+        reading_order: &str,
+        invisible_text: bool,
+        knobs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let doc = self.doc.clone();
+        let page = self.page.clone();
+        let order = reading_order_from_str(reading_order)?;
+        let opts = pdfboss_output::TextOptions { invisible_text };
+        let options = layout::layout_options(knobs)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let oc = doc.oc_state().await;
+            let structure = structure_for(&doc, order).await;
+            let page_layout = pdfboss_output::extract_page_layout_with_opts(
+                &doc,
+                &page,
+                oc.as_ref(),
+                structure.as_ref(),
+                order,
+                opts,
+                &options,
+            )
+            .await
+            .map_err(pdf_err)?;
+            Ok(layout::blocks_of(&page_layout))
         })
     }
 
@@ -3568,6 +3706,7 @@ fn _pdfboss(m: &Bound<'_, PyModule>) -> PyResult<()> {
     forms::register(m)?;
     catalog::register(m)?;
     annotations::register(m)?;
+    layout::register(m)?;
     document::register(m)?;
     write::register(m.py(), m)?;
     Ok(())
