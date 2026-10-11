@@ -161,8 +161,7 @@ fn nest(flat: Vec<(usize, OutlineItem)>) -> Vec<OutlineItem> {
     let mut roots = Vec::new();
     let mut open: Vec<(usize, OutlineItem)> = Vec::new();
     for (depth, item) in flat {
-        while open.last().is_some_and(|(d, _)| *d >= depth) {
-            let (_, done) = open.pop().expect("checked by the loop condition");
+        while let Some((_, done)) = open.pop_if(|(d, _)| *d >= depth) {
             attach(done, &mut open, &mut roots);
         }
         open.push((depth, item));

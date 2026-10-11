@@ -265,35 +265,31 @@ pub fn parse(data: &[u8]) -> Result<Profile, IccError> {
     };
     let to_srgb = xyz_to_linear_srgb(D50);
 
-    let matrix = if channels == 3 && !pcs_lab {
+    let mut matrix = if channels == 3 && !pcs_lab {
         matrix_trc(&tags, &to_srgb)
     } else {
         None
     };
-    if let Some(pipeline) = &matrix {
-        if probes_identity(pipeline, 3) {
-            return Ok(Profile {
-                channels,
-                pipeline: matrix.unwrap(),
-                equivalent: Some(DeviceSpace::Rgb),
-            });
-        }
+    if let Some(pipeline) = matrix.take_if(|pipeline| probes_identity(pipeline, 3)) {
+        return Ok(Profile {
+            channels,
+            pipeline,
+            equivalent: Some(DeviceSpace::Rgb),
+        });
     }
-    let gray = if channels == 1 {
+    let mut gray = if channels == 1 {
         tags.get(b"kTRC")
             .and_then(|tag| Curve::parse(tag).ok())
             .map(|(curve, _)| Pipeline::GrayTrc { curve })
     } else {
         None
     };
-    if let Some(pipeline) = &gray {
-        if probes_identity(pipeline, 1) {
-            return Ok(Profile {
-                channels,
-                pipeline: gray.unwrap(),
-                equivalent: Some(DeviceSpace::Gray),
-            });
-        }
+    if let Some(pipeline) = gray.take_if(|pipeline| probes_identity(pipeline, 1)) {
+        return Ok(Profile {
+            channels,
+            pipeline,
+            equivalent: Some(DeviceSpace::Gray),
+        });
     }
     let lut = tags
         .get(b"A2B0")

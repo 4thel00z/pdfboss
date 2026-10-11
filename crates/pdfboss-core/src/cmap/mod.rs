@@ -286,10 +286,10 @@ impl CidCmap {
                 (Some(&(len, code, _)), Some(r)) => (len, code) <= (r.len, r.lo),
             };
             if single_first {
-                let (len, code, cid) = singles.next().unwrap();
-                push(len, code, code, cid);
-            } else {
-                let r = ranges.next().unwrap();
+                if let Some((len, code, cid)) = singles.next() {
+                    push(len, code, code, cid);
+                }
+            } else if let Some(r) = ranges.next() {
                 push(r.len, r.lo, r.hi, r.cid);
             }
         }

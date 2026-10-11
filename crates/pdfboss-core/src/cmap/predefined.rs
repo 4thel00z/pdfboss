@@ -154,7 +154,7 @@ mod packed {
     use crate::hash::FastMap;
     use std::io::Read;
     use std::ops::Range;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
     static BLOBS: [&[u8]; 5] = [
         include_bytes!("../../assets/cmaps/adobe-japan1.bin"),
@@ -220,7 +220,11 @@ mod packed {
         let collection = collection_of(name)?;
         static PARSED: OnceLock<Mutex<FastMap<String, Arc<CidCmap>>>> = OnceLock::new();
         let cache = PARSED.get_or_init(|| Mutex::new(FastMap::default()));
-        if let Some(cmap) = cache.lock().unwrap().get(name) {
+        if let Some(cmap) = cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+        {
             return Some(Arc::clone(cmap));
         }
         let archive = archive(collection)?;
@@ -229,7 +233,7 @@ mod packed {
         let cmap = Arc::new(CidCmap::parse_with(&archive.data[span], None, &mut resolve));
         cache
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .insert(name.to_owned(), Arc::clone(&cmap));
         Some(cmap)
     }

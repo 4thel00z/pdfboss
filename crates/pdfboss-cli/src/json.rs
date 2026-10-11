@@ -103,7 +103,7 @@ pub fn write_json_pretty(out: &mut String, v: &Value, indent: usize, color: bool
         Value::Bool(b) => paint(out, LIT, if *b { "true" } else { "false" }),
         Value::Number(n) => paint(out, NUM, &n.to_string()),
         Value::String(s) => {
-            let quoted = serde_json::to_string(s).expect("strings always serialize");
+            let quoted = serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"));
             paint(out, STR, &quoted);
         }
         Value::Array(items) => {
@@ -131,7 +131,7 @@ pub fn write_json_pretty(out: &mut String, v: &Value, indent: usize, color: bool
             out.push_str("{\n");
             for (i, (key, value)) in map.iter().enumerate() {
                 push_indent(out, indent + 1);
-                let quoted = serde_json::to_string(key).expect("strings always serialize");
+                let quoted = serde_json::to_string(key).unwrap_or_else(|_| format!("{key:?}"));
                 paint(out, KEY, &quoted);
                 out.push_str(": ");
                 write_json_pretty(out, value, indent + 1, color);

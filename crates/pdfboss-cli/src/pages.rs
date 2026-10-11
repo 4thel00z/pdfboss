@@ -112,7 +112,7 @@ fn is_range_pattern(s: &str) -> bool {
         return false;
     }
 
-    if !s.chars().next().unwrap().is_ascii_digit() {
+    if !s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return false;
     }
 

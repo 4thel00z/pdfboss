@@ -994,12 +994,16 @@ fn pkcs7_pad(data: &[u8]) -> Vec<u8> {
 /// Encrypts a PDF AES value: a fresh 16-byte IV from `rng` followed by the
 /// PKCS#7-padded plaintext under AES-256-CBC, the exact inverse of
 /// [`aes_cbc_decrypt`].
-fn aes_cbc_encrypt(key: &[u8], rng: &mut dyn FnMut(&mut [u8]), data: &[u8]) -> Vec<u8> {
+fn aes_cbc_encrypt(
+    key: &[u8],
+    rng: &mut dyn FnMut(&mut [u8]) -> crate::error::Result<()>,
+    data: &[u8],
+) -> crate::error::Result<Vec<u8>> {
     let mut iv = [0u8; 16];
-    rng(&mut iv);
+    rng(&mut iv)?;
     let mut out = iv.to_vec();
     out.extend_from_slice(&aes_cbc_encrypt_blocks(key, &iv, &pkcs7_pad(data)));
-    out
+    Ok(out)
 }
 
 // --- SHA-2 (FIPS 180-4): 256, 512 and 384 --------------------------------
@@ -1480,7 +1484,10 @@ fn hash_2b(r: i64, password: &[u8], salt: &[u8], udata: &[u8]) -> Vec<u8> {
             _ => sha512(&e),
         };
         round += 1;
-        if round >= 64 && usize::from(*e.last().unwrap()) <= round - 32 {
+        if round >= 64
+            && e.last()
+                .is_some_and(|&last| usize::from(last) <= round - 32)
+        {
             break;
         }
     }
@@ -1506,23 +1513,23 @@ pub(crate) struct KeyMaterial {
 /// 32-byte file key, the user and owner validation/key salts, and the
 /// 4-byte `/Perms` pad. Passwords longer than the 127 UTF-8 bytes the
 /// algorithm defines are truncated, matching the validation side.
-pub(crate) fn r6_key_material(
+pub(crate) fn r6_key_material<E>(
     user_pw: &[u8],
     owner_pw: &[u8],
     p: i32,
     encrypt_metadata: bool,
-    rng: &mut dyn FnMut(&mut [u8]),
-) -> KeyMaterial {
+    rng: &mut dyn FnMut(&mut [u8]) -> std::result::Result<(), E>,
+) -> std::result::Result<KeyMaterial, E> {
     let user_pw = &user_pw[..user_pw.len().min(127)];
     let owner_pw = &owner_pw[..owner_pw.len().min(127)];
 
     let mut file_key = [0u8; 32];
-    rng(&mut file_key);
+    rng(&mut file_key)?;
 
     // Algorithm 8: /U and /UE from a 16-byte random pad, the first 8
     // bytes the validation salt and the last 8 the key salt.
     let mut user_salt = [0u8; 16];
-    rng(&mut user_salt);
+    rng(&mut user_salt)?;
     let mut u = hash_2b(6, user_pw, &user_salt[..8], &[]);
     u.extend_from_slice(&user_salt);
     let user_intermediate = hash_2b(6, user_pw, &user_salt[8..], &[]);
@@ -1531,7 +1538,7 @@ pub(crate) fn r6_key_material(
     // Algorithm 9: /O and /OE, the same derivation but hashing in the
     // first 48 bytes of /U as well.
     let mut owner_salt = [0u8; 16];
-    rng(&mut owner_salt);
+    rng(&mut owner_salt)?;
     let mut o = hash_2b(6, owner_pw, &owner_salt[..8], &u[..48]);
     o.extend_from_slice(&owner_salt);
     let owner_intermediate = hash_2b(6, owner_pw, &owner_salt[8..], &u[..48]);
@@ -1544,17 +1551,17 @@ pub(crate) fn r6_key_material(
     perms_block[4..8].copy_from_slice(&[0xff; 4]);
     perms_block[8] = if encrypt_metadata { b'T' } else { b'F' };
     perms_block[9..12].copy_from_slice(b"adb");
-    rng(&mut perms_block[12..]);
+    rng(&mut perms_block[12..])?;
     aes_encrypt_block(&mut perms_block, &aes_expand_key(&file_key));
 
-    KeyMaterial {
+    Ok(KeyMaterial {
         file_key,
         u,
         ue,
         o,
         oe,
         perms: perms_block.to_vec(),
-    }
+    })
 }
 
 /// Fills `buf` with operating-system random bytes, or reports the source as
@@ -1741,11 +1748,11 @@ fn aes256_encrypt_dict(material: &KeyMaterial, p: i32) -> Dict {
 /// `/Encrypt` dictionary for the trailer.
 #[allow(
     clippy::type_complexity,
-    reason = "Box<dyn FnMut(&mut [u8]) + Send> names the one random-byte source the write path takes; a type alias would only rename it"
+    reason = "Box<dyn FnMut(&mut [u8]) -> Result<()> + Send> names the one random-byte source the write path takes; a type alias would only rename it"
 )]
 pub struct Encryptor {
     file_key: [u8; 32],
-    rng: Box<dyn FnMut(&mut [u8]) + Send>,
+    rng: Box<dyn FnMut(&mut [u8]) -> crate::error::Result<()> + Send>,
 }
 
 impl Encryptor {
@@ -1766,21 +1773,21 @@ impl Encryptor {
         owner_password: &str,
         permissions: Permissions,
     ) -> crate::error::Result<(Encryptor, Dict)> {
-        // The stored closure below is an infallible FnMut, reused for
-        // every later string and stream IV; this probe is where an
-        // unavailable source is reported as an error.
-        let mut probe = [0u8; 1];
-        fill_os_random(&mut probe)?;
-        Ok(Encryptor::aes256_with_rng(
-            user_password,
-            owner_password,
-            permissions,
-            Box::new(|buf: &mut [u8]| {
-                fill_os_random(buf).expect(
-                    "the OS random source was read successfully when this Encryptor was built",
-                )
-            }),
-        ))
+        let mut rng = |buf: &mut [u8]| fill_os_random(buf);
+        let p = permissions.p_value();
+        let material = r6_key_material(
+            user_password.as_bytes(),
+            owner_password.as_bytes(),
+            p,
+            true,
+            &mut rng,
+        )?;
+        let dict = aes256_encrypt_dict(&material, p);
+        let encryptor = Encryptor {
+            file_key: material.file_key,
+            rng: Box::new(|buf: &mut [u8]| fill_os_random(buf)),
+        };
+        Ok((encryptor, dict))
     }
 
     /// [`Encryptor::aes256`] with a caller-supplied source of random bytes
@@ -1794,17 +1801,26 @@ impl Encryptor {
     ) -> (Encryptor, Dict) {
         let mut rng = rng;
         let p = permissions.p_value();
-        let material = r6_key_material(
+        let material = match r6_key_material(
             user_password.as_bytes(),
             owner_password.as_bytes(),
             p,
             true,
-            &mut *rng,
-        );
+            &mut |buf: &mut [u8]| -> std::result::Result<(), std::convert::Infallible> {
+                rng(buf);
+                Ok(())
+            },
+        ) {
+            Ok(material) => material,
+            Err(never) => match never {},
+        };
         let dict = aes256_encrypt_dict(&material, p);
         let encryptor = Encryptor {
             file_key: material.file_key,
-            rng,
+            rng: Box::new(move |buf: &mut [u8]| {
+                rng(buf);
+                Ok(())
+            }),
         };
         (encryptor, dict)
     }
@@ -1817,9 +1833,14 @@ impl Encryptor {
     /// signature symmetry with `decrypt_object`; a future per-object write
     /// cipher (an AESV2 write path, say) would need to start deriving its
     /// key from them instead of discarding them.
-    pub fn encrypt_object(&mut self, obj: &mut Object, num: u32, gen: u16) {
+    pub fn encrypt_object(
+        &mut self,
+        obj: &mut Object,
+        num: u32,
+        gen: u16,
+    ) -> crate::error::Result<()> {
         let _ = (num, gen);
-        encrypt_in_place(obj, &self.file_key, &mut *self.rng);
+        encrypt_in_place(obj, &self.file_key, &mut *self.rng)
     }
 }
 
@@ -1827,33 +1848,38 @@ impl Encryptor {
 /// with the file `key`, mirroring [`decrypt_in_place`]'s walk exactly:
 /// `String`, `Array`, `Dict` values and `Stream` (dict values plus data);
 /// every other object type is left untouched.
-fn encrypt_in_place(obj: &mut Object, key: &[u8], rng: &mut dyn FnMut(&mut [u8])) {
+fn encrypt_in_place(
+    obj: &mut Object,
+    key: &[u8],
+    rng: &mut dyn FnMut(&mut [u8]) -> crate::error::Result<()>,
+) -> crate::error::Result<()> {
     match obj {
-        Object::String(bytes) => *bytes = aes_cbc_encrypt(key, rng, bytes),
+        Object::String(bytes) => *bytes = aes_cbc_encrypt(key, rng, bytes)?,
         Object::Array(items) => {
             for it in items {
-                encrypt_in_place(it, key, &mut *rng);
+                encrypt_in_place(it, key, &mut *rng)?;
             }
         }
         Object::Dict(dict) => {
             for v in dict.values_mut() {
-                encrypt_in_place(v, key, &mut *rng);
+                encrypt_in_place(v, key, &mut *rng)?;
             }
         }
         Object::Stream(stream) => {
             for v in stream.dict.values_mut() {
-                encrypt_in_place(v, key, &mut *rng);
+                encrypt_in_place(v, key, &mut *rng)?;
             }
             // A stream that names the Identity crypt filter says its data
             // is stored in the clear (ISO 32000-1 §7.4.10); keep it so, or
             // no reader could get it back.
             if stream_crypt_filter(&stream.dict).as_deref() == Some("Identity") {
-                return;
+                return Ok(());
             }
-            stream.data = aes_cbc_encrypt(key, rng, &stream.data);
+            stream.data = aes_cbc_encrypt(key, rng, &stream.data)?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Per-round left-rotation amounts (RFC 1321).
@@ -2901,6 +2927,21 @@ mod tests {
     // --- R6 key material (write side): the existing validation code above
     // is the oracle everything generated here must open under. ---
 
+    #[test]
+    fn encrypt_in_place_reports_an_unavailable_random_source() {
+        let mut obj = Object::String(b"secret".to_vec());
+        let mut failing = |_: &mut [u8]| -> crate::error::Result<()> {
+            Err(crate::error::Error::RandomUnavailable(
+                "exhausted".to_owned(),
+            ))
+        };
+        let result = encrypt_in_place(&mut obj, &[0u8; 32], &mut failing);
+        assert!(matches!(
+            result,
+            Err(crate::error::Error::RandomUnavailable(_))
+        ));
+    }
+
     /// Generated key material must open through the same `aesv3_key`
     /// validation a real reader runs, for both passwords, and reject a
     /// wrong one; the embedded `/Perms` must decrypt to its marker under
@@ -2911,13 +2952,17 @@ mod tests {
     #[test]
     fn r6_key_material_opens_under_aesv3_key() {
         let mut c = 0u8;
-        let mut rng = |b: &mut [u8]| {
+        let mut rng = |b: &mut [u8]| -> std::result::Result<(), std::convert::Infallible> {
             for x in b {
                 c = c.wrapping_add(1);
                 *x = c;
             }
+            Ok(())
         };
-        let material = r6_key_material(b"user-pw", b"owner-pw", P, true, &mut rng);
+        let material = match r6_key_material(b"user-pw", b"owner-pw", P, true, &mut rng) {
+            Ok(material) => material,
+            Err(never) => match never {},
+        };
         let dict = aes256_encrypt_dict(&material, P);
 
         let user_key = aesv3_key(&dict, 6, b"user-pw").expect("user password opens");
@@ -3087,7 +3132,7 @@ mod tests {
         let original = Object::Dict(d);
 
         let mut obj = original.clone();
-        enc.encrypt_object(&mut obj, 3, 0);
+        enc.encrypt_object(&mut obj, 3, 0).unwrap();
         assert_ne!(obj, original, "encryption must change the strings");
 
         // Ref, Name, numbers, bools and null pass through untouched, even
@@ -3130,7 +3175,7 @@ mod tests {
             data: b"decrypted stream body".to_vec(),
         });
         let mut obj = original.clone();
-        enc.encrypt_object(&mut obj, 4, 0);
+        enc.encrypt_object(&mut obj, 4, 0).unwrap();
         let encrypted = obj.as_stream().unwrap();
         assert_ne!(encrypted.data, original.as_stream().unwrap().data);
         assert_ne!(
@@ -3171,7 +3216,7 @@ mod tests {
         });
 
         let mut obj = original.clone();
-        enc.encrypt_object(&mut obj, 6, 0);
+        enc.encrypt_object(&mut obj, 6, 0).unwrap();
         assert_eq!(obj, original, "an Identity stream is written as stored");
 
         let decryptor = decryptor_for(&dict, b"");
@@ -3188,7 +3233,7 @@ mod tests {
         for plaintext in [Vec::new(), vec![0x41], vec![0x42; 16]] {
             let original = Object::String(plaintext.clone());
             let mut obj = original.clone();
-            enc.encrypt_object(&mut obj, 1, 0);
+            enc.encrypt_object(&mut obj, 1, 0).unwrap();
             let mut roundtripped = obj;
             decryptor.decrypt_object(&mut roundtripped, 1, 0);
             assert_eq!(roundtripped, original, "{} bytes", plaintext.len());
