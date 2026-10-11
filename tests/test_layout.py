@@ -104,6 +104,7 @@ def test_paragraph_gap_changes_the_paragraphs(report: bytes) -> None:
 def test_every_knob_is_accepted(report: bytes) -> None:
     blocks = Document(data=report).layout(
         line_overlap=0.5,
+        redraw_tolerance=0.1,
         paragraph_gap=1.6,
         paragraph_pitch="lower_half_median",
         min_pitch_steps=4,

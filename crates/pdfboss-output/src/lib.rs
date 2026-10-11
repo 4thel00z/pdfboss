@@ -3638,4 +3638,33 @@ mod tests {
             "\u{627}\u{644}\u{639}\u{627}\u{626}\u{644}\u{629} \u{627}\u{633}\u{645}"
         );
     }
+
+    /// A line the producer draws twice at the same position, each time over
+    /// a fresh white box, shows once and reads once: the second draw's spans
+    /// sit on the first's and are not interleaved with them.
+    #[test]
+    fn a_line_drawn_twice_in_place_reads_once() {
+        let draw = "1 g 450 40 120 14 re f 0 g \
+                    BT /F1 10 Tf 457 44 Td [(Ca)2(r)2(r)-3(ied)2(: _)2(_)2(_)] TJ ET";
+        let doc = Document::load(doc_with_graphics(&format!(
+            "BT /F1 10 Tf 72 700 Td (Body) Tj ET {draw} {draw}"
+        )))
+        .unwrap();
+        let text = page_text(&doc, 0);
+        assert_eq!(text, "Body\nCarried: ___", "{text:?}");
+        let page = doc.page(0).unwrap();
+        let markdown = extract_page_markdown(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(markdown.contains("Carried: ___"), "{markdown:?}");
+        assert!(!markdown.contains("CaCa"), "{markdown:?}");
+    }
+
+    /// The same word drawn at two different places on a line is two words.
+    #[test]
+    fn the_same_text_at_two_places_stays_twice() {
+        let doc = Document::load(doc_with_graphics(
+            "BT /F1 10 Tf 72 700 Td (ab) Tj ET BT /F1 10 Tf 150 700 Td (ab) Tj ET",
+        ))
+        .unwrap();
+        assert_eq!(page_text(&doc, 0), "ab ab");
+    }
 }

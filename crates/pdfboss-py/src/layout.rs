@@ -48,6 +48,7 @@ pub(crate) fn layout_options(knobs: Option<&Bound<'_, PyDict>>) -> PyResult<Layo
         let key: String = key.extract()?;
         match key.as_str() {
             "line_overlap" => options.line_overlap = value.extract()?,
+            "redraw_tolerance" => options.redraw_tolerance = value.extract()?,
             "paragraph_gap" => options.paragraph_gap = value.extract()?,
             "paragraph_pitch" => options.paragraph_pitch = pitch_from_str(value.extract()?)?,
             "min_pitch_steps" => options.min_pitch_steps = value.extract()?,

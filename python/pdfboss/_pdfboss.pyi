@@ -403,6 +403,7 @@ class Document:
         reading_order: str = "content",
         invisible_text: bool = False,
         line_overlap: float = 0.5,
+        redraw_tolerance: float = 0.1,
         paragraph_gap: float = 1.8,
         paragraph_pitch: Literal["median", "lower_half_median"] = "median",
         min_pitch_steps: int = 4,
@@ -425,7 +426,9 @@ class Document:
         negative from the end) picks which pages are returned, in the order
         given. The remaining keywords tune the thresholds blocks are cut by:
         ``line_overlap`` (share of the smaller height two spans must overlap
-        to share a line), ``paragraph_gap`` (baseline step, in line pitches,
+        to share a line), ``redraw_tolerance`` (offset, in font sizes, within
+        which the same text drawn twice on a line reads once; 0 keeps both),
+        ``paragraph_gap`` (baseline step, in line pitches,
         that breaks a paragraph), ``paragraph_pitch`` (``"median"`` step or
         ``"lower_half_median"`` of the downward steps, falling back to the
         median line size below ``min_pitch_steps`` steps), ``flow_step_up``,
@@ -641,6 +644,7 @@ class Page:
         reading_order: str = "content",
         invisible_text: bool = False,
         line_overlap: float = 0.5,
+        redraw_tolerance: float = 0.1,
         paragraph_gap: float = 1.8,
         paragraph_pitch: Literal["median", "lower_half_median"] = "median",
         min_pitch_steps: int = 4,
@@ -2325,6 +2329,7 @@ class AsyncDocument:
         reading_order: str = "content",
         invisible_text: bool = False,
         line_overlap: float = 0.5,
+        redraw_tolerance: float = 0.1,
         paragraph_gap: float = 1.8,
         paragraph_pitch: Literal["median", "lower_half_median"] = "median",
         min_pitch_steps: int = 4,
@@ -2544,6 +2549,7 @@ class AsyncPage:
         reading_order: str = "content",
         invisible_text: bool = False,
         line_overlap: float = 0.5,
+        redraw_tolerance: float = 0.1,
         paragraph_gap: float = 1.8,
         paragraph_pitch: Literal["median", "lower_half_median"] = "median",
         min_pitch_steps: int = 4,

@@ -21,6 +21,11 @@ pub struct LayoutOptions {
     /// fraction of the smaller height: a superscript or subscript, never a
     /// fraction's numerator or denominator.
     pub line_overlap: f32,
+    /// Two spans on a line with the same text and size whose origins lie
+    /// within this fraction of the size of each other are one draw painted
+    /// twice (a producer redrawing a line in place, or overprinting it for
+    /// bold), and the later one is dropped. Zero keeps every span.
+    pub redraw_tolerance: f32,
     /// A baseline step beyond this multiple of a run's line pitch is white
     /// space between paragraphs rather than leading inside one.
     pub paragraph_gap: f32,
@@ -77,6 +82,7 @@ impl Default for LayoutOptions {
     fn default() -> Self {
         LayoutOptions {
             line_overlap: 0.5,
+            redraw_tolerance: 0.1,
             paragraph_gap: 1.8,
             paragraph_pitch: Pitch::Median,
             min_pitch_steps: 4,
@@ -2479,8 +2485,26 @@ fn line_groups<'s>(spans: &[&'s TextSpan], options: &LayoutOptions) -> Vec<Group
     groups.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
     for group in &mut groups {
         group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+        drop_redraws(&mut group.spans, options.redraw_tolerance);
     }
     groups
+}
+
+/// Drops each span that repeats the one kept before it on an x-sorted line:
+/// same text and size, origin within [`LayoutOptions::redraw_tolerance`]
+/// of the size. A viewer shows such a pair as one run of glyphs, and
+/// keeping both interleaves them run by run.
+fn drop_redraws(spans: &mut Vec<&TextSpan>, tolerance: f32) {
+    if tolerance <= 0.0 {
+        return;
+    }
+    spans.dedup_by(|next, kept| {
+        let reach = tolerance * kept.size;
+        next.text == kept.text
+            && next.size == kept.size
+            && (next.x - kept.x).abs() <= reach
+            && (next.y - kept.y).abs() <= reach
+    });
 }
 
 /// A grid and the page-edge lines around it: the lines above the first
@@ -5816,6 +5840,7 @@ fn sequential_groups<'s>(
     }
     for group in &mut groups {
         group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+        drop_redraws(&mut group.spans, options.redraw_tolerance);
     }
     groups
 }
@@ -6405,6 +6430,7 @@ fn flow(spans: &[&TextSpan], order: ReadingOrder, out: &mut String) {
             out.push('\n');
         }
         line.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
+        drop_redraws(&mut line.spans, LayoutOptions::default().redraw_tolerance);
         let mut prev_end: Option<f32> = None;
         let mut prev_size = 0.0f32;
         for span in &line.spans {

@@ -130,6 +130,13 @@ blocks = doc.layout(
 )
 ```
 
+Some producers draw a line twice at the same position, for example over a fresh
+white box or offset by a fraction of a point to fake bold. Text, Markdown and
+`layout()` read such a line once: a span that repeats the span before it (same
+text and size, origin within `redraw_tolerance` of the size, default 0.1) is
+dropped. `redraw_tolerance=0` keeps every copy. `spans()` always reports every
+draw.
+
 The stubs list every keyword with its default and meaning. `AsyncDocument.layout`
 and `AsyncPage.layout` are the coroutine twins. In Rust the same blocks come from
 `extract_layout_opts` and `extract_page_layout_opts`, the thresholds from
