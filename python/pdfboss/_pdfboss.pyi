@@ -389,6 +389,49 @@ class Document:
         """Whole-document markdown: headings, lists and tables inferred from
         layout; heading sizes judged across the document."""
 
+    def layout(
+        self,
+        pages: list[int] | None = None,
+        *,
+        reading_order: str = "content",
+        invisible_text: bool = False,
+        line_overlap: float = 0.5,
+        paragraph_gap: float = 1.8,
+        paragraph_pitch: Literal["median", "lower_half_median"] = "median",
+        min_pitch_steps: int = 4,
+        flow_step_up: float = 2.0,
+        flow_line_up: float = 1.0,
+        flow_step_aside: float = 2.0,
+        heading_min_delta: float = 1.0,
+        heading_max_chars: int = 120,
+        bold_heading_max_chars: int = 72,
+        heading_merge_step: float = 1.8,
+        list_min_lines: int = 2,
+        list_continuation_indent: float = 0.5,
+        page_title_min_gap: float = 1.5,
+        header_footer_min_pages: int = 3,
+    ) -> list[list[LayoutBlock]]:
+        """The document's layout: per page, the headings, paragraphs, lists
+        and tables ``extract_markdown`` renders, each a ``LayoutBlock`` with
+        its box in PDF user space. Heading sizes and running headers and
+        footers are judged across the whole document; ``pages`` (0-based,
+        negative from the end) picks which pages are returned, in the order
+        given. The remaining keywords tune the thresholds blocks are cut by:
+        ``line_overlap`` (share of the smaller height two spans must overlap
+        to share a line), ``paragraph_gap`` (baseline step, in line pitches,
+        that breaks a paragraph), ``paragraph_pitch`` (``"median"`` step or
+        ``"lower_half_median"`` of the downward steps, falling back to the
+        median line size below ``min_pitch_steps`` steps), ``flow_step_up``,
+        ``flow_line_up`` and ``flow_step_aside`` (rises and sideways jumps,
+        in line sizes, that open a new content-order flow),
+        ``heading_min_delta`` (points above body size a heading needs),
+        ``heading_max_chars``, ``bold_heading_max_chars``,
+        ``heading_merge_step`` (step, in line sizes, that keeps heading lines
+        together), ``list_min_lines``, ``list_continuation_indent`` (indent,
+        in sizes, of a wrapped item line), ``page_title_min_gap`` (gap, in
+        pitches, under a body-size page title) and
+        ``header_footer_min_pages``."""
+
     def elements(
         self,
         *,
@@ -585,6 +628,31 @@ class Page:
         ``Document.extract_markdown`` is the better answer whenever the
         whole document is at hand."""
 
+    def layout(
+        self,
+        *,
+        reading_order: str = "content",
+        invisible_text: bool = False,
+        line_overlap: float = 0.5,
+        paragraph_gap: float = 1.8,
+        paragraph_pitch: Literal["median", "lower_half_median"] = "median",
+        min_pitch_steps: int = 4,
+        flow_step_up: float = 2.0,
+        flow_line_up: float = 1.0,
+        flow_step_aside: float = 2.0,
+        heading_min_delta: float = 1.0,
+        heading_max_chars: int = 120,
+        bold_heading_max_chars: int = 72,
+        heading_merge_step: float = 1.8,
+        list_min_lines: int = 2,
+        list_continuation_indent: float = 0.5,
+        page_title_min_gap: float = 1.5,
+        header_footer_min_pages: int = 3,
+    ) -> list[LayoutBlock]:
+        """The page's layout blocks, ranking heading sizes against that page
+        alone. ``Document.layout`` is the better answer whenever the whole
+        document is at hand; same keywords."""
+
     def spans(self, *, reading_order: str = "content") -> list[Span]:
         """The page's styled text spans, in emission order. Releases the
         GIL like ``extract_text``, and is lenient the same way:
@@ -779,6 +847,68 @@ class PlacedImage:
     def inline(self) -> bool:
         """Drawn by an inline ``BI … ID … EI`` sequence rather than a
         ``Do``."""
+
+class LayoutBlock:
+    """One block of a page's layout, in reading order, yielded by
+    ``Document.layout`` and ``Page.layout``."""
+
+    @property
+    def kind(self) -> Literal["heading", "paragraph", "list", "table"]:
+        """What the block is."""
+
+    @property
+    def level(self) -> int | None:
+        """A heading's level, 1 to 6; ``None`` for other blocks."""
+
+    @property
+    def role(self) -> Literal["body", "quote", "page_header", "page_footer"] | None:
+        """A paragraph's role; ``None`` for other blocks."""
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """``(x0, y0, x1, y1)`` in PDF user space, y-up, like ``Span.bbox``."""
+
+    @property
+    def text(self) -> str:
+        """The block as plain text, as ``extract_text`` writes it."""
+
+    @property
+    def items(self) -> list[LayoutListItem]:
+        """A list's items; empty for other blocks."""
+
+    @property
+    def rows(self) -> list[list[LayoutCell]]:
+        """A table's rows of cells; empty for other blocks."""
+
+class LayoutListItem:
+    """One item of a layout list."""
+
+    @property
+    def marker(self) -> str:
+        """The marker as the page writes it (``"-"``, ``"1."``)."""
+
+    @property
+    def text(self) -> str:
+        """The item's text, marker removed, lines joined by ``"\\n"``."""
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        """The box of the item's lines, like ``LayoutBlock.bbox``."""
+
+class LayoutCell:
+    """One cell of a layout table."""
+
+    @property
+    def text(self) -> str:
+        """The cell's text; empty for an empty cell."""
+
+    @property
+    def colspan(self) -> int:
+        """Columns the cell spans."""
+
+    @property
+    def rowspan(self) -> int:
+        """Rows the cell spans."""
 
 class InteractiveForm:
     """The interactive form dictionary (ISO 32000-1 12.7.2, Table 218):
@@ -2181,6 +2311,31 @@ class AsyncDocument:
         ``Document.extract_markdown``: headings, lists and tables inferred
         from layout, heading sizes judged across the document."""
 
+    async def layout(
+        self,
+        pages: list[int] | None = None,
+        *,
+        reading_order: str = "content",
+        invisible_text: bool = False,
+        line_overlap: float = 0.5,
+        paragraph_gap: float = 1.8,
+        paragraph_pitch: Literal["median", "lower_half_median"] = "median",
+        min_pitch_steps: int = 4,
+        flow_step_up: float = 2.0,
+        flow_line_up: float = 1.0,
+        flow_step_aside: float = 2.0,
+        heading_min_delta: float = 1.0,
+        heading_max_chars: int = 120,
+        bold_heading_max_chars: int = 72,
+        heading_merge_step: float = 1.8,
+        list_min_lines: int = 2,
+        list_continuation_indent: float = 0.5,
+        page_title_min_gap: float = 1.5,
+        header_footer_min_pages: int = 3,
+    ) -> list[list[LayoutBlock]]:
+        """The document's layout blocks per page — the async twin of
+        ``Document.layout``, same arguments."""
+
     async def render_pages(
         self,
         pages: list[int] | None = None,
@@ -2375,6 +2530,30 @@ class AsyncPage:
         the async twin of ``Page.extract_markdown``.
         ``AsyncDocument.extract_markdown`` is the better answer whenever
         the whole document is at hand."""
+
+    async def layout(
+        self,
+        *,
+        reading_order: str = "content",
+        invisible_text: bool = False,
+        line_overlap: float = 0.5,
+        paragraph_gap: float = 1.8,
+        paragraph_pitch: Literal["median", "lower_half_median"] = "median",
+        min_pitch_steps: int = 4,
+        flow_step_up: float = 2.0,
+        flow_line_up: float = 1.0,
+        flow_step_aside: float = 2.0,
+        heading_min_delta: float = 1.0,
+        heading_max_chars: int = 120,
+        bold_heading_max_chars: int = 72,
+        heading_merge_step: float = 1.8,
+        list_min_lines: int = 2,
+        list_continuation_indent: float = 0.5,
+        page_title_min_gap: float = 1.5,
+        header_footer_min_pages: int = 3,
+    ) -> list[LayoutBlock]:
+        """The page's layout blocks — the async twin of ``Page.layout``,
+        same arguments."""
 
     async def spans(self, *, reading_order: str = "content") -> list[Span]:
         """The page's styled text spans — the async twin of

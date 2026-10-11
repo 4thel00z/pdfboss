@@ -17,7 +17,8 @@ pub use pdfboss_text::{
     SkippedText, SkippedTextKind, TextSpan,
 };
 pub use structure::{
-    document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
+    document_layout, document_layout_opts, document_layout_with_rulings, layout, page_layout,
+    page_layout_opts, page_layout_with_rulings, LayoutOptions, Pitch,
 };
 
 /// What extraction keeps beyond the visible page.
@@ -308,6 +309,32 @@ pub fn extract_markdown_reporting_opts(
     order: ReadingOrder,
     opts: TextOptions,
 ) -> Result<(String, Vec<ExtractReport>)> {
+    let (layouts, reports) =
+        extract_layout_reporting_opts(doc, order, opts, &LayoutOptions::default())?;
+    Ok((Markdown.render(&layouts), reports))
+}
+
+/// Every page's layout blocks — headings, paragraphs, lists and tables with
+/// their boxes — the structure [`extract_markdown_opts`] renders, cut by the
+/// thresholds `layout` sets.
+pub fn extract_layout_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<Vec<PageLayout>> {
+    let (layouts, _) = extract_layout_reporting_opts(doc, order, opts, layout)?;
+    Ok(layouts)
+}
+
+/// [`extract_layout_opts`] with one [`ExtractReport`] per page, in page
+/// order.
+pub fn extract_layout_reporting_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<(Vec<PageLayout>, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
     // The optional-content state and the structure tree load once for the
     // document: the tree's parent entries are read here, not on every page.
@@ -347,10 +374,7 @@ pub fn extract_markdown_reporting_opts(
         pages.push(page);
         reports.push(report);
     }
-    Ok((
-        Markdown.render(&structure::document_layout_extracted(pages)),
-        reports,
-    ))
+    Ok((structure::document_layout_extracted(pages, layout), reports))
 }
 
 /// One page as Markdown, ranking heading sizes against that page alone.
@@ -375,6 +399,46 @@ pub fn extract_page_markdown_opts(
         retain_rulings_on_page(&mut rulings, page);
     }
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
+}
+
+/// One page's layout blocks, heading sizes ranked against that page alone,
+/// cut by the thresholds `layout` sets. [`extract_layout_opts`] is the
+/// better answer whenever the document is at hand.
+pub fn extract_page_layout_opts(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<PageLayout> {
+    let (mut spans, mut rulings, report) =
+        pdfboss_text::extract_spans_and_rulings_reporting(doc, page, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
+    Ok(page_layout_opts(&spans, &rulings, report.order, layout))
+}
+
+/// [`extract_page_layout_opts`] against any object source. Signed like
+/// [`extract_page_markdown_with_opts`].
+pub async fn extract_page_layout_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<PageLayout> {
+    let (mut spans, mut rulings, report) =
+        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc, structure, order)
+            .await?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
+    Ok(page_layout_opts(&spans, &rulings, report.order, layout))
 }
 
 /// [`extract_page_markdown`] against any object source. Signed like
@@ -1256,7 +1320,10 @@ mod tests {
         assert!(expected.contains("# Annual Report"), "md: {expected}");
         assert!(expected.contains("| --- |"), "md: {expected}");
         assert_eq!(
-            Markdown.render(&structure::document_layout_extracted(extracted)),
+            Markdown.render(&structure::document_layout_extracted(
+                extracted,
+                &LayoutOptions::default()
+            )),
             expected
         );
     }

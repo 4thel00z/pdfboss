@@ -49,12 +49,14 @@ pub enum Marker {
 }
 
 /// One list item: its marker, the marker text's length in characters (the
-/// continuation indent a wrapped item is measured against), and its lines.
+/// continuation indent a wrapped item is measured against), its lines, and
+/// their box.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ListItem {
     pub marker: Marker,
     pub marker_len: usize,
     pub lines: Vec<Line>,
+    pub bbox: BBox,
 }
 
 /// One table cell. An empty cell — or one covered by a neighbour's span —
