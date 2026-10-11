@@ -427,7 +427,7 @@ class Document:
         given. The remaining keywords tune the thresholds blocks are cut by:
         ``line_overlap`` (share of the smaller height two spans must overlap
         to share a line), ``redraw_tolerance`` (offset, in font sizes, within
-        which the same text drawn twice on a line reads once; 0 keeps both),
+        which the same text drawn twice in place reads once; 0 keeps both),
         ``paragraph_gap`` (baseline step, in line pitches,
         that breaks a paragraph), ``paragraph_pitch`` (``"median"`` step or
         ``"lower_half_median"`` of the downward steps, falling back to the

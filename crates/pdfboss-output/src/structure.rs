@@ -9,6 +9,8 @@ use pdfboss_text::{
     ArtifactKind, ReadingOrder, Ruling, StandardKind, StandardOwner, StandardType,
     StructureElement, TextSpan,
 };
+use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// The thresholds the layout pass segments a page by. `Default` holds the
 /// values every `extract_*` entry uses; callers that need block boxes cut
@@ -262,6 +264,7 @@ pub fn page_layout_opts(
     order: ReadingOrder,
     options: &LayoutOptions,
 ) -> PageLayout {
+    let spans = &*without_redraws(spans, options.redraw_tolerance);
     let stats = size_stats(&[spans], options);
     let mut layout = page_layout_with_stats(spans, rulings, &stats, order, options);
     promote_page_title(&mut layout.blocks, &stats, options);
@@ -309,11 +312,15 @@ fn layouts_of(
     pages: &[(&[TextSpan], &[Ruling], ReadingOrder)],
     options: &LayoutOptions,
 ) -> Vec<PageLayout> {
-    let borrowed: Vec<&[TextSpan]> = pages.iter().map(|(spans, _, _)| *spans).collect();
+    let kept: Vec<Cow<'_, [TextSpan]>> = pages
+        .iter()
+        .map(|(spans, _, _)| without_redraws(spans, options.redraw_tolerance))
+        .collect();
+    let borrowed: Vec<&[TextSpan]> = kept.iter().map(|spans| &**spans).collect();
     let stats = size_stats(&borrowed, options);
     let layouts = on_workers(pages.len(), |index| {
-        let (spans, rulings, order) = pages[index];
-        page_layout_with_stats(spans, rulings, &stats, order, options)
+        let (_, rulings, order) = pages[index];
+        page_layout_with_stats(borrowed[index], rulings, &stats, order, options)
     });
     finished(layouts, &stats, options)
 }
@@ -1992,7 +1999,13 @@ pub(crate) struct ExtractedPage {
 }
 
 impl ExtractedPage {
-    pub(crate) fn new(spans: Vec<TextSpan>, rulings: Vec<Ruling>, order: ReadingOrder) -> Self {
+    pub(crate) fn new(
+        mut spans: Vec<TextSpan>,
+        rulings: Vec<Ruling>,
+        order: ReadingOrder,
+        options: &LayoutOptions,
+    ) -> Self {
+        drop_redraws(&mut spans, options.redraw_tolerance);
         let weights = SizeWeights::of(&spans);
         ExtractedPage {
             spans,
@@ -2485,26 +2498,66 @@ fn line_groups<'s>(spans: &[&'s TextSpan], options: &LayoutOptions) -> Vec<Group
     groups.sort_by(|a, b| b.y.total_cmp(&a.y)); // top of page first
     for group in &mut groups {
         group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
-        drop_redraws(&mut group.spans, options.redraw_tolerance);
     }
     groups
 }
 
-/// Drops each span that repeats the one kept before it on an x-sorted line:
-/// same text and size, origin within [`LayoutOptions::redraw_tolerance`]
-/// of the size. A viewer shows such a pair as one run of glyphs, and
-/// keeping both interleaves them run by run.
-fn drop_redraws(spans: &mut Vec<&TextSpan>, tolerance: f32) {
-    if tolerance <= 0.0 {
-        return;
+/// The page's spans without the ones that repeat an earlier span in place:
+/// the same text, size and rotation, the origin within
+/// [`LayoutOptions::redraw_tolerance`] of the size in both directions, and
+/// the copy starting in the first half of the kept span, so two tightly set
+/// glyphs that happen to match stay two. A viewer shows such a pair as one
+/// run, while keeping both interleaves them run by run and counts their
+/// characters twice in the size pass. Borrows when nothing repeats.
+fn without_redraws(spans: &[TextSpan], tolerance: f32) -> Cow<'_, [TextSpan]> {
+    let redrawn = redrawn(spans, tolerance);
+    if !redrawn.contains(&true) {
+        return Cow::Borrowed(spans);
     }
-    spans.dedup_by(|next, kept| {
-        let reach = tolerance * kept.size;
-        next.text == kept.text
-            && next.size == kept.size
-            && (next.x - kept.x).abs() <= reach
-            && (next.y - kept.y).abs() <= reach
-    });
+    Cow::Owned(
+        spans
+            .iter()
+            .zip(&redrawn)
+            .filter(|(_, redrawn)| !**redrawn)
+            .map(|(span, _)| span.clone())
+            .collect(),
+    )
+}
+
+/// Drops the redraws [`without_redraws`] finds from an owned span list.
+fn drop_redraws(spans: &mut Vec<TextSpan>, tolerance: f32) {
+    let redrawn = redrawn(spans, tolerance);
+    let mut flags = redrawn.iter();
+    spans.retain(|_| !flags.next().copied().unwrap_or(false));
+}
+
+/// Per span, whether it repeats an earlier kept span (see
+/// [`without_redraws`]). Spans are bucketed by text, size and rotation, so
+/// a page compares each span with the few earlier spans that could match.
+fn redrawn(spans: &[TextSpan], tolerance: f32) -> Vec<bool> {
+    if tolerance <= 0.0 {
+        return vec![false; spans.len()];
+    }
+    let mut kept: HashMap<(&str, u32, i32), Vec<&TextSpan>> = HashMap::new();
+    spans
+        .iter()
+        .map(|span| {
+            let candidates = kept
+                .entry((span.text.as_str(), span.size.to_bits(), span.rotate))
+                .or_default();
+            let reach = tolerance * span.size;
+            let repeat = candidates.iter().any(|earlier| {
+                let shift = (span.x - earlier.x).abs();
+                shift <= reach
+                    && (span.y - earlier.y).abs() <= reach
+                    && shift < 0.5 * (earlier.end_x - earlier.x).abs()
+            });
+            if !repeat {
+                candidates.push(span);
+            }
+            repeat
+        })
+        .collect()
 }
 
 /// A grid and the page-edge lines around it: the lines above the first
@@ -5840,7 +5893,6 @@ fn sequential_groups<'s>(
     }
     for group in &mut groups {
         group.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
-        drop_redraws(&mut group.spans, options.redraw_tolerance);
     }
     groups
 }
@@ -6377,6 +6429,7 @@ fn x_span(spans: &[&TextSpan]) -> f32 {
 /// divergence is a parity bug in the IR or the [`Text`] adapter.
 #[cfg(test)]
 pub(crate) fn layout_reference(spans: &[TextSpan], order: ReadingOrder) -> String {
+    let spans = &*without_redraws(spans, LayoutOptions::default().redraw_tolerance);
     let mut out = String::new();
     for segment in segments(spans, order, &LayoutOptions::default()) {
         if !out.is_empty() {
@@ -6430,7 +6483,6 @@ fn flow(spans: &[&TextSpan], order: ReadingOrder, out: &mut String) {
             out.push('\n');
         }
         line.spans.sort_by(|a, b| a.x.total_cmp(&b.x));
-        drop_redraws(&mut line.spans, LayoutOptions::default().redraw_tolerance);
         let mut prev_end: Option<f32> = None;
         let mut prev_size = 0.0f32;
         for span in &line.spans {
