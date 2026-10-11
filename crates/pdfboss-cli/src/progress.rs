@@ -8,7 +8,7 @@
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pdfboss_aio::{AsyncDocument, Backend as _, CachedBackend, HttpBackend};
 
@@ -129,7 +129,7 @@ impl OpenMinimap {
     /// The stderr payload for one fetch: the first frame draws both lines,
     /// later frames reclaim and redraw them. None once `finish` ran.
     fn frame(&self, offset: u64, len: u64) -> Option<String> {
-        let mut state = self.state.lock().expect("minimap mutex");
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.finished {
             return None;
         }
@@ -153,7 +153,7 @@ impl OpenMinimap {
     }
 
     fn finish(&self) {
-        let mut state = self.state.lock().expect("minimap mutex");
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let erase = state.started && !state.finished;
         state.finished = true;
         if !erase {

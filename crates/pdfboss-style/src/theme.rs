@@ -36,7 +36,7 @@ pub struct Theme {
 impl Theme {
     /// The default theme: built-in CSS styles.
     pub fn default_theme() -> Theme {
-        let rules = parse_sheet(DEFAULT_CSS).expect("the built-in default theme parses");
+        let rules = parse_sheet(DEFAULT_CSS).unwrap_or_default();
         Theme::from_rules(Theme::empty(), rules)
     }
 

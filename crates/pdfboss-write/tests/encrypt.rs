@@ -604,7 +604,7 @@ fn rewrite_document_carries_an_encrypt_metadata_false_stream_through_unchanged()
         d.insert(name("Msg"), Object::String(b"ordinary secret".to_vec()));
         d
     });
-    enc.encrypt_object(&mut msg, 3, 0);
+    enc.encrypt_object(&mut msg, 3, 0).unwrap();
     let msg_bytes = msg
         .as_dict()
         .unwrap()

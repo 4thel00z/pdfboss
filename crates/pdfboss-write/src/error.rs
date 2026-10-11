@@ -48,6 +48,10 @@ pub enum Error {
     /// The base trailer names no `/Root` to build an update against.
     #[error("trailer has no /Root")]
     MissingRoot,
+    /// The base document has no cross-reference section to chain an
+    /// appended update to.
+    #[error("base document has no cross-reference section")]
+    MissingXrefSection,
     /// The base file carries no `startxref` to chain an appended section's
     /// `/Prev` to.
     #[error("no startxref in the base file")]

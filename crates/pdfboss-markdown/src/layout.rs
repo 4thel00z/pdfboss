@@ -154,14 +154,16 @@ impl<'a> Engine<'a> {
 
     /// The current (last) page.
     fn page(&mut self) -> &mut LaidPage {
-        self.pages
-            .last_mut()
-            .expect("engine always holds at least one page")
+        if self.pages.is_empty() {
+            self.pages.push(LaidPage::default());
+        }
+        let last = self.pages.len() - 1;
+        &mut self.pages[last]
     }
 
     /// The current page's index.
     fn page_index(&self) -> usize {
-        self.pages.len() - 1
+        self.pages.len().saturating_sub(1)
     }
 
     /// Appends one draw item to the current page.

@@ -151,18 +151,18 @@ fn regions(bands: &[Band]) -> Vec<Vec<&Band>> {
     });
     let mut regions: Vec<Vec<&Band>> = Vec::new();
     for band in order {
-        let extends = regions.last().is_some_and(|region| {
-            let last = region[region.len() - 1];
-            last.color == band.color
-                && (last.rect.x0 - band.rect.x0).abs() <= TILING_EPSILON
-                && (last.rect.x1 - band.rect.x1).abs() <= TILING_EPSILON
-                && band.rect.y0 <= last.rect.y1 + TILING_EPSILON
-        });
-        if extends {
-            regions.last_mut().unwrap().push(band);
-            continue;
+        let extends = |region: &Vec<&Band>| -> bool {
+            region.last().is_some_and(|last| {
+                last.color == band.color
+                    && (last.rect.x0 - band.rect.x0).abs() <= TILING_EPSILON
+                    && (last.rect.x1 - band.rect.x1).abs() <= TILING_EPSILON
+                    && band.rect.y0 <= last.rect.y1 + TILING_EPSILON
+            })
+        };
+        match regions.last_mut() {
+            Some(region) if extends(region) => region.push(band),
+            _ => regions.push(vec![band]),
         }
-        regions.push(vec![band]);
     }
     regions
 }

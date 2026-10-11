@@ -325,9 +325,7 @@ impl<'a> ContentOps<'a> {
                             self.stack.clear();
                             self.run_start = None;
                         }
-                        Token::Keyword(_) => {
-                            unreachable!("next_raw_token yields keywords borrowed")
-                        }
+                        Token::Keyword(_) => {}
                     }
                     continue;
                 }

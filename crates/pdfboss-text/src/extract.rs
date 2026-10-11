@@ -162,14 +162,23 @@ pub struct FontCache {
 
 impl FontCache {
     fn get(&self, r: ObjRef) -> Option<Arc<Font>> {
-        self.fonts.lock().unwrap().get(&r).cloned()
+        self.fonts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&r)
+            .cloned()
     }
 
     /// Stores `font` under `r`, keeping (and returning) an already-present
     /// entry: concurrent workers may load the same font twice, and the copies
     /// are interchangeable, so the first one in wins.
     fn insert(&self, r: ObjRef, font: Arc<Font>) -> Arc<Font> {
-        self.fonts.lock().unwrap().entry(r).or_insert(font).clone()
+        self.fonts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(r)
+            .or_insert(font)
+            .clone()
     }
 }
 

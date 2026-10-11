@@ -32,10 +32,7 @@ pub async fn overlay_base(doc: &AsyncDocument) -> Result<OverlayBase> {
     }
     let (trailer, _) = doc.merged_trailer();
     let root = trailer.get_ref("Root").ok_or(Error::MissingRoot)?;
-    let newest = doc
-        .sections()
-        .first()
-        .expect("a successfully opened document has walked at least one section");
+    let newest = doc.sections().first().ok_or(Error::MissingXrefSection)?;
     let kind = match newest.kind {
         XrefKind::Table => XrefStyle::Table,
         XrefKind::Stream => XrefStyle::Stream,

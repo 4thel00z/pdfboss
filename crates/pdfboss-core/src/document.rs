@@ -394,13 +394,12 @@ impl Document {
     /// Forces the page tree first, so no document built from the seed
     /// re-walks it.
     pub fn seed(&self) -> DocumentSeed {
-        self.pages();
         DocumentSeed {
             data: Arc::clone(&self.data),
             version: self.version,
             xref: Arc::clone(&self.xref),
             decryptor: self.decryptor.clone(),
-            pages: Arc::clone(self.pages.get().expect("pages() was just forced")),
+            pages: Arc::clone(self.pages.get_or_init(|| Arc::new(self.flatten_pages()))),
         }
     }
 
@@ -1116,13 +1115,7 @@ where
                         break;
                     }
                     let outcome = worker.page(i).and_then(|page| work(&state, &worker, &page));
-                    // Each index is handed to exactly one worker, so the
-                    // slot is always empty; a failed set would mean the
-                    // counter duplicated an index, which is worth crashing
-                    // over.
-                    if slots[i].set(outcome).is_err() {
-                        unreachable!("page index {i} was dispatched twice");
-                    }
+                    let _ = slots[i].set(outcome);
                 }
             });
         }
@@ -1131,7 +1124,7 @@ where
         .into_iter()
         .map(|slot| {
             slot.into_inner()
-                .expect("every page index below the count was dispatched")
+                .unwrap_or_else(|| Err(Error::Other("page index was never dispatched".to_owned())))
         })
         .collect()
 }

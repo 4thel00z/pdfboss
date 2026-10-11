@@ -174,9 +174,7 @@ fn plain_decimal(formatted: &str) -> String {
 }
 
 fn expand_exponent(mantissa: &str, exponent: &str) -> String {
-    let exp: i32 = exponent
-        .parse()
-        .expect("float formatting produced a malformed exponent");
+    let exp: i32 = exponent.parse().unwrap_or(0);
     let (sign, unsigned) = match mantissa.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", mantissa),

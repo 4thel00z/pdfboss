@@ -769,10 +769,7 @@ impl AsyncDocument {
             doc.setup_decryption(password).await?;
         }
         let pages = doc.flatten_pages().await;
-        doc.inner
-            .pages
-            .set(pages)
-            .expect("page index is set exactly once at open");
+        doc.inner.pages.set(pages).ok();
         Ok(doc)
     }
 
@@ -833,11 +830,7 @@ impl AsyncDocument {
                 // without decryption; drop them so they are re-read through
                 // the decrypting path if referenced again. The container
                 // cache too, for the same reason.
-                self.inner
-                    .objects
-                    .lock()
-                    .expect("object cache mutex")
-                    .clear();
+                self.cached_objects().clear();
                 self.inner.objstms.lock().await.clear();
                 Ok(())
             }
@@ -1101,13 +1094,7 @@ impl AsyncDocument {
         chain: &'a mut Vec<u32>,
     ) -> BoxFuture<'a, Result<Object>> {
         Box::pin(async move {
-            if let Some(cached) = self
-                .inner
-                .objects
-                .lock()
-                .expect("object cache mutex")
-                .get(&(r.num, r.gen))
-            {
+            if let Some(cached) = self.cached_objects().get(&(r.num, r.gen)) {
                 return Ok((**cached).clone());
             }
             if chain.contains(&r.num) {
@@ -1117,13 +1104,17 @@ impl AsyncDocument {
             let outcome = self.load_object(r, chain).await;
             chain.pop();
             let object = outcome?;
-            self.inner
-                .objects
-                .lock()
-                .expect("object cache mutex")
+            self.cached_objects()
                 .insert((r.num, r.gen), Arc::new(object.clone()));
             Ok(object)
         })
+    }
+
+    fn cached_objects(&self) -> std::sync::MutexGuard<'_, HashMap<(u32, u16), Arc<Object>>> {
+        self.inner
+            .objects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Uncached fetch: parses the object at its file offset or extracts it
@@ -1907,10 +1898,7 @@ impl AsyncDocument {
     pub(crate) async fn physical_object(&self, r: ObjRef, offset: u64) -> Result<(Span, Object)> {
         let mut chain = vec![r.num];
         let (span, object) = self.parse_in_file(offset, &mut chain).await?;
-        self.inner
-            .objects
-            .lock()
-            .expect("object cache mutex")
+        self.cached_objects()
             .insert((r.num, r.gen), Arc::new(object.clone()));
         Ok((span, object))
     }
@@ -2041,7 +2029,9 @@ pub(crate) async fn load_xref_chain(
     }
     // Non-empty entries imply at least one parsed section, which set the
     // span before any merge could run.
-    let trailer_span = trailer_span.expect("set on the first parsed section");
+    let Some(trailer_span) = trailer_span else {
+        return Err(Error::Core(pdfboss_core::Error::InvalidXref));
+    };
     Ok((
         XrefIndex {
             entries,
