@@ -37,7 +37,7 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-`doc.elements()` and `doc.spans()` return async iterators, consumed with `async for`, with the same ordering and salvage semantics as their sync twins. Each step hands over items the iterator already holds without suspending and goes back to the document only when they run out, so a long walk costs about as much as the sync one. A step that is cancelled or times out leaves its item for the next step, so no item is lost or repeated. See [Exploring PDF internals](./explorer.md) and [Styled spans](./spans.md).
+`doc.elements()` and `doc.spans()` return async iterators, consumed with `async for`, with the same ordering and salvage semantics as their sync twins. Each step returns one item. The iterator refills an internal buffer from the document in batches, so most steps return without suspending and a long walk costs about as much as the sync one. A step that is cancelled or times out leaves its item for the next step, so no item is lost or repeated. See [Exploring PDF internals](./explorer.md) and [Styled spans](./spans.md).
 
 A remote document differs only in the constructor:
 
