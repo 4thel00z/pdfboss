@@ -9,16 +9,18 @@
 //! parallel instead of serializing on that lock.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyIndexError, PyStopAsyncIteration, PyValueError};
+use pyo3::exceptions::{
+    PyException, PyIndexError, PyStopAsyncIteration, PyStopIteration, PyValueError,
+};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList, PyType};
 use pyo3::IntoPyObjectExt;
 
 use pdfboss_aio::{AsyncDocument as AioDocument, ElementStream};
@@ -2554,7 +2556,10 @@ impl AsyncDocument {
             content_ops,
         };
         AsyncElementIter {
-            stream: Arc::new(tokio::sync::Mutex::new(self.inner.elements(opts))),
+            source: Arc::new(ElementSource {
+                stream: Arc::new(tokio::sync::Mutex::new(self.inner.elements(opts))),
+                buffer: Buffered::shared(),
+            }),
         }
     }
 
@@ -2569,16 +2574,18 @@ impl AsyncDocument {
         let doc = self.inner.clone();
         let pages = pages.unwrap_or_else(|| (0..doc.page_count()).collect());
         Ok(AsyncSpanIter {
-            state: Arc::new(tokio::sync::Mutex::new(AsyncSpanIterState {
-                doc,
-                fonts: FontCache::default(),
-                order,
-                oc: None,
-                structure: None,
-                oc_loaded: false,
-                pages: pages.into_iter(),
-                buffer: Vec::new().into_iter(),
-            })),
+            source: Arc::new(SpanSource {
+                state: Arc::new(tokio::sync::Mutex::new(AsyncSpanIterState {
+                    doc,
+                    fonts: FontCache::default(),
+                    order,
+                    oc: None,
+                    structure: None,
+                    oc_loaded: false,
+                    pages: pages.into_iter(),
+                })),
+                buffer: Buffered::shared(),
+            }),
         })
     }
 
@@ -3268,19 +3275,241 @@ impl AsyncPage {
     }
 }
 
-/// Async iterator over a document's elements, returned by
-/// `AsyncDocument.elements()`. Each `__anext__` is a coroutine driving
-/// the Rust element stream on the tokio runtime, so the asyncio loop is
-/// never blocked.
+/// The most elements one refill moves from the element stream to Python.
+const ELEMENT_BATCH: usize = 256;
+
+/// Items fetched on the tokio runtime and not yet handed to Python, and
+/// whether the source behind them has ended.
+struct Buffered<T> {
+    items: VecDeque<PyResult<T>>,
+    exhausted: bool,
+}
+
+impl<T> Buffered<T> {
+    fn shared() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Buffered {
+            items: VecDeque::new(),
+            exhausted: false,
+        }))
+    }
+}
+
+fn lock_buffer<T>(buffer: &Mutex<Buffered<T>>) -> MutexGuard<'_, Buffered<T>> {
+    buffer.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The next buffered item, `StopAsyncIteration` once the source has ended,
+/// or `None` when the buffer is empty and must be refilled first.
+fn next_buffered<T>(buffer: &Mutex<Buffered<T>>, ended: &'static str) -> Option<PyResult<T>> {
+    let mut buffered = lock_buffer(buffer);
+    if let Some(item) = buffered.items.pop_front() {
+        return Some(item);
+    }
+    if buffered.exhausted {
+        return Some(Err(PyStopAsyncIteration::new_err(ended)));
+    }
+    None
+}
+
+/// What an async iterator draws from: `take` hands over a buffered item
+/// without awaiting, `fill` refills the buffer on the tokio runtime.
+trait Refill: Send + Sync {
+    fn take(&self, py: Python<'_>) -> Option<PyResult<PyObject>>;
+
+    /// A future that moves the next items into the buffer and resolves to
+    /// `None`. It never hands an item to Python itself, so dropping or
+    /// cancelling it loses nothing.
+    fn fill<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>>;
+}
+
+/// How `NextStep` is resumed by the coroutine awaiting it.
+enum Resume {
+    Send(PyObject),
+    Throw(PyErr),
+}
+
+/// The awaitable returned by the async iterators' `__anext__`.
 ///
-/// `ElementStream` is owned and `'static` (it holds a cheap `Arc` clone of
-/// the document, not a borrow of it — see `pdfboss_aio::stream`), so unlike
-/// the sync `ElementIter` this needs no borrow-extension or drop-order
-/// trick: the `Arc<tokio::sync::Mutex<_>>` alone keeps it alive and
-/// serializes advancement across concurrent `__anext__` calls.
+/// A buffered item is handed over without suspending, so a walk crosses
+/// from tokio to asyncio once per refill instead of once per item. When
+/// the buffer is empty it awaits the source's `fill` first and takes the
+/// item only after that wait is over: cancelling a pending `__anext__`
+/// leaves every fetched item buffered for the next call.
+#[pyclass(frozen)]
+struct NextStep {
+    source: Arc<dyn Refill>,
+    waiting: Mutex<Option<PyObject>>,
+}
+
+impl NextStep {
+    fn new(source: Arc<dyn Refill>) -> Self {
+        NextStep {
+            source,
+            waiting: Mutex::new(None),
+        }
+    }
+
+    fn waiting(&self) -> MutexGuard<'_, Option<PyObject>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Drives the pending refill, if any, then takes the next item. Returns
+    /// what the refill yields to the event loop; the item itself arrives as
+    /// the `StopIteration` that ends the await.
+    fn resume(&self, py: Python<'_>, mut resume: Resume) -> PyResult<PyObject> {
+        loop {
+            let waiting = self.waiting().take();
+            let Some(waiting) = waiting else {
+                if let Resume::Throw(err) = resume {
+                    return Err(err);
+                }
+                if let Some(item) = self.source.take(py) {
+                    return Err(PyStopIteration::new_err((item?,)));
+                }
+                let fill = self.source.fill(py)?;
+                *self.waiting() = Some(fill.call_method0("__await__")?.unbind());
+                resume = Resume::Send(py.None());
+                continue;
+            };
+            let outcome = match resume {
+                Resume::Send(value) => waiting.bind(py).call_method1("send", (value,)),
+                Resume::Throw(err) => waiting
+                    .bind(py)
+                    .call_method1("throw", (err.into_value(py),)),
+            };
+            match outcome {
+                Ok(yielded) => {
+                    *self.waiting() = Some(waiting);
+                    return Ok(yielded.unbind());
+                }
+                Err(err) if err.is_instance_of::<PyStopIteration>(py) => {
+                    resume = Resume::Send(py.None());
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+}
+
+#[pymethods]
+impl NextStep {
+    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&self, py: Python<'_>) -> PyResult<PyObject> {
+        self.resume(py, Resume::Send(py.None()))
+    }
+
+    fn send(&self, py: Python<'_>, value: PyObject) -> PyResult<PyObject> {
+        self.resume(py, Resume::Send(value))
+    }
+
+    /// Raises `error` at the await, as a generator's `throw` does; the
+    /// older `throw(type, value, traceback)` form is accepted too.
+    #[pyo3(signature = (error, value=None, traceback=None))]
+    fn throw(
+        &self,
+        py: Python<'_>,
+        error: Bound<'_, PyAny>,
+        value: Option<Bound<'_, PyAny>>,
+        traceback: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        let exception = match value {
+            Some(value) if error.is_instance_of::<PyType>() => error.call1((value,))?,
+            _ => error,
+        };
+        let exception = match traceback {
+            Some(traceback) if !traceback.is_none() => {
+                exception.call_method1("with_traceback", (traceback,))?
+            }
+            _ => exception,
+        };
+        self.resume(py, Resume::Throw(PyErr::from_value(exception)))
+    }
+
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let waiting = self.waiting().take();
+        if let Some(waiting) = waiting {
+            waiting.bind(py).call_method0("close")?;
+        }
+        Ok(())
+    }
+}
+
+/// The element stream behind `AsyncElementIter`, with the elements
+/// fetched from it but not yet handed to Python.
+struct ElementSource {
+    stream: Arc<tokio::sync::Mutex<ElementStream>>,
+    buffer: Arc<Mutex<Buffered<CoreElement>>>,
+}
+
+/// Adds one stream step to `fetched`; true once the stream has ended.
+fn push_element(
+    fetched: &mut VecDeque<PyResult<CoreElement>>,
+    step: Option<pdfboss_aio::Result<CoreElement>>,
+) -> bool {
+    let Some(item) = step else {
+        return true;
+    };
+    fetched.push_back(item.map_err(aio_err));
+    false
+}
+
+impl Refill for ElementSource {
+    fn take(&self, py: Python<'_>) -> Option<PyResult<PyObject>> {
+        next_buffered(&self.buffer, "element stream exhausted")
+            .map(|item| item.and_then(|inner| Element { inner }.into_py_any(py)))
+    }
+
+    /// Awaits the next element, then takes every further element the
+    /// stream has ready without waiting, up to `ELEMENT_BATCH`. Elements
+    /// already prepared for a page come back together; a step that would
+    /// wait (a fetch over HTTP, say) ends the batch instead of delaying it.
+    fn fill<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let stream = Arc::clone(&self.stream);
+        let buffer = Arc::clone(&self.buffer);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut stream = stream.lock().await;
+            {
+                let buffered = lock_buffer(&buffer);
+                if !buffered.items.is_empty() || buffered.exhausted {
+                    return Ok::<(), PyErr>(());
+                }
+            }
+            let mut fetched = VecDeque::new();
+            let mut exhausted = push_element(&mut fetched, stream.next().await);
+            while !exhausted && fetched.len() < ELEMENT_BATCH {
+                let Some(step) = stream.next().now_or_never() else {
+                    break;
+                };
+                exhausted = push_element(&mut fetched, step);
+            }
+            let mut buffered = lock_buffer(&buffer);
+            buffered.items.extend(fetched);
+            buffered.exhausted = exhausted;
+            Ok(())
+        })
+    }
+}
+
+/// Async iterator over a document's elements, returned by
+/// `AsyncDocument.elements()`. The Rust element stream runs on the tokio
+/// runtime, so the asyncio loop is never blocked.
+///
+/// Elements cross to Python in batches: one refill takes the next element
+/// plus every further one the stream has ready, and `__anext__` hands
+/// buffered elements over without suspending. Ordering, per-element
+/// errors and salvage are those of the stream. A cancelled `__anext__`
+/// takes nothing, so no element is lost, and an exhausted iterator keeps
+/// raising `StopAsyncIteration`.
 #[pyclass(frozen)]
 struct AsyncElementIter {
-    stream: Arc<tokio::sync::Mutex<ElementStream>>,
+    source: Arc<ElementSource>,
 }
 
 #[pymethods]
@@ -3289,31 +3518,93 @@ impl AsyncElementIter {
         slf
     }
 
-    /// Coroutine resolving to the next Element; raises StopAsyncIteration
+    /// Awaitable resolving to the next Element; raises StopAsyncIteration
     /// when the stream is exhausted. Per-item failures raise PdfError for
     /// that item and the stream may be continued (salvage semantics).
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let stream = Arc::clone(&self.stream);
+    fn __anext__(&self) -> NextStep {
+        NextStep::new(self.source.clone())
+    }
+}
+
+/// The span walk behind `AsyncSpanIter`: one page is extracted per refill,
+/// and its spans wait in `buffer` until Python takes them.
+struct SpanSource {
+    state: Arc<tokio::sync::Mutex<AsyncSpanIterState>>,
+    buffer: Arc<Mutex<Buffered<TextSpan>>>,
+}
+
+impl Refill for SpanSource {
+    fn take(&self, py: Python<'_>) -> Option<PyResult<PyObject>> {
+        next_buffered(&self.buffer, "span walk exhausted")
+            .map(|item| item.and_then(|inner| Span { inner }.into_py_any(py)))
+    }
+
+    /// Extracts pages until one has spans, or a page fails, or the walk
+    /// ends. A page counts as walked only once its extraction finished, so
+    /// a cancelled refill extracts it again next time.
+    fn fill<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let state = Arc::clone(&self.state);
+        let buffer = Arc::clone(&self.buffer);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut stream = stream.lock().await;
-            match stream.next().await {
-                Some(Ok(element)) => Ok(Element { inner: element }),
-                Some(Err(e)) => Err(aio_err(e)),
-                None => Err(PyStopAsyncIteration::new_err("element stream exhausted")),
+            let mut state = state.lock().await;
+            {
+                let buffered = lock_buffer(&buffer);
+                if !buffered.items.is_empty() || buffered.exhausted {
+                    return Ok::<(), PyErr>(());
+                }
+            }
+            if !state.oc_loaded {
+                state.oc = state.doc.oc_state().await;
+                state.structure = structure_for(&state.doc, state.order).await;
+                state.oc_loaded = true;
+            }
+            loop {
+                let Some(&index) = state.pages.as_slice().first() else {
+                    lock_buffer(&buffer).exhausted = true;
+                    return Ok(());
+                };
+                let extracted = match state.doc.page(index) {
+                    Ok(page) => pdfboss_text::extract_spans_reporting_cached_with(
+                        state.doc.clone(),
+                        &page,
+                        &state.fonts,
+                        state.oc.as_ref(),
+                        state.structure.as_ref(),
+                        state.order,
+                    )
+                    .await
+                    .map(|(spans, _)| spans)
+                    .map_err(pdf_err),
+                    Err(e) => Err(aio_err(e)),
+                };
+                state.pages.next();
+                let spans = match extracted {
+                    Ok(spans) => spans,
+                    Err(err) => {
+                        lock_buffer(&buffer).items.push_back(Err(err));
+                        return Ok(());
+                    }
+                };
+                if spans.is_empty() {
+                    continue;
+                }
+                lock_buffer(&buffer).items.extend(spans.into_iter().map(Ok));
+                return Ok(());
             }
         })
     }
 }
 
 /// Async iterator over a document's styled spans, returned by
-/// `AsyncDocument.spans()`. Buffers one page's spans at a time; each
-/// `__anext__` is a coroutine driving the shared extraction over the
-/// async document's range-fetching reads, with one font cache — and the
+/// `AsyncDocument.spans()`. Extracts one page per refill over the async
+/// document's range-fetching reads, with one font cache — and the
 /// document's optional-content state, loaded once — shared across the
-/// walk.
+/// walk. The page's spans are handed over without suspending, a cancelled
+/// `__anext__` loses no span, and an exhausted iterator keeps raising
+/// `StopAsyncIteration`.
 #[pyclass(frozen)]
 struct AsyncSpanIter {
-    state: Arc<tokio::sync::Mutex<AsyncSpanIterState>>,
+    source: Arc<SpanSource>,
 }
 
 struct AsyncSpanIterState {
@@ -3324,7 +3615,6 @@ struct AsyncSpanIterState {
     structure: Option<pdfboss_core::StructureTree>,
     oc_loaded: bool,
     pages: std::vec::IntoIter<usize>,
-    buffer: std::vec::IntoIter<TextSpan>,
 }
 
 #[pymethods]
@@ -3333,38 +3623,10 @@ impl AsyncSpanIter {
         slf
     }
 
-    /// Coroutine resolving to the next Span; raises StopAsyncIteration
+    /// Awaitable resolving to the next Span; raises StopAsyncIteration
     /// when the walk is exhausted.
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let state = Arc::clone(&self.state);
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut state = state.lock().await;
-            if !state.oc_loaded {
-                state.oc = state.doc.oc_state().await;
-                state.structure = structure_for(&state.doc, state.order).await;
-                state.oc_loaded = true;
-            }
-            loop {
-                if let Some(span) = state.buffer.next() {
-                    return Ok(Span { inner: span });
-                }
-                let Some(index) = state.pages.next() else {
-                    return Err(PyStopAsyncIteration::new_err("span walk exhausted"));
-                };
-                let page = state.doc.page(index).map_err(aio_err)?;
-                let (spans, _) = pdfboss_text::extract_spans_reporting_cached_with(
-                    state.doc.clone(),
-                    &page,
-                    &state.fonts,
-                    state.oc.as_ref(),
-                    state.structure.as_ref(),
-                    state.order,
-                )
-                .await
-                .map_err(pdf_err)?;
-                state.buffer = spans.into_iter();
-            }
-        })
+    fn __anext__(&self) -> NextStep {
+        NextStep::new(self.source.clone())
     }
 }
 
