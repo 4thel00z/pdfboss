@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.14.1](https://github.com/4thel00z/pdfboss/compare/v2.14.0...v2.14.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* **text:** read a line drawn twice in place once ([#258](https://github.com/4thel00z/pdfboss/issues/258)) ([06aeff6](https://github.com/4thel00z/pdfboss/commit/06aeff6e9df97e4ecc6737fc6fa650c0efccb028))
+
+
+### Documentation
+
+* **async:** state the batching and cancellation behaviour of elements() and spans() ([#257](https://github.com/4thel00z/pdfboss/issues/257)) ([0e96e90](https://github.com/4thel00z/pdfboss/commit/0e96e905f893f9c5e42db21ca4e077d3d42eefab))
+
 ## [2.14.0](https://github.com/4thel00z/pdfboss/compare/v2.13.2...v2.14.0) (2026-10-11)
 
 
