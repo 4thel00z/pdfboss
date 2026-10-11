@@ -244,6 +244,15 @@ pub struct TextSpan {
     pub y: f32,
     /// Device-space x after the last glyph's advance.
     pub end_x: f32,
+    /// Device-space y after the last glyph's advance: `y` for upright
+    /// text, the far end of the run for text drawn turned a quarter.
+    pub end_y: f32,
+    /// The page `/Rotate` value under which the span reads upright: the
+    /// direction of its baseline snapped to the nearest quarter turn and
+    /// read clockwise, so text running bottom to top is 90 and upside-down
+    /// text 180. Layout groups a page's spans by it, and `bbox` holds the
+    /// turned run for every value.
+    pub rotate: i32,
     /// Device-space x where each character's glyph starts, one entry per
     /// character of `text` and in the same order: a code that decodes to
     /// several characters repeats its glyph's x, and a `/ReversedChars`
@@ -268,18 +277,20 @@ pub struct TextSpan {
     /// with the `/FontBBox` extent standing in for whichever of the two the
     /// descriptor leaves out or states as zero. A font-wide box, not the
     /// glyphs' own: it contains the ink the font program declares, and can
-    /// stand well clear of it. Exact for unrotated horizontal text, an
-    /// approximation under rotated matrices; vertical writing takes the
-    /// advance as its vertical extent and half the size to each side of the
-    /// baseline.
+    /// stand well clear of it. Exact for horizontal text turned a whole
+    /// quarter (see `rotate`), an approximation at other angles; vertical
+    /// writing takes the advance as its vertical extent and half the size
+    /// to each side of the baseline.
     pub bbox: Rect,
-    /// Height of the box above the baseline, in device units: `bbox.y1 - y`.
-    /// For horizontal text the font's `/Ascent` (else the `/FontBBox` top,
+    /// Height of the box above the baseline, in device units: `bbox.y1 - y`
+    /// when `rotate` is 0, measured along the glyphs' up direction
+    /// otherwise. For horizontal text the font's `/Ascent` (else the `/FontBBox` top,
     /// else `/CapHeight`, else 800 per mille) scaled by the effective size;
     /// for vertical writing the advance's extent above the origin.
     pub ascent: f32,
     /// Depth of the box below the baseline, in device units, zero or
-    /// negative: `bbox.y0 - y`. For horizontal text the font's `/Descent`
+    /// negative: `bbox.y0 - y` when `rotate` is 0, measured along the
+    /// glyphs' up direction otherwise. For horizontal text the font's `/Descent`
     /// (else the `/FontBBox` bottom, else -200 per mille) scaled by the
     /// effective size; for vertical writing the advance's extent below the
     /// origin.
@@ -1955,6 +1966,34 @@ mod tests {
             spans[0]
         );
         assert!(spans[1].x > spans[0].end_x + 12.0, "{:?}", spans[1]);
+    }
+
+    /// A replacement shown turned a quarter keeps its font extents as
+    /// ascent and descent when later shows widen it, rather than offsets
+    /// measured along page y.
+    #[test]
+    fn a_turned_replacement_keeps_its_ascent_and_descent() {
+        let spans_of = |content: &[u8]| -> Vec<TextSpan> {
+            let doc = marked_doc(content, "");
+            let page = doc.page(0).unwrap();
+            extract_spans(&doc, &page, ReadingOrder::Content).unwrap()
+        };
+        let spans = spans_of(
+            b"q 0 1 -1 0 150 10 cm BT /F1 12 Tf /Span << /ActualText (fi) >> BDC (f) Tj (i) Tj EMC ET Q",
+        );
+        let single = spans_of(
+            b"q 0 1 -1 0 150 10 cm BT /F1 12 Tf /Span << /ActualText (f) >> BDC (f) Tj EMC ET Q",
+        )
+        .remove(0);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        let carrier = &spans[0];
+        assert_eq!(carrier.rotate, 90);
+        assert!(carrier.end_y > single.end_y, "{carrier:?}");
+        assert!((carrier.ascent - single.ascent).abs() < 1e-3, "{carrier:?}");
+        assert!(
+            (carrier.descent - single.descent).abs() < 1e-3,
+            "{carrier:?}"
+        );
     }
 
     /// A word break inside a replacement is a space in the text: words are

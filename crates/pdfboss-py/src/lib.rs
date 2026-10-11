@@ -1623,6 +1623,20 @@ impl Span {
         self.inner.end_x
     }
 
+    /// Device-space y after the last glyph's advance: `y` for upright
+    /// text, the far end of the run for text drawn turned a quarter.
+    #[getter]
+    fn end_y(&self) -> f32 {
+        self.inner.end_y
+    }
+
+    /// The page rotation (0, 90, 180 or 270, clockwise) under which the
+    /// span reads upright: text running bottom to top is 90.
+    #[getter]
+    fn rotation(&self) -> i32 {
+        self.inner.rotate
+    }
+
     /// Device-space x where each character's glyph starts, one entry per
     /// character of `text` and in the same order: a code that decodes to
     /// several characters repeats its glyph's x. Each character of an

@@ -13,6 +13,14 @@ with a form feed (`\f`). For structured output (headings, lists, tables), see
 [Markdown output](./markdown.md); for the spans themselves, with fonts, sizes and
 positions, see [Styled spans](./spans.md).
 
+Text drawn turned a quarter, such as a landscape exhibit set on a portrait page or a
+label running up a chart's side, is laid out in its own upright frame: each span's
+baseline direction is snapped to the nearest quarter turn, the spans sharing one are
+grouped into lines and tables the way upright text is, and the groups follow one another
+top to bottom by where they sit on the page. Text at other angles, such as a diagonal
+watermark, is treated as the nearest quarter turn. A page with no turned text skips
+this step.
+
 ## Reading order
 
 Every extraction entry point takes a reading order. There are three:
