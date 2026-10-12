@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.15.0](https://github.com/4thel00z/pdfboss/compare/v2.14.1...v2.15.0) (2026-10-12)
+
+
+### Features
+
+* **write:** arbitrary page sizes and the full ISO 216 series ([#260](https://github.com/4thel00z/pdfboss/issues/260)) ([ef0951b](https://github.com/4thel00z/pdfboss/commit/ef0951b51908789cc2be7ae0b37dfca445a6b31c))
+
 ## [2.14.1](https://github.com/4thel00z/pdfboss/compare/v2.14.0...v2.14.1) (2026-10-11)
 
 
