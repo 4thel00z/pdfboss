@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.15.1](https://github.com/4thel00z/pdfboss/compare/v2.15.0...v2.15.1) (2026-10-12)
+
+
+### Performance Improvements
+
+* **write:** pass plain PNGs through without decoding ([#262](https://github.com/4thel00z/pdfboss/issues/262)) ([7d34eee](https://github.com/4thel00z/pdfboss/commit/7d34eeec210e1a01f0a41019460d7a677ce4b776))
+
 ## [2.15.0](https://github.com/4thel00z/pdfboss/compare/v2.14.1...v2.15.0) (2026-10-12)
 
 
