@@ -162,9 +162,7 @@ class TestPageSpans:
         assert ocr.invisible
 
     # Covers ISO 32000-1 §9.8.1.
-    def test_box_metrics_are_offsets_from_the_baseline(
-        self, styled_pdf: bytes
-    ) -> None:
+    def test_box_metrics_are_offsets_from_the_baseline(self, styled_pdf: bytes) -> None:
         plain, styled, _ = Document(data=styled_pdf)[0].spans()
         assert plain.ascent > 0.0 > plain.descent
         x0, y0, x1, y1 = plain.bbox
@@ -172,6 +170,27 @@ class TestPageSpans:
         assert y0 == pytest.approx(plain.y + plain.descent)
         assert styled.ascent == pytest.approx(12.0 * 0.718, abs=1e-3)
         assert styled.descent == pytest.approx(-12.0 * 0.207, abs=1e-3)
+
+    def test_upright_text_has_rotation_0(self) -> None:
+        (span,) = Document(data=page_doc(HELLO))[0].spans()
+        assert span.rotation == 0
+        assert span.end_y == pytest.approx(span.y)
+
+    def test_turned_text_reports_rotation_and_reads_as_lines(self) -> None:
+        cells = [("Year", "Rate"), ("1", "10%"), ("2", "11%")]
+        shown = b"".join(
+            b"BT /F1 11 Tf %d %d Td (%s) Tj ET "
+            % (20 + 120 * column, 150 - 18 * row, cell.encode())
+            for row, pair in enumerate(cells)
+            for column, cell in enumerate(pair)
+        )
+        page = Document(data=page_doc(b"q 0 1 -1 0 300 100 cm " + shown + b"Q"))[0]
+        spans = page.spans()
+        assert {span.rotation for span in spans} == {90}
+        year = spans[0]
+        assert year.end_x == pytest.approx(year.x)
+        assert year.end_y > year.y
+        assert page.extract_text() == "Year Rate\n1 10%\n2 11%"
 
     def test_hidden_layers_are_excluded(self) -> None:
         data = build_pdf(
@@ -349,10 +368,7 @@ class TestRightToLeft:
             b"BT /F2 12 Tf 100 720 Td (PDF) Tj ET "
             b"BT /F1 12 Tf 140 720 Td <00070004000600010005000400010008000300020001> Tj ET"
         )
-        assert (
-            Document(data=data)[0].extract_text()
-            == "اسم العائلة PDF 12"
-        )
+        assert Document(data=data)[0].extract_text() == "اسم العائلة PDF 12"
 
     # Covers ISO 32000-1 §14.8.2.3.3 and §14.9.4.
     def test_reversed_chars_and_actual_text_spans_are_logical(self) -> None:

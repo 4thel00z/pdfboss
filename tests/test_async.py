@@ -183,6 +183,194 @@ class TestAsyncElements:
         assert ticks > 0
 
 
+def linked_pdf(pages: int, links: int) -> bytes:
+    """A generated PDF whose pages each carry a line of text and a grid of
+    link annotations, so a few dozen pages yield thousands of elements."""
+    pdf = pdfboss.write.Pdf()
+    for number in range(pages):
+        page = pdfboss.write.Page("a4") | pdfboss.write.Text(
+            f"Page {number + 1}", at=(40, 800)
+        )
+        for index in range(links):
+            left = 40 + (index % 10) * 50
+            bottom = 40 + (index // 10) * 20
+            page = page | pdfboss.write.Link(
+                (left, bottom, left + 40, bottom + 15),
+                url=f"https://example.com/{number}/{index}",
+            )
+        pdf = pdf | page
+    return pdf.to_bytes()
+
+
+FAILED = "failed"
+
+
+@pytest.fixture
+def many_elements_pdf() -> bytes:
+    return linked_pdf(pages=30, links=40)
+
+
+def sync_outcomes(document: Document, **options: object) -> list[object]:
+    """Every element key, or ``FAILED`` where an element raised PdfError."""
+    outcomes: list[object] = []
+    iterator = iter(document.elements(**options))
+    while True:
+        try:
+            element = next(iterator)
+        except StopIteration:
+            return outcomes
+        except PdfError:
+            outcomes.append(FAILED)
+            continue
+        outcomes.append(element_key(element))
+
+
+async def async_outcomes(document: AsyncDocument, **options: object) -> list[object]:
+    """``sync_outcomes`` over the async stream."""
+    outcomes: list[object] = []
+    iterator = document.elements(**options)
+    while True:
+        try:
+            element = await anext(iterator)
+        except StopAsyncIteration:
+            return outcomes
+        except PdfError:
+            outcomes.append(FAILED)
+            continue
+        outcomes.append(element_key(element))
+
+
+def corrupt_object(data: bytes, number: int) -> bytes:
+    """``data`` with the body of object ``number`` replaced by bytes that do
+    not parse, keeping every offset in the cross-reference table valid."""
+    start = data.index(f"\n{number} 0 obj".encode()) + 1
+    end = data.index(b"endobj", start)
+    header = f"{number} 0 obj\n".encode()
+    junk = b"<< /Broken [[[" + b" " * (end - start)
+    return data[:start] + header + junk[: end - start - len(header)] + data[end:]
+
+
+class TestAsyncElementBatches:
+    """The async stream hands elements to Python in batches; these pin that
+    batching changes nothing a caller can observe."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("physical", [True, False])
+    async def test_many_elements_match_sync(
+        self, many_elements_pdf: bytes, physical: bool
+    ) -> None:
+        expected = sync_outcomes(Document(data=many_elements_pdf), physical=physical)
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        assert len(expected) > 1000
+        assert await async_outcomes(doc, physical=physical) == expected
+
+    @pytest.mark.asyncio
+    async def test_page_filter_matches_sync(self, many_elements_pdf: bytes) -> None:
+        options = {"physical": False, "pages": [17, 2, 5]}
+        expected = sync_outcomes(Document(data=many_elements_pdf), **options)
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        assert expected
+        assert await async_outcomes(doc, **options) == expected
+
+    @pytest.mark.asyncio
+    async def test_failed_element_arrives_in_order_and_the_stream_goes_on(
+        self, three_pages_pdf: Path
+    ) -> None:
+        data = corrupt_object(three_pages_pdf.read_bytes(), 4)
+        expected = sync_outcomes(Document(data=data), physical=True, logical=False)
+        doc = await AsyncDocument.from_bytes(data)
+        failures = [index for index, item in enumerate(expected) if item == FAILED]
+        assert failures
+        assert failures[-1] < len(expected) - 1
+        assert await async_outcomes(doc, physical=True, logical=False) == expected
+
+    @pytest.mark.asyncio
+    async def test_iteration_resumes_after_break(
+        self, many_elements_pdf: bytes
+    ) -> None:
+        expected = sync_outcomes(Document(data=many_elements_pdf))
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        iterator = doc.elements()
+        first: list[object] = []
+        async for element in iterator:
+            first.append(element_key(element))
+            if len(first) == 300:
+                break
+        rest = [element_key(element) async for element in iterator]
+        assert first + rest == expected
+
+    @pytest.mark.asyncio
+    async def test_cancelled_anext_loses_no_element(
+        self, many_elements_pdf: bytes
+    ) -> None:
+        expected = sync_outcomes(Document(data=many_elements_pdf))
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        iterator = doc.elements()
+        got: list[object] = []
+        for _ in range(20):
+            pending = asyncio.ensure_future(anext(iterator))
+            await asyncio.sleep(0)
+            pending.cancel()
+            try:
+                got.append(element_key(await pending))
+            except asyncio.CancelledError:
+                pass
+            got.extend([element_key(await anext(iterator)) for _ in range(97)])
+        got.extend([element_key(element) async for element in iterator])
+        assert got == expected
+
+    @pytest.mark.asyncio
+    async def test_concurrent_anext_delivers_each_element_once(
+        self, many_elements_pdf: bytes
+    ) -> None:
+        expected = sync_outcomes(Document(data=many_elements_pdf))
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        iterator = doc.elements()
+        taken = await asyncio.gather(*(anext(iterator) for _ in range(500)))
+        rest = [element_key(element) async for element in iterator]
+        got = [element_key(element) for element in taken] + rest
+        assert sorted(map(repr, got)) == sorted(map(repr, expected))
+
+    @pytest.mark.asyncio
+    async def test_exhausted_stream_keeps_stopping(self, hello_pdf: Path) -> None:
+        doc = await AsyncDocument.open(hello_pdf)
+        iterator = doc.elements()
+        assert [element async for element in iterator]
+        for _ in range(3):
+            with pytest.raises(StopAsyncIteration):
+                await anext(iterator)
+
+    @pytest.mark.asyncio
+    async def test_spans_match_sync_across_pages(
+        self, many_elements_pdf: bytes
+    ) -> None:
+        expected = [span.text for span in Document(data=many_elements_pdf).spans()]
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        got = [span.text async for span in doc.spans()]
+        assert len(expected) >= 30
+        assert got == expected
+
+    @pytest.mark.asyncio
+    async def test_cancelled_span_anext_loses_no_span(
+        self, many_elements_pdf: bytes
+    ) -> None:
+        expected = [span.text for span in Document(data=many_elements_pdf).spans()]
+        doc = await AsyncDocument.from_bytes(many_elements_pdf)
+        iterator = doc.spans()
+        got: list[str] = []
+        for _ in range(5):
+            pending = asyncio.ensure_future(anext(iterator))
+            await asyncio.sleep(0)
+            pending.cancel()
+            try:
+                got.append((await pending).text)
+            except asyncio.CancelledError:
+                pass
+            got.append((await anext(iterator)).text)
+        got.extend([span.text async for span in iterator])
+        assert got == expected
+
+
 class RangeRequestHandler(BaseHTTPRequestHandler):
     """Serves one in-memory payload with HTTP Range support.
 

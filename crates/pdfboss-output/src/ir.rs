@@ -26,6 +26,8 @@ pub struct Inline {
 
 /// One visual line. The geometry travels with it because later structure
 /// passes — lists, tables, page headers and footers — classify lines by it.
+/// A line of text turned a quarter on the page keeps the coordinates of the
+/// frame where that text reads upright; its block's `bbox` is in page space.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Line {
     pub inlines: Vec<Inline>,
@@ -47,12 +49,14 @@ pub enum Marker {
 }
 
 /// One list item: its marker, the marker text's length in characters (the
-/// continuation indent a wrapped item is measured against), and its lines.
+/// continuation indent a wrapped item is measured against), its lines, and
+/// their box.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ListItem {
     pub marker: Marker,
     pub marker_len: usize,
     pub lines: Vec<Line>,
+    pub bbox: BBox,
 }
 
 /// One table cell. An empty cell — or one covered by a neighbour's span —

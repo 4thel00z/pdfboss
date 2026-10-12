@@ -244,7 +244,7 @@ impl GlyphFont {
         let subtype = font.get_name("Subtype").map(|n| n.0.to_owned());
         let loaded = match subtype.as_deref() {
             Some("Type0") => load_type0(src, font, painting).await,
-            Some("TrueType") => match load_simple(src, font).await {
+            Some("TrueType") => match load_simple(src, font, painting).await {
                 Some(f) => Some(f),
                 None => substitute_at_full(src, font, painting, provider).await,
             },
@@ -502,10 +502,23 @@ const FLAG_NONSYMBOLIC: i64 = 0x20;
 /// 0xF000 plus the byte, and in a program with no `cmap` the byte itself as
 /// the glyph index.
 ///
+/// A `FontFile2` holding a CFF-flavoured OpenType program (`OTTO`) loads
+/// through [`cff_simple`] at the CFF tier instead.
+///
 /// Covers ISO 32000-1 §9.6.3 and §9.6.6.4.
-async fn load_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
+async fn load_simple<S: AsyncObjectSource>(
+    src: &S,
+    font: &Dict,
+    painting: GlyphPainting,
+) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
+    if program.starts_with(b"OTTO") {
+        if !painting.paints_all_embedded() {
+            return None;
+        }
+        return cff_simple(src, font, program).await;
+    }
     let tt = TrueType::parse(program)?;
 
     let flags = descriptor.get_int("Flags").unwrap_or(0);
@@ -720,6 +733,16 @@ async fn simple_widths<S: AsyncObjectSource>(src: &S, font: &Dict) -> WidthMap {
 async fn load_cff_simple<S: AsyncObjectSource>(src: &S, font: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, font.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
+    cff_simple(src, font, program).await
+}
+
+/// Builds a simple font over a CFF `program`, bare or in an OpenType
+/// wrapper, by the code-to-glyph tiers [`load_cff_simple`] describes.
+async fn cff_simple<S: AsyncObjectSource>(
+    src: &S,
+    font: &Dict,
+    program: Vec<u8>,
+) -> Option<GlyphFont> {
     let cff = CffFont::parse(program)?;
 
     let mut by_unicode: FastMap<char, u16> = FastMap::default();
@@ -1223,7 +1246,7 @@ async fn load_type0<S: AsyncObjectSource>(
     let first = descendants.as_array()?.first()?;
     let cid = resolve_dict(src, first).await?;
     let mut loaded = match cid.get_name("Subtype").map(|n| n.0.as_str()) {
-        Some("CIDFontType2") => load_type0_truetype(src, &cid).await,
+        Some("CIDFontType2") => load_type0_truetype(src, &cid, painting).await,
         Some("CIDFontType0") if painting.paints_all_embedded() => load_cff_cid(src, &cid).await,
         _ => None,
     }?;
@@ -1261,35 +1284,28 @@ async fn composite<S: AsyncObjectSource>(src: &S, font: &Dict, cid: &Dict) -> Co
 /// `/CIDToGIDMap`. The caller ([`load_type0`]) attaches the code-to-CID
 /// mapping.
 ///
+/// A `FontFile2` holding a CFF-flavoured OpenType program (`OTTO`) loads
+/// as the CFF it is, at the CFF tier: macOS Quartz embeds its OpenType
+/// subsets this way, and refusing them left every glyph of the font
+/// unpainted.
+///
 /// Covers ISO 32000-1 §9.7.4.2 and §9.8.3.1.
-async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
+async fn load_type0_truetype<S: AsyncObjectSource>(
+    src: &S,
+    cid: &Dict,
+    painting: GlyphPainting,
+) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile2")?).await?;
+    if program.starts_with(b"OTTO") {
+        if !painting.paints_all_embedded() {
+            return None;
+        }
+        let map = cid_to_gid_map(src, cid).await;
+        return cff_cid(src, cid, program, map).await;
+    }
     let tt = TrueType::parse(program)?;
-
-    // /CIDToGIDMap: /Identity (or absent) means GID == CID; a stream is a
-    // big-endian u16 table indexed by CID, fetched through the checked
-    // fetch — chunking a passthrough codestream into u16s would paint
-    // every glyph of the font from a nonsense table. A refused or
-    // unreadable map keeps the font loaded with an EMPTY table rather
-    // than failing the load or falling back to Identity: every CID then
-    // resolves to gid 0, so each drawn code is a reported NoGlyph skip
-    // (its advance still applies) instead of a silent drop or a wrong
-    // glyph.
-    let map = match rv(src, cid, "CIDToGIDMap").await {
-        Some(Object::Stream(s)) => match decoded_stream_data_with(src, &s).await {
-            Ok(bytes) => Some(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect(),
-            ),
-            Err(_) => Some(Vec::new()),
-        },
-        _ => None, // Identity
-    };
+    let map = cid_to_gid_map(src, cid).await;
     Some(GlyphFont {
         outline_cache: Mutex::new(FastMap::default()),
         flat_cache: Mutex::new(FastMap::default()),
@@ -1301,28 +1317,52 @@ async fn load_type0_truetype<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Optio
     })
 }
 
+/// Reads a `CIDFontType2` descendant's `/CIDToGIDMap`. `/Identity` (or
+/// absent) is `None`, GID == CID; a stream is a big-endian u16 table indexed
+/// by CID, fetched through the checked fetch — chunking a passthrough
+/// codestream into u16s would paint every glyph of the font from a nonsense
+/// table. A refused or unreadable map is an EMPTY table rather than a failed
+/// load or Identity: every CID then resolves to gid 0, so each drawn code is
+/// a reported NoGlyph skip (its advance still applies) instead of a silent
+/// drop or a wrong glyph.
+async fn cid_to_gid_map<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<Vec<u16>> {
+    let Some(Object::Stream(s)) = rv(src, cid, "CIDToGIDMap").await else {
+        return None;
+    };
+    let Ok(bytes) = decoded_stream_data_with(src, &s).await else {
+        return Some(Vec::new());
+    };
+    Some(
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect(),
+    )
+}
+
 /// Parses a descendant CID font's `/W` + `/DW`, keyed by CID (== the code
 /// under the `Identity-H`/`Identity-V` encoding these loaders assume).
-/// `declared` is true iff either key is present, so a descendant with
-/// neither (uncommon, but not forbidden) leaves the fallback in charge.
+/// A CID font's widths are always declared: `/DW` defaults to 1000 (Table
+/// 115), so a descendant with neither key advances every glyph a full em
+/// and never falls back to the program's own `hmtx`. Producers rely on
+/// this, kerning a `TJ` array against the 1000-unit default.
 async fn cid_widths<S: AsyncObjectSource>(src: &S, cid: &Dict) -> WidthMap {
-    let mut default = 1000.0;
-    let mut declared = false;
-    if let Some(dw) = rv(src, cid, "DW").await.and_then(|o| o.as_f64()) {
-        default = dw as f32;
-        declared = true;
-    }
+    let default = rv(src, cid, "DW")
+        .await
+        .and_then(|o| o.as_f64())
+        .map_or(1000.0, |dw| dw as f32);
 
     let mut map = FastMap::default();
     if let Some(Object::Array(items)) = rv(src, cid, "W").await {
-        declared = true;
         parse_cid_width_array(src, &items, &mut map).await;
     }
 
     WidthMap {
         map,
         default,
-        declared,
+        declared: true,
     }
 }
 
@@ -1472,11 +1512,22 @@ async fn parse_cid_vmetrics<S: AsyncObjectSource>(
 async fn load_cff_cid<S: AsyncObjectSource>(src: &S, cid: &Dict) -> Option<GlyphFont> {
     let descriptor = resolve_dict(src, cid.get("FontDescriptor")?).await?;
     let program = stream_bytes(src, descriptor.get("FontFile3")?).await?;
+    cff_cid(src, cid, program, None).await
+}
+
+/// Builds a CID font over a CFF `program`, bare or in an OpenType wrapper.
+/// A CFF with CIDFont operators maps CIDs through its charset; one without
+/// takes `pdf_map` (a `CIDFontType2` descendant's `/CIDToGIDMap`, `None`
+/// for a `CIDFontType0` or Identity) and otherwise uses the CIDs directly as
+/// glyph indices (§9.7.4.2).
+async fn cff_cid<S: AsyncObjectSource>(
+    src: &S,
+    cid: &Dict,
+    program: Vec<u8>,
+    pdf_map: Option<Vec<u16>>,
+) -> Option<GlyphFont> {
     let cff = CffFont::parse(program)?;
-    // A CFF with CIDFont operators maps CIDs through its charset; one
-    // without uses the CIDs directly as glyph indices (§9.7.4.2), which is
-    // the `None` identity map.
-    let cid_to_gid = cff.cid_to_gid();
+    let cid_to_gid = cff.cid_to_gid().or(pdf_map);
     let widths = cid_widths(src, cid).await;
     Some(GlyphFont {
         outline_cache: Mutex::new(FastMap::default()),
@@ -2041,6 +2092,112 @@ mod tests {
         );
     }
 
+    /// One `/Type0` font over a `CIDFontType2` descendant whose `FontFile2`
+    /// is `program`, showing `text` at size 100 from (20, 50); `cid_keys`
+    /// goes into the descendant dictionary verbatim.
+    fn cid_truetype_font_doc(program: &[u8], cid_keys: &str, text: &str) -> Vec<u8> {
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(
+            4,
+            "",
+            format!("BT /F0 100 Tf 20 50 Td {text} Tj ET").as_bytes(),
+        );
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding /Identity-H \
+             /DescendantFonts [6 0 R] >>",
+        );
+        b.object(
+            6,
+            &format!(
+                "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /X \
+                 /FontDescriptor 7 0 R {cid_keys} >>"
+            ),
+        );
+        b.object(
+            7,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 8 0 R >>",
+        );
+        b.stream(8, "", program);
+        b.build(1)
+    }
+
+    // macOS Quartz embeds OpenType subsets as a CIDFontType2 whose
+    // FontFile2 is CFF-flavoured (`OTTO`, no glyf). Covers ISO 32000-1
+    // §9.7.4.2.
+    #[test]
+    fn cff_opentype_in_a_cid_fontfile2_paints_at_the_cff_tier() {
+        let program = wrap_in_opentype(&build_box_glyph_fixture("theboxglyphname"));
+        let bytes = cid_truetype_font_doc(&program, "", "<0001>");
+
+        for tier in [GlyphPainting::AllEmbedded, GlyphPainting::Full] {
+            let pix = render_at_tier(&bytes, tier);
+            assert!(
+                dark_pixel_at(&pix, 55, 115),
+                "the OTTO program in FontFile2 paints its gid 1 at tier {tier:?}"
+            );
+        }
+        let pix = render_at_tier(&bytes, GlyphPainting::EmbeddedTrueTypeOnly);
+        assert!(
+            !dark_pixel_at(&pix, 55, 115),
+            "CFF outlines stay behind the CFF tier gate, whichever stream holds them"
+        );
+    }
+
+    // A simple /TrueType font with a CFF-flavoured FontFile2. Covers ISO
+    // 32000-1 §9.6.3.
+    #[test]
+    fn cff_opentype_in_a_simple_fontfile2_paints() {
+        let program = wrap_in_opentype(&build_box_glyph_fixture("theboxglyphname"));
+        let mut b = PdfBuilder::new().version(1, 5);
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.object(
+            3,
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] \
+             /Resources << /Font << /F0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.stream(4, "", b"BT /F0 100 Tf 20 50 Td <80> Tj ET");
+        b.object(
+            5,
+            "<< /Type /Font /Subtype /TrueType /BaseFont /X /FontDescriptor 6 0 R \
+             /Encoding << /Differences [128 /theboxglyphname] >> >>",
+        );
+        b.object(
+            6,
+            "<< /Type /FontDescriptor /FontName /X /Flags 4 /FontFile2 7 0 R >>",
+        );
+        b.stream(7, "", &program);
+        let pix = render_at_tier(&b.build(1), GlyphPainting::AllEmbedded);
+        assert!(
+            dark_pixel_at(&pix, 55, 115),
+            "the OTTO program in a simple font's FontFile2 paints"
+        );
+    }
+
+    // Table 115: /DW defaults to 1000. A descendant with neither /W nor /DW
+    // advances each glyph a full em, not the program's hmtx (0 in
+    // `build_font`), which stacked every glyph on the first.
+    #[test]
+    fn a_cid_font_without_w_or_dw_advances_by_the_default_width() {
+        let bytes = cid_truetype_font_doc(&build_font(), "", "<00010001>");
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(dark_pixel_at(&pix, 55, 115), "first glyph at (55,115)");
+        assert!(
+            dark_pixel_at(&pix, 155, 115),
+            "second glyph one em (100pt) further right, at (155,115)"
+        );
+    }
+
     // Covers ISO 32000-1 §9.7.2, §9.7.4.2 and §9.8.3.1.
     #[test]
     fn cff_cid_font_paints_at_all_embedded_not_embedded_truetype_only() {
@@ -2106,9 +2263,10 @@ mod tests {
     }
 
     /// `Identity-V`: writing mode 1 shows glyphs top-to-bottom. The glyph
-    /// origin is displaced by the default position vector (vx = w0/2 = 0
-    /// here — the CFF fixture has no declared widths — and vy = 880), and
-    /// each show advances ty by the `/DW2` default w1 = -1000.
+    /// origin is displaced by the default position vector (vx = w0/2 = 500
+    /// here — the descendant declares no widths, so w0 is the `/DW`
+    /// default 1000 — and vy = 880), and each show advances ty by the
+    /// `/DW2` default w1 = -1000.
     // Covers ISO 32000-1 §9.4.4 and §9.7.4.3.
     #[test]
     fn identity_v_advances_downward_with_the_default_position_vector() {
@@ -2138,14 +2296,15 @@ mod tests {
         b.stream(8, "", &build_box_glyph_fixture_cid(5));
         let pix = render_at_tier(&b.build(1), GlyphPainting::AllEmbedded);
         // The box's dark point sits at origin + (35, 35) in page space
-        // (see the horizontal tests' (55, 115)); vertical writing lowers
-        // the glyph by vy = 88 and the second glyph a further 100.
+        // (see the horizontal tests' (55, 115)); vertical writing moves the
+        // glyph left by vx = 50 and down by vy = 88, and the second glyph a
+        // further 100 down.
         assert!(
-            dark_pixel_at(&pix, 55, 93),
-            "first vertical glyph at page y 260-88+35"
+            dark_pixel_at(&pix, 5, 93),
+            "first vertical glyph at page x 20-50+35, y 260-88+35"
         );
         assert!(
-            dark_pixel_at(&pix, 55, 193),
+            dark_pixel_at(&pix, 5, 193),
             "second vertical glyph one em (100) below the first"
         );
         assert!(

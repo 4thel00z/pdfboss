@@ -1,13 +1,13 @@
 # Python API reference
 
-The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public API is twelve document, page and iteration classes, thirteen classes for the interactive form and the catalog's document-level structures, the `md` and `write` submodules and the `__version__` string; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
+The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss`. Its public API is the document, page, layout and iteration classes, thirteen classes for the interactive form and the catalog's document-level structures, the `md` and `write` submodules and the `__version__` string; the typed stubs in [`_pdfboss.pyi`](https://github.com/4thel00z/pdfboss/blob/main/python/pdfboss/_pdfboss.pyi) are the authoritative reference for every signature and docstring. This chapter is the inventory; worked examples live in the guide chapters.
 
-## The twelve document classes
+## The document classes
 
 | Name | What it is |
 |---|---|
-| `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `render_pages`, `elements`, `spans`, plus the form, catalog and document structure readers below |
-| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `spans`, `images`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation`, `viewports`, `separation_info` |
+| `Document` | A loaded PDF, from a path or bytes; pages by index, the `metadata` property, `extract_text`, `extract_markdown`, `layout`, `render_pages`, `elements`, `spans`, plus the form, catalog and document structure readers below |
+| `Page` | One page: geometry (width/height/rotation and the five boxes), `extract_text`, `extract_markdown`, `layout`, `spans`, `images`, `render`, `render_reporting`, `extract_images`, plus `piece_info`, `thumbnail`, `thumbnail_image`, `beads`, `presentation`, `viewports`, `separation_info` |
 | `ReadingOrder` | `CONTENT`, `STRUCTURE_TREE`, `GEOMETRIC`: the `reading_order` keyword every extraction method takes, as the enum or its string value |
 | `AsyncDocument` | The async twin of `Document`, opened from a path, bytes, or an HTTP URL via range requests; data-fetching methods are coroutines |
 | `AsyncPage` | The async twin of `Page`; attributes are synchronous, extraction and rendering are coroutines |
@@ -19,6 +19,9 @@ The `pdfboss` package re-exports the compiled extension module `pdfboss._pdfboss
 | `AsyncSpanIter` | Async iterator over a document's spans |
 | `PageImage` | One embedded image extracted from a page: native `width`/`height` and PNG-encoded `data` |
 | `PlacedImage` | One image a page draws, where it is drawn: `page`, device-space `bbox`, native `width`/`height`, `stencil`, `inline`; yielded by `Page.images` without decoding pixels |
+| `LayoutBlock` | One block of a page's layout from `layout`: `kind` (heading, paragraph, list, table), heading `level`, paragraph `role`, `bbox` in PDF user space, plain `text`, list `items`, table `rows` |
+| `LayoutListItem` | One list item of a `LayoutBlock`: `marker`, `text`, `bbox` |
+| `LayoutCell` | One table cell of a `LayoutBlock`: `text`, `colspan`, `rowspan` |
 | `PdfError` | The exception type for any PDF processing error |
 
 `Document.metadata` is a property returning the document information

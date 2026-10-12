@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.14.1](https://github.com/4thel00z/pdfboss/compare/v2.14.0...v2.14.1) (2026-10-11)
+
+
+### Bug Fixes
+
+* **text:** read a line drawn twice in place once ([#258](https://github.com/4thel00z/pdfboss/issues/258)) ([06aeff6](https://github.com/4thel00z/pdfboss/commit/06aeff6e9df97e4ecc6737fc6fa650c0efccb028))
+
+
+### Documentation
+
+* **async:** state the batching and cancellation behaviour of elements() and spans() ([#257](https://github.com/4thel00z/pdfboss/issues/257)) ([0e96e90](https://github.com/4thel00z/pdfboss/commit/0e96e905f893f9c5e42db21ca4e077d3d42eefab))
+
+## [2.14.0](https://github.com/4thel00z/pdfboss/compare/v2.13.2...v2.14.0) (2026-10-11)
+
+
+### Features
+
+* **layout:** expose layout blocks to Python with tunable thresholds ([#252](https://github.com/4thel00z/pdfboss/issues/252)) ([b3386ea](https://github.com/4thel00z/pdfboss/commit/b3386ea48223fd22d79224e0beef95c6d0ef152c))
+
+
+### Performance Improvements
+
+* **py:** batch async element and span iteration across the Rust boundary ([#255](https://github.com/4thel00z/pdfboss/issues/255)) ([eab6f6a](https://github.com/4thel00z/pdfboss/commit/eab6f6a66715a026a7fd0e6c0e4a86a754f58901))
+
+## [2.13.2](https://github.com/4thel00z/pdfboss/compare/v2.13.1...v2.13.2) (2026-10-11)
+
+
+### Bug Fixes
+
+* **render:** paint CFF OpenType in FontFile2 and default CID widths to 1000 ([#249](https://github.com/4thel00z/pdfboss/issues/249)) ([f47cb0a](https://github.com/4thel00z/pdfboss/commit/f47cb0ab00dc7318ce1a0eb554f5475bc0d99b0c))
+* **text:** lay out text turned a quarter in its own upright frame ([#251](https://github.com/4thel00z/pdfboss/issues/251)) ([8bc3120](https://github.com/4thel00z/pdfboss/commit/8bc3120136359a41b01c580dc5574eb6a9a8b4b9))
+
 ## [2.13.1](https://github.com/4thel00z/pdfboss/compare/v2.13.0...v2.13.1) (2026-10-03)
 
 

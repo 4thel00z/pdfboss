@@ -17,7 +17,8 @@ pub use pdfboss_text::{
     SkippedText, SkippedTextKind, TextSpan,
 };
 pub use structure::{
-    document_layout, document_layout_with_rulings, layout, page_layout, page_layout_with_rulings,
+    document_layout, document_layout_opts, document_layout_with_rulings, layout, page_layout,
+    page_layout_opts, page_layout_with_rulings, LayoutOptions, Pitch,
 };
 
 /// What extraction keeps beyond the visible page.
@@ -308,6 +309,32 @@ pub fn extract_markdown_reporting_opts(
     order: ReadingOrder,
     opts: TextOptions,
 ) -> Result<(String, Vec<ExtractReport>)> {
+    let (layouts, reports) =
+        extract_layout_reporting_opts(doc, order, opts, &LayoutOptions::default())?;
+    Ok((Markdown.render(&layouts), reports))
+}
+
+/// Every page's layout blocks — headings, paragraphs, lists and tables with
+/// their boxes — the structure [`extract_markdown_opts`] renders, cut by the
+/// thresholds `layout` sets.
+pub fn extract_layout_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<Vec<PageLayout>> {
+    let (layouts, _) = extract_layout_reporting_opts(doc, order, opts, layout)?;
+    Ok(layouts)
+}
+
+/// [`extract_layout_opts`] with one [`ExtractReport`] per page, in page
+/// order.
+pub fn extract_layout_reporting_opts(
+    doc: &Document,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<(Vec<PageLayout>, Vec<ExtractReport>)> {
     let fonts = FontCache::default();
     // The optional-content state and the structure tree load once for the
     // document: the tree's parent entries are read here, not on every page.
@@ -336,7 +363,7 @@ pub fn extract_markdown_reporting_opts(
             }
             // The page's share of the size pass is counted here, on the
             // worker, while its spans are still in cache.
-            let page = structure::ExtractedPage::new(spans, rulings, report.order);
+            let page = structure::ExtractedPage::new(spans, rulings, report.order, layout);
             Ok((page, report))
         },
     );
@@ -347,10 +374,7 @@ pub fn extract_markdown_reporting_opts(
         pages.push(page);
         reports.push(report);
     }
-    Ok((
-        Markdown.render(&structure::document_layout_extracted(pages)),
-        reports,
-    ))
+    Ok((structure::document_layout_extracted(pages, layout), reports))
 }
 
 /// One page as Markdown, ranking heading sizes against that page alone.
@@ -375,6 +399,46 @@ pub fn extract_page_markdown_opts(
         retain_rulings_on_page(&mut rulings, page);
     }
     Ok(Markdown.render(&[page_layout_with_rulings(&spans, &rulings, report.order)]))
+}
+
+/// One page's layout blocks, heading sizes ranked against that page alone,
+/// cut by the thresholds `layout` sets. [`extract_layout_opts`] is the
+/// better answer whenever the document is at hand.
+pub fn extract_page_layout_opts(
+    doc: &Document,
+    page: &Page,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<PageLayout> {
+    let (mut spans, mut rulings, report) =
+        pdfboss_text::extract_spans_and_rulings_reporting(doc, page, order)?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
+    Ok(page_layout_opts(&spans, &rulings, report.order, layout))
+}
+
+/// [`extract_page_layout_opts`] against any object source. Signed like
+/// [`extract_page_markdown_with_opts`].
+pub async fn extract_page_layout_with_opts<S: AsyncObjectSource>(
+    src: S,
+    page: &Page,
+    oc: Option<&OcState>,
+    structure: Option<&StructureTree>,
+    order: ReadingOrder,
+    opts: TextOptions,
+    layout: &LayoutOptions,
+) -> Result<PageLayout> {
+    let (mut spans, mut rulings, report) =
+        pdfboss_text::extract_spans_and_rulings_reporting_with(src, page, oc, structure, order)
+            .await?;
+    if !opts.invisible_text {
+        retain_spans_on_page(&mut spans, page);
+        retain_rulings_on_page(&mut rulings, page);
+    }
+    Ok(page_layout_opts(&spans, &rulings, report.order, layout))
 }
 
 /// [`extract_page_markdown`] against any object source. Signed like
@@ -1249,6 +1313,7 @@ mod tests {
                 spans.clone(),
                 rulings.clone(),
                 report.order,
+                &LayoutOptions::default(),
             ));
             pages.push((spans, rulings, report.order));
         }
@@ -1256,7 +1321,10 @@ mod tests {
         assert!(expected.contains("# Annual Report"), "md: {expected}");
         assert!(expected.contains("| --- |"), "md: {expected}");
         assert_eq!(
-            Markdown.render(&structure::document_layout_extracted(extracted)),
+            Markdown.render(&structure::document_layout_extracted(
+                extracted,
+                &LayoutOptions::default()
+            )),
             expected
         );
     }
@@ -3570,5 +3638,93 @@ mod tests {
             page_text(&doc, 0),
             "\u{627}\u{644}\u{639}\u{627}\u{626}\u{644}\u{629} \u{627}\u{633}\u{645}"
         );
+    }
+
+    /// A line the producer draws twice at the same position, each time over
+    /// a fresh white box, shows once and reads once: the second draw's spans
+    /// sit on the first's and are not interleaved with them.
+    #[test]
+    fn a_line_drawn_twice_in_place_reads_once() {
+        let draw = "1 g 450 40 120 14 re f 0 g \
+                    BT /F1 10 Tf 457 44 Td [(Ca)2(r)2(r)-3(ied)2(: _)2(_)2(_)] TJ ET";
+        let doc = Document::load(doc_with_graphics(&format!(
+            "BT /F1 10 Tf 72 700 Td (Body) Tj ET {draw} {draw}"
+        )))
+        .unwrap();
+        let text = page_text(&doc, 0);
+        assert_eq!(text, "Body\nCarried: ___", "{text:?}");
+        let page = doc.page(0).unwrap();
+        let markdown = extract_page_markdown(&doc, &page, ReadingOrder::Content).unwrap();
+        assert!(markdown.contains("Carried: ___"), "{markdown:?}");
+        assert!(!markdown.contains("CaCa"), "{markdown:?}");
+    }
+
+    /// The page's Markdown with the redraw check at `tolerance`.
+    fn markdown_with_redraw_tolerance(content: &str, tolerance: f32) -> String {
+        let doc = Document::load(doc_with_graphics(content)).unwrap();
+        let page = doc.page(0).unwrap();
+        let options = LayoutOptions {
+            redraw_tolerance: tolerance,
+            ..LayoutOptions::default()
+        };
+        let layout = extract_page_layout_opts(
+            &doc,
+            &page,
+            ReadingOrder::Content,
+            TextOptions::default(),
+            &options,
+        )
+        .unwrap();
+        Markdown.render(std::slice::from_ref(&layout))
+    }
+
+    /// A second draw shifted by less than the tolerance, as producers fake
+    /// bold, also reads once; with the check off both copies stay.
+    #[test]
+    fn a_redraw_shifted_within_the_tolerance_reads_once() {
+        let content = "BT /F1 10 Tf 72 700 Td (Body text) Tj ET \
+                       BT /F1 10 Tf 72 680 Td [(Ca)2(rried)] TJ ET \
+                       BT /F1 10 Tf 72.6 680.3 Td [(Ca)2(rried)] TJ ET";
+        let once = markdown_with_redraw_tolerance(content, 0.1);
+        assert!(once.contains("Carried"), "{once:?}");
+        assert!(!once.contains("CaCa"), "{once:?}");
+        let twice = markdown_with_redraw_tolerance(content, 0.0);
+        assert!(twice.contains("CaCa"), "{twice:?}");
+    }
+
+    /// A heading drawn twice counts once in the size pass, so its doubled
+    /// characters cannot make the heading size the body size.
+    #[test]
+    fn a_heading_drawn_twice_stays_a_heading() {
+        let heading = "BT /F1 16 Tf 72 740 Td (Quarterly Results Overview) Tj ET";
+        let content = format!(
+            "{heading} {heading} BT /F1 10 Tf 72 700 Td (The results grew in every region) Tj ET"
+        );
+        let once = markdown_with_redraw_tolerance(&content, 0.1);
+        assert!(once.starts_with("# Quarterly Results Overview"), "{once:?}");
+        let twice = markdown_with_redraw_tolerance(&content, 0.0);
+        assert!(!twice.contains("# Quarterly"), "{twice:?}");
+    }
+
+    /// Two equal glyphs set so tightly that the second starts within the
+    /// tolerance of the first stay two: the copy must start in the first
+    /// half of the span it repeats.
+    #[test]
+    fn tightly_set_equal_glyphs_stay_two() {
+        let doc = Document::load(doc_with_graphics(
+            "BT /F1 10 Tf 10 Tz 72 700 Td [(l)-1(l)] TJ ET",
+        ))
+        .unwrap();
+        assert_eq!(page_text(&doc, 0), "ll");
+    }
+
+    /// The same word drawn at two different places on a line is two words.
+    #[test]
+    fn the_same_text_at_two_places_stays_twice() {
+        let doc = Document::load(doc_with_graphics(
+            "BT /F1 10 Tf 72 700 Td (ab) Tj ET BT /F1 10 Tf 150 700 Td (ab) Tj ET",
+        ))
+        .unwrap();
+        assert_eq!(page_text(&doc, 0), "ab ab");
     }
 }
