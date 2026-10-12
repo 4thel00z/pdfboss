@@ -162,7 +162,8 @@ fn parse_length(text: &str) -> Option<f32> {
         (text, 1.0)
     };
     let value: f32 = number.trim().parse().ok()?;
-    (value.is_finite() && value > 0.0).then_some(value * points_per_unit)
+    let points = value * points_per_unit;
+    (points.is_finite() && points > 0.0).then_some(points)
 }
 
 /// The date type of `/CreationDate` and `/ModDate`, shared with the reader
@@ -1079,6 +1080,8 @@ mod tests {
             "-1x5",
             "ax5",
             "infx5",
+            "3.4e38inx5",
+            "5x3e38cm",
             "612x792x1",
         ] {
             assert_eq!(PageSize::parse(text), None, "{text}");

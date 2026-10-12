@@ -239,7 +239,7 @@ pdfboss create manifest --out <OUT> <INPUT>
 The manifest's tables:
 
 - `[meta]`: optional document information, mapped onto `/Info`: `title`, `author`, `subject`, `keywords`, `creator`, `producer`, each a string.
-- `[[page]]`: one table per page, in reading order. `size` names a page size case-insensitively (`a3`, `a4`, `a5`, `letter`, `legal`; absent defaults to `a4`) and `landscape` (boolean) swaps width and height, both per page.
+- `[[page]]`: one table per page, in reading order. `size` is a page size: a name (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`, case-insensitively) or `<width>x<height>` with each length in points or suffixed `pt`, `mm`, `cm` or `in`; absent defaults to `a4` and `landscape` (boolean) swaps width and height, both per page.
 - `[[page.text]]`: one line of text: `value`, `at = [x, y]` (the baseline origin), optional `font` and `size`.
 - `[[page.paragraph]]`: wrapped text: `value`, `rect = [x0, y0, x1, y1]`, optional `font`, `size`, `leading` and `align` (`left`, `center`, `right`, `justify`).
 - `[[page.image]]`: a placed raster: `path` (resolved relative to the manifest's directory, decoded by content as PNG or JPEG), `at = [x, y]`, optional `width` and `height`.
