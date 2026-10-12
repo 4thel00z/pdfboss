@@ -1445,3 +1445,79 @@ fn page_labels_and_viewer_document_serializes_byte_identically() {
     }
     assert_eq!(build(), build());
 }
+
+fn render_image(image: ImageData) -> Vec<u8> {
+    let mut page = Page::new(PageSize::Custom {
+        width: 8.0,
+        height: 8.0,
+    });
+    let handle = page.canvas.add_image(image);
+    page.canvas.draw_image(handle, 0.0, 0.0, 8.0, 8.0);
+    let bytes = Pdf {
+        pages: vec![page],
+        ..Pdf::default()
+    }
+    .to_bytes()
+    .unwrap();
+    let doc = Document::load(bytes).unwrap();
+    let loaded = doc.page(0).unwrap();
+    let (pix, report) =
+        render_page_reporting(&doc, &loaded, 1.0, &RenderOptions::default()).unwrap();
+    assert!(report.is_empty(), "skipped content: {:?}", report.summary());
+    pix.data
+}
+
+fn encode_png(
+    color: png::ColorType,
+    depth: png::BitDepth,
+    palette: Option<Vec<u8>>,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, 8, 8);
+    encoder.set_color(color);
+    encoder.set_depth(depth);
+    if let Some(palette) = palette {
+        encoder.set_palette(palette);
+    }
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(data).unwrap();
+    writer.finish().unwrap();
+    out
+}
+
+#[test]
+fn passthrough_png_renders_like_the_raster_of_the_same_pixels() {
+    let rgb: Vec<u8> = (0..8 * 8 * 3).map(|i| (i * 37 % 251) as u8).collect();
+    let png_rgb = encode_png(png::ColorType::Rgb, png::BitDepth::Eight, None, &rgb);
+    assert_eq!(
+        render_image(ImageData::png(&png_rgb).unwrap()),
+        render_image(ImageData::rgb8(8, 8, rgb).unwrap())
+    );
+
+    let palette = vec![200, 10, 10, 10, 200, 10, 10, 10, 200, 90, 90, 90];
+    let indices: Vec<u8> = (0..8)
+        .flat_map(|_| [0b00_01_10_11, 0b11_10_01_00])
+        .collect();
+    let png_palette = encode_png(
+        png::ColorType::Indexed,
+        png::BitDepth::Two,
+        Some(palette.clone()),
+        &indices,
+    );
+    let expanded: Vec<u8> = (0..8)
+        .flat_map(|_| [0usize, 1, 2, 3, 3, 2, 1, 0])
+        .flat_map(|index| palette[index * 3..index * 3 + 3].to_vec())
+        .collect();
+    assert_eq!(
+        render_image(ImageData::png(&png_palette).unwrap()),
+        render_image(ImageData::rgb8(8, 8, expanded).unwrap())
+    );
+
+    let rows: Vec<u8> = (0..8).map(|y| 0b1100_1010u8.rotate_left(y)).collect();
+    let png_mono = encode_png(png::ColorType::Grayscale, png::BitDepth::One, None, &rows);
+    assert_eq!(
+        render_image(ImageData::png(&png_mono).unwrap()),
+        render_image(ImageData::mono(8, 8, rows.iter().map(|row| !row).collect()).unwrap())
+    );
+}

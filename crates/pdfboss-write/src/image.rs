@@ -1,7 +1,8 @@
 //! Image import for document creation. JPEG passes through untouched as
-//! `/DCTDecode` (dimensions sniffed from its SOF marker); PNG is decoded
-//! to a raster with its alpha split into an `/SMask`; raw rasters cover
-//! generated content. No encode-side JPX/JBIG2/CCITT — by design.
+//! `/DCTDecode` (dimensions sniffed from its SOF marker); a plain PNG
+//! passes through as `/FlateDecode` with a PNG predictor, and any other PNG
+//! is decoded to a raster with its alpha split into an `/SMask`; raw
+//! rasters cover generated content. No encode-side JPX/JBIG2/CCITT — by design.
 
 use pdfboss_core::{Dict, Name, ObjRef, Object};
 
@@ -21,12 +22,50 @@ pub struct ImageData {
 enum ImageKind {
     /// Original JPEG bytes, embedded as-is with `/Filter /DCTDecode`.
     Jpeg { data: Vec<u8>, gray: bool },
+    /// The concatenated IDAT zlib stream of a non-interlaced PNG without
+    /// alpha, embedded as-is behind a PNG predictor.
+    Png {
+        idat: Vec<u8>,
+        bits: u8,
+        space: PngSpace,
+    },
     /// Uncompressed raster, Flate-compressed on embedding.
     Raster {
         data: Vec<u8>,
         color: RasterColor,
         smask: Option<Vec<u8>>,
     },
+}
+
+/// Color space of a passthrough PNG.
+#[derive(Debug, Clone, PartialEq)]
+enum PngSpace {
+    Gray,
+    Rgb,
+    /// RGB palette, three bytes per entry.
+    Indexed(Vec<u8>),
+}
+
+impl PngSpace {
+    fn colors(&self) -> i64 {
+        match self {
+            PngSpace::Rgb => 3,
+            PngSpace::Gray | PngSpace::Indexed(_) => 1,
+        }
+    }
+
+    fn color_space(&self) -> Object {
+        match self {
+            PngSpace::Gray => Object::Name(name("DeviceGray")),
+            PngSpace::Rgb => Object::Name(name("DeviceRGB")),
+            PngSpace::Indexed(palette) => Object::Array(vec![
+                Object::Name(name("Indexed")),
+                Object::Name(name("DeviceRGB")),
+                Object::Int((palette.len() / 3) as i64 - 1),
+                Object::String(palette.clone()),
+            ]),
+        }
+    }
 }
 
 /// Raster sample layout.
@@ -41,10 +80,14 @@ enum RasterColor {
 }
 
 impl ImageData {
-    /// Imports a PNG. Truecolor and grayscale (8- and 16-bit, the latter
-    /// reduced to 8), palette (expanded), and alpha (split to `/SMask`)
-    /// are all supported.
+    /// Imports a PNG. A non-interlaced image without alpha or `tRNS`, at
+    /// most 8 bits deep, keeps its compressed pixel data untouched. Anything
+    /// else is decoded: truecolor and grayscale (16-bit reduced to 8),
+    /// palette (expanded), and alpha (split to `/SMask`).
     pub fn png(bytes: &[u8]) -> Result<ImageData> {
+        if let Some(image) = png_passthrough(bytes) {
+            return Ok(image);
+        }
         let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
         decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
         let mut reader = decoder
@@ -232,6 +275,19 @@ impl ImageData {
                 dict.insert(name("ColorSpace"), Object::Name(gray_or_rgb(*gray)));
                 w.put_stream_raw(dict, data.clone())
             }
+            ImageKind::Png { idat, bits, space } => {
+                let mut dict = self.base_dict();
+                dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
+                dict.insert(name("BitsPerComponent"), Object::Int(i64::from(*bits)));
+                dict.insert(name("ColorSpace"), space.color_space());
+                let mut parms = Dict::new();
+                parms.insert(name("Predictor"), Object::Int(15));
+                parms.insert(name("Colors"), Object::Int(space.colors()));
+                parms.insert(name("BitsPerComponent"), Object::Int(i64::from(*bits)));
+                parms.insert(name("Columns"), Object::Int(i64::from(self.width)));
+                dict.insert(name("DecodeParms"), Object::Dict(parms));
+                w.put_stream_raw(dict, idat.clone())
+            }
             ImageKind::Raster { data, color, smask } => {
                 let mask_ref = smask.as_ref().map(|alpha| {
                     let mut mask = self.base_dict();
@@ -289,6 +345,59 @@ fn gray_or_rgb(gray: bool) -> Name {
     } else {
         name("DeviceRGB")
     }
+}
+
+fn png_passthrough(bytes: &[u8]) -> Option<ImageData> {
+    let reader = png::Decoder::new(std::io::Cursor::new(bytes))
+        .read_info()
+        .ok()?;
+    let info = reader.info();
+    if info.interlaced || info.trns.is_some() {
+        return None;
+    }
+    let bits = info.bit_depth as u8;
+    if bits > 8 {
+        return None;
+    }
+    let space = match info.color_type {
+        png::ColorType::Grayscale => PngSpace::Gray,
+        png::ColorType::Rgb if bits == 8 => PngSpace::Rgb,
+        png::ColorType::Indexed => {
+            let palette = info.palette.as_ref()?;
+            if palette.is_empty() || palette.len() % 3 != 0 {
+                return None;
+            }
+            PngSpace::Indexed(palette.to_vec())
+        }
+        _ => return None,
+    };
+    let idat = idat_stream(bytes)?;
+    Some(ImageData {
+        width: info.width,
+        height: info.height,
+        kind: ImageKind::Png { idat, bits, space },
+    })
+}
+
+fn idat_stream(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = bytes.get(8..)?;
+    let mut idat = Vec::new();
+    loop {
+        let length = u32::from_be_bytes(*rest.first_chunk::<4>()?) as usize;
+        let kind = rest.get(4..8)?;
+        let body = rest.get(8..8usize.checked_add(length)?)?;
+        rest = rest.get(length.checked_add(12)?..)?;
+        match kind {
+            b"IDAT" => idat.extend_from_slice(body),
+            b"IEND" => break,
+            _ => {}
+        }
+    }
+    let [cmf, flg, ..] = idat[..] else {
+        return None;
+    };
+    let zlib_header = cmf & 0x0F == 8 && (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0;
+    zlib_header.then_some(idat)
 }
 
 fn split_alpha(samples: &[u8], color_channels: usize) -> (Vec<u8>, Vec<u8>) {
@@ -378,7 +487,7 @@ fn check_len(label: &str, expected: usize, got: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ImageData, ImageKind, RasterColor};
+    use super::{ImageData, ImageKind, PngSpace, RasterColor};
     use crate::error::Error;
     use std::io::Write;
 
@@ -436,7 +545,28 @@ mod tests {
         match &img.kind {
             ImageKind::Raster { data, color, smask } => (data, *color, smask.as_deref()),
             ImageKind::Jpeg { .. } => panic!("expected raster, got jpeg"),
+            ImageKind::Png { .. } => panic!("expected raster, got png passthrough"),
         }
+    }
+
+    fn passthrough(img: &ImageData) -> (&[u8], u8, &PngSpace) {
+        match &img.kind {
+            ImageKind::Png { idat, bits, space } => (idat, *bits, space),
+            other => panic!("expected png passthrough, got {other:?}"),
+        }
+    }
+
+    fn idat_payloads(file: &[u8]) -> Vec<u8> {
+        let mut rest = &file[8..];
+        let mut out = Vec::new();
+        while rest.len() >= 12 {
+            let length = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            if &rest[4..8] == b"IDAT" {
+                out.extend_from_slice(&rest[8..8 + length]);
+            }
+            rest = &rest[length + 12..];
+        }
+        out
     }
 
     fn image_message(result: crate::error::Result<ImageData>) -> String {
@@ -447,15 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn png_rgb() {
+    fn png_rgb_passes_through() {
         let data: [u8; 12] = [255, 0, 0, 0, 255, 0, 0, 0, 255, 9, 8, 7];
         let bytes = encode_png(2, 2, png::ColorType::Rgb, png::BitDepth::Eight, None, &data);
         let img = ImageData::png(&bytes).unwrap();
         assert_eq!((img.width(), img.height()), (2, 2));
-        let (pixels, color, smask) = raster(&img);
-        assert_eq!(color, RasterColor::Rgb8);
-        assert_eq!(pixels, data);
-        assert!(smask.is_none());
+        let (idat, bits, space) = passthrough(&img);
+        assert_eq!(idat, idat_payloads(&bytes));
+        assert_eq!(bits, 8);
+        assert_eq!(space, &PngSpace::Rgb);
     }
 
     #[test]
@@ -478,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn png_gray() {
+    fn png_gray_passes_through() {
         let data: [u8; 6] = [0, 60, 120, 180, 220, 255];
         let bytes = encode_png(
             3,
@@ -490,10 +620,46 @@ mod tests {
         );
         let img = ImageData::png(&bytes).unwrap();
         assert_eq!((img.width(), img.height()), (3, 2));
-        let (pixels, color, smask) = raster(&img);
-        assert_eq!(color, RasterColor::Gray8);
-        assert_eq!(pixels, data);
-        assert!(smask.is_none());
+        let (idat, bits, space) = passthrough(&img);
+        assert_eq!(idat, idat_payloads(&bytes));
+        assert_eq!(bits, 8);
+        assert_eq!(space, &PngSpace::Gray);
+    }
+
+    #[test]
+    fn png_low_bit_depth_gray_passes_through() {
+        let bytes = encode_png(
+            8,
+            2,
+            png::ColorType::Grayscale,
+            png::BitDepth::One,
+            None,
+            &[0b1010_1010, 0b0101_0101],
+        );
+        let img = ImageData::png(&bytes).unwrap();
+        let (_, bits, space) = passthrough(&img);
+        assert_eq!(bits, 1);
+        assert_eq!(space, &PngSpace::Gray);
+    }
+
+    #[test]
+    fn png_trns_is_decoded_into_a_soft_mask() {
+        let mut bytes = encode_png(
+            1,
+            1,
+            png::ColorType::Rgb,
+            png::BitDepth::Eight,
+            None,
+            &[1, 2, 3],
+        );
+        let mut trns = png_chunk(b"tRNS", &[0, 1, 0, 2, 0, 3]);
+        let idat_start = bytes.windows(4).position(|w| w == b"IDAT").unwrap() - 4;
+        let tail = bytes.split_off(idat_start);
+        bytes.append(&mut trns);
+        bytes.extend_from_slice(&tail);
+        let img = ImageData::png(&bytes).unwrap();
+        let (_, _, smask) = raster(&img);
+        assert_eq!(smask, Some([0].as_slice()));
     }
 
     #[test]
@@ -516,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn png_palette_expands_to_rgb() {
+    fn png_palette_passes_through_as_indexed() {
         let palette: [u8; 6] = [255, 0, 0, 0, 255, 0];
         let bytes = encode_png(
             2,
@@ -528,10 +694,9 @@ mod tests {
         );
         let img = ImageData::png(&bytes).unwrap();
         assert_eq!((img.width(), img.height()), (2, 1));
-        let (pixels, color, smask) = raster(&img);
-        assert_eq!(color, RasterColor::Rgb8);
-        assert_eq!(pixels, [255, 0, 0, 0, 255, 0]);
-        assert!(smask.is_none());
+        let (_, bits, space) = passthrough(&img);
+        assert_eq!(bits, 8);
+        assert_eq!(space, &PngSpace::Indexed(palette.to_vec()));
     }
 
     #[test]
@@ -612,7 +777,7 @@ mod tests {
                 assert_eq!(data, &bytes);
                 assert!(!gray);
             }
-            ImageKind::Raster { .. } => panic!("expected jpeg passthrough"),
+            ImageKind::Raster { .. } | ImageKind::Png { .. } => panic!("expected jpeg passthrough"),
         }
     }
 
@@ -628,7 +793,7 @@ mod tests {
                 assert_eq!(data, &bytes);
                 assert!(gray);
             }
-            ImageKind::Raster { .. } => panic!("expected jpeg passthrough"),
+            ImageKind::Raster { .. } | ImageKind::Png { .. } => panic!("expected jpeg passthrough"),
         }
     }
 
