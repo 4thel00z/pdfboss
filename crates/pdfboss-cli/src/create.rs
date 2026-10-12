@@ -19,8 +19,9 @@ pub enum CreateCommand {
         /// Number of pages.
         #[arg(long, default_value_t = 1)]
         pages: usize,
-        /// Page size.
-        #[arg(long, value_enum, default_value_t = SizeArg::A4)]
+        /// Page size: a name (a0 to a10, b0 to b10, letter, legal,
+        /// tabloid) or WIDTHxHEIGHT in pt, mm, cm or in.
+        #[arg(long, default_value = "a4")]
         size: SizeArg,
         /// Swap page width and height.
         #[arg(long)]
@@ -39,8 +40,9 @@ pub enum CreateCommand {
         /// Font size in points.
         #[arg(long, default_value_t = 11.0)]
         font_size: f32,
-        /// Page size.
-        #[arg(long, value_enum, default_value_t = SizeArg::A4)]
+        /// Page size: a name (a0 to a10, b0 to b10, letter, legal,
+        /// tabloid) or WIDTHxHEIGHT in pt, mm, cm or in.
+        #[arg(long, default_value = "a4")]
         size: SizeArg,
         /// Swap page width and height.
         #[arg(long)]
@@ -57,8 +59,9 @@ pub enum CreateCommand {
         /// Output PDF file.
         #[arg(short, long)]
         out: PathBuf,
-        /// Page size (default: each page matches its image at 72 dpi).
-        #[arg(long, value_enum)]
+        /// Page size, as for `blank` (default: each page matches its image
+        /// at 72 dpi).
+        #[arg(long)]
         size: Option<SizeArg>,
         /// Swap page width and height (requires --size).
         #[arg(long, requires = "size")]
@@ -74,8 +77,9 @@ pub enum CreateCommand {
         /// CSS theme file (default: the built-in theme).
         #[arg(long)]
         theme: Option<PathBuf>,
-        /// Page size.
-        #[arg(long, value_enum, default_value_t = SizeArg::A4)]
+        /// Page size: a name (a0 to a10, b0 to b10, letter, legal,
+        /// tabloid) or WIDTHxHEIGHT in pt, mm, cm or in.
+        #[arg(long, default_value = "a4")]
         size: SizeArg,
         /// Swap page width and height.
         #[arg(long)]
@@ -149,32 +153,26 @@ impl FontArg {
     }
 }
 
-/// `--size` choices, mirroring `pdfboss_write::PageSize`'s named sizes.
-#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
-pub enum SizeArg {
-    /// 297 × 420 mm.
-    A3,
-    /// 210 × 297 mm (default).
-    #[default]
-    A4,
-    /// 148 × 210 mm.
-    A5,
-    /// 8.5 × 11 in.
-    Letter,
-    /// 8.5 × 14 in.
-    Legal,
+/// `--size`: whatever `pdfboss_write::PageSize::parse` accepts — a name
+/// (`a0` to `a10`, `b0` to `b10`, `letter`, `legal`, `tabloid`) or
+/// `<width>x<height>` in pt, mm, cm or in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SizeArg(PageSize);
+
+impl std::str::FromStr for SizeArg {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<SizeArg, String> {
+        PageSize::parse(text)
+            .map(SizeArg)
+            .ok_or_else(|| format!("unknown page size {text:?}: {}", PageSize::ACCEPTED))
+    }
 }
 
 impl SizeArg {
     /// The library page size this flag names.
     fn to_page_size(self) -> PageSize {
-        match self {
-            SizeArg::A3 => PageSize::A3,
-            SizeArg::A4 => PageSize::A4,
-            SizeArg::A5 => PageSize::A5,
-            SizeArg::Letter => PageSize::Letter,
-            SizeArg::Legal => PageSize::Legal,
-        }
+        self.0
     }
 }
 
@@ -553,7 +551,7 @@ mod tests {
         };
         assert_eq!(out, PathBuf::from("out.pdf"));
         assert_eq!(pages, 1);
-        assert!(matches!(size, SizeArg::A4));
+        assert_eq!(size.to_page_size(), PageSize::A4);
         assert!(!landscape);
     }
 
@@ -595,7 +593,7 @@ mod tests {
         assert_eq!(out, PathBuf::from("o.pdf"));
         assert_eq!(font.to_standard14(), Standard14::CourierBold);
         assert_eq!(font_size, 9.5);
-        assert!(matches!(size, SizeArg::A5));
+        assert_eq!(size.to_page_size(), PageSize::A5);
         assert!(landscape);
         assert_eq!(margin, 36.0);
     }
@@ -622,7 +620,7 @@ mod tests {
         };
         assert_eq!(inputs, [PathBuf::from("a.png"), PathBuf::from("b.jpg")]);
         assert_eq!(out, PathBuf::from("o.pdf"));
-        assert!(matches!(size, Some(SizeArg::Letter)));
+        assert_eq!(size.map(SizeArg::to_page_size), Some(PageSize::Letter));
         assert!(landscape);
     }
 
@@ -682,22 +680,28 @@ mod tests {
             ("a5", PageSize::A5),
             ("letter", PageSize::Letter),
             ("legal", PageSize::Legal),
+            (
+                "612x792",
+                PageSize::Custom {
+                    width: 612.0,
+                    height: 792.0,
+                },
+            ),
         ] {
-            let parsed = SizeArg::from_str(name, false).unwrap();
+            let parsed: SizeArg = name.parse().unwrap();
             assert_eq!(parsed.to_page_size(), expected, "{name}");
         }
+        let (width, height) = "a1".parse::<SizeArg>().unwrap().to_page_size().dimensions();
+        assert!((width - 1683.78).abs() < 0.01 && (height - 2383.94).abs() < 0.01);
+        let err = "poster".parse::<SizeArg>().unwrap_err();
+        assert!(err.contains("poster") && err.contains("a0 to a10"), "{err}");
     }
 
     #[test]
     fn resolved_size_swaps_under_landscape() {
-        assert_eq!(
-            resolved_size(SizeArg::Letter, false).dimensions(),
-            (612.0, 792.0)
-        );
-        assert_eq!(
-            resolved_size(SizeArg::Letter, true).dimensions(),
-            (792.0, 612.0)
-        );
+        let letter: SizeArg = "letter".parse().unwrap();
+        assert_eq!(resolved_size(letter, false).dimensions(), (612.0, 792.0));
+        assert_eq!(resolved_size(letter, true).dimensions(), (792.0, 612.0));
     }
 
     #[test]

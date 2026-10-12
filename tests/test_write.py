@@ -394,3 +394,48 @@ def test_standard14_exposes_all_fourteen_names() -> None:
     ]
     for name in names:
         assert hasattr(Standard14, name)
+
+
+def media_box(pdf: bytes) -> tuple[float, float]:
+    page = pdfboss.Document(data=pdf)[0]
+    return page.width, page.height
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        (None, (595.28, 841.89)),
+        ("a4", (595.28, 841.89)),
+        ("A1", (1683.78, 2383.94)),
+        ("b5", (498.90, 708.66)),
+        ("tabloid", (792.0, 1224.0)),
+        ("612x792", (612.0, 792.0)),
+        ("210mmx297mm", (595.28, 841.89)),
+        ("8.5in x 11in", (612.0, 792.0)),
+        ((200, 100), (200.0, 100.0)),
+        ((200.5, 100.25), (200.5, 100.25)),
+    ],
+)
+def test_page_size_takes_names_dimension_strings_and_tuples(size, expected) -> None:
+    page = Page() if size is None else Page(size=size)
+    assert media_box((Pdf() | page).to_bytes()) == pytest.approx(expected, abs=0.01)
+
+
+def test_landscape_swaps_any_size() -> None:
+    assert media_box((Pdf() | Page(size=(200, 100), landscape=True)).to_bytes()) == (100.0, 200.0)
+    assert media_box((Pdf() | Page(size="a1", landscape=True)).to_bytes()) == pytest.approx(
+        (2383.94, 1683.78), abs=0.01
+    )
+
+
+def test_page_size_errors_name_the_problem() -> None:
+    with pytest.raises(pdfboss.PdfError, match="poster"):
+        Page(size="poster")
+    with pytest.raises(pdfboss.PdfError, match="a0 to a10"):
+        Page(size="612x")
+    with pytest.raises(ValueError, match="positive"):
+        Page(size=(0, 100))
+    with pytest.raises(TypeError, match="tuple"):
+        Page(size=612)
+    with pytest.raises(TypeError, match="tuple"):
+        Page(size=(1, 2, 3))

@@ -3069,9 +3069,21 @@ class write:
         """One page: its size and the content composed onto it with
         ``|``."""
 
-        def __init__(self, size: str = "a4", landscape: bool = False) -> None:
-            """``size`` names a page size case-insensitively, resolved at
-            lowering time."""
+        def __init__(
+            self,
+            size: str | tuple[float, float] | None = None,
+            landscape: bool = False,
+        ) -> None:
+            """``size`` is a page size name (``"a0"`` to ``"a10"``, ``"b0"``
+            to ``"b10"``, ``"letter"``, ``"legal"``, ``"tabloid"``,
+            case-insensitively), a ``"<width>x<height>"`` string with each
+            length in points or suffixed ``pt``, ``mm``, ``cm`` or ``in``
+            (``"612x792"``, ``"210mmx297mm"``), or a ``(width, height)``
+            tuple of points; ``None`` is A4. Resolved at construction: a
+            string that is not one of these forms (an unknown name, a
+            malformed or non-positive length such as ``"0x100"``) raises
+            ``PdfError``, a tuple with a non-positive or non-finite number
+            ``ValueError``, any other type ``TypeError``."""
 
         def __or__(
             self,
