@@ -148,7 +148,9 @@ jobs:
   # crates.io publish chains off the release the same way PyPI does. Auth is
   # the CARGO_REGISTRY_TOKEN repo secret (same convention as the release-plz
   # repos). `--workspace` publishes the members in dependency order and skips
-  # the `publish = false` ones (pdfboss-py, pdfboss-testkit).
+  # the `publish = false` ones (pdfboss-py, pdfboss-testkit). Members whose
+  # version is already on crates.io are excluded, so a rerun after a partial
+  # publish (crates.io indexing slower than cargo's 60 s wait) finishes the rest.
   publish-crates:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
@@ -159,7 +161,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo publish --workspace
+      - run: |
+          excludes=()
+          while read -r name version; do
+            if curl -sf -A pdfboss-release "https://crates.io/api/v1/crates/$name/$version" >/dev/null; then
+              excludes+=(--exclude "$name")
+            fi
+          done < <(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.publish != []) | "\(.name) \(.version)"')
+          cargo publish --workspace "${excludes[@]}"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
