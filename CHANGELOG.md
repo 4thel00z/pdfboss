@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.16.0](https://github.com/4thel00z/pdfboss/compare/v2.15.1...v2.16.0) (2026-10-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* **all:** remove every panic site from production code ([#256](https://github.com/4thel00z/pdfboss/issues/256))
+
+### Miscellaneous Chores
+
+* release 2.16.0 ([31fac30](https://github.com/4thel00z/pdfboss/commit/31fac3097cdf4f3f266ed75e338baa744c96a4f7))
+
+
+### Code Refactoring
+
+* **all:** remove every panic site from production code ([#256](https://github.com/4thel00z/pdfboss/issues/256)) ([656ffd1](https://github.com/4thel00z/pdfboss/commit/656ffd1ccca33e80710ec75105cbd5b742345535))
+
 ## [2.15.1](https://github.com/4thel00z/pdfboss/compare/v2.15.0...v2.15.1) (2026-10-12)
 
 
