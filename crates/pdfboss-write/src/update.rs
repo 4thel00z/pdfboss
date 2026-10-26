@@ -241,7 +241,7 @@ fn overlay_form(writer: &mut Writer, overlay: &Document) -> Result<ObjRef> {
         form,
         Object::Stream(Stream {
             dict,
-            data: deflate(&content),
+            data: deflate(&content)?,
         }),
     )?;
     Ok(form)
@@ -631,7 +631,7 @@ impl Overlay {
         dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
         Ok(self.put(Object::Stream(Stream {
             dict,
-            data: deflate(&content),
+            data: deflate(&content)?,
         })))
     }
 
@@ -1119,14 +1119,10 @@ fn plain_stream(data: Vec<u8>) -> Stream {
     }
 }
 
-pub(crate) fn deflate(data: &[u8]) -> Vec<u8> {
+pub(crate) fn deflate(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(data)
-        .expect("writing into a Vec cannot fail");
-    encoder
-        .finish()
-        .expect("finishing an in-memory zlib stream cannot fail")
+    encoder.write_all(data)?;
+    Ok(encoder.finish()?)
 }
 
 /// A byte position as the 4-byte offset field of a cross-reference stream.

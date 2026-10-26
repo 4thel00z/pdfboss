@@ -42,6 +42,8 @@ fmt-check: ## Fail on unformatted code, changing nothing
 lint: ## Clippy with warnings denied, both CI lanes
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy -p pdfboss-aio --all-targets --all-features -- -D warnings
+	cargo clippy --workspace --lib --bins -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable -D clippy::todo -D clippy::unimplemented
+	cargo clippy -p pdfboss-aio --lib --all-features -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable -D clippy::todo -D clippy::unimplemented
 
 .PHONY: test
 test: ## Run the workspace tests plus the aio all-features lane

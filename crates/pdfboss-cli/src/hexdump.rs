@@ -98,8 +98,8 @@ pub fn hexdump_marked(
     while row_start < bytes.len() {
         let row_end = (row_start + width).min(bytes.len());
         let row_off_end = base_offset + row_end as u64;
-        while marks.peek().is_some_and(|m| m.offset < row_off_end) {
-            writeln!(w, "── {} ──", marks.next().expect("peeked").label)?;
+        while let Some(mark) = marks.next_if(|m| m.offset < row_off_end) {
+            writeln!(w, "── {} ──", mark.label)?;
         }
         write_row(
             w,

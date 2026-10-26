@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::backend::{Backend, BoxFuture};
 
@@ -97,7 +97,7 @@ impl<B: Backend> CachedBackend<B> {
         let (first, run) = self.batch_run(index, file_len);
         let start = first * self.chunk_size as u64;
         let size = usize::try_from((file_len - start).min((run * self.chunk_size) as u64))
-            .expect("batch size fits usize");
+            .unwrap_or(run * self.chunk_size);
         let mut data = vec![0u8; size];
         let mut filled = 0;
         while filled < size {
@@ -145,7 +145,7 @@ impl<B: Backend> CachedBackend<B> {
     /// common), forward, or jitter around a moving locality.
     fn batch_run(&self, index: u64, file_len: u64) -> (u64, usize) {
         let max_chunks = (MAX_BATCH_BYTES.min(self.max_bytes / 4) / self.chunk_size).max(1);
-        let mut state = self.state.lock().expect("cache mutex");
+        let mut state = self.locked();
         let dense = state
             .previous_miss
             .is_some_and(|previous| index.abs_diff(previous) <= 4 * state.batch_chunks as u64);
@@ -170,9 +170,13 @@ impl<B: Backend> CachedBackend<B> {
         (first, (last - first + 1) as usize)
     }
 
+    fn locked(&self) -> MutexGuard<'_, CacheState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Cache lookup, refreshing the entry's recency stamp on a hit.
     fn lookup(&self, index: u64) -> Option<Vec<u8>> {
-        let mut state = self.state.lock().expect("cache mutex");
+        let mut state = self.locked();
         state.clock += 1;
         let stamp = state.clock;
         let entry = state.chunks.get_mut(&index)?;
@@ -183,7 +187,7 @@ impl<B: Backend> CachedBackend<B> {
     /// Inserts a chunk, evicting the least-recently-used entries until the
     /// total stays within `max_bytes`.
     fn insert(&self, index: u64, data: Vec<u8>) {
-        let mut state = self.state.lock().expect("cache mutex");
+        let mut state = self.locked();
         state.clock += 1;
         let stamp = state.clock;
         state.bytes += data.len();

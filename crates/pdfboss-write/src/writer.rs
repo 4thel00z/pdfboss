@@ -439,7 +439,9 @@ async fn emit_stream<S: AsyncByteSink>(
         let num = user_count + c as u32 + 1;
         let mut container = Object::Stream(container);
         if let Some(encryptor) = encryptor.as_deref_mut() {
-            encryptor.encrypt_object(&mut container, num, 0);
+            encryptor
+                .encrypt_object(&mut container, num, 0)
+                .map_err(crate::update::core_error)?;
         }
         write_indirect(emit, num, &container).await?;
     }
@@ -542,7 +544,9 @@ async fn write_indirect_maybe_encrypted<S: AsyncByteSink>(
     match encryptor {
         Some(encryptor) => {
             let mut obj = obj.clone();
-            encryptor.encrypt_object(&mut obj, num, 0);
+            encryptor
+                .encrypt_object(&mut obj, num, 0)
+                .map_err(crate::update::core_error)?;
             write_indirect(emit, num, &obj).await
         }
         None => write_indirect(emit, num, obj).await,
@@ -591,14 +595,12 @@ fn compress_into(dict: &mut Dict, data: Vec<u8>, compress: bool) -> Vec<u8> {
     if !compress || dict.get("Filter").is_some() {
         return data;
     }
-    dict.insert(literal("Filter"), Object::Name(literal("FlateDecode")));
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&data)
-        .expect("writing into a Vec cannot fail");
-    encoder
-        .finish()
-        .expect("finishing an in-memory zlib stream cannot fail")
+    let Ok(compressed) = encoder.write_all(&data).and_then(|()| encoder.finish()) else {
+        return data;
+    };
+    dict.insert(literal("Filter"), Object::Name(literal("FlateDecode")));
+    compressed
 }
 
 /// One `[1 4 2]` cross-reference-stream row.

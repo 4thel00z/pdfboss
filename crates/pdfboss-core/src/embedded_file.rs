@@ -88,7 +88,8 @@ pub async fn file_spec_data_with<S: AsyncObjectSource>(
 ///
 /// Covers ISO 32000-1 §7.11.2.
 pub fn spec_components(spec: &[u8]) -> Vec<Vec<u8>> {
-    let mut components = vec![Vec::new()];
+    let mut components = Vec::new();
+    let mut current = Vec::new();
     let mut bytes = spec.iter();
     while let Some(&b) = bytes.next() {
         match b {
@@ -96,13 +97,14 @@ pub fn spec_components(spec: &[u8]) -> Vec<Vec<u8>> {
                 // The escaped byte is kept as is; a trailing reverse
                 // solidus has nothing to escape and is dropped.
                 if let Some(&escaped) = bytes.next() {
-                    components.last_mut().expect("never empty").push(escaped);
+                    current.push(escaped);
                 }
             }
-            b'/' => components.push(Vec::new()),
-            other => components.last_mut().expect("never empty").push(other),
+            b'/' => components.push(std::mem::take(&mut current)),
+            other => current.push(other),
         }
     }
+    components.push(current);
     components
 }
 

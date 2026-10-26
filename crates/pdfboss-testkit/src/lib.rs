@@ -3,7 +3,6 @@
 //! tests never hand-compute byte positions.
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 
 mod crypt;
 pub use crypt::{encrypted_rc4_doc, encrypted_rc4_doc_with_indirect_cf};
@@ -279,7 +278,7 @@ pub fn multi_page_doc(pages: &[&str]) -> Vec<u8> {
         if i > 0 {
             kids.push(' ');
         }
-        write!(kids, "{} 0 R", 4 + 2 * i as u32).unwrap();
+        kids.push_str(&format!("{} 0 R", 4 + 2 * i as u32));
     }
     b.object(
         2,
@@ -557,7 +556,7 @@ pub fn objstm_payload(objects: &[(u32, &str)]) -> (String, Vec<u8>) {
             header.push(' ');
             bodies.push(b'\n');
         }
-        write!(header, "{} {}", num, bodies.len()).unwrap();
+        header.push_str(&format!("{} {}", num, bodies.len()));
         bodies.extend_from_slice(body.as_bytes());
     }
     header.push('\n');

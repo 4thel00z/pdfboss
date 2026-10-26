@@ -384,7 +384,10 @@ impl Huffman {
         let mut next = vals.iter();
         for (i, &count) in bits.iter().enumerate() {
             for _ in 0..count {
-                let symbol = *next.next().expect("HUFFVAL shorter than BITS") as usize;
+                let Some(&value) = next.next() else {
+                    return table;
+                };
+                let symbol = value as usize;
                 table.code[symbol] = code;
                 table.len[symbol] = i as u8 + 1;
                 code += 1;
@@ -399,11 +402,7 @@ impl Huffman {
     }
 
     fn len(&self, symbol: usize) -> u32 {
-        let len = u32::from(self.len[symbol]);
-        if len == 0 {
-            unreachable!("symbol {symbol:#04x} has no code in this table");
-        }
-        len
+        u32::from(self.len[symbol])
     }
 }
 

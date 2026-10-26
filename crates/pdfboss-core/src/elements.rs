@@ -370,7 +370,7 @@ impl<'a> Iterator for Elements<'a> {
                     let Stage::Logical { part, .. } =
                         std::mem::replace(&mut self.stage, Stage::Done)
                     else {
-                        unreachable!("just matched Stage::Logical");
+                        continue;
                     };
                     match part {
                         PagePart::PageItself => {

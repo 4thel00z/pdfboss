@@ -367,21 +367,16 @@ fn on_workers<T: Send + Sync>(count: usize, work: impl Fn(usize) -> T + Sync) ->
                 if index >= count {
                     break;
                 }
-                // Each index is handed to exactly one worker, so its slot
-                // is empty; a filled one would mean the counter repeated
-                // an index, which is worth crashing over.
-                if slots[index].set(work(index)).is_err() {
-                    unreachable!("index {index} was dispatched twice");
+                if let Some(slot) = slots.get(index) {
+                    slot.set(work(index)).ok();
                 }
             });
         }
     });
     slots
         .into_iter()
-        .map(|slot| {
-            slot.into_inner()
-                .expect("every index below the count was dispatched")
-        })
+        .enumerate()
+        .map(|(index, slot)| slot.into_inner().unwrap_or_else(|| work(index)))
         .collect()
 }
 
@@ -888,15 +883,19 @@ fn demote_contents_entries(blocks: &mut [Block]) {
         return;
     }
     for block in headings {
-        let Block::Heading { lines, bbox, .. } = block else {
-            unreachable!("the filter passes headings only");
-        };
-        *block = Block::Paragraph {
-            lines: std::mem::take(lines),
-            bbox: bbox.clone(),
-            role: Role::Body,
-        };
+        demote_heading(block);
     }
+}
+
+fn demote_heading(block: &mut Block) {
+    let Block::Heading { lines, bbox, .. } = block else {
+        return;
+    };
+    *block = Block::Paragraph {
+        lines: std::mem::take(lines),
+        bbox: bbox.clone(),
+        role: Role::Body,
+    };
 }
 
 /// A block's bounding box, whichever kind it is.
@@ -1011,10 +1010,15 @@ fn promote_page_title(blocks: &mut Vec<Block>, stats: &SizeStats, options: &Layo
         return;
     }
     let Block::Paragraph { lines, .. } = &mut blocks[start] else {
-        unreachable!("the candidate was matched as a paragraph");
+        return;
     };
+    if lines.is_empty() {
+        return;
+    }
     let mut moved = std::mem::take(lines).into_iter();
-    let title = moved.next().expect("the candidate had a first line");
+    let Some(title) = moved.next() else {
+        return;
+    };
     let remainder: Vec<Line> = moved.collect();
     let heading = Block::Heading {
         level: stats.bold_level(),
@@ -1062,14 +1066,7 @@ fn demote_heading_runs(blocks: &mut [Block]) {
         }
         if end - index > HEADING_RUN_MAX {
             for block in &mut blocks[index..end] {
-                let Block::Heading { lines, bbox, .. } = block else {
-                    unreachable!("the run holds headings only");
-                };
-                *block = Block::Paragraph {
-                    lines: std::mem::take(lines),
-                    bbox: bbox.clone(),
-                    role: Role::Body,
-                };
+                demote_heading(block);
             }
         }
         index = end;
@@ -2040,11 +2037,13 @@ pub(crate) fn document_layout_extracted(
         .map(|page| std::sync::Mutex::new(Some(page)))
         .collect();
     let layouts = on_workers(handed.len(), |index| {
-        let page = handed[index]
+        let taken = handed[index]
             .lock()
-            .expect("no worker panicked holding a page")
-            .take()
-            .expect("each page is taken once");
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(page) = taken else {
+            return page_layout_with_stats(&[], &[], &stats, ReadingOrder::default(), options);
+        };
         page_layout_with_stats(&page.spans, &page.rulings, &stats, page.order, options)
     });
     finished(layouts, &stats, options)
@@ -3048,9 +3047,11 @@ fn open_ruled_split(
         out.push(grid);
         return;
     }
-    let widest = (1..ys.len())
-        .max_by(|&a, &b| (ys[a] - ys[a - 1]).total_cmp(&(ys[b] - ys[b - 1])))
-        .expect("two rules have a gap");
+    let Some(widest) =
+        (1..ys.len()).max_by(|&a, &b| (ys[a] - ys[a - 1]).total_cmp(&(ys[b] - ys[b - 1])))
+    else {
+        return;
+    };
     open_ruled_split(inked, &ys[..widest], x0, x1, taken, out);
     open_ruled_split(inked, &ys[widest..], x0, x1, taken, out);
 }
@@ -4871,12 +4872,13 @@ fn table_row(group: &Group, columns: &[std::ops::Range<f32>]) -> Option<Vec<Cell
             Some(last) if start <= last.1 || continues_word => {
                 last.1 = last.1.max(end);
                 last.2.end = position + 1;
-                let extent = extents.last_mut().expect("a claim has an extent");
-                *extent = match (*extent, ink) {
-                    (Some(held), Some((lo, hi))) => Some((held.0.min(lo), held.1.max(hi))),
-                    (held, None) => held,
-                    (None, ink) => ink,
-                };
+                if let Some(extent) = extents.last_mut() {
+                    *extent = match (*extent, ink) {
+                        (Some(held), Some((lo, hi))) => Some((held.0.min(lo), held.1.max(hi))),
+                        (held, None) => held,
+                        (None, ink) => ink,
+                    };
+                }
             }
             _ => {
                 claimed.push((start, end, position..position + 1));
@@ -5744,7 +5746,7 @@ fn segments_with_grids<'s>(
             let mut slots: Vec<Option<Vec<&TextSpan>>> = raw.into_iter().map(Some).collect();
             let ordered: Vec<Vec<&TextSpan>> = order
                 .iter()
-                .map(|&i| slots[i].take().expect("each flow placed once"))
+                .filter_map(|&i| slots.get_mut(i).and_then(Option::take))
                 .collect();
             let assignment: Vec<Option<usize>> =
                 order.iter().map(|&i| stream_assignment[i]).collect();

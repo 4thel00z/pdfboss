@@ -148,7 +148,7 @@ impl<'w, 's, S: AsyncObjectSource> Importer<'w, 's, S> {
         let mut dict = self.copy_dict(&dict)?;
         let data = if self.compress && dict.get("Filter").is_none() {
             dict.insert(name("Filter"), Object::Name(name("FlateDecode")));
-            deflate(&stream.data)
+            deflate(&stream.data)?
         } else {
             stream.data.clone()
         };
@@ -275,7 +275,7 @@ fn widen(value: f32) -> f64 {
     value
         .to_string()
         .parse()
-        .expect("a float's own Display output parses back as a float")
+        .unwrap_or_else(|_| f64::from(value))
 }
 
 fn name(text: &str) -> Name {

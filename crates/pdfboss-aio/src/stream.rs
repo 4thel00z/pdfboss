@@ -161,7 +161,7 @@ fn build_worklist(doc: &AsyncDocument, opts: &ElementOpts) -> VecDeque<WorkItem>
                         index,
                     });
                 }
-                XrefEntry::Free => unreachable!("filtered out above"),
+                XrefEntry::Free => {}
             }
         }
         // Sections in chain order (as stored by the open flow), then the

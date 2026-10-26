@@ -750,7 +750,13 @@ impl Document {
                     });
                     slots
                         .into_iter()
-                        .map(|slot| slot.into_inner().expect("every slot was dispatched"))
+                        .map(|slot| {
+                            slot.into_inner().unwrap_or_else(|| {
+                                Err(pdfboss_core::Error::Decode(
+                                    "render worker produced no output".into(),
+                                ))
+                            })
+                        })
                         .collect()
                 }
             };
@@ -2491,15 +2497,14 @@ impl AsyncDocument {
                 }
             }
             Python::with_gil(|py| {
-                let list: Vec<Py<PyAny>> = images
+                images
                     .into_iter()
                     .map(|image| {
-                        PyBytes::new(py, &image.expect("every slot was dispatched"))
-                            .into_any()
-                            .unbind()
+                        let image = image
+                            .ok_or_else(|| PdfError::new_err("render worker produced no output"))?;
+                        Ok(PyBytes::new(py, &image).into_any().unbind())
                     })
-                    .collect();
-                Ok::<Vec<Py<PyAny>>, PyErr>(list)
+                    .collect::<PyResult<Vec<Py<PyAny>>>>()
             })
         })
     }
