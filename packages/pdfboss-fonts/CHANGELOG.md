@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.16.0](https://github.com/4thel00z/pdfboss/compare/pdfboss-fonts-v0.16.0...pdfboss-fonts-v2.16.0) (2026-10-27)
+
+
+### Miscellaneous Chores
+
+* release 2.16.0 ([31fac30](https://github.com/4thel00z/pdfboss/commit/31fac3097cdf4f3f266ed75e338baa744c96a4f7))
+
 ## [0.16.0](https://github.com/4thel00z/pdfboss/compare/pdfboss-fonts-v0.15.0...pdfboss-fonts-v0.16.0) (2026-09-01)
 
 
