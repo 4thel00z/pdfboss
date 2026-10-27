@@ -36,7 +36,20 @@ const RULING_MAX_FILL_THICKNESS: f32 = 3.0;
 /// structure. Welded into a lattice its edges invent columns a chart never
 /// had. A box small in one dimension only is a drawn cell and keeps its
 /// edges.
+///
+/// Smallness alone does not settle it: a table of short cell text draws
+/// every one of its cells as a box under this extent in both dimensions,
+/// and a two-column table of one- or two-letter cells is small enough to
+/// read as markers. What separates the two is company. A marker stands
+/// alone, while a cell is one of a run whose boxes share the edges between
+/// them, so a box this small keeps its edges only when one of them runs
+/// collinear with an edge of another box. See [`release_tiled_icons`].
 const RULING_MAX_ICON_EXTENT: f32 = 24.0;
+
+/// The share of the shorter edge two collinear rulings must have in
+/// common before they read as one shared border rather than a marker that
+/// happens to sit under a rule.
+const SHARED_EDGE_OVERLAP: f32 = 0.5;
 
 /// What extraction could not read. Extraction is lenient the way rendering
 /// is — content that will not fetch, decode, or parse yields no text rather
@@ -319,6 +332,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         spans: Vec::new(),
         rulings: Vec::new(),
         bands: Vec::new(),
+        icon_edges: Vec::new(),
         images: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
@@ -352,7 +366,9 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         let markups = decorations::markup_annotations(src, page, oc).await;
         decorations::mark_annotated(&mut spans, &markups);
     }
-    (spans, exec.rulings, images, exec.report, exec.marks)
+    let mut rulings = exec.rulings;
+    release_tiled_icons(&mut rulings, &exec.icon_edges);
+    (spans, rulings, images, exec.report, exec.marks)
 }
 
 /// What a page walk does with marked content, fixed when the walk is
@@ -686,6 +702,94 @@ fn ruling_of_rect(rect: Rect) -> Option<Ruling> {
     })
 }
 
+/// Drops the edges of every small closed box that stands alone, keeping
+/// those of boxes that tile against another.
+///
+/// A box under [`RULING_MAX_ICON_EXTENT`] in both dimensions is either a
+/// legend marker, a checkbox or a data-point square — ink that never was
+/// table structure — or one cell of a table whose cells are all that
+/// small, as a two-column table of short values draws them. Size cannot
+/// tell the two apart; company can. A cell shares an edge with the next
+/// cell in its row or its column, so one of its edges runs collinear with
+/// an edge of another box and overlaps it along most of its length. A
+/// marker shares nothing, standing on its own in the page.
+///
+/// `edges` holds one range of `rulings` per small box. The shared-edge
+/// test looks only at those boxes, so a marker lying under an unrelated
+/// table's border is still a marker: what counts is another *small box*
+/// reaching it, not any ruling on the page.
+fn release_tiled_icons(rulings: &mut Vec<Ruling>, edges: &[std::ops::Range<usize>]) {
+    if edges.is_empty() {
+        return;
+    }
+    let tiled: Vec<bool> = (0..edges.len())
+        .map(|i| {
+            (0..edges.len()).any(|j| j != i && boxes_share_an_edge(rulings, &edges[i], &edges[j]))
+        })
+        .collect();
+    if tiled.iter().all(|tiled| *tiled) {
+        return;
+    }
+    // Drop the edges of every box that tiles with nothing: a marker's
+    // edges are not the page's ruling structure.
+    let mut dropped = vec![false; rulings.len()];
+    for (range, tiled) in edges.iter().zip(&tiled) {
+        if *tiled {
+            continue;
+        }
+        for index in range.clone() {
+            dropped[index] = true;
+        }
+    }
+    let mut index = 0;
+    rulings.retain(|_| {
+        let keep = !dropped[index];
+        index += 1;
+        keep
+    });
+}
+
+/// True when some edge of `a` runs collinear with, and overlapping most of
+/// its length, some edge of `b`: two cells set side by side or one above
+/// the other.
+fn boxes_share_an_edge(
+    rulings: &[Ruling],
+    a: &std::ops::Range<usize>,
+    b: &std::ops::Range<usize>,
+) -> bool {
+    a.clone().any(|i| {
+        b.clone()
+            .any(|j| edges_are_shared(&rulings[i], &rulings[j]))
+    })
+}
+
+/// True when two rulings lie on the same line and overlap along at least
+/// [`SHARED_EDGE_OVERLAP`] of the shorter one.
+fn edges_are_shared(a: &Ruling, b: &Ruling) -> bool {
+    let a_horizontal = (a.start.y - a.end.y).abs() <= RULING_AXIS_EPSILON;
+    let b_horizontal = (b.start.y - b.end.y).abs() <= RULING_AXIS_EPSILON;
+    if a_horizontal != b_horizontal {
+        return false;
+    }
+    let (a_lo, a_hi, b_lo, b_hi) = if a_horizontal {
+        if (a.start.y - b.start.y).abs() > RULING_AXIS_EPSILON {
+            return false;
+        }
+        (a.start.x, a.end.x, b.start.x, b.end.x)
+    } else {
+        if (a.start.x - b.start.x).abs() > RULING_AXIS_EPSILON {
+            return false;
+        }
+        (a.start.y, a.end.y, b.start.y, b.end.y)
+    };
+    let shorter = (a_hi - a_lo).min(b_hi - b_lo);
+    if shorter <= 0.0 {
+        return false;
+    }
+    let overlap = a_hi.min(b_hi) - a_lo.max(b_lo);
+    overlap >= SHARED_EDGE_OVERLAP * shorter
+}
+
 /// One subpath under construction, in the frame's untransformed user space.
 ///
 /// A curve operator poisons it — glyph outlines and diagrams are not
@@ -894,6 +998,11 @@ struct Executor<'a, S, M> {
     /// Filled rectangles too thick to be rulings, in paint order: the
     /// highlight candidates the decoration pass weighs against the spans.
     bands: Vec<Band>,
+    /// Ranges of `rulings` holding the edges of closed boxes small enough
+    /// in both dimensions to be markers. Whether they are markers or table
+    /// cells is settled once the walk ends, by [`release_tiled_icons`]:
+    /// only then is every box's company known.
+    icon_edges: Vec<std::ops::Range<usize>>,
     /// Every image drawn so far, in drawing order, at the place the CTM put
     /// it — image XObjects through every form, and inline images.
     images: Vec<PlacedImage>,
@@ -1122,6 +1231,10 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                         self.spans.truncate(frame.spans_mark);
                         self.marks.truncate(frame.spans_mark);
                         self.rulings.truncate(frame.rulings_mark);
+                        // The boxes the truncated stream drew are gone with
+                        // their edges; their ranges would dangle otherwise.
+                        self.icon_edges
+                            .retain(|range| range.start < frame.rulings_mark);
                         self.bands.truncate(frame.bands_mark);
                         self.images.truncate(frame.images_mark);
                         let kind = if frame.depth == 0 {
@@ -1431,7 +1544,14 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 continue;
             }
             let device: Vec<Point> = sub.points.iter().map(|p| ctm.apply(*p)).collect();
-            if stroke && !icon_box(&device, sub.closed) {
+            if stroke {
+                // A closed box small in both dimensions may be a marker or
+                // a table cell, and only the walk's end can tell: a cell is
+                // one of a run sharing its borders, a marker stands alone.
+                // So its edges are collected either way and the tiling
+                // question is asked once, in `release_tiled_icons`.
+                let icon = icon_box(&device, sub.closed);
+                let first = self.rulings.len();
                 let segments = device.windows(2).map(|pair| (pair[0], pair[1]));
                 // A closed 2-point subpath draws one doubled edge, not two.
                 let closing =
@@ -1440,6 +1560,9 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     if let Some(ruling) = ruling_from_segment(a, b, width) {
                         self.rulings.push(ruling);
                     }
+                }
+                if icon {
+                    self.icon_edges.push(first..self.rulings.len());
                 }
             }
             if fill {
@@ -2725,6 +2848,17 @@ mod tests {
     fn a_tiny_closed_stroked_box_yields_no_rulings() {
         let rulings = rulings_of("142 650 18 16 re S");
         assert!(rulings.is_empty(), "{rulings:?}");
+    }
+
+    /// Two narrow cells set side by side share the edge between them: a
+    /// small box tiled against another is a table's cell, not a legend's
+    /// marker standing alone. A two-column table of short cell text draws
+    /// exactly this, every box under `RULING_MAX_ICON_EXTENT` in both
+    /// dimensions, and its edges are the lattice the layout pass reads.
+    #[test]
+    fn narrow_tiled_cells_keep_their_rulings() {
+        let rulings = rulings_of("72 746.49 14.116 23.4 re S 86.116 746.49 14.721 23.4 re S");
+        assert_eq!(rulings.len(), 8, "{rulings:?}");
     }
 
     /// A closed box small in one dimension only is a drawn cell, and its
