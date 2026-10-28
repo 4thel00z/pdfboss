@@ -1,10 +1,31 @@
 """Shared fixtures for the pdfboss pytest suite."""
 
+import random
 from pathlib import Path
 
 import pytest
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def classic_pdf(objects: dict[int, bytes]) -> bytes:
+    """Assembles numbered object bodies into a PDF with a correct classic
+    xref table; object 1 is the catalog."""
+    out = bytearray(b"%PDF-1.7\n")
+    offsets = {}
+    for num, body in sorted(objects.items()):
+        offsets[num] = len(out)
+        out += b"%d 0 obj\n%s\nendobj\n" % (num, body)
+    xref_at = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1)
+    out += b"0000000000 65535 f \n"
+    for num in sorted(objects):
+        out += b"%010d 00000 n \n" % offsets[num]
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        xref_at,
+    )
+    return bytes(out)
 
 
 @pytest.fixture
@@ -59,21 +80,7 @@ def image_pdf() -> bytes:
             b"/Length 4 >>\nstream\n" + gray + b"\nendstream"
         ),
     }
-    out = bytearray(b"%PDF-1.7\n")
-    offsets = {}
-    for num, body in sorted(objects.items()):
-        offsets[num] = len(out)
-        out += b"%d 0 obj\n%s\nendobj\n" % (num, body)
-    xref_at = len(out)
-    out += b"xref\n0 %d\n" % (len(objects) + 1)
-    out += b"0000000000 65535 f \n"
-    for num in sorted(objects):
-        out += b"%010d 00000 n \n" % offsets[num]
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
-        len(objects) + 1,
-        xref_at,
-    )
-    return bytes(out)
+    return classic_pdf(objects)
 
 
 @pytest.fixture
@@ -89,18 +96,23 @@ def boxed_pdf() -> bytes:
             b"/TrimBox [60 70 540 730] >>"
         ),
     }
-    out = bytearray(b"%PDF-1.7\n")
-    offsets = {}
-    for num, body in sorted(objects.items()):
-        offsets[num] = len(out)
-        out += b"%d 0 obj\n%s\nendobj\n" % (num, body)
-    xref_at = len(out)
-    out += b"xref\n0 %d\n" % (len(objects) + 1)
-    out += b"0000000000 65535 f \n"
-    for num in sorted(objects):
-        out += b"%010d 00000 n \n" % offsets[num]
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
-        len(objects) + 1,
-        xref_at,
+    return classic_pdf(objects)
+
+
+@pytest.fixture
+def heavy_page_pdf() -> bytes:
+    """A one-page PDF whose content stream fills 100,000 small rectangles,
+    so one render takes tens of milliseconds: long enough for a lookup
+    that waited out a render on another thread to be measurable."""
+    rng = random.Random(7)
+    fills = b"".join(
+        b"%d %d 4 4 re f\n" % (rng.randrange(0, 600), rng.randrange(0, 800))
+        for _ in range(100_000)
     )
-    return bytes(out)
+    objects = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        3: b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /Contents 4 0 R >>",
+        4: b"<< /Length %d >>\nstream\n" % len(fills) + fills + b"\nendstream",
+    }
+    return classic_pdf(objects)

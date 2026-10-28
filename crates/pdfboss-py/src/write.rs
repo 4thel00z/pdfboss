@@ -1129,7 +1129,7 @@ impl WriteUpdate {
     #[new]
     fn new(doc: PyRef<'_, Document>) -> WriteUpdate {
         WriteUpdate {
-            seed: doc.seed(),
+            seed: doc.shared_seed(doc.py()),
             meta: Mutex::new(CoreMetadata::default()),
         }
     }
