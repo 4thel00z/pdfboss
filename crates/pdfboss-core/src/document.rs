@@ -76,6 +76,14 @@ impl Clone for DocumentSeed {
     }
 }
 
+impl DocumentSeed {
+    /// Number of pages in the flattened page tree the seed carries: what
+    /// every document built from it reports, without materializing one.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+}
+
 /// The flattened, inheritance-applied record for one page.
 ///
 /// Covers ISO 32000-1 §7.7.3.4.
@@ -1678,6 +1686,16 @@ mod tests {
             b.content(&fork).expect("fork content"),
             "decrypted content agrees"
         );
+    }
+
+    /// The seed's page count is the flattened tree's length: the number
+    /// every document built from it reports, available without building one.
+    #[test]
+    fn the_seed_reports_the_flattened_page_count() {
+        let doc = Document::load(multi_page_doc(&["one", "two", "three"])).unwrap();
+        let seed = doc.seed();
+        assert_eq!(seed.page_count(), 3);
+        assert_eq!(Document::from_seed(seed).page_count(), 3);
     }
 
     /// The results come back in page order whatever order the workers finish

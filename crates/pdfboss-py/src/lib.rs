@@ -11,7 +11,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use futures_util::{FutureExt, StreamExt};
 use pyo3::buffer::PyBuffer;
@@ -443,7 +443,10 @@ fn resolve_render_options(
 /// from every handle that needs it. [`CoreDocument`] is single-threaded
 /// by design (interior caches), so it never escapes this wrapper except
 /// as a [`DocumentSeed`]; all direct access borrows the wrapped value,
-/// and the [`Mutex`] serializes those calls.
+/// and the [`Mutex`] serializes those calls. Every caller that takes the
+/// lock does so with the GIL released: a render on another thread may
+/// hold it for a whole page, and waiting for that must never stall the
+/// interpreter.
 struct SharedDocument(Mutex<CoreDocument>);
 
 // SAFETY: see the type-level comment — the non-thread-safe interior state
@@ -468,6 +471,10 @@ impl SharedDocument {
 #[pyclass(frozen)]
 struct Document {
     inner: Arc<SharedDocument>,
+    /// The document's shareable core, taken from the shared document once
+    /// and reused by every page lookup and fan-out after that, so none of
+    /// them needs the lock a render on another thread may be holding.
+    seed: OnceLock<DocumentSeed>,
     /// Fonts loaded once per document across every page render; handed to
     /// each page and to the `render_pages` fan-out workers.
     render_cache: Arc<RenderCache>,
@@ -498,6 +505,7 @@ impl Document {
         };
         Ok(Document {
             inner: SharedDocument::new(core),
+            seed: OnceLock::new(),
             render_cache: Arc::new(RenderCache::default()),
             text_cache: Arc::new(pdfboss_output::FontCache::default()),
         })
@@ -505,55 +513,52 @@ impl Document {
 
     /// Number of pages in the document.
     #[getter]
-    fn page_count(&self) -> usize {
-        self.inner.lock().page_count()
+    fn page_count(&self, py: Python<'_>) -> usize {
+        self.known_page_count(py)
     }
 
     /// PDF version from the file header, e.g. "1.7".
     #[getter]
-    fn version(&self) -> String {
-        version_string(self.inner.lock().version())
+    fn version(&self, py: Python<'_>) -> String {
+        version_string(self.with_shared(py, |doc| doc.version()))
     }
 
     /// Document metadata; only keys present in the file are included.
     #[getter]
     fn metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let meta = self.inner.lock().metadata();
+        let meta = self.with_shared(py, |doc| doc.metadata());
         metadata_dict(py, meta)
     }
 
     /// The language the catalog declares for the document's text (ISO
     /// 32000-1 14.9.2), e.g. "en-US"; None when it declares none.
     #[getter]
-    fn language(&self) -> Option<String> {
-        self.inner.lock().language()
+    fn language(&self, py: Python<'_>) -> Option<String> {
+        self.with_shared(py, |doc| doc.language())
     }
 
-    fn __len__(&self) -> usize {
-        self.inner.lock().page_count()
+    fn __len__(&self, py: Python<'_>) -> usize {
+        self.known_page_count(py)
     }
 
-    fn __getitem__(&self, index: &Bound<'_, PyAny>) -> PyResult<Page> {
+    fn __getitem__(&self, py: Python<'_>, index: &Bound<'_, PyAny>) -> PyResult<Page> {
         // Accept an arbitrary Python object so that an index too large to
         // fit in `isize` surfaces as IndexError (the documented behavior)
         // rather than the OverflowError pyo3 would raise while coercing.
-        let (seed, page) = {
-            let doc = self.inner.lock();
-            let count = doc.page_count();
-            let idx = index
-                .extract::<isize>()
-                .ok()
-                .and_then(|i| normalize_index(i, count));
-            let Some(idx) = idx else {
-                return Err(PyIndexError::new_err(format!(
-                    "page index {index} out of range ({count} pages)"
-                )));
-            };
-            let page = doc.page(idx).map_err(pdf_err)?;
-            // `doc.page` just forced the page tree, so seeding here only
-            // clones a few `Arc`s and the key material.
-            (doc.seed(), page)
+        let requested = index.extract::<isize>().ok();
+        let seed = self.shared_seed(py);
+        let count = seed.page_count();
+        let Some(idx) = requested.and_then(|i| normalize_index(i, count)) else {
+            return Err(PyIndexError::new_err(format!(
+                "page index {index} out of range ({count} pages)"
+            )));
         };
+        // The page record comes off the seed's flattened tree through a
+        // private materialization, so a render holding the shared document
+        // on another thread is never waited for.
+        let page = CoreDocument::from_seed(seed.clone())
+            .page(idx)
+            .map_err(pdf_err)?;
         Ok(Page {
             doc: Arc::clone(&self.inner),
             render_cache: Arc::clone(&self.render_cache),
@@ -584,14 +589,13 @@ impl Document {
         reading_order: &str,
         invisible_text: bool,
     ) -> PyResult<String> {
-        let inner = &self.inner;
+        let seed = self.shared_seed(py);
         let fonts = Arc::clone(&self.text_cache);
         let order = reading_order_from_str(reading_order)?;
         let opts = pdfboss_output::TextOptions { invisible_text };
         py.allow_threads(move || {
-            // The lock is held only long enough to seed; the fan-out runs
-            // on a private materialization.
-            let doc = CoreDocument::from_seed(inner.lock().seed());
+            // The fan-out runs on a private materialization of the seed.
+            let doc = CoreDocument::from_seed(seed);
             // `map_pages` visits exactly the materializable pages — the
             // flattened tree, not the declared `/Count`, which on a damaged
             // file can exceed (or fall short of) what the tree yields. The
@@ -643,11 +647,11 @@ impl Document {
         reading_order: &str,
         invisible_text: bool,
     ) -> PyResult<String> {
-        let inner = &self.inner;
+        let seed = self.shared_seed(py);
         let order = reading_order_from_str(reading_order)?;
         let opts = pdfboss_output::TextOptions { invisible_text };
         py.allow_threads(move || {
-            let doc = CoreDocument::from_seed(inner.lock().seed());
+            let doc = CoreDocument::from_seed(seed);
             pdfboss_output::extract_markdown_opts(&doc, order, opts).map_err(pdf_err)
         })
     }
@@ -667,12 +671,12 @@ impl Document {
         invisible_text: bool,
         knobs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Vec<Vec<layout::LayoutBlock>>> {
-        let inner = &self.inner;
+        let seed = self.shared_seed(py);
         let order = reading_order_from_str(reading_order)?;
         let opts = pdfboss_output::TextOptions { invisible_text };
         let options = layout::layout_options(knobs)?;
         let layouts = py.allow_threads(move || {
-            let doc = CoreDocument::from_seed(inner.lock().seed());
+            let doc = CoreDocument::from_seed(seed);
             pdfboss_output::extract_layout_opts(&doc, order, opts, &options).map_err(pdf_err)
         })?;
         layout::selected_pages(&layouts, pages)
@@ -701,11 +705,10 @@ impl Document {
         let mut opts = resolve_render_options(py, scale, fonts, font_dir)?;
         opts.cache = Some(Arc::clone(&self.render_cache));
         let format = image_format_from_str(format, compression, quality)?;
-        let inner = &self.inner;
+        let seed = self.shared_seed(py);
         let images = py.allow_threads(move || {
-            // The lock is held only long enough to seed; the fan-out runs
-            // on a private materialization.
-            let doc = CoreDocument::from_seed(inner.lock().seed());
+            // The fan-out runs on a private materialization of the seed.
+            let doc = CoreDocument::from_seed(seed);
             let outcomes = match &pages {
                 None => pdfboss_core::map_pages(&doc, |doc, page| {
                     let (pix, _) = pdfboss_render::render_page_reporting(doc, page, scale, &opts)?;
@@ -811,13 +814,15 @@ impl Document {
     /// loads once for the document. Each page's spans come in the
     /// `reading_order` given, as `extract_text` reads them.
     #[pyo3(signature = (pages=None, *, reading_order = "content"))]
-    fn spans(&self, pages: Option<Vec<usize>>, reading_order: &str) -> PyResult<SpanIter> {
+    fn spans(
+        &self,
+        py: Python<'_>,
+        pages: Option<Vec<usize>>,
+        reading_order: &str,
+    ) -> PyResult<SpanIter> {
         let order = reading_order_from_str(reading_order)?;
-        let (seed, count) = {
-            let doc = self.inner.lock();
-            (doc.seed(), doc.page_count())
-        };
-        let pages = pages.unwrap_or_else(|| (0..count).collect());
+        let seed = self.shared_seed(py);
+        let pages = pages.unwrap_or_else(|| (0..seed.page_count()).collect());
         Ok(SpanIter {
             state: Mutex::new(SpanIterState {
                 seed,
@@ -831,11 +836,10 @@ impl Document {
 
     /// The interactive form dictionary: the root fields and the defaults
     /// their widgets are drawn with. `None` for a document without a form.
-    fn interactive_form(&self) -> Option<forms::InteractiveForm> {
-        self.inner
-            .lock()
-            .interactive_form()
-            .map(forms::InteractiveForm::from)
+    fn interactive_form(&self, py: Python<'_>) -> Option<forms::InteractiveForm> {
+        self.with_shared(py, |doc| {
+            doc.interactive_form().map(forms::InteractiveForm::from)
+        })
     }
 
     /// Every field of the interactive form, depth first from the root
@@ -881,16 +885,18 @@ impl Document {
 
     /// The page-numbering ranges, sorted by first page; `None` when the
     /// document defines none.
-    fn page_labels(&self) -> Option<Vec<catalog::PageLabel>> {
-        let ranges = self.inner.lock().page_labels()?;
-        Some(ranges.into_iter().map(catalog::PageLabel::from).collect())
+    fn page_labels(&self, py: Python<'_>) -> Option<Vec<catalog::PageLabel>> {
+        self.with_shared(py, |doc| {
+            let ranges = doc.page_labels()?;
+            Some(ranges.into_iter().map(catalog::PageLabel::from).collect())
+        })
     }
 
     /// The label the page at 0-based `index` shows, such as `"iv"` or
     /// `"A-3"`; `None` when the document defines no page labels or has no
     /// such page.
-    fn page_label(&self, index: usize) -> Option<String> {
-        self.inner.lock().page_label(index)
+    fn page_label(&self, py: Python<'_>, index: usize) -> Option<String> {
+        self.with_shared(py, |doc| doc.page_label(index))
     }
 
     /// The files embedded at document level, the attachments, in the
@@ -980,8 +986,8 @@ impl Document {
     /// Whether the file is linearized and its parameter dictionary still
     /// describes it: a stale declared length after an appended update
     /// makes the file ordinary PDF.
-    fn is_linearized(&self) -> bool {
-        self.inner.lock().is_linearized()
+    fn is_linearized(&self, py: Python<'_>) -> bool {
+        self.with_shared(py, |doc| doc.is_linearized())
     }
 
     /// The optional content groups (PDF layers) the catalog declares, in
@@ -1069,12 +1075,38 @@ impl Document {
 }
 
 impl Document {
-    /// The document's shareable core, for a caller (the `write`
-    /// submodule's `Update`) that needs to rebuild a private
-    /// `CoreDocument` of its own rather than going through this
-    /// document's lock.
-    pub(crate) fn seed(&self) -> DocumentSeed {
-        self.inner.lock().seed()
+    /// Reads from the shared document with the GIL released, so a thread
+    /// waiting for the lock behind a render never stalls the interpreter.
+    fn with_shared<R: Send>(
+        &self,
+        py: Python<'_>,
+        read: impl FnOnce(&CoreDocument) -> R + Send,
+    ) -> R {
+        let inner = Arc::clone(&self.inner);
+        py.allow_threads(move || read(&inner.lock()))
+    }
+
+    /// The document's shareable core. The first call takes it from the
+    /// shared document (GIL released, page tree forced once); every later
+    /// call clones the stored seed without touching the lock. Page lookups,
+    /// fan-outs and the `write` submodule's `Update` all build their
+    /// private `CoreDocument`s from it.
+    pub(crate) fn shared_seed(&self, py: Python<'_>) -> DocumentSeed {
+        if let Some(seed) = self.seed.get() {
+            return seed.clone();
+        }
+        let seed = self.with_shared(py, |doc| doc.seed());
+        self.seed.get_or_init(|| seed).clone()
+    }
+
+    /// The page count: off the stored seed once there is one (the shared
+    /// document's tree is flattened by then, so both report the same
+    /// length), otherwise the shared document's cheap declared count.
+    fn known_page_count(&self, py: Python<'_>) -> usize {
+        match self.seed.get() {
+            Some(seed) => seed.page_count(),
+            None => self.with_shared(py, |doc| doc.page_count()),
+        }
     }
 }
 

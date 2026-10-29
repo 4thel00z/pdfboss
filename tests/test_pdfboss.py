@@ -426,8 +426,9 @@ class TestRenderReporting:
 class TestThreading:
     """Regressions for the pinned threading behavior: ``Document``/``Page``
     are usable from any thread (no ``PanicException``), dropping the last
-    reference on a foreign thread is clean (no unraisable, no leak), and
-    rendering releases the GIL.
+    reference on a foreign thread is clean (no unraisable, no leak),
+    rendering releases the GIL, and a page lookup never waits for a render
+    on another thread.
     """
 
     def test_document_usable_from_worker_thread(self, hello_pdf: Path) -> None:
@@ -506,6 +507,39 @@ class TestThreading:
         # With the GIL held for the whole render the ticker only runs at
         # call boundaries (~1-2 ticks); with it released it runs freely.
         assert ticks >= 10
+
+    def test_page_lookup_does_not_wait_for_a_render(self, heavy_page_pdf: bytes) -> None:
+        doc = Document(data=heavy_page_pdf)
+        page = doc[0]
+        page.render(scale=1.0)  # warm-up: page tree, seed, font cache
+        started = time.perf_counter()
+        page.render(scale=2.0)
+        render_seconds = time.perf_counter() - started
+        stop = threading.Event()
+
+        def renderer() -> None:
+            while not stop.is_set():
+                page.render(scale=2.0)
+
+        thread = threading.Thread(target=renderer)
+        thread.start()
+        worst = 0.0
+        try:
+            time.sleep(0.05)
+            for _ in range(100):
+                started = time.perf_counter()
+                doc[0]
+                len(doc)
+                doc.page_count
+                worst = max(worst, time.perf_counter() - started)
+                time.sleep(0.001)
+        finally:
+            stop.set()
+            thread.join()
+        # A render on another thread holds the shared document for the whole
+        # page. A lookup that took that lock would wait out a render, every
+        # time it collided with one; one that reads the seed never does.
+        assert worst < render_seconds / 4
 
 
 class TestPageFanOut:

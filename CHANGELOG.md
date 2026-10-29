@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.16.1](https://github.com/4thel00z/pdfboss/compare/v2.16.0...v2.16.1) (2026-10-28)
+
+
+### Performance Improvements
+
+* **py:** look pages up off the seed, never off the shared document lock ([#270](https://github.com/4thel00z/pdfboss/issues/270)) ([1fc6990](https://github.com/4thel00z/pdfboss/commit/1fc699031fb6f773f9886eee33cbd4abcd7654b5))
+
 ## [2.16.0](https://github.com/4thel00z/pdfboss/compare/v2.15.1...v2.16.0) (2026-10-26)
 
 
