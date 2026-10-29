@@ -44,6 +44,48 @@ fn output_is_deterministic() {
     assert_eq!(first, second);
 }
 
+/// A two-column table of single-letter cells draws every cell as a stroked
+/// box under `RULING_MAX_ICON_EXTENT` in both dimensions, which read as a
+/// legend marker until small boxes were allowed to tile. The table must
+/// come back as a table, not as a heading and a paragraph.
+///
+/// Covers ISO 32000-1 §8.5.3.2.
+#[test]
+fn narrow_table_survives_the_round_trip() {
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n";
+    let (pdf, report) = to_pdf(md, &Options::default()).unwrap();
+    assert!(report.is_empty(), "{}", report.summary());
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let (out, _) =
+        pdfboss_output::extract_markdown_reporting(&doc, pdfboss_output::ReadingOrder::Content)
+            .unwrap();
+    assert!(
+        out.contains("| a | b |"),
+        "the narrow table came back as {out:?}"
+    );
+    assert!(
+        !out.starts_with('#'),
+        "the table's head row became a heading: {out:?}"
+    );
+}
+
+/// The same two-column shape at the smallest cell texts a table carries:
+/// a header of one letter per column and a single data row.
+#[test]
+fn narrow_single_row_table_survives_the_round_trip() {
+    let md = "| a | b |\n|---|---|\n| 1 | 2 |\n";
+    let (pdf, report) = to_pdf(md, &Options::default()).unwrap();
+    assert!(report.is_empty(), "{}", report.summary());
+    let doc = Document::load(pdf.to_bytes().unwrap()).unwrap();
+    let (out, _) =
+        pdfboss_output::extract_markdown_reporting(&doc, pdfboss_output::ReadingOrder::Content)
+            .unwrap();
+    assert!(
+        out.contains("| a | b |"),
+        "the one-row table came back as {out:?}"
+    );
+}
+
 // Covers ISO 32000-1 §12.5.6.5, §12.6.2 and §12.6.4.7.
 #[test]
 fn links_reach_the_written_file() {

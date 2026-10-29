@@ -36,7 +36,27 @@ const RULING_MAX_FILL_THICKNESS: f32 = 3.0;
 /// structure. Welded into a lattice its edges invent columns a chart never
 /// had. A box small in one dimension only is a drawn cell and keeps its
 /// edges.
+///
+/// Smallness alone does not settle it: a table of short cell text draws
+/// every one of its cells as a box under this extent in both dimensions,
+/// and a two-column table of one- or two-letter cells is small enough to
+/// read as markers. What separates the two is company. A marker stands
+/// alone, while a cell is one of a grid: it shares a vertical edge with the
+/// cell beside it and a horizontal edge with the cell above or below. A box
+/// this small keeps its edges only when it shares both. See
+/// [`release_tiled_icons`].
 const RULING_MAX_ICON_EXTENT: f32 = 24.0;
+
+/// The share of the shorter edge two collinear rulings must have in
+/// common before they read as one shared border rather than a marker that
+/// happens to sit under a rule.
+const SHARED_EDGE_OVERLAP: f32 = 0.5;
+
+/// Width of one bucket in the line hash [`release_tiled_icons`] pairs small
+/// boxes through, in device-space points. Equal to [`RULING_AXIS_EPSILON`],
+/// so two edges within the tolerance are never more than one bucket apart
+/// and a bucket only has to be compared with itself and the one above.
+const LINE_BUCKET_WIDTH: f32 = RULING_AXIS_EPSILON;
 
 /// What extraction could not read. Extraction is lenient the way rendering
 /// is — content that will not fetch, decode, or parse yields no text rather
@@ -319,6 +339,7 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         spans: Vec::new(),
         rulings: Vec::new(),
         bands: Vec::new(),
+        icon_edges: Vec::new(),
         images: Vec::new(),
         fallback: Arc::new(Font::fallback()),
         forms: 0,
@@ -352,7 +373,9 @@ async fn walk_with<S: AsyncObjectSource, M: MarkedContent>(
         let markups = decorations::markup_annotations(src, page, oc).await;
         decorations::mark_annotated(&mut spans, &markups);
     }
-    (spans, exec.rulings, images, exec.report, exec.marks)
+    let mut rulings = exec.rulings;
+    release_tiled_icons(&mut rulings, &exec.icon_edges);
+    (spans, rulings, images, exec.report, exec.marks)
 }
 
 /// What a page walk does with marked content, fixed when the walk is
@@ -686,6 +709,170 @@ fn ruling_of_rect(rect: Rect) -> Option<Ruling> {
     })
 }
 
+/// Drops the edges of every small closed box that stands alone, keeping
+/// those of boxes that tile against another.
+///
+/// A box under [`RULING_MAX_ICON_EXTENT`] in both dimensions is either a
+/// legend marker, a checkbox or a data-point square — ink that never was
+/// table structure — or one cell of a table whose cells are all that
+/// small, as a two-column table of short values draws them. Size cannot
+/// tell the two apart; company can. A cell sits in a grid, so it shares a
+/// vertical border with the cell beside it *and* a horizontal border with
+/// the cell above or below. A marker shares nothing, standing on its own
+/// in the page.
+///
+/// Both axes are required. Paired bars in a chart, or labels stacked down a
+/// schematic, touch along one axis only: they sit side by side or one above
+/// the other, but they do not form a grid. Reading one axis as tiling took
+/// a USDA bar chart's two bars for cells and cost the page its six-column
+/// table; it pulled fourteen schematic labels out of a figure and dropped
+/// them between two paragraphs further down the page.
+///
+/// `edges` holds one range of `rulings` per small box. The shared-edge
+/// test looks only at those boxes, so a marker lying under an unrelated
+/// table's border is still a marker: what counts is another *small box*
+/// reaching it, not any ruling on the page.
+///
+/// Candidates come from a hash of the line each edge lies on, so the pass
+/// costs one lookup per edge rather than a comparison against every other
+/// box. A page of 8000 markers stays within a few ms of the pass that never
+/// ran; comparing every box with every other took 2.6 s.
+fn release_tiled_icons(rulings: &mut Vec<Ruling>, edges: &[std::ops::Range<usize>]) {
+    if edges.is_empty() {
+        return;
+    }
+    // Horizontal edges keyed by their y, vertical ones by their x: two
+    // edges can only be collinear when their lines fall in the same bucket
+    // or in two buckets side by side.
+    let mut horizontals: HashMap<i64, Vec<EdgeRef>> = HashMap::new();
+    let mut verticals: HashMap<i64, Vec<EdgeRef>> = HashMap::new();
+    for (box_index, range) in edges.iter().enumerate() {
+        for index in range.clone() {
+            let ruling = &rulings[index];
+            let horizontal = (ruling.start.y - ruling.end.y).abs() <= RULING_AXIS_EPSILON;
+            let (line, lo, hi) = if horizontal {
+                (ruling.start.y, ruling.start.x, ruling.end.x)
+            } else {
+                (ruling.start.x, ruling.start.y, ruling.end.y)
+            };
+            let edge = EdgeRef {
+                box_index,
+                line,
+                lo,
+                hi,
+            };
+            let buckets = if horizontal {
+                &mut horizontals
+            } else {
+                &mut verticals
+            };
+            buckets
+                .entry((line / LINE_BUCKET_WIDTH).floor() as i64)
+                .or_default()
+                .push(edge);
+        }
+    }
+    // One flag per axis: a box has to reach another box on both before its
+    // edges are a table's lattice.
+    let mut tiled_across = vec![false; edges.len()];
+    let mut tiled_down = vec![false; edges.len()];
+    for (mut buckets, flags) in [
+        (horizontals, &mut tiled_across),
+        (verticals, &mut tiled_down),
+    ] {
+        mark_tiled(&mut buckets, flags);
+    }
+    let tiled: Vec<bool> = tiled_across
+        .iter()
+        .zip(&tiled_down)
+        .map(|(across, down)| *across && *down)
+        .collect();
+    if tiled.iter().all(|tiled| *tiled) {
+        return;
+    }
+    // Drop the edges of every box that tiles with nothing: a marker's
+    // edges are not the page's ruling structure.
+    let mut dropped = vec![false; rulings.len()];
+    for (range, tiled) in edges.iter().zip(&tiled) {
+        if *tiled {
+            continue;
+        }
+        for index in range.clone() {
+            dropped[index] = true;
+        }
+    }
+    let mut index = 0;
+    rulings.retain(|_| {
+        let keep = !dropped[index];
+        index += 1;
+        keep
+    });
+}
+
+/// One small box's edge, as the pairing pass sees it: which box drew it,
+/// the line it lies on, and how far it runs along that line.
+#[derive(Clone, Copy)]
+struct EdgeRef {
+    box_index: usize,
+    line: f32,
+    lo: f32,
+    hi: f32,
+}
+
+/// Flags both boxes of every pair that shares an edge along one axis.
+///
+/// `buckets` holds that axis's edges filed by the line they lie on. Pairs
+/// are settled within a bucket, and from a bucket to the one above it: lines
+/// two buckets apart are further apart than [`RULING_AXIS_EPSILON`], and
+/// looking only upwards visits each pair once.
+fn mark_tiled(buckets: &mut HashMap<i64, Vec<EdgeRef>>, flags: &mut [bool]) {
+    for group in buckets.values_mut() {
+        group.sort_unstable_by(|a, b| a.lo.total_cmp(&b.lo));
+    }
+    for (&key, here) in buckets.iter() {
+        for (position, a) in here.iter().enumerate() {
+            // Sorted by start, a group's overlaps are contiguous: once an
+            // edge starts past this one's end, every later edge does too. A
+            // row of markers therefore costs a sort and one step per edge,
+            // where comparing every box with every other took a scan of the
+            // whole row. The upper bucket sorts the same way.
+            flag_shared(a, here[position + 1..].iter(), flags);
+            if let Some(above) = buckets.get(&(key + 1)) {
+                flag_shared(a, above.iter(), flags);
+            }
+        }
+    }
+}
+
+/// Flags both boxes of every edge in `candidates` that shares a border with
+/// `a`, stopping at the first candidate that starts too late to overlap.
+fn flag_shared<'a>(a: &EdgeRef, candidates: impl Iterator<Item = &'a EdgeRef>, flags: &mut [bool]) {
+    for b in candidates {
+        if b.lo >= a.hi {
+            return;
+        }
+        if a.box_index == b.box_index || !edges_are_shared(a, b) {
+            continue;
+        }
+        flags[a.box_index] = true;
+        flags[b.box_index] = true;
+    }
+}
+
+/// True when two edges lie on the same line and overlap along at least
+/// [`SHARED_EDGE_OVERLAP`] of the shorter one.
+fn edges_are_shared(a: &EdgeRef, b: &EdgeRef) -> bool {
+    if (a.line - b.line).abs() > RULING_AXIS_EPSILON {
+        return false;
+    }
+    let shorter = (a.hi - a.lo).min(b.hi - b.lo);
+    if shorter <= 0.0 {
+        return false;
+    }
+    let overlap = a.hi.min(b.hi) - a.lo.max(b.lo);
+    overlap >= SHARED_EDGE_OVERLAP * shorter
+}
+
 /// One subpath under construction, in the frame's untransformed user space.
 ///
 /// A curve operator poisons it — glyph outlines and diagrams are not
@@ -894,6 +1081,11 @@ struct Executor<'a, S, M> {
     /// Filled rectangles too thick to be rulings, in paint order: the
     /// highlight candidates the decoration pass weighs against the spans.
     bands: Vec<Band>,
+    /// Ranges of `rulings` holding the edges of closed boxes small enough
+    /// in both dimensions to be markers. Whether they are markers or table
+    /// cells is settled once the walk ends, by [`release_tiled_icons`]:
+    /// only then is every box's company known.
+    icon_edges: Vec<std::ops::Range<usize>>,
     /// Every image drawn so far, in drawing order, at the place the CTM put
     /// it — image XObjects through every form, and inline images.
     images: Vec<PlacedImage>,
@@ -1122,6 +1314,10 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                         self.spans.truncate(frame.spans_mark);
                         self.marks.truncate(frame.spans_mark);
                         self.rulings.truncate(frame.rulings_mark);
+                        // The boxes the truncated stream drew are gone with
+                        // their edges; their ranges would dangle otherwise.
+                        self.icon_edges
+                            .retain(|range| range.start < frame.rulings_mark);
                         self.bands.truncate(frame.bands_mark);
                         self.images.truncate(frame.images_mark);
                         let kind = if frame.depth == 0 {
@@ -1431,7 +1627,15 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                 continue;
             }
             let device: Vec<Point> = sub.points.iter().map(|p| ctm.apply(*p)).collect();
-            if stroke && !icon_box(&device, sub.closed) {
+            if stroke {
+                // A closed box small in both dimensions may be a marker or
+                // a table cell, and only the walk's end can tell: a cell
+                // sits in a grid and shares edges on both axes with the
+                // cells around it, a marker stands alone. So its edges are
+                // collected either way and the tiling question is asked
+                // once, in `release_tiled_icons`.
+                let icon = icon_box(&device, sub.closed);
+                let first = self.rulings.len();
                 let segments = device.windows(2).map(|pair| (pair[0], pair[1]));
                 // A closed 2-point subpath draws one doubled edge, not two.
                 let closing =
@@ -1440,6 +1644,9 @@ impl<S: AsyncObjectSource, M: MarkedContent> Executor<'_, S, M> {
                     if let Some(ruling) = ruling_from_segment(a, b, width) {
                         self.rulings.push(ruling);
                     }
+                }
+                if icon {
+                    self.icon_edges.push(first..self.rulings.len());
                 }
             }
             if fill {
@@ -2727,12 +2934,71 @@ mod tests {
         assert!(rulings.is_empty(), "{rulings:?}");
     }
 
+    /// A table of short cell text draws every cell as a box under
+    /// `RULING_MAX_ICON_EXTENT` in both dimensions, and its edges are the
+    /// lattice the layout pass reads. A cell sits in a grid, so it shares a
+    /// vertical border with its neighbour in the row and a horizontal one
+    /// with its neighbour in the column: a 2x2 grid is the smallest shape
+    /// that has both.
+    #[test]
+    fn narrow_tiled_cells_keep_their_rulings() {
+        let rulings = rulings_of(
+            "72 746.49 14.116 23.4 re S 86.116 746.49 14.721 23.4 re S \
+             72 723.09 14.116 23.4 re S 86.116 723.09 14.721 23.4 re S",
+        );
+        assert_eq!(rulings.len(), 16, "{rulings:?}");
+    }
+
+    /// Two small boxes stacked, sharing a horizontal border and nothing
+    /// else: one column of a table drawn cell by cell. No grid, so the
+    /// boxes stay markers and drop their edges.
+    #[test]
+    fn a_single_column_of_small_boxes_stays_markers() {
+        let rulings = rulings_of("72 746.49 14.116 23.4 re S 72 723.09 14.116 23.4 re S");
+        assert!(rulings.is_empty(), "{rulings:?}");
+    }
+
+    /// Two bars of a paired bar chart sit side by side and share the
+    /// vertical edge between them, and nothing else: touching along one
+    /// axis is not tiling. Reading it as tiling turned the chart's own
+    /// six-column table into an eight-column one on `049206.pdf` page 3.
+    #[test]
+    fn two_adjacent_bars_stay_markers() {
+        let rulings = rulings_of("421.94 285.67 23.28 23.28 re S 445.22 285.67 23.28 10.56 re S");
+        assert!(rulings.is_empty(), "{rulings:?}");
+    }
+
+    /// Diagram labels stacked down a figure share vertical edges and
+    /// nothing else. Reading that as tiling pulled fourteen of them out of
+    /// the figure and dropped them between two paragraphs on
+    /// `049361.pdf` page 3.
+    #[test]
+    fn stacked_diagram_labels_stay_markers() {
+        let rulings = rulings_of("324.62 601.51 1.44 11.54 re S 326.07 598.62 5.77 17.32 re S");
+        assert!(rulings.is_empty(), "{rulings:?}");
+    }
+
     /// A closed box small in one dimension only is a drawn cell, and its
     /// edges stay rulings.
     #[test]
     fn a_squat_wide_box_keeps_its_rulings() {
         let rulings = rulings_of("72 650 120 16 re S");
         assert_eq!(rulings.len(), 4, "{rulings:?}");
+    }
+
+    /// Markers in one lattice row share a horizontal line without sharing
+    /// any length of it: they sit a gap apart, not edge to edge. Sharing a
+    /// line is not tiling, and every one of them drops its edges.
+    #[test]
+    fn markers_on_a_shared_line_stay_markers() {
+        let mut content = String::from("0.5 w ");
+        for i in 0..400 {
+            let x = 36.0 + (i % 20) as f32 * 11.0;
+            let y = 700.0 - (i / 20) as f32 * 11.0;
+            content.push_str(&format!("{x} {y} 8 8 re S "));
+        }
+        let rulings = rulings_of(&content);
+        assert!(rulings.is_empty(), "{} rulings survived", rulings.len());
     }
 
     #[test]
