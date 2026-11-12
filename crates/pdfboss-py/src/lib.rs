@@ -776,10 +776,12 @@ impl Document {
 
     /// Lazily iterates the document's elements: physical file structure in
     /// file order, then logical document structure in document order.
-    /// Nothing is parsed or decoded before it is yielded.
+    /// Nothing is parsed or decoded before it is yielded. Releases the GIL
+    /// while the iterator is set up.
     #[pyo3(signature = (*, physical=true, logical=true, pages=None, content_ops=false))]
     fn elements(
         &self,
+        py: Python<'_>,
         physical: bool,
         logical: bool,
         pages: Option<Vec<usize>>,
@@ -792,7 +794,7 @@ impl Document {
             content_ops,
         };
         let doc = Arc::clone(&self.inner);
-        let iter = {
+        let iter = py.allow_threads(|| {
             let guard = doc.lock();
             let core: &CoreDocument = &guard;
             // SAFETY: the borrow is extended to 'static. The Arc stored in
@@ -803,7 +805,7 @@ impl Document {
             let core: &'static CoreDocument =
                 unsafe { std::mem::transmute::<&CoreDocument, &'static CoreDocument>(core) };
             SharedElements(Mutex::new(core.elements(opts)))
-        };
+        });
         ElementIter { doc, iter }
     }
 
@@ -901,10 +903,9 @@ impl Document {
 
     /// The files embedded at document level, the attachments, in the
     /// order of the catalog's name tree; `embedded_file_data` reads one.
-    fn embedded_files(&self) -> Vec<catalog::EmbeddedFile> {
-        self.inner
-            .lock()
-            .embedded_files()
+    /// Releases the GIL while they are read.
+    fn embedded_files(&self, py: Python<'_>) -> Vec<catalog::EmbeddedFile> {
+        self.with_shared(py, |doc| doc.embedded_files())
             .into_iter()
             .map(catalog::EmbeddedFile::from)
             .collect()
@@ -956,19 +957,16 @@ impl Document {
     }
 
     /// The viewer preferences the catalog declares; `None` without the
-    /// dictionary.
-    fn viewer_preferences(&self) -> Option<catalog::ViewerPreferences> {
-        self.inner
-            .lock()
-            .viewer_preferences()
+    /// dictionary. Releases the GIL while they are read.
+    fn viewer_preferences(&self, py: Python<'_>) -> Option<catalog::ViewerPreferences> {
+        self.with_shared(py, |doc| doc.viewer_preferences())
             .map(catalog::ViewerPreferences::from)
     }
 
     /// The developer extensions the catalog declares, sorted by prefix.
-    fn extensions(&self) -> Vec<catalog::DeveloperExtension> {
-        self.inner
-            .lock()
-            .extensions()
+    /// Releases the GIL while they are read.
+    fn extensions(&self, py: Python<'_>) -> Vec<catalog::DeveloperExtension> {
+        self.with_shared(py, |doc| doc.extensions())
             .into_iter()
             .map(catalog::DeveloperExtension::from)
             .collect()
@@ -976,10 +974,9 @@ impl Document {
 
     /// The linearization parameter dictionary, the first object of a
     /// linearized file, as written; `None` when the file has none.
-    fn linearization(&self) -> Option<document::Linearization> {
-        self.inner
-            .lock()
-            .linearization()
+    /// Releases the GIL while it is read.
+    fn linearization(&self, py: Python<'_>) -> Option<document::Linearization> {
+        self.with_shared(py, |doc| doc.linearization())
             .map(document::Linearization::from)
     }
 
@@ -1046,10 +1043,9 @@ impl Document {
 
     /// The catalog's permission handlers, the certifying and usage
     /// rights signatures read as data; `None` without the dictionary.
-    fn permission_handlers(&self) -> Option<document::PermissionHandlers> {
-        self.inner
-            .lock()
-            .permission_handlers()
+    /// Releases the GIL while they are read.
+    fn permission_handlers(&self, py: Python<'_>) -> Option<document::PermissionHandlers> {
+        self.with_shared(py, |doc| doc.permission_handlers())
             .map(document::PermissionHandlers::from)
     }
 
