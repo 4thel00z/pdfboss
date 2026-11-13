@@ -541,6 +541,59 @@ class TestThreading:
         # time it collided with one; one that reads the seed never does.
         assert worst < render_seconds / 4
 
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "elements",
+            "embedded_files",
+            "viewer_preferences",
+            "extensions",
+            "linearization",
+            "permission_handlers",
+        ],
+    )
+    def test_document_read_releases_gil_while_a_render_runs(
+        self, heavy_page_pdf: bytes, method: str
+    ) -> None:
+        doc = Document(data=heavy_page_pdf)
+        page = doc[0]
+        page.render(scale=1.0)  # warm-up: page tree, seed, font cache
+        started = time.perf_counter()
+        page.render(scale=2.0)
+        render_seconds = time.perf_counter() - started
+        stop = threading.Event()
+        worst_gap = 0.0
+
+        def renderer() -> None:
+            while not stop.is_set():
+                page.render(scale=2.0)
+
+        def ticker() -> None:
+            nonlocal worst_gap
+            last = time.perf_counter()
+            while not stop.is_set():
+                time.sleep(0.001)
+                now = time.perf_counter()
+                worst_gap = max(worst_gap, now - last)
+                last = now
+
+        threads = [threading.Thread(target=renderer), threading.Thread(target=ticker)]
+        for thread in threads:
+            thread.start()
+        try:
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                getattr(doc, method)()
+        finally:
+            stop.set()
+            for thread in threads:
+                thread.join()
+        # The read takes the shared document, which a render on another
+        # thread holds for the whole page. Waiting for it with the GIL held
+        # stops every other Python thread for up to a render; waiting with
+        # the GIL released lets the ticker keep running.
+        assert worst_gap < render_seconds / 2
+
 
 class TestPageFanOut:
     """The parallel page fan-out must be invisible in the output: bulk

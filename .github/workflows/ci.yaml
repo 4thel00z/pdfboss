@@ -40,7 +40,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # The pdfboss-py test binary links against the runner's libpython, and
+      # pyo3's build script records that version. Keying the cache on it
+      # makes a runner image with a new Python rebuild pyo3 instead of
+      # linking against a library the image no longer has.
+      - name: Runner Python version
+        id: python
+        run: echo "version=$(python3 -c 'import sys; print(sys.version.split()[0])')" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ steps.python.outputs.version }}
       - run: cargo test --workspace
       - run: cargo test -p pdfboss-aio --all-features
 
