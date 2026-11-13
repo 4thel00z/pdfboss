@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.16.2](https://github.com/4thel00z/pdfboss/compare/v2.16.1...v2.16.2) (2026-11-13)
+
+
+### Performance Improvements
+
+* **py:** release the GIL while Document reads wait for the document lock ([#274](https://github.com/4thel00z/pdfboss/issues/274)) ([f9e11a9](https://github.com/4thel00z/pdfboss/commit/f9e11a93369582d4ac10245be5f4ca1e224ba5ea))
+
 ## [2.16.1](https://github.com/4thel00z/pdfboss/compare/v2.16.0...v2.16.1) (2026-10-28)
 
 
