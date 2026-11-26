@@ -48,6 +48,7 @@ pub async fn overlay_base(doc: &AsyncDocument) -> Result<OverlayBase> {
         prev: newest.span.start,
         kind,
         size: declared.max(highest + 1),
+        xrefstm: newest.xrefstm.and_then(|offset| u64::try_from(offset).ok()),
         root,
         info: trailer.get_ref("Info"),
         id: trailer.get("ID").cloned(),
