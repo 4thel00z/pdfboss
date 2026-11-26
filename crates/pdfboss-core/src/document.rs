@@ -443,48 +443,14 @@ impl Document {
         Document::from_seed(self.seed())
     }
 
-    /// Number of pages.
-    ///
-    /// Reports the page tree's declared `/Count` — the same value mature
-    /// engines return — without walking the tree, so it is cheap on an
-    /// otherwise-untouched document. If `/Count` is absent or implausible the
-    /// tree is flattened and its true (lenient, cycle- and depth-guarded)
-    /// length is returned instead. Once the tree has been flattened for any
-    /// reason, that flattened length is authoritative.
-    pub fn page_count(&self) -> usize {
-        if let Some(pages) = self.pages.get() {
-            return pages.len();
-        }
-        if let Some(count) = self.declared_page_count() {
-            return count;
-        }
-        self.pages().len()
-    }
-
-    /// Number of pages the page tree actually holds: the flattened tree's
-    /// length, walking the tree on first use. This is the count
-    /// [`Document::page`] indexes into; it differs from
-    /// [`Document::page_count`] only while the tree is unwalked and its
-    /// declared `/Count` is wrong.
-    pub fn flattened_page_count(&self) -> usize {
-        self.pages().len()
-    }
-
-    /// Reads the page tree root's `/Count` cheaply (Root → `/Pages` →
-    /// `/Count`) without descending into `/Kids`. Returns `None` when the
-    /// entry is missing, non-integer, negative, or larger than the file could
-    /// possibly hold (a corrupt count), so the caller falls back to a real
-    /// walk.
+    /// Number of pages: the length of the walked page tree, the same count
+    /// [`Document::page`] indexes into. The tree is flattened on first use.
+    /// The declared `/Count` is not consulted, since producers write it
+    /// wrong in both directions.
     ///
     /// Covers ISO 32000-1 §7.7.3 and §7.7.3.2.
-    fn declared_page_count(&self) -> Option<usize> {
-        let root = self.xref.trailer.get("Root")?;
-        let catalog = self.resolve(root).ok()?;
-        let pages = self.resolve(catalog.as_dict()?.get("Pages")?).ok()?;
-        let count = usize::try_from(self.int_value(pages.as_dict()?, "Count")?).ok()?;
-        // A page occupies at least a handful of bytes on disk, so a count that
-        // exceeds the file length is corrupt: fall back to walking the tree.
-        (count <= self.data.len()).then_some(count)
+    pub fn page_count(&self) -> usize {
+        self.pages().len()
     }
 
     /// The page at 0-based `index`.
@@ -2142,11 +2108,7 @@ mod tests {
         }
         b.object(last, "<< /Type /Page >>");
         let doc = Document::load(b.build(1)).unwrap();
-        // `page_count` reports the tree's declared `/Count` (1) cheaply, as
-        // mature engines do; the leaf itself lies beyond the traversal depth
-        // cap, so the flattened tree is empty and the page cannot be
-        // materialized.
-        assert_eq!(doc.page_count(), 1, "declared /Count is reported cheaply");
+        assert_eq!(doc.page_count(), 0, "the leaf lies beyond the depth cap");
         assert!(
             matches!(doc.page(0), Err(Error::PageNotFound(0, 0))),
             "leaf beyond the depth cap cannot be materialized"
@@ -2155,21 +2117,29 @@ mod tests {
 
     // Covers ISO 32000-1 §7.7.3.2.
     #[test]
-    fn page_count_reports_declared_count_cheaply() {
-        // The tree declares five pages but supplies only one kid. `page_count`
-        // reports the declared `/Count` (as mature engines do) without walking,
-        // while page access is bounded by the pages that actually materialize.
+    fn page_count_ignores_a_count_above_the_kids() {
         let mut b = PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
-        b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 5 >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 5 >>");
         b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.object(4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
         let doc = Document::load(b.build(1)).unwrap();
-        assert_eq!(doc.page_count(), 5, "declared /Count reported verbatim");
-        assert!(doc.page(0).is_ok(), "the one real page materializes");
-        assert!(
-            matches!(doc.page(1), Err(Error::PageNotFound(1, 1))),
-            "access past the real pages fails with the true length"
-        );
+        assert_eq!(doc.page_count(), 2);
+        assert!(doc.page(1).is_ok());
+        assert!(matches!(doc.page(2), Err(Error::PageNotFound(2, 2))));
+    }
+
+    // Covers ISO 32000-1 §7.7.3.2.
+    #[test]
+    fn page_count_ignores_a_count_below_the_kids() {
+        let mut b = PdfBuilder::new();
+        b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+        b.object(2, "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 1 >>");
+        b.object(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        b.object(4, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>");
+        let doc = Document::load(b.build(1)).unwrap();
+        assert_eq!(doc.page_count(), 2);
+        assert_eq!(doc.seed().page_count(), 2);
     }
 
     // Covers ISO 32000-1 §7.7.3.2.

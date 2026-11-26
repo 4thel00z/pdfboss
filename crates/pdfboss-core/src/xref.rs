@@ -163,7 +163,11 @@ fn load_chain(data: &[u8], start: usize) -> Result<Xref> {
         if !visited.insert(off) {
             break;
         }
-        let info = parse_section_at(data, off)?;
+        let info = match parse_section_at(data, off) {
+            Ok(info) => info,
+            Err(err) if first => return Err(err),
+            Err(_) => break,
+        };
         if first {
             acc.newest = Some(NewestSection {
                 offset: off as u64,
@@ -822,6 +826,33 @@ mod tests {
         );
         data.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
         let xref = load_xref(&data).unwrap();
+        assert_eq!(
+            xref.get(1),
+            Some(XrefEntry::InFile {
+                offset: obj1 as u64,
+                gen: 0
+            })
+        );
+    }
+
+    // Covers ISO 32000-1 §7.5.6.
+    #[test]
+    fn an_unreadable_prev_keeps_the_newer_section() {
+        let mut data = b"%PDF-1.4\n".to_vec();
+        let obj1 = data.len();
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog >>\nendobj\n");
+        data.extend_from_slice(b"999 0 obj\n<< >>\nendobj\n");
+        let junk = data.len();
+        data.extend_from_slice(b"xref\n0 1\nnot an entry\n");
+        let xref_off = data.len();
+        data.extend_from_slice(b"xref\n0 2\n0000000000 65535 f\r\n");
+        data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+        data.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R /Prev {junk} >>\n").as_bytes(),
+        );
+        data.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
+        let xref = load_xref(&data).unwrap();
+        assert_eq!(xref.get(999), None, "chain path used, not recovery");
         assert_eq!(
             xref.get(1),
             Some(XrefEntry::InFile {

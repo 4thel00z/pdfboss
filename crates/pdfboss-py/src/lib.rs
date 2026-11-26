@@ -1097,7 +1097,7 @@ impl Document {
 
     /// The page count: off the stored seed once there is one (the shared
     /// document's tree is flattened by then, so both report the same
-    /// length), otherwise the shared document's cheap declared count.
+    /// length), otherwise the shared document's walked count.
     fn known_page_count(&self, py: Python<'_>) -> usize {
         match self.seed.get() {
             Some(seed) => seed.page_count(),

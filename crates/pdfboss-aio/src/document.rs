@@ -1999,7 +1999,11 @@ pub(crate) async fn load_xref_chain(
         if !visited.insert(offset) {
             break;
         }
-        let parsed = parse_section_at(fetcher, offset).await?;
+        let parsed = match parse_section_at(fetcher, offset).await {
+            Ok(parsed) => parsed,
+            Err(err) if trailer_span.is_none() => return Err(err),
+            Err(_) => break,
+        };
         if trailer_span.is_none() {
             trailer_span = Some(parsed.record.trailer_span);
         }
@@ -2433,6 +2437,28 @@ mod tests {
         assert_eq!(doc.inner.xref.trailer_span, doc.inner.sections[0].span);
     }
 
+    #[tokio::test]
+    async fn an_unreadable_prev_keeps_the_newer_section() {
+        let mut data = b"%PDF-1.4\n".to_vec();
+        let obj1 = data.len();
+        data.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+        let junk = data.len();
+        data.extend_from_slice(b"xref\n0 1\nnot an entry\n");
+        let xref_off = data.len();
+        data.extend_from_slice(b"xref\n0 2\n0000000000 65535 f\r\n");
+        data.extend_from_slice(format!("{obj1:010} 00000 n\r\n").as_bytes());
+        data.extend_from_slice(
+            format!("trailer\n<< /Size 2 /Root 1 0 R /Prev {junk} >>\n").as_bytes(),
+        );
+        data.extend_from_slice(format!("startxref\n{xref_off}\n%%EOF\n").as_bytes());
+        assert_xref_parity(data.clone()).await;
+        let doc = AsyncDocument::from_bytes(data).await.unwrap();
+        assert!(matches!(
+            doc.inner.xref.entries.get(&1),
+            Some(XrefEntry::InFile { offset, .. }) if *offset == obj1 as u64
+        ));
+    }
+
     /// A hybrid file: the classic table hides object 2 behind a free entry
     /// while /XRefStm reveals it.
     fn hybrid_doc() -> Vec<u8> {
@@ -2810,9 +2836,8 @@ mod tests {
     #[tokio::test]
     async fn page_count_is_the_flattened_length() {
         // The tree declares five pages but supplies one kid. The async
-        // document always flattens at open, so — per adopted rule 6 — it
-        // reports the authoritative flattened length (the sync document
-        // reports the declared /Count until its tree is flattened).
+        // document always flattens at open and reports that length, as the
+        // sync document does.
         let mut b = pdfboss_testkit::PdfBuilder::new();
         b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
         b.object(2, "<< /Type /Pages /Kids [3 0 R] /Count 5 >>");
