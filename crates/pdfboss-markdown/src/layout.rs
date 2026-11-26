@@ -192,7 +192,7 @@ impl<'a> Engine<'a> {
 
     /// Closes every open span's current page-piece, starts a fresh page,
     /// and resets the write position to its top.
-    fn break_page(&mut self) {
+    pub(crate) fn break_page(&mut self) {
         let page = self.pages.len();
         for span in &mut self.spans {
             span.closed.push(Segment {
@@ -209,6 +209,16 @@ impl<'a> Engine<'a> {
         self.y = self.top;
         self.at_top = true;
         self.pending = 0.0;
+    }
+
+    /// The height left on the current page above the bottom margin.
+    pub(crate) fn remaining(&self) -> f32 {
+        self.y - self.bottom
+    }
+
+    /// The content height of one empty page.
+    pub(crate) fn usable(&self) -> f32 {
+        self.top - self.bottom
     }
 
     /// Breaks to a new page first if placing `h` more points of content
