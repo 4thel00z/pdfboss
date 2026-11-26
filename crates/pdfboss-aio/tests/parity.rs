@@ -1075,3 +1075,27 @@ async fn encrypted_documents_decrypt_identically() {
     .expect("async md");
     assert_eq!(sync_md, async_md, "markdown agrees on encrypted files");
 }
+
+/// A stream whose `/Filter` is an indirect `/Crypt` naming Identity is left
+/// as stored by both readers.
+// Covers ISO 32000-1 §7.4.10.
+#[tokio::test]
+async fn indirect_crypt_filter_reference_decrypts_identically() {
+    let bytes = pdfboss_testkit::encrypted_rc4_doc_with_indirect_identity_filter("Stored plain");
+    let sync_doc = Document::load(bytes.clone()).expect("sync opens");
+    let async_doc = AsyncDocument::from_bytes(bytes).await.expect("async opens");
+
+    let content_ref = ObjRef { num: 5, gen: 0 };
+    let sync_content = sync_doc.get(content_ref).expect("sync object");
+    let async_content = async_doc
+        .get_object(content_ref)
+        .await
+        .expect("async object");
+    assert_eq!(sync_content, async_content, "decrypted streams agree");
+    assert!(
+        async_content
+            .as_stream()
+            .is_some_and(|s| s.data.starts_with(b"BT")),
+        "the stream data stays in the clear"
+    );
+}

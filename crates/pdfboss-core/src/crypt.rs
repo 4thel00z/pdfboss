@@ -21,6 +21,7 @@
 //! the complete `/Encrypt` dictionary and encrypts an object's strings and
 //! stream data in place, the exact inverse of [`Decryptor::decrypt_object`].
 
+use crate::hash::FastMap;
 use crate::object::{Dict, Name, ObjRef, Object};
 
 /// Password padding string (ISO 32000 §7.6.3.3, Algorithm 2, step (a)).
@@ -139,29 +140,102 @@ impl CryptFilters {
 /// The crypt filter a stream names for itself: a `/Crypt` entry first in
 /// its `/Filter` (ISO 32000-1 §7.4.10) selects the `/Name` of the matching
 /// `/DecodeParms` dictionary, `Identity` when that is absent. `None` when
-/// the stream has no `/Crypt` filter. Indirect `/Filter` or `/DecodeParms`
-/// values cannot be followed here (the decryptor has no resolver) and read
-/// as absent.
+/// the stream has no `/Crypt` filter. `/Filter`, its array entries,
+/// `/DecodeParms`, its array entries and the `/Name` inside are followed
+/// through `resolve` when they are indirect references; a reference
+/// `resolve` cannot supply reads as absent.
 ///
 /// Covers ISO 32000-1 §7.4.10.
-fn stream_crypt_filter(dict: &Dict) -> Option<String> {
-    let first = match dict.get("Filter")? {
-        Object::Name(n) => n,
-        Object::Array(items) => items.first()?.as_name()?,
+fn stream_crypt_filter(dict: &Dict, resolve: &dyn Fn(ObjRef) -> Option<Object>) -> Option<String> {
+    let filter = followed(dict.get("Filter")?, resolve)?;
+    let first = match &filter {
+        Object::Name(n) => n.clone(),
+        Object::Array(items) => followed(items.first()?, resolve)?.as_name()?.clone(),
         _ => return None,
     };
     if first.0 != "Crypt" {
         return None;
     }
-    let parms = match dict.get("DecodeParms") {
+    let parms = match dict.get("DecodeParms").and_then(|p| followed(p, resolve)) {
         Some(Object::Dict(d)) => Some(d),
-        Some(Object::Array(items)) => items.first().and_then(Object::as_dict),
+        Some(Object::Array(items)) => items
+            .first()
+            .and_then(|p| followed(p, resolve))
+            .and_then(|p| p.as_dict().cloned()),
         _ => None,
     };
     let name = parms
-        .and_then(|p| p.get_name("Name"))
-        .map_or("Identity", |n| n.0.as_str());
-    Some(name.to_string())
+        .and_then(|p| p.get("Name").and_then(|n| followed(n, resolve)))
+        .and_then(|n| n.as_name().map(|n| n.0.clone()))
+        .unwrap_or_else(|| "Identity".to_string());
+    Some(name)
+}
+
+const MAX_REFERENCE_HOPS: usize = 8;
+
+/// `obj` with indirect references followed through `resolve`, a chain of
+/// references included; `None` when one cannot be supplied.
+fn followed(obj: &Object, resolve: &dyn Fn(ObjRef) -> Option<Object>) -> Option<Object> {
+    let mut current = obj.clone();
+    for _ in 0..MAX_REFERENCE_HOPS {
+        let Object::Ref(r) = current else {
+            return Some(current);
+        };
+        current = resolve(r)?;
+    }
+    None
+}
+
+/// The indirect references a stream dictionary's crypt filter selection
+/// still depends on, given the objects already `known`: those of
+/// `/Filter`, its first array entry, `/DecodeParms`, its first array entry
+/// and the `/Name` inside. A caller that has no synchronous resolver
+/// fetches these, adds them to `known`, and asks again until the list is
+/// empty before calling [`Decryptor::decrypt_object_with`].
+pub fn pending_filter_refs(obj: &Object, known: &FastMap<ObjRef, Object>) -> Vec<ObjRef> {
+    let Object::Stream(stream) = obj else {
+        return Vec::new();
+    };
+    let lookup = |r: ObjRef| known.get(&r).cloned();
+    let mut pending = Vec::new();
+    let mut visit = |value: Option<&Object>| -> Option<Object> {
+        let mut current = value?.clone();
+        for _ in 0..MAX_REFERENCE_HOPS {
+            let Object::Ref(r) = current else {
+                return Some(current);
+            };
+            match lookup(r) {
+                Some(next) => current = next,
+                None => {
+                    pending.push(r);
+                    return None;
+                }
+            }
+        }
+        None
+    };
+    let filter = visit(stream.dict.get("Filter"));
+    let first = match &filter {
+        Some(Object::Array(items)) => visit(items.first()),
+        other => other.clone(),
+    };
+    if first
+        .as_ref()
+        .and_then(Object::as_name)
+        .map(|n| n.0.as_str())
+        != Some("Crypt")
+    {
+        return pending;
+    }
+    let parms = visit(stream.dict.get("DecodeParms"));
+    let parms = match &parms {
+        Some(Object::Array(items)) => visit(items.first()),
+        other => other.clone(),
+    };
+    if let Some(Object::Dict(d)) = &parms {
+        visit(d.get("Name"));
+    }
+    pending
 }
 
 /// The indirect references among an encryption dictionary's crypt filters:
@@ -376,7 +450,20 @@ impl Decryptor {
     /// let _ = apply;
     /// ```
     pub fn decrypt_object(&self, obj: &mut Object, num: u32, gen: u16) {
-        self.decrypt_in_place(obj, num, gen);
+        self.decrypt_in_place(obj, num, gen, &|_| None);
+    }
+
+    /// [`Decryptor::decrypt_object`] that follows the indirect `/Filter` and
+    /// `/DecodeParms` values of a stream through `resolve` when deciding
+    /// whether a `/Crypt` filter applies (ISO 32000-1 §7.4.10).
+    pub fn decrypt_object_with(
+        &self,
+        obj: &mut Object,
+        num: u32,
+        gen: u16,
+        resolve: &dyn Fn(ObjRef) -> Option<Object>,
+    ) {
+        self.decrypt_in_place(obj, num, gen, resolve);
     }
 
     /// Recursively decrypts every string and stream body reachable from
@@ -391,24 +478,30 @@ impl Decryptor {
     /// alone; the dictionary's own values still walk normally.
     ///
     /// Covers ISO 32000-1 §7.6.2, §7.6.5 and §7.4.10.
-    fn decrypt_in_place(&self, obj: &mut Object, num: u32, gen: u16) {
+    fn decrypt_in_place(
+        &self,
+        obj: &mut Object,
+        num: u32,
+        gen: u16,
+        resolve: &dyn Fn(ObjRef) -> Option<Object>,
+    ) {
         match obj {
             Object::String(bytes) => self.apply(self.filters.string, num, gen, bytes),
             Object::Array(items) => items
                 .iter_mut()
-                .for_each(|it| self.decrypt_in_place(it, num, gen)),
+                .for_each(|it| self.decrypt_in_place(it, num, gen, resolve)),
             Object::Dict(dict) => dict
                 .values_mut()
-                .for_each(|v| self.decrypt_in_place(v, num, gen)),
+                .for_each(|v| self.decrypt_in_place(v, num, gen, resolve)),
             Object::Stream(stream) => {
                 stream
                     .dict
                     .values_mut()
-                    .for_each(|v| self.decrypt_in_place(v, num, gen));
+                    .for_each(|v| self.decrypt_in_place(v, num, gen, resolve));
                 if !self.encrypt_metadata && is_metadata_stream(&stream.dict) {
                     return;
                 }
-                if let Some(name) = stream_crypt_filter(&stream.dict) {
+                if let Some(name) = stream_crypt_filter(&stream.dict, resolve) {
                     match self.filters.named(&name) {
                         Some(Cipher::Identity) | None => {}
                         Some(cipher) => {
@@ -1872,7 +1965,7 @@ fn encrypt_in_place(
             // A stream that names the Identity crypt filter says its data
             // is stored in the clear (ISO 32000-1 §7.4.10); keep it so, or
             // no reader could get it back.
-            if stream_crypt_filter(&stream.dict).as_deref() == Some("Identity") {
+            if stream_crypt_filter(&stream.dict, &|_| None).as_deref() == Some("Identity") {
                 return Ok(());
             }
             stream.data = aes_cbc_encrypt(key, rng, &stream.data)?;
@@ -2712,6 +2805,99 @@ mod tests {
         );
         let doc = Document::load(data).expect("opens");
         assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
+    // Covers ISO 32000-1 §7.3.10 and §7.4.10: a /Crypt filter named through
+    // indirect objects selects the same crypt filter as a direct one.
+    fn indirect_crypt_fixture(
+        stream_entries: &str,
+        extra: &'static [(u32, &'static str)],
+    ) -> Vec<u8> {
+        v4_fixture(
+            16,
+            &format!("/Length 128 {TWO_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, key| {
+                for (num, body) in extra {
+                    b.object(*num, body);
+                }
+                b.stream(4, stream_entries, &rc4(key, b"under the file key"));
+            },
+        )
+    }
+
+    #[test]
+    fn an_indirect_filter_naming_crypt_selects_the_named_crypt_filter() {
+        use crate::Document;
+        let data = indirect_crypt_fixture(
+            "/Filter 6 0 R /DecodeParms << /Name /RcCF >>",
+            &[(6, "/Crypt")],
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
+    #[test]
+    fn an_indirect_filter_array_entry_naming_crypt_selects_the_named_crypt_filter() {
+        use crate::Document;
+        let data = indirect_crypt_fixture(
+            "/Filter [6 0 R] /DecodeParms [<< /Name /RcCF >>]",
+            &[(6, "/Crypt")],
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
+    #[test]
+    fn an_indirect_filter_array_naming_crypt_selects_the_named_crypt_filter() {
+        use crate::Document;
+        let data = indirect_crypt_fixture(
+            "/Filter 6 0 R /DecodeParms << /Name /RcCF >>",
+            &[(6, "[/Crypt]")],
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
+    #[test]
+    fn an_indirect_decode_parms_dictionary_selects_the_named_crypt_filter() {
+        use crate::Document;
+        let data = indirect_crypt_fixture(
+            "/Filter /Crypt /DecodeParms 6 0 R",
+            &[(6, "<< /Name /RcCF >>")],
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
+    #[test]
+    fn an_indirect_name_inside_decode_parms_selects_the_named_crypt_filter() {
+        use crate::Document;
+        let data = indirect_crypt_fixture(
+            "/Filter /Crypt /DecodeParms << /Name 6 0 R >>",
+            &[(6, "/RcCF")],
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"under the file key");
+    }
+
+    #[test]
+    fn an_indirect_filter_with_indirect_identity_parms_leaves_the_data_as_stored() {
+        use crate::Document;
+        let data = v4_fixture(
+            16,
+            &format!("/Length 128 {AESV2_CF} /StmF /StdCF /StrF /StdCF"),
+            |b, _| {
+                b.object(6, "/Crypt");
+                b.object(7, "<< /Name /Identity >>");
+                b.stream(
+                    4,
+                    "/Filter 6 0 R /DecodeParms 7 0 R",
+                    b"stored in the clear",
+                );
+            },
+        );
+        let doc = Document::load(data).expect("opens");
+        assert_eq!(body_of(&doc, 4), b"stored in the clear");
     }
 
     // --- AESV3 (V5/R5 and R6) end-to-end fixture ---

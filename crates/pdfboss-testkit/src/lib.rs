@@ -5,7 +5,10 @@
 use std::collections::BTreeMap;
 
 mod crypt;
-pub use crypt::{encrypted_rc4_doc, encrypted_rc4_doc_with_indirect_cf};
+pub use crypt::{
+    encrypted_rc4_doc, encrypted_rc4_doc_with_indirect_cf,
+    encrypted_rc4_doc_with_indirect_identity_filter,
+};
 
 /// A lightweight reference to an object added to a [`PdfBuilder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
