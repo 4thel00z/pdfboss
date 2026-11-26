@@ -321,9 +321,18 @@ impl Type1Font {
     /// [`Type1Interpreter`]); a missing gid or malformed charstring yields
     /// whatever partial outline was decoded so far (empty if nothing could be
     /// decoded), never a panic.
+    #[cfg(test)]
     pub(crate) fn glyph_path(&self, gid: u16) -> Vec<Seg> {
+        self.glyph(gid).0
+    }
+
+    /// The outline of `glyph_path` together with the advance
+    /// width the charstring's `hsbw`/`sbw` states, in font design units. The
+    /// width is `None` for a missing gid or a charstring that never reaches
+    /// one of those operators.
+    pub(crate) fn glyph(&self, gid: u16) -> (Vec<Seg>, Option<f32>) {
         let Some(code) = self.charstrings.get(gid as usize) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         Type1Interpreter::new(self).run(code)
     }
@@ -427,6 +436,9 @@ struct Type1Interpreter<'a> {
     depth: u32,
     steps: u32,
     segs: Vec<Seg>,
+    /// The advance `hsbw`/`sbw` stated first; later ones (a `seac`
+    /// component's) do not replace it.
+    advance: Option<f32>,
 }
 
 impl<'a> Type1Interpreter<'a> {
@@ -445,16 +457,18 @@ impl<'a> Type1Interpreter<'a> {
             depth: 0,
             steps: 0,
             segs: Vec::new(),
+            advance: None,
         }
     }
 
-    /// Runs the top-level charstring and returns the decoded outline, closing
-    /// any subpath still open when interpretation stops (whether via
-    /// `endchar` or a malformed charstring that never reaches one).
-    fn run(mut self, code: &[u8]) -> Vec<Seg> {
+    /// Runs the top-level charstring and returns the decoded outline and the
+    /// stated advance, closing any subpath still open when interpretation
+    /// stops (whether via `endchar` or a malformed charstring that never
+    /// reaches one).
+    fn run(mut self, code: &[u8]) -> (Vec<Seg>, Option<f32>) {
         self.exec(code);
         self.close_current();
-        self.segs
+        (self.segs, self.advance)
     }
 
     /// Local subroutine `i`'s bytes, tied to the font's lifetime (not the
@@ -598,10 +612,9 @@ impl<'a> Type1Interpreter<'a> {
     fn exec_operator(&mut self, op: u8) -> OpResult {
         match op {
             T1_HSBW => {
-                // sbx wx: set current point x = sbx (y = 0); wx (advance) is
-                // recorded by the spec but unused for painting.
                 self.x = self.arg(0);
                 self.y = 0.0;
+                self.advance.get_or_insert(self.arg(1));
                 self.stack.clear();
                 OpResult::Continue
             }
@@ -711,9 +724,9 @@ impl<'a> Type1Interpreter<'a> {
                 OpResult::Continue
             }
             T1E_SBW => {
-                // sbx sby wx wy: set current point to (sbx, sby).
                 self.x = self.arg(0);
                 self.y = self.arg(1);
+                self.advance.get_or_insert(self.arg(2));
                 self.stack.clear();
                 OpResult::Continue
             }
@@ -1965,5 +1978,73 @@ pub(crate) mod tests {
             f.glyph_path(gid),
             vec![Seg::Move(-40000.0, 0.0), Seg::Close]
         );
+    }
+
+    fn font_with(font_matrix: &str, glyphs: &[(&str, Vec<u8>)]) -> Type1Font {
+        Type1Font::parse(build_type1_program(font_matrix, &[], glyphs, &[], 4)).expect("parse")
+    }
+
+    #[test]
+    fn glyph_reports_the_hsbw_width() {
+        let f = font_with(
+            "[0.001 0 0 0.001 0 0]",
+            &[("A", box_charstring()), ("B", stub_charstring())],
+        );
+        let gid = f.gid_for_name("A").unwrap();
+        assert_eq!(f.glyph(gid).1, Some(1000.0));
+    }
+
+    #[test]
+    fn glyph_reports_the_sbw_width() {
+        let mut c = Vec::new();
+        cs_num(&mut c, 10);
+        cs_num(&mut c, 0);
+        cs_num(&mut c, 640);
+        cs_num(&mut c, 0);
+        cs_escape(&mut c, 7);
+        cs_op(&mut c, 14);
+        let f = font_with("[0.001 0 0 0.001 0 0]", &[("A", c)]);
+        let gid = f.gid_for_name("A").unwrap();
+        assert_eq!(f.glyph(gid).1, Some(640.0));
+    }
+
+    #[test]
+    fn glyph_width_is_in_the_fonts_own_units_when_the_matrix_is_not_1000() {
+        let mut c = Vec::new();
+        cs_num(&mut c, 0);
+        cs_num(&mut c, 1500);
+        cs_op(&mut c, 13);
+        cs_op(&mut c, 14);
+        let f = font_with("[0.0005 0 0 0.0005 0 0]", &[("A", c)]);
+        let gid = f.gid_for_name("A").unwrap();
+        assert_eq!(f.units_per_em(), 2000.0);
+        assert_eq!(f.glyph(gid).1, Some(1500.0));
+    }
+
+    #[test]
+    fn glyph_without_hsbw_or_sbw_has_no_width() {
+        let f = font_with("[0.001 0 0 0.001 0 0]", &[("A", vec![14])]);
+        let gid = f.gid_for_name("A").unwrap();
+        assert_eq!(f.glyph(gid).1, None);
+    }
+
+    #[test]
+    fn seac_glyph_keeps_its_own_width_not_a_component_s() {
+        let mut comp = Vec::new();
+        cs_num(&mut comp, 0);
+        cs_num(&mut comp, 700);
+        cs_op(&mut comp, 13);
+        cs_num(&mut comp, 0);
+        cs_num(&mut comp, 0);
+        cs_num(&mut comp, 0);
+        cs_num(&mut comp, 65);
+        cs_num(&mut comp, 65);
+        cs_escape(&mut comp, 6);
+        let f = font_with(
+            "[0.001 0 0 0.001 0 0]",
+            &[("A", box_charstring()), ("Agrave", comp)],
+        );
+        let gid = f.gid_for_name("Agrave").unwrap();
+        assert_eq!(f.glyph(gid).1, Some(700.0));
     }
 }
