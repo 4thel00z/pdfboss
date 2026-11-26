@@ -32,10 +32,8 @@ const FDSELECT_OP: u16 = 0x0c00 | 37;
 
 // --- Private DICT operator keys ---------------------------------------------
 const PRIV_SUBRS_OP: u16 = 19;
-// `defaultWidthX` (20) and `nominalWidthX` (21) are intentionally not listed
-// here: `parse_private` never extracts them (see its doc comment for why),
-// so the only remaining reference to those operator codes is in the test
-// fixture builders below, which declare their own copies.
+const PRIV_DEFAULT_WIDTH_X_OP: u16 = 20;
+const PRIV_NOMINAL_WIDTH_X_OP: u16 = 21;
 
 /// SIDs `0..=390` are reserved for the CFF standard strings regardless of how
 /// many of them this module bundles; `391+` index the font's String INDEX.
@@ -282,19 +280,28 @@ impl CffFont {
     /// step/recursion-bounded throughout (see [`Type2Interpreter`]); a
     /// missing or malformed charstring yields whatever partial outline was
     /// decoded so far (empty if nothing could be decoded), never a panic.
+    #[cfg(test)]
     pub(crate) fn glyph_path(&self, gid: u16) -> Vec<Seg> {
+        self.glyph(gid).0
+    }
+
+    /// The outline of `glyph_path` together with the glyph's
+    /// advance width in font design units: the charstring's leading width
+    /// operand plus `nominalWidthX`, else `defaultWidthX`, both from the
+    /// Private DICT that applies to `gid` (the `FDSelect`-chosen one for a
+    /// CID-keyed font). `None` for a missing gid.
+    pub(crate) fn glyph(&self, gid: u16) -> (Vec<Seg>, Option<f32>) {
         let Some(charstring) = self.char_strings.get(gid as usize) else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
-        // Resolves the Private DICT that applies to this glyph -- for CID
-        // fonts, via FDSelect(gid) -- for its local Subrs (`callsubr`). Its
-        // nominalWidthX is also selected here (per the FDSelect'd Private
-        // DICT) but not consumed: painting doesn't need the glyph width, only
-        // that the optional leading width operand is dropped so operand
-        // counts stay correct (see `Type2Interpreter::maybe_drop_width`);
-        // widths for advances come from the PDF font dict, not here.
-        let local_subrs = self.private_for_gid(gid).map(|p| &p.local_subrs);
-        Type2Interpreter::new(&self.global_subrs, local_subrs).run(charstring)
+        let private = self.private_for_gid(gid);
+        let local_subrs = private.map(|p| &p.local_subrs);
+        let (default_width, nominal_width) = private
+            .map(|p| (p.default_width_x, p.nominal_width_x))
+            .unwrap_or_default();
+        let (segs, width) = Type2Interpreter::new(&self.global_subrs, local_subrs).run(charstring);
+        let advance = width.map_or(default_width, |w| nominal_width + w);
+        (segs, Some(advance))
     }
 
     /// The Private DICT that applies to `gid`: the font's single Private
@@ -446,6 +453,8 @@ struct Type2Interpreter<'a> {
     /// Whether the one-time optional-width operand has been looked for yet
     /// (regardless of whether one was actually present).
     width_parsed: bool,
+    /// The leading width operand, when the charstring has one.
+    width: Option<f32>,
     /// Whether a subpath is currently open (there has been a `moveto` not
     /// yet followed by another `moveto` or the end of the glyph).
     open: bool,
@@ -466,6 +475,7 @@ impl<'a> Type2Interpreter<'a> {
             y: 0.0,
             n_stems: 0,
             width_parsed: false,
+            width: None,
             open: false,
             depth: 0,
             steps: 0,
@@ -476,12 +486,12 @@ impl<'a> Type2Interpreter<'a> {
     /// Runs the top-level charstring and returns the decoded outline,
     /// closing any subpath still open when interpretation stops (whether via
     /// `endchar` or a malformed charstring that never reaches one).
-    fn run(mut self, code: &[u8]) -> Vec<Seg> {
+    fn run(mut self, code: &[u8]) -> (Vec<Seg>, Option<f32>) {
         self.exec(code);
         if self.open {
             self.segs.push(Seg::Close);
         }
-        self.segs
+        (self.segs, self.width)
     }
 
     fn push_operand(&mut self, v: f64) {
@@ -506,7 +516,7 @@ impl<'a> Type2Interpreter<'a> {
         }
         self.width_parsed = true;
         if extra && !self.stack.is_empty() {
-            self.stack.remove(0);
+            self.width = Some(self.stack.remove(0) as f32);
         }
     }
 
@@ -980,11 +990,8 @@ fn units_per_em_from_top_dict(top: &Dict) -> f32 {
 /// DICT's own start). Works for both the non-CID Top DICT and a CID font's
 /// per-glyph Font DICT, since both use the same operator.
 ///
-/// The Private DICT's `defaultWidthX`/`nominalWidthX` operands are
-/// deliberately not extracted: as `CffFont::glyph_path` documents, glyph
-/// widths for painting come from the PDF font dict's `/Widths` (or `/W`/
-/// `/DW`), never from the CFF program, so those two operands would only ever
-/// be parsed and then never read.
+/// The Private DICT's `defaultWidthX` and `nominalWidthX` (both default 0)
+/// are kept: they turn a charstring's width operand into an advance.
 fn parse_private(data: &[u8], dict: &Dict) -> Option<Private> {
     let v = dict.get(&PRIVATE_OP)?;
     if v.len() != 2 {
@@ -1004,7 +1011,11 @@ fn parse_private(data: &[u8], dict: &Dict) -> Option<Private> {
         }
         None => Index::default(),
     };
-    Some(Private { local_subrs })
+    Some(Private {
+        local_subrs,
+        default_width_x: first_num(&pd, PRIV_DEFAULT_WIDTH_X_OP).unwrap_or(0.0) as f32,
+        nominal_width_x: first_num(&pd, PRIV_NOMINAL_WIDTH_X_OP).unwrap_or(0.0) as f32,
+    })
 }
 
 /// The first operand of `key`, if `dict` has an entry for it.
@@ -1016,6 +1027,8 @@ fn first_num(dict: &Dict, key: u16) -> Option<f64> {
 /// local Subrs INDEX used by `callsubr`.
 struct Private {
     local_subrs: Index,
+    default_width_x: f32,
+    nominal_width_x: f32,
 }
 
 /// A CFF INDEX: a count-prefixed array of variable-length byte objects (Tech
@@ -1577,13 +1590,6 @@ pub(crate) mod tests {
         d
     }
 
-    // `parse_private` doesn't extract these two operands into `Private`
-    // (see its doc comment), so production no longer names them; the
-    // fixture builders below still embed them, to keep the synthetic Private
-    // DICTs realistic and to exercise the parser skipping past them.
-    const PRIV_DEFAULT_WIDTH_X_OP: u16 = 20;
-    const PRIV_NOMINAL_WIDTH_X_OP: u16 = 21;
-
     fn build_private_dict(default_width_x: i32, nominal_width_x: i32) -> Vec<u8> {
         let mut d = Vec::new();
         dict_int_operand(&mut d, default_width_x);
@@ -2002,11 +2008,14 @@ pub(crate) mod tests {
     /// position. Every operand is a small decimal delta (Type2 charstrings
     /// are relative); a delta bigger than the compact single-byte operand
     /// range is chained as several smaller ones within one `rlineto`.
-    fn box_glyph_charstring() -> Vec<u8> {
+    fn box_glyph_charstring(width_operand: Option<i32>) -> Vec<u8> {
         const RMOVETO: u8 = 21;
         const RLINETO: u8 = 5;
 
         let mut cs = Vec::new();
+        if let Some(width) = width_operand {
+            t2_int(&mut cs, width);
+        }
         t2_int(&mut cs, 100);
         t2_int(&mut cs, 0);
         t2_op(&mut cs, RMOVETO); // move to (100, 0)
@@ -2107,7 +2116,20 @@ pub(crate) mod tests {
         name: BoxGlyphName,
         encoding: FixtureEncoding,
     ) -> Vec<u8> {
-        let cs = box_glyph_charstring();
+        build_box_glyph_fixture_widths(name, encoding, 0, 0, None)
+    }
+
+    /// `build_box_glyph_fixture_with` whose Private DICT states the given
+    /// `defaultWidthX` and `nominalWidthX` and whose box charstring leads
+    /// with `width_operand` when it is `Some`.
+    pub(crate) fn build_box_glyph_fixture_widths(
+        name: BoxGlyphName,
+        encoding: FixtureEncoding,
+        default_width_x: i32,
+        nominal_width_x: i32,
+        width_operand: Option<i32>,
+    ) -> Vec<u8> {
+        let cs = box_glyph_charstring(width_operand);
         let notdef: &[u8] = &[ENDCHAR];
 
         let header = vec![1u8, 0, 4, 4];
@@ -2123,7 +2145,7 @@ pub(crate) mod tests {
             FixtureEncoding::Custom(bytes) => bytes,
             FixtureEncoding::Absent | FixtureEncoding::Expert => &[],
         };
-        let private = build_private_dict(0, 0);
+        let private = build_private_dict(default_width_x, nominal_width_x);
 
         let encoding_operand = |encoding_off: i32| match encoding {
             FixtureEncoding::Absent => None,
@@ -2259,7 +2281,18 @@ pub(crate) mod tests {
     /// (mirrors `build_fixture_cid`'s FDArray/FDSelect layout, but with a
     /// real outline instead of a bare `endchar`).
     pub(crate) fn build_box_glyph_fixture_cid(cid: u16) -> Vec<u8> {
-        let cs = box_glyph_charstring();
+        build_box_glyph_fixture_cid_widths(cid, 0, 0, None)
+    }
+
+    /// `build_box_glyph_fixture_cid` with the width knobs of
+    /// `build_box_glyph_fixture_widths`.
+    pub(crate) fn build_box_glyph_fixture_cid_widths(
+        cid: u16,
+        default_width_x: i32,
+        nominal_width_x: i32,
+        width_operand: Option<i32>,
+    ) -> Vec<u8> {
+        let cs = box_glyph_charstring(width_operand);
         let notdef: &[u8] = &[ENDCHAR];
 
         let header = vec![1u8, 0, 4, 4];
@@ -2269,7 +2302,7 @@ pub(crate) mod tests {
         let charstrings_index = build_index(&[notdef, &cs]);
         let charset = charset_format0(&[cid]); // gid 1 -> CID `cid`
         let fd_select = vec![0u8, 0, 0]; // format 0, fd 0 for both glyphs
-        let private = build_private_dict(0, 0);
+        let private = build_private_dict(default_width_x, nominal_width_x);
 
         let placeholder_top = build_cid_top_dict(0, 0, 0, 0);
         let top_dict_index_len = build_index(&[&placeholder_top]).len();
@@ -2482,5 +2515,54 @@ pub(crate) mod tests {
         data.extend_from_slice(&global_subr_index);
 
         assert!(CffFont::parse(data).is_none());
+    }
+
+    #[test]
+    fn glyph_without_a_width_operand_takes_default_width_x() {
+        let font = CffFont::parse(build_box_glyph_fixture_widths(
+            BoxGlyphName::Custom("box"),
+            FixtureEncoding::Absent,
+            800,
+            500,
+            None,
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.glyph(1).1, Some(800.0));
+    }
+
+    #[test]
+    fn glyph_width_operand_is_added_to_nominal_width_x() {
+        let font = CffFont::parse(build_box_glyph_fixture_widths(
+            BoxGlyphName::Custom("box"),
+            FixtureEncoding::Absent,
+            0,
+            700,
+            Some(-50),
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.glyph(1).1, Some(650.0));
+    }
+
+    #[test]
+    fn cid_keyed_glyph_width_uses_the_font_dicts_private() {
+        let font = CffFont::parse(build_box_glyph_fixture_cid_widths(5, 600, 300, Some(40)))
+            .expect("fixture parses");
+        assert_eq!(font.glyph(1).1, Some(340.0));
+        let font = CffFont::parse(build_box_glyph_fixture_cid_widths(5, 600, 300, None))
+            .expect("fixture parses");
+        assert_eq!(font.glyph(1).1, Some(600.0));
+    }
+
+    #[test]
+    fn missing_glyph_has_no_width() {
+        let font = CffFont::parse(build_box_glyph_fixture_widths(
+            BoxGlyphName::Custom("box"),
+            FixtureEncoding::Absent,
+            800,
+            0,
+            None,
+        ))
+        .expect("fixture parses");
+        assert_eq!(font.glyph(99).1, None);
     }
 }

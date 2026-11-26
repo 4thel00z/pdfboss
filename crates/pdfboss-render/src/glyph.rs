@@ -168,7 +168,7 @@ pub(crate) struct GlyphFont {
     /// lock only across a map lookup or insert, never while parsing. The
     /// stored `Arc<[Seg]>` is handed back by cheap refcount clone rather than
     /// copying the segment vector.
-    outline_cache: Mutex<FastMap<u16, Arc<[Seg]>>>,
+    outline_cache: Mutex<FastMap<u16, CachedGlyph>>,
     /// Per-glyph *flattened* device-space outline memo, keyed by `gid` plus
     /// the exact bits of the transform's linear part `(a, b, c, d)`. The
     /// value is the glyph flattened with translation zeroed; the caller adds
@@ -182,6 +182,14 @@ pub(crate) struct GlyphFont {
     /// so the flattening (whose subdivision tolerance is in device pixels)
     /// stays correct. A `Mutex` for the same reason as `outline_cache`.
     flat_cache: Mutex<FlatCache>,
+}
+
+/// One parsed glyph program: the outline and, for Type 1 and CFF, the advance
+/// its charstring states, both produced by the single interpreter run.
+#[derive(Clone)]
+struct CachedGlyph {
+    segs: Arc<[Seg]>,
+    advance: Option<f32>,
 }
 
 /// Locks a glyph cache, recovering from poisoning instead of panicking.
@@ -327,20 +335,28 @@ impl GlyphFont {
     /// shared with the cache: callers read it (via `build_glyph`) and drop
     /// it, never mutating it.
     pub(crate) fn outline(&self, gid: u16) -> Arc<[Seg]> {
+        self.cached_glyph(gid).segs
+    }
+
+    /// The memoized outline and charstring advance for `gid`.
+    fn cached_glyph(&self, gid: u16) -> CachedGlyph {
         if let Some(cached) = lock_cache(&self.outline_cache).get(&gid) {
-            return Arc::clone(cached);
+            return cached.clone();
         }
         // The lock is released before the charstring is interpreted: parsing
         // is the expensive part and holds nothing shared.
-        let segs: Arc<[Seg]> = match &self.outlines {
-            Outlines::TrueType(tt) | Outlines::Substitute(tt) => tt.glyph_path(gid),
-            Outlines::Cff(cff) => cff.glyph_path(gid),
-            Outlines::Type1(t1) => t1.glyph_path(gid),
-            Outlines::Metrics => Vec::new(),
-        }
-        .into();
-        lock_cache(&self.outline_cache).insert(gid, Arc::clone(&segs));
-        segs
+        let (segs, advance) = match &self.outlines {
+            Outlines::TrueType(tt) | Outlines::Substitute(tt) => (tt.glyph_path(gid), None),
+            Outlines::Cff(cff) => cff.glyph(gid),
+            Outlines::Type1(t1) => t1.glyph(gid),
+            Outlines::Metrics => (Vec::new(), None),
+        };
+        let glyph = CachedGlyph {
+            segs: segs.into(),
+            advance,
+        };
+        lock_cache(&self.outline_cache).insert(gid, glyph.clone());
+        glyph
     }
 
     /// The glyph's outline flattened to device-space polylines under the
@@ -385,11 +401,9 @@ impl GlyphFont {
     /// (Adobe Core-14 AFM metrics, populated only for non-embedded
     /// standard-14 substitution -- empty, and so a no-op, everywhere else);
     /// and only failing both does this fall back to the embedded program's
-    /// own advance metric (`hmtx` for TrueType and for a substitute face,
-    /// `0` for CFF and Type1, neither of which has a per-glyph advance table
-    /// parsed here -- Type1's `hsbw`/`sbw` operator does carry a `wx`
-    /// advance operand, but reading it back out of the charstring is a
-    /// deferred fallback, not yet wired up).
+    /// own advance metric (`hmtx` for TrueType and for a substitute face, the
+    /// charstring's `hsbw`/`sbw` width for Type1, its width operand plus
+    /// `nominalWidthX` or else `defaultWidthX` for CFF).
     pub(crate) fn advance(&self, code: u32) -> f32 {
         if let Some(width_1000) = self.widths.get(code) {
             return width_1000 / 1000.0 * self.units_per_em();
@@ -401,7 +415,11 @@ impl GlyphFont {
             Outlines::TrueType(tt) | Outlines::Substitute(tt) => {
                 f32::from(tt.advance(self.gid(code)))
             }
-            Outlines::Cff(_) | Outlines::Type1(_) | Outlines::Metrics => 0.0,
+            Outlines::Cff(_) | Outlines::Type1(_) => self
+                .cached_glyph(self.gid(code))
+                .advance
+                .unwrap_or_default(),
+            Outlines::Metrics => 0.0,
         }
     }
 
@@ -1564,8 +1582,8 @@ mod tests {
 
     use crate::cff::tests::{
         build_box_glyph_fixture, build_box_glyph_fixture_cid, build_box_glyph_fixture_encoded,
-        build_box_glyph_fixture_with, encoding_format0, wrap_in_opentype, BoxGlyphName,
-        FixtureEncoding,
+        build_box_glyph_fixture_widths, build_box_glyph_fixture_with, encoding_format0,
+        wrap_in_opentype, BoxGlyphName, FixtureEncoding,
     };
     use crate::truetype::tests::build_font;
     use crate::type1::tests::{
@@ -2877,6 +2895,73 @@ mod tests {
         assert!(
             dark_pixel_at(&pix, 135, 115),
             "second glyph at the /Widths-implied (135,115)"
+        );
+    }
+
+    // Covers ISO 32000-1 §9.6.2.1.
+    #[test]
+    fn type1_without_widths_advances_by_the_hsbw_width() {
+        let bytes = simple_type1_font_doc(
+            "/Encoding << /Differences [128 /theboxglyphname] >>",
+            b"BT /F0 100 Tf 20 50 Td <8080> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(dark_pixel_at(&pix, 55, 115), "first glyph at (55,115)");
+        assert!(
+            dark_pixel_at(&pix, 155, 115),
+            "second glyph one hsbw width (1000) further right, at (155,115)"
+        );
+    }
+
+    // Covers ISO 32000-1 §9.6.2.1.
+    #[test]
+    fn cff_without_widths_advances_by_the_default_width() {
+        let program = build_box_glyph_fixture_widths(
+            BoxGlyphName::Custom("theboxglyphname"),
+            FixtureEncoding::Absent,
+            800,
+            0,
+            None,
+        );
+        let bytes = simple_cff_font_doc_with(
+            &program,
+            "/Encoding << /Differences [128 /theboxglyphname] >>",
+            b"BT /F0 100 Tf 20 50 Td <8080> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(dark_pixel_at(&pix, 55, 115), "first glyph at (55,115)");
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "second glyph defaultWidthX (800) further right, at (135,115)"
+        );
+    }
+
+    // Covers ISO 32000-1 §9.6.2.1.
+    #[test]
+    fn cff_without_widths_advances_by_nominal_plus_the_width_operand() {
+        let program = build_box_glyph_fixture_widths(
+            BoxGlyphName::Custom("theboxglyphname"),
+            FixtureEncoding::Absent,
+            0,
+            700,
+            Some(100),
+        );
+        let bytes = simple_cff_font_doc_with(
+            &program,
+            "/Encoding << /Differences [128 /theboxglyphname] >>",
+            b"BT /F0 100 Tf 20 50 Td <8080> Tj ET",
+        );
+        let doc = Document::load(bytes).expect("load");
+        let page = doc.page(0).expect("page");
+        let pix = crate::render_page(&doc, &page, 1.0).expect("render");
+        assert!(dark_pixel_at(&pix, 55, 115), "first glyph at (55,115)");
+        assert!(
+            dark_pixel_at(&pix, 135, 115),
+            "second glyph nominalWidthX + operand (800) further right, at (135,115)"
         );
     }
 
