@@ -549,3 +549,119 @@ async fn read_at_caps_collection_of_an_oversized_response_body() {
     assert_eq!(count, buf.len(), "reads exactly buf.len() bytes");
     assert_eq!(&buf, prefix.as_slice(), "correct prefix content, no error");
 }
+
+/// How [`spawn_scripted_206_server`] answers a ranged GET for `start-end`.
+#[derive(Clone, Copy)]
+enum Reply {
+    HeaderStart(usize),
+    HeaderEnd(usize),
+    NoHeaderPrefix,
+    NoHeaderExact,
+}
+
+/// Serves HEAD honestly and answers every ranged GET with a 206 whose
+/// `Content-Range` (or lack of one) and body follow `reply`, not the range.
+async fn spawn_scripted_206_server(data: Vec<u8>, reply: Reply) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((socket, _)) = listener.accept().await else {
+                break;
+            };
+            let data = data.clone();
+            tokio::spawn(async move {
+                let _ = handle_scripted_connection(socket, data, reply).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn handle_scripted_connection(
+    mut socket: TcpStream,
+    data: Vec<u8>,
+    reply: Reply,
+) -> std::io::Result<()> {
+    let total = data.len();
+    loop {
+        let Some(head) = read_request_head(&mut socket).await? else {
+            return Ok(());
+        };
+        if head.starts_with("HEAD ") {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await?;
+            continue;
+        }
+        let (start, end) = parse_range_header(&head).unwrap_or((0, total - 1));
+        let wanted = end.min(total - 1) - start + 1;
+        let (range_line, body) = match reply {
+            Reply::HeaderStart(other) => (
+                format!(
+                    "Content-Range: bytes {other}-{}/{total}\r\n",
+                    other + wanted - 1
+                ),
+                data[other..other + wanted].to_vec(),
+            ),
+            Reply::HeaderEnd(short) => (
+                format!(
+                    "Content-Range: bytes {start}-{}/{total}\r\n",
+                    start + short - 1
+                ),
+                data[start..start + short].to_vec(),
+            ),
+            Reply::NoHeaderPrefix => (String::new(), data[..wanted + 2].to_vec()),
+            Reply::NoHeaderExact => (String::new(), data[start..start + wanted].to_vec()),
+        };
+        let response = format!(
+            "HTTP/1.1 206 Partial Content\r\n{range_line}Content-Length: {}\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await?;
+        socket.write_all(&body).await?;
+    }
+}
+
+async fn read_error(reply: Reply, offset: u64, len: usize) -> String {
+    let addr = spawn_scripted_206_server(b"0123456789abcdef".to_vec(), reply).await;
+    let backend = HttpBackend::new(format!("http://{addr}/lie.bin"))
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; len];
+    let err = backend.read_at(offset, &mut buf).await.unwrap_err();
+    pdfboss_aio::Error::from(err).to_string()
+}
+
+#[tokio::test]
+async fn partial_content_for_another_offset_is_an_error_naming_both_ranges() {
+    let msg = read_error(Reply::HeaderStart(0), 10, 4).await;
+    assert!(msg.contains("10-13"), "{msg}");
+    assert!(msg.contains("0-3"), "{msg}");
+}
+
+#[tokio::test]
+async fn partial_content_shorter_than_requested_is_an_error() {
+    let msg = read_error(Reply::HeaderEnd(2), 10, 4).await;
+    assert!(msg.contains("10-13"), "{msg}");
+    assert!(msg.contains("10-11"), "{msg}");
+}
+
+#[tokio::test]
+async fn partial_content_without_content_range_and_wrong_length_is_an_error() {
+    let msg = read_error(Reply::NoHeaderPrefix, 10, 4).await;
+    assert!(msg.contains("Content-Range"), "{msg}");
+    assert!(msg.contains("10-13"), "{msg}");
+}
+
+#[tokio::test]
+async fn partial_content_without_content_range_but_exact_length_is_accepted() {
+    let addr = spawn_scripted_206_server(b"0123456789abcdef".to_vec(), Reply::NoHeaderExact).await;
+    let backend = HttpBackend::new(format!("http://{addr}/ok.bin"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 4];
+    assert_eq!(backend.read_at(10, &mut buf).await.unwrap(), 4);
+    assert_eq!(&buf, b"abcd");
+}

@@ -268,6 +268,56 @@ fn http_io_error(marker: crate::error::TransportMarker) -> io::Error {
     io::Error::other(marker)
 }
 
+/// Validates a 206 answer against the requested `offset..=last`. The
+/// `Content-Range` start must equal `offset` and its length must cover the
+/// request (a longer range is tolerated, collection stops at the buffer).
+/// Without `Content-Range`, the body is accepted only when `Content-Length`
+/// equals the requested length.
+#[cfg(feature = "http")]
+fn check_partial_content(
+    response: &reqwest::Response,
+    url: &reqwest::Url,
+    offset: u64,
+    last: u64,
+) -> io::Result<()> {
+    let mismatch = |returned: &str| {
+        http_io_error(crate::error::TransportMarker {
+            status: Some(206),
+            msg: format!("GET {url}: requested range {offset}-{last}, server returned {returned}"),
+        })
+    };
+    let wanted = last - offset + 1;
+    let Some(header) = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        if response.content_length() == Some(wanted) {
+            return Ok(());
+        }
+        return Err(mismatch(&format!(
+            "206 without a usable Content-Range and Content-Length {:?}",
+            response.content_length()
+        )));
+    };
+    let Some((start, end)) = parse_content_range(header) else {
+        return Err(mismatch(&format!("unparseable Content-Range {header:?}")));
+    };
+    if start != offset || end < start || end - start + 1 < wanted {
+        return Err(mismatch(&format!("{start}-{end}")));
+    }
+    Ok(())
+}
+
+/// Parses `bytes start-end/total` (total may be `*`) into `(start, end)`.
+#[cfg(feature = "http")]
+fn parse_content_range(header: &str) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes")?.trim_start();
+    let (range, _total) = spec.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+}
+
 #[cfg(feature = "http")]
 impl Backend for HttpBackend {
     fn len(&self) -> BoxFuture<'_, io::Result<u64>> {
@@ -311,7 +361,7 @@ impl Backend for HttpBackend {
                 tokio::time::sleep(std::time::Duration::from_millis(250 * (1 << attempt))).await;
             };
             match response.status().as_u16() {
-                206 => {}
+                206 => check_partial_content(&response, &self.url, offset, last)?,
                 200 => {
                     // The server ignored the Range header and answered with
                     // the whole resource: keep it and serve every read,
