@@ -1,5 +1,5 @@
 //! Table layout: content-sized columns, proportional fit, and per-row
-//! placement that never splits a row across a page break.
+//! placement that keeps a row whole unless it is taller than a page.
 
 use pdfboss_style::{Align, Edges, Element, TextStyle, Theme};
 use pdfboss_write::Color;
@@ -117,10 +117,10 @@ fn fit(widths: &mut [f32], available: f32) {
     }
 }
 
-/// Places one row's cells left to right at the current write position:
-/// each cell's background then border then manually placed lines, the
-/// whole row requested via [`Engine::need`] so it never splits across a
-/// page break.
+/// Places one row's cells left to right at the current write position.
+/// A row that fits on a page is requested whole via [`Engine::need`]; a
+/// row taller than a page continues onto following pages at line
+/// granularity, each page drawing its own borders and background.
 #[allow(clippy::too_many_arguments)]
 fn place_row(
     engine: &mut Engine,
@@ -142,36 +142,122 @@ fn place_row(
         let inner = (width - padding.left - padding.right).max(0.0);
         wrapped.push(wrap(&styled, inner, style.size)?);
     }
+    let line_h = |line: &LineBox| style.line_height * line.max_size;
     let content_h = wrapped
         .iter()
-        .map(|lines| {
-            lines
-                .iter()
-                .map(|line| style.line_height * line.max_size)
-                .sum::<f32>()
-        })
+        .map(|lines| lines.iter().map(line_h).sum::<f32>())
         .fold(0.0, f32::max);
     let row_h = content_h + padding.top + padding.bottom;
+    let look = RowLook {
+        aligns,
+        widths,
+        style,
+        padding,
+        background,
+        left,
+    };
 
-    engine.need(row_h);
+    if row_h <= engine.usable() {
+        engine.need(row_h);
+        let cells: Vec<&[LineBox]> = wrapped.iter().map(Vec::as_slice).collect();
+        draw_piece(engine, &look, &cells, row_h);
+        return Ok(());
+    }
+
+    let mut next = vec![0usize; wrapped.len()];
+    while next.iter().zip(&wrapped).any(|(n, lines)| *n < lines.len()) {
+        let first = wrapped
+            .iter()
+            .zip(&next)
+            .filter_map(|(lines, n)| lines.get(*n))
+            .map(line_h)
+            .fold(0.0, f32::max);
+        engine.need(first + padding.top + padding.bottom);
+        let cap = engine.remaining() - padding.top - padding.bottom;
+        let mut taken: Vec<usize> = wrapped
+            .iter()
+            .zip(&next)
+            .map(|(lines, n)| {
+                let mut used = 0.0;
+                lines[*n..]
+                    .iter()
+                    .take_while(|line| {
+                        used += line_h(line);
+                        used <= cap
+                    })
+                    .count()
+            })
+            .collect();
+        if taken.iter().all(|count| *count == 0) {
+            if let Some(j) = wrapped
+                .iter()
+                .zip(&next)
+                .position(|(lines, n)| *n < lines.len())
+            {
+                taken[j] = 1;
+            }
+        }
+        let cells: Vec<&[LineBox]> = wrapped
+            .iter()
+            .zip(&next)
+            .zip(&taken)
+            .map(|((lines, n), count)| &lines[*n..*n + *count])
+            .collect();
+        let piece_h = cells
+            .iter()
+            .map(|lines| lines.iter().map(line_h).sum::<f32>())
+            .fold(0.0, f32::max)
+            + padding.top
+            + padding.bottom;
+        draw_piece(engine, &look, &cells, piece_h);
+        for (n, count) in next.iter_mut().zip(&taken) {
+            *n += count;
+        }
+        if next.iter().zip(&wrapped).any(|(n, lines)| *n < lines.len()) {
+            engine.break_page();
+        }
+    }
+    Ok(())
+}
+
+struct RowLook<'a> {
+    aligns: &'a [CellAlign],
+    widths: &'a [f32],
+    style: &'a TextStyle,
+    padding: &'a Edges,
+    background: Option<Color>,
+    left: f32,
+}
+
+/// Draws one row piece `h` points tall at the write position: each cell's
+/// background, border and its `cells` lines, then advances past it.
+fn draw_piece(engine: &mut Engine, look: &RowLook, cells: &[&[LineBox]], h: f32) {
+    let RowLook {
+        aligns,
+        widths,
+        style,
+        padding,
+        background,
+        left,
+    } = look;
     let top = engine.y;
-    let mut x = left;
-    for (j, lines) in wrapped.into_iter().enumerate() {
+    let mut x = *left;
+    for (j, lines) in cells.iter().enumerate() {
         let width = widths[j];
         if let Some(color) = background {
             engine.push(Item::Rect {
                 x,
-                y: top - row_h,
+                y: top - h,
                 w: width,
-                h: row_h,
-                color,
+                h,
+                color: *color,
             });
         }
         engine.push(Item::Frame {
             x,
-            y: top - row_h,
+            y: top - h,
             w: width,
-            h: row_h,
+            h,
             width: BORDER_WIDTH,
             color: BORDER_COLOR,
         });
@@ -180,8 +266,8 @@ fn place_row(
             style.align,
         );
         let mut cursor = top - padding.top;
-        for line in &lines {
-            let h = style.line_height * line.max_size;
+        for line in *lines {
+            let line_h = style.line_height * line.max_size;
             let baseline = cursor - BASELINE * line.max_size;
             let origin = match align {
                 Align::Left => x + padding.left,
@@ -193,13 +279,12 @@ fn place_row(
             for item in frag_items(&line.frags, origin, baseline) {
                 engine.push(item);
             }
-            cursor -= h;
+            cursor -= line_h;
         }
         x += width;
     }
-    engine.y -= row_h;
+    engine.y -= h;
     engine.at_top = false;
-    Ok(())
 }
 
 /// The alignment a cell actually renders with: the pipe alignment from the
@@ -324,6 +409,34 @@ mod tests {
         }
         let pages = laid(&md, MONO);
         assert!(pages.len() >= 2);
+    }
+
+    #[test]
+    fn row_taller_than_a_page_continues_on_following_pages() {
+        let words: Vec<String> = (0..4000).map(|i| format!("word{i}")).collect();
+        let md = format!("| notes |\n|---|\n| {} |\n", words.join(" "));
+        let pages = laid(&md, MONO);
+        assert!(pages.len() >= 3, "pages: {}", pages.len());
+        let mut seen = String::new();
+        for page in &pages {
+            for item in &page.items {
+                match item {
+                    Item::Text { text, y, .. } => {
+                        assert!(*y >= 99.0, "text below the bottom margin: {y}");
+                        seen.push_str(text);
+                        seen.push(' ');
+                    }
+                    Item::Frame { y, .. } => {
+                        assert!(*y >= 99.99, "frame below the bottom margin: {y}")
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let found: Vec<&str> = seen.split_whitespace().collect();
+        for word in &words {
+            assert!(found.contains(&word.as_str()), "missing {word}");
+        }
     }
 
     #[test]
