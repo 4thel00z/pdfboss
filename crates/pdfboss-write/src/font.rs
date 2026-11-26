@@ -132,12 +132,16 @@ impl Standard14 {
     /// Symbol and ZapfDingbats carry no metrics, so theirs are always `None`.
     pub fn width(self, ch: char) -> Option<f32> {
         let code = self.encode_char(ch).ok()?;
-        let glyph = match self {
-            Standard14::Symbol => pdfboss_encoding::symbol_glyph_name(code)?,
-            Standard14::ZapfDingbats => pdfboss_encoding::zapf_dingbats_glyph_name(code)?,
-            _ => pdfboss_encoding::win_ansi_glyph_name(code)?,
-        };
+        let glyph = self.glyph_name(code)?;
         pdfboss_encoding::standard_14_width(self.base_font(), glyph)
+    }
+
+    fn glyph_name(self, code: u8) -> Option<&'static str> {
+        match self {
+            Standard14::Symbol => pdfboss_encoding::symbol_glyph_name(code),
+            Standard14::ZapfDingbats => pdfboss_encoding::zapf_dingbats_glyph_name(code),
+            _ => pdfboss_encoding::win_ansi_glyph_name(code),
+        }
     }
 
     /// Width of a whole string at `size`, in text-space units. Errors on
@@ -149,8 +153,11 @@ impl Standard14 {
         let mut sum = 0.0f32;
         for ch in text.chars() {
             let code = self.encode_char(ch)?;
-            let glyph = pdfboss_encoding::win_ansi_glyph_name(code).ok_or_else(|| {
-                Error::Other(format!("code {code:#04x} has no WinAnsi glyph name"))
+            let glyph = self.glyph_name(code).ok_or_else(|| {
+                Error::Other(format!(
+                    "{} code {code:#04x} has no glyph name",
+                    self.base_font()
+                ))
             })?;
             let width =
                 pdfboss_encoding::standard_14_width(self.base_font(), glyph).ok_or_else(|| {
@@ -285,6 +292,18 @@ mod tests {
         assert!(matches!(
             font.text_width("\u{20AC}", 12.0),
             Err(Error::Other(msg)) if msg.contains("Euro")
+        ));
+    }
+
+    #[test]
+    fn text_width_names_symbol_and_zapf_dingbats_glyphs_from_their_own_encodings() {
+        assert!(matches!(
+            Standard14::Symbol.text_width("\u{03B1}", 12.0),
+            Err(Error::Other(msg)) if msg.contains("\"alpha\"")
+        ));
+        assert!(matches!(
+            Standard14::ZapfDingbats.text_width("\u{2192}", 12.0),
+            Err(Error::Other(msg)) if !msg.contains("Otilde")
         ));
     }
 
