@@ -222,7 +222,13 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        match memchr::memmem::find(&data[start..], b"endstream") {
+        let body = &data[start..];
+        let at_line_start =
+            |idx: &usize| *idx == 0 || matches!(body.get(idx.wrapping_sub(1)), Some(b'\n' | b'\r'));
+        let found = memchr::memmem::find_iter(body, b"endstream")
+            .find(at_line_start)
+            .or_else(|| memchr::memmem::find(body, b"endstream"));
+        match found {
             Some(idx) => {
                 let mut end = start + idx;
                 if end > start && data[end - 1] == b'\n' {
@@ -289,6 +295,26 @@ mod tests {
 
     fn parse(data: &[u8]) -> Object {
         Parser::new(data).parse_object(&NoResolve).unwrap()
+    }
+
+    // Covers ISO 32000-1 §7.3.8.
+    #[test]
+    fn a_commented_endstream_does_not_end_the_stream() {
+        let data = b"<< /Length 99999 >>\nstream\nKEEP\n%endstream\nDROP\nendstream\nendobj";
+        let Object::Stream(stream) = parse(data) else {
+            panic!("expected a stream");
+        };
+        assert_eq!(stream.data, b"KEEP\n%endstream\nDROP");
+    }
+
+    // Covers ISO 32000-1 §7.3.8.
+    #[test]
+    fn an_endstream_glued_to_the_data_still_ends_it() {
+        let data = b"<< /Length 99999 >>\nstream\nKEEPendstream\nendobj";
+        let Object::Stream(stream) = parse(data) else {
+            panic!("expected a stream");
+        };
+        assert_eq!(stream.data, b"KEEP");
     }
 
     // Covers ISO 32000-1 §7.3.2 and §7.3.9.

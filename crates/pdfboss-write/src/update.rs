@@ -73,7 +73,7 @@ fn xobject_name_taken(base: &Document, pages: &[Page], candidate: &str) -> Resul
 /// each page's effective resources only once per watermark construction
 /// rather than once for the probe and again for marking.
 fn fetch_pages(base: &Document) -> Result<Vec<Page>> {
-    crate::assemble::fetch_page_run(base, 0..base.flattened_page_count())
+    crate::assemble::fetch_page_run(base, 0..base.page_count())
 }
 
 /// The content wrappers for one marked page: what precedes the page's own

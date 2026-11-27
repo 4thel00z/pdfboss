@@ -39,7 +39,7 @@ pub fn merge_documents(
         let mut importer = Importer::new(&mut writer, source)?;
         let indices: Vec<usize> = match selection {
             Some(indices) => indices.to_vec(),
-            None => (0..source.flattened_page_count()).collect(),
+            None => (0..source.page_count()).collect(),
         };
         for index in indices {
             kids.push(importer.page(index, pages_ref)?);
@@ -311,7 +311,7 @@ pub fn split_runs(doc: &Document, every: usize) -> Result<Vec<Range<usize>>> {
     if doc.is_locked() {
         return Err(Error::EncryptedBase);
     }
-    let total = doc.flattened_page_count();
+    let total = doc.page_count();
     Ok((0..total)
         .step_by(every)
         .map(|start| start..(start + every).min(total))
