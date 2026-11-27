@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.16.3](https://github.com/4thel00z/pdfboss/compare/v2.16.2...v2.16.3) (2026-11-27)
+
+
+### Bug Fixes
+
+* **core:** count pages from the walked tree, tolerate a bad /Prev, skip commented endstream ([#277](https://github.com/4thel00z/pdfboss/issues/277)) ([44341cb](https://github.com/4thel00z/pdfboss/commit/44341cb70e5651ebfd9c9d49b8d46f161669b39c))
+* **core:** end inline images without /L at a real EI ([#279](https://github.com/4thel00z/pdfboss/issues/279)) ([8ed4723](https://github.com/4thel00z/pdfboss/commit/8ed4723437020ff2a85229e37ec3ca6c930ff0d7))
+* **markdown:** continue a table row taller than a page onto following pages ([#282](https://github.com/4thel00z/pdfboss/issues/282)) ([dc1953e](https://github.com/4thel00z/pdfboss/commit/dc1953ed46920fb70ae062759be4bf680977c89c))
+* **render:** advance embedded Type 1 and CFF glyphs by the font program width ([#280](https://github.com/4thel00z/pdfboss/issues/280)) ([e6bd953](https://github.com/4thel00z/pdfboss/commit/e6bd9534a33c16d5a6e533f7e81c7c507474e820))
+* resolve indirect crypt filters, carry /XRefStm into hybrid appends ([#278](https://github.com/4thel00z/pdfboss/issues/278)) ([bbddf61](https://github.com/4thel00z/pdfboss/commit/bbddf61e76a9d39360f1a3501e6f5a741ec7b8ef))
+* Symbol and ZapfDingbats glyph names in text_width, check 206 Content-Range ([#281](https://github.com/4thel00z/pdfboss/issues/281)) ([2dbd19a](https://github.com/4thel00z/pdfboss/commit/2dbd19a96b7dab27c3103d72a9d47be862c54c23))
+
 ## [2.16.2](https://github.com/4thel00z/pdfboss/compare/v2.16.1...v2.16.2) (2026-11-13)
 
 
