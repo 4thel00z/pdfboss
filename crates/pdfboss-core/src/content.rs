@@ -754,17 +754,12 @@ fn parse_inline_image(lexer: &mut Lexer) -> Option<Op> {
         lexer.seek(end);
         bytes[start..end].to_vec()
     } else {
-        let Some(ei) = find_ei(bytes, start) else {
+        let Some((end, ei)) = inline_data_end(bytes, start, &dict) else {
             // No terminator anywhere: drop the image and stop lexing what
             // can only be binary garbage.
             lexer.seek(bytes.len());
             return None;
         };
-        // The whitespace byte before `EI` is a separator, not data.
-        let mut end = ei;
-        if end > start && is_whitespace(bytes[end - 1]) {
-            end -= 1;
-        }
         lexer.seek(ei);
         bytes[start..end].to_vec()
     };
@@ -772,27 +767,154 @@ fn parse_inline_image(lexer: &mut Lexer) -> Option<Op> {
     Some(Op::InlineImage(ImageParams { dict, data }))
 }
 
+/// Operators that may legitimately follow an inline image.
+const OPERATORS: &[&[u8]] = &[
+    b"q", b"Q", b"cm", b"w", b"J", b"j", b"M", b"d", b"ri", b"i", b"gs", b"m", b"l", b"c", b"v",
+    b"y", b"h", b"re", b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"n", b"W", b"W*",
+    b"CS", b"cs", b"SC", b"sc", b"SCN", b"scn", b"G", b"g", b"RG", b"rg", b"K", b"k", b"BT", b"ET",
+    b"Tc", b"Tw", b"Tz", b"TL", b"Tf", b"d0", b"d1", b"Tr", b"Ts", b"Td", b"TD", b"Tm", b"T*",
+    b"Tj", b"TJ", b"'", b"\"", b"Do", b"sh", b"MP", b"DP", b"BMC", b"BDC", b"EMC", b"BX", b"EX",
+];
+
+/// Operators that must follow a candidate `EI` before it is believed.
+const EI_CONFIRMING_OPERATORS: usize = 3;
+
+/// Tokens examined after a candidate `EI`.
+const EI_LOOKAHEAD_TOKENS: usize = 32;
+
+/// Component count of an inline image colour space, when the dictionary
+/// alone determines it.
+fn inline_components(dict: &Dict) -> Option<u64> {
+    let by_name = |n: &str| match n {
+        "DeviceGray" | "CalGray" => Some(1),
+        "DeviceRGB" | "CalRGB" | "Lab" => Some(3),
+        "DeviceCMYK" => Some(4),
+        _ => None,
+    };
+    match dict.get("ColorSpace")? {
+        Object::Name(n) => by_name(&n.0),
+        Object::Array(items) => match items.first()? {
+            Object::Name(n) if n.0 == "Indexed" => Some(1),
+            Object::Name(n) => by_name(&n.0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Byte length of an unfiltered inline image payload, when the
+/// dictionary determines it.
+fn inline_payload_len(dict: &Dict) -> Option<usize> {
+    if dict.get("Filter").is_some() {
+        return None;
+    }
+    let width = u64::try_from(dict.get_int("Width")?).ok()?;
+    let height = u64::try_from(dict.get_int("Height")?).ok()?;
+    let (components, bpc) = if dict.get("ImageMask") == Some(&Object::Bool(true)) {
+        (1, 1)
+    } else {
+        let bpc = u64::try_from(dict.get_int("BitsPerComponent")?).ok()?;
+        (inline_components(dict)?, bpc)
+    };
+    let row = width.checked_mul(components)?.checked_mul(bpc)?.div_ceil(8);
+    usize::try_from(row.checked_mul(height)?).ok()
+}
+
+/// End of the image data and the offset of its `EI`. The length computed
+/// from the dictionary is tried first; otherwise the first `EI` followed
+/// by plausible content wins, then the first bare `EI`.
+fn inline_data_end(bytes: &[u8], start: usize, dict: &Dict) -> Option<(usize, usize)> {
+    if let Some(len) = inline_payload_len(dict) {
+        let end = start.checked_add(len)?;
+        let mut at = end;
+        while bytes.get(at).is_some_and(|&b| is_whitespace(b)) {
+            at += 1;
+        }
+        if end <= bytes.len() && ei_at(bytes, at) && ei_followed_by_content(bytes, at + 2) {
+            return Some((end, at));
+        }
+    }
+    let ei = find_ei(bytes, start)?;
+    let end = if ei > start && is_whitespace(bytes[ei - 1]) {
+        ei - 1
+    } else {
+        ei
+    };
+    Some((end, ei))
+}
+
+fn ei_at(bytes: &[u8], p: usize) -> bool {
+    if bytes.get(p) != Some(&b'E') || bytes.get(p + 1) != Some(&b'I') {
+        return false;
+    }
+    match bytes.get(p + 2) {
+        None => true,
+        Some(&b) => !crate::lexer::is_regular(b),
+    }
+}
+
+/// Whether the bytes at `after` read as content-stream operands and
+/// operators for a short window.
+fn ei_followed_by_content(bytes: &[u8], after: usize) -> bool {
+    let mut lexer = Lexer::at(bytes, after);
+    let mut operators = 0;
+    let mut depth = 0usize;
+    for _ in 0..EI_LOOKAHEAD_TOKENS {
+        let Ok(raw) = lexer.next_raw_token() else {
+            return false;
+        };
+        match raw {
+            RawToken::Hex(_) => {}
+            RawToken::Owned(Token::Eof) => return true,
+            RawToken::Owned(Token::LitString(_)) => {
+                let terminated = lexer.pos() < bytes.len() || bytes[lexer.pos() - 1] == b')';
+                if !terminated {
+                    return false;
+                }
+            }
+            RawToken::Owned(Token::ArrayOpen | Token::DictOpen) => depth += 1,
+            RawToken::Owned(Token::ArrayClose | Token::DictClose) => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            RawToken::Owned(_) => {}
+            RawToken::Keyword(b"true" | b"false" | b"null") => {}
+            RawToken::Keyword(b"BI") => return true,
+            RawToken::Keyword(kw) => {
+                if !OPERATORS.contains(&kw) {
+                    return false;
+                }
+                operators += 1;
+                if operators >= EI_CONFIRMING_OPERATORS {
+                    return true;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Finds the offset of an `EI` terminator at a token boundary: preceded
 /// by whitespace (or the data start) and followed by a non-regular byte
-/// or end of input.
+/// or end of input. The first candidate whose following bytes read as
+/// content wins; when none does, the first candidate.
 fn find_ei(bytes: &[u8], start: usize) -> Option<usize> {
     let mut from = start;
+    let mut first = None;
     while let Some(off) = memchr::memchr(b'E', &bytes[from..]) {
         let p = from + off;
         from = p + 1;
-        if bytes.get(p + 1) != Some(&b'I') {
+        if !ei_at(bytes, p) || !(p == start || is_whitespace(bytes[p - 1])) {
             continue;
         }
-        let before_ok = p == start || is_whitespace(bytes[p - 1]);
-        let after_ok = match bytes.get(p + 2) {
-            None => true,
-            Some(&b) => !crate::lexer::is_regular(b),
-        };
-        if before_ok && after_ok {
+        if ei_followed_by_content(bytes, p + 2) {
             return Some(p);
         }
+        first = first.or(Some(p));
     }
-    None
+    first
 }
 
 /// Consumes the `EI` keyword after inline image data, scanning forward
@@ -1125,6 +1247,72 @@ mod tests {
         };
         assert!(img.data.is_empty());
         assert_eq!(got[1], Op::EndPath);
+    }
+
+    // Covers ISO 32000-1 §8.9.7.
+    #[test]
+    fn inline_image_without_length_skips_fake_ei_with_open_string() {
+        let src = b"BI /W 8 /H 1 /CS /G /BPC 8 ID AAAA EI (x\nEI\nBT (AFTER) Tj ET\n";
+        let got = ops(src);
+        let Op::InlineImage(img) = &got[0] else {
+            panic!("expected inline image, got {:?}", got[0]);
+        };
+        assert_eq!(img.data, b"AAAA EI (x");
+        assert_eq!(got.len(), 4);
+    }
+
+    // Covers ISO 32000-1 §8.9.7.
+    #[test]
+    fn inline_image_computed_length_beats_plausible_fake_ei() {
+        let src = b"BI /W 10 /H 1 /CS /G /BPC 8 ID A EI Q Q Q\nEI\nBT (AFTER) Tj ET\n";
+        let got = ops(src);
+        let Op::InlineImage(img) = &got[0] else {
+            panic!("expected inline image, got {:?}", got[0]);
+        };
+        assert_eq!(img.data, b"A EI Q Q Q");
+        assert_eq!(got.len(), 4);
+    }
+
+    // Covers ISO 32000-1 §8.9.7.
+    #[test]
+    fn inline_image_computed_length_handles_indexed_mask_and_rows() {
+        let src = b"BI /W 40 /H 2 /CS [/I /RGB 1 <000000FFFFFF>] /BPC 1 ID A EI Q Q Q\nEI\nQ";
+        let got = ops(src);
+        let Op::InlineImage(img) = &got[0] else {
+            panic!("expected inline image, got {:?}", got[0]);
+        };
+        assert_eq!(img.data, b"A EI Q Q Q");
+        let src = b"BI /W 40 /H 2 /IM true ID A EI Q Q Q\nEI\nQ";
+        let got = ops(src);
+        let Op::InlineImage(img) = &got[0] else {
+            panic!("expected inline image, got {:?}", got[0]);
+        };
+        assert_eq!(img.data, b"A EI Q Q Q");
+    }
+
+    // Covers ISO 32000-1 §8.9.7.
+    #[test]
+    fn inline_image_scan_skips_fake_ei_followed_by_open_string() {
+        let src =
+            b"BI /W 9 /H 1 /CS /G /BPC 8 /F /Fl ID AAAA EI (swallowed\nEI\nBT (AFTER) Tj ET\n";
+        let got = ops(src);
+        let Op::InlineImage(img) = &got[0] else {
+            panic!("expected inline image, got {:?}", got[0]);
+        };
+        assert_eq!(img.data, b"AAAA EI (swallowed");
+        assert_eq!(got.len(), 4);
+    }
+
+    // Covers ISO 32000-1 §8.9.7.
+    #[test]
+    fn inline_image_scan_skips_fake_ei_followed_by_binary() {
+        let src = b"BI /W 1 /H 1 /F /DCT ID \x01 EI \xff\xfe\x00 junk EI\nQ";
+        let got = ops(src);
+        let Op::InlineImage(img) = &got[0] else {
+            panic!("expected inline image, got {:?}", got[0]);
+        };
+        assert_eq!(img.data, b"\x01 EI \xff\xfe\x00 junk");
+        assert_eq!(got[1], Op::Restore);
     }
 
     #[test]

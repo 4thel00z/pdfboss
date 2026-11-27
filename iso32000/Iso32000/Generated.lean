@@ -251,59 +251,64 @@ def Generated.citations1 : List Citation := [
   ⟨some 1, some (.clause [14, 6, 1]), "crates/pdfboss-core/src/content.rs", 650, false⟩,
   ⟨some 1, some (.clause [8, 8, 1]), "crates/pdfboss-core/src/content.rs", 650, false⟩,
   ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 717, false⟩,
-  ⟨none, some (.clause [8, 9, 5, 4]), "crates/pdfboss-core/src/content.rs", 813, false⟩,
-  ⟨none, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 813, false⟩,
-  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 816, false⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 897, true⟩,
-  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 897, true⟩,
-  ⟨some 1, some (.clause [8, 2]), "crates/pdfboss-core/src/content.rs", 897, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 3, 2, 3]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 4, 3, 3]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 4, 3, 4]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 4, 3, 5]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 4, 4]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 6, 5, 8]), "crates/pdfboss-core/src/content.rs", 936, true⟩,
-  ⟨some 1, some (.clause [8, 4, 3, 6]), "crates/pdfboss-core/src/content.rs", 966, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 972, true⟩,
-  ⟨some 1, some (.clause [8, 5, 2, 1]), "crates/pdfboss-core/src/content.rs", 972, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 999, true⟩,
-  ⟨some 1, some (.clause [14, 6, 1]), "crates/pdfboss-core/src/content.rs", 999, true⟩,
-  ⟨some 1, some (.clause [14, 6, 2]), "crates/pdfboss-core/src/content.rs", 999, true⟩,
-  ⟨some 1, some (.clause [8, 2]), "crates/pdfboss-core/src/content.rs", 999, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1022, true⟩,
-  ⟨some 1, some (.annex 'I' []), "crates/pdfboss-core/src/content.rs", 1022, true⟩,
-  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1022, true⟩,
-  ⟨some 1, some (.clause [8, 2]), "crates/pdfboss-core/src/content.rs", 1022, true⟩,
-  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1033, true⟩,
+  ⟨none, some (.clause [8, 9, 5, 4]), "crates/pdfboss-core/src/content.rs", 935, false⟩,
+  ⟨none, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 935, false⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 938, false⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1019, true⟩,
+  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1019, true⟩,
+  ⟨some 1, some (.clause [8, 2]), "crates/pdfboss-core/src/content.rs", 1019, true⟩,
   ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
-  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
-  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
-  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1076, true⟩,
-  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1093, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1140, true⟩,
-  ⟨some 1, some (.clause [9, 3, 1]), "crates/pdfboss-core/src/content.rs", 1140, true⟩,
-  ⟨some 1, some (.clause [9, 3, 2]), "crates/pdfboss-core/src/content.rs", 1140, true⟩,
-  ⟨some 1, some (.clause [9, 3, 4]), "crates/pdfboss-core/src/content.rs", 1140, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1160, true⟩,
-  ⟨some 1, some (.clause [9, 3, 5]), "crates/pdfboss-core/src/content.rs", 1160, true⟩,
-  ⟨some 1, some (.clause [9, 4, 2]), "crates/pdfboss-core/src/content.rs", 1160, true⟩,
-  ⟨some 1, some (.clause [9, 4, 3]), "crates/pdfboss-core/src/content.rs", 1160, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1188, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1195, true⟩,
-  ⟨some 1, some (.clause [9, 6, 5]), "crates/pdfboss-core/src/content.rs", 1195, true⟩,
-  ⟨some 1, some (.clause [9, 4, 3]), "crates/pdfboss-core/src/content.rs", 1212, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1228, true⟩,
-  ⟨some 1, some (.clause [8, 6, 2]), "crates/pdfboss-core/src/content.rs", 1228, true⟩,
-  ⟨some 1, some (.clause [8, 6, 8]), "crates/pdfboss-core/src/content.rs", 1228, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1250, true⟩,
-  ⟨some 1, some (.clause [8, 6, 6, 2]), "crates/pdfboss-core/src/content.rs", 1250, true⟩,
-  ⟨some 1, some (.clause [8, 6, 8]), "crates/pdfboss-core/src/content.rs", 1250, true⟩,
-  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1265, true⟩,
-  ⟨some 1, some (.clause [8, 5, 3, 1]), "crates/pdfboss-core/src/content.rs", 1265, true⟩,
-  ⟨some 1, some (.clause [8, 5, 3, 3, 3]), "crates/pdfboss-core/src/content.rs", 1265, true⟩,
-  ⟨some 1, some (.annex 'C' [2]), "crates/pdfboss-core/src/content.rs", 1317, true⟩,
-  ⟨some 1, some (.clause [14, 6, 1]), "crates/pdfboss-core/src/content.rs", 1317, true⟩,
+  ⟨some 1, some (.clause [8, 3, 2, 3]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
+  ⟨some 1, some (.clause [8, 4, 3, 3]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
+  ⟨some 1, some (.clause [8, 4, 3, 4]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
+  ⟨some 1, some (.clause [8, 4, 3, 5]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
+  ⟨some 1, some (.clause [8, 4, 4]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
+  ⟨some 1, some (.clause [8, 6, 5, 8]), "crates/pdfboss-core/src/content.rs", 1058, true⟩,
+  ⟨some 1, some (.clause [8, 4, 3, 6]), "crates/pdfboss-core/src/content.rs", 1088, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1094, true⟩,
+  ⟨some 1, some (.clause [8, 5, 2, 1]), "crates/pdfboss-core/src/content.rs", 1094, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1121, true⟩,
+  ⟨some 1, some (.clause [14, 6, 1]), "crates/pdfboss-core/src/content.rs", 1121, true⟩,
+  ⟨some 1, some (.clause [14, 6, 2]), "crates/pdfboss-core/src/content.rs", 1121, true⟩,
+  ⟨some 1, some (.clause [8, 2]), "crates/pdfboss-core/src/content.rs", 1121, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1144, true⟩,
+  ⟨some 1, some (.annex 'I' []), "crates/pdfboss-core/src/content.rs", 1144, true⟩,
+  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1144, true⟩,
+  ⟨some 1, some (.clause [8, 2]), "crates/pdfboss-core/src/content.rs", 1144, true⟩,
+  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1155, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1180, true⟩,
+  ⟨some 1, some (.clause [7, 8, 2]), "crates/pdfboss-core/src/content.rs", 1180, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1180, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1198, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1215, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1252, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1264, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1276, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1293, true⟩,
+  ⟨some 1, some (.clause [8, 9, 7]), "crates/pdfboss-core/src/content.rs", 1306, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1328, true⟩,
+  ⟨some 1, some (.clause [9, 3, 1]), "crates/pdfboss-core/src/content.rs", 1328, true⟩,
+  ⟨some 1, some (.clause [9, 3, 2]), "crates/pdfboss-core/src/content.rs", 1328, true⟩,
+  ⟨some 1, some (.clause [9, 3, 4]), "crates/pdfboss-core/src/content.rs", 1328, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1348, true⟩,
+  ⟨some 1, some (.clause [9, 3, 5]), "crates/pdfboss-core/src/content.rs", 1348, true⟩,
+  ⟨some 1, some (.clause [9, 4, 2]), "crates/pdfboss-core/src/content.rs", 1348, true⟩,
+  ⟨some 1, some (.clause [9, 4, 3]), "crates/pdfboss-core/src/content.rs", 1348, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1376, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1383, true⟩,
+  ⟨some 1, some (.clause [9, 6, 5]), "crates/pdfboss-core/src/content.rs", 1383, true⟩,
+  ⟨some 1, some (.clause [9, 4, 3]), "crates/pdfboss-core/src/content.rs", 1400, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1416, true⟩,
+  ⟨some 1, some (.clause [8, 6, 2]), "crates/pdfboss-core/src/content.rs", 1416, true⟩,
+  ⟨some 1, some (.clause [8, 6, 8]), "crates/pdfboss-core/src/content.rs", 1416, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1438, true⟩,
+  ⟨some 1, some (.clause [8, 6, 6, 2]), "crates/pdfboss-core/src/content.rs", 1438, true⟩,
+  ⟨some 1, some (.clause [8, 6, 8]), "crates/pdfboss-core/src/content.rs", 1438, true⟩,
+  ⟨some 1, some (.annex 'A' [2]), "crates/pdfboss-core/src/content.rs", 1453, true⟩,
+  ⟨some 1, some (.clause [8, 5, 3, 1]), "crates/pdfboss-core/src/content.rs", 1453, true⟩,
+  ⟨some 1, some (.clause [8, 5, 3, 3, 3]), "crates/pdfboss-core/src/content.rs", 1453, true⟩,
+  ⟨some 1, some (.annex 'C' [2]), "crates/pdfboss-core/src/content.rs", 1505, true⟩,
+  ⟨some 1, some (.clause [14, 6, 1]), "crates/pdfboss-core/src/content.rs", 1505, true⟩,
   ⟨none, some (.clause [7, 6]), "crates/pdfboss-core/src/crypt.rs", 1, false⟩,
   ⟨none, some (.clause [7, 6, 3, 3]), "crates/pdfboss-core/src/crypt.rs", 26, false⟩,
   ⟨some 1, some (.clause [7, 6, 5]), "crates/pdfboss-core/src/crypt.rs", 36, false⟩,
@@ -405,15 +410,15 @@ def Generated.citations1 : List Citation := [
   ⟨some 1, some (.clause [7, 9, 4]), "crates/pdfboss-core/src/date.rs", 272, true⟩,
   ⟨some 1, some (.clause [7, 9, 4]), "crates/pdfboss-core/src/date.rs", 290, true⟩,
   ⟨some 1, some (.clause [7, 9, 4]), "crates/pdfboss-core/src/date.rs", 314, true⟩,
-  ⟨some 1, some (.clause [12, 3, 2]), "crates/pdfboss-core/src/destination.rs", 1, false⟩,
+  ⟨some 1, some (.clause [12, 3, 2]), "crates/pdfboss-core/src/destination.rs", 1, false⟩
+]
+
+def Generated.citations2 : List Citation := [
   ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 12, false⟩,
   ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 26, false⟩,
   ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 59, false⟩,
   ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 72, false⟩,
-  ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 115, false⟩
-]
-
-def Generated.citations2 : List Citation := [
+  ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 115, false⟩,
   ⟨some 1, some (.clause [12, 3, 2, 3]), "crates/pdfboss-core/src/destination.rs", 141, false⟩,
   ⟨some 1, some (.clause [12, 3, 2, 3]), "crates/pdfboss-core/src/destination.rs", 182, false⟩,
   ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-core/src/destination.rs", 214, false⟩,
@@ -608,15 +613,15 @@ def Generated.citations2 : List Citation := [
   ⟨some 1, some (.clause [7, 4, 4, 1]), "crates/pdfboss-core/src/filters/flate.rs", 31, false⟩,
   ⟨some 1, some (.annex 'C' [3]), "crates/pdfboss-core/src/filters/flate.rs", 64, false⟩,
   ⟨some 1, some (.clause [7, 4, 4]), "crates/pdfboss-core/src/filters/flate.rs", 121, true⟩,
-  ⟨some 1, some (.clause [7, 4, 4, 1]), "crates/pdfboss-core/src/filters/flate.rs", 123, true⟩,
+  ⟨some 1, some (.clause [7, 4, 4, 1]), "crates/pdfboss-core/src/filters/flate.rs", 123, true⟩
+]
+
+def Generated.citations3 : List Citation := [
   ⟨some 1, some (.clause [7, 4, 4, 1]), "crates/pdfboss-core/src/filters/flate.rs", 138, true⟩,
   ⟨some 1, some (.clause [7, 4, 4, 1]), "crates/pdfboss-core/src/filters/flate.rs", 150, true⟩,
   ⟨some 1, some (.clause [7, 4, 4, 1]), "crates/pdfboss-core/src/filters/flate.rs", 160, true⟩,
   ⟨some 1, some (.clause [7, 4, 4, 4]), "crates/pdfboss-core/src/filters/flate.rs", 180, true⟩,
-  ⟨some 1, some (.clause [7, 4, 7]), "crates/pdfboss-core/src/filters/jbig2/bitmap.rs", 315, false⟩
-]
-
-def Generated.citations3 : List Citation := [
+  ⟨some 1, some (.clause [7, 4, 7]), "crates/pdfboss-core/src/filters/jbig2/bitmap.rs", 315, false⟩,
   ⟨some 1, some (.clause [7, 4, 7]), "crates/pdfboss-core/src/filters/jbig2/bitmap.rs", 361, false⟩,
   ⟨some 1, some (.clause [7, 4, 6]), "crates/pdfboss-core/src/filters/jbig2/generic.rs", 485, false⟩,
   ⟨some 1, some (.clause [7, 4, 6]), "crates/pdfboss-core/src/filters/jbig2/generic.rs", 1389, true⟩,
@@ -811,15 +816,15 @@ def Generated.citations3 : List Citation := [
   ⟨some 1, some (.annex 'C' [2]), "crates/pdfboss-core/src/lexer.rs", 804, true⟩,
   ⟨some 1, some (.clause [7, 3, 3]), "crates/pdfboss-core/src/lexer.rs", 804, true⟩,
   ⟨some 1, some (.clause [7, 3, 3]), "crates/pdfboss-core/src/lexer.rs", 887, true⟩,
-  ⟨some 1, some (.clause [7, 2, 2]), "crates/pdfboss-core/src/lexer.rs", 904, true⟩,
+  ⟨some 1, some (.clause [7, 2, 2]), "crates/pdfboss-core/src/lexer.rs", 904, true⟩
+]
+
+def Generated.citations4 : List Citation := [
   ⟨some 1, some (.clause [7, 3, 5]), "crates/pdfboss-core/src/lexer.rs", 934, true⟩,
   ⟨some 1, some (.clause [7, 3, 4]), "crates/pdfboss-core/src/lexer.rs", 964, true⟩,
   ⟨some 1, some (.clause [7, 9, 2, 4]), "crates/pdfboss-core/src/lexer.rs", 964, true⟩,
   ⟨some 1, some (.clause [7, 3, 4, 2]), "crates/pdfboss-core/src/lexer.rs", 976, true⟩,
-  ⟨some 1, some (.clause [7, 3, 4, 2]), "crates/pdfboss-core/src/lexer.rs", 987, true⟩
-]
-
-def Generated.citations4 : List Citation := [
+  ⟨some 1, some (.clause [7, 3, 4, 2]), "crates/pdfboss-core/src/lexer.rs", 987, true⟩,
   ⟨some 1, some (.clause [7, 3, 4, 2]), "crates/pdfboss-core/src/lexer.rs", 1002, true⟩,
   ⟨some 1, some (.clause [7, 3, 4, 2]), "crates/pdfboss-core/src/lexer.rs", 1010, true⟩,
   ⟨some 1, some (.clause [7, 3, 4, 3]), "crates/pdfboss-core/src/lexer.rs", 1044, true⟩,
@@ -1014,15 +1019,15 @@ def Generated.citations4 : List Citation := [
   ⟨some 1, some (.clause [14, 5]), "crates/pdfboss-core/src/piece_info.rs", 30, false⟩,
   ⟨some 1, some (.clause [14, 5]), "crates/pdfboss-core/src/piece_info.rs", 43, false⟩,
   ⟨some 1, some (.clause [14, 5]), "crates/pdfboss-core/src/piece_info.rs", 67, false⟩,
-  ⟨some 1, some (.clause [7, 7, 2]), "crates/pdfboss-core/src/piece_info.rs", 67, false⟩,
+  ⟨some 1, some (.clause [7, 7, 2]), "crates/pdfboss-core/src/piece_info.rs", 67, false⟩
+]
+
+def Generated.citations5 : List Citation := [
   ⟨some 1, some (.clause [14, 5]), "crates/pdfboss-core/src/piece_info.rs", 70, false⟩,
   ⟨some 1, some (.clause [14, 5]), "crates/pdfboss-core/src/piece_info.rs", 115, true⟩,
   ⟨some 1, some (.clause [14, 5]), "crates/pdfboss-core/src/piece_info.rs", 149, true⟩,
   ⟨some 1, some (.clause [12, 4, 4]), "crates/pdfboss-core/src/presentation.rs", 1, false⟩,
-  ⟨some 1, some (.clause [12, 4, 4, 1]), "crates/pdfboss-core/src/presentation.rs", 9, false⟩
-]
-
-def Generated.citations5 : List Citation := [
+  ⟨some 1, some (.clause [12, 4, 4, 1]), "crates/pdfboss-core/src/presentation.rs", 9, false⟩,
   ⟨some 1, some (.clause [12, 4, 4, 1]), "crates/pdfboss-core/src/presentation.rs", 120, false⟩,
   ⟨some 1, some (.clause [12, 4, 4]), "crates/pdfboss-core/src/presentation.rs", 120, false⟩,
   ⟨some 1, some (.clause [12, 4, 4]), "crates/pdfboss-core/src/presentation.rs", 154, false⟩,
@@ -1217,15 +1222,15 @@ def Generated.citations5 : List Citation := [
   ⟨some 1, some (.clause [7, 4, 5]), "crates/pdfboss-core/tests/iso32000_vectors.rs", 2, true⟩,
   ⟨some 1, some (.clause [7, 4, 2]), "crates/pdfboss-core/tests/iso32000_vectors.rs", 81, true⟩,
   ⟨some 1, some (.clause [7, 4, 3]), "crates/pdfboss-core/tests/iso32000_vectors.rs", 87, true⟩,
-  ⟨some 1, some (.clause [7, 4, 5]), "crates/pdfboss-core/tests/iso32000_vectors.rs", 93, true⟩,
+  ⟨some 1, some (.clause [7, 4, 5]), "crates/pdfboss-core/tests/iso32000_vectors.rs", 93, true⟩
+]
+
+def Generated.citations6 : List Citation := [
   ⟨some 1, some (.annex 'D' []), "crates/pdfboss-encoding/src/afm.rs", 2, false⟩,
   ⟨some 1, some (.clause [9, 2, 4]), "crates/pdfboss-encoding/src/afm.rs", 4, false⟩,
   ⟨some 1, some (.clause [9, 6, 4]), "crates/pdfboss-encoding/src/afm.rs", 11, false⟩,
   ⟨some 1, some (.clause [9, 6, 4]), "crates/pdfboss-encoding/src/afm.rs", 14, false⟩,
-  ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-encoding/src/afm.rs", 135, false⟩
-]
-
-def Generated.citations6 : List Citation := [
+  ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-encoding/src/afm.rs", 135, false⟩,
   ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-encoding/src/afm.rs", 159, false⟩,
   ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-encoding/src/afm.rs", 1572, true⟩,
   ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-encoding/src/afm.rs", 1594, true⟩,
@@ -1420,15 +1425,15 @@ def Generated.citations6 : List Citation := [
   ⟨some 1, some (.clause [8, 6, 5, 5]), "crates/pdfboss-render/src/color.rs", 1109, true⟩,
   ⟨some 1, some (.clause [10, 2]), "crates/pdfboss-render/src/color.rs", 1119, true⟩,
   ⟨some 1, some (.clause [8, 6, 5, 5]), "crates/pdfboss-render/src/color.rs", 1119, true⟩,
-  ⟨some 1, some (.clause [8, 6, 5, 5]), "crates/pdfboss-render/src/color.rs", 1137, true⟩,
+  ⟨some 1, some (.clause [8, 6, 5, 5]), "crates/pdfboss-render/src/color.rs", 1137, true⟩
+]
+
+def Generated.citations7 : List Citation := [
   ⟨some 1, some (.clause [10, 2]), "crates/pdfboss-render/src/color.rs", 1148, true⟩,
   ⟨some 1, some (.clause [8, 6, 5, 2]), "crates/pdfboss-render/src/color.rs", 1148, true⟩,
   ⟨some 1, some (.clause [8, 6, 5, 3]), "crates/pdfboss-render/src/color.rs", 1148, true⟩,
   ⟨some 1, some (.clause [8, 6, 5, 4]), "crates/pdfboss-render/src/color.rs", 1148, true⟩,
-  ⟨some 1, some (.clause [8, 6, 5, 7]), "crates/pdfboss-render/src/color.rs", 1148, true⟩
-]
-
-def Generated.citations7 : List Citation := [
+  ⟨some 1, some (.clause [8, 6, 5, 7]), "crates/pdfboss-render/src/color.rs", 1148, true⟩,
   ⟨some 1, some (.clause [8, 6, 5, 4]), "crates/pdfboss-render/src/color.rs", 1186, true⟩,
   ⟨some 1, some (.clause [8, 6, 6, 3]), "crates/pdfboss-render/src/color.rs", 1204, true⟩,
   ⟨some 1, some (.clause [8, 4, 2]), "crates/pdfboss-render/src/executor.rs", 40, false⟩,
@@ -1623,15 +1628,15 @@ def Generated.citations7 : List Citation := [
   ⟨some 1, some (.clause [12, 5, 3]), "crates/pdfboss-render/src/executor.rs", 4470, true⟩,
   ⟨some 1, some (.clause [12, 5, 6, 12]), "crates/pdfboss-render/src/executor.rs", 4470, true⟩,
   ⟨some 1, some (.clause [8, 11, 3, 3]), "crates/pdfboss-render/src/executor.rs", 4470, true⟩,
-  ⟨some 1, some (.clause [8, 11, 2, 3]), "crates/pdfboss-render/src/executor.rs", 4520, true⟩,
+  ⟨some 1, some (.clause [8, 11, 2, 3]), "crates/pdfboss-render/src/executor.rs", 4520, true⟩
+]
+
+def Generated.citations8 : List Citation := [
   ⟨some 1, some (.clause [8, 11, 4, 4]), "crates/pdfboss-render/src/executor.rs", 4520, true⟩,
   ⟨some 1, some (.clause [8, 11, 4, 5]), "crates/pdfboss-render/src/executor.rs", 4520, true⟩,
   ⟨some 1, some (.clause [8, 11, 3, 2]), "crates/pdfboss-render/src/executor.rs", 4572, true⟩,
   ⟨some 1, some (.clause [8, 3, 2, 2]), "crates/pdfboss-render/src/executor.rs", 4587, true⟩,
-  ⟨some 1, some (.clause [8, 5, 3, 3, 1]), "crates/pdfboss-render/src/executor.rs", 4587, true⟩
-]
-
-def Generated.citations8 : List Citation := [
+  ⟨some 1, some (.clause [8, 5, 3, 3, 1]), "crates/pdfboss-render/src/executor.rs", 4587, true⟩,
   ⟨some 1, some (.clause [8, 5, 4]), "crates/pdfboss-render/src/executor.rs", 4608, true⟩,
   ⟨some 1, some (.clause [8, 3, 2, 3]), "crates/pdfboss-render/src/executor.rs", 4620, true⟩,
   ⟨some 1, some (.clause [8, 3, 2, 5]), "crates/pdfboss-render/src/executor.rs", 4620, true⟩,
@@ -1826,15 +1831,15 @@ def Generated.citations8 : List Citation := [
   ⟨some 1, some (.clause [12, 5, 6, 10]), "crates/pdfboss-render/src/executor.rs", 7693, true⟩,
   ⟨some 1, some (.clause [12, 5, 6, 2]), "crates/pdfboss-render/src/executor.rs", 7744, true⟩,
   ⟨some 1, some (.clause [12, 5, 3]), "crates/pdfboss-render/src/executor.rs", 7776, true⟩,
-  ⟨some 1, some (.clause [12, 5, 3]), "crates/pdfboss-render/src/executor.rs", 7810, true⟩,
+  ⟨some 1, some (.clause [12, 5, 3]), "crates/pdfboss-render/src/executor.rs", 7810, true⟩
+]
+
+def Generated.citations9 : List Citation := [
   ⟨some 1, some (.clause [12, 5, 4]), "crates/pdfboss-render/src/executor.rs", 7851, true⟩,
   ⟨some 1, some (.clause [12, 5, 6, 5]), "crates/pdfboss-render/src/executor.rs", 7851, true⟩,
   ⟨some 1, some (.clause [12, 5, 5]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩,
   ⟨some 1, some (.clause [12, 5, 6, 19]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩,
-  ⟨some 1, some (.clause [12, 5, 6]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩
-]
-
-def Generated.citations9 : List Citation := [
+  ⟨some 1, some (.clause [12, 5, 6]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩,
   ⟨some 1, some (.clause [12, 7, 4, 2, 3]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩,
   ⟨some 1, some (.clause [12, 7, 4, 2, 4]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩,
   ⟨some 1, some (.clause [12, 7, 4, 2]), "crates/pdfboss-render/src/executor.rs", 7899, true⟩,
@@ -2029,15 +2034,15 @@ def Generated.citations9 : List Citation := [
   ⟨some 1, some (.clause [10, 6, 2]), "crates/pdfboss-render/src/path.rs", 185, false⟩,
   ⟨some 1, some (.clause [8, 5, 2, 1]), "crates/pdfboss-render/src/path.rs", 228, true⟩,
   ⟨some 1, some (.clause [8, 5, 2, 2]), "crates/pdfboss-render/src/path.rs", 257, true⟩,
-  ⟨some 1, some (.clause [10, 6, 2]), "crates/pdfboss-render/src/path.rs", 288, true⟩,
+  ⟨some 1, some (.clause [10, 6, 2]), "crates/pdfboss-render/src/path.rs", 288, true⟩
+]
+
+def Generated.citations10 : List Citation := [
   ⟨some 1, some (.clause [8, 5, 2, 2]), "crates/pdfboss-render/src/path.rs", 288, true⟩,
   ⟨some 1, some (.clause [10, 6, 2]), "crates/pdfboss-render/src/path.rs", 314, true⟩,
   ⟨some 1, some (.clause [8, 5, 2, 2]), "crates/pdfboss-render/src/path.rs", 314, true⟩,
   ⟨some 1, some (.clause [8, 5, 2, 1]), "crates/pdfboss-render/src/path.rs", 325, true⟩,
-  ⟨some 1, some (.clause [8, 5, 3, 2]), "crates/pdfboss-render/src/path.rs", 340, true⟩
-]
-
-def Generated.citations10 : List Citation := [
+  ⟨some 1, some (.clause [8, 5, 3, 2]), "crates/pdfboss-render/src/path.rs", 340, true⟩,
   ⟨some 1, some (.clause [8, 5, 2, 2]), "crates/pdfboss-render/src/path.rs", 359, true⟩,
   ⟨some 1, some (.clause [8, 5, 2, 1]), "crates/pdfboss-render/src/path.rs", 370, true⟩,
   ⟨some 1, some (.clause [8, 5, 3, 3, 2]), "crates/pdfboss-render/src/raster.rs", 10, false⟩,
@@ -2232,15 +2237,15 @@ def Generated.citations10 : List Citation := [
   ⟨none, some (.clause [9, 9]), "crates/pdfboss-render/src/type1.rs", 2, false⟩,
   ⟨none, some (.clause [9, 6, 6, 2]), "crates/pdfboss-render/src/type1.rs", 16, false⟩,
   ⟨none, some (.clause [7, 2, 2]), "crates/pdfboss-render/src/type1.rs", 65, false⟩,
-  ⟨none, some (.clause [9, 9]), "crates/pdfboss-render/src/type1.rs", 190, false⟩,
+  ⟨none, some (.clause [9, 9]), "crates/pdfboss-render/src/type1.rs", 190, false⟩
+]
+
+def Generated.citations11 : List Citation := [
   ⟨some 1, some (.clause [9, 9]), "crates/pdfboss-render/src/type1.rs", 261, false⟩,
   ⟨some 1, some (.clause [9, 9]), "crates/pdfboss-render/src/type1.rs", 1266, true⟩,
   ⟨some 1, some (.clause [9, 9]), "crates/pdfboss-render/src/type1.rs", 1320, true⟩,
   ⟨some 1, some (.clause [9, 6, 5]), "crates/pdfboss-render/src/type3.rs", 1, false⟩,
-  ⟨some 1, some (.clause [9, 6, 5]), "crates/pdfboss-render/src/type3.rs", 64, false⟩
-]
-
-def Generated.citations11 : List Citation := [
+  ⟨some 1, some (.clause [9, 6, 5]), "crates/pdfboss-render/src/type3.rs", 64, false⟩,
   ⟨some 1, some (.clause [9, 6, 5]), "crates/pdfboss-render/src/type3.rs", 160, false⟩,
   ⟨some 1, some (.clause [9, 6, 6, 3]), "crates/pdfboss-render/src/type3.rs", 164, false⟩,
   ⟨some 1, some (.clause [9, 6, 6, 3]), "crates/pdfboss-render/src/type3.rs", 186, false⟩,
@@ -2435,15 +2440,15 @@ def Generated.citations11 : List Citation := [
   ⟨some 1, some (.clause [9, 6, 6, 1]), "crates/pdfboss-text/src/font.rs", 1716, true⟩,
   ⟨some 1, some (.clause [9, 6, 2, 1]), "crates/pdfboss-text/src/font.rs", 1735, true⟩,
   ⟨some 1, some (.clause [9, 8, 1]), "crates/pdfboss-text/src/font.rs", 1735, true⟩,
-  ⟨some 1, some (.clause [14, 8, 2, 4, 2]), "crates/pdfboss-text/src/font.rs", 1747, true⟩,
+  ⟨some 1, some (.clause [14, 8, 2, 4, 2]), "crates/pdfboss-text/src/font.rs", 1747, true⟩
+]
+
+def Generated.citations12 : List Citation := [
   ⟨some 1, some (.clause [14, 8, 2, 4]), "crates/pdfboss-text/src/font.rs", 1747, true⟩,
   ⟨some 1, some (.clause [9, 10, 2]), "crates/pdfboss-text/src/font.rs", 1747, true⟩,
   ⟨some 1, some (.clause [9, 5]), "crates/pdfboss-text/src/font.rs", 1760, true⟩,
   ⟨some 1, some (.clause [9, 7, 2]), "crates/pdfboss-text/src/font.rs", 1760, true⟩,
-  ⟨some 1, some (.clause [9, 7, 4, 1]), "crates/pdfboss-text/src/font.rs", 1760, true⟩
-]
-
-def Generated.citations12 : List Citation := [
+  ⟨some 1, some (.clause [9, 7, 4, 1]), "crates/pdfboss-text/src/font.rs", 1760, true⟩,
   ⟨some 1, some (.clause [9, 7, 4, 3]), "crates/pdfboss-text/src/font.rs", 1760, true⟩,
   ⟨some 1, some (.clause [9, 7, 6, 1]), "crates/pdfboss-text/src/font.rs", 1760, true⟩,
   ⟨some 1, some (.clause [9, 10, 2]), "crates/pdfboss-text/src/font.rs", 1792, true⟩,
@@ -2638,15 +2643,15 @@ def Generated.citations12 : List Citation := [
   ⟨some 1, some (.clause [12, 4, 2]), "crates/pdfboss-write/tests/roundtrip.rs", 1310, true⟩,
   ⟨some 1, some (.clause [12, 4, 2]), "crates/pdfboss-write/tests/roundtrip.rs", 1330, true⟩,
   ⟨some 1, some (.clause [12, 3, 2, 2]), "crates/pdfboss-write/tests/roundtrip.rs", 1346, true⟩,
-  ⟨some 1, some (.clause [12, 3, 2]), "crates/pdfboss-write/tests/roundtrip.rs", 1346, true⟩,
+  ⟨some 1, some (.clause [12, 3, 2]), "crates/pdfboss-write/tests/roundtrip.rs", 1346, true⟩
+]
+
+def Generated.citations13 : List Citation := [
   ⟨some 1, some (.clause [12, 6, 3]), "crates/pdfboss-write/tests/roundtrip.rs", 1346, true⟩,
   ⟨some 1, some (.clause [12, 6, 3]), "crates/pdfboss-write/tests/roundtrip.rs", 1384, true⟩,
   ⟨some 1, some (.clause [12, 6, 3]), "crates/pdfboss-write/tests/roundtrip.rs", 1400, true⟩,
   ⟨some 1, some (.clause [9, 6, 2, 2]), "crates/pdfboss-write/tests/standard14_metrics.rs", 36, true⟩,
-  ⟨some 1, some (.clause [14, 4]), "crates/pdfboss-write/tests/update_append.rs", 422, true⟩
-]
-
-def Generated.citations13 : List Citation := [
+  ⟨some 1, some (.clause [14, 4]), "crates/pdfboss-write/tests/update_append.rs", 422, true⟩,
   ⟨some 1, some (.clause [14, 3, 3]), "crates/pdfboss-write/tests/update_append.rs", 744, true⟩,
   ⟨some 1, some (.clause [14, 3, 2]), "crates/pdfboss-write/tests/update_append.rs", 793, true⟩,
   ⟨some 1, some (.clause [14, 7, 4, 3]), "tests/test_content_items.py", 3, true⟩,
