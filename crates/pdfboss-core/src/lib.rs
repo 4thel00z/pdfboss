@@ -54,7 +54,8 @@ pub use annotation::{
 pub use article::{articles_with, page_beads_with, ArticleThread, Bead};
 pub use cmap::{cid_to_unicode, type0_encoding, CidCmap, CidToUnicode, Type0Encoding};
 pub use crypt::{
-    crypt_filter_refs, direct_crypt_filters, Decryptor, Encryptor, Permissions, PERMISSION_NAMES,
+    crypt_filter_refs, direct_crypt_filters, pending_filter_refs, Decryptor, Encryptor,
+    Permissions, PERMISSION_NAMES,
 };
 pub use date::Date;
 pub use destination::{

@@ -331,7 +331,7 @@ impl Document {
         // stream data; decrypt with this object's key. (Objects living in
         // object streams are decrypted with their container.)
         if let Some(dec) = &self.decryptor {
-            dec.decrypt_object(&mut object, r.num, r.gen);
+            dec.decrypt_object_with(&mut object, r.num, r.gen, &|target| self.get(target).ok());
         }
         Ok((r, object, Span::new(offset as u64, parser.pos() as u64)))
     }

@@ -387,6 +387,10 @@ pub struct OverlayBase {
     /// The next free object number: the base's declared `/Size`, raised to
     /// one past its highest addressed object number.
     pub size: u32,
+    /// Offset of the cross-reference stream the base's newest section names
+    /// as its `/XRefStm`, when the base is a hybrid-reference file; the
+    /// appended trailer repeats it.
+    pub xrefstm: Option<u64>,
     /// The base's catalog.
     pub root: ObjRef,
     /// The base's document information dictionary, when present.
@@ -425,12 +429,18 @@ impl OverlayBase {
                 (offset as u64, kind)
             }
         };
+        let xrefstm = usize::try_from(prev)
+            .ok()
+            .and_then(|offset| parse_section_at(doc.bytes(), offset).ok())
+            .and_then(|section| section.xrefstm)
+            .and_then(|offset| u64::try_from(offset).ok());
         let highest = doc.xref().iter().map(|(num, _)| num).max().unwrap_or(0);
         let declared = trailer.get_int("Size").unwrap_or(0).max(0) as u32;
         Ok(OverlayBase {
             prev,
             kind,
             size: declared.max(highest + 1),
+            xrefstm,
             root,
             info: trailer.get_ref("Info"),
             id: trailer.get("ID").cloned(),
@@ -600,6 +610,9 @@ impl Overlay {
             trailer.insert(name("ID"), id);
         }
         trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
+        if let (XrefStyle::Table, Some(xrefstm)) = (self.base.kind, self.base.xrefstm) {
+            trailer.insert(name("XRefStm"), Object::Int(xrefstm as i64));
+        }
         match self.base.kind {
             XrefStyle::Stream => finish_stream(&mut out, start, rows, trailer, self.next)?,
             XrefStyle::Table => finish_table(&mut out, start, &rows, trailer, self.next)?,

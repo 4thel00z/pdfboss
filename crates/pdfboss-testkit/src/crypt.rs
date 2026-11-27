@@ -254,3 +254,43 @@ pub fn encrypted_rc4_doc_with_indirect_cf(text: &str) -> Vec<u8> {
     let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
     b.trailer_extra(&trailer).build(1)
 }
+
+/// An RC4 document whose content stream is stored in the clear because its
+/// `/Filter` is an indirect reference to `/Crypt` with the `Identity`
+/// crypt filter in `/DecodeParms`.
+pub fn encrypted_rc4_doc_with_indirect_identity_filter(text: &str) -> Vec<u8> {
+    let o = owner_entry();
+    let key = file_key(&o);
+    let u = user_entry(&key);
+    let content = crate::show_text_content(text);
+
+    let mut b = PdfBuilder::new().version(1, 5);
+    b.object(1, "<< /Type /Catalog /Pages 2 0 R >>");
+    b.object(2, "<< /Type /Pages /Kids [4 0 R] /Count 1 >>");
+    b.object(
+        3,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    );
+    b.object(
+        4,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>",
+    );
+    b.stream(
+        5,
+        "/Filter 7 0 R /DecodeParms << /Name /Identity >>",
+        content.as_bytes(),
+    );
+    b.object(7, "/Crypt");
+    b.object(
+        9,
+        &format!(
+            "<< /Filter /Standard /V 4 /R 4 /Length 128 /P {P} /O {} /U {} \
+             /CF << /StdCF << /CFM /V2 /Length 16 >> >> /StmF /StdCF /StrF /StdCF >>",
+            hexstr(&o),
+            hexstr(&u)
+        ),
+    );
+    let trailer = format!("/Encrypt 9 0 R /ID [{}{}]", hexstr(ID0), hexstr(ID0));
+    b.trailer_extra(&trailer).build(1)
+}

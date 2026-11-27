@@ -1018,3 +1018,25 @@ fn rotate_pages_accepts_a_negative_multiple_of_90() {
     let page = reread.page(0).unwrap();
     assert_eq!(page.rotate, 270);
 }
+
+/// ISO 32000-1 §7.5.8.4: a reader finds the objects a hybrid file hides in
+/// its cross-reference stream only through `/XRefStm` on the trailer it is
+/// handed, so an appended section over a hybrid base names the same stream.
+#[test]
+fn hybrid_base_append_carries_xrefstm_in_the_new_trailer() {
+    let bytes = pdfboss_testkit::hybrid_doc();
+    let base_stm = parse_section_at(&bytes, startxref(&bytes).unwrap())
+        .unwrap()
+        .xrefstm;
+    assert!(base_stm.is_some(), "the fixture is a hybrid file");
+    let doc = Document::load(bytes).unwrap();
+
+    let mut update = Update::new(&doc).unwrap();
+    let mut dict = Dict::new();
+    dict.insert(Name("Marker".into()), Object::Int(3));
+    update.set(ObjRef { num: 5, gen: 0 }, Object::Dict(dict));
+    let out = update.bytes().unwrap();
+
+    let appended = parse_section_at(&out, startxref(&out).unwrap()).unwrap();
+    assert_eq!(appended.xrefstm, base_stm);
+}

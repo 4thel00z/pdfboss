@@ -1110,6 +1110,30 @@ impl AsyncDocument {
         })
     }
 
+    /// The objects `object`'s stream dictionary needs resolved to pick its
+    /// crypt filter: its indirect `/Filter` and `/DecodeParms` values,
+    /// fetched until nothing is pending or one cannot be fetched.
+    async fn filter_objects(
+        &self,
+        object: &Object,
+        chain: &mut Vec<u32>,
+    ) -> pdfboss_core::FastMap<ObjRef, Object> {
+        let mut known = pdfboss_core::FastMap::default();
+        for _ in 0..4 {
+            let pending = pdfboss_core::pending_filter_refs(object, &known);
+            if pending.is_empty() {
+                break;
+            }
+            for r in pending {
+                let Ok(fetched) = self.fetch_object_cached(r, chain).await else {
+                    return known;
+                };
+                known.insert(r, fetched);
+            }
+        }
+        known
+    }
+
     fn cached_objects(&self) -> std::sync::MutexGuard<'_, HashMap<(u32, u16), Arc<Object>>> {
         self.inner
             .objects
@@ -1185,7 +1209,13 @@ impl AsyncDocument {
                             // object streams are decrypted with their
                             // container, which passes through here.)
                             if let Some(dec) = self.inner.decryptor.get() {
-                                dec.decrypt_object(&mut object, parsed_ref.num, parsed_ref.gen);
+                                let known = self.filter_objects(&object, chain).await;
+                                dec.decrypt_object_with(
+                                    &mut object,
+                                    parsed_ref.num,
+                                    parsed_ref.gen,
+                                    &|target| known.get(&target).cloned(),
+                                );
                             }
                             return Ok((
                                 Span {
