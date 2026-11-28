@@ -124,16 +124,20 @@ fn lookup(table: &[(&str, u16)], glyph_name: &str) -> Option<f32> {
 /// The advance width (1000-unit glyph space) of `glyph_name` in the
 /// standard-14 font whose PDF `/BaseFont` (or a recognized alias, or a
 /// subsetted variant) is `base_font`, or `None` if `base_font` isn't one
-/// of the standard 14 (including Symbol/ZapfDingbats, which this module
-/// doesn't tabulate) or `glyph_name` is unknown to that font. Courier's
-/// four variants are monospaced (every glyph is 600 units wide per the
-/// Adobe Core-14 AFM metrics) and so always return `Some(600.0)`.
+/// of the standard 14 or `glyph_name` is unknown to that font. Symbol and
+/// ZapfDingbats match only by their exact names, with no aliases, and take
+/// the glyph names of their built-in encodings (Annex D.5 and D.6).
+/// Courier's four variants are monospaced (every glyph is 600 units wide
+/// per the Adobe Core-14 AFM metrics) and so always return `Some(600.0)`.
 /// Oblique variants share their upright counterpart's widths (Helvetica
 /// and Helvetica-Oblique are metrically identical, likewise the bold
 /// pair), so only upright/bold tables are stored.
 ///
 /// Covers ISO 32000-1 §9.6.2.2.
 pub fn standard_14_width(base_font: &str, glyph_name: &str) -> Option<f32> {
+    if let Some(table) = symbolic_table(base_font) {
+        return lookup(table, glyph_name);
+    }
     let (family, bold, italic) = classify(base_font)?;
     match family {
         Family::Courier => Some(600.0),
@@ -153,8 +157,20 @@ pub fn standard_14_width(base_font: &str, glyph_name: &str) -> Option<f32> {
     }
 }
 
+/// The width table of Symbol or ZapfDingbats when `base_font`, after
+/// subset-prefix stripping, is exactly that name.
+fn symbolic_table(base_font: &str) -> Option<&'static [(&'static str, u16)]> {
+    match strip_subset_prefix(base_font) {
+        "Symbol" => Some(SYMBOL),
+        "ZapfDingbats" => Some(ZAPF_DINGBATS),
+        _ => None,
+    }
+}
+
 /// Whether `base_font` (after subset-prefix stripping and alias
-/// normalization) names one of the standard 14 fonts.
+/// normalization) names one of the twelve standard-14 text faces. Symbol
+/// and ZapfDingbats are symbolic fonts with their own built-in encodings
+/// and are not included.
 ///
 /// Covers ISO 32000-1 §9.6.2.2.
 pub fn is_standard_14(base_font: &str) -> bool {
@@ -1565,6 +1581,410 @@ const TIMES_BOLD_ITALIC: &[(&str, u16)] = &[
     ("zero", 500),
 ];
 
+/// `Symbol` glyph widths, sorted by
+/// glyph name for binary search (Adobe Core-14 AFM metrics).
+#[rustfmt::skip]
+const SYMBOL: &[(&str, u16)] = &[
+    ("Alpha", 722),
+    ("Beta", 667),
+    ("Chi", 722),
+    ("Delta", 612),
+    ("Epsilon", 611),
+    ("Eta", 722),
+    ("Euro", 750),
+    ("Gamma", 603),
+    ("Ifraktur", 686),
+    ("Iota", 333),
+    ("Kappa", 722),
+    ("Lambda", 686),
+    ("Mu", 889),
+    ("Nu", 722),
+    ("Omega", 768),
+    ("Omicron", 722),
+    ("Phi", 763),
+    ("Pi", 768),
+    ("Psi", 795),
+    ("Rfraktur", 795),
+    ("Rho", 556),
+    ("Sigma", 592),
+    ("Tau", 611),
+    ("Theta", 741),
+    ("Upsilon", 690),
+    ("Upsilon1", 620),
+    ("Xi", 645),
+    ("Zeta", 611),
+    ("aleph", 823),
+    ("alpha", 631),
+    ("ampersand", 778),
+    ("angle", 768),
+    ("angleleft", 329),
+    ("angleright", 329),
+    ("apple", 790),
+    ("approxequal", 549),
+    ("arrowboth", 1042),
+    ("arrowdblboth", 1042),
+    ("arrowdbldown", 603),
+    ("arrowdblleft", 987),
+    ("arrowdblright", 987),
+    ("arrowdblup", 603),
+    ("arrowdown", 603),
+    ("arrowhorizex", 1000),
+    ("arrowleft", 987),
+    ("arrowright", 987),
+    ("arrowup", 603),
+    ("arrowvertex", 603),
+    ("asteriskmath", 500),
+    ("bar", 200),
+    ("beta", 549),
+    ("braceex", 494),
+    ("braceleft", 480),
+    ("braceleftbt", 494),
+    ("braceleftmid", 494),
+    ("bracelefttp", 494),
+    ("braceright", 480),
+    ("bracerightbt", 494),
+    ("bracerightmid", 494),
+    ("bracerighttp", 494),
+    ("bracketleft", 333),
+    ("bracketleftbt", 384),
+    ("bracketleftex", 384),
+    ("bracketlefttp", 384),
+    ("bracketright", 333),
+    ("bracketrightbt", 384),
+    ("bracketrightex", 384),
+    ("bracketrighttp", 384),
+    ("bullet", 460),
+    ("carriagereturn", 658),
+    ("chi", 549),
+    ("circlemultiply", 768),
+    ("circleplus", 768),
+    ("club", 753),
+    ("colon", 278),
+    ("comma", 250),
+    ("congruent", 549),
+    ("copyrightsans", 790),
+    ("copyrightserif", 790),
+    ("degree", 400),
+    ("delta", 494),
+    ("diamond", 753),
+    ("divide", 549),
+    ("dotmath", 250),
+    ("eight", 500),
+    ("element", 713),
+    ("ellipsis", 1000),
+    ("emptyset", 823),
+    ("epsilon", 439),
+    ("equal", 549),
+    ("equivalence", 549),
+    ("eta", 603),
+    ("exclam", 333),
+    ("existential", 549),
+    ("five", 500),
+    ("florin", 500),
+    ("four", 500),
+    ("fraction", 167),
+    ("gamma", 411),
+    ("gradient", 713),
+    ("greater", 549),
+    ("greaterequal", 549),
+    ("heart", 753),
+    ("infinity", 713),
+    ("integral", 274),
+    ("integralbt", 686),
+    ("integralex", 686),
+    ("integraltp", 686),
+    ("intersection", 768),
+    ("iota", 329),
+    ("kappa", 549),
+    ("lambda", 549),
+    ("less", 549),
+    ("lessequal", 549),
+    ("logicaland", 603),
+    ("logicalnot", 713),
+    ("logicalor", 603),
+    ("lozenge", 494),
+    ("minus", 549),
+    ("minute", 247),
+    ("mu", 576),
+    ("multiply", 549),
+    ("nine", 500),
+    ("notelement", 713),
+    ("notequal", 549),
+    ("notsubset", 713),
+    ("nu", 521),
+    ("numbersign", 500),
+    ("omega", 686),
+    ("omega1", 713),
+    ("omicron", 549),
+    ("one", 500),
+    ("parenleft", 333),
+    ("parenleftbt", 384),
+    ("parenleftex", 384),
+    ("parenlefttp", 384),
+    ("parenright", 333),
+    ("parenrightbt", 384),
+    ("parenrightex", 384),
+    ("parenrighttp", 384),
+    ("partialdiff", 494),
+    ("percent", 833),
+    ("period", 250),
+    ("perpendicular", 658),
+    ("phi", 521),
+    ("phi1", 603),
+    ("pi", 549),
+    ("plus", 549),
+    ("plusminus", 549),
+    ("product", 823),
+    ("propersubset", 713),
+    ("propersuperset", 713),
+    ("proportional", 713),
+    ("psi", 686),
+    ("question", 444),
+    ("radical", 549),
+    ("radicalex", 500),
+    ("reflexsubset", 713),
+    ("reflexsuperset", 713),
+    ("registersans", 790),
+    ("registerserif", 790),
+    ("rho", 549),
+    ("second", 411),
+    ("semicolon", 278),
+    ("seven", 500),
+    ("sigma", 603),
+    ("sigma1", 439),
+    ("similar", 549),
+    ("six", 500),
+    ("slash", 278),
+    ("space", 250),
+    ("spade", 753),
+    ("suchthat", 439),
+    ("summation", 713),
+    ("tau", 439),
+    ("therefore", 863),
+    ("theta", 521),
+    ("theta1", 631),
+    ("three", 500),
+    ("trademarksans", 786),
+    ("trademarkserif", 890),
+    ("two", 500),
+    ("underscore", 500),
+    ("union", 768),
+    ("universal", 713),
+    ("upsilon", 576),
+    ("weierstrass", 987),
+    ("xi", 493),
+    ("zero", 500),
+    ("zeta", 494),
+];
+
+/// `ZapfDingbats` glyph widths, sorted by
+/// glyph name for binary search (Adobe Core-14 AFM metrics).
+#[rustfmt::skip]
+const ZAPF_DINGBATS: &[(&str, u16)] = &[
+    ("a1", 974),
+    ("a10", 692),
+    ("a100", 668),
+    ("a101", 732),
+    ("a102", 544),
+    ("a103", 544),
+    ("a104", 910),
+    ("a105", 911),
+    ("a106", 667),
+    ("a107", 760),
+    ("a108", 760),
+    ("a109", 626),
+    ("a11", 960),
+    ("a110", 694),
+    ("a111", 595),
+    ("a112", 776),
+    ("a117", 690),
+    ("a118", 791),
+    ("a119", 790),
+    ("a12", 939),
+    ("a120", 788),
+    ("a121", 788),
+    ("a122", 788),
+    ("a123", 788),
+    ("a124", 788),
+    ("a125", 788),
+    ("a126", 788),
+    ("a127", 788),
+    ("a128", 788),
+    ("a129", 788),
+    ("a13", 549),
+    ("a130", 788),
+    ("a131", 788),
+    ("a132", 788),
+    ("a133", 788),
+    ("a134", 788),
+    ("a135", 788),
+    ("a136", 788),
+    ("a137", 788),
+    ("a138", 788),
+    ("a139", 788),
+    ("a14", 855),
+    ("a140", 788),
+    ("a141", 788),
+    ("a142", 788),
+    ("a143", 788),
+    ("a144", 788),
+    ("a145", 788),
+    ("a146", 788),
+    ("a147", 788),
+    ("a148", 788),
+    ("a149", 788),
+    ("a15", 911),
+    ("a150", 788),
+    ("a151", 788),
+    ("a152", 788),
+    ("a153", 788),
+    ("a154", 788),
+    ("a155", 788),
+    ("a156", 788),
+    ("a157", 788),
+    ("a158", 788),
+    ("a159", 788),
+    ("a16", 933),
+    ("a160", 894),
+    ("a161", 838),
+    ("a162", 924),
+    ("a163", 1016),
+    ("a164", 458),
+    ("a165", 924),
+    ("a166", 918),
+    ("a167", 927),
+    ("a168", 928),
+    ("a169", 928),
+    ("a17", 945),
+    ("a170", 834),
+    ("a171", 873),
+    ("a172", 828),
+    ("a173", 924),
+    ("a174", 917),
+    ("a175", 930),
+    ("a176", 931),
+    ("a177", 463),
+    ("a178", 883),
+    ("a179", 836),
+    ("a18", 974),
+    ("a180", 867),
+    ("a181", 696),
+    ("a182", 874),
+    ("a183", 760),
+    ("a184", 946),
+    ("a185", 865),
+    ("a186", 967),
+    ("a187", 831),
+    ("a188", 873),
+    ("a189", 927),
+    ("a19", 755),
+    ("a190", 970),
+    ("a191", 918),
+    ("a192", 748),
+    ("a193", 836),
+    ("a194", 771),
+    ("a195", 888),
+    ("a196", 748),
+    ("a197", 771),
+    ("a198", 888),
+    ("a199", 867),
+    ("a2", 961),
+    ("a20", 846),
+    ("a200", 696),
+    ("a201", 874),
+    ("a202", 974),
+    ("a203", 762),
+    ("a204", 759),
+    ("a205", 509),
+    ("a206", 410),
+    ("a21", 762),
+    ("a22", 761),
+    ("a23", 571),
+    ("a24", 677),
+    ("a25", 763),
+    ("a26", 760),
+    ("a27", 759),
+    ("a28", 754),
+    ("a29", 786),
+    ("a3", 980),
+    ("a30", 788),
+    ("a31", 788),
+    ("a32", 790),
+    ("a33", 793),
+    ("a34", 794),
+    ("a35", 816),
+    ("a36", 823),
+    ("a37", 789),
+    ("a38", 841),
+    ("a39", 823),
+    ("a4", 719),
+    ("a40", 833),
+    ("a41", 816),
+    ("a42", 831),
+    ("a43", 923),
+    ("a44", 744),
+    ("a45", 723),
+    ("a46", 749),
+    ("a47", 790),
+    ("a48", 792),
+    ("a49", 695),
+    ("a5", 789),
+    ("a50", 776),
+    ("a51", 768),
+    ("a52", 792),
+    ("a53", 759),
+    ("a54", 707),
+    ("a55", 708),
+    ("a56", 682),
+    ("a57", 701),
+    ("a58", 826),
+    ("a59", 815),
+    ("a6", 494),
+    ("a60", 789),
+    ("a61", 789),
+    ("a62", 707),
+    ("a63", 687),
+    ("a64", 696),
+    ("a65", 689),
+    ("a66", 786),
+    ("a67", 787),
+    ("a68", 713),
+    ("a69", 791),
+    ("a7", 552),
+    ("a70", 785),
+    ("a71", 791),
+    ("a72", 873),
+    ("a73", 761),
+    ("a74", 762),
+    ("a75", 759),
+    ("a76", 892),
+    ("a77", 892),
+    ("a78", 788),
+    ("a79", 784),
+    ("a8", 537),
+    ("a81", 438),
+    ("a82", 138),
+    ("a83", 277),
+    ("a84", 415),
+    ("a85", 509),
+    ("a86", 410),
+    ("a87", 234),
+    ("a88", 234),
+    ("a89", 390),
+    ("a9", 577),
+    ("a90", 390),
+    ("a91", 276),
+    ("a92", 276),
+    ("a93", 317),
+    ("a94", 317),
+    ("a95", 334),
+    ("a96", 334),
+    ("a97", 392),
+    ("a98", 392),
+    ("a99", 668),
+    ("space", 278),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,11 +2018,54 @@ mod tests {
         assert_eq!(standard_14_width("ABCDEF+Times-Bold", "A"), Some(722.0)); // subset prefix stripped
         assert_eq!(standard_14_width("TimesNewRomanPSMT", "A"), Some(722.0)); // TrueType alias -> Times-Roman
         assert_eq!(standard_14_width("CourierNewPS-BoldMT", "A"), Some(600.0)); // TrueType alias -> Courier-Bold
-        assert!(standard_14_width("Symbol", "alpha").is_none()); // out of scope
         assert!(standard_14_width("SomeEmbeddedFont", "A").is_none());
         assert!(is_standard_14("Courier-Bold") && !is_standard_14("Comic Sans"));
         assert!(is_standard_14("Arial-BoldMT"));
         assert!(!is_standard_14("ZapfDingbats"));
+        assert!(!is_standard_14("Symbol"));
+    }
+
+    // Covers ISO 32000-1 §9.6.2.2, Annex D.5 and Annex D.6.
+    #[test]
+    fn symbol_and_zapf_dingbats_widths() {
+        assert_eq!(standard_14_width("Symbol", "alpha"), Some(631.0));
+        assert_eq!(standard_14_width("Symbol", "exclam"), Some(333.0));
+        assert_eq!(standard_14_width("Symbol", "arrowright"), Some(987.0));
+        assert_eq!(standard_14_width("ABCDEF+Symbol", "Omega"), Some(768.0));
+        assert_eq!(standard_14_width("ZapfDingbats", "a1"), Some(974.0));
+        assert_eq!(standard_14_width("ZapfDingbats", "a161"), Some(838.0));
+        assert_eq!(standard_14_width("ZapfDingbats", "space"), Some(278.0));
+        assert!(standard_14_width("Symbol", "A").is_none());
+        assert!(standard_14_width("ZapfDingbats", "alpha").is_none());
+        assert!(standard_14_width("SymbolMT", "alpha").is_none());
+    }
+
+    #[test]
+    fn every_symbolic_encoding_glyph_has_a_width() {
+        for code in 0u8..=255 {
+            if let Some(name) = crate::symbol_glyph_name(code) {
+                assert!(standard_14_width("Symbol", name).is_some(), "{name}");
+            }
+            if let Some(name) = crate::zapf_dingbats_glyph_name(code) {
+                assert!(standard_14_width("ZapfDingbats", name).is_some(), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn width_tables_are_sorted_for_binary_search() {
+        for table in [
+            HELVETICA,
+            HELVETICA_BOLD,
+            TIMES_ROMAN,
+            TIMES_BOLD,
+            TIMES_ITALIC,
+            TIMES_BOLD_ITALIC,
+            SYMBOL,
+            ZAPF_DINGBATS,
+        ] {
+            assert!(table.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        }
     }
 
     // Review-fix regression: `classify()` must reject metrically-distinct
