@@ -2691,7 +2691,7 @@ def Generated.citations13 : List Citation := [
   ⟨some 1, some (.clause [12, 6, 4, 7]), "tests/test_write.py", 158, true⟩,
   ⟨some 1, some (.clause [12, 3, 3]), "tests/test_write.py", 246, true⟩,
   ⟨some 1, some (.clause [12, 4, 2]), "tests/test_write.py", 288, true⟩,
-  ⟨some 1, some (.clause [9, 6, 2, 2]), "tests/test_write.py", 377, true⟩
+  ⟨some 1, some (.clause [9, 6, 2, 2]), "tests/test_write.py", 392, true⟩
 ]
 
 def Generated.citations : List Citation :=
