@@ -457,6 +457,14 @@ fn xref_style(kind: XrefKind) -> XrefStyle {
     }
 }
 
+/// A byte offset as a PDF integer for the trailer entry `key`. An offset
+/// past `i64::MAX` is an error, never a wrapped negative value.
+fn offset_integer(key: &str, offset: u64) -> Result<Object> {
+    i64::try_from(offset)
+        .map(Object::Int)
+        .map_err(|_| Error::Other(format!("/{key} offset {offset} exceeds a PDF integer")))
+}
+
 /// One recorded change against an object number: a new or replacement body
 /// from [`Overlay::set`], or a free marker from [`Overlay::remove`].
 #[derive(Debug, Clone)]
@@ -609,9 +617,9 @@ impl Overlay {
         if let Some(id) = rotated_id(&self.base, &out, &freed) {
             trailer.insert(name("ID"), id);
         }
-        trailer.insert(name("Prev"), Object::Int(self.base.prev as i64));
+        trailer.insert(name("Prev"), offset_integer("Prev", self.base.prev)?);
         if let (XrefStyle::Table, Some(xrefstm)) = (self.base.kind, self.base.xrefstm) {
-            trailer.insert(name("XRefStm"), Object::Int(xrefstm as i64));
+            trailer.insert(name("XRefStm"), offset_integer("XRefStm", xrefstm)?);
         }
         match self.base.kind {
             XrefStyle::Stream => finish_stream(&mut out, start, rows, trailer, self.next)?,
@@ -1160,4 +1168,22 @@ fn name(text: &str) -> Name {
 
 pub(crate) fn core_error(error: pdfboss_core::Error) -> Error {
     Error::Other(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offset_integer_keeps_offsets_that_fit_and_refuses_the_rest() {
+        assert!(matches!(offset_integer("Prev", 521), Ok(Object::Int(521))));
+        assert!(matches!(
+            offset_integer("XRefStm", i64::MAX as u64),
+            Ok(Object::Int(i64::MAX))
+        ));
+        assert!(matches!(
+            offset_integer("XRefStm", u64::MAX),
+            Err(Error::Other(msg)) if msg.contains("/XRefStm")
+        ));
+    }
 }
