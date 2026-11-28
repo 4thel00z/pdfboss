@@ -1,5 +1,22 @@
 # Changelog
 
+## [2.17.0](https://github.com/4thel00z/pdfboss/compare/v2.16.3...v2.17.0) (2026-11-28)
+
+
+### Features
+
+* **write:** measure Symbol and ZapfDingbats text with their AFM widths ([#286](https://github.com/4thel00z/pdfboss/issues/286)) ([2a4a58d](https://github.com/4thel00z/pdfboss/commit/2a4a58dcca7f51547b23a4754dd55b661a6c2af2))
+
+
+### Bug Fixes
+
+* **write:** convert /Prev and /XRefStm offsets with try_from ([#287](https://github.com/4thel00z/pdfboss/issues/287)) ([cecd266](https://github.com/4thel00z/pdfboss/commit/cecd26654ff62771c5bee1924dab7f0901c1fee2))
+
+
+### Documentation
+
+* **failure-modes:** name the 2.16.3 evidence by the squash commits ([#284](https://github.com/4thel00z/pdfboss/issues/284)) ([e0f701c](https://github.com/4thel00z/pdfboss/commit/e0f701c42d0d5d48273d96eb408680747e343daf))
+
 ## [2.16.3](https://github.com/4thel00z/pdfboss/compare/v2.16.2...v2.16.3) (2026-11-27)
 
 
