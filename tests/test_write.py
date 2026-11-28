@@ -321,6 +321,21 @@ def test_paragraph_overflow_raises_pdf_error() -> None:
         (Pdf() | page).to_bytes()
 
 
+def test_paragraph_wraps_symbol_and_zapf_dingbats(tmp_path: Path) -> None:
+    greek = " ".join(["αβγ"] * 30)
+    dingbats = " ".join(["✁✂"] * 30)
+    page = (
+        Page(size="a4")
+        | Paragraph(greek, rect=(72, 500, 222, 700), font=Standard14.SYMBOL, size=10)
+        | Paragraph(dingbats, rect=(72, 200, 222, 400), font=Standard14.ZAPF_DINGBATS, size=10)
+    )
+    path = tmp_path / "symbolic.pdf"
+    path.write_bytes((Pdf() | page).to_bytes())
+    text = pdfboss.Document(str(path)).extract_text()
+    greek_lines = [line for line in text.splitlines() if "α" in line]
+    assert len(greek_lines) >= 2, "the narrow rect must force more than one line"
+
+
 def test_paragraph_rejects_unknown_align() -> None:
     with pytest.raises(TypeError, match="left, center, right"):
         Paragraph("x", rect=(0, 0, 10, 10), align="diagonal")

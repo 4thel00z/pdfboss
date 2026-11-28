@@ -128,8 +128,7 @@ impl Standard14 {
     }
 
     /// Advance width of one character in units per 1000 of font size, from
-    /// the AFM metrics. `None` when the character has no code or metric;
-    /// Symbol and ZapfDingbats carry no metrics, so theirs are always `None`.
+    /// the AFM metrics. `None` when the character has no code or metric.
     pub fn width(self, ch: char) -> Option<f32> {
         let code = self.encode_char(ch).ok()?;
         let glyph = self.glyph_name(code)?;
@@ -243,8 +242,7 @@ mod tests {
     #[test]
     fn symbol_faces_encode_through_their_built_in_encodings() {
         // Greek through Symbol's table, a dingbat through ZapfDingbats', and
-        // a character neither table has is still refused; the two faces
-        // have no bundled metrics, so widths stay unknown.
+        // a character neither table has is still refused.
         assert_eq!(
             Standard14::Symbol.encode("\u{03B1}\u{2126}").unwrap(),
             [0o141, 0o127]
@@ -258,8 +256,8 @@ mod tests {
                 font.encode("a"),
                 Err(Error::Unencodable { ch: 'a', .. })
             ));
-            assert_eq!(font.width('\u{03B1}'), None);
         }
+        assert_eq!(Standard14::ZapfDingbats.width('\u{03B1}'), None);
         assert_eq!(Standard14::Symbol.encode("").unwrap(), Vec::<u8>::new());
     }
 
@@ -296,15 +294,23 @@ mod tests {
     }
 
     #[test]
-    fn text_width_names_symbol_and_zapf_dingbats_glyphs_from_their_own_encodings() {
-        assert!(matches!(
-            Standard14::Symbol.text_width("\u{03B1}", 12.0),
-            Err(Error::Other(msg)) if msg.contains("\"alpha\"")
-        ));
-        assert!(matches!(
-            Standard14::ZapfDingbats.text_width("\u{2192}", 12.0),
-            Err(Error::Other(msg)) if !msg.contains("Otilde")
-        ));
+    fn text_width_measures_symbol_and_zapf_dingbats_from_their_own_metrics() {
+        assert_eq!(
+            Standard14::Symbol.text_width("\u{03B1}", 1000.0).unwrap(),
+            631.0
+        );
+        assert_eq!(
+            Standard14::Symbol.text_width("!", 12.0).unwrap(),
+            333.0 * 12.0 / 1000.0
+        );
+        assert_eq!(
+            Standard14::ZapfDingbats
+                .text_width("\u{2192}", 1000.0)
+                .unwrap(),
+            838.0
+        );
+        assert_eq!(Standard14::Symbol.width('\u{03B1}'), Some(631.0));
+        assert_eq!(Standard14::ZapfDingbats.width('\u{2701}'), Some(974.0));
     }
 
     // Covers ISO 32000-1 §9.5 and §9.6.2.1.
